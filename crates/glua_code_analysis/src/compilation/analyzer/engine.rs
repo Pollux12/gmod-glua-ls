@@ -542,6 +542,18 @@ pub(crate) struct Engine {
     /// to quiescence, since one of their derivations ran too often; and
     /// whether the stage settles on the serial loop instead.
     serial_files: FxHashSet<crate::FileId>,
+    /// The members of a cycle among a worker superstep's work whose outputs
+    /// alternate: tasks run them from one snapshot, where each reads what
+    /// the others held before, so they can swap values every superstep. They
+    /// run on the index for the rest of the stage, one after another as the
+    /// serial loop runs them.
+    cycle_members: FxHashSet<DerivationId>,
+    /// For each member of a cycle a superstep closed, the fingerprints of
+    /// its outputs after the last two supersteps that closed one through it.
+    cycle_outputs: FxHashMap<DerivationId, [Option<derivation::Fingerprint>; 2]>,
+    /// While a superstep's installed facts queue their readers: each reader
+    /// queued, with the key that queued it.
+    queued_while_installing: Option<Vec<(DerivationId, HashedKey)>>,
     /// How often each group, by its first member, waited a superstep for
     /// the queries it read to be computed since the run entered its stage.
     query_deferrals: FxHashMap<DerivationId, u8>,
@@ -1038,6 +1050,9 @@ impl Engine {
         }
         let readers = readers.unwrap_or_else(|| self.stale_readers(db, key));
         for (reader, seen) in readers {
+            if let Some(queued) = &mut self.queued_while_installing {
+                queued.push((reader, key.clone()));
+            }
             self.stats
                 .requeued(key, self.cursor, reader, seen == derivation::ABSENT);
             self.remember_moved_read(db, key, reader, seen);
@@ -1666,7 +1681,9 @@ impl Engine {
             return Dispatched::Settled;
         };
         if group.iter().any(|member| {
-            member.file_id == crate::FileId::VIRTUAL || self.serial_files.contains(&member.file_id)
+            member.file_id == crate::FileId::VIRTUAL
+                || self.serial_files.contains(&member.file_id)
+                || self.cycle_members.contains(member)
         }) {
             return Dispatched::Root;
         }
@@ -1949,6 +1966,23 @@ impl Engine {
             on_root.extend(task.on_root);
             records.extend(task.records);
         }
+        let ran = tasks
+            .iter()
+            .flat_map(|(_, groups, ..)| groups.iter().flat_map(|group| &group.members))
+            .copied()
+            .collect::<FxHashSet<_>>();
+        // What the derivations that ran produced before their records are
+        // replaced: a fact one stops producing still came from it.
+        let produced_before = {
+            let graph = db.reader_graph();
+            let mut produced = FxHashMap::<HashedKey, Vec<DerivationId>>::default();
+            for member in &ran {
+                for key in graph.outputs_of(*member) {
+                    produced.entry(key.clone()).or_default().push(*member);
+                }
+            }
+            produced
+        };
         db.reader_graph_mut()
             .replace_all_kept(records, &mut released, derivation::new_stamp);
         if !self.removed_outputs.is_empty() {
@@ -1983,7 +2017,10 @@ impl Engine {
         derivation::dedup_keys(&mut touched);
         self.forget_installed(db, &touched, &written);
         db.reader_graph().uncheck_derived(&touched);
+        self.queued_while_installing = Some(Vec::new());
         self.readers_of(db, touched.iter());
+        let queued = self.queued_while_installing.take().unwrap_or_default();
+        self.note_cycles(db, &ran, &produced_before, queued);
         drop(checking);
         let _after = crate::profile::PhaseGuard::new("superstep: after");
         let widened = tasks
@@ -2081,6 +2118,67 @@ impl Engine {
         {
             self.worklist.insert(id, reason);
         }
+    }
+
+    /// Notes the cycles among the derivations a superstep `ran`: a reader
+    /// `queued` by a key one of them produces, or `produced_before` the
+    /// superstep, reaches that producer. The members of a loop of reaches
+    /// whose outputs alternate run on the index from then on (see
+    /// [`Self::cycle_members`]).
+    fn note_cycles(
+        &mut self,
+        db: &DbIndex,
+        ran: &FxHashSet<DerivationId>,
+        produced_before: &FxHashMap<HashedKey, Vec<DerivationId>>,
+        queued: Vec<(DerivationId, HashedKey)>,
+    ) {
+        let graph = db.reader_graph();
+        let mut reaches = FxHashMap::<DerivationId, Vec<DerivationId>>::default();
+        for (reader, key) in queued {
+            if !ran.contains(&reader) {
+                continue;
+            }
+            let before = produced_before.get(&key).into_iter().flatten().copied();
+            for producer in graph.producers(&key).chain(before) {
+                if producer != reader && ran.contains(&producer) {
+                    reaches.entry(reader).or_default().push(producer);
+                }
+            }
+        }
+        for component in loops_of(&reaches) {
+            let alternates = component
+                .iter()
+                .any(|member| self.outputs_alternate(db, *member));
+            if alternates {
+                self.stats.cycle_members += component
+                    .into_iter()
+                    .filter(|member| self.cycle_members.insert(*member))
+                    .count();
+            }
+        }
+    }
+
+    /// Records the fingerprint of what `member` produces now, and returns
+    /// whether it is what it produced two cycles back but not one: its
+    /// outputs alternate. A cycle that only grows its facts never returns to
+    /// an earlier state.
+    fn outputs_alternate(&mut self, db: &DbIndex, member: DerivationId) -> bool {
+        let mut outputs = db
+            .reader_graph()
+            .outputs_of(member)
+            .map(|key| {
+                (
+                    derivation::fingerprint_of(key.key()),
+                    self.fingerprint(db, key),
+                )
+            })
+            .collect::<Vec<_>>();
+        outputs.sort_unstable();
+        let now = derivation::fingerprint_of(&outputs);
+        let history = self.cycle_outputs.entry(member).or_default();
+        let alternates = history[0] == Some(now) && history[1] != Some(now);
+        *history = [history[1], Some(now)];
+        alternates
     }
 
     /// Forgets what was taken of the index before the tasks' forks were
@@ -2712,6 +2810,8 @@ impl Engine {
     fn enter_stage(&mut self, db: &mut DbIndex, stage: AnalysisStage) -> Vec<HashedKey> {
         self.stage_runs.clear();
         self.serial_files.clear();
+        self.cycle_members.clear();
+        self.cycle_outputs.clear();
         self.query_deferrals.clear();
         self.serial_stage = false;
         let before = db.analysis_stage();
@@ -3535,9 +3635,11 @@ pub(crate) struct EngineStats {
     /// Tasks run again on the index, by the first value they conflicted on.
     conflicting_tasks: usize,
     task_conflicts: BTreeMap<&'static str, usize>,
-    /// Files and stages a worker run settled on the index.
+    /// Files and stages a worker run settled on the index, and derivations
+    /// of a cycle among a superstep's work it ran there.
     serial_files: usize,
     serial_stages: usize,
+    cycle_members: usize,
     /// Loops of statements cleared, and the derivations they ran again.
     pub(crate) loops_cleared: usize,
     pub(crate) loop_members_cleared: usize,
@@ -3716,6 +3818,20 @@ impl EngineStats {
         self.evaluations.get(&kind).copied().unwrap_or(0)
     }
 
+    /// How many files and stages a worker run settled on the index after
+    /// their work kept moving.
+    #[cfg(test)]
+    pub(crate) fn serial_fallbacks(&self) -> usize {
+        self.serial_files + self.serial_stages
+    }
+
+    /// How many derivations of a cycle among a superstep's work ran on the
+    /// index.
+    #[cfg(test)]
+    pub(crate) fn cycle_members(&self) -> usize {
+        self.cycle_members
+    }
+
     pub(crate) fn total_evaluations(&self) -> usize {
         self.evaluations.values().sum()
     }
@@ -3748,12 +3864,13 @@ impl EngineStats {
         );
         if self.supersteps > 0 {
             eprintln!(
-                "[engine] supersteps={} tasks={} conflicting={} serial files={} serial stages={} conflicts={:?}",
+                "[engine] supersteps={} tasks={} conflicting={} serial files={} serial stages={} cycle members={} conflicts={:?}",
                 self.supersteps,
                 self.superstep_tasks,
                 self.conflicting_tasks,
                 self.serial_files,
                 self.serial_stages,
+                self.cycle_members,
                 self.task_conflicts
             );
             eprintln!(
@@ -4042,6 +4159,86 @@ struct GroupRun {
 /// evaluations to keep, in order, the groups that read a query the snapshot
 /// had no answer for, each with the query outputs it read, and the keys its
 /// kept evaluations moved or produced.
+/// The loops of `reaches`: its strongly connected components of more than
+/// one node.
+fn loops_of(reaches: &FxHashMap<DerivationId, Vec<DerivationId>>) -> Vec<Vec<DerivationId>> {
+    // Tarjan's algorithm, iterative: the graphs are a superstep's re-queues.
+    #[derive(Clone, Copy)]
+    struct Visit {
+        index: usize,
+        low: usize,
+        on_stack: bool,
+    }
+    let mut visits = FxHashMap::<DerivationId, Visit>::default();
+    let mut stack = Vec::new();
+    let mut loops = Vec::new();
+    let mut next_index = 0;
+    let empty = Vec::new();
+    for &start in reaches.keys() {
+        if visits.contains_key(&start) {
+            continue;
+        }
+        let mut path = vec![(start, 0usize)];
+        visits.insert(
+            start,
+            Visit {
+                index: next_index,
+                low: next_index,
+                on_stack: true,
+            },
+        );
+        next_index += 1;
+        stack.push(start);
+        while let Some(&mut (node, ref mut next)) = path.last_mut() {
+            let edges = reaches.get(&node).unwrap_or(&empty);
+            if let Some(&target) = edges.get(*next) {
+                *next += 1;
+                match visits.get(&target).copied() {
+                    None => {
+                        visits.insert(
+                            target,
+                            Visit {
+                                index: next_index,
+                                low: next_index,
+                                on_stack: true,
+                            },
+                        );
+                        next_index += 1;
+                        stack.push(target);
+                        path.push((target, 0));
+                    }
+                    Some(visit) if visit.on_stack => {
+                        let low = visits[&node].low.min(visit.index);
+                        visits.get_mut(&node).expect("visited").low = low;
+                    }
+                    Some(_) => {}
+                }
+                continue;
+            }
+            path.pop();
+            let visit = visits[&node];
+            if let Some(&(parent, _)) = path.last() {
+                let low = visits[&parent].low.min(visit.low);
+                visits.get_mut(&parent).expect("visited").low = low;
+            }
+            if visit.low == visit.index {
+                let mut component = Vec::new();
+                while let Some(member) = stack.pop() {
+                    visits.get_mut(&member).expect("visited").on_stack = false;
+                    component.push(member);
+                    if member == node {
+                        break;
+                    }
+                }
+                if component.len() > 1 {
+                    loops.push(component);
+                }
+            }
+        }
+    }
+    loops
+}
+
 struct FiledTask {
     records: Vec<derivation::KeptRecord>,
     on_root: Vec<(Vec<DerivationId>, Vec<HashedKey>)>,
