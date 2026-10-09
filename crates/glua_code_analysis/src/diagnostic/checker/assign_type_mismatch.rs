@@ -1077,18 +1077,19 @@ fn check_table_last_variadic_type(
     value_variadic: &VariadicType,
     range: TextRange,
 ) -> Option<bool> {
-    // test max 10
-    for offset in idx..(idx + 10) {
+    for offset in 0..value_variadic.element_types().len() {
         let member_key = LuaMemberKey::Integer((idx + offset) as i64 + 1);
-        let source_type = semantic_model
-            .infer_member_type(table_type, &member_key)
-            .ok()?;
+        let Ok(source_type) = semantic_model.infer_member_type(table_type, &member_key) else {
+            continue;
+        };
         match source_type {
             LuaType::Variadic(source_variadic) => {
                 return Some(source_variadic.deref() != value_variadic);
             }
             _ => {
-                let expr_type = value_variadic.get_type(offset)?;
+                let Some(expr_type) = value_variadic.get_type(offset) else {
+                    continue;
+                };
 
                 if let Some(result) = check_assign_type_mismatch(
                     context,

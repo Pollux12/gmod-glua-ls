@@ -4052,3 +4052,18 @@ fn computed_key_write_on_class_is_held_to_declared_index_field() {
         "#,
     ));
 }
+
+#[test]
+fn trailing_call_return_values_are_all_checked_against_table_elements() {
+    let mut ws = crate::VirtualWorkspace::new();
+    assert!(!ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@return number, string
+        local function f() end
+
+        ---@type table<integer, string>
+        local t = { "a", f() }
+        "#,
+    ));
+}
