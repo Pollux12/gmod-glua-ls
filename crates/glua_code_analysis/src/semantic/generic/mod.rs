@@ -5,6 +5,8 @@ mod tpl_context;
 mod tpl_pattern;
 mod type_substitutor;
 
+use std::ops::Deref;
+
 pub use call_constraint::{
     CallConstraintContext, build_call_constraint_context, normalize_constraint_type,
 };
@@ -22,12 +24,67 @@ use crate::LuaDeclExtra;
 use crate::LuaInferCache;
 use crate::LuaMemberOwner;
 use crate::LuaSemanticDeclId;
+use crate::LuaSignature;
 use crate::LuaType;
 use crate::SemanticDeclLevel;
 use crate::TypeOps;
+use crate::VariadicType;
 use crate::infer_node_semantic_decl;
 use crate::semantic::semantic_info::infer_token_semantic_decl;
 pub use instantiate_type::get_keyof_members;
+
+/// `typ`, read off `signature`, for a reader outside the signature's generic
+/// context: each of its templates stands for its constraint, and a string
+/// template for the string naming it.
+pub(crate) fn instantiate_outside_signature(
+    db: &DbIndex,
+    signature: &LuaSignature,
+    typ: &LuaType,
+) -> LuaType {
+    if !signature.is_generic() {
+        return typ.clone();
+    }
+    let mut substitutor = TypeSubstitutor::new();
+    for (idx, generic_param) in signature.generic_params.iter().enumerate() {
+        substitutor.insert_type(
+            GenericTplId::Func(idx as u32),
+            generic_param.constraint.clone().unwrap_or(LuaType::Any),
+            false,
+        );
+    }
+    let instantiated = instantiate_type_generic(db, typ, &substitutor);
+    erase_str_tpl_refs(&instantiated, signature.generic_params.len())
+}
+
+fn erase_str_tpl_refs(typ: &LuaType, generic_count: usize) -> LuaType {
+    match typ {
+        LuaType::StrTplRef(str_tpl) => match str_tpl.get_tpl_id() {
+            GenericTplId::Func(idx) if (idx as usize) < generic_count => LuaType::String,
+            _ => typ.clone(),
+        },
+        LuaType::Union(union) => LuaType::from_vec(
+            union
+                .types()
+                .map(|member| erase_str_tpl_refs(member, generic_count))
+                .collect(),
+        ),
+        LuaType::Variadic(variadic) => match variadic.deref() {
+            VariadicType::Base(base) => LuaType::Variadic(
+                VariadicType::Base(erase_str_tpl_refs(base, generic_count)).into(),
+            ),
+            VariadicType::Multi(types) => LuaType::Variadic(
+                VariadicType::Multi(
+                    types
+                        .iter()
+                        .map(|member| erase_str_tpl_refs(member, generic_count))
+                        .collect(),
+                )
+                .into(),
+            ),
+        },
+        _ => typ.clone(),
+    }
+}
 
 pub fn get_tpl_ref_extend_type(
     db: &DbIndex,

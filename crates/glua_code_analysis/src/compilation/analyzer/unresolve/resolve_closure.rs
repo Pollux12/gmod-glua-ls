@@ -11,7 +11,7 @@ use crate::{
     LuaDocReturnInfo, LuaFunctionType, LuaInferCache, LuaMemberKey, LuaMemberOwner, LuaSignature,
     LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel, ReturnTypeKind, SignatureReturnStatus,
     TypeOps, VariadicType, get_real_type, humanize_type, infer_call_expr_func, infer_expr,
-    infer_table_should_be,
+    infer_table_should_be, instantiate_outside_signature,
 };
 
 use super::{
@@ -615,12 +615,13 @@ fn resolve_closure_member_type(
                 let source_return = signature.get_return_type();
                 let source_return_unsettled = is_unsettled_inferred_return(&source_return);
                 let source_id = *id;
-                let fake_doc_function = signature.to_doc_func_type();
+                let source_contract =
+                    contract_outside_signature(db, signature, source_return.clone());
                 let result = defer_resolve_doc_function(
                     db,
                     writes,
                     closure_params.signature_id,
-                    &fake_doc_function,
+                    &source_contract,
                     self_type,
                 );
                 if result.is_ok() && source_return_unsettled {
@@ -837,8 +838,12 @@ fn resolve_doc_function(
         signature.return_filled_from_slot,
     );
 
+    // An unknown contract return says nothing about the result, so the
+    // closure keeps the return its own body gives.
     let doc_return = doc_func.get_ret();
-    let inferred_tail = (signature.resolve_return == SignatureReturnStatus::InferResolve)
+    let constrains_return = !doc_return.is_unknown();
+    let inferred_tail = (constrains_return
+        && signature.resolve_return == SignatureReturnStatus::InferResolve)
         .then(|| {
             inferred_return_tail_matching_documented_first(
                 doc_return,
@@ -847,13 +852,14 @@ fn resolve_doc_function(
             )
         })
         .flatten();
-    let should_apply_return = match signature.resolve_return {
-        SignatureReturnStatus::UnResolve => true,
-        SignatureReturnStatus::InferResolve => {
-            should_doc_return_override_inferred(doc_return, &signature.get_return_type())
-        }
-        SignatureReturnStatus::DocResolve => signature.return_filled_from_slot,
-    };
+    let should_apply_return = constrains_return
+        && match signature.resolve_return {
+            SignatureReturnStatus::UnResolve => true,
+            SignatureReturnStatus::InferResolve => {
+                should_doc_return_override_inferred(doc_return, &signature.get_return_type())
+            }
+            SignatureReturnStatus::DocResolve => signature.return_filled_from_slot,
+        };
 
     if let Some(inferred_tail) = inferred_tail {
         signature.resolve_return = SignatureReturnStatus::DocResolve;
@@ -1046,6 +1052,29 @@ mod inferred_return_tail_tests {
     }
 }
 
+/// `sig`'s params with `ret`, as a contract for a closure outside `sig`'s
+/// generic context.
+fn contract_outside_signature(db: &DbIndex, sig: &LuaSignature, ret: LuaType) -> LuaFunctionType {
+    let params = sig
+        .get_type_params()
+        .into_iter()
+        .map(|(name, typ)| {
+            (
+                name,
+                typ.map(|typ| instantiate_outside_signature(db, sig, &typ)),
+            )
+        })
+        .collect();
+    LuaFunctionType::new(
+        sig.async_state,
+        sig.is_colon_define,
+        sig.is_vararg,
+        params,
+        instantiate_outside_signature(db, sig, &ret),
+    )
+    .with_optional_params(sig.get_param_optional_flags())
+}
+
 fn filter_signature_type(
     db: &DbIndex,
     typ: &LuaType,
@@ -1086,21 +1115,12 @@ fn filter_signature_type(
                             annotated_params || (preserve_implicit_receiver && sig.is_colon_define)
                         };
                         if has_useful_info {
-                            let params = sig.get_type_params();
                             let ret = if preserve_returns {
                                 sig.get_return_type()
                             } else {
-                                LuaType::Nil
+                                LuaType::Unknown
                             };
-                            let doc_func = LuaFunctionType::new(
-                                sig.async_state,
-                                sig.is_colon_define,
-                                sig.is_vararg,
-                                params,
-                                ret,
-                            )
-                            .with_optional_params(sig.get_param_optional_flags());
-                            result.push(Arc::new(doc_func));
+                            result.push(Arc::new(contract_outside_signature(db, sig, ret)));
                         }
                     }
                 }

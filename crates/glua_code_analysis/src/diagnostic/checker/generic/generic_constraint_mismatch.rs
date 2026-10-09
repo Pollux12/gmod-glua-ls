@@ -59,6 +59,17 @@ fn check_call_expr(
         return Some(());
     };
 
+    // A forwarded `...` fills its slot with one of the pack's values.
+    let arg_infos: Vec<LuaType> = arg_infos
+        .into_iter()
+        .map(|arg_type| match &arg_type {
+            LuaType::Variadic(variadic) => match variadic.as_ref() {
+                VariadicType::Base(base) => base.clone(),
+                VariadicType::Multi(_) => arg_type,
+            },
+            _ => arg_type,
+        })
+        .collect();
     let mut arg_ranges = collect_arg_ranges(semantic_model, &call_expr);
     if call_expr.is_colon_call() && !doc_func.is_colon_define() {
         let colon_range = call_expr.get_colon_token()?.get_range();

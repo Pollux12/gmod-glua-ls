@@ -996,6 +996,35 @@ mod test {
     }
 
     #[test]
+    fn inherited_param_from_generic_base_method_takes_the_template_constraint() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class GenericBase
+            local GenericBase = {}
+
+            ---@generic T : GenericBase
+            ---@param name `T`
+            ---@param fallback T
+            function GenericBase:Make(name, fallback) end
+
+            ---@class GenericChild : GenericBase
+            local GenericChild = {}
+
+            function GenericChild:Make(name, fallback)
+                inherited_template_name = name
+                inherited_template_fallback = fallback
+            end
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("inherited_template_name"), LuaType::String);
+        let fallback = ws.expr_ty("inherited_template_fallback");
+        assert_eq!(ws.humanize_type(fallback), "GenericBase");
+    }
+
+    #[test]
     fn test_stool_buildcpanel_param_inherits_global_tool_contract() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

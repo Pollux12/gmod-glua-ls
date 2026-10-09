@@ -1639,6 +1639,179 @@ end
         ));
     }
 
+    // `PANEL = Panel` types the global every derma file reuses, so each
+    // `function PANEL:Add` fills its params from the base `Panel:Add`.
+    const PANEL_ADD_LIBRARY: &str = r#"
+            ---@meta
+            ---@class Panel
+            Panel = Panel or {}
+
+            ---@class PANEL : Panel
+            PANEL = Panel
+
+            ---@generic T : Panel
+            ---@overload fun(self: Panel, panel: Panel): Panel
+            ---@overload fun(self: Panel, panelTable: table): Panel
+            ---@overload fun(self: Panel, className: `T`, parent: Panel): T
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@[call_arg("gmod.vgui_panel", "parent_self")]
+            ---@param className `T`
+            ---@return (instance) T
+            function Panel:Add(className) end
+
+            ---@param painted boolean
+            function Panel:SetPaintedManually(painted) end
+
+            ---@param x number
+            function Panel:SetWide(x) end
+        "#;
+
+    const VARARG_TOOLTIP_PATH: &str = "gamemodes/cityrp/gamemode/core/derma/cl_tooltip.lua";
+
+    const VARARG_TOOLTIP: &str = r#"
+            DEFINE_BASECLASS("Panel")
+            PANEL = {} ---@class cityrpTooltip : Panel
+
+            function PANEL:Add(...)
+                local panel = BaseClass.Add(self, ...)
+                panel:SetPaintedManually(true)
+                return panel
+            end
+
+            vgui.Register("cityrpTooltip", PANEL, "Panel")
+
+            PANEL = {}
+            vgui.Register("cityrpTooltipMinimalRow", PANEL, "Panel")
+
+            DEFINE_BASECLASS("cityrpTooltip")
+            PANEL = {}
+
+            function PANEL:Add(...)
+                local panel = BaseClass.Add(self, ...)
+                panel:SetPaintedManually(false)
+                return panel
+            end
+
+            function PANEL:AddRow(id)
+                local panel = self:Add("cityrpTooltipMinimalRow")
+                panel.id = id
+                panel:SetPaintedManually(true)
+                added_row = panel
+                return panel
+            end
+
+            vgui.Register("cityrpTooltipMinimal", PANEL, "cityrpTooltip")
+        "#;
+
+    fn panel_library_workspace(ws: &mut VirtualWorkspace, panel_library: &str) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file("library/panel.lua", panel_library);
+    }
+
+    fn vararg_override_param_types(ws: &VirtualWorkspace, file_id: crate::FileId) -> Vec<LuaType> {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let signature_index = semantic_model.get_db().get_signature_index();
+        semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaClosureExpr>()
+            .filter_map(|closure| {
+                let signature =
+                    signature_index.get(&LuaSignatureId::from_closure(file_id, &closure))?;
+                (signature.params.first()? == "...")
+                    .then(|| signature.get_type_params()[0].1.clone())
+                    .flatten()
+            })
+            .collect()
+    }
+
+    #[gtest]
+    fn test_vararg_override_of_generic_base_method_takes_no_template_param() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+        let file_id = ws.def_file(VARARG_TOOLTIP_PATH, VARARG_TOOLTIP);
+
+        expect_that!(
+            vararg_override_param_types(&ws, file_id),
+            elements_are![eq(&LuaType::String), eq(&LuaType::String)]
+        );
+    }
+
+    #[gtest]
+    fn test_vararg_override_of_generic_base_method_returns_the_base_panel() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+        ws.def_file(VARARG_TOOLTIP_PATH, VARARG_TOOLTIP);
+
+        let added_row = ws.expr_ty("added_row");
+        expect_false!(
+            added_row.is_nullable() || added_row.is_unknown(),
+            "{}",
+            ws.humanize_type(added_row.clone())
+        );
+        for code in [
+            DiagnosticCode::UncheckedNilAccess,
+            DiagnosticCode::NeedCheckNil,
+        ] {
+            expect_true!(
+                ws.check_file_for(code, VARARG_TOOLTIP_PATH, VARARG_TOOLTIP),
+                "unexpected {code:?}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_vararg_override_forwarding_to_string_template_base_has_no_constraint_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        let without_overloads = PANEL_ADD_LIBRARY
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("---@overload"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panel_library_workspace(&mut ws, &without_overloads);
+
+        expect_true!(ws.check_file_for(
+            DiagnosticCode::GenericConstraintMismatch,
+            VARARG_TOOLTIP_PATH,
+            VARARG_TOOLTIP,
+        ));
+    }
+
+    #[gtest]
+    fn test_override_filled_from_annotated_base_keeps_its_body_return() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+        ws.def_file(
+            "gamemodes/cityrp/gamemode/core/derma/cl_width.lua",
+            r#"
+            PANEL = {}
+            function PANEL:SetWide(x)
+                return x > 10
+            end
+            wide_result = PANEL:SetWide(20)
+        "#,
+        );
+
+        expect_that!(ws.expr_ty("wide_result"), eq(&LuaType::Boolean));
+    }
+
+    #[gtest]
+    fn test_vararg_override_of_generic_base_method_matches_cold_after_edit() {
+        let edited = VARARG_TOOLTIP.replace("panel:SetPaintedManually(false)", "");
+        VirtualWorkspace::assert_warm_matches_cold(
+            |ws| panel_library_workspace(ws, PANEL_ADD_LIBRARY),
+            &[(VARARG_TOOLTIP_PATH, VARARG_TOOLTIP)],
+            &[(VARARG_TOOLTIP_PATH, &edited)],
+        );
+    }
+
     #[gtest]
     fn test_define_baseclass_local_is_neither_unused_nor_redefined() {
         const PANELS: &str = r#"

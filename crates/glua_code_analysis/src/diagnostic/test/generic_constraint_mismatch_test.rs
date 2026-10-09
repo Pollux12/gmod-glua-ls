@@ -616,6 +616,37 @@ mod test {
         expect_that!(diagnostic.range.start, eq(expected_start));
     }
 
+    fn forwarded_pack_str_tpl_mismatch_count(pack_type: &str) -> usize {
+        let mut ws = VirtualWorkspace::new();
+        ws.enable_check(DiagnosticCode::GenericConstraintMismatch);
+        let file_id = ws.def(&format!(
+            r#"
+                    ---@class Panel
+
+                    ---@generic T: Panel
+                    ---@param name `T`
+                    ---@return T
+                    function create_panel(name) end
+
+                    ---@param ... {pack_type}
+                    function forward(...)
+                        return create_panel(...)
+                    end
+                "#
+        ));
+        generic_constraint_mismatch_diagnostics(&mut ws, file_id).len()
+    }
+
+    #[gtest]
+    fn test_str_tpl_accepts_forwarded_string_pack() {
+        expect_that!(forwarded_pack_str_tpl_mismatch_count("string"), eq(0));
+    }
+
+    #[gtest]
+    fn test_str_tpl_rejects_forwarded_integer_pack() {
+        expect_that!(forwarded_pack_str_tpl_mismatch_count("integer"), eq(1));
+    }
+
     #[gtest]
     fn test_str_tpl_union_all_non_string_emits_single_hard_mismatch() {
         let mut ws = VirtualWorkspace::new();
