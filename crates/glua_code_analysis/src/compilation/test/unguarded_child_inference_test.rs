@@ -2673,4 +2673,32 @@ filter:SetUpdateOnType(true)
             1
         );
     }
+
+    #[test]
+    fn unguarded_child_message_names_the_flow_narrowed_receiver() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_gmod_type_predicates();
+        let file_id = ws.def(
+            r#"
+            ---@class NULL
+            ---@class Entity
+            ---@class Car: Entity
+            ---@field GetFuelCapacity fun(self: Car): number
+            ---@param veh Entity|NULL
+            local function use(veh)
+                if IsValid(veh) then
+                    return veh:GetFuelCapacity()
+                end
+            end
+            "#,
+        );
+
+        let diagnostics = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "expected `Car` but found `Entity`. Add a guard to narrow the parent to `Car`."
+        );
+    }
 }

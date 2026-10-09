@@ -562,6 +562,7 @@ pub(crate) struct UnguardedChildFileResult {
     deferred_definitions: FxHashSet<LuaDefinitionId>,
     nested_scores: HashMap<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>,
     sources: HashMap<(LuaDefinitionId, crate::LuaTypeDeclId), InFiled<glua_parser::LuaSyntaxId>>,
+    found_types: HashMap<InFiled<glua_parser::LuaSyntaxId>, LuaType>,
     initializer_refinements: HashMap<crate::LuaDeclId, LuaType>,
     profile: Option<UnguardedChildProfile>,
 }
@@ -652,10 +653,12 @@ pub(crate) fn publish_unguarded_children(
     let mut sources =
         HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), InFiled<glua_parser::LuaSyntaxId>>::new(
         );
+    let mut found_types = HashMap::<InFiled<glua_parser::LuaSyntaxId>, LuaType>::default();
     let mut initializer_refinements = HashMap::<crate::LuaDeclId, LuaType>::default();
 
     for result in results {
         deferred_definitions.extend(result.deferred_definitions);
+        found_types.extend(result.found_types);
         for (definition, candidates) in result.scores {
             let entry = scores
                 .entry(definition)
@@ -720,7 +723,7 @@ pub(crate) fn publish_unguarded_children(
     let mut scores = scores.into_iter().collect::<Vec<_>>();
     scores.sort_by(|(left, _), (right, _)| left.stable_cmp(right));
     for (definition, candidates) in scores {
-        let found_type = candidates.parent_type;
+        let parent_type = candidates.parent_type;
         let mut candidates = candidates.children;
         credit_inherited_members(db, &mut candidates);
         let Some(max_score) = candidates.values().map(FxHashSet::len).max() else {
@@ -751,6 +754,7 @@ pub(crate) fn publish_unguarded_children(
         else {
             continue;
         };
+        let found_type = found_types.get(&source).cloned().unwrap_or(parent_type);
         let node = LuaInferenceNodeId::Definition(definition);
         // Every definition that reaches the same use files its fact under one
         // event there, so the use is reported once.
@@ -917,6 +921,7 @@ fn collect_unguarded_child_file(
     let mut sources =
         HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), InFiled<glua_parser::LuaSyntaxId>>::new(
         );
+    let mut found_types = HashMap::<InFiled<glua_parser::LuaSyntaxId>, LuaType>::default();
     let mut initializer_refinements = HashMap::<crate::LuaDeclId, LuaType>::default();
     let mut declared_path_bases = DeclaredPathBases::default();
     let mut subtypes_with_member = SubtypesWithMember::default();
@@ -933,6 +938,7 @@ fn collect_unguarded_child_file(
             deferred_definitions,
             nested_scores,
             sources,
+            found_types,
             initializer_refinements,
             profile,
         };
@@ -1094,6 +1100,7 @@ fn collect_unguarded_child_file(
                 })
                 .unwrap_or_else(|| Arc::from([LuaDefinitionId::Declaration(decl_id)]));
             let source = InFiled::new(file_id, index_expr.get_syntax_id());
+            found_types.insert(source.clone(), current.clone());
             let mut evidence_recorded = false;
             for child_id in children.iter() {
                 let owner = LuaMemberOwner::Type(child_id.clone());
@@ -1164,6 +1171,7 @@ fn collect_unguarded_child_file(
         deferred_definitions,
         nested_scores,
         sources,
+        found_types,
         initializer_refinements,
         profile,
     }
