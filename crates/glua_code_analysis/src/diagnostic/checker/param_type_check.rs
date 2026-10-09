@@ -318,7 +318,7 @@ fn check_call_expr(
                     context,
                     semantic_model,
                     *arg_ranges.get(idx)?,
-                    &param_type,
+                    &check_type,
                     arg_type,
                     arg_expr,
                     result,
