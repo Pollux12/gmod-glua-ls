@@ -15,9 +15,10 @@
 //! runs before the readers that rank after it, and within a rank runs every
 //! changed derivation before re-checking any reader: statements read each
 //! other in both directions, and a reader checked once after the rank's new
-//! work has run is checked once, not after each writer. A reader that ranks
-//! before the derivation that queued it (a back edge) waits for the next
-//! round, which re-checks it once however many later producers moved it.
+//! work has run is checked once, not after each writer. A reader that comes
+//! before the derivation that queued it in the round's order (a back edge)
+//! waits for the next round, which re-checks it once however many later
+//! producers moved it.
 //!
 //! A re-analysis settles the re-analysed files first. Until their derivations
 //! settle through every stage, a reader in another file only waits: what it
@@ -417,10 +418,11 @@ pub(crate) struct Engine {
     schedule: Schedule,
     /// This round's work.
     worklist: Queue,
-    /// Back edges: readers ranked before the derivation that queued them.
+    /// Back edges: readers that come before the derivation that queued them.
     next_round: Queue,
-    /// The derivation this round evaluated last.
-    cursor: Option<DerivationId>,
+    /// The derivation this round evaluated or decided last, and, for one
+    /// evaluated on the index, why it was queued.
+    cursor: Option<(DerivationId, Option<Reason>)>,
     stats: EngineStats,
     /// Files whose source passes read a fact that moved. A file's source
     /// layer is only ever rebuilt whole, so the caller re-analyses them.
@@ -837,11 +839,18 @@ impl Engine {
         }
     }
 
-    /// Queues `id` in this round unless it ranks before the derivation being
-    /// evaluated, else in the next. A changed entry stays changed.
+    /// Queues `id` in this round unless it comes before the derivation being
+    /// evaluated on the index in the round's order, or ranks before the one a
+    /// superstep decided last, else in the next. A changed entry stays changed.
     fn queue(&mut self, id: DerivationId, reason: Reason) {
-        if self.cursor.is_some_and(|cursor| {
-            self.worklist.schedule == Schedule::Deferred || id.kind.rank() < cursor.kind.rank()
+        if self.cursor.is_some_and(|(cursor, cursor_reason)| {
+            self.worklist.schedule == Schedule::Deferred
+                || match cursor_reason {
+                    Some(cursor_reason) => {
+                        self.worklist.entry(id, reason) < self.worklist.entry(cursor, cursor_reason)
+                    }
+                    None => id.kind.rank() < cursor.kind.rank(),
+                }
         }) {
             self.next_round.insert(id, reason);
         } else {
@@ -1049,12 +1058,13 @@ impl Engine {
             self.payload_holders.insert(signature_id.get_file_id());
         }
         let readers = readers.unwrap_or_else(|| self.stale_readers(db, key));
+        let cursor = self.cursor.map(|(id, _)| id);
         for (reader, seen) in readers {
             if let Some(queued) = &mut self.queued_while_installing {
                 queued.push((reader, key.clone()));
             }
             self.stats
-                .requeued(key, self.cursor, reader, seen == derivation::ABSENT);
+                .requeued(key, cursor, reader, seen == derivation::ABSENT);
             self.remember_moved_read(db, key, reader, seen);
             if reader.kind.is_query() {
                 db.queries().set_stale(reader, true);
@@ -1062,7 +1072,7 @@ impl Engine {
             if crate::profile::tracing_evaluations() {
                 self.queued_by
                     .entry(reader)
-                    .or_insert_with(|| (key.clone(), self.cursor));
+                    .or_insert_with(|| (key.clone(), cursor));
             }
             match reader.kind {
                 DerivationKind::Diagnostics => {
@@ -1662,7 +1672,7 @@ impl Engine {
         if self.hold_for_stage(db, id, reason) {
             return Dispatched::Settled;
         }
-        self.cursor = Some(id);
+        self.cursor = Some((id, None));
         if id.kind.is_query() {
             return Dispatched::Root;
         }
@@ -2234,7 +2244,7 @@ impl Engine {
         if self.hold_for_stage(db, id, reason) {
             return;
         }
-        self.cursor = Some(id);
+        self.cursor = Some((id, Some(reason)));
         let stale = crate::profile::phase("engine: stale check", || {
             self.needs_evaluation(db, id, reason)
         });
@@ -3222,7 +3232,7 @@ impl Engine {
             if self.hold_for_stage(db, id, reason) {
                 continue;
             }
-            self.cursor = Some(id);
+            self.cursor = Some((id, Some(reason)));
             if !self.needs_evaluation(db, id, reason) || !self.admit_run(id) {
                 self.moved_from.remove(&id);
                 db.queries().set_stale(id, false);
@@ -5562,9 +5572,16 @@ print(tuned{index})"
         engine.run(db, &PeerRead, Slice::Evaluations(100));
     }
 
+    /// The reader copies the size of a member slot two writers, at 10 and
+    /// 20, contribute to.
     struct SlotContributors {
+        reader: u32,
         second: Mutex<bool>,
     }
+
+    /// A reader between the two contributors: a round reaches it after the
+    /// first and before the second.
+    const BETWEEN_CONTRIBUTORS: u32 = 15;
 
     fn joined_owner() -> crate::LuaMemberOwner {
         crate::LuaMemberOwner::Type(crate::LuaTypeDeclId::global("RoundJoined"))
@@ -5573,7 +5590,7 @@ print(tuned{index})"
     impl Recipe for SlotContributors {
         fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
             let joined = joined_owner();
-            if id == statement(READER) {
+            if id == statement(self.reader) {
                 let key = crate::LuaMemberKey::Name("value".into());
                 let slot = db
                     .get_member_index()
@@ -5632,13 +5649,19 @@ print(tuned{index})"
         let mut ws = VirtualWorkspace::new();
         let db = ws.get_db_mut();
         let recipe = SlotContributors {
+            reader: BETWEEN_CONTRIBUTORS,
             second: Mutex::new(true),
         };
         let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
         engine.batch_slot_notifications = batch;
         bind(db, 110, LuaType::IntegerConst(1));
         bind(db, 120, LuaType::IntegerConst(1));
-        assert!(settle(db, &mut engine, &recipe, &[READER, WRITER, 20]));
+        assert!(settle(
+            db,
+            &mut engine,
+            &recipe,
+            &[BETWEEN_CONTRIBUTORS, WRITER, 20]
+        ));
         let answer = copied(db);
         let before = engine.stats.evaluations(DerivationKind::LocalStat);
         bind(db, 110, LuaType::IntegerConst(2));
@@ -5689,6 +5712,7 @@ print(tuned{index})"
         let mut ws = VirtualWorkspace::new();
         let db = ws.get_db_mut();
         let recipe = SlotContributors {
+            reader: READER,
             second: Mutex::new(true),
         };
         let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
@@ -5764,6 +5788,7 @@ print(tuned{index})"
         let mut ws = VirtualWorkspace::new();
         let db = ws.get_db_mut();
         let recipe = SlotContributors {
+            reader: READER,
             second: Mutex::new(true),
         };
         let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
