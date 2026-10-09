@@ -893,10 +893,12 @@ impl LuaMemberIndex {
             return;
         }
         self.snapshot_member(id);
-        let listed = self
-            .effective_path_member_owner(id, owner)
-            .unwrap_or_else(|| owner.clone());
-        let listed = self.canonical(&listed).clone();
+        let listed = derivation::untracked(|| {
+            let listed = self
+                .effective_path_member_owner(id, owner)
+                .unwrap_or_else(|| owner.clone());
+            self.canonical(&listed).clone()
+        });
         if let Some(source) = self.source_members.get_mut(&id) {
             for owner in [owner, &listed] {
                 if !source.derived_owners.contains(owner) {
