@@ -53,6 +53,8 @@ const PATH_CHANGES: &[(&str, EmmyrcChange)] = &[
     ("gmod.annotationsPath", EmmyrcChange::Workspace),
     ("gmod.autoLoadAnnotations", EmmyrcChange::Workspace),
     ("gmod.autoDetectGamemodeBase", EmmyrcChange::Workspace),
+    ("gmod.activeGamemode", EmmyrcChange::Workspace),
+    ("gmod.loadEverything", EmmyrcChange::Workspace),
 ];
 
 impl Emmyrc {
@@ -202,6 +204,14 @@ mod tests {
         )?;
         verify_that!(
             change(|config| config.gmod.annotations_path = Some("annotations".to_string())),
+            eq(EmmyrcChange::Workspace)
+        )?;
+        verify_that!(
+            change(|config| config.gmod.active_gamemode = Some("helix".to_string())),
+            eq(EmmyrcChange::Workspace)
+        )?;
+        verify_that!(
+            change(|config| config.gmod.load_everything = true),
             eq(EmmyrcChange::Workspace)
         )
     }

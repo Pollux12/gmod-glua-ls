@@ -104,6 +104,17 @@ pub struct EmmyrcGmod {
     /// Set to `false` to disable this detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_detect_gamemode_base: Option<bool>,
+    /// The gamemode a Garry's Mod folder (named `garrysmod`, or holding `addons/`
+    /// and `gamemodes/`) loads with its addons, together with the custom
+    /// gamemodes it derives from. `"*"` loads every custom gamemode. Unset, a
+    /// sole custom gamemode loads; with several, each loads while a file in it
+    /// is open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_gamemode: Option<String>,
+    /// Load a whole Garry's Mod folder, `lua/` and the built-in gamemodes
+    /// included, instead of its addons and active gamemode.
+    #[serde(default)]
+    pub load_everything: bool,
 }
 
 /// Scripted class groups used for class analysis, the Class Explorer and scaffolding.
@@ -651,6 +662,8 @@ impl Default for EmmyrcGmod {
             auto_load_annotations: None,
             template_path: None,
             auto_detect_gamemode_base: None,
+            active_gamemode: None,
+            load_everything: false,
         }
     }
 }
