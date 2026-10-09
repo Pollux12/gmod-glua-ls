@@ -11,7 +11,7 @@ use crate::{
     codestyle::apply_workspace_code_style_off_workers,
     context::{
         FileDiagnostic, LoadedConfig, LspFeatures, ProgressTask, ServerContextSnapshot, StatusBar,
-        WorkspaceFileMatcher, get_client_id, load_scoped_config_off_workers,
+        WorkspaceFileMatcher, get_client_id, load_scoped_config_off_workers, send_projects_changed,
         validate_gmod_annotations_for_ls,
     },
     handlers::{
@@ -171,12 +171,13 @@ pub async fn initialized_handler(
         context.status_bar(),
         context.file_diagnostic(),
         context.lsp_features(),
-        scoped_folders,
-        loaded,
+        scoped_folders.clone(),
+        loaded.clone(),
         open_files,
         watchdog_status.clone(),
     )
     .await;
+    send_projects_changed(context.client(), workspace_folders, loaded, scoped_folders).await;
 
     register_files_watch(context.clone(), &params.capabilities).await;
     register_did_change_configuration(context.client(), context.lsp_features(), client_id);

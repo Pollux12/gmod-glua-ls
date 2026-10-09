@@ -5,8 +5,8 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use super::{ClientProxy, DebouncedAnalysis, FileDiagnostic, StatusBar};
 use crate::codestyle::apply_workspace_code_style_off_workers;
-use crate::context::ServerContextSnapshot;
 use crate::context::lsp_features::LspFeatures;
+use crate::context::{ServerContextSnapshot, send_projects_changed};
 use crate::handlers::{
     ClientConfig, apply_file_system_changes, apply_workspace_diagnostic_configs, init_analysis,
     refresh_open_document_features,
@@ -188,12 +188,13 @@ impl WorkspaceManager {
                     &status_bar,
                     &file_diagnostic,
                     &lsp_features,
-                    scoped_folders,
-                    loaded,
+                    scoped_folders.clone(),
+                    loaded.clone(),
                     open_files,
                     watchdog_status,
                 )
                 .await;
+                send_projects_changed(&client, workspace_folders, loaded, scoped_folders).await;
             }
             EmmyrcChange::Editor | EmmyrcChange::Diagnostics | EmmyrcChange::Analysis => {
                 if change >= EmmyrcChange::Diagnostics {
@@ -283,6 +284,23 @@ impl WorkspaceManager {
             file_diagnostic.add_workspace_diagnostic_task(0, true).await;
             refresh_open_document_features(&client, &lsp_features);
         });
+    }
+
+    /// Held while the workspace is scoped again, so a config reload and the
+    /// documents opening and closing scope it one at a time.
+    pub fn scope_lock(&self) -> Arc<Mutex<()>> {
+        self.config_apply.clone()
+    }
+
+    /// Whether `uri` lies in a workspace folder that loads only part of
+    /// itself: a whole Garry's Mod folder.
+    pub fn in_scoped_folder(&self, uri: &Uri) -> bool {
+        let Some(path) = uri_to_file_path(uri) else {
+            return false;
+        };
+        self.workspace_folders
+            .iter()
+            .any(|folder| path.starts_with(&folder.root) && !self.scoped_folders.contains(folder))
     }
 
     /// The paths of the open documents.
@@ -466,9 +484,7 @@ pub fn load_scoped_config(
         load_config_for_roots(config_roots.clone(), &HashSet::new(), client_config.clone());
     let mut scoped_folders = Vec::new();
     let mut scoped_roots = HashSet::new();
-    for folder in folders {
-        let gmod = &loaded.root_emmyrc(&folder.root).gmod;
-        let scoped = scope_workspace_folder(folder, gmod, UnpickedGamemodes::None, open);
+    for (folder, scoped) in folders.iter().zip(scope_each(folders, &loaded, open)) {
         if scoped.as_slice() != std::slice::from_ref(folder) {
             scoped_roots.extend(scoped.iter().map(|scoped| scoped.root.clone()));
         }
@@ -483,6 +499,34 @@ pub fn load_scoped_config(
         .collect();
     let loaded = load_config_for_roots(config_roots, &scoped_roots, client_config);
     (scoped_folders, loaded)
+}
+
+/// The folders the client's `folders` load with `loaded` and the files in
+/// `open`.
+pub fn scope_folders(
+    folders: &[WorkspaceFolder],
+    loaded: &LoadedConfig,
+    open: &[PathBuf],
+) -> Vec<WorkspaceFolder> {
+    scope_each(folders, loaded, open)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// The folders each of `folders` loads.
+fn scope_each(
+    folders: &[WorkspaceFolder],
+    loaded: &LoadedConfig,
+    open: &[PathBuf],
+) -> Vec<Vec<WorkspaceFolder>> {
+    folders
+        .iter()
+        .map(|folder| {
+            let gmod = &loaded.root_emmyrc(&folder.root).gmod;
+            scope_workspace_folder(folder, gmod, UnpickedGamemodes::None, open)
+        })
+        .collect()
 }
 
 #[cfg(test)]

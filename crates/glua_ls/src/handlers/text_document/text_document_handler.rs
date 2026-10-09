@@ -10,7 +10,7 @@ use rowan::NodeCache;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::context::ServerContextSnapshot;
+use crate::context::{ServerContextSnapshot, rescope_open_files};
 
 struct PreparsedDocument {
     tree: LuaSyntaxTree,
@@ -148,8 +148,23 @@ pub async fn on_did_open_text_document(
             true
         } else {
             drop(analysis);
-            let workspace_manager = context.workspace_manager().read().await;
-            workspace_manager.is_workspace_file(&uri)
+            let (admitted, scoped) = {
+                let workspace_manager = context.workspace_manager().read().await;
+                (
+                    workspace_manager.is_workspace_file(&uri),
+                    workspace_manager.in_scoped_folder(&uri),
+                )
+            };
+            if !admitted && scoped {
+                rescope_open_files(&context).await;
+                context
+                    .workspace_manager()
+                    .read()
+                    .await
+                    .is_workspace_file(&uri)
+            } else {
+                admitted
+            }
         }
     };
 
@@ -321,6 +336,17 @@ pub async fn on_did_close_document(
         }
         analysis.get_emmyrc().workspace.encoding.clone()
     };
+
+    // In a whole Garry's Mod folder, closing a gamemode's last open file or
+    // a loose file unloads it.
+    let scoped = context
+        .workspace_manager()
+        .read()
+        .await
+        .in_scoped_folder(uri);
+    if scoped && rescope_open_files(&context).await.contains(uri) {
+        return Some(());
+    }
 
     // Only remove from the index when the file no longer exists on disk
     // (e.g. it was deleted while open). Files that still exist on disk —
