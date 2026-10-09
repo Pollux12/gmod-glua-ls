@@ -391,11 +391,14 @@ mod tests {
         root: &std::path::Path,
         files: &[(&str, &str)],
     ) -> Vec<Uri> {
-        snapshot.workspace_manager().write().await.workspace_folders =
-            vec![glua_code_analysis::WorkspaceFolder::new(
+        {
+            let mut manager = snapshot.workspace_manager().write().await;
+            manager.workspace_folders = vec![glua_code_analysis::WorkspaceFolder::new(
                 root.to_path_buf(),
                 false,
             )];
+            manager.scoped_folders = manager.workspace_folders.clone();
+        }
         let mut analysis = snapshot.analysis().write().await;
         analysis.add_main_workspace(root.to_path_buf());
         files

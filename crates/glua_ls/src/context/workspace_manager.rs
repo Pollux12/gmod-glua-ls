@@ -14,8 +14,8 @@ use crate::handlers::{
 use crate::util::{LongRunningWatchdogStatus, spawn_long_running_watchdog};
 use glua_code_analysis::uri_to_file_path;
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, EmmyrcChange, LuaDiagnosticConfig, WorkspaceFolder, WorkspaceImport,
-    calculate_include_and_exclude, load_configs,
+    EmmyLuaAnalysis, Emmyrc, EmmyrcChange, LuaDiagnosticConfig, UnpickedGamemodes, WorkspaceFolder,
+    WorkspaceImport, calculate_include_and_exclude, load_configs, scope_workspace_folder,
 };
 use log::{debug, info};
 use lsp_types::Uri;
@@ -39,7 +39,12 @@ pub struct WorkspaceManager {
     lsp_features: Arc<LspFeatures>,
     debounced_analysis: Arc<DebouncedAnalysis>,
     pub client_config: ClientConfig,
+    /// The client's workspace folders.
     pub workspace_folders: Vec<WorkspaceFolder>,
+    /// The folders they load: a whole Garry's Mod folder as its addons and
+    /// gamemodes, each its own root, then itself for the open files outside
+    /// them; any other folder as it is.
+    pub scoped_folders: Vec<WorkspaceFolder>,
     pub watcher: Option<notify::RecommendedWatcher>,
     pub current_open_files: HashSet<Uri>,
     /// Fallback matcher used when no workspace-root-specific matcher applies
@@ -68,6 +73,7 @@ impl WorkspaceManager {
             status_bar,
             client_config: ClientConfig::default(),
             workspace_folders: Vec::new(),
+            scoped_folders: Vec::new(),
             recheck_token: Arc::new(Mutex::new(None)),
             config_token: Arc::new(Mutex::new(None)),
             config_apply: Arc::new(Mutex::new(())),
@@ -133,22 +139,24 @@ impl WorkspaceManager {
                 manager.debounced_analysis.clone(),
             )
         };
-        let (workspace_folders, client_config) = {
+        let (workspace_folders, client_config, open_paths) = {
             let manager = workspace_manager.read().await;
             (
                 manager.workspace_folders.clone(),
                 manager.client_config.clone(),
+                manager.open_file_paths(),
             )
         };
 
         let watchdog_status = LongRunningWatchdogStatus::new("Reloading GLuaLS configuration");
         let _watchdog =
             spawn_long_running_watchdog("workspace config reload", watchdog_status.clone());
-        let loaded =
-            load_emmy_config_off_workers(collect_config_roots(&workspace_folders), client_config)
+        let (scoped_folders, loaded) =
+            load_scoped_config_off_workers(workspace_folders.clone(), open_paths, client_config)
                 .await;
         let (change, open_files) = {
             let mut manager = workspace_manager.write().await;
+            manager.scoped_folders = scoped_folders.clone();
             let change = manager
                 .loaded_config
                 .as_ref()
@@ -180,7 +188,7 @@ impl WorkspaceManager {
                     &status_bar,
                     &file_diagnostic,
                     &lsp_features,
-                    workspace_folders,
+                    scoped_folders,
                     loaded,
                     open_files,
                     watchdog_status,
@@ -277,6 +285,17 @@ impl WorkspaceManager {
         });
     }
 
+    /// The paths of the open documents.
+    pub fn open_file_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self
+            .current_open_files
+            .iter()
+            .filter_map(uri_to_file_path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
     /// The open documents the workspace admits, as it would on their opening.
     pub fn open_workspace_files(&self) -> HashSet<Uri> {
         self.current_open_files
@@ -287,7 +306,7 @@ impl WorkspaceManager {
     }
 
     /// Whether `uri` is where the workspace loads config from: directly in a
-    /// workspace root.
+    /// workspace folder or in one of the folders it loads.
     pub fn is_workspace_config_file(&self, uri: &Uri) -> bool {
         uri_to_file_path(uri)
             .as_deref()
@@ -295,6 +314,7 @@ impl WorkspaceManager {
             .is_some_and(|dir| {
                 self.workspace_folders
                     .iter()
+                    .chain(&self.scoped_folders)
                     .any(|workspace| workspace.root == dir)
             })
     }
@@ -302,7 +322,7 @@ impl WorkspaceManager {
     pub fn is_workspace_file(&self, uri: &Uri) -> bool {
         is_workspace_file_inner(
             uri,
-            &self.workspace_folders,
+            &self.scoped_folders,
             &self.per_root_matchers,
             &self.match_file_pattern,
         )
@@ -415,22 +435,70 @@ impl LoadedConfig {
     }
 
     /// The config `root` is collected and diagnosed with.
-    fn root_emmyrc(&self, root: &Path) -> &Emmyrc {
+    pub fn root_emmyrc(&self, root: &Path) -> &Emmyrc {
         self.workspace_emmyrcs.get(root).unwrap_or(&self.emmyrc)
     }
 }
 
-/// [`load_emmy_config`] on a blocking thread: it reads every config file.
-pub async fn load_emmy_config_off_workers(
-    config_roots: Vec<PathBuf>,
+/// [`load_scoped_config`] on a blocking thread: it reads every config file
+/// and the folders' layout.
+pub async fn load_scoped_config_off_workers(
+    folders: Vec<WorkspaceFolder>,
+    open: Vec<PathBuf>,
     client_config: ClientConfig,
-) -> LoadedConfig {
-    tokio::task::spawn_blocking(move || load_emmy_config(config_roots, client_config))
+) -> (Vec<WorkspaceFolder>, LoadedConfig) {
+    tokio::task::spawn_blocking(move || load_scoped_config(&folders, &open, client_config))
         .await
         .unwrap_or_else(|err| std::panic::resume_unwind(err.into_panic()))
 }
 
+/// The folders the client's `folders` load, scoped by their own config and
+/// the files in `open`, and the config they load with: each addon and
+/// gamemode of a scoped Garry's Mod folder is a config root after the
+/// client's folders, as a folder of a multi-root workspace would be.
+pub fn load_scoped_config(
+    folders: &[WorkspaceFolder],
+    open: &[PathBuf],
+    client_config: ClientConfig,
+) -> (Vec<WorkspaceFolder>, LoadedConfig) {
+    let config_roots = collect_config_roots(folders);
+    let loaded =
+        load_config_for_roots(config_roots.clone(), &HashSet::new(), client_config.clone());
+    let mut scoped_folders = Vec::new();
+    let mut scoped_roots = HashSet::new();
+    for folder in folders {
+        let gmod = &loaded.root_emmyrc(&folder.root).gmod;
+        let scoped = scope_workspace_folder(folder, gmod, UnpickedGamemodes::None, open);
+        if scoped.as_slice() != std::slice::from_ref(folder) {
+            scoped_roots.extend(scoped.iter().map(|scoped| scoped.root.clone()));
+        }
+        scoped_folders.extend(scoped);
+    }
+    if scoped_roots.is_empty() {
+        return (scoped_folders, loaded);
+    }
+    let config_roots = config_roots
+        .into_iter()
+        .chain(scoped_folders.iter().map(|folder| folder.root.clone()))
+        .collect();
+    let loaded = load_config_for_roots(config_roots, &scoped_roots, client_config);
+    (scoped_folders, loaded)
+}
+
+#[cfg(test)]
 pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig) -> LoadedConfig {
+    load_config_for_roots(config_roots, &HashSet::new(), client_config)
+}
+
+/// The config of `config_roots`, merged, and each root's own. A root in
+/// `scoped_roots` belongs to a scoped Garry's Mod folder, so no gamemode base
+/// is detected from it: the folder loads its custom gamemodes itself and the
+/// annotations cover the built-in ones.
+fn load_config_for_roots(
+    config_roots: Vec<PathBuf>,
+    scoped_roots: &HashSet<PathBuf>,
+    client_config: ClientConfig,
+) -> LoadedConfig {
     // Config load priority.
     // * Global `<os-specific home-dir>` config files.
     // * Global `<os-specific config-dir>/glua_ls` config files.
@@ -494,14 +562,10 @@ pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig)
     // Inject GMod annotations path if provided and not explicitly disabled
     inject_gmod_annotations(&client_config, &mut emmyrc);
 
-    // Inject gamemode base libraries if detected and not explicitly disabled.
-    // For the global merged config we don't have a single workspace root, so
-    // pass `None`; per-root detection happens in `pre_process_emmyrc_for_all_roots`.
-    inject_gamemode_base_libraries(&client_config, &mut emmyrc, None);
-
     let (workspace_diagnostic_configs, workspace_emmyrcs) = pre_process_emmyrc_for_all_roots(
         &mut emmyrc,
         &config_roots,
+        scoped_roots,
         &global_config_files,
         &client_config,
         luarc_file,
@@ -523,6 +587,7 @@ pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig)
 fn pre_process_emmyrc_for_all_roots(
     emmyrc: &mut Emmyrc,
     config_roots: &[PathBuf],
+    scoped_roots: &HashSet<PathBuf>,
     global_config_files: &[PathBuf],
     client_config: &ClientConfig,
     luarc_file: &str,
@@ -555,11 +620,9 @@ fn pre_process_emmyrc_for_all_roots(
         );
         merge_client_config(client_config, &mut workspace_emmyrc);
         inject_gmod_annotations(client_config, &mut workspace_emmyrc);
-        inject_gamemode_base_libraries(
-            client_config,
-            &mut workspace_emmyrc,
-            Some(workspace_root.as_path()),
-        );
+        if !scoped_roots.contains(workspace_root) {
+            inject_gamemode_base_libraries(&mut workspace_emmyrc, workspace_root);
+        }
         workspace_emmyrc.pre_process_emmyrc(workspace_root);
         workspace_configs.push((workspace_root.clone(), workspace_emmyrc, has_local_config));
     }
@@ -1012,40 +1075,19 @@ fn directory_contains_lua_file(dir: &Path) -> bool {
     false
 }
 
-/// Inject gamemode base libraries detected by the VSCode extension.
-///
-/// When a gamemode derives from a base gamemode (e.g., cityrp derives from
-/// sandbox), the base gamemode's folder is added as a library so that the
-/// language server can resolve references to code defined in the base.
-///
-/// This is controlled by `gmod.autoDetectGamemodeBase` — set to `false` to
-/// disable.
-///
-/// `workspace_root` is optional: when provided, the server will additionally
-/// scan that root for `gamemodes/<name>/<name>.txt` metadata files and follow
-/// the `"base"` chain to detect parent gamemode folders. This is editor-agnostic
-/// (works for `glua_check`, Neovim, etc.) and complements the VSCode extension's
-/// `gamemodeBaseLibraries` initialization option.
-fn inject_gamemode_base_libraries(
-    client_config: &ClientConfig,
-    emmyrc: &mut Emmyrc,
-    workspace_root: Option<&Path>,
-) {
-    // Check if explicitly disabled in config
+/// Adds the gamemodes `workspace_root`'s gamemode derives from (its `.txt`
+/// `"base"` chain, e.g. cityrp from sandbox) as libraries, so references into
+/// them resolve, unless `gmod.autoDetectGamemodeBase` is `false`.
+fn inject_gamemode_base_libraries(emmyrc: &mut Emmyrc, workspace_root: &Path) {
     if matches!(emmyrc.gmod.auto_detect_gamemode_base, Some(false)) {
         log::info!("Gamemode base auto-detection explicitly disabled in config");
         return;
     }
 
-    let mut candidate_paths: Vec<String> = client_config.gamemode_base_libraries.to_vec();
-
-    if let Some(root) = workspace_root {
-        for path in glua_code_analysis::detect_gamemode_base_libraries(root) {
-            // Convert to lossy string for comparison/storage; library paths
-            // are stored as strings in `EmmyLibraryItem::Path`.
-            candidate_paths.push(path.to_string_lossy().into_owned());
-        }
-    }
+    let candidate_paths = glua_code_analysis::detect_gamemode_base_libraries(workspace_root)
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
 
     if candidate_paths.is_empty() {
         return;
@@ -1198,7 +1240,7 @@ mod tests {
 
     use super::{
         WorkspaceFileMatcher, collect_config_files_from_dir, collect_config_roots, dedup_paths,
-        directory_contains_lua_file, inject_gmod_annotations, load_emmy_config,
+        directory_contains_lua_file, inject_gmod_annotations, load_emmy_config, load_scoped_config,
         push_configs_from_preferred_workspace_root, resolve_gmod_annotations_path,
         validate_gmod_annotations_for_ls,
     };
@@ -1612,6 +1654,74 @@ mod tests {
 
         let _ = fs::remove_dir_all(workspace_a);
         let _ = fs::remove_dir_all(workspace_b);
+    }
+
+    fn write_gamemode(root: &Path, name: &str, base: &str) {
+        let dir = root.join("gamemodes").join(name);
+        fs::create_dir_all(dir.join("gamemode")).expect("create gamemode");
+        fs::write(
+            dir.join(format!("{name}.txt")),
+            format!("\"{name}\"\n{{\n\t\"base\"\t\"{base}\"\n}}\n"),
+        )
+        .expect("write manifest");
+    }
+
+    #[test]
+    fn a_whole_gmod_folder_loads_its_pick_with_each_folder_a_config_root() {
+        let root = create_temp_dir().join("garrysmod");
+        fs::create_dir_all(root.join("addons/ulx/lua")).expect("create addon");
+        write_gamemode(&root, "base", "");
+        write_gamemode(&root, "sandbox", "base");
+        write_gamemode(&root, "helix", "sandbox");
+        write_gamemode(&root, "cityrp", "helix");
+        write_gamemode(&root, "darkrp", "sandbox");
+        fs::write(
+            root.join(".gluarc.json"),
+            r#"{ "gmod": { "activeGamemode": "cityrp" } }"#,
+        )
+        .expect("write root config");
+        let cityrp = root.join("gamemodes/cityrp");
+        fs::write(
+            cityrp.join(".gluarc.json"),
+            r#"{ "diagnostics": { "disable": ["unused"] } }"#,
+        )
+        .expect("write gamemode config");
+
+        let (folders, loaded) = load_scoped_config(
+            &[WorkspaceFolder::new(root.clone(), false)],
+            &[],
+            ClientConfig::default(),
+        );
+
+        let whole = folders
+            .iter()
+            .filter(|folder| folder.import == glua_code_analysis::WorkspaceImport::All)
+            .map(|folder| folder.root.clone())
+            .collect::<Vec<_>>();
+        let libraries = loaded
+            .emmyrc
+            .workspace
+            .library
+            .iter()
+            .map(|library| library.get_path().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (
+                whole,
+                loaded.workspace_emmyrcs.contains_key(&cityrp),
+                libraries
+            ),
+            (
+                vec![
+                    root.join("addons/ulx"),
+                    root.join("gamemodes/cityrp"),
+                    root.join("gamemodes/helix"),
+                ],
+                true,
+                Vec::<String>::new()
+            )
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("temp dir"));
     }
 
     #[test]

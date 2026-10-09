@@ -16,7 +16,6 @@ pub struct ClientConfig {
     pub encoding: String,
     pub partial_emmyrcs: Option<Vec<Value>>,
     pub gmod_annotations_path: Option<String>,
-    pub gamemode_base_libraries: Vec<String>,
 }
 
 /// Leaves out the client's settings, which can hold secrets such as
@@ -33,7 +32,6 @@ impl std::fmt::Debug for ClientConfig {
                 &self.partial_emmyrcs.as_ref().map(Vec::len),
             )
             .field("gmod_annotations_path", &self.gmod_annotations_path)
-            .field("gamemode_base_libraries", &self.gamemode_base_libraries)
             .finish()
     }
 }
@@ -44,7 +42,6 @@ impl ClientConfig {
     /// again on a change do not carry them.
     pub fn keep_session_options(&mut self, current: &ClientConfig) {
         self.gmod_annotations_path = current.gmod_annotations_path.clone();
-        self.gamemode_base_libraries = current.gamemode_base_libraries.clone();
     }
 }
 
@@ -60,7 +57,6 @@ pub async fn get_client_config(
         encoding: "utf-8".to_string(),
         partial_emmyrcs: None,
         gmod_annotations_path: None,
-        gamemode_base_libraries: Vec::new(),
     };
     if !supports_config_request {
         return config;

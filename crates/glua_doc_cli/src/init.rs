@@ -1,6 +1,7 @@
 use fern::Dispatch;
 use glua_code_analysis::{
-    EmmyLuaAnalysis, WorkspaceFolder, collect_workspace_files, try_load_configs, update_code_style,
+    EmmyLuaAnalysis, UnpickedGamemodes, WorkspaceFolder, collect_workspace_files,
+    scope_workspace_folder, try_load_configs, update_code_style,
 };
 use log::LevelFilter;
 use std::{
@@ -109,7 +110,14 @@ pub fn load_workspace(
 
     let mut workspace_folders = cmd_workspace_folders
         .iter()
-        .map(|p| WorkspaceFolder::new(p.clone(), false))
+        .flat_map(|path| {
+            scope_workspace_folder(
+                &WorkspaceFolder::new(path.clone(), false),
+                &emmyrc.gmod,
+                UnpickedGamemodes::AllCustom,
+                &[],
+            )
+        })
         .collect::<Vec<WorkspaceFolder>>();
 
     let mut analysis = EmmyLuaAnalysis::new();
@@ -119,8 +127,8 @@ pub fn load_workspace(
         analysis.add_library_workspace(path.clone());
     }
 
-    for path in &cmd_workspace_folders {
-        analysis.add_main_workspace(path.clone());
+    for folder in workspace_folders.iter().filter(|folder| !folder.is_library) {
+        analysis.add_main_workspace(folder.root.clone());
     }
 
     for root in &emmyrc.workspace.workspace_roots {

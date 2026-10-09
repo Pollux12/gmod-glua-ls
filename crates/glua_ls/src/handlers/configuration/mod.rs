@@ -124,8 +124,7 @@ mod tests {
     }
 
     /// Settings read again on a change do not carry what the command line and
-    /// the initialization options set: the annotations path and gamemode bases
-    /// stay.
+    /// the initialization options set: the annotations path stays.
     #[gtest]
     fn a_settings_change_keeps_the_options_set_at_initialization() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
@@ -137,7 +136,6 @@ mod tests {
             {
                 let mut manager = snapshot.workspace_manager().write().await;
                 manager.client_config.gmod_annotations_path = Some("annotations".to_string());
-                manager.client_config.gamemode_base_libraries = vec!["sandbox".to_string()];
             }
             super::on_did_change_configuration(
                 snapshot.clone(),
@@ -147,14 +145,8 @@ mod tests {
             )
             .await;
             let manager = snapshot.workspace_manager().read().await;
-            (
-                manager.client_config.gmod_annotations_path.clone(),
-                manager.client_config.gamemode_base_libraries.clone(),
-            )
+            manager.client_config.gmod_annotations_path.clone()
         });
-        verify_that!(
-            kept,
-            eq(&(Some("annotations".to_string()), vec!["sandbox".to_string()]))
-        )
+        verify_that!(kept, eq(&Some("annotations".to_string())))
     }
 }

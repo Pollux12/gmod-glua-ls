@@ -1,7 +1,8 @@
 use fern::Dispatch;
 use glua_code_analysis::{
-    EmmyLibraryItem, EmmyLuaAnalysis, Emmyrc, WorkspaceFolder, collect_workspace_files,
-    detect_gamemode_base_libraries, load_configs, update_code_style, workspace_collection_folders,
+    EmmyLibraryItem, EmmyLuaAnalysis, Emmyrc, GmodTopology, UnpickedGamemodes, WorkspaceFolder,
+    collect_workspace_files, detect_gamemode_base_libraries, load_configs, scope_workspace_folder,
+    update_code_style, workspace_collection_folders,
 };
 use log::LevelFilter;
 use std::collections::HashSet;
@@ -113,9 +114,18 @@ pub async fn load_workspace(
 
     // Registered as the server registers them, so load order and library
     // precedence match.
+    let mut configured = HashSet::new();
     let workspace_folders = cmd_workspace_folders
         .iter()
-        .flat_map(|root| workspace_collection_folders(Some(root.clone()), &emmyrc))
+        .flat_map(|root| {
+            scope_workspace_folder(
+                &WorkspaceFolder::new(root.clone(), false),
+                &emmyrc.gmod,
+                UnpickedGamemodes::AllCustom,
+                &[],
+            )
+        })
+        .flat_map(|folder| workspace_collection_folders(Some(folder), &emmyrc, &mut configured))
         .collect::<Vec<WorkspaceFolder>>();
     analysis.set_workspace_roots(&workspace_folders);
 
@@ -171,7 +181,9 @@ fn discover_config_files_in_order(root: &Path) -> Vec<PathBuf> {
 /// unless explicitly disabled via `gmod.autoDetectGamemodeBase = false`.
 ///
 /// Detection roots are the actual workspace folders (with `main_path` as a
-/// sensible fallback when none were given). `config_root` is intentionally
+/// sensible fallback when none were given), except a whole Garry's Mod folder
+/// that is scoped to its addons and gamemodes, whose built-in gamemodes the
+/// annotations cover. `config_root` is intentionally
 /// NOT used as a detection root: when `--config` points outside the project
 /// it would scan the wrong directory.
 ///
@@ -196,6 +208,7 @@ pub(crate) fn apply_gamemode_base_detection(
     // Normalize: file path -> parent dir; dedupe by canonical path.
     let mut seen_canon: HashSet<PathBuf> = HashSet::new();
     let mut normalized: Vec<PathBuf> = Vec::new();
+    let scoped = |dir: &Path| !emmyrc.gmod.load_everything && GmodTopology::discover(dir).is_some();
     for root in raw_roots {
         let dir = if root.is_file() {
             match root.parent() {
@@ -205,6 +218,9 @@ pub(crate) fn apply_gamemode_base_detection(
         } else {
             root
         };
+        if scoped(&dir) {
+            continue;
+        }
         let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
         if seen_canon.insert(key) {
             normalized.push(dir);

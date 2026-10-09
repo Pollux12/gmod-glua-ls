@@ -11,7 +11,7 @@ pub enum WorkspaceImport {
     SubPaths(Vec<PathBuf>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceFolder {
     pub root: PathBuf,
     pub import: WorkspaceImport,
@@ -36,18 +36,17 @@ impl WorkspaceFolder {
     }
 }
 
-/// The folders a workspace rooted at `workspace_root` loads under `emmyrc`,
-/// in registration order: the root, its extra roots, its libraries, then its
-/// package directories.
+/// The folders `workspace` loads under `emmyrc`, in registration order: the
+/// workspace, its extra roots, its libraries, then its package directories.
+/// An extra root, library or package directory already in `configured` is left
+/// to the workspace that configured it first.
 pub fn workspace_collection_folders(
-    workspace_root: Option<PathBuf>,
+    workspace: Option<WorkspaceFolder>,
     emmyrc: &Emmyrc,
+    configured: &mut HashSet<PathBuf>,
 ) -> Vec<WorkspaceFolder> {
-    let mut workspaces = Vec::new();
-
-    if let Some(workspace_root) = workspace_root {
-        workspaces.push(WorkspaceFolder::new(workspace_root, false));
-    }
+    let mut own = workspace.is_some();
+    let mut workspaces = Vec::from_iter(workspace);
 
     for extra_root in &emmyrc.workspace.workspace_roots {
         workspaces.push(WorkspaceFolder::new(PathBuf::from(extra_root), false));
@@ -110,6 +109,7 @@ pub fn workspace_collection_folders(
         }
     }
 
+    workspaces.retain(|folder| std::mem::take(&mut own) || configured.insert(folder.root.clone()));
     workspaces
 }
 

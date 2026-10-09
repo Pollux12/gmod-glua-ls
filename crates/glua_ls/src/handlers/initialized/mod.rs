@@ -11,7 +11,7 @@ use crate::{
     codestyle::apply_workspace_code_style_off_workers,
     context::{
         FileDiagnostic, LoadedConfig, LspFeatures, ProgressTask, ServerContextSnapshot, StatusBar,
-        WorkspaceFileMatcher, get_client_id, load_emmy_config_off_workers,
+        WorkspaceFileMatcher, get_client_id, load_scoped_config_off_workers,
         validate_gmod_annotations_for_ls,
     },
     handlers::{
@@ -71,6 +71,7 @@ pub async fn initialized_handler(
         log::info!("set workspace folders: {:?}", workspace_folders);
         let mut workspace_manager = context.workspace_manager().write().await;
         workspace_manager.workspace_folders = workspace_folders.clone();
+        workspace_manager.scoped_folders = workspace_folders.clone();
         log::info!("workspace folders set");
     }
 
@@ -86,27 +87,6 @@ pub async fn initialized_handler(
                 // Only use VSCode path if CLI didn't provide one
                 if client_config.gmod_annotations_path.is_none() {
                     client_config.gmod_annotations_path = Some(path_str.to_string());
-                }
-            }
-        }
-
-        // Extract gamemode base libraries detected by the VSCode extension
-        if let Some(libraries) = init_options.get("gamemodeBaseLibraries") {
-            if let Some(arr) = libraries.as_array() {
-                for lib in arr {
-                    if let Some(lib_str) = lib.as_str() {
-                        if !lib_str.is_empty() {
-                            client_config
-                                .gamemode_base_libraries
-                                .push(lib_str.to_string());
-                        }
-                    }
-                }
-                if !client_config.gamemode_base_libraries.is_empty() {
-                    log::info!(
-                        "Received gamemode base libraries from VSCode: {:?}",
-                        client_config.gamemode_base_libraries
-                    );
                 }
             }
         }
@@ -131,11 +111,13 @@ pub async fn initialized_handler(
     // init config
     watchdog_status.set_phase("Loading GLuaLS configuration");
     log::info!("loading GLuaLS configuration");
-    let config_roots = workspace_folders
-        .iter()
-        .map(|workspace| workspace.root.clone())
-        .collect();
-    let loaded = load_emmy_config_off_workers(config_roots, client_config.clone()).await;
+    let open_paths = context.workspace_manager().read().await.open_file_paths();
+    let (scoped_folders, loaded) = load_scoped_config_off_workers(
+        workspace_folders.clone(),
+        open_paths,
+        client_config.clone(),
+    )
+    .await;
     let emmyrc = loaded.emmyrc.clone();
     apply_workspace_code_style_off_workers(workspace_folders.clone(), emmyrc.clone()).await;
     log::info!("configuration loaded");
@@ -178,6 +160,7 @@ pub async fn initialized_handler(
             WorkspaceFileMatcher::new(include, exclude, exclude_dir);
         workspace_manager.per_root_matchers = loaded.workspace_matchers.clone();
         workspace_manager.loaded_config = Some(loaded.clone());
+        workspace_manager.scoped_folders = scoped_folders.clone();
         log::info!("workspace manager updated with client config and watch file patterns");
         workspace_manager.open_workspace_files()
     };
@@ -188,7 +171,7 @@ pub async fn initialized_handler(
         context.status_bar(),
         context.file_diagnostic(),
         context.lsp_features(),
-        workspace_folders,
+        scoped_folders,
         loaded,
         open_files,
         watchdog_status.clone(),
@@ -238,30 +221,29 @@ pub async fn init_analysis(
     );
     log::info!("preparing workspace folders for initial indexing");
 
-    let workspace_roots = workspace_folders
-        .into_iter()
-        .map(|workspace| workspace.root)
-        .collect::<Vec<_>>();
-
     let mut workspace_collection_groups: Vec<(Arc<Emmyrc>, Vec<WorkspaceFolder>)> = Vec::new();
-    if workspace_roots.is_empty() {
+    if workspace_folders.is_empty() {
         workspace_collection_groups.push((
             emmyrc.clone(),
-            glua_code_analysis::workspace_collection_folders(None, emmyrc.as_ref()),
+            glua_code_analysis::workspace_collection_folders(
+                None,
+                emmyrc.as_ref(),
+                &mut HashSet::new(),
+            ),
         ));
     } else {
-        for workspace_root in workspace_roots {
+        let mut configured = HashSet::new();
+        for workspace in workspace_folders {
             let workspace_config = workspace_emmyrcs
-                .get(&workspace_root)
+                .get(&workspace.root)
                 .cloned()
                 .unwrap_or_else(|| emmyrc.clone());
-            workspace_collection_groups.push((
-                workspace_config.clone(),
-                glua_code_analysis::workspace_collection_folders(
-                    Some(workspace_root),
-                    workspace_config.as_ref(),
-                ),
-            ));
+            let group = glua_code_analysis::workspace_collection_folders(
+                Some(workspace),
+                workspace_config.as_ref(),
+                &mut configured,
+            );
+            workspace_collection_groups.push((workspace_config, group));
         }
     }
 

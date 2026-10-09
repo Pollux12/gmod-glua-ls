@@ -5,12 +5,12 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::WorkspaceFolder;
 use crate::gamemode_base::{
     find_gamemode_manifest, is_valid_gamemode_name, read_gamemode_folder_base,
 };
+use crate::{EmmyrcGmod, WorkspaceFolder, WorkspaceImport};
 
-/// The gamemodes Garry's Mod ships, which the annotations describe.
+/// The gamemodes Garry's Mod ships.
 pub const BUILTIN_GAMEMODES: [&str; 3] = ["base", "sandbox", "terrortown"];
 
 /// The `gmod.activeGamemode` value that picks every custom gamemode.
@@ -193,6 +193,27 @@ impl GmodTopology {
     }
 }
 
+/// The folders `folder` loads: a GMod root's addons and gamemodes, each its
+/// own root, scoped by `gmod` and the files in `open`; any other folder, a
+/// library, or a GMod root under `gmod.loadEverything`, as it is.
+pub fn scope_workspace_folder(
+    folder: &WorkspaceFolder,
+    gmod: &EmmyrcGmod,
+    unpicked: UnpickedGamemodes,
+    open: &[PathBuf],
+) -> Vec<WorkspaceFolder> {
+    if folder.is_library || gmod.load_everything || folder.import != WorkspaceImport::All {
+        return vec![folder.clone()];
+    }
+    match GmodTopology::discover(&folder.root) {
+        Some(topology) => topology.scoped_folders(
+            &topology.picked_gamemodes(gmod.active_gamemode.as_deref(), unpicked),
+            open,
+        ),
+        None => vec![folder.clone()],
+    }
+}
+
 fn is_gmod_root(dir: &Path) -> bool {
     dir.is_dir()
         && (dir
@@ -240,7 +261,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::WorkspaceImport;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -430,6 +450,97 @@ mod tests {
                 &root,
                 &WorkspaceImport::SubPaths(vec![PathBuf::from("lua/autorun/loose.lua")])
             )
+        );
+    }
+
+    /// Each loaded file's module path and the root of its workspace, with
+    /// `folders` registered and collected in order.
+    fn modules(folders: &[WorkspaceFolder]) -> Vec<(PathBuf, String, PathBuf)> {
+        let mut analysis = crate::EmmyLuaAnalysis::new();
+        for folder in folders {
+            analysis.add_main_workspace(folder.root.clone());
+        }
+        let files = crate::collect_workspace_files(&folders.to_vec(), &analysis.emmyrc, None, None);
+        analysis.update_files_by_path(files.into_iter().map(|file| file.into_tuple()).collect());
+        let db = analysis.compilation.get_db();
+        let module_index = db.get_module_index();
+        let mut modules = db
+            .get_vfs()
+            .get_all_local_file_ids()
+            .into_iter()
+            .filter(|file_id| !module_index.is_std(file_id))
+            .map(|file_id| {
+                let module = module_index.get_module(file_id).expect("module");
+                let root = module_index
+                    .workspaces()
+                    .iter()
+                    .find(|workspace| workspace.id == module.workspace_id)
+                    .expect("workspace")
+                    .root
+                    .clone();
+                (
+                    db.get_vfs().get_file_path(&file_id).expect("path").clone(),
+                    module.full_module_name.clone(),
+                    root,
+                )
+            })
+            .collect::<Vec<_>>();
+        modules.sort();
+        modules
+    }
+
+    #[test]
+    fn a_scoped_gmod_root_loads_as_the_multi_root_workspace_of_its_loaded_folders() {
+        let root = install("multi_root");
+        for file in [
+            "addons/ulx/lua/ulib/shared.lua",
+            "addons/wiremod/lua/autorun/wire.lua",
+            "gamemodes/helix/gamemode/init.lua",
+            "gamemodes/helix-hl2rp/gamemode/init.lua",
+            "gamemodes/sandbox/gamemode/init.lua",
+            "lua/autorun/loose.lua",
+        ] {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().expect("parent")).expect("create folder");
+            fs::write(path, "local value = 1\n").expect("write lua");
+        }
+        let topology = GmodTopology::discover(&root).expect("gmod root");
+        let multi_root = [
+            "addons/ulx",
+            "addons/wiremod",
+            "gamemodes/helix",
+            "gamemodes/helix-hl2rp",
+        ]
+        .map(|folder| WorkspaceFolder::new(root.join(folder), false));
+
+        let scoped = topology.scoped_folders(
+            &topology.picked_gamemodes(Some("helix-hl2rp"), UnpickedGamemodes::None),
+            &[],
+        );
+
+        assert_eq!(modules(&scoped), modules(&multi_root));
+    }
+
+    #[test]
+    fn only_a_gmod_root_without_load_everything_is_scoped() {
+        let root = install("scope");
+        let gamemode = WorkspaceFolder::new(root.join("gamemodes/helix"), false);
+        let whole = WorkspaceFolder::new(root.clone(), false);
+        let everything = EmmyrcGmod {
+            load_everything: true,
+            ..EmmyrcGmod::default()
+        };
+        let scope = |folder: &WorkspaceFolder, gmod: &EmmyrcGmod| {
+            scope_workspace_folder(folder, gmod, UnpickedGamemodes::None, &[])
+        };
+
+        assert_eq!(
+            (
+                scope(&gamemode, &EmmyrcGmod::default()),
+                scope(&whole, &everything),
+                scope(&whole, &EmmyrcGmod::default()).len(),
+            ),
+            (vec![gamemode.clone()], vec![whole.clone()], 2 + 5 + 1)
         );
     }
 
