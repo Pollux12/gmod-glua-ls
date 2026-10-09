@@ -1698,4 +1698,43 @@ return M
         let stats = ws.analysis.compilation.last_stats();
         assert_eq!(stats.evaluations(DerivationKind::LocalStat), 0);
     }
+
+    /// A gamemode file's whole-file class declaration is the support of the
+    /// facts inferred from it, so a shift of a file that starts with a blank
+    /// CRLF line, which a diff can align as an edit of that line, leaves the
+    /// readers of those facts in other files alone.
+    #[test]
+    fn a_shift_of_a_gamemode_file_with_a_leading_crlf_line_re_runs_nothing_in_other_files() {
+        const HUD: &str = "gamemodes/helix/gamemode/cl_hud.lua";
+        const HUD_TEXT: &str = "\r\nfunction GM:HUDPaint()\r\n\tlocal x = 1\r\nend\r\n";
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let files = ws.def_files(vec![
+            (HUD, HUD_TEXT),
+            (
+                "lua/annotations/gm.lua",
+                "---@class GM
+---@field BaseClass GM
+GM = {}
+",
+            ),
+            (
+                "gamemodes/helix/gamemode/sh_other.lua",
+                "function GM:Other()\n\tlocal y = 2\nend\n",
+            ),
+            (
+                "gamemodes/helix/gamemode/sh_hooks.lua",
+                "function GM:CanTool(client, trace, tool)\n\treturn self.BaseClass:CanTool(client, trace, tool)\nend\n",
+            ),
+        ]);
+
+        ws.def_file(HUD, &format!("\n{HUD_TEXT}"));
+
+        assert_eq!(
+            ws.analysis.compilation.last_evaluated_files(),
+            vec![files[0]]
+        );
+    }
 }

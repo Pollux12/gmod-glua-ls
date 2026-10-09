@@ -266,6 +266,15 @@ end
     );
 }
 
+/// A line break inserted before a CRLF blank first line is an insertion, not
+/// an edit of that line, so a range starting at the top of the file keeps its
+/// start in both directions.
+#[gtest]
+fn a_line_inserted_before_a_crlf_blank_line_is_one_insertion() {
+    let map = PositionMap::new("\r\nlocal x = 1\r\n", "\n\r\nlocal x = 1\r\n");
+    expect_that!(map.hunks(), eq(&vec![(0, 0, 0, 1)]));
+}
+
 #[gtest]
 fn a_hunk_boundary_never_splits_a_code_point() {
     // The two strings share the first byte of `é` (0xC3) but differ in the

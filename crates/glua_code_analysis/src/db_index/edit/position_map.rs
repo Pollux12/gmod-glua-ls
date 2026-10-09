@@ -393,6 +393,17 @@ mod diff {
         &text.as_bytes()[start..end]
     }
 
+    /// Whether two lines are the same line, perhaps indented or ended
+    /// differently. A blank line has no content to match by, so it matches
+    /// only a blank line ended the same way: an insertion before a CRLF
+    /// blank line stays an insertion rather than an edit of that line.
+    fn same_line(old: &str, new: &str, old_line: (usize, usize), new_line: (usize, usize)) -> bool {
+        let (old_key, new_key) = (key(old, old_line), key(new, new_line));
+        old_key == new_key
+            && (!old_key.is_empty()
+                || old.as_bytes()[old_line.0..old_line.1] == new.as_bytes()[new_line.0..new_line.1])
+    }
+
     /// The bytes lines `from..to` cover, or where they would start.
     fn span(lines: &[(usize, usize)], from: usize, to: usize, len: usize) -> (usize, usize) {
         let start = lines.get(from).map_or(len, |line| line.0);
@@ -414,7 +425,7 @@ mod diff {
     ) {
         while old_from < old_to
             && new_from < new_to
-            && key(old, old_lines[old_from]) == key(new, new_lines[new_from])
+            && same_line(old, new, old_lines[old_from], new_lines[new_from])
         {
             matched.push((old_from, new_from));
             old_from += 1;
@@ -423,7 +434,7 @@ mod diff {
         let mut tail = Vec::new();
         while old_from < old_to
             && new_from < new_to
-            && key(old, old_lines[old_to - 1]) == key(new, new_lines[new_to - 1])
+            && same_line(old, new, old_lines[old_to - 1], new_lines[new_to - 1])
         {
             old_to -= 1;
             new_to -= 1;
