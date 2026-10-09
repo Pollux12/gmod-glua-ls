@@ -5715,12 +5715,7 @@ fn synthesize_vgui_register_file_target(
     let target_panel_decl_ids = ensure_register_file_panel_decls(db, target_file_id)?;
     let panel_decl_id = *target_panel_decl_ids.first()?;
     for decl_id in target_panel_decl_ids {
-        write_type_cache(
-            db,
-            decl_id.into(),
-            LuaTypeCache::InferType(class_type.clone()),
-            TypeCacheWriteMode::ForceOverwrite,
-        );
+        bind_panel_table_decl(db, decl_id, &class_type);
     }
 
     let panel_owner = LuaMemberOwner::GlobalPath(GlobalId::new("PANEL"));
@@ -6179,12 +6174,7 @@ fn synthesize_panel_class_with_id(
             // pass sees the synthesized class before it caches member values.
             // Reassigned locals remain table-literal-only to avoid collapsing
             // distinct registration regions onto one class.
-            write_type_cache(
-                db,
-                decl_id.into(),
-                LuaTypeCache::InferType(class_type.clone()),
-                TypeCacheWriteMode::ForceOverwrite,
-            );
+            bind_panel_table_decl(db, decl_id, &class_type);
         }
 
         // Transfer the members defined in this registration's table region to
@@ -6301,6 +6291,17 @@ fn synthesize_panel_class_with_id(
     {
         bind_inline_vgui_panel_table(db, cache, file_id, &class_decl_id, table_expr, phase);
     }
+}
+
+/// Types a panel table's declaration with the class registered from it.
+///
+/// A global `PANEL` here is one file's scratch table, not a name every file's
+/// `PANEL` shares, so the class is not proposed as the global path's class:
+/// a losing proposal would send this file's members to the path's winning
+/// class whenever it was on record when they were filed.
+fn bind_panel_table_decl(db: &mut DbIndex, decl_id: LuaDeclId, class_type: &LuaType) {
+    db.get_type_index_mut()
+        .force_bind_type(decl_id.into(), LuaTypeCache::InferType(class_type.clone()));
 }
 
 fn find_inline_vgui_panel_table_expr(

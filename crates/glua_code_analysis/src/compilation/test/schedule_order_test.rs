@@ -748,4 +748,37 @@ function GM:Initialize() end
             ("gamemodes/sandbox/gamemode/shared.lua", DERIVE),
         ]);
     }
+
+    /// Each file's global `PANEL` is its own scratch table: registering it must
+    /// not propose the panel's class as the class of every file's `PANEL`,
+    /// which sent a file's methods to whichever class won while it was filed.
+    #[test]
+    fn global_panel_tables_two_files_register_settle_the_same_in_either_order() {
+        let builtins = format!(
+            "{GMOD_CALL_ARG_BUILTINS_FIXTURE}
+---@class Panel
+Panel = Panel or {{}}
+---@class PANEL : Panel
+PANEL = Panel
+"
+        );
+        let panel = |class: &str| {
+            format!(
+                "PANEL = {{}}
+function PANEL:Init() end
+vgui.Register(\"{class}\", PANEL, \"Panel\")
+"
+            )
+        };
+        let tips = panel("AnchoredTips");
+        let scroll = panel("ScrollLabel");
+        assert_schedule_independent(&[
+            ("lua/includes/builtins.lua", builtins.as_str()),
+            ("gamemodes/terrortown/gamemode/cl_tips.lua", tips.as_str()),
+            (
+                "gamemodes/terrortown/gamemode/vgui/scrolllabel.lua",
+                scroll.as_str(),
+            ),
+        ]);
+    }
 }
