@@ -203,34 +203,9 @@ struct SourceMemberState {
     owner_only: bool,
     provenance: Option<GlobalId>,
     non_overwriting: bool,
+    synthesized_owner: bool,
     deferred_index_expr: bool,
     function_scope: Option<TextRange>,
-}
-
-/// The class a scripted-class synthesis moved a member to; see
-/// [`FactKey::MemberTransfer`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct MemberTransfer {
-    owner: LuaMemberOwner,
-    /// Whether a global path's class change leaves the member there.
-    pinned: bool,
-}
-
-/// Where a transferred member's own writers left it homed.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct FiledHome {
-    owner: Option<LuaMemberOwner>,
-    owner_only: bool,
-    provenance: Option<GlobalId>,
-}
-
-/// Who moves a member: its own writers, whose home is part of its
-/// [`FactKey::Member`], or a transfer, which moves only its
-/// [`FactKey::MemberHome`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Homing {
-    Filed,
-    Transferred,
 }
 
 #[derive(Debug, Clone)]
@@ -280,11 +255,9 @@ pub struct LuaMemberIndex {
     /// member list: a write through an instance of a class, not the class.
     /// See [`Self::set_member_owner_only`].
     owner_only_members: CowShardSet<LuaMemberId>,
-    /// The class each member a scripted-class synthesis moved went to.
-    member_transfers: CowShards<LuaMemberId, MemberTransfer>,
-    /// Where each member with a transfer applied was before it: the home its
-    /// own writers own.
-    filed_homes: CowShards<LuaMemberId, FiledHome>,
+    /// Members whose owner was decided by scripted-class synthesis rather
+    /// than by name resolution.
+    synthesized_owner_members: CowShardSet<LuaMemberId>,
     /// Members `try_resolve_member` had to create itself, from a prefix
     /// type read mid-fixpoint.
     deferred_index_expr_members: CowCell<HashSet<LuaMemberId>>,
@@ -385,8 +358,7 @@ impl LuaMemberIndex {
             preserved_co_writer_reconciled: Default::default(),
             homing_revision: 0,
             owner_only_members: Default::default(),
-            member_transfers: CowShards::default(),
-            filed_homes: CowShards::default(),
+            synthesized_owner_members: Default::default(),
             deferred_index_expr_members: Default::default(),
             function_scope_ranges: Default::default(),
             member_function_scope_ranges: Default::default(),
@@ -413,16 +385,7 @@ impl LuaMemberIndex {
                 .get(id)
                 .map_or(ABSENT, |member| fingerprint_of(&member_object(member))),
             FactKey::MemberHome(id) => {
-                let owner = self.member_current_owner.get(id);
-                let provenance = self.member_path_provenance.get(id);
-                let owner_only = self.owner_only_members.contains(id);
-                if owner.is_none() && provenance.is_none() && !owner_only {
-                    return ABSENT;
-                }
-                fingerprint_of(&(owner, owner_only, provenance))
-            }
-            FactKey::MemberTransfer(id) => {
-                derivation::fingerprint_opt(self.member_transfers.get(id))
+                derivation::fingerprint_opt(self.member_current_owner.get(id))
             }
             FactKey::MemberMarks(id) => {
                 let (provenance, flags) = self.member_marks(*id);
@@ -502,11 +465,10 @@ impl LuaMemberIndex {
         }
     }
 
-    /// The member object, the owner its own writers homed it under, flags,
-    /// provenance and scope: a transfer moves none of it.
+    /// The member object, its current owner, flags, provenance and scope.
     fn member_fingerprint(&self, id: LuaMemberId) -> Fingerprint {
         let member = self.members.get(&id).map(member_object);
-        let owner = self.filed_home(id).0;
+        let owner = self.member_current_owner.get(&id);
         let (provenance, flags) = self.member_marks(id);
         let scope = self.member_scope(id);
         if member.is_none()
@@ -527,35 +489,18 @@ impl LuaMemberIndex {
             .map(|range| crate::InFiled::new(id.file_id, *range))
     }
 
-    /// A member's path provenance and its owner-only, deferred and
-    /// non-overwriting flags, as its own writers left them.
-    fn member_marks(&self, id: LuaMemberId) -> (Option<&GlobalId>, [bool; 3]) {
-        let (_, owner_only, provenance) = self.filed_home(id);
+    /// A member's path provenance and its owner-only, synthesized-owner,
+    /// deferred and non-overwriting flags.
+    fn member_marks(&self, id: LuaMemberId) -> (Option<&GlobalId>, [bool; 4]) {
         (
-            provenance,
+            self.member_path_provenance.get(&id),
             [
-                owner_only,
+                self.owner_only_members.contains(&id),
+                self.synthesized_owner_members.contains(&id),
                 self.deferred_index_expr_members.contains(&id),
                 self.non_overwriting_assignment_members.contains(&id),
             ],
         )
-    }
-
-    /// `id`'s owner, owner-only mark and provenance as its own writers left
-    /// them: before the transfer applied to it, if one is.
-    fn filed_home(&self, id: LuaMemberId) -> (Option<&LuaMemberOwner>, bool, Option<&GlobalId>) {
-        match self.filed_homes.get(&id) {
-            Some(home) => (
-                home.owner.as_ref(),
-                home.owner_only,
-                home.provenance.as_ref(),
-            ),
-            None => (
-                self.member_current_owner.get(&id),
-                self.owner_only_members.contains(&id),
-                self.member_path_provenance.get(&id),
-            ),
-        }
     }
 
     /// The item listed under `(owner, key)` and both owner-key index slots in
@@ -591,21 +536,12 @@ impl LuaMemberIndex {
     }
 
     /// Notes every fact naming `id`'s current home: the member object, its
-    /// home, its owner's slot and map, and its key.
+    /// owner's slot and map, and its key.
     fn note_member_home_write(&self, id: LuaMemberId) {
-        self.note_home_write(id, Homing::Filed);
-    }
-
-    /// [`Self::note_member_home_write`] for a move by `homing`: a transfer
-    /// leaves the member object alone.
-    fn note_home_write(&self, id: LuaMemberId, homing: Homing) {
         if !derivation::recording() {
             return;
         }
-        if homing == Homing::Filed {
-            derivation::note_write(|| FactKey::Member(id));
-        }
-        derivation::note_write(|| FactKey::MemberHome(id));
+        derivation::note_write(|| FactKey::Member(id));
         let key = self.members.get(&id).map(LuaMember::get_key);
         if let Some(key) = key {
             derivation::note_write(|| FactKey::MemberKey(key.clone()));
@@ -844,15 +780,11 @@ impl LuaMemberIndex {
             .chain(self.member_path_provenance.keys())
             .chain(self.member_function_scope_ranges.keys())
             .chain(self.owner_only_members.iter())
-            .chain(self.filed_homes.keys())
+            .chain(self.synthesized_owner_members.iter())
             .chain(self.deferred_index_expr_members.iter())
             .chain(self.non_overwriting_assignment_members.iter());
         for id in ids {
             derivation::note_write(|| FactKey::Member(*id));
-            derivation::note_write(|| FactKey::MemberHome(*id));
-        }
-        for id in self.member_transfers.keys() {
-            derivation::note_write(|| FactKey::MemberTransfer(*id));
         }
         for (owner, members) in &self.owner_members {
             note_owner_presence_write(owner);
@@ -921,15 +853,7 @@ impl LuaMemberIndex {
     /// alone — provenance, bookkeeping flags, first filings, owner-slot
     /// bookkeeping — but still change what an id-keyed member read sees.
     fn note_member_object_write(&mut self, member_id: LuaMemberId) {
-        self.note_object_write(member_id, Homing::Filed);
-    }
-
-    /// [`Self::note_member_object_write`] for a write by `homing`.
-    fn note_object_write(&self, member_id: LuaMemberId, homing: Homing) {
-        if homing == Homing::Filed {
-            derivation::note_write(|| FactKey::Member(member_id));
-        }
-        derivation::note_write(|| FactKey::MemberHome(member_id));
+        derivation::note_write(|| FactKey::Member(member_id));
     }
 
     /// Keeps the source layer's version of `id` before a derivation first
@@ -942,13 +866,13 @@ impl LuaMemberIndex {
         if self.source_members.contains_key(&id) {
             return;
         }
-        let (owner, owner_only, provenance) = self.filed_home(id);
         let state = self.members.get(&id).map(|member| SourceMemberState {
             member: member.clone(),
-            owner: owner.cloned(),
-            owner_only,
-            provenance: provenance.cloned(),
+            owner: self.member_current_owner.get(&id).cloned(),
+            owner_only: self.owner_only_members.contains(&id),
+            provenance: self.member_path_provenance.get(&id).cloned(),
             non_overwriting: self.non_overwriting_assignment_members.contains(&id),
+            synthesized_owner: self.synthesized_owner_members.contains(&id),
             deferred_index_expr: self.deferred_index_expr_members.contains(&id),
             function_scope: self.member_function_scope_ranges.get(&id).copied(),
         });
@@ -985,16 +909,8 @@ impl LuaMemberIndex {
     }
 
     /// Restores `id` to what the source layer left: every derived listing is
-    /// dropped and the source member, if any, is filed again, under the
-    /// transfer that still holds for it.
+    /// dropped and the source member, if any, is filed again.
     pub(crate) fn reset_member(&mut self, id: LuaMemberId) {
-        if !self.source_members.contains_key(&id) {
-            return;
-        }
-        self.write_filed(id, |index| index.reset_filed_member(id));
-    }
-
-    fn reset_filed_member(&mut self, id: LuaMemberId) {
         let Some(source) = self.source_members.remove(&id) else {
             return;
         };
@@ -1019,6 +935,9 @@ impl LuaMemberIndex {
         self.file_member(owner, state.member, state.owner_only);
         if state.non_overwriting {
             self.non_overwriting_assignment_members.insert(id);
+        }
+        if state.synthesized_owner {
+            self.synthesized_owner_members.insert(id);
         }
         if state.deferred_index_expr {
             self.deferred_index_expr_members.insert(id);
@@ -1051,10 +970,7 @@ impl LuaMemberIndex {
                 note_slot_write(&owner, member.get_key());
                 note_owner_map_write(&owner);
             }
-            let id = member.get_id();
-            derivation::untracked(|| {
-                self.write_filed(id, |index| index.file_member(owner, member, is_owner_only))
-            })
+            derivation::untracked(|| self.file_member(owner, member, is_owner_only))
         })
     }
 
@@ -1069,7 +985,7 @@ impl LuaMemberIndex {
         let owner = self
             .effective_path_member_owner(id, &owner)
             .unwrap_or(owner);
-        self.note_member_path_provenance(id, &owner, Homing::Filed);
+        self.note_member_path_provenance(id, &owner);
         let owner = self.canonical(&owner).clone();
         let file_id = member.get_file_id();
         let function_scope = self.assignment_file_define_scope_for_member(&member);
@@ -1134,7 +1050,7 @@ impl LuaMemberIndex {
                 if !already_filed_here {
                     self.add_new_member_to_owner_key_indexes(owner.clone(), id);
                 }
-                self.list_member(owner.clone(), id, Homing::Filed);
+                self.add_member_to_owner(owner.clone(), id);
             }
         }
         self.note_member_home_write(id);
@@ -1184,12 +1100,6 @@ impl LuaMemberIndex {
     /// all key-indexed maps move together; a half-moved member would leave the
     /// old slot behind on the next `remove_files`.
     pub fn rekey_member(&mut self, member_id: LuaMemberId, new_key: LuaMemberKey) -> Option<()> {
-        self.write_filed(member_id, |index| {
-            index.rekey_filed_member(member_id, new_key)
-        })
-    }
-
-    fn rekey_filed_member(&mut self, member_id: LuaMemberId, new_key: LuaMemberKey) -> Option<()> {
         self.snapshot_member(member_id);
         let old_key = self.get_member(&member_id)?.get_key().clone();
         if old_key == new_key {
@@ -1211,7 +1121,7 @@ impl LuaMemberIndex {
         if let Some(owner) = owner {
             self.add_current_member_key(member_id);
             self.add_member_to_owner_key_indexes(owner.clone(), member_id);
-            self.list_member(owner, member_id, Homing::Filed);
+            self.add_member_to_owner(owner, member_id);
         }
         self.note_member_home_write(member_id);
         Some(())
@@ -1224,19 +1134,7 @@ impl LuaMemberIndex {
     /// Files `id` under `owner`. A slot holds every member written or declared
     /// for its key, ordered by [`member_id_sort_key`]; readers merge them.
     pub fn add_member_to_owner(&mut self, owner: LuaMemberOwner, id: LuaMemberId) -> Option<()> {
-        self.write_filed(id, |index| index.list_member(owner, id, Homing::Filed))
-    }
-
-    /// [`Self::add_member_to_owner`] for a listing by `homing`.
-    fn list_member(
-        &mut self,
-        owner: LuaMemberOwner,
-        id: LuaMemberId,
-        homing: Homing,
-    ) -> Option<()> {
-        if homing == Homing::Filed {
-            self.note_derived_owner(id, &owner);
-        }
+        self.note_derived_owner(id, &owner);
         let owner = self
             .effective_path_member_owner(id, &owner)
             .unwrap_or(owner);
@@ -1246,7 +1144,7 @@ impl LuaMemberIndex {
             self.add_member_to_owner_key_indexes(owner.clone(), id);
         }
         if self.owner_only_members.remove(&id) {
-            self.note_object_write(id, homing);
+            derivation::note_write(|| FactKey::Member(id));
         }
         self.merge_member_into_owner_item(owner, key, id);
         Some(())
@@ -1263,16 +1161,14 @@ impl LuaMemberIndex {
         file_id: FileId,
         id: LuaMemberId,
     ) -> Option<()> {
-        self.write_filed(id, |index| {
-            index.note_derived_owner(id, &owner);
-            index.home_member(owner, file_id, id, Homing::Filed)?;
-            let owner = index.member_current_owner.get(&id)?.clone();
-            index.remove_member_from_owner_item(&owner, id);
-            if index.owner_only_members.insert(id) {
-                index.note_member_move(id);
-            }
-            Some(())
-        })
+        self.note_derived_owner(id, &owner);
+        self.set_member_owner(owner, file_id, id)?;
+        let owner = self.member_current_owner.get(&id)?.clone();
+        self.remove_member_from_owner_item(&owner, id);
+        if self.owner_only_members.insert(id) {
+            self.note_member_move(id);
+        }
+        Some(())
     }
 
     /// Homes a member whose write went through an alias of the global path
@@ -1294,22 +1190,9 @@ impl LuaMemberIndex {
         alias_path: GlobalId,
         owner_only: bool,
     ) -> Option<()> {
-        self.write_filed(id, |index| {
-            index.home_alias_filed_member(owner, file_id, id, alias_path, owner_only)
-        })
-    }
-
-    fn home_alias_filed_member(
-        &mut self,
-        owner: LuaMemberOwner,
-        file_id: FileId,
-        id: LuaMemberId,
-        alias_path: GlobalId,
-        owner_only: bool,
-    ) -> Option<()> {
         self.note_derived_owner(id, &owner);
-        self.stamp_member_path_provenance(id, &alias_path, Homing::Filed);
-        self.record_member_owner(owner, file_id, id, Homing::Filed)?;
+        self.stamp_member_path_provenance(id, &alias_path);
+        self.record_member_owner(owner, file_id, id)?;
         if owner_only {
             if self.owner_only_members.insert(id) {
                 self.note_member_move(id);
@@ -1325,98 +1208,19 @@ impl LuaMemberIndex {
         Some(())
     }
 
-    /// Moves `id` to `owner`, the class a scripted-class synthesis decided,
-    /// over the home its own writers keep: the move is this transfer's fact,
-    /// not the member's. A `pinned` member stays there when
-    /// [`Self::set_global_path_class`] moves the path's members onto the
-    /// annotated class.
-    pub fn transfer_member(&mut self, owner: LuaMemberOwner, id: LuaMemberId, pinned: bool) {
-        derivation::note_write(|| FactKey::MemberTransfer(id));
-        self.unapply_transfer(id);
-        self.member_transfers
-            .insert(id, MemberTransfer { owner, pinned });
-        self.apply_transfer(id);
-    }
-
-    /// Drops the transfer of `id`, which goes back to the home its own
-    /// writers left it in.
-    pub(crate) fn reset_transfer(&mut self, id: LuaMemberId) {
-        self.unapply_transfer(id);
-        if self.member_transfers.remove(&id).is_some() {
-            derivation::note_write(|| FactKey::MemberTransfer(id));
+    /// Records that `id`'s owner was decided by scripted-class synthesis, so
+    /// [`Self::set_global_path_class`] leaves it where it is instead of moving
+    /// it onto the annotated class.
+    pub fn pin_synthesized_owner(&mut self, id: LuaMemberId) {
+        self.snapshot_member(id);
+        if self.synthesized_owner_members.insert(id) {
+            self.note_member_move(id);
         }
     }
 
-    /// Runs `write`, a write by `id`'s own writers, against the home they left
-    /// it in: the transfer applied to `id` comes off first and goes back on
-    /// after, so where `id` ends up never depends on whether its writers or
-    /// its transfer ran last.
-    fn write_filed<R>(&mut self, id: LuaMemberId, write: impl FnOnce(&mut Self) -> R) -> R {
-        self.unapply_transfer(id);
-        let written = write(self);
-        self.apply_transfer(id);
-        written
-    }
-
-    /// Moves `id` onto its transfer's owner, keeping its filed home.
-    fn apply_transfer(&mut self, id: LuaMemberId) {
-        let Some(transfer) = self.member_transfers.get(&id).cloned() else {
-            return;
-        };
-        if !self.members.contains_key(&id) || self.filed_homes.contains_key(&id) {
-            return;
-        }
-        let (owner, owner_only, provenance) = self.filed_home(id);
-        let filed = FiledHome {
-            owner: owner.cloned(),
-            owner_only,
-            provenance: provenance.cloned(),
-        };
-        self.filed_homes.insert(id, filed);
-        self.home_member(transfer.owner.clone(), id.file_id, id, Homing::Transferred);
-        self.list_member(transfer.owner, id, Homing::Transferred);
-    }
-
-    /// Moves `id` from its transfer's owner back to its filed home, undoing
-    /// [`Self::apply_transfer`].
-    fn unapply_transfer(&mut self, id: LuaMemberId) {
-        let Some(filed) = self.filed_homes.remove(&id) else {
-            return;
-        };
-        let current = self.member_current_owner.get(&id).cloned();
-        if current != filed.owner {
-            self.bump_homing_revision();
-            self.note_home_write(id, Homing::Transferred);
-            if let Some(current) = &current {
-                self.remove_member_from_all_owner_key_indexes(current, id);
-                self.remove_member_from_owner_item(current, id);
-                self.remove_current_owner_member(current, id);
-            }
-            match &filed.owner {
-                Some(owner) => {
-                    self.member_current_owner.insert(id, owner.clone());
-                    self.insert_current_owner_member(owner, id);
-                    self.add_member_to_owner_key_indexes(owner.clone(), id);
-                }
-                None => {
-                    self.member_current_owner.remove(&id);
-                }
-            }
-        }
-        if filed.owner_only {
-            self.owner_only_members.insert(id);
-        } else {
-            self.owner_only_members.remove(&id);
-        }
-        match filed.provenance {
-            Some(path) => {
-                self.member_path_provenance.insert(id, path);
-            }
-            None => {
-                self.member_path_provenance.remove(&id);
-            }
-        }
-        self.note_home_write(id, Homing::Transferred);
+    pub fn has_synthesized_owner(&self, id: &LuaMemberId) -> bool {
+        derivation::note_member_marks_read(*id);
+        self.synthesized_owner_members.contains(id)
     }
 
     /// The global path this member reached its owner through, if it named one:
@@ -1447,10 +1251,6 @@ impl LuaMemberIndex {
     /// Removes `id` from `owner` entirely, including the item
     /// `set_member_owner` leaves behind.
     pub fn detach_member_from_owner(&mut self, owner: &LuaMemberOwner, id: LuaMemberId) {
-        self.write_filed(id, |index| index.detach_filed_member(owner, id));
-    }
-
-    fn detach_filed_member(&mut self, owner: &LuaMemberOwner, id: LuaMemberId) {
         self.snapshot_member(id);
         let owner = &self.canonical(owner).clone();
         let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
@@ -1480,10 +1280,6 @@ impl LuaMemberIndex {
         owner: LuaMemberOwner,
         id: LuaMemberId,
     ) -> Option<()> {
-        self.write_filed(id, |index| index.add_filed_member_alias(owner, id))
-    }
-
-    fn add_filed_member_alias(&mut self, owner: LuaMemberOwner, id: LuaMemberId) -> Option<()> {
         self.note_derived_owner(id, &owner);
         let owner = self.canonical(&owner).clone();
         let member = self.get_member(&id)?;
@@ -1793,30 +1589,15 @@ impl LuaMemberIndex {
         file_id: FileId,
         id: LuaMemberId,
     ) -> Option<()> {
-        self.write_filed(id, |index| {
-            index.home_member(owner, file_id, id, Homing::Filed)
-        })
-    }
-
-    /// [`Self::set_member_owner`] for a move by `homing`.
-    fn home_member(
-        &mut self,
-        owner: LuaMemberOwner,
-        file_id: FileId,
-        id: LuaMemberId,
-        homing: Homing,
-    ) -> Option<()> {
-        if homing == Homing::Filed {
-            self.note_derived_owner(id, &owner);
-        }
+        self.note_derived_owner(id, &owner);
         // Where the member is filed is the index's own placement, as in
         // `file_member`: a later class binding or site registration re-homes it.
         derivation::untracked(|| {
             let owner = self
                 .effective_path_member_owner(id, &owner)
                 .unwrap_or(owner);
-            self.note_member_path_provenance(id, &owner, homing);
-            self.record_member_owner(owner, file_id, id, homing)
+            self.note_member_path_provenance(id, &owner);
+            self.record_member_owner(owner, file_id, id)
         })
     }
 
@@ -1828,7 +1609,6 @@ impl LuaMemberIndex {
         owner: LuaMemberOwner,
         file_id: FileId,
         id: LuaMemberId,
-        homing: Homing,
     ) -> Option<()> {
         let owner = self
             .effective_path_member_owner(id, &owner)
@@ -1840,20 +1620,20 @@ impl LuaMemberIndex {
         // A pure first filing (unknown id) and a same-owner re-home are
         // append-only and must not invalidate memos.
         let already_indexed = self.members.contains_key(&id);
-        self.note_home_write(id, homing);
+        self.note_member_home_write(id);
         let previous_owner = self.member_current_owner.insert(id, owner.clone());
-        self.note_home_write(id, homing);
+        self.note_member_home_write(id);
         if previous_owner.as_ref() != Some(&owner) {
-            self.note_object_write(id, homing);
+            self.note_member_object_write(id);
         }
         match &previous_owner {
             None if already_indexed => {
                 self.bump_homing_revision();
-                self.note_home_write(id, homing);
+                self.note_member_move(id);
             }
             Some(previous) if previous != &owner => {
                 self.bump_homing_revision();
-                self.note_home_write(id, homing);
+                self.note_member_move(id);
             }
             _ => {}
         }
@@ -1871,8 +1651,7 @@ impl LuaMemberIndex {
         self.insert_current_owner_member(&owner, id);
 
         self.add_member_to_owner_key_indexes(owner.clone(), id);
-        if homing == Homing::Filed
-            && self.member_function_scope_range(id).is_none()
+        if self.member_function_scope_range(id).is_none()
             && let Some(member) = self.get_member(&id)
         {
             let function_scope = self.assignment_file_define_scope_for_member(member);
@@ -1998,15 +1777,14 @@ impl LuaMemberIndex {
         for id in &member_ids {
             self.snapshot_member(*id);
         }
+        let member_ids: Vec<LuaMemberId> = member_ids.into_iter().collect();
         for member_id in member_ids {
-            self.write_filed(member_id, |index| {
-                if let std::collections::hash_map::Entry::Vacant(slot) =
-                    index.member_path_provenance.entry(member_id)
-                {
-                    slot.insert(path.clone());
-                    index.note_member_object_write(member_id);
-                }
-            });
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                self.member_path_provenance.entry(member_id)
+            {
+                slot.insert(path.clone());
+                self.note_member_object_write(member_id);
+            }
         }
     }
 
@@ -2056,19 +1834,14 @@ impl LuaMemberIndex {
     /// it must follow the path when its winning `---@class` changes. A member
     /// re-homed onto the path's current canonical owner keeps its provenance;
     /// one re-homed anywhere else is no longer a path member and loses it.
-    fn note_member_path_provenance(
-        &mut self,
-        id: LuaMemberId,
-        raw_owner: &LuaMemberOwner,
-        homing: Homing,
-    ) {
+    fn note_member_path_provenance(&mut self, id: LuaMemberId, raw_owner: &LuaMemberOwner) {
         if let Some(path) = raw_owner.get_path() {
-            self.stamp_member_path_provenance(id, path, homing);
+            self.stamp_member_path_provenance(id, path);
             return;
         }
         let canonical = self.canonical(raw_owner).clone();
         if let Some(path) = canonical.get_path() {
-            self.stamp_member_path_provenance(id, path, homing);
+            self.stamp_member_path_provenance(id, path);
             return;
         }
         let Some(recorded) = self.member_path_provenance.get(&id).cloned() else {
@@ -2079,18 +1852,18 @@ impl LuaMemberIndex {
             .clone();
         if recorded_canonical != canonical {
             self.member_path_provenance.remove(&id);
-            self.note_object_write(id, homing);
+            self.note_member_object_write(id);
         }
     }
 
     /// Writes `id`'s provenance when it differs, so a re-file that re-derives
     /// the same path does not stamp the member-object domain.
-    fn stamp_member_path_provenance(&mut self, id: LuaMemberId, path: &GlobalId, homing: Homing) {
+    fn stamp_member_path_provenance(&mut self, id: LuaMemberId, path: &GlobalId) {
         if self.member_path_provenance.get(&id) == Some(path) {
             return;
         }
         self.member_path_provenance.insert(id, path.clone());
-        self.note_object_write(id, homing);
+        self.note_member_object_write(id);
     }
 
     /// Drops `id`'s provenance when it is detached from the owner the
@@ -2312,7 +2085,7 @@ impl LuaMemberIndex {
             .flat_map(|members| members.get_member_items())
             .flat_map(member_ids_from_item)
             .filter(|id| {
-                !self.is_pinned(id)
+                !self.synthesized_owner_members.contains(id)
                     && self.member_current_owner.get(id) == Some(&path_owner)
                     && (!self.owner_only_members.contains(id)
                         || self.member_path_provenance.get(id) == Some(path))
@@ -2328,7 +2101,7 @@ impl LuaMemberIndex {
                     .flat_map(|members| members.get_member_items())
                     .flat_map(member_ids_from_item)
                     .filter(|id| {
-                        !self.is_pinned(id)
+                        !self.synthesized_owner_members.contains(id)
                             && self.member_current_owner.get(id) == Some(&old_owner)
                             && self.member_path_provenance.get(id) == Some(path)
                     }),
@@ -2338,28 +2111,16 @@ impl LuaMemberIndex {
         member_ids.sort_unstable_by_key(|id| member_id_sort_key(*id));
         member_ids.dedup();
         for member_id in member_ids {
-            self.write_filed(member_id, |index| {
-                index.remove_member_from_owner_item(&path_owner, member_id);
-                if let Some(old) = from {
-                    index.remove_member_from_owner_item(
-                        &LuaMemberOwner::Type(old.clone()),
-                        member_id,
-                    );
-                }
-                index.home_member(to.clone(), member_id.file_id, member_id, Homing::Filed);
-                index.list_member(to.clone(), member_id, Homing::Filed);
-            });
+            self.remove_member_from_owner_item(&path_owner, member_id);
+            if let Some(old) = from {
+                self.remove_member_from_owner_item(&LuaMemberOwner::Type(old.clone()), member_id);
+            }
+            self.set_member_owner(to.clone(), member_id.file_id, member_id);
+            self.add_member_to_owner(to.clone(), member_id);
         }
         if *to != path_owner {
             self.vacate_bound_path_owner(&path_owner);
         }
-    }
-
-    /// Whether a synthesis pinned `id` to the class it transferred it to.
-    fn is_pinned(&self, id: &LuaMemberId) -> bool {
-        self.member_transfers
-            .get(id)
-            .is_some_and(|transfer| transfer.pinned)
     }
 
     /// Drops every item and key-index entry a class-bound path's own key
@@ -3290,7 +3051,7 @@ impl LuaMemberIndex {
         self.member_path_provenance.remove(&member_id);
         self.non_overwriting_assignment_members.remove(&member_id);
         self.owner_only_members.remove(&member_id);
-        self.filed_homes.remove(&member_id);
+        self.synthesized_owner_members.remove(&member_id);
         self.note_member_object_write(member_id);
         self.deferred_index_expr_members.remove(&member_id);
         self.member_function_scope_ranges.remove(&member_id);
@@ -3312,15 +3073,6 @@ impl LuaMemberIndex {
             .collect::<Vec<_>>();
         for member_id in member_ids {
             self.forget_member(member_id);
-        }
-        let transferred = self
-            .member_transfers
-            .file_entries(file_id)
-            .map(|(id, _)| *id)
-            .collect::<Vec<_>>();
-        for member_id in transferred {
-            self.member_transfers.remove(&member_id);
-            derivation::note_write(|| FactKey::MemberTransfer(member_id));
         }
         if let Some(owners) = owners {
             let mut need_removed_owner = Vec::new();
@@ -3536,16 +3288,9 @@ impl LuaMemberIndex {
             .collect();
         self.remap_definition_sites(map);
         for (member_id, old_owner, new_owner) in to_move {
-            self.write_filed(member_id, |index| {
-                index.detach_filed_member(&old_owner, member_id);
-                index.home_member(
-                    new_owner.clone(),
-                    member_id.file_id,
-                    member_id,
-                    Homing::Filed,
-                );
-                index.list_member(new_owner.clone(), member_id, Homing::Filed);
-            });
+            self.detach_member_from_owner(&old_owner, member_id);
+            self.set_member_owner(new_owner.clone(), member_id.file_id, member_id);
+            self.add_member_to_owner(new_owner, member_id);
             if matches!(old_owner, LuaMemberOwner::Element(_))
                 && self
                     .owner_members
@@ -3717,8 +3462,7 @@ impl LuaIndex for LuaMemberIndex {
         self.preserved_co_writer_reconciled.clear();
         self.homing_revision = 0;
         self.owner_only_members.clear();
-        self.member_transfers.clear();
-        self.filed_homes.clear();
+        self.synthesized_owner_members.clear();
         self.deferred_index_expr_members.clear();
         self.function_scope_ranges.clear();
         self.member_function_scope_ranges.clear();
@@ -3760,8 +3504,7 @@ crate::db_index::cow_shards::task_fork_fields!(LuaMemberIndex {
     preserved_co_writer_reconciled,
     homing_revision => crate::db_index::cow_shards::merge_sum,
     owner_only_members,
-    member_transfers,
-    filed_homes,
+    synthesized_owner_members,
     deferred_index_expr_members => crate::db_index::cow_shards::merge_set,
     function_scope_ranges,
     member_function_scope_ranges,

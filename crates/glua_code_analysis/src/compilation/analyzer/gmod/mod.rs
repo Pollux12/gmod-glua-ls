@@ -29,7 +29,7 @@ use crate::{
     LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{
         AnalyzeContext,
-        common::{TypeCacheWriteMode, write_type_cache},
+        common::{TypeCacheWriteMode, add_member, write_type_cache},
     },
     db_index::rebuild_effective_valid_guard_signatures,
     db_index::{
@@ -1679,11 +1679,7 @@ fn collect_scripted_scope_type_bindings_with(
             table_member_ids
                 .sort_unstable_by_key(|member_id| (member_id.file_id.id, member_id.get_position()));
             for member_id in table_member_ids {
-                db.get_member_index_mut().transfer_member(
-                    class_member_owner.clone(),
-                    member_id,
-                    false,
-                );
+                add_member(db, class_member_owner.clone(), member_id);
             }
         }
     }
@@ -4194,8 +4190,7 @@ fn synthesize_scripted_ent_registration(
         })
         .unwrap_or_default();
     for member_id in table_member_ids {
-        db.get_member_index_mut()
-            .transfer_member(class_member_owner.clone(), member_id, false);
+        add_member(db, class_member_owner.clone(), member_id);
     }
 
     db.get_type_index_mut()
@@ -5748,8 +5743,7 @@ fn synthesize_vgui_register_file_target(
         })
         .unwrap_or_default();
     for member_id in member_ids {
-        db.get_member_index_mut()
-            .transfer_member(class_owner.clone(), member_id, false);
+        add_member(db, class_owner.clone(), member_id);
     }
 
     let range = db
@@ -6299,11 +6293,8 @@ fn synthesize_panel_class_with_id(
             table_member_ids
                 .sort_unstable_by_key(|member_id| (member_id.file_id.id, member_id.get_position()));
             for member_id in table_member_ids {
-                db.get_member_index_mut().transfer_member(
-                    class_member_owner.clone(),
-                    member_id,
-                    true,
-                );
+                add_member(db, class_member_owner.clone(), member_id);
+                db.get_member_index_mut().pin_synthesized_owner(member_id);
             }
         }
     } else if let Some(table_expr) = find_inline_vgui_panel_table_expr(db, file_id, call_kind, call)
@@ -6382,8 +6373,7 @@ fn bind_inline_vgui_panel_table(
             .map(|members| members.iter().map(|member| member.get_id()).collect())
             .unwrap_or_default();
         for member_id in table_member_ids {
-            db.get_member_index_mut()
-                .transfer_member(class_member_owner.clone(), member_id, false);
+            add_member(db, class_member_owner.clone(), member_id);
         }
         return;
     }

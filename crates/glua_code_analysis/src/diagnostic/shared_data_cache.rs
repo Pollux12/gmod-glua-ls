@@ -67,9 +67,9 @@ fn read_out_of_base(key: HashedKey) -> HashedKey {
     let base = match key.key() {
         FactKey::GmodRealmAt(file_id, _) => FactKey::GmodRealm(*file_id),
         FactKey::GmodMemberRealmAt(file_id, _) => FactKey::GmodInferFile(*file_id),
-        FactKey::MemberObject(member_id) | FactKey::MemberMarks(member_id) => {
-            FactKey::Member(*member_id)
-        }
+        FactKey::MemberObject(member_id)
+        | FactKey::MemberHome(member_id)
+        | FactKey::MemberMarks(member_id) => FactKey::Member(*member_id),
         _ => return key,
     };
     HashedKey::new(base)

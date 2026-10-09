@@ -1046,9 +1046,9 @@ mod tests {
         assert_ne!(fingerprint(&index, read), read_seen);
     }
 
-    /// A reader of a member's owner records the member's home, a fact of its
-    /// own that a transfer moves too: the member's function scope moving holds
-    /// it, a move to another owner moves it.
+    /// A reader of a member's owner records the owner alone, read out of the
+    /// member: the member's function scope moving holds it, a move to another
+    /// owner moves it.
     #[test]
     fn a_member_scope_move_holds_a_reader_of_the_member_owner() {
         use crate::db_index::derivation::{self, FactKey};
@@ -1064,7 +1064,7 @@ mod tests {
         let [read] = reads.as_slice() else {
             panic!("expected one read, got {reads:?}");
         };
-        assert_eq!(read.key(), &FactKey::MemberHome(member_id));
+        assert_eq!(read.base(), Some(FactKey::Member(member_id)));
         let fingerprint = |index: &LuaMemberIndex, key: &FactKey| {
             derivation::in_file(Some(file_id), || index.fact_fingerprint(key))
         };
@@ -1456,80 +1456,5 @@ mod tests {
             (installed_state(&by_field), by_field_conflicts),
             (installed_state(&one_by_one), one_by_one_conflicts)
         );
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    enum HomeStep {
-        Filed(&'static str),
-        Transfer,
-        ResetTransfer,
-    }
-
-    fn class(name: &str) -> LuaMemberOwner {
-        LuaMemberOwner::Type(LuaTypeDeclId::global(name))
-    }
-
-    fn apply_home_step(index: &mut LuaMemberIndex, id: LuaMemberId, step: HomeStep) {
-        match step {
-            HomeStep::Filed(owner) => {
-                index.set_member_owner(class(owner), id.file_id, id);
-                index.add_member_to_owner(class(owner), id);
-            }
-            HomeStep::Transfer => index.transfer_member(class("Panel"), id, false),
-            HomeStep::ResetTransfer => index.reset_transfer(id),
-        }
-    }
-
-    #[test]
-    fn a_member_is_homed_by_its_transfer_over_its_filing_in_any_order() {
-        let steps = [
-            HomeStep::Filed("First"),
-            HomeStep::Transfer,
-            HomeStep::ResetTransfer,
-            HomeStep::Filed("Second"),
-        ];
-        let id = make_index_member_id(FileId::new(1), 10);
-        let mut orders = vec![Vec::<usize>::new()];
-        for _ in 0..steps.len() {
-            orders = orders
-                .iter()
-                .flat_map(|order| {
-                    (0..steps.len())
-                        .filter(|step| !order.contains(step))
-                        .map(|step| [order.as_slice(), &[step]].concat())
-                })
-                .collect();
-        }
-        assert_eq!(orders.len(), 24);
-        for order in orders {
-            let order = order.iter().map(|step| steps[*step]).collect::<Vec<_>>();
-            let mut index = LuaMemberIndex::new();
-            let mut filed_only = LuaMemberIndex::new();
-            for index in [&mut index, &mut filed_only] {
-                index.add_member(class("Origin"), make_member(id, "Gender"));
-            }
-            let mut filed = "Origin";
-            let mut transferred = false;
-            for step in &order {
-                apply_home_step(&mut index, id, *step);
-                match step {
-                    HomeStep::Filed(owner) => {
-                        apply_home_step(&mut filed_only, id, *step);
-                        filed = owner;
-                    }
-                    HomeStep::Transfer => transferred = true,
-                    HomeStep::ResetTransfer => transferred = false,
-                }
-            }
-            let home = class(if transferred { "Panel" } else { filed });
-
-            assert_eq!(index.get_current_owner(&id), Some(&home), "{order:?}");
-            assert!(owner_member_ids(&index, &home).contains(&id), "{order:?}");
-            assert_eq!(
-                index.fact_fingerprint(&FactKey::Member(id)),
-                filed_only.fact_fingerprint(&FactKey::Member(id)),
-                "{order:?}"
-            );
-        }
     }
 }
