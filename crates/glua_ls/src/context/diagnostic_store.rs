@@ -121,6 +121,9 @@ pub struct DiagnosticStore {
     verify: bool,
     /// Whether workers were started: without them no job is ever claimed.
     working: std::sync::atomic::AtomicBool,
+    /// Makes every computation panic while set, as a diagnostic bug would.
+    #[cfg(test)]
+    panic_computes: std::sync::atomic::AtomicBool,
 }
 
 impl DiagnosticStore {
@@ -140,6 +143,8 @@ impl DiagnosticStore {
             client,
             verify: std::env::var_os("GLUALS_DIAG_VERIFY").is_some(),
             working: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            panic_computes: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -561,13 +566,7 @@ impl DiagnosticStore {
     }
 
     async fn run(&self, job: Job) {
-        let computed = compute(
-            self.analysis.clone(),
-            self.shared.clone(),
-            job.file_id,
-            job.token.clone(),
-        )
-        .await;
+        let computed = self.compute(job.file_id, job.token.clone()).await;
         // Held until the result is published, so no edit lands between the
         // revision check and the publish.
         let analysis = self.analysis.read().await;
@@ -709,13 +708,7 @@ impl DiagnosticStore {
             }
             let Computed::Diagnostics {
                 uri, diagnostics, ..
-            } = compute(
-                self.analysis.clone(),
-                self.shared.clone(),
-                file_id,
-                CancellationToken::new(),
-            )
-            .await
+            } = self.compute(file_id, CancellationToken::new()).await
             else {
                 continue;
             };
@@ -742,6 +735,61 @@ impl DiagnosticStore {
         }
         log::info!("LS_DIAG_VERIFY checked={checked} drifted={drifted}");
     }
+
+    async fn compute(&self, file_id: FileId, token: CancellationToken) -> Computed {
+        let analysis = self.analysis.clone();
+        let shared = self.shared.clone();
+        #[cfg(test)]
+        let panics = self
+            .panic_computes
+            .load(std::sync::atomic::Ordering::Acquire);
+        let computed = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if panics {
+                panic!("injected diagnostic computation panic");
+            }
+            if token.is_cancelled() {
+                return Computed::Cancelled;
+            }
+            let analysis = analysis.blocking_read();
+            let Some(uri) = analysis.get_uri(file_id) else {
+                return Computed::Gone;
+            };
+            // Text the index has not taken in yet would be diagnosed against the
+            // facts of the text before it.
+            if !analysis.compilation.has_taken_text(file_id) {
+                return Computed::Cancelled;
+            }
+            let Some(revision) = analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_revision(&file_id)
+            else {
+                return Computed::Gone;
+            };
+            let shared = shared.get_or_precompute(&analysis);
+            match analysis.diagnose_file_with_shared(file_id, token.clone(), shared) {
+                Some(diagnostics) => Computed::Diagnostics {
+                    uri,
+                    diagnostics,
+                    revision,
+                },
+                None if token.is_cancelled() => Computed::Cancelled,
+                None => Computed::Gone,
+            }
+        })
+        .await;
+        computed.unwrap_or_else(|error| {
+            if !error.is_panic() {
+                return Computed::Cancelled;
+            }
+            log::error!(
+                "LS_DIAGNOSE_FAILED diagnostics of {file_id:?} panicked: {error}; computed again once the file is invalidated"
+            );
+            Computed::Gone
+        })
+    }
 }
 
 enum Computed {
@@ -751,54 +799,10 @@ enum Computed {
         /// The text revision they were computed on.
         revision: u64,
     },
-    /// The file left the workspace.
+    /// Nothing to hold: the file left the workspace, or computing its
+    /// diagnostics failed, which is tried again only once they are invalidated.
     Gone,
     Cancelled,
-}
-
-async fn compute(
-    analysis: Arc<RwLock<EmmyLuaAnalysis>>,
-    shared: SharedDiagnosticDataCache,
-    file_id: FileId,
-    token: CancellationToken,
-) -> Computed {
-    let computed = tokio::task::spawn_blocking(move || {
-        if token.is_cancelled() {
-            return Computed::Cancelled;
-        }
-        let analysis = analysis.blocking_read();
-        let Some(uri) = analysis.get_uri(file_id) else {
-            return Computed::Gone;
-        };
-        // Text the index has not taken in yet would be diagnosed against the
-        // facts of the text before it.
-        if !analysis.compilation.has_taken_text(file_id) {
-            return Computed::Cancelled;
-        }
-        let Some(revision) = analysis
-            .compilation
-            .get_db()
-            .get_vfs()
-            .get_file_revision(&file_id)
-        else {
-            return Computed::Gone;
-        };
-        let shared = shared.get_or_precompute(&analysis);
-        match analysis.diagnose_file_with_shared(file_id, token.clone(), shared) {
-            Some(diagnostics) => Computed::Diagnostics {
-                uri,
-                diagnostics,
-                revision,
-            },
-            None if token.is_cancelled() => Computed::Cancelled,
-            None => Computed::Gone,
-        }
-    })
-    .await;
-    computed.unwrap_or_else(|error| {
-        log::warn!("diagnostic computation for {file_id:?} failed: {error}");
-        Computed::Cancelled
-    })
 }
 
 /// An order-insensitive hash of `diagnostics`, from each one's serialized
@@ -928,6 +932,50 @@ mod tests {
                 .map(|params| params.diagnostics.len())
                 .collect::<Vec<_>>();
             verify_that!(published, eq(&vec![first.diagnostics.len(), 0]))
+        })
+    }
+
+    /// A computation that panics is tried again only once the file is
+    /// invalidated: trying again at once would spin a worker on it.
+    #[gtest]
+    fn a_panicking_computation_waits_for_the_next_invalidation() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = Connection::memory();
+        runtime.block_on(async {
+            let context = ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let workspace = std::env::temp_dir().join("gmod_glua_ls_diagnostic_store_panic");
+            let uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/panics.lua"))
+                .expect("file URI should parse");
+            let file_id = {
+                let mut analysis = snapshot.analysis().write().await;
+                analysis.add_main_workspace(workspace);
+                analysis
+                    .update_file_by_uri(&uri, Some("local unused = UndefinedGlobal".to_string()))
+                    .map(|(file_id, _)| file_id)
+                    .expect("file id")
+            };
+            let store = snapshot.file_diagnostic().store();
+            let cancel = CancellationToken::new();
+            store
+                .panic_computes
+                .store(true, std::sync::atomic::Ordering::Release);
+
+            let failed = tokio::time::timeout(
+                Duration::from_secs(10),
+                store.get(file_id, Priority::Edited, &cancel),
+            )
+            .await
+            .expect("a failed computation ends the wait");
+            verify_that!(failed.is_none(), eq(true))?;
+            verify_that!(store.is_idle(), eq(true))?;
+
+            store
+                .panic_computes
+                .store(false, std::sync::atomic::Ordering::Release);
+            store.invalidate([file_id], &[]);
+            let computed = store.get(file_id, Priority::Edited, &cancel).await;
+            verify_that!(computed.is_some(), eq(true))
         })
     }
 
