@@ -4410,6 +4410,83 @@ end
         );
     }
 
+    /// The shipped `vgui.Register` signature: the call returns the table it
+    /// registers.
+    const VGUI_REGISTER_RETURNING_TABLE: (&str, &str) = (
+        "lua/aaa_annotations/vgui.lua",
+        r#"---@meta
+---@generic T: Panel
+---@[call_arg("gmod.vgui_panel", "define")]
+---@param classname string Classname of the panel to register.
+---@[call_arg("gmod.vgui_panel", "table")]
+---@param panelTable T The table containing the panel information.
+---@[call_arg("gmod.vgui_panel", "base")]
+---@param baseName? string Classname of a panel to inherit functionality from.
+---@return T # The given panel table from second argument.
+function vgui.Register(classname, panelTable, baseName) end
+"#,
+    );
+
+    /// A panel registered from an inline table, its methods defined on the
+    /// local the call initialises (dermaflex's `Flex`).
+    const INLINE_REGISTERED_PANEL: (&str, &str) = (
+        "addons/flex/lua/autorun/client/cl_flex.lua",
+        r#"local FLEX = vgui.Register("InlineFlex", { w = 0 }, "Panel")
+function FLEX:Init() self.offsetX = 0 end
+function FLEX:OnMousePressed() self.clickOffset = 5 end
+function FLEX:Paint(w, h)
+	local x = self.offsetX + 1
+	local y = self.clickOffset + 1
+end
+"#,
+    );
+
+    /// The local an inline `vgui.Register` call initialises is the registered
+    /// table, as a `local PANEL = {}` declaration is: a field its `Init`
+    /// assigns through `self` is the class's, so another method reads it
+    /// without a nil check.
+    #[gtest]
+    fn test_vgui_register_inline_table_fields_set_in_init_are_class_fields() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+        ws.def_file(
+            VGUI_REGISTER_RETURNING_TABLE.0,
+            VGUI_REGISTER_RETURNING_TABLE.1,
+        );
+        let file_id = ws.def_file(INLINE_REGISTERED_PANEL.0, INLINE_REGISTERED_PANEL.1);
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let need_check_nil = Some(NumberOrString::String(
+            DiagnosticCode::NeedCheckNil.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != need_check_nil),
+            "fields an inline-registered panel's Init assigns are class fields: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_register_inline_table_settles_in_any_order() {
+        crate::compilation::test::schedule_order_test::test::assert_schedule_independent(&[
+            (
+                "lua/includes/glua_ls_gmod_call_arg_builtins.lua",
+                crate::test_lib::GMOD_CALL_ARG_BUILTINS_FIXTURE,
+            ),
+            VGUI_REGISTER_RETURNING_TABLE,
+            INLINE_REGISTERED_PANEL,
+        ]);
+    }
+
     #[gtest]
     fn test_vgui_register_table_unrelated_reassignment_does_not_bind_stale_initializer() {
         let mut ws = VirtualWorkspace::new();

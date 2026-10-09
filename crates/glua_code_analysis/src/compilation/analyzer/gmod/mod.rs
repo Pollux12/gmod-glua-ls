@@ -6300,6 +6300,14 @@ fn synthesize_panel_class_with_id(
     } else if let Some(table_expr) = find_inline_vgui_panel_table_expr(db, file_id, call_kind, call)
     {
         bind_inline_vgui_panel_table(db, cache, file_id, &class_decl_id, table_expr, phase);
+        // The local the call initialises is the registered table: its methods
+        // define the class's members, as a `local PANEL = {}` declaration's do.
+        if phase == VguiSynthesisPhase::Bind
+            && let Some(decl_id) = local_decl_for_call_result(db, file_id, call.syntax_id)
+            && !cached_decl_has_reassignment(cache, db, file_id, decl_id)
+        {
+            bind_panel_table_decl(db, decl_id, &LuaType::Def(class_decl_id.clone()));
+        }
     }
 }
 
