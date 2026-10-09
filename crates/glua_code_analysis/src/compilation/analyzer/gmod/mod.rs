@@ -9162,28 +9162,31 @@ fn mapped_hook_for_emitter_call(
     Option<rowan::TextRange>,
     Option<GmodHookNameIssue>,
 )> {
-    for (emitter_path, mapped_hook) in &db.get_emmyrc().gmod.hook_mappings.emitter_to_hook {
-        if !matches_configured_call_path(call_path, emitter_path) {
-            continue;
-        }
+    let (_, mapped_hook) = db
+        .get_emmyrc()
+        .gmod
+        .hook_mappings
+        .emitter_to_hook
+        .iter()
+        .filter(|(emitter_path, _)| matches_configured_call_path(call_path, emitter_path))
+        .max_by(|(left, _), (right, _)| {
+            left.len().cmp(&right.len()).then_with(|| right.cmp(left))
+        })?;
 
-        if mapped_hook == "*" {
-            return Some(extract_static_hook_name(
-                call_expr
-                    .get_args_list()
-                    .and_then(|args| args.get_args().next()),
-            ));
-        }
-
-        let trimmed = mapped_hook.trim();
-        return Some(if trimmed.is_empty() {
-            (None, None, Some(GmodHookNameIssue::Empty))
-        } else {
-            (Some(trimmed.to_string()), None, None)
-        });
+    if mapped_hook == "*" {
+        return Some(extract_static_hook_name(
+            call_expr
+                .get_args_list()
+                .and_then(|args| args.get_args().next()),
+        ));
     }
 
-    None
+    let trimmed = mapped_hook.trim();
+    Some(if trimmed.is_empty() {
+        (None, None, Some(GmodHookNameIssue::Empty))
+    } else {
+        (Some(trimmed.to_string()), None, None)
+    })
 }
 
 fn collect_hook_method_site(db: &DbIndex, func_stat: LuaFuncStat) -> Option<GmodHookSiteMetadata> {

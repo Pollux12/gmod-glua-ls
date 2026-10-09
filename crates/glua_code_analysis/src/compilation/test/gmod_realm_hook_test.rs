@@ -940,6 +940,44 @@ mod test {
     }
 
     #[gtest]
+    fn test_mapped_emitter_prefers_the_most_specific_path() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        for (path, hook) in [
+            ("Fire", "Short"),
+            ("bus.Fire", "Specific"),
+            ("us.Fire", "Middle"),
+            ("s.Fire", "Tiny"),
+        ] {
+            emmyrc
+                .gmod
+                .hook_mappings
+                .emitter_to_hook
+                .insert(path.to_string(), hook.to_string());
+        }
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def(r#"bus.Fire("x")"#);
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_hook_file_metadata(&file_id)
+            .cloned()
+            .expect("expected hook metadata");
+
+        assert_eq!(
+            metadata
+                .sites
+                .iter()
+                .filter(|site| site.kind == GmodHookKind::Emit)
+                .map(|site| site.hook_name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("Specific")]
+        );
+    }
+
+    #[gtest]
     fn test_hook_detection_respects_hook_mappings() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
