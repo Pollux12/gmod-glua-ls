@@ -718,6 +718,43 @@ mod test {
         ));
     }
 
+    #[gtest]
+    fn test_union_of_template_arms_all_rejecting_reports_once() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+
+            ---@generic T: Panel, U: Panel
+            ---@param name `T`|T|U
+            function create_panel(name) end
+
+            create_panel("MissingPanel")
+        "#,
+        );
+
+        let diagnostics = generic_constraint_mismatch_diagnostics(&mut ws, file_id);
+        expect_that!(diagnostics.len(), eq(1));
+    }
+
+    #[gtest]
+    fn test_union_of_template_arms_one_accepting_reports_nothing() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+
+            ---@generic X            ---@param name `T`|T|U
+            function create_panel(name) end
+
+            create_panel("MissingPanel")
+        "#,
+        );
+
+        let diagnostics = generic_constraint_mismatch_diagnostics(&mut ws, file_id);
+        expect_that!(diagnostics.len(), eq(0));
+    }
+
     fn generic_constraint_mismatch_diagnostics(
         ws: &mut VirtualWorkspace,
         file_id: crate::FileId,
