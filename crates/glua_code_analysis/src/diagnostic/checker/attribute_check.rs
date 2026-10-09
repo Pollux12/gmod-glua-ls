@@ -1,5 +1,3 @@
-use rustc_hash::FxHashSet;
-
 use crate::{
     DiagnosticCode, DocTypeInferContext, LuaType, SemanticModel, TypeCheckFailReason,
     TypeCheckResult, diagnostic::checker::humanize_lint_type, infer_doc_type,
@@ -7,7 +5,7 @@ use crate::{
 use glua_parser::{LuaAstNode, LuaDocAttributeUse, LuaDocType, LuaExpr, LuaLiteralExpr};
 use rowan::TextRange;
 
-use super::{Checker, DiagnosticContext};
+use super::{Checker, DiagnosticContext, check_param_count::is_nullable};
 
 pub struct AttributeCheckChecker;
 
@@ -58,7 +56,7 @@ fn check_attribute_use(
         Some(arg_list) => arg_list.get_args().collect::<Vec<_>>(),
         None => vec![],
     };
-    check_param_count(context, &def_params, &attribute_use, &args);
+    check_param_count(context, semantic_model, &def_params, &attribute_use, &args);
     check_param(context, semantic_model, &def_params, args);
 
     Some(())
@@ -67,6 +65,7 @@ fn check_attribute_use(
 /// Checks whether the number of parameters matches
 fn check_param_count(
     context: &mut DiagnosticContext,
+    semantic_model: &SemanticModel,
     def_params: &[(String, Option<LuaType>)],
     attribute_use: &LuaDocAttributeUse,
     args: &[LuaLiteralExpr],
@@ -78,7 +77,7 @@ fn check_param_count(
             if def_param.0 == "..." {
                 break;
             }
-            if def_param.1.as_ref().is_some_and(is_nullable) {
+            if def_param.1.as_ref().is_some_and(|typ| is_nullable(semantic_model.get_db(), typ)) {
                 continue;
             }
             context.add_diagnostic(
@@ -211,26 +210,4 @@ fn add_type_check_diagnostic(
             );
         }
     }
-}
-
-fn is_nullable(typ: &LuaType) -> bool {
-    let mut stack: Vec<LuaType> = Vec::new();
-    stack.push(typ.clone());
-    let mut visited = FxHashSet::default();
-    while let Some(typ) = stack.pop() {
-        if visited.contains(&typ) {
-            continue;
-        }
-        visited.insert(typ.clone());
-        match typ {
-            LuaType::Any | LuaType::Unknown | LuaType::Nil => return true,
-            LuaType::Union(u) => {
-                for t in u.into_vec() {
-                    stack.push(t);
-                }
-            }
-            _ => {}
-        }
-    }
-    false
 }

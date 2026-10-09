@@ -357,7 +357,7 @@ fn get_params_len(params: &[(String, Option<LuaType>)]) -> Option<usize> {
     Some(params.len())
 }
 
-fn is_nullable(db: &DbIndex, typ: &LuaType) -> bool {
+pub(super) fn is_nullable(db: &DbIndex, typ: &LuaType) -> bool {
     let mut stack: Vec<LuaType> = Vec::new();
     stack.push(typ.clone());
     let mut visited = FxHashSet::default();

@@ -43,4 +43,20 @@ mod test {
         "#
         ));
     }
+
+    #[test]
+    fn omitted_alias_nullable_parameter_is_not_missing() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AttributeMissingParameter,
+            r#"
+            ---@alias OptName string|nil
+
+            ---@attribute tagged4(name: OptName)
+
+            ---@[tagged4]
+            local a = 1
+        "#
+        ));
+    }
 }
