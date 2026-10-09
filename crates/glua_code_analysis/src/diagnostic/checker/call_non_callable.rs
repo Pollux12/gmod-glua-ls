@@ -1,6 +1,7 @@
 use glua_parser::{LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr};
 use std::collections::BTreeSet;
 
+use crate::semantic::decl_value_expr;
 use crate::{
     DbIndex, DiagnosticCode, InferFailReason, InferGuard, LuaInferCache, LuaSemanticDeclId,
     LuaType, RenderLevel, SemanticDeclLevel, SemanticModel,
@@ -132,12 +133,7 @@ fn infer_call_target_type(
             Some(decl.get_id())
         })?;
 
-    let decl = db.get_decl_index().get_decl(&decl_id)?;
-    let value_syntax_id = decl.get_value_syntax_id()?;
-    let node = db
-        .get_vfs()
-        .syntax_node_around(&decl_id.file_id, value_syntax_id)?;
-    let expr = LuaExpr::cast(node)?;
+    let expr = decl_value_expr(db, decl_id)?;
     semantic_model.infer_expr(expr).ok()
 }
 

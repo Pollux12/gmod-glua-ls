@@ -1372,15 +1372,10 @@ fn finite_dynamic_key_strings(
 }
 
 fn local_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<LuaExpr> {
-    let decl = db.get_decl_index().get_decl(&decl_id)?;
-    let initializer = decl.get_initializer()?;
-    if initializer.get_ret_idx() != 0 {
-        return None;
+    match crate::semantic::local_initializer_expr(db, decl_id)? {
+        (0, initializer) => Some(initializer),
+        _ => None,
     }
-    LuaExpr::cast(
-        db.get_vfs()
-            .syntax_node_around(&decl_id.file_id, initializer.get_expr_syntax_id())?,
-    )
 }
 
 fn concatenate_finite_strings(left: &[SmolStr], right: &[SmolStr]) -> Vec<SmolStr> {

@@ -1,4 +1,5 @@
 use crate::compilation::analyzer::lua::StatementWrite;
+use crate::semantic::local_initializer_expr;
 use crate::{
     DbIndex, FileId, GlobalId, InFiled, LuaArrayType, LuaMemberKey, LuaTypeCache, TypeOps,
     compilation::analyzer::common::{TypeCacheWriteMode, write_type_cache},
@@ -6,8 +7,8 @@ use crate::{
     semantic::member_key_matches_type,
 };
 use glua_parser::{
-    BinaryOperator, LuaAstNode, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaLiteralToken, LuaTableExpr,
-    LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
+    BinaryOperator, LuaAstNode, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaLiteralToken, LuaVarExpr,
+    NumberResult, PathTrait, UnaryOperator,
 };
 
 use super::super::{LuaAnalyzer, stats::is_local_mutable};
@@ -217,16 +218,9 @@ fn resolve_direct_local_table_prefix_member_owner(
         return None;
     }
 
-    let decl = analyzer.db.get_decl_index().get_decl(&decl_id)?;
-    let initializer = decl.get_initializer()?;
-    if initializer.get_ret_idx() != 0 {
+    let (0, LuaExpr::TableExpr(table_expr)) = local_initializer_expr(&analyzer.db, decl_id)? else {
         return None;
-    }
-    let node = analyzer
-        .db
-        .get_vfs()
-        .syntax_node_around(&decl_id.file_id, initializer.get_expr_syntax_id())?;
-    let table_expr = LuaTableExpr::cast(node)?;
+    };
     Some(LuaMemberOwner::Element(InFiled::new(
         decl_id.file_id,
         table_expr.get_range(),

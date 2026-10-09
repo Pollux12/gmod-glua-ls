@@ -3,6 +3,7 @@ use glua_parser::{
     LuaTableExpr, LuaTableField, LuaVarExpr,
 };
 
+use crate::semantic::semantic_decl_value;
 use crate::{
     DbIndex, InFiled, InferFailReason, LuaDeclExtra, LuaInferCache, LuaInstanceType, LuaMemberKey,
     LuaMemberOwner, LuaType, SemanticDeclLevel, infer_expr,
@@ -98,24 +99,7 @@ fn resolve_table_backing_range(
         SemanticDeclGuard::default(),
         SemanticDeclLevel::default(),
     )?;
-    let (value_file_id, value_expr) = match semantic_decl {
-        crate::LuaSemanticDeclId::LuaDecl(decl_id) => {
-            let value_syntax_id = db
-                .get_decl_index()
-                .get_decl(&decl_id)?
-                .get_value_syntax_id()?;
-            (
-                decl_id.file_id,
-                db.get_vfs()
-                    .syntax_node_around(&decl_id.file_id, value_syntax_id)
-                    .and_then(LuaExpr::cast)?,
-            )
-        }
-        crate::LuaSemanticDeclId::Member(member_id) => {
-            (member_id.file_id, get_member_value_expr(db, member_id)?)
-        }
-        _ => return None,
-    };
+    let (value_file_id, value_expr) = semantic_decl_value(db, semantic_decl)?;
 
     table_backing_range_from_expr(value_file_id, &value_expr)
 }

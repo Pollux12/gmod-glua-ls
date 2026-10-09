@@ -10,6 +10,7 @@ use glua_parser::{
 };
 use rowan::TextSize;
 
+use crate::semantic::{semantic_decl_closure_signature_id, semantic_decl_value_expr};
 use crate::{
     DbIndex, FileId, GlobalId, InferFailReason, LuaDeclId, LuaDeclOrMemberId, LuaDeclTypeKind,
     LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaOperator,
@@ -33,7 +34,7 @@ use crate::{
         LuaFunctionType, LuaMemberFeature, LuaMemberOwner, LuaOutParamRoot, LuaSignature,
         LuaSignatureId, SpecialCallFact, derivation::StageRule,
     },
-    find_members_with_key, get_member_value_expr, humanize_type,
+    find_members_with_key, humanize_type,
     semantic::{
         InferGuard, LuaInferCache, SelfRefId, SemanticDeclGuard, VarRefId, VarRefRootId,
         get_var_expr_var_ref_id, infer_call_expr_func, infer_expr, resolve_dynamic_field_member,
@@ -1057,25 +1058,10 @@ pub(crate) fn get_wrapped_callable_target_expr(
     db: &DbIndex,
     semantic_decl: LuaSemanticDeclId,
 ) -> Option<LuaExpr> {
-    let LuaExpr::CallExpr(call_expr) = get_semantic_decl_value_expr(db, semantic_decl)? else {
+    let LuaExpr::CallExpr(call_expr) = semantic_decl_value_expr(db, semantic_decl)? else {
         return None;
     };
     get_setmetatable_call_target_expr(&call_expr)
-}
-
-fn get_semantic_decl_value_expr(db: &DbIndex, semantic_decl: LuaSemanticDeclId) -> Option<LuaExpr> {
-    match semantic_decl {
-        LuaSemanticDeclId::LuaDecl(decl_id) => {
-            let decl = db.get_decl_index().get_decl(&decl_id)?;
-            let value_syntax_id = decl.get_value_syntax_id()?;
-            LuaExpr::cast(
-                db.get_vfs()
-                    .syntax_node_around(&decl.get_file_id(), value_syntax_id)?,
-            )
-        }
-        LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
-        LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => None,
-    }
 }
 
 pub(crate) fn get_setmetatable_call_target_expr(call_expr: &LuaCallExpr) -> Option<LuaExpr> {
@@ -1590,10 +1576,9 @@ fn collect_special_call_out_param_infos_from_semantic_decl(
                     return Ok(out_params);
                 }
             }
-            if let Some(signature_id) = get_signature_id_from_semantic_decl_value_expr(
-                db,
-                LuaSemanticDeclId::LuaDecl(decl_id),
-            ) {
+            if let Some(signature_id) =
+                semantic_decl_closure_signature_id(db, LuaSemanticDeclId::LuaDecl(decl_id))
+            {
                 let out_params = db
                     .get_signature_index()
                     .get(&signature_id)
@@ -1626,10 +1611,9 @@ fn collect_special_call_out_param_infos_from_semantic_decl(
                     return Ok(out_params);
                 }
             }
-            if let Some(signature_id) = get_signature_id_from_semantic_decl_value_expr(
-                db,
-                LuaSemanticDeclId::Member(member_id),
-            ) {
+            if let Some(signature_id) =
+                semantic_decl_closure_signature_id(db, LuaSemanticDeclId::Member(member_id))
+            {
                 let out_params = db
                     .get_signature_index()
                     .get(&signature_id)
@@ -1685,22 +1669,6 @@ fn collect_same_member_key_special_call_out_params(
         .filter_map(|member| db.get_type_index().get_type_cache(&member.get_id().into()))
         .flat_map(|type_cache| collect_special_call_out_param_infos(db, type_cache.as_type()))
         .collect()
-}
-
-fn get_signature_id_from_semantic_decl_value_expr(
-    db: &DbIndex,
-    semantic_decl: LuaSemanticDeclId,
-) -> Option<LuaSignatureId> {
-    let file_id = match semantic_decl {
-        LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.file_id,
-        LuaSemanticDeclId::Member(member_id) => member_id.file_id,
-        LuaSemanticDeclId::Signature(signature_id) => return Some(signature_id),
-        LuaSemanticDeclId::TypeDecl(_) => return None,
-    };
-    let LuaExpr::ClosureExpr(closure) = get_semantic_decl_value_expr(db, semantic_decl)? else {
-        return None;
-    };
-    Some(LuaSignatureId::from_closure(file_id, &closure))
 }
 
 fn collect_special_call_param_infos(
@@ -1960,7 +1928,7 @@ fn resolve_out_param_target(
         SemanticDeclGuard::default(),
         SemanticDeclLevel::default(),
     )? && visited.insert(semantic_decl.clone())
-        && let Some(value_expr) = get_semantic_decl_value_expr(db, semantic_decl)
+        && let Some(value_expr) = semantic_decl_value_expr(db, semantic_decl)
         && let Some(target) =
             resolve_out_param_target(db, cache, file_id, value_expr, field_path, visited)?
     {
@@ -1999,7 +1967,7 @@ fn resolve_out_param_target_from_member_lookup(
         let semantic_decl = member_info.property_owner_id?;
         Some(ResolvedOutParamTarget {
             owner: semantic_decl_to_type_owner(semantic_decl.clone()),
-            value_expr: get_semantic_decl_value_expr(db, semantic_decl),
+            value_expr: semantic_decl_value_expr(db, semantic_decl),
         })
     }))
 }
@@ -2101,7 +2069,7 @@ fn collect_out_param_effect_path_targets(
         if let Some(semantic_decl) = semantic_decl_from_var_ref_id(&base_var_ref_id)
             && visited_aliases.insert(semantic_decl.clone())
             && !semantic_decl_has_write_before_position(db, &semantic_decl, call_position)
-            && let Some(value_expr) = get_semantic_decl_value_expr(db, semantic_decl)
+            && let Some(value_expr) = semantic_decl_value_expr(db, semantic_decl)
         {
             collect_out_param_effect_path_targets(
                 db,
@@ -2124,7 +2092,7 @@ fn collect_out_param_effect_path_targets(
         SemanticDeclLevel::default(),
     )? && visited_aliases.insert(semantic_decl.clone())
         && !semantic_decl_has_write_before_position(db, &semantic_decl, call_position)
-        && let Some(value_expr) = get_semantic_decl_value_expr(db, semantic_decl)
+        && let Some(value_expr) = semantic_decl_value_expr(db, semantic_decl)
     {
         collect_out_param_effect_path_targets(
             db,

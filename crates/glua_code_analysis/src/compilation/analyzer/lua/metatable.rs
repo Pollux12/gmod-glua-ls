@@ -4,6 +4,7 @@ use glua_parser::{
 };
 
 use super::StatementWrite;
+use crate::semantic::decl_value_expr;
 use crate::{
     InFiled, LuaDeclExtra, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId,
     OperatorFunction, SetmetatableFactoryBinding,
@@ -177,11 +178,7 @@ fn table_backing_range_from_expr(
                 return receiver_owner_table_range(analyzer, name_expr, signature_id);
             }
 
-            let value_expr = analyzer
-                .db
-                .get_vfs()
-                .syntax_node_around(&decl_id.file_id, decl.get_value_syntax_id()?)
-                .and_then(LuaExpr::cast)?;
+            let value_expr = decl_value_expr(&analyzer.db, decl_id)?;
             table_backing_range_from_expr(analyzer, &value_expr)
         }
         LuaExpr::IndexExpr(_) => inferred_table_range(analyzer, expr),

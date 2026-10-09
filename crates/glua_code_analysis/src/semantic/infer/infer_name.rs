@@ -11,6 +11,7 @@ use super::{
     InferFailReason, InferResult, infer_expr, infer_table_field_value_should_be,
     infer_table_should_be,
 };
+use crate::semantic::local_initializer_expr;
 use crate::{
     CacheEntry, FileId, GmodStateMask, LuaArrayLen, LuaArrayType, LuaDecl, LuaDeclExtra, LuaDeclId,
     LuaInferCache, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType,
@@ -747,18 +748,6 @@ fn try_infer_local_initializer_type(
     };
 
     (!init_type.is_never() && !init_type.is_nil()).then_some(init_type)
-}
-
-fn local_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<(usize, LuaExpr)> {
-    let decl = db.get_decl_index().get_decl(&decl_id)?;
-    let initializer = decl.get_initializer()?;
-    let syntax_id = initializer.get_expr_syntax_id();
-    let root = db
-        .get_vfs()
-        .syntax_tree_around(&decl_id.file_id, syntax_id.get_range())?
-        .get_red_root();
-    let node = syntax_id.to_node_from_root(&root)?;
-    Some((initializer.get_ret_idx(), LuaExpr::cast(node)?))
 }
 
 fn local_decl_type_cache_is_inferred(db: &DbIndex, decl_id: LuaDeclId) -> bool {

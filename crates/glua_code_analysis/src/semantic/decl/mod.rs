@@ -1,3 +1,5 @@
+pub(crate) mod value;
+
 use rustc_hash::FxHashSet;
 
 use glua_parser::{LuaAstNode, LuaCallExpr, LuaIndexExpr, LuaSyntaxKind};

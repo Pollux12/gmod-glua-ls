@@ -2,12 +2,13 @@ use rustc_hash::FxHashSet;
 
 use glua_parser::{
     LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaForRangeStat,
-    LuaGeneralToken, LuaIndexKey, LuaLiteralToken, LuaNameExpr,
+    LuaGeneralToken, LuaIndexKey, LuaLiteralToken,
 };
 
+use crate::semantic::{local_name_closure_signature_id, semantic_decl_closure_signature_id};
 use crate::{
     DbIndex, DiagnosticCode, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId,
-    LuaType, LuaTypeDeclId, SemanticDeclLevel, SemanticModel, get_member_value_expr,
+    LuaType, LuaTypeDeclId, SemanticDeclLevel, SemanticModel,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -331,7 +332,8 @@ fn get_prefix_expr_signature_id(
 ) -> Option<crate::LuaSignatureId> {
     let prefix_expr = call_expr.get_prefix_expr()?;
     if let LuaExpr::NameExpr(name_expr) = &prefix_expr
-        && let Some(signature_id) = get_local_name_signature_id(db, semantic_model, name_expr)
+        && let Some(signature_id) =
+            local_name_closure_signature_id(db, semantic_model.get_file_id(), name_expr)
     {
         return Some(signature_id);
     }
@@ -340,64 +342,9 @@ fn get_prefix_expr_signature_id(
         prefix_expr.syntax().clone().into(),
         SemanticDeclLevel::default(),
     )?;
-    get_signature_id_from_semantic_decl_value_expr(db, semantic_decl)
-}
-
-fn get_local_name_signature_id(
-    db: &DbIndex,
-    semantic_model: &SemanticModel,
-    name_expr: &LuaNameExpr,
-) -> Option<crate::LuaSignatureId> {
-    let decl_id = db
-        .get_reference_index()
-        .get_var_reference_decl(&semantic_model.get_file_id(), name_expr.get_range())?;
-    let decl = db.get_decl_index().get_decl(&decl_id)?;
-    let value_syntax_id = decl.get_value_syntax_id()?;
-    let closure = LuaExpr::cast(
-        db.get_vfs()
-            .syntax_node_around(&decl.get_file_id(), value_syntax_id)?,
-    )?;
-    let LuaExpr::ClosureExpr(closure) = closure else {
-        return None;
-    };
-    Some(crate::LuaSignatureId::from_closure(
-        decl.get_file_id(),
-        &closure,
-    ))
-}
-
-fn get_signature_id_from_semantic_decl_value_expr(
-    db: &DbIndex,
-    semantic_decl: LuaSemanticDeclId,
-) -> Option<crate::LuaSignatureId> {
-    if let Some(signature_id) = db.get_property_index().get_signature_owner(&semantic_decl) {
-        return Some(signature_id);
-    }
-    let file_id = match semantic_decl {
-        LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.file_id,
-        LuaSemanticDeclId::Member(member_id) => member_id.file_id,
-        LuaSemanticDeclId::Signature(signature_id) => return Some(signature_id),
-        LuaSemanticDeclId::TypeDecl(_) => return None,
-    };
-    let LuaExpr::ClosureExpr(closure) = get_semantic_decl_value_expr(db, semantic_decl)? else {
-        return None;
-    };
-    Some(crate::LuaSignatureId::from_closure(file_id, &closure))
-}
-
-fn get_semantic_decl_value_expr(db: &DbIndex, semantic_decl: LuaSemanticDeclId) -> Option<LuaExpr> {
-    match semantic_decl {
-        LuaSemanticDeclId::LuaDecl(decl_id) => {
-            let decl = db.get_decl_index().get_decl(&decl_id)?;
-            let value_syntax_id = decl.get_value_syntax_id()?;
-            LuaExpr::cast(
-                db.get_vfs()
-                    .syntax_node_around(&decl.get_file_id(), value_syntax_id)?,
-            )
-        }
-        LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
-        LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => None,
-    }
+    db.get_property_index()
+        .get_signature_owner(&semantic_decl)
+        .or_else(|| semantic_decl_closure_signature_id(db, semantic_decl))
 }
 
 fn get_params_len(params: &[(String, Option<LuaType>)]) -> Option<usize> {

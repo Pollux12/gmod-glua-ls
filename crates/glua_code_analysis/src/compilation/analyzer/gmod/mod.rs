@@ -17,6 +17,7 @@ use glua_parser::{
     NumberResult, PathTrait,
 };
 
+use crate::semantic::{local_initializer_expr, semantic_decl_closure_signature_id};
 use crate::{
     EmmyrcGmodRealm, FileId, GlobalId, GmodClassCallArg, GmodClassCallArgSource,
     GmodClassCallLiteral, GmodDermaSkinCallRoles, GmodNamedStringCallRoles,
@@ -5972,8 +5973,7 @@ fn vgui_table_arg_is_registered_result(
     if region_start != decl_id.position {
         return false;
     }
-    let Some((0, LuaExpr::CallExpr(register_call))) = local_decl_initializer_expr(db, decl_id)
-    else {
+    let Some((0, LuaExpr::CallExpr(register_call))) = local_initializer_expr(db, decl_id) else {
         return false;
     };
 
@@ -8322,7 +8322,7 @@ fn name_expr_local_decl_id(
 }
 
 fn local_decl_aliases_global_name(db: &DbIndex, decl_id: LuaDeclId, global_name: &str) -> bool {
-    let Some((ret_idx, initializer)) = local_decl_initializer_expr(db, decl_id) else {
+    let Some((ret_idx, initializer)) = local_initializer_expr(db, decl_id) else {
         return false;
     };
     if ret_idx != 0 {
@@ -8346,15 +8346,6 @@ fn local_decl_aliases_global_name(db: &DbIndex, decl_id: LuaDeclId, global_name:
         }
         _ => false,
     }
-}
-
-fn local_decl_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<(usize, LuaExpr)> {
-    let decl = db.get_decl_index().get_decl(&decl_id)?;
-    let initializer = decl.get_initializer()?;
-    let node = db
-        .get_vfs()
-        .syntax_node_around(&decl_id.file_id, initializer.get_expr_syntax_id())?;
-    Some((initializer.get_ret_idx(), LuaExpr::cast(node)?))
 }
 
 fn annotated_roles_from_local_call_prefix(
@@ -8425,20 +8416,12 @@ fn annotated_roles_from_local_name_expr(
         return Some(Some(roles.clone()));
     }
 
-    let Some(signature_id) = signature_id_from_decl_value(db, decl_id) else {
+    let Some(signature_id) =
+        semantic_decl_closure_signature_id(db, crate::LuaSemanticDeclId::LuaDecl(decl_id))
+    else {
         return Some(None);
     };
     Some(roles_from_signature(db, signature_id))
-}
-
-fn signature_id_from_decl_value(db: &DbIndex, decl_id: LuaDeclId) -> Option<LuaSignatureId> {
-    let decl = db.get_decl_index().get_decl(&decl_id)?;
-    let value_syntax_id = decl.get_value_syntax_id()?;
-    let value_node = db
-        .get_vfs()
-        .syntax_node_around(&decl_id.file_id, value_syntax_id)?;
-    let closure = LuaClosureExpr::cast(value_node)?;
-    Some(LuaSignatureId::from_closure(decl_id.file_id, &closure))
 }
 
 fn collect_system_call_metadata_into(
@@ -8902,7 +8885,7 @@ fn resolve_name_initializer_field_path_expr(
     let decl_id = db
         .get_reference_index()
         .get_var_reference_decl(&file_id, name_expr.get_range())?;
-    let (_, initializer) = local_decl_initializer_expr(db, decl_id)?;
+    let (_, initializer) = local_initializer_expr(db, decl_id)?;
     resolve_static_initializer_field_path_expr(initializer, field_path, name_expr.get_position())
 }
 
@@ -10186,7 +10169,7 @@ fn static_compilefile_path(
             if reassigned_decls.contains(&decl_id) || !visiting.insert(decl_id) {
                 return None;
             }
-            let (_, initializer) = local_decl_initializer_expr(db, decl_id)?;
+            let (_, initializer) = local_initializer_expr(db, decl_id)?;
             let result =
                 static_compilefile_path(db, file_id, &initializer, reassigned_decls, visiting);
             visiting.remove(&decl_id);
@@ -10232,7 +10215,7 @@ fn static_environment_fields(
             if reassigned_decls.contains(&decl_id) || !visiting.insert(decl_id) {
                 return None;
             }
-            let (_, initializer) = local_decl_initializer_expr(db, decl_id)?;
+            let (_, initializer) = local_initializer_expr(db, decl_id)?;
             let result =
                 static_environment_fields(db, file_id, &initializer, reassigned_decls, visiting);
             visiting.remove(&decl_id);

@@ -13,10 +13,7 @@ use crate::{
     LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType,
     SemanticDeclLevel, SemanticModel, find_best_direct_call_arg_role_from_type,
     find_signature_attribute_use, get_var_expr_var_ref_id,
-    semantic::{
-        InferConditionFlow, apply_cast, contains_gmod_null_type, get_member_value_expr,
-        remove_false_or_nil,
-    },
+    semantic::{InferConditionFlow, apply_cast, contains_gmod_null_type, remove_false_or_nil},
     signature_is_valid_guard_in_realm, signature_is_valid_guard_or_base_runtime_isvalid_in_realm,
 };
 
@@ -1807,14 +1804,12 @@ fn local_call_initializer_slot(
     else {
         return None;
     };
-    let db = semantic_model.get_db();
-    let decl = db.get_decl_index().get_decl(&decl_id)?;
-    let initializer = decl.get_initializer()?;
-    let node = db
-        .get_vfs()
-        .syntax_node_around(&decl_id.file_id, initializer.get_expr_syntax_id())?;
-    let call_expr = LuaCallExpr::cast(node)?;
-    Some((call_expr, initializer.get_ret_idx()))
+    let (ret_idx, LuaExpr::CallExpr(call_expr)) =
+        crate::semantic::local_initializer_expr(semantic_model.get_db(), decl_id)?
+    else {
+        return None;
+    };
+    Some((call_expr, ret_idx))
 }
 
 fn is_result_of_unguarded_child_call(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {
@@ -3353,72 +3348,7 @@ fn call_signature_id(
 
     let semantic_decl =
         semantic_model.find_decl(prefix.syntax().clone().into(), SemanticDeclLevel::default())?;
-    signature_id_from_semantic_decl(semantic_model, semantic_decl)
-}
-
-fn signature_id_from_semantic_decl(
-    semantic_model: &SemanticModel,
-    semantic_decl: LuaSemanticDeclId,
-) -> Option<LuaSignatureId> {
-    let db = semantic_model.get_db();
-    if let Some(signature_id) = db.get_property_index().get_signature_owner(&semantic_decl) {
-        return Some(signature_id);
-    }
-
-    match &semantic_decl {
-        LuaSemanticDeclId::LuaDecl(decl_id) => {
-            if let Some(LuaType::Signature(signature_id)) = db
-                .get_type_index()
-                .get_type_cache(&(*decl_id).into())
-                .map(|type_cache| type_cache.as_type())
-            {
-                return Some(*signature_id);
-            }
-        }
-        LuaSemanticDeclId::Member(member_id) => {
-            if let Some(LuaType::Signature(signature_id)) = db
-                .get_type_index()
-                .get_type_cache(&(*member_id).into())
-                .map(|type_cache| type_cache.as_type())
-            {
-                return Some(*signature_id);
-            }
-        }
-        LuaSemanticDeclId::Signature(signature_id) => return Some(*signature_id),
-        LuaSemanticDeclId::TypeDecl(_) => return None,
-    }
-
-    let file_id = match semantic_decl {
-        LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.file_id,
-        LuaSemanticDeclId::Member(member_id) => member_id.file_id,
-        LuaSemanticDeclId::Signature(signature_id) => return Some(signature_id),
-        LuaSemanticDeclId::TypeDecl(_) => return None,
-    };
-
-    let LuaExpr::ClosureExpr(closure) = semantic_decl_value_expr(semantic_model, semantic_decl)?
-    else {
-        return None;
-    };
-    Some(LuaSignatureId::from_closure(file_id, &closure))
-}
-
-fn semantic_decl_value_expr(
-    semantic_model: &SemanticModel,
-    semantic_decl: LuaSemanticDeclId,
-) -> Option<LuaExpr> {
-    let db = semantic_model.get_db();
-    match semantic_decl {
-        LuaSemanticDeclId::LuaDecl(decl_id) => {
-            let decl = db.get_decl_index().get_decl(&decl_id)?;
-            let value_syntax_id = decl.get_value_syntax_id()?;
-            LuaExpr::cast(
-                db.get_vfs()
-                    .syntax_node_around(&decl.get_file_id(), value_syntax_id)?,
-            )
-        }
-        LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
-        LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => None,
-    }
+    crate::semantic::semantic_decl_signature_id(semantic_model.get_db(), semantic_decl)
 }
 
 fn signature_cast_targets_guarded_expr(
