@@ -82,6 +82,8 @@ pub(super) enum DeclOp {
         path_keys: Vec<String>,
         original_expr: String,
         call_range: TextRange,
+        /// The path argument's range, or the call's when it has no argument.
+        range: TextRange,
     },
     /// The globals a `module` call's option arguments name, whose declarations
     /// are checked for `package.seeall`.
@@ -241,6 +243,7 @@ impl DeclOp {
                 path_keys,
                 original_expr,
                 call_range,
+                range,
             } => {
                 let target_file_id = if let Some(path) = &path {
                     resolve_load_dependency_target(db, file_id, kind, path)
@@ -258,7 +261,7 @@ impl DeclOp {
                         path_keys,
                         original_expr,
                         call_range,
-                        range: call_range,
+                        range,
                     });
             }
             Self::SeeallProbe(names) => {

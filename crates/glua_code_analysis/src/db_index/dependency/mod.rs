@@ -144,19 +144,19 @@ impl LuaDependencyIndex {
     }
 
     pub fn add_dependency_site(&mut self, site: LuaDependencySite) {
-        if !derivation::writes_source() {
-            derivation::note_write(|| FactKey::LoadSites(site.source_file_id));
-            self.derived_sites
-                .entry(site.source_file_id)
-                .or_default()
-                .push(site.clone());
-        }
         let is_new = !self
             .dependency_sites
             .get(&site.source_file_id)
             .is_some_and(|sites| sites.iter().any(|existing| existing == &site));
         if !is_new {
             return;
+        }
+        if !derivation::writes_source() {
+            derivation::note_write(|| FactKey::LoadSites(site.source_file_id));
+            self.derived_sites
+                .entry(site.source_file_id)
+                .or_default()
+                .push(site.clone());
         }
         derivation::note_write(|| FactKey::Dependency(site.source_file_id));
 

@@ -3775,15 +3775,13 @@ end
             .get_file_info(&target_id)
             .expect("target should have load info");
 
-        // Each `include` registers two dependency sites, one on the call range and one on the
-        // path-argument range, so two edges per including file is one edge per site.
         assert_eq!(
             target_info
                 .incoming_edges
                 .iter()
                 .map(|edge| edge.source_file_id)
                 .collect::<Vec<_>>(),
-            vec![a_id, a_id, b_id, b_id],
+            vec![a_id, b_id],
         );
         assert_that!(
             target_info

@@ -107,6 +107,37 @@ mod test {
         );
     }
 
+    /// A load call the builtins also annotate as one is one dependency site,
+    /// ranged over its path argument.
+    #[test]
+    fn an_annotated_include_is_one_site_over_its_path() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/autorun/helper.lua",
+            "HelperValue = 1
+",
+        );
+        let boot_id = ws.def_file(
+            "lua/autorun/sv_boot.lua",
+            "include(\"helper.lua\")
+",
+        );
+
+        let ranges = ws
+            .get_db_mut()
+            .get_file_dependencies_index()
+            .get_dependency_sites(&boot_id)
+            .unwrap_or_default()
+            .iter()
+            .map(|site| (u32::from(site.range.start()), u32::from(site.range.end())))
+            .collect::<Vec<_>>();
+        assert_eq!(ranges, vec![(8, 20)]);
+    }
+
     #[test]
     fn test_dynamic_include_path_does_not_add_dependency_edge() {
         let mut ws = VirtualWorkspace::new();

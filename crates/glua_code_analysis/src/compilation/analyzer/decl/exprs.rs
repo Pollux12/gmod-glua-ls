@@ -404,13 +404,19 @@ pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Opti
         .map(|path| crate::dependency_site_path_keys(analyzer.db, file_id, path))
         .unwrap_or_default();
 
+    let call_range = expr.get_range();
+    let range = expr
+        .get_args_list()
+        .and_then(|args| args.get_args().next())
+        .map_or(call_range, |arg| arg.get_range());
     analyzer.ops.push(DeclOp::Dependency {
         kind: dependency_kind,
         path: dependency_path,
         self_reference,
         path_keys: dependency_path_keys,
         original_expr: expr.syntax().text().to_string(),
-        call_range: expr.get_range(),
+        call_range,
+        range,
     });
 
     Some(())
