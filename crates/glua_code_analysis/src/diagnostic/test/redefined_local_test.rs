@@ -278,4 +278,27 @@ mod tests {
 
         assert!(no_redefined_local);
     }
+
+    #[test]
+    fn test_diagnostics_are_returned_in_range_order() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::RedefinedLocal);
+        let code = (0..24)
+            .map(|i| format!("local v{i} = 1\nlocal v{i} = 2\n"))
+            .collect::<String>();
+        let file_id = ws.def(&code);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_eq!(diagnostics.len(), 24);
+        assert!(
+            diagnostics
+                .windows(2)
+                .all(|pair| pair[0].range.start <= pair[1].range.start)
+        );
+    }
 }

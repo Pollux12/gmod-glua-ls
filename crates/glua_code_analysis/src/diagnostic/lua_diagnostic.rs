@@ -171,7 +171,15 @@ impl LuaDiagnostic {
             return None;
         }
 
-        let diagnostics = context.get_diagnostics();
+        let mut diagnostics = context.get_diagnostics();
+        diagnostics.sort_by(|a, b| {
+            (a.range.start, a.range.end, code_order(&a.code), &a.message).cmp(&(
+                b.range.start,
+                b.range.end,
+                code_order(&b.code),
+                &b.message,
+            ))
+        });
         if let Some((wall_start, cpu_start)) = profile_start {
             drop(semantic_model);
             let path = db
@@ -185,5 +193,13 @@ impl LuaDiagnostic {
             super::checker::report_file_profile(&path, wall_start.elapsed(), cpu);
         }
         Some(diagnostics)
+    }
+}
+
+fn code_order(code: &Option<lsp_types::NumberOrString>) -> (u8, i32, &str) {
+    match code {
+        None => (0, 0, ""),
+        Some(lsp_types::NumberOrString::Number(number)) => (1, *number, ""),
+        Some(lsp_types::NumberOrString::String(name)) => (2, 0, name),
     }
 }
