@@ -77,7 +77,11 @@ fn check_param_count(
             if def_param.0 == "..." {
                 break;
             }
-            if def_param.1.as_ref().is_some_and(|typ| is_nullable(semantic_model.get_db(), typ)) {
+            if def_param
+                .1
+                .as_ref()
+                .is_some_and(|typ| is_nullable(semantic_model.get_db(), typ))
+            {
                 continue;
             }
             context.add_diagnostic(
