@@ -2413,11 +2413,26 @@ impl Engine {
             })
     }
 
+    /// Whether a fact read from outside `lp` moved under a member of it or
+    /// under a derivation that shares a key one writes: such a co-producer
+    /// runs and is cleared with the loop, and what the loop holds can rest on
+    /// what it supplied.
+    fn loop_moved_from_outside(
+        &self,
+        db: &DbIndex,
+        lp: &[DerivationId],
+        parked: &FxHashSet<DerivationId>,
+    ) -> bool {
+        with_co_producers(db, lp.iter().copied())
+            .into_iter()
+            .any(|producer| self.moved_from_outside(db, lp, producer, parked))
+    }
+
     /// At quiescence, once no source layer is left to rebuild, clears every
     /// loop of statements, closed directly or through the passes that run
     /// once statements settle (see [`DerivationKind::closes_loops`]), one of
-    /// whose statements reads from outside the loop a fact that moved since
-    /// it settled on it, and that is not cleared already (see
+    /// whose statements, or a derivation sharing a key one writes, reads from
+    /// outside the loop a fact that moved since it settled on it, and that is not cleared already (see
     /// [`Self::settled_loop_members`]): each member's primary outputs, and
     /// those of whatever shares them, go back to the source layer, they run
     /// again, and the run starts over from the first stage, as a cold build
@@ -2481,14 +2496,12 @@ impl Engine {
         let _search = crate::profile::PhaseGuard::new("loops: search");
         let parked = FxHashSet::default();
         let loops = db.reader_graph().read_loops(
-            roots.iter().copied(),
+            with_co_producers(db, roots),
             DerivationKind::closes_loops,
             |lp| {
                 lp.iter()
                     .any(|member| !self.cleared.contains(member) && !settled.contains(member))
-                    && lp
-                        .iter()
-                        .any(|member| self.moved_from_outside(db, lp, *member, &parked))
+                    && self.loop_moved_from_outside(db, lp, &parked)
             },
         );
         if loops.is_empty() {
@@ -2581,16 +2594,14 @@ impl Engine {
             .copied()
             .collect::<FxHashSet<_>>();
         let loops = db.reader_graph().read_loops(
-            roots.iter().copied(),
+            with_co_producers(db, roots),
             DerivationKind::closes_loops,
             |lp| {
                 lp.iter().any(|member| {
                     !self.cleared.contains(member)
                         && !self.cleared_parked.contains(member)
                         && !pending.contains(member)
-                }) && lp
-                    .iter()
-                    .any(|member| self.moved_from_outside(db, lp, *member, &parked))
+                }) && self.loop_moved_from_outside(db, lp, &parked)
             },
         );
         let loops = loops
@@ -4824,6 +4835,17 @@ fn widened(db: &DbIndex, group: &[DerivationId]) -> bool {
     })
 }
 
+/// `ids` and the derivations that share a key one of them writes: a loop
+/// through a co-producer of one holds what that one supplied with it.
+fn with_co_producers(
+    db: &DbIndex,
+    ids: impl IntoIterator<Item = DerivationId>,
+) -> BTreeSet<DerivationId> {
+    ids.into_iter()
+        .flat_map(|id| co_producers(db, id))
+        .collect()
+}
+
 fn co_producers(db: &DbIndex, id: DerivationId) -> Vec<DerivationId> {
     let graph = db.reader_graph();
     let mut group = BTreeSet::from([id]);
@@ -6660,5 +6682,130 @@ function holder.receiver:Use() end
             recipe.bound(db),
             recipe.bound(recipe.settled_from("new").get_db_mut())
         );
+    }
+
+    /// Statements, each at its start with the position it writes and the
+    /// positions it reads: each binds there the union of what it reads and
+    /// what the group it runs in wrote there before it, as statements assigning
+    /// one local add to its type. An unknown adds nothing to a known value.
+    struct Supplies {
+        writes: Vec<(u32, u32, Vec<u32>)>,
+    }
+
+    impl Supplies {
+        fn bound(&self, db: &DbIndex) -> Vec<Option<LuaType>> {
+            self.writes
+                .iter()
+                .map(|(_, written, _)| {
+                    db.get_type_index()
+                        .get_type_cache(&owner(*written))
+                        .map(|cache| cache.as_type().clone())
+                })
+                .collect()
+        }
+
+        /// A workspace the statements settled in from nothing, `INPUT`
+        /// holding `value`.
+        fn settled_from(&self, value: LuaType) -> VirtualWorkspace {
+            let mut ws = VirtualWorkspace::new();
+            let db = ws.get_db_mut();
+            bind(db, INPUT, value);
+            let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+            for (start, _, _) in &self.writes {
+                engine.changed(statement(*start));
+            }
+            engine.open(db);
+            assert!(engine.run(db, self, Slice::Whole));
+            ws
+        }
+    }
+
+    impl Recipe for Supplies {
+        fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+            let start = u32::from(id.syntax_id().get_range().start());
+            let (_, written, reads) = self
+                .writes
+                .iter()
+                .find(|(at, _, _)| *at == start)
+                .expect("a statement of the recipe");
+            // What is there is merged into, not read, as a declaration's
+            // writes merge into its type.
+            let mut value = derivation::untracked(|| {
+                db.get_type_index()
+                    .get_type_cache(&owner(*written))
+                    .map(|cache| cache.as_type().clone())
+            });
+            for position in reads {
+                let Some(read) = db
+                    .get_type_index()
+                    .get_type_cache(&owner(*position))
+                    .map(|cache| cache.as_type().clone())
+                else {
+                    continue;
+                };
+                value = Some(match value {
+                    None => read,
+                    Some(value) if read.is_unknown() => value,
+                    Some(value) if value.is_unknown() => read,
+                    Some(value) => TypeOps::Union.apply(db, &value, &read),
+                });
+            }
+            if let Some(value) = value {
+                bind(db, *written, value);
+            }
+        }
+
+        fn splits(&self, _: DerivationKind) -> bool {
+            false
+        }
+
+        fn compute(&self, _: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
+            unreachable!("supplies do not split")
+        }
+
+        fn apply(&self, _: &mut DbIndex, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
+            unreachable!("supplies do not split")
+        }
+    }
+
+    #[test]
+    fn a_loop_whose_only_outside_supply_goes_unknown_settles_as_a_cold_build() {
+        // `local x = INPUT`, then `y = x`, `z = y` and `x = x + z`: the loop
+        // through `x` keeps what `INPUT` gave it unless it is cleared, and
+        // only the first statement, outside it, reads `INPUT`.
+        let recipe = Supplies {
+            writes: vec![
+                (10, 10, vec![INPUT]),
+                (20, 20, vec![10]),
+                (30, 30, vec![20]),
+                (40, 10, vec![10, 30]),
+            ],
+        };
+
+        for serial in [true, false] {
+            for schedule in [
+                Schedule::Canonical,
+                Schedule::Reversed,
+                Schedule::Shuffled(7),
+                Schedule::Deferred,
+            ] {
+                let _serial = serial.then(serial_engine);
+                let mut warm = recipe.settled_from(text("old"));
+                let db = warm.get_db_mut();
+                let mut engine = Engine::new(derivation::EditMaps::default(), schedule);
+                bind(db, INPUT, LuaType::Unknown);
+                let input = HashedKey::new(FactKey::TypeCache(owner(INPUT)));
+                db.reader_graph().forget_fingerprint(&input);
+                engine.readers_of(db, [&input]);
+                engine.open(db);
+                assert!(engine.run(db, &recipe, Slice::Whole));
+
+                assert_eq!(
+                    recipe.bound(db),
+                    recipe.bound(recipe.settled_from(LuaType::Unknown).get_db_mut()),
+                    "{schedule:?} serial={serial}"
+                );
+            }
+        }
     }
 }

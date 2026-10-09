@@ -554,4 +554,81 @@ end
             ],
         );
     }
+
+    const GLIDE_ANNOTATIONS: (&str, &str) = (
+        "lua/aaa_annotations/glide.lua",
+        "---@meta
+---@param value number
+---@param min number
+---@param max number
+---@return number
+function math.Clamp(value, min, max) end
+
+---@[call_arg(\"gmod.class_base\", \"reference\")]
+---@param value string
+function _G.DEFINE_BASECLASS(value) end
+
+---@class Angle
+---@field [integer] number
+Angle = {}
+
+---@return Angle
+function _G.Angle() end
+",
+    );
+
+    const GLIDE_INPUT: (&str, &str) = (
+        "lua/entities/base_glide/sv_input.lua",
+        "local math_Clamp = math.Clamp
+function ENT:GetInputFloat(seatIndex, action, entTbl)
+    return math_Clamp(value, -1, 1)
+end
+",
+    );
+
+    const GLIDE_CAR_STEERING: (&str, &str) = (
+        "lua/entities/base_glide_car/init.lua",
+        "function ENT:UpdateSteering(dt, selfTbl)
+    selfTbl = selfTbl or {}
+    local inputSteer = self:GetInputFloat(1, \"steer\")
+    local absInputSteer = inputSteer < 0 and -inputSteer or inputSteer
+    if avgSideSlip < -1 then sideSlip = -1 elseif avgSideSlip > 1 then sideSlip = 1 else sideSlip = avgSideSlip end
+    local totalSpeed = selfTbl.totalSpeed or 0
+    local steerConeFactor = totalSpeed / 1000
+    local counterSteer = sideSlip * steerConeFactor * (1 - absInputSteer)
+    inputSteer = inputSteer + counterSteer
+end
+",
+    );
+
+    const GLIDE_CAR_SHARED: (&str, &str) = (
+        "lua/entities/base_glide_car/shared.lua",
+        "DEFINE_BASECLASS(\"base_glide\")
+local boneAng = Angle()
+function ENT:UpdateWheelBones()
+    local spin = self:GetWheelSpin()
+    if self.spinInvert then spin = -spin end
+    boneAng[3] = spin
+end
+",
+    );
+
+    /// `inputSteer`, `absInputSteer` and `counterSteer` hold one another's
+    /// type through `inputSteer = inputSteer + counterSteer`; only the local's
+    /// declaration, outside that loop, reads the deleted base method.
+    #[test]
+    fn a_loop_held_up_by_a_deleted_base_method_settles_as_cold() {
+        settles_as_cold(
+            &[
+                GLIDE_ANNOTATIONS,
+                GLIDE_INPUT,
+                GLIDE_CAR_STEERING,
+                GLIDE_CAR_SHARED,
+            ],
+            &[
+                Step::Delete(GLIDE_INPUT.0),
+                Step::Write(GLIDE_INPUT.0, GLIDE_INPUT.1),
+            ],
+        );
+    }
 }
