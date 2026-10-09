@@ -1270,14 +1270,12 @@ fn collect_member_path_unguarded_child_evidence(
     let Some(prefix) = receiver.get_prefix_expr() else {
         return;
     };
-    if member_path_assigned_before(
+    let receiver_assigned = member_path_assigned_before(
         db,
         cache,
         db.get_flow_index().get_flow_tree(&file_id),
         receiver,
-    ) {
-        return;
-    }
+    );
     // At the first level the prefix is the root declaration, whose type is
     // already resolved for its whole reference set; reading it off the name
     // expression would run a flow walk per use, and the child lookup below rules
@@ -1307,6 +1305,7 @@ fn collect_member_path_unguarded_child_evidence(
         .declared_path_bases
         .get(&(prefix_type.clone(), receiver_key.clone()))
     {
+        _ if receiver_assigned => None,
         Some(hit) => hit.clone(),
         None => {
             let resolved = crate::semantic::infer_raw_member_type_with_cache(
@@ -1360,8 +1359,9 @@ fn collect_member_path_unguarded_child_evidence(
             }
             (base_id, current)
         }
-        // Nothing is declared for this path, so a guard is the only thing that
-        // could have given it a base. A base read back from this pass's own
+        // Nothing is declared for this path, or an assignment replaced it, so a
+        // guard or the assigned value is the only thing that could have given it
+        // a base. A base read back from this pass's own
         // published narrowing is not one: scoring against it would descend one
         // more level of the class tree per round, so the receiver's pre-pass
         // type is used instead.

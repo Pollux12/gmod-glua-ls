@@ -2015,6 +2015,7 @@ mod test {
         let file_id = ws.def(
             r#"
             ---@class Entity
+            ---@field GetClass fun(self: Entity): string
             ---@class Player: Entity
             ---@field GetClass fun(self: Player): string
             ---@class Holder
@@ -2548,6 +2549,86 @@ filter:SetUpdateOnType(true)
             diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
             0
         );
+    }
+
+    #[test]
+    fn child_method_is_a_candidate_when_only_the_receiver_is_a_member_path() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Weapon: Entity
+            ---@field IsCarried fun(self: Weapon): boolean
+            ---@class Holder
+            ---@field WeaponEnt Entity
+
+            ---@param holder Holder
+            local function use(holder)
+                holder.WeaponEnt:IsCarried()
+            end
+            "#,
+        );
+
+        let unguarded = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert_eq!(unguarded.len(), 1, "{unguarded:?}");
+        assert!(unguarded[0].message.contains("`Weapon`"), "{unguarded:?}");
+    }
+
+    #[test]
+    fn child_method_is_a_candidate_for_a_dotted_call_on_a_member_path() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+            ---@field GetActive fun(self: Player): Entity
+            ---@class NPC: Entity
+            ---@field GetActive fun(self: NPC): Entity
+            ---@class Effect
+            ---@field Player Entity
+
+            ---@param x Effect
+            local function use(x)
+                x.Player:GetActive()
+            end
+            "#,
+        );
+
+        let unguarded = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert_eq!(unguarded.len(), 1, "{unguarded:?}");
+        assert!(
+            unguarded[0].message.contains("`NPC`") && unguarded[0].message.contains("`Player`"),
+            "{unguarded:?}"
+        );
+    }
+
+    #[test]
+    fn child_method_is_a_candidate_on_an_assigned_member_path() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Weapon: Entity
+            ---@field IsCarried fun(self: Weapon): boolean
+            ---@class CEffectData
+            ---@field GetEntity fun(self: CEffectData): Entity
+            ---@class Effect
+
+            ---@param effect Effect
+            ---@param data CEffectData
+            local function init(effect, data)
+                effect.WeaponEnt = data:GetEntity()
+                effect.WeaponEnt:IsCarried()
+            end
+            "#,
+        );
+
+        let unguarded = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert_eq!(unguarded.len(), 1, "{unguarded:?}");
+        assert!(unguarded[0].message.contains("`Weapon`"), "{unguarded:?}");
     }
 
     #[test]
