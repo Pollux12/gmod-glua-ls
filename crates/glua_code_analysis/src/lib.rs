@@ -842,9 +842,17 @@ impl EmmyLuaAnalysis {
     }
 
     pub fn reindex(&mut self) {
+        self.begin_full_reindex();
+        self.compilation.advance_update(Slice::Whole);
+    }
+
+    /// Drops the index and any re-analysis in progress, then starts
+    /// re-analysing every file from the text the VFS holds, as a cold build
+    /// does. Advance it with [`Self::advance_reindex`].
+    pub fn begin_full_reindex(&mut self) {
         let file_ids = self.compilation.get_db().get_vfs().get_all_file_ids();
         self.compilation.clear_index();
-        self.compilation.update_index(file_ids);
+        self.compilation.begin_update(file_ids);
     }
 
     /// Every local file outside the standard library, with its path: what a
