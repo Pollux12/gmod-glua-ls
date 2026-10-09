@@ -1375,6 +1375,29 @@ mod tests {
         assert_eq!(reads.keys(&graph).count(), 1);
     }
 
+    /// A key read before the graph is viewed and again while it is, as its
+    /// slot, is one read of the viewed reads.
+    #[test]
+    fn a_key_read_before_and_while_viewing_the_graph_is_read_once() {
+        let read = || FactKey::FilePath(FileId::new(1));
+        derivation::lend_keys(KeyTable::default());
+        derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        derivation::note_read(read);
+        derivation::end();
+        let mut graph = super::super::ReaderGraph::default();
+        graph.restore_keys(derivation::take_keys());
+        let graph = Arc::new(graph);
+
+        derivation::begin(DerivationId::diagnostics(FileId::new(1)));
+        derivation::note_read(read);
+        let viewed = derivation::view_graph(Arc::clone(&graph));
+        derivation::note_read(read);
+        drop(viewed);
+        let reads = derivation::end().into_viewed_reads(&graph, |_| 1);
+
+        assert_eq!(reads.keys(&graph).count(), 1);
+    }
+
     /// A value reused inside a frame nested in one it was already replayed
     /// into is recorded by the nested frame too: that frame's value is stale
     /// once what the reused value read is written.

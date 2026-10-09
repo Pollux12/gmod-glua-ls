@@ -1493,6 +1493,20 @@ impl Evaluation {
         fingerprint: impl Fn(&HashedKey) -> Fingerprint,
     ) -> ViewedReads {
         let id = self.id;
+        // A key read before the graph was viewed is a slot read if it has one.
+        let mut keys = Vec::new();
+        for key in self.reads.drain() {
+            match graph.find_slot(&key) {
+                Some(slot) => {
+                    self.viewed.insert(slot);
+                }
+                None if records_read(id, &key, |_| false) => {
+                    let seen = fingerprint(&key);
+                    keys.push((key, seen));
+                }
+                None => {}
+            }
+        }
         let mut slots = self
             .viewed
             .drain()
@@ -1502,17 +1516,12 @@ impl Evaluation {
         slots.sort_unstable_by_key(|(slot, _)| *slot);
         let seen = slots.iter().map(|(_, seen)| *seen).collect();
         let slots = slots.iter().map(|(slot, _)| *slot).collect();
-        let keys = self
-            .reads
-            .drain()
-            .filter(|key| records_read(id, key, |_| false))
-            .map(|key| {
-                let seen = fingerprint(&key);
-                (key, seen)
-            })
-            .collect();
         Spare::park(&mut self);
-        ViewedReads { slots, seen, keys }
+        ViewedReads {
+            slots,
+            seen,
+            keys: keys.into_boxed_slice(),
+        }
     }
 
     /// [`Self::into_parts`] with each read's fingerprint left to the caller,
