@@ -2179,11 +2179,11 @@ mod test {
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             diagnostics[0].message,
-            "expected `Middle` but found `Entity`. Add a guard to narrow the parent to `Middle`."
+            "expected `Leaf` but found `Entity`. Add a guard to narrow the parent to `Leaf`."
         );
         assert_eq!(
             member_path_receiver_types(&ws, file_id, "h.proc"),
-            vec!["Middle", "Middle", "Middle"]
+            vec!["Leaf", "Leaf", "Leaf"]
         );
     }
 
@@ -2493,5 +2493,38 @@ filter:SetUpdateOnType(true)
 
         assert_eq!(unrelated_subclass, unrelated_class);
         assert!(declaring_subclass > unrelated_class);
+    }
+
+    #[test]
+    fn unguarded_child_picks_the_class_that_has_every_used_member() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Weapon
+            ---@class SWEP: Weapon
+            ---@field Clip fun(self: SWEP): number
+            ---@class SubSWEP: SWEP
+            ---@field Reload fun(self: SubSWEP)
+
+            ---@param wep Weapon
+            local function use(wep)
+                wep:Reload()
+                return wep:Clip()
+            end
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            0
+        );
+        let unguarded = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert!(
+            unguarded
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("`SWEP`")),
+            "{unguarded:?}"
+        );
     }
 }

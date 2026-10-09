@@ -506,6 +506,31 @@ fn compare_unguarded_child_candidates(
         .then_with(|| left.stable_cmp(right))
 }
 
+/// A candidate also has the members its candidate ancestors declare, which a
+/// nearest-declarer lookup leaves out of its own set.
+fn credit_inherited_members(
+    db: &crate::DbIndex,
+    children: &mut HashMap<crate::LuaTypeDeclId, FxHashSet<LuaMemberKey>>,
+) {
+    let mut inherited = Vec::new();
+    for child_id in children.keys() {
+        let mut supers = Vec::new();
+        child_id.collect_super_types(db, &mut supers);
+        for super_type in supers {
+            if let LuaType::Ref(super_id) = super_type
+                && let Some(keys) = children.get(&super_id)
+            {
+                inherited.push((child_id.clone(), keys.clone()));
+            }
+        }
+    }
+    for (child_id, keys) in inherited {
+        if let Some(own) = children.get_mut(&child_id) {
+            own.extend(keys);
+        }
+    }
+}
+
 fn in_filed_order(value: &InFiled<glua_parser::LuaSyntaxId>) -> (u32, u32, u32) {
     let range = value.value.get_range();
     (
@@ -695,7 +720,8 @@ pub(crate) fn publish_unguarded_children(
     scores.sort_by(|(left, _), (right, _)| left.stable_cmp(right));
     for (definition, candidates) in scores {
         let found_type = candidates.parent_type;
-        let candidates = candidates.children;
+        let mut candidates = candidates.children;
+        credit_inherited_members(db, &mut candidates);
         let Some(max_score) = candidates.values().map(FxHashSet::len).max() else {
             continue;
         };
@@ -763,11 +789,12 @@ pub(crate) fn publish_unguarded_children(
     nested_scores.sort_by_key(|candidates| in_filed_order(&candidates.source));
     for candidates in nested_scores {
         let found_type = candidates.parent_type;
-        let Some(max_score) = candidates.children.values().map(FxHashSet::len).max() else {
+        let mut children = candidates.children;
+        credit_inherited_members(db, &mut children);
+        let Some(max_score) = children.values().map(FxHashSet::len).max() else {
             continue;
         };
-        let mut winners = candidates
-            .children
+        let mut winners = children
             .into_iter()
             .filter_map(|(child_id, keys)| (keys.len() == max_score).then_some(child_id))
             .collect::<Vec<_>>();
