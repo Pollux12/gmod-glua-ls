@@ -975,15 +975,6 @@ fn collect_unguarded_child_file(
         let Some(base_id) = unguarded_child_base_id(&base_type) else {
             continue;
         };
-        if db
-            .get_type_index()
-            .direct_sub_types(&base_id)
-            .next()
-            .is_none()
-        {
-            continue;
-        }
-
         for (name_expr, index_expr) in &all_sites {
             if let Some(profile) = &mut profile {
                 profile.references_scanned += 1;
@@ -1027,7 +1018,7 @@ fn collect_unguarded_child_file(
                 continue;
             }
             let Some(children) =
-                direct_subtypes_with_member(db, &mut subtypes_with_member, &base_id, &member_key)
+                nearest_subtypes_with_member(db, &mut subtypes_with_member, &base_id, &member_key)
             else {
                 continue;
             };
@@ -1255,7 +1246,7 @@ fn collect_member_path_unguarded_child_evidence(
         // the use out before its narrowed type is worth computing.
         Some((declared, base_id)) => {
             if base_has_visible_member(&base_id)
-                || direct_subtypes_with_member(
+                || nearest_subtypes_with_member(
                     db,
                     evidence.subtypes_with_member,
                     &base_id,
@@ -1294,7 +1285,7 @@ fn collect_member_path_unguarded_child_evidence(
         }
     };
     let Some(children) =
-        direct_subtypes_with_member(db, evidence.subtypes_with_member, &base_id, &member_key)
+        nearest_subtypes_with_member(db, evidence.subtypes_with_member, &base_id, &member_key)
     else {
         return;
     };
@@ -1783,17 +1774,20 @@ fn type_has_visible_static_member_at_use(
     })
 }
 
-/// Direct subclasses already matched against a member key in this evaluation.
+/// Descendants already matched against a member key in this evaluation.
 type SubtypesWithMember = FxHashMap<(LuaTypeDeclId, LuaMemberKey), Option<Arc<[LuaTypeDeclId]>>>;
 
 #[cfg(test)]
 thread_local! {
-    static SUBTYPE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DECLARER_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The direct subclasses of `base_id` that declare `member_key`, as a member
-/// or a direct dynamic field, ordered by name. `None` when there are none.
-fn direct_subtypes_with_member(
+/// The nearest descendants of `base_id` that declare `member_key` as a member
+/// or a direct dynamic field, ordered by name: a declaring class hides its own descendants, which inherit
+/// the member from it. Found from the classes that declare the key, walking
+/// up, so the cost does not depend on how many classes derive from the base.
+/// `None` when there are none.
+fn nearest_subtypes_with_member(
     db: &crate::DbIndex,
     memo: &mut SubtypesWithMember,
     base_id: &LuaTypeDeclId,
@@ -1802,32 +1796,58 @@ fn direct_subtypes_with_member(
     memo.entry((base_id.clone(), member_key.clone()))
         .or_insert_with(|| {
             #[cfg(test)]
-            SUBTYPE_SCANS.with(|scans| scans.set(scans.get() + 1));
+            DECLARER_LOOKUPS.with(|scans| scans.set(scans.get() + 1));
             let member_index = db.get_member_index();
-            let dynamic_index = db.get_dynamic_field_index();
-            let mut children = db
-                .get_type_index()
-                .direct_sub_types(base_id)
-                .filter(|child| {
-                    let child_id = child.get_id();
-                    member_index
-                        .get_member_item(&LuaMemberOwner::Type(child_id.clone()), member_key)
-                        .is_some()
-                        || matches!(member_key, LuaMemberKey::Name(name) if dynamic_index
-                            .has_direct_field(&crate::DynamicFieldOwner::Type(child_id), name))
+            let dynamic_declarers = match member_key {
+                LuaMemberKey::Name(name) => {
+                    db.get_dynamic_field_index().types_declaring_field(name)
+                }
+                _ => Vec::new(),
+            };
+            let declarers = member_index
+                .get_current_members_for_key(member_key)
+                .into_iter()
+                .filter_map(
+                    |member| match member_index.get_member_owner(&member.get_id()) {
+                        Some(LuaMemberOwner::Type(owner_id)) => Some(owner_id.clone()),
+                        _ => None,
+                    },
+                )
+                .chain(dynamic_declarers)
+                .collect::<FxHashSet<_>>();
+            let mut candidates = Vec::new();
+            for declarer in declarers {
+                let mut supers = Vec::new();
+                declarer.collect_super_types(db, &mut supers);
+                let ancestors = supers
+                    .into_iter()
+                    .filter_map(|super_type| match super_type {
+                        LuaType::Ref(super_id) => Some(super_id),
+                        _ => None,
+                    })
+                    .collect::<FxHashSet<_>>();
+                if ancestors.contains(base_id) {
+                    candidates.push((declarer, ancestors));
+                }
+            }
+            let mut children = candidates
+                .iter()
+                .filter(|(_, ancestors)| {
+                    !candidates
+                        .iter()
+                        .any(|(other, _)| ancestors.contains(other))
                 })
-                .map(|child| (child.get_name(), child.get_id()))
+                .map(|(declarer, _)| declarer.clone())
                 .collect::<Vec<_>>();
             if children.is_empty() {
                 return None;
             }
             children.sort_by(|left, right| {
-                left.0
-                    .cmp(right.0)
-                    .then_with(|| left.1.stable_cmp(&right.1))
+                left.get_name()
+                    .cmp(right.get_name())
+                    .then_with(|| left.stable_cmp(right))
             });
-            children.dedup_by(|left, right| left.1 == right.1);
-            Some(children.into_iter().map(|(_, child_id)| child_id).collect())
+            Some(children.into())
         })
         .clone()
 }
@@ -2068,7 +2088,7 @@ mod tests {
     }
 
     #[test]
-    fn unguarded_child_scans_a_bases_subtypes_once_per_member_per_evaluation() {
+    fn unguarded_child_looks_up_a_members_declarers_once_per_evaluation() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -2077,7 +2097,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::compilation::analyzer::parallel::set_analysis_threads(1);
-        super::SUBTYPE_SCANS.with(|scans| scans.set(0));
+        super::DECLARER_LOOKUPS.with(|scans| scans.set(0));
 
         ws.def_files(vec![
             (
@@ -2117,15 +2137,15 @@ mod tests {
             .compilation
             .last_stats()
             .evaluations(crate::db_index::derivation::DerivationKind::LocalFallbacks);
-        let scans = super::SUBTYPE_SCANS.with(std::cell::Cell::get);
+        let scans = super::DECLARER_LOOKUPS.with(std::cell::Cell::get);
         assert!(
             (1..=evaluations).contains(&scans),
-            "{scans} subtype scans over {evaluations} evaluations"
+            "{scans} declarer lookups over {evaluations} evaluations"
         );
     }
 
     #[test]
-    fn unguarded_child_skips_the_subtype_scan_for_members_the_base_has() {
+    fn unguarded_child_skips_the_declarer_lookup_for_members_the_base_has() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -2134,7 +2154,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::compilation::analyzer::parallel::set_analysis_threads(1);
-        super::SUBTYPE_SCANS.with(|scans| scans.set(0));
+        super::DECLARER_LOOKUPS.with(|scans| scans.set(0));
 
         ws.def_files(vec![
             (
@@ -2166,7 +2186,7 @@ mod tests {
 
         crate::compilation::analyzer::parallel::set_analysis_threads(0);
         drop(threads);
-        assert_eq!(super::SUBTYPE_SCANS.with(std::cell::Cell::get), 0);
+        assert_eq!(super::DECLARER_LOOKUPS.with(std::cell::Cell::get), 0);
     }
 
     #[test]

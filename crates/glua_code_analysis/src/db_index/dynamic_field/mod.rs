@@ -111,6 +111,8 @@ pub struct DynamicFieldIndex {
     /// them. Keyed by index key, so two same-name writes in one file each own
     /// their record.
     unattributed_fields: CowShards<SmolStr, HashSet<InFiled<TextRange>>>,
+    /// field_name → the types that hold a direct definition of the name.
+    declaring_types: CowShards<SmolStr, HashSet<LuaTypeDeclId>>,
     /// Write site → what its derivation filed, so retracting the site or
     /// removing its file visits only the owners it touched. Keyed by the
     /// site's statement or call range.
@@ -279,6 +281,13 @@ impl DynamicFieldIndex {
             .entry(field_name.clone())
             .or_default();
         let is_new_direct = insert_definition(direct_definitions, definition);
+        if is_new_direct && let DynamicFieldOwner::Type(type_id) = &owner {
+            self.declaring_types
+                .entry(field_name.clone())
+                .or_default()
+                .insert(type_id.clone());
+            derivation::note_write(|| FactKey::DynamicFieldName(field_name.clone()));
+        }
         let is_new_definition =
             self.add_field_inner(site, owner.clone(), field_name.clone(), range);
         self.settle_named(&owner, &field_name, old_slot);
@@ -457,6 +466,20 @@ impl DynamicFieldIndex {
             field_name,
             &definition,
         );
+        if let DynamicFieldOwner::Type(type_id) = owner
+            && !self
+                .direct_field_definitions
+                .get(owner)
+                .is_some_and(|fields| fields.contains_key(field_name.as_str()))
+            && let Some(types) = self.declaring_types.get_mut(field_name.as_str())
+        {
+            if types.remove(type_id) {
+                derivation::note_write(|| FactKey::DynamicFieldName(field_name.clone()));
+            }
+            if types.is_empty() {
+                self.declaring_types.remove(field_name.as_str());
+            }
+        }
         // Draining a definition is a novel fact for the slot's readers,
         // mirroring the signature index's removal tombstones.
         self.note_dynamic_write(owner.clone(), Some(field_name.clone()));
@@ -784,6 +807,22 @@ impl DynamicFieldIndex {
     pub fn has_unattributed_field(&self, field_name: &str) -> bool {
         derivation::note_read(|| FactKey::UnattributedField(field_name.into()));
         self.unattributed_fields.contains_key(field_name)
+    }
+
+    /// The types with a direct definition of `field_name`, ordered by name.
+    pub fn types_declaring_field(&self, field_name: &str) -> Vec<LuaTypeDeclId> {
+        derivation::note_read(|| FactKey::DynamicFieldName(field_name.into()));
+        let mut types = self
+            .declaring_types
+            .get(field_name)
+            .map(|types| types.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        types.sort_by(|left, right| {
+            left.get_name()
+                .cmp(right.get_name())
+                .then_with(|| left.stable_cmp(right))
+        });
+        types
     }
 
     pub fn has_field(&self, owner: &DynamicFieldOwner, field_name: &str) -> bool {
@@ -1287,6 +1326,18 @@ impl DynamicFieldIndex {
                         )
                     })
             }
+            FactKey::DynamicFieldName(field_name) => {
+                self.declaring_types
+                    .get(field_name)
+                    .map_or(derivation::ABSENT, |types| {
+                        derivation::fingerprint_of(
+                            &types
+                                .iter()
+                                .map(derivation::fingerprint_of)
+                                .fold(0u64, u64::wrapping_add),
+                        )
+                    })
+            }
             FactKey::UnattributedField(field_name) => {
                 if self.unattributed_fields.contains_key(field_name) {
                     derivation::fingerprint_of(&true)
@@ -1382,6 +1433,9 @@ impl LuaIndex for DynamicFieldIndex {
             for field_name in self.unattributed_fields.keys() {
                 derivation::note_write(|| FactKey::UnattributedField(field_name.clone()));
             }
+            for field_name in self.declaring_types.keys() {
+                derivation::note_write(|| FactKey::DynamicFieldName(field_name.clone()));
+            }
         }
         self.owner_named_fingerprints.clear();
         self.owner_fields.clear();
@@ -1390,6 +1444,7 @@ impl LuaIndex for DynamicFieldIndex {
         self.finite_named_members.clear();
         self.wildcard_definitions.clear();
         self.unattributed_fields.clear();
+        self.declaring_types.clear();
         self.site_contributions.clear();
     }
 }
@@ -2208,6 +2263,7 @@ crate::db_index::cow_shards::task_fork_fields!(DynamicFieldIndex {
     finite_named_members => crate::db_index::cow_shards::merge_set,
     wildcard_definitions => merge_definitions,
     unattributed_fields => crate::db_index::cow_shards::merge_set,
+    declaring_types => crate::db_index::cow_shards::merge_set,
     site_contributions,
     owner_named_fingerprints => crate::db_index::cow_shards::rebuilt,
 } prepare owners_to_rebuild then rebuild_owner_named

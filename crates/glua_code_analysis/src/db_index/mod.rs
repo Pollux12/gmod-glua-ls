@@ -621,6 +621,7 @@ impl DbIndex {
             K::DynamicField(..)
             | K::DynamicFieldWildcards(_)
             | K::DynamicFieldFinite(_)
+            | K::DynamicFieldName(_)
             | K::UnattributedField(_)
             | K::DynamicFieldSite(_) => self.dynamic_field_index.fact_fingerprint(key),
             K::OperatorOwner(_) | K::OperatorFile(_) | K::OperatorContrib(_) => {

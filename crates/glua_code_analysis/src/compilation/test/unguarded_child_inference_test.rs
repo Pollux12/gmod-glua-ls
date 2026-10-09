@@ -940,7 +940,7 @@ mod test {
     }
 
     #[test]
-    fn unguarded_child_never_uses_a_grandchild() {
+    fn unguarded_child_uses_a_grandchild() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         let file_id = ws.def(
@@ -958,11 +958,11 @@ mod test {
 
         assert_eq!(
             ws.humanize_type(last_name_type(&ws, file_id, "value")),
-            "Base"
+            "Leaf"
         );
         assert_eq!(
             diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
-            1
+            0
         );
     }
 
@@ -2401,5 +2401,97 @@ end
         assert_eq!(warm.settled_digest(), cold.settled_digest());
         assert!(warm.stale_derivations().is_empty());
         assert!(warm.phantom_derivations().is_empty());
+    }
+
+    const PANEL_TREE: &str = r#"
+        ---@class Panel
+        ---@class TextEntry: Panel
+        ---@class DTextEntry: TextEntry
+        ---@field SetUpdateOnType fun(self: DTextEntry, update: boolean)
+        ---@class DPanel: Panel
+        ---@class DNumPad: DPanel
+        ---@field SetUpdateOnType fun(self: DNumPad, update: boolean)
+        ---@class DNumPadSub: DNumPad
+        "#;
+
+    fn panel_tree_diagnostics(consumer: &str) -> (usize, usize, Vec<String>) {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def(PANEL_TREE);
+        let file_id = ws.def(consumer);
+        let unguarded = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        (
+            unguarded.len(),
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            unguarded.into_iter().map(|d| d.message).collect(),
+        )
+    }
+
+    #[test]
+    fn unguarded_child_finds_a_grandchild_that_declares_the_member() {
+        let (unguarded, undefined, messages) = panel_tree_diagnostics(
+            r#"
+            ---@type Panel
+            local filter
+            filter:SetUpdateOnType(true)
+            "#,
+        );
+
+        assert_eq!(undefined, 0);
+        assert_eq!(unguarded, 1);
+        assert!(messages[0].contains("`DTextEntry`"), "{messages:?}");
+    }
+
+    #[test]
+    fn unguarded_child_lists_the_nearest_declaring_class_only() {
+        let (_, _, messages) = panel_tree_diagnostics(
+            r#"
+            ---@type Panel
+            local filter
+            filter:SetUpdateOnType(true)
+            "#,
+        );
+
+        assert!(
+            messages[0].contains("one of `DNumPad`, `DTextEntry`."),
+            "{messages:?}"
+        );
+    }
+
+    /// A subclass of the parent that does not declare the used member leaves the
+    /// unguarded use alone; one that declares it re-evaluates the use.
+    #[test]
+    fn adding_a_subclass_re_runs_unguarded_uses_only_when_it_declares_the_member() {
+        const CONSUMER: &str = "lua/autorun/client/consumer.lua";
+        const CONSUMER_TEXT: &str = "---@type Panel
+local filter
+filter:SetUpdateOnType(true)
+";
+        let fallbacks_after_adding = |file: &str, text: &str| {
+            let mut ws = VirtualWorkspace::new();
+            enable_gmod(&mut ws);
+            ws.def_files(vec![
+                ("lua/autorun/sh_types.lua", PANEL_TREE),
+                (CONSUMER, CONSUMER_TEXT),
+            ]);
+            ws.def_file(file, text);
+            ws.analysis
+                .compilation
+                .last_stats()
+                .evaluations(crate::db_index::derivation::DerivationKind::LocalFallbacks)
+        };
+
+        let unrelated_class =
+            fallbacks_after_adding("lua/autorun/sh_other.lua", "---@class Unrelated");
+        let unrelated_subclass =
+            fallbacks_after_adding("lua/autorun/sh_other.lua", "---@class DLabel: Panel");
+        let declaring_subclass = fallbacks_after_adding(
+            "lua/autorun/sh_other.lua",
+            "---@class DSlider: Panel
+---@field SetUpdateOnType fun(self: DSlider, update: boolean)",
+        );
+
+        assert_eq!(unrelated_subclass, unrelated_class);
+        assert!(declaring_subclass > unrelated_class);
     }
 }

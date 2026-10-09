@@ -352,7 +352,7 @@ mod test {
     }
 
     #[test]
-    fn recursive_descendant_member_reports_undefined_method() {
+    fn recursive_descendant_member_reports_unguarded_child() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         ws.def_file(
@@ -377,7 +377,14 @@ mod test {
 
         let undefined_methods =
             diagnostics_for_code_with_shared(&mut ws, file_id, DiagnosticCode::UndefinedMethod);
-        assert_eq!(undefined_methods.len(), 1, "{undefined_methods:?}");
+        assert!(undefined_methods.is_empty(), "{undefined_methods:?}");
+        let child_inference =
+            diagnostics_for_code_with_shared(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert_eq!(child_inference.len(), 1, "{child_inference:?}");
+        assert!(
+            child_inference[0].message.contains("`CustomPlayer`"),
+            "{child_inference:?}"
+        );
     }
 
     #[test]
@@ -3614,7 +3621,7 @@ owner:GetShootPos()
     }
 
     #[test]
-    fn test_method_on_deep_subclass_reports_undefined_method() {
+    fn test_method_on_deep_subclass_reports_unguarded_child() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         let file_id = ws.def(
@@ -3639,11 +3646,21 @@ owner:GetShootPos()
             file_id,
             DiagnosticCode::UndefinedMethod,
         );
-        assert_eq!(undefined_methods.len(), 1, "{undefined_methods:?}");
+        assert!(undefined_methods.is_empty(), "{undefined_methods:?}");
+        let child_inference = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::InferUnguardedChild,
+        );
+        assert_eq!(child_inference.len(), 1, "{child_inference:?}");
+        assert!(
+            child_inference[0].message.contains("`DeepSubTest.Airboat`"),
+            "{child_inference:?}"
+        );
     }
 
     #[test]
-    fn test_panel_method_on_deep_custom_panel_reports_undefined_method() {
+    fn test_panel_method_on_deep_custom_panel_reports_unguarded_child() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         let file_id = ws.def(
@@ -3669,7 +3686,17 @@ owner:GetShootPos()
             file_id,
             DiagnosticCode::UndefinedMethod,
         );
-        assert_eq!(undefined_methods.len(), 1, "{undefined_methods:?}");
+        assert!(undefined_methods.is_empty(), "{undefined_methods:?}");
+        let child_inference = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::InferUnguardedChild,
+        );
+        assert_eq!(child_inference.len(), 1, "{child_inference:?}");
+        assert!(
+            child_inference[0].message.contains("`MyCustomPanel`"),
+            "{child_inference:?}"
+        );
     }
 
     #[test]

@@ -326,6 +326,8 @@ pub enum FactKey {
     DynamicFieldWildcards(DynamicFieldOwner),
     /// An owner's members written through a finite set of names.
     DynamicFieldFinite(DynamicFieldOwner),
+    /// The types that hold a direct dynamic field, by name.
+    DynamicFieldName(SmolStr),
     /// An unattributed dynamic field, by name.
     UnattributedField(SmolStr),
     /// One operand owner's operator table.
@@ -956,6 +958,7 @@ impl FactKey {
             | K::DynamicField(..)
             | K::DynamicFieldWildcards(_)
             | K::DynamicFieldFinite(_)
+            | K::DynamicFieldName(_)
             | K::UnattributedField(_)
             | K::OperatorOwner(_)
             | K::GmodMeta(_)
