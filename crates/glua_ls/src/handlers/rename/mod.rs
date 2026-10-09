@@ -136,17 +136,17 @@ fn find_rename_target(
     }
 }
 
-/// A colon method's `self` is implicit: there is no declaration to carry the
-/// new name, so the edit would only break the code. A written `self` — an
-/// explicit parameter, or a `local self = self` capture — has one and renames
-/// normally.
+/// A colon method's `self` and the `BaseClass` a `DEFINE_BASECLASS` call
+/// declares are implicit: there is no declaration to carry the new name, so
+/// the edit would only break the code. A written `self` — an explicit
+/// parameter, or a `local self = self` capture — has one and renames normally.
 fn is_unrenameable(semantic_model: &SemanticModel, semantic_decl: &LuaSemanticDeclId) -> bool {
     let LuaSemanticDeclId::LuaDecl(decl_id) = semantic_decl else {
         return false;
     };
 
     match semantic_model.get_db().get_decl_index().get_decl(decl_id) {
-        Some(decl) => decl.is_implicit_self(),
+        Some(decl) => decl.is_implicit_self() || decl.is_macro_local(),
         None => true,
     }
 }

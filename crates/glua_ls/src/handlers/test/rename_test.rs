@@ -54,6 +54,33 @@ mod tests {
         Ok(())
     }
 
+    /// `DEFINE_BASECLASS` writes no `BaseClass` name to carry a new one, so
+    /// renaming it would only overwrite the macro's argument.
+    #[gtest]
+    fn test_rename_refused_for_define_baseclass_local() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = glua_code_analysis::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                DEFINE_BASECLASS("Panel")
+                local _ = <??>BaseClass
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/vgui/cl_panel.lua", &content);
+        verify_that!(
+            rename(&ws.analysis, file_id, position, "renamed".to_string()).is_none(),
+            eq(true)
+        )?;
+        verify_that!(
+            prepare_rename(&ws.analysis, file_id, position).is_none(),
+            eq(true)
+        )?;
+        Ok(())
+    }
+
     /// The request position and the returned edit ranges count UTF-16 code
     /// units, so a name after an emoji sits one column further right than its
     /// character count.

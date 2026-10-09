@@ -32,7 +32,10 @@ impl Checker for UnusedChecker {
             .map(|decl| (decl.get_range(), decl))
             .collect::<FxHashMap<_, _>>();
         for decl in decl_tree.get_decls().values() {
-            if decl.is_global() || decl.is_param() && decl.get_name() == "..." {
+            if decl.is_global()
+                || decl.is_macro_local()
+                || decl.is_param() && decl.get_name() == "..."
+            {
                 continue;
             }
             if semantic_model.get_emmyrc().gmod.enabled && decl.is_param() {

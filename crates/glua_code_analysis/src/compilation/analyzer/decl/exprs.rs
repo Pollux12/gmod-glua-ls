@@ -7,8 +7,11 @@ use smol_str::SmolStr;
 
 use crate::{
     EmmyrcLuaVersion, FileId, InFiled, LegacyModuleEnv, LuaDeclExtra, LuaDeclId, LuaMemberFeature,
-    LuaMemberId, LuaSignatureId,
-    db_index::{LuaDecl, LuaDependencyKind, LuaMember, LuaMemberKey, LuaMemberOwner},
+    LuaMemberId, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDeclId,
+    db_index::{
+        GmodScriptedClassCallKind, LuaDecl, LuaDependencyKind, LuaMember, LuaMemberKey,
+        LuaMemberOwner,
+    },
 };
 
 use super::{DeclAnalyzer, DeclOp};
@@ -388,6 +391,7 @@ pub fn analyze_literal_expr(analyzer: &mut DeclAnalyzer, expr: LuaLiteralExpr) -
 
 pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Option<()> {
     try_analyze_legacy_module_call(analyzer, &expr);
+    try_declare_define_baseclass_local(analyzer, &expr);
 
     let Some((dependency_kind, dependency_path)) = get_dependency_call_info(&expr) else {
         return Some(());
@@ -419,6 +423,45 @@ pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Opti
         range,
     });
 
+    Some(())
+}
+
+/// `DEFINE_BASECLASS("X")` expands to `local BaseClass = baseclass.Get("X")`,
+/// so it declares a local at the call, typed by the class it names.
+fn try_declare_define_baseclass_local(
+    analyzer: &mut DeclAnalyzer,
+    expr: &LuaCallExpr,
+) -> Option<()> {
+    let LuaExpr::NameExpr(name_expr) = expr.get_prefix_expr()? else {
+        return Some(());
+    };
+    if !analyzer.db.get_emmyrc().gmod.enabled
+        || GmodScriptedClassCallKind::from_call_name(&name_expr.get_name_text()?)
+            != Some(GmodScriptedClassCallKind::DefineBaseClass)
+        || expr.get_parent::<LuaCallExprStat>().is_none()
+    {
+        return Some(());
+    }
+
+    let args_list = expr.get_args_list()?;
+    let decl_id = analyzer.add_decl(LuaDecl::new(
+        "BaseClass",
+        analyzer.get_file_id(),
+        args_list.get_range(),
+        LuaDeclExtra::Local {
+            kind: args_list.syntax().kind(),
+            attrib: None,
+        },
+        None,
+    ));
+    let base_type = match get_static_string_arg(expr) {
+        Some(base_name) if !base_name.is_empty() => LuaType::Ref(LuaTypeDeclId::global(&base_name)),
+        _ => LuaType::Any,
+    };
+    analyzer.ops.push(DeclOp::WriteTypeCache {
+        owner: decl_id.into(),
+        cache: LuaTypeCache::DocType(base_type),
+    });
     Some(())
 }
 

@@ -85,7 +85,8 @@ fn check_scope_for_redefined_locals(
             && let Some(decl) = decl_tree.get_decl(decl_id)
         {
             let name = decl.get_name().to_string();
-            if decl.is_local() && name != "..." && !name.starts_with("_") {
+            if decl.is_local() && !decl.is_macro_local() && name != "..." && !name.starts_with("_")
+            {
                 if gmod_enabled && name == "self" {
                     continue;
                 }

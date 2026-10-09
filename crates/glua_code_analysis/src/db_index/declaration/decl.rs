@@ -188,6 +188,11 @@ impl LuaDecl {
     pub fn is_implicit_self(&self) -> bool {
         matches!(&self.extra, LuaDeclExtra::ImplicitSelf { .. })
     }
+
+    /// Whether a macro call such as `DEFINE_BASECLASS("X")` declares this local at its arguments.
+    pub fn is_macro_local(&self) -> bool {
+        matches!(&self.extra, LuaDeclExtra::Local { kind, .. } if *kind == LuaSyntaxKind::CallArgList.into())
+    }
 }
 
 #[derive(Eq, PartialEq, Hash, Debug, Clone)]

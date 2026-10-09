@@ -1514,6 +1514,205 @@ end
         );
     }
 
+    fn gmod_baseclass_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws
+    }
+
+    fn baseclass_reference_types(ws: &VirtualWorkspace, file_id: crate::FileId) -> Vec<LuaType> {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter(|name_expr| name_expr.get_name_text().as_deref() == Some("BaseClass"))
+            .map(|name_expr| {
+                semantic_model
+                    .infer_expr(LuaExpr::NameExpr(name_expr))
+                    .unwrap_or(LuaType::Unknown)
+            })
+            .collect()
+    }
+
+    fn global_ref(name: &str) -> LuaType {
+        LuaType::Ref(LuaTypeDeclId::global(name))
+    }
+
+    #[gtest]
+    fn test_define_baseclass_each_top_level_call_scopes_baseclass_until_the_next() {
+        let mut ws = gmod_baseclass_workspace();
+        let file_id = ws.def_file(
+            "gamemodes/cityrp/gamemode/core/derma/cl_panels.lua",
+            r#"
+            ---@class BaseA
+            ---@class BaseB
+
+            DEFINE_BASECLASS("BaseA")
+            local FIRST = {}
+            function FIRST:Init()
+                local _ = BaseClass
+            end
+            vgui.Register("cityrpFirst", FIRST, "BaseA")
+
+            DEFINE_BASECLASS("BaseB")
+            local SECOND = {}
+            function SECOND:Init()
+                local _ = BaseClass
+            end
+            vgui.Register("cityrpSecond", SECOND, "BaseB")
+        "#,
+        );
+
+        assert_eq!(
+            baseclass_reference_types(&ws, file_id),
+            vec![global_ref("BaseA"), global_ref("BaseB")]
+        );
+    }
+
+    #[gtest]
+    fn test_define_baseclass_inside_function_body_stays_in_that_function() {
+        let mut ws = gmod_baseclass_workspace();
+        let file_id = ws.def_file(
+            "gamemodes/cityrp/gamemode/core/derma/cl_builder.lua",
+            r#"
+            ---@class OuterBase
+            ---@class InnerBase
+
+            DEFINE_BASECLASS("OuterBase")
+            local function build()
+                DEFINE_BASECLASS("InnerBase")
+                local _ = BaseClass
+            end
+            local _ = BaseClass
+        "#,
+        );
+
+        assert_eq!(
+            baseclass_reference_types(&ws, file_id),
+            vec![global_ref("InnerBase"), global_ref("OuterBase")]
+        );
+    }
+
+    #[gtest]
+    fn test_define_baseclass_method_called_with_subclass_self_has_no_param_type_mismatch() {
+        let mut ws = gmod_baseclass_workspace();
+        ws.def_file(
+            "lua/includes/extensions/client/panel.lua",
+            r#"
+            ---@class Panel
+            local Panel = {}
+            function Panel:Remove() end
+
+            ---@class EditablePanel : Panel
+
+            ---@class DScrollPanel : Panel
+            local DScrollPanel = {}
+            function DScrollPanel:Remove() end
+        "#,
+        );
+
+        assert!(ws.check_file_for(
+            DiagnosticCode::ParamTypeMismatch,
+            "gamemodes/cityrp/gamemode/core/derma/cl_settings.lua",
+            r#"
+            DEFINE_BASECLASS("Panel")
+            local ROW = {}
+            function ROW:Remove()
+                BaseClass.Remove(self)
+            end
+            vgui.Register("cityrpSettingsRow", ROW, "EditablePanel")
+
+            DEFINE_BASECLASS("DScrollPanel")
+            local LIST = {}
+            function LIST:Remove()
+                BaseClass.Remove(self)
+            end
+            vgui.Register("cityrpSettingsList", LIST, "DScrollPanel")
+        "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_define_baseclass_local_is_neither_unused_nor_redefined() {
+        const PANELS: &str = r#"
+            DEFINE_BASECLASS("BaseA")
+            local FIRST = {}
+            vgui.Register("cityrpFirst", FIRST, "BaseA")
+
+            DEFINE_BASECLASS("BaseB")
+            local SECOND = {}
+            vgui.Register("cityrpSecond", SECOND, "BaseB")
+        "#;
+        let mut ws = gmod_baseclass_workspace();
+        assert!(ws.check_file_for(
+            DiagnosticCode::Unused,
+            "gamemodes/cityrp/gamemode/core/derma/cl_unused.lua",
+            PANELS,
+        ));
+        assert!(ws.check_file_for(
+            DiagnosticCode::RedefinedLocal,
+            "gamemodes/cityrp/gamemode/core/derma/cl_redefined.lua",
+            PANELS,
+        ));
+    }
+
+    #[gtest]
+    fn test_define_baseclass_scope_follows_edit_delete_and_reopen() {
+        const PATH: &str = "gamemodes/cityrp/gamemode/core/derma/cl_edit.lua";
+        const FIRST: &str = r#"
+            DEFINE_BASECLASS("BaseA")
+            local _ = BaseClass
+            DEFINE_BASECLASS("BaseB")
+            local _ = BaseClass
+        "#;
+        const EDITED: &str = r#"
+            DEFINE_BASECLASS("BaseC")
+            local _ = BaseClass
+            local function build()
+                DEFINE_BASECLASS("BaseB")
+            end
+            local _ = BaseClass
+        "#;
+        let mut ws = gmod_baseclass_workspace();
+        let file_id = ws.def_file(PATH, FIRST);
+        assert_eq!(
+            baseclass_reference_types(&ws, file_id),
+            vec![global_ref("BaseA"), global_ref("BaseB")]
+        );
+
+        let file_id = ws.def_file(PATH, EDITED);
+        assert_eq!(
+            baseclass_reference_types(&ws, file_id),
+            vec![global_ref("BaseC"), global_ref("BaseC")]
+        );
+
+        let uri = ws.virtual_url_generator.new_uri(PATH);
+        ws.analysis.remove_file_by_uri(&uri);
+        let file_id = ws.def_file(PATH, EDITED);
+        assert_eq!(
+            baseclass_reference_types(&ws, file_id),
+            vec![global_ref("BaseC"), global_ref("BaseC")]
+        );
+
+        VirtualWorkspace::assert_warm_matches_cold(
+            |ws| {
+                let mut emmyrc = Emmyrc::default();
+                emmyrc.gmod.enabled = true;
+                ws.update_emmyrc(emmyrc);
+                ws.def_gmod_call_arg_builtins();
+            },
+            &[(PATH, FIRST)],
+            &[(PATH, EDITED)],
+        );
+    }
+
     #[gtest]
     fn test_derma_define_control_baseclass_member_uses_base_arg_syntax_id() {
         let mut ws = VirtualWorkspace::new();

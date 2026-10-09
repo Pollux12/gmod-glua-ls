@@ -342,9 +342,6 @@ pub enum FactKey {
     GmodMeta(SmolStr),
     /// A file's gmod class call metadata.
     GmodClassFile(FileId),
-    /// The base class a file's `DEFINE_BASECLASS` calls name, read out of its
-    /// [`FactKey::GmodClassFile`].
-    GmodBaseClass(FileId),
     /// A file's `vgui.Register` and `derma.DefineControl` calls, read out of
     /// its [`FactKey::GmodClassFile`].
     GmodVguiRegistrations(FileId),
@@ -842,9 +839,7 @@ impl FactKey {
             FactKey::IndexReferenceFiles(name) => Some(FactKey::ReferencesByName(name.clone())),
             FactKey::DeclReferences(decl_id) => Some(FactKey::References(decl_id.file_id)),
             FactKey::SpecialCallFor(file_id, _) => Some(FactKey::SpecialCallFile(*file_id)),
-            FactKey::GmodBaseClass(file_id) | FactKey::GmodVguiRegistrations(file_id) => {
-                Some(FactKey::GmodClassFile(*file_id))
-            }
+            FactKey::GmodVguiRegistrations(file_id) => Some(FactKey::GmodClassFile(*file_id)),
             FactKey::TypeDeclFiles(decl_id) => Some(FactKey::TypeDeclLocations(decl_id.clone())),
             FactKey::TypeSuperTypes(decl_id) | FactKey::TypeSuperEdges(decl_id) => {
                 Some(FactKey::TypeSupers(decl_id.clone()))
@@ -913,7 +908,6 @@ impl FactKey {
             | K::OperatorFile(file_id)
             | K::MetatableFactory(file_id)
             | K::GmodClassFile(file_id)
-            | K::GmodBaseClass(file_id)
             | K::GmodVguiRegistrations(file_id)
             | K::VguiRelations(file_id)
             | K::GmodInferFile(file_id)

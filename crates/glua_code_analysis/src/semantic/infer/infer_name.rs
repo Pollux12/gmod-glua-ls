@@ -96,10 +96,6 @@ pub fn infer_name_expr(
             return Ok(implicit_module_type);
         }
 
-        if let Some(define_baseclass_type) = infer_define_baseclass_type(db, file_id, name) {
-            return Ok(define_baseclass_type);
-        }
-
         if let Some(class_decl_id) = resolve_global_singleton_scripted_type_decl_id(db, cache, name)
         {
             return Ok(LuaType::Def(class_decl_id));
@@ -765,17 +761,6 @@ fn is_gmod_dynamic_initializer(db: &DbIndex, decl_id: LuaDeclId) -> bool {
         local_initializer_expr(db, decl_id),
         Some((_, LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_)))
     )
-}
-
-fn infer_define_baseclass_type(db: &DbIndex, file_id: FileId, name: &str) -> Option<LuaType> {
-    if !db.get_emmyrc().gmod.enabled || name != "BaseClass" {
-        return None;
-    }
-
-    let base_name = db
-        .get_gmod_class_metadata_index()
-        .get_define_baseclass_name(&file_id)?;
-    Some(LuaType::Ref(LuaTypeDeclId::global(base_name)))
 }
 
 fn infer_self(db: &DbIndex, cache: &mut LuaInferCache, name_expr: LuaNameExpr) -> InferResult {

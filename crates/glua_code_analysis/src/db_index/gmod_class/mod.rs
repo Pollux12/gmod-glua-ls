@@ -371,17 +371,6 @@ pub struct GmodVguiFileRelations {
 }
 
 impl GmodScriptedClassFileMetadata {
-    pub fn get_define_baseclass_name(&self) -> Option<&str> {
-        self.define_baseclass_calls.iter().rev().find_map(|call| {
-            match call.literal_args.get(call.inheritance_name_arg_idx()) {
-                Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
-                    Some(name.as_str())
-                }
-                _ => None,
-            }
-        })
-    }
-
     fn calls_by_kind_mut(
         &mut self,
         kind: GmodScriptedClassCallKind,
@@ -559,9 +548,6 @@ impl GmodClassMetadataIndex {
             FactKey::GmodClassFile(file_id) => {
                 derivation::fingerprint_opt(self.file_metadata.get(file_id))
             }
-            FactKey::GmodBaseClass(file_id) => self
-                .define_baseclass_name(file_id)
-                .map_or(derivation::ABSENT, derivation::fingerprint_of),
             FactKey::GmodVguiRegistrations(file_id) => {
                 let mut calls = self.vgui_registrations(file_id).peekable();
                 if calls.peek().is_none() {
@@ -999,15 +985,6 @@ impl GmodClassMetadataIndex {
         self.file_metadata.get(file_id)
     }
 
-    pub fn get_define_baseclass_name(&self, file_id: &FileId) -> Option<&str> {
-        derivation::note_read(|| FactKey::GmodBaseClass(*file_id));
-        self.define_baseclass_name(file_id)
-    }
-
-    fn define_baseclass_name(&self, file_id: &FileId) -> Option<&str> {
-        self.file_metadata.get(file_id)?.get_define_baseclass_name()
-    }
-
     /// A file's `derma.DefineControl` calls, then its `vgui.Register` calls.
     pub fn get_vgui_registrations(
         &self,
@@ -1390,11 +1367,11 @@ mod tests {
         assert_eq!(index.derma_skins, expected.derma_skins);
     }
 
-    /// Readers of a file's base class and of its panel registrations record
-    /// those, read out of the file's class calls: another kind of call landing
-    /// holds both, and each moves with its own calls.
+    /// Readers of a file's panel registrations record those, read out of the
+    /// file's class calls: another kind of call landing holds them, and they
+    /// move with their own calls.
     #[test]
-    fn a_class_call_of_another_kind_holds_readers_of_the_base_class_and_registrations() {
+    fn a_class_call_of_another_kind_holds_readers_of_the_registrations() {
         use crate::db_index::derivation::{self, FactKey};
 
         let mut index = GmodClassMetadataIndex::new();
@@ -1402,12 +1379,11 @@ mod tests {
         let _recording = derivation::begin(derivation::DerivationId::workspace(
             derivation::DerivationKind::GmodLoad,
         ));
-        assert!(index.get_define_baseclass_name(&file).is_none());
         assert!(index.get_vgui_registrations(&file).next().is_none());
         let reads = derivation::end().into_recorded().2;
         let file_calls = FactKey::GmodClassFile(file);
         assert!(file_calls.is_base());
-        assert_eq!(reads.len(), 2);
+        assert_eq!(reads.len(), 1);
         assert!(
             reads
                 .iter()
@@ -1441,7 +1417,7 @@ mod tests {
             before.iter().zip(after).filter(|(b, a)| b != a).count()
         };
         let based = fingerprints(&index);
-        assert_eq!(moved(&seen, &based), 1);
+        assert_eq!(moved(&seen, &based), 0);
 
         index.add_call(
             file,
@@ -1449,7 +1425,6 @@ mod tests {
             vgui_register_call("Panel", "DFrame", 30),
         );
         assert_eq!(moved(&based, &fingerprints(&index)), 1);
-        assert_eq!(index.get_define_baseclass_name(&file), Some("base_anim"));
         assert_eq!(index.get_vgui_registrations(&file).count(), 1);
     }
 }
