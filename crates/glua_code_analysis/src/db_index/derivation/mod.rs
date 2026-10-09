@@ -244,8 +244,13 @@ pub enum FactKey {
     /// A member object alone: its key, feature and global id. Read out of its
     /// [`FactKey::Member`].
     MemberObject(LuaMemberId),
-    /// A member's current owner. Read out of its [`FactKey::Member`].
+    /// Where a member lives now: its owner, whether it is listed there, and
+    /// the global path it was homed through. Its own writers and a transfer
+    /// both move it.
     MemberHome(LuaMemberId),
+    /// The class a scripted-class synthesis moved a member to, and whether a
+    /// global path's class change leaves it there.
+    MemberTransfer(LuaMemberId),
     /// A member's path provenance, flags and function scope. Read out of its
     /// [`FactKey::Member`].
     MemberMarks(LuaMemberId),
@@ -612,6 +617,7 @@ impl FactKey {
                 | K::DeclClaim(_)
                 | K::Decl(_)
                 | K::Member(_)
+                | K::MemberTransfer(_)
                 | K::Signature(_)
                 | K::ValidGuard(_)
                 | K::InferredGuard(_)
@@ -706,6 +712,7 @@ impl FactKey {
                 | K::Member(_)
                 | K::MemberObject(_)
                 | K::MemberHome(_)
+                | K::MemberTransfer(_)
                 | K::MemberMarks(_)
                 | K::MemberSlot(..)
                 | K::MemberOwnerMap(_)
@@ -835,9 +842,9 @@ impl FactKey {
             | FactKey::SpecialCallSignature(signature_id) => {
                 Some(FactKey::Signature(*signature_id))
             }
-            FactKey::MemberObject(member_id)
-            | FactKey::MemberHome(member_id)
-            | FactKey::MemberMarks(member_id) => Some(FactKey::Member(*member_id)),
+            FactKey::MemberObject(member_id) | FactKey::MemberMarks(member_id) => {
+                Some(FactKey::Member(*member_id))
+            }
             FactKey::IndexReferenceFiles(name) => Some(FactKey::ReferencesByName(name.clone())),
             FactKey::DeclReferences(decl_id) => Some(FactKey::References(decl_id.file_id)),
             FactKey::SpecialCallFor(file_id, _) => Some(FactKey::SpecialCallFile(*file_id)),
@@ -866,6 +873,7 @@ impl FactKey {
             K::Member(member_id)
             | K::MemberObject(member_id)
             | K::MemberHome(member_id)
+            | K::MemberTransfer(member_id)
             | K::MemberMarks(member_id) => Some(member_id.file_id),
             K::NetCall(site) | K::NetHelper(site) | K::NetFlows(site) => Some(site.file_id),
             K::GmodRealmAt(file_id, _)

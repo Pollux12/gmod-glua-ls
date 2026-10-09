@@ -365,6 +365,7 @@ impl DbIndex {
                 .get_signature_index_mut()
                 .reset_inferred_guard(signature_id),
             K::Member(member_id) => self.get_member_index_mut().reset_member(*member_id),
+            K::MemberTransfer(member_id) => self.get_member_index_mut().reset_transfer(*member_id),
             K::TypeContrib(id) => self.get_type_index_mut().retract_contributions(id),
             K::PathClassContrib(id) => self.get_member_index_mut().retract_path_classes(id),
             K::OperatorContrib(id) => self.get_operator_index_mut().retract_contributions(id),
@@ -582,6 +583,7 @@ impl DbIndex {
             K::Member(_)
             | K::MemberObject(_)
             | K::MemberHome(_)
+            | K::MemberTransfer(_)
             | K::MemberMarks(_)
             | K::MemberSlot(..)
             | K::MemberOwnerMap(_)

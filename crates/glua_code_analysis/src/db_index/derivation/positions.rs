@@ -224,6 +224,7 @@ impl EditMaps {
             K::Member(id) => K::Member(self.member_id(*id)?),
             K::MemberObject(id) => K::MemberObject(self.member_id(*id)?),
             K::MemberHome(id) => K::MemberHome(self.member_id(*id)?),
+            K::MemberTransfer(id) => K::MemberTransfer(self.member_id(*id)?),
             K::MemberMarks(id) => K::MemberMarks(self.member_id(*id)?),
             K::MemberSlot(owner, key) => {
                 K::MemberSlot(self.member_owner(owner)?, self.member_key(key)?)
