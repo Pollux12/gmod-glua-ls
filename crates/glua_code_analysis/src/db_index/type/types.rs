@@ -918,6 +918,11 @@ impl LuaFunctionType {
         self
     }
 
+    pub fn with_ret(mut self, ret: LuaType) -> Self {
+        self.ret = ret;
+        self
+    }
+
     pub fn get_call_arg_roles(&self) -> &[LuaCallArgRole] {
         &self.call_arg_roles
     }

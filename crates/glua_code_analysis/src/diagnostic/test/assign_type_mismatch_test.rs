@@ -4067,3 +4067,44 @@ fn trailing_call_return_values_are_all_checked_against_table_elements() {
         "#,
     ));
 }
+
+const HOOK_CLASS: &str = r#"
+---@class HookPanel
+local HookPanel = {}
+
+---@return boolean
+function HookPanel:Paint(width, height) end
+
+---@param keyCode number
+---@return boolean
+function HookPanel:OnMousePressed(keyCode) end
+
+---@param cb fun(): boolean
+local function takes_callback(cb) end
+
+---@type HookPanel
+local p
+"#;
+
+#[test]
+fn closure_without_returns_may_be_assigned_to_a_method_field() {
+    let mut ws = crate::VirtualWorkspace::new();
+    let code = format!(
+        "{HOOK_CLASS}\np.Paint = function(s, w, h) end\np.OnMousePressed = function(s, code) end"
+    );
+    assert!(ws.check_code_for(crate::DiagnosticCode::AssignTypeMismatch, &code));
+}
+
+#[test]
+fn closure_returning_the_wrong_type_is_still_reported_for_a_method_field() {
+    let mut ws = crate::VirtualWorkspace::new();
+    let code = format!("{HOOK_CLASS}\np.Paint = function(s, w, h) return \"x\" end");
+    assert!(!ws.check_code_for(crate::DiagnosticCode::AssignTypeMismatch, &code));
+}
+
+#[test]
+fn closure_without_returns_stays_rejected_as_a_callback_argument() {
+    let mut ws = crate::VirtualWorkspace::new();
+    let code = format!("{HOOK_CLASS}\ntakes_callback(function() end)");
+    assert!(!ws.check_code_for(crate::DiagnosticCode::ParamTypeMismatch, &code));
+}

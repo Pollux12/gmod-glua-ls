@@ -201,6 +201,8 @@ fn check_index_expr(
         };
 
     let value_type = semantic_model.infer_expr_list_value_type_at(exprs, value_idx)?;
+    let value_type =
+        closure_without_returns_as_method_definition(semantic_model, expr.as_ref(), value_type);
     check_assign_type_mismatch(
         context,
         semantic_model,
@@ -226,6 +228,31 @@ fn check_index_expr(
         }
     }
     Some(())
+}
+
+/// A closure that returns nothing is accepted for a member's declared return,
+/// as `function obj:Method() end` is, so `obj.Method = function() end` is too.
+fn closure_without_returns_as_method_definition(
+    semantic_model: &SemanticModel,
+    expr: Option<&LuaExpr>,
+    value_type: LuaType,
+) -> LuaType {
+    let (Some(LuaExpr::ClosureExpr(_)), LuaType::Signature(signature_id)) = (expr, &value_type)
+    else {
+        return value_type;
+    };
+    let Some(signature) = semantic_model
+        .get_db()
+        .get_signature_index()
+        .get(signature_id)
+    else {
+        return value_type;
+    };
+    let func = signature.to_doc_func_type();
+    if !func.get_ret().is_nil() {
+        return value_type;
+    }
+    LuaType::DocFunction((*func).clone().with_ret(LuaType::Any).into())
 }
 
 fn index_target_is_inferred(semantic_model: &SemanticModel, index_expr: &LuaIndexExpr) -> bool {
