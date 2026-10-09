@@ -59,4 +59,20 @@ mod test {
         "#
         ));
     }
+
+    #[test]
+    fn boolean_argument_matches_boolean_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            ---@attribute flagged(name: string, enabled: boolean)
+
+            ---@[flagged("a", true)]
+            local a = 1
+
+            ---@[flagged("b", false)]
+            local b = 1
+        "#;
+        assert!(ws.check_code_for(DiagnosticCode::DocSyntaxError, code));
+        assert!(ws.check_code_for(DiagnosticCode::AttributeParamTypeMismatch, code));
+    }
 }

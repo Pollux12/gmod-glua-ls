@@ -3201,6 +3201,17 @@ Syntax(Chunk)@0..105
     }
 
     #[test]
+    fn test_attribute_use_boolean_arguments() {
+        let code = r#"
+        ---@attribute flags(a: string, b: nil, c: boolean, d: boolean)
+        ---@[flags("a", nil, true, false)]
+        local x = 1
+        "#;
+        let tree = LuaParser::parse(code, ParserConfig::default());
+        assert!(tree.get_errors().is_empty(), "{:?}", tree.get_errors());
+    }
+
+    #[test]
     fn test_infer_keyword() {
         // 只有在 extends 后的 infer 才能被视为关键词
         {
