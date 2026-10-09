@@ -239,7 +239,7 @@ fn sender_sort_key(
         .unwrap_or_default();
 
     SenderSortKey {
-        normalized_path: crate::vfs::normalize_path_for_ordering(&raw_path),
+        normalized_path: raw_path.replace('\\', "/"),
         raw_path,
         file_id: file_id.id,
         start_offset: u32::from(send_flow.start_range.start()),

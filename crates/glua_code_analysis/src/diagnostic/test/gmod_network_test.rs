@@ -3101,4 +3101,50 @@ mod tests {
             .canonical_op_name("string", NetOpDirection::Read);
         expect_that!(canonical, eq(Some("net.ReadString")));
     }
+
+    #[gtest]
+    fn test_sender_tie_break_uses_byte_order_of_path() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteTypeMismatch);
+
+        ws.def_file(
+            "lua/autorun/server/alpha.lua",
+            r#"
+            util.AddNetworkString("Msg")
+            net.Start("Msg")
+            net.WriteBool(true)
+            net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/server/Zeta.lua",
+            r#"
+            net.Start("Msg")
+            net.WriteEntity(e)
+            net.Broadcast()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("Msg", function()
+                local x = net.ReadString()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        assert_that!(
+            count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteTypeMismatch),
+            eq(1usize)
+        );
+        expect_that!(
+            diagnostics[0]
+                .message
+                .contains("expected `net.ReadEntity`, got `net.ReadString`"),
+            eq(true)
+        );
+    }
 }
