@@ -1664,6 +1664,29 @@ end
 
             ---@param x number
             function Panel:SetWide(x) end
+
+            ---@param name string
+            ---@param func function
+            ---@param menu? table
+            function Panel:Receiver(name, func, menu) end
+
+            ---@param text string
+            function Panel:SetText(text) end
+
+            ---@class DPanel : Panel
+            local DPanel = {}
+
+            ---@param color table
+            function DPanel:SetBackgroundColor(color) end
+
+            vgui = vgui or {}
+
+            ---@generic T : Panel
+            ---@param classname `T`
+            ---@param parent? Panel
+            ---@param name? string
+            ---@return T
+            function vgui.Create(classname, parent, name) end
         "#;
 
     const VARARG_TOOLTIP_PATH: &str = "gamemodes/cityrp/gamemode/core/derma/cl_tooltip.lua";
@@ -1733,15 +1756,75 @@ end
     }
 
     #[gtest]
-    fn test_vararg_override_of_generic_base_method_takes_no_template_param() {
+    fn test_vararg_override_of_generic_base_method_takes_every_base_form() {
         let mut ws = VirtualWorkspace::new();
         panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
         let file_id = ws.def_file(VARARG_TOOLTIP_PATH, VARARG_TOOLTIP);
 
         expect_that!(
             vararg_override_param_types(&ws, file_id),
-            elements_are![eq(&LuaType::String), eq(&LuaType::String)]
+            elements_are![eq(&LuaType::Any), eq(&LuaType::Any)]
         );
+    }
+
+    #[gtest]
+    fn test_vararg_override_takes_every_remaining_base_param() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+        let file_id = ws.def_file(
+            "gamemodes/cityrp/gamemode/core/derma/cl_dropzone.lua",
+            r#"
+            DEFINE_BASECLASS("Panel")
+            PANEL = {}
+            function PANEL:Receiver(...)
+                BaseClass.Receiver(self, ...)
+            end
+        "#,
+        );
+
+        expect_that!(
+            vararg_override_param_types(&ws, file_id),
+            elements_are![eq(&LuaType::Any)]
+        );
+    }
+
+    #[gtest]
+    fn test_override_param_is_any_where_base_forms_disagree() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+
+        expect_true!(ws.check_file_for(
+            DiagnosticCode::ParamTypeMismatch,
+            "gamemodes/cityrp/gamemode/core/derma/cl_category.lua",
+            r#"
+            PANEL = {}
+            function PANEL:Add(strName)
+                local button = vgui.Create("Panel", self)
+                button:SetText(strName)
+                return button
+            end
+        "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_override_param_accepts_every_base_overload() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+
+        expect_true!(ws.check_file_for(
+            DiagnosticCode::AssignTypeMismatch,
+            "gamemodes/cityrp/plugins/images/library/ui_nstable.lua",
+            r#"
+            PANEL = {}
+            function PANEL:Add(comp)
+                if not comp then
+                    comp = vgui.Create("Panel")
+                end
+                return comp
+            end
+        "#,
+        ));
     }
 
     #[gtest]

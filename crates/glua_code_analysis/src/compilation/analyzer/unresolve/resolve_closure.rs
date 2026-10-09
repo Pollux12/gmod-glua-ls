@@ -582,7 +582,17 @@ fn resolve_closure_member_type(
 ) -> ResolveResult {
     match &member_type {
         LuaType::DocFunction(doc_func) => {
-            defer_resolve_doc_function(db, writes, closure_params.signature_id, doc_func, self_type)
+            let target = db
+                .get_signature_index()
+                .get(&closure_params.signature_id)
+                .ok_or(InferFailReason::None)?;
+            defer_resolve_doc_function(
+                db,
+                writes,
+                closure_params.signature_id,
+                &contract_for_target(db, target, doc_func),
+                self_type,
+            )
         }
         LuaType::Signature(id) => {
             if id == &closure_params.signature_id {
@@ -615,13 +625,20 @@ fn resolve_closure_member_type(
                 let source_return = signature.get_return_type();
                 let source_return_unsettled = is_unsettled_inferred_return(&source_return);
                 let source_id = *id;
-                let source_contract =
-                    contract_outside_signature(db, signature, source_return.clone());
+                let target = db
+                    .get_signature_index()
+                    .get(&closure_params.signature_id)
+                    .ok_or(InferFailReason::None)?;
+                let source_contract = Arc::new(contract_outside_signature(
+                    db,
+                    signature,
+                    source_return.clone(),
+                ));
                 let result = defer_resolve_doc_function(
                     db,
                     writes,
                     closure_params.signature_id,
-                    &source_contract,
+                    &contract_for_target(db, target, &source_contract),
                     self_type,
                 );
                 if result.is_ok() && source_return_unsettled {
@@ -639,9 +656,6 @@ fn resolve_closure_member_type(
                 .get_signature_index()
                 .get(&closure_params.signature_id)
                 .ok_or(InferFailReason::None)?;
-            let mut final_params = signature.get_type_params().to_vec();
-            let mut final_ret = LuaType::Never;
-
             let mut multi_function_type = Vec::new();
             for typ in union_types.into_vec() {
                 match typ {
@@ -667,54 +681,15 @@ fn resolve_closure_member_type(
                 };
             }
 
-            let mut variadic_type = LuaType::Unknown;
-            for doc_func in multi_function_type {
-                let mut doc_params = doc_func.get_params().to_vec();
-                match (doc_func.is_colon_define(), signature.is_colon_define) {
-                    (true, false) => {
-                        // The original signature is colon-defined but the unresolved one is not, so the first parameter must be inserted
-                        doc_params.insert(0, ("self".to_string(), Some(LuaType::SelfInfer)));
-                    }
-                    (false, true) => {
-                        // The original signature is not colon-defined but the unresolved one is, so the first parameter must be removed
-                        if !doc_params.is_empty() {
-                            doc_params.remove(0);
-                        }
-                    }
-                    _ => {}
-                }
-
-                for (idx, param) in doc_params.iter().enumerate() {
-                    if let Some(final_param) = final_params.get(idx) {
-                        if final_param.0 == "..." {
-                            // If the type of `doc_params` differs from the following parameters, `variadic_type` is `Any`
-                            for i in idx..doc_params.len() {
-                                if let Some(param) = doc_params.get(i)
-                                    && let Some(typ) = &param.1
-                                {
-                                    if variadic_type == LuaType::Unknown {
-                                        variadic_type = typ.clone();
-                                    } else if variadic_type != *typ {
-                                        variadic_type = LuaType::Any;
-                                    }
-                                }
-                            }
-
-                            break;
-                        }
-                        let new_type = match (&final_param.1, &param.1) {
-                            (Some(seen), Some(typ)) => TypeOps::Union.apply(db, seen, typ),
-                            (seen, typ) => seen
-                                .clone()
-                                .or_else(|| typ.clone())
-                                .unwrap_or(LuaType::Unknown),
-                        };
-                        final_params[idx] = (final_param.0.clone(), Some(new_type));
-                    } else {
-                        final_params.push((param.0.clone(), param.1.clone()));
-                    }
-                }
-
+            let final_params = merge_contract_params(
+                db,
+                signature.get_type_params(),
+                signature.is_colon_define,
+                &multi_function_type,
+                ParamMerge::Union,
+            );
+            let mut final_ret = LuaType::Never;
+            for doc_func in &multi_function_type {
                 final_ret = TypeOps::Union.apply(db, &final_ret, doc_func.get_ret());
             }
 
@@ -722,12 +697,6 @@ fn resolve_closure_member_type(
             // letting the seed reach the synthesized signature.
             if final_ret.is_never() {
                 final_ret = LuaType::Unknown;
-            }
-
-            if !variadic_type.is_unknown()
-                && let Some(param) = final_params.last_mut()
-            {
-                param.1 = Some(variadic_type);
             }
 
             defer_resolve_doc_function(
@@ -1053,18 +1022,40 @@ mod inferred_return_tail_tests {
 }
 
 /// `sig`'s params with `ret`, as a contract for a closure outside `sig`'s
-/// generic context.
+/// generic context, merged over all of `sig`'s forms.
 fn contract_outside_signature(db: &DbIndex, sig: &LuaSignature, ret: LuaType) -> LuaFunctionType {
-    let params = sig
-        .get_type_params()
-        .into_iter()
-        .map(|(name, typ)| {
-            (
-                name,
-                typ.map(|typ| instantiate_outside_signature(db, sig, &typ)),
-            )
+    let instantiate_params = |params: &[(String, Option<LuaType>)]| -> Vec<_> {
+        params
+            .iter()
+            .map(|(name, typ)| {
+                (
+                    name.clone(),
+                    typ.as_ref()
+                        .map(|typ| instantiate_outside_signature(db, sig, typ)),
+                )
+            })
+            .collect()
+    };
+    let overloads: Vec<_> = sig
+        .overloads
+        .iter()
+        .map(|overload| {
+            Arc::new(LuaFunctionType::new(
+                overload.get_async_state(),
+                overload.is_colon_define(),
+                overload.is_variadic(),
+                instantiate_params(overload.get_params()),
+                LuaType::Unknown,
+            ))
         })
         .collect();
+    let params = merge_contract_params(
+        db,
+        instantiate_params(&sig.get_type_params()),
+        sig.is_colon_define,
+        &overloads,
+        ParamMerge::Agreement,
+    );
     LuaFunctionType::new(
         sig.async_state,
         sig.is_colon_define,
@@ -1073,6 +1064,108 @@ fn contract_outside_signature(db: &DbIndex, sig: &LuaSignature, ret: LuaType) ->
         instantiate_outside_signature(db, sig, &ret),
     )
     .with_optional_params(sig.get_param_optional_flags())
+}
+
+/// `contract` as `target` takes it, by `target`'s own params.
+fn contract_for_target(
+    db: &DbIndex,
+    target: &LuaSignature,
+    contract: &Arc<LuaFunctionType>,
+) -> LuaFunctionType {
+    let target_params = target
+        .params
+        .iter()
+        .map(|name| (name.to_string(), None))
+        .collect();
+    LuaFunctionType::new(
+        contract.get_async_state(),
+        target.is_colon_define,
+        target.is_vararg,
+        merge_contract_params(
+            db,
+            target_params,
+            target.is_colon_define,
+            std::slice::from_ref(contract),
+            ParamMerge::Agreement,
+        ),
+        contract.get_ret().clone(),
+    )
+}
+
+/// How [`merge_contract_params`] settles a position its contracts type
+/// differently.
+#[derive(Clone, Copy)]
+enum ParamMerge {
+    /// The closure's own forms: the position takes any of their types.
+    Union,
+    /// A base's forms, for an override that declares none: the position is
+    /// `any`, as a `...` is over later positions that differ.
+    Agreement,
+}
+
+/// Merges `contracts` into the `params` of a closure defined with
+/// `is_colon_define`. A `...` takes every later position: their shared type,
+/// or `any` where they differ.
+fn merge_contract_params(
+    db: &DbIndex,
+    mut params: Vec<(String, Option<LuaType>)>,
+    is_colon_define: bool,
+    contracts: &[Arc<LuaFunctionType>],
+    merge: ParamMerge,
+) -> Vec<(String, Option<LuaType>)> {
+    let mut variadic_type = LuaType::Unknown;
+    for contract in contracts {
+        let mut contract_params = contract.get_params().to_vec();
+        match (contract.is_colon_define(), is_colon_define) {
+            (true, false) => {
+                // The original signature is colon-defined but the unresolved one is not, so the first parameter must be inserted
+                contract_params.insert(0, ("self".to_string(), Some(LuaType::SelfInfer)));
+            }
+            (false, true) => {
+                // The original signature is not colon-defined but the unresolved one is, so the first parameter must be removed
+                if !contract_params.is_empty() {
+                    contract_params.remove(0);
+                }
+            }
+            _ => {}
+        }
+
+        for (idx, param) in contract_params.iter().enumerate() {
+            if let Some(final_param) = params.get(idx) {
+                if final_param.0 == "..." {
+                    // If the type of `contract_params` differs from the following parameters, `variadic_type` is `Any`
+                    for later in &contract_params[idx..] {
+                        if let Some(typ) = &later.1 {
+                            if variadic_type == LuaType::Unknown {
+                                variadic_type = typ.clone();
+                            } else if variadic_type != *typ {
+                                variadic_type = LuaType::Any;
+                            }
+                        }
+                    }
+
+                    break;
+                }
+                let new_type = match (&final_param.1, &param.1) {
+                    (Some(seen), Some(typ)) if seen != typ => Some(match merge {
+                        ParamMerge::Union => TypeOps::Union.apply(db, seen, typ),
+                        ParamMerge::Agreement => LuaType::Any,
+                    }),
+                    (seen, typ) => seen.clone().or_else(|| typ.clone()),
+                };
+                params[idx] = (final_param.0.clone(), new_type);
+            } else {
+                params.push((param.0.clone(), param.1.clone()));
+            }
+        }
+    }
+
+    if !variadic_type.is_unknown()
+        && let Some(param) = params.last_mut()
+    {
+        param.1 = Some(variadic_type);
+    }
+    params
 }
 
 fn filter_signature_type(
