@@ -725,8 +725,10 @@ pub(crate) fn publish_unguarded_children(
             continue;
         };
         let node = LuaInferenceNodeId::Definition(definition);
+        // Every definition that reaches the same use files its fact under one
+        // event there, so the use is reported once.
         let event = LuaInferenceEventId {
-            node: node.clone(),
+            node: LuaInferenceNodeId::TypeOwner(crate::LuaTypeOwner::SyntaxId(source.clone())),
             kind: LuaInferenceProvenanceKind::UnguardedChild,
             source: source.clone(),
         };

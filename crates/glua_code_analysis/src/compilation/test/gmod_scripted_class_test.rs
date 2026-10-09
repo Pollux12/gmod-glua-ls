@@ -1673,6 +1673,10 @@ end
             ---@param text string
             function Panel:SetText(text) end
 
+            ---@param childIndex integer
+            ---@return Panel
+            function Panel:GetChild(childIndex) end
+
             ---@class DPanel : Panel
             local DPanel = {}
 
@@ -1824,6 +1828,40 @@ end
             end
         "#,
         ));
+    }
+
+    #[gtest]
+    fn test_unguarded_child_reached_by_two_definitions_reports_once() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::InferUnguardedChild);
+        let file_id = ws.def_file(
+            "gamemodes/cityrp/plugins/vehicles/cl_hooks.lua",
+            r#"
+            ---@param tooltip Panel
+            function UpdateRow(tooltip)
+                local row = tooltip:GetChild(0)
+                if not row then
+                    row = tooltip:GetChild(1)
+                end
+                row:SetBackgroundColor({})
+            end
+        "#,
+        );
+
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::InferUnguardedChild.get_name().to_string(),
+        ));
+        let found = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .count();
+        expect_that!(found, eq(1));
     }
 
     #[gtest]
