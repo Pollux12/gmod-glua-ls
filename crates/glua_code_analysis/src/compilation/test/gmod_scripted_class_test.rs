@@ -1808,6 +1808,25 @@ end
     }
 
     #[gtest]
+    fn test_any_argument_keeps_the_main_signature_return() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+
+        expect_true!(ws.check_file_for(
+            DiagnosticCode::InferUnguardedChild,
+            "gamemodes/cityrp/gamemode/core/derma/cl_any_child.lua",
+            r#"
+            ---@param parent Panel
+            ---@param child any
+            function AddAnyChild(parent, child)
+                local panel = parent:Add(child)
+                panel:SetBackgroundColor({})
+            end
+        "#,
+        ));
+    }
+
+    #[gtest]
     fn test_override_param_accepts_every_base_overload() {
         let mut ws = VirtualWorkspace::new();
         panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);

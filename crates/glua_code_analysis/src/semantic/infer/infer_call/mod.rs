@@ -965,10 +965,12 @@ fn infer_signature_doc_function(
             &fake_doc_function,
         ));
 
-        let resolved = resolve_signature(
+        let main_idx = new_overloads.len() - 1;
+        let (resolved, _) = crate::semantic::overload_resolve::resolve_signature_with_index(
             db,
             cache,
             new_overloads,
+            Some(main_idx),
             call_expr.clone(),
             is_generic,
             args_count,
@@ -1027,7 +1029,13 @@ pub(crate) fn signature_call_selects_declared_overload(
         .with_optional_params(signature.get_param_optional_flags()),
     ));
     crate::semantic::overload_resolve::resolve_signature_with_index(
-        db, cache, candidates, call_expr, is_generic, None,
+        db,
+        cache,
+        candidates,
+        Some(declared_overload_count),
+        call_expr,
+        is_generic,
+        None,
     )
     .is_ok_and(|(_, selected_idx)| selected_idx < declared_overload_count)
 }
