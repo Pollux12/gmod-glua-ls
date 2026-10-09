@@ -2574,4 +2574,37 @@ filter:SetUpdateOnType(true)
         );
     }
 
+    #[test]
+    fn assigned_member_path_is_not_unguarded_child_evidence() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@class AvatarImage: Panel
+            ---@field SetPaintedManually fun(self: AvatarImage, painted: boolean)
+            ---@class DFrame: Panel
+            ---@field Avatar AvatarImage
+
+            vgui = vgui or {}
+
+            ---@generic T : Panel
+            ---@param classname `T`
+            ---@param parent? Panel
+            ---@return T
+            function vgui.Create(classname, parent) end
+
+            ---@param pnl Panel
+            local function build(pnl)
+                pnl.Avatar = vgui.Create("AvatarImage", pnl)
+                pnl.Avatar:SetPaintedManually(true)
+            end
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            0
+        );
+    }
 }

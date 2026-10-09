@@ -509,6 +509,50 @@ impl FlowTree {
             .as_deref()
     }
 
+    /// Whether every live path back from `flow_id` meets a node that `settle`
+    /// answers `Some(true)` for before it meets one answering `Some(false)`, the
+    /// start of the flow, or a deferred closure's entry.
+    pub fn every_path_settles(
+        &self,
+        flow_id: FlowId,
+        mut settle: impl FnMut(&FlowNode) -> Option<bool>,
+    ) -> bool {
+        let mut pending = vec![flow_id];
+        let mut visited = HashSet::default();
+
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            let Some(node) = self.get_flow_node(current) else {
+                return false;
+            };
+            if let Some(settled) = settle(node) {
+                if settled {
+                    continue;
+                }
+                return false;
+            }
+
+            match node.kind {
+                FlowNodeKind::Unreachable | FlowNodeKind::Return | FlowNodeKind::Break => continue,
+                FlowNodeKind::Start | FlowNodeKind::ClosureEntry(_) => return false,
+                _ => {}
+            }
+            match node.antecedent {
+                Some(crate::FlowAntecedent::Single(antecedent)) => pending.push(antecedent),
+                Some(crate::FlowAntecedent::Multiple(index)) => {
+                    let Some(antecedents) = self.get_multi_antecedents(index) else {
+                        return false;
+                    };
+                    pending.extend(antecedents.iter().copied());
+                }
+                None => return false,
+            }
+        }
+        true
+    }
+
     pub fn reaching_definitions(
         &self,
         decl_id: LuaDeclId,

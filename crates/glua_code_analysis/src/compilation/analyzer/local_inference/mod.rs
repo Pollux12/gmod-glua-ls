@@ -13,14 +13,15 @@ use glua_parser::{
 use rustc_hash::FxHashSet;
 
 use crate::{
-    InFiled, LuaDefinitionId, LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
-    LuaInferenceProvenanceKind, LuaInferenceStep, LuaInferredGuardOwner, LuaInferredPositiveGuard,
-    LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType, LuaTypeDeclId, LuaTypeFact,
-    SignatureReturnStatus, TypeOps,
+    FlowNodeKind, InFiled, LuaDefinitionId, LuaInferenceConfidence, LuaInferenceEventId,
+    LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaInferenceStep, LuaInferredGuardOwner,
+    LuaInferredPositiveGuard, LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType, LuaTypeDeclId,
+    LuaTypeFact, SignatureReturnStatus, TypeOps,
     compilation::analyzer::AnalyzeContext,
     semantic::{
-        LuaInferCache, dynamic_field_type_without, infer_bind_value_type, infer_expr,
-        infer_true_condition_narrowing, resolve_dynamic_field_member,
+        LuaInferCache, VarRefId, dynamic_field_type_without, get_var_expr_var_ref_id,
+        infer_bind_value_type, infer_expr, infer_true_condition_narrowing,
+        resolve_dynamic_field_member,
     },
 };
 
@@ -1044,6 +1045,9 @@ fn collect_unguarded_child_file(
             ) {
                 continue;
             }
+            if member_path_assigned_before(db, &mut infer_cache, flow_tree, index_expr) {
+                continue;
+            }
             let Some(children) = nearest_subtypes_with_member(
                 db,
                 &mut subtypes_with_member,
@@ -1165,6 +1169,49 @@ fn collect_unguarded_child_file(
     }
 }
 
+/// Whether every path reaching `path` assigns that same access path first, so
+/// its value there is the assigned one rather than a lookup on the declared type.
+fn member_path_assigned_before(
+    db: &crate::DbIndex,
+    cache: &mut crate::LuaInferCache,
+    flow_tree: Option<&crate::FlowTree>,
+    path: &LuaIndexExpr,
+) -> bool {
+    let Some(flow_tree) = flow_tree else {
+        return false;
+    };
+    let (Some(flow_id), Some(root)) = (
+        flow_tree.get_flow_id(path.get_syntax_id()),
+        glua_parser::LuaChunk::cast(path.get_root()),
+    ) else {
+        return false;
+    };
+    let Some(path_ref) = get_var_expr_var_ref_id(db, cache, LuaExpr::IndexExpr(path.clone()))
+    else {
+        return false;
+    };
+    let root_ref = match &path_ref {
+        VarRefId::IndexRef(path_root, _) => path_root.as_decl_id().map(VarRefId::VarRef),
+        _ => None,
+    };
+    flow_tree.every_path_settles(flow_id, |node| {
+        let FlowNodeKind::Assignment(assignment, _) = &node.kind else {
+            return None;
+        };
+        let (vars, _) = assignment.to_node(&root)?.get_var_and_expr_list();
+        let mut assigns_path = false;
+        for var in vars {
+            let var_ref = get_var_expr_var_ref_id(db, cache, var.to_expr())?;
+            if var_ref == path_ref {
+                assigns_path = true;
+            } else if Some(&var_ref) == root_ref.as_ref() {
+                return Some(false);
+            }
+        }
+        assigns_path.then_some(true)
+    })
+}
+
 /// The next level of a member path, e.g. `self.Owner:ConCommand` from
 /// `self.Owner`.
 fn member_path_parent(receiver: &LuaIndexExpr) -> Option<LuaIndexExpr> {
@@ -1215,6 +1262,14 @@ fn collect_member_path_unguarded_child_evidence(
     let Some(prefix) = receiver.get_prefix_expr() else {
         return;
     };
+    if member_path_assigned_before(
+        db,
+        cache,
+        db.get_flow_index().get_flow_tree(&file_id),
+        receiver,
+    ) {
+        return;
+    }
     // At the first level the prefix is the root declaration, whose type is
     // already resolved for its whole reference set; reading it off the name
     // expression would run a flow walk per use, and the child lookup below rules
