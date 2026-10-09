@@ -5,7 +5,7 @@ use crate::{
     vfs::loader::normalize_path_for_ordering,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceImport {
     All,
     SubPaths(Vec<PathBuf>),

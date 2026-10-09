@@ -14,6 +14,7 @@ mod config;
 mod db_index;
 mod diagnostic;
 mod gamemode_base;
+mod gmod_workspace;
 mod library_collision;
 pub mod profile;
 pub mod progress;
@@ -29,6 +30,9 @@ pub use diagnostic::*;
 pub use gamemode_base::detect_gamemode_base_libraries;
 pub use glua_codestyle::*;
 use glua_parser::{LineIndex, LuaCallExpr, LuaSyntaxTree};
+pub use gmod_workspace::{
+    ALL_CUSTOM_GAMEMODES, BUILTIN_GAMEMODES, Gamemode, GmodTopology, UnpickedGamemodes,
+};
 pub use library_collision::LibraryDefinitionCollision;
 use lsp_types::Uri;
 pub use profile::Profile;

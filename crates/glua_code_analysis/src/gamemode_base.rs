@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 /// segments, drive prefixes, whitespace — is rejected to prevent a malicious
 /// `"base"` value (e.g. `../../etc`) from steering the detector at folders
 /// outside `gamemodes/`.
-fn is_valid_gamemode_name(name: &str) -> bool {
+pub(crate) fn is_valid_gamemode_name(name: &str) -> bool {
     if name.is_empty() || name == "." || name == ".." {
         return false;
     }
@@ -55,6 +55,24 @@ pub fn read_gamemode_base(txt_path: &Path) -> Option<String> {
     // Some authoring tools save .txt with a UTF-8 BOM. Strip it before parsing.
     let trimmed = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
     parse_base_field(trimmed)
+}
+
+/// A gamemode folder's manifest: `<name>/<name>.txt`, or else the first `.txt`
+/// in it, by name, that holds a KeyValues block (`helix-hl2rp/ixhl2rp.txt`).
+pub(crate) fn find_gamemode_manifest(dir: &Path) -> Option<PathBuf> {
+    preferred_manifest(dir).or_else(|| {
+        fallback_manifests(dir).into_iter().find(|path| {
+            std::fs::read_to_string(path).is_ok_and(|content| {
+                is_keyvalues_block(content.strip_prefix('\u{FEFF}').unwrap_or(&content))
+            })
+        })
+    })
+}
+
+/// Whether `input` opens with a named KeyValues block.
+fn is_keyvalues_block(input: &str) -> bool {
+    let mut tokens = Tokenizer::new(input);
+    matches!(tokens.next_token(), Some(Token::Word(_))) && tokens.next_token() == Some(Token::Open)
 }
 
 /// Detect base gamemode library paths for a single workspace root.
@@ -173,27 +191,39 @@ fn walk_chain(
     }
 }
 
-fn read_gamemode_folder_base(folder: &Path) -> Option<String> {
-    let name = folder.file_name()?.to_str()?;
-    let preferred = folder.join(format!("{name}.txt"));
-    if preferred.is_file() {
-        return read_gamemode_base(&preferred);
+/// The `"base"` of a gamemode folder: its `<name>.txt`, or else the first
+/// `.txt` in it, by name, that names one.
+pub(crate) fn read_gamemode_folder_base(folder: &Path) -> Option<String> {
+    match preferred_manifest(folder) {
+        Some(preferred) => read_gamemode_base(&preferred),
+        None => fallback_manifests(folder)
+            .iter()
+            .find_map(|path| read_gamemode_base(path)),
     }
+}
 
+fn preferred_manifest(folder: &Path) -> Option<PathBuf> {
+    let name = folder.file_name()?.to_str()?;
+    Some(folder.join(format!("{name}.txt"))).filter(|path| path.is_file())
+}
+
+fn fallback_manifests(folder: &Path) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(folder)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.is_file()
+                        && path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     candidates.sort();
-    candidates.iter().find_map(|path| read_gamemode_base(path))
+    candidates
 }
 
 fn canonicalize_or(p: &Path) -> PathBuf {
