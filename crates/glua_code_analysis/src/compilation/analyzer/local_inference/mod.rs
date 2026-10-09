@@ -1866,6 +1866,16 @@ fn type_has_visible_static_member_at_use(
     })
 }
 
+/// Whether a guard can name `id`: a class synthesized for an anonymous
+/// registration, such as a `vgui.RegisterTable` table, has no name in source.
+fn is_nameable(db: &crate::DbIndex, id: &LuaTypeDeclId) -> bool {
+    id.is_global()
+        || !db
+            .get_type_index()
+            .get_type_decl(id)
+            .is_some_and(|decl| decl.is_auto_generated())
+}
+
 /// Descendants already matched against a member key and access shape in this
 /// evaluation.
 type SubtypesWithMember =
@@ -1918,6 +1928,7 @@ fn nearest_subtypes_with_member(
                     },
                 )
                 .chain(dynamic_declarers)
+                .filter(|declarer| is_nameable(db, declarer))
                 .collect::<FxHashSet<_>>();
             let mut candidates = Vec::new();
             for declarer in declarers {
