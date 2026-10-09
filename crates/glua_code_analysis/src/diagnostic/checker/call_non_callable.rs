@@ -1,7 +1,7 @@
 use glua_parser::{LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr};
 use std::collections::BTreeSet;
 
-use crate::semantic::decl_value_expr;
+use crate::semantic::{infer_expr, semantic_decl_value};
 use crate::{
     DbIndex, DiagnosticCode, InferFailReason, InferGuard, LuaInferCache, LuaSemanticDeclId,
     LuaType, RenderLevel, SemanticDeclLevel, SemanticModel,
@@ -133,8 +133,13 @@ fn infer_call_target_type(
             Some(decl.get_id())
         })?;
 
-    let expr = decl_value_expr(db, decl_id)?;
-    semantic_model.infer_expr(expr).ok()
+    let (value_file_id, expr) = semantic_decl_value(db, LuaSemanticDeclId::LuaDecl(decl_id))?;
+    if value_file_id == file_id {
+        return semantic_model.infer_expr(expr).ok();
+    }
+    let config = semantic_model.get_cache().borrow_mut().get_config().clone();
+    let mut value_cache = LuaInferCache::new(value_file_id, config);
+    infer_expr(db, &mut value_cache, expr).ok()
 }
 
 fn has_non_callable_member(db: &DbIndex, typ: &LuaType) -> bool {
