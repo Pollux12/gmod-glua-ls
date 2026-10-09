@@ -1225,4 +1225,21 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn two_unknown_arguments_pick_the_overload_that_fits_their_count() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/insert-unknown.lua",
+            r#"
+            local settings = {}
+            function AddTeam(a, b, name)
+                local n = name
+                table.insert(settings[a][b]["Teams"], n)
+            end
+            "#,
+        );
+
+        assert!(diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown).is_empty());
+    }
 }

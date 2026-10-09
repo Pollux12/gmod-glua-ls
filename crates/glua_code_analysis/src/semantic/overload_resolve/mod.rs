@@ -107,7 +107,7 @@ fn args_carry_no_evidence(
                     || main.is_param_optional(idx + receiver_params)
                     || param_type
                         .as_ref()
-                        .is_none_or(|param_type| param_type.is_any() || param_type.is_nullable())
+                        .is_some_and(|param_type| param_type.is_nullable())
             });
     !args.is_empty()
         && takes_every_arg
