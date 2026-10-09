@@ -915,6 +915,31 @@ mod test {
     }
 
     #[gtest]
+    fn test_mapped_emitter_call_is_collected_without_hook_text() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .hook_mappings
+            .emitter_to_hook
+            .insert("bus.Fire".to_string(), "*".to_string());
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def(r#"bus.Fire("MappedFire")"#);
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_hook_file_metadata(&file_id)
+            .cloned()
+            .expect("expected hook metadata");
+
+        assert!(metadata.sites.iter().any(|site| {
+            site.kind == GmodHookKind::Emit && site.hook_name.as_deref() == Some("MappedFire")
+        }));
+    }
+
+    #[gtest]
     fn test_hook_detection_respects_hook_mappings() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

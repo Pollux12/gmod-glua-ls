@@ -133,8 +133,18 @@ fn scan_gmod_keywords(
         || content.contains("gmod.gamemode");
     let has_load_annotation = content.contains("gmod.load");
     let annotated_candidates = annotated_global_call_roles.candidate_presence(db, file_id);
+    let calls_configured_emitter = db
+        .get_emmyrc()
+        .gmod
+        .hook_mappings
+        .emitter_to_hook
+        .keys()
+        .any(|emitter_path| content.contains(configured_call_name(emitter_path)));
     GmodKeywords {
-        has_hook: content.contains("hook") || has_hook_annotation || annotated_candidates.has_hook,
+        has_hook: content.contains("hook")
+            || has_hook_annotation
+            || annotated_candidates.has_hook
+            || calls_configured_emitter,
         has_system_call: content.contains("timer.")
             || content.contains("concommand")
             || content.contains("ConVar")
@@ -8717,6 +8727,10 @@ fn vgui_parent_call_source(
             field_args,
         ),
     }
+}
+
+fn configured_call_name(path: &str) -> &str {
+    path.rsplit(['.', ':']).next().unwrap_or(path)
 }
 
 fn matches_configured_call_path(path: &str, target: &str) -> bool {
