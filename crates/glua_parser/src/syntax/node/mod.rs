@@ -275,6 +275,7 @@ impl LuaAstNode for LuaAst {
                 | LuaSyntaxKind::DocTagCast
                 | LuaSyntaxKind::DocTagSource
                 | LuaSyntaxKind::DocTagSchema
+                | LuaSyntaxKind::DocTagAttributeUse
                 | LuaSyntaxKind::DocTagOther
                 | LuaSyntaxKind::DocTagNamespace
                 | LuaSyntaxKind::DocTagUsing
