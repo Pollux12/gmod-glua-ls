@@ -1044,9 +1044,13 @@ fn collect_unguarded_child_file(
             ) {
                 continue;
             }
-            let Some(children) =
-                nearest_subtypes_with_member(db, &mut subtypes_with_member, &base_id, &member_key)
-            else {
+            let Some(children) = nearest_subtypes_with_member(
+                db,
+                &mut subtypes_with_member,
+                &base_id,
+                &member_key,
+                member_path_parent(index_expr).is_some(),
+            ) else {
                 continue;
             };
 
@@ -1258,6 +1262,7 @@ fn collect_member_path_unguarded_child_evidence(
             resolved
         }
     };
+    let indexed_into = member_path_parent(index_expr).is_some();
     let base_has_visible_member = |base_id: &LuaTypeDeclId| {
         type_has_visible_member_at_use(
             db,
@@ -1278,6 +1283,7 @@ fn collect_member_path_unguarded_child_evidence(
                     evidence.subtypes_with_member,
                     &base_id,
                     &member_key,
+                    indexed_into,
                 )
                 .is_none()
             {
@@ -1311,9 +1317,13 @@ fn collect_member_path_unguarded_child_evidence(
             (base_id, current)
         }
     };
-    let Some(children) =
-        nearest_subtypes_with_member(db, evidence.subtypes_with_member, &base_id, &member_key)
-    else {
+    let Some(children) = nearest_subtypes_with_member(
+        db,
+        evidence.subtypes_with_member,
+        &base_id,
+        &member_key,
+        indexed_into,
+    ) else {
         return;
     };
     if is_matching_short_circuit_guard(db, cache, index_expr) {
@@ -1801,8 +1811,10 @@ fn type_has_visible_static_member_at_use(
     })
 }
 
-/// Descendants already matched against a member key in this evaluation.
-type SubtypesWithMember = FxHashMap<(LuaTypeDeclId, LuaMemberKey), Option<Arc<[LuaTypeDeclId]>>>;
+/// Descendants already matched against a member key and access shape in this
+/// evaluation.
+type SubtypesWithMember =
+    FxHashMap<(LuaTypeDeclId, LuaMemberKey, bool), Option<Arc<[LuaTypeDeclId]>>>;
 
 #[cfg(test)]
 thread_local! {
@@ -1813,14 +1825,17 @@ thread_local! {
 /// or a direct dynamic field, ordered by name: a declaring class hides its own descendants, which inherit
 /// the member from it. Found from the classes that declare the key, walking
 /// up, so the cost does not depend on how many classes derive from the base.
-/// `None` when there are none.
+/// When the use indexes into the member's value (`indexed_into`), a class that
+/// declares the member only as a function cannot be the receiver. `None` when
+/// there are none.
 fn nearest_subtypes_with_member(
     db: &crate::DbIndex,
     memo: &mut SubtypesWithMember,
     base_id: &LuaTypeDeclId,
     member_key: &LuaMemberKey,
+    indexed_into: bool,
 ) -> Option<Arc<[LuaTypeDeclId]>> {
-    memo.entry((base_id.clone(), member_key.clone()))
+    memo.entry((base_id.clone(), member_key.clone(), indexed_into))
         .or_insert_with(|| {
             #[cfg(test)]
             DECLARER_LOOKUPS.with(|scans| scans.set(scans.get() + 1));
@@ -1834,6 +1849,13 @@ fn nearest_subtypes_with_member(
             let declarers = member_index
                 .get_current_members_for_key(member_key)
                 .into_iter()
+                .filter(|member| {
+                    !indexed_into
+                        || !db
+                            .get_type_index()
+                            .get_type_cache(&crate::LuaTypeOwner::Member(member.get_id()))
+                            .is_some_and(|cache| cache.as_type().is_function())
+                })
                 .filter_map(
                     |member| match member_index.get_member_owner(&member.get_id()) {
                         Some(LuaMemberOwner::Type(owner_id)) => Some(owner_id.clone()),

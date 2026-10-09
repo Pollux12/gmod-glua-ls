@@ -2527,4 +2527,51 @@ filter:SetUpdateOnType(true)
             "{unguarded:?}"
         );
     }
+
+    #[test]
+    fn child_method_is_not_a_candidate_for_a_field_indexed_into() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class D: Base
+            ---@field Thing fun(self: D)
+
+            ---@param base Base
+            local function use(base)
+                base.Thing:Other()
+            end
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            0
+        );
+    }
+
+    #[test]
+    fn child_method_is_still_a_candidate_for_a_method_call() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class D: Base
+            ---@field Thing fun(self: D)
+
+            ---@param base Base
+            local function use(base)
+                base:Thing()
+            end
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            1
+        );
+    }
+
 }
