@@ -295,7 +295,7 @@ mod tests {
                 lsp_types::ClientCapabilities::default(),
             );
             let snapshot = context.snapshot();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_watched_deletion");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_watched_deletion");
             let data_uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/sh_data.lua"))
                 .expect("data URI should parse");
             let data = {
@@ -348,7 +348,7 @@ mod tests {
                 lsp_types::ClientCapabilities::default(),
             );
             let snapshot = context.snapshot();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_changed_on_disk");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_changed_on_disk");
             let data_uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/sh_data.lua"))
                 .expect("data URI should parse");
             let data = {

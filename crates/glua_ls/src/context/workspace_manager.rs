@@ -3061,7 +3061,7 @@ mod reload_tests {
     #[test]
     fn only_config_files_directly_in_a_workspace_root_are_loaded() {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-        let root = std::env::temp_dir().join("glua_ls_reload_config_location");
+        let root = crate::util::unique_temp_dir("glua_ls_reload_config_location");
         let (connection, _peer) = Connection::memory();
         runtime.block_on(async {
             let context = ServerContext::new(connection, ClientCapabilities::default());
@@ -3072,7 +3072,7 @@ mod reload_tests {
             assert!(manager.is_workspace_config_file(&uri(&root, ".gluarc.json")));
             assert!(!manager.is_workspace_config_file(&uri(&root, "lua/.luarc.json")));
             assert!(!manager.is_workspace_config_file(&uri(
-                &std::env::temp_dir().join("glua_ls_reload_elsewhere"),
+                &crate::util::unique_temp_dir("glua_ls_reload_elsewhere"),
                 ".emmyrc.json"
             )));
         });

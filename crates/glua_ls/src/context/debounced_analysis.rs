@@ -1434,7 +1434,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_idle_debounce_schedule");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_idle_debounce_schedule");
             analysis.add_main_workspace(workspace.clone());
             let uri = file_path_to_uri(&workspace.join("lua/autorun/shared/edited.lua"))
                 .expect("URI should parse");
@@ -1542,7 +1542,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_edited_first");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_debounced_edited_first");
             analysis.add_main_workspace(workspace.clone());
             analysis
                 .diagnostic
@@ -1591,7 +1591,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_edited_escape");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_debounced_edited_escape");
             analysis.add_main_workspace(workspace.clone());
             let uri = file_path_to_uri(&workspace.join("lua/edited_escape/edited.lua"))
                 .expect("URI should parse");
@@ -1848,7 +1848,7 @@ mod tests {
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
             let workspace =
-                std::env::temp_dir().join("gmod_glua_ls_debounced_shared_diagnostic_cache");
+                crate::util::unique_temp_dir("gmod_glua_ls_debounced_shared_diagnostic_cache");
             analysis.add_main_workspace(workspace.clone());
             analysis
                 .diagnostic
@@ -1992,7 +1992,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_rename_refresh");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_debounced_rename_refresh");
             analysis.add_main_workspace(workspace.clone());
             analysis
                 .diagnostic
@@ -2086,7 +2086,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_expedite");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_debounced_expedite");
             analysis.add_main_workspace(workspace.clone());
             let uri = file_path_to_uri(&workspace.join("lua/autorun/shared/edited.lua"))
                 .expect("URI should parse");
@@ -2155,7 +2155,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_at_once");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_debounced_at_once");
             analysis.add_main_workspace(workspace.clone());
             let uri = file_path_to_uri(&workspace.join("lua/autorun/shared/on_disk.lua"))
                 .expect("URI should parse");
@@ -2223,7 +2223,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_untouched");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_debounced_untouched");
             analysis.add_main_workspace(workspace.clone());
             let edited = file_path_to_uri(&workspace.join("lua/autorun/shared/edited.lua"))
                 .expect("URI should parse");
@@ -2323,7 +2323,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_refused");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_debounced_refused");
             analysis.add_main_workspace(workspace.clone());
             let uri = file_path_to_uri(&workspace.join("lua/autorun/shared/edited.lua"))
                 .expect("URI should parse");
@@ -2389,7 +2389,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_ripple_sideband");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_debounced_ripple_sideband");
             analysis.add_main_workspace(workspace.clone());
 
             let provider_uri = file_path_to_uri(&workspace.join("lua/chain/provider.lua"))
@@ -2476,7 +2476,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_settled_wait");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_debounced_settled_wait");
             analysis.add_main_workspace(workspace.clone());
             let provider_uri = file_path_to_uri(&workspace.join("lua/settle/provider.lua"))
                 .expect("provider URI should parse");
@@ -2541,7 +2541,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_untaken");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_debounced_untaken");
             analysis.add_main_workspace(workspace.clone());
             let uri = file_path_to_uri(&workspace.join("lua/untaken/edited.lua"))
                 .expect("URI should parse");
@@ -2597,7 +2597,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_preempt");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_debounced_preempt");
             analysis.add_main_workspace(workspace.clone());
             analysis
                 .diagnostic
@@ -2654,7 +2654,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_passive");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_debounced_passive");
             analysis.add_main_workspace(workspace.clone());
             let uri = file_path_to_uri(&workspace.join("lua/autorun/shared/edited.lua"))
                 .expect("URI should parse");
@@ -2900,7 +2900,7 @@ mod tests {
         runtime.block_on(async {
             let mut analysis = EmmyLuaAnalysis::new();
             analysis.compilation.set_detached_tasks(true);
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_debounced_slice_panic");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_debounced_slice_panic");
             analysis.add_main_workspace(workspace.clone());
             analysis
                 .diagnostic

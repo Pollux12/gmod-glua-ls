@@ -1209,7 +1209,7 @@ mod test {
             .diagnostic
             .enable_only(DiagnosticCode::UndefinedField);
 
-        let root = std::env::temp_dir().join("gmod_glua_ls_ix_type_batch");
+        let root = crate::test_lib::unique_temp_dir("gmod_glua_ls_ix_type_batch");
         let helix_root = root.join("garrysmod/gamemodes/helix");
         let schema_root = root.join("garrysmod/gamemodes/helix-hl2rp");
         analysis.add_library_workspace(helix_root.clone());

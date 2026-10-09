@@ -899,7 +899,7 @@ mod tests {
         runtime.block_on(async {
             let context = ServerContext::new(connection, ClientCapabilities::default());
             let snapshot = context.snapshot();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_diagnostic_store");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_diagnostic_store");
             let uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/store_test.lua"))
                 .expect("file URI should parse");
             let file_id = {
@@ -944,7 +944,7 @@ mod tests {
         runtime.block_on(async {
             let context = ServerContext::new(connection, ClientCapabilities::default());
             let snapshot = context.snapshot();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_diagnostic_store_panic");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_diagnostic_store_panic");
             let uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/panics.lua"))
                 .expect("file URI should parse");
             let file_id = {
@@ -988,7 +988,7 @@ mod tests {
         runtime.block_on(async {
             let context = ServerContext::new(connection, ClientCapabilities::default());
             let snapshot = context.snapshot();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_diagnostic_store_version");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_diagnostic_store_version");
             let open_uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/open.lua"))
                 .expect("file URI should parse");
             let closed_uri =
@@ -1034,7 +1034,7 @@ mod tests {
         runtime.block_on(async {
             let context = ServerContext::new(connection, ClientCapabilities::default());
             let snapshot = context.snapshot();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_diagnostic_store_reopen");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_diagnostic_store_reopen");
             let uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/opened.lua"))
                 .expect("file URI should parse");
             let file_id = {
@@ -1072,7 +1072,7 @@ mod tests {
         runtime.block_on(async {
             let context = ServerContext::new(connection, ClientCapabilities::default());
             let snapshot = context.snapshot();
-            let workspace = std::env::temp_dir().join("gmod_glua_ls_diagnostic_store_staged");
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_diagnostic_store_staged");
             let uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/staged.lua"))
                 .expect("file URI should parse");
             let file_id = {

@@ -12,3 +12,10 @@ pub use module_name_convert::{
     file_name_convert, module_name_convert, to_camel_case, to_pascal_case, to_snake_case,
 };
 pub use time_cancel_token::time_cancel_token;
+
+#[cfg(test)]
+pub(crate) fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{}-{id}", std::process::id()))
+}

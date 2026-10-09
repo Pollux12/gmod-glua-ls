@@ -273,7 +273,7 @@ mod tests {
     #[gtest]
     fn concurrent_diagnostic_pulls_share_the_first_precompute() {
         let mut analysis = EmmyLuaAnalysis::new();
-        let workspace = std::env::temp_dir().join("gmod_glua_ls_concurrent_shared_diagnostics");
+        let workspace = crate::util::unique_temp_dir("gmod_glua_ls_concurrent_shared_diagnostics");
         analysis.add_main_workspace(workspace.clone());
         for i in 0..8 {
             let uri = file_path_to_uri(&workspace.join(format!("lua/autorun/shared_{i}.lua")))
@@ -351,7 +351,7 @@ mod tests {
     #[gtest]
     fn single_file_diagnostics_use_shared_workspace_data() -> Result<()> {
         let mut analysis = EmmyLuaAnalysis::new();
-        let workspace = std::env::temp_dir().join("gmod_glua_ls_shared_single_file_diagnostics");
+        let workspace = crate::util::unique_temp_dir("gmod_glua_ls_shared_single_file_diagnostics");
         analysis.add_main_workspace(workspace.clone());
 
         let mut emmyrc = Emmyrc::default();

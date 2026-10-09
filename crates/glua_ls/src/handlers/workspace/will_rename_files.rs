@@ -89,7 +89,7 @@ mod tests {
         files: &[(&str, &str)],
         renames: &[(&str, &str)],
     ) -> (std::path::PathBuf, Option<WorkspaceEdit>) {
-        let root = std::env::temp_dir().join("gmod_glua_ls_will_rename");
+        let root = crate::util::unique_temp_dir("gmod_glua_ls_will_rename");
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         let (connection, _peer) = lsp_server::Connection::memory();
         let edit = runtime.block_on(async {

@@ -1109,3 +1109,10 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{}-{id}", std::process::id()))
+}

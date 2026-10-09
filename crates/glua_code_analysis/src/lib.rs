@@ -952,7 +952,8 @@ mod tests {
 
     #[test]
     fn diagnostic_file_ids_are_prioritized_by_source_size_then_file_id() {
-        let workspace = std::env::temp_dir().join("gmod_glua_ls_diagnostic_priority_workspace");
+        let workspace =
+            crate::test_lib::unique_temp_dir("gmod_glua_ls_diagnostic_priority_workspace");
         let make_uri = |name: &str| {
             Uri::parse_from_file_path(&workspace.join(name)).expect("uri should parse")
         };
@@ -991,7 +992,7 @@ mod tests {
     }
 
     fn test_workspace_and_uri() -> (PathBuf, Uri) {
-        let workspace = std::env::temp_dir().join("gmod_glua_ls_analysis_test_workspace");
+        let workspace = crate::test_lib::unique_temp_dir("gmod_glua_ls_analysis_test_workspace");
         let test_file = workspace.join("test.lua");
         let uri = Uri::parse_from_file_path(&test_file).expect("uri should parse");
         (workspace, uri)
@@ -1064,8 +1065,8 @@ mod tests {
             Uri::parse_from_file_path(&file).expect("uri should parse")
         };
 
-        let workspace_a = std::env::temp_dir().join("gmod_glua_ls_stable_ids_a");
-        let workspace_b = std::env::temp_dir().join("gmod_glua_ls_stable_ids_b");
+        let workspace_a = crate::test_lib::unique_temp_dir("gmod_glua_ls_stable_ids_a");
+        let workspace_b = crate::test_lib::unique_temp_dir("gmod_glua_ls_stable_ids_b");
 
         let mut analysis_a = EmmyLuaAnalysis::new();
         analysis_a.add_main_workspace(workspace_a.clone());
@@ -1112,9 +1113,9 @@ mod tests {
     #[test]
     fn multi_file_batch_reindex_matches_clean_build_diagnostics() {
         let incremental_workspace =
-            std::env::temp_dir().join("gmod_glua_ls_batch_reindex_incremental_workspace");
+            crate::test_lib::unique_temp_dir("gmod_glua_ls_batch_reindex_incremental_workspace");
         let clean_workspace =
-            std::env::temp_dir().join("gmod_glua_ls_batch_reindex_clean_workspace");
+            crate::test_lib::unique_temp_dir("gmod_glua_ls_batch_reindex_clean_workspace");
         let uris = |workspace: &PathBuf| {
             ["producer.lua", "consumer.lua", "helper.lua"].map(|name| {
                 Uri::parse_from_file_path(&workspace.join(name)).expect("uri should parse")
