@@ -8,6 +8,7 @@ use crate::{
     db_index::{
         DbIndex, LuaGenericType, LuaIntersectionType, LuaMemberKey, LuaObjectType,
         LuaOperatorMetaMethod, LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType,
+        member_id_sort_key,
     },
     infer_expr, instantiate_type_generic,
     semantic::{InferGuard, visible_super_types_in_workspace_for_file_at_offset},
@@ -575,9 +576,17 @@ fn find_member_by_index_table(
             let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
             if let LuaIndexKey::Expr(expr) = index_key {
                 let key_type = infer_expr(db, cache, expr.clone())?;
-                let members = db
-                    .get_member_index()
-                    .get_members(&LuaMemberOwner::Element(table_range.clone()));
+                let owner = LuaMemberOwner::Element(table_range.clone());
+                let member_index = db.get_member_index();
+                let members = match LuaMemberKey::from_expr_type(key_type.clone()) {
+                    // A constant key names one entry, whatever its siblings hold.
+                    key @ (LuaMemberKey::Integer(_) | LuaMemberKey::Name(_)) => {
+                        let mut members = member_index.get_members_for_owner_key(&owner, &key);
+                        members.sort_by_key(|member| member_id_sort_key(member.get_id()));
+                        Some(members)
+                    }
+                    _ => member_index.get_members(&owner),
+                };
                 if let Some(members) = members {
                     let mut result_type = LuaType::Never;
                     for member in members {

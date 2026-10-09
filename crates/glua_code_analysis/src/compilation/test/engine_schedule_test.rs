@@ -361,4 +361,33 @@ end
         assert!(reads.contains(&&FactKey::FunctionSummaries(lib)));
         assert!(!reads.contains(&&FactKey::References(lib)));
     }
+
+    /// Handlers stored in a shared table under constants a later file
+    /// defines: each handler's key lands as its constant does.
+    fn command_table_workspace(commands: usize) -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        let handlers = (0..commands)
+            .map(|index| {
+                format!("commands[Lib.CMD_{index}] = function()\n    local value = {index}\nend\n")
+            })
+            .collect::<String>();
+        let handlers = format!("local commands = Lib.Commands\n{handlers}");
+        let constants = (0..commands)
+            .map(|index| format!("Lib.CMD_{index} = {index}\n"))
+            .collect::<String>();
+        ws.def_files(vec![
+            ("lua/autorun/a_lib.lua", "Lib = {}\nLib.Commands = {}\n"),
+            ("lua/autorun/client/cl_commands.lua", &handlers),
+            ("lua/autorun/sh_constants.lua", &constants),
+        ]);
+        ws
+    }
+
+    #[test]
+    fn a_handler_under_a_constant_key_runs_a_few_times_however_many_siblings_land() {
+        let _serial = crate::compilation::analyzer::serial_engine();
+        let ws = command_table_workspace(24);
+
+        assert!(ws.analysis.compilation.last_stats().most_runs() <= 4);
+    }
 }

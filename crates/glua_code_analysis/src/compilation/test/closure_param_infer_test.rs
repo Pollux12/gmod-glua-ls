@@ -1800,4 +1800,28 @@ mod test {
         assert_eq!(ws.humanize_type(ply), ws.humanize_type(player_type));
         assert_eq!(ws.humanize_type(ent), ws.humanize_type(entity_type));
     }
+
+    #[test]
+    fn a_handler_under_a_constant_key_takes_no_param_type_from_a_sibling_handler() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            Lib = {}
+            Lib.CMD_TEXT = 2
+            Lib.CMD_VALUE = 1
+
+            ---@param text string
+            local function on_text(text) end
+
+            local handlers = {}
+            handlers[Lib.CMD_TEXT] = on_text
+            handlers[Lib.CMD_VALUE] = function(value)
+                first_handler_value = value
+            end
+            "#,
+        );
+
+        let ty = ws.expr_ty("first_handler_value");
+        assert_ne!(ws.humanize_type(ty), "string");
+    }
 }
