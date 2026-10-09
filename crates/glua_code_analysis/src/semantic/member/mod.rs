@@ -1121,7 +1121,12 @@ fn resolve_dynamic_field_uncached(
     if definitions.is_empty() {
         return None;
     }
-    Some(dynamic_field_definitions_type(db, cache, definitions))
+    Some(dynamic_field_definitions_type(
+        db,
+        cache,
+        definitions,
+        false,
+    ))
 }
 
 /// What `field_name` holds on `prefix_type` at `access_position`, from every
@@ -1155,15 +1160,19 @@ pub(crate) fn dynamic_field_type_without(
     if kept.is_empty() {
         return Some(None);
     }
-    Some(Some(dynamic_field_definitions_type(db, cache, kept).0))
+    Some(Some(
+        dynamic_field_definitions_type(db, cache, kept, true).0,
+    ))
 }
 
 /// The type the dynamic writers `definitions` give a field, with the member
-/// the first of them names.
+/// the first of them names. `informative_only` leaves out writers whose value
+/// is `any` or `unknown`, which say nothing of the field.
 fn dynamic_field_definitions_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     definitions: Vec<VisibleDynamicFieldDefinition>,
+    informative_only: bool,
 ) -> (LuaType, Option<LuaSemanticDeclId>) {
     let mut member_types = Vec::new();
     let mut semantic_decl = None;
@@ -1175,7 +1184,9 @@ fn dynamic_field_definitions_type(
         if semantic_decl.is_none() {
             semantic_decl = Some(LuaSemanticDeclId::Member(member_id));
         }
-        if let Some(typ) = dynamic_field_member_type(db, cache, &member_id) {
+        if let Some(typ) = dynamic_field_member_type(db, cache, &member_id)
+            && !(informative_only && matches!(typ, LuaType::Any | LuaType::Unknown))
+        {
             member_types.push(typ);
             if definition.visibility == DynamicFieldDefinitionVisibility::Runtime {
                 has_runtime_type = true;

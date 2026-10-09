@@ -1242,4 +1242,49 @@ mod tests {
 
         assert!(diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown).is_empty());
     }
+
+    #[test]
+    fn unresolved_writers_are_no_evidence_for_a_stored_local() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/aaa_annotations/panel.lua",
+            r#"
+            ---@class Panel
+            Panel = Panel or {}
+            ---@generic T : Panel
+            ---@param className `T`
+            ---@return (instance) T
+            function Panel:Add(className) end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/other_writers.lua",
+            r#"
+            ---@param panel Panel
+            ---@param anything any
+            function OtherWriters(panel, anything)
+                panel.id = anything
+                panel.id = 5
+            end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/stored_local.lua",
+            r#"
+            ---@param row Panel
+            function StoreKey(row)
+                local key = UndefinedPlugins.loaded
+                row.id = key
+            end
+
+            ---@param row Panel
+            function StoreUnloadedKey(row)
+                local unloaded = UndefinedPlugins.unloaded
+                row.id = unloaded
+            end
+            "#,
+        );
+
+        assert_eq!(local_type(&ws, file_id, "key"), LuaType::IntegerConst(5));
+    }
 }
