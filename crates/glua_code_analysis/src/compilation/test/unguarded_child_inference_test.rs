@@ -2936,6 +2936,33 @@ filter:SetUpdateOnType(true)
         );
     }
 
+    /// A field the variable is given through a cast is evidence of what the
+    /// variable may be: an unguarded read of it before the cast is reported.
+    #[test]
+    fn a_field_written_under_a_cast_names_the_child_for_an_earlier_read() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class ReadCar: Entity
+
+            ---@param ent Entity
+            local function stamp(ent)
+                local before = ent.Boost
+                ---@cast ent ReadCar
+                ent.Boost = 1
+                return before
+            end
+            return stamp
+            "#,
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            1
+        );
+    }
+
     #[test]
     fn a_member_check_on_a_replaced_entity_table_does_not_guard_the_entity() {
         assert_eq!(
