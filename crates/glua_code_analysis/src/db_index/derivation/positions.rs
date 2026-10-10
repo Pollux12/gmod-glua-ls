@@ -306,11 +306,16 @@ fn any_thread_mapping_back() -> bool {
     MAPPING_BACK.load(Ordering::Relaxed) != 0
 }
 
+/// How many threads are hashing with positions set aside
+/// ([`hash_apart_from_positions`]): the same guard for that lookup.
+static SETTING_ASIDE: AtomicUsize = AtomicUsize::new(0);
+
 thread_local! {
     static BACK_MAPS: RefCell<Option<EditMaps>> = const { RefCell::new(None) };
     static HASHING: Cell<bool> = const { Cell::new(false) };
     static FINGERPRINTING: Cell<bool> = const { Cell::new(false) };
     static FACT_FILE: Cell<Option<FileId>> = const { Cell::new(None) };
+    static SET_ASIDE: RefCell<Option<Vec<u64>>> = const { RefCell::new(None) };
 }
 
 /// Runs `f` with `file_id` as the file whose positions bare ranges, offsets
@@ -395,6 +400,65 @@ pub(super) fn hash_value<T: Hash + ?Sized, H: Hasher>(value: &T, state: &mut H) 
     value.hash(state);
 }
 
+/// Hashes `value` as a fingerprint does but with every position it names left
+/// out, and returns that hash with the positions, each packed file-major, in
+/// the order it named them. An edit that only moves positions leaves the hash
+/// as it is and the positions in the same order.
+pub fn hash_apart_from_positions<T: Hash + ?Sized>(value: &T) -> (u64, Vec<u64>) {
+    let outer = SET_ASIDE.with(|positions| positions.replace(Some(Vec::new())));
+    let fingerprinting = FINGERPRINTING.with(|flag| flag.replace(true));
+    SETTING_ASIDE.fetch_add(1, Ordering::Relaxed);
+    let mut state = std::collections::hash_map::DefaultHasher::new();
+    {
+        let _restore = super::OnDrop(|| {
+            SETTING_ASIDE.fetch_sub(1, Ordering::Relaxed);
+            FINGERPRINTING.with(|flag| flag.set(fingerprinting));
+        });
+        value.hash(&mut state);
+    }
+    let positions = SET_ASIDE.with(|positions| positions.replace(outer));
+    (state.finish(), positions.unwrap_or_default())
+}
+
+/// Sets a position of `file_id` aside instead of hashing it, inside
+/// [`hash_apart_from_positions`]. Returns whether it did.
+fn set_aside(file_id: FileId, offset: u32) -> bool {
+    if SETTING_ASIDE.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    SET_ASIDE.with(|positions| {
+        let mut positions = positions.borrow_mut();
+        let Some(positions) = positions.as_mut() else {
+            return false;
+        };
+        positions.push((u64::from(file_id.id) << 32) | u64::from(offset));
+        true
+    })
+}
+
+/// Where a positional identity starts.
+trait Offset {
+    fn offset(&self) -> u32;
+}
+
+impl Offset for TextSize {
+    fn offset(&self) -> u32 {
+        u32::from(*self)
+    }
+}
+
+impl Offset for TextRange {
+    fn offset(&self) -> u32 {
+        u32::from(self.start())
+    }
+}
+
+impl Offset for LuaSyntaxId {
+    fn offset(&self) -> u32 {
+        u32::from(self.get_range().start())
+    }
+}
+
 /// What a positional identity in `file_id` hashes as right now: `None` to
 /// hash it as it is.
 fn mapped<T>(file_id: FileId, map: impl FnOnce(&EditMaps) -> Option<T>) -> Option<Option<T>> {
@@ -410,12 +474,15 @@ fn mapped<T>(file_id: FileId, map: impl FnOnce(&EditMaps) -> Option<T>) -> Optio
 
 /// Hashes a position of `file_id`, or a lost marker when it has no pre-edit
 /// image.
-fn hash_mapped<T: Hash, H: Hasher>(
+fn hash_mapped<T: Hash + Offset, H: Hasher>(
     file_id: FileId,
     value: &T,
     map: impl FnOnce(&EditMaps) -> Option<T>,
     state: &mut H,
 ) {
+    if set_aside(file_id, value.offset()) {
+        return;
+    }
     match mapped(file_id, map) {
         None => value.hash(state),
         Some(Some(old)) => old.hash(state),

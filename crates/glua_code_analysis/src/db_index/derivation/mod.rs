@@ -80,8 +80,8 @@ impl std::fmt::Debug for dyn DerivedFact {
 }
 pub use graph::{KeptRecord, KeyIdx, KeyTable, ReaderGraph};
 pub use positions::{
-    EditMaps, FilePosition, Local, fingerprint_before_edits, fingerprinting, hash_local, in_file,
-    mapping_back, unmapped,
+    EditMaps, FilePosition, Local, fingerprint_before_edits, fingerprinting,
+    hash_apart_from_positions, hash_local, in_file, mapping_back, unmapped,
 };
 
 use glua_parser::{LuaSyntaxId, LuaSyntaxKind};

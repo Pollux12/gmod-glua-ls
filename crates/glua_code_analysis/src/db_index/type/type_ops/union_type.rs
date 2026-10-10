@@ -1,4 +1,4 @@
-use crate::db_index::r#type::types::{lua_type_sort_key, lua_type_sort_ordinal};
+use crate::db_index::r#type::types::{LuaTypeSortKey, lua_type_sort_key, lua_type_sort_ordinal};
 use crate::{DbIndex, LuaMultiLineUnion, LuaType, LuaUnionType, get_real_type};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -423,7 +423,7 @@ fn contains_preserved_union_member(typ: &LuaType) -> bool {
 }
 
 fn contains_distinct_sort_key_collision(types: &[LuaType]) -> bool {
-    fn visit<'a>(typ: &'a LuaType, keys: &mut FxHashMap<(u8, u64), &'a LuaType>) -> bool {
+    fn visit<'a>(typ: &'a LuaType, keys: &mut FxHashMap<LuaTypeSortKey, &'a LuaType>) -> bool {
         if let LuaType::Union(union) = typ {
             return union.types().any(|member| visit(member, keys));
         }

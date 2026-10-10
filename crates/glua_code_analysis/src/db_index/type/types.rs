@@ -2091,15 +2091,20 @@ impl LuaMappedType {
     }
 }
 
-/// Produces a deterministic, allocation-free sort key for `LuaType` variants.
-/// Used by `LuaUnionType::from_set` to ensure stable ordering without the
-/// cost of `format!("{ty:?}")`.
+/// See [`lua_type_sort_key`].
+pub(crate) type LuaTypeSortKey = (u8, u64, Option<Arc<[u64]>>);
+
+/// Produces a deterministic sort key for `LuaType` variants, the canonical
+/// order of an order-insensitive union's members.
 ///
-/// The key is `(discriminant_ordinal, variant_detail)` where
-/// `variant_detail` differentiates same-variant entries cheaply
-/// (e.g., by pointer address for Arc-wrapped types, or by value for Copy types).
-pub(crate) fn lua_type_sort_key(ty: &LuaType) -> (u8, u64) {
-    (lua_type_sort_ordinal(ty), lua_type_sort_detail(ty))
+/// The key is `(discriminant_ordinal, variant_detail, positions)`: the detail
+/// tells same-variant entries apart, and a composite type that names
+/// positions is told apart by its content without them, then by those
+/// positions file-major. An edit moves one file's positions without
+/// reordering them, so the order survives remapping.
+pub(crate) fn lua_type_sort_key(ty: &LuaType) -> LuaTypeSortKey {
+    let (detail, positions) = lua_type_sort_detail(ty);
+    (lua_type_sort_ordinal(ty), detail, positions)
 }
 
 /// The discriminant half of [`lua_type_sort_key`], on its own.
@@ -2165,8 +2170,8 @@ pub(crate) fn lua_type_sort_ordinal(ty: &LuaType) -> u8 {
 // For same-variant tiebreaking, use a deterministic identity value.
 // Copy types use their value; Arc-wrapped types use content hashing
 // for determinism (pointer addresses vary across runs/edits).
-fn lua_type_sort_detail(ty: &LuaType) -> u64 {
-    match ty {
+fn lua_type_sort_detail(ty: &LuaType) -> (u64, Option<Arc<[u64]>>) {
+    let detail = match ty {
         LuaType::BooleanConst(b) => *b as u64,
         LuaType::IntegerConst(n) => *n as u64,
         LuaType::DocIntegerConst(n) => *n as u64,
@@ -2204,49 +2209,57 @@ fn lua_type_sort_detail(ty: &LuaType) -> u64 {
         | LuaType::Unknown
         | LuaType::Any
         | LuaType::Io => 0,
-        // Arc-wrapped complex types: hash Debug representation for determinism.
-        // Pointer addresses are non-deterministic across runs/edits.
-        _ => memoized_debug_detail(ty),
-    }
+        // Complex types: their content apart from the positions they name,
+        // then those positions, file-major like `TableConst`.
+        _ => return memoized_content_detail(ty),
+    };
+    (detail, None)
 }
 
-/// [`lua_type_sort_detail`]'s `Debug` hash, computed once per allocation.
+/// A complex type's content hashed apart from the positions it names, and
+/// those positions.
+fn content_detail(ty: &LuaType) -> (u64, Option<Arc<[u64]>>) {
+    let (hash, positions) = crate::db_index::derivation::hash_apart_from_positions(ty);
+    (hash, (!positions.is_empty()).then(|| positions.into()))
+}
+
+/// [`content_detail`], computed once per allocation.
 ///
-/// Rendering a whole type through `Debug` to hash it is the expensive half of
-/// the sort key, and a union re-sorts the same members on every rebuild. The
-/// hash is a pure function of the type's contents, which are immutable, so it
-/// is cached against the identity of the allocation the type points at. The
-/// cache owns a clone of the type, which keeps that allocation alive: no other
-/// live type can reuse the address while it is a key, and dropping an entry
-/// drops the type with it. Nothing derived from the address leaves this
-/// function.
-fn memoized_debug_detail(ty: &LuaType) -> u64 {
+/// Hashing a whole type is the expensive half of the sort key, and a union
+/// re-sorts the same members on every rebuild. The detail is a pure function
+/// of the type's contents, which are immutable, so it is cached against the
+/// identity of the allocation the type points at. The cache owns a clone of
+/// the type, which keeps that allocation alive: no other live type can reuse
+/// the address while it is a key, and dropping an entry drops the type with
+/// it. Nothing derived from the address leaves this function.
+fn memoized_content_detail(ty: &LuaType) -> (u64, Option<Arc<[u64]>>) {
     /// Entries are dropped wholesale rather than individually, so a session that
     /// churns through types cannot grow the cache without bound.
     const CAPACITY: usize = 1 << 16;
 
     thread_local! {
-        static MEMO: std::cell::RefCell<rustc_hash::FxHashMap<(u8, usize), (LuaType, u64)>> =
-            Default::default();
+        static MEMO: std::cell::RefCell<
+            rustc_hash::FxHashMap<(u8, usize), (LuaType, (u64, Option<Arc<[u64]>>))>,
+        > = Default::default();
     }
 
     let Some(address) = payload_address(ty) else {
-        return hash_str_content(&format!("{ty:?}"));
+        return content_detail(ty);
     };
     // Two variants can wrap the same allocation (`TplRef` and `ConstTplRef`),
-    // and they render differently.
+    // and they hash differently.
     let id = (lua_type_sort_ordinal(ty), address);
 
     MEMO.with(|memo| {
         if let Some((_, detail)) = memo.borrow().get(&id) {
-            return *detail;
+            return detail.clone();
         }
-        let detail = hash_str_content(&format!("{ty:?}"));
+        let detail = content_detail(ty);
         let mut memo = memo.borrow_mut();
         if memo.len() >= CAPACITY {
             memo.clear();
         }
-        memo.insert(id, (ty.clone(), detail));
+        memo.insert(id, (ty.clone(), detail.clone()));
         detail
     })
 }
@@ -2516,10 +2529,10 @@ mod tests {
         }
     }
 
-    /// The sort key's `Debug` hash is memoised against the address of the type's
-    /// allocation, which only holds while the cache pins that allocation: two
-    /// equal types allocated apart still key alike, and two variants sharing one
-    /// allocation still key apart.
+    /// The sort key's content detail is memoised against the address of the
+    /// type's allocation, which only holds while the cache pins that
+    /// allocation: two equal types allocated apart still key alike, and two
+    /// variants sharing one allocation still key apart.
     #[test]
     fn memoised_sort_keys_follow_contents_not_allocations() {
         let build = || LuaType::TableGeneric(Arc::new(vec![LuaType::String, LuaType::Integer]));
@@ -2527,7 +2540,7 @@ mod tests {
         assert_eq!(lua_type_sort_key(&left), lua_type_sort_key(&right));
         assert_eq!(
             lua_type_sort_key(&left).1,
-            hash_str_content(&format!("{left:?}")),
+            content_detail(&left).0,
             "memoised detail drifted from the hash it caches"
         );
 
@@ -2578,6 +2591,60 @@ mod tests {
         );
     }
 
+    /// An edit moves the table literals of one file that objects name, and an
+    /// inferred union keeps its member order through the remap, so the
+    /// canonical order of such objects has to survive the move.
+    #[test]
+    fn inferred_unions_order_objects_naming_table_literals_independent_of_edits() {
+        let table = |start: u32| {
+            LuaType::TableConst(InFiled::new(
+                crate::FileId::new(7),
+                TextRange::at(start.into(), 10.into()),
+            ))
+        };
+        let object = |model: &str, groups: u32| {
+            LuaType::Object(Arc::new(LuaObjectType::new_with_fields(
+                BTreeMap::from([
+                    (
+                        LuaMemberKey::Name("model".into()),
+                        LuaType::StringConst(ArcIntern::new(SmolStr::new(model))),
+                    ),
+                    (LuaMemberKey::Name("bodygroups".into()), table(groups)),
+                ]),
+                Vec::new(),
+            )))
+        };
+        let models = |shift: u32| -> Vec<String> {
+            let members = match LuaType::from_inferred_vec(vec![
+                object("male", 12717 + shift),
+                object("female", 12992 + shift),
+            ]) {
+                LuaType::Union(union) => union.into_vec(),
+                other => vec![other],
+            };
+            members
+                .iter()
+                .map(|member| match member {
+                    LuaType::Object(object) => {
+                        format!(
+                            "{:?}",
+                            object.get_field(&LuaMemberKey::Name("model".into()))
+                        )
+                    }
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        };
+        let unedited = models(0);
+        for shift in 1..64 {
+            assert_eq!(
+                models(shift),
+                unedited,
+                "the order moved with a shift of {shift}"
+            );
+        }
+    }
+
     #[test]
     fn tableof_sort_keys_do_not_memoise_box_addresses() {
         let original = LuaType::TableOf(Box::new(LuaType::Number));
@@ -2589,10 +2656,7 @@ mod tests {
         assert_eq!(payload_address(&original), None);
         for inner in [LuaType::Number, LuaType::String, LuaType::Boolean] {
             let typ = LuaType::TableOf(Box::new(inner));
-            assert_eq!(
-                lua_type_sort_key(&typ).1,
-                hash_str_content(&format!("{typ:?}"))
-            );
+            assert_eq!(lua_type_sort_key(&typ).1, content_detail(&typ).0);
         }
     }
 }

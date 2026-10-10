@@ -1551,6 +1551,37 @@ end
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![config]);
     }
 
+    /// A local holding a union of objects that name another file's table
+    /// literals keeps its members' order when that file shifts, so its
+    /// readers stand however far the literals move.
+    #[test]
+    fn a_shift_in_a_file_whose_tables_a_union_holds_re_runs_nothing_in_its_readers() {
+        const CONFIG: &str = "lua/cfg.lua";
+        const CONFIG_TEXT: &str = "cfg = {}\ncfg.male = { { model = \"m1\", groups = { torso = 1 } }, { model = \"m2\", groups = { torso = 2 } } }\ncfg.female = { { model = \"f1\", names = { \"legs\" } }, { model = \"f2\", names = { \"arms\" } } }\n";
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_files(vec![
+            (CONFIG, CONFIG_TEXT),
+            (
+                "lua/user.lua",
+                "optimised = {}\nfor _, data in pairs(cfg.male) do\n    optimised[data.model] = data\nend\nfor _, data in pairs(cfg.female) do\n    optimised[data.model] = data\nend\n",
+            ),
+            (
+                "lua/reader.lua",
+                "function Populate(model)\n    local data = optimised[model] or {}\n    local groups = data.groups or {}\n    local names = data.names or {}\n    return groups, names\nend\n",
+            ),
+        ]);
+
+        for shift in 1..32 {
+            let config = ws.def_file(CONFIG, &format!("{}{CONFIG_TEXT}", "\n".repeat(shift)));
+
+            assert_eq!(
+                ws.analysis.compilation.last_evaluated_files(),
+                vec![config],
+                "a shift of {shift} re-ran a reader"
+            );
+        }
+    }
+
     /// A file's accessor members come from its own accessor calls, so a shift
     /// in another file calling an accessor function re-runs nothing here.
     #[test]
