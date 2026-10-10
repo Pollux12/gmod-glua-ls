@@ -717,7 +717,7 @@ fn can_narrow_type_guard_through_decl_alias(
     true
 }
 
-pub(super) fn has_decl_write_in_open_interval(
+fn has_decl_write_in_open_interval(
     db: &DbIndex,
     file_id: crate::FileId,
     decl_id: crate::LuaDeclId,

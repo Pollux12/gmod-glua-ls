@@ -2926,6 +2926,14 @@ filter:SetUpdateOnType(true)
             ),
             0
         );
+        assert_eq!(
+            entity_table_guard_hint_count(
+                "ent = other
+                local tbl = GetTable(ent)
+                if tbl.Honk then ent:Honk() end"
+            ),
+            0
+        );
     }
 
     #[test]
@@ -2935,6 +2943,16 @@ filter:SetUpdateOnType(true)
                 "local tbl = GetTable(ent)
                 ent = other
                 if tbl.Honk then ent:Honk() end"
+            ),
+            1
+        );
+        assert_eq!(
+            entity_table_guard_hint_count(
+                "local tbl = ent:GetTable()
+                for _ = 1, 2 do
+                    if tbl.Honk then ent:Honk() end
+                    ent = other
+                end"
             ),
             1
         );

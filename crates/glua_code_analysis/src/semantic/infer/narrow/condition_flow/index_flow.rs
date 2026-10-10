@@ -12,10 +12,7 @@ use crate::{
             infer_index::infer_member_by_member_key,
             narrow::{
                 ResultTypeOrContinue,
-                condition_flow::{
-                    InferConditionFlow, binary_flow::has_decl_write_in_open_interval,
-                    get_condition_antecedent_type,
-                },
+                condition_flow::{InferConditionFlow, get_condition_antecedent_type},
                 get_type_at_flow::FlowWalkPolicy,
                 narrow_false_or_nil, remove_false_or_nil,
                 var_ref_id::{
@@ -99,8 +96,7 @@ fn maybe_field_exist_narrow(
     let maybe_var_ref_id = get_var_expr_var_ref_id(db, cache, prefix_expr.clone());
 
     if maybe_var_ref_id.as_ref() != Some(var_ref_id)
-        && entity_table_owner(db, cache, &prefix_expr, index_expr.get_position()).as_ref()
-            != Some(var_ref_id)
+        && entity_table_owner(db, cache, &prefix_expr).as_ref() != Some(var_ref_id)
     {
         // Direct prefix doesn't match the queried var. For an Unknown base in
         // the truthy branch we still want to narrow the *transitive* leftmost
@@ -243,14 +239,13 @@ fn maybe_field_exist_narrow(
 
 /// The variable whose entity table `table_expr` names: a local whose only
 /// value is a call returning `tableof<self>` of that variable, such as
-/// `local t = GetTable(ent)` or `local t = ent:GetTable()`, the variable
-/// unwritten between then and `at`. A field read off the table is a field
-/// read off the variable.
+/// `local t = GetTable(ent)` or `local t = ent:GetTable()`, of a variable no
+/// write reaches after the call, loops included. A field read off the table
+/// is a field read off the variable.
 fn entity_table_owner(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     table_expr: &LuaExpr,
-    at: rowan::TextSize,
 ) -> Option<VarRefId> {
     let LuaExpr::NameExpr(name_expr) = table_expr else {
         return None;
@@ -285,7 +280,15 @@ fn entity_table_owner(
     };
     let owner = get_var_expr_var_ref_id(db, cache, owner_expr)?;
     let owner_decl_id = owner.get_decl_id_ref()?;
-    (!has_decl_write_in_open_interval(db, file_id, owner_decl_id, call_expr.get_position(), at))
+    let aliased_at = call_expr.get_position();
+    db.get_reference_index()
+        .get_decl_references(&owner_decl_id.file_id, &owner_decl_id)
+        .is_some_and(|references| {
+            !references
+                .cells
+                .iter()
+                .any(|cell| cell.is_write && cell.range.start() > aliased_at)
+        })
         .then_some(owner)
 }
 
