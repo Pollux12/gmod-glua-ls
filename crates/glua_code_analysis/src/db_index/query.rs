@@ -458,6 +458,19 @@ impl<F: QueryFamily> QueryTable<F> {
         self.pending_count.load(Ordering::Relaxed) != 0
     }
 
+    /// Queues a filing of `id` with `reads`, as if this family had just
+    /// computed it.
+    #[cfg(test)]
+    pub(crate) fn queue_filing(&self, id: DerivationId, reads: Vec<(HashedKey, Fingerprint)>) {
+        let mut pending = self.pending();
+        pending.push(Filing {
+            id,
+            reads,
+            moved: None,
+        });
+        self.pending_count.store(pending.len(), Ordering::Relaxed);
+    }
+
     fn take_pending(&self) -> Vec<Filing> {
         let filings = std::mem::take(&mut *self.pending());
         self.pending_count.store(0, Ordering::Relaxed);

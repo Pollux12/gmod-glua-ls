@@ -1561,9 +1561,21 @@ impl ReaderGraph {
     /// new keys are interned in order, and each record is kept and diffed on
     /// worker threads.
     pub fn file_viewed(&mut self, records: Vec<(DerivationId, super::ViewedReads)>) {
-        let mut released = std::mem::take(&mut self.held_releases);
-        self.keep_viewed(records, &mut released);
+        let mut released = Vec::new();
+        self.file_viewed_into(records, &mut released);
         self.release_keys(released);
+    }
+
+    /// [`Self::file_viewed`], the slots it would free added to `released`
+    /// instead, for the caller to free with [`Self::release_keys`] once the
+    /// records it still holds, which may name them, are filed too.
+    pub fn file_viewed_into(
+        &mut self,
+        records: Vec<(DerivationId, super::ViewedReads)>,
+        released: &mut Vec<KeyIdx>,
+    ) {
+        released.append(&mut self.held_releases);
+        self.keep_viewed(records, released);
     }
 
     /// [`Self::file_viewed`] for some of the records viewing this graph, the

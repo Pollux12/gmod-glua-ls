@@ -3613,7 +3613,11 @@ impl Engine {
         reset: &FxHashMap<HashedKey, usize>,
         step: impl Fn() -> String,
     ) {
-        touched.extend(file_queries(db));
+        // The queries the evaluations computed are filed first, so the reads
+        // below fingerprint what they moved; the slots they no longer keep
+        // are freed with the evaluations' own, which may read them.
+        let mut released = Vec::new();
+        touched.extend(file_queries_into(db, &mut released));
         for key in touched.iter().chain(
             evaluations
                 .iter()
@@ -3626,7 +3630,6 @@ impl Engine {
         // Out of the index while its records are replaced, so the reads can be
         // fingerprinted against it.
         let mut graph = std::mem::take(db.reader_graph_mut());
-        let mut released = Vec::new();
         for (position, (evaluation, ended)) in evaluations.into_iter().enumerate() {
             touched.extend(evaluation.moved().cloned());
             let (id, mut slots, reads, outputs) = evaluation.into_recorded();
@@ -4844,6 +4847,16 @@ fn forget_before_edits(
 }
 
 pub(super) fn file_queries(db: &mut DbIndex) -> Vec<HashedKey> {
+    let mut released = Vec::new();
+    let moved = file_queries_into(db, &mut released);
+    db.reader_graph_mut().release_keys(released);
+    moved
+}
+
+/// [`file_queries`], the slots the filed records no longer keep added to
+/// `released` for the caller to free once the evaluations it holds, which may
+/// read them, are filed too.
+fn file_queries_into(db: &mut DbIndex, released: &mut Vec<derivation::KeyIdx>) -> Vec<HashedKey> {
     if !db.queries().has_pending() {
         return Vec::new();
     }
@@ -4858,7 +4871,7 @@ pub(super) fn file_queries(db: &mut DbIndex) -> Vec<HashedKey> {
         }
         records.push((filing.id, derivation::ViewedReads::from_keys(filing.reads)));
     }
-    graph.file_viewed(records);
+    graph.file_viewed_into(records, released);
     moved
 }
 
@@ -5938,6 +5951,54 @@ print(tuned{index})"
         assert!(engine.run(db, &recipe, Slice::Whole));
         assert_eq!(copied(db), Some(LuaType::IntegerConst(2)));
     }
+    /// A query the evaluations computed is filed with them: a key only its
+    /// previous record and an unfiled evaluation read stays live for the
+    /// evaluation's record.
+    #[test]
+    fn a_query_filed_with_an_evaluation_keeps_the_keys_the_evaluation_read() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+        let read = HashedKey::new(FactKey::TypeCache(owner(WRITTEN)));
+        let query = DerivationId::new(
+            DerivationKind::ReceiverAuthority,
+            FileId::new(FILE),
+            LuaSyntaxId::new(
+                LuaSyntaxKind::ClosureExpr.into(),
+                TextRange::at(TextSize::new(WRITTEN), TextSize::new(1)),
+            ),
+        );
+        db.reader_graph_mut().file_viewed(vec![(
+            query,
+            derivation::ViewedReads::from_keys(vec![(read.clone(), 1)]),
+        )]);
+        derivation::lend_keys(db.reader_graph_mut().lend_keys());
+        let lent = scopeguard_lent_keys();
+        let recording = derivation::begin(statement(READER));
+        let _ = db.get_type_index().get_type_cache(&owner(WRITTEN));
+        drop(recording);
+        let evaluation = derivation::end();
+        db.reader_graph_mut().restore_keys(derivation::take_keys());
+        std::mem::forget(lent);
+        db.queries()
+            .receiver_authority
+            .queue_filing(query, Vec::new());
+
+        let engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        engine.record(
+            db,
+            vec![(evaluation, None)],
+            &mut FxHashSet::default(),
+            &FxHashMap::default(),
+            String::new,
+        );
+
+        assert!(
+            db.reader_graph()
+                .reads_of(statement(READER))
+                .any(|key| *key == read)
+        );
+    }
+
     #[test]
     fn member_round_notifications_mark_receiver_query_stale_before_flush() {
         use glua_parser::{LuaAstNode, LuaClosureExpr};
