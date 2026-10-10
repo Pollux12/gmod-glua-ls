@@ -453,12 +453,25 @@ mod tests {
     const DISK_TEXT: &str = "local x = 1\n";
     const NEW_TEXT: &str = "local x = 1\nfunction Added() end\n";
 
+    /// A test folder on disk, removed when dropped.
+    struct DiskFolder(std::path::PathBuf);
+
+    impl Drop for DiskFolder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A context holding `name` on disk and indexed from that text, with the
-    /// client's end of its connection.
-    async fn context_with_disk_file(name: &str) -> (ServerContext, Connection, Uri) {
+    /// client's end of its connection and the folder holding the file.
+    async fn context_with_disk_file(name: &str) -> (ServerContext, Connection, Uri, DiskFolder) {
         let (connection, peer) = Connection::memory();
         let context = ServerContext::new(connection, ClientCapabilities::default());
-        let path = std::env::temp_dir().join(format!("gmod_glua_ls_{name}.lua"));
+        let folder = DiskFolder(crate::util::unique_temp_dir(&format!(
+            "gmod_glua_ls_{name}"
+        )));
+        std::fs::create_dir_all(&folder.0).expect("test folder should be created");
+        let path = folder.0.join("document.lua");
         std::fs::write(&path, DISK_TEXT).expect("test file should be written");
         let uri = glua_code_analysis::file_path_to_uri(&path).expect("file URI should parse");
         context
@@ -467,7 +480,7 @@ mod tests {
             .write()
             .await
             .update_file_by_uri(&uri, Some(DISK_TEXT.to_string()));
-        (context, peer, uri)
+        (context, peer, uri, folder)
     }
 
     async fn open(snapshot: &ServerContextSnapshot, uri: &Uri, version: i32, text: &str) {
@@ -534,7 +547,7 @@ mod tests {
     fn a_document_reopened_after_an_undone_edit_takes_its_new_edits() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
-            let (context, _peer, uri) = context_with_disk_file("reopen_after_undo").await;
+            let (context, _peer, uri, _folder) = context_with_disk_file("reopen_after_undo").await;
             let snapshot = context.snapshot();
             open(&snapshot, &uri, 1, DISK_TEXT).await;
             change(&snapshot, &uri, 3, DISK_TEXT).await;
@@ -554,7 +567,8 @@ mod tests {
     fn a_reopen_that_overtakes_the_close_takes_its_new_edits() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
-            let (context, _peer, uri) = context_with_disk_file("reopen_overtakes_close").await;
+            let (context, _peer, uri, _file) =
+                context_with_disk_file("reopen_overtakes_close").await;
             let snapshot = context.snapshot();
             open(&snapshot, &uri, 1, DISK_TEXT).await;
             change(&snapshot, &uri, 3, "local x = 3\n").await;
@@ -576,7 +590,8 @@ mod tests {
     fn a_syntax_request_reads_the_edit_once_it_is_taken() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
-            let (context, _peer, uri) = context_with_disk_file("syntax_request_taken").await;
+            let (context, _peer, uri, _folder) =
+                context_with_disk_file("syntax_request_taken").await;
             let snapshot = context.snapshot();
             open(&snapshot, &uri, 1, DISK_TEXT).await;
             change(&snapshot, &uri, 2, NEW_TEXT).await;
