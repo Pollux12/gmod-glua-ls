@@ -15,12 +15,16 @@ use crate::db_index::derivation::{DerivationId, DerivationKind};
 use crate::{DbIndex, FileId, InFiled};
 
 /// Whether a table field is a positional value of a table that is not a
-/// shaped array literal, which analysis never reads or writes.
+/// shaped array literal and is not a trailing call or `...` of an object
+/// literal, which analysis never reads or writes.
 fn is_inert_value_field(
     field: &LuaTableField,
     shaped_tables: &mut FxHashMap<LuaSyntaxId, bool>,
 ) -> bool {
     if !field.is_value_field() {
+        return false;
+    }
+    if field.is_trailing_spread() {
         return false;
     }
     if !matches!(field.get_value_expr(), Some(LuaExpr::TableExpr(_))) {

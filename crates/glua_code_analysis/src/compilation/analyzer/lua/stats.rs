@@ -2679,7 +2679,8 @@ fn is_shaped_array_value_field(field: &LuaTableField) -> bool {
 pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> Option<()> {
     register_expr_key_member(analyzer, &field);
 
-    if field.is_assign_field() || is_shaped_array_value_field(&field) {
+    let trailing_spread = field.is_trailing_spread();
+    if field.is_assign_field() || is_shaped_array_value_field(&field) || trailing_spread {
         let value_expr = field.get_value_expr()?;
         let member_id = LuaMemberId::new(field.get_syntax_id(), analyzer.file_id);
         let inferred = analyzer.infer_expr(&value_expr.clone());
@@ -2710,6 +2711,9 @@ pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> 
                 return None;
             }
         };
+        if trailing_spread && !matches!(value_type, LuaType::Variadic(_)) {
+            return None;
+        }
         // A table-valued field of a guarded `x = x or { ... }` literal
         // bootstraps the same member `x.y = x.y or {}` does: when every writer
         // of the slot is a guard they all name one table — the earliest

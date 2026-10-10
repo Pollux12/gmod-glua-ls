@@ -9,7 +9,7 @@ use glua_parser::{
 
 use crate::{
     DbIndex, DiagnosticCode, LuaMemberFeature, LuaMemberOwner, LuaSemanticDeclId, LuaType,
-    LuaTypeCache, LuaTypeDeclId, SemanticModel,
+    LuaTypeCache, LuaTypeDeclId, SemanticModel, VariadicType,
 };
 
 use super::{Checker, DiagnosticContext, humanize_lint_type};
@@ -106,10 +106,11 @@ fn check_table_expr(
         return Some(());
     }
 
-    let current_fields = fields
+    let mut current_fields: HashSet<String> = fields
         .iter()
         .filter_map(|field| field.get_field_key().map(|key| key.get_path_part()))
         .collect();
+    let spread = trailing_spread_slots(semantic_model, &fields);
 
     let required_fields = match &table_type {
         LuaType::Ref(type_decl_id) => get_precomputed_required_fields(context, type_decl_id)
@@ -164,6 +165,14 @@ fn check_table_expr(
         _ => return Some(()),
     };
 
+    if let Some(spread) = &spread {
+        current_fields.extend(
+            required_fields
+                .iter()
+                .filter(|name| spread.fills(name))
+                .cloned(),
+        );
+    }
     let mut missing: HashSet<&str> = required_fields
         .difference(&current_fields)
         .map(String::as_str)
@@ -358,6 +367,54 @@ fn get_precomputed_required_fields(
     context
         .get_shared_data_arc()
         .and_then(|shared| shared.missing_required_fields.get(type_decl_id).cloned())
+}
+
+/// The positional slots a trailing call or `...` fills: from `first` onward,
+/// `count` of them, or all of them when the number of values is unknown.
+struct SpreadSlots {
+    first: usize,
+    count: Option<usize>,
+}
+
+impl SpreadSlots {
+    fn fills(&self, field_name: &str) -> bool {
+        let Some(slot) = field_name
+            .strip_prefix('[')
+            .and_then(|name| name.strip_suffix(']'))
+            .and_then(|slot| slot.parse::<usize>().ok())
+        else {
+            return false;
+        };
+        slot >= self.first && self.count.is_none_or(|count| slot < self.first + count)
+    }
+}
+
+fn trailing_spread_slots(
+    semantic_model: &SemanticModel,
+    fields: &[LuaTableField],
+) -> Option<SpreadSlots> {
+    let (last, preceding) = fields.split_last()?;
+    if !last.is_value_field() {
+        return None;
+    }
+    let spread = match semantic_model.infer_expr_fact(last.get_value_expr()?).typ() {
+        LuaType::Variadic(spread) => spread.clone(),
+        _ => return None,
+    };
+    let first = preceding
+        .iter()
+        .filter(|field| field.is_value_field())
+        .count()
+        + 1;
+    let count = match spread.as_ref() {
+        VariadicType::Multi(types)
+            if !types.iter().any(|ty| matches!(ty, LuaType::Variadic(_))) =>
+        {
+            Some(types.len())
+        }
+        _ => None,
+    };
+    Some(SpreadSlots { first, count })
 }
 
 fn table_literal_looks_array_like(fields: &[LuaTableField]) -> bool {

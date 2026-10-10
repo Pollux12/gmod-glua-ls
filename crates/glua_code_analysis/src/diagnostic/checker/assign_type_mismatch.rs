@@ -1008,11 +1008,15 @@ fn check_table_expr_content(
             && idx == fields.len() - 1
             && let LuaType::Variadic(variadic) = &expr_type
         {
+            let positional_before = fields[..idx]
+                .iter()
+                .filter(|field| field.is_value_field())
+                .count();
             if let Some(result) = check_table_last_variadic_type(
                 context,
                 semantic_model,
                 table_type,
-                idx,
+                positional_before,
                 variadic,
                 field.get_range(),
             ) {
@@ -1100,12 +1104,12 @@ fn check_table_last_variadic_type(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     table_type: &LuaType,
-    idx: usize,
+    positional_before: usize,
     value_variadic: &VariadicType,
     range: TextRange,
 ) -> Option<bool> {
     for offset in 0..value_variadic.element_types().len() {
-        let member_key = LuaMemberKey::Integer((idx + offset) as i64 + 1);
+        let member_key = LuaMemberKey::Integer((positional_before + offset) as i64 + 1);
         let Ok(source_type) = semantic_model.infer_member_type(table_type, &member_key) else {
             continue;
         };

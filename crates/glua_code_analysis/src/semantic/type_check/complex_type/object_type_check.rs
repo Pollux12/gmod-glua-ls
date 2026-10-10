@@ -306,6 +306,33 @@ fn member_key_type_for_index(member_key: &LuaMemberKey) -> Option<LuaType> {
     }
 }
 
+/// The value an integer slot receives from the literal's trailing call or
+/// `...`, which fills every slot from its own position onward. The analyzer
+/// binds the spread to the trailing field's member.
+fn trailing_spread_slot_type(
+    context: &TypeCheckContext,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+) -> Option<LuaType> {
+    let LuaMemberKey::Integer(slot) = key else {
+        return None;
+    };
+    let db = context.db;
+    db.get_member_index()
+        .get_members(owner)?
+        .into_iter()
+        .find_map(|member| {
+            let LuaMemberKey::Integer(start) = member.get_key() else {
+                return None;
+            };
+            let offset = usize::try_from(slot.checked_sub(*start)?).ok()?;
+            let Some(LuaType::Variadic(spread)) = context.member_type(member.get_id()) else {
+                return None;
+            };
+            spread.get_type(offset).cloned()
+        })
+}
+
 fn check_object_type_compact_table_const(
     context: &mut TypeCheckContext,
     source_object: &LuaObjectType,
@@ -322,6 +349,10 @@ fn check_object_type_compact_table_const(
         let member_item = match member_index.get_member_item(&member_owner, key) {
             Some(member_item) => member_item,
             None => {
+                if let Some(slot_type) = trailing_spread_slot_type(context, &member_owner, key) {
+                    check_member_value(context, key, None, source_type, &slot_type, check_guard)?;
+                    continue;
+                }
                 if source_type.is_nullable() || source_type.is_any() {
                     continue;
                 } else {
@@ -332,6 +363,10 @@ fn check_object_type_compact_table_const(
             }
         };
         let member_type = match context.resolve_member_item_type(member_item) {
+            Ok(LuaType::Variadic(spread)) => match spread.get_type(0) {
+                Some(first) => first.clone(),
+                None => continue,
+            },
             Ok(t) => t,
             _ => {
                 continue;

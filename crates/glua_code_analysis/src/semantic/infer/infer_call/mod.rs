@@ -2059,19 +2059,21 @@ fn is_need_wrap_instance(
 }
 
 fn is_last_call_expr(call_expr: &LuaCallExpr) -> bool {
-    let mut opt_parent = call_expr.syntax().parent();
-    while let Some(parent) = &opt_parent {
+    let mut node = call_expr.syntax().clone();
+    let mut opt_parent = node.parent();
+    while let Some(parent) = opt_parent {
         match parent.kind().into() {
             LuaSyntaxKind::AssignStat
             | LuaSyntaxKind::LocalStat
             | LuaSyntaxKind::ReturnStat
             | LuaSyntaxKind::TableArrayExpr
+            | LuaSyntaxKind::TableObjectExpr
             | LuaSyntaxKind::CallArgList => {
-                let next_expr = call_expr.syntax().next_sibling();
-                return next_expr.is_none();
+                return node.next_sibling().is_none();
             }
             LuaSyntaxKind::TableFieldValue => {
                 opt_parent = parent.parent();
+                node = parent;
             }
             LuaSyntaxKind::ForRangeStat => return true,
             _ => return false,

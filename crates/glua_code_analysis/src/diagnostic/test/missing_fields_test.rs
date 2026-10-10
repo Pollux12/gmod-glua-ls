@@ -795,4 +795,93 @@ foo({})
             "#,
         ));
     }
+
+    const MULTI_RETURNS: &str = r#"
+        ---@return number, string, boolean
+        local function m() return 1, "a", true end
+        ---@return number, string
+        local function m2() return 1, "a" end
+        ---@return string, number
+        local function g() return "a", 1 end
+        ---@return number
+        local function one() return 1 end
+        ---@return number...
+        local function va() return 1 end
+    "#;
+
+    #[test]
+    fn trailing_call_fills_every_positional_slot_it_returns() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            &format!(
+                r#"{MULTI_RETURNS}
+                ---@type {{ [1]: number, [2]: string, [3]: boolean }}
+                local t = {{ m() }}
+                ---@type {{ [1]: number, [2]: string, [3]: boolean }}
+                local u = {{ 1, m2() }}
+                "#
+            ),
+        ));
+    }
+
+    #[test]
+    fn trailing_call_after_named_field_fills_positional_slots() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            &format!(
+                r#"{MULTI_RETURNS}
+                ---@type {{ name: string, [1]: string, [2]: number }}
+                local t = {{ name = "x", g() }}
+                "#
+            ),
+        ));
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            &format!(
+                r#"{MULTI_RETURNS}
+                ---@type {{ name: string, [1]: string, [2]: number }}
+                local t = {{ name = "x", g() }}
+                "#
+            ),
+        ));
+    }
+
+    #[test]
+    fn trailing_variadic_call_may_fill_remaining_slots() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            &format!(
+                r#"{MULTI_RETURNS}
+                ---@type {{ [1]: number, [2]: number, [3]: number }}
+                local t = {{ va() }}
+                "#
+            ),
+        ));
+    }
+
+    #[test]
+    fn trailing_call_returning_too_few_values_is_still_missing() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            &format!(
+                r#"{MULTI_RETURNS}
+                ---@type {{ [1]: number, [2]: string, [3]: boolean }}
+                local t = {{ one() }}
+                "#
+            ),
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            &format!(
+                r#"{MULTI_RETURNS}
+                ---@type {{ [1]: number, [2]: string, [3]: boolean }}
+                local t = {{ m2() }}
+                "#
+            ),
+        ));
+    }
 }
