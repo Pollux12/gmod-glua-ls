@@ -145,8 +145,6 @@ impl<T> CacheEntry<T> {
     }
 }
 
-/// A `self` seed replaced by [`LuaInferCache::seed_self`], and where its
-/// scope began.
 /// A closure-baseline walk set aside by [`LuaInferCache::suspend_baseline`].
 pub(crate) struct SuspendedBaseline {
     memo: FxHashMap<(VarRefCacheKey, FlowCacheInnerKey), LuaType>,
@@ -155,6 +153,8 @@ pub(crate) struct SuspendedBaseline {
     scope: derivation::ScopeMark,
 }
 
+/// A `self` seed replaced by [`LuaInferCache::seed_self`], and where its
+/// scope began.
 #[derive(Debug)]
 pub(crate) struct SelfSeed {
     seed: Option<(VarRefId, LuaType)>,
