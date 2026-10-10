@@ -700,12 +700,13 @@ impl TaskRecorder {
 
     /// What the evaluation the task ended at `at` saw of each of its reads,
     /// in order: a read of a key another member of its group wrote after it
-    /// ended at stamp `ended`, unless `reset` holds the key, is unseen.
+    /// ended at stamp `ended`, unless `reset_before` accepts the key, is
+    /// unseen.
     pub(crate) fn read_states(
         &self,
         at: usize,
         ended: Option<u64>,
-        reset: &FxHashSet<HashedKey>,
+        reset_before: impl Fn(&HashedKey) -> bool,
     ) -> Vec<ReadState> {
         with_keys(|worker| {
             let task = worker.task.as_ref().expect("a task records into its logs");
@@ -717,7 +718,7 @@ impl TaskRecorder {
                 .map(|local| {
                     let key = worker.keys.key(*local, &snapshot.graph);
                     if ended.is_some_and(|ended| worker.keys.written_after(*local, ended))
-                        && !reset.contains(key)
+                        && !reset_before(key)
                     {
                         return ReadState::Unseen;
                     }

@@ -3193,7 +3193,7 @@ impl Engine {
         for (member, reads) in batch.iter().zip(computed_reads.iter().flatten()) {
             assert_batch_reads_held(db, *member, reads);
         }
-        self.record(db, evaluations, &mut touched, &FxHashSet::default(), || {
+        self.record(db, evaluations, &mut touched, &FxHashMap::default(), || {
             format!("evaluating {batch:?}")
         });
         if let Some(started) = started {
@@ -3413,7 +3413,7 @@ impl Engine {
                 db,
                 vec![(evaluation, None)],
                 &mut published,
-                &FxHashSet::default(),
+                &FxHashMap::default(),
                 || format!("publishing {id:?}"),
             );
             touched.extend(published);
@@ -3538,16 +3538,16 @@ impl Engine {
     /// Resets the group's primary outputs and re-runs it. Returns every key the
     /// group touched: its previous outputs and its new ones.
     ///
-    /// A key two members write is reset before any of them runs, and read
-    /// inside the group as the group leaves it: the group re-runs as a unit,
-    /// so what a member read of it is internal to the group, not a stale
-    /// input. A key one later member writes alone is reset only when that
-    /// member runs, so an earlier member reads it as that member last left it
-    /// and is recorded as having seen that: members settle as they would one
-    /// by one, whatever grouped them. Which keys two members write comes from
-    /// their records; a run that shows two members writing a key not reset
-    /// before either ran is discarded, and the group runs again with it reset
-    /// first, along with everything the discarded run wrote.
+    /// Each key is reset only as the first member that writes it runs, so a
+    /// member before that reads it as the group last left it and is recorded
+    /// as having seen that: members settle as they would one by one, whatever
+    /// grouped them. A key two members write is read from its reset on as
+    /// the group leaves it: the group re-runs as a unit, so what a later
+    /// member read of it is internal to the group, not a stale input. Which
+    /// keys two members write comes from their records; a run that shows two
+    /// members writing a key not reset before either ran is discarded, and
+    /// the group runs again with it reset first, along with everything the
+    /// discarded run wrote.
     fn evaluate_group(
         &self,
         db: &mut DbIndex,
@@ -3560,20 +3560,20 @@ impl Engine {
         let mut shared = FxHashSet::default();
         let mut discarded = FxHashSet::default();
         loop {
-            let (own, mut reset) = group_resets(db, group, &shared, &discarded);
-            let deferred = own.iter().flatten().cloned().collect::<FxHashSet<_>>();
-            let grouped = group.len() > 1;
+            let resets = group_resets(db, group, &shared, &discarded);
+            let mut front = resets.front.clone();
             touched.extend(self.reset_outputs(
                 db,
                 group,
                 &discarded,
-                &deferred,
-                grouped.then_some(&mut reset),
+                &resets.deferred(),
+                (group.len() > 1).then_some(&mut front),
                 None,
             ));
+            let mut reset = front.into_iter().map(|key| (key, 0)).collect();
             let mut cleared = FxHashSet::default();
             let (evaluations, found) = self.with_lent_keys(db, &touched, |db| {
-                run_group(db, group, own, &reset, &mut cleared, |db, member| {
+                run_group(db, group, resets, &mut reset, &mut cleared, |db, member| {
                     let _recording = derivation::begin(member);
                     recipe.evaluate(db, member);
                     let evaluation = derivation::end();
@@ -3603,14 +3603,14 @@ impl Engine {
     ///
     /// A group member others ran after carries the stamp it ended at: a read
     /// of what they moved since is recorded as unseen (see
-    /// [`derivation::ReaderGraph::seen_by_member`]), `reset` holding the keys
-    /// reset before the group ran.
+    /// [`derivation::ReaderGraph::seen_by_member`]), `reset` holding the
+    /// position in the group of each key reset as the group ran.
     fn record(
         &self,
         db: &mut DbIndex,
         evaluations: Vec<(derivation::Evaluation, Option<u64>)>,
         touched: &mut FxHashSet<HashedKey>,
-        reset: &FxHashSet<HashedKey>,
+        reset: &FxHashMap<HashedKey, usize>,
         step: impl Fn() -> String,
     ) {
         touched.extend(file_queries(db));
@@ -3627,7 +3627,7 @@ impl Engine {
         // fingerprinted against it.
         let mut graph = std::mem::take(db.reader_graph_mut());
         let mut released = Vec::new();
-        for (evaluation, ended) in evaluations {
+        for (position, (evaluation, ended)) in evaluations.into_iter().enumerate() {
             touched.extend(evaluation.moved().cloned());
             let (id, mut slots, reads, outputs) = evaluation.into_recorded();
             let now = derivation::new_stamp();
@@ -3638,7 +3638,9 @@ impl Engine {
             slots.dedup();
             touched.extend(outputs.iter().cloned());
             let slots = match ended {
-                Some(ended) => graph.seen_by_member(slots, ended, reset),
+                Some(ended) => {
+                    graph.seen_by_member(slots, ended, |key| reset_before(reset, key, position))
+                }
                 None => slots.into_iter().map(|slot| (slot, None)).collect(),
             };
             graph.replace_slots(
@@ -4555,8 +4557,9 @@ fn evaluate_on_worker(
     let mut shared = FxHashSet::default();
     let mut discarded = FxHashSet::default();
     loop {
-        let (own, mut reset) = group_resets(db, group, &shared, &discarded);
-        let deferred = own.iter().flatten().cloned().collect::<FxHashSet<_>>();
+        let resets = group_resets(db, group, &shared, &discarded);
+        let deferred = resets.deferred();
+        let mut reset = FxHashMap::default();
         let mut outputs = discarded.clone();
         for member in group {
             outputs.extend(db.reader_graph().outputs_of(*member).cloned());
@@ -4565,7 +4568,7 @@ fn evaluate_on_worker(
             .iter()
             .map(|key| (key.clone(), task_fingerprint(db, recorder, key)))
             .collect::<FxHashMap<_, _>>();
-        let resets = derivation::capture_writes(|| {
+        let written = derivation::capture_writes(|| {
             for key in outputs
                 .iter()
                 .filter(|key| key.is_primary() && !deferred.contains(*key))
@@ -4574,10 +4577,16 @@ fn evaluate_on_worker(
             }
         });
         if group.len() > 1 {
-            reset.extend(resets.iter().cloned());
+            reset.extend(
+                resets
+                    .front
+                    .iter()
+                    .chain(&written)
+                    .map(|key| (key.clone(), 0)),
+            );
         }
         touched.extend(outputs);
-        touched.extend(resets);
+        touched.extend(written);
         derivation::note_recomputing(recomputing.keys().cloned());
         derivation::note_written(
             touched
@@ -4586,14 +4595,15 @@ fn evaluate_on_worker(
                 .cloned(),
         );
         let mut cleared = FxHashSet::default();
-        let (evaluations, found) = run_group(db, group, own, &reset, &mut cleared, |db, member| {
-            recorder.begin(member);
-            recipe.evaluate(db, member);
-            let at = recorder.end();
-            let outputs =
-                recorder.with_ended(at, |evaluation, _| evaluation.outputs().cloned().collect());
-            (at, outputs)
-        });
+        let (evaluations, found) =
+            run_group(db, group, resets, &mut reset, &mut cleared, |db, member| {
+                recorder.begin(member);
+                recipe.evaluate(db, member);
+                let at = recorder.end();
+                let outputs = recorder
+                    .with_ended(at, |evaluation, _| evaluation.outputs().cloned().collect());
+                (at, outputs)
+            });
         derivation::note_recomputed(|key| recomputing.get(key) == Some(&db.fact_fingerprint(key)));
         touched.extend(cleared);
         for (at, _) in &evaluations {
@@ -4604,10 +4614,11 @@ fn evaluate_on_worker(
         if found.is_empty() {
             let records = evaluations
                 .into_iter()
-                .map(|(at, ended)| {
+                .enumerate()
+                .map(|(position, (at, ended))| {
                     let id = recorder.with_ended(at, |evaluation, _| evaluation.id);
                     let seen = recorder
-                        .read_states(at, ended, &reset)
+                        .read_states(at, ended, |key| reset_before(&reset, key, position))
                         .into_iter()
                         .map(|state| match state {
                             derivation::ReadState::Unseen => derivation::UNSEEN,
@@ -4677,81 +4688,121 @@ fn task_fingerprint(
     }
 }
 
+/// When a group run resets each primary key its members wrote.
+struct GroupResets {
+    /// Reset before the group runs: the first member's keys, and the keys a
+    /// discarded run wrote or showed two members writing.
+    front: FxHashSet<HashedKey>,
+    /// Each member's own keys, which no other derivation writes, reset as it
+    /// runs.
+    own: Vec<Vec<HashedKey>>,
+    /// The keys each member is the first of several writers of, reset as it
+    /// runs.
+    joint: Vec<Vec<HashedKey>>,
+}
+
+impl GroupResets {
+    /// The keys reset only as a member runs.
+    fn deferred(&self) -> FxHashSet<HashedKey> {
+        self.own
+            .iter()
+            .chain(&self.joint)
+            .flatten()
+            .cloned()
+            .collect()
+    }
+}
+
 fn group_resets(
     db: &DbIndex,
     group: &[DerivationId],
     shared: &FxHashSet<HashedKey>,
     discarded: &FxHashSet<HashedKey>,
-) -> (Vec<Vec<HashedKey>>, FxHashSet<HashedKey>) {
+) -> GroupResets {
     let graph = db.reader_graph();
-    let own = group
-        .iter()
-        .enumerate()
-        .map(|(position, member)| {
-            if position == 0 {
-                return Vec::new();
-            }
-            graph
-                .outputs_of(*member)
-                .filter(|key| {
-                    key.is_primary()
-                        && !shared.contains(*key)
-                        && !discarded.contains(*key)
-                        && graph.producers(key).all(|producer| {
-                            producer == *member || producer.kind == DerivationKind::Source
-                        })
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let mut reset = FxHashSet::default();
-    if group.len() > 1 {
-        let deferred = own.iter().flatten().collect::<FxHashSet<_>>();
-        reset.extend(
-            group
-                .iter()
-                .flat_map(|member| graph.outputs_of(*member))
-                .chain(discarded)
-                .filter(|key| key.is_primary() && !deferred.contains(key))
-                .cloned(),
-        );
+    let mut resets = GroupResets {
+        front: FxHashSet::default(),
+        own: vec![Vec::new(); group.len()],
+        joint: vec![Vec::new(); group.len()],
+    };
+    if group.len() == 1 {
+        return resets;
     }
-    (own, reset)
+    let mut placed = FxHashSet::default();
+    for (position, member) in group.iter().enumerate() {
+        for key in graph.outputs_of(*member).filter(|key| key.is_primary()) {
+            if !placed.insert(key) {
+                continue;
+            }
+            if position == 0 || shared.contains(key) || discarded.contains(key) {
+                resets.front.insert(key.clone());
+            } else if graph
+                .producers(key)
+                .all(|producer| producer == *member || producer.kind == DerivationKind::Source)
+            {
+                resets.own[position].push(key.clone());
+            } else {
+                resets.joint[position].push(key.clone());
+            }
+        }
+    }
+    resets
+        .front
+        .extend(discarded.iter().filter(|key| key.is_primary()).cloned());
+    resets
 }
 
-/// Runs `group`'s members in order, each resetting its `own` keys first. Stops
-/// at the first sign that two members write a primary key not `reset` before
-/// either ran: a member's own key an earlier one wrote, or a key two members
-/// wrote. Returns the evaluations, each but the last with the stamp it ended
-/// at, and the keys that stopped it (none if it ran through).
+/// Whether `key` was reset as the group ran, at or before the member at
+/// `position`, so the member read it as the group leaves it.
+fn reset_before(reset: &FxHashMap<HashedKey, usize>, key: &HashedKey, position: usize) -> bool {
+    reset.get(key).is_some_and(|from| *from <= position)
+}
+
+/// Runs `group`'s members in order, each resetting first the keys `resets`
+/// defers to it, and notes in `reset` the position at which each joint key
+/// and what its reset wrote was reset. Stops at the first sign that two
+/// members write a primary key not reset before either ran: a key reset as a
+/// member runs that an earlier one wrote, or a key two members wrote. Returns
+/// the evaluations, each but the last with the stamp it ended at, and the
+/// keys that stopped it (none if it ran through).
 fn run_group<E>(
     db: &mut DbIndex,
     group: &[DerivationId],
-    own: Vec<Vec<HashedKey>>,
-    reset: &FxHashSet<HashedKey>,
+    resets: GroupResets,
+    reset: &mut FxHashMap<HashedKey, usize>,
     cleared: &mut FxHashSet<HashedKey>,
     mut evaluate: impl FnMut(&mut DbIndex, DerivationId) -> (E, Vec<HashedKey>),
 ) -> (Vec<(E, Option<u64>)>, FxHashSet<HashedKey>) {
     let mut evaluations = Vec::with_capacity(group.len());
-    // Each primary key written that was not reset before the group, with the
-    // position of the member that wrote it first.
+    // Each primary key written before it was reset, with the position of the
+    // member that wrote it first.
     let mut writers = FxHashMap::<HashedKey, usize>::default();
-    for (position, (member, own)) in group.iter().zip(own).enumerate() {
+    let steps = group.iter().zip(resets.own.into_iter().zip(resets.joint));
+    for (position, (member, (own, joint))) in steps.enumerate() {
         let taken = own
             .iter()
+            .chain(&joint)
             .filter(|key| writers.contains_key(*key))
             .cloned()
             .collect::<FxHashSet<_>>();
         if !taken.is_empty() {
             return (evaluations, taken);
         }
-        if !own.is_empty() {
-            let moved = derivation::capture_writes(|| {
-                for key in &own {
-                    db.reset_fact(key);
-                }
-            });
+        let mut moved = derivation::capture_writes(|| {
+            for key in &own {
+                db.reset_fact(key);
+            }
+        });
+        let joint_moved = derivation::capture_writes(|| {
+            for key in &joint {
+                db.reset_fact(key);
+            }
+        });
+        for key in joint.into_iter().chain(joint_moved.iter().cloned()) {
+            reset.entry(key).or_insert(position);
+        }
+        moved.extend(joint_moved);
+        if !moved.is_empty() {
             derivation::note_written(moved.iter().cloned());
             cleared.extend(moved);
         }
@@ -4759,7 +4810,7 @@ fn run_group<E>(
         let mut found = FxHashSet::default();
         for key in outputs
             .iter()
-            .filter(|key| key.is_primary() && !reset.contains(*key))
+            .filter(|key| key.is_primary() && !reset.contains_key(*key))
         {
             let first = *writers.entry(key.clone()).or_insert(position);
             if first != position {
@@ -5506,6 +5557,73 @@ print(tuned{index})"
 
         assert_eq!((settled, copied(db)), (true, Some(LuaType::String)));
     }
+
+    /// Three statements that all write `SHARED`, so they run as one group.
+    /// The first copies `WRITTEN`, which the other two both write.
+    struct Trio {
+        written: Mutex<LuaType>,
+    }
+
+    const THIRD: u32 = 20;
+
+    impl Recipe for Trio {
+        fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+            if id == statement(READER) {
+                let seen = db
+                    .get_type_index()
+                    .get_type_cache(&owner(WRITTEN))
+                    .map_or(LuaType::Unknown, |cache| cache.as_type().clone());
+                bind(db, COPIED, seen);
+            } else {
+                let written = self.written.lock().unwrap().clone();
+                bind(db, WRITTEN, written);
+            }
+            bind(db, SHARED, LuaType::Nil);
+        }
+
+        fn splits(&self, _: DerivationKind) -> bool {
+            false
+        }
+
+        fn compute(&self, _: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
+            unreachable!("a trio does not split")
+        }
+
+        fn apply(&self, _: &mut DbIndex, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
+            unreachable!("a trio does not split")
+        }
+    }
+
+    #[test]
+    fn a_group_member_reads_a_fact_two_later_members_write_as_they_leave_it() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+        let trio = Trio {
+            written: Mutex::new(LuaType::Integer),
+        };
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+
+        let settled = settle(db, &mut engine, &trio, &[READER, WRITER, THIRD]);
+
+        assert_eq!((settled, copied(db)), (true, Some(LuaType::Integer)));
+    }
+
+    #[test]
+    fn a_group_member_reads_again_a_fact_two_later_members_move() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+        let trio = Trio {
+            written: Mutex::new(LuaType::Integer),
+        };
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        settle(db, &mut engine, &trio, &[READER, WRITER, THIRD]);
+
+        *trio.written.lock().unwrap() = LuaType::String;
+        let settled = settle(db, &mut engine, &trio, &[WRITER, THIRD]);
+
+        assert_eq!((settled, copied(db)), (true, Some(LuaType::String)));
+    }
+
     #[test]
     fn changed_work_outside_the_focus_waits_for_it() {
         let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
@@ -5745,7 +5863,7 @@ print(tuned{index})"
             db,
             vec![(evaluation, None)],
             &mut touched,
-            &FxHashSet::default(),
+            &FxHashMap::default(),
             || "slot publication fixture".into(),
         );
         engine.readers_of(db, touched.iter());
@@ -6362,6 +6480,91 @@ function holder.receiver:Use() end
             "{:?}",
             workers.0
         );
+    }
+
+    /// Statements of three files that all bind one fact in the first file,
+    /// so they run as one group: the first file's copies a fact both others
+    /// bind `value` into.
+    struct SpanningTrio {
+        reader: FileId,
+        value: Mutex<LuaType>,
+    }
+
+    impl Recipe for SpanningTrio {
+        fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+            let written = relay_owner(self.reader, RELAY);
+            if id.file_id == self.reader {
+                let seen = db
+                    .get_type_index()
+                    .get_type_cache(&written)
+                    .map_or(LuaType::Unknown, |cache| cache.as_type().clone());
+                bind_relay(db, relay_owner(self.reader, RELAY_PAIRED), seen);
+            } else {
+                bind_relay(db, written, self.value.lock().unwrap().clone());
+            }
+            bind_relay(db, relay_owner(self.reader, RELAY_SHARED), LuaType::Nil);
+        }
+
+        fn splits(&self, _: DerivationKind) -> bool {
+            false
+        }
+
+        fn compute(&self, _: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
+            unreachable!("a spanning trio does not split")
+        }
+
+        fn apply(&self, _: &mut DbIndex, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
+            unreachable!("a spanning trio does not split")
+        }
+    }
+
+    /// What the reader's copy settles to after each of `values` is written,
+    /// and how many groups across files ran in tasks.
+    fn spanning_trio_run(serial: bool, values: &[LuaType]) -> (Vec<Option<LuaType>>, usize) {
+        let _serial = serial.then(serial_engine);
+        let (mut ws, _, files, _) = relay_workspace();
+        let recipe = SpanningTrio {
+            reader: files[0],
+            value: Mutex::new(values[0].clone()),
+        };
+        let statements = files[..3]
+            .iter()
+            .map(|file_id| relay_statement(*file_id, RELAY))
+            .collect::<Vec<_>>();
+        let db = ws.get_db_mut();
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        let mut copies = Vec::new();
+        for (round, value) in values.iter().enumerate() {
+            *recipe.value.lock().unwrap() = value.clone();
+            let changed = if round == 0 {
+                &statements[..]
+            } else {
+                &statements[1..]
+            };
+            for id in changed {
+                engine.changed(*id);
+            }
+            engine.open(db);
+            assert!(engine.run(db, &recipe, Slice::Whole));
+            copies.push(
+                db.get_type_index()
+                    .get_type_cache(&relay_owner(files[0], RELAY_PAIRED))
+                    .map(|cache| cache.as_type().clone()),
+            );
+        }
+        (copies, engine.stats.cross_file_groups)
+    }
+
+    #[test]
+    fn a_group_in_a_task_reads_a_fact_two_later_members_write_as_they_leave_it() {
+        let values = [LuaType::Integer, LuaType::String];
+        let expected = values.iter().cloned().map(Some).collect::<Vec<_>>();
+
+        let serial = spanning_trio_run(true, &values);
+        let workers = spanning_trio_run(false, &values);
+
+        assert!(workers.1 > 0, "no group across files ran in a task");
+        assert_eq!((serial.0, workers.0), (expected.clone(), expected));
     }
 
     /// Twelve runners, each passing its callers a table, and a caller of

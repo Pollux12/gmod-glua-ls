@@ -2659,21 +2659,21 @@ impl ReaderGraph {
 
     /// What a group member that ended at stamp `ended` saw of each of
     /// `slots`, the key table's windows closed. A key a later member moved
-    /// since, other than one `reset` before the group ran, is
-    /// [`super::UNSEEN`]; any other key it saw as it stands, which recording
-    /// takes. A key that came back as it was before its window reads as
-    /// unwritten, so only a moved one is unseen.
+    /// since, other than one the group reset before the member ran, which
+    /// `reset_before` accepts, is [`super::UNSEEN`]; any other key it saw as
+    /// it stands, which recording takes. A key that came back as it was
+    /// before its window reads as unwritten, so only a moved one is unseen.
     pub fn seen_by_member(
         &self,
         slots: Vec<KeyIdx>,
         ended: u64,
-        reset: &FxHashSet<HashedKey>,
+        reset_before: impl Fn(&HashedKey) -> bool,
     ) -> Vec<(KeyIdx, Option<Fingerprint>)> {
         slots
             .into_iter()
             .map(|slot| {
-                let moved = self.table.keys[slot as usize].written > ended
-                    && !reset.contains(self.key(slot));
+                let moved =
+                    self.table.keys[slot as usize].written > ended && !reset_before(self.key(slot));
                 (slot, moved.then_some(super::UNSEEN))
             })
             .collect()
