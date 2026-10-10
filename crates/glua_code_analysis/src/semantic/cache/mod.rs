@@ -147,6 +147,14 @@ impl<T> CacheEntry<T> {
 
 /// A `self` seed replaced by [`LuaInferCache::seed_self`], and where its
 /// scope began.
+/// A closure-baseline walk set aside by [`LuaInferCache::suspend_baseline`].
+pub(crate) struct SuspendedBaseline {
+    memo: FxHashMap<(VarRefCacheKey, FlowCacheInnerKey), LuaType>,
+    depth: u32,
+    root: Option<VarRefCacheKey>,
+    scope: derivation::ScopeMark,
+}
+
 #[derive(Debug)]
 pub(crate) struct SelfSeed {
     seed: Option<(VarRefId, LuaType)>,
@@ -218,9 +226,13 @@ pub struct LuaInferCache {
     ///
     /// Cleared when the outermost baseline query returns: a baseline answer
     /// depends on how far the pass has got, which is not in the key, so one
-    /// must never answer a later query.
+    /// must never answer a later query. A query for another variable that an
+    /// inference during the walk starts is a query of its own, with its own
+    /// memo (see [`Self::suspend_baseline`]).
     pub baseline_flow_memo: FxHashMap<(VarRefCacheKey, FlowCacheInnerKey), LuaType>,
     pub baseline_flow_depth: u32,
+    /// The variable the closure-baseline walk in progress is for.
+    pub(crate) baseline_root: Option<VarRefCacheKey>,
     /// Where the outermost closure-baseline query began.
     pub(crate) baseline_scope: derivation::ScopeMark,
     pub flow_node_realm_cache: TrackedMap<FlowId, GmodRealm>,
@@ -401,6 +413,7 @@ impl LuaInferCache {
             flow_query_realm: None,
             baseline_flow_memo: Default::default(),
             baseline_flow_depth: 0,
+            baseline_root: None,
             baseline_scope: derivation::ScopeMark::default(),
             flow_node_realm_cache: Default::default(),
             numeric_table_index_query_cache: Default::default(),
@@ -628,6 +641,26 @@ impl LuaInferCache {
         }
     }
 
+    /// Sets the closure-baseline walk in progress aside, so a query for another
+    /// variable runs as a walk of its own; hand the result back to
+    /// [`Self::resume_baseline`].
+    pub(crate) fn suspend_baseline(&mut self) -> SuspendedBaseline {
+        SuspendedBaseline {
+            memo: std::mem::take(&mut self.baseline_flow_memo),
+            depth: std::mem::take(&mut self.baseline_flow_depth),
+            root: self.baseline_root.take(),
+            scope: self.baseline_scope,
+        }
+    }
+
+    /// Resumes the walk [`Self::suspend_baseline`] set aside.
+    pub(crate) fn resume_baseline(&mut self, suspended: SuspendedBaseline) {
+        self.baseline_flow_memo = suspended.memo;
+        self.baseline_flow_depth = suspended.depth;
+        self.baseline_root = suspended.root;
+        self.baseline_scope = suspended.scope;
+    }
+
     /// Whether dynamic fields are visible, noting the gate consulted.
     pub fn dynamic_fields_visible(&self) -> bool {
         derivation::consult_gates(DYNAMIC_FIELDS_GATE);
@@ -811,6 +844,7 @@ impl LuaInferCache {
         self.flow_query_realm = None;
         empty(&mut self.baseline_flow_memo);
         self.baseline_flow_depth = 0;
+        self.baseline_root = None;
         empty(&mut self.unambiguous_int_const_cache.0);
         self.decl_name_index = None;
         empty(&mut self.index_ref_origin_type_cache);
@@ -954,6 +988,7 @@ impl LuaInferCache {
         self.flow_query_realm = None;
         self.baseline_flow_memo.clear();
         self.baseline_flow_depth = 0;
+        self.baseline_root = None;
         self.index_ref_origin_type_cache.clear();
         self.keyed.clear();
         self.param_type_cache.clear();

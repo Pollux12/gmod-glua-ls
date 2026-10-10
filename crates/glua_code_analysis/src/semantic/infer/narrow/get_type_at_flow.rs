@@ -243,6 +243,13 @@ pub(super) fn get_type_at_flow_in_mode(
                 VarRefCacheKey::from(var_ref_id),
                 (flow_id, query_realm, policy.origin),
             );
+            if cache.baseline_flow_depth != 0 && cache.baseline_root.as_ref() != Some(&memo_key.0) {
+                let suspended = cache.suspend_baseline();
+                let result =
+                    get_type_at_flow_in_mode(db, tree, cache, root, var_ref_id, flow_id, policy);
+                cache.resume_baseline(suspended);
+                return result;
+            }
             if let Some(narrow_type) = cache.baseline_flow_memo.get(&memo_key) {
                 crate::db_index::derivation::consult_scope(cache.baseline_scope);
                 return Ok(narrow_type.clone());
@@ -253,6 +260,7 @@ pub(super) fn get_type_at_flow_in_mode(
 
             if cache.baseline_flow_depth == 0 {
                 cache.baseline_scope = crate::db_index::derivation::scope_mark();
+                cache.baseline_root = Some(memo_key.0.clone());
             }
             cache.baseline_flow_depth += 1;
             let mut visited_flow_ids = Vec::new();
@@ -277,6 +285,7 @@ pub(super) fn get_type_at_flow_in_mode(
             cache.baseline_flow_depth -= 1;
             if cache.baseline_flow_depth == 0 {
                 cache.baseline_flow_memo.clear();
+                cache.baseline_root = None;
             }
             result
         }
@@ -4449,6 +4458,62 @@ mod tests {
                 .get_flow_cache_with_origin(&var_ref_id, FlowId(1), query_realm, FlowOrigin::Real,),
             Some(CacheEntry::Cache(narrow_type)) if **narrow_type == LuaType::String
         ));
+    }
+
+    /// A closure-baseline query for another variable, started by an inference
+    /// inside a walk, answers as it does on its own: the walk's memo holds
+    /// answers to its own variable only.
+    #[test]
+    fn a_baseline_query_inside_another_walk_answers_as_on_its_own() {
+        let mut ws = crate::VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@return boolean
+            ---@return_cast self Entity
+            ---@[self_guard("gmod.entity")]
+            function Entity:IsValid() end
+
+            ---@return Entity
+            function GetTarget() end
+
+            local target = {}
+
+            local function Use(entity)
+                return { first = entity, second = entity }
+            end
+
+            local function OnPaint()
+                if target.locked then
+                    if not target.entity:IsValid() then return end
+                else
+                    local entity = GetTarget()
+                    if not entity:IsValid() then return end
+                    target.entity = entity
+                end
+                return Use(target.entity)
+            end
+            "#,
+        );
+        let db = ws.analysis.compilation.get_db();
+        let arg = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("syntax tree")
+            .get_chunk_node()
+            .descendants::<glua_parser::LuaCallExpr>()
+            .filter_map(|call| call.get_args_list()?.get_args().next())
+            .last()
+            .expect("the call argument");
+        let infer_at_depth = |depth: u32| {
+            let mut cache = LuaInferCache::new(file_id, Default::default());
+            cache.baseline_flow_depth = depth;
+            crate::semantic::infer_expr(db, &mut cache, arg.clone())
+        };
+
+        assert_eq!(infer_at_depth(1), infer_at_depth(0));
     }
 
     /// C3-remnant guard: the `ClosureEntry` arm must route through
