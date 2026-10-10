@@ -2017,7 +2017,6 @@ fn nearest_subtypes_with_member(
                     },
                 )
                 .chain(dynamic_declarers)
-                .filter(|declarer| is_nameable(db, declarer))
                 .collect::<FxHashSet<_>>();
             let mut candidates = Vec::new();
             for declarer in declarers {
@@ -2043,7 +2042,9 @@ fn nearest_subtypes_with_member(
                 })
                 .map(|(declarer, _)| declarer.clone())
                 .collect::<Vec<_>>();
-            if children.is_empty() {
+            // A guard cannot name a declarer the use may reach, so no other
+            // child is worth suggesting.
+            if children.is_empty() || children.iter().any(|child| !is_nameable(db, child)) {
                 return None;
             }
             children.sort_by(|left, right| {

@@ -2744,6 +2744,54 @@ filter:SetUpdateOnType(true)
     }
 
     #[test]
+    fn a_member_an_anonymous_panel_class_declares_suggests_no_other_class() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/menu/annotations.lua",
+            r#"
+            ---@class Panel
+            ---@class DPanel: Panel
+            ---@class PublishWindow: Panel
+            ---@field UpdateProgress Panel
+
+            ---@generic T: table
+            ---@[call_arg("gmod.load", "include")]
+            ---@[call_arg("gmod.vgui_panel", "register_file")]
+            ---@param file string
+            ---@return T
+            function vgui.RegisterFile(file) end
+            "#,
+        );
+        ws.def_file(
+            "lua/menu/vgui/workshop.lua",
+            r#"
+            PANEL.Base = "DPanel"
+
+            function PANEL:UpdateProgress(done) end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/menu/mount.lua",
+            r#"
+            local pnlWorkshop = vgui.RegisterFile("vgui/workshop.lua")
+
+            ---@param pnl Panel
+            local function show(pnl)
+                pnl:UpdateProgress(1)
+            end
+            return pnlWorkshop, show
+            "#,
+        );
+
+        assert_eq!(
+            diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            Vec::new()
+        );
+    }
+
+    #[test]
     fn unguarded_use_fires_without_any_guard() {
         assert_eq!(guard_form_diagnostic_count("ent:Honk()"), 1);
     }
