@@ -1054,12 +1054,16 @@ fn collect_unguarded_child_file(
             if member_path_assigned_before(db, &mut infer_cache, flow_tree, index_expr) {
                 continue;
             }
+            let receiver =
+                get_var_expr_var_ref_id(db, &mut infer_cache, LuaExpr::NameExpr(name_expr.clone()));
             let Some(children) = nearest_subtypes_with_member(
                 db,
+                &mut infer_cache,
                 &mut subtypes_with_member,
                 &base_id,
                 &member_key,
                 member_path_parent(index_expr).is_some(),
+                receiver.as_ref(),
             ) else {
                 continue;
             };
@@ -1406,6 +1410,7 @@ fn collect_member_path_unguarded_child_evidence(
         }
     };
     let indexed_into = member_path_parent(index_expr).is_some();
+    let receiver_ref = get_var_expr_var_ref_id(db, cache, LuaExpr::IndexExpr(receiver.clone()));
     let base_has_visible_member = |base_id: &LuaTypeDeclId| {
         type_has_visible_member_at_use(
             db,
@@ -1423,10 +1428,12 @@ fn collect_member_path_unguarded_child_evidence(
             if base_has_visible_member(&base_id)
                 || nearest_subtypes_with_member(
                     db,
+                    cache,
                     evidence.subtypes_with_member,
                     &base_id,
                     &member_key,
                     indexed_into,
+                    receiver_ref.as_ref(),
                 )
                 .is_none()
             {
@@ -1463,10 +1470,12 @@ fn collect_member_path_unguarded_child_evidence(
     };
     let Some(children) = nearest_subtypes_with_member(
         db,
+        cache,
         evidence.subtypes_with_member,
         &base_id,
         &member_key,
         indexed_into,
+        receiver_ref.as_ref(),
     ) else {
         return;
     };
@@ -1968,7 +1977,7 @@ fn is_nameable(db: &crate::DbIndex, id: &LuaTypeDeclId) -> bool {
 /// Descendants already matched against a member key and access shape in this
 /// evaluation.
 type SubtypesWithMember =
-    FxHashMap<(LuaTypeDeclId, LuaMemberKey, bool), Option<Arc<[LuaTypeDeclId]>>>;
+    FxHashMap<(LuaTypeDeclId, LuaMemberKey, bool, Option<VarRefId>), Option<Arc<[LuaTypeDeclId]>>>;
 
 #[cfg(test)]
 thread_local! {
@@ -1984,77 +1993,128 @@ thread_local! {
 /// there are none.
 fn nearest_subtypes_with_member(
     db: &crate::DbIndex,
+    cache: &mut LuaInferCache,
     memo: &mut SubtypesWithMember,
     base_id: &LuaTypeDeclId,
     member_key: &LuaMemberKey,
     indexed_into: bool,
+    receiver: Option<&VarRefId>,
 ) -> Option<Arc<[LuaTypeDeclId]>> {
-    memo.entry((base_id.clone(), member_key.clone(), indexed_into))
-        .or_insert_with(|| {
-            #[cfg(test)]
-            DECLARER_LOOKUPS.with(|scans| scans.set(scans.get() + 1));
-            let member_index = db.get_member_index();
-            let dynamic_declarers = match member_key {
-                LuaMemberKey::Name(name) => {
-                    db.get_dynamic_field_index().types_declaring_field(name)
-                }
-                _ => Vec::new(),
-            };
-            let declarers = member_index
-                .get_current_members_for_key(member_key)
+    memo.entry((
+        base_id.clone(),
+        member_key.clone(),
+        indexed_into,
+        receiver.cloned(),
+    ))
+    .or_insert_with(|| {
+        #[cfg(test)]
+        DECLARER_LOOKUPS.with(|scans| scans.set(scans.get() + 1));
+        let member_index = db.get_member_index();
+        // A field the receiver itself is given is no evidence of what the
+        // receiver is: its own writes put the field on whatever it was
+        // taken to be.
+        let mut given_by_receiver = |site: &InFiled<rowan::TextRange>| {
+            receiver.is_some_and(|receiver| written_through(db, cache, site, receiver))
+        };
+        let dynamic_declarers = match member_key {
+            LuaMemberKey::Name(name) => db
+                .get_dynamic_field_index()
+                .types_declaring_field(name)
                 .into_iter()
-                .filter(|member| {
-                    !indexed_into
-                        || !db
-                            .get_type_index()
-                            .get_type_cache(&crate::LuaTypeOwner::Member(member.get_id()))
-                            .is_some_and(|cache| cache.as_type().is_function())
-                })
-                .filter_map(
-                    |member| match member_index.get_member_owner(&member.get_id()) {
-                        Some(LuaMemberOwner::Type(owner_id)) => Some(owner_id.clone()),
-                        _ => None,
-                    },
-                )
-                .chain(dynamic_declarers)
-                .collect::<FxHashSet<_>>();
-            let mut candidates = Vec::new();
-            for declarer in declarers {
-                let mut supers = Vec::new();
-                declarer.collect_super_types(db, &mut supers);
-                let ancestors = supers
-                    .into_iter()
-                    .filter_map(|super_type| match super_type {
-                        LuaType::Ref(super_id) => Some(super_id),
-                        _ => None,
-                    })
-                    .collect::<FxHashSet<_>>();
-                if ancestors.contains(base_id) {
-                    candidates.push((declarer, ancestors));
-                }
-            }
-            let mut children = candidates
-                .iter()
-                .filter(|(_, ancestors)| {
-                    !candidates
+                .filter(|type_id| {
+                    db.get_dynamic_field_index()
+                        .field_definitions(&crate::DynamicFieldOwner::Type(type_id.clone()), name)
                         .iter()
-                        .any(|(other, _)| ancestors.contains(other))
+                        .any(|site| !given_by_receiver(site))
                 })
-                .map(|(declarer, _)| declarer.clone())
-                .collect::<Vec<_>>();
-            // A guard cannot name a declarer the use may reach, so no other
-            // child is worth suggesting.
-            if children.is_empty() || children.iter().any(|child| !is_nameable(db, child)) {
-                return None;
+                .collect(),
+            _ => Vec::new(),
+        };
+        let declarers = member_index
+            .get_current_members_for_key(member_key)
+            .into_iter()
+            .filter(|member| {
+                !indexed_into
+                    || !db
+                        .get_type_index()
+                        .get_type_cache(&crate::LuaTypeOwner::Member(member.get_id()))
+                        .is_some_and(|cache| cache.as_type().is_function())
+            })
+            .filter(|member| {
+                !member.is_assignment_define()
+                    || !given_by_receiver(&InFiled::new(member.get_file_id(), member.get_range()))
+            })
+            .filter_map(
+                |member| match member_index.get_member_owner(&member.get_id()) {
+                    Some(LuaMemberOwner::Type(owner_id)) => Some(owner_id.clone()),
+                    _ => None,
+                },
+            )
+            .chain(dynamic_declarers)
+            .collect::<FxHashSet<_>>();
+        let mut candidates = Vec::new();
+        for declarer in declarers {
+            let mut supers = Vec::new();
+            declarer.collect_super_types(db, &mut supers);
+            let ancestors = supers
+                .into_iter()
+                .filter_map(|super_type| match super_type {
+                    LuaType::Ref(super_id) => Some(super_id),
+                    _ => None,
+                })
+                .collect::<FxHashSet<_>>();
+            if ancestors.contains(base_id) {
+                candidates.push((declarer, ancestors));
             }
-            children.sort_by(|left, right| {
-                left.get_name()
-                    .cmp(right.get_name())
-                    .then_with(|| left.stable_cmp(right))
-            });
-            Some(children.into())
-        })
-        .clone()
+        }
+        let mut children = candidates
+            .iter()
+            .filter(|(_, ancestors)| {
+                !candidates
+                    .iter()
+                    .any(|(other, _)| ancestors.contains(other))
+            })
+            .map(|(declarer, _)| declarer.clone())
+            .collect::<Vec<_>>();
+        // A guard cannot name a declarer the use may reach, so no other
+        // child is worth suggesting.
+        if children.is_empty() || children.iter().any(|child| !is_nameable(db, child)) {
+            return None;
+        }
+        children.sort_by(|left, right| {
+            left.get_name()
+                .cmp(right.get_name())
+                .then_with(|| left.stable_cmp(right))
+        });
+        Some(children.into())
+    })
+    .clone()
+}
+
+/// Whether the field written at `site`, an index key or the index expression
+/// holding it, is written through `receiver`.
+fn written_through(
+    db: &crate::DbIndex,
+    cache: &mut LuaInferCache,
+    site: &InFiled<rowan::TextRange>,
+    receiver: &VarRefId,
+) -> bool {
+    if site.file_id != cache.get_file_id() {
+        return false;
+    }
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&site.file_id)
+        .map(|tree| tree.get_red_root())
+    else {
+        return false;
+    };
+    root.covering_element(site.value)
+        .ancestors()
+        .find_map(LuaIndexExpr::cast)
+        .and_then(|index_expr| index_expr.get_prefix_expr())
+        .and_then(|prefix| get_var_expr_var_ref_id(db, cache, prefix))
+        .is_some_and(|written| &written == receiver)
 }
 
 fn is_condition_evidence(index_expr: &LuaIndexExpr) -> bool {
@@ -2254,6 +2314,71 @@ mod tests {
             .descendants::<LuaIndexExpr>()
             .next()
             .expect("expected index expression")
+    }
+
+    /// A field written through a receiver is no evidence of what that receiver
+    /// is: the class that has the field only from the receiver's own write
+    /// is no declarer of it for the receiver, while one another write gives
+    /// the field still is.
+    #[test]
+    fn a_field_written_through_the_receiver_names_no_declarer_for_it() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def_file(
+            "lua/vgui/clicks.lua",
+            r#"
+            ---@class Panel
+            ---@class LineA: Panel
+            ---@class BarB: Panel
+
+            ---@param a LineA
+            function StampA(a) a.m_fClickTime = 1 end
+
+            ---@param line BarB
+            function StampLine(line) line.m_fClickTime = 2 end
+            "#,
+        );
+        let db = ws.analysis.compilation.get_db();
+        let line = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("syntax tree")
+            .get_chunk_node()
+            .descendants::<LuaNameExpr>()
+            .find(|name| name.get_name_text().as_deref() == Some("line"))
+            .expect("the receiver");
+        let mut cache = crate::LuaInferCache::new(file_id, Default::default());
+        let receiver =
+            crate::semantic::get_var_expr_var_ref_id(db, &mut cache, LuaExpr::NameExpr(line))
+                .expect("the receiver's var ref");
+        let declarers = |receiver: Option<&crate::semantic::VarRefId>| {
+            super::nearest_subtypes_with_member(
+                db,
+                &mut crate::LuaInferCache::new(file_id, Default::default()),
+                &mut Default::default(),
+                &LuaTypeDeclId::global("Panel"),
+                &crate::LuaMemberKey::Name("m_fClickTime".into()),
+                false,
+                receiver,
+            )
+            .map(|children| {
+                children
+                    .iter()
+                    .map(|child| child.get_name().to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        assert_eq!(
+            (declarers(None), declarers(Some(&receiver))),
+            (
+                Some(vec!["BarB".to_string(), "LineA".to_string()]),
+                Some(vec!["LineA".to_string()])
+            )
+        );
     }
 
     #[test]
