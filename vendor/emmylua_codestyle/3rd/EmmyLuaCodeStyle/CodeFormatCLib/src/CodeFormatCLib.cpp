@@ -39,9 +39,9 @@ EMMY_API void RemoveCodeStyle(const char *workspaceUri) {
     codeFormat.RemoveCodeStyle(workspaceUri);
 }
 
-EMMY_API char *CheckCodeStyle(const char *code, const char *uri) {
+EMMY_API char *CheckCodeStyle(const char *code, const char *uri, bool nonStandardSymbol) {
     CodeFormat &codeFormat = CodeFormat::GetInstance();
-    auto result = codeFormat.Diagnostic(uri, code);
+    auto result = codeFormat.Diagnostic(uri, code, nonStandardSymbol);
     if (result.Type != ResultType::Ok) {
         return nullptr;
     }

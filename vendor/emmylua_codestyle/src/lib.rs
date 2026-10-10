@@ -67,7 +67,11 @@ unsafe extern "C" {
     fn FreeReformatResult(ptr: *mut libc::c_char);
     fn UpdateCodeStyle(workspaceUri: *const libc::c_char, configPath: *const libc::c_char);
     fn RemoveCodeStyle(workspaceUri: *const libc::c_char);
-    fn CheckCodeStyle(code: *const libc::c_char, uri: *const libc::c_char) -> *mut libc::c_char;
+    fn CheckCodeStyle(
+        code: *const libc::c_char,
+        uri: *const libc::c_char,
+        non_standard_symbol: bool,
+    ) -> *mut libc::c_char;
 }
 
 pub fn reformat_code(code: &str, uri: &str, options: FormattingOptions) -> String {
@@ -132,10 +136,10 @@ pub fn remove_code_style(workspace_uri: &str) {
     unsafe { RemoveCodeStyle(c_workspace_uri.as_ptr()) };
 }
 
-pub fn check_code_style(uri: &str, code: &str) -> Vec<CodeStyleDiagnostic> {
+pub fn check_code_style(uri: &str, code: &str, non_standard_symbol: bool) -> Vec<CodeStyleDiagnostic> {
     let c_uri = CString::new(uri).unwrap();
     let c_code = CString::new(code).unwrap();
-    let c_result = unsafe { CheckCodeStyle(c_code.as_ptr(), c_uri.as_ptr()) };
+    let c_result = unsafe { CheckCodeStyle(c_code.as_ptr(), c_uri.as_ptr(), non_standard_symbol) };
     if c_result.is_null() {
         return vec![];
     }

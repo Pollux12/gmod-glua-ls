@@ -41,7 +41,7 @@ EMMY_API void UpdateCodeStyle(const char *workspaceUri, const char *configPath);
 
 EMMY_API void RemoveCodeStyle(const char *workspaceUri);
 
-EMMY_API char *CheckCodeStyle(const char *code, const char *uri);
+EMMY_API char *CheckCodeStyle(const char *code, const char *uri, bool nonStandardSymbol);
 }
 
 

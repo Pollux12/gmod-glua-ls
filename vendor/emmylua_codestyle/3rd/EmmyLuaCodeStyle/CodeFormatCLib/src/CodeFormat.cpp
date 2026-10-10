@@ -177,13 +177,13 @@ CodeFormat::TypeFormat(const std::string &uri, std::size_t line, std::size_t cha
     return tf.GetResult();
 }
 
-Result<std::vector<LuaDiagnosticInfo>> CodeFormat::Diagnostic(const std::string &uri, std::string &&text) {
+Result<std::vector<LuaDiagnosticInfo>> CodeFormat::Diagnostic(const std::string &uri, std::string &&text, bool nonStandardSymbol) {
     auto file = std::make_shared<LuaSource>(std::move(text));
     LuaLexer luaLexer(file);
-    if (_supportNonStandardSymbol) {
+    if (_supportNonStandardSymbol || nonStandardSymbol) {
         luaLexer.SupportNonStandardSymbol();
     }
-    if (_supportCLikeComments) {
+    if (_supportCLikeComments || nonStandardSymbol) {
         luaLexer.SupportCLikeComments();
     }
 
