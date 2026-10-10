@@ -253,6 +253,70 @@ vgui.Register(\"PlayerBanButton\", PANEL, \"DButton\")
         ]);
     }
 
+    /// A file a `vgui.RegisterFile` call loads declares a forced accessor
+    /// through the annotated `AccessorFunc`, which synthesizes the getter too:
+    /// the getter returns what the force names in either order.
+    #[test]
+    fn a_forced_accessor_of_a_registered_file_panel_returns_its_forced_type_in_either_order() {
+        let builtins = format!(
+            "{GMOD_CALL_ARG_BUILTINS_FIXTURE}
+---@accessorfunc 3
+function AccessorFunc(tab, key, name, force) end
+---@class Panel
+Panel = Panel or {{}}
+---@class PANEL : Panel
+PANEL = Panel
+---@class DPanel: Panel
+---@generic T: table
+---@[call_arg(\"gmod.load\", \"include\")]
+---@[call_arg(\"gmod.vgui_panel\", \"register_file\")]
+---@param file string
+---@return T
+function vgui.RegisterFile(file) end
+"
+        );
+        let files = [
+            ("lua/includes/builtins.lua", builtins.as_str()),
+            (
+                "lua/menu/mount/mount.lua",
+                "local pnlWorkshop = vgui.RegisterFile(\"vgui/workshop.lua\")
+return pnlWorkshop
+",
+            ),
+            (
+                "lua/menu/mount/vgui/workshop.lua",
+                "PANEL.Base = \"DPanel\"
+AccessorFunc(PANEL, \"m_bDrawProgress\", \"DrawProgress\", FORCE_BOOL)
+",
+            ),
+        ];
+        assert_schedule_independent(&files);
+
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_files(files.to_vec());
+        let db = ws.analysis.compilation.get_db();
+        let getters = db
+            .get_member_index()
+            .get_current_members_for_key(&crate::LuaMemberKey::Name("GetDrawProgress".into()))
+            .into_iter()
+            .map(|member| {
+                db.get_type_index()
+                    .get_type_cache(&member.get_id().into())
+                    .map(|cache| cache.as_type().clone())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            getters.iter().all(|getter| matches!(
+                getter,
+                Some(crate::LuaType::DocFunction(func)) if func.get_ret() == &crate::LuaType::Boolean
+            )),
+            "{getters:?}"
+        );
+    }
+
     #[test]
     fn a_global_bootstrapped_in_client_shared_and_server_files_settles_the_same_in_either_order() {
         assert_schedule_independent(&[

@@ -5282,11 +5282,13 @@ fn synthesize_accessor_func(
             None,
         );
         db.get_member_index_mut().add_member(owner.clone(), member);
+        // An annotated accessor function synthesizes the same getter without
+        // reading the force argument; whichever ran first must not decide it.
         write_type_cache(
             db,
             member_id.into(),
             LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(getter_func))),
-            TypeCacheWriteMode::InsertOnly,
+            TypeCacheWriteMode::ForceOverwrite,
         );
     }
 
