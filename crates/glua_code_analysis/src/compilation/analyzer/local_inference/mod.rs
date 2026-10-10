@@ -2349,6 +2349,70 @@ mod tests {
             .expect("expected index expression")
     }
 
+    /// A write through a receiver that, as the pass sees it there, is not the
+    /// declaring class gives no evidence for that class; under a cast to it,
+    /// the same write does.
+    #[test]
+    fn a_receiver_write_is_evidence_only_where_it_reaches_the_class() {
+        fn excluded(source: &str) -> bool {
+            let mut ws = VirtualWorkspace::new();
+            let file_id = ws.def_file("lua/vgui/clicks.lua", source);
+            let db = ws.analysis.compilation.get_db();
+            let write = db
+                .get_vfs()
+                .get_syntax_tree(&file_id)
+                .expect("syntax tree")
+                .get_chunk_node()
+                .descendants::<LuaIndexExpr>()
+                .last()
+                .expect("the write");
+            let mut cache = crate::LuaInferCache::new(file_id, Default::default());
+            let receiver = crate::semantic::get_var_expr_var_ref_id(
+                db,
+                &mut cache,
+                write.get_prefix_expr().expect("the receiver"),
+            )
+            .expect("the receiver's var ref");
+            let site = crate::InFiled::new(
+                file_id,
+                write
+                    .get_index_key()
+                    .expect("the key")
+                    .get_range()
+                    .expect("its range"),
+            );
+            super::written_through_without_reaching(
+                db,
+                &mut cache,
+                &site,
+                &receiver,
+                &LuaTypeDeclId::global("BarB"),
+            )
+        }
+
+        let classes = "---@class Panel
+---@class BarB: Panel
+";
+        assert_eq!(
+            (
+                excluded(&format!(
+                    "{classes}local function stamp(line)
+    line.m_fClickTime = 1
+end
+"
+                )),
+                excluded(&format!(
+                    "{classes}local function stamp(line)
+    ---@cast line BarB
+    line.m_fClickTime = 1
+end
+"
+                )),
+            ),
+            (true, false)
+        );
+    }
+
     #[test]
     fn assignment_target_classifier_accepts_index_on_left_hand_side() {
         let index_expr = parse_index_expr("value.ChildOnly = function() end");
