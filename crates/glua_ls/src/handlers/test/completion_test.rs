@@ -8,11 +8,7 @@ mod tests {
         CompletionItemKind, CompletionItemTag, CompletionResponse, CompletionTriggerKind,
         Documentation, InsertTextFormat, MarkupContent,
     };
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{fs, path::PathBuf};
     use tokio_util::sync::CancellationToken;
 
     use crate::handlers::completion::{completion, completion_with_deprecated_tag_support};
@@ -5400,31 +5396,8 @@ mod tests {
         )
     }
 
-    /// A directory under the system temp dir, removed when dropped.
-    struct TempRoot(PathBuf);
-
-    impl std::ops::Deref for TempRoot {
-        type Target = Path;
-
-        fn deref(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempRoot {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn create_path_completion_root(name: &str) -> Result<TempRoot> {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .or_fail()?
-            .as_nanos();
-        let root = TempRoot(std::env::temp_dir().join(format!("glua_ls_{name}_{nonce}")));
-        fs::create_dir_all(&*root).or_fail()?;
-        Ok(root)
+    fn create_path_completion_root(name: &str) -> Result<crate::util::TempDir> {
+        Ok(crate::util::TempDir::new(&format!("glua_ls_{name}")))
     }
 
     fn define_disk_file(

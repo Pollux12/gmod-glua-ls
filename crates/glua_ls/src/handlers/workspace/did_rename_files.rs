@@ -62,7 +62,6 @@ pub async fn on_did_rename_files_handler(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::time::Duration;
 
     use glua_code_analysis::{FileId, file_path_to_uri};
@@ -84,7 +83,7 @@ mod tests {
     const DIAGNOSED: &str = "SHARED_VALUE = 1\nlocal broken =\n";
 
     struct RenamedWorkspace {
-        root: PathBuf,
+        _root: crate::util::TempDir,
         snapshot: ServerContextSnapshot,
         client: Connection,
         old_uri: Uri,
@@ -93,19 +92,10 @@ mod tests {
         _context: ServerContext,
     }
 
-    impl Drop for RenamedWorkspace {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
-    }
-
     /// A workspace where `lua/autorun/sh_old.lua`, which another file
     /// includes, was renamed on disk to `sh_new.lua`, which holds `text`.
     async fn workspace_to_rename(name: &str, text: &str) -> RenamedWorkspace {
-        let root = std::env::temp_dir().join(format!(
-            "gmod_glua_ls_did_rename_{name}_{}",
-            std::process::id()
-        ));
+        let root = crate::util::TempDir::new(&format!("gmod_glua_ls_did_rename_{name}"));
         let autorun = root.join("lua/autorun");
         std::fs::create_dir_all(&autorun).expect("workspace folder is created");
         std::fs::write(autorun.join("sh_new.lua"), text).expect("renamed file is written");
@@ -118,7 +108,7 @@ mod tests {
         let snapshot = context.snapshot();
         let old_id = {
             let mut analysis = snapshot.analysis().write().await;
-            analysis.add_main_workspace(root.clone());
+            analysis.add_main_workspace(root.to_path_buf());
             analysis.update_file_by_uri(&loader_uri, Some(LOADER.to_string()));
             analysis
                 .update_file_by_uri(&old_uri, Some(text.to_string()))
@@ -126,7 +116,7 @@ mod tests {
                 .0
         };
         RenamedWorkspace {
-            root,
+            _root: root,
             snapshot,
             client,
             old_uri,

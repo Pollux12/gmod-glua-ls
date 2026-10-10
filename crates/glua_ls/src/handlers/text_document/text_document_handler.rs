@@ -398,6 +398,7 @@ pub async fn on_did_close_document(
 mod tests {
     use super::*;
     use crate::context::ServerContext;
+    use crate::util::TempDir;
     use googletest::prelude::*;
     use lsp_server::Connection;
     use lsp_types::{
@@ -453,25 +454,13 @@ mod tests {
     const DISK_TEXT: &str = "local x = 1\n";
     const NEW_TEXT: &str = "local x = 1\nfunction Added() end\n";
 
-    /// A test folder on disk, removed when dropped.
-    struct DiskFolder(std::path::PathBuf);
-
-    impl Drop for DiskFolder {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     /// A context holding `name` on disk and indexed from that text, with the
     /// client's end of its connection and the folder holding the file.
-    async fn context_with_disk_file(name: &str) -> (ServerContext, Connection, Uri, DiskFolder) {
+    async fn context_with_disk_file(name: &str) -> (ServerContext, Connection, Uri, TempDir) {
         let (connection, peer) = Connection::memory();
         let context = ServerContext::new(connection, ClientCapabilities::default());
-        let folder = DiskFolder(crate::util::unique_temp_dir(&format!(
-            "gmod_glua_ls_{name}"
-        )));
-        std::fs::create_dir_all(&folder.0).expect("test folder should be created");
-        let path = folder.0.join("document.lua");
+        let folder = TempDir::new(&format!("gmod_glua_ls_{name}"));
+        let path = folder.join("document.lua");
         std::fs::write(&path, DISK_TEXT).expect("test file should be written");
         let uri = glua_code_analysis::file_path_to_uri(&path).expect("file URI should parse");
         context
@@ -567,7 +556,7 @@ mod tests {
     fn a_reopen_that_overtakes_the_close_takes_its_new_edits() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
-            let (context, _peer, uri, _file) =
+            let (context, _peer, uri, _folder) =
                 context_with_disk_file("reopen_overtakes_close").await;
             let snapshot = context.snapshot();
             open(&snapshot, &uri, 1, DISK_TEXT).await;
