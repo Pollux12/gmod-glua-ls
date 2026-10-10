@@ -75,19 +75,10 @@ fn find_generic_constraint(func: &LuaFunctionType, id: GenericTplId) -> Option<L
 }
 
 /// The type a string-template parameter binds from `arg_expr`, whose own type
-/// is `arg_type`, when the arg is not a literal string constant. Two
-/// resolution paths exist:
-///
-/// 1. VGUI panel reference: when the param has a StrTplRef and the call is
-///    annotated with call_arg("gmod.vgui_panel", "reference"), resolve from
-///    the enclosing PANEL method context. This works for any arg type
-///    (String, Unknown, Any) because the resolution is purely contextual.
-///
-/// 2. Inferred string default: when arg_type is plain `String` and the
-///    variable has a flow-valid `x = x or "literal"` default.
-///
-/// Path 1 is tried first (it is more specific). Path 2 only applies to
-/// `String` args.
+/// is `arg_type`: the panel class its enclosing PANEL method names when the
+/// call marks the argument a `gmod.vgui_panel` reference, else a plain
+/// `string` argument's flow-valid `x = x or "literal"` default, else
+/// `arg_type` itself.
 pub(crate) fn str_tpl_arg_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,

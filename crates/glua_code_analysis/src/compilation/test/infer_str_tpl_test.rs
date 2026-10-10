@@ -517,8 +517,8 @@ mod test {
     }
 
     #[gtest]
-    fn test_str_tpl_class_a_defaulted_argument_names_is_declared_like_a_literal_one() -> Result<()>
-    {
+    fn test_str_tpl_class_named_by_a_defaulted_argument_is_declared_like_a_literal_one()
+    -> Result<()> {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
