@@ -74,18 +74,6 @@ fn find_generic_constraint(func: &LuaFunctionType, id: GenericTplId) -> Option<L
     constraint
 }
 
-/// Resolve a flow-valid inferred string default for a call argument expression.
-///
-/// When the arg is a local variable with an inferred string default (from
-/// `x = x or "literal"`), and the self-coalescing assignment is the last
-/// write to that variable that dominates the call site, returns
-/// `Some(LuaType::StringConst(value))`.
-///
-/// Only returns a value when:
-/// - `arg_type` is exactly `LuaType::String`
-/// - `param_type` actually contains a `StrTplRef`
-/// - exactly one candidate default is flow-valid at the use site
-/// - no explicit `---@param` default takes precedence
 /// The type a string-template parameter binds from `arg_expr`, whose own type
 /// is `arg_type`, when the arg is not a literal string constant. Two
 /// resolution paths exist:
@@ -118,6 +106,18 @@ pub(crate) fn str_tpl_arg_type(
         .unwrap_or(arg_type)
 }
 
+/// Resolve a flow-valid inferred string default for a call argument expression.
+///
+/// When the arg is a local variable with an inferred string default (from
+/// `x = x or "literal"`), and the self-coalescing assignment is the last
+/// write to that variable that dominates the call site, returns
+/// `Some(LuaType::StringConst(value))`.
+///
+/// Only returns a value when:
+/// - `arg_type` is exactly `LuaType::String`
+/// - `param_type` actually contains a `StrTplRef`
+/// - exactly one candidate default is flow-valid at the use site
+/// - no explicit `---@param` default takes precedence
 fn resolve_str_default_from_arg(
     db: &DbIndex,
     cache: &mut LuaInferCache,
