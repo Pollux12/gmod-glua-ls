@@ -4415,6 +4415,9 @@ end
     const VGUI_REGISTER_RETURNING_TABLE: (&str, &str) = (
         "lua/aaa_annotations/vgui.lua",
         r#"---@meta
+---@class Panel
+vgui = {}
+
 ---@generic T: Panel
 ---@[call_arg("gmod.vgui_panel", "define")]
 ---@param classname string Classname of the panel to register.
