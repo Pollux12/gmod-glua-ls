@@ -405,19 +405,22 @@ pub(super) fn hash_value<T: Hash + ?Sized, H: Hasher>(value: &T, state: &mut H) 
 /// the order it named them. An edit that only moves positions leaves the hash
 /// as it is and the positions in the same order.
 pub fn hash_apart_from_positions<T: Hash + ?Sized>(value: &T) -> (u64, Vec<u64>) {
-    let outer = SET_ASIDE.with(|positions| positions.replace(Some(Vec::new())));
+    let mut outer = SET_ASIDE.with(|positions| positions.replace(Some(Vec::new())));
     let fingerprinting = FINGERPRINTING.with(|flag| flag.replace(true));
     SETTING_ASIDE.fetch_add(1, Ordering::Relaxed);
     let mut state = std::collections::hash_map::DefaultHasher::new();
+    let mut positions = Vec::new();
     {
         let _restore = super::OnDrop(|| {
             SETTING_ASIDE.fetch_sub(1, Ordering::Relaxed);
             FINGERPRINTING.with(|flag| flag.set(fingerprinting));
+            positions = SET_ASIDE
+                .with(|set_aside| set_aside.replace(outer.take()))
+                .unwrap_or_default();
         });
         value.hash(&mut state);
     }
-    let positions = SET_ASIDE.with(|positions| positions.replace(outer));
-    (state.finish(), positions.unwrap_or_default())
+    (state.finish(), positions)
 }
 
 /// Sets a position of `file_id` aside instead of hashing it, inside
