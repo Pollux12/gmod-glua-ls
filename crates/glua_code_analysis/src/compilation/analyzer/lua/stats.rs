@@ -1715,32 +1715,11 @@ fn index_chain_roots_at_decl(
                     .get_reference_index()
                     .get_local_reference(&file_id)
                     .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
-                    .is_some_and(|read| {
-                        read == decl_id || local_alias_roots_at_decl(db, file_id, decl_id, read)
-                    });
+                    == Some(decl_id);
             }
             _ => return false,
         }
     }
-}
-
-/// Whether `alias` is a local never written after its declaration whose
-/// initializer reads out of `decl_id`: reading the alias reads the decl's
-/// slot (`local id = data; data = id`).
-fn local_alias_roots_at_decl(
-    db: &DbIndex,
-    file_id: crate::FileId,
-    decl_id: LuaDeclId,
-    alias: LuaDeclId,
-) -> bool {
-    db.get_reference_index()
-        .get_decl_references(&file_id, &alias)
-        .is_some_and(|references| !references.mutable)
-        && crate::semantic::local_initializer_expr(db, alias).is_some_and(
-            |(ret_idx, initializer)| {
-                ret_idx == 0 && index_chain_roots_at_decl(db, file_id, decl_id, &initializer)
-            },
-        )
 }
 
 /// Whether this assignment would seed an empty decl slot from a read out of
@@ -3501,56 +3480,6 @@ mod tests {
         assert_eq!(
             rebuilt, None,
             "memoized query must rebuild to poisoned instead of the stale clean answer"
-        );
-    }
-
-    /// A write of a local through an alias of itself (`local id = data;
-    /// data = id`) derives its type from the slot it fills, like a direct read
-    /// of it: it reads out of the decl.
-    #[test]
-    fn decl_assignment_through_a_local_alias_of_itself_reads_out_of_it() {
-        let mut ws = crate::VirtualWorkspace::new();
-        let file_id = ws.def_file(
-            "lua/autorun/alias-self-read.lua",
-            r#"
-            local function handle(read, key)
-                local data = read()
-                if key then
-                    local id = data
-                    local first = data[1]
-                    data = id
-                    data = first
-                end
-                return data
-            end
-            "#,
-        );
-
-        let db = ws.analysis.compilation.get_db();
-        let root = db
-            .get_vfs()
-            .get_syntax_tree(&file_id)
-            .expect("syntax tree")
-            .get_chunk_node();
-        let references = db
-            .get_reference_index()
-            .get_local_reference(&file_id)
-            .expect("local references");
-        let data_decl = root
-            .descendants::<glua_parser::LuaNameExpr>()
-            .find(|name| name.get_name_text().as_deref() == Some("data"))
-            .and_then(|name| references.get_decl_id(&name.get_range()))
-            .expect("data decl");
-        let assigned = root
-            .descendants::<glua_parser::LuaAssignStat>()
-            .filter_map(|assign| assign.get_var_and_expr_list().1.into_iter().next())
-            .collect::<Vec<_>>();
-
-        assert_eq!(assigned.len(), 2);
-        assert!(
-            assigned
-                .iter()
-                .all(|expr| { super::expr_reads_out_of_decl(db, file_id, data_decl, expr) })
         );
     }
 }
