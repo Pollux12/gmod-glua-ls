@@ -13,8 +13,9 @@ use crate::{
     db_index::{DbIndex, DynamicFieldOwner, LuaMemberOwner, LuaSemanticDeclId, WorkspaceKind},
     find_signature_attribute_use,
     semantic::{
-        declaring_for_range, find_members_with_key, get_var_expr_var_ref_id, infer_expr,
-        raw_get_access_path, try_infer_enclosing_for_range_iter_type, unwrap_paren_to_name_expr,
+        contains_gmod_null_type, declaring_for_range, find_members_with_key,
+        get_var_expr_var_ref_id, infer_expr, raw_get_access_path,
+        try_infer_enclosing_for_range_iter_type, unwrap_paren_to_name_expr,
     },
 };
 
@@ -1990,7 +1991,8 @@ fn collect_wildcard_for_type_inner(
         return;
     }
     match typ {
-        LuaType::Ref(id) | LuaType::Def(id) => {
+        // `NULL` holds no fields: a write through it errors at runtime.
+        LuaType::Ref(id) | LuaType::Def(id) if !contains_gmod_null_type(db, typ) => {
             result.push((DynamicFieldOwner::Type(id.clone()), file_id, range));
         }
         // Canonicalized at push, like `collect_for_type`: the
@@ -2060,7 +2062,8 @@ fn collect_for_type_inner(
         return;
     }
     match typ {
-        LuaType::Ref(id) | LuaType::Def(id) => {
+        // `NULL` holds no fields: a write through it errors at runtime.
+        LuaType::Ref(id) | LuaType::Def(id) if !contains_gmod_null_type(db, typ) => {
             result.push((
                 DynamicFieldOwner::Type(id.clone()),
                 field_name.clone(),

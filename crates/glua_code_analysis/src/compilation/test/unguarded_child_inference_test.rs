@@ -2850,6 +2850,37 @@ filter:SetUpdateOnType(true)
         );
     }
 
+    #[test]
+    fn a_field_written_through_a_maybe_null_entity_is_not_declared_on_null() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL: Entity
+            ---@class Car: Entity
+
+            ---@return Car|NULL
+            local function make() end
+            local car = make()
+            car.Driver = 1
+
+            ---@param ent Entity
+            local function use(ent)
+                return ent.Driver
+            end
+            return use
+            "#,
+        );
+
+        let diagnostics = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "expected `Car` but found `Entity`. Add a guard to narrow the parent to `Car`."
+        );
+    }
+
     fn entity_table_guard_hint_count(use_site: &str) -> usize {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
