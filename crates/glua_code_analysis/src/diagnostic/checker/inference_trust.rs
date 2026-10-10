@@ -3,9 +3,10 @@ use glua_parser::{LuaAstNode, LuaIndexExpr, LuaIndexKey, LuaSyntaxId};
 use crate::{
     DiagnosticCode, FileId, InFiled, LuaInferenceProvenanceKind, LuaType, RenderLevel,
     SemanticModel, humanize_type,
+    semantic::{ParamInferenceSource, infer_param_source},
 };
 
-use super::{Checker, DiagnosticContext};
+use super::{Checker, DiagnosticContext, named_param};
 
 /// A tie lists this many candidate children before it falls back to a count.
 const MAX_LISTED_CHILDREN: usize = 3;
@@ -35,6 +36,17 @@ impl Checker for InferenceTrustChecker {
         for inference in events {
             let (code, is_unguarded_child) = match inference.event.kind {
                 LuaInferenceProvenanceKind::ContextualUnknown => {
+                    (DiagnosticCode::InferUnknown, false)
+                }
+                // A child read off a param only its name types was inferred
+                // from usage: there is no declared parent a guard could narrow.
+                LuaInferenceProvenanceKind::UnguardedChild
+                    if reads_name_guessed_param(
+                        semantic_model,
+                        context.get_file_id(),
+                        &inference.event.source,
+                    ) =>
+                {
                     (DiagnosticCode::InferUnknown, false)
                 }
                 LuaInferenceProvenanceKind::UnguardedChild => {
@@ -123,16 +135,43 @@ fn unguarded_child_message(
     }
 }
 
+/// Whether the use at `source` reads its member straight off a param whose
+/// only type is the guess its name gives.
+fn reads_name_guessed_param(
+    semantic_model: &SemanticModel,
+    file_id: FileId,
+    source: &InFiled<LuaSyntaxId>,
+) -> bool {
+    use_index_expr(semantic_model, file_id, source)
+        .and_then(|index_expr| index_expr.get_prefix_expr())
+        .and_then(|prefix| named_param(semantic_model, &prefix))
+        .is_some_and(|decl| {
+            infer_param_source(
+                semantic_model.get_db(),
+                &mut semantic_model.get_cache().borrow_mut(),
+                decl,
+            ) == Some(ParamInferenceSource::NameFallback)
+        })
+}
+
+fn use_index_expr(
+    semantic_model: &SemanticModel,
+    file_id: FileId,
+    source: &InFiled<LuaSyntaxId>,
+) -> Option<LuaIndexExpr> {
+    if source.file_id != file_id {
+        return None;
+    }
+    let root = semantic_model.get_root().syntax().clone();
+    LuaIndexExpr::cast(source.value.to_node_from_root(&root)?)
+}
+
 fn used_member_name(
     semantic_model: &SemanticModel,
     file_id: FileId,
     source: &InFiled<LuaSyntaxId>,
 ) -> Option<String> {
-    if source.file_id != file_id {
-        return None;
-    }
-    let root = semantic_model.get_root().syntax().clone();
-    let index_expr = LuaIndexExpr::cast(source.value.to_node_from_root(&root)?)?;
+    let index_expr = use_index_expr(semantic_model, file_id, source)?;
     match index_expr.get_index_key()? {
         LuaIndexKey::Name(name) => Some(name.get_name_text().to_string()),
         LuaIndexKey::String(string) => Some(string.get_value().to_string()),

@@ -1965,11 +1965,20 @@ pub fn infer_param_with_cache(
 }
 
 pub(crate) fn infer_param_is_weak(db: &DbIndex, cache: &mut LuaInferCache, decl: &LuaDecl) -> bool {
+    infer_param_source(db, cache, decl).is_some_and(ParamInferenceSource::is_weak)
+}
+
+/// Where the type of the param `decl` came from, when it has one.
+pub(crate) fn infer_param_source(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl: &LuaDecl,
+) -> Option<ParamInferenceSource> {
     let _ = infer_param_with_cache(db, cache, decl);
-    matches!(
-        cache.param_type_source_cache.get(&decl.get_id()),
-        Some(CacheEntry::Cache(source)) if source.is_weak()
-    )
+    match cache.param_type_source_cache.get(&decl.get_id()) {
+        Some(CacheEntry::Cache(source)) => Some(*source),
+        _ => None,
+    }
 }
 
 fn direct_table_field_from_member_id(

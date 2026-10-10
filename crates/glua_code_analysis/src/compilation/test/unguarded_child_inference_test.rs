@@ -2707,6 +2707,42 @@ filter:SetUpdateOnType(true)
         diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild)
     }
 
+    /// The unguarded-child and usage-inference hints on a callback's read of
+    /// a child-only member off its `panel` param.
+    fn callback_panel_hints(param_doc: &str) -> (usize, usize) {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let source = format!(
+            r#"
+            ---@class Panel
+            ---@class FacePanel: Panel
+            ---@field charData table
+            local data = {{
+                {param_doc}
+                Think = function(animation, panel)
+                    return panel.charData
+                end,
+            }}
+            return data
+            "#
+        );
+        let file_id = ws.def(&source);
+        (
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnknown),
+        )
+    }
+
+    #[test]
+    fn a_child_read_off_a_param_only_its_name_types_is_inferred_from_usage() {
+        assert_eq!(callback_panel_hints(""), (0, 1));
+    }
+
+    #[test]
+    fn a_child_read_off_a_param_declared_as_the_parent_needs_a_guard() {
+        assert_eq!(callback_panel_hints("---@param panel Panel"), (1, 0));
+    }
+
     #[test]
     fn unguarded_use_fires_without_any_guard() {
         assert_eq!(guard_form_diagnostic_count("ent:Honk()"), 1);

@@ -40,7 +40,7 @@ pub(crate) use infer_name::is_authoritative_self_receiver_type;
 pub(crate) use infer_name::is_concrete_self_receiver_type;
 pub(crate) use infer_name::try_local_decl_initializer_fallback_type;
 pub(crate) use infer_name::type_decl_is_vgui_panel;
-pub(crate) use infer_name::{ParamInferenceSource, infer_param_is_weak};
+pub(crate) use infer_name::{ParamInferenceSource, infer_param_is_weak, infer_param_source};
 pub(crate) use infer_name::{declaring_for_range, try_infer_enclosing_for_range_iter_type};
 pub use infer_name::{infer_param, infer_param_with_cache};
 use infer_table::infer_table_expr;

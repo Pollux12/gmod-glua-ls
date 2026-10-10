@@ -16,13 +16,12 @@ use crate::{
     semantic::{
         infer_owner_raw_member_type_with_realm, infer_param_is_weak, is_doc_tag_table_const,
         member_key_matches_type, resolve_decl_backed_global_path_member_type,
-        unwrap_paren_to_name_expr,
     },
 };
 
 use super::{
     AssignmentPrefixEvents, Checker, DiagnosticContext, humanize_lint_type,
-    is_initialized_assignment_access, is_initialized_assignment_prefix,
+    is_initialized_assignment_access, is_initialized_assignment_prefix, named_param,
 };
 
 pub struct CheckFieldChecker;
@@ -141,16 +140,12 @@ fn receiver_is_weak(semantic_model: &SemanticModel, index_expr: &LuaIndexExpr) -
 }
 
 fn is_weak_receiver(semantic_model: &SemanticModel, prefix_expr: &LuaExpr) -> bool {
-    let db = semantic_model.get_db();
-    if let Some(name_expr) = unwrap_paren_to_name_expr(prefix_expr)
-        && let Some(decl_id) = db
-            .get_reference_index()
-            .get_local_reference(&semantic_model.get_file_id())
-            .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
-        && let Some(decl) = db.get_decl_index().get_decl(&decl_id)
-        && decl.is_param()
-    {
-        return infer_param_is_weak(db, &mut semantic_model.get_cache().borrow_mut(), decl);
+    if let Some(decl) = named_param(semantic_model, prefix_expr) {
+        return infer_param_is_weak(
+            semantic_model.get_db(),
+            &mut semantic_model.get_cache().borrow_mut(),
+            decl,
+        );
     }
 
     semantic_model

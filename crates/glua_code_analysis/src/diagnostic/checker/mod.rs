@@ -60,8 +60,8 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    FileId, LuaSemanticDeclId, LuaType, LuaTypeDeclId, RenderLevel, SemanticDeclLevel, WorkspaceId,
-    db_index::DbIndex, humanize_type, semantic::SemanticModel,
+    FileId, LuaDecl, LuaSemanticDeclId, LuaType, LuaTypeDeclId, RenderLevel, SemanticDeclLevel,
+    WorkspaceId, db_index::DbIndex, humanize_type, semantic::SemanticModel,
 };
 
 use super::{
@@ -1104,6 +1104,19 @@ pub fn humanize_lint_type(db: &DbIndex, typ: &LuaType) -> String {
         LuaType::DocBooleanConst(_) => "boolean".to_string(),
         _ => humanize_type(db, typ, RenderLevel::Simple),
     }
+}
+
+/// The param `expr` names, through any parentheses.
+fn named_param<'a>(semantic_model: &'a SemanticModel, expr: &LuaExpr) -> Option<&'a LuaDecl> {
+    let name_expr = crate::semantic::unwrap_paren_to_name_expr(expr)?;
+    let db = semantic_model.get_db();
+    let decl_id = db
+        .get_reference_index()
+        .get_local_reference(&semantic_model.get_file_id())?
+        .get_decl_id(&name_expr.get_range())?;
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .filter(|decl| decl.is_param())
 }
 
 fn decl_has_inferred_type(semantic_model: &SemanticModel, decl: LuaSemanticDeclId) -> bool {
