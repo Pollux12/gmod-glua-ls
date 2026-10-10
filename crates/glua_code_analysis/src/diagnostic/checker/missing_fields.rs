@@ -369,23 +369,21 @@ fn get_precomputed_required_fields(
         .and_then(|shared| shared.missing_required_fields.get(type_decl_id).cloned())
 }
 
-/// The positional slots a trailing call or `...` fills: from `first` onward,
-/// `count` of them, or all of them when the number of values is unknown.
+/// The values a trailing call or `...` fills the positional slots with, from
+/// slot `first` onward.
 struct SpreadSlots {
     first: usize,
-    count: Option<usize>,
+    values: VariadicType,
 }
 
 impl SpreadSlots {
     fn fills(&self, field_name: &str) -> bool {
-        let Some(slot) = field_name
+        field_name
             .strip_prefix('[')
             .and_then(|name| name.strip_suffix(']'))
             .and_then(|slot| slot.parse::<usize>().ok())
-        else {
-            return false;
-        };
-        slot >= self.first && self.count.is_none_or(|count| slot < self.first + count)
+            .and_then(|slot| slot.checked_sub(self.first))
+            .is_some_and(|offset| self.values.get_type(offset).is_some())
     }
 }
 
@@ -397,24 +395,19 @@ fn trailing_spread_slots(
     if !last.is_value_field() {
         return None;
     }
-    let spread = match semantic_model.infer_expr_fact(last.get_value_expr()?).typ() {
-        LuaType::Variadic(spread) => spread.clone(),
-        _ => return None,
+    let fact = semantic_model.infer_expr_fact(last.get_value_expr()?);
+    let LuaType::Variadic(values) = fact.typ() else {
+        return None;
     };
     let first = preceding
         .iter()
         .filter(|field| field.is_value_field())
         .count()
         + 1;
-    let count = match spread.as_ref() {
-        VariadicType::Multi(types)
-            if !types.iter().any(|ty| matches!(ty, LuaType::Variadic(_))) =>
-        {
-            Some(types.len())
-        }
-        _ => None,
-    };
-    Some(SpreadSlots { first, count })
+    Some(SpreadSlots {
+        first,
+        values: values.as_ref().clone(),
+    })
 }
 
 fn table_literal_looks_array_like(fields: &[LuaTableField]) -> bool {
