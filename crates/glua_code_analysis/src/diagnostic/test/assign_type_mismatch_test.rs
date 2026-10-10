@@ -4068,6 +4068,7 @@ fn trailing_call_return_values_are_all_checked_against_table_elements() {
     ));
 }
 
+#[cfg(test)]
 const HOOK_CLASS: &str = r#"
 ---@class HookPanel
 local HookPanel = {}
