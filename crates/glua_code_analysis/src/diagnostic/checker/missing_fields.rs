@@ -602,11 +602,28 @@ mod tests {
     use googletest::prelude::*;
     use tokio_util::sync::CancellationToken;
 
-    use super::get_required_fields;
+    use super::{SpreadSlots, get_required_fields};
     use crate::{
-        DiagnosticCode, Emmyrc, LuaType, diagnostic::lua_diagnostic_config::LuaDiagnosticConfig,
-        test_lib::VirtualWorkspace,
+        DiagnosticCode, Emmyrc, LuaType, VariadicType,
+        diagnostic::lua_diagnostic_config::LuaDiagnosticConfig, test_lib::VirtualWorkspace,
     };
+
+    /// A spread short of the end of the values gives one of them, as the type
+    /// check reads the values; only the last spread reaches every later slot.
+    #[test]
+    fn a_spread_short_of_the_end_fills_one_slot() {
+        let slots = SpreadSlots {
+            first: 2,
+            values: VariadicType::Multi(vec![
+                LuaType::Variadic(Arc::new(VariadicType::Base(LuaType::Number))),
+                LuaType::String,
+            ]),
+        };
+        assert!(!slots.fills("[1]"));
+        assert!(slots.fills("[2]"));
+        assert!(slots.fills("[3]"));
+        assert!(!slots.fills("[4]"));
+    }
 
     #[gtest]
     fn get_required_fields_stops_when_cancelled() {
