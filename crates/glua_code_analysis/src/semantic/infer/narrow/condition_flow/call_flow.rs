@@ -68,20 +68,22 @@ pub fn get_type_at_call_expr(
                 });
                 let return_type = f.get_ret();
                 let type_guard_result = match return_type {
-                    LuaType::TypeGuard(_) => get_type_at_call_expr_by_type_guard(
-                        db,
-                        tree,
-                        cache,
-                        root,
-                        var_ref_id,
-                        flow_node,
-                        call_expr.clone(),
-                        f,
-                        signature_cast,
-                        is_valid_guard,
-                        condition_flow,
-                        policy,
-                    ),
+                    _ if is_valid_guard || matches!(return_type, LuaType::TypeGuard(_)) => {
+                        get_type_at_call_expr_by_type_guard(
+                            db,
+                            tree,
+                            cache,
+                            root,
+                            var_ref_id,
+                            flow_node,
+                            call_expr.clone(),
+                            f,
+                            signature_cast,
+                            is_valid_guard,
+                            condition_flow,
+                            policy,
+                        )
+                    }
                     _ => {
                         // If the return type is not a type guard, we cannot infer the type cast.
                         Ok(ResultTypeOrContinue::Continue)
@@ -117,7 +119,7 @@ pub fn get_type_at_call_expr(
                     call_prefix_signature_is_valid_guard(db, cache, &call_expr_ref, signature_id);
                 let mut type_guard_did_not_apply = false;
                 match ret {
-                    LuaType::TypeGuard(_) => {
+                    _ if is_valid_guard || matches!(ret, LuaType::TypeGuard(_)) => {
                         // Try TypeGuard narrowing. If it doesn't apply (e.g., when the
                         // target is a member access, not a simple variable), fall through
                         // to the member guard fallback below.
@@ -642,6 +644,9 @@ fn get_type_at_call_expr_by_type_guard(
 
     let guard_type = match return_type {
         LuaType::TypeGuard(guard) => guard.deref().clone(),
+        // A valid guard answers true only for a valid object, whatever its
+        // declared return, as the runtime `IsValid` in `includes/util.lua` does.
+        _ if is_valid_guard => LuaType::Any,
         _ => return Ok(ResultTypeOrContinue::Continue),
     };
 

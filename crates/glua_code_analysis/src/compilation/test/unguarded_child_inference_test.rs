@@ -2867,6 +2867,77 @@ filter:SetUpdateOnType(true)
         );
     }
 
+    #[test]
+    fn unguarded_child_message_names_the_receiver_an_early_return_narrowed() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_gmod_type_predicates();
+        let file_id = ws.def(
+            r#"
+            ---@class NULL
+            ---@class Entity
+            ---@class Car: Entity
+            ---@field GetFuelCapacity fun(self: Car): number
+            ---@return Entity|NULL
+            local function find() end
+            local function use()
+                local veh = find()
+                if not IsValid(veh) then return end
+                return veh:GetFuelCapacity()
+            end
+            return use
+            "#,
+        );
+
+        let diagnostics = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "expected `Car` but found `Entity`. Add a guard to narrow the parent to `Car`."
+        );
+    }
+
+    #[test]
+    fn the_runtime_isvalid_in_util_lua_narrows_like_the_annotated_one() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "lua/includes/util.lua",
+            r#"
+            function IsValid(object)
+                if ( !object ) then return false end
+                local isvalid = object.IsValid
+                if ( !isvalid ) then return false end
+                return isvalid( object )
+            end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/fuel.lua",
+            r#"
+            ---@class NULL
+            ---@class Entity
+            ---@class Car: Entity
+            ---@field GetFuelCapacity fun(self: Car): number
+            ---@return Entity|NULL
+            local function find() end
+            local function use()
+                local veh = find()
+                if not IsValid(veh) then return end
+                return veh:GetFuelCapacity()
+            end
+            return use
+            "#,
+        );
+
+        let diagnostics = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "expected `Car` but found `Entity`. Add a guard to narrow the parent to `Car`."
+        );
+    }
+
     fn closure_receiver_hint_count(write_avatar: bool) -> usize {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
