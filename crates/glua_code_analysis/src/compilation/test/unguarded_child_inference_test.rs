@@ -2850,6 +2850,65 @@ filter:SetUpdateOnType(true)
         );
     }
 
+    fn entity_table_guard_hint_count(use_site: &str) -> usize {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let source = format!(
+            r#"
+            ---@class Entity
+            Entity = {{}}
+
+            ---@return tableof<self>
+            function Entity:GetTable() end
+
+            ---@class Car: Entity
+            ---@field Honk fun(self: Car)
+
+            local GetTable = Entity.GetTable
+
+            ---@param ent Entity
+            ---@param other Entity
+            local function use(ent, other)
+                {use_site}
+            end
+            return use
+            "#
+        );
+        let file_id = ws.def(&source);
+        diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild)
+    }
+
+    #[test]
+    fn a_member_check_on_the_entity_table_guards_the_entity() {
+        assert_eq!(
+            entity_table_guard_hint_count(
+                "local tbl = ent:GetTable()
+                if tbl and tbl.Honk then ent:Honk() end"
+            ),
+            0
+        );
+        assert_eq!(
+            entity_table_guard_hint_count(
+                "local tbl = GetTable(ent)
+                if not tbl or not tbl.Honk then return end
+                ent:Honk()"
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn a_member_check_on_a_replaced_entity_table_does_not_guard_the_entity() {
+        assert_eq!(
+            entity_table_guard_hint_count(
+                "local tbl = GetTable(ent)
+                ent = other
+                if tbl.Honk then ent:Honk() end"
+            ),
+            1
+        );
+    }
+
     #[test]
     fn is_valid_guard_alone_does_not_narrow_to_child() {
         assert_eq!(

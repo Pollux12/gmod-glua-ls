@@ -6,12 +6,16 @@ use crate::{
     DbIndex, FlowNode, FlowTree, GmodRealm, InferFailReason, LuaInferCache, LuaMemberKey,
     LuaMemberOwner, LuaType, LuaTypeDeclId,
     semantic::{
+        decl::value::local_initializer_expr,
         infer::{
-            VarRefId,
+            VarRefId, infer_expr,
             infer_index::infer_member_by_member_key,
             narrow::{
                 ResultTypeOrContinue,
-                condition_flow::{InferConditionFlow, get_condition_antecedent_type},
+                condition_flow::{
+                    InferConditionFlow, binary_flow::has_decl_write_in_open_interval,
+                    get_condition_antecedent_type,
+                },
                 get_type_at_flow::FlowWalkPolicy,
                 narrow_false_or_nil, remove_false_or_nil,
                 var_ref_id::{
@@ -94,7 +98,10 @@ fn maybe_field_exist_narrow(
 
     let maybe_var_ref_id = get_var_expr_var_ref_id(db, cache, prefix_expr.clone());
 
-    if maybe_var_ref_id.as_ref() != Some(var_ref_id) {
+    if maybe_var_ref_id.as_ref() != Some(var_ref_id)
+        && entity_table_owner(db, cache, &prefix_expr, index_expr.get_position()).as_ref()
+            != Some(var_ref_id)
+    {
         // Direct prefix doesn't match the queried var. For an Unknown base in
         // the truthy branch we still want to narrow the *transitive* leftmost
         // name (e.g. `if a.b.c then` → `a` is non-nil), so fall through to the
@@ -232,6 +239,54 @@ fn maybe_field_exist_narrow(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+/// The variable whose entity table `table_expr` names: a local whose only
+/// value is a call returning `tableof<self>` of that variable, such as
+/// `local t = GetTable(ent)` or `local t = ent:GetTable()`, the variable
+/// unwritten between then and `at`. A field read off the table is a field
+/// read off the variable.
+fn entity_table_owner(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    table_expr: &LuaExpr,
+    at: rowan::TextSize,
+) -> Option<VarRefId> {
+    let LuaExpr::NameExpr(name_expr) = table_expr else {
+        return None;
+    };
+    let file_id = cache.get_file_id();
+    let table_decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, name_expr.get_range())?;
+    if db
+        .get_reference_index()
+        .get_decl_references(&file_id, &table_decl_id)
+        .is_none_or(|references| references.mutable)
+    {
+        return None;
+    }
+    let (0, LuaExpr::CallExpr(call_expr)) = local_initializer_expr(db, table_decl_id)? else {
+        return None;
+    };
+    if !matches!(
+        infer_expr(db, cache, LuaExpr::CallExpr(call_expr.clone())),
+        Ok(LuaType::TableOf(_))
+    ) {
+        return None;
+    }
+    let owner_expr = if call_expr.is_colon_call() {
+        let LuaExpr::IndexExpr(method) = call_expr.get_prefix_expr()? else {
+            return None;
+        };
+        method.get_prefix_expr()?
+    } else {
+        call_expr.get_args_list()?.get_args().next()?
+    };
+    let owner = get_var_expr_var_ref_id(db, cache, owner_expr)?;
+    let owner_decl_id = owner.get_decl_id_ref()?;
+    (!has_decl_write_in_open_interval(db, file_id, owner_decl_id, call_expr.get_position(), at))
+        .then_some(owner)
 }
 
 fn type_directly_owns_member(
