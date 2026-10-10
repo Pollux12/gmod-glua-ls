@@ -2230,7 +2230,14 @@ fn materialize_str_tpl_class_from_call(
     else {
         return Ok(());
     };
-    let Some(arg_name) = infer_string_const_arg(db, cache, &arg_expr) else {
+    // The name a call binds the template to, as the call's generic
+    // instantiation binds it.
+    let Ok(arg_type) = infer_expr(db, cache, arg_expr.clone()) else {
+        return Ok(());
+    };
+    let LuaType::StringConst(arg_name) = crate::semantic::str_tpl_arg_type(
+        db, cache, param_type, &arg_expr, call_expr, param_idx, arg_type,
+    ) else {
         return Ok(());
     };
 

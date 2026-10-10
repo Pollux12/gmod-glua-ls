@@ -86,6 +86,38 @@ fn find_generic_constraint(func: &LuaFunctionType, id: GenericTplId) -> Option<L
 /// - `param_type` actually contains a `StrTplRef`
 /// - exactly one candidate default is flow-valid at the use site
 /// - no explicit `---@param` default takes precedence
+/// The type a string-template parameter binds from `arg_expr`, whose own type
+/// is `arg_type`, when the arg is not a literal string constant. Two
+/// resolution paths exist:
+///
+/// 1. VGUI panel reference: when the param has a StrTplRef and the call is
+///    annotated with call_arg("gmod.vgui_panel", "reference"), resolve from
+///    the enclosing PANEL method context. This works for any arg type
+///    (String, Unknown, Any) because the resolution is purely contextual.
+///
+/// 2. Inferred string default: when arg_type is plain `String` and the
+///    variable has a flow-valid `x = x or "literal"` default.
+///
+/// Path 1 is tried first (it is more specific). Path 2 only applies to
+/// `String` args.
+pub(crate) fn str_tpl_arg_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    param_type: &LuaType,
+    arg_expr: &LuaExpr,
+    call_expr: &LuaCallExpr,
+    param_idx: usize,
+    arg_type: LuaType,
+) -> LuaType {
+    resolve_vgui_panel_ref_from_arg(db, cache, param_type, arg_expr, call_expr, param_idx)
+        .or_else(|| {
+            matches!(arg_type, LuaType::String)
+                .then(|| resolve_str_default_from_arg(db, cache, param_type, arg_expr))
+                .flatten()
+        })
+        .unwrap_or(arg_type)
+}
+
 fn resolve_str_default_from_arg(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -669,42 +701,15 @@ fn infer_generic_types_from_call(
                 break;
             }
             _ => {
-                // Try to bind a StrTplRef from context when the arg is not a
-                // literal string constant.  Two resolution paths exist:
-                //
-                // 1. VGUI panel reference: when the param has a StrTplRef and
-                //    the call is annotated with call_arg("gmod.vgui_panel",
-                //    "reference"), resolve from the enclosing PANEL method
-                //    context.  This works for any arg type (String, Unknown,
-                //    Any) because the resolution is purely contextual.
-                //
-                // 2. Inferred string default: when arg_type is plain `String`
-                //    and the variable has a flow-valid `x = x or "literal"`
-                //    default.
-                //
-                // Path 1 is tried first (it is more specific).  Path 2 only
-                // applies to `String` args.
-                let effective_type = resolve_vgui_panel_ref_from_arg(
+                let effective_type = str_tpl_arg_type(
                     db,
                     context.cache,
                     func_param_type,
                     call_arg_expr,
                     call_expr,
                     i,
-                )
-                .or_else(|| {
-                    if matches!(arg_type, LuaType::String) {
-                        resolve_str_default_from_arg(
-                            db,
-                            context.cache,
-                            func_param_type,
-                            call_arg_expr,
-                        )
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| arg_type.clone());
+                    arg_type,
+                );
                 tpl_pattern_match(context, func_param_type, &effective_type)?;
             }
         }

@@ -517,6 +517,57 @@ mod test {
     }
 
     #[gtest]
+    fn test_str_tpl_class_a_defaulted_argument_names_is_declared_like_a_literal_one() -> Result<()>
+    {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field SetPos fun(self: Entity, pos: any)
+
+            ents = {}
+
+            ---@generic T: Entity
+            ---@param class `T`
+            ---@return T
+            function ents.Create(class) end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/server/sv_scanner.lua",
+            r#"
+            local function CreateScanner(client, class)
+                class = class or "npc_cscanner"
+                local entity = ents.Create(class)
+                entity:SetPos(client)
+            end
+            return CreateScanner
+            "#,
+        );
+
+        let declared = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_type_decl(&LuaTypeDeclId::global("npc_cscanner"))
+            .map(|decl| decl.is_auto_generated());
+        verify_that!(declared, some(eq(true)))?;
+        verify_that!(
+            ws.analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default()
+                .iter()
+                .any(|diagnostic| diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string()
+                    ))),
+            eq(false)
+        )
+    }
+
+    #[gtest]
     fn test_str_tpl_generic_override_with_extra_param_preserves_instantiated_return() {
         let mut ws = VirtualWorkspace::new();
 
