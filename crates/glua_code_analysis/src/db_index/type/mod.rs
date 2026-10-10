@@ -1842,11 +1842,11 @@ impl LuaTypeIndex {
     /// what files declare, never on what analysis synthesized.
     pub fn find_source_type_decl(&self, file_id: FileId, name: &str) -> Option<&LuaTypeDecl> {
         let namespaced = |ns: &str| LuaTypeDeclId::global(&format!("{}.{}", ns, name));
-        let candidates = self
-            .file_namespace
-            .get(&file_id)
-            .map(|ns| namespaced(ns))
+        let namespace = self.file_namespace.get(&file_id);
+        let candidates = namespace
+            .map(|ns| LuaTypeDeclId::local(file_id, &format!("{}.{}", ns, name)))
             .into_iter()
+            .chain(namespace.map(|ns| namespaced(ns)))
             .chain(
                 self.file_using_namespace
                     .get(&file_id)
@@ -1881,7 +1881,13 @@ impl LuaTypeIndex {
 
     pub fn find_type_decl(&self, file_id: FileId, name: &str) -> Option<&LuaTypeDecl> {
         if let Some(ns) = self.get_file_namespace(&file_id) {
-            let full_name = LuaTypeDeclId::global(&format!("{}.{}", ns, name));
+            let qualified = format!("{}.{}", ns, name);
+            let private_id = LuaTypeDeclId::local(file_id, &qualified);
+            derivation::note_type_decl_read(&private_id);
+            if let Some(decl) = self.full_name_type_map.get(&private_id) {
+                return Some(decl);
+            }
+            let full_name = LuaTypeDeclId::global(&qualified);
             derivation::note_type_decl_read(&full_name);
             if let Some(decl) = self.full_name_type_map.get(&full_name) {
                 return Some(decl);

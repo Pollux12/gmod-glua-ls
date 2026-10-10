@@ -955,4 +955,28 @@ mod test {
         assert_eq!(decl.get_namespace(), "test".into());
         assert_eq!(decl.get_full_name(), "test.new_type");
     }
+
+    #[test]
+    fn test_private_namespaced_class_visible_only_in_own_file() {
+        let mut index = create_type_index();
+        let file_id = FileId { id: 1 };
+        let other_file_id = FileId { id: 2 };
+        index.add_file_namespace(file_id, "ns".to_string());
+        index.add_file_namespace(other_file_id, "ns".to_string());
+        index.add_type_decl(
+            file_id,
+            LuaTypeDecl::new(
+                file_id,
+                TextRange::new(0.into(), 4.into()),
+                "Hidden".to_string(),
+                LuaDeclTypeKind::Class,
+                LuaTypeFlag::Private.into(),
+                LuaTypeDeclId::local(file_id, "ns.Hidden"),
+            ),
+        );
+
+        let own = index.find_type_decl(file_id, "Hidden").unwrap();
+        assert_eq!(own.get_id(), LuaTypeDeclId::local(file_id, "ns.Hidden"));
+        assert!(index.find_type_decl(other_file_id, "Hidden").is_none());
+    }
 }
