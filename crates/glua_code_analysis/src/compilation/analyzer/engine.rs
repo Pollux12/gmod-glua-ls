@@ -3561,25 +3561,38 @@ impl Engine {
         let mut discarded = FxHashSet::default();
         loop {
             let resets = group_resets(db, group, &shared, &discarded);
-            let mut front = resets.front.clone();
+            let deferred = resets.deferred();
+            let GroupResets {
+                mut front,
+                own,
+                joint,
+            } = resets;
             touched.extend(self.reset_outputs(
                 db,
                 group,
                 &discarded,
-                &resets.deferred(),
+                &deferred,
                 (group.len() > 1).then_some(&mut front),
                 None,
             ));
             let mut reset = front.into_iter().map(|key| (key, 0)).collect();
             let mut cleared = FxHashSet::default();
             let (evaluations, found) = self.with_lent_keys(db, &touched, |db| {
-                run_group(db, group, resets, &mut reset, &mut cleared, |db, member| {
-                    let _recording = derivation::begin(member);
-                    recipe.evaluate(db, member);
-                    let evaluation = derivation::end();
-                    let outputs = evaluation.outputs().cloned().collect();
-                    (evaluation, outputs)
-                })
+                run_group(
+                    db,
+                    group,
+                    own,
+                    joint,
+                    &mut reset,
+                    &mut cleared,
+                    |db, member| {
+                        let _recording = derivation::begin(member);
+                        recipe.evaluate(db, member);
+                        let evaluation = derivation::end();
+                        let outputs = evaluation.outputs().cloned().collect();
+                        (evaluation, outputs)
+                    },
+                )
             });
             touched.extend(cleared);
             if found.is_empty() {
@@ -4562,6 +4575,7 @@ fn evaluate_on_worker(
     loop {
         let resets = group_resets(db, group, &shared, &discarded);
         let deferred = resets.deferred();
+        let GroupResets { front, own, joint } = resets;
         let mut reset = FxHashMap::default();
         let mut outputs = discarded.clone();
         for member in group {
@@ -4580,13 +4594,7 @@ fn evaluate_on_worker(
             }
         });
         if group.len() > 1 {
-            reset.extend(
-                resets
-                    .front
-                    .iter()
-                    .chain(&written)
-                    .map(|key| (key.clone(), 0)),
-            );
+            reset.extend(front.iter().chain(&written).map(|key| (key.clone(), 0)));
         }
         touched.extend(outputs);
         touched.extend(written);
@@ -4598,15 +4606,22 @@ fn evaluate_on_worker(
                 .cloned(),
         );
         let mut cleared = FxHashSet::default();
-        let (evaluations, found) =
-            run_group(db, group, resets, &mut reset, &mut cleared, |db, member| {
+        let (evaluations, found) = run_group(
+            db,
+            group,
+            own,
+            joint,
+            &mut reset,
+            &mut cleared,
+            |db, member| {
                 recorder.begin(member);
                 recipe.evaluate(db, member);
                 let at = recorder.end();
                 let outputs = recorder
                     .with_ended(at, |evaluation, _| evaluation.outputs().cloned().collect());
                 (at, outputs)
-            });
+            },
+        );
         derivation::note_recomputed(|key| recomputing.get(key) == Some(&db.fact_fingerprint(key)));
         touched.extend(cleared);
         for (at, _) in &evaluations {
@@ -4771,7 +4786,8 @@ fn reset_before(reset: &FxHashMap<HashedKey, usize>, key: &HashedKey, position: 
 fn run_group<E>(
     db: &mut DbIndex,
     group: &[DerivationId],
-    resets: GroupResets,
+    own: Vec<Vec<HashedKey>>,
+    joint: Vec<Vec<HashedKey>>,
     reset: &mut FxHashMap<HashedKey, usize>,
     cleared: &mut FxHashSet<HashedKey>,
     mut evaluate: impl FnMut(&mut DbIndex, DerivationId) -> (E, Vec<HashedKey>),
@@ -4780,7 +4796,7 @@ fn run_group<E>(
     // Each primary key written before it was reset, with the position of the
     // member that wrote it first.
     let mut writers = FxHashMap::<HashedKey, usize>::default();
-    let steps = group.iter().zip(resets.own.into_iter().zip(resets.joint));
+    let steps = group.iter().zip(own.into_iter().zip(joint));
     for (position, (member, (own, joint))) in steps.enumerate() {
         let taken = own
             .iter()
@@ -5951,6 +5967,7 @@ print(tuned{index})"
         assert!(engine.run(db, &recipe, Slice::Whole));
         assert_eq!(copied(db), Some(LuaType::IntegerConst(2)));
     }
+
     /// A query the evaluations computed is filed with them: a key only its
     /// previous record and an unfiled evaluation read stays live for the
     /// evaluation's record.
