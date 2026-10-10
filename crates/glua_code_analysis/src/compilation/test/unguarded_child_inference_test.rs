@@ -2832,6 +2832,25 @@ filter:SetUpdateOnType(true)
     }
 
     #[test]
+    fn class_name_comparison_guard_does_not_fire() {
+        assert_eq!(
+            guard_form_diagnostic_count(r#"if ent:GetClass() == "Car" then ent:Honk() end"#),
+            0
+        );
+    }
+
+    #[test]
+    fn class_name_early_return_guard_does_not_fire() {
+        assert_eq!(
+            guard_form_diagnostic_count(
+                r#"if ent:GetClass() ~= "Car" then return end
+                ent:Honk()"#
+            ),
+            0
+        );
+    }
+
+    #[test]
     fn is_valid_guard_alone_does_not_narrow_to_child() {
         assert_eq!(
             guard_form_diagnostic_count("if IsValid(ent) then ent:Honk() end"),
