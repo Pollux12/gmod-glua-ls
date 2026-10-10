@@ -3002,6 +3002,11 @@ fn is_undefined_global_name_expr(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool
 #[cfg(test)]
 mod tests {
     use glua_parser::LuaSyntaxId;
+    use rowan::{TextRange, TextSize};
+
+    use crate::{DbIndex, FileId, InFiled, LuaMergedTableType, LuaUnionType};
+
+    use super::*;
 
     /// Every assignment of a local produces the local's slot, the ones whose
     /// value the slot did not take included, so the local's writers run as
@@ -3053,12 +3058,6 @@ mod tests {
 
         assert_eq!(producing, vec![true, true]);
     }
-
-    use rowan::{TextRange, TextSize};
-
-    use crate::{DbIndex, FileId, InFiled, LuaMergedTableType, LuaUnionType};
-
-    use super::*;
 
     fn table_const(start: u32, end: u32) -> LuaType {
         LuaType::TableConst(InFiled::new(
