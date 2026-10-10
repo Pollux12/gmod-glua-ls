@@ -5322,7 +5322,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
-        let root = create_path_completion_root("gmod_include_path")?;
+        let root = crate::util::TempDir::new("glua_ls_gmod_include_path");
         fs::create_dir_all(root.join("lua/includes")).or_fail()?;
         fs::write(root.join("lua/includes/init.lua"), "").or_fail()?;
         fs::write(root.join("lua/includes/icon.png"), "").or_fail()?;
@@ -5355,7 +5355,7 @@ mod tests {
     #[gtest]
     fn test_member_named_include_uses_annotation_path_kind() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
-        let root = create_path_completion_root("member_include_path")?;
+        let root = crate::util::TempDir::new("glua_ls_member_include_path");
         fs::create_dir_all(root.join("materials/icons")).or_fail()?;
         fs::write(root.join("materials/icons/icon.png"), "").or_fail()?;
         fs::write(root.join("materials/icons/cl_init.lua"), "").or_fail()?;
@@ -5394,10 +5394,6 @@ mod tests {
             items.iter().any(|item| item.label == "cl_init.lua"),
             eq(true)
         )
-    }
-
-    fn create_path_completion_root(name: &str) -> Result<crate::util::TempDir> {
-        Ok(crate::util::TempDir::new(&format!("glua_ls_{name}")))
     }
 
     fn define_disk_file(
