@@ -2981,6 +2981,58 @@ fn is_undefined_global_name_expr(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool
 #[cfg(test)]
 mod tests {
     use glua_parser::LuaSyntaxId;
+
+    /// Every assignment of a local produces the local's slot, the ones whose
+    /// value the slot did not take included, so the local's writers run as
+    /// one group on every run.
+    #[test]
+    fn every_assignment_of_a_local_produces_its_slot() {
+        use crate::db_index::derivation::{DerivationId, DerivationKind, FactKey};
+
+        let mut ws = crate::VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/local_writes.lua",
+            r#"
+            local torque = 1
+            if brake then
+                torque = torque + 2
+            else
+                torque = unknown_source
+            end
+            "#,
+        );
+        let db = ws.analysis.compilation.get_db();
+        let root = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("syntax tree")
+            .get_chunk_node();
+        let decl_id = root
+            .descendants::<glua_parser::LuaLocalName>()
+            .find_map(|name| {
+                db.get_decl_index()
+                    .get_decl(&crate::LuaDeclId::new(file_id, name.get_position()))
+                    .map(|decl| decl.get_id())
+            })
+            .expect("the local");
+        let slot = FactKey::TypeCache(crate::LuaTypeOwner::Decl(decl_id));
+        let producing = root
+            .descendants::<glua_parser::LuaAssignStat>()
+            .map(|assign| {
+                let id = DerivationId::new(
+                    DerivationKind::AssignStat,
+                    file_id,
+                    LuaSyntaxId::from_node(assign.syntax()),
+                );
+                db.reader_graph()
+                    .outputs_of(id)
+                    .any(|key| key.key() == &slot)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(producing, vec![true, true]);
+    }
+
     use rowan::{TextRange, TextSize};
 
     use crate::{DbIndex, FileId, InFiled, LuaMergedTableType, LuaUnionType};

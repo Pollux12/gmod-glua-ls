@@ -5,7 +5,8 @@ use crate::{
     FileId, InFiled, LuaDeclId, LuaMemberId, LuaTypeCache, LuaTypeOwner, LuaUnionType,
     compilation::analyzer::lua::iterates_table_member_map,
     db_index::{
-        DbIndex, LuaMemberOwner, LuaType, LuaTypeDeclId, is_informative_type, is_undetermined_type,
+        DbIndex, LuaMemberOwner, LuaType, LuaTypeDeclId, derivation, is_informative_type,
+        is_undetermined_type,
     },
 };
 
@@ -415,6 +416,10 @@ pub fn bind_decl_write(
         }
         return Some(());
     }
+    // Every write of a local produces its slot, whether its value lands or
+    // not, so the local's writers run as one group on every run rather than
+    // only those whose value the slot took last time.
+    derivation::note_write(|| derivation::FactKey::TypeCache(type_owner.clone()));
     // Only a local's own initializer claims its empty slot: a later write that
     // reached it first would hold it just until the initializer answered.
     if db.get_type_index().get_type_cache(&type_owner).is_none()
