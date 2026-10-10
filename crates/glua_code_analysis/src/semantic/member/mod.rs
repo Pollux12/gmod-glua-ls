@@ -1167,7 +1167,10 @@ pub(crate) fn dynamic_field_type_without(
 
 /// The type the dynamic writers `definitions` give a field, with the member
 /// the first of them names. `informative_only` leaves out writers whose value
-/// is `any` or `unknown`, which say nothing of the field.
+/// is `any` or `unknown`, which say nothing of the field. A writer whose value
+/// is unresolved adds no type while another writer has one, as a member
+/// slot's untyped writers do not: otherwise the floor a cycle of writers took
+/// before one of them landed stays in the field for good.
 fn dynamic_field_definitions_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -1192,6 +1195,9 @@ fn dynamic_field_definitions_type(
                 has_runtime_type = true;
             }
         }
+    }
+    if member_types.iter().any(|typ| !typ.is_unknown()) {
+        member_types.retain(|typ| !typ.is_unknown());
     }
 
     if !member_types.is_empty() && !has_runtime_type {

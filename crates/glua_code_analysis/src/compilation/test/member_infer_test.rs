@@ -4915,6 +4915,46 @@ end
             ws.humanize_type_detailed(warm_ty)
         );
     }
+
+    /// A dynamic field written once with a value and once with what has not
+    /// resolved reads as the value: the unresolved writer says nothing of the
+    /// field, so a cycle of writers that floored before the typed one landed
+    /// does not keep `unknown` in it.
+    #[test]
+    fn a_dynamic_field_reads_its_typed_writers_beside_an_unresolved_one() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def_file(
+            "gamemodes/helix/gamemode/core/meta/sh_weapon.lua",
+            r#"
+            ---@class Weapon
+            local Weapon = {}
+
+            local ITEM = { name = "item" }
+
+            ---@param weapon Weapon
+            function ITEM:Equip(weapon)
+                weapon.ixItem = self
+            end
+
+            ---@param weapon Weapon
+            function RestoreItem(weapon, saved)
+                weapon.ixItem = saved
+            end
+
+            ---@param weapon Weapon
+            function ReadItem(weapon)
+                local item = weapon.ixItem
+            end
+            "#,
+        );
+
+        let item = local_name_type(&mut ws, file_id, "item");
+        assert_eq!(ws.humanize_type(item), "table?");
+    }
 }
 
 #[cfg(test)]
