@@ -32,10 +32,12 @@ mod test {
         ws.analysis
             .diagnostic
             .enable_only(DiagnosticCode::CodeStyleCheck);
-        let file_id = ws.def("// glua comment
+        let file_id = ws.def(
+            "// glua comment
 local a = 1
 if a != 2 && a != 3 then local t=1 end
-");
+",
+        );
         let found = ws
             .analysis
             .diagnose_file(file_id, CancellationToken::new())
