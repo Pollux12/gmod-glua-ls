@@ -451,14 +451,56 @@ pub(crate) fn find_metatable_index_field(
     table: &InFiled<TextRange>,
     key: &LuaMemberKey,
 ) -> MetatableIndexField {
-    metatable_index_field(db, table, key, &mut LookupPath::default())
+    metatable_index_field(db, table, key, &mut LookupPath::new())
 }
 
-/// The tables and aliases a lookup is inside of, innermost last.
-#[derive(Default)]
+#[derive(PartialEq)]
+enum PathEntry {
+    Table(InFiled<TextRange>),
+    Alias(LuaTypeDeclId),
+}
+
+/// Where one key's lookup is: the tables and aliases it is inside of,
+/// innermost last, and the answers of the tables it has finished.
 struct LookupPath {
-    tables: Vec<InFiled<TextRange>>,
-    aliases: Vec<LuaTypeDeclId>,
+    entries: Vec<PathEntry>,
+    /// The outermost entry a cycle inside the current one came back to.
+    reached: usize,
+    /// Tables whose answer no cycle reaching outside them cut short, so it is
+    /// theirs wherever the lookup meets them again.
+    answers: HashMap<InFiled<TextRange>, MetatableIndexField>,
+}
+
+impl LookupPath {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            reached: usize::MAX,
+            answers: HashMap::default(),
+        }
+    }
+
+    /// `look` inside `entry`, or `cut` when the lookup is inside it already;
+    /// with whether the answer holds wherever `entry` is met.
+    fn inside(
+        &mut self,
+        entry: PathEntry,
+        cut: MetatableIndexField,
+        look: impl FnOnce(&mut Self) -> MetatableIndexField,
+    ) -> (MetatableIndexField, bool) {
+        if let Some(at) = self.entries.iter().position(|inside| *inside == entry) {
+            self.reached = self.reached.min(at);
+            return (cut, false);
+        }
+        let depth = self.entries.len();
+        let outer = std::mem::replace(&mut self.reached, usize::MAX);
+        self.entries.push(entry);
+        let field = look(self);
+        self.entries.pop();
+        let holds = self.reached >= depth;
+        self.reached = outer.min(self.reached);
+        (field, holds)
+    }
 }
 
 /// [`find_metatable_index_field`] inside `path`: a chain that comes back to a
@@ -469,12 +511,17 @@ fn metatable_index_field(
     key: &LuaMemberKey,
     path: &mut LookupPath,
 ) -> MetatableIndexField {
-    if path.tables.contains(table) {
-        return MetatableIndexField::Absent;
+    if let Some(answer) = path.answers.get(table) {
+        return answer.clone();
     }
-    path.tables.push(table.clone());
-    let field = table_metatable_index_field(db, table, key, path);
-    path.tables.pop();
+    let (field, holds) = path.inside(
+        PathEntry::Table(table.clone()),
+        MetatableIndexField::Absent,
+        |path| table_metatable_index_field(db, table, key, path),
+    );
+    if holds {
+        path.answers.insert(table.clone(), field.clone());
+    }
     field
 }
 
@@ -547,13 +594,12 @@ fn index_value_field(
                 .filter(|decl| decl.is_alias())
                 .and_then(|decl| decl.get_alias_origin(db, None)) =>
         {
-            if path.aliases.contains(type_id) {
-                return MetatableIndexField::Unknown;
-            }
-            path.aliases.push(type_id.clone());
-            let field = index_value_field(db, &origin, key, path);
-            path.aliases.pop();
-            field
+            path.inside(
+                PathEntry::Alias(type_id.clone()),
+                MetatableIndexField::Unknown,
+                |path| index_value_field(db, &origin, key, path),
+            )
+            .0
         }
         LuaType::TableConst(table) => match super::infer_raw_member_type(db, index_type, key) {
             Ok(typ) => MetatableIndexField::Present(typ),
@@ -561,11 +607,17 @@ fn index_value_field(
             Err(_) => MetatableIndexField::Unknown,
         },
         // A table given a metatable whose `__index` is the instance's base:
-        // its own fields first, then what the base answers.
+        // its own fields first, then what the metatable it holds now answers,
+        // or the base when none is indexed for it.
         LuaType::Instance(instance) => {
-            let table = LuaType::TableConst(instance.get_range().clone());
-            match super::infer_raw_member_type(db, &table, key) {
+            let range = instance.get_range();
+            match super::infer_raw_member_type(db, &LuaType::TableConst(range.clone()), key) {
                 Ok(typ) => MetatableIndexField::Present(typ),
+                Err(InferFailReason::FieldNotFound)
+                    if db.get_metatable_index().get(range).is_some() =>
+                {
+                    metatable_index_field(db, range, key, path)
+                }
                 Err(InferFailReason::FieldNotFound) => {
                     index_value_field(db, instance.get_base(), key, path)
                 }

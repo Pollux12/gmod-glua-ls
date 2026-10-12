@@ -3744,6 +3744,54 @@ mod test {
         assert!(ws.check_code_for(DiagnosticCode::ParamTypeMismatch, &setup));
     }
 
+    /// Index tables shared level after level are each looked through once:
+    /// a lookup that went down every branch again would take 2^24 steps here.
+    #[test]
+    fn layered_shared_index_tables_are_each_looked_through_once() {
+        let mut setup = String::from(
+            "local fallback0 = {}\nsetmetatable(fallback0, { __index = { foo = \"yes\" } })\n",
+        );
+        for level in 1..=24 {
+            let previous = level - 1;
+            setup.push_str(&format!(
+                "local left{level}, right{level} = {{}}, {{}}\n\
+                 setmetatable(left{level}, {{ __index = fallback{previous} }})\n\
+                 setmetatable(right{level}, {{ __index = fallback{previous} }})\n\
+                 local fallback{level} = math.random() > 0.5 and left{level} or right{level}\n"
+            ));
+        }
+        setup.push_str(
+            "local value = {}\nsetmetatable(value, { __index = fallback24 })\nconsume(value)\n",
+        );
+
+        assert_eq!(reports_param_mismatch(&[setup.as_str()]), [false]);
+    }
+
+    /// A table made by `setmetatable` answers with its own fields first, then
+    /// through its metatable, an `__index` function answering with its
+    /// declared result.
+    #[test]
+    fn a_field_read_through_an_instance_follows_its_metatable() {
+        let setups = [
+            r#"
+            ---@return integer
+            local function index(t, key) return 123 end
+            local fallback = setmetatable({ bar = true }, { __index = index })
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            local fallback = setmetatable({ foo = "yes" }, { __index = { foo = 123 } })
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+        ];
+
+        assert_eq!(reports_param_mismatch(&setups), [true, false]);
+    }
+
     /// An `__index` that may be nil may leave the field nil, which only a
     /// nullable-tolerant check accepts in a non-nullable field.
     #[test]
