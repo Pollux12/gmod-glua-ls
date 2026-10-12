@@ -9125,4 +9125,52 @@ _2 = a[1]
             "lookup(source, key)",
         )
     }
+
+    const STORED_ENTITY_PRELUDE: &str = r#"
+            ---@class ScriptedEntityStored
+            ---@field t table
+
+            ---@return ScriptedEntityStored?
+            local function get_stored() end
+
+            ---@return table
+            local function fallback() end
+
+            local w = get_stored()
+    "#;
+
+    fn local_after(body: &str) -> String {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&format!(
+            "{STORED_ENTITY_PRELUDE}\n{body}\nlocal after = w\n"
+        ));
+        let after = ws.local_ty(file_id, "after");
+        ws.humanize_type(after)
+    }
+
+    #[gtest]
+    fn a_local_assigned_its_own_member_holds_the_member() {
+        expect_that!(local_after("if w then w = w.t end"), eq("table?"));
+    }
+
+    #[gtest]
+    fn a_local_assigned_its_own_member_or_a_fallback_holds_either() {
+        expect_that!(
+            local_after("if w then w = w.t or fallback() end"),
+            eq("table?")
+        );
+    }
+
+    #[gtest]
+    fn a_local_assigned_its_own_member_behind_a_nil_guard_holds_the_member() {
+        expect_that!(local_after("w = w and w.t"), eq("table?"));
+    }
+
+    #[gtest]
+    fn a_local_defaulted_to_a_table_keeps_its_own_class() {
+        expect_that!(
+            local_after("w = w or fallback()"),
+            contains_substring("ScriptedEntityStored")
+        );
+    }
 }

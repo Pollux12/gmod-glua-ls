@@ -2085,11 +2085,16 @@ fn get_type_at_assign_stat(
             && antecedent_has_relevant_special_call_effect_before_node(
                 db, tree, cache, root, flow_node, var_ref_id,
             );
+        let rhs_is_read_out_of_var = explicit_var_type.is_none()
+            && exprs
+                .get(i)
+                .is_some_and(|expr| value_is_read_out_of_var(db, cache, var_ref_id, expr));
 
         let narrowed = if rhs_replaces_table_identity
             || rhs_is_string_literal
             || rhs_is_class_instance
             || rhs_replaces_special_call_effect
+            || rhs_is_read_out_of_var
         {
             Some(expr_type.clone())
         } else {
@@ -3821,6 +3826,71 @@ fn try_infer_decl_initializer_type(
     };
 
     Ok(Some(init_type))
+}
+
+/// Whether `expr` reads its value out of `var_ref_id`'s current value and can
+/// never be that value, as `node = node.parent`, `ent = ent.t or fallback` and
+/// `ent = ent and ent.t` are: the variable then holds what its old value
+/// stored, not a narrower view of the old value.
+fn value_is_read_out_of_var(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    var_ref_id: &VarRefId,
+    expr: &LuaExpr,
+) -> bool {
+    let mut reads_member = false;
+    value_avoids_var(db, cache, var_ref_id, expr, &mut reads_member) && reads_member
+}
+
+/// Whether no value `expr` can produce is `var_ref_id`'s current value,
+/// noting in `reads_member` a value read out of one of its members.
+fn value_avoids_var(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    var_ref_id: &VarRefId,
+    expr: &LuaExpr,
+    reads_member: &mut bool,
+) -> bool {
+    match expr {
+        LuaExpr::ParenExpr(paren_expr) => paren_expr
+            .get_expr()
+            .is_some_and(|inner| value_avoids_var(db, cache, var_ref_id, &inner, reads_member)),
+        LuaExpr::BinaryExpr(binary_expr) => {
+            let (Some(op), Some((left, right))) = (
+                binary_expr.get_op_token().map(|token| token.get_op()),
+                binary_expr.get_exprs(),
+            ) else {
+                return true;
+            };
+            match op {
+                // The left operand of `and` is the value only when it is falsy.
+                BinaryOperator::OpAnd => {
+                    value_avoids_var(db, cache, var_ref_id, &right, reads_member)
+                }
+                BinaryOperator::OpOr => {
+                    value_avoids_var(db, cache, var_ref_id, &left, reads_member)
+                        && value_avoids_var(db, cache, var_ref_id, &right, reads_member)
+                }
+                _ => true,
+            }
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            let mut prefix = index_expr.get_prefix_expr();
+            while let Some(LuaExpr::IndexExpr(parent)) = prefix {
+                prefix = parent.get_prefix_expr();
+            }
+            if prefix.and_then(|root| get_var_expr_var_ref_id(db, cache, root))
+                == Some(var_ref_id.clone())
+            {
+                *reads_member = true;
+            }
+            true
+        }
+        LuaExpr::NameExpr(_) => {
+            get_var_expr_var_ref_id(db, cache, expr.clone()).is_none_or(|read| read != *var_ref_id)
+        }
+        _ => true,
+    }
 }
 
 fn is_self_coalescing_or_expr(
