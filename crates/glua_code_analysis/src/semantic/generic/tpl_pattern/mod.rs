@@ -194,6 +194,9 @@ fn infer_str_tpl_member_type(
     str_tpl: &LuaStringTplType,
     value: &str,
 ) -> LuaType {
+    if !super::str_tpl_value_names_type(value) {
+        return str_tpl.get_constraint().cloned().unwrap_or(LuaType::Any);
+    }
     let type_name = SmolStr::new(format!(
         "{}{}{}",
         str_tpl.get_prefix(),

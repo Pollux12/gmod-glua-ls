@@ -37,6 +37,12 @@ pub use instantiate_type::get_keyof_members;
 /// `typ`, read off `signature`, for a reader outside the signature's generic
 /// context: each of its templates stands for its constraint, and a string
 /// template for the string naming it.
+/// Whether a class-name template value names a type: `*` is the wildcard
+/// `ents.FindByClass("weapon_*")` matches with, never part of a type name.
+pub(crate) fn str_tpl_value_names_type(value: &str) -> bool {
+    !value.contains('*')
+}
+
 pub(crate) fn instantiate_outside_signature(
     db: &DbIndex,
     signature: &LuaSignature,

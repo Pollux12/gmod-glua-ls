@@ -475,6 +475,9 @@ fn emit_str_tpl_const_diagnostic(
     range: TextRange,
     extend_type: Option<&LuaType>,
 ) {
+    if !crate::semantic::str_tpl_value_names_type(str) {
+        return;
+    }
     let full_type_name = str_tpl_full_type_name(str_tpl_ref, str);
     let founded_type_decl = semantic_model
         .get_db()

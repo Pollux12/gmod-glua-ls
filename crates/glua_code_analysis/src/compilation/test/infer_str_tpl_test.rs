@@ -2750,4 +2750,40 @@ vgui.Register(\"cityrpStoreItem\", PANEL, \"EditablePanel\")
         let unknown = ws.local_ty(file_id, "unknown");
         expect_that!(ws.humanize_type(unknown), eq("Entity[]"));
     }
+
+    #[gtest]
+    fn a_wildcard_class_pattern_binds_the_constraint_without_minting_a_class() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GenericConstraintMismatch);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return T[]
+            local function find_by_class(class) end
+
+            local weapons = find_by_class("weapon_*")
+            "#,
+        );
+
+        let weapons = ws.local_ty(file_id, "weapons");
+        expect_that!(ws.humanize_type(weapons), eq("Entity[]"));
+        expect_that!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_type_index()
+                .get_type_decl(&LuaTypeDeclId::global("weapon_*")),
+            none()
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        expect_that!(diagnostics, is_empty());
+    }
 }

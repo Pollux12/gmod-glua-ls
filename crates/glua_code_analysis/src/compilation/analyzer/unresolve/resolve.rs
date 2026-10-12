@@ -2240,6 +2240,9 @@ fn materialize_str_tpl_class_from_call(
     ) else {
         return Ok(());
     };
+    if !crate::semantic::str_tpl_value_names_type(&arg_name) {
+        return Ok(());
+    }
 
     let class_name = format!(
         "{}{}{}",
