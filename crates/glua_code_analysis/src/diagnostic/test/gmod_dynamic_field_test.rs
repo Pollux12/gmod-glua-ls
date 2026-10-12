@@ -1762,4 +1762,65 @@ mod test {
             vec!["pnl.col may be nil"]
         );
     }
+
+    const SCORE_ROW_PRELUDE: &str = r#"
+            ---@class InfoTags
+            ---@class InfoSearch
+            ---@return InfoTags
+            local function make_tags() end
+            ---@return InfoSearch
+            local function make_search() end
+    "#;
+
+    fn score_row_assign_mismatches(class_docs: &str) -> Vec<String> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "gamemodes/terrortown/gamemode/vgui/sb_row.lua",
+            &format!(
+                "{SCORE_ROW_PRELUDE}
+            {class_docs}
+            local PANEL = {{}}
+            function PANEL:Init()
+               self.info = nil
+            end
+            function PANEL:SetPlayer(group)
+               if not self.info then
+                  if group == 1 then
+                     self.info = make_tags()
+                  elseif group == 2 then
+                     self.info = make_search()
+                  end
+               end
+            end
+            "
+            ),
+        );
+        diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::AssignTypeMismatch)
+    }
+
+    #[gtest]
+    fn a_field_only_assignments_define_holds_each_class_written_to_it() {
+        expect_that!(
+            score_row_assign_mismatches("---@class ScoreRow"),
+            is_empty()
+        );
+    }
+
+    #[gtest]
+    fn a_declared_field_still_rejects_another_class() {
+        expect_that!(
+            score_row_assign_mismatches("---@class ScoreRow\n---@field info InfoTags?"),
+            elements_are![contains_substring("InfoSearch")]
+        );
+    }
+
+    #[gtest]
+    fn a_field_a_base_class_declares_still_rejects_another_class() {
+        expect_that!(
+            score_row_assign_mismatches(
+                "---@class RowBase\n---@field info InfoTags?\n\n---@class ScoreRow : RowBase"
+            ),
+            elements_are![contains_substring("InfoSearch")]
+        );
+    }
 }

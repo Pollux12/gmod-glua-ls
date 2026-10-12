@@ -194,6 +194,7 @@ fn check_index_expr(
         match class_computed_key_target(semantic_model, index_expr) {
             Some(ComputedKeyTarget::Undeclared) => return Some(()),
             Some(ComputedKeyTarget::Declared(declared_type)) => (Some(declared_type), false),
+            None if is_undeclared_class_field(semantic_model, index_expr) => return Some(()),
             None => (
                 index_target_type(semantic_model, index_expr),
                 index_target_is_inferred(semantic_model, index_expr),
@@ -297,6 +298,39 @@ fn index_target_type(semantic_model: &SemanticModel, index_expr: &LuaIndexExpr) 
             )
             .ok()
         })
+}
+
+/// Whether `index_expr` writes a class field that only assignments define. The
+/// field holds every value written to it, so a write of a new type widens it;
+/// only a declaration on the class or a super states a type to mismatch.
+fn is_undeclared_class_field(semantic_model: &SemanticModel, index_expr: &LuaIndexExpr) -> bool {
+    let db = semantic_model.get_db();
+    let member_index = db.get_member_index();
+    let type_index = db.get_type_index();
+    let member_id =
+        crate::LuaMemberId::new(index_expr.get_syntax_id(), semantic_model.get_file_id());
+    let (Some(member), Some(crate::LuaMemberOwner::Type(type_id))) = (
+        member_index.get_member(&member_id),
+        member_index.get_member_owner(&member_id),
+    ) else {
+        return false;
+    };
+    let mut class_types = vec![LuaType::Ref(type_id.clone())];
+    type_id.collect_super_types(db, &mut class_types);
+    class_types.iter().all(|class_type| {
+        let (LuaType::Ref(id) | LuaType::Def(id)) = class_type else {
+            return true;
+        };
+        member_index
+            .get_members_for_owner_key(&crate::LuaMemberOwner::Type(id.clone()), member.get_key())
+            .into_iter()
+            .all(|writer| {
+                writer.is_assignment_define()
+                    && type_index
+                        .get_type_cache(&writer.get_id().into())
+                        .is_some_and(|cache| cache.is_infer())
+            })
+    })
 }
 
 enum ComputedKeyTarget {

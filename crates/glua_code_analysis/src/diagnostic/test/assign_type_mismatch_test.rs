@@ -450,7 +450,7 @@ t.x = y
             "#
         ));
 
-        assert!(!ws.check_code_for_namespace(
+        assert!(ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
 ---@class A
