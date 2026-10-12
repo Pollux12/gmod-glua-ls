@@ -1107,34 +1107,21 @@ fn collect_unguarded_child_file(
             found_types.insert(source.clone(), current.clone());
             let mut evidence_recorded = false;
             for child_id in children.iter() {
-                let owner = LuaMemberOwner::Type(child_id.clone());
-                let visible = db
-                    .get_member_index()
-                    .get_member_item(&owner, &member_key)
-                    .is_some_and(|item| {
-                        !item
-                            .visible_member_ids_with_realm_at_offset(
-                                db,
-                                &file_id,
-                                index_expr.get_position(),
-                            )
-                            .is_empty()
-                    });
-                let visible = visible
-                    || match resolve_dynamic_field_member(
-                        db,
-                        &mut infer_cache,
-                        &LuaType::Ref(child_id.clone()),
-                        &member_key,
-                        None,
-                    ) {
-                        Ok(resolution) => resolution.is_some(),
-                        Err(reason) if reason.is_need_resolve() => {
-                            deferred_definitions.extend(definitions.iter().cloned());
-                            break;
-                        }
-                        Err(_) => false,
-                    };
+                let visible = match child_member_visible_at(
+                    db,
+                    &mut infer_cache,
+                    child_id,
+                    &member_key,
+                    file_id,
+                    index_expr.get_position(),
+                ) {
+                    Ok(visible) => visible,
+                    Err(reason) if reason.is_need_resolve() => {
+                        deferred_definitions.extend(definitions.iter().cloned());
+                        break;
+                    }
+                    Err(_) => false,
+                };
                 if !visible {
                     continue;
                 }
@@ -1783,6 +1770,73 @@ fn type_is_boolean(typ: &LuaType) -> bool {
     }
 }
 
+/// The nearest descendants of the class `receiver_type` names whose
+/// `member_key` the read `index_expr` of `file_id` sees: the children a guard
+/// narrowing its receiver could name. `None` when no single class types the
+/// receiver or none of its children do.
+pub(crate) fn unguarded_child_candidates(
+    db: &crate::DbIndex,
+    cache: &mut LuaInferCache,
+    memo: &mut SubtypesWithMember,
+    file_id: crate::FileId,
+    index_expr: &LuaIndexExpr,
+    receiver_type: &LuaType,
+    member_key: &LuaMemberKey,
+) -> Option<Vec<LuaTypeDeclId>> {
+    let base_id = unguarded_child_base_id(receiver_type)?;
+    let children = nearest_subtypes_with_member(
+        db,
+        cache,
+        memo,
+        &base_id,
+        member_key,
+        member_path_parent(index_expr).is_some(),
+        None,
+    )?;
+    let visible = children
+        .iter()
+        .filter(|child_id| {
+            child_member_visible_at(
+                db,
+                cache,
+                child_id,
+                member_key,
+                file_id,
+                index_expr.get_position(),
+            )
+            .unwrap_or(false)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    (!visible.is_empty()).then_some(visible)
+}
+
+/// Whether a read at `position` of `file_id` sees `child_id`'s `member_key`:
+/// a member its realm sees, or a dynamic field.
+fn child_member_visible_at(
+    db: &crate::DbIndex,
+    cache: &mut LuaInferCache,
+    child_id: &LuaTypeDeclId,
+    member_key: &LuaMemberKey,
+    file_id: crate::FileId,
+    position: rowan::TextSize,
+) -> Result<bool, crate::InferFailReason> {
+    let owner = LuaMemberOwner::Type(child_id.clone());
+    let declared = db
+        .get_member_index()
+        .get_member_item(&owner, member_key)
+        .is_some_and(|item| {
+            !item
+                .visible_member_ids_with_realm_at_offset(db, &file_id, position)
+                .is_empty()
+        });
+    if declared {
+        return Ok(true);
+    }
+    resolve_dynamic_field_member(db, cache, &LuaType::Ref(child_id.clone()), member_key, None)
+        .map(|resolution| resolution.is_some())
+}
+
 fn unguarded_child_base_id(typ: &LuaType) -> Option<LuaTypeDeclId> {
     match typ {
         LuaType::Ref(type_id) | LuaType::Def(type_id) => Some(type_id.clone()),
@@ -1976,7 +2030,7 @@ fn is_nameable(db: &crate::DbIndex, id: &LuaTypeDeclId) -> bool {
 
 /// Descendants already matched against a member key and access shape in this
 /// evaluation.
-type SubtypesWithMember =
+pub(crate) type SubtypesWithMember =
     FxHashMap<(LuaTypeDeclId, LuaMemberKey, bool, Option<VarRefId>), Option<Arc<[LuaTypeDeclId]>>>;
 
 #[cfg(test)]

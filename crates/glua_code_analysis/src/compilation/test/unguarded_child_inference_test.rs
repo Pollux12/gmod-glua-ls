@@ -2791,6 +2791,48 @@ filter:SetUpdateOnType(true)
         );
     }
 
+    /// A child-only member read straight off a call returning the parent,
+    /// `self:GetOwner():GetAimVector()`, needs a guard as the same read off a
+    /// local does; a member no child defines stays undefined.
+    #[test]
+    fn a_child_read_off_a_call_needs_a_guard_as_off_a_local() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+            ---@field GetAimVector fun(self: Player): number
+            ---@class NPC: Entity
+            ---@field GetAimVector fun(self: NPC): number
+
+            ---@return Entity
+            local function owner() end
+
+            local through_local = owner()
+            local a = through_local:GetAimVector()
+            local b = owner():GetAimVector()
+            local c = owner():NoSuchMethod()
+            "#,
+        );
+
+        let messages = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild)
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        let undefined = diagnostics_for(&mut ws, file_id, DiagnosticCode::UndefinedMethod)
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+
+        let advice = "`GetAimVector` is not defined on `Entity`. Add a guard that narrows the parent to one of `NPC`, `Player`.";
+        assert_eq!(messages, vec![advice.to_string(), advice.to_string()]);
+        assert_eq!(
+            undefined,
+            vec!["Undefined method `NoSuchMethod`. ".to_string()]
+        );
+    }
+
     #[test]
     fn unguarded_use_fires_without_any_guard() {
         assert_eq!(guard_form_diagnostic_count("ent:Honk()"), 1);

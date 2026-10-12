@@ -102,16 +102,31 @@ fn unguarded_child_message(
     found: &str,
 ) -> String {
     let LuaType::Union(union) = inferred_type else {
-        return format!(
-            "expected `{inferred_text}` but found `{found}`. Add a guard to narrow the parent to `{inferred_text}`."
-        );
+        return unguarded_children_message(None, found, &[inferred_text.to_string()]);
     };
-    // A union orders its arms by a content hash, so the names are sorted before
-    // the cap decides which of them the message keeps.
-    let mut children = union
+    let children = union
         .types()
         .map(|child| humanize_type(semantic_model.get_db(), child, RenderLevel::Simple))
         .collect::<Vec<_>>();
+    let member = used_member_name(semantic_model, file_id, source);
+    unguarded_children_message(member.as_deref(), found, &children)
+}
+
+/// The guard advice for a member `found` lacks that its `children` define:
+/// one child is named as the type to narrow to, several are listed.
+pub(super) fn unguarded_children_message(
+    member: Option<&str>,
+    found: &str,
+    children: &[String],
+) -> String {
+    if let [child] = children {
+        return format!(
+            "expected `{child}` but found `{found}`. Add a guard to narrow the parent to `{child}`."
+        );
+    }
+    // A union orders its arms by a content hash, so the names are sorted before
+    // the cap decides which of them the message keeps.
+    let mut children = children.to_vec();
     children.sort();
     let listed = children
         .iter()
@@ -125,7 +140,7 @@ fn unguarded_child_message(
     } else {
         format!("{listed} and {remaining} more")
     };
-    match used_member_name(semantic_model, file_id, source) {
+    match member {
         Some(member) => format!(
             "`{member}` is not defined on `{found}`. Add a guard that narrows the parent to one of {candidates}."
         ),

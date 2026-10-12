@@ -31,6 +31,7 @@ impl Checker for CheckFieldChecker {
         DiagnosticCode::InjectField,
         DiagnosticCode::UndefinedField,
         DiagnosticCode::UndefinedMethod,
+        DiagnosticCode::InferUnguardedChild,
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
@@ -205,6 +206,7 @@ fn collect_initialized_assignment_accesses(
 #[derive(Default)]
 struct CheckFieldState {
     member_infer_cache: HashMap<(LuaType, LuaMemberKey, bool), bool>,
+    subtypes_with_member: crate::compilation::analyzer::SubtypesWithMember,
 }
 
 #[derive(Default)]
@@ -420,6 +422,40 @@ fn check_index_expr(
                 }
             }
         }
+    }
+
+    // A member the receiver's class lacks but its children define is a read
+    // that needs a guard, as when inference meets it on a local.
+    if matches!(
+        code,
+        DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+    ) && let Some(children) = crate::compilation::analyzer::unguarded_child_candidates(
+        db,
+        &mut semantic_model.get_cache().borrow_mut(),
+        &mut state.subtypes_with_member,
+        context.get_file_id(),
+        index_expr,
+        &prefix_typ,
+        &LuaMemberKey::Name(field_name.clone()),
+    ) {
+        let children = children
+            .iter()
+            .map(|child| {
+                crate::humanize_type(db, &LuaType::Ref(child.clone()), crate::RenderLevel::Simple)
+            })
+            .collect::<Vec<_>>();
+        let found = crate::humanize_type(db, &prefix_typ, crate::RenderLevel::Simple);
+        context.add_diagnostic(
+            DiagnosticCode::InferUnguardedChild,
+            index_expr.get_range(),
+            super::inference_trust::unguarded_children_message(
+                Some(field_name.as_str()),
+                &found,
+                &children,
+            ),
+            None,
+        );
+        return Some(());
     }
 
     match code {

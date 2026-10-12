@@ -26,6 +26,7 @@ pub(crate) use engine::EngineStats;
 #[cfg(test)]
 pub(crate) use engine::serial_engine;
 pub use engine::{Schedule, Slice};
+pub(crate) use local_inference::{SubtypesWithMember, unguarded_child_candidates};
 pub use lua::is_member_assignment_in_conditional_branch;
 pub(crate) use lua::{
     dominating_guarded_table_bootstrap_range, infer_for_range_iter_expr_func,
