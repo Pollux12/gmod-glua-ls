@@ -71,6 +71,9 @@ pub enum UpdateProgress {
 
 impl LuaCompilation {
     pub fn new(emmyrc: Arc<Emmyrc>) -> Self {
+        // Raw parallel iterators reach rayon's global pool too, so it is sized
+        // before anything can run on it.
+        analyzer::parallel::init_pool();
         let mut compilation = Self {
             db: DbIndex::new(),
             emmyrc: emmyrc.clone(),

@@ -37,7 +37,7 @@ static REQUESTED_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 /// Sets how many threads analysis uses, pool and caller included. One runs
 /// every batch on the caller's thread. Takes effect for the pool only if set
-/// before its first use, so callers set it before indexing.
+/// before the first analysis is created, which sizes it.
 pub fn set_analysis_threads(threads: usize) {
     REQUESTED_THREADS.store(threads, Ordering::Relaxed);
 }
@@ -127,15 +127,18 @@ fn runs_on_caller(file_count: usize) -> bool {
 ///
 /// Workers run the same recursive inference and type-graph walks the caller's
 /// thread does, so they get [`crate::ANALYSIS_STACK_SIZE`] rather than the
-/// default. `build_global` is a no-op error if something already initialized the
-/// pool, in which case the workers are not ours to size.
+/// default. `build_global` fails if something already initialized the pool, in
+/// which case the workers are not ours to size.
 pub(crate) fn init_pool() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        let _ = rayon::ThreadPoolBuilder::new()
+        if let Err(error) = rayon::ThreadPoolBuilder::new()
             .num_threads(analysis_threads())
             .stack_size(crate::ANALYSIS_STACK_SIZE)
-            .build_global();
+            .build_global()
+        {
+            log::warn!("analysis runs on a thread pool it did not size: {error}");
+        }
     });
 }
 
@@ -365,5 +368,68 @@ mod tests {
         });
         set_analysis_threads(0);
         assert!(threads.iter().all(|thread| *thread == caller));
+    }
+
+    /// Runs this test binary's `test` alone in a fresh process, where rayon's
+    /// global pool is not yet built, with `GLUALS_POOL_PROBE` set to `threads`.
+    fn probe_in_fresh_process(test: &str, threads: usize) {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([test, "--exact", "--test-threads=1"])
+            .env("GLUALS_POOL_PROBE", threads.to_string())
+            .output()
+            .expect("the probe runs");
+        assert!(
+            output.status.success(),
+            "{test} with {threads} thread(s) failed:
+{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// The thread count the probe asks for, when this runs as one.
+    fn probed_threads() -> Option<usize> {
+        std::env::var("GLUALS_POOL_PROBE").ok()?.parse().ok()
+    }
+
+    /// The pool takes the requested size even when the first update is too
+    /// small for the batched passes, which size it, and reaches the raw
+    /// parallel iterators first.
+    #[test]
+    fn a_small_first_update_runs_on_the_requested_pool() {
+        if let Some(threads) = probed_threads() {
+            set_analysis_threads(threads);
+            let mut ws = crate::VirtualWorkspace::new();
+            ws.def_file("lua/autorun/sh_one.lua", "local one = 1");
+            assert_eq!(rayon::current_num_threads(), threads);
+            return;
+        }
+        for threads in [2, 3] {
+            probe_in_fresh_process(
+                "compilation::analyzer::parallel::tests::a_small_first_update_runs_on_the_requested_pool",
+                threads,
+            );
+        }
+    }
+
+    #[test]
+    fn a_large_first_update_runs_on_the_requested_pool() {
+        if let Some(threads) = probed_threads() {
+            set_analysis_threads(threads);
+            let mut ws = crate::VirtualWorkspace::new();
+            ws.def_files(
+                (0..MIN_PARALLEL_FILES * 2)
+                    .map(|index| (format!("lua/autorun/f{index}.lua"), "local a = 1"))
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .map(|(path, text)| (path.as_str(), *text))
+                    .collect(),
+            );
+            assert_eq!(rayon::current_num_threads(), threads);
+            return;
+        }
+        probe_in_fresh_process(
+            "compilation::analyzer::parallel::tests::a_large_first_update_runs_on_the_requested_pool",
+            3,
+        );
     }
 }
