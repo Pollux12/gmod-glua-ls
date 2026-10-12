@@ -9009,4 +9009,120 @@ _2 = a[1]
         expect_that!(ws.humanize_type(typ), eq("1"));
         verify_that!(cache.branch_special_call_effect_cache.is_empty(), eq(true))
     }
+
+    const LATER_WRITE_PRELUDE: &str = r#"
+            ---@class DImage
+            ---@field SetMaterial fun(self: DImage, mat: string)
+
+            ---@class DButton
+            ---@field DoClick fun(self: DButton)
+
+            ---@return DImage
+            local function create_image() end
+
+            ---@return DButton
+            local function create_button() end
+
+            ---@param s string
+            local function write_string(s) end
+    "#;
+
+    #[gtest]
+    fn a_read_before_a_later_assignment_holds_the_initializers_value() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&format!(
+            "{LATER_WRITE_PRELUDE}
+            local function order(args)
+               local id = args[1]
+               _G.before = id
+               write_string(id)
+               id = create_image()
+               _G.after = id
+            end
+            "
+        ));
+
+        let before = nth_name_expr_type_from_end(&mut ws, file_id, "id", 3);
+        expect_that!(ws.humanize_type(before), eq("unknown"));
+        let after = nth_name_expr_type_from_end(&mut ws, file_id, "id", 0);
+        expect_that!(ws.humanize_type(after), eq("DImage"));
+        verify_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            eq(false)
+        )
+    }
+
+    #[gtest]
+    fn a_closure_reading_a_local_assigned_after_it_sees_the_assignment() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&format!(
+            "{LATER_WRITE_PRELUDE}
+            local function setup(source)
+               local image = source.image
+               local button = create_button()
+               button.DoClick = function()
+                  _G.inside = image
+               end
+               image = create_image()
+            end
+            "
+        ));
+
+        let inside = nth_name_expr_type_from_end(&mut ws, file_id, "image", 1);
+        verify_that!(ws.humanize_type(inside), contains_substring("DImage"))
+    }
+
+    /// `local mat = eicon; eicon = create_image(); eicon:SetMaterial(mat)`:
+    /// the copy holds what `eicon` was declared with, not the image.
+    fn assert_copy_before_reassignment_keeps_the_old_value(
+        helpers: &str,
+        initializer: &str,
+    ) -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&format!(
+            "{LATER_WRITE_PRELUDE}
+            {helpers}
+            local function fill(source, key)
+               local eicon = {initializer}
+               if eicon then
+                  local mat = eicon
+                  eicon = create_image()
+                  eicon:SetMaterial(mat)
+               end
+            end
+            "
+        ));
+
+        let mat = nth_name_expr_type_from_end(&mut ws, file_id, "mat", 0);
+        expect_that!(ws.humanize_type(mat), not(eq("DImage")));
+        verify_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            eq(false)
+        )
+    }
+
+    #[gtest]
+    fn a_copy_of_a_local_read_off_an_unknown_value_keeps_the_old_value() -> Result<()> {
+        assert_copy_before_reassignment_keeps_the_old_value("", "source.icon")
+    }
+
+    #[gtest]
+    fn a_copy_of_a_local_whose_initializer_may_be_nil_keeps_the_old_value() -> Result<()> {
+        assert_copy_before_reassignment_keeps_the_old_value(
+            "local function lookup(registry, key)
+               if not key then return end
+               return registry[key]
+            end",
+            "lookup(source, key)",
+        )
+    }
+
+    #[gtest]
+    fn a_copy_of_a_local_initialized_to_any_keeps_the_old_value() -> Result<()> {
+        assert_copy_before_reassignment_keeps_the_old_value(
+            "---@return any
+            local function lookup(registry, key) end",
+            "lookup(source, key)",
+        )
+    }
 }

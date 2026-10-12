@@ -563,6 +563,14 @@ fn get_type_at_flow_walk(
                                 return Ok(init_type);
                             }
 
+                            if !policy.is_closure_baseline()
+                                && let Some(init_type) = initializer_type_a_later_write_displaced(
+                                    db, cache, root, var_ref_id, &var_type,
+                                )
+                            {
+                                return Ok(init_type);
+                            }
+
                             return Ok(var_type);
                         }
                         Err(err) => {
@@ -990,6 +998,37 @@ fn get_decl_position_var_ref_type(
     }
 
     get_var_ref_type(db, cache, var_ref_id)
+}
+
+/// The value a local holds at its declaration when its initializer determined
+/// nothing and a later write determined its slot: a straight-line read reaching
+/// the declaration sees the initializer, while a closure reads the whole slot.
+fn initializer_type_a_later_write_displaced(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    slot_type: &LuaType,
+) -> Option<LuaType> {
+    let decl_id = var_ref_id.get_decl_id_ref()?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    if !matches!(decl.extra, crate::LuaDeclExtra::Local { .. })
+        || !crate::is_informative_type(slot_type)
+        || !db
+            .get_reference_index()
+            .get_decl_references(&decl_id.file_id, &decl_id)
+            .is_some_and(|references| references.mutable)
+        || db
+            .get_type_index()
+            .holds_contextual_fallback(&decl_id.into())
+    {
+        return None;
+    }
+    match try_infer_decl_initializer_type(db, cache, root, var_ref_id) {
+        Ok(Some(init_type)) if !crate::is_informative_type(&init_type) => Some(init_type),
+        Err(InferFailReason::FieldNotFound) => Some(LuaType::Unknown),
+        _ => None,
+    }
 }
 
 fn should_retry_decl_initializer_type(typ: &LuaType) -> bool {
