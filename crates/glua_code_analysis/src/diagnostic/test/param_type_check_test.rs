@@ -3859,9 +3859,14 @@ mod test {
             "---@type table<string, string>\nlocal t = {}\nconsume(t)\n",
             "---@type table<string, integer>\nlocal t = {}\nconsume(t)\n",
             "---@type table<integer, string>\nlocal t = {}\nconsume(t)\n",
+            "---@type table<any, any>\nlocal t = {}\nconsume(t)\n",
+            "---@type table<string, any>\nlocal t = {}\nconsume(t)\n",
         ];
 
-        assert_eq!(reports_param_mismatch(&setups), [false, true, true]);
+        assert_eq!(
+            reports_param_mismatch(&setups),
+            [false, true, true, false, false]
+        );
     }
 
     /// A field the index table lacks is read through that table's own
