@@ -3,9 +3,9 @@ use std::collections::hash_map::Entry;
 
 use crate::{
     LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaTupleType, LuaType, RenderLevel,
-    TypeCheckFailReason, TypeCheckResult, humanize_type,
+    TypeCheckFailReason, TypeCheckResult, check_type_compact, humanize_type,
     semantic::{
-        member::{find_members, member_key_matches_type},
+        member::{find_members, member_key_as_type, member_key_matches_type},
         type_check::{
             check_general_type_compact, type_check_context::TypeCheckContext,
             type_check_guard::TypeCheckGuard,
@@ -88,7 +88,9 @@ fn check_object_type_compact_table_generic(
     let key_type = params.first().unwrap_or(&LuaType::Any);
     let value_type = params.get(1).unwrap_or(&LuaType::Any);
     for (field_key, field_type) in source_object.get_fields() {
-        if member_key_matches_type(context.db, key_type, field_key) {
+        let admitted = member_key_as_type(field_key)
+            .is_some_and(|field_key| check_type_compact(context.db, key_type, &field_key).is_ok());
+        if admitted {
             check_general_type_compact(context, field_type, value_type, check_guard.next_level()?)?;
         } else if !(field_type.is_nullable() || field_type.is_any()) {
             return Err(TypeCheckFailReason::TypeNotMatch);

@@ -765,6 +765,10 @@ mod test {
             ("{ foo: number }", "table<'foo', number>", true),
             ("{ foo?: string }", "table<'foo' | integer, number>", false),
             ("{ bar?: string }", "table<'foo' | integer, number>", true),
+            ("{ [3]: number }", "table<1 | 2, number>", false),
+            ("{ [3]: string? }", "table<1 | 2, number>", true),
+            ("{ [2]: number }", "table<1 | 2, number>", true),
+            ("{ [2]: string }", "table<1 | 2, number>", false),
         ];
 
         let results = cases
