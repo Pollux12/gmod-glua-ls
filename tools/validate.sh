@@ -91,7 +91,8 @@ CR_CORE=gamemode/core/sh_data.lua,gamemode/core/sh_configuration.lua,gamemode/co
 
 if [ -z "${SKIP_BUILD:-}" ] && [ -z "${VALIDATE_BIN:-}" ]; then
   echo "== build"
-  cargo build --release -p determinism -p glua_check -p glua_ls 2>&1 | grep -E "^error|Finished" || exit 1
+  cargo build --release -p determinism -p glua_check -p glua_ls 2>&1 | grep -E "^error|Finished"
+  [ "${PIPESTATUS[0]}" -eq 0 ] || exit 1
 fi
 
 TARGET_STAGES=schedule,schedule:deferred,edit,revert,noop,reload,delete,recreate,gate
