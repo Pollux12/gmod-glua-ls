@@ -6063,3 +6063,87 @@ end
         );
     }
 }
+
+#[cfg(test)]
+mod localised_library_members {
+    use crate::{DiagnosticCode, VirtualWorkspace};
+
+    /// The GMod annotations declare the standard libraries again as plain tables.
+    const LIBRARY_ANNOTATIONS: &str = "---@meta
+string = {}
+table = {}
+";
+
+    fn workspace_with_libraries() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file("library/string.lua", LIBRARY_ANNOTATIONS);
+        ws
+    }
+
+    const LOCALISED_LIBRARY_EXTENSIONS: &str = "local string = string
+local table = table
+function string.Interp(str, tbl) return str end
+function table.HasTable(tbl, needle) return false end
+";
+
+    #[test]
+    fn a_function_defined_through_a_localised_library_is_a_library_member() {
+        let mut ws = workspace_with_libraries();
+        ws.def_file(
+            "gamemodes/terrortown/gamemode/util.lua",
+            LOCALISED_LIBRARY_EXTENSIONS,
+        );
+        assert!(ws.check_file_for(
+            DiagnosticCode::UndefinedField,
+            "gamemodes/terrortown/gamemode/cl_hud.lua",
+            "local string = string
+local interp = string.Interp
+local function has(t) return table.HasTable(t, 1) end
+",
+        ));
+        let hud = ws.def_file(
+            "gamemodes/terrortown/gamemode/cl_hud.lua",
+            "local interp = string.Interp\n",
+        );
+        assert!(ws.local_ty(hud, "interp").is_function());
+    }
+
+    #[test]
+    fn a_library_alias_assigned_again_does_not_define_library_members() {
+        let mut ws = workspace_with_libraries();
+        ws.def_file(
+            "gamemodes/terrortown/gamemode/util.lua",
+            "local string = string
+string = {}
+function string.Shout(str) return str end
+",
+        );
+        assert!(!ws.check_file_for(
+            DiagnosticCode::UndefinedField,
+            "gamemodes/terrortown/gamemode/cl_hud.lua",
+            "local shout = string.Shout\n",
+        ));
+    }
+
+    #[test]
+    fn removing_a_function_defined_through_a_localised_library_settles_as_a_fresh_load() {
+        VirtualWorkspace::assert_warm_matches_cold(
+            |ws| ws.analysis.init_std_lib(),
+            &[
+                ("library/string.lua", LIBRARY_ANNOTATIONS),
+                (
+                    "gamemodes/terrortown/gamemode/util.lua",
+                    LOCALISED_LIBRARY_EXTENSIONS,
+                ),
+                (
+                    "gamemodes/terrortown/gamemode/cl_hud.lua",
+                    "local interp = string.Interp\n",
+                ),
+            ],
+            &[(
+                "gamemodes/terrortown/gamemode/util.lua",
+                "local string = string\nfunction string.Other(str) return str end\n",
+            )],
+        );
+    }
+}

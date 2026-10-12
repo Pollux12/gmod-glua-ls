@@ -409,6 +409,37 @@ impl<'a> DeclAnalyzer<'a> {
         Some(decl)
     }
 
+    /// Whether `decl` is a local that localises the global of its name, as
+    /// `local string = string` does, and is never assigned again: what is
+    /// written through it is written to the global.
+    pub fn localises_global_of_its_name(&self, decl: &LuaDecl) -> bool {
+        let (LuaDeclExtra::Local { .. }, Some(initializer)) = (&decl.extra, decl.get_initializer())
+        else {
+            return false;
+        };
+        if initializer.get_ret_idx() != 0 {
+            return false;
+        }
+        let Some(value) = initializer
+            .get_expr_syntax_id()
+            .to_node_from_root(self.root.syntax())
+            .and_then(LuaNameExpr::cast)
+        else {
+            return false;
+        };
+        let file_reference = self.references.file_reference();
+        value.get_name_text().as_deref() == Some(decl.get_name())
+            && file_reference
+                .get_decl_id(&value.get_range())
+                .and_then(|source| self.decl.get_decl(&source))
+                .is_none_or(|source| source.is_global())
+            && !file_reference
+                .get_decl_references(&decl.get_id())
+                .is_some_and(|references| {
+                    references.is_written_after_declaration(decl.get_position())
+                })
+    }
+
     pub fn is_scoped_class_global_name(&self, name: &str) -> bool {
         self.scoped_class_global_names
             .as_ref()
