@@ -19,9 +19,9 @@
 //            keystrokes, so keystrokes land both within the debounce and in
 //            the middle of a re-analysis
 //   revert   the original text back in one change, as an undo
-//   recreate the file closed, deleted on disk and re-created, through
-//            watched-file events; a push server must clear the deleted
-//            file's diagnostics before it is re-created
+//   delete   the file closed and deleted on disk, through a watched-file
+//            event; a push server must clear the deleted file's diagnostics
+//   recreate the file re-created, through a watched-file event
 //
 // Runs on temporary copies of the workspace; the codebase is never touched.
 //
@@ -207,14 +207,17 @@ async function main() {
     // Each copy keeps the codebase's folder name, which names a gamemode rooted there.
     const work = path.join(scratch, 'work', path.basename(path.resolve(codebase)));
     const edited = path.join(scratch, 'edited', path.basename(path.resolve(codebase)));
+    const deleted = path.join(scratch, 'deleted', path.basename(path.resolve(codebase)));
     try {
         copyWorkspace(codebase, work);
         copyWorkspace(codebase, edited);
+        copyWorkspace(codebase, deleted);
         const relative = opts.file.replace(/\\/g, '/');
         const target = path.join(work, relative);
         const original = fs.readFileSync(target, 'utf8');
         const texts = typedTexts(original, opts.editFind, opts.editReplace);
         fs.writeFileSync(path.join(edited, relative), texts[texts.length - 1]);
+        fs.rmSync(path.join(deleted, relative));
 
         // Cold checks run one at a time next to the server, which bounds memory
         // at two analyses.
@@ -225,6 +228,9 @@ async function main() {
         const editedCold = originalCold.then(() =>
             coldCheck(glua, edited, annotations, path.join(scratch, 'edited.json'))
                 .then((output) => loadCold(edited, output)));
+        const deletedCold = editedCold.then(() =>
+            coldCheck(glua, deleted, annotations, path.join(scratch, 'deleted.json'))
+                .then((output) => loadCold(deleted, output)));
 
         const { proc, client, loadMs, push, incremental } = await startServer(server, work, annotations);
         children.add(proc);
@@ -342,23 +348,24 @@ async function main() {
         fs.rmSync(target);
         client.notify('workspace/didChangeWatchedFiles', { changes: [{ uri, type: 3 }] });
         await settle();
+        const deletedFile = relativeKey(work, target);
         if (push) {
             // The server clears a deleted file with an empty publish; anything
             // still shown for it would stay in the editor.
-            const stale = shown.get(relativeKey(work, target)) || [];
+            const stale = shown.get(deletedFile) || [];
             if (stale.length) {
                 console.log(`[delete] ${stale.length} diagnostic(s) still shown for the deleted file`);
-                for (const key of stale.slice(0, 40)) console.log(`  STALE   ${relativeKey(work, target)} ${key}`);
-            } else {
-                console.log('[delete] +0 diagnostics');
+                for (const key of stale.slice(0, 40)) console.log(`  STALE   ${deletedFile} ${key}`);
             }
             differences += stale.length;
         } else {
             // The server forgets a deleted file's report; the editor drops it
             // and the result id it held.
-            shown.delete(relativeKey(work, target));
+            shown.delete(deletedFile);
             resultIds.delete(uri);
         }
+        const shownElsewhere = new Map([...shown].filter(([file]) => file !== deletedFile));
+        differences += compare('delete', shownElsewhere, await deletedCold);
         fs.writeFileSync(target, original);
         client.notify('workspace/didChangeWatchedFiles', { changes: [{ uri, type: 1 }] });
         await settle();
