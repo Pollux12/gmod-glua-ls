@@ -80,6 +80,20 @@ impl LuaOperator {
         }
     }
 
+    /// Whether the result type is declared rather than inferred from the
+    /// function's body.
+    pub fn declares_result(&self, db: &DbIndex) -> bool {
+        match &self.func {
+            OperatorFunction::Signature(signature_id) => db
+                .get_signature_index()
+                .get(signature_id)
+                .is_some_and(|signature| {
+                    signature.resolve_return == SignatureReturnStatus::DocResolve
+                }),
+            OperatorFunction::Func(_) | OperatorFunction::DefaultClassCtor { .. } => true,
+        }
+    }
+
     pub fn get_result(&self, db: &DbIndex) -> Result<LuaType, InferFailReason> {
         match &self.func {
             OperatorFunction::Func(func) => Ok(func.get_ret().clone()),

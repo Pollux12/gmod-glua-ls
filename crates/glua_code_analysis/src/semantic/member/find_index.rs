@@ -426,8 +426,9 @@ pub(crate) enum MetatableIndexField {
 }
 
 /// What `table`'s metatable `__index` supplies for `key`: a table's own member
-/// of that key, or the result of a function whose key parameter takes it, as a
-/// read through it resolves.
+/// of that key, or the declared result of a function whose key parameter takes
+/// it, as a read through it resolves. A function's inferred result merges what
+/// it returns for every key, so it says nothing of one key's value.
 pub(crate) fn find_metatable_index_field(
     db: &DbIndex,
     table: &InFiled<TextRange>,
@@ -484,6 +485,9 @@ pub(crate) fn find_metatable_index_field(
         .filter_map(|operator_id| operator_index.get_operator(operator_id))
     {
         if crate::check_type_compact(db, &operator.get_operand(db), &key_type).is_ok() {
+            if !operator.declares_result(db) {
+                return MetatableIndexField::Unknown;
+            }
             return operator
                 .get_result(db)
                 .map_or(MetatableIndexField::Unknown, MetatableIndexField::Present);

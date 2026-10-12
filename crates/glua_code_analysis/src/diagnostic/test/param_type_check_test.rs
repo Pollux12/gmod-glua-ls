@@ -3563,6 +3563,48 @@ mod test {
         assert_eq!(reports_param_mismatch(&setups), [false, true]);
     }
 
+    /// An `__index` function without a declared result returns one inferred
+    /// type for every key, which says nothing of one field: a recursive
+    /// copy-on-write proxy, inferred to return the proxy itself, fills the
+    /// class.
+    #[test]
+    fn an_index_function_without_a_declared_result_fills_a_class_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class ProxyState
+            ---@field Normal string
+
+            ---@class ProxyColours
+            ---@field Button ProxyState
+
+            ---@class ProxySkin
+            ---@field Colours ProxyColours?
+
+            ---@param skin ProxySkin
+            local function DefineSkin(skin) end
+
+            local function makeRecursiveCOW(o)
+                return setmetatable({}, {
+                    __index = function(t, key)
+                        local v = o[key]
+                        if type(v) == "table" then
+                            v = makeRecursiveCOW(v)
+                        end
+                        rawset(t, key, v)
+                        return v
+                    end,
+                })
+            end
+
+            local SKIN = {}
+            SKIN.Colours = makeRecursiveCOW({})
+            DefineSkin(SKIN)
+            "#
+        ));
+    }
+
     #[test]
     fn pcall_accepts_functions_returning_different_numbers_of_values() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
