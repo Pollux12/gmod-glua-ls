@@ -3218,6 +3218,12 @@ impl Harness<'_> {
                     })?
                 })
                 .collect::<Vec<_>>();
+            assert!(
+                !files.is_empty(),
+                "the sweep selected no file (DET_ONLY={:?}, DET_HUBS={}, DET_STRIDE={stride}, DET_STRIDE_OFFSET={offset})",
+                std::env::var("DET_ONLY").unwrap_or_default(),
+                hubs.len(),
+            );
             eprintln!("[sweep] {} file(s)", files.len());
             files
         })
