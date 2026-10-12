@@ -3767,6 +3767,41 @@ mod test {
         assert_eq!(reports_param_mismatch(&[setup.as_str()]), [false]);
     }
 
+    /// A lookup through layered shared index tables that loop back to the top,
+    /// or through layered shared aliases, also looks through each one once.
+    #[test]
+    fn cyclic_layers_and_alias_layers_are_each_looked_through_once() {
+        let mut cyclic = String::from("local fallback0 = {}\n");
+        let mut aliases = String::from("---@alias Layer0 table<string, string>\n");
+        for level in 1..=24 {
+            let previous = level - 1;
+            cyclic.push_str(&format!(
+                "local left{level}, right{level} = {{}}, {{}}\n\
+                 setmetatable(left{level}, {{ __index = fallback{previous} }})\n\
+                 setmetatable(right{level}, {{ __index = fallback{previous} }})\n\
+                 local fallback{level} = math.random() > 0.5 and left{level} or right{level}\n"
+            ));
+            aliases.push_str(&format!(
+                "---@alias Left{level} Layer{previous}\n\
+                 ---@alias Right{level} Layer{previous}\n\
+                 ---@alias Layer{level} Left{level}|Right{level}\n"
+            ));
+        }
+        cyclic.push_str(
+            "setmetatable(fallback0, { __index = fallback24 })\n\
+             local value = {}\nsetmetatable(value, { __index = fallback24 })\nconsume(value)\n",
+        );
+        aliases.push_str(
+            "---@type Layer24\nlocal fallback = {}\n\
+             local value = {}\nsetmetatable(value, { __index = fallback })\nconsume(value)\n",
+        );
+
+        assert_eq!(
+            reports_param_mismatch(&[cyclic.as_str(), aliases.as_str()]),
+            [true, false]
+        );
+    }
+
     /// A table made by `setmetatable` answers with its own fields first, then
     /// through its metatable, an `__index` function answering with its
     /// declared result.
