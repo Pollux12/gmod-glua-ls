@@ -411,3 +411,83 @@ fn find_index_table_generic(db: &DbIndex, table_params: &[LuaType]) -> FindMembe
 
     Some(members)
 }
+
+/// What a read of `key` that `table` lacks finds through its metatable's
+/// `__index`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum MetatableIndexField {
+    /// Nothing answers the key: there is no `__index`, or the one it has is a
+    /// table without the key.
+    Absent,
+    /// The `__index` answers the key with a value of this type.
+    Present(LuaType),
+    /// The `__index` answers some keys, but which cannot be told.
+    Unknown,
+}
+
+/// What `table`'s metatable `__index` supplies for `key`: a table's own member
+/// of that key, or the result of a function whose key parameter takes it, as a
+/// read through it resolves.
+pub(crate) fn find_metatable_index_field(
+    db: &DbIndex,
+    table: &InFiled<TextRange>,
+    key: &LuaMemberKey,
+) -> MetatableIndexField {
+    let Some(metatable) = db.get_metatable_index().get(table) else {
+        return MetatableIndexField::Absent;
+    };
+    if let Some(index_item) = db.get_member_index().get_member_item(
+        &LuaMemberOwner::Element(metatable.clone()),
+        &LuaMemberKey::Name("__index".into()),
+    ) {
+        let Ok(index_type) = index_item.resolve_type(db) else {
+            return MetatableIndexField::Unknown;
+        };
+        match crate::semantic::infer::classify_metatable_index_candidate(&index_type) {
+            crate::semantic::infer::MetatableIndexCandidate::Supported(index_type) => {
+                return match super::find_members(db, &index_type) {
+                    Some(members) => members
+                        .into_iter()
+                        .find(|member| &member.key == key)
+                        .map_or(MetatableIndexField::Absent, |member| {
+                            MetatableIndexField::Present(member.typ)
+                        }),
+                    None => MetatableIndexField::Absent,
+                };
+            }
+            crate::semantic::infer::MetatableIndexCandidate::Unsupported
+                if index_type.is_nil() || matches!(index_type, LuaType::BooleanConst(false)) =>
+            {
+                return MetatableIndexField::Absent;
+            }
+            crate::semantic::infer::MetatableIndexCandidate::Unsupported
+                if !index_type.is_function() =>
+            {
+                return MetatableIndexField::Unknown;
+            }
+            crate::semantic::infer::MetatableIndexCandidate::Unsupported => {}
+        }
+    }
+
+    let Some(key_type) = member_key_as_type(key) else {
+        return MetatableIndexField::Unknown;
+    };
+    let operator_index = db.get_operator_index();
+    let Some(operator_ids) = operator_index.get_operators(
+        &LuaOperatorOwner::Table(metatable.clone()),
+        LuaOperatorMetaMethod::Index,
+    ) else {
+        return MetatableIndexField::Absent;
+    };
+    for operator in operator_ids
+        .iter()
+        .filter_map(|operator_id| operator_index.get_operator(operator_id))
+    {
+        if crate::check_type_compact(db, &operator.get_operand(db), &key_type).is_ok() {
+            return operator
+                .get_result(db)
+                .map_or(MetatableIndexField::Unknown, MetatableIndexField::Present);
+        }
+    }
+    MetatableIndexField::Absent
+}

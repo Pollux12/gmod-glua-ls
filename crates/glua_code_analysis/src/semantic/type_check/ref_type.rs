@@ -4,7 +4,9 @@ use crate::{
     LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaSemanticDeclId, LuaTupleType, LuaType,
     LuaTypeDecl, LuaTypeDeclId, RenderLevel, humanize_type,
     semantic::{
-        member::{find_members, find_structural_members},
+        member::{
+            MetatableIndexField, find_members, find_metatable_index_field, find_structural_members,
+        },
         type_check::{
             complex_type::structural_object_from_members,
             intersection_utils::intersection_to_object, type_check_context::TypeCheckContext,
@@ -380,8 +382,6 @@ fn check_ref_type_compact_table(
     };
 
     let mut checked_keys = HashSet::default();
-    let indexes_through_metatable = indexes_through_metatable(context.db, &table_owner);
-
     for source_member in source_type_members {
         let key = source_member.key;
         if !checked_keys.insert(key.clone()) {
@@ -407,15 +407,28 @@ fn check_ref_type_compact_table(
             source_member_type = typ;
         }
 
-        match table_member_map.get(&key) {
+        // A field the table lacks is read through its metatable's `__index`.
+        let table_member_type = match table_member_map.get(&key) {
             Some(table_member_id) => {
                 let table_member = member_index
                     .get_member(table_member_id)
                     .ok_or(TypeCheckFailReason::TypeNotMatch)?;
-                let table_member_type = context
-                    .member_type(table_member.get_id())
-                    .unwrap_or(LuaType::Any);
+                MetatableIndexField::Present(
+                    context
+                        .member_type(table_member.get_id())
+                        .unwrap_or(LuaType::Any),
+                )
+            }
+            None => match &table_owner {
+                LuaMemberOwner::Element(table) => {
+                    find_metatable_index_field(context.db, table, &key)
+                }
+                _ => MetatableIndexField::Absent,
+            },
+        };
 
+        match table_member_type {
+            MetatableIndexField::Present(table_member_type) => {
                 if let Err(err) = check_general_type_compact(
                     context,
                     &source_member_type,
@@ -440,8 +453,8 @@ fn check_ref_type_compact_table(
                     ));
                 }
             }
-            None if !indexes_through_metatable
-                && member_is_required(
+            MetatableIndexField::Absent
+                if member_is_required(
                     context.db,
                     source_member.property_owner_id.as_ref(),
                     &source_member_type,
@@ -455,29 +468,11 @@ fn check_ref_type_compact_table(
                     format!("missing member {name}, in table", name = key.to_path()).to_string(),
                 ));
             }
-            _ => {} // Optional member not found, continue
+            _ => {} // Optional or unknowable member, continue
         }
     }
 
     Ok(())
-}
-
-/// Whether a read of a field `table_owner` lacks goes through its metatable's
-/// `__index`, which answers it at runtime.
-fn indexes_through_metatable(db: &crate::DbIndex, table_owner: &LuaMemberOwner) -> bool {
-    let LuaMemberOwner::Element(table) = table_owner else {
-        return false;
-    };
-    db.get_metatable_index()
-        .get(table)
-        .is_some_and(|metatable| {
-            db.get_member_index()
-                .get_member_item(
-                    &LuaMemberOwner::Element(metatable.clone()),
-                    &LuaMemberKey::Name("__index".into()),
-                )
-                .is_some()
-        })
 }
 
 fn check_ref_type_compact_object(

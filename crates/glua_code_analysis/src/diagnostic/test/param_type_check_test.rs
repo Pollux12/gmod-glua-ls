@@ -3455,6 +3455,114 @@ mod test {
         ));
     }
 
+    /// A class with a required `foo: string`, a consumer of it, and `setup`,
+    /// which builds the value passed to it.
+    fn metatable_backed_value(setup: &str) -> String {
+        format!(
+            r#"
+            ---@class MetaRequired
+            ---@field foo string
+
+            ---@param value MetaRequired
+            local function consume(value) end
+
+            {setup}
+            "#
+        )
+    }
+
+    /// Whether passing the value each setup builds reports a mismatch.
+    fn reports_param_mismatch(setups: &[&str]) -> Vec<bool> {
+        setups
+            .iter()
+            .map(|setup| {
+                let mut ws = VirtualWorkspace::new_with_init_std_lib();
+                !ws.check_code_for(
+                    DiagnosticCode::ParamTypeMismatch,
+                    &metatable_backed_value(setup),
+                )
+            })
+            .collect()
+    }
+
+    /// A field the table lacks is read through its metatable's `__index`
+    /// table: it fills the class field when its type fits, and is wrong or
+    /// missing otherwise, set up inline or apart, returned or not.
+    #[test]
+    fn a_field_read_through_an_index_table_is_checked_against_the_class() {
+        let setups = [
+            r#"
+            local function factory()
+                local value = {}
+                setmetatable(value, { __index = { foo = "yes" } })
+                return value
+            end
+            consume(factory())
+            "#,
+            r#"
+            local function factory()
+                local value = {}
+                setmetatable(value, { __index = { foo = 123 } })
+                return value
+            end
+            consume(factory())
+            "#,
+            r#"
+            local function factory()
+                local value = {}
+                setmetatable(value, { __index = { bar = "yes" } })
+                return value
+            end
+            consume(factory())
+            "#,
+            r#"
+            local value = {}
+            setmetatable(value, { __index = { foo = 123 } })
+            consume(value)
+            "#,
+            r#"
+            local value = setmetatable({}, { __index = { foo = 123 } })
+            consume(value)
+            "#,
+            r#"
+            local value = {}
+            setmetatable(value, { __index = false })
+            consume(value)
+            "#,
+        ];
+
+        assert_eq!(
+            reports_param_mismatch(&setups),
+            [false, true, true, true, true, true]
+        );
+    }
+
+    /// An `__index` function answers every key its key parameter takes, with
+    /// what it returns.
+    #[test]
+    fn a_field_read_through_an_index_function_is_checked_against_its_result() {
+        let setups = [
+            r#"
+            local value = {}
+            setmetatable(value, {
+                ---@return string
+                __index = function(t, key) return "yes" end,
+            })
+            consume(value)
+            "#,
+            r#"
+            local value = {}
+            setmetatable(value, {
+                ---@return integer
+                __index = function(t, key) return 1 end,
+            })
+            consume(value)
+            "#,
+        ];
+
+        assert_eq!(reports_param_mismatch(&setups), [false, true]);
+    }
+
     #[test]
     fn pcall_accepts_functions_returning_different_numbers_of_values() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
