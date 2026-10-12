@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use glua_code_analysis::{
-    DbIndex, FileId, FileRenames, Vfs, file_path_to_uri, load_path_rename_edits,
+    DbIndex, FileId, FileRenames, LuaDocument, Vfs, file_path_to_uri, load_path_rename_edits,
     read_file_with_encoding, uri_to_file_path,
 };
+use glua_parser::LineIndex;
 use lsp_types::{
     ApplyWorkspaceEditParams, DocumentChanges, MessageActionItem, MessageType, OneOf3,
     OptionalVersionedTextDocumentIdentifier, RenameFilesParams, ShowMessageRequestParams,
@@ -117,55 +118,65 @@ fn offered_edits(db: &DbIndex, renames: &FileRenames) -> Vec<OfferedEdit> {
         .collect()
 }
 
-/// The `edits` whose text is still where it was offered, addressed to each
-/// file where it is now, at the document version the server holds when the
-/// client can check it.
+/// The `edits` whose text is still where it was offered in the newest text the
+/// server holds of each file, addressed to where the file is now. When the
+/// client checks versions, each names the editor version that text came from,
+/// or none for text read from disk.
 fn current_edit(
-    context: &ServerContextSnapshot,
+    supports_document_changes: bool,
     vfs: &Vfs,
     edits: Vec<OfferedEdit>,
 ) -> Option<WorkspaceEdit> {
-    let mut by_uri: Vec<(Uri, Vec<TextEdit>)> = Vec::new();
+    let mut by_file: BTreeMap<FileId, Vec<OfferedEdit>> = BTreeMap::new();
     for edit in edits {
-        let Some(document) = vfs.get_document(&edit.file_id) else {
+        by_file.entry(edit.file_id).or_default().push(edit);
+    }
+    let mut by_uri: Vec<(Uri, Option<i32>, Vec<TextEdit>)> = Vec::new();
+    for (file_id, edits) in by_file {
+        let (Some(text), Some(path), Some(uri)) = (
+            vfs.latest_content(&file_id),
+            vfs.get_file_path(&file_id),
+            vfs.get_uri(&file_id),
+        ) else {
             continue;
         };
-        let current = document
-            .get_text()
-            .get(std::ops::Range::<usize>::from(edit.range));
-        if current != Some(edit.old_text.as_str()) {
-            continue;
-        }
-        let Some(range) = document.to_lsp_range(edit.range) else {
-            continue;
-        };
-        let text_edit = TextEdit {
-            range,
-            new_text: edit.new_text,
-        };
-        let uri = document.get_uri();
-        match by_uri.iter_mut().find(|(known, _)| *known == uri) {
-            Some((_, text_edits)) => text_edits.push(text_edit),
-            None => by_uri.push((uri, vec![text_edit])),
+        let line_index = LineIndex::parse(text);
+        let document = LuaDocument::new(file_id, path, text, &line_index);
+        let text_edits = edits
+            .into_iter()
+            .filter(|edit| {
+                text.get(std::ops::Range::<usize>::from(edit.range)) == Some(edit.old_text.as_str())
+            })
+            .filter_map(|edit| {
+                Some(TextEdit {
+                    range: document.to_lsp_range(edit.range)?,
+                    new_text: edit.new_text,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !text_edits.is_empty() {
+            by_uri.push((uri, vfs.latest_version(&file_id), text_edits));
         }
     }
     if by_uri.is_empty() {
         return None;
     }
-    by_uri.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
-    if !context.lsp_features().supports_document_changes() {
+    by_uri.sort_by(|(left, ..), (right, ..)| left.as_str().cmp(right.as_str()));
+    if !supports_document_changes {
         return Some(WorkspaceEdit {
-            changes: Some(by_uri.into_iter().collect()),
+            changes: Some(
+                by_uri
+                    .into_iter()
+                    .map(|(uri, _, text_edits)| (uri, text_edits))
+                    .collect(),
+            ),
             ..Default::default()
         });
     }
     let document_edits = by_uri
         .into_iter()
-        .map(|(uri, text_edits)| TextDocumentEdit {
-            text_document: OptionalVersionedTextDocumentIdentifier {
-                version: context.applied_document_version(&uri),
-                uri,
-            },
+        .map(|(uri, version, text_edits)| TextDocumentEdit {
+            text_document: OptionalVersionedTextDocumentIdentifier { uri, version },
             edits: text_edits.into_iter().map(OneOf3::Left).collect(),
         })
         .collect();
@@ -201,7 +212,11 @@ async fn offer_load_path_edits(context: ServerContextSnapshot, edits: Vec<Offere
     }
     let edit = {
         let analysis = context.analysis().read().await;
-        current_edit(&context, analysis.compilation.get_db().get_vfs(), edits)
+        current_edit(
+            context.lsp_features().supports_document_changes(),
+            analysis.compilation.get_db().get_vfs(),
+            edits,
+        )
     };
     let Some(edit) = edit else {
         return;
@@ -572,8 +587,35 @@ mod tests {
         });
     }
 
-    /// A client that checks document versions gets the edit for the version of
-    /// each open document the server holds.
+    /// Newer text the server holds but has not indexed yet, as a closed
+    /// document's text read back from disk, is what an offered edit is
+    /// checked against.
+    #[test]
+    fn a_load_path_edit_is_checked_against_the_newest_text_held() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let workspace =
+                workspace_to_rename_for("staged", RENAMED, applying_client(false)).await;
+            rename(&workspace).await;
+            let prompt = next_request(&workspace.client, Duration::from_secs(10))
+                .expect("the user is asked");
+
+            workspace
+                .snapshot
+                .analysis()
+                .write()
+                .await
+                .stage_file_system_changes(vec![(
+                    workspace.loader_uri.clone(),
+                    Some("print(1)\n".to_string()),
+                )]);
+
+            assert!(accept(&workspace, prompt).await.is_none());
+        });
+    }
+
+    /// A client that checks document versions gets the edit for the editor
+    /// version of the text it was checked against.
     #[test]
     fn a_load_path_edit_names_the_document_version_it_was_made_for() {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
@@ -588,9 +630,15 @@ mod tests {
                 ..Default::default()
             });
             let workspace = workspace_to_rename_for("versioned", RENAMED, capabilities).await;
-            workspace
-                .snapshot
-                .note_document_applied_version(&workspace.loader_uri, 7);
+            {
+                let mut analysis = workspace.snapshot.analysis().write().await;
+                let loader = analysis.get_file_id(&workspace.loader_uri).expect("loader");
+                analysis
+                    .compilation
+                    .get_db_mut()
+                    .get_vfs_mut()
+                    .update_file_version(&loader, Some(7));
+            }
             rename(&workspace).await;
 
             let params = accept_offer(&workspace).await.expect("the edit is applied");
