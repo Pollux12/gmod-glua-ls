@@ -102,8 +102,10 @@ if [ "$TIER" = change ] || [ "$TIER" = phase ]; then
   if [ "$TIER" = phase ]; then
     # The fingerprint check runs the whole suite; it overlaps the harness runs,
     # which leave most cores idle.
-    ( GLUALS_CHECK_FINGERPRINTS=1 cargo test -p glua_code_analysis --lib > "$OUT/suite_fingerprints.log" 2>&1
-      cargo test -p glua_ls > "$OUT/suite_ls.log" 2>&1 ) &
+    ( rc=0
+      GLUALS_CHECK_FINGERPRINTS=1 cargo test -p glua_code_analysis --lib > "$OUT/suite_fingerprints.log" 2>&1 || rc=1
+      cargo test -p glua_ls > "$OUT/suite_ls.log" 2>&1 || rc=1
+      exit $rc ) &
     SUITES=$!
   else
     step suite cargo test -p glua_code_analysis --lib
