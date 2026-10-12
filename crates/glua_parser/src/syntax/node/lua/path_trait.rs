@@ -18,14 +18,14 @@ fn join_path(paths: &[SmolStr]) -> SmolStr {
 
 /// The access-path segment of the string key `key`: bare where it reads as a
 /// name would, else `["key"]` with `"` and `\` escaped. No bare segment holds
-/// a `.`, opens a bracket or starts as a number does, so `t["a.b"]` and
-/// `t.a.b`, or `t["1"]` and `t[1]`, never share a path.
+/// a `.` or a `[` or starts as a number does, so `t["a.b"]` and `t.a.b`, or
+/// `t["1"]` and `t[1]`, never share a path.
 pub fn path_segment(key: &str) -> SmolStr {
     let bare = key
         .chars()
         .next()
-        .is_some_and(|first| !first.is_ascii_digit() && !matches!(first, '-' | '['))
-        && !key.contains('.');
+        .is_some_and(|first| !first.is_ascii_digit() && first != '-')
+        && !key.contains(['.', '[']);
     if bare {
         return SmolStr::new(key);
     }

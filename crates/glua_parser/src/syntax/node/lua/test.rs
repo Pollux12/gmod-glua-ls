@@ -135,6 +135,7 @@ mod tests {
             "-2",
             "",
             "[x]",
+            "a[b",
             r#"quote " and slash \"#,
             "plain",
         ] {
@@ -157,5 +158,11 @@ mod tests {
             Some(("t", r#"["a.b"]"#))
         );
         assert_eq!(split_last_path_segment("t"), None);
+
+        let opened = format!("t.{}.c", path_segment("a[b"));
+        assert_eq!(
+            path_segments(&opened).collect::<Vec<_>>(),
+            ["t", path_segment("a[b").as_str(), "c"]
+        );
     }
 }
