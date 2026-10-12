@@ -1,6 +1,8 @@
 use std::{collections::HashMap, str::FromStr};
 
-use glua_code_analysis::{FileRenames, load_path_rename_edits, uri_to_file_path};
+use glua_code_analysis::{
+    DbIndex, FileId, FileRenames, Vfs, load_path_rename_edits, uri_to_file_path,
+};
 use lsp_types::{FileRename, RenameFilesParams, TextEdit, Uri, WorkspaceEdit};
 use tokio_util::sync::CancellationToken;
 
@@ -19,22 +21,36 @@ pub async fn on_will_rename_files_handler(
     }
     let analysis = context.read_analysis(&cancel_token).await?;
     let db = analysis.compilation.get_db();
+    workspace_edit(db.get_vfs(), load_path_edits(db, &renames))
+}
+
+/// The edits rewriting the load paths that name `renames`' files, in each
+/// loading file's text as indexed now, before the renames.
+pub(super) fn load_path_edits(db: &DbIndex, renames: &FileRenames) -> Vec<(FileId, TextEdit)> {
     let vfs = db.get_vfs();
+    load_path_rename_edits(db, renames)
+        .into_iter()
+        .filter_map(|edit| {
+            let range = vfs.get_document(&edit.file_id)?.to_lsp_range(edit.range)?;
+            Some((
+                edit.file_id,
+                TextEdit {
+                    range,
+                    new_text: edit.new_path,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// `edits` addressed to each file's URI in `vfs`.
+pub(super) fn workspace_edit(vfs: &Vfs, edits: Vec<(FileId, TextEdit)>) -> Option<WorkspaceEdit> {
     #[allow(clippy::mutable_key_type)]
     let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
-    for edit in load_path_rename_edits(db, &renames) {
-        let (Some(uri), Some(document)) =
-            (vfs.get_uri(&edit.file_id), vfs.get_document(&edit.file_id))
-        else {
-            continue;
-        };
-        let Some(range) = document.to_lsp_range(edit.range) else {
-            continue;
-        };
-        changes.entry(uri).or_default().push(TextEdit {
-            range,
-            new_text: edit.new_path,
-        });
+    for (file_id, edit) in edits {
+        if let Some(uri) = vfs.get_uri(&file_id) {
+            changes.entry(uri).or_default().push(edit);
+        }
     }
     if changes.is_empty() {
         return None;

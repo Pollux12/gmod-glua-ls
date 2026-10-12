@@ -33,6 +33,16 @@ impl LspFeatures {
             .unwrap_or(false)
     }
 
+    /// Whether the client asks for the edits of a rename before making it.
+    pub fn supports_will_rename_files(&self) -> bool {
+        self.client_capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.file_operations.as_ref())
+            .and_then(|file_operations| file_operations.will_rename)
+            .unwrap_or(false)
+    }
+
     /// Gates `workspace/applyEdit`.
     pub fn supports_apply_edit(&self) -> bool {
         self.client_capabilities

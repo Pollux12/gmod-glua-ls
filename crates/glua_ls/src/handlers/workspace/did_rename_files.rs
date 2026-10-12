@@ -1,18 +1,34 @@
-use glua_code_analysis::{file_path_to_uri, read_file_with_encoding, uri_to_file_path};
-use lsp_types::RenameFilesParams;
+use std::collections::HashMap;
 
-use super::will_rename_files::file_renames;
+use glua_code_analysis::{FileId, file_path_to_uri, read_file_with_encoding, uri_to_file_path};
+use lsp_types::{
+    ApplyWorkspaceEditParams, MessageActionItem, MessageType, RenameFilesParams,
+    ShowMessageRequestParams, TextEdit,
+};
+use tokio_util::sync::CancellationToken;
+
+use super::will_rename_files::{file_renames, load_path_edits, workspace_edit};
 use crate::{context::ServerContextSnapshot, handlers::text_document::apply_file_system_changes};
 
-/// Moves the renamed files in the server's state. The load paths naming them
-/// are rewritten by the client from `workspace/willRenameFiles`.
+/// Moves the renamed files in the server's state. A client that asks
+/// `workspace/willRenameFiles` rewrites the load paths naming them from its
+/// answer; one that does not but applies edits is offered the same edit here.
 pub async fn on_did_rename_files_handler(
     context: ServerContextSnapshot,
     params: RenameFilesParams,
 ) -> Option<()> {
     let renames = file_renames(&params.files);
-    let (encoding, moved) = {
+    let features = context.lsp_features();
+    let offers_edit = !features.supports_will_rename_files() && features.supports_apply_edit();
+    let (encoding, moved, edits) = {
         let analysis = context.analysis().read().await;
+        // The load paths are found where the files are indexed now, before
+        // they move.
+        let edits = if offers_edit {
+            load_path_edits(analysis.compilation.get_db(), &renames)
+        } else {
+            Vec::new()
+        };
         let vfs = analysis.compilation.get_db().get_vfs();
         let moved = renames
             .moved_files(vfs)
@@ -21,7 +37,11 @@ pub async fn on_did_rename_files_handler(
                 Some((vfs.get_uri(&file_id)?, file_path_to_uri(&new_path)?))
             })
             .collect::<Vec<_>>();
-        (analysis.get_emmyrc().workspace.encoding.clone(), moved)
+        (
+            analysis.get_emmyrc().workspace.encoding.clone(),
+            moved,
+            edits,
+        )
     };
     if moved.is_empty() {
         return Some(());
@@ -57,7 +77,55 @@ pub async fn on_did_rename_files_handler(
     let renamed_uris = batch.iter().map(|(uri, _)| uri.clone()).collect::<Vec<_>>();
     apply_file_system_changes(&context, batch).await;
     context.note_renamed_uris(renamed_uris);
+    if !edits.is_empty() {
+        // The user's answer can take a while; later file changes do not wait
+        // for it.
+        tokio::spawn(offer_load_path_edits(context, edits));
+    }
     Some(())
+}
+
+/// Asks the user whether to rewrite the load paths naming the renamed files,
+/// and applies `edits` if so. A moved file keeps its id, so each edit goes to
+/// where its file is now.
+async fn offer_load_path_edits(context: ServerContextSnapshot, edits: Vec<(FileId, TextEdit)>) {
+    let update = MessageActionItem {
+        title: "Update".to_string(),
+        properties: HashMap::new(),
+    };
+    let answer = context
+        .client()
+        .show_message_request(
+            ShowMessageRequestParams {
+                typ: MessageType::INFO,
+                message: "Update the paths that load the renamed files?".to_string(),
+                actions: Some(vec![update.clone()]),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    if answer.is_none_or(|answer| answer.title != update.title) {
+        return;
+    }
+    let Some(edit) = workspace_edit(
+        context
+            .analysis()
+            .read()
+            .await
+            .compilation
+            .get_db()
+            .get_vfs(),
+        edits,
+    ) else {
+        return;
+    };
+    context
+        .client()
+        .apply_edit(
+            ApplyWorkspaceEditParams { label: None, edit },
+            CancellationToken::new(),
+        )
+        .await;
 }
 
 #[cfg(test)]
@@ -66,9 +134,12 @@ mod tests {
 
     use glua_code_analysis::{FileId, file_path_to_uri};
     use lsp_server::{Connection, Message};
+    use std::collections::HashMap;
+
     use lsp_types::{
-        ClientCapabilities, DidChangeWatchedFilesParams, FileChangeType, FileEvent, FileRename,
-        PublishDiagnosticsParams, RenameFilesParams, Uri,
+        ApplyWorkspaceEditParams, ClientCapabilities, DidChangeWatchedFilesParams, FileChangeType,
+        FileEvent, FileRename, Position, PublishDiagnosticsParams, Range, RenameFilesParams,
+        TextEdit, Uri, WorkspaceClientCapabilities, WorkspaceFileOperationsClientCapabilities,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -88,6 +159,7 @@ mod tests {
         client: Connection,
         old_uri: Uri,
         new_uri: Uri,
+        loader_uri: Uri,
         old_id: FileId,
         _context: ServerContext,
     }
@@ -95,6 +167,15 @@ mod tests {
     /// A workspace where `lua/autorun/sh_old.lua`, which another file
     /// includes, was renamed on disk to `sh_new.lua`, which holds `text`.
     async fn workspace_to_rename(name: &str, text: &str) -> RenamedWorkspace {
+        workspace_to_rename_for(name, text, ClientCapabilities::default()).await
+    }
+
+    /// [`workspace_to_rename`] served to a client with `capabilities`.
+    async fn workspace_to_rename_for(
+        name: &str,
+        text: &str,
+        capabilities: ClientCapabilities,
+    ) -> RenamedWorkspace {
         let root = crate::util::TempDir::new(&format!("gmod_glua_ls_did_rename_{name}"));
         let autorun = root.join("lua/autorun");
         std::fs::create_dir_all(&autorun).expect("workspace folder is created");
@@ -104,7 +185,7 @@ mod tests {
         let loader_uri = file_path_to_uri(&autorun.join("sh_loader.lua")).expect("loader URI");
 
         let (connection, client) = Connection::memory();
-        let context = ServerContext::new(connection, ClientCapabilities::default());
+        let context = ServerContext::new(connection, capabilities);
         let snapshot = context.snapshot();
         let old_id = {
             let mut analysis = snapshot.analysis().write().await;
@@ -121,9 +202,39 @@ mod tests {
             client,
             old_uri,
             new_uri,
+            loader_uri,
             old_id,
             _context: context,
         }
+    }
+
+    /// A client that applies edits, and asks `willRenameFiles` when `asks`.
+    fn applying_client(asks_will_rename: bool) -> ClientCapabilities {
+        ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                apply_edit: Some(true),
+                file_operations: Some(WorkspaceFileOperationsClientCapabilities {
+                    did_rename: Some(true),
+                    will_rename: Some(asks_will_rename),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The next request the server sends the client within `wait`.
+    fn next_request(client: &Connection, wait: Duration) -> Option<lsp_server::Request> {
+        let deadline = std::time::Instant::now() + wait;
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match client.receiver.recv_timeout(left) {
+                Ok(Message::Request(request)) => return Some(request),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+        None
     }
 
     /// Hands the rename of `workspace` to `didRenameFiles`.
@@ -282,8 +393,67 @@ mod tests {
         });
     }
 
-    /// The load paths are rewritten by the client from `willRenameFiles`, so
-    /// `didRenameFiles` neither prompts nor applies an edit.
+    /// A client that applies edits but never asks `willRenameFiles` is offered
+    /// the load path edit after the rename, at the loading file.
+    #[test]
+    fn a_client_without_will_rename_is_offered_the_load_path_edit() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let workspace =
+                workspace_to_rename_for("offered", RENAMED, applying_client(false)).await;
+            rename(&workspace).await;
+
+            let prompt = next_request(&workspace.client, Duration::from_secs(10))
+                .expect("the user is asked");
+            assert_eq!(prompt.method, "window/showMessageRequest");
+            workspace
+                .snapshot
+                .client()
+                .on_response(lsp_server::Response::new_ok(
+                    prompt.id,
+                    serde_json::json!({ "title": "Update" }),
+                ))
+                .await;
+            let apply = next_request(&workspace.client, Duration::from_secs(10))
+                .expect("the edit is applied");
+            assert_eq!(apply.method, "workspace/applyEdit");
+
+            let params: ApplyWorkspaceEditParams =
+                serde_json::from_value(apply.params).expect("applyEdit params");
+            #[allow(clippy::mutable_key_type)]
+            let expected = HashMap::from([(
+                workspace.loader_uri.clone(),
+                vec![TextEdit {
+                    range: Range::new(Position::new(0, 9), Position::new(0, 19)),
+                    new_text: "sh_new.lua".to_string(),
+                }],
+            )]);
+            assert_eq!(params.edit.changes, Some(expected));
+        });
+    }
+
+    /// A client that asks `willRenameFiles` already has the edit, so
+    /// `didRenameFiles` does not offer it again.
+    #[test]
+    fn a_client_with_will_rename_is_not_offered_the_edit_again() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let workspace =
+                workspace_to_rename_for("asked_before", RENAMED, applying_client(true)).await;
+            rename(&workspace).await;
+
+            let requests =
+                std::iter::from_fn(|| next_request(&workspace.client, Duration::from_secs(2)))
+                    .map(|request| request.method)
+                    .filter(|method| {
+                        method == "window/showMessageRequest" || method == "workspace/applyEdit"
+                    })
+                    .collect::<Vec<_>>();
+            assert!(requests.is_empty(), "{requests:?}");
+        });
+    }
+
+    /// A client that cannot apply an edit is neither asked nor sent one.
     #[test]
     fn a_handled_rename_neither_prompts_nor_edits() {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
