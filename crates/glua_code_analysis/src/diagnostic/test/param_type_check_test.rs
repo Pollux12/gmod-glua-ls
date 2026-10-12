@@ -3667,6 +3667,83 @@ mod test {
         assert_eq!(reports_param_mismatch(&setups), [true, false, false, false]);
     }
 
+    /// A table given a metatable answers with its own fields, then its
+    /// `__index`; a class answers through its index signatures; and an alias
+    /// that names itself says nothing rather than recursing forever.
+    #[test]
+    fn a_field_read_through_an_instance_class_or_recursive_alias() {
+        let setups = [
+            r#"
+            local fallback = setmetatable({ bar = true }, { __index = { foo = 123 } })
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            local fallback = setmetatable({ bar = true }, { __index = { foo = "yes" } })
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@class LookupStrings
+            ---@field [string] string
+            ---@type LookupStrings
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@class LookupIntegers
+            ---@field [string] integer
+            ---@type LookupIntegers
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@alias RecursiveIndex RecursiveIndex|table<string, string>
+            ---@type RecursiveIndex
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+        ];
+
+        assert_eq!(
+            reports_param_mismatch(&setups),
+            [true, false, false, true, false]
+        );
+    }
+
+    /// Branches of a union that share an index table each find the field
+    /// through it: a table reached twice is not a cycle.
+    #[test]
+    fn a_shared_index_table_answers_every_branch_that_reaches_it() {
+        let setup = metatable_backed_value(
+            r#"
+            local shared = {}
+            setmetatable(shared, { __index = { foo = "yes" } })
+            local left, right = {}, {}
+            setmetatable(left, { __index = shared })
+            setmetatable(right, { __index = shared })
+            local fallback = math.random() > 0.5 and left or right
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+        );
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.strict.allow_nullable_as_non_nullable = false;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_code_for(DiagnosticCode::ParamTypeMismatch, &setup));
+    }
+
     /// An `__index` that may be nil may leave the field nil, which only a
     /// nullable-tolerant check accepts in a non-nullable field.
     #[test]

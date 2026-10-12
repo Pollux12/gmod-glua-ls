@@ -451,21 +451,39 @@ pub(crate) fn find_metatable_index_field(
     table: &InFiled<TextRange>,
     key: &LuaMemberKey,
 ) -> MetatableIndexField {
-    metatable_index_field(db, table, key, &mut Vec::new())
+    metatable_index_field(db, table, key, &mut LookupPath::default())
 }
 
-/// [`find_metatable_index_field`], past the `tables` already looked through:
-/// a chain that comes back to one supplies nothing new.
+/// The tables and aliases a lookup is inside of, innermost last.
+#[derive(Default)]
+struct LookupPath {
+    tables: Vec<InFiled<TextRange>>,
+    aliases: Vec<LuaTypeDeclId>,
+}
+
+/// [`find_metatable_index_field`] inside `path`: a chain that comes back to a
+/// table it is inside of supplies nothing new.
 fn metatable_index_field(
     db: &DbIndex,
     table: &InFiled<TextRange>,
     key: &LuaMemberKey,
-    tables: &mut Vec<InFiled<TextRange>>,
+    path: &mut LookupPath,
 ) -> MetatableIndexField {
-    if tables.contains(table) {
+    if path.tables.contains(table) {
         return MetatableIndexField::Absent;
     }
-    tables.push(table.clone());
+    path.tables.push(table.clone());
+    let field = table_metatable_index_field(db, table, key, path);
+    path.tables.pop();
+    field
+}
+
+fn table_metatable_index_field(
+    db: &DbIndex,
+    table: &InFiled<TextRange>,
+    key: &LuaMemberKey,
+    path: &mut LookupPath,
+) -> MetatableIndexField {
     let Some(metatable) = db.get_metatable_index().get(table) else {
         return MetatableIndexField::Absent;
     };
@@ -477,7 +495,7 @@ fn metatable_index_field(
             return MetatableIndexField::Unknown;
         };
         if !index_type.is_function() {
-            return index_value_field(db, &index_type, key, tables);
+            return index_value_field(db, &index_type, key, path);
         }
     }
 
@@ -512,16 +530,16 @@ fn index_value_field(
     db: &DbIndex,
     index_type: &LuaType,
     key: &LuaMemberKey,
-    tables: &mut Vec<InFiled<TextRange>>,
+    path: &mut LookupPath,
 ) -> MetatableIndexField {
     match index_type {
         LuaType::Nil | LuaType::BooleanConst(false) => MetatableIndexField::Absent,
         LuaType::Union(union) => union
             .types()
-            .map(|alternative| index_value_field(db, alternative, key, tables))
+            .map(|alternative| index_value_field(db, alternative, key, path))
             .reduce(|left, right| left.or(db, right))
             .unwrap_or(MetatableIndexField::Absent),
-        LuaType::TypeGuard(inner) => index_value_field(db, inner, key, tables),
+        LuaType::TypeGuard(inner) => index_value_field(db, inner, key, path),
         LuaType::Ref(type_id) | LuaType::Def(type_id)
             if let Some(origin) = db
                 .get_type_index()
@@ -529,17 +547,56 @@ fn index_value_field(
                 .filter(|decl| decl.is_alias())
                 .and_then(|decl| decl.get_alias_origin(db, None)) =>
         {
-            index_value_field(db, &origin, key, tables)
+            if path.aliases.contains(type_id) {
+                return MetatableIndexField::Unknown;
+            }
+            path.aliases.push(type_id.clone());
+            let field = index_value_field(db, &origin, key, path);
+            path.aliases.pop();
+            field
         }
         LuaType::TableConst(table) => match super::infer_raw_member_type(db, index_type, key) {
             Ok(typ) => MetatableIndexField::Present(typ),
-            Err(InferFailReason::FieldNotFound) => metatable_index_field(db, table, key, tables),
+            Err(InferFailReason::FieldNotFound) => metatable_index_field(db, table, key, path),
             Err(_) => MetatableIndexField::Unknown,
         },
+        // A table given a metatable whose `__index` is the instance's base:
+        // its own fields first, then what the base answers.
+        LuaType::Instance(instance) => {
+            let table = LuaType::TableConst(instance.get_range().clone());
+            match super::infer_raw_member_type(db, &table, key) {
+                Ok(typ) => MetatableIndexField::Present(typ),
+                Err(InferFailReason::FieldNotFound) => {
+                    index_value_field(db, instance.get_base(), key, path)
+                }
+                Err(_) => MetatableIndexField::Unknown,
+            }
+        }
         _ => match super::infer_raw_member_type(db, index_type, key) {
             Ok(typ) => MetatableIndexField::Present(typ),
-            Err(InferFailReason::FieldNotFound) => MetatableIndexField::Absent,
+            Err(InferFailReason::FieldNotFound) => index_signature_field(db, index_type, key),
             Err(_) => MetatableIndexField::Unknown,
         },
     }
+}
+
+/// What the index signatures of `typ`, a class or an instantiated generic
+/// class, answer for a `key` none of its named members has.
+fn index_signature_field(db: &DbIndex, typ: &LuaType, key: &LuaMemberKey) -> MetatableIndexField {
+    if !matches!(typ, LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_)) {
+        return MetatableIndexField::Absent;
+    }
+    let Some(key_type) = member_key_as_type(key) else {
+        return MetatableIndexField::Unknown;
+    };
+    find_index_operations(db, typ)
+        .into_iter()
+        .flatten()
+        .find(|operation| {
+            matches!(&operation.key, LuaMemberKey::ExprType(index_key)
+                if crate::check_type_compact(db, index_key, &key_type).is_ok())
+        })
+        .map_or(MetatableIndexField::Absent, |operation| {
+            MetatableIndexField::Present(operation.typ)
+        })
 }
