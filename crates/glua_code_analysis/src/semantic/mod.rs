@@ -15,8 +15,10 @@ mod visibility;
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// Test-only work counter, re-exported so scaling guards can assert on the
-/// number of walks rather than on how long they took.
+/// Test-only work counters, re-exported so scaling guards can assert on the
+/// amount of work rather than on how long it took.
+#[cfg(test)]
+pub(crate) use infer::CONSTANT_EXPR_CLASSIFICATIONS;
 #[cfg(test)]
 pub(crate) use infer::narrow::get_type_at_flow::BASELINE_FLOW_WALKS;
 

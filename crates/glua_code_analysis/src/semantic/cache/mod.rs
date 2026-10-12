@@ -261,6 +261,14 @@ pub struct LuaInferCache {
     /// Pure syntax plus the immutable flow index, so it survives deferred and
     /// unresolve clearing like the other structural caches.
     pub branch_special_call_effect_cache: TrackedMap<(FlowId, FlowId, VarRefCacheKey), bool>,
+    /// Whether an expression folds to a constant, keyed by the expression.
+    /// A local read shares its initializer's answer, so a chain of locals
+    /// built from earlier ones is classified once per local.
+    ///
+    /// Pure syntax plus the file's declaration and reference indexes, so it
+    /// survives deferred and unresolve clearing like the other structural
+    /// caches.
+    pub constant_expr_cache: TrackedMap<LuaSyntaxId, bool>,
     /// Empty `visited_flow_ids` buffers for the flow walk. A walk takes one
     /// and returns it afterwards, so repeated and nested walks (a merge point
     /// re-enters through `get_type_at_flow_with_origin`) reuse allocations.
@@ -420,6 +428,7 @@ impl LuaInferCache {
             unambiguous_int_const_cache: Default::default(),
             decl_name_index: None,
             branch_special_call_effect_cache: Default::default(),
+            constant_expr_cache: Default::default(),
             flow_walk_scratch: Vec::new(),
             index_ref_origin_type_cache: Default::default(),
             keyed: Vec::new(),
@@ -832,6 +841,7 @@ impl LuaInferCache {
         self.flow_node_realm_cache.clear_local();
         self.numeric_table_index_query_cache.clear_local();
         self.branch_special_call_effect_cache.clear_local();
+        self.constant_expr_cache.clear_local();
         for key in self.flow_local_keys.drain(..) {
             if let Some(entries) = self.flow_node_cache.get_mut(&key) {
                 entries.clear_local();
@@ -898,6 +908,7 @@ impl LuaInferCache {
             flow_node_realm_cache,
             numeric_table_index_query_cache,
             branch_special_call_effect_cache,
+            constant_expr_cache,
             expr_var_ref_id_cache,
             self_type_cache,
             dynamic_field_resolution_cache,

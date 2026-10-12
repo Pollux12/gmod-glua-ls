@@ -212,6 +212,7 @@ impl LuaInferCache {
             flow_node_realm_cache,
             numeric_table_index_query_cache,
             branch_special_call_effect_cache,
+            constant_expr_cache,
             expr_var_ref_id_cache,
             self_type_cache,
             dynamic_field_resolution_cache,

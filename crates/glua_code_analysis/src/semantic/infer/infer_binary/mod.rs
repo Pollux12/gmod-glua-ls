@@ -73,8 +73,7 @@ pub fn infer_binary_expr(
     };
     let right_type = infer_expr(db, cache, right.clone())?;
     let (left_type, right_type) = if folds_constants(op)
-        && !(is_constant_expr(db, cache.get_file_id(), &left)
-            && is_constant_expr(db, cache.get_file_id(), &right))
+        && !(is_constant_expr(db, cache, &left) && is_constant_expr(db, cache, &right))
     {
         (
             crate::db_index::widen_literal_type_for_assignment(&left_type),
@@ -137,22 +136,47 @@ fn folds_constants(op: BinaryOperator) -> bool {
 /// assigns. Only such operands fold to a constant. A constant read from a
 /// variable or field is the value one run left there, and folding it would let
 /// a value computed from its own previous value count up without end.
-fn is_constant_expr(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> bool {
-    match expr {
-        LuaExpr::LiteralExpr(_) => true,
+fn is_constant_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: &LuaExpr) -> bool {
+    if matches!(expr, LuaExpr::LiteralExpr(_)) {
+        return true;
+    }
+    let syntax_id = expr.get_syntax_id();
+    if let Some(constant) = cache.tracked_get(|cache| &mut cache.constant_expr_cache, &syntax_id) {
+        return constant;
+    }
+    #[cfg(test)]
+    CONSTANT_EXPR_CLASSIFICATIONS.with(|count| count.set(count.get() + 1));
+    let frame = crate::db_index::derivation::open_frame();
+    let constant = match expr {
         LuaExpr::ParenExpr(paren) => paren
             .get_expr()
-            .is_some_and(|inner| is_constant_expr(db, file_id, &inner)),
+            .is_some_and(|inner| is_constant_expr(db, cache, &inner)),
         LuaExpr::UnaryExpr(unary) => unary
             .get_expr()
-            .is_some_and(|inner| is_constant_expr(db, file_id, &inner)),
+            .is_some_and(|inner| is_constant_expr(db, cache, &inner)),
         LuaExpr::BinaryExpr(binary) => binary.get_exprs().is_some_and(|(left, right)| {
-            is_constant_expr(db, file_id, &left) && is_constant_expr(db, file_id, &right)
+            is_constant_expr(db, cache, &left) && is_constant_expr(db, cache, &right)
         }),
-        LuaExpr::NameExpr(name) => constant_local_initializer(db, file_id, name)
-            .is_some_and(|initializer| is_constant_expr(db, file_id, &initializer)),
+        LuaExpr::NameExpr(name) => constant_local_initializer(db, cache.get_file_id(), name)
+            .is_some_and(|initializer| is_constant_expr(db, cache, &initializer)),
         _ => false,
-    }
+    };
+    cache.tracked_insert(
+        |cache| &mut cache.constant_expr_cache,
+        syntax_id,
+        constant,
+        frame,
+    );
+    constant
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Constant-expression classifications that missed the memo, on this
+    /// thread: a count, so the guard against re-walking shared initializers
+    /// does not depend on how loaded the machine is.
+    pub(crate) static CONSTANT_EXPR_CLASSIFICATIONS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// The initializer of the local `name` reads, when nothing else assigns it.

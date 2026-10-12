@@ -15,6 +15,8 @@ use glua_parser::{
     LuaAst, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaLiteralExpr, LuaLiteralToken,
     LuaNameExpr, LuaSyntaxKind, LuaTableExpr, LuaVarExpr, NumberResult,
 };
+#[cfg(test)]
+pub(crate) use infer_binary::CONSTANT_EXPR_CLASSIFICATIONS;
 use infer_binary::infer_binary_expr;
 pub(crate) use infer_call::get_prefix_expr_signature_id;
 use infer_call::infer_call_expr;

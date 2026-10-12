@@ -324,4 +324,60 @@ mod test {
             )
         );
     }
+
+    /// Locals each built from the one before, read twice: `a{steps}` holds
+    /// `2^steps`.
+    fn doubling_chain(steps: usize) -> String {
+        let mut text = String::from("local a0 = 1\n");
+        for i in 1..=steps {
+            text.push_str(&format!("local a{i} = a{} + a{}\n", i - 1, i - 1));
+        }
+        text.push_str(&format!("chain_result = a{steps}\n"));
+        text
+    }
+
+    /// Classifying an operand reads each local's initializer, and every local
+    /// here is read twice by the next one, so without a memo the work doubles
+    /// per local. Counted rather than timed so the guard cannot flake.
+    #[test]
+    fn a_chain_of_locals_read_twice_each_is_classified_once_per_local() {
+        let classified = |steps: usize| {
+            crate::semantic::CONSTANT_EXPR_CLASSIFICATIONS.with(|count| count.set(0));
+            let mut ws = VirtualWorkspace::new();
+            ws.def(&doubling_chain(steps));
+            let result = ws.expr_ty("chain_result");
+            (
+                ws.humanize_type(result),
+                crate::semantic::CONSTANT_EXPR_CLASSIFICATIONS.with(|count| count.get()),
+            )
+        };
+
+        let (small_result, small) = classified(12);
+        let (large_result, large) = classified(24);
+
+        assert_eq!(
+            (small_result, large_result),
+            ("4096".to_string(), "16777216".to_string())
+        );
+        assert!(small > 0, "no classification ran; the guard is vacuous");
+        assert!(
+            large <= small * 4,
+            "classifications grew from {small} to {large} when the chain doubled"
+        );
+    }
+
+    #[test]
+    fn a_chain_of_locals_widens_once_an_edit_reassigns_a_link() {
+        let path = "lua/autorun/sh_chain.lua";
+        let chain = doubling_chain(6);
+        let edited = format!("{chain}a3 = 5\n");
+        let mut ws = VirtualWorkspace::assert_warm_matches_cold(
+            |_| {},
+            &[(path, chain.as_str())],
+            &[(path, edited.as_str())],
+        );
+
+        let result = ws.expr_ty("chain_result");
+        assert_eq!(ws.humanize_type(result), "integer");
+    }
 }
