@@ -201,8 +201,11 @@ fn check_index_expr(
         };
 
     let value_type = semantic_model.infer_expr_list_value_type_at(exprs, value_idx)?;
-    let value_type =
-        closure_without_returns_as_method_definition(semantic_model, expr.as_ref(), value_type);
+    let value_type = if source_type.as_ref().is_some_and(expects_function) {
+        function_without_returns_as_method_definition(semantic_model, value_type)
+    } else {
+        value_type
+    };
     check_assign_type_mismatch(
         context,
         semantic_model,
@@ -230,15 +233,21 @@ fn check_index_expr(
     Some(())
 }
 
-/// A closure that returns nothing is accepted for a member's declared return,
-/// as `function obj:Method() end` is, so `obj.Method = function() end` is too.
-fn closure_without_returns_as_method_definition(
+fn expects_function(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Union(union) => union.types().any(LuaType::is_function),
+        typ => typ.is_function(),
+    }
+}
+
+/// A function that returns nothing is accepted for a member's declared return,
+/// as `function obj:Method() end` is, so `obj.Method = function() end` and
+/// `obj.Method = handler` are too.
+fn function_without_returns_as_method_definition(
     semantic_model: &SemanticModel,
-    expr: Option<&LuaExpr>,
     value_type: LuaType,
 ) -> LuaType {
-    let (Some(LuaExpr::ClosureExpr(_)), LuaType::Signature(signature_id)) = (expr, &value_type)
-    else {
+    let LuaType::Signature(signature_id) = &value_type else {
         return value_type;
     };
     let Some(signature) = semantic_model

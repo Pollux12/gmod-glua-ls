@@ -4097,6 +4097,30 @@ fn closure_without_returns_may_be_assigned_to_a_method_field() {
 }
 
 #[test]
+fn a_named_function_without_returns_may_be_assigned_to_a_method_field() {
+    let mut ws = crate::VirtualWorkspace::new();
+    let code = format!(
+        "{HOOK_CLASS}
+local function draw_selected(s) end
+p.Paint = draw_selected
+function HookPanel:PaintHovered() end
+p.Paint = p.PaintHovered"
+    );
+    assert!(ws.check_code_for(crate::DiagnosticCode::AssignTypeMismatch, &code));
+}
+
+#[test]
+fn a_named_function_returning_the_wrong_type_is_still_reported_for_a_method_field() {
+    let mut ws = crate::VirtualWorkspace::new();
+    let code = format!(
+        "{HOOK_CLASS}
+local function draw_label(s) return \"x\" end
+p.Paint = draw_label"
+    );
+    assert!(!ws.check_code_for(crate::DiagnosticCode::AssignTypeMismatch, &code));
+}
+
+#[test]
 fn closure_returning_the_wrong_type_is_still_reported_for_a_method_field() {
     let mut ws = crate::VirtualWorkspace::new();
     let code = format!("{HOOK_CLASS}\np.Paint = function(s, w, h) return \"x\" end");
