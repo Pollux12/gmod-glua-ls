@@ -22,6 +22,39 @@ mod test {
             .expect("index expression type")
     }
 
+    /// A local function passed by name as a callback takes the callback's
+    /// parameter types, as a closure written in its place does; a parameter it
+    /// documents itself keeps its own type, and a direct call of it is not
+    /// held to the callback's contract.
+    #[test]
+    fn a_local_function_passed_as_a_callback_takes_its_param_types() {
+        let source = r#"
+            ---@param name string
+            ---@param callback fun(ply: number, cmd: string, args: string[], argStr: string)
+            local function add_command(name, callback) end
+
+            ---@param cmd string?
+            local function handler(ply, cmd, args)
+                first_arg = args[1]
+                own_cmd = cmd
+            end
+            add_command("x", handler)
+            handler(1, nil, { 0 })
+            "#;
+        let mut ws = VirtualWorkspace::new();
+        ws.def(source);
+
+        assert_eq!(ws.expr_ty("first_arg"), ws.ty("string"));
+        assert_eq!(ws.expr_ty("own_cmd"), ws.ty("string?"));
+        for code in [
+            crate::DiagnosticCode::ParamTypeMismatch,
+            crate::DiagnosticCode::MissingParameter,
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(ws.check_code_for(code, source), "{code:?}");
+        }
+    }
+
     #[test]
     fn test_closure_param_infer() {
         let mut ws = VirtualWorkspace::new();

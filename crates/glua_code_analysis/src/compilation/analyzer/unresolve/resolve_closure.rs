@@ -26,45 +26,15 @@ pub fn try_resolve_call_closure_params(
     cache: &mut LuaInferCache,
     closure_params: &mut UnResolveCallClosureParams,
 ) -> ResolveResult {
-    let call_expr = closure_params.call_expr.clone();
-    let prefix_expr = call_expr.get_prefix_expr().ok_or(InferFailReason::None)?;
-    let call_expr_type = infer_expr(db, cache, prefix_expr)?;
-
-    let call_doc_func = infer_call_expr_func(
+    let Some(callback_func) = callback_contract_for_arg(
         db,
         cache,
-        call_expr.clone(),
-        call_expr_type,
-        &InferGuard::new(),
-        None,
-    )?;
-
-    let colon_call = call_expr.is_colon_call();
-    let colon_define = call_doc_func.is_colon_define();
-
-    let mut param_idx = closure_params.param_idx;
-    match (colon_call, colon_define) {
-        (true, false) => {
-            param_idx += 1;
-        }
-        (false, true) => {
-            if param_idx == 0 {
-                return Ok(());
-            }
-
-            param_idx -= 1;
-        }
-        _ => {}
-    }
-
-    let Some(callback_func) = resolve_call_param_doc_function(
-        db,
-        &call_expr,
-        &call_doc_func,
-        param_idx,
+        &closure_params.call_expr,
+        closure_params.param_idx,
         closure_params.signature_id,
         closure_params.file_id,
-    ) else {
+    )?
+    else {
         return Ok(());
     };
     let async_state = callback_func.get_async_state();
@@ -242,6 +212,43 @@ fn try_convert_to_func_body_infer(
     };
 
     try_resolve_return_point(db, writes, cache, &mut unresolve)
+}
+
+/// The function type the callee of `call_expr` declares for its argument at
+/// `arg_idx`: the contract a callback passed there is called with. `origin`
+/// is the callback's own signature, which a hook contract is chosen for.
+pub(crate) fn callback_contract_for_arg(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    arg_idx: usize,
+    origin: LuaSignatureId,
+    call_file_id: crate::FileId,
+) -> Result<Option<Arc<LuaFunctionType>>, InferFailReason> {
+    let prefix_expr = call_expr.get_prefix_expr().ok_or(InferFailReason::None)?;
+    let call_expr_type = infer_expr(db, cache, prefix_expr)?;
+    let call_doc_func = infer_call_expr_func(
+        db,
+        cache,
+        call_expr.clone(),
+        call_expr_type,
+        &InferGuard::new(),
+        None,
+    )?;
+    let param_idx = match (call_expr.is_colon_call(), call_doc_func.is_colon_define()) {
+        (true, false) => arg_idx + 1,
+        (false, true) if arg_idx == 0 => return Ok(None),
+        (false, true) => arg_idx - 1,
+        _ => arg_idx,
+    };
+    Ok(resolve_call_param_doc_function(
+        db,
+        call_expr,
+        &call_doc_func,
+        param_idx,
+        origin,
+        call_file_id,
+    ))
 }
 
 fn resolve_call_param_doc_function(

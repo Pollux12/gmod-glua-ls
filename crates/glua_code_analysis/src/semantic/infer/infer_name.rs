@@ -1148,6 +1148,13 @@ fn infer_param_inner(
         return Ok((file_hint_type, ParamInferenceSource::Explicit));
     }
 
+    if let Some(cache) = cache.as_mut()
+        && let Some(contract_type) =
+            infer_param_type_from_callback_slots(db, cache, decl, signature_id, param_idx)
+    {
+        return Ok((contract_type, ParamInferenceSource::Concrete));
+    }
+
     if let Some(call_site_type) = db
         .get_call_site_param_index()
         .get_inferred_param(&signature_id, param_idx)
@@ -1187,6 +1194,84 @@ fn infer_param_inner(
     }
 
     Err(InferFailReason::UnResolveDeclType(decl.get_id()))
+}
+
+/// What the callback slots a local function is passed into declare for its
+/// parameter `param_idx`: `concommand.Add("x", handler)` types `handler`'s
+/// params as a closure written there is typed, without binding the
+/// function's other callers to that contract.
+fn infer_param_type_from_callback_slots(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl: &LuaDecl,
+    signature_id: LuaSignatureId,
+    param_idx: usize,
+) -> Option<LuaType> {
+    let file_id = signature_id.get_file_id();
+    if decl.get_file_id() != file_id {
+        return None;
+    }
+    let target_decl_id = db
+        .get_signature_index()
+        .local_func_decl_for(&signature_id)?;
+    let decl_refs = db
+        .get_reference_index()
+        .get_local_reference(&file_id)?
+        .get_decl_references(&target_decl_id)?;
+    if decl_refs.mutable {
+        return None;
+    }
+    let mut cells = decl_refs.cells.clone();
+    cells.sort_by_key(|cell| cell.range.start());
+    let mut inferred: Option<LuaType> = None;
+    for cell in cells.iter().filter(|cell| !cell.is_write) {
+        let Some(name_expr) = db
+            .get_vfs()
+            .syntax_tree_around(&file_id, cell.range)
+            .and_then(|tree| {
+                tree.get_red_root()
+                    .covering_element(cell.range)
+                    .ancestors()
+                    .find_map(LuaNameExpr::cast)
+            })
+            .filter(|name_expr| name_expr.get_range() == cell.range)
+        else {
+            continue;
+        };
+        let Some(arg_list) = name_expr.get_parent::<glua_parser::LuaCallArgList>() else {
+            continue;
+        };
+        let (Some(call_expr), Some(arg_idx)) = (
+            arg_list.get_parent::<LuaCallExpr>(),
+            arg_list
+                .get_args()
+                .position(|arg| arg.get_position() == name_expr.get_position()),
+        ) else {
+            continue;
+        };
+        let Ok(Some(contract)) = crate::compilation::analyzer::unresolve::callback_contract_for_arg(
+            db,
+            cache,
+            &call_expr,
+            arg_idx,
+            signature_id,
+            file_id,
+        ) else {
+            continue;
+        };
+        let Some(param_type) = contract
+            .get_params()
+            .get(param_idx)
+            .and_then(|(_, typ)| typ.clone())
+        else {
+            continue;
+        };
+        inferred = Some(match inferred {
+            Some(current) => TypeOps::Union.apply(db, &current, &param_type),
+            None => param_type,
+        });
+    }
+    inferred
 }
 
 fn infer_param_type_from_call_sites(
