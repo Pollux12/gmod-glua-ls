@@ -184,7 +184,6 @@ impl ServerContext {
         file_diagnostic.store().start(
             file_diagnostic::workspace_diagnostic_parallelism(),
             debounced_analysis.clone(),
-            debounced_shutdown.clone(),
         );
 
         // Supervise the debounce loop: freshness waiters park on it with no
@@ -372,6 +371,7 @@ impl ServerContext {
 
     pub async fn close(&self) {
         self.debounced_shutdown.cancel();
+        self.inner.file_diagnostic.store().stop();
         let mut workspace_manager = self.inner.workspace_manager.write().await;
         workspace_manager.watcher = None;
     }

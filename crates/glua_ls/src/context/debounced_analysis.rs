@@ -1887,9 +1887,7 @@ mod tests {
                 file_diagnostic.clone(),
                 test_lsp_features(),
             ));
-            file_diagnostic
-                .store()
-                .start(1, debounced_analysis.clone(), shutdown.clone());
+            file_diagnostic.store().start(1, debounced_analysis.clone());
 
             let initial_diagnostics = file_diagnostic
                 .file_diagnostics(user_uri.clone(), CancellationToken::new())
@@ -1930,6 +1928,7 @@ mod tests {
                 eq(true)
             )?;
             shutdown.cancel();
+            file_diagnostic.store().stop();
 
             Ok(())
         })
@@ -1968,9 +1967,7 @@ mod tests {
             file_diagnostic.clone(),
             test_lsp_features(),
         ));
-        file_diagnostic
-            .store()
-            .start(1, debounced_analysis.clone(), shutdown);
+        file_diagnostic.store().start(1, debounced_analysis.clone());
         (debounced_analysis, peer)
     }
 

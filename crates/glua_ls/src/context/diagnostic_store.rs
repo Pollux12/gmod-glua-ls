@@ -121,6 +121,9 @@ pub struct DiagnosticStore {
     verify: bool,
     /// Whether workers were started: without them no job is ever claimed.
     working: std::sync::atomic::AtomicBool,
+    /// Cancelled at shutdown: the workers stop, and nothing waits on a file
+    /// they would have computed.
+    stopped: CancellationToken,
     /// Makes every computation panic while set, as a diagnostic bug would.
     #[cfg(test)]
     panic_computes: std::sync::atomic::AtomicBool,
@@ -143,9 +146,25 @@ impl DiagnosticStore {
             client,
             verify: std::env::var_os("GLUALS_DIAG_VERIFY").is_some(),
             working: std::sync::atomic::AtomicBool::new(false),
+            stopped: CancellationToken::new(),
             #[cfg(test)]
             panic_computes: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Stops the workers, cancels what they compute and releases every
+    /// waiter, as the server shuts down.
+    pub fn stop(&self) {
+        self.stopped.cancel();
+        for (_, token) in self.state().computing.values() {
+            token.cancel();
+        }
+        self.computed.notify_waiters();
+    }
+
+    /// Resolves once the store is stopped.
+    pub async fn stopped(&self) {
+        self.stopped.cancelled().await;
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -155,13 +174,9 @@ impl DiagnosticStore {
     /// Starts `workers` tasks computing dirty files once no edit is pending,
     /// the edited ones as soon as their own text has settled, one filing what
     /// they read once none is left, and the verifier under
-    /// `GLUALS_DIAG_VERIFY`.
-    pub fn start(
-        self: &Arc<Self>,
-        workers: usize,
-        debounced: Arc<DebouncedAnalysis>,
-        shutdown: CancellationToken,
-    ) {
+    /// `GLUALS_DIAG_VERIFY`, all until [`Self::stop`].
+    pub fn start(self: &Arc<Self>, workers: usize, debounced: Arc<DebouncedAnalysis>) {
+        let shutdown = self.stopped.clone();
         self.working
             .store(true, std::sync::atomic::Ordering::Release);
         for _ in 0..workers.max(1) {
@@ -481,6 +496,7 @@ impl DiagnosticStore {
             tokio::select! {
                 _ = computed => {}
                 _ = cancel.cancelled() => return None,
+                _ = self.stopped.cancelled() => return None,
             }
         }
     }
@@ -512,7 +528,7 @@ impl DiagnosticStore {
             let priority = self.state().priority_of(file_id, false);
             match self.get(file_id, priority, cancel).await {
                 Some(diagnostics) => stored.push(diagnostics),
-                None if cancel.is_cancelled() => break,
+                None if cancel.is_cancelled() || self.stopped.is_cancelled() => break,
                 None => {}
             }
         }
@@ -1089,6 +1105,54 @@ mod tests {
                 verify_that!(counts, eq(&vec![shown, 0, shown]))?;
             }
             Ok(())
+        })
+    }
+
+    /// A wait for diagnostics no worker will compute ends when the server
+    /// shuts down, whether it began before the shutdown or after it.
+    #[gtest]
+    fn shutting_down_releases_waits_for_diagnostics() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = Connection::memory();
+        runtime.block_on(async {
+            let context = ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_diagnostic_store_stop");
+            let uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/pending.lua"))
+                .expect("file URI should parse");
+            let file_id = {
+                let mut analysis = snapshot.analysis().write().await;
+                analysis.add_main_workspace(workspace);
+                let (file_id, _) = analysis
+                    .update_file_by_uri(&uri, Some("local unused = UndefinedGlobal".to_string()))
+                    .expect("file id");
+                // Text no re-analysis takes keeps the file from being computed.
+                analysis.update_file_text_only(&uri, "local a = Missing".to_string());
+                file_id
+            };
+            let store = snapshot.file_diagnostic().store().clone();
+            let pending = tokio::spawn({
+                let store = store.clone();
+                async move {
+                    store
+                        .get_all(&[file_id], &CancellationToken::new(), |_| {})
+                        .await
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            verify_that!(pending.is_finished(), eq(false))?;
+
+            context.close().await;
+            let released = tokio::time::timeout(Duration::from_secs(5), pending).await;
+            verify_that!(released.is_ok(), eq(true))?;
+
+            store.invalidate([file_id], &[file_id]);
+            let after = tokio::time::timeout(
+                Duration::from_secs(5),
+                store.get(file_id, Priority::Edited, &CancellationToken::new()),
+            )
+            .await;
+            verify_that!(after, ok(none()))
         })
     }
 

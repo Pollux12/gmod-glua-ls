@@ -150,6 +150,7 @@ impl FileDiagnostic {
                 _ = cancel_token.cancelled() => {
                     log::info!("cancel workspace diagnostic");
                 }
+                _ = file_diagnostic.store.stopped() => {}
             }
         });
     }
