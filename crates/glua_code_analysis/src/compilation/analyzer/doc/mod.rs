@@ -8,6 +8,8 @@ mod tags;
 mod type_def_tags;
 mod type_ref_tags;
 
+pub(crate) use type_ref_tags::register_inferred_accessor_generators;
+
 use super::AnalyzeContext;
 use super::common::estimate_file_index_entries;
 use crate::{

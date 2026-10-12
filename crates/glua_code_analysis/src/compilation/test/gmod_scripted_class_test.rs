@@ -1197,6 +1197,70 @@ end
         );
     }
 
+    /// A function that makes a `Get`/`Set` pair from a name, as TTT's
+    /// `AccessorFuncDT` does, synthesizes members at its calls as an
+    /// `@accessorfunc` one does, from a function or a method.
+    #[gtest]
+    fn test_inferred_accessor_generator_synthesizes_get_set_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/autorun/sh_accessor_util.lua",
+            r#"
+            function AccessorFuncDT(tbl, varname, name)
+               tbl["Get" .. name] = function(s) return s.dt and s.dt[varname] end
+               tbl["Set" .. name] = function(s, v) if s.dt then s.dt[varname] = v end end
+            end
+
+            function NotAnAccessor(tbl, name)
+               tbl[name] = function() end
+            end
+        "#,
+        );
+        ws.def_file(
+            "lua/entities/my_entity/shared.lua",
+            r#"
+            function ENT:RegisterProperty(name)
+               self["Get" .. name] = function(s) return s[name] end
+               self["Set" .. name] = function(s, v) s[name] = v end
+            end
+
+            AccessorFuncDT(ENT, "armed", "Armed")
+            NotAnAccessor(ENT, "Plain")
+            ENT:RegisterProperty("Health")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("my_entity"));
+        let member_names: Vec<_> = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members on my_entity class")
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        for expected in ["GetArmed", "SetArmed", "GetHealth", "SetHealth"] {
+            assert!(
+                member_names.iter().any(|name| name == expected),
+                "missing {expected} in {member_names:?}"
+            );
+        }
+        assert!(
+            !member_names.iter().any(|name| name == "GetPlain"),
+            "{member_names:?}"
+        );
+    }
+
     #[gtest]
     fn test_accessor_func_force_type_resolves_correctly() {
         let mut ws = VirtualWorkspace::new();

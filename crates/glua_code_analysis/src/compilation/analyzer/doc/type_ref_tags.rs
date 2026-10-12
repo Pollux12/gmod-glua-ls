@@ -744,6 +744,115 @@ fn extract_func_name_from_ast(ast: &LuaAst) -> Option<String> {
     }
 }
 
+/// Registers each function of `root` that makes a `Get`/`Set` pair on a table
+/// from a name, `tbl["Get" .. name] = function ... end`, as an accessor
+/// generator, as `@accessorfunc` marks one.
+pub(crate) fn register_inferred_accessor_generators(
+    db: &mut crate::DbIndex,
+    file_id: crate::FileId,
+    root: &glua_parser::LuaChunk,
+) {
+    for ast in root.descendants::<LuaAst>() {
+        let (closure, is_method) = match &ast {
+            LuaAst::LuaFuncStat(func) => (
+                func.get_closure(),
+                matches!(func.get_func_name(), Some(LuaVarExpr::IndexExpr(index))
+                    if index.get_index_token().is_some_and(|token| token.is_colon())),
+            ),
+            LuaAst::LuaLocalFuncStat(func) => (func.get_closure(), false),
+            _ => continue,
+        };
+        let (Some(closure), Some(name)) = (closure, extract_func_name_from_ast(&ast)) else {
+            continue;
+        };
+        if let Some(name_param_index) = accessor_name_param(&closure, is_method) {
+            db.get_accessor_func_index_mut().register(
+                name.into(),
+                AccessorFuncAnnotation {
+                    name_param_index,
+                    file_id,
+                },
+            );
+        }
+    }
+}
+
+/// The parameter `closure` names the accessors it makes after, when it assigns
+/// a function to both `owner["Get" .. name]` and `owner["Set" .. name]`; the
+/// owner is `self` for a method and the first parameter otherwise.
+fn accessor_name_param(closure: &LuaClosureExpr, is_method: bool) -> Option<usize> {
+    let params = closure
+        .get_params_list()?
+        .get_params()
+        .map(|param| {
+            param
+                .get_name_token()
+                .map(|token| token.get_name_text().to_string())
+        })
+        .collect::<Vec<_>>();
+    let owner = if is_method {
+        "self".to_string()
+    } else {
+        params.first()?.clone()?
+    };
+    let mut made = [None::<usize>; 2];
+    for assign in closure.descendants::<LuaAssignStat>() {
+        let in_closure = assign
+            .syntax()
+            .ancestors()
+            .find_map(LuaClosureExpr::cast)
+            .is_some_and(|enclosing| enclosing.syntax() == closure.syntax());
+        if !in_closure {
+            continue;
+        }
+        let (vars, values) = assign.get_var_and_expr_list();
+        for (var, value) in vars.iter().zip(values.iter()) {
+            let (LuaVarExpr::IndexExpr(index), LuaExpr::ClosureExpr(_)) = (var, value) else {
+                continue;
+            };
+            let Some(LuaExpr::NameExpr(prefix)) = index.get_prefix_expr() else {
+                continue;
+            };
+            if prefix.get_name_text().as_deref() != Some(owner.as_str()) {
+                continue;
+            }
+            let Some(LuaIndexKey::Expr(LuaExpr::BinaryExpr(key))) = index.get_index_key() else {
+                continue;
+            };
+            if key.get_op_token().map(|op| op.get_op())
+                != Some(glua_parser::BinaryOperator::OpConcat)
+            {
+                continue;
+            }
+            let Some((LuaExpr::LiteralExpr(accessor_prefix), LuaExpr::NameExpr(name_expr))) =
+                key.get_exprs()
+            else {
+                continue;
+            };
+            let Some(glua_parser::LuaLiteralToken::String(accessor_prefix)) =
+                accessor_prefix.get_literal()
+            else {
+                continue;
+            };
+            let slot = match accessor_prefix.get_value().as_str() {
+                "Get" => 0,
+                "Set" => 1,
+                _ => continue,
+            };
+            let Some(name) = name_expr.get_name_text() else {
+                continue;
+            };
+            made[slot] = params
+                .iter()
+                .position(|param| param.as_deref() == Some(name.as_str()));
+        }
+    }
+    match made {
+        [Some(get), Some(set)] if get == set && (is_method || get != 0) => Some(get),
+        _ => None,
+    }
+}
+
 fn parse_accessorfunc_param_index(description: &str) -> usize {
     let trimmed = description.trim();
     if trimmed.is_empty() {

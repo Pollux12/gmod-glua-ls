@@ -1271,6 +1271,12 @@ fn document_source(
 ) -> (Vec<derivation::HashedKey>, Vec<derivation::DerivationId>) {
     let _recording = derivation::resume(evaluation);
     run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
+    let source_root = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .expect("a live file has a syntax tree")
+        .get_chunk_node();
+    doc::register_inferred_accessor_generators(db, file_id, &source_root);
     publish_callable_signatures(db, &context);
     resolve_early_member_owners(db, &mut context);
     local_inference::prepare_inferred_positive_guards(db, &context);
