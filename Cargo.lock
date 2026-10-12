@@ -555,9 +555,9 @@ dependencies = [
  "emmy_lsp_types",
  "glua_code_analysis",
  "glua_parser",
+ "glua_rowan",
  "mimalloc",
  "rayon",
- "rowan",
  "tokio-util",
 ]
 
@@ -877,9 +877,9 @@ dependencies = [
  "fern",
  "glua_code_analysis",
  "glua_parser",
+ "glua_rowan",
  "log",
  "mimalloc",
- "rowan",
  "serde",
  "serde_json",
  "tokio",
@@ -898,6 +898,7 @@ dependencies = [
  "flagset",
  "glua_diagnostic_macro",
  "glua_parser",
+ "glua_rowan",
  "googletest",
  "hashbrown 0.15.4",
  "ignore",
@@ -910,7 +911,6 @@ dependencies = [
  "rayon",
  "regex",
  "reqwest",
- "rowan",
  "rustc-hash 2.1.1",
  "schema_to_glua",
  "schemars 1.0.4",
@@ -932,8 +932,8 @@ version = "0.1.5"
 dependencies = [
  "clap",
  "glua_parser",
+ "glua_rowan",
  "mimalloc",
- "rowan",
  "serde",
  "serde_json",
  "serde_yml",
@@ -957,11 +957,11 @@ dependencies = [
  "fern",
  "glua_code_analysis",
  "glua_parser",
+ "glua_rowan",
  "include_dir",
  "log",
  "mimalloc",
  "num-traits",
- "rowan",
  "serde",
  "serde_json",
  "tera",
@@ -981,6 +981,7 @@ dependencies = [
  "glua_code_analysis",
  "glua_parser",
  "glua_parser_desc",
+ "glua_rowan",
  "googletest",
  "internment",
  "itertools 0.14.0",
@@ -988,7 +989,6 @@ dependencies = [
  "lsp-server",
  "mimalloc",
  "notify",
- "rowan",
  "rustc-hash 2.1.1",
  "serde",
  "serde_json",
@@ -1003,7 +1003,7 @@ dependencies = [
 name = "glua_parser"
 version = "0.1.5"
 dependencies = [
- "rowan",
+ "glua_rowan",
  "rustc-hash 2.1.1",
  "serde",
  "smol_str",
@@ -1015,9 +1015,20 @@ name = "glua_parser_desc"
 version = "0.1.5"
 dependencies = [
  "glua_parser",
+ "glua_rowan",
  "googletest",
- "rowan",
  "unicode-general-category",
+]
+
+[[package]]
+name = "glua_rowan"
+version = "0.1.5"
+dependencies = [
+ "countme",
+ "hashbrown 0.14.5",
+ "rustc-hash 1.1.0",
+ "serde",
+ "text-size",
 ]
 
 [[package]]
@@ -2267,16 +2278,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rowan"
-version = "0.16.1"
-dependencies = [
- "countme",
- "hashbrown 0.14.5",
- "rustc-hash 1.1.0",
- "text-size",
-]
-
-[[package]]
 name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2813,6 +2814,9 @@ name = "text-size"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f18aa187839b2bdb1ad2fa35ead8c4c2976b64e4363c386d45ac0f7ee85c9233"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "thiserror"

@@ -2,6 +2,7 @@ use std::fs;
 use toml_edit::{value, DocumentMut};
 
 const CARGOS: &[&str] = &[
+    "vendor/rowan/Cargo.toml",
     "crates/glua_code_analysis/Cargo.toml",
     "crates/glua_diagnostic_macro/Cargo.toml",
     "crates/glua_parser_desc/Cargo.toml",
@@ -52,6 +53,7 @@ fn main() {
 
     let dependencies = doc["workspace"]["dependencies"].as_table_mut().unwrap();
     for dep_name in [
+        "rowan",
         "glua_code_analysis",
         "glua_parser",
         "glua_parser_desc",

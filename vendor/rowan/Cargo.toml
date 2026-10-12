@@ -9,22 +9,26 @@
 # will likely look very different (and much more reasonable).
 # See Cargo.toml.orig for the original contents.
 
-# GLuaLS vendor note: exact copy of crates.io rowan 0.16.1, except the
-# iterative `GreenNode` drop (see `src/green/node.rs` + `src/arc.rs`), the
-# stored-hash `NodeCache` rehash key (see `src/green/node_cache.rs`), and the
-# removal below of the upstream examples/tests (with their `m_lexer`
-# dev-dependency), which are not shipped and would otherwise add resolve-time
-# dependencies to every workspace build. `Cargo.toml.orig` is kept so the
-# vendored tree can be diffed against upstream when re-vendoring.
+# GLuaLS vendor note: copy of crates.io rowan 0.16.1, published as
+# `glua_rowan` so the published GLuaLS crates build against it. It differs
+# from upstream by the iterative `GreenNode` drop (see `src/green/node.rs` +
+# `src/arc.rs`), the stored-hash `NodeCache` rehash key (see
+# `src/green/node_cache.rs`), the green-tree walks `descendants_matching` and
+# `child_at_range_info` (see `src/cursor.rs`), and the removal below of the
+# upstream examples/tests (with their `m_lexer` dev-dependency), which are not
+# shipped and would otherwise add resolve-time dependencies to every workspace
+# build. `Cargo.toml.orig` is kept so the vendored tree can be diffed against
+# upstream when re-vendoring.
 
 [package]
 edition = "2021"
 rust-version = "1.77.0"
-name = "rowan"
-version = "0.16.1"
+name = "glua_rowan"
+version = "0.1.5"
 authors = ["Aleksey Kladov <aleksey.kladov@gmail.com>"]
 build = false
 exclude = [
+    "Cargo.toml.orig",
     ".github/",
     "bors.toml",
     "rustfmt.toml",
@@ -33,13 +37,13 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Library for generic lossless syntax trees"
+description = "GLuaLS fork of rowan, a library for generic lossless syntax trees"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/rust-analyzer/rowan"
+repository = "https://github.com/Pollux12/gmod-glua-ls"
 
 [lib]
-name = "rowan"
+name = "glua_rowan"
 path = "src/lib.rs"
 
 [dependencies.countme]

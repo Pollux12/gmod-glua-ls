@@ -36,7 +36,7 @@ jobs:
               - 'rustfmt.toml'
               - 'crates/**'
               - 'tools/**'
-              - 'vendor/emmylua_codestyle/**'
+              - 'vendor/**'
               - '.github/workflows/test.yml'
 
   clippy:

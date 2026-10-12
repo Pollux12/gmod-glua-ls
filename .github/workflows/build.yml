@@ -47,7 +47,7 @@ jobs:
               - 'rustfmt.toml'
               - 'crates/**'
               - 'tools/**'
-              - 'vendor/emmylua_codestyle/**'
+              - 'vendor/**'
               - '.github/workflows/build.yml'
 
   # Lightweight dev builds for every push/PR — Linux x64, Windows x64, and experimental macOS.
@@ -287,6 +287,7 @@ jobs:
           }
 
           # Publish only the public crates we ship plus the internal crates they require.
+          publish_with_retry vendor/rowan/Cargo.toml
           publish_with_retry crates/glua_parser/Cargo.toml
           publish_with_retry crates/glua_diagnostic_macro/Cargo.toml
           publish_with_retry crates/schema_to_glua/Cargo.toml
