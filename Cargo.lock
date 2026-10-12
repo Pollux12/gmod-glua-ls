@@ -665,15 +665,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "emmylua_codestyle"
-version = "0.6.0"
-dependencies = [
- "cc",
- "glob",
- "libc",
-]
-
-[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -893,9 +884,9 @@ version = "0.1.5"
 dependencies = [
  "dirs",
  "emmy_lsp_types",
- "emmylua_codestyle",
  "encoding_rs",
  "flagset",
+ "glua_codestyle",
  "glua_diagnostic_macro",
  "glua_parser",
  "glua_rowan",
@@ -937,6 +928,15 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+]
+
+[[package]]
+name = "glua_codestyle"
+version = "0.1.5"
+dependencies = [
+ "cc",
+ "glob",
+ "libc",
 ]
 
 [[package]]

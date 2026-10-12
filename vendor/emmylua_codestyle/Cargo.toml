@@ -9,10 +9,14 @@
 # will likely look very different (and much more reasonable).
 # See Cargo.toml.orig for the original contents.
 
+# GLuaLS vendor note: copy of crates.io emmylua_codestyle 0.6.0 with GLuaLS
+# changes to its formatter and code style check, published as `glua_codestyle`
+# so the published GLuaLS crates build against it.
+
 [package]
 edition = "2024"
-name = "emmylua_codestyle"
-version = "0.6.0"
+name = "glua_codestyle"
+version = "0.1.5"
 authors = ["CppCXY"]
 build = "build.rs"
 include = [
@@ -30,7 +34,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Lua code formatting lib with EmmyLuaCodeStyle"
+description = "GLuaLS fork of emmylua_codestyle, a Lua code formatting lib with EmmyLuaCodeStyle"
 readme = "README.md"
 keywords = [
     "lua",
@@ -41,10 +45,10 @@ keywords = [
 ]
 categories = ["development-tools"]
 license = "MIT"
-repository = "https://github.com/CppCXY/emmylua-codestyle-sys"
+repository = "https://github.com/Pollux12/gmod-glua-ls"
 
 [lib]
-name = "emmylua_codestyle"
+name = "glua_codestyle"
 path = "src/lib.rs"
 
 [dependencies.libc]
