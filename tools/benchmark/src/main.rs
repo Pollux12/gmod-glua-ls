@@ -152,6 +152,7 @@ static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 fn run_incremental_edits(
     analysis: &mut EmmyLuaAnalysis,
     sample: Vec<(FileId, usize)>,
+    parallelism: usize,
 ) -> Option<std::time::Duration> {
     let mut total = std::time::Duration::ZERO;
     let mut worst = std::time::Duration::ZERO;
@@ -228,7 +229,7 @@ fn run_incremental_edits(
             );
 
             let t = Instant::now();
-            diagnose_files(analysis, &affected);
+            diagnose_files(analysis, &affected, parallelism);
             let diagnostics = t.elapsed();
             let elapsed = reindex + diagnostics;
             total += elapsed;
@@ -255,14 +256,13 @@ fn run_incremental_edits(
     Some(worst)
 }
 
-/// Diagnoses `file_ids` on every available thread, as the language server
+/// Diagnoses `file_ids` on `parallelism` threads, as the language server
 /// re-diagnoses the files an edit left stale.
-fn diagnose_files(analysis: &EmmyLuaAnalysis, file_ids: &[FileId]) {
+fn diagnose_files(analysis: &EmmyLuaAnalysis, file_ids: &[FileId], parallelism: usize) {
     let shared = analysis.precompute_diagnostic_shared_data();
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     std::thread::scope(|s| {
-        for _ in 0..threads {
+        for _ in 0..parallelism {
             let shared = shared.clone();
             let next = &next;
             s.spawn(move || {
@@ -935,7 +935,7 @@ async fn run() {
                 .file_name("dhat-edit.json")
                 .trim_backtraces(Some(24))
                 .build();
-            incremental_worst = run_incremental_edits(&mut analysis, sample);
+            incremental_worst = run_incremental_edits(&mut analysis, sample, parallelism);
             alloc_report!("incremental edits", alloc_mark);
             #[cfg(feature = "dhat-heap")]
             drop(dhat_edit);
@@ -1007,7 +1007,7 @@ async fn run() {
                 }
             }
 
-            incremental_worst = run_incremental_edits(&mut analysis, sample);
+            incremental_worst = run_incremental_edits(&mut analysis, sample, parallelism);
         }
     }
 
