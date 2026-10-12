@@ -84,6 +84,8 @@ impl ClientProxy {
         }));
     }
 
+    /// Sends a request and waits for its response, or for `cancel_token`; a
+    /// request whose token is already cancelled is never sent.
     pub async fn send_request(
         &self,
         id: RequestId,
@@ -91,6 +93,9 @@ impl ClientProxy {
         params: impl serde::Serialize,
         cancel_token: CancellationToken,
     ) -> Option<Response> {
+        if cancel_token.is_cancelled() {
+            return None;
+        }
         let (sender, receiver) = oneshot::channel();
         self.response_manager
             .lock()
@@ -353,6 +358,32 @@ mod tests {
         };
 
         request
+    }
+
+    /// A request made once its token is cancelled, as at shutdown, never
+    /// reaches the client.
+    #[gtest]
+    fn a_request_with_a_cancelled_token_is_not_sent() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (client, peer) = create_client_proxy();
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+
+        let response = runtime.block_on(client.apply_edit(
+            lsp_types::ApplyWorkspaceEditParams {
+                label: None,
+                edit: lsp_types::WorkspaceEdit::default(),
+            },
+            cancelled,
+        ));
+
+        verify_that!(response, none())?;
+        verify_that!(
+            peer.receiver
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            eq(true)
+        )
     }
 
     #[gtest]
