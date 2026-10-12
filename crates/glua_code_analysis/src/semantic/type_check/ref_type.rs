@@ -6,6 +6,7 @@ use crate::{
     semantic::{
         member::{
             MetatableIndexField, find_members, find_metatable_index_field, find_structural_members,
+            infer_raw_member_type,
         },
         type_check::{
             complex_type::structural_object_from_members,
@@ -310,6 +311,12 @@ fn check_ref_class(
             )
         }
         LuaType::Table => Ok(()),
+        LuaType::TableGeneric(_) => check_ref_type_compact_table_generic(
+            context,
+            source_id,
+            compact_type,
+            check_guard.next_level()?,
+        ),
         LuaType::TableOf(inner) => check_general_type_compact(
             context,
             &LuaType::Ref(source_id.clone()),
@@ -356,6 +363,48 @@ fn check_ref_class(
             }
         }
     }
+}
+
+/// A generic table answers each field of the class with what a read of the
+/// field's key gives: its value type when its key type admits the key, and
+/// nothing, which only an optional field accepts, otherwise.
+fn check_ref_type_compact_table_generic(
+    context: &mut TypeCheckContext,
+    source_id: &LuaTypeDeclId,
+    table_generic: &LuaType,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    let source_type = LuaType::Ref(source_id.clone());
+    let Some(source_members) = find_structural_members(context.db, &source_type) else {
+        return Ok(());
+    };
+    let mut checked_keys = HashSet::default();
+    for source_member in source_members {
+        if !checked_keys.insert(source_member.key.clone())
+            || is_structural_method_member(source_member.feature)
+        {
+            continue;
+        }
+        match infer_raw_member_type(context.db, table_generic, &source_member.key) {
+            Ok(read_type) => check_general_type_compact(
+                context,
+                &source_member.typ,
+                &read_type,
+                check_guard.next_level()?,
+            )?,
+            Err(_)
+                if member_is_required(
+                    context.db,
+                    source_member.property_owner_id.as_ref(),
+                    &source_member.typ,
+                ) =>
+            {
+                return Err(TypeCheckFailReason::TypeNotMatch);
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(())
 }
 
 fn check_ref_type_compact_table(

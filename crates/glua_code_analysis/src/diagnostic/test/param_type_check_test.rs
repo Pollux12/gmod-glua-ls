@@ -3596,9 +3596,24 @@ mod test {
             setmetatable(value, { __index = fallback })
             consume(value)
             "#,
+            r#"
+            ---@type table<string, string>
+            local fallback = {}
+            local value = setmetatable({}, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@type table<string, integer>
+            local fallback = {}
+            local value = setmetatable({}, { __index = fallback })
+            consume(value)
+            "#,
         ];
 
-        assert_eq!(reports_param_mismatch(&setups), [false, false, true, true]);
+        assert_eq!(
+            reports_param_mismatch(&setups),
+            [false, false, true, true, false, true]
+        );
     }
 
     /// An `__index` value read as a read through it resolves: every
@@ -3674,6 +3689,19 @@ mod test {
         });
 
         assert_eq!(reports, [false, true]);
+    }
+
+    /// A generic table meets a class field by field: a field whose key its
+    /// key type admits holds its value type, and any other must be optional.
+    #[test]
+    fn a_generic_table_meets_a_class_field_by_field() {
+        let setups = [
+            "---@type table<string, string>\nlocal t = {}\nconsume(t)\n",
+            "---@type table<string, integer>\nlocal t = {}\nconsume(t)\n",
+            "---@type table<integer, string>\nlocal t = {}\nconsume(t)\n",
+        ];
+
+        assert_eq!(reports_param_mismatch(&setups), [false, true, true]);
     }
 
     /// A field the index table lacks is read through that table's own
