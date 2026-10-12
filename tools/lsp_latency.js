@@ -146,7 +146,7 @@ function describeReport(result) {
  *
  * `self.` is preferred because resolving it exercises the class/type indexes
  * rather than a module table, which is where a stale index shows up first.
- * Comments are skipped: completion there is rightly empty.
+ * Comments and strings are skipped: completion there is rightly empty.
  */
 function memberAccessPosition(text) {
     const lines = codeLines(text);
@@ -164,31 +164,47 @@ function memberAccessPosition(text) {
         || { line: 0, character: 0 };
 }
 
-/** `text`'s lines with their line and long comments blanked, columns kept. */
+/** `text`'s lines with comments and string contents blanked, columns kept. */
 function codeLines(text) {
-    // The `]=*]` that ends the long comment in progress, if one is.
-    let closing = null;
-    return text.split('\n').map((line) => {
-        let code = '';
-        let rest = line;
-        for (;;) {
-            if (closing !== null) {
-                const end = rest.indexOf(closing);
-                if (end < 0) return code + ' '.repeat(rest.length);
-                code += ' '.repeat(end + closing.length);
-                rest = rest.slice(end + closing.length);
-                closing = null;
+    const longBracket = /\[(=*)\[/y;
+    const longAt = (at) => {
+        longBracket.lastIndex = at;
+        return longBracket.exec(text);
+    };
+    let code = '';
+    let at = 0;
+    const blankTo = (end) => {
+        code += text.slice(at, end).replace(/[^\r\n]/g, ' ');
+        at = end;
+    };
+    const blankLong = (open, from) => {
+        const close = text.indexOf(`]${open[1]}]`, from + open[0].length);
+        blankTo(close < 0 ? text.length : close + open[1].length + 2);
+    };
+    while (at < text.length) {
+        const ch = text[at];
+        if (ch === '-' && text[at + 1] === '-') {
+            const open = longAt(at + 2);
+            if (open) {
+                blankLong(open, at + 2);
+            } else {
+                const lineEnd = text.indexOf('\n', at);
+                blankTo(lineEnd < 0 ? text.length : lineEnd);
             }
-            const start = rest.indexOf('--');
-            if (start < 0) return code + rest;
-            code += rest.slice(0, start);
-            const long = /^--\[(=*)\[/.exec(rest.slice(start));
-            if (!long) return code + ' '.repeat(rest.length - start);
-            closing = `]${long[1]}]`;
-            code += ' '.repeat(long[0].length);
-            rest = rest.slice(start + long[0].length);
+        } else if (ch === '[' && longAt(at)) {
+            blankLong(longAt(at), at);
+        } else if (ch === '"' || ch === "'") {
+            let end = at + 1;
+            while (end < text.length && text[end] !== ch && text[end] !== '\n') {
+                end += text[end] === '\\' ? 2 : 1;
+            }
+            blankTo(Math.min(end + 1, text.length));
+        } else {
+            code += ch;
+            at += 1;
         }
-    });
+    }
+    return code.split('\n');
 }
 
 async function main() {
