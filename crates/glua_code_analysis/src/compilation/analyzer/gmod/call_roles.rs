@@ -75,10 +75,17 @@ impl Touched {
             .paths
             .iter()
             .map(|path| CallRoleKey::Path(SmolStr::new(path)));
+        let receiver_methods = self
+            .paths
+            .iter()
+            .filter_map(|path| method_name(&GlobalId::new(path)).map(CallRoleKey::ReceiverMethod))
+            .collect::<HashSet<_>>()
+            .into_iter();
         let globals = self.globals.iter().cloned().map(CallRoleKey::Global);
         let methods = self.methods.iter().cloned().map(CallRoleKey::Method);
         let signatures = self.signatures.iter().copied().map(CallRoleKey::Signature);
         paths
+            .chain(receiver_methods)
             .chain(globals)
             .chain(methods)
             .chain(signatures)
@@ -357,6 +364,20 @@ impl GmodCallRoles {
                     roles.path_fingerprints.remove(path);
                 }
             }
+            if let Some(name) = method_name(&GlobalId::new(path)) {
+                if roles.roles_by_path.contains_key(path) {
+                    roles
+                        .receiver_paths
+                        .entry(name)
+                        .or_default()
+                        .insert(path.clone());
+                } else if let Some(paths) = roles.receiver_paths.get_mut(&name) {
+                    paths.remove(path);
+                    if paths.is_empty() {
+                        roles.receiver_paths.remove(&name);
+                    }
+                }
+            }
         }
         for key in &touched.net_ops {
             match contributions.net_op_winner(key) {
@@ -424,6 +445,12 @@ impl derivation::CallRoles for GmodCallRoles {
             .roles_by_path
             .keys()
             .map(|path| CallRoleKey::Path(SmolStr::new(path)));
+        let receiver_methods = self
+            .roles
+            .receiver_paths
+            .keys()
+            .cloned()
+            .map(CallRoleKey::ReceiverMethod);
         let globals = self
             .registry
             .globals
@@ -443,6 +470,7 @@ impl derivation::CallRoles for GmodCallRoles {
             .copied()
             .map(CallRoleKey::Signature);
         paths
+            .chain(receiver_methods)
             .chain(globals)
             .chain(methods)
             .chain(signatures)
@@ -454,6 +482,13 @@ impl derivation::CallRoles for GmodCallRoles {
         let site =
             |(file_id, syntax_id): &(FileId, LuaSyntaxId)| InFiled::new(*file_id, *syntax_id);
         match key {
+            CallRoleKey::ReceiverMethod(name) => self
+                .roles
+                .receiver_paths
+                .get(name)
+                .map_or(derivation::ABSENT, |_| {
+                    derivation::fingerprint_of(&self.roles.receiver_presence_value(name))
+                }),
             CallRoleKey::Path(path) if !derivation::mapping_back() => self
                 .roles
                 .path_fingerprints

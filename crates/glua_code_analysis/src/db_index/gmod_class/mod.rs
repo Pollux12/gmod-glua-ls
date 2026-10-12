@@ -159,6 +159,7 @@ pub struct GmodNamedStringCallRoles {
 pub struct GmodNetworkVarCallRoles {
     pub type_arg_idx: Option<usize>,
     pub name_arg_idx: usize,
+    pub slot_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

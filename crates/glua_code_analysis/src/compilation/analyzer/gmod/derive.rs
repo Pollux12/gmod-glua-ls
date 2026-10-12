@@ -120,14 +120,24 @@ pub(crate) fn apply_pre(
             wrappers,
         }) => {
             if let Some(scope_match) = scope_match {
-                ensure_scoped_class_type_decl(
+                let range = in_filed_tree.value.syntax().text_range();
+                let class_decl_id = ensure_scoped_class_type_decl(
                     db,
                     file_id,
                     &scope_match.class_name,
                     &scope_match.global_name,
                     &scope_match.super_types,
-                    in_filed_tree.value.syntax().text_range(),
+                    range,
                 );
+                for super_type in scoped_class_super_types(
+                    &scope_match.global_name,
+                    &scope_match.class_name,
+                    &scope_match.super_types,
+                ) {
+                    if let LuaType::Ref(base_id) = super_type {
+                        add_data_table_super_type(db, file_id, &class_decl_id, &base_id, range);
+                    }
+                }
                 collect_scripted_scope_type_bindings_with(db, file_id, &scope_match);
                 synthesize_scoped_base_assignments_with(
                     db,

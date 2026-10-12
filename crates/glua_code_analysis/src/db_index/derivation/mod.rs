@@ -166,6 +166,8 @@ impl StageRule {
 pub enum CallRoleKey {
     /// A global call path's annotated roles.
     Path(SmolStr),
+    /// The annotated role presence of methods sharing a receiver method name.
+    ReceiverMethod(SmolStr),
     /// The helper body a global function names.
     Global(GlobalId),
     /// The helper body a method name uniquely names.
@@ -979,7 +981,12 @@ impl FactKey {
             | K::NetReceives(_)
             | K::NetDefinitionUses(_)
             | K::HelperRegistry
-            | K::CallRole(CallRoleKey::Path(_) | CallRoleKey::Global(_) | CallRoleKey::Method(_))
+            | K::CallRole(
+                CallRoleKey::Path(_)
+                | CallRoleKey::ReceiverMethod(_)
+                | CallRoleKey::Global(_)
+                | CallRoleKey::Method(_),
+            )
             | K::HelperScanFiles
             | K::LoadScanFiles
             | K::FileSet

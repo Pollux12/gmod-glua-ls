@@ -484,7 +484,7 @@ impl LuaCompilation {
             reanalysis: Mutex::default(),
             interrupt: Arc::default(),
             index_revision: self.index_revision,
-            scopes: analyzer::ScopesCache::default(),
+            scopes: self.scopes.clone(),
             memos: Mutex::default(),
             detach_tasks: self.detach_tasks,
         }

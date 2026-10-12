@@ -25,6 +25,29 @@ mod test {
             .collect()
     }
 
+    fn data_table_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/includes/glua_ls_data_table_types.lua",
+            &format!(
+                r#"
+            ---@meta
+            ---@class Entity
+            local Entity = {{}}
+            ---@class Weapon: Entity
+            local Weapon = {{}}
+            ---@class Vector
+            local Vector = {{}}
+            ---@class Angle
+            local Angle = {{}}
+            {}
+            "#,
+                crate::test_lib::GMOD_CALL_ARG_BUILTINS_FIXTURE
+            ),
+        );
+        ws
+    }
+
     fn index_expr_type(
         ws: &mut VirtualWorkspace,
         file_id: crate::FileId,
@@ -1414,6 +1437,412 @@ end
         assert!(
             member_names.contains(&"SetOwner".to_string()),
             "missing SetOwner in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_data_table_network_var_slots_have_declared_types() {
+        let mut ws = data_table_workspace();
+        let file_id = ws.def_file(
+            "addons/dt_slots/lua/entities/dt_entity/shared.lua",
+            r#"
+            function ENT:SetupDataTables()
+                self:NetworkVar("Bool", 0, "Enabled")
+                self:NetworkVar("Int", 0, "Count")
+                self:NetworkVar("Float", "Speed")
+                self:NetworkVar("String", 0, "Label")
+                self:NetworkVar("Entity", 0, "Owner")
+                self:NetworkVar("Vector", 0, "Offset")
+                self:NetworkVar("Angle", 0, "Direction")
+            end
+            function ENT:ReadSlots()
+                return self.dt.Enabled, self.dt.Count, self.dt.Speed, self.dt.Label,
+                    self.dt.Owner, self.dt.Offset, self.dt.Direction
+            end
+            ---@param ent dt_entity
+            local function _read(ent)
+                return ent.dt.Speed
+            end
+            "#,
+        );
+        for (expr, expected) in [
+            ("self.dt.Enabled", LuaType::Boolean),
+            ("self.dt.Count", LuaType::Integer),
+            ("self.dt.Speed", LuaType::Number),
+            ("self.dt.Label", LuaType::String),
+            (
+                "self.dt.Owner",
+                LuaType::Ref(LuaTypeDeclId::global("Entity")),
+            ),
+            (
+                "self.dt.Offset",
+                LuaType::Ref(LuaTypeDeclId::global("Vector")),
+            ),
+            (
+                "self.dt.Direction",
+                LuaType::Ref(LuaTypeDeclId::global("Angle")),
+            ),
+            ("ent.dt.Speed", LuaType::Number),
+        ] {
+            assert_eq!(index_expr_type(&mut ws, file_id, expr), expected, "{expr}");
+        }
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[gtest]
+    fn test_data_table_slots_inherit_through_weapon_bases() {
+        let mut ws = data_table_workspace();
+        ws.def_files(vec![
+            (
+                "addons/dt_slots/lua/weapons/weapon_dt_base.lua",
+                r#"
+                function SWEP:SetupDataTables()
+                    self:NetworkVar("Bool", 0, "ironsights")
+                end
+                "#,
+            ),
+            (
+                "addons/dt_slots/lua/weapons/weapon_dt_middle.lua",
+                r#"SWEP.Base = "weapon_dt_base""#,
+            ),
+        ]);
+        let file_id = ws.def_file(
+            "addons/dt_slots/lua/weapons/weapon_dt_child.lua",
+            r#"
+            SWEP.Base = "weapon_dt_middle"
+            function SWEP:SetupDataTables()
+                self.BaseClass.SetupDataTables(self)
+                self:NetworkVar("Float", 0, "charge")
+            end
+            function SWEP:ReadSlots()
+                return self.dt.ironsights, self.dt.charge
+            end
+            "#,
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.ironsights"),
+            LuaType::Boolean
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.charge"),
+            LuaType::Number
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[gtest]
+    fn test_data_table_slots_inherit_through_configured_scope() {
+        let mut ws = data_table_workspace();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.scripted_class_scopes = serde_json::from_str(
+            r#"{
+                "include": [{
+                    "id": "custom-entities",
+                    "label": "Custom entities",
+                    "classGlobal": "SCRIPT",
+                    "path": ["custom", "entities"],
+                    "include": ["custom/entities/**"],
+                    "superTypes": ["Entity"]
+                }]
+            }"#,
+        )
+        .unwrap();
+        ws.update_emmyrc(emmyrc);
+        ws.def_files(vec![
+            (
+                "addons/dt_slots/lua/custom/entities/dt_base/shared.lua",
+                r#"
+                function SCRIPT:SetupDataTables()
+                    self:NetworkVar("Bool", 0, "armed")
+                end
+                "#,
+            ),
+            (
+                "addons/dt_slots/lua/custom/entities/dt_middle/shared.lua",
+                r#"SCRIPT.Base = "dt_base""#,
+            ),
+        ]);
+        let file_id = ws.def_file(
+            "addons/dt_slots/lua/custom/entities/dt_child/shared.lua",
+            r#"
+            SCRIPT.Base = "dt_middle"
+            function SCRIPT:SetupDataTables()
+                self:NetworkVar("Float", 0, "charge")
+            end
+            function SCRIPT:ReadSlots() return self.dt.armed, self.dt.charge end
+            "#,
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.armed"),
+            LuaType::Boolean
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.charge"),
+            LuaType::Number
+        );
+        let empty_file = ws.def_file(
+            "addons/dt_slots/lua/custom/entities/dt_empty/shared.lua",
+            "function SCRIPT:Initialize() end",
+        );
+        assert!(
+            ws.get_db_mut()
+                .get_member_index()
+                .get_file_members(empty_file)
+                .iter()
+                .all(|member| member.get_key().get_name().is_none_or(|name| name != "dt"))
+        );
+    }
+
+    #[gtest]
+    fn test_data_table_dtvar_roles_register_slots_without_accessors() {
+        let mut ws = data_table_workspace();
+        let file_id = ws.def_file(
+            "addons/dt_slots/lua/entities/dt_bomb/shared.lua",
+            r#"
+            function ENT:SetupDataTables()
+                self:DTVar("Bool", 0, "armed")
+                self:DTVar("Int", "charge")
+                self:DTVar("Float", nil, "explode_time")
+            end
+            function ENT:ReadSlots()
+                return self.dt.armed, self.dt.charge, self.dt.explode_time
+            end
+            "#,
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.armed"),
+            LuaType::Boolean
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.charge"),
+            LuaType::Integer
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.explode_time"),
+            LuaType::Number
+        );
+        let db = ws.get_db_mut();
+        let calls = &db
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(&file_id)
+            .unwrap()
+            .network_var_calls;
+        assert_eq!(calls.len(), 3);
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.network_var_roles.is_some_and(|roles| roles.slot_only))
+        );
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("dt_bomb"));
+        let members = db.get_member_index().get_members(&owner).unwrap();
+        for name in [
+            "Getarmed",
+            "Setarmed",
+            "Getcharge",
+            "Setcharge",
+            "Getexplode_time",
+            "Setexplode_time",
+        ] {
+            assert!(
+                members
+                    .iter()
+                    .all(|member| member.get_key().get_name() != Some(name)),
+                "unexpected accessor {name}"
+            );
+        }
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[gtest]
+    fn test_data_table_slot_removal_edit_delete_and_reopen() {
+        let mut ws = data_table_workspace();
+        let path = "addons/dt_slots/lua/entities/dt_edit/shared.lua";
+        let source = r#"
+            function ENT:SetupDataTables()
+                self:NetworkVar("Bool", 0, "Enabled")
+                self:NetworkVar("Float", 0, "Speed")
+            end
+        "#;
+        ws.def_file(path, source);
+        let reader_id = ws.def_file(
+            "addons/dt_slots/lua/entities/dt_edit/cl_init.lua",
+            "function ENT:ReadSpeed() return self.dt.Speed end",
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, reader_id, "self.dt.Speed"),
+            LuaType::Number
+        );
+        ws.def_file(
+            path,
+            &source.replace("self:NetworkVar(\"Float\", 0, \"Speed\")", ""),
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(reader_id, CancellationToken::new())
+            .unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Speed")
+                    && diagnostic.code
+                        == Some(NumberOrString::String(
+                            DiagnosticCode::UndefinedField.get_name().to_string()
+                        ))),
+            "{diagnostics:?}"
+        );
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("dt_edit.dt"));
+        assert!(
+            ws.get_db_mut()
+                .get_member_index()
+                .get_members(&owner)
+                .unwrap()
+                .iter()
+                .all(|member| member.get_key().get_name() != Some("Speed"))
+        );
+        ws.def_file(path, source);
+        assert_eq!(
+            index_expr_type(&mut ws, reader_id, "self.dt.Speed"),
+            LuaType::Number
+        );
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert!(
+            ws.get_db_mut()
+                .get_member_index()
+                .get_members(&owner)
+                .is_none()
+        );
+        ws.def_file(path, source);
+        assert_eq!(
+            index_expr_type(&mut ws, reader_id, "self.dt.Speed"),
+            LuaType::Number
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(reader_id, CancellationToken::new())
+            .unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[gtest]
+    fn test_data_table_slot_role_on_custom_receiver_method() {
+        let mut ws = data_table_workspace();
+        let file_id = ws.def_file(
+            "addons/dt_slots/lua/entities/dt_wrapper/shared.lua",
+            r#"
+            ---@[call_arg("gmod.network_var", "type")]
+            ---@param type string
+            ---@[call_arg("gmod.network_var", "define_slot")]
+            ---@param name string
+            function ENT:RegisterSlot(type, name) end
+            function ENT:SetupDataTables()
+                self:RegisterSlot("Bool", "armed")
+            end
+            function ENT:ReadArmed() return self.dt.armed end
+            "#,
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.armed"),
+            LuaType::Boolean
+        );
+    }
+
+    #[gtest]
+    fn test_data_table_unannotated_dtvar_override_does_not_register_slots() {
+        let mut ws = data_table_workspace();
+        ws.def_file(
+            "addons/dt_slots/lua/entities/dt_override/shared.lua",
+            r#"
+            function ENT:DTVar(type, slot, name) end
+            function ENT:SetupDataTables()
+                self:DTVar("Bool", 0, "armed")
+            end
+            "#,
+        );
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("dt_override.dt"));
+        assert!(
+            ws.get_db_mut()
+                .get_member_index()
+                .get_members(&owner)
+                .is_none()
+        );
+    }
+
+    #[gtest]
+    fn test_data_table_registration_preserves_surrounding_array_type() {
+        let mut ws = data_table_workspace();
+        let file_id = ws.def_file(
+            "addons/dt_slots/lua/entities/dt_array/shared.lua",
+            r#"
+            ---@[call_arg("gmod.network_var", "type")]
+            ---@param type string
+            ---@[call_arg("gmod.network_var", "define_slot")]
+            ---@param name string
+            ---@return integer
+            function ENT:RegisterSlot(type, name) return 1 end
+            function ENT:SetupDataTables()
+                self.Registered = { self:RegisterSlot("Bool", "armed") }
+                local _value = self.Registered[1]
+            end
+            function ENT:ReadArmed() return self.dt.armed end
+            "#,
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.Registered[1]"),
+            LuaType::Integer
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.armed"),
+            LuaType::Boolean
+        );
+    }
+
+    #[gtest]
+    fn test_data_table_slots_follow_weapon_rename_in_analysis_fork() {
+        let mut ws = data_table_workspace();
+        let old_path = "addons/dt_slots/lua/weapons/weapon_dt_original.lua";
+        let new_path = "addons/dt_slots/lua/weapons/weapon_dt_renamed.lua";
+        let source = r#"
+            function SWEP:SetupDataTables()
+                self:NetworkVar("Float", 0, "Speed")
+            end
+            function SWEP:ReadSpeed() return self.dt.Speed end
+        "#;
+        ws.def_file(old_path, source);
+        let old_uri = ws.virtual_url_generator.new_uri(old_path);
+        let new_uri = ws.virtual_url_generator.new_uri(new_path);
+        ws.analysis = ws.analysis.fork();
+        ws.analysis.update_files_by_uri(vec![
+            (old_uri, None),
+            (new_uri.clone(), Some(source.to_string())),
+        ]);
+        let file_id = ws.analysis.get_file_id(&new_uri).unwrap();
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.Speed"),
+            LuaType::Number
+        );
+        let db = ws.get_db_mut();
+        let old_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("weapon_dt_original.dt"));
+        let new_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("weapon_dt_renamed.dt"));
+        assert!(db.get_member_index().get_members(&old_owner).is_none());
+        assert!(
+            db.get_member_index()
+                .get_members(&new_owner)
+                .unwrap()
+                .iter()
+                .any(|member| member.get_key().get_name() == Some("Speed"))
         );
     }
 

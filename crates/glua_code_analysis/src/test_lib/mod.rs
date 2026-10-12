@@ -444,6 +444,19 @@ function Panel:SetSkin(skinName) end
 function Entity:NetworkVar(type, slot, name, extended) end
 
 ---@[overload_call_arg(0, "gmod.network_var", "type")]
+---@[overload_call_arg(1, "gmod.network_var", "define_slot")]
+---@overload fun(type: string, name: string)
+---@[overload_call_arg(0, "gmod.network_var", "type")]
+---@[overload_call_arg(2, "gmod.network_var", "define_slot")]
+---@overload fun(type: string, slot: nil, name: string)
+---@[call_arg("gmod.network_var", "type")]
+---@param type string
+---@param slot number
+---@[call_arg("gmod.network_var", "define_slot")]
+---@param name string
+function Entity:DTVar(type, slot, name) end
+
+---@[overload_call_arg(0, "gmod.network_var", "type")]
 ---@[overload_call_arg(2, "gmod.network_var", "define_element")]
 ---@overload fun(type: string, element: string, name: string, extended?: table)
 ---@[call_arg("gmod.network_var", "type")]

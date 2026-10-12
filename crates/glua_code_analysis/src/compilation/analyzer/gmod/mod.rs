@@ -84,7 +84,7 @@ struct GmodKeywords {
     has_realm_anno: bool,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 struct AnnotatedGmodCandidatePresence {
     has_system: bool,
     has_hook: bool,
@@ -525,14 +525,12 @@ pub(crate) fn collect_role_mentions(
     db.get_emmyrc()
         .gmod
         .enabled
-        .then(|| global_path_mentions(db, file_id, root))
+        .then(|| call_role_mentions(db, file_id, root))
 }
 
-/// The global paths `root`'s syntax names, sorted: every path a call-role
-/// lookup in the file can ask for. A name that resolves to a local, and every
-/// path through it, names no global, unless the local localises the global of
-/// its name, as `local vgui = vgui` does.
-fn global_path_mentions(db: &DbIndex, file_id: FileId, root: &LuaChunk) -> Arc<[SmolStr]> {
+/// Sorted global paths and `*.<method>` receiver mentions that call-role lookups
+/// can read; locals name no global unless they localise it, as `local vgui = vgui` does.
+fn call_role_mentions(db: &DbIndex, file_id: FileId, root: &LuaChunk) -> Arc<[SmolStr]> {
     let references = db.get_reference_index();
     let decl_tree = db.get_decl_index().get_decl_tree(&file_id);
     let names_no_global = |name_expr: &LuaNameExpr| {
@@ -551,31 +549,51 @@ fn global_path_mentions(db: &DbIndex, file_id: FileId, root: &LuaChunk) -> Arc<[
     };
     let mut paths = Vec::new();
     for name_expr in root.descendants::<LuaNameExpr>() {
-        if names_no_global(&name_expr) {
-            continue;
-        }
+        let global_root = !names_no_global(&name_expr);
         let Some(name) = name_expr.get_name_text() else {
             continue;
         };
-        paths.push(name);
+        if global_root {
+            paths.push(name);
+        }
         let mut node = name_expr.syntax().clone();
         while let Some(parent) = node.parent() {
-            let is_prefix =
-                if let Some(index_expr) = glua_parser::LuaIndexExpr::cast(parent.clone()) {
-                    let is_prefix = index_expr
-                        .get_prefix_expr()
-                        .is_some_and(|prefix| *prefix.syntax() == node);
-                    if is_prefix && let Some(path) = index_expr.get_access_path() {
-                        paths.push(path);
+            let is_prefix = if let Some(index_expr) =
+                glua_parser::LuaIndexExpr::cast(parent.clone())
+            {
+                let is_prefix = index_expr
+                    .get_prefix_expr()
+                    .is_some_and(|prefix| *prefix.syntax() == node);
+                if is_prefix
+                    && global_root
+                    && let Some(path) = index_expr.get_access_path()
+                {
+                    paths.push(path);
+                }
+                is_prefix
+            } else if let Some(call_expr) = LuaCallExpr::cast(parent.clone()) {
+                let is_prefix = call_expr
+                    .get_prefix_expr()
+                    .is_some_and(|prefix| *prefix.syntax() == node);
+                if is_prefix && let Some(index_expr) = glua_parser::LuaIndexExpr::cast(node.clone())
+                {
+                    let mention = match index_expr.get_index_key() {
+                        Some(LuaIndexKey::Name(name)) => {
+                            Some(SmolStr::new(format!("*.{}", name.get_name_text())))
+                        }
+                        Some(LuaIndexKey::String(name)) => {
+                            Some(SmolStr::new(format!("*.{}", name.get_value())))
+                        }
+                        _ => None,
+                    };
+                    if let Some(mention) = mention {
+                        paths.push(mention);
                     }
-                    is_prefix
-                } else if let Some(call_expr) = LuaCallExpr::cast(parent.clone()) {
-                    call_expr
-                        .get_prefix_expr()
-                        .is_some_and(|prefix| *prefix.syntax() == node)
-                } else {
-                    false
-                };
+                }
+                is_prefix
+            } else {
+                false
+            };
             if !is_prefix {
                 break;
             }
@@ -3530,6 +3548,13 @@ fn synthesize_scripted_class_members(
                     scope_match.class_name_prefix.as_deref(),
                 )
             {
+                add_data_table_super_type(
+                    db,
+                    file_id,
+                    &class_decl_id,
+                    &LuaTypeDeclId::global(&effective_base_name),
+                    source_syntax_id.get_range(),
+                );
                 synthesize_inheritance_base(
                     db,
                     file_id,
@@ -4221,6 +4246,13 @@ fn synthesize_scripted_ent_registration(
     if let Some((base_name, source_range)) = base {
         let super_type = LuaType::Ref(LuaTypeDeclId::global(&base_name));
         if super_type != class_type {
+            add_data_table_super_type(
+                db,
+                file_id,
+                &class_decl_id,
+                &LuaTypeDeclId::global(&base_name),
+                source_range,
+            );
             db.get_type_index_mut().add_super_type(
                 class_decl_id.clone(),
                 file_id,
@@ -4536,6 +4568,13 @@ fn add_scoped_super_type_if_missing(
     if super_type == LuaType::Ref(class_decl_id.clone()) {
         return;
     }
+    add_data_table_super_type(
+        db,
+        file_id,
+        class_decl_id,
+        &LuaTypeDeclId::global(super_name),
+        source_range,
+    );
     db.get_type_index_mut().add_super_type(
         class_decl_id.clone(),
         file_id,
@@ -5369,6 +5408,10 @@ fn synthesize_network_var(
     };
 
     let value_type = resolve_networkvar_type(&type_name);
+    synthesize_data_table_slot(db, file_id, class_decl_id, call, &prop_name, &value_type);
+    if call.network_var_roles.is_some_and(|roles| roles.slot_only) {
+        return;
+    }
     let owner = LuaMemberOwner::Type(class_decl_id.clone());
 
     // Synthesize getter: GetPropName(self: Class): valueType
@@ -5416,6 +5459,94 @@ fn synthesize_network_var(
         LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(setter_func))),
         TypeCacheWriteMode::InsertOnly,
     );
+}
+
+/// The nominal slot-table type belonging to a scripted class.
+fn data_table_type_decl_id(class_decl_id: &LuaTypeDeclId) -> LuaTypeDeclId {
+    LuaTypeDeclId::global(&format!("{}.dt", class_decl_id.get_name()))
+}
+
+/// Mirrors a scripted class's inheritance edge on its slot-table type.
+fn add_data_table_super_type(
+    db: &mut DbIndex,
+    file_id: FileId,
+    class_decl_id: &LuaTypeDeclId,
+    base_id: &LuaTypeDeclId,
+    range: TextRange,
+) {
+    let dt_id = ensure_data_table_type_decl(db, file_id, class_decl_id, range);
+    db.get_type_index_mut().add_super_type(
+        dt_id,
+        file_id,
+        range,
+        LuaType::Ref(data_table_type_decl_id(base_id)),
+    );
+}
+
+/// Declares the scripted class's slot-table type at its contributing source.
+fn ensure_data_table_type_decl(
+    db: &mut DbIndex,
+    file_id: FileId,
+    class_decl_id: &LuaTypeDeclId,
+    range: TextRange,
+) -> LuaTypeDeclId {
+    let dt_id = data_table_type_decl_id(class_decl_id);
+    db.get_type_index_mut().add_type_decl(
+        file_id,
+        LuaTypeDecl::new(
+            file_id,
+            range,
+            dt_id.get_simple_name().to_string(),
+            LuaDeclTypeKind::Class,
+            LuaTypeFlag::None.into(),
+            dt_id.clone(),
+        ),
+    );
+    dt_id
+}
+
+/// Adds a typed slot and the scripted class's `dt` member from a declared call role.
+fn synthesize_data_table_slot(
+    db: &mut DbIndex,
+    file_id: FileId,
+    class_decl_id: &LuaTypeDeclId,
+    call: &GmodScriptedClassCallMetadata,
+    name: &str,
+    value_type: &LuaType,
+) {
+    let range = call.syntax_id.get_range();
+    let dt_id = ensure_data_table_type_decl(db, file_id, class_decl_id, range);
+    for (kind, owner, key, typ) in [
+        (
+            glua_parser::LuaSyntaxKind::TableFieldAssign,
+            LuaMemberOwner::Type(class_decl_id.clone()),
+            "dt",
+            LuaType::Ref(dt_id.clone()),
+        ),
+        (
+            glua_parser::LuaSyntaxKind::IndexExpr,
+            LuaMemberOwner::Type(dt_id),
+            name,
+            value_type.clone(),
+        ),
+    ] {
+        let member_id = LuaMemberId::new(LuaSyntaxId::new(kind.into(), range), file_id);
+        db.get_member_index_mut().add_member(
+            owner,
+            LuaMember::new(
+                member_id,
+                LuaMemberKey::Name(key.into()),
+                LuaMemberFeature::FileFieldDecl,
+                None,
+            ),
+        );
+        write_type_cache(
+            db,
+            member_id.into(),
+            LuaTypeCache::DocType(typ),
+            TypeCacheWriteMode::InsertOnly,
+        );
+    }
 }
 
 fn synthesize_network_var_element(
@@ -6577,7 +6708,12 @@ fn member_defined_via_variable(
             return false;
         }
         if let Some(assign_stat) = LuaAssignStat::cast(ancestor.clone()) {
-            let (vars, _) = assign_stat.get_var_and_expr_list();
+            let (vars, exprs) = assign_stat.get_var_and_expr_list();
+            if !vars.iter().any(|var| var.get_range().contains(member_position))
+                && !exprs.iter().any(|expr| matches!(expr, LuaExpr::ClosureExpr(closure) if closure.get_range().contains(member_position)))
+            {
+                continue;
+            }
             for var in vars {
                 if let LuaVarExpr::IndexExpr(index_expr) = &var {
                     if index_expr_prefix_matches(index_expr, var_name) {
@@ -6878,6 +7014,7 @@ impl std::fmt::Debug for AnnotatedGmodGlobalCallRoleMap {
 #[derive(Default, Clone)]
 pub(crate) struct AnnotatedGmodGlobalCallRoleMap {
     roles_by_path: HashMap<String, AnnotatedGmodCallRoles>,
+    receiver_paths: HashMap<SmolStr, HashSet<String>>,
     /// Each path's roles fingerprinted once, when its file's scan is built.
     path_fingerprints: HashMap<String, crate::db_index::derivation::Fingerprint>,
     environment_role_source_files: HashSet<FileId>,
@@ -6961,6 +7098,7 @@ struct AnnotatedGmodCallRoles {
     file_find_search_path_roles: Vec<AnnotatedGmodCallArgRole>,
     inheritance_roles: Vec<(GmodScriptedClassCallKind, AnnotatedGmodCallArgRole)>,
     network_var_kind: Option<GmodScriptedClassCallKind>,
+    network_var_slot_only: bool,
     network_var_type_roles: Vec<AnnotatedGmodCallArgRole>,
     network_var_define_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_kind: Option<GmodScriptedClassCallKind>,
@@ -7090,6 +7228,10 @@ impl AnnotatedGmodCallRoles {
             }
             ("gmod.network_var", "define_element") => {
                 self.network_var_kind = Some(GmodScriptedClassCallKind::NetworkVarElement);
+                self.network_var_define_roles.push(arg_role);
+            }
+            ("gmod.network_var", "define_slot") => {
+                self.network_var_slot_only = true;
                 self.network_var_define_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "define") => {
@@ -7417,6 +7559,7 @@ impl AnnotatedGmodCallRoles {
         Some((
             kind,
             GmodNetworkVarCallRoles {
+                slot_only: self.network_var_slot_only,
                 type_arg_idx: self.network_var_type_roles.first().and_then(|role| {
                     param_idx_to_call_arg_idx(role.param_idx, is_colon_call, self.is_colon_define)
                 }),
@@ -7778,11 +7921,36 @@ impl AnnotatedGmodGlobalCallRoleMap {
     fn candidate_presence(&self, db: &DbIndex, file_id: FileId) -> AnnotatedGmodCandidatePresence {
         let mut presence = AnnotatedGmodCandidatePresence::default();
         for path in db.role_mentions(file_id).iter() {
+            if let Some(name) = path.strip_prefix("*.") {
+                presence.merge(self.receiver_presence(name));
+                continue;
+            }
             if let Some(roles) = self.roles(path) {
                 presence.merge(roles.candidate_presence());
             }
         }
         presence
+    }
+
+    fn receiver_presence(&self, name: &str) -> AnnotatedGmodCandidatePresence {
+        crate::db_index::derivation::note_read(|| {
+            crate::db_index::derivation::FactKey::CallRole(
+                crate::db_index::derivation::CallRoleKey::ReceiverMethod(SmolStr::new(name)),
+            )
+        });
+        self.receiver_presence_value(name)
+    }
+
+    fn receiver_presence_value(&self, name: &str) -> AnnotatedGmodCandidatePresence {
+        self.receiver_paths.get(name).into_iter().flatten().fold(
+            AnnotatedGmodCandidatePresence::default(),
+            |mut presence, path| {
+                if let Some(roles) = self.roles_by_path.get(path) {
+                    presence.merge(roles.candidate_presence());
+                }
+                presence
+            },
+        )
     }
 
     fn add_signature_closure(
@@ -7792,6 +7960,7 @@ impl AnnotatedGmodGlobalCallRoleMap {
         closure: &LuaClosureExpr,
     ) {
         let Some(call_path) = global_call_path_for_signature_closure(db, signature_id, closure)
+            .or_else(|| class_method_path_for_signature_closure(db, signature_id, closure))
         else {
             return;
         };
@@ -8177,7 +8346,12 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
         call_expr: &LuaCallExpr,
         call_path: &str,
     ) -> Option<AnnotatedGmodCallRoles> {
-        if !inferred_receiver_method_candidate(call_expr, call_path) {
+        if !matches!(call_expr.get_prefix_expr(), Some(LuaExpr::IndexExpr(_)))
+            || self
+                .global_roles
+                .receiver_presence(call_path.rsplit('.').next()?)
+                == AnnotatedGmodCandidatePresence::default()
+        {
             return None;
         }
         let signature_id = db
@@ -8199,21 +8373,6 @@ fn call_expr_local_root_decl_id(
             .and_then(|name_expr| name_expr_local_decl_id(db, file_id, &name_expr)),
         _ => None,
     }
-}
-
-/// Whether a call can only be matched to a VGUI parent role through the type
-/// of its receiver.
-///
-/// A local access path such as self.tabContainer:AddPanel cannot match the
-/// annotated DHorizontalScroller.AddPanel path, but its member signature can.
-/// Most calls have no VGUI parent role, so only the method names that carry
-/// one consult the receiver's call target.
-fn inferred_receiver_method_candidate(call_expr: &LuaCallExpr, call_path: &str) -> bool {
-    matches!(call_expr.get_prefix_expr(), Some(LuaExpr::IndexExpr(_)))
-        && matches!(
-            call_path.rsplit('.').next(),
-            Some("Add" | "AddPanel" | "SetParent")
-        )
 }
 
 fn roles_from_signature(
@@ -8286,6 +8445,31 @@ fn global_call_path_for_signature_closure(
     let var_expr = vars.get(value_idx)?;
     var_expr_has_global_root(db, file_id, var_expr)
         .then(|| var_expr.get_access_path().map(Into::into))?
+}
+
+fn class_method_path_for_signature_closure(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+    closure: &LuaClosureExpr,
+) -> Option<String> {
+    let func_name = closure.get_parent::<LuaFuncStat>()?.get_func_name()?;
+    let LuaVarExpr::IndexExpr(index_expr) = func_name else {
+        return None;
+    };
+    let LuaExpr::NameExpr(root) = index_expr.get_prefix_expr()? else {
+        return None;
+    };
+    let decl_id = name_expr_local_decl_id(db, signature_id.get_file_id(), &root)?;
+    let type_cache = db.get_type_index().get_type_cache(&decl_id.into())?;
+    let LuaType::Def(class_id) = type_cache.as_type() else {
+        return None;
+    };
+    let method = match index_expr.get_index_key()? {
+        LuaIndexKey::Name(name) => name.get_name_text().to_string(),
+        LuaIndexKey::String(name) => name.get_value(),
+        _ => return None,
+    };
+    Some(format!("{}.{method}", class_id.get_name()))
 }
 
 fn var_expr_has_global_root(db: &DbIndex, file_id: FileId, var_expr: &LuaVarExpr) -> bool {

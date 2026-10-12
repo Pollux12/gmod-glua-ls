@@ -229,6 +229,7 @@ fn main_workspace_roots(db: &DbIndex) -> Vec<(WorkspaceId, Option<PathBuf>)> {
 
 /// [`ScriptedScopes`] with what they were computed from besides the config:
 /// each live file's path, the main workspaces and their gamemode folders.
+#[derive(Clone)]
 struct HeldScopes {
     paths: HashMap<FileId, Option<PathBuf>>,
     workspaces: Vec<(WorkspaceId, Option<PathBuf>)>,
@@ -306,7 +307,7 @@ impl HeldScopes {
 
 /// The last [`ScriptedScopes`], followed file by file while the main
 /// workspaces and their gamemode folders stand. A new config clears it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ScopesCache(Option<HeldScopes>);
 
 impl std::fmt::Debug for ScopesCache {
