@@ -836,11 +836,16 @@ impl LuaModuleIndex {
         workspace_id: WorkspaceId,
     ) -> Option<&ModuleInfo> {
         let file_ids = self.module_name_to_file_ids.get(last_name)?;
+        let suffix_with_boundary = format!(".{module_path}");
         let mut best: Option<(&ModuleInfo, u8)> = None;
 
         for file_id in file_ids {
-            let module_info = self.file_module_map.get(file_id)?;
-            if !module_info.full_module_name.ends_with(module_path) {
+            let Some(module_info) = self.file_module_map.get(file_id) else {
+                continue;
+            };
+            let full_module_name = module_info.full_module_name.as_str();
+            if full_module_name != module_path && !full_module_name.ends_with(&suffix_with_boundary)
+            {
                 continue;
             }
 

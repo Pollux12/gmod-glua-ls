@@ -403,6 +403,30 @@ mod tests {
         assert_eq!(module_info.full_module_name, "nvim-cmp.lua.cmp.utils.event");
     }
 
+    /// A require looked up from a workspace matches whole trailing segments,
+    /// as a lookup from nowhere does.
+    #[test]
+    fn test_require_fuzzy_match_in_a_workspace_honors_segment_boundaries() {
+        let mut m = LuaModuleIndex::new();
+        m.update_config(Arc::new(Emmyrc::default()));
+        m.add_workspace_root(
+            Path::new("C:/Users/username/Documents").into(),
+            WorkspaceId::MAIN,
+        );
+
+        let file_id = FileId { id: 1 };
+        m.add_module_by_path(file_id, "C:/Users/username/Documents/a/foobar/new.lua");
+
+        assert!(
+            m.find_module_in_workspace("bar.new", WorkspaceId::MAIN)
+                .is_none()
+        );
+        let module_info = m
+            .find_module_in_workspace("foobar.new", WorkspaceId::MAIN)
+            .unwrap();
+        assert_eq!(module_info.file_id, file_id);
+    }
+
     #[test]
     fn test_require_fuzzy_match_prefers_shortest_prefix_independent_of_insert_order() {
         const PLUGIN_ENTRY: &str = "C:/Users/username/Documents/plugin/treesitter-context.lua";
