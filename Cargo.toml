@@ -3,6 +3,8 @@ resolver = "2"
 members = ["crates/*",
     "tools/*",
 ]
+# Vendored crates keep their upstream formatting and lints.
+exclude = ["vendor"]
 
 # Default release profile stays fast to compile for active development and
 # testing (no whole-program optimization). Iteration rebuilds are ~40s.
