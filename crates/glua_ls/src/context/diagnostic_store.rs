@@ -776,7 +776,13 @@ impl DiagnosticStore {
                     revision,
                 },
                 None if token.is_cancelled() => Computed::Cancelled,
-                None => Computed::Gone,
+                // Diagnostics are off for the file, so it shows none, and what
+                // the client showed before is cleared.
+                None => Computed::Diagnostics {
+                    uri,
+                    diagnostics: Vec::new(),
+                    revision,
+                },
             }
         })
         .await;
@@ -835,7 +841,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{Priority, State};
-    use crate::context::ServerContext;
+    use crate::context::{ServerContext, ServerContextSnapshot};
 
     /// The diagnostics published to the client so far, in order.
     fn published(peer: &Connection) -> Vec<PublishDiagnosticsParams> {
@@ -1022,6 +1028,67 @@ mod tests {
                 .map(|params| (params.uri, params.version))
                 .collect::<Vec<_>>();
             verify_that!(versions, eq(&vec![(open_uri, Some(7)), (closed_uri, None)]))
+        })
+    }
+
+    async fn set_diagnostics_enabled(snapshot: &ServerContextSnapshot, enable: bool) {
+        let mut analysis = snapshot.analysis().write().await;
+        let mut emmyrc = (*analysis.get_emmyrc()).clone();
+        emmyrc.diagnostics.enable = enable;
+        analysis.update_config(std::sync::Arc::new(emmyrc));
+    }
+
+    /// Turning diagnostics off clears what an open and a closed file showed,
+    /// and turning them on again brings it back.
+    #[gtest]
+    fn turning_diagnostics_off_clears_what_files_showed() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, peer) = Connection::memory();
+        runtime.block_on(async {
+            let context = ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_diagnostic_store_off");
+            let uris = ["lua/open.lua", "lua/closed.lua"].map(|path| {
+                glua_code_analysis::file_path_to_uri(&workspace.join(path))
+                    .expect("file URI should parse")
+            });
+            let file_ids = {
+                let mut analysis = snapshot.analysis().write().await;
+                analysis.add_main_workspace(workspace);
+                uris.clone().map(|uri| {
+                    analysis
+                        .update_file_by_uri(
+                            &uri,
+                            Some("local unused = UndefinedGlobal".to_string()),
+                        )
+                        .expect("file id")
+                        .0
+                })
+            };
+            let store = snapshot.file_diagnostic().store();
+            store.set_open(file_ids[0], true);
+            let cancel = CancellationToken::new();
+            let diagnose = || store.get_all(&file_ids, &cancel, |_| {});
+
+            let shown = diagnose().await[0].diagnostics.len();
+            verify_that!(shown, gt(0))?;
+            set_diagnostics_enabled(&snapshot, false).await;
+            store.invalidate_all([]);
+            diagnose().await;
+            set_diagnostics_enabled(&snapshot, true).await;
+            store.invalidate_all([]);
+            diagnose().await;
+
+            let published = published(&peer);
+            for uri in &uris {
+                let counts = published
+                    .iter()
+                    .filter(|params| &params.uri == uri)
+                    .map(|params| params.diagnostics.len())
+                    .collect::<Vec<_>>();
+                verify_that!(counts, eq(&vec![shown, 0, shown]))?;
+            }
+            Ok(())
         })
     }
 
