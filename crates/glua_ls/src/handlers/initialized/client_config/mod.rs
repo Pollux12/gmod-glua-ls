@@ -38,6 +38,16 @@ impl std::fmt::Debug for ClientConfig {
     }
 }
 
+impl ClientConfig {
+    /// Takes the options `current` got from the command line and the
+    /// initialization options, which the client sends once: settings read
+    /// again on a change do not carry them.
+    pub fn keep_session_options(&mut self, current: &ClientConfig) {
+        self.gmod_annotations_path = current.gmod_annotations_path.clone();
+        self.gamemode_base_libraries = current.gamemode_base_libraries.clone();
+    }
+}
+
 pub async fn get_client_config(
     context: &ServerContextSnapshot,
     client_id: ClientId,

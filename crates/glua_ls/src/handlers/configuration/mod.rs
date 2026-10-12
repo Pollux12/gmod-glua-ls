@@ -27,10 +27,12 @@ pub async fn on_did_change_configuration(
     let supports_config_request = context.lsp_features().supports_config_request();
     log::info!("change config client_id: {:?}", client_id);
 
-    let new_client_config = get_client_config(&context, client_id, supports_config_request).await;
+    let mut new_client_config =
+        get_client_config(&context, client_id, supports_config_request).await;
 
     let workspace_manager = context.workspace_manager_arc();
     let mut manager = workspace_manager.write().await;
+    new_client_config.keep_session_options(&manager.client_config);
     if manager.client_config == new_client_config {
         log::info!("skip config reload; client config unchanged");
         return Some(());
@@ -119,5 +121,40 @@ mod tests {
     #[gtest]
     fn registers_nothing_without_dynamic_registration() -> Result<()> {
         verify_that!(registrations(serde_json::json!({})), is_empty())
+    }
+
+    /// Settings read again on a change do not carry what the command line and
+    /// the initialization options set: the annotations path and gamemode bases
+    /// stay.
+    #[gtest]
+    fn a_settings_change_keeps_the_options_set_at_initialization() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let kept = runtime.block_on(async {
+            let (connection, _peer) = Connection::memory();
+            let context =
+                crate::context::ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            {
+                let mut manager = snapshot.workspace_manager().write().await;
+                manager.client_config.gmod_annotations_path = Some("annotations".to_string());
+                manager.client_config.gamemode_base_libraries = vec!["sandbox".to_string()];
+            }
+            super::on_did_change_configuration(
+                snapshot.clone(),
+                lsp_types::DidChangeConfigurationParams {
+                    settings: serde_json::Value::Null,
+                },
+            )
+            .await;
+            let manager = snapshot.workspace_manager().read().await;
+            (
+                manager.client_config.gmod_annotations_path.clone(),
+                manager.client_config.gamemode_base_libraries.clone(),
+            )
+        });
+        verify_that!(
+            kept,
+            eq(&(Some("annotations".to_string()), vec!["sandbox".to_string()]))
+        )
     }
 }
