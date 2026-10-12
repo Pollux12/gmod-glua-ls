@@ -2883,7 +2883,11 @@ impl Harness<'_> {
                 _ => {}
             }
         }
-        inputs.into_iter().map(ColdKey::oracle).collect()
+        inputs
+            .into_iter()
+            .filter(|input| *input != ColdInput::default())
+            .map(ColdKey::oracle)
+            .collect()
     }
 
     fn edit(&mut self, targets: &[Target]) {
@@ -3493,8 +3497,10 @@ fn run() {
 
     let started = Instant::now();
     let jobs = env_usize("DET_JOBS", 2).max(1);
+    // Every other stage compares with a cold build other than the base.
+    let base_only = |stage: &str| matches!(stage, "revert" | "noop" | "reload" | "exact" | "unrewrite");
     assert!(
-        jobs >= 2 || !stages.iter().any(|stage| order_of(stage).is_some()),
+        jobs >= 2 || stages.iter().all(|stage| base_only(stage)),
         "a cold-build comparison stage needs DET_JOBS of at least 2: its cold build waits for a slot the live base holds"
     );
     let keys = AnswerKeys::new(jobs);
