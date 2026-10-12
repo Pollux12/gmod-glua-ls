@@ -121,8 +121,9 @@ pub struct DiagnosticStore {
     verify: bool,
     /// Whether workers were started: without them no job is ever claimed.
     working: std::sync::atomic::AtomicBool,
-    /// Cancelled at shutdown: the workers stop, and nothing waits on a file
-    /// they would have computed.
+    /// Cancelled at shutdown: the workers stop, every computation's token,
+    /// a child of it, is cancelled, and nothing waits on a file they would
+    /// have computed.
     stopped: CancellationToken,
     /// Makes every computation panic while set, as a diagnostic bug would.
     #[cfg(test)]
@@ -156,9 +157,6 @@ impl DiagnosticStore {
     /// waiter, as the server shuts down.
     pub fn stop(&self) {
         self.stopped.cancel();
-        for (_, token) in self.state().computing.values() {
-            token.cancel();
-        }
         self.computed.notify_waiters();
     }
 
@@ -186,8 +184,9 @@ impl DiagnosticStore {
             tokio::spawn(async move {
                 loop {
                     let job = tokio::select! {
-                        job = store.next_job(&debounced) => job,
+                        biased;
                         _ = shutdown.cancelled() => return,
+                        job = store.next_job(&debounced) => job,
                     };
                     store.run(job).await;
                 }
@@ -559,7 +558,7 @@ impl DiagnosticStore {
                 let mut state = self.state();
                 if let Some((priority, sequence)) = state.dirty.remove(&file_id) {
                     state.queue.remove(&(priority, sequence, file_id));
-                    let token = CancellationToken::new();
+                    let token = self.stopped.child_token();
                     state.sequence += 1;
                     let id = state.sequence;
                     state.computing.insert(file_id, (id, token.clone()));
@@ -704,7 +703,7 @@ impl DiagnosticStore {
     /// Under `GLUALS_DIAG_VERIFY`, computes every file whose stored
     /// diagnostics hold again and logs `LS_DIAG_DRIFT` for each that differs.
     /// Only a quiet index is compared: the pass stops once an edit is pending,
-    /// and the next settle starts another.
+    /// and the next settle starts another, or once the store stops.
     async fn verify_stored(&self, debounced: &DebouncedAnalysis) {
         let held = {
             let state = self.state();
@@ -719,16 +718,16 @@ impl DiagnosticStore {
         };
         let (mut checked, mut drifted) = (0usize, 0usize);
         for (file_id, stored_id) in held {
-            if debounced.is_dirty() {
+            if debounced.is_dirty() || self.stopped.is_cancelled() {
                 break;
             }
             let Computed::Diagnostics {
                 uri, diagnostics, ..
-            } = self.compute(file_id, CancellationToken::new()).await
+            } = self.compute(file_id, self.stopped.child_token()).await
             else {
                 continue;
             };
-            if debounced.is_dirty() {
+            if debounced.is_dirty() || self.stopped.is_cancelled() {
                 break;
             }
             let state = self.state();
@@ -910,6 +909,41 @@ mod tests {
         verify_that!(token.is_cancelled(), eq(true))?;
         verify_that!(state.computing.contains_key(&file_id), eq(false))?;
         verify_that!(state.dirty.contains_key(&file_id), eq(true))
+    }
+
+    /// A job a worker claims after the store stopped is cancelled before it
+    /// computes, so nothing is computed or published past shutdown.
+    #[test]
+    fn a_job_claimed_after_stop_is_cancelled() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = Connection::memory();
+        runtime.block_on(async {
+            let context = ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let workspace = crate::util::TempDir::new("gmod_glua_ls_store_stop");
+            let uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/stop_test.lua"))
+                .expect("file URI should parse");
+            let file_id = {
+                let mut analysis = snapshot.analysis().write().await;
+                analysis.add_main_workspace(workspace.to_path_buf());
+                analysis
+                    .update_file_by_uri(&uri, Some("local unused = 1".to_string()))
+                    .map(|(file_id, _)| file_id)
+                    .expect("file id")
+            };
+            let store = snapshot.file_diagnostic().store();
+            store.stop();
+            store.invalidate([file_id], &[]);
+
+            let job = tokio::time::timeout(
+                Duration::from_secs(10),
+                store.next_job(snapshot.debounced_analysis()),
+            )
+            .await
+            .expect("the dirty file is claimed");
+
+            assert!(job.token.is_cancelled());
+        });
     }
 
     /// A file computed again to the same diagnostics is not published again,
