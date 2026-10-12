@@ -36,6 +36,67 @@ mod test {
     }
 
     #[test]
+    fn exhaustive_branch_returns_have_no_implicit_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let file_id = ws.def_file(
+            "gamemodes/terrortown/gamemode/cl_voice.lua",
+            r#"
+            local function drain(active, admin, detective)
+                if not active then return 0 end
+                if admin then
+                    return 1
+                elseif detective then
+                    return 2
+                else
+                    return 3
+                end
+            end
+            local function unreachable(active)
+                if active then return 1 else return 2 end
+                return nil
+            end
+            local function terminating(active)
+                if active then return 1 else error("inactive") end
+            end
+            local function looped(active)
+                for i = 1, 2 do
+                    if active then break else return 1 end
+                    return nil
+                end
+                return 2
+            end
+            local function partial(active)
+                if active then return 1 end
+            end
+            local function empty_branch(active)
+                if active then else return 1 end
+            end
+            local amount = drain(true, false, false) + 1
+            local reached = unreachable(true) + 1
+            local total = terminating(true) + 1
+            local loop_result = looped(true) + 1
+            local unsafe = partial(false) + 1
+            local also_unsafe = empty_branch(true) + 1
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap();
+        let mut messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        messages.sort();
+        assert_eq!(messages.len(), 2, "{diagnostics:?}");
+        assert!(messages[0].contains("empty_branch(true)"), "{messages:?}");
+        assert!(messages[1].contains("partial(false)"), "{messages:?}");
+    }
+
+    #[test]
     fn uninitialized_annotated_local_uses_authoritative_declared_type() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 

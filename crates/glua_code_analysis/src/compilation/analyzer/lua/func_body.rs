@@ -1,6 +1,6 @@
 use glua_parser::{
-    LuaBlock, LuaCallExprStat, LuaDoStat, LuaExpr, LuaForRangeStat, LuaForStat, LuaIfStat,
-    LuaRepeatStat, LuaReturnStat, LuaStat, LuaWhileStat,
+    LuaBlock, LuaCallExprStat, LuaDoStat, LuaExpr, LuaForRangeStat, LuaForStat, LuaIfClauseStat,
+    LuaIfStat, LuaRepeatStat, LuaReturnStat, LuaStat, LuaWhileStat,
 };
 
 #[derive(Debug, Clone)]
@@ -50,7 +50,11 @@ fn analyze_block_returns(block: LuaBlock, returns: &mut Vec<LuaReturnPoint>) -> 
                 analyze_repeat_stat_returns(repeat_stat, returns);
             }
             LuaStat::IfStat(if_stat) => {
-                analyze_if_stat_returns(if_stat, returns);
+                let flow = analyze_if_stat_returns(if_stat, returns);
+                match flow {
+                    Some(ChangeFlow::None) => {}
+                    _ => return flow,
+                }
             }
             LuaStat::ForStat(for_stat) => {
                 analyze_for_stat_returns(for_stat, returns);
@@ -117,17 +121,23 @@ fn analyze_for_stat_returns(
     }
 }
 
-// todo
 fn analyze_if_stat_returns(
     if_stat: LuaIfStat,
     returns: &mut Vec<LuaReturnPoint>,
 ) -> Option<ChangeFlow> {
-    analyze_block_returns(if_stat.get_block()?, returns);
+    let mut branch_flow = |block: Option<LuaBlock>| {
+        block
+            .and_then(|block| analyze_block_returns(block, returns))
+            .unwrap_or(ChangeFlow::None)
+    };
+    let mut flow = branch_flow(if_stat.get_block());
+    let mut has_else = false;
     for clause in if_stat.get_all_clause() {
-        analyze_block_returns(clause.get_block()?, returns);
+        has_else |= matches!(clause, LuaIfClauseStat::Else(_));
+        flow = flow.min(branch_flow(clause.get_block()));
     }
 
-    Some(ChangeFlow::None)
+    Some(if has_else { flow } else { ChangeFlow::None })
 }
 
 fn analyze_for_range_stat_returns(
