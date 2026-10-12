@@ -3549,6 +3549,59 @@ end
         );
     }
 
+    /// A library localised for speed, `local vgui = vgui`, registers panels as
+    /// the global does.
+    #[gtest]
+    fn test_vgui_register_through_a_localised_library_creates_panel_class() {
+        for alias in ["local vgui = vgui", "local vgui = _G.vgui"] {
+            let mut ws = VirtualWorkspace::new();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+            ws.def_gmod_call_arg_builtins();
+
+            let file_id = ws.def_file(
+                "lua/vgui/localised_panel.lua",
+                &format!(
+                    r#"
+                    {alias}
+
+                    local PANEL = {{}}
+                    function PANEL:Init()
+                    end
+                    vgui.Register("LocalisedPanel", PANEL, "DPanel")
+                "#
+                ),
+            );
+
+            let db = ws.get_db_mut();
+            let class_id = LuaTypeDeclId::global("LocalisedPanel");
+            let super_types: Vec<_> = db
+                .get_type_index()
+                .get_super_types_iter(&class_id)
+                .map(|iter| iter.cloned().collect())
+                .unwrap_or_default();
+            assert!(
+                super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("DPanel"))),
+                "{alias}: expected DPanel super type, got {super_types:?}"
+            );
+            let panel_decl = db
+                .get_decl_index()
+                .get_decl_tree(&file_id)
+                .expect("expected decl tree")
+                .get_decls()
+                .values()
+                .find(|decl| decl.get_name() == "PANEL" && decl.is_local())
+                .map(|decl| decl.get_id())
+                .expect("expected the PANEL local");
+            let panel_type = db
+                .get_type_index()
+                .get_type_cache(&panel_decl.into())
+                .map(|cache| cache.as_type().clone());
+            assert_eq!(panel_type, Some(LuaType::Def(class_id)), "{alias}");
+        }
+    }
+
     #[gtest]
     fn test_vgui_register_multiple_panels_bind_nearest_panel_decl() {
         let mut ws = VirtualWorkspace::new();

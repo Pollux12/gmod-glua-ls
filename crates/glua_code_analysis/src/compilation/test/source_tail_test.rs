@@ -254,7 +254,7 @@ mod test {
                 .any(|path| path == "util.AddNetworkString")
         );
         assert!(!role_mentions.iter().any(|path| path == "net.Start"));
-        assert!(!role_mentions.iter().any(|path| path == "hook.Run"));
+        assert!(role_mentions.iter().any(|path| path == "hook.Run"));
     }
 
     #[test]

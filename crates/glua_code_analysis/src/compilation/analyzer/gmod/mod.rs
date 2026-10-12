@@ -530,19 +530,28 @@ pub(crate) fn collect_role_mentions(
 
 /// The global paths `root`'s syntax names, sorted: every path a call-role
 /// lookup in the file can ask for. A name that resolves to a local, and every
-/// path through it, names no global.
+/// path through it, names no global, unless the local localises the global of
+/// its name, as `local vgui = vgui` does.
 fn global_path_mentions(db: &DbIndex, file_id: FileId, root: &LuaChunk) -> Arc<[SmolStr]> {
     let references = db.get_reference_index();
     let decl_tree = db.get_decl_index().get_decl_tree(&file_id);
-    let is_local = |name_expr: &LuaNameExpr| {
+    let names_no_global = |name_expr: &LuaNameExpr| {
         references
             .get_var_reference_decl(&file_id, name_expr.get_range())
-            .and_then(|decl_id| decl_tree?.get_decl(&decl_id))
-            .is_some_and(|decl| decl.is_local())
+            .filter(|decl_id| {
+                decl_tree
+                    .and_then(|tree| tree.get_decl(decl_id))
+                    .is_some_and(|decl| decl.is_local())
+            })
+            .is_some_and(|decl_id| {
+                !name_expr
+                    .get_name_text()
+                    .is_some_and(|name| local_decl_aliases_global_name(db, decl_id, &name))
+            })
     };
     let mut paths = Vec::new();
     for name_expr in root.descendants::<LuaNameExpr>() {
-        if is_local(&name_expr) {
+        if names_no_global(&name_expr) {
             continue;
         }
         let Some(name) = name_expr.get_name_text() else {
