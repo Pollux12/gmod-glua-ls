@@ -5,7 +5,6 @@ use lsp_types::{
     ApplyWorkspaceEditParams, MessageActionItem, MessageType, RenameFilesParams,
     ShowMessageRequestParams, TextEdit,
 };
-use tokio_util::sync::CancellationToken;
 
 use super::will_rename_files::{file_renames, load_path_edits, workspace_edit};
 use crate::{context::ServerContextSnapshot, handlers::text_document::apply_file_system_changes};
@@ -87,8 +86,9 @@ pub async fn on_did_rename_files_handler(
 
 /// Asks the user whether to rewrite the load paths naming the renamed files,
 /// and applies `edits` if so. A moved file keeps its id, so each edit goes to
-/// where its file is now.
+/// where its file is now. Shutting down ends an unanswered request.
 async fn offer_load_path_edits(context: ServerContextSnapshot, edits: Vec<(FileId, TextEdit)>) {
+    let shutdown = context.debounced_analysis().shutdown_token();
     let update = MessageActionItem {
         title: "Update".to_string(),
         properties: HashMap::new(),
@@ -101,7 +101,7 @@ async fn offer_load_path_edits(context: ServerContextSnapshot, edits: Vec<(FileI
                 message: "Update the paths that load the renamed files?".to_string(),
                 actions: Some(vec![update.clone()]),
             },
-            CancellationToken::new(),
+            shutdown.clone(),
         )
         .await;
     if answer.is_none_or(|answer| answer.title != update.title) {
@@ -121,10 +121,7 @@ async fn offer_load_path_edits(context: ServerContextSnapshot, edits: Vec<(FileI
     };
     context
         .client()
-        .apply_edit(
-            ApplyWorkspaceEditParams { label: None, edit },
-            CancellationToken::new(),
-        )
+        .apply_edit(ApplyWorkspaceEditParams { label: None, edit }, shutdown)
         .await;
 }
 
@@ -429,6 +426,45 @@ mod tests {
                 }],
             )]);
             assert_eq!(params.edit.changes, Some(expected));
+        });
+    }
+
+    /// A load path edit the user never answers does not hold the connection
+    /// open past shutdown.
+    #[test]
+    fn an_unanswered_load_path_offer_ends_at_shutdown() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let workspace =
+                workspace_to_rename_for("unanswered", RENAMED, applying_client(false)).await;
+            rename(&workspace).await;
+            let prompt = next_request(&workspace.client, Duration::from_secs(10))
+                .expect("the user is asked");
+            assert_eq!(prompt.method, "window/showMessageRequest");
+
+            let RenamedWorkspace {
+                snapshot,
+                client,
+                _context: context,
+                _root: root,
+                ..
+            } = workspace;
+            context.close().await;
+            drop(snapshot);
+            drop(context);
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let disconnected = loop {
+                let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                    break false;
+                };
+                match client.receiver.recv_timeout(left) {
+                    Ok(_) => continue,
+                    Err(error) => break error.is_disconnected(),
+                }
+            };
+            drop(root);
+            assert!(disconnected, "the connection outlived shutdown");
         });
     }
 

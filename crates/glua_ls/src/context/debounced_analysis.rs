@@ -414,6 +414,11 @@ impl DebouncedAnalysis {
     /// Handlers that need consistent tree + index data (e.g. semantic tokens)
     /// can use this to decide whether to serve stale results or return `None`
     /// so the client keeps its previous state.
+    /// Cancelled when the server shuts down.
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.has_pending_changes.load(Ordering::Acquire)
     }
