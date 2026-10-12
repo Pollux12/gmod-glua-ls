@@ -160,20 +160,56 @@ fn infer_table_array_summary(
     ))
 }
 
-/// A row's type as a summary holds it: an inferred tuple becomes `table`.
+/// A row's type as a summary holds it: an inferred tuple keeps its own
+/// positions, and any inferred tuple inside them becomes `table`.
 ///
 /// A summary's positions are evidence about the literal itself. Copying a
-/// row's own summary into them nests without bound when the row's value is
-/// the literal (`local c = G; G = { c }`), where `table` is the fixpoint.
+/// row's own summary into them whole nests without bound when the row's value
+/// is the literal (`local c = G; G = { c }`); keeping one level of rows bounds
+/// how deep a summary nests, so such a literal settles.
 fn summary_row_type(typ: LuaType) -> LuaType {
+    match typ {
+        LuaType::Tuple(tuple)
+            if matches!(tuple.status, LuaTupleStatus::InferResolve)
+                && tuple.get_types().iter().any(holds_inferred_tuple) =>
+        {
+            LuaType::Tuple(
+                LuaTupleType::new(
+                    tuple
+                        .get_types()
+                        .iter()
+                        .cloned()
+                        .map(nested_row_type)
+                        .collect(),
+                    LuaTupleStatus::InferResolve,
+                )
+                .into(),
+            )
+        }
+        LuaType::Union(union) if union.into_vec().iter().any(holds_inferred_tuple) => {
+            LuaType::from_vec(union.into_vec().into_iter().map(summary_row_type).collect())
+        }
+        typ => typ,
+    }
+}
+
+/// A position inside a row: an inferred tuple there becomes `table`.
+fn nested_row_type(typ: LuaType) -> LuaType {
     match typ {
         LuaType::Tuple(tuple) if matches!(tuple.status, LuaTupleStatus::InferResolve) => {
             LuaType::Table
         }
         LuaType::Union(union) if union.into_vec().iter().any(is_inferred_tuple) => {
-            LuaType::from_vec(union.into_vec().into_iter().map(summary_row_type).collect())
+            LuaType::from_vec(union.into_vec().into_iter().map(nested_row_type).collect())
         }
         typ => typ,
+    }
+}
+
+fn holds_inferred_tuple(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Union(union) => union.into_vec().iter().any(is_inferred_tuple),
+        typ => is_inferred_tuple(typ),
     }
 }
 

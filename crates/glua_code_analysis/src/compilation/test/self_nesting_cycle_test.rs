@@ -3,7 +3,7 @@ mod test {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use crate::VirtualWorkspace;
+    use crate::{DiagnosticCode, VirtualWorkspace};
 
     /// The semantic digest of `source` analysed on its own, or `None` when the
     /// analysis does not settle within a generous bound.
@@ -56,6 +56,38 @@ mod test {
             .iter()
             .filter_map(|line| line.split_once(": ").map(|(_, typed)| typed))
             .collect::<Vec<_>>();
-        assert_eq!(types, ["G = (table)", "G = (table)", "c = (table)"]);
+        assert_eq!(types, ["G = ((table))", "G = ((table))", "c = ((table))"]);
+    }
+
+    /// A row that holds no summary of the literal keeps its positions, so an
+    /// index through it reads the exact value.
+    #[test]
+    fn a_row_nested_without_a_cycle_keeps_its_positions() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_rows.lua",
+            r#"
+            local row = { 1, "x" }
+            local rows = { row }
+            local value = rows[1][2]
+            "#,
+        );
+
+        let value = ws.local_ty(file_id, "value");
+        assert_eq!(ws.humanize_type(value), "\"x\"");
+    }
+
+    #[test]
+    fn a_value_read_through_a_nested_row_is_checked_against_its_annotation() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            local row = { 1, "x" }
+            local rows = { row }
+            ---@type number
+            local value = rows[1][2]
+            "#,
+        ));
     }
 }
