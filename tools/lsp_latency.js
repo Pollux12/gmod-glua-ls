@@ -196,7 +196,11 @@ function codeLines(text) {
         } else if (ch === '"' || ch === "'") {
             let end = at + 1;
             while (end < text.length && text[end] !== ch && text[end] !== '\n') {
-                end += text[end] === '\\' ? 2 : 1;
+                if (text[end] !== '\\') {
+                    end += 1;
+                } else {
+                    end += text.startsWith('\r\n', end + 1) ? 3 : 2;
+                }
             }
             blankTo(Math.min(end + 1, text.length));
         } else {
