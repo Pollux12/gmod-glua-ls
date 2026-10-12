@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::cell::OnceCell;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
 use glua_parser::{LuaAstToken, LuaStringToken, LuaSyntaxToken};
 use rowan::{NodeOrToken, TextRange, TextSize};
@@ -25,15 +26,18 @@ pub struct LoadPathEdit {
 pub fn load_path_rename_edits(db: &DbIndex, renames: &FileRenames) -> Vec<LoadPathEdit> {
     let dependencies = db.get_file_dependencies_index();
     let module_index = db.get_module_index();
+    let moved = renames.moved_files(db.get_vfs());
+    let module_names = OnceCell::new();
+    let modules_after = || module_names.get_or_init(|| module_names_after(db, &moved));
     let mut edits = BTreeMap::new();
-    for (file_id, _) in renames.moved_files(db.get_vfs()) {
+    for (file_id, _) in &moved {
         let sites = dependencies
-            .get_dependency_sites(&file_id)
+            .get_dependency_sites(file_id)
             .unwrap_or_default()
             .iter()
-            .chain(dependencies.get_sites_loading(file_id));
+            .chain(dependencies.get_sites_loading(*file_id));
         for site in sites.filter(|site| !module_index.is_std(&site.source_file_id)) {
-            if let Some(edit) = site_edit(db, renames, site) {
+            if let Some(edit) = site_edit(db, renames, &modules_after, site) {
                 edits
                     .entry((edit.file_id, edit.range.start()))
                     .or_insert(edit);
@@ -43,9 +47,34 @@ pub fn load_path_rename_edits(db: &DbIndex, renames: &FileRenames) -> Vec<LoadPa
     edits.into_values().collect()
 }
 
-fn site_edit(
+/// Each module's name once the renames are done, by its last segment.
+type ModulesAfter = HashMap<String, Vec<(FileId, String)>>;
+
+fn module_names_after(db: &DbIndex, moved: &[(FileId, PathBuf)]) -> ModulesAfter {
+    let module_index = db.get_module_index();
+    let moved = moved.iter().cloned().collect::<HashMap<_, _>>();
+    let mut names = ModulesAfter::new();
+    for module in module_index.get_module_infos() {
+        let name = match moved.get(&module.file_id) {
+            Some(path) => match path
+                .to_str()
+                .and_then(|path| module_index.module_path_at(path))
+            {
+                Some((name, _)) => name,
+                None => continue,
+            },
+            None => module.full_module_name.clone(),
+        };
+        let last = name.rsplit('.').next().unwrap_or_default().to_string();
+        names.entry(last).or_default().push((module.file_id, name));
+    }
+    names
+}
+
+fn site_edit<'a>(
     db: &DbIndex,
     renames: &FileRenames,
+    modules_after: &impl Fn() -> &'a ModulesAfter,
     site: &LuaDependencySite,
 ) -> Option<LoadPathEdit> {
     let path = site.path.as_deref()?;
@@ -55,7 +84,7 @@ fn site_edit(
     let target = vfs.get_file_path(&target_file_id)?;
     let new_path = match site.kind {
         LuaDependencyKind::Require => {
-            rewritten_require_path(db, renames, path, target_file_id, target)?
+            rewritten_require_path(db, renames, modules_after(), path, target_file_id, target)?
         }
         _ => rewritten_load_path(renames, path, source, target)?,
     };
@@ -118,10 +147,12 @@ fn quoted_contents(text: &str, quote: char) -> String {
 /// `path`, a `require` that names the module `target_file_id` registers
 /// as, rewritten to name the module it registers as from where the renames
 /// leave it: as many trailing segments of it as `path` names, which is what
-/// the lookup matches, in the same style.
+/// the lookup matches, and more while another module ends in them too, in
+/// the same style.
 fn rewritten_require_path(
     db: &DbIndex,
     renames: &FileRenames,
+    modules_after: &ModulesAfter,
     path: &str,
     target_file_id: FileId,
     target: &Path,
@@ -141,7 +172,22 @@ fn rewritten_require_path(
 
     let (new_module, _) = module_index.module_path_at(renames.after(target).to_str()?)?;
     let new_parts = new_module.split('.').collect::<Vec<_>>();
-    let kept = &new_parts[new_parts.len().saturating_sub(named_parts.len())..];
+    let others = modules_after
+        .get(*new_parts.last()?)
+        .into_iter()
+        .flatten()
+        .filter(|(file_id, _)| *file_id != target_file_id)
+        .collect::<Vec<_>>();
+    let kept = (named_parts.len().min(new_parts.len())..new_parts.len())
+        .map(|len| &new_parts[new_parts.len() - len..])
+        .find(|kept| {
+            let suffix = kept.join(".");
+            !others.iter().any(|(_, name)| {
+                name.strip_suffix(suffix.as_str())
+                    .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('.'))
+            })
+        })
+        .unwrap_or(&new_parts);
     let separator = if path.contains('/') { "/" } else { "." };
     Some(kept.join(separator))
 }

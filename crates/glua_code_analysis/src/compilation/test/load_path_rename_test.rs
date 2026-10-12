@@ -279,6 +279,34 @@ mod test {
         );
     }
 
+    /// A `require` names enough trailing segments of the module's new name
+    /// that no other module answers to them once the renames are done.
+    #[gtest]
+    fn a_require_names_only_the_module_it_loaded() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            ("zlib/old.lua", "return {}\n"),
+            ("new.lua", "return {}\n"),
+            ("other/stale.lua", "return {}\n"),
+            ("loader.lua", "local z = require(\"old\")\n"),
+        ]);
+
+        let renamed = [("zlib/old.lua", "zlib/new.lua")];
+        let other_moves_in = [renamed[0], ("other/stale.lua", "other/new.lua")];
+        let other_moves_away = [renamed[0], ("new.lua", "newer.lua")];
+        let edits = [&renamed[..], &other_moves_in, &other_moves_away]
+            .map(|renames| rename_edits(&ws, renames));
+
+        assert_that!(
+            edits,
+            elements_are![
+                elements_are![eq(&edit("loader.lua", "old", "zlib.new"))],
+                elements_are![eq(&edit("loader.lua", "old", "zlib.new"))],
+                elements_are![eq(&edit("loader.lua", "old", "new"))],
+            ]
+        );
+    }
+
     /// A `require` of a folder module, found through its `init.lua`, names the
     /// folder's new name.
     #[gtest]
