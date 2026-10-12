@@ -3563,6 +3563,44 @@ mod test {
         assert_eq!(reports_param_mismatch(&setups), [false, true]);
     }
 
+    /// An index table answers every key its index signature admits, with the
+    /// value type the signature gives.
+    #[test]
+    fn a_field_read_through_an_index_signature_is_checked_against_the_class() {
+        let setups = [
+            r#"
+            ---@type table<string, string>
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@type { [string]: string }
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@type table<string, integer>
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@type table<integer, string>
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+        ];
+
+        assert_eq!(reports_param_mismatch(&setups), [false, false, true, true]);
+    }
+
     /// A field the index table lacks is read through that table's own
     /// metatable in turn, as a class inheriting from a base reads it.
     #[test]

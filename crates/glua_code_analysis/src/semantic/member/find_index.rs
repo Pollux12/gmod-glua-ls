@@ -425,10 +425,11 @@ pub(crate) enum MetatableIndexField {
     Unknown,
 }
 
-/// What `table`'s metatable `__index` supplies for `key`: a table's own member
-/// of that key, or the declared result of a function whose key parameter takes
-/// it, as a read through it resolves. A function's inferred result merges what
-/// it returns for every key, so it says nothing of one key's value.
+/// What `table`'s metatable `__index` supplies for `key`: a table's member of
+/// that key or the value of an index signature that admits it, or the declared
+/// result of a function whose key parameter takes it, as a read through it
+/// resolves. A function's inferred result merges what it returns for every
+/// key, so it says nothing of one key's value.
 pub(crate) fn find_metatable_index_field(
     db: &DbIndex,
     table: &InFiled<TextRange>,
@@ -446,15 +447,32 @@ pub(crate) fn find_metatable_index_field(
         };
         match crate::semantic::infer::classify_metatable_index_candidate(&index_type) {
             crate::semantic::infer::MetatableIndexCandidate::Supported(index_type) => {
-                return match super::find_members(db, &index_type) {
-                    Some(members) => members
+                if let Some(member) =
+                    super::find_members_with_key(db, &index_type, key.clone(), false)
                         .into_iter()
-                        .find(|member| &member.key == key)
-                        .map_or(MetatableIndexField::Absent, |member| {
-                            MetatableIndexField::Present(member.typ)
-                        }),
-                    None => MetatableIndexField::Absent,
+                        .flatten()
+                        .next()
+                {
+                    return MetatableIndexField::Present(member.typ);
+                }
+                let Some(key_type) = member_key_as_type(key) else {
+                    return MetatableIndexField::Unknown;
                 };
+                return find_index_operations(db, &index_type)
+                    .into_iter()
+                    .flatten()
+                    .find(|operation| match &operation.key {
+                        LuaMemberKey::ExprType(
+                            LuaType::StringConst(_) | LuaType::IntegerConst(_),
+                        ) => false,
+                        LuaMemberKey::ExprType(index_key) => {
+                            crate::check_type_compact(db, index_key, &key_type).is_ok()
+                        }
+                        _ => false,
+                    })
+                    .map_or(MetatableIndexField::Absent, |operation| {
+                        MetatableIndexField::Present(operation.typ)
+                    });
             }
             crate::semantic::infer::MetatableIndexCandidate::Unsupported
                 if index_type.is_nil() || matches!(index_type, LuaType::BooleanConst(false)) =>
