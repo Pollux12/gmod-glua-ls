@@ -595,6 +595,12 @@ impl DiagnosticStore {
                 return;
             }
             state.computing.remove(&job.file_id);
+            // A result finished as the store stopped is not published.
+            let computed = if job.token.is_cancelled() {
+                Computed::Cancelled
+            } else {
+                computed
+            };
             match computed {
                 Computed::Cancelled => {
                     let priority = state.priority_of(job.file_id, false);
