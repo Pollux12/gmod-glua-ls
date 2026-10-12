@@ -36,7 +36,7 @@ pub(super) fn load_path_edits(db: &DbIndex, renames: &FileRenames) -> Vec<(FileI
                 edit.file_id,
                 TextEdit {
                     range,
-                    new_text: edit.new_path,
+                    new_text: edit.new_text,
                 },
             ))
         })

@@ -2,6 +2,8 @@
 mod test {
     use googletest::prelude::*;
 
+    use glua_parser::{LuaAstNode, LuaLiteralExpr, LuaLiteralToken, LuaParser, ParserConfig};
+
     use crate::{FileRenames, VirtualWorkspace, load_path_rename_edits};
 
     /// Each edit as (file, the text it replaces, its new text).
@@ -33,7 +35,7 @@ mod test {
                         .to_string_lossy()
                         .replace('\\', "/"),
                     text[edit.range].to_string(),
-                    edit.new_path,
+                    edit.new_text,
                 )
             })
             .collect()
@@ -186,5 +188,70 @@ mod test {
                 "autorun/server/sv_helpers.lua"
             ))]
         );
+    }
+
+    /// `file`'s text with the edits `renames` makes applied, and the values
+    /// of the string literals the result parses to.
+    fn renamed_strings(ws: &VirtualWorkspace, file: &str, renames: &[(&str, &str)]) -> Vec<String> {
+        let base = &ws.virtual_url_generator.base;
+        let renames = FileRenames::new(
+            renames
+                .iter()
+                .map(|(old, new)| (base.join(old), base.join(new)))
+                .collect(),
+        );
+        let db = ws.analysis.compilation.get_db();
+        let file_id = db
+            .get_vfs()
+            .get_file_id(&ws.virtual_url_generator.new_uri(file))
+            .expect("the file is indexed");
+        let mut text = db
+            .get_vfs()
+            .get_file_content(&file_id)
+            .expect("the file has text")
+            .clone();
+        let mut edits = load_path_rename_edits(db, &renames)
+            .into_iter()
+            .filter(|edit| edit.file_id == file_id)
+            .collect::<Vec<_>>();
+        edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start()));
+        for edit in edits {
+            text.replace_range(std::ops::Range::<usize>::from(edit.range), &edit.new_text);
+        }
+        let tree = LuaParser::parse(&text, ParserConfig::default());
+        assert!(tree.get_errors().is_empty(), "{text}");
+        tree.get_chunk_node()
+            .descendants::<LuaLiteralExpr>()
+            .filter_map(|literal| match literal.get_literal()? {
+                LuaLiteralToken::String(string) => Some(string.get_value()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A new path holding a quote, a backslash or a long string's closing
+    /// bracket is written so the literal still parses to exactly that path.
+    #[test]
+    fn a_new_path_is_written_for_the_literal_it_goes_into() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            ("lua/autorun/sh_old.lua", "return {}\n"),
+            (
+                "lua/autorun/sh_loader.lua",
+                "include('sh_old.lua')\ninclude(\"sh_old.lua\")\ninclude([[sh_old.lua]])\ninclude([==[sh_old.lua]==])\n",
+            ),
+        ]);
+
+        for new_name in [r#"sh_o'b"r.lua"#, "sh_tab\tname.lua", "sh_a]]b.lua"] {
+            assert_eq!(
+                renamed_strings(
+                    &ws,
+                    "lua/autorun/sh_loader.lua",
+                    &[("lua/autorun/sh_old.lua", &format!("lua/autorun/{new_name}"))],
+                ),
+                [new_name; 4],
+                "{new_name}"
+            );
+        }
     }
 }

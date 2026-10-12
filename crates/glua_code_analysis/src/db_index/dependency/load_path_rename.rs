@@ -11,9 +11,11 @@ use crate::{DbIndex, FileId, FileRenames, LuaDependencyKind, LuaDependencySite};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadPathEdit {
     pub file_id: FileId,
-    /// The string's contents, without its delimiters.
+    /// The text to replace: the string's contents, without its delimiters, or
+    /// the whole literal where they cannot hold the new path.
     pub range: TextRange,
-    pub new_path: String,
+    /// The new path, written for the literal it goes into.
+    pub new_text: String,
 }
 
 /// The `include`, `AddCSLuaFile`, `require` and other load path strings that
@@ -54,11 +56,57 @@ fn site_edit(
     if new_path == path {
         return None;
     }
+    let (token, contents) = path_string(db, site, path)?;
+    let (range, new_text) = written_for_literal(&token, contents, &new_path);
     Some(LoadPathEdit {
         file_id: site.source_file_id,
-        range: path_string_range(db, site, path)?,
-        new_path,
+        range,
+        new_text,
     })
+}
+
+/// `new_path` as it replaces the `contents` of the string literal `token`:
+/// escaped for a quoted string, as is in a long string that can hold it, and
+/// otherwise as a quoted string replacing the whole literal.
+fn written_for_literal(
+    token: &LuaSyntaxToken,
+    contents: TextRange,
+    new_path: &str,
+) -> (TextRange, String) {
+    let text = token.text();
+    if let Some(quote @ (b'"' | b'\'')) = text.bytes().next() {
+        return (contents, quoted_contents(new_path, char::from(quote)));
+    }
+    let level = text[1..].bytes().take_while(|byte| *byte == b'=').count();
+    let closing = format!("]{}]", "=".repeat(level));
+    // A long string drops a newline right after its opening bracket.
+    if new_path.contains(&closing) || new_path.starts_with(['\n', '\r']) {
+        (
+            token.text_range(),
+            format!("\"{}\"", quoted_contents(new_path, '"')),
+        )
+    } else {
+        (contents, new_path.to_string())
+    }
+}
+
+/// `text` escaped to sit between two `quote`s.
+fn quoted_contents(text: &str, quote: char) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            ch if ch == quote => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            ch if ch.is_ascii_control() => escaped.push_str(&format!("\\{:03}", u32::from(ch))),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// `path`, which names `target` from `source`, rewritten to name the file
@@ -144,8 +192,12 @@ fn lua_root_relative(path: &Path) -> Option<&Path> {
     path.strip_prefix(root).ok()
 }
 
-/// The contents of the string literal holding `path` in `site`'s call.
-fn path_string_range(db: &DbIndex, site: &LuaDependencySite, path: &str) -> Option<TextRange> {
+/// The string literal holding `path` in `site`'s call, and its contents.
+fn path_string(
+    db: &DbIndex,
+    site: &LuaDependencySite,
+    path: &str,
+) -> Option<(LuaSyntaxToken, TextRange)> {
     let root = db
         .get_vfs()
         .get_syntax_tree(&site.source_file_id)?
@@ -157,7 +209,11 @@ fn path_string_range(db: &DbIndex, site: &LuaDependencySite, path: &str) -> Opti
     call.descendants_with_tokens()
         .filter_map(NodeOrToken::into_token)
         .filter(|token| site.range.contains_range(token.text_range()))
-        .find_map(|token| string_contents_range(LuaStringToken::cast(token)?.syntax(), path))
+        .find_map(|token| {
+            let token = LuaStringToken::cast(token)?.syntax().clone();
+            let contents = string_contents_range(&token, path)?;
+            Some((token, contents))
+        })
 }
 
 /// The range of `token`'s contents when they are exactly `value`, so escapes
@@ -176,4 +232,14 @@ fn string_contents_range(token: &LuaSyntaxToken, value: &str) -> Option<TextRang
             TextSize::of(contents),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quoted_contents;
+
+    #[test]
+    fn a_quoted_path_escapes_its_quote_backslashes_and_control_characters() {
+        assert_eq!(quoted_contents("a\\b'c\"d\te", '\''), r#"a\\b\'c"d\009e"#);
+    }
 }
