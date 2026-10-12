@@ -22,7 +22,9 @@ build = "build.rs"
 include = [
     "Cargo.toml",
     "build.rs",
+    "LICENSE",
     "src/**",
+    "3rd/EmmyLuaCodeStyle/LICENSE",
     "3rd/EmmyLuaCodeStyle/3rd/wildcards/**",
     "3rd/EmmyLuaCodeStyle/CodeFormatCLib/**",
     "3rd/EmmyLuaCodeStyle/CodeFormatCore/**",
