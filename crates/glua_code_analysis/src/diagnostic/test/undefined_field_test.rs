@@ -188,6 +188,61 @@ mod test {
         ws.analysis.update_config(Arc::new(emmyrc));
     }
 
+    #[test]
+    fn returned_empty_table_accepts_numeric_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "annotations/entity.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@class Player : Entity
+            player = {}
+            ---@return Player[]
+            function player.GetAll() end
+        "#,
+        );
+        let file = ws.def_file(
+            "gamemodes/terrortown/gamemode/util.lua",
+            r#"
+            function GetAlivePlayers()
+                local alive = {}
+                for _, p in ipairs(player.GetAll()) do
+                    table.insert(alive, p)
+                end
+                return alive
+            end
+            local alive = GetAlivePlayers()
+            local choice = alive[1]
+        "#,
+        );
+        let diagnostics =
+            diagnostics_for_code_with_shared(&mut ws, file, DiagnosticCode::UndefinedField);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn returned_table_named_members_keep_numeric_access_closed() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file = ws.def_file(
+            "gamemodes/terrortown/gamemode/util.lua",
+            r#"
+            local function Empty() return {} end
+            local function Named() return {name = "value"} end
+            local empty = Empty()
+            local named = Named()
+            local extended = Empty()
+            extended.name = "value"
+            print(empty.missing, named[1], extended[1])
+        "#,
+        );
+        let diagnostics =
+            diagnostics_for_code_with_shared(&mut ws, file, DiagnosticCode::UndefinedField);
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+    }
+
     fn name_expr_types(
         ws: &VirtualWorkspace,
         file_id: crate::FileId,

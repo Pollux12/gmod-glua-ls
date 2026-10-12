@@ -774,6 +774,17 @@ fn is_valid_member_inner(
                 TableConstMemberCheck::NotFound => {}
             }
         }
+        LuaType::Instance(_) => {
+            if any_table_const_component_valid(
+                semantic_model,
+                index_expr,
+                index_key,
+                code,
+                std::iter::once(prefix_typ),
+            ) {
+                return Some(());
+            }
+        }
         // A composite of table literals is the set of shapes the value can
         // take; each `TableConst` component keeps its own member rules — a
         // field spelled by any literal writer is valid, and an empty literal
@@ -1111,11 +1122,23 @@ fn any_table_const_component_valid<'a>(
     code: DiagnosticCode,
     mut components: impl Iterator<Item = &'a LuaType>,
 ) -> bool {
-    components.any(|component| {
-        matches!(component, LuaType::TableConst(id) if matches!(
+    components.any(|component| match component {
+        LuaType::TableConst(id) => matches!(
             check_table_const_member(semantic_model, index_expr, index_key, code, id),
             TableConstMemberCheck::Valid
-        ))
+        ),
+        LuaType::Instance(instance)
+            if table_const_is_empty(semantic_model.get_db(), instance.get_range()) =>
+        {
+            any_table_const_component_valid(
+                semantic_model,
+                index_expr,
+                index_key,
+                code,
+                std::iter::once(instance.get_base()),
+            )
+        }
+        _ => false,
     })
 }
 
