@@ -42,17 +42,20 @@ impl ServerMessageProcessor {
         }
     }
 
-    /// Check if message can be processed during initialization
+    /// Check if message can be processed during initialization: responses,
+    /// cancellations, and the shutdown sequence, which does not wait for the
+    /// workspace to load. After `shutdown` every message is handled at once.
     pub(super) fn can_process_during_init(&self, msg: &Message) -> bool {
         match msg {
-            // Allow all responses (including configuration responses)
             Message::Response(_) => true,
-            // Allow specific notifications
+            _ if self.shutdown_requested => true,
             Message::Notification(notify) => {
-                matches!(notify.method.as_str(), "$/cancelRequest" | "initialized")
+                matches!(
+                    notify.method.as_str(),
+                    "$/cancelRequest" | "initialized" | "exit"
+                )
             }
-            // Don't process other requests during initialization
-            Message::Request(_) => false,
+            Message::Request(request) => request.method == "shutdown",
         }
     }
 
@@ -138,6 +141,20 @@ impl ServerMessageProcessor {
             Message::Request(req) if req.method == "shutdown" => {
                 self.shutdown_requested = true;
                 server_context.close().await;
+                // Requests held back while the workspace initialized are
+                // refused as any request after `shutdown` is.
+                for pending in std::mem::take(&mut self.pending_messages) {
+                    if let Message::Request(pending) = pending {
+                        connection.send(
+                            Response::new_err(
+                                pending.id,
+                                ErrorCode::InvalidRequest as i32,
+                                "the server is shutting down".to_owned(),
+                            )
+                            .into(),
+                        )?;
+                    }
+                }
                 connection.send(Response::new_ok(req.id, ()).into())?;
             }
             Message::Request(req) => {
@@ -174,6 +191,61 @@ mod tests {
             method.to_owned(),
             serde_json::Value::Null,
         ))
+    }
+
+    /// While the workspace initializes, `shutdown` and `exit` are handled at
+    /// once, and a request held back until initialization is refused before
+    /// `shutdown` is answered.
+    #[test]
+    fn shutdown_during_initialization_is_answered_at_once() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (handled_at_once, held_back, replies) = runtime.block_on(async {
+            let (server, client) = Connection::memory();
+            let mut context = context::ServerContext::new(
+                Connection {
+                    sender: server.sender.clone(),
+                    receiver: server.receiver.clone(),
+                },
+                Default::default(),
+            );
+            let mut connection = AsyncConnection::from_sync(server);
+            let (_init_tx, init_rx) = oneshot::channel();
+            let mut processor = ServerMessageProcessor::new(init_rx);
+            let held = request(5, "textDocument/definition");
+            let held_back = !processor.can_process_during_init(&held);
+            processor.pending_messages.push(held);
+            let handled_at_once = [request(1, "shutdown"), notification("exit")]
+                .iter()
+                .all(|msg| processor.can_process_during_init(msg));
+            processor
+                .handle_message(request(1, "shutdown"), &mut connection, &mut context)
+                .await
+                .expect("shutdown is handled");
+            let replies = client
+                .receiver
+                .try_iter()
+                .filter_map(|msg| match msg {
+                    Message::Response(response) => {
+                        Some((response.id, response.error.map(|error| error.code)))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (handled_at_once, held_back, replies)
+        });
+        runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+
+        assert_eq!(
+            (handled_at_once, held_back, replies),
+            (
+                true,
+                true,
+                vec![
+                    (RequestId::from(5), Some(ErrorCode::InvalidRequest as i32)),
+                    (RequestId::from(1), None),
+                ]
+            )
+        );
     }
 
     /// After `shutdown`, a request is refused and a notification dropped
