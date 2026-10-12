@@ -12,7 +12,10 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smol_str::SmolStr;
 
 use crate::handlers::completion::{
-    add_completions::{CompletionTriggerStatus, add_member_completion_with_description_hint},
+    add_completions::{
+        CompletionTriggerStatus, add_member_completion_with_description_hint,
+        is_callable_member_type,
+    },
     completion_builder::CompletionBuilder,
 };
 
@@ -217,14 +220,16 @@ enum SlotWrite {
 }
 
 /// Drops the writes of a key that only happen in a branch, where one outside
-/// any branch exists.
+/// any branch of the same kind, callable or not, exists.
 ///
 /// This is the only separation available here. Load order across files is
 /// decided by member resolution, which also picks the write the caller's realm
 /// selects, both before these infos are built; what is left is whether a write
-/// is conditional at all. Writes that are all unconditional — guarded bootstrap
-/// siblings (`x = x or {}`) among them — say nothing about each other and all
-/// survive.
+/// is conditional at all. A plain value says nothing about a method a branch
+/// defines, which can still be what a `:` call reaches, so only a write of the
+/// same kind stands in for a branch write. Writes that are all unconditional —
+/// guarded bootstrap siblings (`x = x or {}`) among them — say nothing about
+/// each other and all survive.
 fn resolve_slot_writes(db: &DbIndex, infos: &mut Vec<LuaMemberInfo>) {
     if infos.len() <= 1 {
         return;
@@ -232,14 +237,25 @@ fn resolve_slot_writes(db: &DbIndex, infos: &mut Vec<LuaMemberInfo>) {
 
     let writes = infos
         .iter()
-        .map(|info| classify_slot_write(db, info))
+        .map(|info| {
+            (
+                classify_slot_write(db, info),
+                is_callable_member_type(db, &info.typ),
+            )
+        })
         .collect::<Vec<_>>();
-    if !writes.contains(&SlotWrite::Unconditional) {
-        return;
-    }
+    let superseded = writes
+        .iter()
+        .map(|(write, callable)| {
+            *write == SlotWrite::Branch
+                && writes.iter().any(|(other, other_callable)| {
+                    *other == SlotWrite::Unconditional && other_callable == callable
+                })
+        })
+        .collect::<Vec<_>>();
 
-    let mut writes = writes.into_iter();
-    infos.retain(|_| writes.next() != Some(SlotWrite::Branch));
+    let mut superseded = superseded.into_iter();
+    infos.retain(|_| superseded.next() != Some(true));
 }
 
 fn classify_slot_write(db: &DbIndex, info: &LuaMemberInfo) -> SlotWrite {

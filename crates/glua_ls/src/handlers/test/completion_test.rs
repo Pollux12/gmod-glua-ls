@@ -1544,6 +1544,43 @@ mod tests {
         Ok(())
     }
 
+    /// A branch write is dropped beside an unconditional write of its kind;
+    /// a method a branch defines can still be what a `:` call reaches past a
+    /// plain value, so it stays.
+    #[gtest]
+    fn test_completion_branch_method_stays_beside_a_plain_value() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "a.lua",
+            r#"
+                cfg = {}
+                cfg.run = false
+            "#,
+        );
+        ws.def_file(
+            "b.lua",
+            r#"
+                if enabled then
+                    function cfg:run() end
+                end
+            "#,
+        );
+        check!(ws.check_completion(
+            r#"
+                cfg:<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "run".to_string(),
+                kind: CompletionItemKind::METHOD,
+                label_detail: Some("()".to_string()),
+            }],
+        ));
+        Ok(())
+    }
+
     /// A branch write is dropped beside an unconditional one whatever form the
     /// unconditional one takes — a guarded bootstrap included, since it runs on
     /// every load of its file.

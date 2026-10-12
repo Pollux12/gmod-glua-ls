@@ -392,6 +392,11 @@ fn get_member_completion_kind(
     }
 }
 
+/// Whether a member of type `typ` is offered after `:`.
+pub(crate) fn is_callable_member_type(db: &DbIndex, typ: &LuaType) -> bool {
+    is_completion_callable_type(&get_function_remove_nil(db, typ).unwrap_or(typ.clone()))
+}
+
 fn is_completion_callable_type(typ: &LuaType) -> bool {
     typ.is_function() || get_completion_kind(typ) == lsp_types::CompletionItemKind::FUNCTION
 }

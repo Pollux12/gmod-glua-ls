@@ -5,6 +5,7 @@ mod completion_item_info;
 
 pub use add_decl_completion::add_decl_completion;
 pub use add_member_completion::get_index_alias_name;
+pub(crate) use add_member_completion::is_callable_member_type;
 pub use add_member_completion::{
     CompletionTriggerStatus, add_member_completion_with_description_hint,
 };
