@@ -18,6 +18,8 @@ struct Server {
     stdin: Option<ChildStdin>,
     messages: mpsc::Receiver<Message>,
     next_id: i32,
+    /// Whether the server reported its workspace loaded yet.
+    loaded: bool,
 }
 
 impl Server {
@@ -48,6 +50,7 @@ impl Server {
             stdin,
             messages,
             next_id: 0,
+            loaded: false,
         };
         let root =
             glua_code_analysis::file_path_to_uri(&workspace.to_path_buf()).expect("workspace URI");
@@ -115,6 +118,12 @@ impl Server {
         loop {
             let left = deadline.checked_duration_since(Instant::now())?;
             let message = self.messages.recv_timeout(left).ok()?;
+            if let Message::Notification(notification) = &message
+                && notification.method == "gluals/serverStatus"
+                && notification.params["state"] == "workspaceLoaded"
+            {
+                self.loaded = true;
+            }
             if let Some(value) = found(&message) {
                 return Some(value);
             }
@@ -135,6 +144,12 @@ impl Server {
     /// process then exits within `timeout`.
     fn shuts_down_within(mut self, timeout: Duration) -> bool {
         self.request("shutdown", Value::Null);
+        self.exits_within(timeout)
+    }
+
+    /// Sends `exit`, closes stdin, and reports whether the process then exits
+    /// within `timeout`.
+    fn exits_within(mut self, timeout: Duration) -> bool {
         self.notify("exit", Value::Null);
         drop(self.stdin.take());
         let deadline = Instant::now() + timeout;
@@ -183,6 +198,23 @@ fn a_settled_server_exits_after_shutdown() {
 
     let exited = server.shuts_down_within(Duration::from_secs(10));
     let _ = std::fs::remove_dir_all(root);
+    assert!(exited, "the server did not exit");
+}
+
+/// Shut down as soon as the client initialized, while the workspace is still
+/// loading: `shutdown` is answered before the load finishes, and the process
+/// ends at `exit` though the load is still running.
+#[test]
+fn a_server_still_loading_answers_shutdown_and_exits() {
+    let (root, workspace, annotations) = workspace("gmod_glua_ls_exit_loading", 400);
+    let mut server = Server::start(&workspace, &annotations);
+
+    let answered = server.request("shutdown", Value::Null);
+    let loaded_first = server.loaded;
+    let exited = server.exits_within(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(root);
+    assert!(answered.error.is_none(), "{answered:?}");
+    assert!(!loaded_first, "shutdown waited for the workspace to load");
     assert!(exited, "the server did not exit");
 }
 

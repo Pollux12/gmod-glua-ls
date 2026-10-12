@@ -6,8 +6,19 @@ use std::error::Error;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+/// Ends the process when the session does, as `exit` asks, whatever work is
+/// still running: 0 after a clean `shutdown` and `exit`, 1 otherwise.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
+async fn main() {
     let cmd_args = CmdArgs::parse();
-    glua_ls::run_ls(cmd_args).await
+    let result: Result<(), Box<dyn Error + Sync + Send>> = glua_ls::run_ls(cmd_args).await;
+    log::logger().flush();
+    let code = match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            1
+        }
+    };
+    std::process::exit(code);
 }

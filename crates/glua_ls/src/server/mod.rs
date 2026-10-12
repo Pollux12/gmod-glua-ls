@@ -53,9 +53,10 @@ pub async fn run_ls(cmd_args: CmdArgs) -> Result<(), Box<dyn Error + Sync + Send
 
     // Create async connection wrapper
     let async_connection = AsyncConnection::from_sync(connection);
-    main_loop::main_loop(async_connection, initialization_params, cmd_args).await?;
-    threads.join()?;
-
-    eprintln!("Server shutting down.");
-    Ok(())
+    // The session ends at `exit` or when the client closes the connection.
+    // Work still running then, such as a workspace load that has not finished,
+    // holds the connection open, so the I/O threads are not waited for: the
+    // caller ends the process.
+    drop(threads);
+    main_loop::main_loop(async_connection, initialization_params, cmd_args).await
 }
