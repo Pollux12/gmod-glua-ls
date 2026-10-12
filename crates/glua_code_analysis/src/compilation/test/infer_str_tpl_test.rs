@@ -2722,4 +2722,32 @@ vgui.Register(\"cityrpStoreItem\", PANEL, \"EditablePanel\")
             );
         }
     }
+
+    #[gtest]
+    fn a_class_name_known_only_at_runtime_binds_the_constraint() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@field BeingRemoved boolean?
+
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return T[]
+            local function find_by_class(class) end
+
+            ---@type string
+            local classname = GetConVarString("ttt_spawn_class")
+            local named = find_by_class(classname)
+
+            local function by_unknown(cls) return find_by_class(cls) end
+            local unknown = by_unknown(nil)
+            "#,
+        );
+
+        let named = ws.local_ty(file_id, "named");
+        expect_that!(ws.humanize_type(named), eq("Entity[]"));
+        let unknown = ws.local_ty(file_id, "unknown");
+        expect_that!(ws.humanize_type(unknown), eq("Entity[]"));
+    }
 }

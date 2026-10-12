@@ -183,6 +183,8 @@ fn infer_str_tpl_target_type(
                 _ => Some(LuaType::Union(LuaUnionType::from_vec(inferred).into())),
             }
         }
+        // A name not known until runtime names some type the constraint admits.
+        LuaType::String | LuaType::Unknown => str_tpl.get_constraint().cloned(),
         _ => None,
     }
 }
