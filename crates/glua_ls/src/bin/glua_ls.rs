@@ -13,6 +13,7 @@ async fn main() {
     let cmd_args = CmdArgs::parse();
     let result: Result<(), Box<dyn Error + Sync + Send>> = glua_ls::run_ls(cmd_args).await;
     log::logger().flush();
+    glua_ls::drain_stderr_log(std::time::Duration::from_secs(1));
     let code = match result {
         Ok(()) => 0,
         Err(error) => {

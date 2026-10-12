@@ -9,4 +9,5 @@ mod util;
 
 pub use clap::Parser;
 pub use cmd_args::*;
+pub use logger::drain_stderr_log;
 pub use server::{AsyncConnection, ExitError, run_ls};
