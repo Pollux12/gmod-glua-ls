@@ -6,6 +6,8 @@
 
 const fs = require('fs');
 
+const SEVERITY = { 1: 'error', 2: 'warning', 3: 'info', 4: 'hint' };
+
 function load(file) {
     const entries = JSON.parse(fs.readFileSync(file, 'utf8'));
     const paths = entries.map((entry) => entry.file.replace(/\\/g, '/'));
@@ -15,8 +17,9 @@ function load(file) {
     const byFile = new Map();
     entries.forEach((entry, i) => {
         const keys = entry.diagnostics.map((d) => {
-            const r = d.range;
-            return `${r.start.line + 1}:${r.start.character + 1} [${d.code}] ${String(d.message).replace(/[\r\n]+/g, ' ')}`;
+            const { start, end } = d.range;
+            const range = `${start.line + 1}:${start.character + 1}-${end.line + 1}:${end.character + 1}`;
+            return `${range} ${SEVERITY[d.severity] ?? d.severity} [${d.code}] ${String(d.message).replace(/[\r\n]+/g, ' ')}`;
         });
         byFile.set(paths[i].slice(root.length).toLowerCase(), keys);
     });
