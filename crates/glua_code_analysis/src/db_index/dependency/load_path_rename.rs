@@ -51,8 +51,14 @@ fn site_edit(
     let path = site.path.as_deref()?;
     let vfs = db.get_vfs();
     let source = vfs.get_file_path(&site.source_file_id)?;
-    let target = vfs.get_file_path(&site.target_file_id?)?;
-    let new_path = rewritten_load_path(renames, site.kind, path, source, target)?;
+    let target_file_id = site.target_file_id?;
+    let target = vfs.get_file_path(&target_file_id)?;
+    let new_path = match site.kind {
+        LuaDependencyKind::Require => {
+            rewritten_require_path(db, renames, path, target_file_id, target)?
+        }
+        _ => rewritten_load_path(renames, path, source, target)?,
+    };
     if new_path == path {
         return None;
     }
@@ -109,6 +115,37 @@ fn quoted_contents(text: &str, quote: char) -> String {
     escaped
 }
 
+/// `path`, a `require` that names the module `target_file_id` registers
+/// as, rewritten to name the module it registers as from where the renames
+/// leave it: as many trailing segments of it as `path` names, which is what
+/// the lookup matches, in the same style.
+fn rewritten_require_path(
+    db: &DbIndex,
+    renames: &FileRenames,
+    path: &str,
+    target_file_id: FileId,
+    target: &Path,
+) -> Option<String> {
+    let module_index = db.get_module_index();
+    let module = &module_index.get_module(target_file_id)?.full_module_name;
+    let module_parts = module.split('.').collect::<Vec<_>>();
+    let named_parts = path.split(['.', '/', '\\']).collect::<Vec<_>>();
+    let unnamed = module_parts.len().checked_sub(named_parts.len())?;
+    if !named_parts
+        .iter()
+        .zip(&module_parts[unnamed..])
+        .all(|(named, part)| named.eq_ignore_ascii_case(part))
+    {
+        return None;
+    }
+
+    let (new_module, _) = module_index.module_path_at(renames.after(target).to_str()?)?;
+    let new_parts = new_module.split('.').collect::<Vec<_>>();
+    let kept = &new_parts[new_parts.len().saturating_sub(named_parts.len())..];
+    let separator = if path.contains('/') { "/" } else { "." };
+    Some(kept.join(separator))
+}
+
 /// `path`, which names `target` from `source`, rewritten to name the file
 /// from where the renames leave both, in the same style.
 ///
@@ -116,24 +153,17 @@ fn quoted_contents(text: &str, quote: char) -> String {
 /// and otherwise is written from the `lua/` or `gamemodes/` root.
 fn rewritten_load_path(
     renames: &FileRenames,
-    kind: LuaDependencyKind,
     path: &str,
     source: &Path,
     target: &Path,
 ) -> Option<String> {
-    let is_require = kind == LuaDependencyKind::Require;
     let with_extension = path.ends_with(".lua");
     let named = path.strip_suffix(".lua").unwrap_or(path);
     let named = named.trim_start_matches("./");
-    let separators: &[char] = if is_require {
-        &['.', '/', '\\']
-    } else {
-        &['/', '\\']
-    };
-    let named_parts = named.split(separators).collect::<Vec<_>>();
+    let named_parts = named.split(['/', '\\']).collect::<Vec<_>>();
     let base = named_base(target, &named_parts)?;
 
-    let new_base = if !is_require && Some(base) == source.parent() {
+    let new_base = if Some(base) == source.parent() {
         renames.after(source).parent()?.to_path_buf()
     } else {
         renames.after(base)
@@ -141,8 +171,7 @@ fn rewritten_load_path(
     let new_target = renames.after(target);
     let relative = match new_target.strip_prefix(&new_base) {
         Ok(relative) => relative,
-        Err(_) if !is_require => lua_root_relative(&new_target)?,
-        Err(_) => return None,
+        Err(_) => lua_root_relative(&new_target)?,
     };
 
     let mut parts = relative
@@ -153,12 +182,7 @@ fn rewritten_load_path(
         let file_name = parts.pop()?;
         parts.push(Path::new(file_name).file_stem()?.to_str()?);
     }
-    let separator = if is_require && !path.contains('/') {
-        "."
-    } else {
-        "/"
-    };
-    Some(parts.join(separator))
+    Some(parts.join("/"))
 }
 
 /// The folder `named_parts` name `target` from: `target`'s folder with as

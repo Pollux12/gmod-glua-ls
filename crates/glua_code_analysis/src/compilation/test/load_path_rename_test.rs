@@ -254,4 +254,49 @@ mod test {
             );
         }
     }
+
+    /// A `require` of a folder module, found through its `init.lua`, names the
+    /// folder's new name.
+    #[gtest]
+    fn a_folder_module_rename_rewrites_its_require() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            ("shop/init.lua", "return {}\n"),
+            ("loader.lua", "local shop = require(\"shop\")\n"),
+        ]);
+
+        let edits = rename_edits(&ws, &[("shop", "store")]);
+
+        assert_that!(
+            edits,
+            elements_are![eq(&edit("loader.lua", "shop", "store"))]
+        );
+    }
+
+    /// A `require` names a module by the trailing segments of its path, in
+    /// the caller's own separators, through the configured patterns.
+    #[gtest]
+    fn a_require_keeps_its_style_and_follows_the_configured_patterns() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.runtime.require_pattern = vec!["?.lua".to_string(), "?/main.lua".to_string()];
+        ws.update_emmyrc(emmyrc);
+        ws.def_files(vec![
+            ("mylib/core/util/main.lua", "return {}\n"),
+            (
+                "loader.lua",
+                "local a = require(\"core.util\")\nlocal b = require(\"core/util\")\n",
+            ),
+        ]);
+
+        let edits = rename_edits(&ws, &[("mylib/core", "mylib/base")]);
+
+        assert_that!(
+            edits,
+            elements_are![
+                eq(&edit("loader.lua", "core.util", "base.util")),
+                eq(&edit("loader.lua", "core/util", "base/util")),
+            ]
+        );
+    }
 }

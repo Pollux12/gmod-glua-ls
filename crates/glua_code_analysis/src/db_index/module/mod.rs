@@ -199,16 +199,24 @@ impl LuaModuleIndex {
         }
 
         let normalized_path = path.replace('\\', "/");
-        let (module_path, workspace_id) = self.extract_module_path(&normalized_path)?;
-        let mut module_path = module_path.replace(['\\', '/'], ".");
-        if !self.module_replace_vec.is_empty() {
-            module_path = self.replace_module_path(&module_path);
-        }
+        let (module_path, workspace_id) = self.module_path_at(&normalized_path)?;
 
         self.add_module_by_module_path(file_id, module_path, workspace_id);
         self.file_module_paths.insert(file_id, normalized_path);
         note_module_fact_write(file_id);
         Some(workspace_id)
+    }
+
+    /// The dotted module path, and workspace, a file at `path` registers as.
+    pub fn module_path_at(&self, path: &str) -> Option<(String, WorkspaceId)> {
+        let (module_path, workspace_id) = self.extract_module_path(path)?;
+        let module_path = module_path.replace(['\\', '/'], ".");
+        let module_path = if self.module_replace_vec.is_empty() {
+            module_path
+        } else {
+            self.replace_module_path(&module_path)
+        };
+        Some((module_path, workspace_id))
     }
 
     pub fn add_module_by_module_path(
