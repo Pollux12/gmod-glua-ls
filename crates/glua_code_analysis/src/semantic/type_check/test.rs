@@ -748,4 +748,33 @@ mod test {
             }
         }
     }
+
+    /// A named field the generic table's key type excludes is never in the
+    /// table: an optional one is met, a required one is not. A field the key
+    /// type admits must accept the value type.
+    #[test]
+    fn a_generic_table_meets_only_the_fields_its_key_type_admits() {
+        let mut ws = VirtualWorkspace::new();
+        let cases = [
+            ("{ foo?: string }", "table<integer, number>", true),
+            ("{ foo: number }", "table<integer, number>", false),
+            ("{ foo?: string }", "table<string, number>", false),
+            ("{ foo: number }", "table<string, number>", true),
+            ("{ foo?: string }", "table<'bar', number>", true),
+            ("{ foo: number }", "table<'bar', number>", false),
+            ("{ foo: number }", "table<'foo', number>", true),
+            ("{ foo?: string }", "table<'foo' | integer, number>", false),
+            ("{ bar?: string }", "table<'foo' | integer, number>", true),
+        ];
+
+        let results = cases
+            .iter()
+            .map(|(object, table, _)| {
+                let object_ty = ws.ty(object);
+                let table_ty = ws.ty(table);
+                (*object, *table, ws.check_type(&object_ty, &table_ty))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results, cases);
+    }
 }

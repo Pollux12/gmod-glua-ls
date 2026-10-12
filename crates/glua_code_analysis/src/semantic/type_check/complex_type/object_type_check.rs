@@ -75,9 +75,10 @@ pub fn check_object_type_compact(
     Err(TypeCheckFailReason::DonotCheck)
 }
 
-/// A `table<K, V>` holds `V` under every key it has, so each field and each
-/// indexed value of the object must accept `V`, and each index key must accept
-/// `K`.
+/// A `table<K, V>` holds `V` under every key it has, so each field whose key
+/// `K` admits and each indexed value of the object must accept `V`, and each
+/// index key must accept `K`. A field whose key `K` excludes is never there:
+/// fine when optional, unmet when required.
 fn check_object_type_compact_table_generic(
     context: &mut TypeCheckContext,
     source_object: &LuaObjectType,
@@ -86,8 +87,12 @@ fn check_object_type_compact_table_generic(
 ) -> TypeCheckResult {
     let key_type = params.first().unwrap_or(&LuaType::Any);
     let value_type = params.get(1).unwrap_or(&LuaType::Any);
-    for field_type in source_object.get_fields().values() {
-        check_general_type_compact(context, field_type, value_type, check_guard.next_level()?)?;
+    for (field_key, field_type) in source_object.get_fields() {
+        if member_key_matches_type(context.db, key_type, field_key) {
+            check_general_type_compact(context, field_type, value_type, check_guard.next_level()?)?;
+        } else if !(field_type.is_nullable() || field_type.is_any()) {
+            return Err(TypeCheckFailReason::TypeNotMatch);
+        }
     }
     for (index_key, index_value) in source_object.get_index_access() {
         check_general_type_compact(context, index_key, key_type, check_guard.next_level()?)?;
