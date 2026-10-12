@@ -255,6 +255,30 @@ mod test {
         }
     }
 
+    /// A literal that spells its path with escapes, as a rename writes one, or
+    /// with a long string's dropped newline is found by the path it parses to,
+    /// so the next rename rewrites it too.
+    #[test]
+    fn a_path_spelled_with_escapes_is_rewritten_again() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            ("lua/autorun/sh_o'b.lua", "return {}\n"),
+            (
+                "lua/autorun/sh_loader.lua",
+                "include('sh_o\\'b.lua')\ninclude(\"sh_o\\039b.lua\")\ninclude([[\nsh_o'b.lua]])\n",
+            ),
+        ]);
+
+        assert_eq!(
+            renamed_strings(
+                &ws,
+                "lua/autorun/sh_loader.lua",
+                &[("lua/autorun/sh_o'b.lua", "lua/autorun/sh_new.lua")],
+            ),
+            ["sh_new.lua"; 3]
+        );
+    }
+
     /// A `require` of a folder module, found through its `init.lua`, names the
     /// folder's new name.
     #[gtest]

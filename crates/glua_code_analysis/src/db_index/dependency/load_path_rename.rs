@@ -234,15 +234,18 @@ fn path_string(
         .filter_map(NodeOrToken::into_token)
         .filter(|token| site.range.contains_range(token.text_range()))
         .find_map(|token| {
-            let token = LuaStringToken::cast(token)?.syntax().clone();
-            let contents = string_contents_range(&token, path)?;
+            let string = LuaStringToken::cast(token)?;
+            if string.get_value() != path {
+                return None;
+            }
+            let token = string.syntax().clone();
+            let contents = string_contents_range(&token)?;
             Some((token, contents))
         })
 }
 
-/// The range of `token`'s contents when they are exactly `value`, so escapes
-/// and long-string newlines are never rewritten.
-fn string_contents_range(token: &LuaSyntaxToken, value: &str) -> Option<TextRange> {
+/// The range of `token`'s contents, everything between its delimiters.
+fn string_contents_range(token: &LuaSyntaxToken) -> Option<TextRange> {
     let text = token.text();
     let delimiter = match text.as_bytes().first()? {
         b'"' | b'\'' => 1,
@@ -250,12 +253,10 @@ fn string_contents_range(token: &LuaSyntaxToken, value: &str) -> Option<TextRang
         _ => return None,
     };
     let contents = text.get(delimiter..text.len().checked_sub(delimiter)?)?;
-    (contents == value).then(|| {
-        TextRange::at(
-            token.text_range().start() + TextSize::of(&text[..delimiter]),
-            TextSize::of(contents),
-        )
-    })
+    Some(TextRange::at(
+        token.text_range().start() + TextSize::of(&text[..delimiter]),
+        TextSize::of(contents),
+    ))
 }
 
 #[cfg(test)]
