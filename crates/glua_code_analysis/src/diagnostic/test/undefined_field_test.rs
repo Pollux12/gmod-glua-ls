@@ -243,6 +243,76 @@ mod test {
         assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
     }
 
+    #[test]
+    fn narrowed_dynamic_write_after_unresolved_write_keeps_owner() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "annotations/entity.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@field GetClass fun(self: Entity): string
+            ---@class prop_ragdoll : Entity
+            "#,
+        );
+        let read = ws.def_file(
+            "gamemodes/terrortown/gamemode/shared.lua",
+            r#"
+            ---@param ent Entity
+            local function RunIgniteTimer(ent)
+                print(ent.burn_destroy)
+            end
+            "#,
+        );
+        let path = "gamemodes/terrortown/entities/weapons/weapon_ttt_flaregun.lua";
+        let source = r#"
+            function IgniteTarget(path)
+                local ent = path.Entity
+                ent.ignite_info = {}
+                if ent:GetClass() == "prop_ragdoll" then
+                    ent.burn_destroy = 6
+                end
+            end
+        "#;
+        ws.def_file(path, source);
+        let db = ws.analysis.compilation.get_db();
+        assert!(db.get_dynamic_field_index().has_direct_field(
+            &crate::DynamicFieldOwner::Type(crate::LuaTypeDeclId::global("prop_ragdoll")),
+            "burn_destroy",
+        ));
+        assert!(
+            diagnostics_for_code_with_shared(&mut ws, read, DiagnosticCode::UndefinedField)
+                .is_empty()
+        );
+
+        ws.def_file(
+            path,
+            &source.replace("ent.burn_destroy = 6", "ent.other = 6"),
+        );
+        assert_eq!(
+            diagnostics_for_code_with_shared(&mut ws, read, DiagnosticCode::UndefinedField).len(),
+            1
+        );
+        ws.def_file(path, source);
+        assert!(
+            diagnostics_for_code_with_shared(&mut ws, read, DiagnosticCode::UndefinedField)
+                .is_empty()
+        );
+
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert_eq!(
+            diagnostics_for_code_with_shared(&mut ws, read, DiagnosticCode::UndefinedField).len(),
+            1
+        );
+        ws.def_file(path, source);
+        assert!(
+            diagnostics_for_code_with_shared(&mut ws, read, DiagnosticCode::UndefinedField)
+                .is_empty()
+        );
+    }
+
     fn name_expr_types(
         ws: &VirtualWorkspace,
         file_id: crate::FileId,

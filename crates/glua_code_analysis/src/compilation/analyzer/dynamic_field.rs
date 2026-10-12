@@ -338,8 +338,9 @@ fn reach_target(
 
 /// The type every write through `key` takes its prefix to have: the type
 /// inferred at the first target in tree order the pass collects from whose
-/// prefix names that reference, the target at `at` included. A prefix that
-/// names no variable is a reference of its own.
+/// prefix names that reference, the target at `at` included, unless that type
+/// says nothing about the value, when this write's own prefix type is used. A
+/// prefix that names no variable is a reference of its own.
 fn shared_prefix_type(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
@@ -379,7 +380,10 @@ fn shared_prefix_type(
                 continue;
             };
             if PrefixKey::from_expr(db, cache, &reached.prefix_expr) == *key {
-                return infer_expr(db, cache, reached.prefix_expr).ok();
+                return infer_expr(db, cache, reached.prefix_expr)
+                    .ok()
+                    .filter(crate::db_index::is_informative_type)
+                    .or_else(|| infer_expr(db, cache, prefix_expr.clone()).ok());
             }
         }
     }
