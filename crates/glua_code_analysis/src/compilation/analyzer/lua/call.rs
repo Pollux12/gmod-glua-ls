@@ -809,7 +809,7 @@ fn append_member_chain_to_access_path(
         match member_key {
             LuaMemberKey::Name(name) => {
                 access_path.push('.');
-                access_path.push_str(name);
+                access_path.push_str(&glua_parser::path_segment(name));
             }
             LuaMemberKey::Integer(value) => {
                 access_path.push('[');

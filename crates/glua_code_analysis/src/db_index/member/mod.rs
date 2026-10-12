@@ -2813,14 +2813,14 @@ impl LuaMemberIndex {
             return Vec::new();
         };
         let name = global_id.get_name();
-        // Not the last dotted segment: a bracketed string key keeps its dots, so
-        // `T["a.b"] = v` stores one member keyed `a.b` under `T`.
-        let key_text = match owner {
+        // The segment below the owner: a string key that is no name, such as
+        // `a.b` in `T["a.b"] = v`, is one bracketed segment.
+        let segment = match owner {
             LuaMemberOwner::GlobalPath(owner_id) => name
                 .strip_prefix(owner_id.get_name())
                 .and_then(|rest| rest.strip_prefix('.'))
                 .unwrap_or(name),
-            _ => name.rsplit_once('.').map_or(name, |(_, last)| last),
+            _ => glua_parser::split_last_path_segment(name).map_or(name, |(_, last)| last),
         };
 
         let mut matched = Vec::new();
@@ -2835,10 +2835,15 @@ impl LuaMemberIndex {
                     == Some(global_id)
             }));
         };
-        collect(&LuaMemberKey::Name(key_text.into()), &mut matched);
-        // A numeric field is keyed by its integer, not by its spelling.
-        if let Ok(index) = key_text.parse::<i64>() {
-            collect(&LuaMemberKey::Integer(index), &mut matched);
+        match glua_parser::path_segment_string_key(segment) {
+            Some(key) => collect(&LuaMemberKey::Name(key.into()), &mut matched),
+            None => {
+                collect(&LuaMemberKey::Name(segment.into()), &mut matched);
+                // A numeric field is keyed by its integer, not by its spelling.
+                if let Ok(index) = segment.parse::<i64>() {
+                    collect(&LuaMemberKey::Integer(index), &mut matched);
+                }
+            }
         }
 
         matched.sort_unstable_by_key(|member_id| member_id_sort_key(*member_id));

@@ -16,6 +16,88 @@ fn join_path(paths: &[SmolStr]) -> SmolStr {
     SmolStr::new(joined)
 }
 
+/// The access-path segment of the string key `key`: bare where it reads as a
+/// name would, else `["key"]` with `"` and `\` escaped. No bare segment holds
+/// a `.`, opens a bracket or starts as a number does, so `t["a.b"]` and
+/// `t.a.b`, or `t["1"]` and `t[1]`, never share a path.
+pub fn path_segment(key: &str) -> SmolStr {
+    let bare = key
+        .chars()
+        .next()
+        .is_some_and(|first| !first.is_ascii_digit() && !matches!(first, '-' | '['))
+        && !key.contains('.');
+    if bare {
+        return SmolStr::new(key);
+    }
+    let mut segment = String::with_capacity(key.len() + 4);
+    segment.push_str("[\"");
+    for ch in key.chars() {
+        if matches!(ch, '"' | '\\') {
+            segment.push('\\');
+        }
+        segment.push(ch);
+    }
+    segment.push_str("\"]");
+    SmolStr::new(segment)
+}
+
+/// The string key a segment [`path_segment`] bracketed names.
+pub fn path_segment_string_key(segment: &str) -> Option<String> {
+    let escaped = segment.strip_prefix("[\"")?.strip_suffix("\"]")?;
+    let mut key = String::with_capacity(escaped.len());
+    let mut chars = escaped.chars();
+    while let Some(ch) = chars.next() {
+        key.push(if ch == '\\' { chars.next()? } else { ch });
+    }
+    Some(key)
+}
+
+/// Where the `.`s separating `path`'s segments are: none inside a bracketed
+/// segment, string key or computed key.
+fn path_separators(path: &str) -> impl Iterator<Item = usize> + '_ {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    path.char_indices().filter_map(move |(index, ch)| {
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == open {
+                quote = None;
+            }
+            return None;
+        }
+        match ch {
+            '"' | '\'' if depth > 0 => quote = Some(ch),
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            '.' if depth == 0 => return Some(index),
+            _ => {}
+        }
+        None
+    })
+}
+
+/// `path`'s segments in order.
+pub fn path_segments(path: &str) -> impl Iterator<Item = &str> + '_ {
+    let mut start = 0;
+    path_separators(path)
+        .chain(std::iter::once(path.len()))
+        .map(move |end| {
+            let segment = &path[start..end];
+            start = end + 1;
+            segment
+        })
+}
+
+/// `path` split before its last segment, if it has more than one.
+pub fn split_last_path_segment(path: &str) -> Option<(&str, &str)> {
+    let at = path_separators(path).last()?;
+    Some((&path[..at], &path[at + 1..]))
+}
+
 /// How a computed index key is written into an access path.
 #[derive(Clone, Copy)]
 enum ComputedKey {
@@ -45,7 +127,7 @@ fn access_path(node: &LuaSyntaxNode, computed: ComputedKey) -> Option<SmolStr> {
             }
             LuaExpr::IndexExpr(index_expr) => {
                 match index_expr.get_index_key()? {
-                    LuaIndexKey::String(s) => paths.push(SmolStr::new(s.get_value())),
+                    LuaIndexKey::String(s) => paths.push(path_segment(&s.get_value())),
                     LuaIndexKey::Name(name) => paths.push(SmolStr::new(name.get_name_text())),
                     LuaIndexKey::Integer(i) => {
                         paths.push(SmolStr::new(i.get_number_value().to_string()))

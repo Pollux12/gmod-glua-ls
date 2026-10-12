@@ -5966,4 +5966,100 @@ end
         assert_that!(warm_return, eq(&cold_return));
         assert_that!(filled_after, eq(filled_from_slot));
     }
+
+    /// The types of `names`, each a local of `file_id`, humanized.
+    fn local_types(ws: &VirtualWorkspace, file_id: crate::FileId, names: &[&str]) -> Vec<String> {
+        names
+            .iter()
+            .map(|name| ws.humanize_type(ws.local_ty(file_id, name)))
+            .collect()
+    }
+
+    /// `T["a"]` and `T.a` name one field; `T["a.b"]` and `T.a.b` name two,
+    /// however the tables are written.
+    #[test]
+    fn a_string_key_holding_a_dot_names_its_own_field() {
+        let mut ws = VirtualWorkspace::new();
+        let literal = ws.def_file(
+            "lua/autorun/sh_literal.lua",
+            r#"
+            T = {
+                ["a.b"] = { x = 1 },
+                a = { b = { y = "text" } },
+            }
+            local own = T["a.b"].x
+            local leaked = T["a.b"].y
+            local nested = T.a.b.y
+            local same = T["a"].b.y
+            "#,
+        );
+        let assigned = ws.def_file(
+            "lua/autorun/sh_assigned.lua",
+            r#"
+            U = {}
+            U["a.b"] = {}
+            U["a.b"].x = 1
+            U.a = {}
+            U.a.b = {}
+            U.a.b.y = "text"
+            local own = U["a.b"].x
+            local leaked = U["a.b"].y
+            local nested = U.a.b.x
+            local same = U["a"].b.y
+            "#,
+        );
+
+        let names = ["own", "leaked", "nested", "same"];
+        assert_eq!(
+            local_types(&ws, literal, &names),
+            ["1", "nil", "\"text\"", "\"text\""]
+        );
+        assert_eq!(
+            local_types(&ws, assigned, &names),
+            ["1", "nil", "nil", "\"text\""]
+        );
+    }
+
+    #[test]
+    fn a_string_key_spelling_a_number_names_its_own_field() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_numeric.lua",
+            r#"
+            V = {}
+            V[1] = { x = 1 }
+            V["1"] = { y = "s" }
+            local int_x = V[1].x
+            local int_y = V[1].y
+            local str_x = V["1"].x
+            local str_y = V["1"].y
+            "#,
+        );
+
+        assert_eq!(
+            local_types(&ws, file_id, &["int_x", "int_y", "str_x", "str_y"]),
+            ["1", "nil", "nil", "\"s\""]
+        );
+    }
+
+    #[test]
+    fn editing_the_nested_path_leaves_the_dotted_key_field_alone() {
+        let path = "lua/autorun/sh_dotted.lua";
+        let original = "U = {}\nU[\"a.b\"] = { x = 1 }\nU.a = { b = { y = \"text\" } }\nlocal own = U[\"a.b\"].x\nlocal leaked = U[\"a.b\"].y\n";
+        let edited = "U = {}\nU[\"a.b\"] = { x = 1 }\nU.a = { b = { y = 2 } }\nlocal own = U[\"a.b\"].x\nlocal leaked = U[\"a.b\"].y\nlocal nested = U.a.b.y\n";
+        let ws = VirtualWorkspace::assert_warm_matches_cold(
+            |_| {},
+            &[(path, original)],
+            &[(path, edited)],
+        );
+
+        let file_id = ws
+            .analysis
+            .get_file_id(&ws.virtual_url_generator.new_uri(path))
+            .expect("the file has an id");
+        assert_eq!(
+            local_types(&ws, file_id, &["own", "leaked", "nested"]),
+            ["1", "nil", "2"]
+        );
+    }
 }

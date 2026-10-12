@@ -579,10 +579,13 @@ fn static_member_path_keys(path: &str) -> Option<Vec<LuaMemberKey>> {
         return None;
     }
 
-    path.split('.')
+    glua_parser::path_segments(path)
         .map(|part| {
             if part.is_empty() {
                 return None;
+            }
+            if let Some(key) = glua_parser::path_segment_string_key(part) {
+                return Some(LuaMemberKey::Name(key.into()));
             }
 
             Some(

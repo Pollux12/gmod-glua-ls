@@ -918,19 +918,18 @@ fn infer_namespace_member_decl_type(
 ) -> FunctionTypeResult {
     let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
     let member_key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
-    let member_key = match member_key {
-        LuaMemberKey::Name(name) => name.to_string(),
-        LuaMemberKey::Integer(i) => i.to_string(),
+    let (name, segment) = match member_key {
+        LuaMemberKey::Name(name) => (name.to_string(), glua_parser::path_segment(&name)),
+        LuaMemberKey::Integer(i) => (i.to_string(), SmolStr::new(i.to_string())),
         _ => return Err(InferFailReason::None),
     };
 
-    let namespace_or_type_id = format!("{}.{}", ns, member_key);
-    let type_id = LuaTypeDeclId::global(&namespace_or_type_id);
+    let type_id = LuaTypeDeclId::global(&format!("{ns}.{name}"));
     if db.get_type_index().get_type_decl(&type_id).is_some() {
         return Ok(LuaType::Def(type_id));
     }
 
     Ok(LuaType::Namespace(
-        SmolStr::new(namespace_or_type_id).into(),
+        SmolStr::new(format!("{ns}.{segment}")).into(),
     ))
 }

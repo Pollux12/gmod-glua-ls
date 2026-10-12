@@ -357,7 +357,7 @@ pub(crate) fn raw_get_access_path(call_expr: &LuaCallExpr) -> Option<String> {
     match args.next()? {
         LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal()? {
             LuaLiteralToken::String(string_token) => {
-                access_path.push_str(string_token.get_value().as_str());
+                access_path.push_str(&glua_parser::path_segment(&string_token.get_value()));
             }
             LuaLiteralToken::Number(number_token) => {
                 access_path.push_str(number_token.get_number_value().to_string().as_str());

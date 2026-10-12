@@ -1,8 +1,9 @@
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCommentOwner, LuaDocTag, LuaExpr, LuaForRangeStat,
     LuaForStat, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat, LuaLocalStat,
-    LuaSyntaxId, LuaSyntaxKind, LuaTableExpr, LuaVarExpr, NumberResult,
+    LuaSyntaxId, LuaSyntaxKind, LuaTableExpr, LuaVarExpr, NumberResult, path_segment,
 };
+use smol_str::SmolStr;
 
 use crate::{
     GlobalId, InFiled, LuaDeclExtra, LuaMemberFeature, LuaMemberId, LuaSemanticDeclId,
@@ -106,9 +107,9 @@ fn set_definition_sites(
         site: InFiled::new(file_id, table_expr.get_range()),
     });
     for field in table_expr.get_fields() {
-        let name = match field.get_field_key() {
-            Some(LuaIndexKey::Name(name)) => name.get_name_text().to_string(),
-            Some(LuaIndexKey::String(text)) => text.get_value(),
+        let segment = match field.get_field_key() {
+            Some(LuaIndexKey::Name(name)) => SmolStr::new(name.get_name_text()),
+            Some(LuaIndexKey::String(text)) => path_segment(&text.get_value()),
             _ => continue,
         };
         let Some(nested) = field
@@ -118,7 +119,7 @@ fn set_definition_sites(
         else {
             continue;
         };
-        let nested_path = GlobalId::new(&format!("{}.{name}", path.get_name()));
+        let nested_path = GlobalId::new(&format!("{}.{segment}", path.get_name()));
         set_definition_sites(ops, nested_path, &nested, file_id);
     }
 }

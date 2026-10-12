@@ -71,12 +71,6 @@ impl GlobalId {
     }
 
     pub fn get_prev_id(&self) -> Option<GlobalId> {
-        let name = self.get_name();
-        if let Some(pos) = name.rfind('.') {
-            let new_name = &name[..pos];
-            return Some(GlobalId::new(new_name));
-        }
-
-        None
+        glua_parser::split_last_path_segment(self.get_name()).map(|(owner, _)| GlobalId::new(owner))
     }
 }

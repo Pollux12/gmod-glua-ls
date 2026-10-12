@@ -5412,4 +5412,35 @@ mod tests {
             .map(|(id, _)| id)
             .or_fail()
     }
+
+    /// `T["a.b"]` and `T.a.b` are two fields, so neither offers the other's
+    /// members.
+    #[gtest]
+    fn a_dotted_string_key_completes_only_its_own_members() -> Result<()> {
+        let tables = r#"
+            T = {
+                ["a.b"] = { own = 1 },
+                a = { b = { nested = 2 } },
+            }
+        "#;
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_completion(
+            &format!("{tables}local v = T[\"a.b\"].<??>"),
+            vec![VirtualCompletionItem {
+                label: "own".to_string(),
+                kind: CompletionItemKind::FIELD,
+                label_detail: Some(" = 1".to_string()),
+            }],
+        ));
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_completion(
+            &format!("{tables}local v = T.a.b.<??>"),
+            vec![VirtualCompletionItem {
+                label: "nested".to_string(),
+                kind: CompletionItemKind::FIELD,
+                label_detail: Some(" = 2".to_string()),
+            }],
+        ));
+        Ok(())
+    }
 }

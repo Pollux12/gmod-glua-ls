@@ -88,10 +88,11 @@ impl Touched {
 
 /// The method name a global function path ends in, if it names a method.
 fn method_name(global_id: &GlobalId) -> Option<SmolStr> {
-    global_id
-        .get_name()
-        .rsplit_once('.')
-        .map(|(_, method)| SmolStr::new(method))
+    let (_, method) = glua_parser::split_last_path_segment(global_id.get_name())?;
+    Some(
+        glua_parser::path_segment_string_key(method)
+            .map_or_else(|| SmolStr::new(method), SmolStr::from),
+    )
 }
 
 impl Contributions {
