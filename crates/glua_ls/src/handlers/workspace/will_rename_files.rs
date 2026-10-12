@@ -26,7 +26,7 @@ pub async fn on_will_rename_files_handler(
 
 /// The edits rewriting the load paths that name `renames`' files, in each
 /// loading file's text as indexed now, before the renames.
-pub(super) fn load_path_edits(db: &DbIndex, renames: &FileRenames) -> Vec<(FileId, TextEdit)> {
+fn load_path_edits(db: &DbIndex, renames: &FileRenames) -> Vec<(FileId, TextEdit)> {
     let vfs = db.get_vfs();
     load_path_rename_edits(db, renames)
         .into_iter()
@@ -44,7 +44,7 @@ pub(super) fn load_path_edits(db: &DbIndex, renames: &FileRenames) -> Vec<(FileI
 }
 
 /// `edits` addressed to each file's URI in `vfs`.
-pub(super) fn workspace_edit(vfs: &Vfs, edits: Vec<(FileId, TextEdit)>) -> Option<WorkspaceEdit> {
+fn workspace_edit(vfs: &Vfs, edits: Vec<(FileId, TextEdit)>) -> Option<WorkspaceEdit> {
     #[allow(clippy::mutable_key_type)]
     let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
     for (file_id, edit) in edits {

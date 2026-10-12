@@ -111,6 +111,16 @@ impl ServerContextSnapshot {
         is_stale_document_version(self.document_versions().get(uri).copied(), version)
     }
 
+    /// The version of the open document `uri` whose text the server holds.
+    pub fn applied_document_version(&self, uri: &Uri) -> Option<i32> {
+        match self.document_versions().get(uri).copied() {
+            Some(DocumentVersionState::Open {
+                applied_version, ..
+            }) => applied_version,
+            _ => None,
+        }
+    }
+
     pub fn note_document_applied_version(&self, uri: &Uri, version: i32) {
         let mut versions = self.document_versions();
         let next_state = match versions.get(uri).copied() {

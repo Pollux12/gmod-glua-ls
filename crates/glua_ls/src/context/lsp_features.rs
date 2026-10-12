@@ -44,6 +44,16 @@ impl LspFeatures {
     }
 
     /// Gates `workspace/applyEdit`.
+    /// Whether a workspace edit can name the document version it was made for.
+    pub fn supports_document_changes(&self) -> bool {
+        self.client_capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.workspace_edit.as_ref())
+            .and_then(|workspace_edit| workspace_edit.document_changes)
+            .unwrap_or(false)
+    }
+
     pub fn supports_apply_edit(&self) -> bool {
         self.client_capabilities
             .workspace

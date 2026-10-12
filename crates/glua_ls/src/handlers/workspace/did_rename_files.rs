@@ -1,12 +1,17 @@
 use std::collections::HashMap;
 
-use glua_code_analysis::{FileId, file_path_to_uri, read_file_with_encoding, uri_to_file_path};
-use lsp_types::{
-    ApplyWorkspaceEditParams, MessageActionItem, MessageType, RenameFilesParams,
-    ShowMessageRequestParams, TextEdit,
+use glua_code_analysis::{
+    DbIndex, FileId, FileRenames, Vfs, file_path_to_uri, load_path_rename_edits,
+    read_file_with_encoding, uri_to_file_path,
 };
+use lsp_types::{
+    ApplyWorkspaceEditParams, DocumentChanges, MessageActionItem, MessageType, OneOf3,
+    OptionalVersionedTextDocumentIdentifier, RenameFilesParams, ShowMessageRequestParams,
+    TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
+};
+use rowan::TextRange;
 
-use super::will_rename_files::{file_renames, load_path_edits, workspace_edit};
+use super::will_rename_files::file_renames;
 use crate::{context::ServerContextSnapshot, handlers::text_document::apply_file_system_changes};
 
 /// Moves the renamed files in the server's state. A client that asks
@@ -24,7 +29,7 @@ pub async fn on_did_rename_files_handler(
         // The load paths are found where the files are indexed now, before
         // they move.
         let edits = if offers_edit {
-            load_path_edits(analysis.compilation.get_db(), &renames)
+            offered_edits(analysis.compilation.get_db(), &renames)
         } else {
             Vec::new()
         };
@@ -84,10 +89,97 @@ pub async fn on_did_rename_files_handler(
     Some(())
 }
 
+/// A load path edit as offered: the text it replaces in its file as indexed
+/// before the rename, and where.
+struct OfferedEdit {
+    file_id: FileId,
+    range: TextRange,
+    old_text: String,
+    new_text: String,
+}
+
+fn offered_edits(db: &DbIndex, renames: &FileRenames) -> Vec<OfferedEdit> {
+    let vfs = db.get_vfs();
+    load_path_rename_edits(db, renames)
+        .into_iter()
+        .filter_map(|edit| {
+            let old_text = vfs
+                .get_file_content(&edit.file_id)?
+                .get(std::ops::Range::<usize>::from(edit.range))?
+                .to_string();
+            Some(OfferedEdit {
+                file_id: edit.file_id,
+                range: edit.range,
+                old_text,
+                new_text: edit.new_text,
+            })
+        })
+        .collect()
+}
+
+/// The `edits` whose text is still where it was offered, addressed to each
+/// file where it is now, at the document version the server holds when the
+/// client can check it.
+fn current_edit(
+    context: &ServerContextSnapshot,
+    vfs: &Vfs,
+    edits: Vec<OfferedEdit>,
+) -> Option<WorkspaceEdit> {
+    let mut by_uri: Vec<(Uri, Vec<TextEdit>)> = Vec::new();
+    for edit in edits {
+        let Some(document) = vfs.get_document(&edit.file_id) else {
+            continue;
+        };
+        let current = document
+            .get_text()
+            .get(std::ops::Range::<usize>::from(edit.range));
+        if current != Some(edit.old_text.as_str()) {
+            continue;
+        }
+        let Some(range) = document.to_lsp_range(edit.range) else {
+            continue;
+        };
+        let text_edit = TextEdit {
+            range,
+            new_text: edit.new_text,
+        };
+        let uri = document.get_uri();
+        match by_uri.iter_mut().find(|(known, _)| *known == uri) {
+            Some((_, text_edits)) => text_edits.push(text_edit),
+            None => by_uri.push((uri, vec![text_edit])),
+        }
+    }
+    if by_uri.is_empty() {
+        return None;
+    }
+    by_uri.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+    if !context.lsp_features().supports_document_changes() {
+        return Some(WorkspaceEdit {
+            changes: Some(by_uri.into_iter().collect()),
+            ..Default::default()
+        });
+    }
+    let document_edits = by_uri
+        .into_iter()
+        .map(|(uri, text_edits)| TextDocumentEdit {
+            text_document: OptionalVersionedTextDocumentIdentifier {
+                version: context.applied_document_version(&uri),
+                uri,
+            },
+            edits: text_edits.into_iter().map(OneOf3::Left).collect(),
+        })
+        .collect();
+    Some(WorkspaceEdit {
+        document_changes: Some(DocumentChanges::Edits(document_edits)),
+        ..Default::default()
+    })
+}
+
 /// Asks the user whether to rewrite the load paths naming the renamed files,
 /// and applies `edits` if so. A moved file keeps its id, so each edit goes to
-/// where its file is now. Shutting down ends an unanswered request.
-async fn offer_load_path_edits(context: ServerContextSnapshot, edits: Vec<(FileId, TextEdit)>) {
+/// where its file is now; an edit whose text changed while the user decided
+/// is dropped. Shutting down ends an unanswered request.
+async fn offer_load_path_edits(context: ServerContextSnapshot, edits: Vec<OfferedEdit>) {
     let shutdown = context.debounced_analysis().shutdown_token();
     let update = MessageActionItem {
         title: "Update".to_string(),
@@ -107,16 +199,11 @@ async fn offer_load_path_edits(context: ServerContextSnapshot, edits: Vec<(FileI
     if answer.is_none_or(|answer| answer.title != update.title) {
         return;
     }
-    let Some(edit) = workspace_edit(
-        context
-            .analysis()
-            .read()
-            .await
-            .compilation
-            .get_db()
-            .get_vfs(),
-        edits,
-    ) else {
+    let edit = {
+        let analysis = context.analysis().read().await;
+        current_edit(&context, analysis.compilation.get_db().get_vfs(), edits)
+    };
+    let Some(edit) = edit else {
         return;
     };
     context
@@ -426,6 +513,103 @@ mod tests {
                 }],
             )]);
             assert_eq!(params.edit.changes, Some(expected));
+        });
+    }
+
+    /// Accepts the load path offer `workspace`'s rename made, and returns the
+    /// edit the server then applies, if any.
+    async fn accept_offer(workspace: &RenamedWorkspace) -> Option<ApplyWorkspaceEditParams> {
+        let prompt =
+            next_request(&workspace.client, Duration::from_secs(10)).expect("the user is asked");
+        assert_eq!(prompt.method, "window/showMessageRequest");
+        accept(workspace, prompt).await
+    }
+
+    async fn accept(
+        workspace: &RenamedWorkspace,
+        prompt: lsp_server::Request,
+    ) -> Option<ApplyWorkspaceEditParams> {
+        workspace
+            .snapshot
+            .client()
+            .on_response(lsp_server::Response::new_ok(
+                prompt.id,
+                serde_json::json!({ "title": "Update" }),
+            ))
+            .await;
+        let apply = next_request(&workspace.client, Duration::from_secs(2))?;
+        assert_eq!(apply.method, "workspace/applyEdit");
+        Some(serde_json::from_value(apply.params).expect("applyEdit params"))
+    }
+
+    /// An edit to the loading file while the user decides leaves its load path
+    /// edit out: it was made for text that is no longer there.
+    #[test]
+    fn a_load_path_edit_is_dropped_when_its_text_changed_before_acceptance() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let workspace =
+                workspace_to_rename_for("changed", RENAMED, applying_client(false)).await;
+            rename(&workspace).await;
+            let prompt = next_request(&workspace.client, Duration::from_secs(10))
+                .expect("the user is asked");
+
+            workspace
+                .snapshot
+                .analysis()
+                .write()
+                .await
+                .update_file_by_uri(
+                    &workspace.loader_uri,
+                    Some(
+                        "print(\"sh_old.lua was here\")
+"
+                        .to_string(),
+                    ),
+                );
+
+            assert!(accept(&workspace, prompt).await.is_none());
+        });
+    }
+
+    /// A client that checks document versions gets the edit for the version of
+    /// each open document the server holds.
+    #[test]
+    fn a_load_path_edit_names_the_document_version_it_was_made_for() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut capabilities = applying_client(false);
+            capabilities
+                .workspace
+                .as_mut()
+                .expect("workspace capabilities")
+                .workspace_edit = Some(lsp_types::WorkspaceEditClientCapabilities {
+                document_changes: Some(true),
+                ..Default::default()
+            });
+            let workspace = workspace_to_rename_for("versioned", RENAMED, capabilities).await;
+            workspace
+                .snapshot
+                .note_document_applied_version(&workspace.loader_uri, 7);
+            rename(&workspace).await;
+
+            let params = accept_offer(&workspace).await.expect("the edit is applied");
+
+            assert_eq!(
+                params.edit.document_changes,
+                Some(lsp_types::DocumentChanges::Edits(vec![
+                    lsp_types::TextDocumentEdit {
+                        text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
+                            uri: workspace.loader_uri.clone(),
+                            version: Some(7),
+                        },
+                        edits: vec![lsp_types::OneOf3::Left(TextEdit {
+                            range: Range::new(Position::new(0, 9), Position::new(0, 19)),
+                            new_text: "sh_new.lua".to_string(),
+                        })],
+                    }
+                ]))
+            );
         });
     }
 
