@@ -3563,6 +3563,30 @@ mod test {
         assert_eq!(reports_param_mismatch(&setups), [false, true]);
     }
 
+    /// A field the index table lacks is read through that table's own
+    /// metatable in turn, as a class inheriting from a base reads it.
+    #[test]
+    fn a_field_read_through_a_chain_of_index_tables_is_checked_against_the_class() {
+        let chained = |base_foo: &str| {
+            format!(
+                r#"
+            local Base = {{ foo = {base_foo} }}
+            local Class = setmetatable({{}}, {{ __index = Base }})
+            local function new()
+                local value = {{}}
+                setmetatable(value, {{ __index = Class }})
+                return value
+            end
+            consume(new())
+            "#
+            )
+        };
+        let good = chained(r#""yes""#);
+        let wrong = chained("123");
+
+        assert_eq!(reports_param_mismatch(&[&good, &wrong]), [false, true]);
+    }
+
     /// An `__index` function without a declared result returns one inferred
     /// type for every key, which says nothing of one field: a recursive
     /// copy-on-write proxy, inferred to return the proxy itself, fills the
