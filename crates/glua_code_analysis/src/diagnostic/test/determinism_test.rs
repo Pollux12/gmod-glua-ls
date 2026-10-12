@@ -718,4 +718,68 @@ mod tests {
             "type-not-found must clear once the class decl exists: {snapshots:?}"
         );
     }
+
+    /// Two meta files that each assign a fresh table to the same field of a
+    /// class keep one table each, in whichever order they are analysed: a
+    /// table literal is a value, so the other file's never declares this one.
+    #[gtest]
+    fn a_meta_table_literal_keeps_its_own_type_whichever_file_lands_first() {
+        let sources = [
+            (
+                "---@meta
+---@class MetaSkin
+MetaSkin = {}
+MetaSkin.tex = {}
+",
+                None,
+            ),
+            (
+                "---@meta
+---@class MetaSkinTex
+---@class MetaSkin
+---@field tex MetaSkinTex
+MetaSkin = {}
+MetaSkin.tex = {}
+",
+                Some("MetaSkinTex"),
+            ),
+        ];
+        for (source, declared) in sources {
+            for order in [["lua/a.lua", "lua/b.lua"], ["lua/b.lua", "lua/a.lua"]] {
+                let mut ws = VirtualWorkspace::new();
+                let file_ids = order.map(|path| ws.def_file(path, source));
+                let db = ws.analysis.compilation.get_db();
+                for file_id in file_ids {
+                    let root = db
+                        .get_vfs()
+                        .get_syntax_tree(&file_id)
+                        .expect("syntax tree")
+                        .get_chunk_node();
+                    let literal = root
+                        .descendants::<glua_parser::LuaTableExpr>()
+                        .last()
+                        .expect("the field's table literal");
+                    let field = root
+                        .descendants::<LuaIndexExpr>()
+                        .last()
+                        .expect("the field assignment");
+                    let cached = db
+                        .get_type_index()
+                        .get_type_cache(&crate::LuaTypeOwner::Member(crate::LuaMemberId::new(
+                            field.get_syntax_id(),
+                            file_id,
+                        )))
+                        .map(|cache| cache.as_type().clone());
+                    let expected = match declared {
+                        Some(name) => crate::LuaType::Ref(crate::LuaTypeDeclId::global(name)),
+                        None => crate::LuaType::TableConst(crate::InFiled::new(
+                            file_id,
+                            literal.get_range(),
+                        )),
+                    };
+                    assert_eq!(cached, Some(expected), "{order:?}, file {file_id:?}");
+                }
+            }
+        }
+    }
 }

@@ -1283,6 +1283,8 @@ fn declared_empty_table_assignment_type(
 
 fn declared_table_assignment_type(db: &crate::DbIndex, declared_type: &LuaType) -> Option<LuaType> {
     match declared_type {
+        // Another assignment's table literal, a value that declares nothing.
+        LuaType::TableConst(_) => None,
         typ if typ.is_table() => Some(typ.clone()),
         LuaType::Ref(type_id) | LuaType::Def(type_id)
             if db
