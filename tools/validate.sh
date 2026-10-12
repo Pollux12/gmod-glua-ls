@@ -41,8 +41,12 @@ det() { # corpus jobs env...
 
 corpus() { # name dir: glua_check JSON, diffed against VALIDATE_REF/<name>.json when present
   local name=$1 dir=$2
-  "$REL/glua_check$X" "$dir" -f json --output "$OUT/$name.json" --gmod-annotations "$ANN" > /dev/null 2>&1
-  [ -f "$OUT/$name.json" ] || { echo "glua_check wrote nothing"; return 1; }
+  rm -f "$OUT/$name.json"
+  # Exits 1 on error diagnostics too, so only complete JSON output proves a finished run.
+  "$REL/glua_check$X" "$dir" -f json --output "$OUT/$name.json" --gmod-annotations "$ANN" > "$OUT/$name.check.log" 2>&1
+  local rc=$?
+  node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$OUT/$name.json" 2> /dev/null ||
+    { echo "glua_check exited $rc without complete output (see $OUT/$name.check.log)"; return 1; }
   if [ -n "${VALIDATE_REF:-}" ] && [ -f "$VALIDATE_REF/$name.json" ]; then
     node tools/diagnostics_diff.js "$VALIDATE_REF/$name.json" "$OUT/$name.json"
   else
