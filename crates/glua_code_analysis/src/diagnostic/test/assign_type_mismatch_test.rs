@@ -4121,6 +4121,29 @@ p.Paint = draw_label"
 }
 
 #[test]
+fn a_function_without_returns_that_still_mismatches_is_reported_as_written() {
+    let mut ws = crate::VirtualWorkspace::new();
+    ws.analysis
+        .diagnostic
+        .enable_only(crate::DiagnosticCode::AssignTypeMismatch);
+    let file_id = ws.def(&format!(
+        "{HOOK_CLASS}
+---@param code string
+local function on_press(s, code) end
+p.OnMousePressed = on_press"
+    ));
+    let messages = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|diagnostic| diagnostic.message)
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(!messages[0].contains("-> any"), "{messages:?}");
+}
+
+#[test]
 fn closure_returning_the_wrong_type_is_still_reported_for_a_method_field() {
     let mut ws = crate::VirtualWorkspace::new();
     let code = format!("{HOOK_CLASS}\np.Paint = function(s, w, h) return \"x\" end");

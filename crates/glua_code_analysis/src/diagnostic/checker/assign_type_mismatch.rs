@@ -202,11 +202,11 @@ fn check_index_expr(
         };
 
     let value_type = semantic_model.infer_expr_list_value_type_at(exprs, value_idx)?;
-    let value_type = if source_type.as_ref().is_some_and(expects_function) {
-        function_without_returns_as_method_definition(semantic_model, value_type)
-    } else {
-        value_type
-    };
+    let value_type = function_without_returns_as_method_definition(
+        semantic_model,
+        source_type.as_ref(),
+        value_type,
+    );
     check_assign_type_mismatch(
         context,
         semantic_model,
@@ -234,21 +234,16 @@ fn check_index_expr(
     Some(())
 }
 
-fn expects_function(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Union(union) => union.types().any(LuaType::is_function),
-        typ => typ.is_function(),
-    }
-}
-
 /// A function that returns nothing is accepted for a member's declared return,
 /// as `function obj:Method() end` is, so `obj.Method = function() end` and
-/// `obj.Method = handler` are too.
+/// `obj.Method = handler` are too, when the return is all that keeps it from
+/// the member's type.
 fn function_without_returns_as_method_definition(
     semantic_model: &SemanticModel,
+    source_type: Option<&LuaType>,
     value_type: LuaType,
 ) -> LuaType {
-    let LuaType::Signature(signature_id) = &value_type else {
+    let (Some(source_type), LuaType::Signature(signature_id)) = (source_type, &value_type) else {
         return value_type;
     };
     let Some(signature) = semantic_model
@@ -262,7 +257,15 @@ fn function_without_returns_as_method_definition(
     if !func.get_ret().is_nil() {
         return value_type;
     }
-    LuaType::DocFunction((*func).clone().with_ret(LuaType::Any).into())
+    let relaxed = LuaType::DocFunction((*func).clone().with_ret(LuaType::Any).into());
+    if semantic_model
+        .type_check_detail(source_type, &relaxed)
+        .is_ok()
+    {
+        relaxed
+    } else {
+        value_type
+    }
 }
 
 fn index_target_is_inferred(semantic_model: &SemanticModel, index_expr: &LuaIndexExpr) -> bool {
