@@ -300,6 +300,12 @@ pub async fn on_did_change_text_document(
         return Some(());
     }
 
+    // Only an open document is changed, and its didOpen may have been
+    // superseded by this change before it took the document's ownership.
+    if let Some(file_id) = file_id {
+        context.file_diagnostic().store().set_open(file_id, true);
+    }
+
     // Schedule debounced reindex — rapid edits into a single reindex.
     //
     // Profiling: `notify_to_schedule_ms` covers the applied-version note
@@ -569,6 +575,43 @@ mod tests {
             change(&snapshot, &uri, 2, NEW_TEXT).await;
 
             verify_new_session_applied(&snapshot, &uri).await
+        })
+    }
+
+    /// A change that supersedes the document's didOpen before it ran makes
+    /// the document open all the same.
+    #[gtest]
+    fn a_change_that_supersedes_the_open_opens_the_document() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (context, _peer, uri, _folder) = context_with_disk_file("open_superseded").await;
+            let snapshot = context.snapshot();
+            snapshot.note_document_seen_version(&uri, 2);
+            on_did_open_text_document(
+                snapshot.clone(),
+                DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "lua".to_string(),
+                        version: 1,
+                        text: DISK_TEXT.to_string(),
+                    },
+                },
+            )
+            .await;
+            change(&snapshot, &uri, 2, NEW_TEXT).await;
+
+            let file_id = snapshot
+                .analysis()
+                .read()
+                .await
+                .get_file_id(&uri)
+                .expect("the document is indexed");
+            let store = snapshot.file_diagnostic().store();
+            verify_that!(store.any_open(&[file_id], &[]), eq(true))?;
+
+            close(&snapshot, &uri).await;
+            verify_that!(store.any_open(&[file_id], &[]), eq(false))
         })
     }
 
