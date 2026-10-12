@@ -884,4 +884,38 @@ foo({})
             ),
         ));
     }
+
+    /// Whether the literal `index_table` backs through `setmetatable` is
+    /// reported missing a required field.
+    fn reports_missing_with_index_table(index_table: &str) -> bool {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        !ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            &format!(
+                r#"
+                ---@class MetaRequired
+                ---@field foo string
+
+                ---@param value MetaRequired
+                local function consume(value) end
+
+                local value = {{}}
+                setmetatable(value, {{ __index = {index_table} }})
+                consume(value)
+                "#
+            ),
+        )
+    }
+
+    /// A field the metatable's `__index` table supplies is there when read;
+    /// one it lacks stays missing. A supplied field of the wrong type is not
+    /// missing: the type check reports it.
+    #[test]
+    fn a_field_an_index_table_supplies_is_not_missing() {
+        assert_eq!(
+            [r#"{ foo = "yes" }"#, "{ foo = 123 }", r#"{ bar = "yes" }"#]
+                .map(reports_missing_with_index_table),
+            [false, false, true]
+        );
+    }
 }

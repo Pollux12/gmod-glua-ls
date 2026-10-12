@@ -73,6 +73,7 @@ pub(crate) use member::infer_raw_member_type_with_cache;
 pub(crate) use member::member_key_matches_type;
 pub(crate) use member::merge_open_table_types;
 pub(crate) use member::visible_super_types_in_workspace_for_file_at_offset;
+pub(crate) use member::{MetatableIndexField, find_metatable_index_field};
 pub(crate) use member::{dynamic_field_type_without, resolve_dynamic_field_member};
 use reference::is_reference_to;
 use rowan::{NodeOrToken, TextRange};

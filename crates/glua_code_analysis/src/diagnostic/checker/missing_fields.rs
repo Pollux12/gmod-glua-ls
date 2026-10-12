@@ -8,8 +8,9 @@ use glua_parser::{
 };
 
 use crate::{
-    DbIndex, DiagnosticCode, LuaMemberFeature, LuaMemberOwner, LuaSemanticDeclId, LuaType,
-    LuaTypeCache, LuaTypeDeclId, SemanticModel, VariadicType,
+    DbIndex, DiagnosticCode, FileId, InFiled, LuaMemberFeature, LuaMemberKey, LuaMemberOwner,
+    LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDeclId, SemanticModel, VariadicType,
+    semantic::{MetatableIndexField, find_metatable_index_field},
 };
 
 use super::{Checker, DiagnosticContext, humanize_lint_type};
@@ -182,6 +183,7 @@ fn check_table_expr(
     }
 
     remove_fields_completed_after(semantic_model, &table_type, expr, &mut missing);
+    remove_fields_supplied_by_metatable(db, semantic_model.get_file_id(), expr, &mut missing);
     if missing.is_empty() {
         return Some(());
     }
@@ -337,6 +339,28 @@ fn remove_fields_filled_by_callee(
     }
 
     Some(())
+}
+
+/// A field the literal's metatable `__index` answers is there when read, so it
+/// is not missing; whether its type fits is the type check's to report.
+fn remove_fields_supplied_by_metatable(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: &LuaTableExpr,
+    missing: &mut HashSet<&str>,
+) {
+    let table = InFiled::new(file_id, expr.get_range());
+    missing.retain(|name| {
+        let key = name
+            .strip_prefix('[')
+            .and_then(|index| index.strip_suffix(']'))
+            .and_then(|index| index.parse::<i64>().ok())
+            .map_or_else(|| LuaMemberKey::Name((*name).into()), LuaMemberKey::Integer);
+        matches!(
+            find_metatable_index_field(db, &table, &key),
+            MetatableIndexField::Absent
+        )
+    });
 }
 
 /// The path the literal is assigned to, e.g. `self.portals` or `cfg`.
