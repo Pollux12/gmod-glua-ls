@@ -21,7 +21,7 @@ function load(file) {
             const range = `${start.line + 1}:${start.character + 1}-${end.line + 1}:${end.character + 1}`;
             return `${range} ${SEVERITY[d.severity] ?? d.severity} [${d.code}] ${String(d.message).replace(/[\r\n]+/g, ' ')}`;
         });
-        byFile.set(paths[i].slice(root.length).toLowerCase(), keys);
+        byFile.set(paths[i].slice(root.length), keys);
     });
     return byFile;
 }
