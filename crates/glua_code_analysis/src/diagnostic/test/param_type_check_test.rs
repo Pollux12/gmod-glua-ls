@@ -3601,6 +3601,81 @@ mod test {
         assert_eq!(reports_param_mismatch(&setups), [false, false, true, true]);
     }
 
+    /// An `__index` value read as a read through it resolves: every
+    /// alternative of a union or alias answers, a generic instantiated to a
+    /// constant key answers that key, and a table backed by a function
+    /// without a declared result says nothing of one key.
+    #[test]
+    fn a_field_read_through_an_index_value_answers_as_a_read_would() {
+        let setups = [
+            r#"
+            ---@alias IndexEither table<string, string>|table<string, integer>
+            ---@type IndexEither
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@alias IndexSame table<string, string>|{ foo: string }
+            ---@type IndexSame
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@generic K
+            ---@param key std.ConstTpl<K>
+            ---@return table<K, string>
+            local function make_fallback(key)
+                return {}
+            end
+            local value = {}
+            setmetatable(value, { __index = make_fallback("foo") })
+            consume(value)
+            "#,
+            r#"
+            local fallback = {}
+            setmetatable(fallback, {
+                __index = function(t, key)
+                    if key == "foo" then return "yes" end
+                    return 123
+                end
+            })
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+        ];
+
+        assert_eq!(reports_param_mismatch(&setups), [true, false, false, false]);
+    }
+
+    /// An `__index` that may be nil may leave the field nil, which only a
+    /// nullable-tolerant check accepts in a non-nullable field.
+    #[test]
+    fn a_field_read_through_a_nullable_index_value_may_be_nil() {
+        let setup = metatable_backed_value(
+            r#"
+            ---@return table<string, string>?
+            local function make_fallback() end
+            local value = {}
+            setmetatable(value, { __index = make_fallback() })
+            consume(value)
+            "#,
+        );
+        let reports = [true, false].map(|allow_nullable| {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let mut emmyrc = ws.get_emmyrc();
+            emmyrc.strict.allow_nullable_as_non_nullable = allow_nullable;
+            ws.update_emmyrc(emmyrc);
+            !ws.check_code_for(DiagnosticCode::ParamTypeMismatch, &setup)
+        });
+
+        assert_eq!(reports, [false, true]);
+    }
+
     /// A field the index table lacks is read through that table's own
     /// metatable in turn, as a class inheriting from a base reads it.
     #[test]

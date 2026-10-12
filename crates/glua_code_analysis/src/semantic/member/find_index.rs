@@ -1,9 +1,9 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
-    DbIndex, InFiled, InferGuardRef, LuaGenericType, LuaIntersectionType, LuaMemberKey,
-    LuaMemberOwner, LuaMergedTableType, LuaObjectType, LuaOperatorMetaMethod, LuaOperatorOwner,
-    LuaSemanticDeclId, LuaType, LuaTypeDeclId, LuaUnionType, TypeOps,
+    DbIndex, InFiled, InferFailReason, InferGuardRef, LuaGenericType, LuaIntersectionType,
+    LuaMemberKey, LuaMemberOwner, LuaMergedTableType, LuaObjectType, LuaOperatorMetaMethod,
+    LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, LuaUnionType, TypeOps,
     semantic::{
         InferGuard,
         generic::{TypeSubstitutor, instantiate_type_generic},
@@ -425,16 +425,47 @@ pub(crate) enum MetatableIndexField {
     Unknown,
 }
 
-/// What `table`'s metatable `__index` supplies for `key`: a table's member of
-/// that key or the value of an index signature that admits it, or the declared
-/// result of a function whose key parameter takes it, as a read through it
-/// resolves. A function's inferred result merges what it returns for every
-/// key, so it says nothing of one key's value.
+impl MetatableIndexField {
+    /// What a read finds when either `self` or `other` may answer it.
+    fn or(self, db: &DbIndex, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::Absent, Self::Absent) => Self::Absent,
+            (Self::Present(left), Self::Present(right)) => {
+                Self::Present(TypeOps::Union.apply(db, &left, &right))
+            }
+            (Self::Present(typ), Self::Absent) | (Self::Absent, Self::Present(typ)) => {
+                Self::Present(TypeOps::Union.apply(db, &typ, &LuaType::Nil))
+            }
+        }
+    }
+}
+
+/// What `table`'s metatable `__index` supplies for `key`, as a read through it
+/// resolves: what a read of the key finds in an `__index` value, through its
+/// own metatable when it lacks the key, or the declared result of a function
+/// whose key parameter takes it. A function's inferred result merges what it
+/// returns for every key, so it says nothing of one key's value.
 pub(crate) fn find_metatable_index_field(
     db: &DbIndex,
     table: &InFiled<TextRange>,
     key: &LuaMemberKey,
 ) -> MetatableIndexField {
+    metatable_index_field(db, table, key, &mut Vec::new())
+}
+
+/// [`find_metatable_index_field`], past the `tables` already looked through:
+/// a chain that comes back to one supplies nothing new.
+fn metatable_index_field(
+    db: &DbIndex,
+    table: &InFiled<TextRange>,
+    key: &LuaMemberKey,
+    tables: &mut Vec<InFiled<TextRange>>,
+) -> MetatableIndexField {
+    if tables.contains(table) {
+        return MetatableIndexField::Absent;
+    }
+    tables.push(table.clone());
     let Some(metatable) = db.get_metatable_index().get(table) else {
         return MetatableIndexField::Absent;
     };
@@ -445,46 +476,8 @@ pub(crate) fn find_metatable_index_field(
         let Ok(index_type) = index_item.resolve_type(db) else {
             return MetatableIndexField::Unknown;
         };
-        match crate::semantic::infer::classify_metatable_index_candidate(&index_type) {
-            crate::semantic::infer::MetatableIndexCandidate::Supported(index_type) => {
-                if let Some(member) =
-                    super::find_members_with_key(db, &index_type, key.clone(), false)
-                        .into_iter()
-                        .flatten()
-                        .next()
-                {
-                    return MetatableIndexField::Present(member.typ);
-                }
-                let Some(key_type) = member_key_as_type(key) else {
-                    return MetatableIndexField::Unknown;
-                };
-                return find_index_operations(db, &index_type)
-                    .into_iter()
-                    .flatten()
-                    .find(|operation| match &operation.key {
-                        LuaMemberKey::ExprType(
-                            LuaType::StringConst(_) | LuaType::IntegerConst(_),
-                        ) => false,
-                        LuaMemberKey::ExprType(index_key) => {
-                            crate::check_type_compact(db, index_key, &key_type).is_ok()
-                        }
-                        _ => false,
-                    })
-                    .map_or(MetatableIndexField::Absent, |operation| {
-                        MetatableIndexField::Present(operation.typ)
-                    });
-            }
-            crate::semantic::infer::MetatableIndexCandidate::Unsupported
-                if index_type.is_nil() || matches!(index_type, LuaType::BooleanConst(false)) =>
-            {
-                return MetatableIndexField::Absent;
-            }
-            crate::semantic::infer::MetatableIndexCandidate::Unsupported
-                if !index_type.is_function() =>
-            {
-                return MetatableIndexField::Unknown;
-            }
-            crate::semantic::infer::MetatableIndexCandidate::Unsupported => {}
+        if !index_type.is_function() {
+            return index_value_field(db, &index_type, key, tables);
         }
     }
 
@@ -512,4 +505,41 @@ pub(crate) fn find_metatable_index_field(
         }
     }
     MetatableIndexField::Absent
+}
+
+/// What a read of `key` finds in `index_type`, the value of an `__index`.
+fn index_value_field(
+    db: &DbIndex,
+    index_type: &LuaType,
+    key: &LuaMemberKey,
+    tables: &mut Vec<InFiled<TextRange>>,
+) -> MetatableIndexField {
+    match index_type {
+        LuaType::Nil | LuaType::BooleanConst(false) => MetatableIndexField::Absent,
+        LuaType::Union(union) => union
+            .types()
+            .map(|alternative| index_value_field(db, alternative, key, tables))
+            .reduce(|left, right| left.or(db, right))
+            .unwrap_or(MetatableIndexField::Absent),
+        LuaType::TypeGuard(inner) => index_value_field(db, inner, key, tables),
+        LuaType::Ref(type_id) | LuaType::Def(type_id)
+            if let Some(origin) = db
+                .get_type_index()
+                .get_type_decl(type_id)
+                .filter(|decl| decl.is_alias())
+                .and_then(|decl| decl.get_alias_origin(db, None)) =>
+        {
+            index_value_field(db, &origin, key, tables)
+        }
+        LuaType::TableConst(table) => match super::infer_raw_member_type(db, index_type, key) {
+            Ok(typ) => MetatableIndexField::Present(typ),
+            Err(InferFailReason::FieldNotFound) => metatable_index_field(db, table, key, tables),
+            Err(_) => MetatableIndexField::Unknown,
+        },
+        _ => match super::infer_raw_member_type(db, index_type, key) {
+            Ok(typ) => MetatableIndexField::Present(typ),
+            Err(InferFailReason::FieldNotFound) => MetatableIndexField::Absent,
+            Err(_) => MetatableIndexField::Unknown,
+        },
+    }
 }
