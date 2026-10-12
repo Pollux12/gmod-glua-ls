@@ -15186,4 +15186,45 @@ mod test {
             eq(true)
         );
     }
+
+    /// Whether a nil warning is reported for the body of `if x then ... end`,
+    /// where `x` may be nil.
+    fn warns_in_guarded_body(body: &str) -> bool {
+        let mut ws = VirtualWorkspace::new();
+        !ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            &format!(
+                r#"
+                ---@type {{foo: string}}?
+                local x
+                local cond = true
+
+                if x then
+                    {body}
+                end
+                "#
+            ),
+        )
+    }
+
+    /// The truthiness guard stops holding where a statement before the read,
+    /// at any depth in the guarded block, sets the guarded value again; a
+    /// write after the read, in a branch the read is not on, or to another
+    /// variable of the same name leaves it holding.
+    #[test]
+    fn a_write_before_the_read_ends_the_guard_at_any_depth() {
+        let bodies = [
+            "x = nil print(x.foo)",
+            "do x = nil print(x.foo) end",
+            "while cond do x = nil print(x.foo) end",
+            "do print(x.foo) x = nil end",
+            "if cond then x = nil else print(x.foo) end",
+            r#"do local x = { foo = "a" } print(x.foo) end"#,
+        ];
+
+        assert_eq!(
+            bodies.map(warns_in_guarded_body),
+            [true, true, true, false, false, false]
+        );
+    }
 }

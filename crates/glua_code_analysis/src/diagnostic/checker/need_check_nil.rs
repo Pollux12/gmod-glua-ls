@@ -1103,28 +1103,39 @@ fn prior_assignment_value_for_expr(
     Some(assigned_expr)
 }
 
+/// Whether a statement that runs before the access, in `block` or in a block
+/// nested in it that holds the access, reassigns or shadows what it reads.
 fn guarded_block_reassigns_guarded_expr_before_access(
     semantic_model: &SemanticModel,
     block: &LuaBlock,
     guarded_expr: &LuaExpr,
 ) -> bool {
     let access_start = guarded_expr.syntax().text_range().start();
+    let enclosing_blocks = guarded_expr
+        .syntax()
+        .ancestors()
+        .filter(|node| LuaSyntaxKind::from(node.kind()) == LuaSyntaxKind::Block);
 
-    for node in block.syntax().children() {
-        if node.text_range().end() > access_start {
-            continue;
-        }
-
-        if node.descendants_of::<LuaAssignStat>().any(|assign_stat| {
-            assign_stat_reassigns_guarded_receiver_value(semantic_model, &assign_stat, guarded_expr)
-        }) {
+    for enclosing in enclosing_blocks {
+        let reassigned = enclosing
+            .children()
+            .take_while(|node| node.text_range().end() <= access_start)
+            .any(|node| {
+                node.descendants_of::<LuaAssignStat>().any(|assign_stat| {
+                    assign_stat_reassigns_guarded_receiver_value(
+                        semantic_model,
+                        &assign_stat,
+                        guarded_expr,
+                    )
+                }) || LuaLocalStat::cast(node.clone()).is_some_and(|local_stat| {
+                    local_stat_shadows_guarded_expr(semantic_model, &local_stat, guarded_expr)
+                })
+            });
+        if reassigned {
             return true;
         }
-
-        if let Some(local_stat) = LuaLocalStat::cast(node.clone())
-            && local_stat_shadows_guarded_expr(semantic_model, &local_stat, guarded_expr)
-        {
-            return true;
+        if enclosing == *block.syntax() {
+            break;
         }
     }
 
