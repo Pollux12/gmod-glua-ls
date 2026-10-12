@@ -3279,4 +3279,50 @@ end
         ws.analysis.reindex_files(vec![file_id]);
         expect_that!(ws.analysis.compilation.has_taken_text(file_id), eq(true));
     }
+
+    const CANCEL_PRODUCER: &str = "lua/autorun/sh_cancel_producer.lua";
+    const CANCEL_CONSUMER: &str = "lua/autorun/sh_cancel_consumer.lua";
+    const CANCEL_CONSUMER_TEXT: &str = "---@type number\nlocal n = CancelValue\n";
+
+    /// A diagnosis cancelled after one that finished leaves that report's
+    /// reads: changing what it read still reports the consumer affected, and
+    /// it settles to what a cold build reports.
+    #[gtest]
+    fn a_cancelled_diagnosis_keeps_the_last_reports_reads() {
+        let codes = vec![DiagnosticCode::AssignTypeMismatch];
+        let mut ws = workspace_with(codes.clone());
+        let producer_uri = ws.virtual_url_generator.new_uri(CANCEL_PRODUCER);
+        write(
+            &mut ws,
+            &producer_uri,
+            "---@type string\nCancelValue = 's'\n",
+        );
+        let consumer_uri = ws.virtual_url_generator.new_uri(CANCEL_CONSUMER);
+        let consumer_id = write(&mut ws, &consumer_uri, CANCEL_CONSUMER_TEXT);
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            contains(eq(DiagnosticCode::AssignTypeMismatch.get_name()))
+        );
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(ws.analysis.diagnose_file(consumer_id, cancel).is_none());
+
+        let producer_text = "---@type number\nCancelValue = 1\n";
+        let affected = ws
+            .analysis
+            .apply_file_system_changes(vec![(producer_uri, Some(producer_text.to_string()))]);
+        expect_that!(affected, contains(eq(&consumer_id)));
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            eq(&cold_codes(
+                codes,
+                &[
+                    (CANCEL_PRODUCER, producer_text),
+                    (CANCEL_CONSUMER, CANCEL_CONSUMER_TEXT)
+                ],
+                CANCEL_CONSUMER
+            ))
+        );
+    }
 }

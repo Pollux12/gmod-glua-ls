@@ -376,11 +376,14 @@ impl LuaCompilation {
         keys
     }
 
+    /// Runs `diagnose` for `file_id`, recording what it reads. Only a report
+    /// replaces the reads of the last one: a run cancelled before it finished
+    /// leaves the last report standing, and with it what that report read.
     pub(crate) fn record_diagnostic_reads<T>(
         &self,
         file_id: FileId,
-        diagnose: impl FnOnce() -> T,
-    ) -> T {
+        diagnose: impl FnOnce() -> Option<T>,
+    ) -> Option<T> {
         if derivation::recording() {
             return diagnose();
         }
@@ -394,12 +397,15 @@ impl LuaCompilation {
         let result = diagnose();
         drop(viewed);
         // Fingerprints the engine took stand while nothing writes.
-        let reads = derivation::end()
-            .into_viewed_reads(self.db.reader_graph(), |key| self.db.fact_fingerprint(key));
-        self.diagnosed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(file_id, reads);
+        let recorded = derivation::end();
+        if result.is_some() {
+            let reads = recorded
+                .into_viewed_reads(self.db.reader_graph(), |key| self.db.fact_fingerprint(key));
+            self.diagnosed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(file_id, reads);
+        }
         result
     }
 
