@@ -10,6 +10,7 @@ mod class_name_return_alias_test;
 mod closure_generic;
 mod closure_param_infer_test;
 mod closure_return_test;
+mod collection_promotion_test;
 mod decl_test;
 mod dependency_test;
 mod diagnostic_disable_test;

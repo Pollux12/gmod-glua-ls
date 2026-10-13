@@ -613,6 +613,12 @@ pub(in crate::compilation::analyzer) fn widen_member_collections(
         };
 
         let widened_base = TypeOps::Union.apply(db, existing_array.get_base(), &incoming_base);
+        // A widening that adds no element type says nothing new: rewriting the
+        // member's own collection as an array would only change its form, and
+        // the statement that wrote it would write it back.
+        if &widened_base == existing_array.get_base() {
+            continue;
+        }
         write_type_cache(
             db,
             (*member_id).into(),
