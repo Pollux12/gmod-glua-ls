@@ -3672,7 +3672,9 @@ fn check_condition_expr(
                 check_condition_expr(context, semantic_model, right);
             }
         }
-        LuaExpr::ParenExpr(paren_expr) => {
+        LuaExpr::ParenExpr(paren_expr)
+            if matches!(paren_expr.get_expr(), Some(LuaExpr::BinaryExpr(_))) =>
+        {
             if let Some(inner_expr) = paren_expr.get_expr() {
                 check_condition_expr(context, semantic_model, inner_expr);
             }

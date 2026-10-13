@@ -2210,6 +2210,32 @@ mod test {
     }
 
     #[gtest]
+    fn test_parenthesized_negation_of_created_entity_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local function MakeConstraint(enabled)
+                    local Constraint = nil
+                    if ( enabled ) then
+                        Constraint = GetEntityOrNULL()
+                        Constraint:GetPos()
+                    end
+                    return Constraint
+                end
+
+                local Constraint = MakeConstraint(true)
+                if ( not Constraint ) then return end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
     fn test_method_call_after_failed_isvalid_truthiness_still_reports_null_receiver() {
         let mut ws = VirtualWorkspace::new();
         def_entity_or_null_fixture(&mut ws);
