@@ -46,6 +46,7 @@ pub(crate) use gmod_vgui_context::{
 pub(crate) use infer::check_iter_var_range;
 pub(crate) use infer::get_prefix_expr_signature_id;
 pub(crate) use infer::infer_bind_value_type;
+pub(crate) use infer::infer_expr_list_types;
 pub use infer::infer_index_expr;
 pub(crate) use infer::narrow::infer_true_condition_narrowing;
 pub(crate) use infer::narrow::{InferConditionFlow, apply_cast};
@@ -59,7 +60,7 @@ pub(crate) use infer::{
     take_access_path_snapshot, with_access_paths,
 };
 pub(crate) use infer::{declaring_for_range, try_infer_enclosing_for_range_iter_type};
-use infer::{infer_call_arg_expr_list_types, infer_expr_list_types, infer_expr_list_value_type_at};
+use infer::{infer_call_arg_expr_list_types, infer_expr_list_value_type_at};
 pub use infer::{infer_table_field_value_should_be, infer_table_should_be};
 use lsp_types::Uri;
 pub use member::LuaMemberInfo;

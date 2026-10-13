@@ -19,7 +19,7 @@ use crate::{
 pub struct CallSiteParamContribution {
     pub signature_id: LuaSignatureId,
     pub param_idx: usize,
-    pub param_fact: LuaTypeFact,
+    pub param_fact: Option<LuaTypeFact>,
 }
 
 struct CallSiteParamAccumulator {
@@ -135,7 +135,7 @@ impl CallSiteParamIndex {
         &mut self,
         file_id: FileId,
         range: TextRange,
-        contributions: Vec<(LuaSignatureId, usize, LuaTypeFact)>,
+        contributions: Vec<(LuaSignatureId, usize, Option<LuaTypeFact>)>,
     ) {
         self.set_source(file_id, EvidenceSource::call(range), contributions);
     }
@@ -144,7 +144,7 @@ impl CallSiteParamIndex {
     pub fn set_callback_contributions(
         &mut self,
         file_id: FileId,
-        contributions: Vec<(LuaSignatureId, usize, LuaTypeFact)>,
+        contributions: Vec<(LuaSignatureId, usize, Option<LuaTypeFact>)>,
     ) {
         self.set_source(file_id, EvidenceSource::Callbacks, contributions);
     }
@@ -153,7 +153,7 @@ impl CallSiteParamIndex {
         &mut self,
         file_id: FileId,
         source: EvidenceSource,
-        contributions: Vec<(LuaSignatureId, usize, LuaTypeFact)>,
+        contributions: Vec<(LuaSignatureId, usize, Option<LuaTypeFact>)>,
     ) {
         derivation::note_write(|| source.fact_key(file_id));
         let mut slots = self.take_source(file_id, source);
@@ -309,6 +309,10 @@ impl CallSiteParamIndex {
                     .flat_map(|params| params.keys().copied())
                     .map(move |param_idx| (signature_id, param_idx))
             })
+            .chain(
+                self.contributors
+                    .both_changed_keys(&frozen.contributors, &fork.contributors),
+            )
             .collect()
     }
 
@@ -318,6 +322,7 @@ impl CallSiteParamIndex {
         for (signature_id, param_idx) in slots {
             derivation::note_write(|| FactKey::Contrib(signature_id, param_idx));
             let mut accumulator: Option<CallSiteParamAccumulator> = None;
+            let mut complete = true;
             for (file_id, source) in self
                 .contributors
                 .get(&(signature_id, param_idx))
@@ -331,16 +336,17 @@ impl CallSiteParamIndex {
                             && contribution.param_idx == param_idx
                     })
                 {
+                    let Some(fact) = &contribution.param_fact else {
+                        complete = false;
+                        continue;
+                    };
                     match &mut accumulator {
-                        Some(accumulator) => accumulator.push(&contribution.param_fact),
-                        None => {
-                            accumulator =
-                                Some(CallSiteParamAccumulator::new(&contribution.param_fact))
-                        }
+                        Some(accumulator) => accumulator.push(fact),
+                        None => accumulator = Some(CallSiteParamAccumulator::new(fact)),
                     }
                 }
             }
-            match accumulator {
+            match accumulator.filter(|_| complete) {
                 Some(accumulator) => {
                     self.inferred_params
                         .entry(signature_id)
@@ -394,10 +400,11 @@ impl CallSiteParamIndex {
                                 contribution.signature_id
                             }
                         };
-                        let param_fact =
-                            remap_type_fact(&contribution.param_fact, remap, &mut lost)
+                        let param_fact = contribution.param_fact.as_ref().map(|fact| {
+                            remap_type_fact(fact, remap, &mut lost)
                                 .inspect(|_| moved = true)
-                                .unwrap_or_else(|| contribution.param_fact.clone());
+                                .unwrap_or_else(|| fact.clone())
+                        });
                         (signature_id, contribution.param_idx, param_fact)
                     })
                     .collect::<Vec<_>>();
@@ -477,8 +484,8 @@ impl CallSiteParamIndex {
             events.extend(
                 contribution
                     .param_fact
-                    .provenance()
                     .iter()
+                    .flat_map(|fact| fact.provenance())
                     .filter(|step| step.event.source.file_id == file_id)
                     .map(|step| LuaInferenceDiagnosticEvent {
                         event: step.event.clone(),
@@ -586,7 +593,9 @@ fn referenced_files(
     let mut files = HashSet::default();
     for contribution in contributions {
         files.insert(contribution.signature_id.get_file_id());
-        files.extend(type_fact_referenced_files(&contribution.param_fact));
+        if let Some(fact) = &contribution.param_fact {
+            files.extend(type_fact_referenced_files(fact));
+        }
     }
     files.remove(&file_id);
     files

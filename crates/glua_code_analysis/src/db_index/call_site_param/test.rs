@@ -9,11 +9,11 @@ mod tests {
 
     fn facts(
         contributions: Vec<(LuaSignatureId, usize, LuaType)>,
-    ) -> Vec<(LuaSignatureId, usize, LuaTypeFact)> {
+    ) -> Vec<(LuaSignatureId, usize, Option<LuaTypeFact>)> {
         contributions
             .into_iter()
             .map(|(signature_id, param_idx, typ)| {
-                (signature_id, param_idx, LuaTypeFact::certain(typ))
+                (signature_id, param_idx, Some(LuaTypeFact::certain(typ)))
             })
             .collect()
     }
@@ -317,5 +317,58 @@ mod tests {
             index.get_inferred_param(&signature_id(callee_file, 2), 0),
             None
         );
+    }
+    #[test]
+    fn unsupported_contribution_blocks_publication_until_retracted() {
+        let mut index = CallSiteParamIndex::new();
+        let callee = FileId { id: 1 };
+        let supported = FileId { id: 2 };
+        let unsupported = FileId { id: 3 };
+        let signature = signature_id(callee, 0);
+        set_call(
+            &mut index,
+            supported,
+            call(0, 10),
+            vec![(signature, 0, LuaType::Nil)],
+        );
+        let before = index.fact_fingerprint(&FactKey::Contrib(signature, 0));
+        index.set_call_contributions(unsupported, call(0, 10), vec![(signature, 0, None)]);
+        assert!(index.get_inferred_param(&signature, 0).is_none());
+        assert_ne!(
+            before,
+            index.fact_fingerprint(&FactKey::Contrib(signature, 0))
+        );
+        index.remove(unsupported);
+        assert_eq!(index.get_inferred_param(&signature, 0), Some(&LuaType::Nil));
+    }
+
+    #[test]
+    fn unsupported_and_supported_task_forks_merge_without_publishing_partial_type() {
+        use crate::db_index::cow_shards::TaskFork;
+        let frozen = CallSiteParamIndex::new();
+        let mut supported = frozen.task_fork();
+        let mut unsupported = frozen.task_fork();
+        let signature = signature_id(FileId { id: 1 }, 0);
+        set_call(
+            &mut supported,
+            FileId { id: 2 },
+            call(0, 10),
+            vec![(signature, 0, LuaType::Nil)],
+        );
+        unsupported.set_call_contributions(
+            FileId { id: 3 },
+            call(0, 10),
+            vec![(signature, 0, None)],
+        );
+        for reverse in [false, true] {
+            let mut index = frozen.clone();
+            let tasks = if reverse {
+                vec![(0, unsupported.clone()), (1, supported.clone())]
+            } else {
+                vec![(0, supported.clone()), (1, unsupported.clone())]
+            };
+            assert!(index.install_tasks(&frozen, tasks).is_empty());
+            assert!(index.get_inferred_param(&signature, 0).is_none());
+        }
     }
 }

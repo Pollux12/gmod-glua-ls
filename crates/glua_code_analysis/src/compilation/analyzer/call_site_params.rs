@@ -7,9 +7,9 @@ use crate::{
     LuaInferCache, LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
     LuaInferenceProvenanceKind, LuaInferenceStep, LuaMemberId, LuaMemberIndexItem, LuaMemberKey,
     LuaMemberOwner, LuaObjectType, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId,
-    LuaTypeFact, WorkspaceId, find_signature_attribute_use, get_member_map, get_member_value_expr,
-    get_prefix_expr_signature_id, infer_authoritative_method_self_type, infer_expr,
-    infer_expr_semantic_decl,
+    LuaTypeFact, TypeOps, WorkspaceId, find_signature_attribute_use, get_member_map,
+    get_member_value_expr, get_prefix_expr_signature_id, infer_authoritative_method_self_type,
+    infer_expr, infer_expr_semantic_decl,
 };
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,
@@ -46,7 +46,7 @@ struct ReturnedMemberSignature {
     history: LuaMemberIndexItem,
 }
 
-pub(super) type Contribution = (LuaSignatureId, usize, LuaTypeFact);
+pub(super) type Contribution = (LuaSignatureId, usize, Option<LuaTypeFact>);
 
 /// What the lookups of one call's collection share. Lives for one evaluation,
 /// so every read behind a memoised answer is recorded by that evaluation.
@@ -289,7 +289,7 @@ fn collect_vgui_named_callback_receiver_types(
             contributions.push((
                 candidate.signature_id,
                 0,
-                LuaTypeFact::new(
+                Some(LuaTypeFact::new(
                     LuaType::Def(candidate.receiver_id.clone()),
                     LuaInferenceConfidence::Certain,
                     Arc::from([LuaInferenceStep {
@@ -298,7 +298,7 @@ fn collect_vgui_named_callback_receiver_types(
                         inferred_type: None,
                         found_type: None,
                     }]),
-                ),
+                )),
             ));
         }
     }
@@ -601,12 +601,6 @@ fn collect_call_site_param_types(
     collect_exact_colon_receiver_type(db, cache, file_id, &call_expr, &prefix_expr, contributions);
 
     let call_args = args.get_args().collect::<Vec<_>>();
-    let useful_args = call_args
-        .iter()
-        .cloned()
-        .enumerate()
-        .filter(|(_, arg)| is_supported_call_site_arg_shape(db, file_id, arg))
-        .collect::<Vec<_>>();
     let colon_call_arg_shift = usize::from(call_expr.is_colon_call());
     let (mut signature_ids, lookup_kind) =
         signature_ids_from_call_prefix(db, cache, scope, file_id, &call_expr, &prefix_expr);
@@ -636,9 +630,6 @@ fn collect_call_site_param_types(
             );
         }
     }
-    if useful_args.is_empty() {
-        return Some(());
-    }
     for signature_id in signature_ids {
         if !is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
             continue;
@@ -648,11 +639,17 @@ fn collect_call_site_param_types(
         };
         let has_authoritative_receiver =
             signature.is_colon_define && db.receiver_authority(signature_id);
-        for (arg_idx, arg) in &useful_args {
+        let expected_args = if signature.is_colon_define {
+            signature.params.len() + usize::from(!call_expr.is_colon_call())
+        } else {
+            signature.params.len().saturating_sub(colon_call_arg_shift)
+        };
+        for arg_idx in 0..call_args.len().max(expected_args) {
+            let arg = call_args.get(arg_idx);
             let is_implicit_receiver =
-                signature.is_colon_define && !call_expr.is_colon_call() && *arg_idx == 0;
+                signature.is_colon_define && !call_expr.is_colon_call() && arg_idx == 0;
             let is_explicit_receiver = !call_expr.is_colon_call()
-                && *arg_idx == 0
+                && arg_idx == 0
                 && (signature.is_colon_define
                     || signature
                         .params
@@ -663,7 +660,7 @@ fn collect_call_site_param_types(
             match lookup_kind {
                 SignatureLookupKind::Direct => {}
                 SignatureLookupKind::InferredCallable
-                    if !is_self_name_expr(arg) && !is_explicit_receiver =>
+                    if !arg.is_some_and(is_self_name_expr) && !is_explicit_receiver =>
                 {
                     continue;
                 }
@@ -683,9 +680,9 @@ fn collect_call_site_param_types(
                 };
                 param_idx
             } else if signature.is_colon_define {
-                *arg_idx
+                arg_idx
             } else {
-                *arg_idx + colon_call_arg_shift
+                arg_idx + colon_call_arg_shift
             };
             if (!is_implicit_receiver && param_idx >= signature.params.len())
                 || signature.param_docs.contains_key(&param_idx)
@@ -703,15 +700,21 @@ fn collect_call_site_param_types(
             if is_param_mutated(db, signature_id, param_idx) {
                 continue;
             }
-            let arg_syntax_id = arg.get_syntax_id();
-            let Some(arg_type) =
-                infer_supported_call_site_arg_type(db, cache, file_id, arg.clone())
-            else {
+            let Some(arg) = arg else {
+                if lookup_kind == SignatureLookupKind::Direct {
+                    contributions.push((signature_id, param_idx, None));
+                }
                 continue;
             };
-            if !argument_type_is_usable(signature, param_idx, &arg_type) {
+            let arg_syntax_id = arg.get_syntax_id();
+            let arg_type = infer_supported_call_site_arg_type(db, cache, file_id, arg.clone())
+                .filter(|(typ, _)| argument_type_is_usable(signature, param_idx, typ));
+            let Some((arg_type, provenance_kind)) = arg_type else {
+                if lookup_kind == SignatureLookupKind::Direct {
+                    contributions.push((signature_id, param_idx, None));
+                }
                 continue;
-            }
+            };
 
             let node = LuaInferenceNodeId::SignatureParam {
                 signature_id,
@@ -719,13 +722,17 @@ fn collect_call_site_param_types(
             };
             let event = LuaInferenceEventId {
                 node,
-                kind: LuaInferenceProvenanceKind::ContextualUnknown,
+                kind: if is_implicit_receiver || is_explicit_receiver || is_exact_include_receiver {
+                    LuaInferenceProvenanceKind::ContextualUnknown
+                } else {
+                    provenance_kind
+                },
                 source: InFiled::new(file_id, arg_syntax_id),
             };
             contributions.push((
                 signature_id,
                 param_idx,
-                LuaTypeFact::new(
+                Some(LuaTypeFact::new(
                     arg_type.clone(),
                     LuaInferenceConfidence::Anchored,
                     vec![LuaInferenceStep {
@@ -735,7 +742,7 @@ fn collect_call_site_param_types(
                         found_type: None,
                     }]
                     .into(),
-                ),
+                )),
             ));
         }
     }
@@ -801,7 +808,7 @@ fn collect_direct_callback_param_types(
             contributions.push((
                 target_signature_id,
                 target_param_idx,
-                LuaTypeFact::new(
+                Some(LuaTypeFact::new(
                     callback_arg.typ.clone(),
                     LuaInferenceConfidence::Certain,
                     Arc::from([LuaInferenceStep {
@@ -810,7 +817,7 @@ fn collect_direct_callback_param_types(
                         inferred_type: None,
                         found_type: None,
                     }]),
-                ),
+                )),
             ));
         }
     }
@@ -1012,7 +1019,7 @@ fn collect_exact_colon_receiver_type(
     contributions.push((
         signature_id,
         0,
-        LuaTypeFact::new(
+        Some(LuaTypeFact::new(
             receiver_type.clone(),
             LuaInferenceConfidence::Anchored,
             vec![LuaInferenceStep {
@@ -1022,7 +1029,7 @@ fn collect_exact_colon_receiver_type(
                 found_type: None,
             }]
             .into(),
-        ),
+        )),
     ));
     Some(())
 }
@@ -1291,6 +1298,16 @@ fn signature_ids_from_call_prefix(
         _ => None,
     };
     if let Some(signature_id) = direct {
+        return (vec![signature_id], SignatureLookupKind::Direct);
+    }
+
+    let is_local_callee = matches!(prefix_expr, LuaExpr::NameExpr(name_expr)
+        if db.get_reference_index().get_local_reference(&file_id)
+            .and_then(|refs| refs.get_decl_id(&name_expr.get_range())).is_some());
+    if !is_local_callee
+        && let Some(signature_id) = super::call_target::call_target_of(db, file_id, call_expr)
+            .and_then(|target| target.declared)
+    {
         return (vec![signature_id], SignatureLookupKind::Direct);
     }
 
@@ -2025,8 +2042,24 @@ fn argument_type_is_usable(
     param_idx: usize,
     typ: &LuaType,
 ) -> bool {
-    if typ.is_unknown() || typ.is_never() {
-        return false;
+    match typ {
+        LuaType::Any | LuaType::Unknown | LuaType::Never => return false,
+        LuaType::Union(union)
+            if !union
+                .types()
+                .all(|typ| argument_type_is_usable(signature, param_idx, typ)) =>
+        {
+            return false;
+        }
+        LuaType::MultiLineUnion(union)
+            if !union
+                .get_unions()
+                .iter()
+                .all(|(typ, _)| argument_type_is_usable(signature, param_idx, typ)) =>
+        {
+            return false;
+        }
+        _ => {}
     }
     let is_receiver = if signature.is_colon_define {
         param_idx == signature.params.len()
@@ -2041,36 +2074,136 @@ fn infer_supported_call_site_arg_type(
     cache: &mut LuaInferCache,
     file_id: FileId,
     arg: LuaExpr,
-) -> Option<LuaType> {
-    match &arg {
-        LuaExpr::LiteralExpr(_) | LuaExpr::TableExpr(_) => infer_expr(db, cache, arg).ok(),
-        LuaExpr::CallExpr(call_expr) if is_zero_arg_call(call_expr) => {
-            infer_expr(db, cache, arg).ok()
+) -> Option<(LuaType, LuaInferenceProvenanceKind)> {
+    if is_self_name_expr(&arg) {
+        let typ = infer_expr(db, cache, arg).ok()?;
+        return (!typ.is_unknown() && !typ.is_any() && !typ.is_never())
+            .then_some((typ, LuaInferenceProvenanceKind::ContextualUnknown));
+    }
+    infer_call_site_value_type(db, cache, file_id, arg, 0, &mut HashSet::default())
+}
+
+fn infer_call_site_value_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    expr: LuaExpr,
+    value_idx: usize,
+    visiting: &mut HashSet<LuaDeclId>,
+) -> Option<(LuaType, LuaInferenceProvenanceKind)> {
+    match expr {
+        LuaExpr::LiteralExpr(ref literal)
+            if matches!(
+                literal.get_literal(),
+                Some(glua_parser::LuaLiteralToken::Dots(_))
+            ) =>
+        {
+            None
         }
-        LuaExpr::NameExpr(name_expr) => {
-            if name_expr.get_name_text().as_deref() == Some("self") {
-                let typ = infer_expr(db, cache, arg).ok()?;
-                return (!typ.is_unknown() && !typ.is_any() && !typ.is_never()).then_some(typ);
+        LuaExpr::LiteralExpr(_) | LuaExpr::TableExpr(_) => {
+            let typ = if value_idx == 0 {
+                infer_expr(db, cache, expr).ok()?
+            } else {
+                LuaType::Nil
+            };
+            Some((typ, LuaInferenceProvenanceKind::ConcreteValue))
+        }
+        LuaExpr::CallExpr(ref call) if is_zero_arg_call(call) => {
+            let fact = crate::semantic::infer_expr_fact_with_cache(db, cache, expr.clone());
+            let types = crate::semantic::infer_expr_list_types(
+                db,
+                cache,
+                &[expr],
+                Some(value_idx + 1),
+                infer_expr,
+            )
+            .ok()?;
+            let typ = types
+                .get(value_idx)
+                .map_or(LuaType::Nil, |(typ, _)| typ.clone());
+            let kind = if fact.confidence() >= LuaInferenceConfidence::Certain {
+                LuaInferenceProvenanceKind::ConcreteValue
+            } else {
+                LuaInferenceProvenanceKind::ContextualUnknown
+            };
+            Some((typ, kind))
+        }
+        LuaExpr::NameExpr(name) => {
+            if value_idx != 0 {
+                return Some((LuaType::Nil, LuaInferenceProvenanceKind::ConcreteValue));
             }
-            if is_mutable_local_name_arg(db, file_id, &arg) {
+            let refs = db.get_reference_index().get_local_reference(&file_id)?;
+            let decl_id = refs.get_decl_id(&name.get_range())?;
+            let decl = db.get_decl_index().get_decl(&decl_id)?;
+            if !matches!(decl.extra, LuaDeclExtra::Local { .. }) {
                 return None;
             }
-
-            let value_expr = db
-                .get_reference_index()
-                .get_local_reference(&file_id)
-                .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))
-                .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
-                .filter(|decl| matches!(decl.extra, LuaDeclExtra::Local { .. }))
-                .and_then(|decl| decl.get_value_syntax_id())
-                .and_then(|syntax_id| db.get_vfs().syntax_node_around(&file_id, syntax_id))
-                .and_then(LuaExpr::cast)
-                .filter(|value_expr| match value_expr {
-                    LuaExpr::LiteralExpr(_) | LuaExpr::TableExpr(_) => true,
-                    LuaExpr::CallExpr(call_expr) => is_zero_arg_call(call_expr),
-                    _ => false,
-                })?;
-            infer_expr(db, cache, value_expr).ok()
+            if let Some(typ) = db
+                .get_type_index()
+                .get_type_cache(&decl_id.into())
+                .filter(|cache| cache.is_doc())
+            {
+                return Some((
+                    typ.as_type().clone(),
+                    LuaInferenceProvenanceKind::ExplicitAnnotation,
+                ));
+            }
+            if !visiting.insert(decl_id) {
+                return None;
+            }
+            let result = (|| {
+                let initializer = decl.get_initializer()?;
+                let value = db
+                    .get_vfs()
+                    .syntax_node_around(&file_id, initializer.get_expr_syntax_id())
+                    .and_then(LuaExpr::cast)?;
+                let (mut typ, mut kind) = infer_call_site_value_type(
+                    db,
+                    cache,
+                    file_id,
+                    value,
+                    initializer.get_ret_idx(),
+                    visiting,
+                )?;
+                let mut writes = refs
+                    .get_decl_references(&decl_id)?
+                    .cells
+                    .iter()
+                    .filter(|cell| cell.is_write && cell.range != decl.get_range())
+                    .collect::<Vec<_>>();
+                writes.sort_unstable_by_key(|cell| cell.range.start());
+                for write in writes {
+                    let tree = db.get_vfs().syntax_tree_around(&file_id, write.range)?;
+                    let name = tree
+                        .get_red_root()
+                        .covering_element(write.range)
+                        .ancestors()
+                        .find_map(LuaNameExpr::cast)?;
+                    let assign = name.get_parent::<LuaAssignStat>()?;
+                    let (vars, values) = assign.get_var_and_expr_list();
+                    let idx = vars.iter().position(|var| var.get_range() == write.range)?;
+                    let expr_idx = idx.min(values.len().checked_sub(1)?);
+                    let (assigned, assigned_kind) = infer_call_site_value_type(
+                        db,
+                        cache,
+                        file_id,
+                        values[expr_idx].clone(),
+                        idx - expr_idx,
+                        visiting,
+                    )?;
+                    typ = TypeOps::Union.apply(db, &typ, &assigned);
+                    if assigned_kind == LuaInferenceProvenanceKind::ContextualUnknown {
+                        kind = assigned_kind;
+                    } else if kind != LuaInferenceProvenanceKind::ContextualUnknown
+                        && kind != assigned_kind
+                    {
+                        kind = LuaInferenceProvenanceKind::ConcreteValue;
+                    }
+                }
+                Some((typ, kind))
+            })();
+            visiting.remove(&decl_id);
+            result
         }
         _ => None,
     }
@@ -2083,60 +2216,6 @@ fn exact_receiver_type_is_usable(typ: &LuaType) -> bool {
         && !typ.is_any()
         && !typ.is_never()
         && !matches!(typ, LuaType::Union(_) | LuaType::Intersection(_))
-}
-
-fn is_supported_call_site_arg_shape(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> bool {
-    match arg {
-        LuaExpr::LiteralExpr(_) | LuaExpr::TableExpr(_) => true,
-        LuaExpr::CallExpr(call_expr) => is_zero_arg_call(call_expr),
-        LuaExpr::NameExpr(name_expr) => {
-            if name_expr.get_name_text().as_deref() == Some("self") {
-                return true;
-            }
-            if is_mutable_local_name_arg(db, file_id, arg) {
-                return false;
-            }
-            let Some(decl_id) = db
-                .get_reference_index()
-                .get_local_reference(&file_id)
-                .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))
-            else {
-                return false;
-            };
-            let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
-                return false;
-            };
-            if !matches!(decl.extra, LuaDeclExtra::Local { .. }) {
-                return false;
-            }
-            let Some(value_expr) = decl
-                .get_value_syntax_id()
-                .and_then(|syntax_id| db.get_vfs().syntax_node_around(&file_id, syntax_id))
-                .and_then(LuaExpr::cast)
-            else {
-                return false;
-            };
-            matches!(value_expr, LuaExpr::LiteralExpr(_) | LuaExpr::TableExpr(_))
-                || matches!(&value_expr, LuaExpr::CallExpr(call_expr) if is_zero_arg_call(call_expr))
-        }
-        _ => false,
-    }
-}
-
-fn is_mutable_local_name_arg(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> bool {
-    let LuaExpr::NameExpr(name_expr) = arg else {
-        return false;
-    };
-    let Some(file_refs) = db.get_reference_index().get_local_reference(&file_id) else {
-        return false;
-    };
-    let Some(decl_id) = file_refs.get_decl_id(&name_expr.get_range()) else {
-        return false;
-    };
-
-    file_refs
-        .get_decl_references(&decl_id)
-        .is_some_and(|decl_refs| decl_refs.mutable)
 }
 
 fn is_zero_arg_call(call_expr: &LuaCallExpr) -> bool {
