@@ -215,7 +215,12 @@ fn check_general_type_compact(
     }
 
     if let LuaType::Union(union_type) = compact_type {
+        let accepts_classes = ref_type::accepts_gmod_class_union(context, source, union_type);
         for compact_sub_type in union_type.types() {
+            if accepts_classes && ref_type::gmod_union_class_id(context, compact_sub_type).is_some()
+            {
+                continue;
+            }
             check_general_type_compact(
                 context,
                 source,

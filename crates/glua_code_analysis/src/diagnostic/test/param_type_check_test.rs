@@ -5400,3 +5400,96 @@ fn dangling_scoped_class_ref_matches_its_own_def() {
         "a value of a dangling scripted-class ref must satisfy its own type: {diags:#?}"
     );
 }
+
+#[cfg(test)]
+fn check_gmod_class_union_argument(argument: &str, gmod: bool) -> bool {
+    let mut ws = crate::VirtualWorkspace::new();
+    let mut config = crate::Emmyrc::default();
+    config.gmod.enabled = gmod;
+    config.strict.allow_nullable_as_non_nullable = false;
+    ws.update_emmyrc(config);
+    ws.def_file(
+        "addons/union_leniency/lua/autorun/sh_classes.lua",
+        r#"
+        ---@class Entity
+        ---@class NULL : Entity
+        ---@class Player : Entity
+        ---@class NPC : Entity
+        ---@class Zombie : NPC
+        ---@class Vector
+        "#,
+    );
+    let file_id = ws.def_file(
+        "addons/union_leniency/lua/weapons/weapon_owner/shared.lua",
+        &format!(
+            r#"
+            ---@param owner Player
+            local function use_owner(owner) end
+            ---@param owner {argument}
+            local function equip(owner)
+                use_owner(owner)
+            end
+            "#
+        ),
+    );
+    ws.analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap()
+        .iter()
+        .all(|d| {
+            d.code
+                != Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::ParamTypeMismatch
+                        .get_name()
+                        .to_string(),
+                ))
+        })
+}
+
+#[test]
+fn gmod_class_union_accepts_sibling_owners_with_null() {
+    assert!(check_gmod_class_union_argument("Player|NPC|NULL", true));
+}
+
+#[test]
+fn gmod_class_union_accepts_sibling_owners() {
+    assert!(check_gmod_class_union_argument("Player|NPC", true));
+}
+
+#[test]
+fn gmod_class_union_preserves_other_argument_checks() {
+    for (argument, accepted) in [
+        ("NPC", false),
+        ("NPC|NULL", false),
+        ("NPC|Vector", false),
+        ("Player|NPC|Vector", false),
+        ("Player|NPC|string", false),
+        ("Player|NPC|nil", false),
+        ("NPC|Zombie", false),
+        ("Entity", true),
+        ("NULL", true),
+    ] {
+        assert_eq!(
+            check_gmod_class_union_argument(argument, true),
+            accepted,
+            "{argument}"
+        );
+    }
+}
+
+#[test]
+fn gmod_class_union_preserves_non_gmod_argument_checks() {
+    for argument in [
+        "Player|NPC|NULL",
+        "Player|NPC",
+        "NPC",
+        "NPC|Vector",
+        "Entity",
+    ] {
+        assert!(
+            !check_gmod_class_union_argument(argument, false),
+            "{argument}"
+        );
+    }
+    assert!(check_gmod_class_union_argument("Player", false));
+}

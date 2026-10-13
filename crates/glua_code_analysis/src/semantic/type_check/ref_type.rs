@@ -59,6 +59,76 @@ fn is_gmod_null_family_type(
     false
 }
 
+pub(super) fn gmod_union_class_id<'a>(
+    context: &TypeCheckContext,
+    typ: &'a LuaType,
+) -> Option<&'a LuaTypeDeclId> {
+    let (LuaType::Ref(id) | LuaType::Def(id)) = typ else {
+        return None;
+    };
+    if is_exact_gmod_null_decl_id(context, id) {
+        return None;
+    }
+    context
+        .db
+        .get_type_index()
+        .get_type_decl(id)
+        .filter(|decl| decl.is_class())
+        .map(|_| id)
+}
+
+pub(super) fn accepts_gmod_class_union(
+    context: &TypeCheckContext,
+    source: &LuaType,
+    union: &crate::LuaUnionType,
+) -> bool {
+    if !context.db.get_emmyrc().gmod.enabled {
+        return false;
+    }
+    let Some(source_id) = gmod_union_class_id(context, source) else {
+        return false;
+    };
+    let classes: Vec<_> = union
+        .types()
+        .filter_map(|typ| gmod_union_class_id(context, typ))
+        .collect();
+    let Some(first) = classes.first() else {
+        return false;
+    };
+    let mut stack = vec![*first];
+    let mut ancestors = HashSet::default();
+    while let Some(id) = stack.pop() {
+        if !ancestors.insert(id) {
+            continue;
+        }
+        if let Some(supers) = context.db.get_type_index().get_super_types_iter(id) {
+            for typ in supers {
+                match typ {
+                    LuaType::Ref(id) => stack.push(id),
+                    LuaType::Generic(generic) => stack.push(generic.get_base_type_id_ref()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let common: Vec<_> = ancestors
+        .into_iter()
+        .filter(|ancestor| {
+            classes
+                .iter()
+                .all(|id| is_sub_type_of(context.db, id, ancestor))
+        })
+        .collect();
+    common.iter().any(|ancestor| {
+        is_sub_type_of(context.db, source_id, ancestor)
+            && !common.iter().any(|other| {
+                other != ancestor
+                    && is_sub_type_of(context.db, other, ancestor)
+                    && !is_sub_type_of(context.db, ancestor, other)
+            })
+    })
+}
+
 pub fn check_ref_type_compact(
     context: &mut TypeCheckContext,
     source_id: &LuaTypeDeclId,
