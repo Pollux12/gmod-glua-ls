@@ -1215,6 +1215,30 @@ function LoadPalette() end",
     }
 
     #[test]
+    fn residual_col_param_shared_alias_chain_is_folded_once_per_local() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut ws = VirtualWorkspace::new();
+            ws.def_gmod_call_arg_builtins();
+            ws.def("---@class Color");
+            let mut source = String::from(
+                "function AcceptPalette(col) local value = col end\nlocal p0 = { bg = 1 }\n",
+            );
+            for idx in 1..=26 {
+                let prev = idx - 1;
+                source.push_str(&format!("local p{idx} = p{prev}\np{idx} = p{prev}\n"));
+            }
+            source.push_str("AcceptPalette(p26)");
+            let file = ws.def_file("gamemodes/terrortown/gamemode/cl_palette.lua", &source);
+            sender.send(residual_col_param_type(&ws, file)).unwrap();
+        });
+        let typ = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("each aliased local must be folded once, not once per path to it");
+        assert!(matches!(typ, LuaType::TableConst(_)), "{typ:?}");
+    }
+
+    #[test]
     fn residual_col_param_cross_file_edit_delete_reopen() {
         use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr};
         let mut ws = VirtualWorkspace::new();

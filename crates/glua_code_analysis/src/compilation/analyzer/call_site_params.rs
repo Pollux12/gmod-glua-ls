@@ -53,6 +53,7 @@ pub(super) type Contribution = (LuaSignatureId, usize, Option<LuaTypeFact>);
 #[derive(Default)]
 struct CallScope {
     returned_tables: HashMap<FileId, Option<Arc<ReturnedTableInfo>>>,
+    local_values: HashMap<LuaDeclId, Option<(LuaType, LuaInferenceProvenanceKind)>>,
 }
 
 /// The last function statement of `file_id` at or before `position`
@@ -707,8 +708,9 @@ fn collect_call_site_param_types(
                 continue;
             };
             let arg_syntax_id = arg.get_syntax_id();
-            let arg_type = infer_supported_call_site_arg_type(db, cache, file_id, arg.clone())
-                .filter(|(typ, _)| argument_type_is_usable(signature, param_idx, typ));
+            let arg_type =
+                infer_supported_call_site_arg_type(db, cache, scope, file_id, arg.clone())
+                    .filter(|(typ, _)| argument_type_is_usable(signature, param_idx, typ));
             let Some((arg_type, provenance_kind)) = arg_type else {
                 if lookup_kind == SignatureLookupKind::Direct {
                     contributions.push((signature_id, param_idx, None));
@@ -2072,6 +2074,7 @@ fn argument_type_is_usable(
 fn infer_supported_call_site_arg_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
+    scope: &mut CallScope,
     file_id: FileId,
     arg: LuaExpr,
 ) -> Option<(LuaType, LuaInferenceProvenanceKind)> {
@@ -2080,12 +2083,15 @@ fn infer_supported_call_site_arg_type(
         return (!typ.is_unknown() && !typ.is_any() && !typ.is_never())
             .then_some((typ, LuaInferenceProvenanceKind::ContextualUnknown));
     }
-    infer_call_site_value_type(db, cache, file_id, arg, 0, &mut HashSet::default())
+    infer_call_site_value_type(db, cache, scope, file_id, arg, 0, &mut HashSet::default())
 }
 
+/// A local's value does not depend on which lookup reached it: any alias cycle
+/// reachable from it fails the whole lookup, so each local is folded once per scope.
 fn infer_call_site_value_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
+    scope: &mut CallScope,
     file_id: FileId,
     expr: LuaExpr,
     value_idx: usize,
@@ -2148,6 +2154,9 @@ fn infer_call_site_value_type(
                     LuaInferenceProvenanceKind::ExplicitAnnotation,
                 ));
             }
+            if let Some(result) = scope.local_values.get(&decl_id) {
+                return result.clone();
+            }
             if !visiting.insert(decl_id) {
                 return None;
             }
@@ -2160,6 +2169,7 @@ fn infer_call_site_value_type(
                 let (mut typ, mut kind) = infer_call_site_value_type(
                     db,
                     cache,
+                    scope,
                     file_id,
                     value,
                     initializer.get_ret_idx(),
@@ -2186,6 +2196,7 @@ fn infer_call_site_value_type(
                     let (assigned, assigned_kind) = infer_call_site_value_type(
                         db,
                         cache,
+                        scope,
                         file_id,
                         values[expr_idx].clone(),
                         idx - expr_idx,
@@ -2203,6 +2214,7 @@ fn infer_call_site_value_type(
                 Some((typ, kind))
             })();
             visiting.remove(&decl_id);
+            scope.local_values.insert(decl_id, result.clone());
             result
         }
         _ => None,
