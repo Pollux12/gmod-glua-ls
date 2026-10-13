@@ -232,6 +232,13 @@ fn infer_call_expr_func_miss(
         let func_ret = refine_known_vgui_parent_return(db, cache, func_ret, &call_expr);
         match &func_ret {
             LuaType::TypeGuard(_) => Ok(func_ty),
+            _ if matches!(&call_expr_type, LuaType::Signature(signature_id) if db
+                .get_signature_index()
+                .get(signature_id)
+                .is_some_and(|signature| signature.direct_param_return_alias().is_some())) =>
+            {
+                Ok(func_ty)
+            }
             _ => unwrapp_return_type(db, cache, func_ret, call_expr).map(|new_ret| {
                 LuaFunctionType::new(
                     func_ty.get_async_state(),
@@ -1565,7 +1572,10 @@ fn call_arg_for_param(
 ) -> Option<LuaExpr> {
     match (func_ty.is_colon_define(), call_expr.is_colon_call()) {
         (true, false) => args.get(param_idx.checked_add(1)?).cloned(),
-        (false, true) if param_idx == 0 => call_expr.get_prefix_expr(),
+        (false, true) if param_idx == 0 => match call_expr.get_prefix_expr()? {
+            LuaExpr::IndexExpr(index_expr) => index_expr.get_prefix_expr(),
+            _ => None,
+        },
         (false, true) => args.get(param_idx.checked_sub(1)?).cloned(),
         _ => args.get(param_idx).cloned(),
     }

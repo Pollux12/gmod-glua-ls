@@ -75,6 +75,79 @@ mod test {
             .expect("expected semantic info for local name")
     }
 
+    #[test]
+    fn object_identity_explicit_self_return_colon_call() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "lua/autorun/sh_parser.lua",
+            r#"
+            local Parser = {}
+            function Parser.new(self, tokens)
+                self.tokens = tokens
+                return self
+            end
+            function Parser:parse() return self.tokens end
+            local parser = Parser:new({})
+            parser:parse()
+        "#,
+        );
+        assert_eq!(
+            file_diagnostic_messages(&mut ws, file, DiagnosticCode::UndefinedMethod),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            local_name_type(&mut ws, file, "parser"),
+            local_name_type(&mut ws, file, "Parser")
+        );
+    }
+
+    #[test]
+    fn object_identity_explicit_self_return_updates_across_files() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let path = "lua/autorun/sh_parser.lua";
+        let source = r#"
+            Parser = {}
+            function Parser.new(self, tokens)
+                self.tokens = tokens
+                return self
+            end
+            function Parser:parse() return self.tokens end
+        "#;
+        ws.def_file(path, source);
+        let caller = ws.def_file(
+            "lua/autorun/sh_use_parser.lua",
+            "local parser = Parser:new({})
+parser:parse()",
+        );
+        assert_eq!(
+            file_diagnostic_messages(&mut ws, caller, DiagnosticCode::UndefinedMethod),
+            Vec::<String>::new()
+        );
+        ws.def_file(
+            path,
+            &source.replace("return self", "return { tokens = tokens }"),
+        );
+        assert!(file_has_diagnostic(
+            &mut ws,
+            caller,
+            DiagnosticCode::UndefinedMethod
+        ));
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis
+            .update_file_by_uri(&uri, None)
+            .expect("source removed");
+        assert!(file_has_diagnostic(
+            &mut ws,
+            caller,
+            DiagnosticCode::UndefinedGlobal
+        ));
+        ws.def_file(path, source);
+        assert_eq!(
+            file_diagnostic_messages(&mut ws, caller, DiagnosticCode::UndefinedMethod),
+            Vec::<String>::new()
+        );
+    }
+
     fn setup_vehicle_weapon_registry_same_file_fixture() -> (VirtualWorkspace, crate::FileId) {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
