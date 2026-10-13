@@ -86,6 +86,30 @@ mod test {
     }
 
     #[test]
+    fn direct_param_return_alias_returns_one_actual_argument_value() {
+        let mut ws = VirtualWorkspace::new();
+        let file = ws.def_file(
+            "addons/return_arity/lua/autorun/sh_identity.lua",
+            r#"
+            local function pair() return 1, "extra" end
+            local function identity(value) return value end
+            local function one() return 1 end
+            local a, b = identity(pair())
+            local c, d = one()
+            print(a, b, c, d)
+            "#,
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "a"),
+            LuaType::IntegerConst(1)
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "b"),
+            infer_last_name_expr_type_in_file(&ws, file, "d")
+        );
+    }
+
+    #[test]
     fn test_custom_binary() {
         let mut ws = VirtualWorkspace::new();
 

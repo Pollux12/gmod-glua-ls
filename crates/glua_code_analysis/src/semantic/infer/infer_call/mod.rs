@@ -1305,6 +1305,10 @@ fn specialize_direct_param_return_alias_for_call(
     let Ok(return_type) = infer_expr(db, cache, arg) else {
         return None;
     };
+    let return_type = match return_type {
+        LuaType::Variadic(variadic) => variadic.get_type(0).cloned().unwrap_or(LuaType::Nil),
+        typ => typ,
+    };
     if direct_param_alias_type_is_uninformative(&return_type) || &return_type == func_ty.get_ret() {
         return None;
     }
