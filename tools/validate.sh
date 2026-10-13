@@ -101,6 +101,8 @@ fi
 
 TARGET_STAGES=schedule,schedule:deferred,edit,revert,noop,reload,delete,recreate,gate
 
+step drift_suite node --test tools/lsp_drift.test.js
+
 if [ "$TIER" = change ] || [ "$TIER" = phase ]; then
   VB=${GLUALS_VB:?GLUALS_VB is required}
   if [ "$TIER" = phase ]; then

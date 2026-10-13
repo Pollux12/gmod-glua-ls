@@ -1528,6 +1528,56 @@ end)
         expect_that!(codes_in(&ws, reader_id), is_empty());
     }
 
+    #[gtest]
+    fn repeated_deletion_during_reanalysis_refreshes_member_readers() {
+        let codes = vec![
+            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UncheckedNilAccess,
+        ];
+        let files = [
+            ("gamemode/core/sh_cityrp.lua", "cityrp = {}"),
+            (
+                "gamemode/core/sh_data.lua",
+                "cityrp.data = {}\nfunction cityrp.data.Get(key, default) return default end",
+            ),
+            (
+                "plugins/warps/sh_plugin.lua",
+                "local _ = cityrp.data.Get(\"places\", {})",
+            ),
+        ];
+        for slice in [0, 1] {
+            let mut ws = workspace_with(codes.clone());
+            ws.def_files(files.to_vec());
+            let provider_uri = ws.virtual_url_generator.new_uri(files[1].0);
+            let reader_uri = ws.virtual_url_generator.new_uri(files[2].0);
+            let reader_id = ws.analysis.get_file_id(&reader_uri).unwrap();
+            expect_that!(codes_in(&ws, reader_id), is_empty());
+            let changed = ws
+                .analysis
+                .stage_file_system_changes(vec![(provider_uri.clone(), None)]);
+            ws.analysis.begin_reindex(changed);
+            if slice > 0 {
+                ws.analysis
+                    .advance_reindex(crate::Slice::Evaluations(slice));
+            }
+            let changed = ws
+                .analysis
+                .stage_file_system_changes(vec![(provider_uri.clone(), None)]);
+            ws.analysis.begin_reindex(changed);
+            let crate::UpdateProgress::Settled(affected) =
+                ws.analysis.advance_reindex(crate::Slice::Whole)
+            else {
+                panic!("whole slice must settle");
+            };
+            expect_that!(affected, contains(eq(&reader_id)));
+            let expected = cold_codes(codes.clone(), &[files[0], files[2]], files[2].0);
+            expect_that!(expected, not(is_empty()));
+            expect_that!(codes_in(&ws, reader_id), eq(&expected));
+            write(&mut ws, &provider_uri, files[1].1);
+            expect_that!(codes_in(&ws, reader_id), is_empty());
+        }
+    }
+
     /// Deleting a file purges every `Element` owner in it, including literals
     /// no anchor could name. Recreating it must leave the workspace exactly as
     /// it was - an over-eager purge would take members belonging to files the

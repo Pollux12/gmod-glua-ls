@@ -8,9 +8,9 @@
 //
 // A server that advertises `diagnosticProvider` is pulled, as VS Code pulls
 // it; one that does not is followed by its `publishDiagnostics` alone, where
-// the latest publish per file is what the client shows. A push scenario has
-// settled once no publish has arrived for --quiet-ms, and the load scenario
-// also waits for the server's `startupComplete` status first.
+// the latest publish per file is what the client shows. A push scenario waits
+// for fresh workspace analysis, then for --quiet-ms without a publish. The
+// load scenario also waits for the server's `startupComplete` status first.
 //
 // Scenarios:
 //   load     the workspace as loaded
@@ -113,6 +113,15 @@ const SERVER_CANCELLED = -32802;
 
 /** Pulls sent for one request before its cancellations fail the run. */
 const PULL_ATTEMPTS = 10;
+
+async function settlePush(client, quietMs) {
+    if (!client.statusAt.has('startupComplete')) {
+        await client.waitForStatus('startupComplete', 300000);
+    }
+    const barrier = await client.request('workspace/symbol', { query: '__gluals_drift_barrier__' });
+    if (barrier.message.error) throw new Error(JSON.stringify(barrier.message.error));
+    await client.waitForPublishQuiet(quietMs, Date.now());
+}
 
 /** Child processes still running, stopped before the scratch folder is removed. */
 const children = new Set();
@@ -277,14 +286,6 @@ async function main() {
         };
 
         const open = new Set();
-        // A push server has settled once no publish has arrived for --quiet-ms
-        // since the scenario's last change.
-        const settlePush = async () => {
-            if (!client.statusAt.has('startupComplete')) {
-                await client.waitForStatus('startupComplete', 300000);
-            }
-            await client.waitForPublishQuiet(opts.quietMs, Date.now());
-        };
         // A pull server has settled once a workspace pull, which waits for
         // fresh analysis, is followed by no refresh request for --quiet-ms;
         // then one more pull picks up anything a missed refresh armed.
@@ -311,7 +312,7 @@ async function main() {
             }
             await pullWorkspace();
         };
-        const settle = push ? settlePush : settlePull;
+        const settle = push ? () => settlePush(client, opts.quietMs) : settlePull;
 
         let differences = 0;
         await settle();
@@ -387,7 +388,9 @@ async function main() {
     }
 }
 
-main().then((differences) => {
+module.exports = { settlePush };
+
+if (require.main === module) main().then((differences) => {
     if (differences > 0) {
         console.error(`\nFAILED: ${differences} difference(s) from the cold check`);
         process.exit(1);
