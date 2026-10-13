@@ -3568,7 +3568,8 @@ fn check_binary_expr(
                 &binary_expr,
                 non_nil_side,
                 op,
-            ) {
+            ) || is_validity_tested_by_branch_condition(semantic_model, non_nil_side)
+            {
                 return Some(());
             }
 
@@ -3671,6 +3672,11 @@ fn check_condition_expr(
                 check_condition_expr(context, semantic_model, right);
             }
         }
+        LuaExpr::ParenExpr(paren_expr) => {
+            if let Some(inner_expr) = paren_expr.get_expr() {
+                check_condition_expr(context, semantic_model, inner_expr);
+            }
+        }
         expr => {
             let truthy_expr = match &expr {
                 LuaExpr::UnaryExpr(unary)
@@ -3682,7 +3688,9 @@ fn check_condition_expr(
                 }
                 _ => expr.clone(),
             };
-            if is_sentinel_followed_by_type_guard(semantic_model, &truthy_expr) {
+            if is_sentinel_followed_by_type_guard(semantic_model, &truthy_expr)
+                || is_validity_tested_by_branch_condition(semantic_model, &truthy_expr)
+            {
                 return;
             }
             if let Ok(expr_type) = semantic_model.infer_expr(expr.clone())
@@ -3849,6 +3857,43 @@ fn is_nil_sentinel_comparison_before_type_guard_elseif(
         is_type_guard_call_guarding_expr(semantic_model, &guard_call, non_nil_side)
             || type_guard_call_textually_guards_expr(semantic_model, &guard_call, non_nil_side)
     })
+}
+
+/// Whether a condition the branch holding `expr` passed through already tests `IsValid(expr)`,
+/// which makes a nil or truthiness test of `expr` there a deliberate nil/NULL distinction.
+fn is_validity_tested_by_branch_condition(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {
+    let expr_range = expr.syntax().text_range();
+    expr.syntax()
+        .ancestors()
+        .filter_map(LuaIfStat::cast)
+        .any(|if_stat| {
+            let clauses = std::iter::once((if_stat.get_condition_expr(), if_stat.get_block()))
+                .chain(
+                    if_stat
+                        .get_else_if_clause_list()
+                        .map(|clause| (clause.get_condition_expr(), clause.get_block())),
+                );
+            let mut passed_conditions = Vec::new();
+            for (condition, block) in clauses {
+                let Some(condition) = condition else {
+                    continue;
+                };
+                if range_contains(condition.syntax().text_range(), expr_range) {
+                    break;
+                }
+                passed_conditions.push(condition);
+                if block
+                    .is_some_and(|block| range_contains(block.syntax().text_range(), expr_range))
+                {
+                    break;
+                }
+            }
+            passed_conditions.iter().any(|condition| {
+                condition
+                    .descendants::<LuaCallExpr>()
+                    .any(|call| is_isvalid_call_guarding_stable_expr(semantic_model, &call, expr))
+            })
+        })
 }
 
 fn is_sentinel_followed_by_type_guard(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {

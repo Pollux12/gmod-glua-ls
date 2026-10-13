@@ -2055,6 +2055,114 @@ mod test {
         );
     }
 
+    fn def_entity_or_null_fixture(ws: &mut VirtualWorkspace) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(ws);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+
+            ---@return Entity|NULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+    }
+
+    #[gtest]
+    fn test_nil_comparison_after_failed_isvalid_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local ply = GetEntityOrNULL()
+                if IsValid(ply) then
+                    ply:GetPos()
+                elseif ply ~= nil then
+                    print("disconnected")
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_truthiness_after_enclosing_isvalid_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local carry = { held = GetEntityOrNULL(), hack = GetEntityOrNULL() }
+                if (not IsValid(carry.held)) or (not IsValid(carry.hack)) then
+                    if (carry.held or carry.hack) then
+                        carry.held = nil
+                    end
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_parenthesized_truthiness_without_isvalid_reports_each_operand() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::GmodNullCheck,
+            r#"
+            local held, hack = GetEntityOrNULL(), GetEntityOrNULL()
+            if (held or hack) then
+                print("holding")
+            end
+            "#,
+        );
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect::<Vec<_>>(),
+            unordered_elements_are![
+                eq("held may be NULL; NULL is truthy, use IsValid(...) to check entity validity"),
+                eq("hack may be NULL; NULL is truthy, use IsValid(...) to check entity validity"),
+            ]
+        );
+    }
+
+    #[gtest]
+    fn test_method_call_after_failed_isvalid_truthiness_still_reports_null_receiver() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local ent = GetEntityOrNULL()
+                if not IsValid(ent) then
+                    if ent then
+                        ent:GetPos()
+                    end
+                end
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
     #[gtest]
     fn test_negated_conjunction_early_return_guards_each_stable_operand() {
         let mut ws = VirtualWorkspace::new();
