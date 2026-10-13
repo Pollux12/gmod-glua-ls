@@ -168,6 +168,7 @@ pub fn bind_call_expr(
     call_expr: LuaCallExpr,
     current: FlowId,
 ) -> Option<()> {
+    binder.bind_syntax_node(call_expr.get_syntax_id(), current);
     bind_each_child(binder, LuaAst::LuaCallExpr(call_expr.clone()), current);
     Some(())
 }

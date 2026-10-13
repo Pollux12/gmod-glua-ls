@@ -276,6 +276,8 @@
 --- should remain that type after the guard.
 ---@attribute valid_guard()
 
+---@attribute fresh_result()
+
 --- Marks a function that terminates a net message and sends it, such as `net.Send` or
 --- `net.Broadcast`. Language server features use this to pair senders with receivers without
 --- matching the callable by name, so aliases and annotated replacement APIs are recognized too.

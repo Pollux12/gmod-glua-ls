@@ -322,6 +322,36 @@ fn get_call_expr_var_ref_id(
     let prefix_expr = call_expr.get_prefix_expr()?;
     let maybe_func = infer_expr(db, cache, prefix_expr.clone()).ok()?;
 
+    if call_expr.is_colon_call() && call_expr.get_args_list()?.get_args().next().is_none() {
+        if crate::db_index::callee_signature_ids(&maybe_func)
+            .into_iter()
+            .any(|id| crate::signature_has_fresh_result(db, id))
+        {
+            return None;
+        }
+        let LuaExpr::IndexExpr(method) = prefix_expr else {
+            return None;
+        };
+        let receiver = method.get_prefix_expr()?;
+        let receiver_ref = get_var_expr_var_ref_id(db, cache, receiver.clone())?;
+        let (root, path) = match receiver_ref {
+            VarRefId::IndexRef(root, path) => (root, path.to_string()),
+            reference => (
+                call_var_ref_root(reference)?,
+                getter_access_path(&receiver)?,
+            ),
+        };
+        let name = method
+            .get_index_key()?
+            .get_name()?
+            .get_name_text()
+            .to_string();
+        return Some(VarRefId::IndexRef(
+            root,
+            crate::db_index::intern_smol_str(&format!("{path}.[:{name}()]")),
+        ));
+    }
+
     let ret = match maybe_func {
         LuaType::DocFunction(f) => f.get_ret().clone(),
         LuaType::Signature(signature_id) => db
@@ -405,4 +435,31 @@ pub fn get_var_expr_var_ref_id(
         frame,
     );
     Some(ref_id)
+}
+
+pub(crate) fn getter_access_path(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::NameExpr(name) => Some(name.get_name_text()?.to_string()),
+        LuaExpr::IndexExpr(index) => {
+            let prefix = getter_access_path(&index.get_prefix_expr()?)?;
+            let path = index.get_access_path()?;
+            let key = glua_parser::path_segments(&path).last()?;
+            Some(format!("{prefix}.{key}"))
+        }
+        LuaExpr::CallExpr(call)
+            if call.is_colon_call() && call.get_args_list()?.get_args().next().is_none() =>
+        {
+            let LuaExpr::IndexExpr(method) = call.get_prefix_expr()? else {
+                return None;
+            };
+            let prefix = getter_access_path(&method.get_prefix_expr()?)?;
+            let name = method
+                .get_index_key()?
+                .get_name()?
+                .get_name_text()
+                .to_string();
+            Some(format!("{prefix}.[:{name}()]"))
+        }
+        _ => None,
+    }
 }

@@ -54,172 +54,18 @@ pub fn get_type_at_call_expr(
     // fall through to supported fallback handling.
     let result = match infer_expr(db, cache, prefix_expr.clone()) {
         Err(_) => Ok(ResultTypeOrContinue::Continue),
-        Ok(maybe_func) => match maybe_func {
-            LuaType::DocFunction(f) => {
-                let prefix_signature_id = get_call_prefix_signature_id(db, cache, &call_expr);
-                let is_valid_guard = prefix_signature_id.is_some_and(|signature_id| {
-                    call_prefix_signature_is_valid_guard(db, cache, &call_expr_ref, signature_id)
-                });
-                let signature_cast = prefix_signature_id.and_then(|signature_id| {
-                    db.get_signature_index()
-                        .get(&signature_id)
-                        .and_then(|signature| signature.return_cast.as_ref())
-                        .map(|cast| (cast, signature_id))
-                });
-                let return_type = f.get_ret();
-                let type_guard_result = match return_type {
-                    _ if is_valid_guard || matches!(return_type, LuaType::TypeGuard(_)) => {
-                        get_type_at_call_expr_by_type_guard(
-                            db,
-                            tree,
-                            cache,
-                            root,
-                            var_ref_id,
-                            flow_node,
-                            call_expr.clone(),
-                            f,
-                            signature_cast,
-                            is_valid_guard,
-                            condition_flow,
-                            policy,
-                        )
-                    }
-                    _ => {
-                        // If the return type is not a type guard, we cannot infer the type cast.
-                        Ok(ResultTypeOrContinue::Continue)
-                    }
-                };
-                if matches!(type_guard_result, Ok(ResultTypeOrContinue::Continue))
-                    && matches!(condition_flow, InferConditionFlow::TrueCondition)
-                    && let Some(signature_id) = prefix_signature_id
-                    && let Some(narrowed_type) = try_inferred_positive_guard(
-                        db,
-                        tree,
-                        cache,
-                        root,
-                        var_ref_id,
-                        flow_node,
-                        &call_expr_ref,
-                        signature_id,
-                        policy,
-                    )?
-                {
-                    return Ok(ResultTypeOrContinue::Result(narrowed_type));
-                }
-                type_guard_result
-            }
-            LuaType::Signature(signature_id) => {
-                let Some(signature) = db.get_signature_index().get(&signature_id) else {
-                    return Ok(ResultTypeOrContinue::Continue);
-                };
-
-                let ret = signature.get_return_type();
-                let signature_cast = signature.return_cast.as_ref();
-                let is_valid_guard =
-                    call_prefix_signature_is_valid_guard(db, cache, &call_expr_ref, signature_id);
-                let mut type_guard_did_not_apply = false;
-                match ret {
-                    _ if is_valid_guard || matches!(ret, LuaType::TypeGuard(_)) => {
-                        // Try TypeGuard narrowing. If it doesn't apply (e.g., when the
-                        // target is a member access, not a simple variable), fall through
-                        // to the member guard fallback below.
-                        let type_guard_result = get_type_at_call_expr_by_type_guard(
-                            db,
-                            tree,
-                            cache,
-                            root,
-                            var_ref_id,
-                            flow_node,
-                            call_expr.clone(),
-                            signature.to_doc_func_type(),
-                            signature_cast.map(|cast| (cast, signature_id)),
-                            is_valid_guard,
-                            condition_flow,
-                            policy,
-                        );
-                        if !matches!(type_guard_result, Ok(ResultTypeOrContinue::Continue)) {
-                            return type_guard_result;
-                        }
-                        // TypeGuard narrowing didn't apply; fall through to member guard fallback.
-                        type_guard_did_not_apply = true;
-                    }
-                    LuaType::Call(call) => {
-                        return get_type_at_call_expr_by_call(
-                            db,
-                            tree,
-                            cache,
-                            root,
-                            var_ref_id,
-                            flow_node,
-                            call_expr,
-                            &call,
-                            condition_flow,
-                        );
-                    }
-                    _ => {}
-                }
-
-                if matches!(condition_flow, InferConditionFlow::TrueCondition)
-                    && let Some(narrowed_type) = try_inferred_positive_guard(
-                        db,
-                        tree,
-                        cache,
-                        root,
-                        var_ref_id,
-                        flow_node,
-                        &call_expr_ref,
-                        signature_id,
-                        policy,
-                    )?
-                {
-                    return Ok(ResultTypeOrContinue::Result(narrowed_type));
-                }
-
-                // If TypeGuard narrowing didn't apply, skip the signature_cast path
-                // and go directly to the member guard fallback.
-                if type_guard_did_not_apply {
-                    // Fall through to the fallback at the end of the function.
-                } else if let Some(signature_cast) = signature_cast {
-                    return match signature_cast.name.as_str() {
-                        "self" => get_type_at_call_expr_by_signature_self(
-                            db,
-                            tree,
-                            cache,
-                            root,
-                            var_ref_id,
-                            flow_node,
-                            call_expr,
-                            signature_cast,
-                            signature_id,
-                            condition_flow,
-                            policy,
-                        ),
-                        name => get_type_at_call_expr_by_signature_param_name(
-                            db,
-                            tree,
-                            cache,
-                            root,
-                            var_ref_id,
-                            flow_node,
-                            call_expr,
-                            signature_cast,
-                            signature_id,
-                            name,
-                            condition_flow,
-                            policy,
-                        ),
-                    };
-                }
-
-                // No @cast annotation found — fall through so supported predicate
-                // fallback narrowing can still run.
-                Ok(ResultTypeOrContinue::Continue)
-            }
-            _ => {
-                // If the prefix expression is not a function, we cannot infer the type cast.
-                Ok(ResultTypeOrContinue::Continue)
-            }
-        },
+        Ok(function_type) => get_type_at_call_expr_by_function_type(
+            db,
+            tree,
+            cache,
+            root,
+            var_ref_id,
+            flow_node,
+            call_expr,
+            function_type,
+            condition_flow,
+            policy,
+        ),
     };
 
     // Fallback: check metadata-driven member-guard predicate patterns when
@@ -263,6 +109,212 @@ pub fn get_type_at_call_expr(
     }
 
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn get_type_at_call_expr_by_function_type(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    call_expr: LuaCallExpr,
+    function_type: LuaType,
+    condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
+) -> Result<ResultTypeOrContinue, InferFailReason> {
+    let call_expr_ref = call_expr.clone();
+    match function_type {
+        LuaType::Union(union) => {
+            let mut merged = LuaType::Never;
+            for candidate in union.types() {
+                let ResultTypeOrContinue::Result(narrowed) =
+                    get_type_at_call_expr_by_function_type(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        var_ref_id,
+                        flow_node,
+                        call_expr.clone(),
+                        candidate.clone(),
+                        condition_flow,
+                        policy,
+                    )?
+                else {
+                    return Ok(ResultTypeOrContinue::Continue);
+                };
+                merged = TypeOps::Union.apply(db, &merged, &narrowed);
+            }
+            Ok(ResultTypeOrContinue::Result(merged))
+        }
+
+        LuaType::DocFunction(f) => {
+            let prefix_signature_id = get_call_prefix_signature_id(db, cache, &call_expr);
+            let is_valid_guard = prefix_signature_id.is_some_and(|signature_id| {
+                call_prefix_signature_is_valid_guard(db, cache, &call_expr_ref, signature_id)
+            });
+            let signature_cast = prefix_signature_id.and_then(|signature_id| {
+                db.get_signature_index()
+                    .get(&signature_id)
+                    .and_then(|signature| signature.return_cast.as_ref())
+                    .map(|cast| (cast, signature_id))
+            });
+            let return_type = f.get_ret();
+            let type_guard_result = match return_type {
+                _ if is_valid_guard || matches!(return_type, LuaType::TypeGuard(_)) => {
+                    get_type_at_call_expr_by_type_guard(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        var_ref_id,
+                        flow_node,
+                        call_expr.clone(),
+                        f,
+                        signature_cast,
+                        is_valid_guard,
+                        condition_flow,
+                        policy,
+                    )
+                }
+                _ => {
+                    // If the return type is not a type guard, we cannot infer the type cast.
+                    Ok(ResultTypeOrContinue::Continue)
+                }
+            };
+            if matches!(type_guard_result, Ok(ResultTypeOrContinue::Continue))
+                && matches!(condition_flow, InferConditionFlow::TrueCondition)
+                && let Some(signature_id) = prefix_signature_id
+                && let Some(narrowed_type) = try_inferred_positive_guard(
+                    db,
+                    tree,
+                    cache,
+                    root,
+                    var_ref_id,
+                    flow_node,
+                    &call_expr_ref,
+                    signature_id,
+                    policy,
+                )?
+            {
+                return Ok(ResultTypeOrContinue::Result(narrowed_type));
+            }
+            type_guard_result
+        }
+        LuaType::Signature(signature_id) => {
+            let Some(signature) = db.get_signature_index().get(&signature_id) else {
+                return Ok(ResultTypeOrContinue::Continue);
+            };
+
+            let ret = signature.get_return_type();
+            let signature_cast = signature.return_cast.as_ref();
+            let is_valid_guard =
+                call_prefix_signature_is_valid_guard(db, cache, &call_expr_ref, signature_id);
+            let mut type_guard_did_not_apply = false;
+            match ret {
+                _ if is_valid_guard || matches!(ret, LuaType::TypeGuard(_)) => {
+                    // Try TypeGuard narrowing. If it doesn't apply (e.g., when the
+                    // target is a member access, not a simple variable), fall through
+                    // to the member guard fallback below.
+                    let type_guard_result = get_type_at_call_expr_by_type_guard(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        var_ref_id,
+                        flow_node,
+                        call_expr.clone(),
+                        signature.to_doc_func_type(),
+                        signature_cast.map(|cast| (cast, signature_id)),
+                        is_valid_guard,
+                        condition_flow,
+                        policy,
+                    );
+                    if !matches!(type_guard_result, Ok(ResultTypeOrContinue::Continue)) {
+                        return type_guard_result;
+                    }
+                    // TypeGuard narrowing didn't apply; fall through to member guard fallback.
+                    type_guard_did_not_apply = true;
+                }
+                LuaType::Call(call) => {
+                    return get_type_at_call_expr_by_call(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        var_ref_id,
+                        flow_node,
+                        call_expr,
+                        &call,
+                        condition_flow,
+                    );
+                }
+                _ => {}
+            }
+
+            if matches!(condition_flow, InferConditionFlow::TrueCondition)
+                && let Some(narrowed_type) = try_inferred_positive_guard(
+                    db,
+                    tree,
+                    cache,
+                    root,
+                    var_ref_id,
+                    flow_node,
+                    &call_expr_ref,
+                    signature_id,
+                    policy,
+                )?
+            {
+                return Ok(ResultTypeOrContinue::Result(narrowed_type));
+            }
+
+            // If TypeGuard narrowing didn't apply, skip the signature_cast path
+            // and go directly to the member guard fallback.
+            if type_guard_did_not_apply {
+                // Fall through to the fallback at the end of the function.
+            } else if let Some(signature_cast) = signature_cast {
+                return match signature_cast.name.as_str() {
+                    "self" => get_type_at_call_expr_by_signature_self(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        var_ref_id,
+                        flow_node,
+                        call_expr,
+                        signature_cast,
+                        signature_id,
+                        condition_flow,
+                        policy,
+                    ),
+                    name => get_type_at_call_expr_by_signature_param_name(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        var_ref_id,
+                        flow_node,
+                        call_expr,
+                        signature_cast,
+                        signature_id,
+                        name,
+                        condition_flow,
+                        policy,
+                    ),
+                };
+            }
+
+            // No @cast annotation found — fall through so supported predicate
+            // fallback narrowing can still run.
+            Ok(ResultTypeOrContinue::Continue)
+        }
+        _ => {
+            // If the prefix expression is not a function, we cannot infer the type cast.
+            Ok(ResultTypeOrContinue::Continue)
+        }
+    }
 }
 
 /// Whether `call_expr`, called through `prefix_expr`, names the variable

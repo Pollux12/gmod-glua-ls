@@ -2111,12 +2111,47 @@ pub fn infer_call_expr(
 
     if let Some(tree) = db.get_flow_index().get_flow_tree(&cache.get_file_id())
         && let Some(flow_id) = tree.get_flow_id(call_expr.get_syntax_id())
-        && let Some(flow_ret_type) =
-            get_type_at_call_expr_inline_cast(db, cache, tree, call_expr, flow_id, ret_type.clone())
+        && let Some(flow_ret_type) = get_type_at_call_expr_inline_cast(
+            db,
+            cache,
+            tree,
+            call_expr.clone(),
+            flow_id,
+            ret_type.clone(),
+        )
     {
         return Ok(flow_ret_type);
     }
 
+    if call_expr.is_colon_call()
+        && call_expr
+            .get_args_list()
+            .is_some_and(|args| args.get_args().next().is_none())
+        && let Some(reference) =
+            crate::get_var_expr_var_ref_id(db, cache, LuaExpr::CallExpr(call_expr.clone()))
+    {
+        let can_narrow =
+            super::narrow::var_ref_can_be_narrowed(db, &cache.get_file_id(), &reference);
+        if can_narrow {
+            let previous_flow = cache.key_flow_cache(&reference, &ret_type);
+            let previous_origin = cache.replace_index_ref_origin_type_cache(
+                &reference,
+                CacheEntry::Cache(ret_type.clone()),
+            );
+            let result = super::narrow::infer_expr_narrow_type(
+                db,
+                cache,
+                LuaExpr::CallExpr(call_expr),
+                reference.clone(),
+            );
+            cache.restore_index_ref_origin_type_cache(&reference, previous_origin);
+            cache.unkey_flow_cache(&reference, ret_type.clone(), previous_flow);
+            match result {
+                Err(InferFailReason::None) => {}
+                result => return result,
+            }
+        }
+    }
     Ok(ret_type)
 }
 

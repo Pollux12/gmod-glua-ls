@@ -529,6 +529,19 @@ fn index_expr_var_ref_id_uncached(
         prefix_expr = nested.get_prefix_expr()?;
     }
 
+    if let LuaExpr::CallExpr(call) = &prefix_expr {
+        let VarRefId::IndexRef(root, _) =
+            crate::get_var_expr_var_ref_id(db, cache, LuaExpr::CallExpr(call.clone()))?
+        else {
+            return None;
+        };
+        let path = super::narrow::getter_access_path(&LuaExpr::IndexExpr(index_expr.clone()))?;
+        return Some(VarRefId::IndexRef(
+            root,
+            crate::db_index::intern_smol_str(&path),
+        ));
+    }
+
     if let LuaExpr::NameExpr(name_expr) = prefix_expr {
         let root = match get_name_expr_var_ref_id(db, cache, &name_expr) {
             Some(VarRefId::SelfRef(self_ref_id)) => VarRefRootId::SelfRef(self_ref_id),

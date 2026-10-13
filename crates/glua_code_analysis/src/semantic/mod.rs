@@ -123,7 +123,9 @@ pub(crate) use infer::remove_false_or_nil;
 pub(crate) use infer::type_decl_is_vgui_panel;
 pub(crate) use infer::{ParamInferenceSource, infer_param_is_weak, infer_param_source};
 pub use infer::{SelfRefId, VarRefId, VarRefRootId};
-pub(crate) use infer::{contains_gmod_null_type, get_var_expr_var_ref_id, raw_get_access_path};
+pub(crate) use infer::{
+    contains_gmod_null_type, get_var_expr_var_ref_id, getter_access_path, raw_get_access_path,
+};
 pub use infer::{infer_param, infer_param_with_cache};
 use overload_resolve::resolve_signature;
 pub use semantic_info::SemanticDeclLevel;

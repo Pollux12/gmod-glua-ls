@@ -409,7 +409,7 @@ impl<'a> FlowBinder<'a> {
     }
 
     fn record_narrowable_refs(&mut self, expr: &LuaExpr, from_condition: bool) {
-        use glua_parser::{LuaAstNode, LuaIndexExpr, LuaNameExpr, PathTrait};
+        use glua_parser::{LuaAstNode, LuaCallExpr, LuaIndexExpr, LuaNameExpr, PathTrait};
         // Record the expr itself if it is a name or index, then recurse into
         // descendants to cover nested references (e.g. `a.b and c(d.e)`).
         for node in expr.syntax().descendants() {
@@ -419,12 +419,19 @@ impl<'a> FlowBinder<'a> {
                 } else {
                     self.record_opaque_name(from_condition);
                 }
+            } else if let Some(call) = LuaCallExpr::cast(node.clone()) {
+                if let Some(path) = crate::semantic::getter_access_path(&LuaExpr::CallExpr(call)) {
+                    self.record_index_path(&path, from_condition);
+                }
             } else if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
                 let dynamic = matches!(
                     index_expr.get_index_key(),
                     Some(glua_parser::LuaIndexKey::Expr(_))
                 );
-                match index_expr.get_access_path() {
+                match crate::semantic::getter_access_path(&LuaExpr::IndexExpr(index_expr.clone()))
+                    .map(smol_str::SmolStr::new)
+                    .or_else(|| index_expr.get_access_path())
+                {
                     Some(path) if !dynamic => {
                         self.record_index_path(&path, from_condition);
                     }

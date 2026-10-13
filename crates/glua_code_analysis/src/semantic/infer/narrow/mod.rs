@@ -26,8 +26,8 @@ pub use narrow_type::{
     narrow_direct_name_false_or_nil, narrow_down_type, narrow_false_or_nil, remove_false_or_nil,
 };
 pub(crate) use var_ref_id::call_var_ref_root;
-pub(crate) use var_ref_id::raw_get_access_path;
 pub use var_ref_id::{SelfRefId, VarRefId, VarRefRootId, get_var_expr_var_ref_id};
+pub(crate) use var_ref_id::{getter_access_path, raw_get_access_path};
 
 const GMOD_NULL_TYPE_NAME: &str = "NULL";
 

@@ -136,6 +136,8 @@ pub const GMOD_DOMAIN_VALID_GUARD: &str = "gmod.valid_guard";
 /// static type when one exists.
 pub const GMOD_ATTR_VALID_GUARD: &str = "valid_guard";
 
+pub const GMOD_ATTR_FRESH_RESULT: &str = "fresh_result";
+
 /// Signature-level standalone attribute name for calls whose write effects are
 /// bounded to the listed global/root identities.
 ///
@@ -557,6 +559,10 @@ fn attribute_string_param(attribute_use: &crate::LuaAttributeUse, name: &str) ->
         LuaType::DocStringConst(value) | LuaType::StringConst(value) => Some(value.to_string()),
         _ => None,
     }
+}
+
+pub fn signature_has_fresh_result(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    find_signature_attribute_use(db, signature_id, GMOD_ATTR_FRESH_RESULT).is_some()
 }
 
 fn signature_has_valid_guard_attribute(db: &DbIndex, signature_id: LuaSignatureId) -> bool {

@@ -121,6 +121,9 @@ pub fn get_type_at_call_expr_inline_cast(
 
     let root = LuaChunk::cast(call_expr.get_root())?;
     let tag_cast = tag_cast_ptr.to_node(&root)?;
+    if tag_cast.get_key_expr().is_some() {
+        return None;
+    }
 
     for cast_op_type in tag_cast.get_op_types() {
         return_type = apply_cast(

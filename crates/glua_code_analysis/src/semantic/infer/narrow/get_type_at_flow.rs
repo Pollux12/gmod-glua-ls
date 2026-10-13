@@ -2002,11 +2002,9 @@ fn get_type_at_assign_stat(
                 {
                     return Ok(ResultTypeOrContinue::Result(member_type));
                 }
-                if exprs.get(i).is_some_and(expr_is_table_constructor) {
-                    return Ok(ResultTypeOrContinue::Result(get_var_ref_type(
-                        db, cache, var_ref_id,
-                    )?));
-                }
+                return Ok(ResultTypeOrContinue::Result(get_var_ref_type(
+                    db, cache, var_ref_id,
+                )?));
             }
 
             continue;
@@ -3526,7 +3524,7 @@ fn assignment_flow_info_cannot_match(
     flow_id: FlowId,
     var_ref_id: &VarRefId,
 ) -> bool {
-    let VarRefId::IndexRef(_, query_path) = var_ref_id else {
+    let VarRefId::IndexRef(root, query_path) = var_ref_id else {
         return false;
     };
 
@@ -3537,6 +3535,17 @@ fn assignment_flow_info_cannot_match(
         return false;
     }
     if info.has_unknown_index_target {
+        return false;
+    }
+    let root_decl_id = match root {
+        super::VarRefRootId::SelfRef(self_ref) => Some(self_ref.self_decl_id),
+        root => root.as_decl_id(),
+    };
+    if info
+        .name_targets
+        .iter()
+        .any(|target| Some(target.decl_id) == root_decl_id)
+    {
         return false;
     }
 
