@@ -148,6 +148,79 @@ parser:parse()",
         );
     }
 
+    #[test]
+    fn object_identity_instance_field_shadows_prototype_in_method() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "lua/autorun/sh_instance.lua",
+            r#"
+            local prototype = { Title = { label = true } }
+            local instance = setmetatable({ sentinel = true }, { __index = prototype })
+            function instance:GetTitle() return self.Title end
+            instance.Title = "group"
+            ---@param value string
+            local function consume(value) end
+            consume(instance:GetTitle())
+            local fallback = { Title = "fallback" }
+            local empty = setmetatable({ sentinel = true }, { __index = fallback })
+            function empty:GetTitle() return self.Title end
+            empty.Title = nil
+            consume(empty:GetTitle())
+        "#,
+        );
+        assert_eq!(
+            file_diagnostic_messages(&mut ws, file, DiagnosticCode::ParamTypeMismatch),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn object_identity_instance_shadow_updates_across_files() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let path = "lua/autorun/sh_instance.lua";
+        let source = r#"
+            Prototype = { Title = { label = true } }
+            Instance = setmetatable({ sentinel = true }, { __index = Prototype })
+            function Instance:GetTitle() return self.Title end
+            Instance.Title = "group"
+        "#;
+        ws.def_file(path, source);
+        let file = ws.def_file(
+            "lua/autorun/sh_consume.lua",
+            r#"
+            ---@param value string
+            local function consume(value) end
+            consume(Instance:GetTitle())
+        "#,
+        );
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            file,
+            DiagnosticCode::ParamTypeMismatch
+        ));
+        ws.def_file(path, &source.replace("Instance.Title = \"group\"", ""));
+        assert!(file_has_diagnostic(
+            &mut ws,
+            file,
+            DiagnosticCode::ParamTypeMismatch
+        ));
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis
+            .update_file_by_uri(&uri, None)
+            .expect("instance removed");
+        assert!(file_has_diagnostic(
+            &mut ws,
+            file,
+            DiagnosticCode::UndefinedGlobal
+        ));
+        ws.def_file(path, source);
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            file,
+            DiagnosticCode::ParamTypeMismatch
+        ));
+    }
+
     fn setup_vehicle_weapon_registry_same_file_fixture() -> (VirtualWorkspace, crate::FileId) {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();

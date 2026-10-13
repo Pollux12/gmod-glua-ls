@@ -3109,7 +3109,11 @@ fn infer_instance_member(
         ) {
             Ok(table_type) => {
                 return Ok(match TypeOps::Intersect.apply(db, &typ, &table_type) {
-                    LuaType::Never => typ,
+                    LuaType::Never if table_type.is_nullable() => {
+                        let present = TypeOps::Remove.apply(db, &table_type, &LuaType::Nil);
+                        TypeOps::Union.apply(db, &present, &typ)
+                    }
+                    LuaType::Never => table_type,
                     intersected => intersected,
                 });
             }
