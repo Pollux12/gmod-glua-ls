@@ -3872,26 +3872,41 @@ fn is_validity_tested_by_branch_condition(semantic_model: &SemanticModel, expr: 
                     if_stat
                         .get_else_if_clause_list()
                         .map(|clause| (clause.get_condition_expr(), clause.get_block())),
+                )
+                .chain(
+                    if_stat
+                        .get_else_clause()
+                        .map(|clause| (None, clause.get_block())),
                 );
             let mut passed_conditions = Vec::new();
+            let mut guarded_block = None;
             for (condition, block) in clauses {
-                let Some(condition) = condition else {
-                    continue;
-                };
-                if range_contains(condition.syntax().text_range(), expr_range) {
-                    break;
+                if let Some(condition) = condition {
+                    if range_contains(condition.syntax().text_range(), expr_range) {
+                        break;
+                    }
+                    passed_conditions.push(condition);
                 }
-                passed_conditions.push(condition);
-                if block
-                    .is_some_and(|block| range_contains(block.syntax().text_range(), expr_range))
+                if let Some(block) =
+                    block.filter(|block| range_contains(block.syntax().text_range(), expr_range))
                 {
+                    guarded_block = Some(block);
                     break;
                 }
             }
+            if guarded_block.is_some_and(|block| {
+                guarded_block_reassigns_guarded_expr_before_access(semantic_model, &block, expr)
+            }) {
+                return false;
+            }
             passed_conditions.iter().any(|condition| {
-                condition
-                    .descendants::<LuaCallExpr>()
-                    .any(|call| is_isvalid_call_guarding_stable_expr(semantic_model, &call, expr))
+                let condition_range = condition.syntax().text_range();
+                condition.descendants::<LuaCallExpr>().any(|call| {
+                    !call.syntax().ancestors().any(|node| {
+                        range_contains(condition_range, node.text_range())
+                            && LuaClosureExpr::cast(node).is_some()
+                    }) && is_isvalid_call_guarding_stable_expr(semantic_model, &call, expr)
+                })
             })
         })
 }

@@ -2095,6 +2095,73 @@ mod test {
     }
 
     #[gtest]
+    fn test_nil_comparison_after_reassignment_reports_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        for code in [
+            r#"
+            local ent = GetEntityOrNULL()
+            if not IsValid(ent) then
+                ent = GetEntityOrNULL()
+                if ent ~= nil then print("replaced") end
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if not IsValid(holder.ent) then
+                holder.ent = GetEntityOrNULL()
+                if holder.ent ~= nil then print("replaced") end
+            end
+            "#,
+        ] {
+            assert_that!(
+                ws.check_code_for(DiagnosticCode::GmodNullCheck, code),
+                eq(false)
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_nil_comparison_of_shadowing_local_reports_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local ent = GetEntityOrNULL()
+                if not IsValid(ent) then
+                    local ent = GetEntityOrNULL()
+                    if ent ~= nil then print("shadowed") end
+                end
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_isvalid_inside_condition_closure_does_not_exempt_nil_comparison() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local ent = GetEntityOrNULL()
+                if (function() return IsValid(ent) end) then
+                    if ent ~= nil then print("closure") end
+                end
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
     fn test_truthiness_after_enclosing_isvalid_does_not_report_gmod_null_check() {
         let mut ws = VirtualWorkspace::new();
         def_entity_or_null_fixture(&mut ws);
