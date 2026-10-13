@@ -1284,9 +1284,8 @@ fn infer_table_metatable_member(
 
     let meta_owner = LuaMemberOwner::Element(metatable.clone());
     let index_member_key = LuaMemberKey::Name("__index".into());
-    // Every `__index` writer is visible; a slot whose writers disagree (a
-    // table in one place, a function or another table elsewhere) names no
-    // single lookup table, so nothing is resolved through it.
+    // Writers that disagree (one table here, another there) are looked up
+    // through each of them, the way the runtime reads whichever one is set.
     match infer_owner_raw_member_type_with_realm_cached(
         db,
         cache,
@@ -1297,9 +1296,12 @@ fn infer_table_metatable_member(
         None,
     ) {
         Ok(index_type) => {
-            if let super::infer_call::MetatableIndexCandidate::Supported(index_type) =
-                super::infer_call::classify_metatable_index_candidate(&index_type)
-                && !metatable_index_type_points_to_table(&index_type, table_range)
+            let index_type =
+                match super::infer_call::classify_metatable_index_candidate(&index_type) {
+                    super::infer_call::MetatableIndexCandidate::Supported(index_type) => index_type,
+                    super::infer_call::MetatableIndexCandidate::Unsupported => index_type,
+                };
+            if !metatable_index_type_points_to_table(&index_type, table_range)
                 && let Ok(typ) = infer_member_by_member_key_with_table_guard(
                     db,
                     cache,

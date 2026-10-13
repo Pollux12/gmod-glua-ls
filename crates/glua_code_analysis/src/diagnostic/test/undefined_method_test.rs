@@ -5,6 +5,76 @@ mod tests {
     use lsp_types::{DiagnosticSeverity, NumberOrString};
     use tokio_util::sync::CancellationToken;
 
+    #[test]
+    fn metatable_index_resolves_methods_through_each_table_alternative() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "lua/includes/modules/drivers.lua",
+            r#"
+            local first = {}
+            function first:Init() return 1 end
+            local second = {}
+            function second:Init() return 2 end
+            ---@param choose boolean
+            local function build(choose)
+                local base = choose and first or second
+                local method = {}
+                setmetatable(method, { __index = base })
+                method:Init()
+            end
+            build(true)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn metatable_index_without_the_method_reports_it_undefined() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "lua/includes/modules/drivers.lua",
+            r#"
+            local method = {}
+            setmetatable(method, { __index = { Other = function() end } })
+            method:Init()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn metatable_index_table_alternatives_refresh_after_edit_delete_reopen() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let path = "lua/includes/modules/drivers.lua";
+        let definitions = r#"
+            local first = {}
+            function first:Init() return 1 end
+            local second = {}
+            function second:Init() return 2 end
+            return { first = first, second = second }
+        "#;
+        let reader_path = "lua/includes/modules/drive_reader.lua";
+        let reader = r#"
+            local drivers = require("drivers")
+            ---@param choose boolean
+            local function build(choose)
+                local base = choose and drivers.first or drivers.second
+                local method = {}
+                setmetatable(method, { __index = base })
+                method:Init()
+            end
+            build(true)
+        "#;
+        ws.def_file(path, definitions);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, reader_path, reader));
+        ws.def_file(path, &definitions.replace("Init", "Other"));
+        assert!(!ws.check_file_for(DiagnosticCode::UndefinedMethod, reader_path, reader));
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        ws.def_file(path, definitions);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, reader_path, reader));
+    }
+
     fn diagnostics(ws: &mut VirtualWorkspace, source: &str) -> Vec<lsp_types::Diagnostic> {
         let file_id = ws.def(source);
         ws.analysis
