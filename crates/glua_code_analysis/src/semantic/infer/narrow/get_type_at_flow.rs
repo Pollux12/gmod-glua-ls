@@ -2060,11 +2060,12 @@ fn get_type_at_assign_stat(
             return Ok(ResultTypeOrContinue::Continue);
         };
 
-        if explicit_var_type.is_none()
-            && crate::db_index::is_unresolved_type(&expr_type)
-            && annotated_var_type(db, var_ref_id).is_none()
-        {
-            return Ok(ResultTypeOrContinue::Result(expr_type));
+        // An unresolved value says nothing of the variable beyond what its
+        // annotation does, like `any` below.
+        if explicit_var_type.is_none() && crate::db_index::is_unresolved_type(&expr_type) {
+            return Ok(ResultTypeOrContinue::Result(
+                annotated_var_type(db, var_ref_id).unwrap_or(expr_type),
+            ));
         }
 
         if explicit_var_type.is_none()

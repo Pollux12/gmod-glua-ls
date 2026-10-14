@@ -9015,6 +9015,34 @@ _2 = a[1]
     }
 
     #[test]
+    fn assigning_an_unresolved_entry_to_an_annotated_local_takes_its_annotation_not_its_last_value()
+    {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_id = ws.def(
+            r#"
+            local registry = {}
+            local function Register(name, data)
+                name = string.lower(name)
+                registry[name] = data
+            end
+
+            local function Resolve(level)
+                ---@type string|number
+                local class = "w"
+                class = "changed"
+                class = registry[level]
+                local assigned = class
+            end
+            "#,
+        );
+
+        let assigned = nth_name_expr_type_from_end(&mut ws, file_id, "class", 0);
+        let declared = ws.ty("string|number");
+        assert_eq!(ws.humanize_type(assigned), ws.humanize_type(declared));
+    }
+
+    #[test]
     fn assigning_an_unresolved_entry_to_an_unannotated_local_drops_its_old_kind() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 
