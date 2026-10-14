@@ -567,6 +567,28 @@ fn credit_inherited_members(
     }
 }
 
+/// `children` and the supers whose evidence they are credited with, whose reads are
+/// evidence for them too.
+fn with_credited_supers(
+    db: &crate::DbIndex,
+    children: &[crate::LuaTypeDeclId],
+) -> Vec<crate::LuaTypeDeclId> {
+    let mut lineage = children.to_vec();
+    for child in children {
+        let mut supers = Vec::new();
+        child.collect_super_types(db, &mut supers);
+        lineage.extend(
+            supers
+                .into_iter()
+                .filter_map(|super_type| match super_type {
+                    LuaType::Ref(super_id) => Some(super_id),
+                    _ => None,
+                }),
+        );
+    }
+    lineage
+}
+
 fn in_filed_order(value: &InFiled<glua_parser::LuaSyntaxId>) -> (u32, u32, u32) {
     let range = value.value.get_range();
     (
@@ -794,9 +816,9 @@ pub(crate) fn publish_unguarded_children(
                 .unwrap_or_else(|| right.get_name());
             compare_unguarded_child_candidates(left, left_display_name, right, right_display_name)
         });
-        let Some(source) = winners
-            .iter()
-            .filter_map(|child| sources.get(&(definition.clone(), child.clone())))
+        let Some(source) = with_credited_supers(db, &winners)
+            .into_iter()
+            .filter_map(|child| sources.get(&(definition.clone(), child)))
             .min_by_key(|source| (source.guarded, source.site.value.get_range().start()))
             .map(|source| source.site.clone())
         else {
@@ -875,8 +897,8 @@ pub(crate) fn publish_unguarded_children(
         }
         support.sort_by(LuaInferenceNodeId::stable_cmp);
         support.dedup();
-        let Some(source) =
-            winning_source(&candidates.sources, &winners).map(|source| source.site.clone())
+        let Some(source) = winning_source(&candidates.sources, &with_credited_supers(db, &winners))
+            .map(|source| source.site.clone())
         else {
             continue;
         };
@@ -2515,32 +2537,52 @@ fn matching_guard_in_expr(
     })
 }
 
-/// Whether `guard`'s member is one the variable it indexes is not declared to have,
-/// so its presence shows that variable holds a child type that defines it.
+/// Whether `guard`'s member is one the table it indexes is not declared to have, so
+/// its presence shows that table holds a child type that defines it.
 fn proves_child_type(
     db: &crate::DbIndex,
     cache: &mut crate::semantic::LuaInferCache,
     guard: &LuaIndexExpr,
 ) -> bool {
-    let (Some(LuaExpr::NameExpr(prefix)), Some(key)) =
-        (guard.get_prefix_expr(), guard.get_index_key())
-    else {
-        return true;
-    };
-    let Some(decl_id) =
-        crate::semantic::get_var_expr_var_ref_id(db, cache, LuaExpr::NameExpr(prefix))
-            .and_then(|reference| reference.get_decl_id_ref())
-    else {
+    let (Some(prefix), Some(key)) = (guard.get_prefix_expr(), guard.get_index_key()) else {
         return true;
     };
     let (Some(declared), Ok(key)) = (
-        declaration_base_type(db, cache, decl_id),
+        declared_type(db, cache, &prefix),
         LuaMemberKey::from_index_key(db, cache, &key),
     ) else {
         return true;
     };
     crate::semantic::find_members_with_key(db, &declared, key, false)
         .is_none_or(|members| members.is_empty())
+}
+
+/// The type `expr`, a variable or a member path off one, is declared with, before any
+/// child inference refines it.
+fn declared_type(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
+    expr: &LuaExpr,
+) -> Option<LuaType> {
+    match expr {
+        LuaExpr::NameExpr(name) => {
+            let decl_id = crate::semantic::get_var_expr_var_ref_id(
+                db,
+                cache,
+                LuaExpr::NameExpr(name.clone()),
+            )?
+            .get_decl_id_ref()?;
+            declaration_base_type(db, cache, decl_id)
+        }
+        LuaExpr::IndexExpr(index) => {
+            let table = declared_type(db, cache, &index.get_prefix_expr()?)?;
+            let key = LuaMemberKey::from_index_key(db, cache, &index.get_index_key()?).ok()?;
+            let members = crate::semantic::find_members_with_key(db, &table, key, false)?;
+            (!members.is_empty())
+                .then(|| LuaType::from_vec(members.into_iter().map(|member| member.typ).collect()))
+        }
+        _ => None,
+    }
 }
 
 /// The member paths `expr` proves hold a value when it is true: the paths it tests

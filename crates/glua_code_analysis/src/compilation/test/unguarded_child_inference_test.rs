@@ -2050,6 +2050,56 @@ mod test {
     }
 
     #[test]
+    fn an_inherited_member_read_is_reported_for_the_child_that_inherits_it() {
+        let mut ws = VirtualWorkspace::new();
+        let lines = guarded_lines(
+            &mut ws,
+            r#"
+            ---@class Panel
+            ---@class Scroll: Panel
+            ---@field up Panel
+            ---@class SpecialScroll: Scroll
+            ---@field special Panel
+            ---@class Holder
+            ---@field panel Panel
+
+            ---@param holder Holder
+            local function paint(holder)
+                local up = holder.panel.up
+                if holder.panel.special then
+                    return holder.panel.special, up
+                end
+            end
+            "#,
+        );
+        assert_eq!(lines, vec![11]);
+    }
+
+    #[test]
+    fn a_guard_on_a_member_path_base_field_does_not_cover_a_child_read() {
+        let mut ws = VirtualWorkspace::new();
+        let lines = guarded_lines(
+            &mut ws,
+            r#"
+            ---@class Entity
+            ---@field Enabled boolean
+            ---@class Player: Entity
+            ---@field PlayerOnly number
+            ---@class Holder
+            ---@field ent Entity
+
+            ---@param holder Holder
+            local function read(holder)
+                if holder.ent.Enabled then
+                    return holder.ent.PlayerOnly
+                end
+            end
+            "#,
+        );
+        assert_eq!(lines, vec![11]);
+    }
+
+    #[test]
     fn a_presence_guard_still_lets_its_reads_infer_the_child_for_sibling_members() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
