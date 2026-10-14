@@ -8,7 +8,7 @@ use rowan::{TextRange, TextSize};
 
 use crate::{
     DiagnosticCode, GlobalId, LuaDeclId, LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType,
-    SemanticModel, semantic::unwrap_paren_to_name_expr,
+    SemanticModel, compilation::analyzer::is_nil_literal_expr, semantic::unwrap_paren_to_name_expr,
 };
 
 use super::{Checker, DiagnosticContext, FileNodeBuckets};
@@ -36,12 +36,15 @@ impl Checker for UndefinedGlobalChecker {
         //   * names reached through `or`/`and`/parens in those positions
         let silent_use_ranges = calc_silent_use_name_expr_ranges(&buckets);
         calc_name_expr_ref(semantic_model, &mut use_range_set);
+        let tested_names =
+            calc_presence_tested_global_names(semantic_model, &buckets, &use_range_set);
         for name_expr in buckets.name_exprs.iter().cloned() {
             check_name_expr(
                 context,
                 semantic_model,
                 &mut use_range_set,
                 &guarded_range_set,
+                &tested_names,
                 &silent_use_ranges,
                 name_expr,
             );
@@ -473,23 +476,15 @@ fn collect_truthy_guarded_names(
 }
 
 fn name_compared_with_nil(left_expr: &LuaExpr, right_expr: &LuaExpr) -> Option<LuaNameExpr> {
-    if is_nil_literal(left_expr) {
+    if is_nil_literal_expr(left_expr) {
         return unwrap_paren_to_name_expr(right_expr);
     }
 
-    if is_nil_literal(right_expr) {
+    if is_nil_literal_expr(right_expr) {
         return unwrap_paren_to_name_expr(left_expr);
     }
 
     None
-}
-
-fn is_nil_literal(expr: &LuaExpr) -> bool {
-    let LuaExpr::LiteralExpr(literal_expr) = expr else {
-        return false;
-    };
-
-    matches!(literal_expr.get_literal(), Some(LuaLiteralToken::Nil(_)))
 }
 
 fn guarded_call_target_name(
@@ -506,7 +501,10 @@ fn guarded_call_target_name(
         LuaExpr::NameExpr(name_expr) => {
             // Metadata-driven: recognize any callee whose resolved return type
             // is `TypeGuard<...>`, regardless of the function's name.
-            if !call_prefix_returns_type_guard(semantic_model, &name_expr) {
+            if !call_prefix_returns_type_guard(
+                semantic_model,
+                &LuaExpr::NameExpr(name_expr.clone()),
+            ) {
                 return None;
             }
 
@@ -716,8 +714,8 @@ fn collect_condition_guard_side_effects(
     }
 }
 
-fn call_prefix_returns_type_guard(semantic_model: &SemanticModel, name_expr: &LuaNameExpr) -> bool {
-    match semantic_model.infer_expr(LuaExpr::NameExpr(name_expr.clone())) {
+fn call_prefix_returns_type_guard(semantic_model: &SemanticModel, prefix: &LuaExpr) -> bool {
+    match semantic_model.infer_expr(prefix.clone()) {
         Ok(LuaType::DocFunction(func)) => matches!(func.get_ret(), LuaType::TypeGuard(_)),
         Ok(LuaType::Signature(signature_id)) => semantic_model
             .get_db()
@@ -897,6 +895,73 @@ fn extract_direct_name_expr(expr: &LuaExpr) -> Option<LuaNameExpr> {
     }
 }
 
+/// The globals this file tests for a value, which it treats as optional externals.
+fn calc_presence_tested_global_names(
+    semantic_model: &SemanticModel,
+    buckets: &FileNodeBuckets,
+    local_ranges: &HashSet<TextRange>,
+) -> HashSet<String> {
+    buckets
+        .name_exprs
+        .iter()
+        .filter(|name_expr| !local_ranges.contains(&name_expr.get_range()))
+        .filter(|name_expr| is_presence_tested(semantic_model, name_expr.syntax()))
+        .filter_map(|name_expr| name_expr.get_name_text().map(|name| name.to_string()))
+        .collect()
+}
+
+/// Whether `node`'s value is only tested for presence; the left of an untested `or` is a fallback.
+fn is_presence_tested(semantic_model: &SemanticModel, node: &glua_parser::LuaSyntaxNode) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if let Some(LuaExpr::ParenExpr(paren)) = LuaExpr::cast(parent.clone()) {
+        return is_presence_tested(semantic_model, paren.syntax());
+    }
+    if let Some(LuaExpr::UnaryExpr(unary)) = LuaExpr::cast(parent.clone()) {
+        return unary
+            .get_op_token()
+            .is_some_and(|op| op.get_op() == UnaryOperator::OpNot);
+    }
+    if let Some(LuaExpr::BinaryExpr(binary)) = LuaExpr::cast(parent.clone()) {
+        let (Some(op), Some((left, right))) = (
+            binary.get_op_token().map(|op| op.get_op()),
+            binary.get_exprs(),
+        ) else {
+            return false;
+        };
+        let is_left = left.syntax() == node;
+        return match op {
+            BinaryOperator::OpAnd => is_left || is_presence_tested(semantic_model, binary.syntax()),
+            BinaryOperator::OpOr => is_presence_tested(semantic_model, binary.syntax()),
+            BinaryOperator::OpEq | BinaryOperator::OpNe => {
+                is_nil_literal_expr(if is_left { &right } else { &left })
+            }
+            _ => false,
+        };
+    }
+    if let Some(args) = glua_parser::LuaCallArgList::cast(parent.clone()) {
+        let is_first_arg = args
+            .get_args()
+            .next()
+            .is_some_and(|arg| arg.syntax() == node);
+        return is_first_arg
+            && args
+                .get_parent::<LuaCallExpr>()
+                .and_then(|call| call.get_prefix_expr())
+                .is_some_and(|prefix| call_prefix_returns_type_guard(semantic_model, &prefix));
+    }
+    let is_condition_of =
+        |condition: Option<LuaExpr>| condition.is_some_and(|condition| condition.syntax() == node);
+    LuaIfStat::cast(parent.clone()).is_some_and(|stat| is_condition_of(stat.get_condition_expr()))
+        || glua_parser::LuaElseIfClauseStat::cast(parent.clone())
+            .is_some_and(|clause| is_condition_of(clause.get_condition_expr()))
+        || glua_parser::LuaWhileStat::cast(parent.clone())
+            .is_some_and(|stat| is_condition_of(stat.get_condition_expr()))
+        || glua_parser::LuaRepeatStat::cast(parent)
+            .is_some_and(|stat| is_condition_of(stat.get_condition_expr()))
+}
+
 fn calc_name_expr_ref(
     semantic_model: &SemanticModel,
     use_range_set: &mut HashSet<TextRange>,
@@ -918,6 +983,7 @@ fn check_name_expr(
     semantic_model: &SemanticModel,
     use_range_set: &mut HashSet<TextRange>,
     guarded_range_set: &HashSet<TextRange>,
+    tested_names: &HashSet<String>,
     silent_use_ranges: &HashSet<TextRange>,
     name_expr: LuaNameExpr,
 ) -> Option<()> {
@@ -985,8 +1051,7 @@ fn check_name_expr(
         db.get_global_index().is_exist_global_decl(&name_text)
     };
 
-    if is_valid_global {
-        // Name exists as global - skip diagnostic
+    if is_valid_global || tested_names.contains(name_text.as_str()) {
         return Some(());
     }
 
