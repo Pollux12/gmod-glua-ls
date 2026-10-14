@@ -233,7 +233,9 @@ fn remove_fields_completed_after(
 
         let mut written_prefixes = Vec::new();
         if let Some(assign) = LuaAssignStat::cast(node.clone()) {
-            for var in assign.get_var_and_expr_list().0 {
+            let (vars, values) = assign.get_var_and_expr_list();
+            let mut written_keys = Vec::new();
+            for var in vars {
                 let LuaVarExpr::IndexExpr(index) = var else {
                     continue;
                 };
@@ -249,8 +251,44 @@ fn remove_fields_completed_after(
                 }
                 written_prefixes.push(prefix.syntax().clone());
                 if let Some(key) = index.get_index_key() {
-                    missing.remove(key.get_path_part().as_str());
+                    written_keys.push(key.get_path_part());
                 }
+            }
+
+            // The values run before the assignment stores them, so a value that
+            // passes the whole target on consumes it without this statement's writes.
+            // A function value only runs later.
+            let consumed_by_values = values
+                .iter()
+                .flat_map(|value| {
+                    value
+                        .syntax()
+                        .descendants_of::<LuaVarExpr>()
+                        .filter(move |var| {
+                            !var.syntax()
+                                .ancestors()
+                                .find_map(glua_parser::LuaClosureExpr::cast)
+                                .is_some_and(|closure| {
+                                    value
+                                        .syntax()
+                                        .text_range()
+                                        .contains_range(closure.syntax().text_range())
+                                })
+                        })
+                })
+                .filter(|var| {
+                    var.get_access_path().as_deref() == Some(target.as_str())
+                        && !is_field_access_prefix(var)
+                })
+                .collect::<Vec<_>>();
+            if !consumed_by_values.is_empty() {
+                for var in consumed_by_values {
+                    remove_fields_filled_by_callee(semantic_model, table_type, &var, missing);
+                }
+                break;
+            }
+            for key in &written_keys {
+                missing.remove(key.as_str());
             }
         }
 
@@ -274,6 +312,22 @@ fn remove_fields_completed_after(
     }
 
     Some(())
+}
+
+/// Whether `var` only reads a field of itself (`t.a`, `t[k]`), not a method call
+/// that hands the whole table on as `self`.
+fn is_field_access_prefix(var: &LuaVarExpr) -> bool {
+    var.syntax()
+        .parent()
+        .and_then(glua_parser::LuaIndexExpr::cast)
+        .is_some_and(|index| {
+            index
+                .get_prefix_expr()
+                .is_some_and(|prefix| prefix.syntax() == var.syntax())
+                && !index
+                    .get_index_token()
+                    .is_some_and(|token| token.is_colon())
+        })
 }
 
 /// A literal passed as an out-parameter is completed by the callee, not by the

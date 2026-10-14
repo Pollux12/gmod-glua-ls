@@ -807,11 +807,14 @@ foo({})
 
     #[test]
     fn a_field_written_from_its_own_use_is_still_missing_there() {
-        let mut ws = VirtualWorkspace::new();
+        for before in ["observe(value)", ""] {
+            let mut ws = VirtualWorkspace::new();
 
-        assert!(!ws.check_code_for(
-            DiagnosticCode::MissingFields,
-            r#"
+            assert!(
+                !ws.check_code_for(
+                    DiagnosticCode::MissingFields,
+                    &format!(
+                        r#"
             ---@class Full
             ---@field required string
 
@@ -822,9 +825,69 @@ foo({})
             ---@return string
             local function consume(value) return value.required end
 
-            local value = {}
-            observe(value)
+            local value = {{}}
+            {before}
             value.required = consume(value)
+            "#
+                    ),
+                ),
+                "{before}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_written_from_another_field_of_the_table_is_given() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Size
+            ---@field w number
+            ---@field h number
+
+            ---@type Size
+            local size = {}
+            size.w = 10
+            size.h = size.w * 2
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_function_written_onto_the_table_it_uses_is_given() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Button
+            ---@field DoClick fun()
+
+            ---@type Button
+            local button = {}
+            button.DoClick = function() print(button) end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_table_of_functions_written_onto_the_table_they_use_is_given() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Callbacks
+            ---@field run fun()
+
+            ---@class Job
+            ---@field callbacks Callbacks
+
+            ---@type Job
+            local job = {}
+            job.callbacks = { run = function() print(job) end }
             "#,
         ));
     }
