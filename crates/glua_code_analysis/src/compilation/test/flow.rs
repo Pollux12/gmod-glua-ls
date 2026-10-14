@@ -8915,6 +8915,44 @@ _2 = a[1]
     }
 
     #[test]
+    fn a_type_guard_that_shares_no_arm_with_the_value_narrows_to_the_guarded_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_type_predicates();
+
+        let file_id = ws.def(
+            r#"
+            ---@param tree table<integer, integer|table>
+            ---@param act integer
+            local function Translate(tree, act)
+                if isstring(tree[act]) then
+                    local sequence = tree[act]
+                end
+            end
+            "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let index = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaIndexExpr>()
+            .last()
+            .expect("guarded read");
+        let guarded = semantic_model
+            .infer_expr(glua_parser::LuaExpr::IndexExpr(index))
+            .expect("guarded read type");
+        assert_eq!(
+            guarded,
+            LuaType::String,
+            "got: {}",
+            ws.humanize_type(guarded.clone())
+        );
+    }
+
+    #[test]
     fn assigning_an_any_value_keeps_a_doc_declared_param_type() {
         let mut ws = VirtualWorkspace::new();
 

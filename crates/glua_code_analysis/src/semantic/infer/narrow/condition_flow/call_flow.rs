@@ -5,14 +5,13 @@ use glua_parser::{LuaAstNode, LuaCallExpr, LuaChunk, LuaExpr, LuaIndexMemberExpr
 use crate::{
     DbIndex, FileId, FlowNode, FlowTree, GMOD_ATTR_SELF_GUARD, InferFailReason, InferGuard,
     LuaAliasCallKind, LuaAliasCallType, LuaFunctionType, LuaInferCache, LuaSignatureCast,
-    LuaSignatureId, LuaType, TypeOps, find_signature_attribute_use, infer_call_expr_func,
-    infer_expr,
+    LuaSignatureId, LuaType, TypeOps, check_type_compact, find_signature_attribute_use,
+    infer_call_expr_func, infer_expr,
     semantic::{
         SemanticDeclGuard, SemanticDeclLevel,
         infer::{
             VarRefId,
             infer_index::infer_member_by_member_key,
-            infer_param_with_cache,
             narrow::{
                 ResultTypeOrContinue, call_var_ref_root,
                 condition_flow::{InferConditionFlow, get_condition_antecedent_type},
@@ -408,8 +407,6 @@ fn try_inferred_positive_guard(
         get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
     Ok(Some(narrow_type_guard_true_branch(
         db,
-        cache,
-        var_ref_id,
         antecedent_type,
         guard.narrowed_type,
         false,
@@ -706,14 +703,9 @@ fn get_type_at_call_expr_by_type_guard(
         get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
 
     let result_type = match condition_flow {
-        InferConditionFlow::TrueCondition => narrow_type_guard_true_branch(
-            db,
-            cache,
-            var_ref_id,
-            antecedent_type,
-            guard_type,
-            is_valid_guard,
-        ),
+        InferConditionFlow::TrueCondition => {
+            narrow_type_guard_true_branch(db, antecedent_type, guard_type, is_valid_guard)
+        }
         InferConditionFlow::FalseCondition => {
             TypeOps::Remove.apply(db, &antecedent_type, &guard_type)
         }
@@ -752,8 +744,6 @@ fn type_guard_target_expr(call_expr: &LuaCallExpr) -> Option<LuaExpr> {
 
 fn narrow_type_guard_true_branch(
     db: &DbIndex,
-    cache: &mut LuaInferCache,
-    var_ref_id: &VarRefId,
     antecedent_type: LuaType,
     guard_type: LuaType,
     is_valid_guard: bool,
@@ -780,19 +770,26 @@ fn narrow_type_guard_true_branch(
         return narrowed_type;
     }
 
-    if antecedent_type.is_unknown() || antecedent_type.is_any() {
-        return guard_type;
-    }
+    // Inside the guard the value is what the guard proves: the arms it accepts, or
+    // the guarded type itself when nothing the value is known to hold passes.
+    guard_accepted_arms(db, &antecedent_type, &guard_type).unwrap_or(guard_type)
+}
 
-    // The inferred type cache for mutable unannotated parameters is flow-insensitive:
-    // later writes can poison the origin type used by earlier guards (for example,
-    // Starfall's `sfmeshdata = meshToStream(...)` made `elseif istable(sfmeshdata)`
-    // start from `string`). In that case the runtime TypeGuard is the better authority.
-    if is_inferred_mutable_param_without_declared_type(db, cache, var_ref_id) {
-        return guard_type;
-    }
-
-    remove_false_or_nil(antecedent_type)
+fn guard_accepted_arms(db: &DbIndex, value: &LuaType, guard_type: &LuaType) -> Option<LuaType> {
+    let arms = match value {
+        LuaType::Union(union) => union.types().cloned().collect::<Vec<_>>(),
+        _ => vec![value.clone()],
+    };
+    let accepted = arms
+        .into_iter()
+        .filter(|arm| {
+            !arm.is_nil()
+                && !arm.is_unknown()
+                && !arm.is_any()
+                && check_type_compact(db, guard_type, arm).is_ok()
+        })
+        .collect::<Vec<_>>();
+    (!accepted.is_empty()).then(|| LuaType::from_vec(accepted))
 }
 
 fn narrow_valid_guard_true_branch(
@@ -874,33 +871,6 @@ fn apply_signature_cast(
             None => apply_cast(db, &signature_cast.cast, source_type, condition_flow),
         },
     }
-}
-
-fn is_inferred_mutable_param_without_declared_type(
-    db: &DbIndex,
-    cache: &mut LuaInferCache,
-    var_ref_id: &VarRefId,
-) -> bool {
-    let Some(decl_id) = var_ref_id.get_decl_id_ref() else {
-        return false;
-    };
-    let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
-        return false;
-    };
-    if !decl.is_param() || infer_param_with_cache(db, cache, decl).is_ok() {
-        return false;
-    }
-    if !db
-        .get_type_index()
-        .get_type_cache(&decl_id.into())
-        .is_some_and(|type_cache| type_cache.is_infer())
-    {
-        return false;
-    }
-
-    db.get_reference_index()
-        .get_decl_references(&decl_id.file_id, &decl_id)
-        .is_some_and(|decl_refs| decl_refs.mutable)
 }
 
 fn get_call_prefix_signature_id(

@@ -587,7 +587,7 @@ mod test {
     }
 
     #[test]
-    fn test_istable_guard_does_not_broaden_incompatible_known_type() {
+    fn test_istable_guard_narrows_an_incompatible_known_type_to_table() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         ws.def_gmod_type_predicates();
 
@@ -604,11 +604,11 @@ mod test {
             "value",
         );
 
-        assert_eq!(ty, ws.ty("string"));
+        assert_eq!(ty, LuaType::Table);
     }
 
     #[test]
-    fn test_istable_guard_preserves_unannotated_string_const_initializer() {
+    fn test_istable_guard_narrows_an_unannotated_string_const_initializer_to_table() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         ws.def_gmod_type_predicates();
 
@@ -624,7 +624,7 @@ mod test {
             "value",
         );
 
-        assert_eq!(ty, LuaType::StringConst(smol_str::SmolStr::new("x").into()));
+        assert_eq!(ty, LuaType::Table);
     }
 
     #[test]
