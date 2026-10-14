@@ -388,12 +388,17 @@ fn infer_binary_expr_add(db: &DbIndex, left: LuaType, right: LuaType) -> InferRe
         };
     }
 
+    // A value we know nothing about takes the other operand's type, unless that
+    // operand's own `__add` is what runs for a `nil`.
+    let nil_has_operator = |nil_side: &LuaType, other: &LuaType| {
+        nil_side.is_nil() && has_operator_taking_nil(db, other, BinaryOperator::OpAdd)
+    };
     match (
         left.is_nil() || left.is_any() || left.is_unknown(),
         right.is_nil() || right.is_any() || right.is_unknown(),
     ) {
-        (true, false) => return Ok(right),
-        (false, true) => return Ok(left),
+        (true, false) if !nil_has_operator(&left, &right) => return Ok(right),
+        (false, true) if !nil_has_operator(&right, &left) => return Ok(left),
         _ => {}
     }
 

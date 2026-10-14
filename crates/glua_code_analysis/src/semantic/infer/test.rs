@@ -251,6 +251,29 @@ mod test {
     }
 
     #[test]
+    fn addition_with_a_nullable_operand_keeps_what_its_operator_taking_nil_yields() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "addons/add_nil_op/lua/autorun/sh_add_nil_op.lua",
+            r#"
+            ---@class Offset
+            ---@operator add(number): number
+            ---@operator add(nil): string
+
+            ---@param value number?
+            ---@param offset Offset?
+            local function shift(value, offset)
+                local sum = value + offset
+                return sum
+            end
+            "#,
+        );
+        let sum = infer_last_name_expr_type_in_file(&ws, file, "sum");
+        let expected = ws.ty("number|string");
+        assert_eq!(ws.humanize_type(sum), ws.humanize_type(expected));
+    }
+
+    #[test]
     fn direct_param_return_alias_returns_one_actual_argument_value() {
         let mut ws = VirtualWorkspace::new();
         let file = ws.def_file(
