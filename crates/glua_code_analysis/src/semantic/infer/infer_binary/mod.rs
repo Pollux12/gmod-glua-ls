@@ -227,12 +227,16 @@ fn infer_union_binary_expr(
         .types()
         .filter(|ty| !(raises_on_nil && ty.is_nil()))
         .filter_map(|ty| {
-            if is_left_union {
-                infer_binary_expr_type(db, ty.clone(), other.clone(), op)
+            let (left, right) = if is_left_union {
+                (ty.clone(), other.clone())
             } else {
-                infer_binary_expr_type(db, other.clone(), ty.clone(), op)
-            }
-            .ok()
+                (other.clone(), ty.clone())
+            };
+            // The other operand may be a union too: each pair of arms is its own operation.
+            infer_union_binary_expr(db, op, &left, &right)
+                .map(Ok)
+                .unwrap_or_else(|| infer_binary_expr_type(db, left, right, op))
+                .ok()
         })
         .reduce(|left, right| TypeOps::Union.apply(db, &left, &right));
     // Every member failed: pin the escape value instead of returning the seed.
@@ -250,12 +254,18 @@ fn has_operator_taking_nil(db: &DbIndex, operand: &LuaType, op: BinaryOperator) 
         BinaryOperator::OpConcat => LuaOperatorMetaMethod::Concat,
         _ => return false,
     };
-    operand.is_custom_type()
-        && get_custom_type_operator(db, operand.clone(), meta_method).is_some_and(|operators| {
-            operators.iter().any(|operator| {
-                check_type_compact(db, &operator.get_operand(db), &LuaType::Nil).is_ok()
+    let arms = match operand {
+        LuaType::Union(union) => union.types().cloned().collect::<Vec<_>>(),
+        _ => vec![operand.clone()],
+    };
+    arms.into_iter().any(|arm| {
+        arm.is_custom_type()
+            && get_custom_type_operator(db, arm, meta_method).is_some_and(|operators| {
+                operators.iter().any(|operator| {
+                    check_type_compact(db, &operator.get_operand(db), &LuaType::Nil).is_ok()
+                })
             })
-        })
+    })
 }
 
 fn infer_binary_expr_type(

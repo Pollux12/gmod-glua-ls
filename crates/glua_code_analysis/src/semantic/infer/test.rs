@@ -206,6 +206,29 @@ mod test {
     }
 
     #[test]
+    fn arithmetic_with_a_nullable_operand_keeps_what_its_operator_taking_nil_yields() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "addons/arith_nil_op2/lua/autorun/sh_arith_nil_op2.lua",
+            r#"
+            ---@class Factor2
+            ---@operator mul(number): number
+            ---@operator mul(nil): string
+
+            ---@param value number?
+            ---@param factor Factor2?
+            local function multiply(value, factor)
+                local product = value * factor
+                return product
+            end
+            "#,
+        );
+        let product = infer_last_name_expr_type_in_file(&ws, file, "product");
+        let rendered = ws.humanize_type(product);
+        assert!(rendered.contains("string"), "{rendered}");
+    }
+
+    #[test]
     fn direct_param_return_alias_returns_one_actual_argument_value() {
         let mut ws = VirtualWorkspace::new();
         let file = ws.def_file(
