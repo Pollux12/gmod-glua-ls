@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaExpr, LuaIndexKey, LuaStat,
-    LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 
 use crate::{
@@ -232,8 +232,10 @@ fn remove_fields_completed_after(
         }
 
         let mut written_prefixes = Vec::new();
+        let mut values = Vec::new();
         if let Some(assign) = LuaAssignStat::cast(node.clone()) {
-            let (vars, values) = assign.get_var_and_expr_list();
+            let vars;
+            (vars, values) = assign.get_var_and_expr_list();
             let mut written_keys = Vec::new();
             for var in vars {
                 let LuaVarExpr::IndexExpr(index) = var else {
@@ -255,9 +257,7 @@ fn remove_fields_completed_after(
                 }
             }
 
-            // The values run before the assignment stores them, so a value that
-            // hands the whole target to a call consumes it without this statement's
-            // writes. A function value only runs later, unless it is called there.
+            // Values run before their writes; a function value runs later unless called there.
             let consumed_by_values = values
                 .iter()
                 .flat_map(|value| {
@@ -267,7 +267,9 @@ fn remove_fields_completed_after(
                         .filter(move |var| !runs_after_value(var, value))
                 })
                 .filter(|var| {
-                    var.get_access_path().as_deref() == Some(target.as_str()) && hands_to_call(var)
+                    var.get_access_path().as_deref() == Some(target.as_str())
+                        && !declared_within(semantic_model, var, &node)
+                        && hands_to_call(var)
                 })
                 .collect::<Vec<_>>();
             if !consumed_by_values.is_empty() {
@@ -288,6 +290,14 @@ fn remove_fields_completed_after(
             .filter(|var| {
                 var.get_access_path().as_deref() == Some(target.as_str())
                     && !written_prefixes.contains(var.syntax())
+                    && !declared_within(semantic_model, var, &node)
+                    && !values.iter().any(|value| {
+                        value
+                            .syntax()
+                            .text_range()
+                            .contains_range(var.syntax().text_range())
+                            && runs_after_value(var, value)
+                    })
             })
             .collect::<Vec<_>>();
         if !escaping_vars.is_empty() {
@@ -305,41 +315,92 @@ fn remove_fields_completed_after(
 
 /// Whether `var` is handed to a call, as an argument or as a method call's `self`.
 fn hands_to_call(var: &LuaVarExpr) -> bool {
-    let Some(parent) = var.syntax().parent() else {
+    let operand = outermost_value(var.syntax());
+    let Some(parent) = operand.parent() else {
         return false;
     };
     LuaCallArgList::can_cast(parent.kind().into())
         || glua_parser::LuaIndexExpr::cast(parent).is_some_and(|index| {
             index
                 .get_prefix_expr()
-                .is_some_and(|prefix| prefix.syntax() == var.syntax())
+                .is_some_and(|prefix| prefix.syntax() == &operand)
                 && index
                     .get_index_token()
                     .is_some_and(|token| token.is_colon())
         })
 }
 
-/// Whether `var` sits in a function `value` creates without calling it.
+/// `node` together with the parentheses wrapped around it, which pass on exactly its value.
+fn outermost_parens(node: &LuaSyntaxNode) -> LuaSyntaxNode {
+    let mut operand = node.clone();
+    while let Some(paren) = operand.parent().and_then(glua_parser::LuaParenExpr::cast) {
+        operand = paren.syntax().clone();
+    }
+    operand
+}
+
+/// `node` together with the parentheses and `and`/`or` operators that may pass its value on.
+fn outermost_value(node: &LuaSyntaxNode) -> LuaSyntaxNode {
+    let mut operand = node.clone();
+    while let Some(parent) = operand.parent() {
+        let carries_value = glua_parser::LuaParenExpr::can_cast(parent.kind().into())
+            || glua_parser::LuaBinaryExpr::cast(parent.clone()).is_some_and(|binary| {
+                binary.get_op_token().is_some_and(|op| {
+                    matches!(
+                        op.get_op(),
+                        glua_parser::BinaryOperator::OpAnd | glua_parser::BinaryOperator::OpOr
+                    )
+                })
+            });
+        if !carries_value {
+            break;
+        }
+        operand = parent;
+    }
+    operand
+}
+
+/// Whether `var`'s root variable is declared inside `scope`, shadowing any outer one.
+fn declared_within(
+    semantic_model: &SemanticModel,
+    var: &LuaVarExpr,
+    scope: &LuaSyntaxNode,
+) -> bool {
+    let mut root = LuaExpr::cast(var.syntax().clone());
+    while let Some(LuaExpr::IndexExpr(index)) = root {
+        root = index.get_prefix_expr();
+    }
+    let Some(LuaExpr::NameExpr(name)) = root else {
+        return false;
+    };
+    semantic_model
+        .get_db()
+        .get_reference_index()
+        .get_local_reference(&semantic_model.get_file_id())
+        .and_then(|references| references.get_decl_id(&name.get_range()))
+        .is_some_and(|decl_id| scope.text_range().contains(decl_id.position))
+}
+
+/// Whether `var` sits in a function `value` stores for later instead of running it.
 fn runs_after_value(var: &LuaVarExpr, value: &LuaExpr) -> bool {
     var.syntax()
         .ancestors()
         .take_while(|node| node != value.syntax())
         .chain(std::iter::once(value.syntax().clone()))
         .filter_map(glua_parser::LuaClosureExpr::cast)
-        .any(|closure| !is_called_where_written(&closure))
+        .any(|closure| !may_run_where_written(&closure))
 }
 
-/// Whether `closure` is called where it is written, as in `(function() end)()`.
-fn is_called_where_written(closure: &glua_parser::LuaClosureExpr) -> bool {
-    let mut callee = closure.syntax().clone();
-    while let Some(paren) = callee.parent().and_then(glua_parser::LuaParenExpr::cast) {
-        callee = paren.syntax().clone();
-    }
-    callee
-        .parent()
-        .and_then(LuaCallExpr::cast)
-        .and_then(|call| call.get_prefix_expr())
-        .is_some_and(|prefix| prefix.syntax() == &callee)
+/// Whether `closure` is called where it is written, or handed to a call that may run it.
+fn may_run_where_written(closure: &glua_parser::LuaClosureExpr) -> bool {
+    let operand = outermost_value(closure.syntax());
+    let Some(parent) = operand.parent() else {
+        return false;
+    };
+    LuaCallArgList::can_cast(parent.kind().into())
+        || LuaCallExpr::cast(parent)
+            .and_then(|call| call.get_prefix_expr())
+            .is_some_and(|prefix| prefix.syntax() == &operand)
 }
 
 /// A literal passed as an out-parameter is completed by the callee, not by the
@@ -353,11 +414,12 @@ fn remove_fields_filled_by_callee(
     var: &LuaVarExpr,
     missing: &mut HashSet<&str>,
 ) -> Option<()> {
-    let arg_list = var.get_parent::<LuaCallArgList>()?;
+    let operand = outermost_parens(var.syntax());
+    let arg_list = LuaCallArgList::cast(operand.parent()?)?;
     let call_expr = arg_list.get_parent::<LuaCallExpr>()?;
     let arg_index = arg_list
         .get_args()
-        .position(|arg| arg.get_position() == var.get_position())?;
+        .position(|arg| arg.syntax() == &operand)?;
 
     let prefix_expr = call_expr.get_prefix_expr()?;
     let LuaType::Signature(signature_id) = semantic_model.infer_expr(prefix_expr).ok()? else {

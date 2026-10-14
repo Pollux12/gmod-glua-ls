@@ -1148,4 +1148,127 @@ foo({})
             [false, false, true]
         );
     }
+    /// Handing `(value)` to a call consumes the table as handing `value` does.
+    #[test]
+    fn a_parenthesized_use_of_the_table_still_consumes_it() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value Full
+            ---@return string
+            local function consume(value) return value.required end
+
+            ---@type Full
+            local value = {}
+            value.required = consume((value))
+            "#,
+        ));
+    }
+
+    /// A function stored on the table runs once called, after the later writes.
+    #[test]
+    fn a_callback_written_before_another_field_does_not_consume_the_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Pair
+            ---@field fn fun()
+            ---@field required string
+
+            ---@param value Pair
+            local function consume(value) end
+
+            ---@type Pair
+            local value = {}
+            value.fn = function() consume(value) end
+            value.required = "ready"
+            value.fn()
+            "#,
+        ));
+    }
+
+    /// A function handed to a call may run there, consuming the table it uses.
+    #[test]
+    fn a_function_handed_to_a_call_consumes_the_table_it_uses() {
+        for callback in [
+            "function() consume(value) end",
+            "true and function() consume(value) end",
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+            assert!(
+                !ws.check_code_for(
+                    DiagnosticCode::MissingFields,
+                    &format!(
+                        r#"
+            ---@class Pair
+            ---@field ok boolean
+            ---@field required string
+
+            ---@param value Pair
+            local function consume(value) end
+
+            ---@type Pair
+            local value = {{}}
+            value.ok = pcall({callback})
+            value.required = "ready"
+            "#
+                    ),
+                ),
+                "{callback}"
+            );
+        }
+    }
+
+    /// A callee filling an `and`/`or` argument may fill the other operand, not the table.
+    #[test]
+    fn a_callee_filling_a_logical_argument_does_not_complete_the_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param target Full
+            local function Fill(target)
+                target.required = "ready"
+            end
+
+            ---@type Full
+            local value = {}
+            Fill(value and { required = "other" })
+            "#,
+        ));
+    }
+
+    /// A parameter named like the table is another value, not the table.
+    #[test]
+    fn a_shadowing_parameter_handed_to_a_call_is_not_the_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value Full
+            ---@return string
+            local function consume(value) return value.required end
+
+            ---@type Full
+            local value = {}
+            value.required = (function(value) return consume(value) end)({ required = "ready" })
+            "#,
+        ));
+    }
 }
