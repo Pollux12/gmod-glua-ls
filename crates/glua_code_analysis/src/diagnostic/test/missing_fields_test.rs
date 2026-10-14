@@ -751,6 +751,31 @@ foo({})
     }
 
     #[test]
+    fn unannotated_local_table_filled_before_its_use_has_no_missing_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Ray
+            ---@field start number
+            ---@field endpos number
+            ---@field mins number
+
+            ---@param ray Ray
+            local function trace(ray) return ray end
+
+            local ray = { mins = 1 }
+            function Fire(pos)
+                ray.start = pos
+                ray.endpos = pos + 1
+                return trace(ray)
+            end
+            "#,
+        ));
+    }
+
+    #[test]
     fn unannotated_local_table_passed_to_reader_reports_missing_fields() {
         let mut ws = VirtualWorkspace::new();
 

@@ -184,6 +184,7 @@ fn check_table_expr(
 
     remove_fields_completed_after(semantic_model, &table_type, expr, &mut missing);
     remove_fields_supplied_by_metatable(db, semantic_model.get_file_id(), expr, &mut missing);
+    remove_fields_gained_before_use(db, semantic_model.get_file_id(), expr, &mut missing);
     if missing.is_empty() {
         return Some(());
     }
@@ -360,6 +361,72 @@ fn remove_fields_supplied_by_metatable(
             find_metatable_index_field(db, &table, &key),
             MetatableIndexField::Absent
         )
+    });
+}
+
+/// A literal an untyped local holds is expected to be what the local's call uses
+/// take, so like those uses it counts the fields its table is given before them:
+/// `local trace = { mins = m }` filled with `trace.start = p` before
+/// `util.TraceHull(trace)` is complete.
+fn remove_fields_gained_before_use(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: &LuaTableExpr,
+    missing: &mut HashSet<&str>,
+) {
+    let table = InFiled::new(file_id, expr.get_range());
+    let Some(decl_id) = expr
+        .get_parent::<glua_parser::LuaLocalStat>()
+        .and_then(|local| {
+            let index = local
+                .get_value_exprs()
+                .position(|value| value.syntax() == expr.syntax())?;
+            let name = local.get_local_name_list().nth(index)?;
+            Some(crate::LuaDeclId::new(file_id, name.get_position()))
+        })
+    else {
+        return;
+    };
+    if !db
+        .get_type_index()
+        .get_type_cache(&decl_id.into())
+        .is_some_and(|cache| cache.as_type() == &LuaType::TableConst(table.clone()))
+    {
+        return;
+    }
+    let Some(root) = expr.syntax().ancestors().last() else {
+        return;
+    };
+    let Some(first_use) = db
+        .get_reference_index()
+        .get_decl_references(&file_id, &decl_id)
+        .and_then(|references| {
+            references
+                .cells
+                .iter()
+                .filter(|cell| !cell.is_write)
+                .filter(|cell| {
+                    root.covering_element(cell.range)
+                        .ancestors()
+                        .nth(1)
+                        .is_some_and(|parent| LuaCallArgList::can_cast(parent.kind().into()))
+                })
+                .map(|cell| cell.range.start())
+                .min()
+        })
+    else {
+        return;
+    };
+    let Some(members) = db
+        .get_member_index()
+        .get_members(&LuaMemberOwner::Element(table))
+    else {
+        return;
+    };
+    missing.retain(|name| {
+        !members.iter().any(|member| {
+            member.get_key().to_path() == *name && member.get_id().get_position() < first_use
+        })
     });
 }
 
