@@ -1372,6 +1372,42 @@ end
     }
 
     #[test]
+    fn a_failed_predicate_that_removes_a_type_adds_it_only_where_the_value_could_hold_it() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL: Entity
+            ---@class Panel
+
+            ---@return boolean
+            ---@return_cast object -NULL
+            function IsLive(object) end
+
+            ---@param ent Entity
+            ---@param pnl Panel
+            local function make(ent, pnl)
+                if not IsLive(ent) then
+                    failed_entity = ent
+                end
+                if not IsLive(pnl) then
+                    failed_panel = pnl
+                end
+            end
+            "#,
+        );
+
+        let failed_entity = ws.expr_ty("failed_entity");
+        let entity_or_null = ws.ty("Entity|NULL");
+        assert_eq!(
+            ws.humanize_type(failed_entity),
+            ws.humanize_type(entity_or_null)
+        );
+        assert_eq!(ws.expr_ty("failed_panel"), ws.ty("Panel"));
+    }
+
+    #[test]
     fn deferred_closure_retains_immutable_return_cast_false_branch() {
         let mut ws = VirtualWorkspace::new();
 

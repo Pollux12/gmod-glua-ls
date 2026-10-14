@@ -161,6 +161,13 @@ pub fn apply_cast(
         None => return source_type,
     };
     match action {
+        // A predicate that removes `target` when true leaves it possible when false
+        // only where the value could have held it.
+        LuaCastAction::Add
+            if condition_flow.is_false() && !any_arm_can_hold(db, &source_type, target) =>
+        {
+            source_type
+        }
         LuaCastAction::Add => TypeOps::Union.apply(db, &source_type, target),
         LuaCastAction::Remove => {
             let removed = TypeOps::Remove.apply(db, &source_type, target);
@@ -172,6 +179,18 @@ pub fn apply_cast(
         }
         LuaCastAction::Force => target.clone(),
     }
+}
+
+fn any_arm_can_hold(db: &DbIndex, source: &LuaType, target: &LuaType) -> bool {
+    let arms = match source {
+        LuaType::Union(union) => union.types().cloned().collect::<Vec<_>>(),
+        _ => vec![source.clone()],
+    };
+    arms.iter().any(|arm| {
+        !arm.is_unknown()
+            && !arm.is_any()
+            && crate::semantic::type_check::check_type_compact(db, arm, target).is_ok()
+    })
 }
 
 /// The operation a `---@cast` in `file_id` writes, with the type the doc
