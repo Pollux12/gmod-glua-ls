@@ -4816,6 +4816,36 @@ mod test {
         ));
     }
 
+    /// A literal `tonumber` reads as a number passes, whitespace and hex included.
+    #[test]
+    fn a_number_param_accepts_a_literal_tonumber_converts() {
+        for literal in ["\" 5 \"", "\"0x1F\"", "\"-2.5e3\""] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(
+                ws.check_code_for(
+                    DiagnosticCode::ParamTypeMismatch,
+                    &format!(
+                        r#"
+            ---@param n number
+            local function calc(n) end
+            calc({literal})
+        "#
+                    )
+                ),
+                "{literal}"
+            );
+        }
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number
+            local function calc(n) end
+            calc("0x")
+        "#
+        ));
+    }
+
     /// A bare `string` type must be rejected for `number` params.
     #[test]
     fn test_number_param_rejects_bare_string_type() {

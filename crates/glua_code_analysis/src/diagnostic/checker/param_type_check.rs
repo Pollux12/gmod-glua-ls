@@ -1603,8 +1603,22 @@ fn is_number_coercible(ty: &LuaType) -> bool {
 /// Returns `true` if `ty` is a string constant that is a valid number (integer or float).
 fn is_numeric_string_literal(ty: &LuaType) -> bool {
     match ty {
-        LuaType::StringConst(s) | LuaType::DocStringConst(s) => s.parse::<f64>().is_ok(),
+        LuaType::StringConst(s) | LuaType::DocStringConst(s) => converts_to_number(s),
         _ => false,
+    }
+}
+
+/// Whether LuaJIT's `tonumber` reads `text` as a number: surrounding whitespace
+/// is skipped and a `0x` prefix reads hexadecimal.
+fn converts_to_number(text: &str) -> bool {
+    let text = text.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r'));
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    match unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+    {
+        Some(digits) => !digits.is_empty() && digits.chars().all(|c| c.is_ascii_hexdigit()),
+        None => text.parse::<f64>().is_ok(),
     }
 }
 
