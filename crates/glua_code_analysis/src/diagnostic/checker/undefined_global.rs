@@ -164,7 +164,7 @@ fn continuation_guard_names(
     if_stat: &LuaIfStat,
 ) -> Option<HashSet<String>> {
     let block = if_stat.get_block()?;
-    if !is_return_only_block(&block) {
+    if !ends_with_return(&block) {
         return None;
     }
 
@@ -232,22 +232,13 @@ impl GuardedTarget {
     }
 }
 
-fn is_return_only_block(block: &LuaBlock) -> bool {
-    let mut has_return_stat = false;
-    for stat in block.get_stats() {
-        match stat {
-            LuaStat::EmptyStat(_) => {}
-            LuaStat::ReturnStat(_) => {
-                if has_return_stat {
-                    return false;
-                }
-                has_return_stat = true;
-            }
-            _ => return false,
-        }
-    }
-
-    has_return_stat
+/// Whether `block` always leaves the function: whatever it does first, it ends in a `return`.
+fn ends_with_return(block: &LuaBlock) -> bool {
+    block
+        .get_stats()
+        .filter(|stat| !matches!(stat, LuaStat::EmptyStat(_)))
+        .last()
+        .is_some_and(|stat| matches!(stat, LuaStat::ReturnStat(_)))
 }
 
 fn extract_continuation_guarded_names(

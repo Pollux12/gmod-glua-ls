@@ -368,6 +368,26 @@ mod test {
     }
 
     #[test]
+    fn test_continuation_guard_that_cleans_up_before_returning_suppresses_later_use() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "lua/autorun/client/cl_pac_update.lua",
+            r#"
+            local function update(stop)
+                if not pac then
+                    stop()
+                    return
+                end
+
+                print(pac.LocalPlayer)
+            end
+            "#,
+            "pac",
+        ));
+    }
+
+    #[test]
     fn test_top_level_not_guard_without_early_return_does_not_suppress_later_use() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(!ws.check_code_for(
