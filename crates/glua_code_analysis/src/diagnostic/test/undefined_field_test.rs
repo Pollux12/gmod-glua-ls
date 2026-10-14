@@ -6279,4 +6279,75 @@ owner:CompletelyMadeUpMethod()
         let fields = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
         assert!(fields.is_empty(), "{fields:#?}");
     }
+
+    /// A missing method errors before `or`/`and` act on the call's result.
+    #[test]
+    fn a_defaulted_call_result_does_not_excuse_the_method() {
+        for call in ["owner:GetHelth() or 0", "owner:GetHelth() and 1"] {
+            let mut ws = VirtualWorkspace::new();
+            enable_gmod(&mut ws);
+            ws.def_file("annotations/entity.lua", "---@meta\n---@class Entity\n");
+            let file_id = ws.def_file(
+                "lua/autorun/server/sv_health.lua",
+                &format!("---@type Entity\nlocal owner\nlocal health = {call}\nprint(health)\n"),
+            );
+
+            let diagnostics = default_diagnostics_for_code_with_shared(
+                &mut ws,
+                file_id,
+                DiagnosticCode::UndefinedMethod,
+            );
+
+            assert_eq!(diagnostics.len(), 1, "{call}: {diagnostics:?}");
+        }
+    }
+
+    /// A `~= nil` test of the method before the call excuses it like a truthiness test.
+    #[test]
+    fn a_nil_compared_presence_test_excuses_the_call_it_guards() {
+        for (test, reports) in [
+            ("owner.OptionalMethod ~= nil", 0),
+            ("nil ~= (owner.OptionalMethod)", 0),
+            ("owner.OptionalMethod ~= (nil)", 0),
+            ("(owner.OptionalMethod or false) ~= nil", 1),
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            enable_gmod(&mut ws);
+            ws.def_file("annotations/entity.lua", "---@meta\n---@class Entity\n");
+            let file_id = ws.def_file(
+                "lua/autorun/server/sv_optional.lua",
+                &format!(
+                    "---@type Entity\nlocal owner\nlocal result = {test} and (owner:OptionalMethod() or 0)\nprint(result)\n"
+                ),
+            );
+
+            let diagnostics = default_diagnostics_for_code_with_shared(
+                &mut ws,
+                file_id,
+                DiagnosticCode::UndefinedMethod,
+            );
+
+            assert_eq!(diagnostics.len(), reports, "{test}: {diagnostics:?}");
+        }
+    }
+
+    /// A field read with a default is the nil-safe use `or` exists for.
+    #[test]
+    fn a_defaulted_field_read_is_not_reported() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file("annotations/entity.lua", "---@meta\n---@class Entity\n");
+        let file_id = ws.def_file(
+            "lua/autorun/server/sv_health.lua",
+            "---@type Entity\nlocal owner\nlocal health = owner.Helth or 0\nprint(health)\n",
+        );
+
+        let diagnostics = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UndefinedField,
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
 }

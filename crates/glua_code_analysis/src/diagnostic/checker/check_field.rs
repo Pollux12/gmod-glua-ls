@@ -1809,6 +1809,11 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr, weak_receiver: bool) -> bo
     let normalized_target = normalize_colon_access(&index_expr.syntax().text().to_string());
     let node_range = index_expr.syntax().text_range();
     let target_root_name = extract_root_identifier(&normalized_target);
+    // A member being called fails before `or`/`and` can act on the call's result.
+    let is_called = index_expr
+        .get_parent::<LuaCallExpr>()
+        .and_then(|call| call.get_prefix_expr())
+        .is_some_and(|prefix| prefix.syntax() == index_expr.syntax());
 
     for ancestor in index_expr.syntax().ancestors() {
         match ancestor.kind().into() {
@@ -1899,7 +1904,7 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr, weak_receiver: bool) -> bo
                             .collect();
                         if let Some(first) = exprs.first() {
                             let first_range = first.get_range();
-                            if first_range.contains_range(node_range) {
+                            if !is_called && first_range.contains_range(node_range) {
                                 return true;
                             }
                         }
@@ -1917,7 +1922,7 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr, weak_receiver: bool) -> bo
                             .collect();
                         if let Some(first) = exprs.first() {
                             let first_range = first.get_range();
-                            if first_range.contains_range(node_range) {
+                            if !is_called && first_range.contains_range(node_range) {
                                 return true;
                             }
                             // `obj.method and obj:method()` — the left operand
@@ -2039,14 +2044,12 @@ fn is_not_expr(unary: &LuaUnaryExpr) -> bool {
 }
 
 /// Whether `expr` tests `field_text` itself for presence: the member read alone,
-/// or as an operand of `and`/`or`. A negation inverts the test, and a mention in
-/// an unrelated call's arguments (`tostring(obj.x)`) does not test anything, so
-/// neither vouches for the member.
+/// compared `~= nil`, or as an operand of `and`/`or`. A negation inverts the test,
+/// and a mention in an unrelated call's arguments (`tostring(obj.x)`) does not test
+/// anything, so neither vouches for the member.
 fn is_positive_member_test(expr: &LuaExpr, field_text: &str) -> bool {
     match expr {
-        LuaExpr::IndexExpr(idx) => {
-            normalize_colon_access(&idx.syntax().text().to_string()) == field_text
-        }
+        LuaExpr::IndexExpr(_) => is_member_path(expr, field_text),
         LuaExpr::ParenExpr(paren) => paren
             .get_expr()
             .is_some_and(|inner| is_positive_member_test(&inner, field_text)),
@@ -2055,6 +2058,19 @@ fn is_positive_member_test(expr: &LuaExpr, field_text: &str) -> bool {
                 let kind = child.kind();
                 kind == LuaTokenKind::TkAnd.into() || kind == LuaTokenKind::TkOr.into()
             });
+            if binary
+                .get_op_token()
+                .is_some_and(|op| op.get_op() == glua_parser::BinaryOperator::OpNe)
+            {
+                return binary.get_exprs().is_some_and(|(left, right)| {
+                    [(&left, &right), (&right, &left)]
+                        .into_iter()
+                        .any(|(tested, other)| {
+                            crate::compilation::analyzer::is_nil_literal_expr(other)
+                                && is_member_path(tested, field_text)
+                        })
+                });
+            }
             has_and_or
                 && binary
                     .syntax()
@@ -2062,6 +2078,19 @@ fn is_positive_member_test(expr: &LuaExpr, field_text: &str) -> bool {
                     .filter_map(LuaExpr::cast)
                     .any(|operand| is_positive_member_test(&operand, field_text))
         }
+        _ => false,
+    }
+}
+
+/// Whether `expr` reads `field_text` itself, parentheses aside.
+fn is_member_path(expr: &LuaExpr, field_text: &str) -> bool {
+    match expr {
+        LuaExpr::IndexExpr(idx) => {
+            normalize_colon_access(&idx.syntax().text().to_string()) == field_text
+        }
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| is_member_path(&inner, field_text)),
         _ => false,
     }
 }
