@@ -2170,8 +2170,6 @@ fn annotated_var_type(db: &DbIndex, var_ref_id: &VarRefId) -> Option<LuaType> {
         .map(|type_cache| type_cache.as_type().clone())
 }
 
-/// `typ` without its `nil` and `false` members, or `None` when nothing else is
-/// left.
 fn try_get_numeric_range_table_arg_population_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
