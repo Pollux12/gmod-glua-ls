@@ -874,9 +874,9 @@ mod test {
     }
 
     #[test]
-    fn test_setmetatable_factory_fields_ignore_alias_writes() {
+    fn test_setmetatable_factory_alias_writes_reach_its_instances() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
+        assert!(ws.check_code_for(
             DiagnosticCode::UndefinedField,
             r#"
                 local Animation = {}
@@ -897,9 +897,9 @@ mod test {
     }
 
     #[test]
-    fn test_setmetatable_factory_fields_ignore_nested_closure_writes() {
+    fn test_setmetatable_factory_nested_closure_writes_reach_its_instances() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
+        assert!(ws.check_code_for(
             DiagnosticCode::UndefinedField,
             r#"
                 local Animation = {}

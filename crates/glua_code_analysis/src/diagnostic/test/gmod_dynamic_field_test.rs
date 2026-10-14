@@ -2146,4 +2146,47 @@ function UnknownPosition() end"
             elements_are![contains_substring("InfoSearch")]
         );
     }
+
+    #[gtest]
+    fn a_field_written_on_an_instance_is_one_its_prototype_methods_read_through_self() {
+        let mut ws = VirtualWorkspace::new();
+        let prototype = ws.def_file(
+            "lua/includes/modules/markup_object.lua",
+            r#"
+            MarkupObject = {}
+            function MarkupObject:create()
+                local o = {}
+                setmetatable(o, self)
+                self.__index = self
+                return o
+            end
+            function MarkupObject:GetWidth()
+                return self.totalWidth
+            end
+            "#,
+        );
+        let parser_path = "lua/includes/modules/markup_parse.lua";
+        let parser = r#"
+            function MarkupParse()
+                local object = MarkupObject:create()
+                object.totalWidth = 5
+                return object
+            end
+            "#;
+        ws.def_file(parser_path, parser);
+        let undefined = |ws: &mut VirtualWorkspace| {
+            diagnostic_messages_for_file(ws, prototype, DiagnosticCode::UndefinedField)
+        };
+        expect_that!(undefined(&mut ws), is_empty());
+
+        let uri = ws.virtual_url_generator.new_uri(parser_path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        expect_that!(
+            undefined(&mut ws),
+            elements_are![contains_substring("totalWidth")]
+        );
+
+        ws.def_file(parser_path, parser);
+        expect_that!(undefined(&mut ws), is_empty());
+    }
 }

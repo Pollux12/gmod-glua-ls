@@ -1951,6 +1951,14 @@ fn propagate_dynamic_fields_to_super_types(
         .collect();
     let mut propagated = Vec::new();
     for (owner, field_name, file_id, range) in collected {
+        if let DynamicFieldOwner::Table(table) = owner {
+            if let Some(prototype) = metatable_index_owner(db, table)
+                && !owner_has_member(db, &prototype, field_name)
+            {
+                propagated.push((prototype, field_name.clone(), *file_id, *range));
+            }
+            continue;
+        }
         let DynamicFieldOwner::Type(type_id) = owner else {
             continue;
         };
@@ -1970,6 +1978,33 @@ fn propagate_dynamic_fields_to_super_types(
         }
     }
     propagated
+}
+
+/// The table a literal's metatable `__index` names: the prototype whose methods
+/// run with the literal as `self`, so a field the literal holds is one `self` may.
+fn metatable_index_owner(
+    db: &DbIndex,
+    table: &InFiled<rowan::TextRange>,
+) -> Option<DynamicFieldOwner> {
+    let metatable = db.get_metatable_index().get(table)?.clone();
+    match infer_index_type_from_metatable_type(db, &LuaType::TableConst(metatable))? {
+        LuaType::TableConst(prototype) if prototype != *table => Some(
+            crate::canonical_dynamic_field_owner(db, DynamicFieldOwner::Table(prototype)),
+        ),
+        _ => None,
+    }
+}
+
+/// Whether `owner` already declares `name`, so a propagated field would only blur its type.
+fn owner_has_member(db: &DbIndex, owner: &DynamicFieldOwner, name: &SmolStr) -> bool {
+    let member_owner = match owner {
+        DynamicFieldOwner::Type(id) => LuaMemberOwner::Type(id.clone()),
+        DynamicFieldOwner::Table(range) => LuaMemberOwner::Element(range.clone()),
+        DynamicFieldOwner::GlobalPath(path) => LuaMemberOwner::GlobalPath(path.clone()),
+    };
+    !db.get_member_index()
+        .get_current_owner_members_for_key(&member_owner, &LuaMemberKey::Name(name.clone()))
+        .is_empty()
 }
 
 fn collect_wildcard_for_type(

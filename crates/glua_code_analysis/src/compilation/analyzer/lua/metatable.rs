@@ -165,17 +165,21 @@ fn table_backing_range_from_expr(
                     .map(|closure| LuaSignatureId::from_closure(analyzer.file_id, &closure)),
                 _ => None,
             };
+            let is_mutated = analyzer
+                .db
+                .get_reference_index()
+                .get_decl_references(&analyzer.file_id, &decl_id)
+                .is_some_and(|references| references.mutable);
             if let Some(signature_id) = receiver_signature_id {
-                let is_mutated = analyzer
-                    .db
-                    .get_reference_index()
-                    .get_decl_references(&analyzer.file_id, &decl_id)
-                    .is_some_and(|references| references.mutable);
                 if is_mutated {
                     return None;
                 }
 
                 return receiver_owner_table_range(analyzer, name_expr, signature_id);
+            }
+            // A reassigned local holds the table its last write left, not its initializer.
+            if is_mutated {
+                return inferred_table_range(analyzer, expr);
             }
 
             let value_expr = decl_value_expr(&analyzer.db, decl_id)?;
