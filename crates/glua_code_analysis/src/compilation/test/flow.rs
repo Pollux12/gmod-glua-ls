@@ -9016,6 +9016,31 @@ _2 = a[1]
     }
 
     #[test]
+    fn assigning_an_unresolved_entry_to_an_annotated_local_keeps_its_declared_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_id = ws.def(
+            r#"
+            local registry = {}
+            local function Register(name, data)
+                name = string.lower(name)
+                registry[name] = data
+            end
+
+            local function Resolve(level)
+                ---@type string
+                local class = "w"
+                class = registry[level]
+                local assigned = class
+            end
+            "#,
+        );
+
+        let assigned = nth_name_expr_type_from_end(&mut ws, file_id, "class", 0);
+        assert_eq!(assigned, LuaType::String);
+    }
+
+    #[test]
     fn a_type_guard_that_shares_no_arm_with_the_value_narrows_to_the_guarded_type() {
         let mut ws = VirtualWorkspace::new();
         ws.def_gmod_type_predicates();
