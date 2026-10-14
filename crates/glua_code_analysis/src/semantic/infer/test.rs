@@ -134,6 +134,30 @@ mod test {
     }
 
     #[test]
+    fn arithmetic_on_a_value_that_may_be_nil_yields_what_its_other_arms_yield() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "addons/arith_nil/lua/autorun/sh_arith_nil.lua",
+            r#"
+            ---@param time number?
+            local function scale(time)
+                local scaled = time * 0.75
+                local reduced = time - 1
+                return scaled, reduced
+            end
+            "#,
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "scaled"),
+            LuaType::Number
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "reduced"),
+            LuaType::Number
+        );
+    }
+
+    #[test]
     fn direct_param_return_alias_returns_one_actual_argument_value() {
         let mut ws = VirtualWorkspace::new();
         let file = ws.def_file(

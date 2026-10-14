@@ -219,9 +219,12 @@ fn infer_union_binary_expr(
         return None;
     };
 
+    // A `nil` arm makes arithmetic or concatenation raise rather than yield a value.
+    let raises_on_nil = folds_constants(op);
     // Only clone on an actual call instead of cloning up front
     let inferred = u
         .types()
+        .filter(|ty| !(raises_on_nil && ty.is_nil()))
         .filter_map(|ty| {
             if is_left_union {
                 infer_binary_expr_type(db, ty.clone(), other.clone(), op)
