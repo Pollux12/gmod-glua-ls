@@ -806,6 +806,54 @@ foo({})
     }
 
     #[test]
+    fn a_field_written_from_its_own_use_is_still_missing_there() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value any
+            local function observe(value) end
+
+            ---@param value Full
+            ---@return string
+            local function consume(value) return value.required end
+
+            local value = {}
+            observe(value)
+            value.required = consume(value)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_field_written_in_a_do_block_before_the_use_is_given() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value any
+            local function observe(value) end
+
+            ---@param value Full
+            local function consume(value) end
+
+            local value = {}
+            observe(value)
+            do value.required = "ready" end
+            consume(value)
+            "#,
+        ));
+    }
+
+    #[test]
     fn an_untyped_use_before_the_completion_does_not_cut_it_off() {
         let mut ws = VirtualWorkspace::new();
 

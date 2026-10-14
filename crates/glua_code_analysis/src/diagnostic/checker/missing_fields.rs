@@ -435,8 +435,9 @@ fn remove_fields_gained_before_use(
     });
 }
 
-/// Whether the write `write` always runs before the read at `use_start`: earlier in
-/// the same function, in a block that also holds the read.
+/// Whether the write `write` always runs before the read at `use_start`: its
+/// statement ends earlier in the same function, in a block that also holds the read
+/// or one only `do ... end` blocks separate from it.
 fn write_runs_before_use(
     write: &glua_parser::LuaSyntaxNode,
     use_node: &rowan::NodeOrToken<glua_parser::LuaSyntaxNode, glua_parser::LuaSyntaxToken>,
@@ -445,12 +446,24 @@ fn write_runs_before_use(
     let function_of = |node: Option<glua_parser::LuaSyntaxNode>| {
         node.and_then(|node| node.ancestors().find_map(glua_parser::LuaClosureExpr::cast))
     };
-    write.text_range().start() < use_start
-        && function_of(Some(write.clone())) == function_of(use_node.parent())
-        && write
-            .ancestors()
-            .find_map(glua_parser::LuaBlock::cast)
-            .is_some_and(|block| block.syntax().text_range().contains(use_start))
+    let Some(stat) = write.ancestors().find_map(LuaStat::cast) else {
+        return false;
+    };
+    if stat.syntax().text_range().end() > use_start
+        || function_of(Some(write.clone())) != function_of(use_node.parent())
+    {
+        return false;
+    }
+    let mut block = stat.get_parent::<glua_parser::LuaBlock>();
+    while let Some(current) = block {
+        if current.syntax().text_range().contains(use_start) {
+            return true;
+        }
+        block = current
+            .get_parent::<glua_parser::LuaDoStat>()
+            .and_then(|do_stat| do_stat.get_parent::<glua_parser::LuaBlock>());
+    }
+    false
 }
 
 /// The path the literal is assigned to, e.g. `self.portals` or `cfg`.
