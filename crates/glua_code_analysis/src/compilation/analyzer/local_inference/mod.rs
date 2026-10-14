@@ -492,7 +492,7 @@ struct NestedUnguardedChildCandidates {
     parent_type: LuaType,
     children: HashMap<crate::LuaTypeDeclId, FxHashSet<LuaMemberKey>>,
     receivers: FxHashSet<InFiled<glua_parser::LuaSyntaxId>>,
-    source: InFiled<glua_parser::LuaSyntaxId>,
+    source: ChildSource,
 }
 
 fn compare_unguarded_child_candidates(
@@ -701,8 +701,7 @@ pub(crate) fn publish_unguarded_children(
                 entry.children.entry(child_id).or_default().extend(keys);
             }
             entry.receivers.extend(candidates.receivers);
-            if candidates.source.value.get_range().start() < entry.source.value.get_range().start()
-            {
+            if candidates.source.precedes(&entry.source) {
                 entry.source = candidates.source;
             }
         }
@@ -805,7 +804,7 @@ pub(crate) fn publish_unguarded_children(
     }
 
     let mut nested_scores = nested_scores.into_values().collect::<Vec<_>>();
-    nested_scores.sort_by_key(|candidates| in_filed_order(&candidates.source));
+    nested_scores.sort_by_key(|candidates| in_filed_order(&candidates.source.site));
     for candidates in nested_scores {
         let found_type = candidates.parent_type;
         let mut children = candidates.children;
@@ -841,19 +840,20 @@ pub(crate) fn publish_unguarded_children(
         }
         support.sort_by(LuaInferenceNodeId::stable_cmp);
         support.dedup();
-        update_sources.push(candidates.source.clone());
+        update_sources.push(candidates.source.site.clone());
         let mut receivers = candidates.receivers.into_iter().collect::<Vec<_>>();
         receivers.sort_by_key(in_filed_order);
         let nodes = receivers
             .into_iter()
             .map(|receiver| LuaInferenceNodeId::TypeOwner(crate::LuaTypeOwner::SyntaxId(receiver)));
-        let event_node =
-            LuaInferenceNodeId::TypeOwner(crate::LuaTypeOwner::SyntaxId(candidates.source.clone()));
+        let event_node = LuaInferenceNodeId::TypeOwner(crate::LuaTypeOwner::SyntaxId(
+            candidates.source.site.clone(),
+        ));
         for node in nodes {
             let event = LuaInferenceEventId {
                 node: event_node.clone(),
                 kind: LuaInferenceProvenanceKind::UnguardedChild,
-                source: candidates.source.clone(),
+                source: candidates.source.site.clone(),
             };
             updates.push((
                 node,
@@ -1119,12 +1119,7 @@ fn collect_unguarded_child_file(
             found_types.insert(source.clone(), current.clone());
             let source = ChildSource {
                 site: source,
-                guarded: enclosing_guard_covers(
-                    db,
-                    &mut infer_cache,
-                    index_expr,
-                    GuardScope::Parent,
-                ),
+                guarded: is_guarded_by_enclosing_condition(db, &mut infer_cache, index_expr),
             };
             let mut evidence_recorded = false;
             for child_id in children.iter() {
@@ -1493,7 +1488,10 @@ fn collect_member_path_unguarded_child_evidence(
     else {
         return;
     };
-    let source = InFiled::new(file_id, index_expr.get_syntax_id());
+    let source = ChildSource {
+        site: InFiled::new(file_id, index_expr.get_syntax_id()),
+        guarded: is_guarded_by_enclosing_condition(db, cache, index_expr),
+    };
     let receiver = InFiled::new(file_id, receiver.get_syntax_id());
     let candidates =
         evidence
@@ -1509,7 +1507,7 @@ fn collect_member_path_unguarded_child_evidence(
         return;
     }
     candidates.receivers.insert(receiver);
-    if source.value.get_range().start() < candidates.source.value.get_range().start() {
+    if source.precedes(&candidates.source) {
         candidates.source = source;
     }
     for child_id in children.iter() {
@@ -2354,15 +2352,15 @@ enum GuardScope {
     Parent,
 }
 
-/// Whether an `if`/`elseif` around `index_expr` only runs its block when the same
-/// member path holds a value, as in `if IsValid(ent.Child) then ent = ent.Child end`,
+/// Whether an `if`/`elseif` around `index_expr` only runs its block when a member of
+/// the table it indexes holds a value, as in `if IsValid(ent.Child) then ent = ent.Child end`,
 /// with the path's root not reassigned earlier in that block.
 pub(crate) fn is_guarded_by_enclosing_condition(
     db: &crate::DbIndex,
     cache: &mut crate::semantic::LuaInferCache,
     index_expr: &LuaIndexExpr,
 ) -> bool {
-    enclosing_guard_covers(db, cache, index_expr, GuardScope::Path)
+    enclosing_guard_covers(db, cache, index_expr, GuardScope::Parent)
 }
 
 fn enclosing_guard_covers(
@@ -2398,19 +2396,27 @@ fn enclosing_guard_covers(
 }
 
 /// Whether the variable `index_expr`'s path starts from is written inside `block`
-/// before the read.
+/// before the read, outside closures the block only creates.
 fn root_written_in_block_before(
     db: &crate::DbIndex,
     cache: &mut crate::semantic::LuaInferCache,
     block: &glua_parser::LuaBlock,
     index_expr: &LuaIndexExpr,
 ) -> bool {
-    let Some(crate::semantic::VarRefId::IndexRef(root, _)) =
+    let Some(decl_id) =
         crate::semantic::get_var_expr_var_ref_id(db, cache, LuaExpr::IndexExpr(index_expr.clone()))
+            .and_then(|reference| match reference {
+                crate::semantic::VarRefId::IndexRef(root, _) => written_decl(&root),
+                _ => None,
+            })
     else {
         return false;
     };
-    let Some(decl_id) = root.as_decl_id() else {
+    let Some(references) = db
+        .get_reference_index()
+        .get_decl_references(&decl_id.file_id, &decl_id)
+        .filter(|references| references.mutable)
+    else {
         return false;
     };
     // A statement evaluates its reads before its own writes.
@@ -2419,15 +2425,28 @@ fn root_written_in_block_before(
         .next()
         .map_or(index_expr.get_position(), |stat| stat.get_position());
     let block_start = block.get_position();
-    db.get_reference_index()
-        .get_decl_references(&decl_id.file_id, &decl_id)
-        .is_some_and(|references| {
-            references.cells.iter().any(|cell| {
-                cell.is_write
-                    && cell.range.start() >= block_start
-                    && cell.range.start() < read_start
+    let root = block.syntax().ancestors().last();
+    references.cells.iter().any(|cell| {
+        cell.is_write
+            && cell.range.start() >= block_start
+            && cell.range.start() < read_start
+            && root.as_ref().is_some_and(|root| {
+                !root
+                    .covering_element(cell.range)
+                    .ancestors()
+                    .take_while(|node| node != block.syntax())
+                    .any(|node| LuaClosureExpr::can_cast(node.kind().into()))
             })
-        })
+    })
+}
+
+/// The declaration whose writes replace what `root` names: an implicit `self` is its
+/// own declaration, not its receiver's.
+fn written_decl(root: &crate::semantic::VarRefRootId) -> Option<crate::LuaDeclId> {
+    match root {
+        crate::semantic::VarRefRootId::SelfRef(self_ref) => Some(self_ref.self_decl_id),
+        _ => root.as_decl_id(),
+    }
 }
 
 fn matching_guard_in_expr(
@@ -2438,19 +2457,24 @@ fn matching_guard_in_expr(
     scope: GuardScope,
 ) -> bool {
     let guards = positive_guard_indexes(db, cache, guard_expr);
-    let mut reference = |index: &LuaIndexExpr| {
-        let target = match scope {
-            GuardScope::Path => Some(LuaExpr::IndexExpr(index.clone())),
-            GuardScope::Parent => index.get_prefix_expr(),
+    let mut identity = |index: &LuaIndexExpr| {
+        let table = index
+            .get_prefix_expr()
+            .and_then(|prefix| crate::semantic::get_var_expr_var_ref_id(db, cache, prefix))?;
+        let key = match scope {
+            GuardScope::Path => {
+                Some(LuaMemberKey::from_index_key(db, cache, &index.get_index_key()?).ok()?)
+            }
+            GuardScope::Parent => None,
         };
-        target.and_then(|target| crate::semantic::get_var_expr_var_ref_id(db, cache, target))
+        Some((table, key))
     };
-    let Some(guarded_ref) = reference(guarded) else {
+    let Some(guarded_identity) = identity(guarded) else {
         return false;
     };
-    guards
-        .iter()
-        .any(|guard| reference(guard).is_some_and(|guard_ref| guard_ref == guarded_ref))
+    guards.iter().any(|guard| {
+        identity(guard).is_some_and(|guard_identity| guard_identity == guarded_identity)
+    })
 }
 
 /// The member paths `expr` proves hold a value when it is true: the paths it tests

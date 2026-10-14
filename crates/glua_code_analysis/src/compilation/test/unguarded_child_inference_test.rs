@@ -1770,6 +1770,170 @@ mod test {
         assert_eq!(lines, vec![10, 19]);
     }
 
+    fn guarded_lines(ws: &mut VirtualWorkspace, code: &str) -> Vec<u32> {
+        enable_gmod(ws);
+        ws.def_gmod_type_predicates();
+        let file_id = ws.def(code);
+        diagnostics_for(ws, file_id, DiagnosticCode::InferUnguardedChild)
+            .into_iter()
+            .map(|diagnostic| diagnostic.range.start.line)
+            .collect()
+    }
+
+    const ATTACHED: &str = r#"
+            ---@class Entity
+            ---@class prop_effect: Entity
+            ---@field AttachedEntity Entity
+            ---@class Panel
+            ---@class DVScrollBar: Panel
+            ---@field btnUp Panel
+            ---@field btnDown Panel
+    "#;
+
+    #[test]
+    fn a_guard_is_not_undone_by_a_write_in_a_closure_it_never_calls() {
+        let mut ws = VirtualWorkspace::new();
+        let lines = guarded_lines(
+            &mut ws,
+            &format!(
+                "{ATTACHED}
+            ---@param ent Entity
+            ---@param other Entity
+            local function target(ent, other)
+                if IsValid(ent.AttachedEntity) then
+                    local reset = function() ent = other end
+                    return ent.AttachedEntity, reset
+                end
+            end
+            "
+            ),
+        );
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn a_guard_through_a_constant_key_covers_the_named_read() {
+        let mut ws = VirtualWorkspace::new();
+        let lines = guarded_lines(
+            &mut ws,
+            &format!(
+                "{ATTACHED}
+            ---@param ent Entity
+            local function target(ent)
+                local key = \"AttachedEntity\"
+                if IsValid(ent[key]) then
+                    return ent.AttachedEntity
+                end
+            end
+            "
+            ),
+        );
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn sibling_reads_inside_a_guard_are_covered_in_either_order() {
+        let mut ws = VirtualWorkspace::new();
+        let lines = guarded_lines(
+            &mut ws,
+            &format!(
+                "{ATTACHED}
+            ---@param parent Panel
+            local function paint(parent)
+                if IsValid(parent.btnUp) then
+                    local down = parent.btnDown
+                    local up = parent.btnUp
+                    return up, down
+                end
+            end
+            "
+            ),
+        );
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn an_unguarded_read_through_a_nested_receiver_is_reported_after_a_guarded_one() {
+        let mut ws = VirtualWorkspace::new();
+        let lines = guarded_lines(
+            &mut ws,
+            &format!(
+                "{ATTACHED}
+            ---@class Holder
+            ---@field panel Panel
+
+            ---@param holder Holder
+            local function paint(holder)
+                if IsValid(holder.panel.btnUp) then
+                    local up = holder.panel.btnUp
+                end
+                return holder.panel.btnDown
+            end
+            "
+            ),
+        );
+        assert_eq!(lines, vec![17]);
+    }
+
+    #[test]
+    fn a_type_guard_whose_alias_allows_nil_does_not_cover_its_reads() {
+        let mut ws = VirtualWorkspace::new();
+        let lines = guarded_lines(
+            &mut ws,
+            &format!(
+                "{ATTACHED}
+            ---@alias MaybeEntity Entity|nil
+            ---@param value any
+            ---@return TypeGuard<MaybeEntity>
+            function isMaybeEntity(value) end
+
+            ---@param ent Entity
+            local function target(ent)
+                if isMaybeEntity(ent.AttachedEntity) then
+                    return ent.AttachedEntity
+                end
+            end
+            "
+            ),
+        );
+        assert_eq!(lines, vec![17]);
+    }
+
+    #[test]
+    fn a_colon_presence_predicate_tests_its_receiver() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Probe
+            ---@return TypeGuard<Probe>
+            function Probe:Holds(other) end
+
+            ---@param probe Probe
+            local function check(probe, other)
+                return probe:Holds(other.Child)
+            end
+            "#,
+        );
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let call = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaCallExpr>()
+            .next()
+            .expect("call");
+        let target = crate::semantic::presence_guard_target(
+            semantic_model.get_db(),
+            &mut semantic_model.get_cache().borrow_mut(),
+            &call,
+        )
+        .expect("a presence guard");
+        assert_eq!(target.syntax().text().to_string(), "probe");
+    }
+
     #[test]
     fn a_presence_guard_still_lets_its_reads_infer_the_child_for_sibling_members() {
         let mut ws = VirtualWorkspace::new();

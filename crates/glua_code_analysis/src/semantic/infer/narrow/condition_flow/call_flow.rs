@@ -882,9 +882,15 @@ pub(crate) fn presence_guard_target(
 ) -> Option<LuaExpr> {
     let signature_id = get_call_prefix_signature_id(db, cache, call_expr)?;
     let guards_presence = call_prefix_signature_is_valid_guard(db, cache, call_expr, signature_id)
-        || db.get_signature_index().get(&signature_id).is_some_and(|signature| {
-            matches!(signature.get_return_type(), LuaType::TypeGuard(guard) if !guard.is_nullable() && !guard.is_nil())
-        });
+        || db
+            .get_signature_index()
+            .get(&signature_id)
+            .is_some_and(|signature| {
+                matches!(signature.get_return_type(), LuaType::TypeGuard(guard) if {
+                    let guard = crate::get_real_type(db, guard.as_ref()).unwrap_or(guard.as_ref());
+                    !guard.contain_tpl() && !guard.is_nullable() && !guard.is_nil()
+                })
+            });
     guards_presence
         .then(|| type_guard_target_expr(call_expr))
         .flatten()
