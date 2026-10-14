@@ -217,18 +217,23 @@ pub fn narrow_down_type(
         LuaType::Instance(base) => {
             return narrow_down_type(db, source, base.get_base().clone(), declared);
         }
-        LuaType::BooleanConst(_) => {
+        LuaType::BooleanConst(b) => {
             if real_source_ref.is_boolean() {
                 return Some(LuaType::Boolean);
             } else if real_source_ref.is_unknown() {
-                return Some(LuaType::BooleanConst(true));
+                return Some(LuaType::BooleanConst(*b));
             }
         }
         LuaType::Union(target_u) => {
+            // An unknown source declares nothing an arm could be dropped against.
+            let keeps_unmatched_arms = real_source_ref.is_unknown();
             let source_types = target_u
                 .into_vec()
                 .into_iter()
-                .filter_map(|t| narrow_down_type(db, real_source_ref.clone(), t, declared.clone()))
+                .filter_map(|t| {
+                    narrow_down_type(db, real_source_ref.clone(), t.clone(), declared.clone())
+                        .or_else(|| keeps_unmatched_arms.then_some(t))
+                })
                 .collect::<Vec<_>>();
 
             if source_types.is_empty() {

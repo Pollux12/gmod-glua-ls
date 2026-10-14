@@ -1372,6 +1372,42 @@ end
     }
 
     #[test]
+    fn assigning_to_an_untyped_param_takes_the_assigned_value() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Player
+
+            ---@type Player
+            local any_player
+
+            local function find(name)
+                if name then
+                    return false
+                end
+                return any_player
+            end
+
+            local function reset(found, flag)
+                found = find(1)
+                assigned_union = found
+                flag = false
+                assigned_false = flag
+            end
+            "#,
+        );
+
+        let assigned_union = ws.expr_ty("assigned_union");
+        let player_or_false = ws.ty("Player|false");
+        assert_eq!(
+            ws.humanize_type(assigned_union),
+            ws.humanize_type(player_or_false)
+        );
+        assert_eq!(ws.expr_ty("assigned_false"), LuaType::BooleanConst(false));
+    }
+
+    #[test]
     fn a_failed_predicate_that_removes_a_type_adds_it_only_where_the_value_could_hold_it() {
         let mut ws = VirtualWorkspace::new();
 
