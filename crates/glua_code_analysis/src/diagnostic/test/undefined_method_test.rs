@@ -29,6 +29,38 @@ mod tests {
     }
 
     #[test]
+    fn methods_installed_on_a_metatable_parameter_belong_to_its_class() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/annotations/meta.lua",
+            "---@meta\n---@class Panel\n---@generic T : table\n---@param metaName `T`\n---@return (definition) T\nfunction FindMetaTable(metaName) end\n",
+        );
+        let installer_path = "gamemodes/helix/gamemode/core/libs/sh_animation.lua";
+        let installer = r#"
+            ix = ix or {}
+            ix.util = ix.util or {}
+            function ix.util.InstallAnimationMethods(meta)
+                function meta:CreateAnimation(length, data) end
+            end
+            local panelMeta = FindMetaTable("Panel")
+            ix.util.InstallAnimationMethods(panelMeta)
+        "#;
+        let user_path = "gamemodes/helix/gamemode/core/derma/cl_notice.lua";
+        let user =
+            "---@param panel Panel\nlocal function Show(panel) panel:CreateAnimation(1, {}) end\n";
+        ws.def_file(installer_path, installer);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, user_path, user));
+        let uri = ws.virtual_url_generator.new_uri(installer_path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert!(!ws.check_file_for(DiagnosticCode::UndefinedMethod, user_path, user));
+        ws.def_file(installer_path, installer);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, user_path, user));
+    }
+
+    #[test]
     fn metatable_index_without_the_method_reports_it_undefined() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(!ws.check_file_for(

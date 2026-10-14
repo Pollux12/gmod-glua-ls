@@ -53,7 +53,7 @@ pub(super) type Contribution = (LuaSignatureId, usize, Option<LuaTypeFact>);
 #[derive(Default)]
 struct CallScope {
     returned_tables: HashMap<FileId, Option<Arc<ReturnedTableInfo>>>,
-    local_values: HashMap<LuaDeclId, Option<(LuaType, LuaInferenceProvenanceKind)>>,
+    local_values: HashMap<(LuaDeclId, bool), Option<(LuaType, LuaInferenceProvenanceKind)>>,
 }
 
 /// The last function statement of `file_id` at or before `position`
@@ -65,6 +65,17 @@ fn source_signature_at(
     position: TextSize,
 ) -> Option<LuaSignatureId> {
     function_summaries(db, file_id)?.source_signature_at(path, position)
+}
+
+/// Whether the function declaring `signature_id` defines methods on parameter
+/// `param_idx`.
+fn is_installer_param(db: &DbIndex, signature_id: LuaSignatureId, param_idx: usize) -> bool {
+    function_summaries(db, signature_id.get_file_id()).is_some_and(|summaries| {
+        summaries
+            .installer_params
+            .get(&signature_id.get_position())
+            .is_some_and(|params| params.contains(&param_idx))
+    })
 }
 
 /// Whether the function statement declaring `signature_id` assigns to
@@ -441,25 +452,76 @@ pub(super) fn source_signatures_in_file(
 }
 
 /// Each file function's syntactic parameter facts, keyed by closure position:
-/// the parameters each function statement assigns to, and the closures whose
-/// unmutated explicit `self` parameter is returned.
+/// the parameters each function statement assigns to, the parameters each
+/// function defines methods on, and the closures whose unmutated explicit
+/// `self` parameter is returned.
 pub(super) fn collect_param_summaries(
     db: &DbIndex,
     file_id: FileId,
     root: &glua_parser::LuaChunk,
-) -> (HashMap<TextSize, Vec<usize>>, HashSet<TextSize>) {
+) -> (
+    HashMap<TextSize, Vec<usize>>,
+    HashMap<TextSize, Vec<usize>>,
+    HashSet<TextSize>,
+) {
     let mut mutated_params = HashMap::default();
+    let mut installer_params = HashMap::default();
     let mut returns_explicit_self = HashSet::default();
     for closure in root.descendants::<LuaClosureExpr>() {
         let mutated = function_statement_mutated_params(db, file_id, &closure);
         if !mutated.is_empty() {
             mutated_params.insert(closure.get_position(), mutated);
         }
+        let installed = method_installer_params(db, file_id, &closure);
+        if !installed.is_empty() {
+            installer_params.insert(closure.get_position(), installed);
+        }
         if returns_unmutated_explicit_self(db, file_id, &closure) {
             returns_explicit_self.insert(closure.get_position());
         }
     }
-    (mutated_params, returns_explicit_self)
+    (mutated_params, installer_params, returns_explicit_self)
+}
+
+/// The parameters `closure`'s body defines methods on, as `function meta:Name()`
+/// and `function meta.Name()` do.
+fn method_installer_params(db: &DbIndex, file_id: FileId, closure: &LuaClosureExpr) -> Vec<usize> {
+    let Some(params_list) = closure.get_params_list() else {
+        return Vec::new();
+    };
+    let params = params_list
+        .get_params()
+        .enumerate()
+        .filter_map(|(idx, param)| {
+            let token = param.get_name_token()?;
+            Some((idx, LuaDeclId::new(file_id, token.get_range().start())))
+        })
+        .collect::<Vec<_>>();
+    if params.is_empty() {
+        return Vec::new();
+    }
+    let Some(references) = db.get_reference_index().get_local_reference(&file_id) else {
+        return Vec::new();
+    };
+    let mut installed = closure
+        .descendants::<LuaFuncStat>()
+        .filter_map(|func_stat| match func_stat.get_func_name()? {
+            LuaVarExpr::IndexExpr(index_expr) => match index_expr.get_prefix_expr()? {
+                LuaExpr::NameExpr(prefix) => references.get_decl_id(&prefix.get_range()),
+                _ => None,
+            },
+            LuaVarExpr::NameExpr(_) => None,
+        })
+        .filter_map(|decl_id| {
+            params
+                .iter()
+                .find(|(_, param_decl_id)| *param_decl_id == decl_id)
+                .map(|(idx, _)| *idx)
+        })
+        .collect::<Vec<_>>();
+    installed.sort_unstable();
+    installed.dedup();
+    installed
 }
 
 /// The parameters a function statement assigns to; empty for any other
@@ -694,7 +756,9 @@ fn collect_call_site_param_types(
                 let Some(param_name) = signature.params.get(param_idx) else {
                     continue;
                 };
-                if !has_gmod_param_name_hint(db, param_name) {
+                if !has_gmod_param_name_hint(db, param_name)
+                    && !is_installer_param(db, signature_id, param_idx)
+                {
                     continue;
                 }
             }
@@ -708,9 +772,16 @@ fn collect_call_site_param_types(
                 continue;
             };
             let arg_syntax_id = arg.get_syntax_id();
-            let arg_type =
-                infer_supported_call_site_arg_type(db, cache, scope, file_id, arg.clone())
-                    .filter(|(typ, _)| argument_type_is_usable(signature, param_idx, typ));
+            let calls_with_args = is_installer_param(db, signature_id, param_idx);
+            let arg_type = infer_supported_call_site_arg_type(
+                db,
+                cache,
+                scope,
+                file_id,
+                arg.clone(),
+                calls_with_args,
+            )
+            .filter(|(typ, _)| argument_type_is_usable(signature, param_idx, typ));
             let Some((arg_type, provenance_kind)) = arg_type else {
                 if lookup_kind == SignatureLookupKind::Direct {
                     contributions.push((signature_id, param_idx, None));
@@ -2077,13 +2148,23 @@ fn infer_supported_call_site_arg_type(
     scope: &mut CallScope,
     file_id: FileId,
     arg: LuaExpr,
+    calls_with_args: bool,
 ) -> Option<(LuaType, LuaInferenceProvenanceKind)> {
     if is_self_name_expr(&arg) {
         let typ = infer_expr(db, cache, arg).ok()?;
         return (!typ.is_unknown() && !typ.is_any() && !typ.is_never())
             .then_some((typ, LuaInferenceProvenanceKind::ContextualUnknown));
     }
-    infer_call_site_value_type(db, cache, scope, file_id, arg, 0, &mut HashSet::default())
+    infer_call_site_value_type(
+        db,
+        cache,
+        scope,
+        file_id,
+        arg,
+        0,
+        calls_with_args,
+        &mut HashSet::default(),
+    )
 }
 
 /// A local's value does not depend on which lookup reached it: any alias cycle
@@ -2095,6 +2176,7 @@ fn infer_call_site_value_type(
     file_id: FileId,
     expr: LuaExpr,
     value_idx: usize,
+    calls_with_args: bool,
     visiting: &mut HashSet<LuaDeclId>,
 ) -> Option<(LuaType, LuaInferenceProvenanceKind)> {
     match expr {
@@ -2114,8 +2196,15 @@ fn infer_call_site_value_type(
             };
             Some((typ, LuaInferenceProvenanceKind::ConcreteValue))
         }
-        LuaExpr::CallExpr(ref call) if is_zero_arg_call(call) => {
+        LuaExpr::CallExpr(ref call) => {
             let fact = crate::semantic::infer_expr_fact_with_cache(db, cache, expr.clone());
+            // A call that takes arguments is evidence for an installer parameter, and only
+            // when its result is certain.
+            if !is_zero_arg_call(call)
+                && !(calls_with_args && fact.confidence() >= LuaInferenceConfidence::Certain)
+            {
+                return None;
+            }
             let types = crate::semantic::infer_expr_list_types(
                 db,
                 cache,
@@ -2154,7 +2243,7 @@ fn infer_call_site_value_type(
                     LuaInferenceProvenanceKind::ExplicitAnnotation,
                 ));
             }
-            if let Some(result) = scope.local_values.get(&decl_id) {
+            if let Some(result) = scope.local_values.get(&(decl_id, calls_with_args)) {
                 return result.clone();
             }
             if !visiting.insert(decl_id) {
@@ -2173,6 +2262,7 @@ fn infer_call_site_value_type(
                     file_id,
                     value,
                     initializer.get_ret_idx(),
+                    calls_with_args,
                     visiting,
                 )?;
                 let mut writes = refs
@@ -2200,6 +2290,7 @@ fn infer_call_site_value_type(
                         file_id,
                         values[expr_idx].clone(),
                         idx - expr_idx,
+                        calls_with_args,
                         visiting,
                     )?;
                     typ = TypeOps::Union.apply(db, &typ, &assigned);
@@ -2214,7 +2305,9 @@ fn infer_call_site_value_type(
                 Some((typ, kind))
             })();
             visiting.remove(&decl_id);
-            scope.local_values.insert(decl_id, result.clone());
+            scope
+                .local_values
+                .insert((decl_id, calls_with_args), result.clone());
             result
         }
         _ => None,
