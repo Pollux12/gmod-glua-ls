@@ -219,8 +219,9 @@ fn infer_union_binary_expr(
         return None;
     };
 
-    // A `nil` arm makes arithmetic or concatenation raise rather than yield a value.
-    let raises_on_nil = folds_constants(op);
+    // A `nil` arm makes arithmetic or concatenation raise rather than yield a value,
+    // unless the other operand's metamethod takes `nil`.
+    let raises_on_nil = folds_constants(op) && !has_operator_taking_nil(db, other, op);
     // Only clone on an actual call instead of cloning up front
     let inferred = u
         .types()
@@ -236,6 +237,25 @@ fn infer_union_binary_expr(
         .reduce(|left, right| TypeOps::Union.apply(db, &left, &right));
     // Every member failed: pin the escape value instead of returning the seed.
     Some(inferred.unwrap_or(LuaType::Unknown))
+}
+
+fn has_operator_taking_nil(db: &DbIndex, operand: &LuaType, op: BinaryOperator) -> bool {
+    let meta_method = match op {
+        BinaryOperator::OpAdd => LuaOperatorMetaMethod::Add,
+        BinaryOperator::OpSub => LuaOperatorMetaMethod::Sub,
+        BinaryOperator::OpMul => LuaOperatorMetaMethod::Mul,
+        BinaryOperator::OpDiv => LuaOperatorMetaMethod::Div,
+        BinaryOperator::OpMod => LuaOperatorMetaMethod::Mod,
+        BinaryOperator::OpPow => LuaOperatorMetaMethod::Pow,
+        BinaryOperator::OpConcat => LuaOperatorMetaMethod::Concat,
+        _ => return false,
+    };
+    operand.is_custom_type()
+        && get_custom_type_operator(db, operand.clone(), meta_method).is_some_and(|operators| {
+            operators.iter().any(|operator| {
+                check_type_compact(db, &operator.get_operand(db), &LuaType::Nil).is_ok()
+            })
+        })
 }
 
 fn infer_binary_expr_type(
