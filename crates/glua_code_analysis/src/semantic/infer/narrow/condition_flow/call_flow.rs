@@ -873,6 +873,20 @@ fn apply_signature_cast(
     }
 }
 
+/// Whether `typ`, with its aliases resolved, admits `nil`.
+fn may_be_nil(db: &DbIndex, typ: &LuaType, visited: &mut rustc_hash::FxHashSet<LuaType>) -> bool {
+    if !visited.insert(typ.clone()) {
+        return false;
+    }
+    let typ = crate::get_real_type(db, typ).unwrap_or(typ);
+    typ.is_nil()
+        || typ.is_nullable()
+        || match typ {
+            LuaType::Union(union) => union.types().any(|arm| may_be_nil(db, arm, visited)),
+            _ => false,
+        }
+}
+
 /// The value `call_expr` answers true for only when it holds one: what a valid guard
 /// such as `IsValid` tests, or a `TypeGuard` predicate whose type excludes nil.
 pub(crate) fn presence_guard_target(
@@ -886,10 +900,9 @@ pub(crate) fn presence_guard_target(
             .get_signature_index()
             .get(&signature_id)
             .is_some_and(|signature| {
-                matches!(signature.get_return_type(), LuaType::TypeGuard(guard) if {
-                    let guard = crate::get_real_type(db, guard.as_ref()).unwrap_or(guard.as_ref());
-                    !guard.contain_tpl() && !guard.is_nullable() && !guard.is_nil()
-                })
+                matches!(signature.get_return_type(), LuaType::TypeGuard(guard)
+                    if !guard.contain_tpl()
+                        && !may_be_nil(db, &guard, &mut rustc_hash::FxHashSet::default()))
             });
     guards_presence
         .then(|| type_guard_target_expr(call_expr))

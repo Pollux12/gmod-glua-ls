@@ -1997,6 +1997,31 @@ mod test {
     }
 
     #[test]
+    fn a_type_guard_whose_union_hides_a_nullable_alias_does_not_cover_its_reads() {
+        let mut ws = VirtualWorkspace::new();
+        let lines = guarded_lines(
+            &mut ws,
+            &format!(
+                "{ATTACHED}
+            ---@alias MaybeEntity Entity|nil
+            ---@alias GuardedValue MaybeEntity|string
+            ---@param value any
+            ---@return TypeGuard<GuardedValue>
+            function isMaybeEntity(value) end
+
+            ---@param ent Entity
+            local function target(ent)
+                if isMaybeEntity(ent.AttachedEntity) then
+                    return ent.AttachedEntity
+                end
+            end
+            "
+            ),
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+    }
+
+    #[test]
     fn a_nested_inference_is_reported_at_a_read_of_the_child_it_names() {
         let mut ws = VirtualWorkspace::new();
         let lines = guarded_lines(
