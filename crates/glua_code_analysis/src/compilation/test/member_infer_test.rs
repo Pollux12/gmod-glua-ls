@@ -6037,7 +6037,7 @@ end
 SWEP.Base = "cw_base"
 SWEP.Attachments = {[1] = {header = "Sight", atts = {"md_kobra"}}}
 function SWEP:GetSlotText()
-    return self:GetSlotText()
+    return "child"
 end
 "#,
             ),
@@ -6101,10 +6101,12 @@ end
             eq(false),
             "the override's return must be its own, got return {cold_return:?}"
         );
-        let rendered = format!("{cold_return:?}");
-        assert!(
-            !rendered.contains("IntegerConst(5)"),
-            "the base body's return must not reach the override, got {rendered}"
+        assert_that!(
+            &cold_return,
+            eq(&LuaType::StringConst(
+                smol_str::SmolStr::new("child").into()
+            )),
+            "the override's return must be its own body's"
         );
 
         ws.analysis.reindex_files(vec![base_file]);
