@@ -115,7 +115,8 @@ fn check_call_expr(
     let func = semantic_model.infer_call_expr_func(call_expr.clone(), None)?;
     let mut fake_params = func.get_params().to_vec();
     let mut fake_param_optional = func.get_optional_params().to_vec();
-    if let Some(signature_id) = get_prefix_expr_signature_id(context.db, semantic_model, &call_expr)
+    let prefix_signature_id = get_prefix_expr_signature_id(context.db, semantic_model, &call_expr);
+    if let Some(signature_id) = prefix_signature_id
         && let Some(signature) = context.db.get_signature_index().get(&signature_id)
         && !signature.param_docs.is_empty()
     {
@@ -193,6 +194,11 @@ fn check_call_expr(
 
         if !miss_parameter_info.is_empty() {
             if call_args_count == 0 && is_nonliteral_index_dispatch_call(&call_expr) {
+                return Some(());
+            }
+            if prefix_signature_id.is_some_and(|signature_id| {
+                is_gamemode_hook_method(context.db, semantic_model, signature_id)
+            }) {
                 return Some(());
             }
 
@@ -345,6 +351,30 @@ fn get_prefix_expr_signature_id(
     db.get_property_index()
         .get_signature_owner(&semantic_decl)
         .or_else(|| semantic_decl_closure_signature_id(db, semantic_decl))
+}
+
+/// Whether `signature_id` is a gamemode hook method. Its parameters are what the
+/// engine passes when it runs the hook; a direct Lua call may leave trailing ones off.
+fn is_gamemode_hook_method(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    signature_id: LuaSignatureId,
+) -> bool {
+    let Some(func_name) = semantic_model
+        .get_signature_closure(signature_id)
+        .and_then(|closure| closure.get_parent::<glua_parser::LuaFuncStat>())
+        .and_then(|func_stat| func_stat.get_func_name())
+    else {
+        return false;
+    };
+    let syntax_id = func_name.get_syntax_id();
+    db.get_gmod_infer_index()
+        .get_hook_file_metadata(&signature_id.get_file_id())
+        .is_some_and(|metadata| {
+            metadata.sites.iter().any(|site| {
+                site.kind == crate::GmodHookKind::GamemodeMethod && site.syntax_id == syntax_id
+            })
+        })
 }
 
 fn get_params_len(params: &[(String, Option<LuaType>)]) -> Option<usize> {

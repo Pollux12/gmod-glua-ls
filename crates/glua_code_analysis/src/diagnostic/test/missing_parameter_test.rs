@@ -9,6 +9,58 @@ mod test {
     }
 
     #[test]
+    fn calling_a_gamemode_hook_with_fewer_arguments_is_not_missing_parameters() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "lua/aaa_annotations/sandbox.lua",
+            r#"
+            ---@class SANDBOX
+            SANDBOX = {}
+
+            ---@hook CanTool
+            ---@param ply table
+            ---@param trace table
+            ---@param mode string
+            ---@param tool table
+            ---@param button number
+            ---@return boolean
+            function SANDBOX:CanTool(ply, trace, mode, tool, button) end
+
+            ---@class ToolRules
+            ToolRules = {}
+
+            ---@param ply table
+            ---@param trace table
+            ---@param mode string
+            ---@param tool table
+            ---@param button number
+            ---@return boolean
+            function ToolRules:CanTool(ply, trace, mode, tool, button) end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingParameter,
+            r#"
+            ---@param base SANDBOX
+            local function CanTool(base, ply, trace, mode)
+                return base:CanTool(ply, trace, mode)
+            end
+            "#
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingParameter,
+            r#"
+            ---@param rules ToolRules
+            local function CanTool(rules, ply, trace, mode)
+                return rules:CanTool(ply, trace, mode)
+            end
+            "#
+        ));
+    }
+
+    #[test]
     fn test_issue_276() {
         let mut ws = VirtualWorkspace::new();
 
