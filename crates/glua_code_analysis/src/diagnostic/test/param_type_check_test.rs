@@ -4819,7 +4819,13 @@ mod test {
     /// A literal `tonumber` reads as a number passes, whitespace and hex included.
     #[test]
     fn a_number_param_accepts_a_literal_tonumber_converts() {
-        for literal in ["\" 5 \"", "\"0x1F\"", "\"-2.5e3\""] {
+        for literal in [
+            "\" 5 \"",
+            "\"0x1F\"",
+            "\"-2.5e3\"",
+            "\"0x1.8p1\"",
+            "\"-0x.8\"",
+        ] {
             let mut ws = VirtualWorkspace::new();
             assert!(
                 ws.check_code_for(
@@ -4842,6 +4848,14 @@ mod test {
             ---@param n number
             local function calc(n) end
             calc("0x")
+        "#
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number
+            local function calc(n) end
+            calc("0x1p")
         "#
         ));
     }

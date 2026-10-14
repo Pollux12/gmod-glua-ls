@@ -1609,7 +1609,8 @@ fn is_numeric_string_literal(ty: &LuaType) -> bool {
 }
 
 /// Whether LuaJIT's `tonumber` reads `text` as a number: surrounding whitespace
-/// is skipped and a `0x` prefix reads hexadecimal.
+/// is skipped and a `0x` prefix reads hexadecimal, with an optional fraction and
+/// binary `p` exponent.
 fn converts_to_number(text: &str) -> bool {
     let text = text.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r'));
     let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
@@ -1617,9 +1618,26 @@ fn converts_to_number(text: &str) -> bool {
         .strip_prefix("0x")
         .or_else(|| unsigned.strip_prefix("0X"))
     {
-        Some(digits) => !digits.is_empty() && digits.chars().all(|c| c.is_ascii_hexdigit()),
+        Some(hex) => is_hex_number(hex),
         None => text.parse::<f64>().is_ok(),
     }
+}
+
+fn is_hex_number(hex: &str) -> bool {
+    let (mantissa, exponent) = match hex.split_once(['p', 'P']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (hex, None),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let hex_digits = |part: &str| part.chars().all(|c| c.is_ascii_hexdigit());
+    let exponent_ok = exponent.is_none_or(|exponent| {
+        let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+    });
+    !(whole.is_empty() && fraction.is_empty())
+        && hex_digits(whole)
+        && hex_digits(fraction)
+        && exponent_ok
 }
 
 /// Returns `true` if `ty` is a primitive whose `tostring()` result is well-defined:
