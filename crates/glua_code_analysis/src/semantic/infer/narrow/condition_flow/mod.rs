@@ -2,6 +2,8 @@ mod binary_flow;
 mod call_flow;
 mod index_flow;
 
+pub(crate) use call_flow::call_is_presence_guard;
+
 use std::sync::Arc;
 
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr, LuaNameExpr, LuaUnaryExpr, UnaryOperator};

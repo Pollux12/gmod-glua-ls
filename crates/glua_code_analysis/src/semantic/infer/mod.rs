@@ -50,8 +50,8 @@ pub use infer_table::{infer_table_field_value_should_be, infer_table_should_be};
 use infer_unary::infer_unary_expr;
 pub use narrow::{SelfRefId, VarRefId, VarRefRootId};
 pub(crate) use narrow::{
-    contains_gmod_null_type, get_var_expr_var_ref_id, getter_access_path, raw_get_access_path,
-    remove_false_or_nil,
+    call_is_presence_guard, contains_gmod_null_type, get_var_expr_var_ref_id, getter_access_path,
+    raw_get_access_path, remove_false_or_nil,
 };
 
 use rowan::TextRange;

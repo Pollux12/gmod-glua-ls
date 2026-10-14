@@ -1034,6 +1034,9 @@ fn collect_unguarded_child_file(
                 }
                 continue;
             }
+            if is_guarded_by_enclosing_condition(db, &mut infer_cache, index_expr) {
+                continue;
+            }
             if LuaMemberKey::index_key_is_dynamic(db, &mut infer_cache, &index_key) {
                 continue;
             }
@@ -2306,9 +2309,10 @@ fn is_matching_short_circuit_guard(
             continue;
         };
         if left.syntax().text_range().contains_range(index_range) {
-            if positive_guard_contains_index(&left, &mut |guard| {
-                guard.syntax() == index_expr.syntax()
-            }) {
+            if positive_guard_indexes(db, cache, &left)
+                .iter()
+                .any(|guard| guard.syntax() == index_expr.syntax())
+            {
                 return true;
             }
             continue;
@@ -2321,6 +2325,66 @@ fn is_matching_short_circuit_guard(
         }
     }
     false
+}
+
+/// Whether an `if`/`elseif` around `index_expr` only runs its block when the same
+/// member path holds a value, as in `if IsValid(ent.Child) then ent = ent.Child end`,
+/// with the path's root not reassigned earlier in that block.
+fn is_guarded_by_enclosing_condition(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let index_range = index_expr.syntax().text_range();
+    for ancestor in index_expr.syntax().ancestors() {
+        if LuaClosureExpr::cast(ancestor.clone()).is_some() {
+            break;
+        }
+        let guarded_clause = LuaIfStat::cast(ancestor.clone())
+            .and_then(|stat| Some((stat.get_condition_expr()?, stat.get_block()?)))
+            .or_else(|| {
+                LuaElseIfClauseStat::cast(ancestor)
+                    .and_then(|clause| Some((clause.get_condition_expr()?, clause.get_block()?)))
+            });
+        let Some((condition, block)) = guarded_clause else {
+            continue;
+        };
+        if !block.syntax().text_range().contains_range(index_range) {
+            continue;
+        }
+        if matching_guard_in_expr(db, cache, &condition, index_expr)
+            && !root_reassigned_in_block_before(&block, index_expr)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn root_reassigned_in_block_before(
+    block: &glua_parser::LuaBlock,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let mut root = index_expr.get_prefix_expr();
+    while let Some(LuaExpr::IndexExpr(prefix)) = &root {
+        root = prefix.get_prefix_expr();
+    }
+    let Some(LuaExpr::NameExpr(root)) = root else {
+        return false;
+    };
+    let Some(root_name) = root.get_name_text() else {
+        return false;
+    };
+    let read_start = index_expr.get_position();
+    block
+        .get_stats()
+        .take_while(|stat| !stat.syntax().text_range().contains(read_start))
+        .filter_map(|stat| LuaAssignStat::cast(stat.syntax().clone()))
+        .any(|assign| {
+            assign.get_var_and_expr_list().0.into_iter().any(|var| {
+                matches!(var, LuaVarExpr::NameExpr(name) if name.get_name_text().as_deref() == Some(root_name.as_str()))
+            })
+        })
 }
 
 fn matching_guard_in_expr(
@@ -2339,35 +2403,54 @@ fn matching_guard_in_expr(
         return false;
     };
 
-    positive_guard_contains_index(guard_expr, &mut |guard| {
-        guard
-            .get_prefix_expr()
-            .is_some_and(|prefix| prefix.syntax().text() == guarded_prefix.syntax().text())
-            && guard.get_index_key().is_some_and(|key| {
-                LuaMemberKey::from_index_key(db, cache, &key)
-                    .is_ok_and(|guard_key| guard_key == guarded_key)
-            })
-    })
+    positive_guard_indexes(db, cache, guard_expr)
+        .iter()
+        .any(|guard| {
+            guard
+                .get_prefix_expr()
+                .is_some_and(|prefix| prefix.syntax().text() == guarded_prefix.syntax().text())
+                && guard.get_index_key().is_some_and(|key| {
+                    LuaMemberKey::from_index_key(db, cache, &key)
+                        .is_ok_and(|guard_key| guard_key == guarded_key)
+                })
+        })
 }
 
-fn positive_guard_contains_index(
+/// The member paths `expr` proves hold a value when it is true: the paths it tests
+/// for truthiness, joined by `and`, and the first argument of a presence guard call.
+fn positive_guard_indexes(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
     expr: &LuaExpr,
-    predicate: &mut impl FnMut(&LuaIndexExpr) -> bool,
-) -> bool {
+) -> Vec<LuaIndexExpr> {
     match expr {
-        LuaExpr::IndexExpr(index) => predicate(index),
+        LuaExpr::IndexExpr(index) => vec![index.clone()],
         LuaExpr::ParenExpr(paren) => paren
             .get_expr()
-            .is_some_and(|inner| positive_guard_contains_index(&inner, predicate)),
+            .map(|inner| positive_guard_indexes(db, cache, &inner))
+            .unwrap_or_default(),
         LuaExpr::BinaryExpr(binary)
             if binary.get_op_token().map(|token| token.get_op()) == Some(BinaryOperator::OpAnd) =>
         {
-            binary.get_exprs().is_some_and(|(left, right)| {
-                positive_guard_contains_index(&left, predicate)
-                    || positive_guard_contains_index(&right, predicate)
-            })
+            binary
+                .get_exprs()
+                .map(|(left, right)| {
+                    let mut indexes = positive_guard_indexes(db, cache, &left);
+                    indexes.extend(positive_guard_indexes(db, cache, &right));
+                    indexes
+                })
+                .unwrap_or_default()
         }
-        _ => false,
+        LuaExpr::CallExpr(call) if crate::semantic::call_is_presence_guard(db, cache, call) => call
+            .get_args_list()
+            .and_then(|args| args.get_args().next())
+            .map(|argument| match argument {
+                LuaExpr::IndexExpr(index) => vec![index],
+                LuaExpr::ParenExpr(_) => positive_guard_indexes(db, cache, &argument),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
     }
 }
 

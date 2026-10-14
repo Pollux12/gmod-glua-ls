@@ -1703,6 +1703,36 @@ mod test {
     }
 
     #[test]
+    fn a_member_read_a_guard_on_the_same_path_proves_present_is_not_an_unguarded_child() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_gmod_type_predicates();
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class prop_effect: Entity
+            ---@field AttachedEntity Entity
+
+            ---@param ent Entity
+            local function target(ent)
+                if IsValid(ent.AttachedEntity) then ent = ent.AttachedEntity end
+                local other = IsValid(ent.AttachedEntity) and ent.AttachedEntity or ent
+                return ent, other
+            end
+
+            ---@param ent Entity
+            local function unguarded(ent)
+                return ent.AttachedEntity
+            end
+            "#,
+        );
+
+        let diagnostics = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].range.start.line, 14);
+    }
+
+    #[test]
     fn mutable_return_cast_guard_reports_only_closure_child_access() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);

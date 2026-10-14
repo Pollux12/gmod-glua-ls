@@ -873,6 +873,23 @@ fn apply_signature_cast(
     }
 }
 
+/// Whether `call_expr` answers true only when its first argument holds a value: a
+/// `TypeGuard` predicate such as `isstring`, or a valid guard such as `IsValid`.
+pub(crate) fn call_is_presence_guard(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    let Some(signature_id) = get_call_prefix_signature_id(db, cache, call_expr) else {
+        return false;
+    };
+    call_prefix_signature_is_valid_guard(db, cache, call_expr, signature_id)
+        || db
+            .get_signature_index()
+            .get(&signature_id)
+            .is_some_and(|signature| matches!(signature.get_return_type(), LuaType::TypeGuard(_)))
+}
+
 fn get_call_prefix_signature_id(
     db: &DbIndex,
     cache: &mut LuaInferCache,
