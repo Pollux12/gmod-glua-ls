@@ -8857,6 +8857,33 @@ _2 = a[1]
     }
 
     #[test]
+    fn assigning_an_any_value_to_an_unannotated_local_makes_it_any() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            ---@param lookup any
+            local function Resolve(level, lookup)
+                local class = "w"
+                if level == 2 then
+                    class = "ic"
+                end
+                class = lookup
+                local assigned = class
+            end
+            "#,
+        );
+
+        let assigned = nth_name_expr_type_from_end(&mut ws, file_id, "class", 0);
+        assert_eq!(
+            assigned,
+            LuaType::Any,
+            "got: {}",
+            ws.humanize_type(assigned.clone())
+        );
+    }
+
+    #[test]
     fn assigning_an_any_value_keeps_a_doc_declared_param_type() {
         let mut ws = VirtualWorkspace::new();
 

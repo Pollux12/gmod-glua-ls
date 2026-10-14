@@ -2110,13 +2110,10 @@ fn get_type_at_assign_stat(
                     }
                     Err(err) => return Err(err),
                 };
-                // An `any` value takes the type the variable is annotated with,
-                // or else keeps the kind of value the variable held, not the
-                // `nil`/`false` of the old value it replaces (e.g. the
-                // `if not x then` branch it is assigned in).
+                // An `any` value takes the type the variable is annotated with, and
+                // is otherwise just `any`: the value it replaces says nothing about it.
                 if expr_type.is_any() {
                     annotated_var_type(db, var_ref_id)
-                        .or_else(|| without_falsy_values(antecedent_type))
                 } else {
                     Some(antecedent_type)
                 }
@@ -2163,26 +2160,6 @@ fn annotated_var_type(db: &DbIndex, var_ref_id: &VarRefId) -> Option<LuaType> {
 
 /// `typ` without its `nil` and `false` members, or `None` when nothing else is
 /// left.
-fn without_falsy_values(typ: LuaType) -> Option<LuaType> {
-    let is_falsy = |member: &LuaType| {
-        matches!(
-            member,
-            LuaType::Nil | LuaType::BooleanConst(false) | LuaType::DocBooleanConst(false)
-        )
-    };
-    match typ {
-        LuaType::Union(union) => {
-            let kept = union
-                .types()
-                .filter(|member| !is_falsy(member))
-                .cloned()
-                .collect::<Vec<_>>();
-            (!kept.is_empty()).then(|| LuaType::from_vec(kept))
-        }
-        typ => (!is_falsy(&typ)).then_some(typ),
-    }
-}
-
 fn try_get_numeric_range_table_arg_population_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
