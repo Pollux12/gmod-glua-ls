@@ -2200,9 +2200,9 @@ fn infer_call_site_value_type(
             let fact = crate::semantic::infer_expr_fact_with_cache(db, cache, expr.clone());
             // A call that takes arguments is evidence for an installer parameter, and only
             // when its result is certain.
-            if !is_zero_arg_call(call)
-                && !(calls_with_args && fact.confidence() >= LuaInferenceConfidence::Certain)
-            {
+            let accepted = is_zero_arg_call(call)
+                || (calls_with_args && fact.confidence() >= LuaInferenceConfidence::Certain);
+            if !accepted {
                 return None;
             }
             let types = crate::semantic::infer_expr_list_types(
