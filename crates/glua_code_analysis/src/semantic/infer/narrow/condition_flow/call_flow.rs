@@ -883,6 +883,10 @@ fn may_be_nil(db: &DbIndex, typ: &LuaType, visited: &mut rustc_hash::FxHashSet<L
         || typ.is_nullable()
         || match typ {
             LuaType::Union(union) => union.types().any(|arm| may_be_nil(db, arm, visited)),
+            LuaType::MultiLineUnion(union) => union
+                .get_unions()
+                .iter()
+                .any(|(arm, _)| may_be_nil(db, arm, visited)),
             _ => false,
         }
 }

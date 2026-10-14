@@ -2100,6 +2100,32 @@ mod test {
     }
 
     #[test]
+    fn a_type_guard_whose_multiline_alias_allows_nil_does_not_cover_its_reads() {
+        let mut ws = VirtualWorkspace::new();
+        let lines = guarded_lines(
+            &mut ws,
+            &format!(
+                "{ATTACHED}
+            ---@alias MaybeEntity
+            ---| Entity
+            ---| nil
+            ---@param value any
+            ---@return TypeGuard<MaybeEntity>
+            function isMaybeEntity(value) end
+
+            ---@param ent Entity
+            local function target(ent)
+                if isMaybeEntity(ent.AttachedEntity) then
+                    return ent.AttachedEntity
+                end
+            end
+            "
+            ),
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+    }
+
+    #[test]
     fn a_presence_guard_still_lets_its_reads_infer_the_child_for_sibling_members() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
