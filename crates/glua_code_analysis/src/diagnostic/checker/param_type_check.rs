@@ -1608,19 +1608,32 @@ fn is_numeric_string_literal(ty: &LuaType) -> bool {
     }
 }
 
-/// Whether LuaJIT's `tonumber` reads `text` as a number: surrounding whitespace
-/// is skipped and a `0x` prefix reads hexadecimal, with an optional fraction and
-/// binary `p` exponent.
+/// Whether LuaJIT's `tonumber` reads `text` as a number, whitespace, sign, `0x` and `0b` included.
 fn converts_to_number(text: &str) -> bool {
     let text = text.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r'));
     let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
-    match unsigned
+    if let Some(hex) = unsigned
         .strip_prefix("0x")
         .or_else(|| unsigned.strip_prefix("0X"))
     {
-        Some(hex) => is_hex_number(hex),
-        None => text.parse::<f64>().is_ok(),
+        return is_hex_number(hex);
     }
+    if let Some(binary) = unsigned
+        .strip_prefix("0b")
+        .or_else(|| unsigned.strip_prefix("0B"))
+    {
+        return is_binary_number(binary);
+    }
+    text.parse::<f64>().is_ok()
+}
+
+/// LuaJIT 2.1.0-beta3 reads binary as an integer of up to 64 digits, past a point only zeros.
+fn is_binary_number(binary: &str) -> bool {
+    let (whole, fraction) = binary.split_once('.').unwrap_or((binary, ""));
+    !(whole.is_empty() && fraction.is_empty())
+        && whole.chars().all(|c| matches!(c, '0' | '1'))
+        && fraction.chars().all(|c| c == '0')
+        && whole.trim_start_matches('0').len() <= 64
 }
 
 fn is_hex_number(hex: &str) -> bool {

@@ -4816,6 +4816,41 @@ mod test {
         ));
     }
 
+    /// LuaJIT's `tonumber` reads a `0b` prefix as binary digits, any fraction all zeros.
+    #[test]
+    fn a_number_param_accepts_a_binary_literal_tonumber_converts() {
+        for (literal, converts) in [
+            ("\"0b101\"", true),
+            ("\"-0B11\"", true),
+            ("\" 0b0 \"", true),
+            ("\"0b1.\"", true),
+            ("\"0b10.00\"", true),
+            ("\"0b0.0\"", true),
+            (format!("\"0b000{}\"", "1".repeat(64)).as_str(), true),
+            (format!("\"0b{}\"", "1".repeat(65)).as_str(), false),
+            ("\"0b\"", false),
+            ("\"0b.\"", false),
+            ("\"0b102\"", false),
+            ("\"0b1.1\"", false),
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert_eq!(
+                ws.check_code_for(
+                    DiagnosticCode::ParamTypeMismatch,
+                    &format!(
+                        r#"
+            ---@param n number
+            local function calc(n) end
+            calc({literal})
+        "#
+                    )
+                ),
+                converts,
+                "{literal}"
+            );
+        }
+    }
+
     /// A literal `tonumber` reads as a number passes, whitespace and hex included.
     #[test]
     fn a_number_param_accepts_a_literal_tonumber_converts() {
