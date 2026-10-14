@@ -42,13 +42,13 @@ Garry's Mod Lua settings live under the `gmod` key in `.gluarc.json`. These sett
 
 ## Gamemode inheritance
 
-GLuaLS supports gamemode inheritance. `DeriveGamemode("...")` keeps inherited `GM` members working. The `gmod.autoDetectGamemodeBase` setting loads parent gamemode folders from your gamemode's `<name>.txt` `base` value so parent files are available for completions, definitions, and diagnostics.
+GLuaLS supports gamemode inheritance. `DeriveGamemode("...")` keeps inherited `GM` members working. The `gmod.autoDetectGamemodeBase` setting loads parent gamemode folders from your gamemode's `<name>.txt` `base` value so parent files are available for completions, definitions, and diagnostics. The `base` and `sandbox` gamemodes are never loaded this way: the GMod annotations already declare them.
 
 This setting controls the `.txt` file lookup. `DeriveGamemode("...")` support remains active.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `gmod.autoDetectGamemodeBase` | `boolean \| null` | `null` (enabled) | Automatically loads parent gamemode folders from the gamemode `.txt` `base` value. Set to `false` to turn this off. |
+| `gmod.autoDetectGamemodeBase` | `boolean \| null` | `null` (enabled) | Automatically loads parent gamemode folders from the gamemode `.txt` `base` value, except `base` and `sandbox`, which the annotations provide. Set to `false` to turn this off. |
 
 ---
 

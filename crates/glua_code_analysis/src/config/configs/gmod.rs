@@ -93,6 +93,7 @@ pub struct EmmyrcGmod {
     pub template_path: Option<String>,
     /// Automatically detect and add the base gamemode as a library when a gamemode
     /// derives from another (via the `"base"` field in the gamemode `.txt` file).
+    /// `base` and `sandbox` come from the GMod annotations and are never added.
     /// Set to `false` to disable this detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_detect_gamemode_base: Option<bool>,

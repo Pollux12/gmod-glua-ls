@@ -1474,7 +1474,7 @@
           ]
         },
         "autoDetectGamemodeBase": {
-          "description": "Automatically detect and add the base gamemode as a library when a gamemode\nderives from another (via the `\"base\"` field in the gamemode `.txt` file).\nSet to `false` to disable this detection.",
+          "description": "Automatically detect and add the base gamemode as a library when a gamemode\nderives from another (via the `\"base\"` field in the gamemode `.txt` file).\n`base` and `sandbox` come from the GMod annotations and are never added.\nSet to `false` to disable this detection.",
           "type": [
             "boolean",
             "null"
