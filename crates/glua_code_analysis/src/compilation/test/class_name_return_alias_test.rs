@@ -373,3 +373,37 @@ mod test {
         );
     }
 }
+
+#[cfg(test)]
+mod conditional_class_name {
+    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+
+    #[test]
+    fn conditional_class_name_creates_either_registered_panel() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def(
+            "---@class Panel
+---@class DPanel : Panel
+",
+        );
+        assert!(ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "gamemodes/helix/gamemode/core/derma/cl_tooltip.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:SetEntity(entity) end
+            vgui.Register("ixTooltip", PANEL, "DPanel")
+            local MINIMAL = {}
+            vgui.Register("ixTooltipMinimal", MINIMAL, "ixTooltip")
+            local function Show(minimal)
+                local tooltip = vgui.Create(minimal and "ixTooltipMinimal" or "ixTooltip")
+                tooltip:SetEntity(1)
+            end
+            "#,
+        ));
+    }
+}

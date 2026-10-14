@@ -129,6 +129,20 @@ pub fn special_or_rule(
         return Some(narrowed);
     }
 
+    // `c and a or b` with an always-truthy `a` yields `a` or `b` when `c` may go either way.
+    if !left_type.is_always_truthy()
+        && !left_type.is_always_falsy()
+        && let LuaExpr::BinaryExpr(and_expr) = &left_expr
+        && and_expr
+            .get_op_token()
+            .is_some_and(|token| token.get_op() == glua_parser::BinaryOperator::OpAnd)
+        && let Some((_, truthy_expr)) = and_expr.get_exprs()
+        && let Ok(truthy_type) = crate::infer_expr(db, cache, truthy_expr)
+        && truthy_type.is_always_truthy()
+    {
+        return Some(TypeOps::Union.apply(db, &truthy_type, right_type));
+    }
+
     if is_unresolved_global_unknown_name_expr(db, cache, &left_expr, left_type) {
         let effective_right =
             if is_unresolved_global_unknown_name_expr(db, cache, &right_expr, right_type) {

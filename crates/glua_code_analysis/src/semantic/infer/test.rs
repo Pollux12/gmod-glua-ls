@@ -86,6 +86,30 @@ mod test {
     }
 
     #[test]
+    fn ternary_idiom_yields_both_branches_whatever_the_condition() {
+        let mut ws = VirtualWorkspace::new();
+        let file = ws.def_file(
+            "addons/ternary/lua/autorun/sh_ternary.lua",
+            r#"
+            local function pick(condition)
+                local chosen = condition and "first" or "second"
+                return chosen
+            end
+            "#,
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "chosen"),
+            LuaType::Union(
+                LuaUnionType::from_vec(vec![
+                    LuaType::StringConst(smol_str::SmolStr::new("first").into()),
+                    LuaType::StringConst(smol_str::SmolStr::new("second").into()),
+                ])
+                .into()
+            )
+        );
+    }
+
+    #[test]
     fn direct_param_return_alias_returns_one_actual_argument_value() {
         let mut ws = VirtualWorkspace::new();
         let file = ws.def_file(
