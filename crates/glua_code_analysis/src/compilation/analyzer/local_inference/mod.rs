@@ -492,7 +492,42 @@ struct NestedUnguardedChildCandidates {
     parent_type: LuaType,
     children: HashMap<crate::LuaTypeDeclId, FxHashSet<LuaMemberKey>>,
     receivers: FxHashSet<InFiled<glua_parser::LuaSyntaxId>>,
+    sources: HashMap<crate::LuaTypeDeclId, ChildSource>,
+}
+
+/// The read reported for `children`: the one their own evidence prefers.
+fn winning_source<'a>(
+    sources: &'a HashMap<crate::LuaTypeDeclId, ChildSource>,
+    children: &[crate::LuaTypeDeclId],
+) -> Option<&'a ChildSource> {
+    children
+        .iter()
+        .filter_map(|child| sources.get(child))
+        .min_by_key(|source| (source.guarded, source.site.value.get_range().start()))
+}
+
+impl NestedUnguardedChildCandidates {
+    fn earliest_site(&self) -> Option<&InFiled<glua_parser::LuaSyntaxId>> {
+        self.sources
+            .values()
+            .map(|source| &source.site)
+            .min_by_key(|site| in_filed_order(site))
+    }
+}
+
+fn record_child_source(
+    sources: &mut HashMap<crate::LuaTypeDeclId, ChildSource>,
+    child: crate::LuaTypeDeclId,
     source: ChildSource,
+) {
+    sources
+        .entry(child)
+        .and_modify(|existing| {
+            if source.precedes(existing) {
+                *existing = source.clone();
+            }
+        })
+        .or_insert(source);
 }
 
 fn compare_unguarded_child_candidates(
@@ -692,7 +727,7 @@ pub(crate) fn publish_unguarded_children(
                         parent_type: candidates.parent_type.clone(),
                         children: HashMap::default(),
                         receivers: FxHashSet::default(),
-                        source: candidates.source.clone(),
+                        sources: HashMap::default(),
                     });
             if entry.parent_type != candidates.parent_type {
                 continue;
@@ -701,8 +736,8 @@ pub(crate) fn publish_unguarded_children(
                 entry.children.entry(child_id).or_default().extend(keys);
             }
             entry.receivers.extend(candidates.receivers);
-            if candidates.source.precedes(&entry.source) {
-                entry.source = candidates.source;
+            for (child, source) in candidates.sources {
+                record_child_source(&mut entry.sources, child, source);
             }
         }
         for (source_key, source) in result.sources {
@@ -804,7 +839,7 @@ pub(crate) fn publish_unguarded_children(
     }
 
     let mut nested_scores = nested_scores.into_values().collect::<Vec<_>>();
-    nested_scores.sort_by_key(|candidates| in_filed_order(&candidates.source.site));
+    nested_scores.sort_by_key(|candidates| candidates.earliest_site().map(in_filed_order));
     for candidates in nested_scores {
         let found_type = candidates.parent_type;
         let mut children = candidates.children;
@@ -840,20 +875,24 @@ pub(crate) fn publish_unguarded_children(
         }
         support.sort_by(LuaInferenceNodeId::stable_cmp);
         support.dedup();
-        update_sources.push(candidates.source.site.clone());
+        let Some(source) =
+            winning_source(&candidates.sources, &winners).map(|source| source.site.clone())
+        else {
+            continue;
+        };
+        update_sources.push(source.clone());
         let mut receivers = candidates.receivers.into_iter().collect::<Vec<_>>();
         receivers.sort_by_key(in_filed_order);
         let nodes = receivers
             .into_iter()
             .map(|receiver| LuaInferenceNodeId::TypeOwner(crate::LuaTypeOwner::SyntaxId(receiver)));
-        let event_node = LuaInferenceNodeId::TypeOwner(crate::LuaTypeOwner::SyntaxId(
-            candidates.source.site.clone(),
-        ));
+        let event_node =
+            LuaInferenceNodeId::TypeOwner(crate::LuaTypeOwner::SyntaxId(source.clone()));
         for node in nodes {
             let event = LuaInferenceEventId {
                 node: event_node.clone(),
                 kind: LuaInferenceProvenanceKind::UnguardedChild,
-                source: candidates.source.site.clone(),
+                source: source.clone(),
             };
             updates.push((
                 node,
@@ -1501,16 +1540,14 @@ fn collect_member_path_unguarded_child_evidence(
                 parent_type: current.clone(),
                 children: HashMap::default(),
                 receivers: FxHashSet::default(),
-                source: source.clone(),
+                sources: HashMap::default(),
             });
     if candidates.parent_type != current {
         return;
     }
     candidates.receivers.insert(receiver);
-    if source.precedes(&candidates.source) {
-        candidates.source = source;
-    }
     for child_id in children.iter() {
+        record_child_source(&mut candidates.sources, child_id.clone(), source.clone());
         candidates
             .children
             .entry(child_id.clone())
@@ -2457,24 +2494,53 @@ fn matching_guard_in_expr(
     scope: GuardScope,
 ) -> bool {
     let guards = positive_guard_indexes(db, cache, guard_expr);
-    let mut identity = |index: &LuaIndexExpr| {
+    let mut path = |index: &LuaIndexExpr| {
         let table = index
             .get_prefix_expr()
             .and_then(|prefix| crate::semantic::get_var_expr_var_ref_id(db, cache, prefix))?;
-        let key = match scope {
-            GuardScope::Path => {
-                Some(LuaMemberKey::from_index_key(db, cache, &index.get_index_key()?).ok()?)
-            }
-            GuardScope::Parent => None,
-        };
+        let key = LuaMemberKey::from_index_key(db, cache, &index.get_index_key()?).ok();
         Some((table, key))
     };
-    let Some(guarded_identity) = identity(guarded) else {
+    let Some((guarded_table, guarded_key)) = path(guarded) else {
         return false;
     };
-    guards.iter().any(|guard| {
-        identity(guard).is_some_and(|guard_identity| guard_identity == guarded_identity)
+    let candidates = guards
+        .into_iter()
+        .filter_map(|guard| path(&guard).map(|guard_path| (guard, guard_path)))
+        .filter(|(_, (table, _))| *table == guarded_table)
+        .collect::<Vec<_>>();
+    candidates.into_iter().any(|(guard, (_, key))| {
+        (key.is_some() && key == guarded_key)
+            || (matches!(scope, GuardScope::Parent) && proves_child_type(db, cache, &guard))
     })
+}
+
+/// Whether `guard`'s member is one the variable it indexes is not declared to have,
+/// so its presence shows that variable holds a child type that defines it.
+fn proves_child_type(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
+    guard: &LuaIndexExpr,
+) -> bool {
+    let (Some(LuaExpr::NameExpr(prefix)), Some(key)) =
+        (guard.get_prefix_expr(), guard.get_index_key())
+    else {
+        return true;
+    };
+    let Some(decl_id) =
+        crate::semantic::get_var_expr_var_ref_id(db, cache, LuaExpr::NameExpr(prefix))
+            .and_then(|reference| reference.get_decl_id_ref())
+    else {
+        return true;
+    };
+    let (Some(declared), Ok(key)) = (
+        declaration_base_type(db, cache, decl_id),
+        LuaMemberKey::from_index_key(db, cache, &key),
+    ) else {
+        return true;
+    };
+    crate::semantic::find_members_with_key(db, &declared, key, false)
+        .is_none_or(|members| members.is_empty())
 }
 
 /// The member paths `expr` proves hold a value when it is true: the paths it tests

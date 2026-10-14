@@ -1935,6 +1935,96 @@ mod test {
     }
 
     #[test]
+    fn a_guard_on_the_read_path_covers_it_for_a_local_the_guard_reassigns() {
+        let mut ws = VirtualWorkspace::new();
+        let lines = guarded_lines(
+            &mut ws,
+            &format!(
+                "{ATTACHED}
+            ---@class Trace
+            ---@field Entity Entity
+
+            ---@param trace Trace
+            local function click(trace)
+                local ent = trace.Entity
+                if IsValid(ent.AttachedEntity) then ent = ent.AttachedEntity end
+                return ent
+            end
+            "
+            ),
+        );
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn a_guard_on_a_member_the_base_type_has_does_not_cover_a_child_read() {
+        let mut ws = VirtualWorkspace::new();
+        let lines = guarded_lines(
+            &mut ws,
+            r#"
+            ---@class Entity
+            ---@field Enabled boolean
+            ---@class Player: Entity
+            ---@field PlayerOnly number
+
+            ---@param ent Entity
+            local function read(ent)
+                if ent.Enabled then
+                    return ent.PlayerOnly
+                end
+            end
+            "#,
+        );
+        assert_eq!(lines, vec![9]);
+    }
+
+    #[test]
+    fn a_short_circuit_guard_through_a_constant_key_covers_the_named_read() {
+        let mut ws = VirtualWorkspace::new();
+        let lines = guarded_lines(
+            &mut ws,
+            &format!(
+                "{ATTACHED}
+            ---@param ent Entity
+            local function target(ent)
+                local key = \"AttachedEntity\"
+                return IsValid(ent[key]) and ent.AttachedEntity or ent
+            end
+            "
+            ),
+        );
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn a_nested_inference_is_reported_at_a_read_of_the_child_it_names() {
+        let mut ws = VirtualWorkspace::new();
+        let lines = guarded_lines(
+            &mut ws,
+            r#"
+            ---@class Panel
+            ---@class Scroll: Panel
+            ---@field up Panel
+            ---@field down Panel
+            ---@class Label: Panel
+            ---@field text string
+            ---@class Holder
+            ---@field panel Panel
+
+            ---@param holder Holder
+            local function paint(holder)
+                if IsValid(holder.panel.up) then
+                    local up = holder.panel.up
+                    local down = holder.panel.down
+                end
+                return holder.panel.text
+            end
+            "#,
+        );
+        assert!(!lines.contains(&16), "{lines:?}");
+    }
+
+    #[test]
     fn a_presence_guard_still_lets_its_reads_infer_the_child_for_sibling_members() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
