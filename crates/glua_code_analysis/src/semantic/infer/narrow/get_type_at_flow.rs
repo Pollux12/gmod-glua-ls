@@ -1000,10 +1000,7 @@ fn get_decl_position_var_ref_type(
     get_var_ref_type(db, cache, var_ref_id)
 }
 
-/// The value a local holds at its declaration when its initializer, or for a loop
-/// variable the value its iterator yields, determined nothing and a later write
-/// determined its slot: a straight-line read reaching the declaration sees that
-/// value, while a closure reads the whole slot.
+/// A local's declared value, or a loop variable's iterated one, that a later write displaced from its slot.
 fn initializer_type_a_later_write_displaced(
     db: &DbIndex,
     cache: &mut LuaInferCache,

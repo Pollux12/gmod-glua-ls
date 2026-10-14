@@ -9316,14 +9316,23 @@ _2 = a[1]
                for key, value in pairs(rows) do
                   _G.before = value
                   write_string(value)
-                  value = create_image()
+                  if key then
+                     _G.sibling = value
+                  else
+                     value = create_image()
+                     _G.after = value
+                  end
                end
             end
             "
         ));
 
-        let before = nth_name_expr_type_from_end(&mut ws, file_id, "value", 2);
+        let before = nth_name_expr_type_from_end(&mut ws, file_id, "value", 4);
         expect_that!(ws.humanize_type(before), eq("any"));
+        let sibling = nth_name_expr_type_from_end(&mut ws, file_id, "value", 2);
+        expect_that!(ws.humanize_type(sibling), eq("any"));
+        let after = nth_name_expr_type_from_end(&mut ws, file_id, "value", 0);
+        expect_that!(ws.humanize_type(after), contains_substring("DImage"));
         verify_that!(
             file_has_diagnostic(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
             eq(false)
