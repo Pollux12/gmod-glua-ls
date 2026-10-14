@@ -415,7 +415,11 @@ fn is_tagged_hook(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
     db.get_property_index()
         .get_property(&LuaSemanticDeclId::Signature(signature_id))
         .and_then(|property| property.tag_content())
-        .is_some_and(|tags| tags.tags.iter().any(|(name, _)| name == "hook"))
+        .is_some_and(|tags| {
+            tags.tags
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("hook"))
+        })
 }
 
 fn get_params_len(params: &[(String, Option<LuaType>)]) -> Option<usize> {

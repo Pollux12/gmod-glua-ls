@@ -177,6 +177,28 @@ mod test {
     }
 
     #[test]
+    fn a_hook_tag_is_recognised_in_any_case() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "lua/aaa_annotations/rules_case.lua",
+            r#"
+            ---@class RulesCase
+            RulesCase = {}
+            ---@Hook Pulse
+            ---@param n number
+            function RulesCase:Pulse(n) end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingParameter,
+            r#"
+            RulesCase:Pulse()
+            "#,
+        ));
+    }
+
+    #[test]
     fn calling_a_panel_hook_with_fewer_arguments_is_not_missing_parameters() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         set_gmod_enabled(&mut ws);
