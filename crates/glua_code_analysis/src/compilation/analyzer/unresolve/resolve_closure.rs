@@ -629,8 +629,16 @@ fn resolve_closure_member_type(
                 // signature, which no later pass reopens, so queue a settled
                 // retry that can refresh the slot-filled return once the base
                 // settles.
-                let source_return = signature.get_return_type();
-                let source_return_unsettled = is_unsettled_inferred_return(&source_return);
+                // A return inferred from the base's body describes that body, not
+                // a contract its overrides keep, so only a documented one carries.
+                let documented = signature.resolve_return == SignatureReturnStatus::DocResolve;
+                let source_return = if documented {
+                    signature.get_return_type()
+                } else {
+                    LuaType::Unknown
+                };
+                let source_return_unsettled =
+                    documented && is_unsettled_inferred_return(&source_return);
                 let source_id = *id;
                 let target = db
                     .get_signature_index()

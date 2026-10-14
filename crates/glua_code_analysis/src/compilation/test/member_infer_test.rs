@@ -6008,7 +6008,7 @@ end
     }
 
     #[test]
-    fn settled_parent_closure_refreshes_partially_unsettled_inherited_return() {
+    fn an_override_does_not_take_the_return_its_base_body_infers() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = crate::Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -6098,13 +6098,13 @@ end
         let (filled_from_slot, cold_return) = child_signature(&ws);
         assert_that!(
             filled_from_slot,
-            eq(true),
-            "inherited return must be marked slot-filled, got return {cold_return:?}"
+            eq(false),
+            "the override's return must be its own, got return {cold_return:?}"
         );
         let rendered = format!("{cold_return:?}");
         assert!(
-            rendered.contains("IntegerConst(5)"),
-            "inherited return must contain the settled slot, got {rendered}"
+            !rendered.contains("IntegerConst(5)"),
+            "the base body's return must not reach the override, got {rendered}"
         );
 
         ws.analysis.reindex_files(vec![base_file]);

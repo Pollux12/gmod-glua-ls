@@ -552,4 +552,46 @@ mod tests {
         "#,
         ));
     }
+
+    #[test]
+    fn an_override_keeps_its_own_return_count_when_the_base_return_is_only_inferred() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingReturnValue,
+            r#"
+            ---@return number
+            ---@return number
+            local function pair() return 1, 2 end
+
+            ---@class OverrideReturn.Base
+            local Base = {}
+            function Base:Grab() return pair() end
+
+            ---@class OverrideReturn.Child: OverrideReturn.Base
+            local Child = {}
+            function Child:Grab() return 1 end
+        "#
+        ));
+    }
+
+    #[test]
+    fn an_override_keeps_the_return_count_its_base_documents() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingReturnValue,
+            r#"
+            ---@class OverrideReturnDoc.Base
+            local Base = {}
+            ---@return number
+            ---@return number
+            function Base:Grab() return 1, 2 end
+
+            ---@class OverrideReturnDoc.Child: OverrideReturnDoc.Base
+            local Child = {}
+            function Child:Grab() return 1 end
+        "#
+        ));
+    }
 }
