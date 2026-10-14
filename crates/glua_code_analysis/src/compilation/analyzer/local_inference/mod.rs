@@ -1034,9 +1034,6 @@ fn collect_unguarded_child_file(
                 }
                 continue;
             }
-            if is_guarded_by_enclosing_condition(db, &mut infer_cache, index_expr) {
-                continue;
-            }
             if LuaMemberKey::index_key_is_dynamic(db, &mut infer_cache, &index_key) {
                 continue;
             }
@@ -2330,7 +2327,7 @@ fn is_matching_short_circuit_guard(
 /// Whether an `if`/`elseif` around `index_expr` only runs its block when the same
 /// member path holds a value, as in `if IsValid(ent.Child) then ent = ent.Child end`,
 /// with the path's root not reassigned earlier in that block.
-fn is_guarded_by_enclosing_condition(
+pub(crate) fn is_guarded_by_enclosing_condition(
     db: &crate::DbIndex,
     cache: &mut crate::semantic::LuaInferCache,
     index_expr: &LuaIndexExpr,

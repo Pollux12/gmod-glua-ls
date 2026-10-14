@@ -1733,6 +1733,38 @@ mod test {
     }
 
     #[test]
+    fn a_presence_guard_still_lets_its_reads_infer_the_child_for_sibling_members() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_gmod_type_predicates();
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@class DVScrollBar: Panel
+            ---@field btnUp Panel
+            ---@field btnDown Panel
+
+            ---@param parent Panel
+            local function paint(parent)
+                if IsValid(parent.btnUp) then
+                    local up = parent.btnUp
+                    local down = parent.btnDown
+                    return up, down
+                end
+            end
+            "#,
+        );
+
+        for code in [
+            DiagnosticCode::InferUnguardedChild,
+            DiagnosticCode::UndefinedField,
+        ] {
+            let diagnostics = diagnostics_for(&mut ws, file_id, code);
+            assert!(diagnostics.is_empty(), "{code:?}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
     fn mutable_return_cast_guard_reports_only_closure_child_access() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);

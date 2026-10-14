@@ -49,6 +49,13 @@ impl Checker for InferenceTrustChecker {
                 {
                     (DiagnosticCode::InferUnknown, false)
                 }
+                // A read inside a guard proving the same member path present is
+                // where that guard already stands, so there is nothing to add.
+                LuaInferenceProvenanceKind::UnguardedChild
+                    if source_is_presence_guarded(semantic_model, &inference.event.source) =>
+                {
+                    continue;
+                }
                 LuaInferenceProvenanceKind::UnguardedChild => {
                     (DiagnosticCode::InferUnguardedChild, true)
                 }
@@ -88,6 +95,24 @@ impl Checker for InferenceTrustChecker {
             );
         }
     }
+}
+
+fn source_is_presence_guarded(
+    semantic_model: &SemanticModel,
+    source: &InFiled<LuaSyntaxId>,
+) -> bool {
+    let Some(index_expr) = source
+        .value
+        .to_node_from_root(semantic_model.get_root().syntax())
+        .and_then(LuaIndexExpr::cast)
+    else {
+        return false;
+    };
+    crate::compilation::analyzer::is_guarded_by_enclosing_condition(
+        semantic_model.get_db(),
+        &mut semantic_model.get_cache().borrow_mut(),
+        &index_expr,
+    )
 }
 
 /// A single winning child can be written into a guard, so it is named directly.
