@@ -465,7 +465,7 @@ fn try_infer_pairs_iter_types_from_table_members(
         );
         return Ok(Some(VariadicType::Multi(vec![key_type, value_type])));
     }
-    let Some(table_type) = pairs_enumerable_type(table_type) else {
+    let Some(table_type) = pairs_enumerable_type(db, table_type) else {
         return Ok(None);
     };
     let Some(members) = get_member_map(db, &table_type) else {
@@ -573,7 +573,8 @@ fn try_infer_pairs_iter_types_from_table_members(
 
 /// The arms of `typ` that `pairs` enumerates: a string's members are the library its
 /// metatable indexes, not entries of the value, so a string arm contributes none.
-fn pairs_enumerable_type(typ: LuaType) -> Option<LuaType> {
+fn pairs_enumerable_type(db: &DbIndex, typ: LuaType) -> Option<LuaType> {
+    let typ = crate::get_real_type(db, &typ).cloned().unwrap_or(typ);
     let arms = match &typ {
         LuaType::Union(union) => union.types().cloned().collect::<Vec<_>>(),
         LuaType::MultiLineUnion(union) => union

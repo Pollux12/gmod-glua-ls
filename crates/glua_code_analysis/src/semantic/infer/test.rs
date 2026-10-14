@@ -181,6 +181,31 @@ mod test {
     }
 
     #[test]
+    fn pairs_over_an_alias_that_may_be_a_string_enumerates_only_its_table_arm() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "addons/pairs_string_alias/lua/autorun/sh_pairs_string_alias.lua",
+            r#"
+            ---@alias List string|table
+            ---@param list List
+            local function each(list)
+                for key, value in pairs(list) do
+                    print(key, value)
+                end
+            end
+            "#,
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "key"),
+            LuaType::Any
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "value"),
+            LuaType::Any
+        );
+    }
+
+    #[test]
     fn direct_param_return_alias_returns_one_actual_argument_value() {
         let mut ws = VirtualWorkspace::new();
         let file = ws.def_file(
