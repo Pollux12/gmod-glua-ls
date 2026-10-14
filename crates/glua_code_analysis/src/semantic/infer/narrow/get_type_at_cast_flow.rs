@@ -164,7 +164,7 @@ pub fn apply_cast(
         // A predicate that removes `target` when true leaves possible when false only
         // the parts of it the value could have held.
         LuaCastAction::Add if condition_flow.is_false() => {
-            let held = arms(target)
+            let held = arms(crate::get_real_type(db, target).unwrap_or(target))
                 .filter(|part| arms(&source_type).any(|arm| arm_can_hold(db, arm, part)))
                 .cloned()
                 .collect::<Vec<_>>();
