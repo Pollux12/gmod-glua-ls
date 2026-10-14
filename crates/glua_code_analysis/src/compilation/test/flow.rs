@@ -1444,6 +1444,35 @@ end
     }
 
     #[test]
+    fn a_failed_predicate_that_removes_several_types_adds_each_one_the_value_could_hold() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL: Entity
+            ---@class Panel
+            ---@class Vector
+
+            ---@return boolean
+            ---@return_cast object -NULL|Vector
+            function IsLive(object) end
+
+            ---@param thing Entity|Panel
+            local function make(thing)
+                if not IsLive(thing) then
+                    failed_thing = thing
+                end
+            end
+            "#,
+        );
+
+        let failed_thing = ws.expr_ty("failed_thing");
+        let with_null = ws.ty("Entity|Panel|NULL");
+        assert_eq!(ws.humanize_type(failed_thing), ws.humanize_type(with_null));
+    }
+
+    #[test]
     fn deferred_closure_retains_immutable_return_cast_false_branch() {
         let mut ws = VirtualWorkspace::new();
 

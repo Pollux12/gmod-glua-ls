@@ -161,12 +161,18 @@ pub fn apply_cast(
         None => return source_type,
     };
     match action {
-        // A predicate that removes `target` when true leaves it possible when false
-        // only where the value could have held it.
-        LuaCastAction::Add
-            if condition_flow.is_false() && !any_arm_can_hold(db, &source_type, target) =>
-        {
-            source_type
+        // A predicate that removes `target` when true leaves possible when false only
+        // the parts of it the value could have held.
+        LuaCastAction::Add if condition_flow.is_false() => {
+            let held = arms(target)
+                .filter(|part| arms(&source_type).any(|arm| arm_can_hold(db, arm, part)))
+                .cloned()
+                .collect::<Vec<_>>();
+            if held.is_empty() {
+                source_type
+            } else {
+                TypeOps::Union.apply(db, &source_type, &LuaType::from_vec(held))
+            }
         }
         LuaCastAction::Add => TypeOps::Union.apply(db, &source_type, target),
         LuaCastAction::Remove => {
@@ -181,16 +187,17 @@ pub fn apply_cast(
     }
 }
 
-fn any_arm_can_hold(db: &DbIndex, source: &LuaType, target: &LuaType) -> bool {
-    let arms = match source {
-        LuaType::Union(union) => union.types().cloned().collect::<Vec<_>>(),
-        _ => vec![source.clone()],
-    };
-    arms.iter().any(|arm| {
-        !arm.is_unknown()
-            && !arm.is_any()
-            && crate::semantic::type_check::check_type_compact(db, arm, target).is_ok()
-    })
+fn arms(typ: &LuaType) -> Box<dyn Iterator<Item = &LuaType> + '_> {
+    match typ {
+        LuaType::Union(union) => Box::new(union.types()),
+        _ => Box::new(std::iter::once(typ)),
+    }
+}
+
+fn arm_can_hold(db: &DbIndex, arm: &LuaType, part: &LuaType) -> bool {
+    !arm.is_unknown()
+        && !arm.is_any()
+        && crate::semantic::type_check::check_type_compact(db, arm, part).is_ok()
 }
 
 /// The operation a `---@cast` in `file_id` writes, with the type the doc
