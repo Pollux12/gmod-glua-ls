@@ -256,29 +256,18 @@ fn remove_fields_completed_after(
             }
 
             // The values run before the assignment stores them, so a value that
-            // passes the whole target on consumes it without this statement's writes.
-            // A function value only runs later.
+            // hands the whole target to a call consumes it without this statement's
+            // writes. A function value only runs later, unless it is called there.
             let consumed_by_values = values
                 .iter()
                 .flat_map(|value| {
                     value
                         .syntax()
                         .descendants_of::<LuaVarExpr>()
-                        .filter(move |var| {
-                            !var.syntax()
-                                .ancestors()
-                                .find_map(glua_parser::LuaClosureExpr::cast)
-                                .is_some_and(|closure| {
-                                    value
-                                        .syntax()
-                                        .text_range()
-                                        .contains_range(closure.syntax().text_range())
-                                })
-                        })
+                        .filter(move |var| !runs_after_value(var, value))
                 })
                 .filter(|var| {
-                    var.get_access_path().as_deref() == Some(target.as_str())
-                        && !is_field_access_prefix(var)
+                    var.get_access_path().as_deref() == Some(target.as_str()) && hands_to_call(var)
                 })
                 .collect::<Vec<_>>();
             if !consumed_by_values.is_empty() {
@@ -314,20 +303,43 @@ fn remove_fields_completed_after(
     Some(())
 }
 
-/// Whether `var` only reads a field of itself (`t.a`, `t[k]`), not a method call
-/// that hands the whole table on as `self`.
-fn is_field_access_prefix(var: &LuaVarExpr) -> bool {
-    var.syntax()
-        .parent()
-        .and_then(glua_parser::LuaIndexExpr::cast)
-        .is_some_and(|index| {
+/// Whether `var` is handed to a call, as an argument or as a method call's `self`.
+fn hands_to_call(var: &LuaVarExpr) -> bool {
+    let Some(parent) = var.syntax().parent() else {
+        return false;
+    };
+    LuaCallArgList::can_cast(parent.kind().into())
+        || glua_parser::LuaIndexExpr::cast(parent).is_some_and(|index| {
             index
                 .get_prefix_expr()
                 .is_some_and(|prefix| prefix.syntax() == var.syntax())
-                && !index
+                && index
                     .get_index_token()
                     .is_some_and(|token| token.is_colon())
         })
+}
+
+/// Whether `var` sits in a function `value` creates without calling it.
+fn runs_after_value(var: &LuaVarExpr, value: &LuaExpr) -> bool {
+    var.syntax()
+        .ancestors()
+        .take_while(|node| node != value.syntax())
+        .chain(std::iter::once(value.syntax().clone()))
+        .filter_map(glua_parser::LuaClosureExpr::cast)
+        .any(|closure| !is_called_where_written(&closure))
+}
+
+/// Whether `closure` is called where it is written, as in `(function() end)()`.
+fn is_called_where_written(closure: &glua_parser::LuaClosureExpr) -> bool {
+    let mut callee = closure.syntax().clone();
+    while let Some(paren) = callee.parent().and_then(glua_parser::LuaParenExpr::cast) {
+        callee = paren.syntax().clone();
+    }
+    callee
+        .parent()
+        .and_then(LuaCallExpr::cast)
+        .and_then(|call| call.get_prefix_expr())
+        .is_some_and(|prefix| prefix.syntax() == &callee)
 }
 
 /// A literal passed as an out-parameter is completed by the callee, not by the

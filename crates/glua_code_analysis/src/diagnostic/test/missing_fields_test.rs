@@ -837,6 +837,46 @@ foo({})
     }
 
     #[test]
+    fn a_field_written_from_a_call_its_value_makes_at_once_is_still_missing_there() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value Full
+            ---@return string
+            local function consume(value) return value.required end
+
+            ---@type Full
+            local value = {}
+            value.required = (function()
+                return consume(value)
+            end)()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_field_holding_the_table_itself_is_given() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Node
+            ---@field parent Node
+
+            ---@type Node
+            local root = {}
+            root.parent = root
+            "#,
+        ));
+    }
+
+    #[test]
     fn a_field_written_from_another_field_of_the_table_is_given() {
         let mut ws = VirtualWorkspace::new();
 
