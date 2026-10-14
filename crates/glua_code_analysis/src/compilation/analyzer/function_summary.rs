@@ -20,8 +20,10 @@ pub(crate) struct FileFunctionSummaries {
     pub(super) field_setter_helpers: FxHashMap<TextSize, Vec<dynamic_field::FieldSetterHelper>>,
     /// The parameters each function statement assigns to.
     pub(super) mutated_params: FxHashMap<TextSize, Vec<usize>>,
-    /// The parameters each function defines methods on, as `function param:Name()` does.
+    /// The parameters each function installs named members on.
     pub(super) installer_params: FxHashMap<TextSize, Vec<usize>>,
+    /// The parameters each function assigns named fields onto.
+    pub(super) filled_params: FxHashMap<TextSize, Vec<usize>>,
     /// The closures whose unmutated explicit `self` parameter is returned.
     pub(super) returns_explicit_self: FxHashSet<TextSize>,
     /// Access path → the signatures of the function statements declaring it,
@@ -35,6 +37,7 @@ impl FileFunctionSummaries {
         self.field_setter_helpers.is_empty()
             && self.mutated_params.is_empty()
             && self.installer_params.is_empty()
+            && self.filled_params.is_empty()
             && self.returns_explicit_self.is_empty()
             && self.source_signatures.is_empty()
     }
@@ -69,6 +72,7 @@ impl Hash for FileFunctionSummaries {
         hash_sorted(&self.field_setter_helpers, state);
         hash_sorted(&self.mutated_params, state);
         hash_sorted(&self.installer_params, state);
+        hash_sorted(&self.filled_params, state);
         let mut returns_explicit_self = self.returns_explicit_self.iter().collect::<Vec<_>>();
         returns_explicit_self.sort();
         returns_explicit_self.len().hash(state);
@@ -91,12 +95,13 @@ pub(super) fn collect_function_summaries(
     file_id: FileId,
     root: &LuaChunk,
 ) -> Option<(Arc<FileFunctionSummaries>, Fingerprint)> {
-    let (mutated_params, installer_params, returns_explicit_self) =
+    let (mutated_params, installer_params, filled_params, returns_explicit_self) =
         call_site_params::collect_param_summaries(db, file_id, root);
     let summaries = FileFunctionSummaries {
         field_setter_helpers: dynamic_field::collect_field_setter_helpers(root),
         mutated_params,
         installer_params,
+        filled_params,
         returns_explicit_self,
         source_signatures: call_site_params::source_signatures_in_file(file_id, root),
     };

@@ -852,6 +852,181 @@ end
         assert_eq!(undefined_fields, ["Undefined field `DefinitelyMissing`. "]);
     }
 
+    /// Undefined methods reported when `PopulateFromList` is called as `callers` call it.
+    fn installed_tree_method_reports(callers: &str) -> Vec<String> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/annotations/meta.lua",
+            "---@meta
+---@class Panel
+---@class DTree: Panel
+---@class SpawnmenuContentPanel: Panel
+",
+        );
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/content.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:PopulateFromList(listName, tree, options)
+                tree.Categories = {}
+                tree.RefreshContent = function(self, item, spawnname) end
+            end
+            vgui.Register("SpawnmenuContentPanel", PANEL, "Panel")
+            "#,
+        );
+        let file_id = ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/contenttypes/weapons.lua",
+            &format!(
+                r#"
+            {callers}
+
+            ---@type DTree
+            local navTree
+            navTree:RefreshContent({{}}, "weapon_crowbar")
+            "#
+            ),
+        );
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect()
+    }
+
+    #[test]
+    fn a_panel_method_installs_a_field_on_the_panel_its_callers_pass() {
+        assert_eq!(
+            installed_tree_method_reports(
+                r#"
+            ---@param pnlContent SpawnmenuContentPanel
+            ---@param tree DTree
+            local function populate(pnlContent, tree)
+                pnlContent:PopulateFromList("Weapon", tree, {})
+            end
+            "#
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A forwarded vararg names no value, so the tree stays untyped.
+    #[test]
+    fn a_forwarded_vararg_leaves_an_installed_parameter_untyped() {
+        assert_eq!(
+            installed_tree_method_reports(
+                r#"
+            ---@param pnlContent SpawnmenuContentPanel
+            ---@param tree DTree
+            local function populate(pnlContent, tree)
+                pnlContent:PopulateFromList("Weapon", tree, {})
+            end
+
+            ---@param pnlContent SpawnmenuContentPanel
+            local function forward(pnlContent, ...)
+                pnlContent:PopulateFromList("Weapon", ...)
+            end
+            "#
+            ),
+            ["Undefined method `RefreshContent`. "]
+        );
+    }
+
+    /// A call through a value holding either handler types neither handler's parameter.
+    #[test]
+    fn a_pooled_handler_call_does_not_type_an_installed_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        assert!(!ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "lua/autorun/handlers.lua",
+            r#"
+            ---@class DTree
+
+            local Handlers = {}
+            function Handlers.Mark(key, target)
+                target.Marked = function() end
+            end
+            function Handlers.Other(key, target) end
+
+            ---@param self DTree
+            ---@param marks boolean
+            local function run(self, marks)
+                local handler = marks and Handlers.Mark or Handlers.Other
+                handler("key", self)
+            end
+
+            ---@type DTree
+            local tree
+            tree:Marked()
+            "#,
+        ));
+    }
+
+    /// A call through a value holding one function types the parameter it installs on.
+    #[test]
+    fn an_aliased_installer_call_types_its_installed_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        assert!(ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "lua/autorun/handlers.lua",
+            r#"
+            ---@class DTree
+
+            local Handlers = {}
+            function Handlers.Install(key, target)
+                target.Marked = function() end
+            end
+
+            ---@param self DTree
+            local function run(self)
+                local handler = Handlers.Install
+                handler("key", self)
+            end
+
+            ---@type DTree
+            local tree
+            tree:Marked()
+            "#,
+        ));
+    }
+
+    /// A named table passed to an installer gets the members it installs.
+    #[test]
+    fn a_named_table_passed_to_an_installer_gets_its_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        assert!(ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "lua/autorun/install.lua",
+            r#"
+            function Install(target)
+                function target:Marked() end
+            end
+            local tree = {}
+            Install(tree)
+            tree:Marked()
+            "#,
+        ));
+    }
+
     #[test]
     fn vgui_parent_chain_resolves_add_panel_canvas_to_owner() {
         let mut ws = VirtualWorkspace::new();
@@ -1882,5 +2057,34 @@ end
         );
 
         assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    /// A table a function fills fields into is that caller's input, not the parameter's type.
+    #[test]
+    fn a_registered_table_does_not_close_the_input_it_fills() {
+        for table in ["CLASS", "{ format = \"x\" }", "self"] {
+            let mut ws = VirtualWorkspace::new();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+            assert!(
+                ws.check_file_for(
+                    DiagnosticCode::UndefinedField,
+                    "lua/autorun/register.lua",
+                    &format!(
+                        r#"
+            function Register(name, data)
+                data.uniqueID = name
+                return {{ bNoIndicator = data.bNoIndicator }}
+            end
+            local CLASS = {{}}
+            local self = {{}}
+            Register("chat", {table})
+            "#
+                    ),
+                ),
+                "{table}"
+            );
+        }
     }
 }

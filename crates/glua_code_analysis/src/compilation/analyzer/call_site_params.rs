@@ -78,6 +78,16 @@ fn is_installer_param(db: &DbIndex, signature_id: LuaSignatureId, param_idx: usi
     })
 }
 
+/// Whether the function declaring `signature_id` assigns named fields onto parameter `param_idx`.
+fn is_filled_param(db: &DbIndex, signature_id: LuaSignatureId, param_idx: usize) -> bool {
+    function_summaries(db, signature_id.get_file_id()).is_some_and(|summaries| {
+        summaries
+            .filled_params
+            .get(&signature_id.get_position())
+            .is_some_and(|params| params.contains(&param_idx))
+    })
+}
+
 /// Whether the function statement declaring `signature_id` assigns to
 /// parameter `param_idx`.
 fn is_param_mutated(db: &DbIndex, signature_id: LuaSignatureId, param_idx: usize) -> bool {
@@ -452,9 +462,8 @@ pub(super) fn source_signatures_in_file(
 }
 
 /// Each file function's syntactic parameter facts, keyed by closure position:
-/// the parameters each function statement assigns to, the parameters each
-/// function defines methods on, and the closures whose unmutated explicit
-/// `self` parameter is returned.
+/// The parameters each function statement assigns to, each function installs members
+/// on and assigns named fields onto, and the closures returning an unmutated explicit `self`.
 pub(super) fn collect_param_summaries(
     db: &DbIndex,
     file_id: FileId,
@@ -462,32 +471,45 @@ pub(super) fn collect_param_summaries(
 ) -> (
     HashMap<TextSize, Vec<usize>>,
     HashMap<TextSize, Vec<usize>>,
+    HashMap<TextSize, Vec<usize>>,
     HashSet<TextSize>,
 ) {
     let mut mutated_params = HashMap::default();
     let mut installer_params = HashMap::default();
+    let mut filled_params = HashMap::default();
     let mut returns_explicit_self = HashSet::default();
     for closure in root.descendants::<LuaClosureExpr>() {
         let mutated = function_statement_mutated_params(db, file_id, &closure);
         if !mutated.is_empty() {
             mutated_params.insert(closure.get_position(), mutated);
         }
-        let installed = method_installer_params(db, file_id, &closure);
+        let (installed, filled) = method_installer_params(db, file_id, &closure);
         if !installed.is_empty() {
             installer_params.insert(closure.get_position(), installed);
+        }
+        if !filled.is_empty() {
+            filled_params.insert(closure.get_position(), filled);
         }
         if returns_unmutated_explicit_self(db, file_id, &closure) {
             returns_explicit_self.insert(closure.get_position());
         }
     }
-    (mutated_params, installer_params, returns_explicit_self)
+    (
+        mutated_params,
+        installer_params,
+        filled_params,
+        returns_explicit_self,
+    )
 }
 
-/// The parameters `closure`'s body defines methods on, as `function meta:Name()`
-/// and `function meta.Name()` do.
-fn method_installer_params(db: &DbIndex, file_id: FileId, closure: &LuaClosureExpr) -> Vec<usize> {
+/// The parameters `closure`'s body installs named members on, and those of them it assigns fields to.
+fn method_installer_params(
+    db: &DbIndex,
+    file_id: FileId,
+    closure: &LuaClosureExpr,
+) -> (Vec<usize>, Vec<usize>) {
     let Some(params_list) = closure.get_params_list() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let params = params_list
         .get_params()
@@ -498,30 +520,41 @@ fn method_installer_params(db: &DbIndex, file_id: FileId, closure: &LuaClosureEx
         })
         .collect::<Vec<_>>();
     if params.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let Some(references) = db.get_reference_index().get_local_reference(&file_id) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
+    let param_of = |var: LuaVarExpr| {
+        let LuaVarExpr::IndexExpr(index_expr) = var else {
+            return None;
+        };
+        let LuaExpr::NameExpr(prefix) = index_expr.get_prefix_expr()? else {
+            return None;
+        };
+        let decl_id = references.get_decl_id(&prefix.get_range())?;
+        params
+            .iter()
+            .find(|(_, param_decl_id)| *param_decl_id == decl_id)
+            .map(|(idx, _)| *idx)
+    };
+    let mut filled = closure
+        .descendants::<LuaAssignStat>()
+        .flat_map(|assign| assign.get_var_and_expr_list().0)
+        .filter(writes_named_field)
+        .filter_map(param_of)
+        .collect::<Vec<_>>();
+    filled.sort_unstable();
+    filled.dedup();
     let mut installed = closure
         .descendants::<LuaFuncStat>()
-        .filter_map(|func_stat| match func_stat.get_func_name()? {
-            LuaVarExpr::IndexExpr(index_expr) => match index_expr.get_prefix_expr()? {
-                LuaExpr::NameExpr(prefix) => references.get_decl_id(&prefix.get_range()),
-                _ => None,
-            },
-            LuaVarExpr::NameExpr(_) => None,
-        })
-        .filter_map(|decl_id| {
-            params
-                .iter()
-                .find(|(_, param_decl_id)| *param_decl_id == decl_id)
-                .map(|(idx, _)| *idx)
-        })
+        .filter_map(|func_stat| func_stat.get_func_name())
+        .filter_map(param_of)
+        .chain(filled.iter().copied())
         .collect::<Vec<_>>();
     installed.sort_unstable();
     installed.dedup();
-    installed
+    (installed, filled)
 }
 
 /// The parameters a function statement assigns to; empty for any other
@@ -623,7 +656,7 @@ fn get_mutated_params(
                         _ => is_direct_closure,
                     }
                 } else if is_direct_closure {
-                    var_writes_param(&var, param_name)
+                    var_writes_param(db, &var, param_name)
                 } else {
                     false
                 };
@@ -681,6 +714,9 @@ fn collect_call_site_param_types(
             None => {}
         }
     }
+    // A value holding several functions may call any of them.
+    let is_pooled_callee =
+        lookup_kind == SignatureLookupKind::InferredCallable && signature_ids.len() > 1;
     for signature_id in signature_ids.iter().copied() {
         if is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
             collect_direct_callback_param_types(
@@ -752,13 +788,16 @@ fn collect_call_site_param_types(
             {
                 continue;
             }
+            let installs_on_arg = is_installer_param(db, signature_id, param_idx);
+            // A pooled call may reach any of its functions, so only its receiver types an installer.
+            if is_pooled_callee && installs_on_arg && !is_explicit_receiver {
+                continue;
+            }
             if !is_implicit_receiver && !is_exact_include_receiver {
                 let Some(param_name) = signature.params.get(param_idx) else {
                     continue;
                 };
-                if !has_gmod_param_name_hint(db, param_name)
-                    && !is_installer_param(db, signature_id, param_idx)
-                {
+                if !has_gmod_param_name_hint(db, param_name) && !installs_on_arg {
                     continue;
                 }
             }
@@ -772,14 +811,14 @@ fn collect_call_site_param_types(
                 continue;
             };
             let arg_syntax_id = arg.get_syntax_id();
-            let calls_with_args = is_installer_param(db, signature_id, param_idx);
             let arg_type = infer_supported_call_site_arg_type(
                 db,
                 cache,
                 scope,
                 file_id,
                 arg.clone(),
-                calls_with_args,
+                installs_on_arg,
+                is_filled_param(db, signature_id, param_idx),
             )
             .filter(|(typ, _)| argument_type_is_usable(signature, param_idx, typ));
             let Some((arg_type, provenance_kind)) = arg_type else {
@@ -1312,15 +1351,25 @@ fn signature_has_authoritative_receiver(db: &DbIndex, signature_id: LuaSignature
     infer_authoritative_method_self_type(db, &mut cache, &func_stat).is_some()
 }
 
-fn var_writes_param(var: &LuaVarExpr, param_name: &str) -> bool {
+/// Whether `var` rebinds or writes into the parameter; a named field on an unhinted one installs instead.
+fn var_writes_param(db: &DbIndex, var: &LuaVarExpr, param_name: &str) -> bool {
     match var {
         LuaVarExpr::NameExpr(name_expr) => name_expr
             .get_name_text()
             .is_some_and(|name| name.as_str() == param_name),
-        LuaVarExpr::IndexExpr(index_expr) => index_expr
-            .get_prefix_expr()
-            .is_some_and(|expr| expr_reads_param(&expr, param_name)),
+        LuaVarExpr::IndexExpr(index_expr) => {
+            index_expr
+                .get_prefix_expr()
+                .is_some_and(|expr| expr_reads_param(&expr, param_name))
+                && (has_gmod_param_name_hint(db, param_name) || !writes_named_field(var))
+        }
     }
+}
+
+/// Whether `var` is a field written under its name, as in `value.Name`.
+fn writes_named_field(var: &LuaVarExpr) -> bool {
+    matches!(var, LuaVarExpr::IndexExpr(index_expr)
+        if matches!(index_expr.get_index_key(), Some(LuaIndexKey::Name(_))))
 }
 
 fn expr_reads_param(expr: &LuaExpr, param_name: &str) -> bool {
@@ -2149,22 +2198,92 @@ fn infer_supported_call_site_arg_type(
     file_id: FileId,
     arg: LuaExpr,
     calls_with_args: bool,
+    fills_fields: bool,
+) -> Option<(LuaType, LuaInferenceProvenanceKind)> {
+    // A table a function fills fields into is only that caller's input, unless it is the
+    // caller's receiver, which those members extend.
+    let is_receiver = is_receiver_self(db, file_id, &arg);
+    infer_call_site_arg_value(db, cache, scope, file_id, arg, calls_with_args)
+        .filter(|(typ, _)| is_receiver || !(fills_fields && holds_table_const(typ)))
+}
+
+/// Whether `expr` names its function's receiver: an implicit `self` or a leading `self` parameter.
+fn is_receiver_self(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> bool {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return false;
+    };
+    name_expr.get_name_text().as_deref() == Some("self")
+        && db
+            .get_reference_index()
+            .get_var_reference_decl(&file_id, name_expr.get_range())
+            .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
+            .is_some_and(|decl| {
+                matches!(
+                    &decl.extra,
+                    LuaDeclExtra::Param { idx: 0, .. } | LuaDeclExtra::ImplicitSelf { .. }
+                )
+            })
+}
+
+fn infer_call_site_arg_value(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    scope: &mut CallScope,
+    file_id: FileId,
+    arg: LuaExpr,
+    calls_with_args: bool,
 ) -> Option<(LuaType, LuaInferenceProvenanceKind)> {
     if is_self_name_expr(&arg) {
         let typ = infer_expr(db, cache, arg).ok()?;
         return (!typ.is_unknown() && !typ.is_any() && !typ.is_never())
             .then_some((typ, LuaInferenceProvenanceKind::ContextualUnknown));
     }
-    infer_call_site_value_type(
+    let value = infer_call_site_value_type(
         db,
         cache,
         scope,
         file_id,
-        arg,
+        arg.clone(),
         0,
         calls_with_args,
         &mut HashSet::default(),
-    )
+    );
+    if !calls_with_args {
+        return value;
+    }
+    // A name or field inference is certain of types an installer the call passes it to.
+    value.or_else(|| {
+        let arg = unparenthesized(arg);
+        if !matches!(arg, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)) {
+            return None;
+        }
+        let fact = crate::semantic::infer_expr_fact_with_cache(db, cache, arg);
+        let typ = fact.typ();
+        (fact.confidence() >= LuaInferenceConfidence::Certain
+            && !typ.is_unknown()
+            && !typ.is_any()
+            && !typ.is_never()
+            && !matches!(typ, LuaType::Variadic(_)))
+        .then(|| (typ.clone(), LuaInferenceProvenanceKind::ConcreteValue))
+    })
+}
+
+fn holds_table_const(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::TableConst(_) => true,
+        LuaType::Union(union) => union.types().any(holds_table_const),
+        _ => false,
+    }
+}
+
+fn unparenthesized(mut expr: LuaExpr) -> LuaExpr {
+    while let LuaExpr::ParenExpr(paren) = &expr {
+        let Some(inner) = paren.get_expr() else {
+            break;
+        };
+        expr = inner;
+    }
+    expr
 }
 
 /// A local's value does not depend on which lookup reached it: any alias cycle
