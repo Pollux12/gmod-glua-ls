@@ -557,11 +557,27 @@ struct MemberPathEvidence<'a> {
     scores: &'a mut HashMap<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>,
 }
 
+/// A read a child inference is reported at, with whether a guard on a member of
+/// the same table encloses it.
+#[derive(Clone)]
+struct ChildSource {
+    site: InFiled<glua_parser::LuaSyntaxId>,
+    guarded: bool,
+}
+
+impl ChildSource {
+    /// An unguarded read is reported before a guarded one, then the earliest.
+    fn precedes(&self, other: &Self) -> bool {
+        (self.guarded, self.site.value.get_range().start())
+            < (other.guarded, other.site.value.get_range().start())
+    }
+}
+
 pub(crate) struct UnguardedChildFileResult {
     scores: HashMap<LuaDefinitionId, UnguardedChildCandidates>,
     deferred_definitions: FxHashSet<LuaDefinitionId>,
     nested_scores: HashMap<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>,
-    sources: HashMap<(LuaDefinitionId, crate::LuaTypeDeclId), InFiled<glua_parser::LuaSyntaxId>>,
+    sources: HashMap<(LuaDefinitionId, crate::LuaTypeDeclId), ChildSource>,
     found_types: HashMap<InFiled<glua_parser::LuaSyntaxId>, LuaType>,
     initializer_refinements: HashMap<crate::LuaDeclId, LuaType>,
     profile: Option<UnguardedChildProfile>,
@@ -650,9 +666,7 @@ pub(crate) fn publish_unguarded_children(
     let mut deferred_definitions = FxHashSet::<LuaDefinitionId>::default();
     let mut nested_scores =
         HashMap::<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>::default();
-    let mut sources =
-        HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), InFiled<glua_parser::LuaSyntaxId>>::new(
-        );
+    let mut sources = HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), ChildSource>::new();
     let mut found_types = HashMap::<InFiled<glua_parser::LuaSyntaxId>, LuaType>::default();
     let mut initializer_refinements = HashMap::<crate::LuaDeclId, LuaType>::default();
 
@@ -696,7 +710,7 @@ pub(crate) fn publish_unguarded_children(
             sources
                 .entry(source_key)
                 .and_modify(|existing| {
-                    if source.value.get_range().start() < existing.value.get_range().start() {
+                    if source.precedes(existing) {
                         *existing = source.clone();
                     }
                 })
@@ -749,8 +763,8 @@ pub(crate) fn publish_unguarded_children(
         let Some(source) = winners
             .iter()
             .filter_map(|child| sources.get(&(definition.clone(), child.clone())))
-            .min_by_key(|source| source.value.get_range().start())
-            .cloned()
+            .min_by_key(|source| (source.guarded, source.site.value.get_range().start()))
+            .map(|source| source.site.clone())
         else {
             continue;
         };
@@ -918,9 +932,7 @@ fn collect_unguarded_child_file(
     let mut deferred_definitions = FxHashSet::<LuaDefinitionId>::default();
     let mut nested_scores =
         HashMap::<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>::default();
-    let mut sources =
-        HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), InFiled<glua_parser::LuaSyntaxId>>::new(
-        );
+    let mut sources = HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), ChildSource>::new();
     let mut found_types = HashMap::<InFiled<glua_parser::LuaSyntaxId>, LuaType>::default();
     let mut initializer_refinements = HashMap::<crate::LuaDeclId, LuaType>::default();
     let mut declared_path_bases = DeclaredPathBases::default();
@@ -1105,6 +1117,15 @@ fn collect_unguarded_child_file(
                 .unwrap_or_else(|| Arc::from([LuaDefinitionId::Declaration(decl_id)]));
             let source = InFiled::new(file_id, index_expr.get_syntax_id());
             found_types.insert(source.clone(), current.clone());
+            let source = ChildSource {
+                site: source,
+                guarded: enclosing_guard_covers(
+                    db,
+                    &mut infer_cache,
+                    index_expr,
+                    GuardScope::Parent,
+                ),
+            };
             let mut evidence_recorded = false;
             for child_id in children.iter() {
                 let visible = match child_member_visible_at(
@@ -1146,8 +1167,7 @@ fn collect_unguarded_child_file(
                     sources
                         .entry(source_key)
                         .and_modify(|existing| {
-                            if source.value.get_range().start() < existing.value.get_range().start()
-                            {
+                            if source.precedes(existing) {
                                 *existing = source.clone();
                             }
                         })
@@ -2317,11 +2337,21 @@ fn is_matching_short_circuit_guard(
         if !right.syntax().text_range().contains_range(index_range) {
             continue;
         }
-        if matching_guard_in_expr(db, cache, &left, index_expr) {
+        if matching_guard_in_expr(db, cache, &left, index_expr, GuardScope::Path) {
             return true;
         }
     }
     false
+}
+
+/// What a guard has to prove present to cover a read.
+#[derive(Clone, Copy)]
+enum GuardScope {
+    /// The read's own member path.
+    Path,
+    /// Some member of the table the read indexes: a guard on `ent.a` shows `ent`
+    /// is a type that defines `a`, which covers `ent.b` too.
+    Parent,
 }
 
 /// Whether an `if`/`elseif` around `index_expr` only runs its block when the same
@@ -2331,6 +2361,15 @@ pub(crate) fn is_guarded_by_enclosing_condition(
     db: &crate::DbIndex,
     cache: &mut crate::semantic::LuaInferCache,
     index_expr: &LuaIndexExpr,
+) -> bool {
+    enclosing_guard_covers(db, cache, index_expr, GuardScope::Path)
+}
+
+fn enclosing_guard_covers(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
+    index_expr: &LuaIndexExpr,
+    scope: GuardScope,
 ) -> bool {
     let index_range = index_expr.syntax().text_range();
     for ancestor in index_expr.syntax().ancestors() {
@@ -2349,8 +2388,8 @@ pub(crate) fn is_guarded_by_enclosing_condition(
         if !block.syntax().text_range().contains_range(index_range) {
             continue;
         }
-        if matching_guard_in_expr(db, cache, &condition, index_expr)
-            && !root_reassigned_in_block_before(&block, index_expr)
+        if matching_guard_in_expr(db, cache, &condition, index_expr, scope)
+            && !root_written_in_block_before(db, cache, &block, index_expr)
         {
             return true;
         }
@@ -2358,28 +2397,35 @@ pub(crate) fn is_guarded_by_enclosing_condition(
     false
 }
 
-fn root_reassigned_in_block_before(
+/// Whether the variable `index_expr`'s path starts from is written inside `block`
+/// before the read.
+fn root_written_in_block_before(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
     block: &glua_parser::LuaBlock,
     index_expr: &LuaIndexExpr,
 ) -> bool {
-    let mut root = index_expr.get_prefix_expr();
-    while let Some(LuaExpr::IndexExpr(prefix)) = &root {
-        root = prefix.get_prefix_expr();
-    }
-    let Some(LuaExpr::NameExpr(root)) = root else {
+    let Some(crate::semantic::VarRefId::IndexRef(root, _)) =
+        crate::semantic::get_var_expr_var_ref_id(db, cache, LuaExpr::IndexExpr(index_expr.clone()))
+    else {
         return false;
     };
-    let Some(root_name) = root.get_name_text() else {
+    let Some(decl_id) = root.as_decl_id() else {
         return false;
     };
-    let read_start = index_expr.get_position();
-    block
-        .get_stats()
-        .take_while(|stat| !stat.syntax().text_range().contains(read_start))
-        .filter_map(|stat| LuaAssignStat::cast(stat.syntax().clone()))
-        .any(|assign| {
-            assign.get_var_and_expr_list().0.into_iter().any(|var| {
-                matches!(var, LuaVarExpr::NameExpr(name) if name.get_name_text().as_deref() == Some(root_name.as_str()))
+    // A statement evaluates its reads before its own writes.
+    let read_start = index_expr
+        .ancestors::<glua_parser::LuaStat>()
+        .next()
+        .map_or(index_expr.get_position(), |stat| stat.get_position());
+    let block_start = block.get_position();
+    db.get_reference_index()
+        .get_decl_references(&decl_id.file_id, &decl_id)
+        .is_some_and(|references| {
+            references.cells.iter().any(|cell| {
+                cell.is_write
+                    && cell.range.start() >= block_start
+                    && cell.range.start() < read_start
             })
         })
 }
@@ -2389,32 +2435,26 @@ fn matching_guard_in_expr(
     cache: &mut crate::semantic::LuaInferCache,
     guard_expr: &LuaExpr,
     guarded: &LuaIndexExpr,
+    scope: GuardScope,
 ) -> bool {
-    let Some(guarded_prefix) = guarded.get_prefix_expr() else {
+    let guards = positive_guard_indexes(db, cache, guard_expr);
+    let mut reference = |index: &LuaIndexExpr| {
+        let target = match scope {
+            GuardScope::Path => Some(LuaExpr::IndexExpr(index.clone())),
+            GuardScope::Parent => index.get_prefix_expr(),
+        };
+        target.and_then(|target| crate::semantic::get_var_expr_var_ref_id(db, cache, target))
+    };
+    let Some(guarded_ref) = reference(guarded) else {
         return false;
     };
-    let Some(guarded_key) = guarded.get_index_key() else {
-        return false;
-    };
-    let Ok(guarded_key) = LuaMemberKey::from_index_key(db, cache, &guarded_key) else {
-        return false;
-    };
-
-    positive_guard_indexes(db, cache, guard_expr)
+    guards
         .iter()
-        .any(|guard| {
-            guard
-                .get_prefix_expr()
-                .is_some_and(|prefix| prefix.syntax().text() == guarded_prefix.syntax().text())
-                && guard.get_index_key().is_some_and(|key| {
-                    LuaMemberKey::from_index_key(db, cache, &key)
-                        .is_ok_and(|guard_key| guard_key == guarded_key)
-                })
-        })
+        .any(|guard| reference(guard).is_some_and(|guard_ref| guard_ref == guarded_ref))
 }
 
 /// The member paths `expr` proves hold a value when it is true: the paths it tests
-/// for truthiness, joined by `and`, and the first argument of a presence guard call.
+/// for truthiness, joined by `and`, and the value a presence guard call tests.
 fn positive_guard_indexes(
     db: &crate::DbIndex,
     cache: &mut crate::semantic::LuaInferCache,
@@ -2438,12 +2478,10 @@ fn positive_guard_indexes(
                 })
                 .unwrap_or_default()
         }
-        LuaExpr::CallExpr(call) if crate::semantic::call_is_presence_guard(db, cache, call) => call
-            .get_args_list()
-            .and_then(|args| args.get_args().next())
-            .map(|argument| match argument {
+        LuaExpr::CallExpr(call) => crate::semantic::presence_guard_target(db, cache, call)
+            .map(|target| match target {
                 LuaExpr::IndexExpr(index) => vec![index],
-                LuaExpr::ParenExpr(_) => positive_guard_indexes(db, cache, &argument),
+                LuaExpr::ParenExpr(_) => positive_guard_indexes(db, cache, &target),
                 _ => Vec::new(),
             })
             .unwrap_or_default(),

@@ -1733,6 +1733,44 @@ mod test {
     }
 
     #[test]
+    fn a_guard_does_not_cover_a_read_after_its_root_is_replaced_or_shadowed() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_gmod_type_predicates();
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class prop_effect: Entity
+            ---@field AttachedEntity Entity
+
+            ---@param ent Entity
+            ---@param other Entity
+            local function replaced(ent, other, flag)
+                if IsValid(ent.AttachedEntity) then
+                    if flag then ent = other end
+                    return ent.AttachedEntity
+                end
+            end
+
+            ---@param ent Entity
+            ---@param other Entity
+            local function shadowed(ent, other)
+                if IsValid(ent.AttachedEntity) then
+                    local ent = other
+                    return ent.AttachedEntity
+                end
+            end
+            "#,
+        );
+
+        let lines = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild)
+            .into_iter()
+            .map(|diagnostic| diagnostic.range.start.line)
+            .collect::<Vec<_>>();
+        assert_eq!(lines, vec![10, 19]);
+    }
+
+    #[test]
     fn a_presence_guard_still_lets_its_reads_infer_the_child_for_sibling_members() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
@@ -1762,6 +1800,35 @@ mod test {
             let diagnostics = diagnostics_for(&mut ws, file_id, code);
             assert!(diagnostics.is_empty(), "{code:?}: {diagnostics:?}");
         }
+    }
+
+    #[test]
+    fn an_unguarded_read_is_reported_even_when_a_guarded_read_comes_first() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_gmod_type_predicates();
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@class DVScrollBar: Panel
+            ---@field btnUp Panel
+            ---@field btnDown Panel
+
+            ---@param parent Panel
+            local function paint(parent)
+                if IsValid(parent.btnUp) then
+                    local up = parent.btnUp
+                end
+                return parent.btnDown
+            end
+            "#,
+        );
+
+        let lines = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild)
+            .into_iter()
+            .map(|diagnostic| diagnostic.range.start.line)
+            .collect::<Vec<_>>();
+        assert_eq!(lines, vec![11]);
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::{
         infer_name::{find_decl_member_type, infer_global_type},
     },
 };
-pub(crate) use condition_flow::{InferConditionFlow, call_is_presence_guard};
+pub(crate) use condition_flow::{InferConditionFlow, presence_guard_target};
 pub(crate) use get_type_at_cast_flow::apply_cast;
 pub use get_type_at_cast_flow::get_type_at_call_expr_inline_cast;
 pub use get_type_at_flow::{

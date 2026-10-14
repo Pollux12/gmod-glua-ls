@@ -2,7 +2,7 @@ mod binary_flow;
 mod call_flow;
 mod index_flow;
 
-pub(crate) use call_flow::call_is_presence_guard;
+pub(crate) use call_flow::presence_guard_target;
 
 use std::sync::Arc;
 

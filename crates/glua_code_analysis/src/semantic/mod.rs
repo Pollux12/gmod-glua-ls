@@ -43,7 +43,6 @@ pub(crate) use gmod_vgui_context::{
     find_latest_decl_write_before_position, resolve_registered_vgui_method_context,
     resolve_registered_vgui_method_context_for_func,
 };
-pub(crate) use infer::call_is_presence_guard;
 pub(crate) use infer::check_iter_var_range;
 pub(crate) use infer::get_prefix_expr_signature_id;
 pub(crate) use infer::infer_bind_value_type;
@@ -55,6 +54,7 @@ pub use infer::narrow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
 };
 pub(crate) use infer::pairs_iter_value_registry_path;
+pub(crate) use infer::presence_guard_target;
 pub(crate) use infer::resolve_decl_backed_global_path_member_type;
 pub(crate) use infer::{
     AccessPaths, keep_access_paths, restore_access_path_snapshot, stop_keeping_access_paths,
