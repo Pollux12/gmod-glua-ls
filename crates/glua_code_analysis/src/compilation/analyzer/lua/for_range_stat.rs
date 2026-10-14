@@ -574,21 +574,38 @@ fn try_infer_pairs_iter_types_from_table_members(
 /// The arms of `typ` that `pairs` enumerates: a string's members are the library its
 /// metatable indexes, not entries of the value, so a string arm contributes none.
 fn pairs_enumerable_type(db: &DbIndex, typ: LuaType) -> Option<LuaType> {
-    let typ = crate::get_real_type(db, &typ).cloned().unwrap_or(typ);
-    let arms = match &typ {
-        LuaType::Union(union) => union.types().cloned().collect::<Vec<_>>(),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .map(|(arm, _)| arm.clone())
-            .collect(),
-        _ => return get_buildin_type_map_type_id(&typ).is_none().then_some(typ),
-    };
+    let mut arms = Vec::new();
+    collect_resolved_arms(db, typ, &mut arms, &mut HashSet::default());
     let enumerable = arms
         .into_iter()
         .filter(|arm| get_buildin_type_map_type_id(arm).is_none())
         .collect::<Vec<_>>();
     (!enumerable.is_empty()).then(|| LuaType::from_vec(enumerable))
+}
+
+/// The arms of `typ` with every alias among them resolved.
+fn collect_resolved_arms(
+    db: &DbIndex,
+    typ: LuaType,
+    arms: &mut Vec<LuaType>,
+    visited: &mut HashSet<LuaType>,
+) {
+    if !visited.insert(typ.clone()) {
+        return;
+    }
+    match crate::get_real_type(db, &typ).cloned().unwrap_or(typ) {
+        LuaType::Union(union) => {
+            for arm in union.types() {
+                collect_resolved_arms(db, arm.clone(), arms, visited);
+            }
+        }
+        LuaType::MultiLineUnion(union) => {
+            for (arm, _) in union.get_unions() {
+                collect_resolved_arms(db, arm.clone(), arms, visited);
+            }
+        }
+        resolved => arms.push(resolved),
+    }
 }
 
 /// Whether `member_id` writes a table back through the key variable of a
