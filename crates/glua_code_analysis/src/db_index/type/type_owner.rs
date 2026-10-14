@@ -233,6 +233,12 @@ pub(crate) fn is_bottom_type(typ: &LuaType) -> bool {
     uninformative_rank(typ).is_some_and(|rank| rank <= NIL_RANK)
 }
 
+/// Whether `typ` is a value inference could not resolve — `unknown`, alone or
+/// beside `nil` — rather than a known absence of value or `any`.
+pub(crate) fn is_unresolved_type(typ: &LuaType) -> bool {
+    uninformative_rank(typ) == Some(UNKNOWN_RANK)
+}
+
 /// Whether `typ` records that no value could be determined — `never`, `nil` or
 /// `unknown` — as opposed to `any`, which states that any value is allowed.
 pub(crate) fn is_undetermined_type(typ: &LuaType) -> bool {

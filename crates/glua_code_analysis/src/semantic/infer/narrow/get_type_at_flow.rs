@@ -2048,7 +2048,7 @@ fn get_type_at_assign_stat(
             return Ok(ResultTypeOrContinue::Continue);
         };
 
-        if explicit_var_type.is_none() && expr_type.is_unknown() {
+        if explicit_var_type.is_none() && crate::db_index::is_unresolved_type(&expr_type) {
             return Ok(ResultTypeOrContinue::Result(expr_type));
         }
 
