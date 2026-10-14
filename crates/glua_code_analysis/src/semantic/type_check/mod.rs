@@ -215,6 +215,10 @@ fn check_general_type_compact(
     }
 
     if let LuaType::Union(union_type) = compact_type {
+        // A value that may be `any` is no more provably wrong than `any` itself.
+        if context.detail && union_type.types().any(LuaType::is_any) {
+            return Ok(());
+        }
         for compact_sub_type in union_type.types() {
             check_general_type_compact(
                 context,

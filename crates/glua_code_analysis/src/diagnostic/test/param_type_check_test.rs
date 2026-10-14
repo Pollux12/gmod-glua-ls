@@ -127,6 +127,34 @@ mod test {
     }
 
     #[test]
+    fn test_union_containing_any_is_not_a_param_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param armor number
+            local function SetArmor(armor) end
+
+            ---@type any|boolean|table
+            local stored
+            SetArmor(stored)
+        "#
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param armor number
+            local function SetArmor(armor) end
+
+            ---@type boolean|table
+            local stored
+            SetArmor(stored)
+        "#
+        ));
+    }
+
+    #[test]
     fn test_issue_216() {
         let mut ws = VirtualWorkspace::new();
 
@@ -4974,24 +5002,6 @@ mod test {
         ));
     }
 
-    /// `(any|string)` passed to `number` param SHOULD still mismatch.
-    /// The `string` arm remains incompatible with `number`.
-    #[test]
-    fn test_any_string_union_to_number_param_still_mismatches() {
-        let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
-            DiagnosticCode::ParamTypeMismatch,
-            r#"
-            ---@param n number
-            local function f(n) end
-
-            ---@type any|string
-            local val
-            f(val)
-        "#
-        ));
-    }
-
     /// `any|string|nil` should satisfy `string?` through nullable string coercion.
     #[test]
     fn test_any_string_nil_to_string_nullable_passes() {
@@ -5009,11 +5019,11 @@ mod test {
         ));
     }
 
-    /// `any|string|nil` should still mismatch `number?` because `string` is incompatible.
+    /// `any|string|nil` may be `any`, so it satisfies `number?` as well.
     #[test]
-    fn test_any_string_nil_to_number_nullable_mismatches() {
+    fn test_any_string_nil_to_number_nullable_passes() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
+        assert!(ws.check_code_for(
             DiagnosticCode::ParamTypeMismatch,
             r#"
             ---@param n number?
