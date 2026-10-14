@@ -1066,11 +1066,21 @@ fn is_informative_guarded_table_branch(db: &DbIndex, typ: &LuaType) -> bool {
 fn is_guarded_table_bootstrap_branch(db: &DbIndex, typ: &LuaType) -> bool {
     match typ {
         LuaType::Table => true,
-        LuaType::TableConst(table_id) => {
-            db.get_member_index()
-                .get_member_len(&LuaMemberOwner::Element(table_id.clone()))
-                == 0
-        }
+        // An index write (`t[0] = v`, `t[#t + 1] = v`) stores into whatever table the
+        // slot holds, so only named members and the literal's own fields are its content.
+        LuaType::TableConst(table_id) => db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Element(table_id.clone()))
+            .is_none_or(|members| {
+                !members.iter().any(|member| {
+                    matches!(member.get_key(), crate::LuaMemberKey::Name(_))
+                        || matches!(
+                            member.get_id().get_syntax_id().get_kind(),
+                            glua_parser::LuaSyntaxKind::TableFieldAssign
+                                | glua_parser::LuaSyntaxKind::TableFieldValue
+                        )
+                })
+            }),
         LuaType::MergedTable(merged) => merged
             .get_types()
             .iter()

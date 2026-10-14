@@ -979,4 +979,57 @@ mod test {
         assert_eq!(own.get_id(), LuaTypeDeclId::local(file_id, "ns.Hidden"));
         assert!(index.find_type_decl(other_file_id, "Hidden").is_none());
     }
+
+    #[test]
+    fn a_literal_holding_only_index_writes_is_still_an_empty_bootstrap() {
+        use crate::{
+            LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaMemberOwner, TypeOps,
+            prune_redundant_guarded_table_bootstrap_type,
+        };
+
+        let mut db = DbIndex::new();
+        let literal = InFiled::new(file_id(), TextRange::new(10.into(), 12.into()));
+        let write = |start: u32, key: LuaMemberKey| {
+            LuaMember::new(
+                LuaMemberId::new(
+                    LuaSyntaxId::new(
+                        LuaKind::Syntax(LuaSyntaxKind::IndexExpr),
+                        TextRange::new(start.into(), (start + 8).into()),
+                    ),
+                    file_id(),
+                ),
+                key,
+                LuaMemberFeature::FileDefine,
+                None,
+            )
+        };
+        let slot = || LuaType::from_vec(vec![LuaType::TableConst(literal.clone()), LuaType::Nil]);
+
+        db.get_member_index_mut().add_member(
+            LuaMemberOwner::Element(literal.clone()),
+            write(40, LuaMemberKey::ExprType(LuaType::Integer)),
+        );
+        assert_eq!(
+            prune_redundant_guarded_table_bootstrap_type(&db, slot()),
+            TypeOps::Union.apply(&db, &LuaType::Table, &LuaType::Nil)
+        );
+
+        db.get_member_index_mut().add_member(
+            LuaMemberOwner::Element(literal.clone()),
+            write(60, LuaMemberKey::Integer(0)),
+        );
+        assert_eq!(
+            prune_redundant_guarded_table_bootstrap_type(&db, slot()),
+            TypeOps::Union.apply(&db, &LuaType::Table, &LuaType::Nil)
+        );
+
+        db.get_member_index_mut().add_member(
+            LuaMemberOwner::Element(literal.clone()),
+            write(80, LuaMemberKey::Name("count".into())),
+        );
+        assert_eq!(
+            prune_redundant_guarded_table_bootstrap_type(&db, slot()),
+            slot()
+        );
+    }
 }
