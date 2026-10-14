@@ -61,6 +61,49 @@ mod test {
     }
 
     #[test]
+    fn calling_a_panel_hook_with_fewer_arguments_is_not_missing_parameters() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "lua/aaa_annotations/panel.lua",
+            r#"
+            ---@class Panel
+            local Panel = {}
+
+            ---@hook PaintOver
+            ---@param width number
+            ---@param height number
+            ---@return boolean?
+            function Panel:PaintOver(width, height) end
+
+            ---@param width number
+            ---@param height number
+            function Panel:SetSize(width, height) end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingParameter,
+            r#"
+            ---@param pnl Panel
+            local function DrawOver(pnl)
+                pnl.m_OldPaintOver = pnl.PaintOver
+                pnl:m_OldPaintOver()
+            end
+            "#
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingParameter,
+            r#"
+            ---@param pnl Panel
+            local function Resize(pnl)
+                pnl:SetSize(10)
+            end
+            "#
+        ));
+    }
+
+    #[test]
     fn test_issue_276() {
         let mut ws = VirtualWorkspace::new();
 

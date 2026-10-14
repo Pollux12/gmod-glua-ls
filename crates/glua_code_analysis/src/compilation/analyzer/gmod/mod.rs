@@ -9785,6 +9785,11 @@ struct HookAnnotationMetadata {
     name_issue: Option<GmodHookNameIssue>,
 }
 
+/// Whether `func_stat`'s doc comment tags it `@hook`: the engine runs it.
+pub(crate) fn is_hook_annotated(func_stat: &LuaFuncStat) -> bool {
+    hook_annotation_from_doc(func_stat).is_some()
+}
+
 fn hook_annotation_from_doc(func_stat: &LuaFuncStat) -> Option<HookAnnotationMetadata> {
     let comment = func_stat.get_left_comment()?;
     for tag in comment.get_doc_tags() {

@@ -197,7 +197,7 @@ fn check_call_expr(
                 return Some(());
             }
             if prefix_signature_id.is_some_and(|signature_id| {
-                is_gamemode_hook_method(context.db, semantic_model, signature_id)
+                is_hook_signature(context.db, semantic_model, signature_id)
             }) {
                 return Some(());
             }
@@ -344,27 +344,40 @@ fn get_prefix_expr_signature_id(
         return Some(signature_id);
     }
 
-    let semantic_decl = semantic_model.find_decl(
-        prefix_expr.syntax().clone().into(),
-        SemanticDeclLevel::default(),
-    )?;
-    db.get_property_index()
-        .get_signature_owner(&semantic_decl)
-        .or_else(|| semantic_decl_closure_signature_id(db, semantic_decl))
+    semantic_model
+        .find_decl(
+            prefix_expr.syntax().clone().into(),
+            SemanticDeclLevel::default(),
+        )
+        .and_then(|semantic_decl| {
+            db.get_property_index()
+                .get_signature_owner(&semantic_decl)
+                .or_else(|| semantic_decl_closure_signature_id(db, semantic_decl))
+        })
+        .or_else(|| match semantic_model.infer_expr(prefix_expr).ok()? {
+            LuaType::Signature(signature_id) => Some(signature_id),
+            _ => None,
+        })
 }
 
-/// Whether `signature_id` is a gamemode hook method. Its parameters are what the
-/// engine passes when it runs the hook; a direct Lua call may leave trailing ones off.
-fn is_gamemode_hook_method(
+/// Whether `signature_id` is a hook: a gamemode hook method or a function tagged
+/// `@hook`. Its parameters are what the engine passes when it runs the hook; a
+/// direct Lua call may leave trailing ones off.
+fn is_hook_signature(
     db: &DbIndex,
     semantic_model: &SemanticModel,
     signature_id: LuaSignatureId,
 ) -> bool {
-    let Some(func_name) = semantic_model
+    let Some(func_stat) = semantic_model
         .get_signature_closure(signature_id)
         .and_then(|closure| closure.get_parent::<glua_parser::LuaFuncStat>())
-        .and_then(|func_stat| func_stat.get_func_name())
     else {
+        return false;
+    };
+    if crate::compilation::analyzer::gmod::is_hook_annotated(&func_stat) {
+        return true;
+    }
+    let Some(func_name) = func_stat.get_func_name() else {
         return false;
     };
     let syntax_id = func_name.get_syntax_id();
