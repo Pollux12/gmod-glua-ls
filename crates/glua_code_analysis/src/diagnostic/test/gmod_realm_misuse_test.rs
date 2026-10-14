@@ -1485,4 +1485,83 @@ mod tests {
             "Expected inherited shared Think to suppress the client override mismatch, got: {diagnostics:?}"
         );
     }
+    /// Realm reports for a client `source` beside a server `ENT:ServerPos` and `ServerOnlyApi`.
+    fn guarded_call_realm_reports(source: &str) -> Vec<lsp_types::Diagnostic> {
+        let mut ws = VirtualWorkspace::new();
+        enable_only_realm_mismatch_diagnostics(&mut ws);
+        ws.def_file(
+            "lua/entities/realm_guard_entity/init.lua",
+            "function ENT:ServerPos() return 1 end\n",
+        );
+        ws.def_file(
+            "lua/autorun/server/sv_api.lua",
+            "function ServerOnlyApi() return true end\n",
+        );
+        let file_id = ws.def_file("lua/entities/realm_guard_entity/cl_init.lua", source);
+        let codes = [
+            DiagnosticCode::GmodRealmMismatch,
+            DiagnosticCode::GmodRealmMismatchHeuristic,
+        ]
+        .map(|code| Some(NumberOrString::String(code.get_name().to_string())));
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| codes.contains(&diagnostic.code))
+            .collect()
+    }
+
+    /// A call made only once its callee is proven present never runs where it is missing.
+    #[gtest]
+    fn a_presence_guarded_call_is_not_a_realm_mismatch() {
+        for body in [
+            "if self.ServerPos then self:ServerPos() end",
+            "local pos = self.ServerPos and self:ServerPos()",
+            "if not self.ServerPos then return end\n    self:ServerPos()",
+            "if self.ServerPos == nil then return end\n    for i = 1, 2 do self:ServerPos() end",
+            "if self.ServerPos ~= nil then self:ServerPos() end",
+            "if (self.ServerPos) == nil then return end\n    self:ServerPos()",
+            "for i = 1, 2 do\n        if not self.ServerPos then break end\n        self:ServerPos()\n    end",
+            "if ServerOnlyApi then ServerOnlyApi() end",
+            "local ok = ServerOnlyApi and ServerOnlyApi()",
+            "if not ServerOnlyApi then return end\n    ServerOnlyApi()",
+        ] {
+            let source = format!("function ENT:Draw()\n    {body}\nend\n");
+            let reports = guarded_call_realm_reports(&source);
+            assert!(reports.is_empty(), "{body}: {reports:?}");
+        }
+    }
+
+    /// A guard on another member, or one that does not exit, leaves the call reachable.
+    #[gtest]
+    fn a_call_its_guard_does_not_cover_is_a_realm_mismatch() {
+        for body in [
+            "self:ServerPos()",
+            "if self.Other then self:ServerPos() end",
+            "if self.ServerPos then print(1) end\n    self:ServerPos()",
+            "if not self.ServerPos then print(1) end\n    self:ServerPos()",
+            "if not self.ServerPos then goto call end\n    ::call::\n    self:ServerPos()",
+            "if not self.ServerPos then\n        if Other then goto call end\n        return\n    end\n    ::call::\n    self:ServerPos()",
+            "if Other then goto call end\n    if not self.ServerPos then return end\n    ::call::\n    self:ServerPos()",
+            "local ent, other = self, self\n    if not ent.ServerPos then return else ent = other end\n    ent:ServerPos()",
+            "if Other then ServerOnlyApi() end",
+        ] {
+            let source = format!("function ENT:Draw()\n    {body}\nend\n");
+            let reports = guarded_call_realm_reports(&source);
+            assert_eq!(reports.len(), 1, "{body}: {reports:?}");
+        }
+    }
+    /// A name guard does not cover a local that shadows the tested global.
+    #[gtest]
+    fn a_name_guard_does_not_cover_a_local_that_shadows_it() {
+        let local_call = "local ServerOnlyApi = ServerOnlyApi\n        ServerOnlyApi()";
+        let unguarded =
+            format!("function ENT:Draw()\n    do\n        {local_call}\n    end\nend\n");
+        assert_eq!(guarded_call_realm_reports(&unguarded).len(), 1);
+        let guarded = format!(
+            "function ENT:Draw()\n    if ServerOnlyApi then\n        {local_call}\n    end\nend\n"
+        );
+        let reports = guarded_call_realm_reports(&guarded);
+        assert_eq!(reports.len(), 1, "{reports:?}");
+    }
 }

@@ -49,7 +49,7 @@ impl Checker for UndefinedGlobalChecker {
     }
 }
 
-fn calc_guarded_name_expr_ranges(
+pub(super) fn calc_guarded_name_expr_ranges(
     semantic_model: &SemanticModel,
     buckets: &FileNodeBuckets,
 ) -> HashSet<TextRange> {

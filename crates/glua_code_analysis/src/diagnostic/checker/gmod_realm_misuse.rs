@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaIndexKey, PathTrait};
-use rowan::{NodeOrToken, TextSize};
+use rowan::{NodeOrToken, TextRange, TextSize};
 
 use crate::{
     DiagnosticCode, FileId, GmodRealm, GmodRealmFileMetadata, GmodStateMask, LuaDeclarationTree,
@@ -13,7 +13,7 @@ use crate::{
     SemanticDeclLevel, SemanticModel, WorkspaceId, semantic::is_sub_type_of,
 };
 
-use super::{Checker, DiagnosticContext};
+use super::{Checker, DiagnosticContext, FileNodeBuckets};
 
 /// The realm each of one file's declarations, members and signatures
 /// resolves to as a callee.
@@ -173,6 +173,7 @@ impl Checker for GmodRealmMisuseChecker {
         let Some(buckets) = context.file_buckets() else {
             return;
         };
+        let mut guarded_names = None;
         for call_expr in buckets.call_exprs.iter() {
             if context.is_cancelled() {
                 return;
@@ -243,6 +244,10 @@ impl Checker for GmodRealmMisuseChecker {
             }
 
             if let Some(callee_realm) = unknown_realm_candidate(call_realm, &callee_realms) {
+                if is_presence_guarded_call(semantic_model, &buckets, &mut guarded_names, call_expr)
+                {
+                    continue;
+                }
                 let call_name = call_expr
                     .get_access_path()
                     .unwrap_or_else(|| "function".into());
@@ -296,6 +301,9 @@ impl Checker for GmodRealmMisuseChecker {
             else {
                 continue;
             };
+            if is_presence_guarded_call(semantic_model, &buckets, &mut guarded_names, call_expr) {
+                continue;
+            }
 
             let call_name = call_expr
                 .get_access_path()
@@ -314,6 +322,44 @@ impl Checker for GmodRealmMisuseChecker {
         if let Some(profile) = profile {
             profile.log(file_id);
         }
+    }
+}
+
+/// Whether `call_expr` only runs where its callee is present; a name guard covers only a global callee.
+fn is_presence_guarded_call(
+    semantic_model: &SemanticModel,
+    buckets: &FileNodeBuckets,
+    guarded_names: &mut Option<FxHashSet<TextRange>>,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    match call_expr.get_prefix_expr() {
+        Some(LuaExpr::IndexExpr(index_expr)) => {
+            crate::compilation::analyzer::is_member_path_presence_guarded(
+                semantic_model.get_db(),
+                &mut semantic_model.get_cache().borrow_mut(),
+                &index_expr,
+            )
+        }
+        Some(LuaExpr::NameExpr(name_expr)) => {
+            let is_global = name_expr.get_name_text().is_some_and(|name| {
+                semantic_model
+                    .get_db()
+                    .get_decl_index()
+                    .get_decl_tree(&semantic_model.get_file_id())
+                    .and_then(|tree| tree.find_local_decl(&name, name_expr.get_position()))
+                    .is_none()
+            });
+            is_global
+                && guarded_names
+                    .get_or_insert_with(|| {
+                        super::undefined_global::calc_guarded_name_expr_ranges(
+                            semantic_model,
+                            buckets,
+                        )
+                    })
+                    .contains(&name_expr.get_range())
+        }
+        _ => false,
     }
 }
 

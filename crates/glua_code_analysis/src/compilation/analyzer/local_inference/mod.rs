@@ -2422,6 +2422,152 @@ pub(crate) fn is_guarded_by_enclosing_condition(
     enclosing_guard_covers(db, cache, index_expr, GuardScope::Parent)
 }
 
+/// Whether the member path `index_expr` reads is proven present by an enclosing test or earlier exit.
+pub(crate) fn is_member_path_presence_guarded(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    enclosing_guard_covers(db, cache, index_expr, GuardScope::Path)
+        || is_matching_short_circuit_guard(db, cache, index_expr)
+        || is_guarded_by_absence_exit(db, cache, index_expr)
+}
+
+/// Whether an earlier `if not path then return end` in an enclosing block covers `index_expr`.
+fn is_guarded_by_absence_exit(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    for block in index_expr.syntax().ancestors() {
+        if LuaClosureExpr::can_cast(block.kind().into()) {
+            break;
+        }
+        let Some(block) = glua_parser::LuaBlock::cast(block) else {
+            continue;
+        };
+        let read_start = index_expr.get_position();
+        let stats = block
+            .get_stats()
+            .take_while(|stat| stat.get_position() < read_start)
+            .collect::<Vec<_>>();
+        for (idx, stat) in stats.iter().enumerate() {
+            let glua_parser::LuaStat::IfStat(if_stat) = stat else {
+                continue;
+            };
+            // A label after the exit lets a `goto` from before it skip the test.
+            if stats[idx + 1..]
+                .iter()
+                .any(|stat| matches!(stat, glua_parser::LuaStat::LabelStat(_)))
+            {
+                continue;
+            }
+            let (Some(condition), Some(exit_block)) =
+                (if_stat.get_condition_expr(), if_stat.get_block())
+            else {
+                continue;
+            };
+            if if_stat
+                .syntax()
+                .text_range()
+                .contains_range(index_expr.syntax().text_range())
+                || !always_leaves(&exit_block)
+            {
+                continue;
+            }
+            let guards = present_after_exit_indexes(db, cache, &condition);
+            if guards_cover(db, cache, guards, index_expr, GuardScope::Path)
+                && !root_written_in_block_before(
+                    db,
+                    cache,
+                    &block,
+                    condition.syntax().text_range().end(),
+                    index_expr,
+                )
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether `block` ends in `return` or `break`/`continue` with no `goto` that may land elsewhere.
+fn always_leaves(block: &glua_parser::LuaBlock) -> bool {
+    let ends_in_exit = block
+        .get_stats()
+        .filter(|stat| !matches!(stat, glua_parser::LuaStat::EmptyStat(_)))
+        .last()
+        .is_some_and(|stat| {
+            matches!(
+                stat,
+                glua_parser::LuaStat::ReturnStat(_) | glua_parser::LuaStat::BreakStat(_)
+            )
+        });
+    ends_in_exit
+        && block
+            .syntax()
+            .descendants()
+            .all(|node| glua_parser::LuaGotoStat::cast(node).is_none())
+}
+
+/// The member paths a false `condition` proves present: `not path`, `path == nil` and `or`s of them.
+fn present_after_exit_indexes(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
+    condition: &LuaExpr,
+) -> Vec<LuaIndexExpr> {
+    match condition {
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .map(|inner| present_after_exit_indexes(db, cache, &inner))
+            .unwrap_or_default(),
+        LuaExpr::UnaryExpr(unary)
+            if unary.get_op_token().map(|token| token.get_op())
+                == Some(glua_parser::UnaryOperator::OpNot) =>
+        {
+            unary
+                .get_expr()
+                .map(|inner| positive_guard_indexes(db, cache, &inner))
+                .unwrap_or_default()
+        }
+        LuaExpr::BinaryExpr(binary) => {
+            let (Some(op), Some((left, right))) = (
+                binary.get_op_token().map(|token| token.get_op()),
+                binary.get_exprs(),
+            ) else {
+                return Vec::new();
+            };
+            match op {
+                BinaryOperator::OpOr => {
+                    let mut indexes = present_after_exit_indexes(db, cache, &left);
+                    indexes.extend(present_after_exit_indexes(db, cache, &right));
+                    indexes
+                }
+                BinaryOperator::OpEq => nil_compared_index(&left, &right).into_iter().collect(),
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The member path one side of a comparison reads when the other side is `nil`.
+fn nil_compared_index(left: &LuaExpr, right: &LuaExpr) -> Option<LuaIndexExpr> {
+    [(left, right), (right, left)]
+        .into_iter()
+        .find(|(_, other)| crate::compilation::analyzer::common::is_nil_literal_expr(other))
+        .and_then(|(tested, _)| unparenthesized_index(tested))
+}
+
+fn unparenthesized_index(expr: &LuaExpr) -> Option<LuaIndexExpr> {
+    match expr {
+        LuaExpr::IndexExpr(index) => Some(index.clone()),
+        LuaExpr::ParenExpr(paren) => unparenthesized_index(&paren.get_expr()?),
+        _ => None,
+    }
+}
+
 fn enclosing_guard_covers(
     db: &crate::DbIndex,
     cache: &mut crate::semantic::LuaInferCache,
@@ -2446,7 +2592,7 @@ fn enclosing_guard_covers(
             continue;
         }
         if matching_guard_in_expr(db, cache, &condition, index_expr, scope)
-            && !root_written_in_block_before(db, cache, &block, index_expr)
+            && !root_written_in_block_before(db, cache, &block, block.get_position(), index_expr)
         {
             return true;
         }
@@ -2455,11 +2601,12 @@ fn enclosing_guard_covers(
 }
 
 /// Whether the variable `index_expr`'s path starts from is written inside `block`
-/// before the read, outside closures the block only creates.
+/// from `from` up to the read, outside closures the block only creates.
 fn root_written_in_block_before(
     db: &crate::DbIndex,
     cache: &mut crate::semantic::LuaInferCache,
     block: &glua_parser::LuaBlock,
+    from: rowan::TextSize,
     index_expr: &LuaIndexExpr,
 ) -> bool {
     let Some(decl_id) =
@@ -2483,11 +2630,10 @@ fn root_written_in_block_before(
         .ancestors::<glua_parser::LuaStat>()
         .next()
         .map_or(index_expr.get_position(), |stat| stat.get_position());
-    let block_start = block.get_position();
     let root = block.syntax().ancestors().last();
     references.cells.iter().any(|cell| {
         cell.is_write
-            && cell.range.start() >= block_start
+            && cell.range.start() >= from
             && cell.range.start() < read_start
             && root.as_ref().is_some_and(|root| {
                 !root
@@ -2516,6 +2662,17 @@ fn matching_guard_in_expr(
     scope: GuardScope,
 ) -> bool {
     let guards = positive_guard_indexes(db, cache, guard_expr);
+    guards_cover(db, cache, guards, guarded, scope)
+}
+
+/// Whether one of `guards`, member paths proven present, covers the read `guarded`.
+fn guards_cover(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
+    guards: Vec<LuaIndexExpr>,
+    guarded: &LuaIndexExpr,
+    scope: GuardScope,
+) -> bool {
     let mut path = |index: &LuaIndexExpr| {
         let table = index
             .get_prefix_expr()
@@ -2585,8 +2742,7 @@ fn declared_type(
     }
 }
 
-/// The member paths `expr` proves hold a value when it is true: the paths it tests
-/// for truthiness, joined by `and`, and the value a presence guard call tests.
+/// The member paths a true `expr` proves present: tested, `~= nil`, `and`-joined or presence-guarded.
 fn positive_guard_indexes(
     db: &crate::DbIndex,
     cache: &mut crate::semantic::LuaInferCache,
@@ -2609,6 +2765,15 @@ fn positive_guard_indexes(
                     indexes
                 })
                 .unwrap_or_default()
+        }
+        LuaExpr::BinaryExpr(binary)
+            if binary.get_op_token().map(|token| token.get_op()) == Some(BinaryOperator::OpNe) =>
+        {
+            binary
+                .get_exprs()
+                .and_then(|(left, right)| nil_compared_index(&left, &right))
+                .into_iter()
+                .collect()
         }
         LuaExpr::CallExpr(call) => crate::semantic::presence_guard_target(db, cache, call)
             .map(|target| match target {
