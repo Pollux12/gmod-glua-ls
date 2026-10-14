@@ -106,6 +106,77 @@ mod test {
     }
 
     #[test]
+    fn untagging_the_hook_a_method_overrides_reports_its_short_calls_again() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        let base_path = "lua/aaa_annotations/rules.lua";
+        let tagged = r#"
+            ---@class Rules
+            Rules = {}
+            ---@hook Pulse
+            ---@param n number
+            function Rules:Pulse(n) end
+            "#;
+        ws.def_file(base_path, tagged);
+        let file_id = ws.def_file(
+            "lua/autorun/rules_child.lua",
+            r#"
+            function Rules:Pulse(n) end
+            Rules:Pulse()
+            "#,
+        );
+        let missing = |ws: &mut VirtualWorkspace| {
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::MissingParameter);
+            ws.analysis
+                .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+                .unwrap_or_default()
+                .len()
+        };
+        assert_eq!(missing(&mut ws), 0);
+
+        ws.def_file(
+            base_path,
+            &tagged.replace("---@hook Pulse", "---@noop Pulse"),
+        );
+        assert_eq!(missing(&mut ws), 1);
+
+        ws.def_file(base_path, tagged);
+        assert_eq!(missing(&mut ws), 0);
+    }
+
+    #[test]
+    fn a_hook_of_the_other_realm_does_not_excuse_a_short_call() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "lua/autorun/sh_rules.lua",
+            r#"
+            ---@class Rules
+            Rules = {}
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/server/sv_rules.lua",
+            r#"
+            ---@hook Pulse
+            ---@param n number
+            function Rules:Pulse(n) end
+            "#,
+        );
+        assert!(!ws.check_file_for(
+            DiagnosticCode::MissingParameter,
+            "lua/autorun/client/cl_rules.lua",
+            r#"
+            ---@param n number
+            function Rules:Pulse(n) end
+            Rules:Pulse()
+            "#,
+        ));
+    }
+
+    #[test]
     fn calling_a_panel_hook_with_fewer_arguments_is_not_missing_parameters() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         set_gmod_enabled(&mut ws);

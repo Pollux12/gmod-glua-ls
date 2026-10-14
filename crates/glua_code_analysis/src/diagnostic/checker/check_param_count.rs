@@ -373,41 +373,49 @@ fn is_hook_signature(
     semantic_model: &SemanticModel,
     signature_id: LuaSignatureId,
 ) -> bool {
-    let func_stat_of = |signature_id: LuaSignatureId| {
-        semantic_model
-            .get_signature_closure(signature_id)
-            .and_then(|closure| closure.get_parent::<glua_parser::LuaFuncStat>())
-    };
-    let Some(func_stat) = func_stat_of(signature_id) else {
-        return false;
-    };
-    if crate::compilation::analyzer::gmod::is_hook_annotated(&func_stat) {
+    if is_tagged_hook(db, signature_id) {
         return true;
     }
-    let Some(glua_parser::LuaVarExpr::IndexExpr(func_name)) = func_stat.get_func_name() else {
+    let Some(glua_parser::LuaVarExpr::IndexExpr(func_name)) = semantic_model
+        .get_signature_closure(signature_id)
+        .and_then(|closure| closure.get_parent::<glua_parser::LuaFuncStat>())
+        .and_then(|func_stat| func_stat.get_func_name())
+    else {
         return false;
     };
     let Some(LuaIndexKey::Name(name)) = func_name.get_index_key() else {
         return false;
     };
-    let member_id = crate::LuaMemberId::new(func_name.get_syntax_id(), signature_id.get_file_id());
-    let Some(LuaMemberOwner::Type(owner)) = db.get_member_index().get_current_owner(&member_id)
-    else {
+    let file_id = signature_id.get_file_id();
+    let member_id = crate::LuaMemberId::new(func_name.get_syntax_id(), file_id);
+    let (Some(LuaMemberOwner::Type(owner)), Some(workspace_id)) = (
+        db.get_member_index().get_current_owner(&member_id),
+        db.get_module_index().get_workspace_id(file_id),
+    ) else {
         return false;
     };
-    crate::semantic::find_members_with_key(
+    crate::semantic::find_members_with_key_in_workspace_for_file_at_offset(
         db,
         &LuaType::Ref(owner.clone()),
         LuaMemberKey::Name(name.get_name_text().into()),
         true,
+        workspace_id,
+        file_id,
+        func_name.get_position(),
     )
     .into_iter()
     .flatten()
     .any(|member| {
-        matches!(member.typ, LuaType::Signature(overridden) if overridden != signature_id
-            && func_stat_of(overridden)
-                .is_some_and(|stat| crate::compilation::analyzer::gmod::is_hook_annotated(&stat)))
+        matches!(member.typ, LuaType::Signature(overridden)
+            if overridden != signature_id && is_tagged_hook(db, overridden))
     })
+}
+
+fn is_tagged_hook(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    db.get_property_index()
+        .get_property(&LuaSemanticDeclId::Signature(signature_id))
+        .and_then(|property| property.tag_content())
+        .is_some_and(|tags| tags.tags.iter().any(|(name, _)| name == "hook"))
 }
 
 fn get_params_len(params: &[(String, Option<LuaType>)]) -> Option<usize> {
