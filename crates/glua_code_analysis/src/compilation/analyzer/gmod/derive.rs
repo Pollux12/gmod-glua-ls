@@ -93,6 +93,7 @@ pub(crate) fn apply_pre(
         annotation_realm,
         file_params,
         scope,
+        published_bases,
     }) = metadata
     else {
         return;
@@ -102,6 +103,7 @@ pub(crate) fn apply_pre(
     };
     let file_id = in_filed_tree.file_id;
     synthesize_vgui_registrations(db, context, &[file_id], VguiSynthesisPhase::Bind);
+    bind_published_scope_bases(db, file_id, &published_bases);
 
     if let Some((hook_sites, system_metadata, gm_method_realms)) = hook_metadata {
         db.get_gmod_infer_index_mut()

@@ -1048,6 +1048,8 @@ pub(crate) struct GmodFileMetadataResult {
     file_params: Option<Vec<(String, String)>>,
     /// What the file's scripted-class scope binds, read off its syntax.
     scope: Option<ScopedFilePlan>,
+    /// The local tables the file publishes into `_G` under a scripted-class global.
+    published_bases: Vec<(LuaDeclId, String)>,
 }
 
 /// The syntax-derived inputs of binding a scripted-scope file's class.
@@ -1110,6 +1112,7 @@ fn collect_file_gmod_metadata(
             annotation_realm: None,
             file_params: None,
             scope: None,
+            published_bases: Vec::new(),
         };
     };
 
@@ -1148,7 +1151,145 @@ fn collect_file_gmod_metadata(
         annotation_realm,
         file_params,
         scope: None,
+        published_bases: collect_published_scope_bases(db, file_id, &root),
     }
+}
+
+/// The local tables `root` publishes into `_G` under a scripted-class global, with that
+/// global: `_G["PLUGIN"] = PLUGIN`, or a loader's `_G[variable] = PLUGIN` whose `variable`
+/// defaults to `"PLUGIN"`. Such a table is what every class of that scope starts from.
+fn collect_published_scope_bases(
+    db: &DbIndex,
+    file_id: FileId,
+    root: &LuaChunk,
+) -> Vec<(LuaDeclId, String)> {
+    let Some(references) = db.get_reference_index().get_local_reference(&file_id) else {
+        return Vec::new();
+    };
+    let definitions = db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .resolved_definitions_slice();
+    let mut bases = Vec::new();
+    for assign in root.descendants::<LuaAssignStat>() {
+        let (vars, values) = assign.get_var_and_expr_list();
+        for (var, value) in vars.iter().zip(values.iter()) {
+            let LuaVarExpr::IndexExpr(index_expr) = var else {
+                continue;
+            };
+            let Some(LuaExpr::NameExpr(prefix)) = index_expr.get_prefix_expr() else {
+                continue;
+            };
+            if !matches!(prefix.get_name_text().as_deref(), Some("_G" | "_ENV"))
+                || references.get_decl_id(&prefix.get_range()).is_some()
+            {
+                continue;
+            }
+            let keys = match index_expr.get_index_key() {
+                Some(LuaIndexKey::String(key)) => vec![key.get_value()],
+                Some(LuaIndexKey::Expr(LuaExpr::NameExpr(key))) => {
+                    literal_string_values(db, file_id, root, &key, assign.get_position())
+                }
+                _ => Vec::new(),
+            };
+            let globals = keys
+                .into_iter()
+                .filter(|key| {
+                    definitions
+                        .iter()
+                        .any(|definition| definition.class_global == *key)
+                })
+                .collect::<Vec<_>>();
+            if globals.is_empty() {
+                continue;
+            }
+            let LuaExpr::NameExpr(table_name) = value else {
+                continue;
+            };
+            let Some(decl) = references
+                .get_decl_id(&table_name.get_range())
+                .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
+            else {
+                continue;
+            };
+            let initializes_table = matches!(decl.extra, LuaDeclExtra::Local { .. })
+                && decl
+                    .get_value_syntax_id()
+                    .and_then(|syntax_id| syntax_id.to_node_from_root(root.syntax()))
+                    .and_then(LuaExpr::cast)
+                    .is_some_and(|value| matches!(value, LuaExpr::TableExpr(_)));
+            if initializes_table {
+                bases.extend(globals.into_iter().map(|global| (decl.get_id(), global)));
+            }
+        }
+    }
+    bases
+}
+
+/// The strings `key` may hold before `before`, sorted: what its initializer and earlier
+/// reassignments give it as literals, or as the default of `name or "literal"`.
+fn literal_string_values(
+    db: &DbIndex,
+    file_id: FileId,
+    root: &LuaChunk,
+    key: &LuaNameExpr,
+    before: TextSize,
+) -> Vec<String> {
+    let Some(references) = db.get_reference_index().get_local_reference(&file_id) else {
+        return Vec::new();
+    };
+    let Some(decl) = references
+        .get_decl_id(&key.get_range())
+        .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
+    else {
+        return Vec::new();
+    };
+    let decl_id = decl.get_id();
+    let initializer = decl
+        .get_value_syntax_id()
+        .and_then(|syntax_id| syntax_id.to_node_from_root(root.syntax()))
+        .and_then(LuaExpr::cast);
+    let reassigned = root
+        .descendants::<LuaAssignStat>()
+        .filter(|assign| assign.get_position() < before)
+        .flat_map(|assign| {
+            let (vars, values) = assign.get_var_and_expr_list();
+            vars.into_iter()
+                .zip(values)
+                .filter(|(var, _)| {
+                    matches!(var, LuaVarExpr::NameExpr(name)
+                        if references.get_decl_id(&name.get_range()) == Some(decl_id))
+                })
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>()
+        });
+    let mut strings = initializer
+        .into_iter()
+        .chain(reassigned)
+        .filter_map(|value| {
+            let literal = match value {
+                LuaExpr::BinaryExpr(binary)
+                    if binary
+                        .get_op_token()
+                        .is_some_and(|token| token.get_op() == BinaryOperator::OpOr) =>
+                {
+                    binary.get_exprs()?.1
+                }
+                value => value,
+            };
+            match literal {
+                LuaExpr::LiteralExpr(literal) => match literal.get_literal()? {
+                    LuaLiteralToken::String(string) => Some(string.get_value()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    strings.sort();
+    strings.dedup();
+    strings
 }
 
 /// The scope inputs of `file_id` when it is a scripted-scope file.
@@ -1742,6 +1883,66 @@ fn ensure_scoped_class_type_decl(
             .add_super_type(class_decl_id.clone(), file_id, range, super_type);
     }
     class_decl_id
+}
+
+/// Declares the shared class of each scope whose global `file_id` publishes a local table
+/// as, and types that table as the class, unless an annotation already types it.
+pub(crate) fn bind_published_scope_bases(
+    db: &mut DbIndex,
+    file_id: FileId,
+    published_bases: &[(LuaDeclId, String)],
+) {
+    for (decl_id, global) in published_bases {
+        if db
+            .get_type_index()
+            .get_type_cache(&(*decl_id).into())
+            .is_some_and(|cache| cache.is_doc())
+        {
+            continue;
+        }
+        let Some(range) = db
+            .get_decl_index()
+            .get_decl(decl_id)
+            .map(|decl| decl.get_range())
+        else {
+            continue;
+        };
+        let configured_super_types = db
+            .get_emmyrc()
+            .gmod
+            .scripted_class_scopes
+            .resolved_definitions_slice()
+            .iter()
+            .filter(|definition| definition.class_global == *global)
+            .flat_map(|definition| definition.super_types.iter().cloned())
+            .collect::<Vec<_>>();
+        let class_decl_id = LuaTypeDeclId::global(global);
+        db.get_type_index_mut().add_type_decl(
+            file_id,
+            LuaTypeDecl::new(
+                file_id,
+                range,
+                global.clone(),
+                LuaDeclTypeKind::Class,
+                LuaTypeFlag::None.into(),
+                class_decl_id.clone(),
+            ),
+        );
+        for super_type in scoped_class_super_types(global, global, &configured_super_types) {
+            db.get_type_index_mut().add_super_type(
+                class_decl_id.clone(),
+                file_id,
+                range,
+                super_type,
+            );
+        }
+        write_type_cache(
+            db,
+            (*decl_id).into(),
+            LuaTypeCache::DocType(LuaType::Def(class_decl_id)),
+            TypeCacheWriteMode::InsertOnly,
+        );
+    }
 }
 
 pub(crate) fn get_scripted_class_type_decl_id(

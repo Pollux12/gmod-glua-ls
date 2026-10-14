@@ -61,6 +61,44 @@ mod tests {
     }
 
     #[test]
+    fn plugin_files_inherit_methods_from_the_table_the_loader_publishes() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let loader_path = "gamemode/core/libs/sh_plugin.lua";
+        let loader = r#"
+            ix = ix or {}
+            ix.plugin = ix.plugin or {}
+            function ix.plugin.Load(uniqueID, path, isSingleFile, variable)
+                variable = variable or "PLUGIN"
+                if (uniqueID == "schema") then
+                    variable = "Schema"
+                end
+                local PLUGIN = {
+                    folder = path,
+                    uniqueID = uniqueID,
+                }
+                _G[variable] = PLUGIN
+                function PLUGIN:SetData(value, global, ignoreMap) end
+            end
+        "#;
+        let plugin_path = "plugins/3dpanel.lua";
+        let plugin = "local PLUGIN = PLUGIN
+function PLUGIN:SavePanels()
+    self:SetData(self.list)
+end
+";
+        ws.def_file(loader_path, loader);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, plugin_path, plugin));
+        let uri = ws.virtual_url_generator.new_uri(loader_path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert!(!ws.check_file_for(DiagnosticCode::UndefinedMethod, plugin_path, plugin));
+        ws.def_file(loader_path, loader);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, plugin_path, plugin));
+    }
+
+    #[test]
     fn metatable_index_without_the_method_reports_it_undefined() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(!ws.check_file_for(
