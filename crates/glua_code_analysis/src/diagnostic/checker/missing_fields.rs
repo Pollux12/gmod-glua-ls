@@ -184,7 +184,7 @@ fn check_table_expr(
 
     remove_fields_completed_after(semantic_model, &table_type, expr, &mut missing);
     remove_fields_supplied_by_metatable(db, semantic_model.get_file_id(), expr, &mut missing);
-    remove_fields_gained_before_use(db, semantic_model.get_file_id(), expr, &mut missing);
+    remove_fields_gained_before_use(semantic_model, expr, &mut missing);
     if missing.is_empty() {
         return Some(());
     }
@@ -364,16 +364,17 @@ fn remove_fields_supplied_by_metatable(
     });
 }
 
-/// A literal an untyped local holds is expected to be what the local's call uses
-/// take, so like those uses it counts the fields its table is given before them:
-/// `local trace = { mins = m }` filled with `trace.start = p` before
-/// `util.TraceHull(trace)` is complete.
+/// A literal an untyped local holds is expected to be what the local's typed call
+/// uses take, so like those uses it counts a field its table is given before each
+/// of them on the way there: `local trace = { mins = m }` filled with
+/// `trace.start = p` ahead of `util.TraceHull(trace)` in the same function.
 fn remove_fields_gained_before_use(
-    db: &DbIndex,
-    file_id: FileId,
+    semantic_model: &SemanticModel,
     expr: &LuaTableExpr,
     missing: &mut HashSet<&str>,
 ) {
+    let db = semantic_model.get_db();
+    let file_id = semantic_model.get_file_id();
     let table = InFiled::new(file_id, expr.get_range());
     let Some(decl_id) = expr
         .get_parent::<glua_parser::LuaLocalStat>()
@@ -394,40 +395,62 @@ fn remove_fields_gained_before_use(
     {
         return;
     }
-    let Some(root) = expr.syntax().ancestors().last() else {
+    let Ok(uses) = crate::semantic::local_call_reference_expectations(
+        db,
+        &mut semantic_model.get_cache().borrow_mut(),
+        decl_id,
+    ) else {
         return;
     };
-    let Some(first_use) = db
-        .get_reference_index()
-        .get_decl_references(&file_id, &decl_id)
-        .and_then(|references| {
-            references
-                .cells
-                .iter()
-                .filter(|cell| !cell.is_write)
-                .filter(|cell| {
-                    root.covering_element(cell.range)
-                        .ancestors()
-                        .nth(1)
-                        .is_some_and(|parent| LuaCallArgList::can_cast(parent.kind().into()))
-                })
-                .map(|cell| cell.range.start())
-                .min()
-        })
-    else {
+    if uses.is_empty() {
         return;
-    };
+    }
     let Some(members) = db
         .get_member_index()
         .get_members(&LuaMemberOwner::Element(table))
     else {
         return;
     };
+    let root = semantic_model.get_root().syntax().clone();
+    let mut writes: HashMap<String, Vec<glua_parser::LuaSyntaxNode>> = HashMap::new();
+    for member in members {
+        let name = member.get_key().to_path();
+        if !missing.contains(name.as_str()) {
+            continue;
+        }
+        if let Some(node) = member.get_id().get_syntax_id().to_node_from_root(&root) {
+            writes.entry(name).or_default().push(node);
+        }
+    }
     missing.retain(|name| {
-        !members.iter().any(|member| {
-            member.get_key().to_path() == *name && member.get_id().get_position() < first_use
+        let Some(writes) = writes.get(*name) else {
+            return true;
+        };
+        !uses.iter().all(|(use_range, _)| {
+            let use_node = root.covering_element(*use_range);
+            writes
+                .iter()
+                .any(|write| write_runs_before_use(write, &use_node, use_range.start()))
         })
     });
+}
+
+/// Whether the write `write` always runs before the read at `use_start`: earlier in
+/// the same function, in a block that also holds the read.
+fn write_runs_before_use(
+    write: &glua_parser::LuaSyntaxNode,
+    use_node: &rowan::NodeOrToken<glua_parser::LuaSyntaxNode, glua_parser::LuaSyntaxToken>,
+    use_start: rowan::TextSize,
+) -> bool {
+    let function_of = |node: Option<glua_parser::LuaSyntaxNode>| {
+        node.and_then(|node| node.ancestors().find_map(glua_parser::LuaClosureExpr::cast))
+    };
+    write.text_range().start() < use_start
+        && function_of(Some(write.clone())) == function_of(use_node.parent())
+        && write
+            .ancestors()
+            .find_map(glua_parser::LuaBlock::cast)
+            .is_some_and(|block| block.syntax().text_range().contains(use_start))
 }
 
 /// The path the literal is assigned to, e.g. `self.portals` or `cfg`.

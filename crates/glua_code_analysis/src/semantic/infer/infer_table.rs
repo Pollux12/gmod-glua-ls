@@ -482,6 +482,25 @@ fn infer_table_type_from_local_call_references(
     cache: &mut LuaInferCache,
     decl_id: LuaDeclId,
 ) -> InferResult {
+    let typ = local_call_reference_expectations(db, cache, decl_id)?
+        .into_iter()
+        .fold(LuaType::Never, |typ, (_, expected)| {
+            TypeOps::Union.apply(db, &typ, &expected)
+        });
+    if typ.is_never() {
+        Err(InferFailReason::None)
+    } else {
+        Ok(typ)
+    }
+}
+
+/// Where an unreassigned local is passed as a call argument whose parameter
+/// expects a known type, with that type: what a table literal it holds must be.
+pub(crate) fn local_call_reference_expectations(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl_id: LuaDeclId,
+) -> Result<Vec<(TextRange, LuaType)>, InferFailReason> {
     let file_id = cache.get_file_id();
     let references = db
         .get_reference_index()
@@ -501,7 +520,7 @@ fn infer_table_type_from_local_call_references(
         .ok_or(InferFailReason::None)?
         .get_chunk_node();
 
-    let mut typ = LuaType::Never;
+    let mut expectations = Vec::new();
     for cell in &references.cells {
         if cell.is_write {
             continue;
@@ -531,14 +550,9 @@ fn infer_table_type_from_local_call_references(
             continue;
         }
 
-        typ = TypeOps::Union.apply(db, &typ, &call_arg_type);
+        expectations.push((cell.range, call_arg_type));
     }
-
-    if typ.is_never() {
-        Err(InferFailReason::None)
-    } else {
-        Ok(typ)
-    }
+    Ok(expectations)
 }
 
 fn find_reference_expr_on_range_spine(root: &LuaChunk, range: TextRange) -> Option<LuaExpr> {

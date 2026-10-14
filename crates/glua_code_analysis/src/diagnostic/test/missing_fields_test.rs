@@ -776,6 +776,60 @@ foo({})
     }
 
     #[test]
+    fn a_field_written_only_where_it_may_not_run_before_the_use_is_still_missing() {
+        let mut ws = VirtualWorkspace::new();
+
+        for completion in [
+            "local function prepare() value.required = \"ready\" end",
+            "if flag then value.required = \"ready\" end",
+        ] {
+            assert!(
+                !ws.check_code_for(
+                    DiagnosticCode::MissingFields,
+                    &format!(
+                        r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value Full
+            local function consume(value) end
+
+            local value = {{}}
+            {completion}
+            consume(value)
+            "#
+                    ),
+                ),
+                "{completion}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_untyped_use_before_the_completion_does_not_cut_it_off() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value any
+            local function observe(value) end
+
+            ---@param value Full
+            local function consume(value) end
+
+            local value = {}
+            observe(value)
+            value.required = "ready"
+            consume(value)
+            "#,
+        ));
+    }
+
+    #[test]
     fn unannotated_local_table_passed_to_reader_reports_missing_fields() {
         let mut ws = VirtualWorkspace::new();
 

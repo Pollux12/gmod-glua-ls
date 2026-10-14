@@ -46,6 +46,7 @@ pub(crate) use infer_name::{ParamInferenceSource, infer_param_is_weak, infer_par
 pub(crate) use infer_name::{declaring_for_range, try_infer_enclosing_for_range_iter_type};
 pub use infer_name::{infer_param, infer_param_with_cache};
 use infer_table::infer_table_expr;
+pub(crate) use infer_table::local_call_reference_expectations;
 pub use infer_table::{infer_table_field_value_should_be, infer_table_should_be};
 use infer_unary::infer_unary_expr;
 pub use narrow::{SelfRefId, VarRefId, VarRefRootId};

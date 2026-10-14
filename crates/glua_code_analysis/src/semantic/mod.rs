@@ -48,6 +48,7 @@ pub(crate) use infer::get_prefix_expr_signature_id;
 pub(crate) use infer::infer_bind_value_type;
 pub(crate) use infer::infer_expr_list_types;
 pub use infer::infer_index_expr;
+pub(crate) use infer::local_call_reference_expectations;
 pub(crate) use infer::narrow::infer_true_condition_narrowing;
 pub(crate) use infer::narrow::{InferConditionFlow, apply_cast};
 pub use infer::narrow::{
