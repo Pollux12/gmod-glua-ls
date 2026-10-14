@@ -196,9 +196,14 @@ fn check_call_expr(
             if call_args_count == 0 && is_nonliteral_index_dispatch_call(&call_expr) {
                 return Some(());
             }
-            if prefix_signature_id.is_some_and(|signature_id| {
-                is_hook_signature(context.db, semantic_model, signature_id)
-            }) {
+            // A hook's receiver is the one argument the engine passes that a Lua
+            // call must supply too.
+            let omits_receiver = !colon_call && colon_define && call_args.is_empty();
+            if !omits_receiver
+                && prefix_signature_id.is_some_and(|signature_id| {
+                    is_hook_signature(context.db, semantic_model, signature_id)
+                })
+            {
                 return Some(());
             }
 
@@ -360,34 +365,49 @@ fn get_prefix_expr_signature_id(
         })
 }
 
-/// Whether `signature_id` is a hook: a gamemode hook method or a function tagged
-/// `@hook`. Its parameters are what the engine passes when it runs the hook; a
-/// direct Lua call may leave trailing ones off.
+/// Whether `signature_id` is a hook: a function tagged `@hook`, or a method that
+/// overrides one. Its parameters are what the engine passes when it runs the hook;
+/// a direct Lua call may leave trailing ones off.
 fn is_hook_signature(
     db: &DbIndex,
     semantic_model: &SemanticModel,
     signature_id: LuaSignatureId,
 ) -> bool {
-    let Some(func_stat) = semantic_model
-        .get_signature_closure(signature_id)
-        .and_then(|closure| closure.get_parent::<glua_parser::LuaFuncStat>())
-    else {
+    let func_stat_of = |signature_id: LuaSignatureId| {
+        semantic_model
+            .get_signature_closure(signature_id)
+            .and_then(|closure| closure.get_parent::<glua_parser::LuaFuncStat>())
+    };
+    let Some(func_stat) = func_stat_of(signature_id) else {
         return false;
     };
     if crate::compilation::analyzer::gmod::is_hook_annotated(&func_stat) {
         return true;
     }
-    let Some(func_name) = func_stat.get_func_name() else {
+    let Some(glua_parser::LuaVarExpr::IndexExpr(func_name)) = func_stat.get_func_name() else {
         return false;
     };
-    let syntax_id = func_name.get_syntax_id();
-    db.get_gmod_infer_index()
-        .get_hook_file_metadata(&signature_id.get_file_id())
-        .is_some_and(|metadata| {
-            metadata.sites.iter().any(|site| {
-                site.kind == crate::GmodHookKind::GamemodeMethod && site.syntax_id == syntax_id
-            })
-        })
+    let Some(LuaIndexKey::Name(name)) = func_name.get_index_key() else {
+        return false;
+    };
+    let member_id = crate::LuaMemberId::new(func_name.get_syntax_id(), signature_id.get_file_id());
+    let Some(LuaMemberOwner::Type(owner)) = db.get_member_index().get_current_owner(&member_id)
+    else {
+        return false;
+    };
+    crate::semantic::find_members_with_key(
+        db,
+        &LuaType::Ref(owner.clone()),
+        LuaMemberKey::Name(name.get_name_text().into()),
+        true,
+    )
+    .into_iter()
+    .flatten()
+    .any(|member| {
+        matches!(member.typ, LuaType::Signature(overridden) if overridden != signature_id
+            && func_stat_of(overridden)
+                .is_some_and(|stat| crate::compilation::analyzer::gmod::is_hook_annotated(&stat)))
+    })
 }
 
 fn get_params_len(params: &[(String, Option<LuaType>)]) -> Option<usize> {

@@ -61,6 +61,51 @@ mod test {
     }
 
     #[test]
+    fn only_a_gamemode_method_overriding_a_hook_may_be_called_with_fewer_arguments() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "lua/aaa_annotations/gm.lua",
+            r#"
+            ---@class GM
+            GM = {}
+
+            ---@hook PlayerSpawn
+            ---@param ply table
+            ---@param transition boolean
+            function GM:PlayerSpawn(ply, transition) end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "gamemodes/sample/gamemode/init.lua",
+            r#"
+            function GM:PlayerSpawn(ply, transition) end
+
+            ---@param amount number
+            function GM:ChargeAccount(amount) return amount end
+
+            function GM:Respawn(ply)
+                self:PlayerSpawn(ply)
+                self:ChargeAccount()
+                GM.PlayerSpawn()
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::MissingParameter);
+        let lines = ws
+            .analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|diagnostic| diagnostic.range.start.line)
+            .collect::<Vec<_>>();
+        assert_eq!(lines, vec![8, 9]);
+    }
+
+    #[test]
     fn calling_a_panel_hook_with_fewer_arguments_is_not_missing_parameters() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         set_gmod_enabled(&mut ws);
