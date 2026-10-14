@@ -9196,6 +9196,29 @@ _2 = a[1]
     "#;
 
     #[gtest]
+    fn a_read_of_a_loop_variable_before_its_reassignment_holds_the_iterated_value() -> Result<()> {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(&format!(
+            "{LATER_WRITE_PRELUDE}
+            local function render(rows)
+               for key, value in pairs(rows) do
+                  _G.before = value
+                  write_string(value)
+                  value = create_image()
+               end
+            end
+            "
+        ));
+
+        let before = nth_name_expr_type_from_end(&mut ws, file_id, "value", 2);
+        expect_that!(ws.humanize_type(before), eq("any"));
+        verify_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            eq(false)
+        )
+    }
+
+    #[gtest]
     fn a_read_before_a_later_assignment_holds_the_initializers_value() -> Result<()> {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(&format!(

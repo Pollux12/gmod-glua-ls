@@ -147,7 +147,7 @@ pub fn infer_name_expr(
     if let Some(decl_id) = decl_id
         && result.as_ref().is_ok_and(|typ| typ.contain_tpl())
         && let Some(iter_type) =
-            try_infer_enclosing_for_range_iter_type(db, cache, &name_expr, decl_id)
+            try_infer_enclosing_for_range_iter_type(db, cache, name_expr.syntax(), decl_id)
     {
         return Ok(iter_type);
     }
@@ -558,12 +558,10 @@ fn name_expr_resolves_to_decl(
 /// The `for ... in` loop around `name_expr` that declares `decl_id`, with the
 /// variable's index among the loop's.
 pub(crate) fn declaring_for_range(
-    name_expr: &LuaNameExpr,
+    node: &LuaSyntaxNode,
     decl_id: LuaDeclId,
 ) -> Option<(LuaForRangeStat, usize)> {
-    name_expr
-        .syntax()
-        .ancestors()
+    node.ancestors()
         .filter_map(LuaForRangeStat::cast)
         .find_map(|for_range| {
             let var_idx = for_range
@@ -578,7 +576,7 @@ pub(crate) fn declaring_for_range(
 pub(crate) fn try_infer_enclosing_for_range_iter_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    name_expr: &LuaNameExpr,
+    node: &LuaSyntaxNode,
     decl_id: LuaDeclId,
 ) -> Option<LuaType> {
     if let Some(cached) = cache.for_range_iter_var_type_cache.get(&decl_id).cloned() {
@@ -588,7 +586,7 @@ pub(crate) fn try_infer_enclosing_for_range_iter_type(
         };
     }
 
-    let (for_range, var_idx) = declaring_for_range(name_expr, decl_id)?;
+    let (for_range, var_idx) = declaring_for_range(node, decl_id)?;
     let iter_exprs = for_range.get_expr_list().collect::<Vec<_>>();
     cache
         .for_range_iter_var_type_cache

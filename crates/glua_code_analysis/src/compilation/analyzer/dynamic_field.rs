@@ -1256,9 +1256,9 @@ fn computed_key_type(
             .get_reference_index()
             .get_local_reference(&cache.get_file_id())
             .and_then(|references| references.get_decl_id(&name_expr.get_range()))
-        && declaring_for_range(name_expr, decl_id).is_some()
+        && declaring_for_range(name_expr.syntax(), decl_id).is_some()
     {
-        return try_infer_enclosing_for_range_iter_type(db, cache, name_expr, decl_id);
+        return try_infer_enclosing_for_range_iter_type(db, cache, name_expr.syntax(), decl_id);
     }
     infer_expr(db, cache, expr.clone()).ok()
 }

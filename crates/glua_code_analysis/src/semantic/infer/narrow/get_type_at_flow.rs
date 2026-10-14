@@ -1000,9 +1000,10 @@ fn get_decl_position_var_ref_type(
     get_var_ref_type(db, cache, var_ref_id)
 }
 
-/// The value a local holds at its declaration when its initializer determined
-/// nothing and a later write determined its slot: a straight-line read reaching
-/// the declaration sees the initializer, while a closure reads the whole slot.
+/// The value a local holds at its declaration when its initializer, or for a loop
+/// variable the value its iterator yields, determined nothing and a later write
+/// determined its slot: a straight-line read reaching the declaration sees that
+/// value, while a closure reads the whole slot.
 fn initializer_type_a_later_write_displaced(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -1027,6 +1028,17 @@ fn initializer_type_a_later_write_displaced(
     match try_infer_decl_initializer_type(db, cache, root, var_ref_id) {
         Ok(Some(init_type)) if !crate::is_informative_type(&init_type) => Some(init_type),
         Err(InferFailReason::FieldNotFound) => Some(LuaType::Unknown),
+        Ok(None) => {
+            let name = root
+                .syntax()
+                .token_at_offset(decl_id.position)
+                .right_biased()?
+                .parent()?;
+            crate::semantic::infer::try_infer_enclosing_for_range_iter_type(
+                db, cache, &name, decl_id,
+            )
+            .filter(|iter_type| !crate::is_informative_type(iter_type))
+        }
         _ => None,
     }
 }
