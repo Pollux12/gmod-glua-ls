@@ -67,6 +67,7 @@ pub use member::LuaMemberInfo;
 pub use member::find_index_operations;
 use member::find_member_origin_owner;
 pub(crate) use member::find_members;
+pub(crate) use member::get_buildin_type_map_type_id;
 pub use member::get_member_map;
 pub use member::get_member_value_expr;
 pub(crate) use member::infer_owner_raw_member_type_with_realm;
