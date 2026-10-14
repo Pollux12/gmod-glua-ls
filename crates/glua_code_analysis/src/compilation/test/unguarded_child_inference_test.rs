@@ -2051,10 +2051,12 @@ mod test {
 
     #[test]
     fn an_inherited_member_read_is_reported_for_the_child_that_inherits_it() {
-        let mut ws = VirtualWorkspace::new();
-        let lines = guarded_lines(
-            &mut ws,
-            r#"
+        for (param, receiver) in [("holder Holder", "holder.panel"), ("panel Panel", "panel")] {
+            let mut ws = VirtualWorkspace::new();
+            enable_gmod(&mut ws);
+            ws.def_gmod_type_predicates();
+            let file_id = ws.def(&format!(
+                r#"
             ---@class Panel
             ---@class Scroll: Panel
             ---@field up Panel
@@ -2063,16 +2065,24 @@ mod test {
             ---@class Holder
             ---@field panel Panel
 
-            ---@param holder Holder
-            local function paint(holder)
-                local up = holder.panel.up
-                if holder.panel.special then
-                    return holder.panel.special, up
-                end
+            ---@param {param}
+            local function paint(holder, panel)
+                local up = {receiver}.up
+                return {receiver}.special, up
             end
-            "#,
-        );
-        assert_eq!(lines, vec![11]);
+            "#
+            ));
+            let reports = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild)
+                .into_iter()
+                .map(|diagnostic| (diagnostic.range.start.line, diagnostic.message))
+                .collect::<Vec<_>>();
+            assert_eq!(reports.len(), 1, "{receiver}: {reports:?}");
+            assert_eq!(reports[0].0, 11, "{receiver}: {reports:?}");
+            assert!(
+                reports[0].1.contains("SpecialScroll"),
+                "{receiver}: {reports:?}"
+            );
+        }
     }
 
     #[test]
