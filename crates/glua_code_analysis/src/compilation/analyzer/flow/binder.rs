@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use glua_parser::{LuaAstPtr, LuaExpr, LuaNameToken, LuaSyntaxId};
 use internment::ArcIntern;
@@ -48,6 +48,9 @@ pub struct FlowBinder<'a> {
     /// drains these into the diagnostic index sequentially afterward.
     pub errors: Vec<AnalyzeError>,
     pub decl_bind_expr_ref: FxHashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
+    /// The call each never reassigned local was declared with: a condition reading
+    /// the local narrows what the call does.
+    pub call_initializers: FxHashMap<LuaDeclId, LuaExpr>,
     pub start: FlowId,
     pub unreachable: FlowId,
     pub loop_label: FlowId,
@@ -81,6 +84,7 @@ impl<'a> FlowBinder<'a> {
             flow_nodes: Vec::new(),
             multiple_antecedents: Vec::new(),
             decl_bind_expr_ref: FxHashMap::default(),
+            call_initializers: FxHashMap::default(),
             labels: FxHashMap::default(),
             start: FlowId::default(),
             unreachable: FlowId::default(),
@@ -370,9 +374,21 @@ impl<'a> FlowBinder<'a> {
         self.record_narrowable_refs(expr, false);
     }
 
-    /// Record condition references separately from assignment and cast targets.
+    /// Record condition references separately from assignment and cast targets,
+    /// with the references of the call each local the condition reads was declared
+    /// with.
     pub fn record_condition_refs_in_expr(&mut self, expr: &LuaExpr) {
-        self.record_narrowable_refs(expr, true);
+        let mut pending = vec![expr.clone()];
+        let mut expanded = FxHashSet::default();
+        while let Some(expr) = pending.pop() {
+            for decl_id in self.record_narrowable_refs(&expr, true) {
+                if expanded.insert(decl_id)
+                    && let Some(call) = self.call_initializers.get(&decl_id)
+                {
+                    pending.push(call.clone());
+                }
+            }
+        }
     }
 
     fn record_name(&mut self, name: &str, from_condition: bool) {
@@ -408,16 +424,28 @@ impl<'a> FlowBinder<'a> {
         });
     }
 
-    fn record_narrowable_refs(&mut self, expr: &LuaExpr, from_condition: bool) {
+    /// Records the names and paths `expr` references, returning the locals it reads
+    /// that were declared with a call.
+    fn record_narrowable_refs(&mut self, expr: &LuaExpr, from_condition: bool) -> Vec<LuaDeclId> {
         use glua_parser::{LuaAstNode, LuaCallExpr, LuaIndexExpr, LuaNameExpr, PathTrait};
         // Record the expr itself if it is a name or index, then recurse into
         // descendants to cover nested references (e.g. `a.b and c(d.e)`).
+        let mut call_locals = Vec::new();
         for node in expr.syntax().descendants() {
             if let Some(name_expr) = LuaNameExpr::cast(node.clone()) {
                 if let Some(name) = name_expr.get_name_text() {
                     self.record_name(&name, from_condition);
                 } else {
                     self.record_opaque_name(from_condition);
+                }
+                if from_condition
+                    && let Some(decl_id) = self
+                        .db
+                        .get_reference_index()
+                        .get_var_reference_decl(&self.file_id, name_expr.get_range())
+                        .filter(|decl_id| self.call_initializers.contains_key(decl_id))
+                {
+                    call_locals.push(decl_id);
                 }
             } else if let Some(call) = LuaCallExpr::cast(node.clone()) {
                 if let Some(path) = crate::semantic::getter_access_path(&LuaExpr::CallExpr(call)) {
@@ -441,6 +469,7 @@ impl<'a> FlowBinder<'a> {
                 }
             }
         }
+        call_locals
     }
 
     pub fn finish(self) -> (FlowTree, Vec<AnalyzeError>) {

@@ -30,8 +30,14 @@ pub fn bind_local_stat(
         let name = &local_names[i];
         let value = &values[i];
         let decl_id = LuaDeclId::new(binder.file_id, name.get_position());
-        if check_local_immutable(binder, decl_id) && check_value_expr_is_check_expr(value.clone()) {
+        if !check_local_immutable(binder, decl_id) {
+            continue;
+        }
+        if check_value_expr_is_check_expr(value.clone()) {
             binder.decl_bind_expr_ref.insert(decl_id, value.to_ptr());
+        }
+        if matches!(value, LuaExpr::CallExpr(_)) {
+            binder.call_initializers.insert(decl_id, value.clone());
         }
     }
 

@@ -1,8 +1,9 @@
 use glua_parser::{
-    BinaryOperator, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaChunk, LuaExpr, LuaIndexMemberExpr,
-    LuaLiteralToken, UnaryOperator,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaChunk,
+    LuaClosureExpr, LuaExpr, LuaForRangeStat, LuaForStat, LuaGotoStat, LuaIndexMemberExpr,
+    LuaLiteralToken, LuaNameExpr, LuaRepeatStat, LuaWhileStat, UnaryOperator,
 };
-use rowan::TextSize;
+use rowan::{TextRange, TextSize};
 
 use crate::{
     DbIndex, FlowNode, FlowTree, InferFailReason, LuaArrayLen, LuaArrayType, LuaInferCache,
@@ -741,6 +742,137 @@ fn has_decl_write_in_open_interval(
         })
 }
 
+/// The call a local that is never reassigned was declared with, in the closure of
+/// `name_expr` and before it, with the declaration's position.
+fn unreassigned_local_initializer_call(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    root: &LuaChunk,
+    name_expr: &LuaNameExpr,
+) -> Option<(LuaCallExpr, TextSize)> {
+    let file_id = cache.get_file_id();
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, name_expr.get_range())?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    if !matches!(decl.extra, crate::LuaDeclExtra::Local { .. })
+        || decl_id.position >= name_expr.get_position()
+        || db
+            .get_reference_index()
+            .get_decl_references(&file_id, &decl_id)
+            .is_some_and(|decl_refs| decl_refs.mutable)
+    {
+        return None;
+    }
+
+    let call_expr = LuaCallExpr::cast(
+        decl.get_value_syntax_id()?
+            .to_node_from_root(root.syntax())?,
+    )?;
+    let enclosing_closure =
+        |node: &glua_parser::LuaSyntaxNode| node.ancestors().find_map(LuaClosureExpr::cast);
+    (enclosing_closure(call_expr.syntax()) == enclosing_closure(name_expr.syntax()))
+        .then_some((call_expr, decl_id.position))
+}
+
+/// Whether `var_ref_id`, or a table it is read through, may be assigned after a
+/// local declared at `start` took its value and before a test at `end` reads it:
+/// strictly between the two, anywhere in a loop that repeats the test without the
+/// declaration, or anywhere when the code can jump back with `goto`.
+fn has_var_write_in_open_interval(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    start: TextSize,
+    end: TextSize,
+) -> bool {
+    if start >= end {
+        return false;
+    }
+    let Some(test_token) = root.syntax().token_at_offset(end).right_biased() else {
+        return true;
+    };
+    let mut end = end;
+    let mut body = None;
+    for ancestor in test_token.parent_ancestors() {
+        if LuaClosureExpr::cast(ancestor.clone()).is_some()
+            || LuaChunk::cast(ancestor.clone()).is_some()
+        {
+            body = Some(ancestor);
+            break;
+        }
+        let is_loop = LuaWhileStat::cast(ancestor.clone()).is_some()
+            || LuaRepeatStat::cast(ancestor.clone()).is_some()
+            || LuaForStat::cast(ancestor.clone()).is_some()
+            || LuaForRangeStat::cast(ancestor.clone()).is_some();
+        if is_loop && ancestor.text_range().start() > start {
+            end = end.max(ancestor.text_range().end());
+        }
+    }
+    let jumps_back = body.is_some_and(|body| {
+        body.descendants()
+            .filter_map(LuaGotoStat::cast)
+            .any(|goto| {
+                goto.syntax()
+                    .ancestors()
+                    .find(|node| {
+                        LuaClosureExpr::cast(node.clone()).is_some()
+                            || LuaChunk::cast(node.clone()).is_some()
+                    })
+                    .is_some_and(|enclosing| enclosing == body)
+            })
+    });
+    if jumps_back {
+        return true;
+    }
+
+    let root_decl_id = match var_ref_id {
+        VarRefId::IndexRef(root_id, _) => root_id.as_decl_id(),
+        _ => var_ref_id.get_decl_id_ref(),
+    };
+    if root_decl_id.is_some_and(|decl_id| {
+        has_decl_write_in_open_interval(db, cache.get_file_id(), decl_id, start, end)
+    }) {
+        return true;
+    }
+
+    let Some(scope) = root
+        .syntax()
+        .covering_element(TextRange::new(start, end))
+        .ancestors()
+        .next()
+    else {
+        return false;
+    };
+    let written_vars = scope
+        .descendants()
+        .filter_map(LuaAssignStat::cast)
+        .filter(|assign_stat| {
+            let position = assign_stat.get_position();
+            position > start && position < end
+        })
+        .flat_map(|assign_stat| assign_stat.get_var_and_expr_list().0)
+        .collect::<Vec<_>>();
+    written_vars.into_iter().any(|var_expr| {
+        // A computed key may name any field of the table it indexes.
+        let written = match &var_expr {
+            glua_parser::LuaVarExpr::IndexExpr(index_expr)
+                if matches!(
+                    index_expr.get_index_key(),
+                    Some(glua_parser::LuaIndexKey::Expr(_))
+                ) =>
+            {
+                index_expr.get_prefix_expr()
+            }
+            _ => Some(var_expr.into()),
+        };
+        written
+            .and_then(|written| get_var_expr_var_ref_id(db, cache, written))
+            .is_some_and(|written| written == *var_ref_id || var_ref_id.start_with(&written))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn maybe_var_eq_narrow(
     db: &DbIndex,
@@ -1013,12 +1145,23 @@ fn maybe_type_name_literal_eq_narrow(
     condition_flow: InferConditionFlow,
     policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
-    let (call_expr, literal_expr) = match (left_expr, right_expr) {
-        (LuaExpr::CallExpr(call_expr), LuaExpr::LiteralExpr(literal_expr)) => {
-            (call_expr, literal_expr)
+    let (call_expr, literal_expr, alias_interval) = match (left_expr, right_expr) {
+        (LuaExpr::CallExpr(call_expr), LuaExpr::LiteralExpr(literal_expr))
+        | (LuaExpr::LiteralExpr(literal_expr), LuaExpr::CallExpr(call_expr)) => {
+            (call_expr, literal_expr, None)
         }
-        (LuaExpr::LiteralExpr(literal_expr), LuaExpr::CallExpr(call_expr)) => {
-            (call_expr, literal_expr)
+        (LuaExpr::NameExpr(name_expr), LuaExpr::LiteralExpr(literal_expr))
+        | (LuaExpr::LiteralExpr(literal_expr), LuaExpr::NameExpr(name_expr)) => {
+            let Some((call_expr, alias_position)) =
+                unreassigned_local_initializer_call(db, cache, root, &name_expr)
+            else {
+                return Ok(ResultTypeOrContinue::Continue);
+            };
+            (
+                call_expr,
+                literal_expr,
+                Some((alias_position, name_expr.get_position())),
+            )
         }
         _ => return Ok(ResultTypeOrContinue::Continue),
     };
@@ -1040,6 +1183,18 @@ fn maybe_type_name_literal_eq_narrow(
         return Ok(ResultTypeOrContinue::Continue);
     };
     if target_ref_id != *var_ref_id {
+        return Ok(ResultTypeOrContinue::Continue);
+    }
+    if let Some((alias_position, guard_position)) = alias_interval
+        && has_var_write_in_open_interval(
+            db,
+            cache,
+            root,
+            var_ref_id,
+            alias_position,
+            guard_position,
+        )
+    {
         return Ok(ResultTypeOrContinue::Continue);
     }
 

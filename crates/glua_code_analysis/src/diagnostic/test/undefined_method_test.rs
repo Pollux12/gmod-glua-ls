@@ -2087,4 +2087,89 @@ end
             );
         }
     }
+
+    const CLASS_NAME_ANNOTATIONS: &str = r#"
+        ---@meta
+        ---@class Entity
+        local Entity = {}
+        ---@return string
+        function Entity:GetClass() end
+        ---@class farmplot : Entity
+        local farmplot = {}
+        function farmplot:GetPlotSize() end
+        ---@class composter : Entity
+        local composter = {}
+        function composter:GetComposting() end
+        ---@class plant : Entity
+        local plant = {}
+        function plant:GetGrowth() end
+        ---@class ground_plant : plant
+        local ground_plant = {}
+        ---@class TraceResult
+        ---@field Entity Entity
+        local TraceResult = {}
+    "#;
+
+    fn class_name_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file("lua/annotations/entity.lua", CLASS_NAME_ANNOTATIONS);
+        ws
+    }
+
+    /// `local class = ent:GetClass()` compared with a class name narrows `ent` as the call itself would.
+    #[test]
+    fn a_class_name_local_narrows_the_entity_it_was_read_from() {
+        let source = r#"
+            ---@param trace TraceResult
+            local function draw(trace)
+                local class = trace.Entity:GetClass()
+                if class == "farmplot" then
+                    print(trace.Entity:GetPlotSize())
+                elseif "composter" == class then
+                    print(trace.Entity:GetComposting())
+                elseif (class == "plant" or class == "ground_plant") then
+                    print(trace.Entity:GetGrowth())
+                end
+            end
+            print(draw)
+        "#;
+        for code in [
+            DiagnosticCode::UndefinedMethod,
+            DiagnosticCode::InferUnguardedChild,
+        ] {
+            let mut ws = class_name_workspace();
+            assert!(
+                ws.check_file_for(code, "lua/autorun/client/cl_draw.lua", source),
+                "{code:?}"
+            );
+        }
+    }
+
+    /// The class name a local holds stops describing the entity once either is reassigned, and
+    /// says nothing inside a closure that may run later.
+    #[test]
+    fn a_class_name_local_does_not_narrow_past_a_write_or_into_a_closure() {
+        for body in [
+            "local class = trace.Entity:GetClass()\ntrace.Entity = other\nif class == \"composter\" then print(trace.Entity:GetComposting()) end",
+            "local class = trace.Entity:GetClass()\ntrace = { Entity = other }\nif class == \"composter\" then print(trace.Entity:GetComposting()) end",
+            "local class = trace.Entity:GetClass()\nclass = other:GetClass()\nif class == \"composter\" then print(trace.Entity:GetComposting()) end",
+            "local class = trace.Entity:GetClass()\nlocal function later() if class == \"composter\" then print(trace.Entity:GetComposting()) end end\nlater()",
+        ] {
+            let mut ws = class_name_workspace();
+            let source = format!(
+                "---@param trace TraceResult\n---@param other Entity\nlocal function draw(trace, other)\n{body}\nend\nprint(draw)\n"
+            );
+            assert!(
+                !ws.check_file_for(
+                    DiagnosticCode::InferUnguardedChild,
+                    "lua/autorun/client/cl_draw.lua",
+                    &source,
+                ),
+                "{body}"
+            );
+        }
+    }
 }
