@@ -1119,8 +1119,8 @@ enum ParamMerge {
 }
 
 /// Merges `contracts` into the `params` of a closure defined with
-/// `is_colon_define`. A `...` takes every later position: their shared type,
-/// or `any` where they differ.
+/// `is_colon_define`. A `...` takes the type of the contract's own `...`, and
+/// is `any` where the contract has a position there instead.
 fn merge_contract_params(
     db: &DbIndex,
     mut params: Vec<(String, Option<LuaType>)>,
@@ -1148,14 +1148,17 @@ fn merge_contract_params(
         for (idx, param) in contract_params.iter().enumerate() {
             if let Some(final_param) = params.get(idx) {
                 if final_param.0 == "..." {
-                    // If the type of `contract_params` differs from the following parameters, `variadic_type` is `Any`
-                    for later in &contract_params[idx..] {
-                        if let Some(typ) = &later.1 {
-                            if variadic_type == LuaType::Unknown {
-                                variadic_type = typ.clone();
-                            } else if variadic_type != *typ {
-                                variadic_type = LuaType::Any;
-                            }
+                    // Only a `...` in the contract types it; any other slot there is a position, not the forwarded values
+                    let typ = if param.0 == "..." {
+                        param.1.clone()
+                    } else {
+                        Some(LuaType::Any)
+                    };
+                    if let Some(typ) = typ {
+                        if variadic_type == LuaType::Unknown {
+                            variadic_type = typ;
+                        } else if variadic_type != typ {
+                            variadic_type = LuaType::Any;
                         }
                     }
 
@@ -1177,6 +1180,8 @@ fn merge_contract_params(
 
     if !variadic_type.is_unknown()
         && let Some(param) = params.last_mut()
+        && param.0 == "..."
+        && param.1.is_none()
     {
         param.1 = Some(variadic_type);
     }

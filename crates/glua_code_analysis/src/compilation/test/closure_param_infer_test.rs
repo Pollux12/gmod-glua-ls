@@ -1857,4 +1857,89 @@ mod test {
         let ty = ws.expr_ty("first_handler_value");
         assert_ne!(ws.humanize_type(ty), "string");
     }
+
+    /// A `...` forwards whatever the caller passed; a one-position base does
+    /// not type it.
+    #[test]
+    fn test_dots_override_of_positional_base_does_not_type_forwarded_args() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            crate::DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param count number
+            local function take_count(count) end
+
+            ---@class DotsPositionalBase
+            ---@field Run fun(entities: table)
+
+            ---@class DotsPositionalChild : DotsPositionalBase
+            local DotsPositionalChild = {}
+
+            function DotsPositionalChild.Run(...)
+                take_count(...)
+            end
+            "#
+        ));
+    }
+
+    /// A `...` the base declares still types the forwarded args.
+    #[test]
+    fn test_dots_override_of_variadic_base_types_forwarded_args() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            crate::DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param name table
+            local function take_name(name) end
+
+            ---@class DotsVariadicBase
+            ---@field Run fun(...: number)
+
+            ---@class DotsVariadicChild : DotsVariadicBase
+            local DotsVariadicChild = {}
+
+            function DotsVariadicChild.Run(...)
+                take_name(...)
+            end
+            "#
+        ));
+    }
+
+    /// A declared `...` type survives a positional overload of the same function.
+    #[test]
+    fn test_declared_dots_type_survives_positional_overload() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            crate::DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value table
+            local function need_table(value) end
+
+            ---@overload fun(value: number)
+            ---@param ... number
+            local function forward(...)
+                need_table(...)
+            end
+
+            forward(1)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_declared_dots_type_is_inferred_beside_positional_overload() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@overload fun(value: number)
+            ---@param ... number
+            local function forward(...)
+                local first = ...
+                return first
+            end
+            "#,
+        );
+        let first = ws.local_ty(file_id, "first");
+        assert_eq!(ws.humanize_type(first), "number");
+    }
 }

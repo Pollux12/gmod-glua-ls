@@ -1061,7 +1061,7 @@ fn infer_param_inner(
                 typ,
                 param_idx,
                 colon_define,
-                decl.get_name() == "...",
+                false,
             );
 
             if let Some(member_id) = member_id
@@ -1070,7 +1070,7 @@ fn infer_param_inner(
                     member_id,
                     param_idx,
                     colon_define,
-                    decl.get_name() == "...",
+                    false,
                     Some(&typ),
                 )
             {
@@ -2233,20 +2233,24 @@ fn adjust_param_idx(
     adjusted_idx
 }
 
+/// `any` for a `...` over a contract position that is not itself a `...`.
 fn check_dots_param_types(
     params: &[(String, Option<LuaType>)],
     param_idx: usize,
-    cur_type: &Option<LuaType>,
 ) -> Option<LuaType> {
-    for (_, typ) in params.iter().skip(param_idx) {
-        if let Some(typ) = typ
-            && let Some(cur_type) = cur_type
-            && cur_type != typ
-        {
-            return Some(LuaType::Any);
-        }
-    }
-    None
+    params
+        .get(param_idx)
+        .is_some_and(|(name, _)| name != "...")
+        .then_some(LuaType::Any)
+}
+
+/// Whether the declared signature takes a `...` where argument `param_idx` goes.
+fn signature_slot_is_dots(signature: &LuaSignature, param_idx: usize) -> bool {
+    signature
+        .params
+        .get(param_idx)
+        .or_else(|| signature.params.last())
+        .is_some_and(|name| name == "...")
 }
 
 fn union_signature_overload_param_types(
@@ -2284,7 +2288,7 @@ fn find_signature_overload_param_type(
 
         if is_dots
             && let Some(any_type) =
-                check_dots_param_types(overload.get_params(), adjusted_idx, cur_type)
+                check_dots_param_types(overload.get_params(), adjusted_idx)
         {
             return Some(any_type);
         }
@@ -2314,6 +2318,9 @@ fn find_param_type_from_type(
                 adjust_param_idx(param_idx, current_colon_define, signature.is_colon_define);
 
             match signature.get_param_info_by_id(adjusted_idx) {
+                Some(_) if is_dots && !signature_slot_is_dots(signature, adjusted_idx) => {
+                    Some(LuaType::Any)
+                }
                 Some(param_info) => {
                     let mut typ = param_info.type_ref.clone();
                     if param_info.nullable && !typ.is_nullable() {
@@ -2349,11 +2356,7 @@ fn find_param_type_from_type(
                             };
 
                         if is_dots
-                            && let Some(any_type) = check_dots_param_types(
-                                overload.get_params(),
-                                adjusted_idx,
-                                &cur_type,
-                            )
+                            && let Some(any_type) = check_dots_param_types(overload.get_params(), adjusted_idx)
                         {
                             return Some(any_type);
                         }
@@ -2376,7 +2379,7 @@ fn find_param_type_from_type(
                 let cur_type = typ.clone();
                 if is_dots
                     && let Some(any_type) =
-                        check_dots_param_types(f.get_params(), adjusted_idx, &cur_type)
+                        check_dots_param_types(f.get_params(), adjusted_idx)
                 {
                     return Some(any_type);
                 }
@@ -2405,6 +2408,12 @@ fn find_param_type_from_union(
             if !signature.param_docs.is_empty() {
                 let adjusted_idx =
                     adjust_param_idx(param_idx, origin_colon_define, signature.is_colon_define);
+                if is_dots
+                    && signature.get_param_info_by_id(adjusted_idx).is_some()
+                    && !signature_slot_is_dots(signature, adjusted_idx)
+                {
+                    return Some(LuaType::Any);
+                }
                 return if let Some(param_info) = signature.get_param_info_by_id(adjusted_idx) {
                     let mut typ = param_info.type_ref.clone();
                     if param_info.nullable && !typ.is_nullable() {
@@ -2435,7 +2444,7 @@ fn find_param_type_from_union(
 
                 if is_dots
                     && let Some(any_type) =
-                        check_dots_param_types(overload.get_params(), adjusted_idx, &cur_type)
+                        check_dots_param_types(overload.get_params(), adjusted_idx)
                 {
                     return Some(any_type);
                 }
@@ -2460,7 +2469,7 @@ fn find_param_type_from_union(
 
             if is_dots
                 && let Some(any_type) =
-                    check_dots_param_types(f.get_params(), adjusted_idx, &cur_type)
+                    check_dots_param_types(f.get_params(), adjusted_idx)
             {
                 return Some(any_type);
             }
