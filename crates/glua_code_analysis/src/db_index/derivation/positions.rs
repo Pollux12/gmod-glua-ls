@@ -103,9 +103,10 @@ impl EditMaps {
     }
 
     fn member_id(&self, id: LuaMemberId) -> Option<LuaMemberId> {
-        Some(LuaMemberId::new(
+        Some(LuaMemberId::new_in_slot(
             self.syntax_id(id.file_id, *id.get_syntax_id())?,
             id.file_id,
+            id.get_slot(),
         ))
     }
 
@@ -528,6 +529,7 @@ impl Hash for LuaMemberId {
             |maps| maps.syntax_id(self.file_id, id),
             state,
         );
+        self.get_slot().hash(state);
     }
 }
 

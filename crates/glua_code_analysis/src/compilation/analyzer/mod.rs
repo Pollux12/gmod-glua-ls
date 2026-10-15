@@ -18,7 +18,8 @@ pub(crate) mod unresolve;
 
 pub(crate) use call_site_params::{CallbackArg, CallbackParamsQuery, ReceiverAuthorityQuery};
 pub(crate) use common::{
-    is_nil_literal_expr, is_presence_tested, union_widens_cached_type, widen_mutable_decl_literal,
+    is_falsy_literal_expr, is_nil_literal_expr, is_presence_tested, union_widens_cached_type,
+    widen_mutable_decl_literal,
 };
 pub(crate) use dynamic_field::is_provably_builtin_iterator_call;
 pub(crate) use dynamic_field::{
@@ -1428,54 +1429,40 @@ fn type_is_uninformative(typ: &LuaType) -> bool {
 fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
     for &file_id in file_ids {
         let file_calls = db.get_accessor_func_call_index().calls_in(file_id).to_vec();
-        for call in file_calls {
-            if call.accessor_name.is_empty() {
-                continue;
-            }
-
-            let setter_member_id = LuaMemberId::new(call.syntax_id, file_id);
-
-            let owner = LuaMemberOwner::Type(call.owner_type_id.clone());
-
-            let getter_name = format!("Get{}", call.accessor_name);
-            let getter_func =
-                LuaFunctionType::new(AsyncState::None, true, false, vec![], LuaType::Any);
-            let getter_syntax_id = call.name_arg_syntax_id.unwrap_or(call.syntax_id);
-            let getter_member_id = LuaMemberId::new(getter_syntax_id, file_id);
-            let getter_member = LuaMember::new(
-                getter_member_id,
-                LuaMemberKey::Name(getter_name.as_str().into()),
-                LuaMemberFeature::FileMethodDecl,
-                None,
+        for member in file_calls.into_iter().flat_map(|call| call.members) {
+            let member_id = LuaMemberId::new_in_slot(member.syntax_id, file_id, member.slot);
+            let func = match member.signature {
+                crate::AccessorSignature::Setter => LuaFunctionType::new(
+                    AsyncState::None,
+                    true,
+                    false,
+                    vec![("value".to_string(), Some(LuaType::Any))],
+                    LuaType::Nil,
+                ),
+                crate::AccessorSignature::Getter => {
+                    LuaFunctionType::new(AsyncState::None, true, false, vec![], LuaType::Any)
+                }
+                crate::AccessorSignature::Any => LuaFunctionType::new(
+                    AsyncState::None,
+                    true,
+                    false,
+                    vec![("...".to_string(), Some(LuaType::Any))],
+                    LuaType::Any,
+                ),
+            };
+            db.get_member_index_mut().add_member(
+                LuaMemberOwner::Type(member.owner_type_id),
+                LuaMember::new(
+                    member_id,
+                    LuaMemberKey::Name(member.name),
+                    LuaMemberFeature::FileMethodDecl,
+                    None,
+                ),
             );
-            db.get_member_index_mut()
-                .add_member(owner.clone(), getter_member);
             write_type_cache(
                 db,
-                getter_member_id.into(),
-                LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(getter_func))),
-                TypeCacheWriteMode::InsertOnly,
-            );
-
-            let setter_name = format!("Set{}", call.accessor_name);
-            let setter_func = LuaFunctionType::new(
-                AsyncState::None,
-                true,
-                false,
-                vec![("value".to_string(), Some(LuaType::Any))],
-                LuaType::Nil,
-            );
-            let setter_member = LuaMember::new(
-                setter_member_id,
-                LuaMemberKey::Name(setter_name.as_str().into()),
-                LuaMemberFeature::FileMethodDecl,
-                None,
-            );
-            db.get_member_index_mut().add_member(owner, setter_member);
-            write_type_cache(
-                db,
-                setter_member_id.into(),
-                LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(setter_func))),
+                member_id.into(),
+                LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(func))),
                 TypeCacheWriteMode::InsertOnly,
             );
         }

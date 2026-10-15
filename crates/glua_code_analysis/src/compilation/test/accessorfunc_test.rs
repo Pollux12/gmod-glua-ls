@@ -290,4 +290,28 @@ mod test {
             "unexpected undefined-field diagnostics in cross-file use: {undefined_fields:?}"
         );
     }
+
+    /// An `@accessorfunc` on a local function is the generator a call through that local
+    /// reaches, though its body makes no accessor itself.
+    #[gtest]
+    fn test_accessorfunc_on_a_local_function_synthesizes_at_its_calls() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def_file(
+            "lua/items/base_item.lua",
+            r#"
+            ---@class base_item
+            local ITEM = {}
+
+            ---@accessorfunc 2
+            local function Make(tbl, name)
+            end
+
+            Make(ITEM, "Health")
+        "#,
+        );
+
+        let member_names = member_names_for_type(&mut ws, "base_item");
+        assert_has_members(&member_names, &["GetHealth", "SetHealth"]);
+    }
 }

@@ -69,7 +69,8 @@ impl LuaTypeOwner {
                 (LuaTypeOwner::Member(left), LuaTypeOwner::Member(right)) => left
                     .file_id
                     .cmp(&right.file_id)
-                    .then_with(|| syntax_id_cmp(left.get_syntax_id(), right.get_syntax_id())),
+                    .then_with(|| syntax_id_cmp(left.get_syntax_id(), right.get_syntax_id()))
+                    .then_with(|| left.get_slot().cmp(&right.get_slot())),
                 (LuaTypeOwner::SyntaxId(left), LuaTypeOwner::SyntaxId(right)) => left
                     .file_id
                     .cmp(&right.file_id)
@@ -264,6 +265,22 @@ impl std::ops::Deref for LuaTypeCache {
 mod tests {
     use super::*;
     use crate::LuaUnionType;
+
+    /// The members one node makes in different slots are different owners, so a
+    /// sort by this order groups each one's writes together.
+    #[test]
+    fn stable_cmp_tells_apart_the_slots_of_one_node() {
+        let call = LuaSyntaxId::new(
+            glua_parser::LuaSyntaxKind::CallExpr.into(),
+            rowan::TextRange::new(0.into(), 6.into()),
+        );
+        let member = |slot| {
+            LuaTypeOwner::Member(crate::LuaMemberId::new_in_slot(call, FileId::new(1), slot))
+        };
+        let mut owners = vec![member(0), member(1), member(0)];
+        owners.sort_by(LuaTypeOwner::stable_cmp);
+        assert_eq!(owners, vec![member(0), member(0), member(1)]);
+    }
 
     fn union(types: Vec<LuaType>) -> LuaType {
         LuaType::from_vec(types)

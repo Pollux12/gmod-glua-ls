@@ -2477,7 +2477,7 @@ pub fn note_member_realm_at_read(file_id: FileId, offset: TextSize) {
     });
 }
 
-/// An exact identity for a member.
+/// An exact identity for the member a node declares, slot 0.
 fn member_identity(id: &LuaMemberId) -> u128 {
     let syntax = id.get_syntax_id();
     let range = syntax.get_range();
@@ -2487,27 +2487,32 @@ fn member_identity(id: &LuaMemberId) -> u128 {
         | u128::from(u32::from(range.end()))
 }
 
+/// Records a read of the fact `key` names about the member `id`: deduplicated by
+/// its exact identity for the member a node declares, and by the fact itself for
+/// the further members one node makes in other slots, which share that identity.
+fn note_member_read(kind: u8, id: &LuaMemberId, key: impl FnOnce() -> FactKey) {
+    if id.get_slot() == 0 {
+        note_read_by((kind, member_identity(id)), key);
+    } else {
+        note_read(key);
+    }
+}
+
 /// Records a read of the current owner of the member `id`.
 pub fn note_member_home_read(id: LuaMemberId) {
-    note_read_by((u8::MAX - 1, member_identity(&id)), || {
-        FactKey::MemberHome(id)
-    });
+    note_member_read(u8::MAX - 1, &id, || FactKey::MemberHome(id));
 }
 
 /// Records a read of the path provenance, flags and function scope of the
 /// member `id`.
 pub fn note_member_marks_read(id: LuaMemberId) {
-    note_read_by((u8::MAX - 22, member_identity(&id)), || {
-        FactKey::MemberMarks(id)
-    });
+    note_member_read(u8::MAX - 22, &id, || FactKey::MemberMarks(id));
 }
 
 /// Records a read of the member object `id` alone: its key, feature and
 /// global id.
 pub fn note_member_object_read(id: LuaMemberId) {
-    note_read_by((u8::MAX - 20, member_identity(&id)), || {
-        FactKey::MemberObject(id)
-    });
+    note_member_read(u8::MAX - 20, &id, || FactKey::MemberObject(id));
 }
 
 /// Records a read of the declaration object `id`.
@@ -2700,9 +2705,9 @@ pub fn note_type_cache_read(owner: &LuaTypeOwner) {
             (u8::MAX - 5, file_position(id.file_id, id.position)),
             || FactKey::TypeCache(owner.clone()),
         ),
-        LuaTypeOwner::Member(id) => note_read_by((u8::MAX - 6, member_identity(id)), || {
-            FactKey::TypeCache(owner.clone())
-        }),
+        LuaTypeOwner::Member(id) => {
+            note_member_read(u8::MAX - 6, id, || FactKey::TypeCache(owner.clone()))
+        }
         LuaTypeOwner::SyntaxId(id) => {
             let range = id.value.get_range();
             let identity = u128::from(id.file_id.id) << 80
@@ -2913,6 +2918,37 @@ mod noting_tests {
             ),
             (1, 2)
         );
+    }
+}
+
+#[cfg(test)]
+mod member_read_tests {
+    use super::*;
+
+    /// The members one node makes in different slots are read as different facts.
+    #[test]
+    fn reads_of_members_one_node_makes_are_recorded_for_each_slot() {
+        let file = FileId::new(1);
+        let call = glua_parser::LuaSyntaxId::new(
+            glua_parser::LuaSyntaxKind::CallExpr.into(),
+            rowan::TextRange::new(0.into(), 6.into()),
+        );
+        let owners =
+            [0, 1, 2].map(|slot| LuaTypeOwner::Member(LuaMemberId::new_in_slot(call, file, slot)));
+        let _recording = begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        for owner in &owners {
+            note_type_cache_read(owner);
+            note_type_cache_read(owner);
+        }
+        let (_, reads, _) = end().into_unfingerprinted_parts();
+        let mut read_keys = reads.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+        let mut expected = owners
+            .iter()
+            .map(|owner| HashedKey::new(FactKey::TypeCache(owner.clone())))
+            .collect::<Vec<_>>();
+        read_keys.sort_by_key(|key| format!("{key:?}"));
+        expected.sort_by_key(|key| format!("{key:?}"));
+        assert_eq!(read_keys, expected);
     }
 }
 

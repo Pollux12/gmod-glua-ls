@@ -1690,3 +1690,64 @@ fn a_member_keyed_by_another_files_tables_follows_that_file_shifting() {
 
     expect_that!(member_keys(&warm, user), eq(&member_keys(&cold, cold_user)));
 }
+
+/// The accessors one generator call makes share the call's syntax in different
+/// slots; a shift carries each to its own slot at the moved call.
+#[gtest]
+fn a_shift_keeps_the_slot_of_each_member_a_call_makes() {
+    let generator = r#"---@meta
+---@class Player
+---@generic T : table
+---@param metaName `T`
+---@return (definition) T
+function FindMetaTable(metaName) end
+function G(name)
+    local player = FindMetaTable("Player")
+    player["Get" .. name] = function() end
+    player["Set" .. name] = function() end
+    player["Is" .. name] = function() end
+    player["Has" .. name] = function() end
+end
+G("X")
+"#;
+    let shifted = format!("\n\n{generator}");
+    let mut ws = workspace();
+    let uri = ws
+        .virtual_url_generator
+        .new_uri("lua/autorun/sh_generate.lua");
+    let file_id = write(&mut ws, &uri, generator);
+    let slotted = |db: &DbIndex| {
+        let mut ids = db
+            .get_member_index()
+            .get_file_members(file_id)
+            .into_iter()
+            .map(|member| member.get_id())
+            .filter(|id| id.get_slot() > 0)
+            .collect::<Vec<_>>();
+        ids.sort_by_key(|id| id.get_slot());
+        ids
+    };
+    let before = slotted(ws.analysis.compilation.get_db());
+    assert_eq!(before.len(), 2);
+
+    ws.analysis.update_file_text_only(&uri, shifted.clone());
+    ws.analysis.compilation.remove_index(vec![file_id]);
+    ws.analysis.compilation.update_index(vec![file_id]);
+    let after = slotted(ws.analysis.compilation.get_db());
+    let remap = FileRemap::validated(
+        ws.analysis.compilation.get_db(),
+        file_id,
+        PositionMap::new(generator, &shifted),
+    );
+    let moved = before
+        .into_iter()
+        .map(|id| remap.member_id(id))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        moved,
+        after
+            .into_iter()
+            .map(super::Remap::Moved)
+            .collect::<Vec<_>>()
+    );
+}

@@ -97,6 +97,22 @@ pub fn is_presence_tested(
             .is_some_and(|stat| is_condition_of(stat.get_condition_expr()))
 }
 
+/// Whether `expr` is a `nil` or `false` literal, possibly parenthesized: a value
+/// `x or default` replaces with its default.
+pub fn is_falsy_literal_expr(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal() {
+            Some(LuaLiteralToken::Nil(_)) => true,
+            Some(LuaLiteralToken::Bool(value)) => !value.is_true(),
+            _ => false,
+        },
+        LuaExpr::ParenExpr(paren_expr) => paren_expr
+            .get_expr()
+            .is_some_and(|expr| is_falsy_literal_expr(&expr)),
+        _ => false,
+    }
+}
+
 /// Whether `expr` in tail position can expand to fill extra assignment slots:
 /// a call returns all its values, and `...` spreads.
 pub fn expr_expands_to_fill_slots(expr: &LuaExpr) -> bool {

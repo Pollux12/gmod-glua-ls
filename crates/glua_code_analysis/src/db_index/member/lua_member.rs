@@ -92,11 +92,22 @@ impl LuaMember {
 pub struct LuaMemberId {
     pub file_id: FileId,
     id: LuaSyntaxId,
+    /// Tells apart the members one node makes, such as the accessors of one generator
+    /// call; 0 for the member a node declares.
+    slot: u32,
 }
 
 impl LuaMemberId {
     pub fn new(id: LuaSyntaxId, file_id: FileId) -> Self {
-        Self { id, file_id }
+        Self::new_in_slot(id, file_id, 0)
+    }
+
+    pub fn new_in_slot(id: LuaSyntaxId, file_id: FileId, slot: u32) -> Self {
+        Self { id, file_id, slot }
+    }
+
+    pub fn get_slot(&self) -> u32 {
+        self.slot
     }
 
     pub fn get_syntax_id(&self) -> &LuaSyntaxId {

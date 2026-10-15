@@ -1284,6 +1284,457 @@ end
         );
     }
 
+    /// Generators that make accessors on a metatable a local holds, under prefixes a
+    /// local holds, synthesize them at the calls of a function that passes its name on.
+    #[gtest]
+    fn test_split_accessor_generators_synthesize_members_on_a_named_metatable() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/annotations/meta.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@class Player : Entity
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return (definition) T
+            function FindMetaTable(metaName) end
+            "#,
+        );
+        let generators_path = "gamemodes/cityrp/gamemode/core/metatables/sh_player.lua";
+        let generators = r#"
+            function PlayerNSReader(name, key, iForce, default, prefix)
+                local pMeta = FindMetaTable("Player")
+                if iForce == FORCE_BOOL then
+                    local fn = (prefix or "Is") .. name
+                    pMeta[fn] = function(self) return self:GetNetVar(key, default) end
+                    return
+                end
+                local fn = (prefix or "Get") .. name
+                pMeta[fn] = function(self, def) return self:GetNetVar(key, def) end
+            end
+
+            function PlayerNSWriter(name, key)
+                local pMeta = FindMetaTable("Player")
+                local fn = "Set" .. name
+                pMeta[fn] = function(self, value) self:SetNetVar(key, value) end
+            end
+
+            function PlayerNSAccessor(name, key, iForce, default, readPrefix)
+                PlayerNSReader(name, key, iForce, default, readPrefix)
+                PlayerNSWriter(name, key)
+            end
+        "#;
+        ws.def_file(generators_path, generators);
+        ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sh_accessors.lua",
+            r#"
+            PlayerNSAccessor("Pass", "pass")
+            PlayerNSAccessor("AdminHelp", "AdminHelp", FORCE_BOOL, false, "Has")
+            "#,
+        );
+
+        let member_names = |ws: &mut VirtualWorkspace| {
+            let mut names: Vec<String> = ws
+                .get_db_mut()
+                .get_member_index()
+                .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global("Player")))
+                .map(|members| {
+                    members
+                        .iter()
+                        .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            member_names(&mut ws),
+            [
+                "GetPass",
+                "HasAdminHelp",
+                "IsPass",
+                "SetAdminHelp",
+                "SetPass"
+            ]
+        );
+        assert!(ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "gamemodes/cityrp/gamemode/core/sh_pass.lua",
+            "---@param ent Entity\nlocal function Pass(ent) return ent:GetPass() end\nprint(Pass)\n",
+        ));
+
+        let uri = ws.virtual_url_generator.new_uri(generators_path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert!(member_names(&mut ws).is_empty());
+        ws.def_file(generators_path, generators);
+        assert_eq!(
+            member_names(&mut ws),
+            [
+                "GetPass",
+                "HasAdminHelp",
+                "IsPass",
+                "SetAdminHelp",
+                "SetPass"
+            ]
+        );
+    }
+
+    /// A generator that makes accessors itself and forwards its name makes both sets,
+    /// through wrappers defined before what they wrap; `false` picks a prefix's default;
+    /// a metatable from a local function of the same name names no class.
+    #[gtest]
+    fn test_accessor_generators_merge_forwarded_templates_in_any_order() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/annotations/meta.lua",
+            r#"
+            ---@meta
+            ---@class Player
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return (definition) T
+            function FindMetaTable(metaName) end
+            ---@generic T
+            ---@param className `T`
+            ---@return table
+            function NewTable(className) end
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sh_generators.lua",
+            r#"
+            function Wrap(name) Mixed(name) end
+
+            function Mixed(name)
+                local meta = FindMetaTable("Player")
+                meta["Get" .. name] = function() end
+                Writer(name)
+            end
+
+            function Writer(name)
+                local meta = FindMetaTable("Player")
+                meta["Set" .. name] = function() end
+            end
+
+            function Reader(name, prefix)
+                local meta = FindMetaTable("Player")
+                meta[(prefix or "Is") .. name] = function() end
+            end
+
+            local function LocalWriter(name)
+                local meta = FindMetaTable("Player")
+                meta["Set" .. name] = function() end
+            end
+            function LocalWrap(name) LocalWriter(name) end
+
+            function ShadowedWrap(name, Writer) Writer(name) end
+
+            function Swapped(t, a, b)
+                t["Get" .. a] = function() end
+                SwappedBack(t, b, a)
+            end
+            function SwappedBack(t, a, b) Swapped(t, a, b) end
+
+            function CycleA(t, n) CycleB(t, n) MakeGet(t, n) end
+            function CycleB(t, n) CycleC(t, n) MakeSet(t, n) end
+            function CycleC(t, n) CycleA(t, n) MakeIs(t, n) end
+            function MakeGet(t, n) t["Get" .. n] = function() end end
+            function MakeSet(t, n) t["Set" .. n] = function() end end
+            function MakeIs(t, n) t["Is" .. n] = function() end end
+
+            function LoopA(t, n) LoopB(t, n) LoopD(t, n, n) end
+            function LoopB(t, n) LoopC(t, n) end
+            function LoopC(t, n) LoopA(t, n) end
+            function LoopD(t, a, b) t["Get" .. a] = function() end LoopE(t, b) end
+            function LoopE(t, n) t["Set" .. n] = function() end end
+
+            function OrderA(t, a, b) t["Is" .. a] = function() end OrderD(t, b, a) end
+            function OrderD(t, a, b) t["Get" .. a] = function() end OrderE(t, b) end
+            function OrderE(t, n) t["Set" .. n] = function() end end
+            function ReverseE(t, n) t["Set" .. n] = function() end end
+            function ReverseD(t, a, b) t["Get" .. a] = function() end ReverseE(t, b) end
+            function ReverseA(t, a, b) t["Is" .. a] = function() end ReverseD(t, b, a) end
+
+            function Reprefix(name, prefix)
+                local meta = FindMetaTable("Player")
+                prefix = "Is"
+                meta[(prefix or "Get") .. name] = function() end
+            end
+
+            function PlainTable(name)
+                local meta = NewTable("Player")
+                meta["Get" .. name] = function() end
+            end
+
+            function LoopName(name)
+                local meta = FindMetaTable("Player")
+                for name in pairs({ Actual = true }) do
+                    meta["Get" .. name] = function() end
+                end
+            end
+
+            local function LocalSetter(name)
+                local meta = FindMetaTable("Player")
+                meta["Set" .. name] = function() end
+            end
+            LocalSetter = function() end
+            function ReassignedWrap(name) LocalSetter(name) end
+
+            function GlobalWriter(name)
+                local meta = FindMetaTable("Player")
+                meta["Set" .. name] = function() end
+            end
+            GlobalWriter = function() end
+            function GlobalWrap(name) GlobalWriter(name) end
+
+            function Player:Remake(name)
+                self = {}
+                self["Is" .. name] = function() end
+            end
+
+            local function DirectSetter(name)
+                local meta = FindMetaTable("Player")
+                meta["Set" .. name] = function() end
+            end
+            DirectSetter("Direct")
+            do
+                local Wrap = function() end
+                Wrap("SameFileShadow")
+            end
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sh_shadowed.lua",
+            r#"
+            local FindMetaTable = function() return {} end
+            function LocalReader(name)
+                local meta = FindMetaTable("Player")
+                meta["Get" .. name] = function() end
+            end
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sh_accessors.lua",
+            r#"
+            Wrap("Pass")
+            Reader("Hidden", false)
+            LocalReader("Shadow")
+            LocalWrap("Local")
+            ShadowedWrap("Ghost", function() end)
+            Reprefix("Changed")
+            PlainTable("Fake")
+            LoopName("Loop")
+            ReassignedWrap("Again")
+            do
+                local Wrap = function() end
+                Wrap("Shadowed")
+            end
+            "#,
+        );
+
+        let accessors = ws.get_db_mut().get_accessor_func_index();
+        for name in [
+            "Swapped",
+            "SwappedBack",
+            "ShadowedWrap",
+            "LoopD",
+            "OrderA",
+            "OrderD",
+            "ReverseA",
+            "ReverseD",
+            "Reprefix",
+            "LoopName",
+            "ReassignedWrap",
+            "GlobalWrap",
+            "Remake",
+        ] {
+            assert!(!accessors.contains_name(name), "{name}");
+        }
+        let accessor_count = |name: &str| {
+            accessors
+                .get_annotations(name)
+                .and_then(|annotations| annotations.first())
+                .map(|annotation| annotation.accessors.len())
+        };
+        for (name, count) in [
+            ("CycleA", 3),
+            ("CycleB", 3),
+            ("CycleC", 3),
+            ("LoopA", 2),
+            ("LoopB", 2),
+            ("LoopC", 2),
+            ("OrderE", 1),
+            ("ReverseE", 1),
+        ] {
+            assert_eq!(accessor_count(name), Some(count), "{name}");
+        }
+        let mut names: Vec<String> = ws
+            .get_db_mut()
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global("Player")))
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        assert_eq!(
+            names,
+            ["GetPass", "IsHidden", "SetDirect", "SetLocal", "SetPass"]
+        );
+    }
+
+    /// The accessors of a generator call keep their identities when an edit moves the
+    /// call, so a shift settles as a cold analysis of the moved text does.
+    #[gtest]
+    fn test_accessor_generator_members_survive_a_shift() {
+        let setup = |ws: &mut VirtualWorkspace| {
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+        };
+        let generator = r#"
+            function G(name)
+                local player = FindMetaTable("Player")
+                player["Get" .. name] = function() return 1 end
+                player["Set" .. name] = function() end
+                player["Is" .. name] = function() return true end
+                player["Has" .. name] = function() return "" end
+            end
+            G("X")
+            "#;
+        let shifted = format!("\n\n{generator}");
+        VirtualWorkspace::assert_warm_matches_cold(
+            setup,
+            &[
+                (
+                    "lua/annotations/meta.lua",
+                    "---@meta\n---@class Player\n---@generic T : table\n---@param metaName `T`\n---@return (definition) T\nfunction FindMetaTable(metaName) end\n",
+                ),
+                ("lua/autorun/sh_generate.lua", generator),
+                (
+                    "lua/autorun/sh_use.lua",
+                    "---@param ply Player\nfunction UseX(ply) return ply:GetX(), ply:IsX(), ply:HasX() end\n",
+                ),
+            ],
+            &[("lua/autorun/sh_generate.lua", &shifted)],
+        );
+    }
+
+    /// An inferred generator's accessors take whatever its functions do, whichever
+    /// prefix a call gives them.
+    #[gtest]
+    fn test_inferred_accessors_accept_the_arguments_their_functions_take() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/annotations/meta.lua",
+            "---@meta\n---@class Player\n---@generic T : table\n---@param metaName `T`\n---@return (definition) T\nfunction FindMetaTable(metaName) end\n",
+        );
+        ws.def_file(
+            "lua/autorun/sh_accessors.lua",
+            r#"
+            function Writer(name, prefix)
+                local meta = FindMetaTable("Player")
+                meta[(prefix or "Set") .. name] = function(self, value) end
+            end
+            function Reader(name)
+                local meta = FindMetaTable("Player")
+                meta["Get" .. name] = function(self, default) return default end
+            end
+            Writer("Health", "Write")
+            Reader("Pass")
+            "#,
+        );
+        assert!(ws.check_file_for(
+            DiagnosticCode::RedundantParameter,
+            "lua/autorun/sh_use.lua",
+            "---@param ply Player\nfunction UseAccessors(ply) ply:WriteHealth(100) return ply:GetPass(\"none\") end\n",
+        ));
+    }
+
+    /// Each call makes every member its generator does, more than the call has
+    /// nodes, and a call nested in another's arguments keeps its own.
+    #[gtest]
+    fn test_accessor_generator_calls_make_every_member_nested_or_not() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/annotations/meta.lua",
+            r#"
+            ---@meta
+            ---@class Player
+            ---@class Weapon
+            ---@class NPC
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return (definition) T
+            function FindMetaTable(metaName) end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_generate.lua",
+            r#"
+            function G(name)
+                local player = FindMetaTable("Player")
+                local weapon = FindMetaTable("Weapon")
+                local npc = FindMetaTable("NPC")
+                player["Get" .. name] = function() end
+                player["Set" .. name] = function() end
+                player["Is" .. name] = function() end
+                player["Has" .. name] = function() end
+                weapon["Get" .. name] = function() end
+                weapon["Set" .. name] = function() end
+                weapon["Is" .. name] = function() end
+                weapon["Has" .. name] = function() end
+                npc["Get" .. name] = function() end
+                npc["Set" .. name] = function() end
+                npc["Is" .. name] = function() end
+                npc["Has" .. name] = function() end
+            end
+            G("X")
+            G("Outer", G("Inner"))
+            "#,
+        );
+
+        for class in ["Player", "Weapon", "NPC"] {
+            let mut names: Vec<String> = ws
+                .get_db_mut()
+                .get_member_index()
+                .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global(class)))
+                .map(|members| {
+                    members
+                        .iter()
+                        .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            assert_eq!(
+                names,
+                [
+                    "GetInner", "GetOuter", "GetX", "HasInner", "HasOuter", "HasX", "IsInner",
+                    "IsOuter", "IsX", "SetInner", "SetOuter", "SetX"
+                ],
+                "{class}"
+            );
+        }
+    }
+
     #[gtest]
     fn test_accessor_func_force_type_resolves_correctly() {
         let mut ws = VirtualWorkspace::new();

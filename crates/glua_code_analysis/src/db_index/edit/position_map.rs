@@ -619,7 +619,7 @@ impl<T> Remap<T> {
 pub struct FileFacts {
     signature_positions: FxHashSet<TextSize>,
     decl_positions: FxHashSet<TextSize>,
-    member_ids: FxHashSet<LuaSyntaxId>,
+    member_ids: FxHashSet<LuaMemberId>,
     syntax_ids: FxHashSet<LuaSyntaxId>,
     /// The ranges an identity keyed on an expression can still name: every
     /// expression in the new tree, and every range the re-indexed file
@@ -650,7 +650,7 @@ impl FileFacts {
             .get_member_index()
             .get_file_members(file_id)
             .into_iter()
-            .map(|member| *member.get_id().get_syntax_id())
+            .map(|member| member.get_id())
             .collect();
         let mut owner_ranges = db
             .get_member_index()
@@ -933,9 +933,10 @@ impl FileRemap {
 
     pub fn member_id(&self, id: LuaMemberId) -> Remap<LuaMemberId> {
         let mapped = match self.range(id.file_id, id.get_syntax_id().get_range()) {
-            Remap::Moved(range) => Remap::Moved(LuaMemberId::new(
+            Remap::Moved(range) => Remap::Moved(LuaMemberId::new_in_slot(
                 with_range(*id.get_syntax_id(), range),
                 id.file_id,
+                id.get_slot(),
             )),
             Remap::Unrelated => Remap::Unrelated,
             Remap::Lost => Remap::Lost,
@@ -945,8 +946,8 @@ impl FileRemap {
             self.range_is_before_the_hunk(id.get_syntax_id().get_range()),
             self.facts
                 .as_ref()
-                .is_some_and(|facts| facts.member_ids.contains(id.get_syntax_id())),
-            |facts, id| facts.member_ids.contains(id.get_syntax_id()),
+                .is_some_and(|facts| facts.member_ids.contains(&id)),
+            |facts, id| facts.member_ids.contains(id),
         )
     }
 

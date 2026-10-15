@@ -3248,13 +3248,14 @@ fn expr_key_files(key: &LuaMemberKey, member_id: LuaMemberId) -> Vec<FileId> {
         .collect()
 }
 
-pub(crate) fn member_id_sort_key(member_id: LuaMemberId) -> (u32, u32, u32, u16) {
+pub(crate) fn member_id_sort_key(member_id: LuaMemberId) -> (u32, u32, u32, u16, u32) {
     let syntax_id = member_id.get_syntax_id();
     (
         member_id.file_id.id,
         u32::from(member_id.get_position()),
         u32::from(syntax_id.get_range().end()),
         syntax_id.get_kind() as u16,
+        member_id.get_slot(),
     )
 }
 

@@ -7,11 +7,13 @@ use glua_parser::{
 };
 use rowan::TextSize;
 
+use smol_str::SmolStr;
+
 use crate::{
-    AccessorFuncCallMetadata, DbIndex, FileId, GlobalId, GmodClassCallArg, GmodClassCallLiteral,
-    GmodScriptedClassCallKind, GmodScriptedClassCallMetadata, InFiled, InferFailReason,
-    LuaMemberKey, LuaMemberOwner, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId, LuaType,
-    LuaTypeDeclId,
+    AccessorFuncCallMetadata, AccessorMember, AccessorOwner, AccessorPrefix, AccessorSignature,
+    DbIndex, FileId, GlobalId, GmodClassCallArg, GmodClassCallLiteral, GmodScriptedClassCallKind,
+    GmodScriptedClassCallMetadata, InFiled, InferFailReason, LuaMemberKey, LuaMemberOwner,
+    LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId, LuaType, LuaTypeDeclId,
     compilation::analyzer::{lua::LuaAnalyzer, unresolve::UnResolveSpecialCall},
     get_member_value_expr,
     semantic::find_members_with_key,
@@ -1223,20 +1225,17 @@ fn collect_accessorfunc_annotated_call(
 ) -> Option<()> {
     let prefix_expr = call_expr.get_prefix_expr()?;
 
-    // Extract function name: handle both `obj.Method(...)` (IndexExpr) and `FuncName(...)` (NameExpr)
-    let (func_name, owner_arg_index) = match &prefix_expr {
+    // `obj.Method(...)` takes its receiver from the prefix, `FuncName(...)` from its first argument.
+    let (func_name, receiver_is_first_arg) = match &prefix_expr {
         LuaExpr::IndexExpr(index_expr) => {
             let name = match index_expr.get_index_key()? {
                 LuaIndexKey::Name(name_token) => name_token.get_name_text().to_string(),
                 LuaIndexKey::String(string_token) => string_token.get_value().to_string(),
                 _ => return None,
             };
-            (name, None) // owner comes from prefix
+            (name, false)
         }
-        LuaExpr::NameExpr(name_expr) => {
-            let name = name_expr.get_name_text()?.to_string();
-            (name, Some(0usize)) // owner is the first argument
-        }
+        LuaExpr::NameExpr(name_expr) => (name_expr.get_name_text()?.to_string(), true),
         _ => return None,
     };
 
@@ -1248,49 +1247,201 @@ fn collect_accessorfunc_annotated_call(
         return None;
     }
 
-    let name_param_index = analyzer
+    // A name a local binds reaches only the generator that local holds.
+    let local_callee = match &prefix_expr {
+        LuaExpr::NameExpr(name_expr) => {
+            local_callee_signature(analyzer.db, analyzer.file_id, name_expr)
+        }
+        _ => None,
+    };
+    let annotation = analyzer
         .db
         .get_accessor_func_index()
-        .get_annotations(&func_name)
-        .and_then(|annotations| {
-            annotations
-                .first()
-                .map(|annotation| annotation.name_param_index)
+        .get_annotations(&func_name)?
+        .iter()
+        .find(|annotation| match local_callee {
+            None => true,
+            Some(signature_id) => signature_id.is_some() && annotation.signature_id == signature_id,
         })
-        .unwrap_or(0);
+        .cloned()?;
 
     let args_list = call_expr.get_args_list()?;
     let args = args_list.get_args().collect::<Vec<_>>();
-    let name_arg = args.get(name_param_index)?;
+    let name_arg = args.get(annotation.name_param_index)?;
     let accessor_name = extract_string_literal(name_arg)?;
     if accessor_name.is_empty() {
         return None;
     }
 
-    let call_syntax_id = call_expr.get_syntax_id();
-    let name_arg_syntax_id = Some(name_arg.get_syntax_id());
+    let mut receiver_type_id = None;
+    let mut made: Vec<(LuaTypeDeclId, SmolStr, bool)> = Vec::new();
+    for template in &annotation.accessors {
+        let owner_type_id = match &template.owner {
+            AccessorOwner::Receiver => receiver_type_id
+                .get_or_insert_with(|| {
+                    let receiver = if receiver_is_first_arg {
+                        args.first().cloned()
+                    } else {
+                        match &prefix_expr {
+                            LuaExpr::IndexExpr(index_expr) => index_expr.get_prefix_expr(),
+                            _ => None,
+                        }
+                    };
+                    receiver.and_then(|receiver| find_owner_type_for_prefix(analyzer, &receiver))
+                })
+                .clone(),
+            AccessorOwner::NamedClass { callee, class_name } => {
+                named_class_type_id(analyzer.db, analyzer.file_id, callee, class_name)
+            }
+        };
+        let Some(owner_type_id) = owner_type_id else {
+            continue;
+        };
+        let prefix: SmolStr = match &template.prefix {
+            AccessorPrefix::Literal(prefix) => prefix.clone(),
+            AccessorPrefix::ParamOr(index, default) => match args.get(*index) {
+                Some(arg) if !crate::compilation::analyzer::is_falsy_literal_expr(arg) => {
+                    let Some(prefix) = extract_string_literal(arg) else {
+                        continue;
+                    };
+                    prefix.into()
+                }
+                _ => default.clone(),
+            },
+        };
+        let name = SmolStr::from(format!("{prefix}{accessor_name}"));
+        if !made
+            .iter()
+            .any(|(owner, made_name, _)| *owner == owner_type_id && *made_name == name)
+        {
+            made.push((owner_type_id, name, prefix == "Set"));
+        }
+    }
 
-    // Find owner type: from first argument (global call) or from prefix expression (method call)
-    let owner_type_id = if let Some(arg_idx) = owner_arg_index {
-        let owner_arg = args.get(arg_idx)?;
-        find_owner_type_for_prefix(analyzer, owner_arg)?
-    } else if let LuaExpr::IndexExpr(index_expr) = &prefix_expr {
-        find_owner_type_for_prefix(analyzer, &index_expr.get_prefix_expr()?)?
-    } else {
+    // The first getter is declared at the name argument and the first setter at the
+    // call; every further member at the call, each in a slot of its own.
+    made.sort_by_key(|(_, _, is_setter)| *is_setter);
+    let mut getter_at_name = true;
+    let mut setter_at_call = true;
+    let mut next_slot = 1;
+    let members = made
+        .into_iter()
+        .map(|(owner_type_id, name, is_setter)| {
+            let (syntax_id, slot) = if !is_setter && std::mem::take(&mut getter_at_name) {
+                (name_arg.get_syntax_id(), 0)
+            } else if is_setter && std::mem::take(&mut setter_at_call) {
+                (call_expr.get_syntax_id(), 0)
+            } else {
+                next_slot += 1;
+                (call_expr.get_syntax_id(), next_slot - 1)
+            };
+            AccessorMember {
+                owner_type_id,
+                name,
+                signature: match (annotation.inferred, is_setter) {
+                    (true, _) => AccessorSignature::Any,
+                    (false, true) => AccessorSignature::Setter,
+                    (false, false) => AccessorSignature::Getter,
+                },
+                syntax_id,
+                slot,
+            }
+        })
+        .collect::<Vec<_>>();
+    if members.is_empty() {
         return None;
-    };
+    }
 
     analyzer.write(StatementWrite::AddAccessorFuncCall {
         file_id: analyzer.file_id,
         metadata: AccessorFuncCallMetadata {
-            syntax_id: call_syntax_id,
-            owner_type_id,
-            accessor_name,
-            name_arg_syntax_id,
+            syntax_id: call_expr.get_syntax_id(),
+            members,
         },
     });
 
     Some(())
+}
+
+/// The class a call to the global `callee` names by the literal `class_name`, when
+/// `callee` takes its first parameter as a class-name template and returns that class,
+/// as `FindMetaTable` does.
+fn named_class_type_id(
+    db: &DbIndex,
+    file_id: FileId,
+    callee: &str,
+    class_name: &str,
+) -> Option<LuaTypeDeclId> {
+    let names_class = db
+        .get_global_index()
+        .get_global_decl_ids(callee)?
+        .iter()
+        .any(|decl_id| {
+            let Some(LuaType::Signature(signature_id)) = db
+                .get_type_index()
+                .get_type_cache(&(*decl_id).into())
+                .map(|cache| cache.as_type().clone())
+            else {
+                return false;
+            };
+            let Some(signature) = db.get_signature_index().get(&signature_id) else {
+                return false;
+            };
+            let Some(LuaType::StrTplRef(class_template)) = signature
+                .get_param_info_by_id(0)
+                .map(|param| &param.type_ref)
+            else {
+                return false;
+            };
+            class_template.get_prefix().is_empty()
+                && class_template.get_suffix().is_empty()
+                && matches!(
+                    signature.get_return_type(),
+                    LuaType::TplRef(returned) | LuaType::ConstTplRef(returned)
+                        if returned.get_tpl_id() == class_template.get_tpl_id()
+                )
+        });
+    if !names_class {
+        return None;
+    }
+    let type_decl = db.get_type_index().find_type_decl(file_id, class_name)?;
+    type_decl.is_class().then(|| type_decl.get_id())
+}
+
+/// The function a local that `name_expr` reads was declared with and still holds;
+/// `Some(None)` for a local holding something else or reassigned, and `None` for a
+/// global name.
+fn local_callee_signature(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+) -> Option<Option<LuaSignatureId>> {
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, name_expr.get_range())?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    if decl.is_global() {
+        return None;
+    }
+    if db
+        .get_reference_index()
+        .get_decl_references(&file_id, &decl_id)
+        .is_some_and(|references| references.mutable)
+    {
+        return Some(None);
+    }
+    let signature_id = match db
+        .get_type_index()
+        .get_type_cache(&decl_id.into())
+        .map(|cache| cache.as_type())
+    {
+        Some(LuaType::Signature(signature_id)) => Some(*signature_id),
+        _ => decl
+            .get_value_syntax_id()
+            .filter(|value| value.get_kind() == glua_parser::LuaSyntaxKind::ClosureExpr)
+            .map(|value| LuaSignatureId::new(file_id, value.get_range().start())),
+    };
+    Some(signature_id)
 }
 
 fn extract_string_literal(expr: &LuaExpr) -> Option<String> {

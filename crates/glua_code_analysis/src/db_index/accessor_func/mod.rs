@@ -6,7 +6,7 @@ use smol_str::SmolStr;
 
 use super::traits::LuaIndex;
 use crate::{
-    FileId, LuaTypeDeclId,
+    FileId, LuaSignatureId, LuaTypeDeclId,
     db_index::derivation::{self, FactKey, Fingerprint},
 };
 
@@ -14,6 +14,52 @@ use crate::{
 pub struct AccessorFuncAnnotation {
     pub name_param_index: usize,
     pub file_id: FileId,
+    pub accessors: Vec<AccessorTemplate>,
+    /// The function the generator is, which a local name reaching it holds.
+    pub signature_id: Option<LuaSignatureId>,
+    /// Read off the function's body rather than declared by `@accessorfunc`, so the
+    /// shape of the accessors it makes is not known.
+    pub inferred: bool,
+}
+
+/// Whose method an accessor generator makes.
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AccessorOwner {
+    /// The table a call passes first, or the one it is called on.
+    Receiver,
+    /// The class a call to the global `callee` names by its first argument, `class_name`.
+    NamedClass {
+        callee: SmolStr,
+        class_name: SmolStr,
+    },
+}
+
+/// What an accessor generator puts before the name it is given.
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AccessorPrefix {
+    Literal(SmolStr),
+    /// The string a call passes at this parameter, or the default when it passes none.
+    ParamOr(usize, SmolStr),
+}
+
+/// One method an accessor generator makes for each name it is given.
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AccessorTemplate {
+    pub owner: AccessorOwner,
+    pub prefix: AccessorPrefix,
+}
+
+impl AccessorTemplate {
+    /// The `Get`/`Set` pair `@accessorfunc` makes on its receiver.
+    pub fn receiver_get_set_pair() -> Vec<Self> {
+        ["Get", "Set"]
+            .into_iter()
+            .map(|prefix| Self {
+                owner: AccessorOwner::Receiver,
+                prefix: AccessorPrefix::Literal(prefix.into()),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -126,9 +172,29 @@ impl LuaIndex for AccessorFuncAnnotationIndex {
 #[derive(Debug, Clone, Hash, PartialEq)]
 pub struct AccessorFuncCallMetadata {
     pub syntax_id: LuaSyntaxId,
+    pub members: Vec<AccessorMember>,
+}
+
+/// A method an accessor generator call makes, declared at `syntax_id` of the call in
+/// `slot`, which tells apart the members one node declares.
+#[derive(Debug, Clone, Hash, PartialEq)]
+pub struct AccessorMember {
     pub owner_type_id: LuaTypeDeclId,
-    pub accessor_name: String,
-    pub name_arg_syntax_id: Option<LuaSyntaxId>,
+    pub name: SmolStr,
+    pub signature: AccessorSignature,
+    pub syntax_id: LuaSyntaxId,
+    pub slot: u32,
+}
+
+/// The callable shape of a synthesized accessor.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum AccessorSignature {
+    /// `@accessorfunc`'s getter: no arguments, any value.
+    Getter,
+    /// `@accessorfunc`'s setter: one value.
+    Setter,
+    /// An inferred generator's function, whose branches may take any arguments.
+    Any,
 }
 
 #[derive(Debug, Default, Clone)]
