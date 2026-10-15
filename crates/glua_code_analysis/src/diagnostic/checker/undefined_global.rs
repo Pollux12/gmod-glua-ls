@@ -8,7 +8,9 @@ use rowan::{TextRange, TextSize};
 
 use crate::{
     DiagnosticCode, GlobalId, LuaDeclId, LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType,
-    SemanticModel, compilation::analyzer::is_nil_literal_expr, semantic::unwrap_paren_to_name_expr,
+    SemanticModel,
+    compilation::analyzer::{is_nil_literal_expr, is_presence_tested},
+    semantic::unwrap_paren_to_name_expr,
 };
 
 use super::{Checker, DiagnosticContext, FileNodeBuckets};
@@ -905,61 +907,14 @@ fn calc_presence_tested_global_names(
         .name_exprs
         .iter()
         .filter(|name_expr| !local_ranges.contains(&name_expr.get_range()))
-        .filter(|name_expr| is_presence_tested(semantic_model, name_expr.syntax()))
+        .filter(|name_expr| {
+            is_presence_tested(name_expr.syntax(), &mut |call: &LuaCallExpr| {
+                call.get_prefix_expr()
+                    .is_some_and(|prefix| call_prefix_returns_type_guard(semantic_model, &prefix))
+            })
+        })
         .filter_map(|name_expr| name_expr.get_name_text().map(|name| name.to_string()))
         .collect()
-}
-
-/// Whether `node`'s value is only tested for presence; the left of an untested `or` is a fallback.
-fn is_presence_tested(semantic_model: &SemanticModel, node: &glua_parser::LuaSyntaxNode) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    if let Some(LuaExpr::ParenExpr(paren)) = LuaExpr::cast(parent.clone()) {
-        return is_presence_tested(semantic_model, paren.syntax());
-    }
-    if let Some(LuaExpr::UnaryExpr(unary)) = LuaExpr::cast(parent.clone()) {
-        return unary
-            .get_op_token()
-            .is_some_and(|op| op.get_op() == UnaryOperator::OpNot);
-    }
-    if let Some(LuaExpr::BinaryExpr(binary)) = LuaExpr::cast(parent.clone()) {
-        let (Some(op), Some((left, right))) = (
-            binary.get_op_token().map(|op| op.get_op()),
-            binary.get_exprs(),
-        ) else {
-            return false;
-        };
-        let is_left = left.syntax() == node;
-        return match op {
-            BinaryOperator::OpAnd => is_left || is_presence_tested(semantic_model, binary.syntax()),
-            BinaryOperator::OpOr => is_presence_tested(semantic_model, binary.syntax()),
-            BinaryOperator::OpEq | BinaryOperator::OpNe => {
-                is_nil_literal_expr(if is_left { &right } else { &left })
-            }
-            _ => false,
-        };
-    }
-    if let Some(args) = glua_parser::LuaCallArgList::cast(parent.clone()) {
-        let is_first_arg = args
-            .get_args()
-            .next()
-            .is_some_and(|arg| arg.syntax() == node);
-        return is_first_arg
-            && args
-                .get_parent::<LuaCallExpr>()
-                .and_then(|call| call.get_prefix_expr())
-                .is_some_and(|prefix| call_prefix_returns_type_guard(semantic_model, &prefix));
-    }
-    let is_condition_of =
-        |condition: Option<LuaExpr>| condition.is_some_and(|condition| condition.syntax() == node);
-    LuaIfStat::cast(parent.clone()).is_some_and(|stat| is_condition_of(stat.get_condition_expr()))
-        || glua_parser::LuaElseIfClauseStat::cast(parent.clone())
-            .is_some_and(|clause| is_condition_of(clause.get_condition_expr()))
-        || glua_parser::LuaWhileStat::cast(parent.clone())
-            .is_some_and(|stat| is_condition_of(stat.get_condition_expr()))
-        || glua_parser::LuaRepeatStat::cast(parent)
-            .is_some_and(|stat| is_condition_of(stat.get_condition_expr()))
 }
 
 fn calc_name_expr_ref(

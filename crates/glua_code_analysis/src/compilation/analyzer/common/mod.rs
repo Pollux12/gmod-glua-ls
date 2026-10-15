@@ -1,4 +1,8 @@
-use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaLiteralToken};
+use glua_parser::{
+    BinaryOperator, LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaElseIfClauseStat,
+    LuaExpr, LuaForRangeStat, LuaIfStat, LuaLiteralToken, LuaRepeatStat, LuaSyntaxNode,
+    LuaWhileStat, UnaryOperator,
+};
 use rowan::{TextRange, TextSize};
 
 use crate::{
@@ -36,6 +40,61 @@ pub fn is_nil_literal_expr(expr: &LuaExpr) -> bool {
             .is_some_and(|expr| is_nil_literal_expr(&expr)),
         _ => false,
     }
+}
+
+/// Whether `node`'s value is only tested for presence; the left of an untested `or` is a
+/// fallback. `guard_call_arg` decides a first argument of the call it is passed.
+pub fn is_presence_tested(
+    node: &LuaSyntaxNode,
+    guard_call_arg: &mut dyn FnMut(&LuaCallExpr) -> bool,
+) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if let Some(LuaExpr::ParenExpr(paren)) = LuaExpr::cast(parent.clone()) {
+        return is_presence_tested(paren.syntax(), guard_call_arg);
+    }
+    if let Some(LuaExpr::UnaryExpr(unary)) = LuaExpr::cast(parent.clone()) {
+        return unary
+            .get_op_token()
+            .is_some_and(|op| op.get_op() == UnaryOperator::OpNot);
+    }
+    if let Some(LuaExpr::BinaryExpr(binary)) = LuaExpr::cast(parent.clone()) {
+        let (Some(op), Some((left, right))) = (
+            binary.get_op_token().map(|op| op.get_op()),
+            binary.get_exprs(),
+        ) else {
+            return false;
+        };
+        let is_left = left.syntax() == node;
+        return match op {
+            BinaryOperator::OpAnd => is_left || is_presence_tested(binary.syntax(), guard_call_arg),
+            BinaryOperator::OpOr => is_presence_tested(binary.syntax(), guard_call_arg),
+            BinaryOperator::OpEq | BinaryOperator::OpNe => {
+                is_nil_literal_expr(if is_left { &right } else { &left })
+            }
+            _ => false,
+        };
+    }
+    if let Some(args) = LuaCallArgList::cast(parent.clone()) {
+        let is_first_arg = args
+            .get_args()
+            .next()
+            .is_some_and(|arg| arg.syntax() == node);
+        return is_first_arg
+            && args
+                .get_parent::<LuaCallExpr>()
+                .is_some_and(|call| guard_call_arg(&call));
+    }
+    let is_condition_of =
+        |condition: Option<LuaExpr>| condition.is_some_and(|condition| condition.syntax() == node);
+    LuaIfStat::cast(parent.clone()).is_some_and(|stat| is_condition_of(stat.get_condition_expr()))
+        || LuaElseIfClauseStat::cast(parent.clone())
+            .is_some_and(|clause| is_condition_of(clause.get_condition_expr()))
+        || LuaWhileStat::cast(parent.clone())
+            .is_some_and(|stat| is_condition_of(stat.get_condition_expr()))
+        || LuaRepeatStat::cast(parent)
+            .is_some_and(|stat| is_condition_of(stat.get_condition_expr()))
 }
 
 /// Whether `expr` in tail position can expand to fill extra assignment slots:

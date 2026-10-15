@@ -168,6 +168,10 @@ fn infer_expr_miss(
         .expr_in_progress
         .insert(key, crate::db_index::derivation::scope_mark());
 
+    let index_syntax = match &expr {
+        LuaExpr::IndexExpr(index_expr) => Some(index_expr.syntax().clone()),
+        _ => None,
+    };
     let result_type = match expr {
         LuaExpr::CallExpr(call_expr) => infer_call_expr(db, cache, call_expr),
         LuaExpr::TableExpr(table_expr) => infer_table_expr(db, cache, table_expr),
@@ -205,10 +209,15 @@ fn infer_expr_miss(
         ),
         Err(InferFailReason::FieldNotFound) => {
             if floors {
-                (
-                    Ok(LuaType::Nil),
-                    Some(Some(CacheEntry::Cache(LuaType::Nil))),
-                )
+                // A missing member a test reads for presence may be installed at run time.
+                let floor = if index_syntax.is_some_and(|syntax| {
+                    crate::compilation::analyzer::is_presence_tested(&syntax, &mut |_| false)
+                }) {
+                    LuaType::Unknown
+                } else {
+                    LuaType::Nil
+                };
+                (Ok(floor.clone()), Some(Some(CacheEntry::Cache(floor))))
             } else if is_diagnostics {
                 (
                     Err(InferFailReason::FieldNotFound),

@@ -18,7 +18,7 @@ pub(crate) mod unresolve;
 
 pub(crate) use call_site_params::{CallbackArg, CallbackParamsQuery, ReceiverAuthorityQuery};
 pub(crate) use common::{
-    is_nil_literal_expr, union_widens_cached_type, widen_mutable_decl_literal,
+    is_nil_literal_expr, is_presence_tested, union_widens_cached_type, widen_mutable_decl_literal,
 };
 pub(crate) use dynamic_field::is_provably_builtin_iterator_call;
 pub(crate) use dynamic_field::{

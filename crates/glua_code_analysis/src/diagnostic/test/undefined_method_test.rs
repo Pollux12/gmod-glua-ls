@@ -2172,4 +2172,33 @@ end
             );
         }
     }
+
+    /// A missing method a test reads for presence may be installed at run time, so the read is
+    /// unknown rather than nil; a plain read of it stays nil.
+    #[test]
+    fn a_presence_tested_missing_method_reads_as_unknown() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let file = ws.def_file(
+            "lua/autorun/server/sv_car.lua",
+            r#"
+            ---@class Car
+            local Car = {}
+            ---@param hasPhoton boolean
+            function Car:OnSeatInput(hasPhoton)
+                local controller = hasPhoton and self.GetPhotonController and self:GetPhotonController()
+                local plain = self.GetPhotonController
+                print(controller, plain)
+            end
+            "#,
+        );
+        let controller = ws.humanize_type(ws.local_ty(file, "controller"));
+        assert!(
+            controller.contains("unknown") && !controller.contains("nil"),
+            "{controller}"
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file, "plain")), "nil");
+    }
 }
