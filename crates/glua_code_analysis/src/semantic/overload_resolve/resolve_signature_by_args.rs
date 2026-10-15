@@ -5,7 +5,7 @@ use rowan::TextRange;
 use crate::{
     InferFailReason, check_type_compact,
     db_index::{DbIndex, LuaFunctionType, LuaType},
-    semantic::infer::InferCallFuncResult,
+    semantic::{infer::InferCallFuncResult, is_nullable},
 };
 
 pub fn resolve_signature_by_args(
@@ -25,6 +25,17 @@ pub fn resolve_signature_by_args(
             .map(|it| Some(it.clone()))
             .collect::<Vec<_>>(),
     };
+
+    let mut finite_funcs = overloads
+        .iter()
+        .filter(|func| !is_func_last_param_variadic(func))
+        .peekable();
+    if finite_funcs.peek().is_some()
+        && finite_funcs.all(|func| arg_capacity(func, is_colon_call) < arg_count)
+        && let Some(func) = resolve_by_leading_fit(db, overloads, expr_types, is_colon_call)
+    {
+        return Ok(func);
+    }
 
     if expr_len == 0 {
         for overload in overloads {
@@ -87,26 +98,7 @@ pub fn resolve_signature_by_args(
                 continue;
             };
 
-            let match_result = if param_type.is_any() {
-                ParamMatchResult::Any
-            } else if expr_type.is_never() {
-                // `Never` (bottom type) is the result of unreachable
-                // expressions such as indexing a `nil` base. A `Never` value
-                // cannot exist at runtime, so it should not cause overload
-                // resolution to reject an otherwise-matching signature.
-                // Without this, calls like `Vector(nilVar[1], nilVar[2], nilVar[3])`
-                // (3 args of type `Never`) end up incorrectly resolved to a
-                // 1-arg overload via the fallback path below.
-                ParamMatchResult::Type
-            } else if is_exact_param_match(&param_type, expr_type) {
-                ParamMatchResult::Exact
-            } else if check_type_compact(db, &param_type, expr_type).is_ok() {
-                ParamMatchResult::Type
-            } else if has_union_component_param_match(db, &param_type, expr_type) {
-                ParamMatchResult::UnionComponent
-            } else {
-                ParamMatchResult::Not
-            };
+            let match_result = classify_arg_match(db, &param_type, expr_type);
 
             if match_result > current_match_result {
                 current_match_result = match_result;
@@ -241,6 +233,137 @@ fn is_func_last_param_variadic(func: &LuaFunctionType) -> bool {
         last_param.0 == "..."
     } else {
         false
+    }
+}
+
+/// Among candidates whose own capacity is filled by compatible arguments, the one consuming the most arguments.
+/// Candidates with every required parameter supplied rank first, then those matching every argument in full
+/// rather than only a union component.
+fn resolve_by_leading_fit(
+    db: &DbIndex,
+    overloads: &[Arc<LuaFunctionType>],
+    expr_types: &[(LuaType, TextRange)],
+    is_colon_call: bool,
+) -> Option<Arc<LuaFunctionType>> {
+    let mut best: Option<((bool, bool, usize), &Arc<LuaFunctionType>)> = None;
+    for func in overloads {
+        let consumed = if is_func_last_param_variadic(func) {
+            expr_types.len()
+        } else {
+            expr_types.len().min(arg_capacity(func, is_colon_call))
+        };
+        let supplied = required_params_supplied(db, func, expr_types.len(), is_colon_call);
+        if best.is_some_and(|(best_rank, _)| best_rank >= (supplied, true, consumed)) {
+            continue;
+        }
+        let Some(full) = leading_args_fit(db, func, &expr_types[..consumed], is_colon_call) else {
+            continue;
+        };
+        let rank = (supplied, full, consumed);
+        if best.is_none_or(|(best_rank, _)| rank > best_rank) {
+            best = Some((rank, func));
+        }
+    }
+    best.map(|(_, func)| Arc::clone(func))
+}
+
+/// A finite candidate is measured at its own capacity; a variadic one needs its required fixed parameters supplied.
+fn required_params_supplied(
+    db: &DbIndex,
+    func: &LuaFunctionType,
+    arg_count: usize,
+    is_colon_call: bool,
+) -> bool {
+    if !is_func_last_param_variadic(func) {
+        return true;
+    }
+    let supplied = effective_arg_count(arg_count, func.is_colon_define(), is_colon_call);
+    let params = func.get_params();
+    params[..params.len() - 1]
+        .iter()
+        .enumerate()
+        .skip(supplied)
+        .all(|(param_index, (_, param_type))| {
+            func.is_param_optional(param_index)
+                || param_type
+                    .as_ref()
+                    .is_none_or(|param_type| is_nullable(db, param_type))
+        })
+}
+
+/// `None` when an argument does not fit; otherwise whether every argument fits in full.
+fn leading_args_fit(
+    db: &DbIndex,
+    func: &LuaFunctionType,
+    expr_types: &[(LuaType, TextRange)],
+    is_colon_call: bool,
+) -> Option<bool> {
+    let mut full = true;
+    for (arg_index, (expr_type, _)) in expr_types.iter().enumerate() {
+        match leading_arg_match(db, func, arg_index, expr_type, is_colon_call) {
+            ParamMatchResult::Not => return None,
+            ParamMatchResult::UnionComponent => full = false,
+            _ => {}
+        }
+    }
+    Some(full)
+}
+
+fn leading_arg_match(
+    db: &DbIndex,
+    func: &LuaFunctionType,
+    arg_index: usize,
+    expr_type: &LuaType,
+    is_colon_call: bool,
+) -> ParamMatchResult {
+    let param_index = match (func.is_colon_define(), is_colon_call) {
+        (true, false) => match arg_index.checked_sub(1) {
+            Some(index) => index,
+            None => return ParamMatchResult::Type,
+        },
+        (false, true) => arg_index + 1,
+        _ => arg_index,
+    };
+    let params = func.get_params();
+    let param_type = match params.get(param_index).or_else(|| params.last()) {
+        Some((name, ty)) if param_index < params.len() || name == "..." => {
+            ty.clone().unwrap_or(LuaType::Any)
+        }
+        _ => return ParamMatchResult::Not,
+    };
+    classify_arg_match(db, &param_type, expr_type)
+}
+
+fn classify_arg_match(
+    db: &DbIndex,
+    param_type: &LuaType,
+    expr_type: &LuaType,
+) -> ParamMatchResult {
+    if param_type.is_any() {
+        ParamMatchResult::Any
+    } else if expr_type.is_never() {
+        // `Never` (bottom type) is the result of unreachable expressions such as
+        // indexing a `nil` base; no such value exists at runtime, so it must not
+        // reject an otherwise-matching signature (e.g. `Vector(nilVar[1], nilVar[2], nilVar[3])`).
+        ParamMatchResult::Type
+    } else if is_exact_param_match(param_type, expr_type) {
+        ParamMatchResult::Exact
+    } else if check_type_compact(db, param_type, expr_type).is_ok() {
+        ParamMatchResult::Type
+    } else if has_union_component_param_match(db, param_type, expr_type) {
+        ParamMatchResult::UnionComponent
+    } else {
+        ParamMatchResult::Not
+    }
+}
+
+/// How many call arguments `func` takes without a surplus.
+fn arg_capacity(func: &LuaFunctionType, is_colon_call: bool) -> usize {
+    let param_len = func.get_params().len();
+    match (func.is_colon_define(), is_colon_call) {
+        (true, false) => param_len.saturating_add(1),
+        (false, true) => param_len.saturating_sub(1),
+        _ => param_len,
     }
 }
 
