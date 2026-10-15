@@ -15530,4 +15530,98 @@ mod test {
             [false, false, false, true, true, true, true, true, true]
         );
     }
+
+    /// Whether a nil-access warning is reported for `body`, a function body over `U.Entities`
+    /// (an inferred table whose elements come from `table.insert`) and the declared controls.
+    fn slot_alias_warns(ws: &mut VirtualWorkspace, file_name: &str, body: &str) -> bool {
+        let code = format!(
+            r#"
+            ---@class Entity
+            ---@field Remove fun(self: Entity)
+            ---@class NULL : Entity
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+
+            local U = nil
+            function Mk() U = {{}}; U.Entities = {{}} end
+            function Add(e) if not U then return end; table.insert(U.Entities, e) end
+
+            ---@type {{n: Entity?}}
+            local V = {{}}
+            ---@type (Entity|nil)[]
+            local arr = {{}}
+
+            function Run()
+                if not U then return end
+                {body}
+            end
+            "#
+        );
+        [DiagnosticCode::NeedCheckNil, DiagnosticCode::UncheckedNilAccess]
+            .into_iter()
+            .any(|diagnostic_code| !ws.check_file_for(diagnostic_code, file_name, &code))
+    }
+
+    /// A local initialised from a slot an `IsValid` call guards holds the guarded value, as the
+    /// slot read directly does, whether or not the table's element type is known.
+    #[gtest]
+    fn a_local_initialised_from_a_guarded_missing_slot_is_not_nullable() {
+        let guarded = |read: &str| {
+            format!("if IsValid({read}) then local e = {read}; e:Remove() end")
+        };
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        expect_that!(
+            slot_alias_warns(
+                &mut ws,
+                "lua/autorun/slot_direct.lua",
+                "if IsValid(U.Entities[1]) then U.Entities[1]:Remove() end"
+            ),
+            eq(false)
+        );
+        for (index, read) in ["U.Entities[1]", "V.n", "arr[1]"].into_iter().enumerate() {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            expect_that!(
+                slot_alias_warns(
+                    &mut ws,
+                    &format!("lua/autorun/slot_guarded_{index}.lua"),
+                    &guarded(read)
+                ),
+                eq(false),
+                "{read}"
+            );
+        }
+    }
+
+    /// The same alias outside the guard is still nullable.
+    #[gtest]
+    fn a_local_initialised_from_an_unguarded_missing_slot_is_nullable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        expect_that!(
+            slot_alias_warns(
+                &mut ws,
+                "lua/autorun/slot_unguarded.lua",
+                "local e = U.Entities[1]; e:Remove()"
+            ),
+            eq(true)
+        );
+    }
+
+    /// Removing the guard from an analysed file brings the warning back, as a cold analysis of the
+    /// edited file reports it.
+    #[gtest]
+    fn removing_the_guard_around_a_slot_alias_brings_the_warning_back() {
+        let file = "lua/autorun/slot_edit.lua";
+        let guarded = "if IsValid(U.Entities[1]) then local e = U.Entities[1]; e:Remove() end";
+        let unguarded = "do local e = U.Entities[1]; e:Remove() end";
+        let mut warm = VirtualWorkspace::new_with_init_std_lib();
+        expect_that!(slot_alias_warns(&mut warm, file, guarded), eq(false));
+        let warm_after_edit = slot_alias_warns(&mut warm, file, unguarded);
+        let mut cold = VirtualWorkspace::new_with_init_std_lib();
+        let cold_after_edit = slot_alias_warns(&mut cold, file, unguarded);
+        expect_that!(warm_after_edit, eq(true));
+        expect_that!(warm_after_edit, eq(cold_after_edit));
+    }
 }

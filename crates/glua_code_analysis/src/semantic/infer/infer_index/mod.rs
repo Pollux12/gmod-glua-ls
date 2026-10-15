@@ -180,6 +180,13 @@ pub fn infer_index_expr(
     // only holds once none can add it any more.
     if pass_flow && db.stage_rule_holds(crate::db_index::derivation::StageRule::FloorUnsettled) {
         match infer_member_type_fallback_pass_flow(db, cache, index_expr) {
+            // A guard on the path leaves the missing member unknown rather than nil, and a
+            // floor must not read it as the nil it proved absent.
+            Ok(member_type) if member_type.is_unknown() => {
+                if crate::semantic::infer::floors_unsettled(db, cache) {
+                    return Ok(member_type);
+                }
+            }
             Ok(member_type) => return Ok(member_type),
             Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
             Err(err) => return Err(err),
@@ -356,7 +363,7 @@ fn infer_result_to_cache_entry(
 
 fn finalize_fallback_result(result: InferResult) -> InferResult {
     match result {
-        Ok(member_type) if !member_type.is_nil() && !member_type.is_unknown() => Ok(member_type),
+        Ok(member_type) if !member_type.is_nil() => Ok(member_type),
         Ok(_) | Err(InferFailReason::None) => Err(InferFailReason::FieldNotFound),
         Err(err) => Err(err),
     }
