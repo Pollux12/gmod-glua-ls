@@ -136,9 +136,6 @@ fn indexed_targets(node: &LuaSyntaxNode) -> Vec<(usize, glua_parser::LuaIndexExp
     }
     if let Some(func_stat) = LuaFuncStat::cast(node.clone())
         && let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name()
-        && index_expr
-            .get_index_token()
-            .is_some_and(|token| !token.is_colon())
     {
         return vec![(0, index_expr)];
     }
@@ -147,7 +144,9 @@ fn indexed_targets(node: &LuaSyntaxNode) -> Vec<(usize, glua_parser::LuaIndexExp
 
 /// The field-definition sites a statement contributes, as `(position among
 /// its assigned variables, indexed target, assigned value)`. A function
-/// statement defines a field only where its name is no member yet.
+/// statement defines a field where its dotted name is no member yet, and,
+/// where no class owns it, on the table a name holds when that table is a
+/// call's result, as an assignment to the same target does.
 fn field_definition_sites(
     db: &DbIndex,
     file_id: crate::FileId,
@@ -163,12 +162,50 @@ fn field_definition_sites(
     indexed_targets(node)
         .into_iter()
         .filter(|(_, index_expr)| {
-            db.get_member_index()
-                .get_current_owner(&LuaMemberId::new(index_expr.get_syntax_id(), file_id))
-                .is_none()
+            let owner = db
+                .get_member_index()
+                .get_current_owner(&LuaMemberId::new(index_expr.get_syntax_id(), file_id));
+            let dotted = index_expr
+                .get_index_token()
+                .is_some_and(|token| !token.is_colon());
+            match owner {
+                None if dotted => true,
+                Some(crate::LuaMemberOwner::Type(_)) => false,
+                _ => prefix_holds_call_result(db, file_id, index_expr),
+            }
         })
         .map(|(var, index_expr)| (var, index_expr, None))
         .collect()
+}
+
+/// Whether the prefix of `index_expr` is a name every declaration of which
+/// takes a call's result: a table made elsewhere, such as a factory's.
+fn prefix_holds_call_result(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    index_expr: &glua_parser::LuaIndexExpr,
+) -> bool {
+    let Some(LuaExpr::NameExpr(name_expr)) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let decl_index = db.get_decl_index();
+    let takes_call_result = |decl_id: &LuaDeclId| {
+        decl_index.get_decl(decl_id).is_some_and(|decl| {
+            decl.get_value_syntax_id()
+                .is_some_and(|value| value.get_kind() == LuaSyntaxKind::CallExpr)
+        })
+    };
+    if let Some(decl_id) = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, name_expr.get_range())
+    {
+        return takes_call_result(&decl_id);
+    }
+    name_expr.get_name_text().is_some_and(|name| {
+        db.get_global_index()
+            .get_global_decl_ids(&name)
+            .is_some_and(|decl_ids| !decl_ids.is_empty() && decl_ids.iter().all(takes_call_result))
+    })
 }
 
 /// Whether a node is a write site of its own: a statement with an indexed
@@ -456,6 +493,22 @@ fn collect_statement_fields(
         } else {
             prefix_type
         };
+        // A method defined on a call's result reaches the table a factory made,
+        // not a class instance whose other instances lack it.
+        let made_table = match &effective_type {
+            LuaType::Instance(instance) => instance.get_base(),
+            typ => typ,
+        };
+        if value_expr.is_none()
+            && LuaFuncStat::cast(node.clone()).is_some()
+            && !matches!(made_table, LuaType::TableConst(_))
+            && db
+                .get_member_index()
+                .get_current_owner(&LuaMemberId::new(index_expr.get_syntax_id(), file_id))
+                .is_some()
+        {
+            continue;
+        }
         if should_collect_wildcard {
             collect_wildcard_for_type(
                 db,

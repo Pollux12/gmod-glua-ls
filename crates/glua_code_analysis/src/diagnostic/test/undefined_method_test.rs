@@ -2201,4 +2201,58 @@ end
         );
         assert_eq!(ws.humanize_type(ws.local_ty(file, "plain")), "nil");
     }
+
+    /// Methods a caller defines on the table a factory returns are members of that table,
+    /// which the factory's own methods may call; a class instance's other instances
+    /// do not gain them.
+    #[test]
+    fn a_method_defined_on_a_factory_result_belongs_to_the_table_it_made() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let factory_path = "lua/includes/util/workshop_files.lua";
+        let factory = r#"
+            function WorkshopFileBase(namespace)
+                local ret = {}
+                function ret:Fetch(kind)
+                    if kind == "local" then return self:FetchLocal(1) end
+                    if kind == "dot" then return self.FetchDot() end
+                    return self:FetchOther()
+                end
+                return ret
+            end
+        "#;
+        let consumer_path = "lua/menu/menu_save.lua";
+        let consumer = r#"
+            ws_save = WorkshopFileBase("save")
+            function ws_save:FetchLocal(offset) return offset end
+            function ws_save.FetchDot() return 1 end
+            local ws_dupe = WorkshopFileBase("dupe")
+            function ws_dupe:FetchOther() return 2 end
+        "#;
+        ws.def_file(consumer_path, consumer);
+        for code in [
+            DiagnosticCode::UndefinedMethod,
+            DiagnosticCode::UndefinedField,
+        ] {
+            assert!(ws.check_file_for(code, factory_path, factory), "{code:?}");
+        }
+
+        let uri = ws.virtual_url_generator.new_uri(consumer_path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert!(!ws.check_file_for(DiagnosticCode::UndefinedMethod, factory_path, factory));
+        ws.def_file(consumer_path, consumer);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, factory_path, factory));
+
+        ws.def_file(
+            "lua/annotations/panel.lua",
+            "---@meta\n---@class Panel\nlocal Panel = {}\n---@return Panel\nfunction CreatePanel() end\n",
+        );
+        assert!(!ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "lua/autorun/client/cl_panel.lua",
+            "local a = CreatePanel()\nfunction a:Custom() end\n---@param b Panel\nlocal function Use(b) b:Custom() end\nprint(Use)\n",
+        ));
+    }
 }
