@@ -321,9 +321,9 @@ mod tests {
     #[test]
     fn auto_detects_chain_from_workspace_folder() {
         let root = make_workspace();
-        write_gamemode(&root, "darkrp", Some("sandbox"));
-        write_gamemode(&root, "sandbox", Some("base"));
-        write_gamemode(&root, "base", None);
+        write_gamemode(&root, "darkrp", Some("framework"));
+        write_gamemode(&root, "framework", Some("ancestor"));
+        write_gamemode(&root, "ancestor", None);
 
         let mut emmyrc = Emmyrc::default();
         apply_gamemode_base_detection(&mut emmyrc, std::slice::from_ref(&root), &root);
@@ -337,18 +337,18 @@ mod tests {
         assert_eq!(
             lib_paths.len(),
             2,
-            "expected sandbox + base, got {lib_paths:?}"
+            "expected framework + ancestor, got {lib_paths:?}"
         );
-        assert!(lib_paths.iter().any(|p| p.ends_with("sandbox")));
-        assert!(lib_paths.iter().any(|p| p.ends_with("base")));
+        assert!(lib_paths.iter().any(|p| p.ends_with("framework")));
+        assert!(lib_paths.iter().any(|p| p.ends_with("ancestor")));
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn skips_detection_when_disabled() {
         let root = make_workspace();
-        write_gamemode(&root, "darkrp", Some("sandbox"));
-        write_gamemode(&root, "sandbox", None);
+        write_gamemode(&root, "darkrp", Some("framework"));
+        write_gamemode(&root, "framework", None);
 
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.auto_detect_gamemode_base = Some(false);
@@ -364,22 +364,26 @@ mod tests {
     #[test]
     fn falls_back_to_main_path_when_no_workspaces() {
         let root = make_workspace();
-        write_gamemode(&root, "darkrp", Some("sandbox"));
-        write_gamemode(&root, "sandbox", None);
+        write_gamemode(&root, "darkrp", Some("framework"));
+        write_gamemode(&root, "framework", None);
 
         let mut emmyrc = Emmyrc::default();
         apply_gamemode_base_detection(&mut emmyrc, &[], &root);
 
         assert_eq!(emmyrc.workspace.library.len(), 1);
-        assert!(emmyrc.workspace.library[0].get_path().ends_with("sandbox"));
+        assert!(
+            emmyrc.workspace.library[0]
+                .get_path()
+                .ends_with("framework")
+        );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn handles_file_workspace_path() {
         let root = make_workspace();
-        write_gamemode(&root, "darkrp", Some("sandbox"));
-        write_gamemode(&root, "sandbox", None);
+        write_gamemode(&root, "darkrp", Some("framework"));
+        write_gamemode(&root, "framework", None);
         let some_file = root.join("init.lua");
         fs::write(&some_file, "-- placeholder\n").unwrap();
 
@@ -397,15 +401,14 @@ mod tests {
     #[test]
     fn dedupes_against_existing_library_entry() {
         let root = make_workspace();
-        write_gamemode(&root, "darkrp", Some("sandbox"));
-        write_gamemode(&root, "sandbox", None);
-        let sandbox_path = root.join("gamemodes").join("sandbox");
+        write_gamemode(&root, "darkrp", Some("framework"));
+        write_gamemode(&root, "framework", None);
+        let framework_path = root.join("gamemodes").join("framework");
 
         let mut emmyrc = Emmyrc::default();
-        emmyrc
-            .workspace
-            .library
-            .push(EmmyLibraryItem::Path(sandbox_path.to_string_lossy().into()));
+        emmyrc.workspace.library.push(EmmyLibraryItem::Path(
+            framework_path.to_string_lossy().into(),
+        ));
         apply_gamemode_base_detection(&mut emmyrc, std::slice::from_ref(&root), &root);
 
         assert_eq!(
