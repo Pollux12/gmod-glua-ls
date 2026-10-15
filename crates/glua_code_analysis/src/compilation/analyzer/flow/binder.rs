@@ -55,6 +55,8 @@ pub struct FlowBinder<'a> {
     pub unreachable: FlowId,
     pub loop_label: FlowId,
     pub break_target_label: FlowId,
+    /// Where a `continue` goes: the until condition entry of a repeat loop, unreachable in other loops.
+    pub continue_target_label: FlowId,
     pub true_target: FlowId,
     pub false_target: FlowId,
     flow_nodes: Vec<FlowNode>,
@@ -89,6 +91,7 @@ impl<'a> FlowBinder<'a> {
             start: FlowId::default(),
             unreachable: FlowId::default(),
             break_target_label: FlowId::default(),
+            continue_target_label: FlowId::default(),
             bindings: FxHashMap::default(),
             goto_stats: Vec::new(),
             loop_label: FlowId::default(),
@@ -108,6 +111,7 @@ impl<'a> FlowBinder<'a> {
         binder.start = binder.create_start();
         binder.unreachable = binder.create_unreachable();
         binder.break_target_label = binder.unreachable;
+        binder.continue_target_label = binder.unreachable;
         binder.loop_label = binder.unreachable;
         binder.true_target = binder.unreachable;
         binder.false_target = binder.unreachable;

@@ -332,7 +332,14 @@ pub fn bind_break_stat(
     }
 
     binder.add_antecedent(break_flow_id, current);
-    binder.add_antecedent(binder.break_target_label, break_flow_id);
+    // The carried state is live at the loop exit (break) or at the repeat condition (continue);
+    // the Break node only ends the body. A `continue` in a while or for loop returns to the head.
+    let target = if break_stat.is_continue() {
+        binder.continue_target_label
+    } else {
+        binder.break_target_label
+    };
+    binder.add_antecedent(target, current);
     break_flow_id
 }
 
@@ -411,18 +418,22 @@ fn bind_iter_block(
     current: FlowId,
     loop_label: FlowId,
     break_target_label: FlowId,
+    continue_target_label: FlowId,
 ) -> FlowId {
     let old_loop_label = binder.loop_label;
     let old_loop_post_label = binder.break_target_label;
+    let old_continue_label = binder.continue_target_label;
 
     binder.loop_label = loop_label;
     binder.break_target_label = break_target_label;
+    binder.continue_target_label = continue_target_label;
     // Bind the block of code inside the iterator
     let flow_id = bind_block(binder, iter_block, current);
 
     // Restore the previous loop labels
     binder.loop_label = old_loop_label;
     binder.break_target_label = old_loop_post_label;
+    binder.continue_target_label = old_continue_label;
 
     flow_id
 }
@@ -450,6 +461,7 @@ pub fn bind_while_stat(
 
     let block_current = finish_flow_label(binder, pre_block_label, current);
 
+    let no_continue_target = binder.unreachable;
     if let Some(iter_block) = while_stat.get_block() {
         // Bind the block of code inside the while loop
         bind_iter_block(
@@ -458,6 +470,7 @@ pub fn bind_while_stat(
             block_current,
             pre_while_label,
             post_while_label,
+            no_continue_target,
         );
     }
 
@@ -477,6 +490,8 @@ pub fn bind_repeat_stat(
     let post_repeat_label = binder.create_branch_label();
     binder.add_antecedent(pre_repeat_label, current);
 
+    let until_label = binder.create_branch_label();
+
     let mut block_flow_id = pre_repeat_label;
     // Bind the block of code inside the repeat statement
     if let Some(iter_block) = repeat_stat.get_block() {
@@ -486,15 +501,60 @@ pub fn bind_repeat_stat(
             pre_repeat_label,
             pre_repeat_label,
             post_repeat_label,
+            until_label,
         );
     }
 
-    // Bind the condition expression
-    if let Some(condition_expr) = repeat_stat.get_condition_expr() {
-        bind_expr(binder, condition_expr, block_flow_id);
+    // The body's end and every `continue` reach the until condition.
+    binder.add_antecedent(until_label, block_flow_id);
+    let until_entry = finish_flow_label(binder, until_label, block_flow_id);
+
+    // The loop is left either by the until condition turning true or by a `break`.
+    bind_repeat_exit(
+        binder,
+        repeat_stat.get_condition_expr(),
+        until_entry,
+        post_repeat_label,
+    );
+    finish_flow_label(binder, post_repeat_label, until_entry)
+}
+
+fn bind_repeat_exit(
+    binder: &mut FlowBinder,
+    condition_expr: Option<LuaExpr>,
+    body_end: FlowId,
+    exit_label: FlowId,
+) {
+    let Some(condition_expr) = condition_expr else {
+        binder.add_antecedent(exit_label, body_end);
+        return;
+    };
+    let truthiness = static_truthiness(&condition_expr);
+    if truthiness.is_some() || body_end == binder.unreachable {
+        bind_expr(binder, condition_expr, body_end);
+        if truthiness == Some(true) {
+            binder.add_antecedent(exit_label, body_end);
+        }
+        return;
     }
 
-    finish_flow_label(binder, post_repeat_label, block_flow_id)
+    // The false outcome repeats the body, which has no back edge in the flow graph.
+    let repeat_target = binder.unreachable;
+    bind_condition_expr(binder, condition_expr, body_end, exit_label, repeat_target);
+}
+
+fn static_truthiness(expr: &LuaExpr) -> Option<bool> {
+    match expr {
+        LuaExpr::ParenExpr(paren_expr) => static_truthiness(&paren_expr.get_expr()?),
+        LuaExpr::TableExpr(_) | LuaExpr::ClosureExpr(_) => Some(true),
+        LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal()? {
+            LuaLiteralToken::Bool(bool_token) => Some(bool_token.is_true()),
+            LuaLiteralToken::Nil(_) => Some(false),
+            LuaLiteralToken::Number(_) | LuaLiteralToken::String(_) => Some(true),
+            LuaLiteralToken::Dots(_) | LuaLiteralToken::Question(_) => None,
+        },
+        _ => None,
+    }
 }
 
 pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId) -> FlowId {
@@ -647,6 +707,7 @@ pub fn bind_for_range_stat(
     let decl_flow = binder.create_decl(for_range_stat.get_position());
     binder.add_antecedent(decl_flow, pre_for_range_label);
 
+    let no_continue_target = binder.unreachable;
     if let Some(iter_block) = for_range_stat.get_block() {
         // Bind the block of code inside the for loop
         bind_iter_block(
@@ -655,6 +716,7 @@ pub fn bind_for_range_stat(
             decl_flow,
             pre_for_range_label,
             post_for_range_label,
+            no_continue_target,
         );
     }
 
@@ -673,9 +735,17 @@ pub fn bind_for_stat(binder: &mut FlowBinder, for_stat: LuaForStat, current: Flo
     let for_node = binder.create_node(FlowNodeKind::ForIStat(for_stat.to_ptr()));
     binder.add_antecedent(for_node, pre_for_label);
 
+    let no_continue_target = binder.unreachable;
     if let Some(iter_block) = for_stat.get_block() {
         // Bind the block of code inside the for loop
-        bind_iter_block(binder, iter_block, for_node, pre_for_label, post_for_label);
+        bind_iter_block(
+            binder,
+            iter_block,
+            for_node,
+            pre_for_label,
+            post_for_label,
+            no_continue_target,
+        );
     }
 
     current

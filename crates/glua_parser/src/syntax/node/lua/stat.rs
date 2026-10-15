@@ -855,6 +855,14 @@ impl LuaAstNode for LuaBreakStat {
     }
 }
 
+impl LuaBreakStat {
+    /// The lexer gives `break` and `continue` the same token kind; the keyword's spelling tells them apart.
+    pub fn is_continue(&self) -> bool {
+        self.token_by_kind(LuaTokenKind::TkBreak)
+            .is_some_and(|token| token.get_text() == "continue")
+    }
+}
+
 impl LuaCommentOwner for LuaBreakStat {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -812,15 +812,11 @@ fn loop_contains_rejected_control_flow(for_block: &LuaBlock) -> bool {
             | LuaStat::WhileStat(_)
             | LuaStat::RepeatStat(_)
             | LuaStat::ForStat(_) => return true,
-            LuaStat::BreakStat(ref break_stat) if !is_continue_stat(break_stat) => return true,
+            LuaStat::BreakStat(ref break_stat) if !break_stat.is_continue() => return true,
             _ => {}
         }
     }
     false
-}
-
-fn is_continue_stat(break_stat: &LuaBreakStat) -> bool {
-    break_stat.syntax().text().to_string().trim() == "continue"
 }
 
 fn final_loop_target_assignment(stats: &[LuaStat]) -> Option<LuaAssignStat> {
@@ -885,7 +881,7 @@ fn branchy_stat_writes_target_before_continue(
             helpers,
             protected_names,
         ),
-        LuaStat::BreakStat(break_stat) => !is_continue_stat(break_stat) || target_written,
+        LuaStat::BreakStat(break_stat) => !break_stat.is_continue() || target_written,
         LuaStat::IfStat(if_stat) => if_stat_continue_paths_are_safe(
             db,
             cache,

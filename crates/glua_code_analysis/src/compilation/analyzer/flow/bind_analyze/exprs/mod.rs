@@ -101,10 +101,12 @@ pub fn bind_closure_expr(
 
     let old_loop = binder.loop_label;
     let old_break = binder.break_target_label;
+    let old_continue = binder.continue_target_label;
     let old_true = binder.true_target;
     let old_false = binder.false_target;
     binder.loop_label = binder.unreachable;
     binder.break_target_label = binder.unreachable;
+    binder.continue_target_label = binder.unreachable;
     binder.true_target = binder.unreachable;
     binder.false_target = binder.unreachable;
 
@@ -112,6 +114,7 @@ pub fn bind_closure_expr(
 
     binder.loop_label = old_loop;
     binder.break_target_label = old_break;
+    binder.continue_target_label = old_continue;
     binder.true_target = old_true;
     binder.false_target = old_false;
     Some(())
@@ -200,10 +203,12 @@ mod tests {
         let mut binder = FlowBinder::new(&db, FileId::new(1));
         let outer_loop = binder.create_loop_label();
         let outer_break = binder.create_branch_label();
+        let outer_continue = binder.create_branch_label();
         let outer_true = binder.create_branch_label();
         let outer_false = binder.create_branch_label();
         binder.loop_label = outer_loop;
         binder.break_target_label = outer_break;
+        binder.continue_target_label = outer_continue;
         binder.true_target = outer_true;
         binder.false_target = outer_false;
 
@@ -214,20 +219,27 @@ mod tests {
             [
                 binder.loop_label,
                 binder.break_target_label,
+                binder.continue_target_label,
                 binder.true_target,
                 binder.false_target,
             ],
-            [outer_loop, outer_break, outer_true, outer_false]
+            [
+                outer_loop,
+                outer_break,
+                outer_continue,
+                outer_true,
+                outer_false
+            ]
         );
 
         let (tree, errors) = binder.finish();
         let outer_targets_have_antecedents =
-            [outer_break, outer_true, outer_false].map(|flow_id| {
+            [outer_break, outer_continue, outer_true, outer_false].map(|flow_id| {
                 tree.get_flow_node(flow_id)
                     .is_some_and(|node| node.antecedent.is_some())
             });
 
-        assert_eq!(outer_targets_have_antecedents, [false, false, false]);
+        assert_eq!(outer_targets_have_antecedents, [false, false, false, false]);
         assert_eq!(
             errors
                 .iter()

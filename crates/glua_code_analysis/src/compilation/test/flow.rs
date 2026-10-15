@@ -9538,4 +9538,146 @@ _2 = a[1]
             contains_substring("ScriptedEntityStored")
         );
     }
+
+    #[gtest]
+    fn a_value_written_only_on_break_paths_may_be_unwritten_after_a_repeat_loop() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@param first boolean
+            ---@param second boolean
+            ---@param number_value number
+            ---@param string_value string
+            local function use(first, second, number_value, string_value)
+                local v
+                repeat
+                    if first then
+                        v = number_value
+                        break
+                    elseif second then
+                        v = string_value
+                        break
+                    end
+                until true
+                local after = v
+                return after
+            end
+        "#,
+        );
+        let after_ty = ws.local_ty(file_id, "after");
+        expect_that!(after_ty.is_nullable(), eq(true));
+        let after = ws.humanize_type(after_ty);
+        expect_that!(after, contains_substring("number"));
+        expect_that!(after, contains_substring("string"));
+    }
+
+    fn local_after_in_function(params: &str, body: &str) -> String {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&format!(
+            r#"
+            ---@return string?
+            local function fetch() end
+
+            {params}
+            local function use(value, flag, number_value, string_value)
+                {body}
+                local after = value
+                return after
+            end
+            "#
+        ));
+        let after = ws.local_ty(file_id, "after");
+        ws.humanize_type(after)
+    }
+
+    #[gtest]
+    fn an_optional_parameter_keeps_nil_when_a_repeat_breaks_on_nil() {
+        expect_that!(
+            local_after_in_function(
+                "---@param value string?",
+                r#"repeat
+                    if value == nil then
+                        break
+                    end
+                until true"#
+            ),
+            eq("string?")
+        );
+    }
+
+    #[gtest]
+    fn a_while_loop_break_carries_its_assignment_to_the_loop_exit() {
+        let after = local_after_in_function(
+            "---@param value number\n---@param flag boolean\n---@param string_value string",
+            r#"while flag do
+                    value = string_value
+                    break
+                end"#,
+        );
+        expect_that!(after, contains_substring("number"));
+        expect_that!(after, contains_substring("string"));
+    }
+
+    #[gtest]
+    fn a_repeat_exit_holds_the_value_its_until_condition_confirms() {
+        expect_that!(
+            local_after_in_function(
+                "---@param value string?",
+                r#"repeat
+                    value = fetch()
+                until value ~= nil"#
+            ),
+            eq("string")
+        );
+    }
+
+    #[gtest]
+    fn a_repeat_whose_only_exit_is_a_break_leaves_the_following_code_reachable() {
+        expect_that!(
+            local_after_in_function(
+                "---@param value string?\n---@param string_value string",
+                r#"repeat
+                    value = string_value
+                    break
+                until false"#
+            ),
+            eq("string")
+        );
+    }
+
+    #[gtest]
+    fn a_repeat_continue_carries_its_state_through_the_until_condition_to_the_exit() {
+        let params = "---@param value string?";
+        let guard = "if value == nil then continue end";
+        let cases = [
+            format!("repeat {guard} until true"),
+            format!("repeat repeat break until true {guard} until true"),
+            format!("repeat repeat {guard} until true until true"),
+        ];
+        for body in cases {
+            expect_that!(local_after_in_function(params, &body), eq("string?"));
+        }
+    }
+
+    #[gtest]
+    fn a_continue_in_an_inner_loop_does_not_feed_the_outer_repeat_condition() {
+        for inner in ["while flag do value = string_value continue end", "for _ = 1, 2 do value = string_value continue end"] {
+            let after = local_after_in_function(
+                "---@param value number\n---@param flag boolean\n---@param string_value string",
+                &format!("repeat {inner} until true"),
+            );
+            expect_that!(after.contains("string"), eq(false));
+        }
+    }
+
+    #[gtest]
+    fn a_continue_with_a_semicolon_flows_like_one_without() {
+        let params = "---@param value string?";
+        let with = |stat: &str| {
+            local_after_in_function(params, &format!("while value ~= nil do {stat} end"))
+        };
+        assert_eq!(with("continue;"), with("continue"));
+        expect_that!(with("continue"), eq("nil"));
+        expect_that!(with("break"), eq("string?"));
+    }
 }
