@@ -375,17 +375,29 @@ impl<'a> FlowBinder<'a> {
     }
 
     /// Record condition references separately from assignment and cast targets,
-    /// with the references of the call each local the condition reads was declared
-    /// with.
+    /// with what the call each local the condition reads was declared with can
+    /// narrow: its arguments and the receiver of a method call.
     pub fn record_condition_refs_in_expr(&mut self, expr: &LuaExpr) {
         let mut pending = vec![expr.clone()];
         let mut expanded = FxHashSet::default();
         while let Some(expr) = pending.pop() {
             for decl_id in self.record_narrowable_refs(&expr, true) {
-                if expanded.insert(decl_id)
-                    && let Some(call) = self.call_initializers.get(&decl_id)
+                if !expanded.insert(decl_id) {
+                    continue;
+                }
+                let Some(LuaExpr::CallExpr(call)) = self.call_initializers.get(&decl_id) else {
+                    continue;
+                };
+                pending.extend(
+                    call.get_args_list()
+                        .into_iter()
+                        .flat_map(|args| args.get_args()),
+                );
+                if call.is_colon_call()
+                    && let Some(LuaExpr::IndexExpr(method)) = call.get_prefix_expr()
+                    && let Some(receiver) = method.get_prefix_expr()
                 {
-                    pending.push(call.clone());
+                    pending.push(receiver);
                 }
             }
         }

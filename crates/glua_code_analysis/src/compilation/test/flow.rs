@@ -6670,6 +6670,41 @@ _2 = a[1]
         ));
     }
 
+    /// A stored `type()` result describes the value it was taken of, not one assigned
+    /// after it, nor one seen from a closure that may run later.
+    #[gtest]
+    fn test_type_guard_class_name_alias_does_not_outlive_its_value() {
+        let warns = |body: &str| {
+            let mut ws = VirtualWorkspace::new();
+            !ws.check_code_for(
+                DiagnosticCode::UndefinedMethod,
+                &format!(
+                    r#"
+            ---@class Dog
+            local Dog = {{}}
+            function Dog:Bark() end
+
+            ---@return Dog
+            local function makeDog() end
+
+            local function test()
+                local value = makeDog()
+                {body}
+            end
+            "#
+                ),
+            )
+        };
+        assert_eq!(
+            [
+                "local kind = type(value)\nvalue = 42\nif kind == \"Dog\" then value:Bark() end",
+                "value = 42\nlocal kind = type(value)\nlocal function later() if kind == \"Dog\" then value:Bark() end end\nlater()",
+            ]
+            .map(warns),
+            [true, true]
+        );
+    }
+
     #[gtest]
     fn test_type_guard_class_name_does_not_narrow_a_global_of_another_type() {
         let mut ws = VirtualWorkspace::new();

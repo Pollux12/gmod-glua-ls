@@ -357,6 +357,8 @@ fn maybe_type_guard_binary(
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let mut type_guard_expr: Option<LuaCallExpr> = None;
     let mut literal_string = String::new();
+    // The local a `type()` call was stored in, where it is declared and where it is tested.
+    let mut type_alias: Option<(TextSize, LuaNameExpr)> = None;
     if let LuaExpr::CallExpr(call_expr) = left_expr {
         if call_expr.is_type() {
             type_guard_expr = Some(call_expr);
@@ -403,6 +405,7 @@ fn maybe_type_guard_binary(
         if let LuaExpr::CallExpr(call_expr) = expr {
             if call_expr.is_type() {
                 type_guard_expr = Some(call_expr);
+                type_alias = Some((decl_id.position, name_expr.clone()));
                 match literal_expr.get_literal() {
                     Some(LuaLiteralToken::String(s)) => {
                         literal_string = s.get_value();
@@ -434,6 +437,19 @@ fn maybe_type_guard_binary(
         // If we cannot find a reference declaration ID, we cannot narrow it
         return Ok(ResultTypeOrContinue::Continue);
     };
+    if let Some((decl_position, name_expr)) = &type_alias
+        && !call_alias_holds(
+            db,
+            cache,
+            root,
+            &maybe_var_ref_id,
+            &type_guard_expr,
+            *decl_position,
+            name_expr,
+        )
+    {
+        return Ok(ResultTypeOrContinue::Continue);
+    }
 
     let related_member_query = if maybe_var_ref_id != *var_ref_id {
         let related_member_query =
@@ -751,37 +767,29 @@ fn has_decl_write_in_open_interval(
         })
 }
 
-/// The call a local that is never reassigned was declared with, in the closure of
-/// `name_expr` and before it, with the declaration's position.
-fn unreassigned_local_initializer_call(
+/// Whether what the call a never reassigned local declared at `decl_position` was
+/// initialised with says of `var_ref_id` still holds where `name_expr` tests that
+/// local: in the call's closure, while nothing reassigns the variable in between.
+pub(super) fn call_alias_holds(
     db: &DbIndex,
-    cache: &LuaInferCache,
+    cache: &mut LuaInferCache,
     root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    call_expr: &LuaCallExpr,
+    decl_position: TextSize,
     name_expr: &LuaNameExpr,
-) -> Option<(LuaCallExpr, TextSize)> {
-    let file_id = cache.get_file_id();
-    let decl_id = db
-        .get_reference_index()
-        .get_var_reference_decl(&file_id, name_expr.get_range())?;
-    let decl = db.get_decl_index().get_decl(&decl_id)?;
-    if !matches!(decl.extra, crate::LuaDeclExtra::Local { .. })
-        || decl_id.position >= name_expr.get_position()
-        || db
-            .get_reference_index()
-            .get_decl_references(&file_id, &decl_id)
-            .is_some_and(|decl_refs| decl_refs.mutable)
-    {
-        return None;
-    }
-
-    let call_expr = LuaCallExpr::cast(
-        decl.get_value_syntax_id()?
-            .to_node_from_root(root.syntax())?,
-    )?;
+) -> bool {
     let enclosing_closure =
         |node: &glua_parser::LuaSyntaxNode| node.ancestors().find_map(LuaClosureExpr::cast);
-    (enclosing_closure(call_expr.syntax()) == enclosing_closure(name_expr.syntax()))
-        .then_some((call_expr, decl_id.position))
+    enclosing_closure(call_expr.syntax()) == enclosing_closure(name_expr.syntax())
+        && !has_var_write_in_open_interval(
+            db,
+            cache,
+            root,
+            var_ref_id,
+            decl_position,
+            name_expr.get_position(),
+        )
 }
 
 /// Whether `var_ref_id`, or a table it is read through, may be assigned after a
@@ -1161,16 +1169,26 @@ fn maybe_type_name_literal_eq_narrow(
         }
         (LuaExpr::NameExpr(name_expr), LuaExpr::LiteralExpr(literal_expr))
         | (LuaExpr::LiteralExpr(literal_expr), LuaExpr::NameExpr(name_expr)) => {
-            let Some((call_expr, alias_position)) =
-                unreassigned_local_initializer_call(db, cache, root, &name_expr)
+            // A string that names no class is no class test, whatever the name holds.
+            let names_class = matches!(literal_expr.get_literal(),
+                Some(LuaLiteralToken::String(s))
+                    if resolve_class_name_target_type(db, cache, &s.get_value()).is_some());
+            if !names_class {
+                return Ok(ResultTypeOrContinue::Continue);
+            }
+            let Some(decl_id) = db
+                .get_reference_index()
+                .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())
             else {
                 return Ok(ResultTypeOrContinue::Continue);
             };
-            (
-                call_expr,
-                literal_expr,
-                Some((alias_position, name_expr.get_position())),
-            )
+            let Some(LuaExpr::CallExpr(call_expr)) = tree
+                .get_decl_ref_expr(&decl_id)
+                .and_then(|expr| expr.to_node(root))
+            else {
+                return Ok(ResultTypeOrContinue::Continue);
+            };
+            (call_expr, literal_expr, Some((decl_id.position, name_expr)))
         }
         _ => return Ok(ResultTypeOrContinue::Continue),
     };
@@ -1194,14 +1212,15 @@ fn maybe_type_name_literal_eq_narrow(
     if target_ref_id != *var_ref_id {
         return Ok(ResultTypeOrContinue::Continue);
     }
-    if let Some((alias_position, guard_position)) = alias_interval
-        && has_var_write_in_open_interval(
+    if let Some((decl_position, name_expr)) = &alias_interval
+        && !call_alias_holds(
             db,
             cache,
             root,
             var_ref_id,
-            alias_position,
-            guard_position,
+            &call_expr,
+            *decl_position,
+            name_expr,
         )
     {
         return Ok(ResultTypeOrContinue::Continue);

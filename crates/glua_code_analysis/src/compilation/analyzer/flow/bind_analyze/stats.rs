@@ -33,7 +33,7 @@ pub fn bind_local_stat(
         if !check_local_immutable(binder, decl_id) {
             continue;
         }
-        if check_value_expr_is_check_expr(value.clone()) {
+        if condition_rereads(value) {
             binder.decl_bind_expr_ref.insert(decl_id, value.to_ptr());
         }
         if matches!(value, LuaExpr::CallExpr(_)) {
@@ -63,17 +63,15 @@ fn check_local_immutable(binder: &mut FlowBinder, decl_id: LuaDeclId) -> bool {
     !decl_ref.mutable
 }
 
-fn check_value_expr_is_check_expr(value_expr: LuaExpr) -> bool {
+/// Whether a condition reading a local declared with `value_expr` narrows as
+/// `value_expr` itself does: a comparison, or a call such as `type(x)` or `IsValid(x)`.
+fn condition_rereads(value_expr: &LuaExpr) -> bool {
     match value_expr {
-        LuaExpr::BinaryExpr(binary_expr) => {
-            let Some(op) = binary_expr.get_op_token() else {
-                return false;
-            };
-
-            matches!(op.get_op(), BinaryOperator::OpEq | BinaryOperator::OpNe)
-        }
-        LuaExpr::CallExpr(call) => call.is_type(),
-        _ => false, // Other expressions can be checked
+        LuaExpr::BinaryExpr(binary_expr) => binary_expr
+            .get_op_token()
+            .is_some_and(|op| matches!(op.get_op(), BinaryOperator::OpEq | BinaryOperator::OpNe)),
+        LuaExpr::CallExpr(_) => true,
+        _ => false,
     }
 }
 

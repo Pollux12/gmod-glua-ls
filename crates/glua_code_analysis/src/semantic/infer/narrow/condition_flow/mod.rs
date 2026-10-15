@@ -15,7 +15,8 @@ use crate::{
         narrow::{
             ResultTypeOrContinue,
             condition_flow::{
-                binary_flow::get_type_at_binary_expr, call_flow::get_type_at_call_expr,
+                binary_flow::{call_alias_holds, get_type_at_binary_expr},
+                call_flow::get_type_at_call_expr,
                 index_flow::get_type_at_index_expr,
             },
             get_single_antecedent,
@@ -285,25 +286,39 @@ fn get_type_at_name_ref(
         return Ok(ResultTypeOrContinue::Continue);
     };
 
-    let Some(expr_ptr) = tree.get_decl_ref_expr(&decl_id) else {
+    let Some(expr) = tree
+        .get_decl_ref_expr(&decl_id)
+        .and_then(|expr_ptr| expr_ptr.to_node(root))
+    else {
         return Ok(ResultTypeOrContinue::Continue);
     };
 
-    let Some(expr) = expr_ptr.to_node(root) else {
-        return Ok(ResultTypeOrContinue::Continue);
-    };
-
-    get_type_at_condition_flow(
+    let result = get_type_at_condition_flow(
         db,
         tree,
         cache,
         root,
         var_ref_id,
         flow_node,
-        expr,
+        expr.clone(),
         condition_flow,
         policy,
-    )
+    )?;
+    if matches!(result, ResultTypeOrContinue::Result(_))
+        && let LuaExpr::CallExpr(call_expr) = &expr
+        && !call_alias_holds(
+            db,
+            cache,
+            root,
+            var_ref_id,
+            call_expr,
+            decl_id.position,
+            &name_expr,
+        )
+    {
+        return Ok(ResultTypeOrContinue::Continue);
+    }
+    Ok(result)
 }
 
 #[allow(clippy::too_many_arguments)]

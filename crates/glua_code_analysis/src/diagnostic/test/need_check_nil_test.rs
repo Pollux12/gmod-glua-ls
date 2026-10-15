@@ -15489,4 +15489,45 @@ mod test {
             [true, true, true, false, false, false]
         );
     }
+
+    /// A local holding a guard call's result narrows like the call, while what it checked keeps its value.
+    #[gtest]
+    fn a_local_holding_an_isvalid_result_narrows_what_it_checked() {
+        let warns = |body: &str| {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            def_isvalid_type_guard(&mut ws);
+            !ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                &format!(
+                    r#"
+            ---@class Entity
+            ---@field GetEditingData fun(self: Entity): table
+
+            ---@return Entity?
+            function maybeEntity() end
+
+            local function run()
+                local maybe = maybeEntity()
+                {body}
+            end
+            "#
+                ),
+            )
+        };
+        assert_eq!(
+            [
+                "local valid = IsValid(maybe)\nif valid then maybe:GetEditingData() end",
+                "local valid = IsValid(maybe)\nif not valid then return end\nmaybe:GetEditingData()",
+                "local holder = { maybe = maybe }\nlocal valid = IsValid(holder.maybe)\nif valid then holder.maybe:GetEditingData() end",
+                "local valid = IsValid(maybe)\nmaybe = maybeEntity()\nif valid then maybe:GetEditingData() end",
+                "local valid = IsValid(maybe)\nlocal function later() if valid then maybe:GetEditingData() end end\nlater()",
+                "local valid = IsValid(maybe)\nvalid = true\nif valid then maybe:GetEditingData() end",
+                "local valid = IsValid(maybe)\nwhile valid do\nmaybe:GetEditingData()\nmaybe = maybeEntity()\nend",
+                "local valid = IsValid(maybe)\n::again::\nif valid then maybe:GetEditingData() end\nmaybe = maybeEntity()\ngoto again",
+                "local holder = { maybe = maybe }\nlocal valid = IsValid(holder.maybe)\nlocal key = \"maybe\"\nholder[key] = maybeEntity()\nif valid then holder.maybe:GetEditingData() end",
+            ]
+            .map(warns),
+            [false, false, false, true, true, true, true, true, true]
+        );
+    }
 }
