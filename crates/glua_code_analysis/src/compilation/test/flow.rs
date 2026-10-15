@@ -6671,6 +6671,24 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_type_guard_class_name_does_not_narrow_a_global_of_another_type() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            ---@class Dog
+            local Dog = {}
+            function Dog:Bark() end
+
+            pet = "text"
+            if type(pet) == "Dog" then
+                pet:Bark()
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
     fn test_type_guard_alias_name_does_not_narrow() {
         let mut ws = VirtualWorkspace::new();
         assert!(!ws.check_code_for(

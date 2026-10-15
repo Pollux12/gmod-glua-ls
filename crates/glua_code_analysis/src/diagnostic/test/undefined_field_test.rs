@@ -6350,4 +6350,50 @@ owner:CompletelyMadeUpMethod()
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
+
+    /// A passing `type(x) == "Entity"` proves `x` is an entity even where inference says it cannot be.
+    #[test]
+    fn a_type_test_for_a_class_overrides_an_inference_it_contradicts() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/annotations/entity.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            local Entity = {}
+            ---@return integer
+            function Entity:EntIndex() end
+            ---@param value any
+            ---@return boolean
+            function IsValid(value) end
+            ---@class DebugSnapshot
+            ---@field vehicle integer?
+            "#,
+        );
+        for code in [
+            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
+        ] {
+            assert!(
+                ws.check_file_for(
+                    code,
+                    "lua/glide/sh_network.lua",
+                    r#"
+            ---@param tbl DebugSnapshot
+            function SendDebugSnapshot(tbl)
+                local vehicleId = tbl.vehicle
+                if vehicleId ~= nil and type(vehicleId) == "Entity" then
+                    vehicleId = IsValid(vehicleId) and vehicleId:EntIndex() or nil
+                end
+                return vehicleId
+            end
+            "#,
+                ),
+                "{code:?}"
+            );
+        }
+    }
 }

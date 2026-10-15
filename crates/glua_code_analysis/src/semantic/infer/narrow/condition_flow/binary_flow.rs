@@ -474,15 +474,15 @@ fn maybe_type_guard_binary(
         policy,
     )?;
 
-    let narrow = match literal_string.as_str() {
-        "number" => LuaType::Number,
-        "string" => LuaType::String,
-        "boolean" => LuaType::Boolean,
-        "table" => LuaType::Table,
-        "function" => LuaType::Function,
-        "thread" => LuaType::Thread,
-        "userdata" => LuaType::Userdata,
-        "nil" => LuaType::Nil,
+    let (narrow, test_contradicts_inference) = match literal_string.as_str() {
+        "number" => (LuaType::Number, false),
+        "string" => (LuaType::String, false),
+        "boolean" => (LuaType::Boolean, false),
+        "table" => (LuaType::Table, false),
+        "function" => (LuaType::Function, false),
+        "thread" => (LuaType::Thread, false),
+        "userdata" => (LuaType::Userdata, false),
+        "nil" => (LuaType::Nil, false),
         _ => {
             let Some(target_type) = resolve_class_name_target_type(db, cache, &literal_string)
             else {
@@ -494,7 +494,15 @@ fn maybe_type_guard_binary(
                 return Ok(ResultTypeOrContinue::Continue);
             };
 
-            if !can_target_class_be_a_more_specific_narrowing(db, &antecedent_type, target_type_id)
+            let test_contradicts_inference = condition_flow.is_true()
+                && !has_declared_type(db, narrowed_var_ref_id)
+                && antecedent_excludes_target_class(db, &antecedent_type, target_type_id);
+            if !test_contradicts_inference
+                && !can_target_class_be_a_more_specific_narrowing(
+                    db,
+                    &antecedent_type,
+                    target_type_id,
+                )
             {
                 if let Some(member_keys) = related_member_query.as_ref()
                     && antecedent_already_target_or_more_specific(
@@ -512,11 +520,12 @@ fn maybe_type_guard_binary(
                 return Ok(ResultTypeOrContinue::Continue);
             }
 
-            target_type
+            (target_type, test_contradicts_inference)
         }
     };
 
     let result_type = match condition_flow {
+        InferConditionFlow::TrueCondition if test_contradicts_inference => narrow,
         InferConditionFlow::TrueCondition => {
             narrow_down_type(db, antecedent_type.clone(), narrow.clone(), None).unwrap_or(narrow)
         }
@@ -1285,6 +1294,74 @@ fn antecedent_already_target_or_more_specific(
             .get_unions()
             .iter()
             .all(|(ty, _)| antecedent_already_target_or_more_specific(db, ty, target_type_id)),
+        _ => false,
+    }
+}
+
+/// Whether an annotation declares the type of `var_ref_id`, so a test it cannot pass
+/// checks that contract rather than correcting an inference; only a local or a
+/// parameter is known to have none.
+fn has_declared_type(db: &DbIndex, var_ref_id: &VarRefId) -> bool {
+    let Some(decl_id) = var_ref_id.get_decl_id_ref() else {
+        return true;
+    };
+    let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
+        return true;
+    };
+    match &decl.extra {
+        crate::LuaDeclExtra::Param {
+            idx, signature_id, ..
+        } => db
+            .get_signature_index()
+            .get(signature_id)
+            .is_some_and(|signature| signature.get_param_info_by_id(*idx).is_some()),
+        crate::LuaDeclExtra::Local { .. } => db
+            .get_type_index()
+            .get_type_cache(&decl_id.into())
+            .is_some_and(|cache| cache.is_doc()),
+        _ => true,
+    }
+}
+
+/// Whether no alternative of `antecedent_type` can hold an instance of the target
+/// class, so a runtime `type()` test that it does contradicts the inference.
+fn antecedent_excludes_target_class(
+    db: &DbIndex,
+    antecedent_type: &LuaType,
+    target_type_id: &crate::LuaTypeDeclId,
+) -> bool {
+    match antecedent_type {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            type_id != target_type_id
+                && !is_sub_type_of(db, target_type_id, type_id)
+                && !is_sub_type_of(db, type_id, target_type_id)
+        }
+        LuaType::Instance(instance_type) => {
+            antecedent_excludes_target_class(db, instance_type.get_base(), target_type_id)
+        }
+        LuaType::Union(union_type) => union_type
+            .types()
+            .all(|ty| antecedent_excludes_target_class(db, ty, target_type_id)),
+        LuaType::MultiLineUnion(multi_line_union) => multi_line_union
+            .get_unions()
+            .iter()
+            .all(|(ty, _)| antecedent_excludes_target_class(db, ty, target_type_id)),
+        LuaType::Nil
+        | LuaType::Boolean
+        | LuaType::BooleanConst(_)
+        | LuaType::DocBooleanConst(_)
+        | LuaType::String
+        | LuaType::StringConst(_)
+        | LuaType::DocStringConst(_)
+        | LuaType::Integer
+        | LuaType::IntegerConst(_)
+        | LuaType::DocIntegerConst(_)
+        | LuaType::Number
+        | LuaType::FloatConst(_)
+        | LuaType::Function
+        | LuaType::DocFunction(_)
+        | LuaType::Signature(_)
+        | LuaType::Thread => true,
         _ => false,
     }
 }
