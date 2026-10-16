@@ -2,7 +2,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use glua_parser::{
     BinaryOperator, LuaAstNode, LuaBinaryExpr, LuaBlock, LuaCallExpr, LuaClosureExpr, LuaExpr,
-    LuaIfStat, LuaLiteralToken, LuaLocalStat, LuaNameExpr, LuaStat, UnaryOperator,
+    LuaIfStat, LuaLiteralToken, LuaLocalStat, LuaNameExpr, LuaParenExpr, LuaStat, UnaryOperator,
 };
 use rowan::{TextRange, TextSize};
 
@@ -187,13 +187,23 @@ fn collect_short_circuit_guarded_name_expr_ranges(
         .map(|op| op.get_op())
         .unwrap_or(BinaryOperator::OpNop);
 
-    if op != BinaryOperator::OpAnd {
+    if op != BinaryOperator::OpAnd && op != BinaryOperator::OpOr {
         return;
     }
 
     let Some((left_expr, right_expr)) = binary_expr.get_exprs() else {
         return;
     };
+
+    if op == BinaryOperator::OpOr {
+        // `local X = X or fallback` probes an optional global for a local of its name.
+        if let Some(name_expr) = unwrap_paren_to_name_expr(&left_expr)
+            && initializes_local_of_same_name(binary_expr, &name_expr)
+        {
+            guarded_ranges.insert(name_expr.get_range());
+        }
+        return;
+    }
 
     let mut lhs_guard_ranges = HashSet::default();
     let lhs_guarded_names =
@@ -213,6 +223,42 @@ fn collect_short_circuit_guarded_name_expr_ranges(
             guarded_ranges.insert(rhs_name_expr.get_range());
         }
     }
+}
+
+/// Whether `or_expr`, through parentheses and the left of further `or`s, initializes a local
+/// declared with the name the probed `name_expr` reads, as in `local X = (X or a) or b`.
+fn initializes_local_of_same_name(or_expr: &LuaBinaryExpr, name_expr: &LuaNameExpr) -> bool {
+    let Some(name) = name_expr.get_name_text() else {
+        return false;
+    };
+    let mut initializer = or_expr.syntax().clone();
+    while let Some(parent) = initializer.parent() {
+        let continues = LuaParenExpr::cast(parent.clone()).is_some()
+            || LuaBinaryExpr::cast(parent.clone()).is_some_and(|outer| {
+                outer
+                    .get_op_token()
+                    .is_some_and(|token| token.get_op() == BinaryOperator::OpOr)
+                    && outer
+                        .get_exprs()
+                        .is_some_and(|(left, _)| left.syntax() == &initializer)
+            });
+        if !continues {
+            break;
+        }
+        initializer = parent;
+    }
+    let Some(local_stat) = initializer.parent().and_then(LuaLocalStat::cast) else {
+        return false;
+    };
+    local_stat
+        .get_local_name_list()
+        .zip(local_stat.get_value_exprs())
+        .any(|(local_name, value)| {
+            value.syntax() == &initializer
+                && local_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == name)
+        })
 }
 
 #[derive(Debug)]

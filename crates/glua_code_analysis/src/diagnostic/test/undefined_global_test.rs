@@ -167,6 +167,122 @@ mod test {
         ));
     }
 
+    /// Codes of the undefined-global diagnostics `content` produces, with every default check on.
+    fn undefined_global_codes(ws: &mut VirtualWorkspace, content: &str) -> Vec<String> {
+        let file_id = ws.def(content);
+        let codes = [
+            DiagnosticCode::UndefinedGlobal.get_name().to_string(),
+            DiagnosticCode::UndefinedGlobalAssignment
+                .get_name()
+                .to_string(),
+        ];
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|diagnostic| match diagnostic.code {
+                Some(NumberOrString::String(code)) if codes.contains(&code) => Some(code),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_left_of_or_probes_global_presence() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert_eq!(
+            undefined_global_codes(
+                &mut ws,
+                r#"
+                local schemaName = schemaName or { name = "default" }
+                local wrapped = (wrapped) or false
+                local folder = ((folder or (Schema and Schema.folder)))
+                local chained = chained or nil or "fallback"
+                "#
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_a_self_named_probe_leaves_a_later_global_read_strict() {
+        let strict = DiagnosticCode::UndefinedGlobal.get_name().to_string();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert_eq!(
+            undefined_global_codes(
+                &mut ws,
+                r#"
+                do local optional = optional or {} end
+                optional.run()
+                "#
+            ),
+            [strict]
+        );
+    }
+
+    #[test]
+    fn test_or_probe_into_a_differently_named_local_keeps_the_assignment_warning() {
+        let assignment = DiagnosticCode::UndefinedGlobalAssignment
+            .get_name()
+            .to_string();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert_eq!(
+            undefined_global_codes(
+                &mut ws,
+                r#"
+                local schema = missingSchema or { name = "default" }
+                "#
+            ),
+            [assignment]
+        );
+    }
+
+    #[test]
+    fn test_or_probe_exempts_only_the_tested_name() {
+        let strict = DiagnosticCode::UndefinedGlobal.get_name().to_string();
+        let assignment = DiagnosticCode::UndefinedGlobalAssignment
+            .get_name()
+            .to_string();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(
+            undefined_global_codes(
+                &mut ws,
+                r#"
+                local folder = missingMember.folder or "fallback"
+                "#
+            )
+            .contains(&strict)
+        );
+        assert!(
+            undefined_global_codes(
+                &mut ws,
+                r#"
+                local value = missingCall() or 1
+                "#
+            )
+            .contains(&strict)
+        );
+        assert_eq!(
+            undefined_global_codes(
+                &mut ws,
+                r#"
+                local imported = missingImport
+                "#
+            ),
+            [assignment]
+        );
+        assert!(
+            undefined_global_codes(
+                &mut ws,
+                r#"
+                local probed = missingLater or 1
+                missingLater.run()
+                "#
+            )
+            .contains(&strict)
+        );
+    }
+
     #[test]
     fn test_guarded_undefined_global_if_isvalid() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
