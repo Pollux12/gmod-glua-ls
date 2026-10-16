@@ -28,6 +28,24 @@ pub struct LuaDeclIndex {
     derived_decl_ids: CowShards<DerivationId, Vec<LuaDeclId>>,
 }
 
+/// Whether `call_expr` calls the `error` intrinsic: the parser marks it as an `error(...)` call
+/// and no local `error` is in scope there.
+pub fn calls_intrinsic_error(
+    db: &crate::DbIndex,
+    file_id: FileId,
+    call_expr: &glua_parser::LuaCallExpr,
+) -> bool {
+    use glua_parser::LuaAstNode;
+    call_expr.is_error()
+        && db
+            .get_decl_index()
+            .get_decl_tree(&file_id)
+            .is_none_or(|tree| {
+                tree.find_local_decl("error", call_expr.get_position())
+                    .is_none()
+            })
+}
+
 impl Default for LuaDeclIndex {
     fn default() -> Self {
         Self::new()

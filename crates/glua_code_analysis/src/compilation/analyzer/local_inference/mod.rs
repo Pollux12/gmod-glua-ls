@@ -7,8 +7,8 @@ use rustc_hash::FxHashMap;
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaClosureExpr,
-    LuaElseIfClauseStat, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexExpr, LuaNameExpr, LuaRepeatStat,
-    LuaVarExpr, LuaWhileStat,
+    LuaElseIfClauseStat, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexExpr, LuaLocalStat, LuaNameExpr,
+    LuaParenExpr, LuaRepeatStat, LuaReturnStat, LuaSyntaxNode, LuaVarExpr, LuaWhileStat,
 };
 use rustc_hash::FxHashSet;
 
@@ -16,12 +16,12 @@ use crate::{
     FlowNodeKind, InFiled, LuaDefinitionId, LuaInferenceConfidence, LuaInferenceEventId,
     LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaInferenceStep, LuaInferredGuardOwner,
     LuaInferredPositiveGuard, LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType, LuaTypeDeclId,
-    LuaTypeFact, SignatureReturnStatus, TypeOps,
+    LuaTypeFact, SignatureReturnStatus, TypeOps, check_type_compact,
     compilation::analyzer::AnalyzeContext,
     semantic::{
         LuaInferCache, VarRefId, VarRefRootId, dynamic_field_type_without, get_var_expr_var_ref_id,
-        infer_bind_value_type, infer_expr, infer_true_condition_narrowing,
-        resolve_dynamic_field_member,
+        get_var_ref_type, infer_bind_value_type, infer_expr, infer_true_condition_narrowing,
+        infer_var_type_at_node, resolve_dynamic_field_member, type_name_test,
     },
 };
 
@@ -1846,9 +1846,6 @@ fn global_path_from_index_expr(
 ) -> Option<Vec<smol_str::SmolStr>> {
     use glua_parser::LuaIndexKey;
 
-    if index_expr.get_index_token()?.is_colon() {
-        return None;
-    }
     let mut path = match index_expr.get_prefix_expr()? {
         LuaExpr::NameExpr(name_expr) => {
             vec![name_expr.get_name_token()?.get_name_text().into()]
@@ -1873,31 +1870,34 @@ fn inferred_positive_guard_for_closure(
 ) -> Option<(LuaInferredPositiveGuard, Vec<crate::LuaDocReturnInfo>)> {
     let signature_id = LuaSignatureId::from_closure(file_id, closure);
     let signature = db.get_signature_index().get(&signature_id)?;
-    if signature.resolve_return == SignatureReturnStatus::DocResolve
-        || signature.is_colon_define
-        || signature.is_generic()
-        || signature.is_vararg
-        || !signature.param_docs.is_empty()
-        || !signature.overloads.is_empty()
-    {
+    if signature.is_generic() || signature.is_vararg || !signature.overloads.is_empty() {
         return None;
     }
 
-    let return_points = super::lua::func_body::analyze_func_body_returns(closure.get_block()?);
-    let [super::lua::LuaReturnPoint::Expr(return_expr)] = return_points.as_slice() else {
-        return None;
-    };
-    let return_type = if signature.resolve_return == SignatureReturnStatus::InferResolve {
-        signature.get_return_type()
-    } else {
-        crate::infer_expr(
-            db,
-            context.infer_manager.get_infer_cache(file_id),
-            return_expr.clone(),
-        )
-        .ok()?
-    };
-    if !type_is_boolean(&return_type) {
+    let return_points =
+        super::lua::func_body::analyze_func_body_returns(Some((db, file_id)), closure.get_block()?);
+    let mut truthy_exprs = Vec::new();
+    for point in &return_points {
+        match point {
+            super::lua::LuaReturnPoint::Expr(expr)
+                if !super::common::is_falsy_literal_expr(expr) =>
+            {
+                truthy_exprs.push(expr);
+            }
+            super::lua::LuaReturnPoint::MuliExpr(_) => return None,
+            super::lua::LuaReturnPoint::Error(call) => {
+                let cache = context.infer_manager.get_infer_cache(file_id);
+                if !infer_expr(db, cache, LuaExpr::CallExpr(call.clone()))
+                    .ok()?
+                    .is_never()
+                {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if truthy_exprs.is_empty() {
         return None;
     }
     let returns = super::lua::analyze_return_point(
@@ -1906,6 +1906,18 @@ fn inferred_positive_guard_for_closure(
         &return_points,
     )
     .ok()?;
+    let return_type = if signature.resolve_return == SignatureReturnStatus::UnResolve {
+        returns.first()?.type_ref.clone()
+    } else {
+        signature.return_docs.first()?.type_ref.clone()
+    };
+    let return_type = match return_type {
+        LuaType::Variadic(values) => values.get_type(0).cloned().unwrap_or(LuaType::Nil),
+        typ => typ,
+    };
+    if !type_is_boolean(&return_type) {
+        return None;
+    }
     let mut candidates = closure
         .get_params_list()?
         .get_params()
@@ -1919,48 +1931,161 @@ fn inferred_positive_guard_for_closure(
             {
                 return None;
             }
-            let target_expr = return_expr
-                .descendants::<LuaNameExpr>()
-                .find(|name_expr| {
-                    db.get_reference_index()
-                        .get_var_reference_decl(&file_id, name_expr.get_range())
-                        == Some(decl_id)
-                })
-                .map(LuaExpr::NameExpr)?;
-            let (antecedent, narrowed_type) = infer_true_condition_narrowing(
-                db,
-                context.infer_manager.get_infer_cache(file_id),
-                target_expr,
-                return_expr.clone(),
-            )?;
-            if antecedent == narrowed_type
-                || antecedent.is_any()
-                || antecedent.is_unknown()
-                || narrowed_type.is_any()
-                || narrowed_type.is_unknown()
-                || narrowed_type.is_never()
-                || narrowed_type.is_nil()
-            {
-                return None;
-            }
+            let cache = context.infer_manager.get_infer_cache(file_id);
+            let tested_type = match return_points.as_slice() {
+                [super::lua::LuaReturnPoint::Expr(expr)] => type_name_test(db, cache, expr)
+                    .and_then(|(tested, typ)| {
+                        matches!(&tested, LuaExpr::NameExpr(name_expr)
+                            if names_param(db, file_id, decl_id, name_expr))
+                        .then_some(typ)
+                    }),
+                _ => None,
+            };
+            let false_removed_type = tested_type.clone().filter(|typ| match typ {
+                LuaType::Ref(id) | LuaType::Def(id) => {
+                    db.get_type_index().direct_sub_types(id).next().is_none()
+                }
+                _ => true,
+            });
+            let narrowed_type = if let Some(typ) = &tested_type {
+                if let Some(param) = signature.param_docs.get(&param_idx)
+                    && check_type_compact(db, &param.type_ref, typ).is_err()
+                {
+                    return None;
+                }
+                typ.clone()
+            } else {
+                inferred_guard_param_narrowing(
+                    db,
+                    cache,
+                    closure,
+                    decl_id,
+                    signature.param_docs.contains_key(&param_idx),
+                    &truthy_exprs,
+                )?
+            };
             Some(LuaInferredPositiveGuard {
                 param_idx,
                 narrowed_type,
+                false_removed_type,
             })
         });
     let guard = candidates.next()?;
     candidates.next().is_none().then_some((guard, returns))
 }
 
+fn names_param(
+    db: &crate::DbIndex,
+    file_id: crate::FileId,
+    decl_id: crate::LuaDeclId,
+    name_expr: &LuaNameExpr,
+) -> bool {
+    db.get_reference_index()
+        .get_var_reference_decl(&file_id, name_expr.get_range())
+        == Some(decl_id)
+}
+
+/// The type the parameter `decl_id` holds wherever `truthy_exprs`, the values
+/// its function can return truthy, are returned: the union of what each
+/// return narrows it to. `None` when any of them leaves it unnarrowed. A
+/// documented parameter is measured against its declared type, and the
+/// narrowed type must be compatible with it (`check_type_compact`, not strict
+/// subtyping).
+fn inferred_guard_param_narrowing(
+    db: &crate::DbIndex,
+    cache: &mut LuaInferCache,
+    closure: &LuaClosureExpr,
+    decl_id: crate::LuaDeclId,
+    param_documented: bool,
+    truthy_exprs: &[&LuaExpr],
+) -> Option<LuaType> {
+    let file_id = cache.get_file_id();
+    let references_param = |name_expr: &LuaNameExpr| names_param(db, file_id, decl_id, name_expr);
+    let var_ref_id = get_var_expr_var_ref_id(
+        db,
+        cache,
+        closure
+            .get_block()?
+            .descendants::<LuaNameExpr>()
+            .find(references_param)
+            .map(LuaExpr::NameExpr)?,
+    )?;
+    let declared = get_var_ref_type(db, cache, &var_ref_id).ok()?;
+    let mut narrowed_types = Vec::new();
+    for return_expr in truthy_exprs {
+        let return_stat = return_expr.get_parent::<LuaReturnStat>()?;
+        let flow_type = infer_var_type_at_node(db, cache, &return_stat, var_ref_id.clone()).ok()?;
+        let condition_proof = return_expr
+            .descendants::<LuaNameExpr>()
+            .find(references_param)
+            .map(LuaExpr::NameExpr)
+            .and_then(|target_expr| {
+                infer_true_condition_narrowing(db, cache, target_expr, (*return_expr).clone())
+            });
+        let (condition_antecedent, narrowed_type) = match condition_proof {
+            Some((antecedent, narrowed)) => (
+                antecedent,
+                TypeOps::Intersect.apply(db, &flow_type, &narrowed),
+            ),
+            None => (declared.clone(), flow_type),
+        };
+        let antecedent = if param_documented {
+            declared.clone()
+        } else {
+            condition_antecedent
+        };
+        if antecedent == narrowed_type
+            || antecedent.is_any()
+            || narrowed_type.is_any()
+            || narrowed_type.is_unknown()
+            || narrowed_type.is_never()
+            || narrowed_type.is_nil()
+        {
+            return None;
+        }
+        if antecedent.is_unknown() {
+            if !is_type_test_result(&narrowed_type) {
+                return None;
+            }
+        } else if param_documented && check_type_compact(db, &antecedent, &narrowed_type).is_err() {
+            return None;
+        }
+        narrowed_types.push(narrowed_type);
+    }
+    let multiple_returns = narrowed_types.len() > 1;
+    let union = LuaType::from_vec(narrowed_types);
+    if multiple_returns && union == declared {
+        return None;
+    }
+    Some(union)
+}
+
+/// The builtin types a `type(value) == "name"` test narrows an untyped value to.
+fn is_type_test_result(typ: &LuaType) -> bool {
+    matches!(
+        typ,
+        LuaType::Table
+            | LuaType::String
+            | LuaType::Number
+            | LuaType::Boolean
+            | LuaType::Function
+            | LuaType::Userdata
+            | LuaType::Thread
+    )
+}
+
+/// Whether `typ` is a predicate's boolean result: booleans, possibly nil, since nil is falsy.
 fn type_is_boolean(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Union(union) => union.types().all(type_is_boolean),
+    let arms = match typ {
+        LuaType::Union(union) => union.types().cloned().collect::<Vec<_>>(),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
             .iter()
-            .all(|(typ, _)| type_is_boolean(typ)),
-        _ => typ.is_boolean(),
-    }
+            .map(|(arm, _)| arm.clone())
+            .collect(),
+        _ => return typ.is_boolean(),
+    };
+    arms.iter().any(type_is_boolean) && arms.iter().all(|arm| arm.is_nil() || type_is_boolean(arm))
 }
 
 /// The nearest descendants of the class `receiver_type` names whose

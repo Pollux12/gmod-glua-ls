@@ -9,7 +9,7 @@ use super::{LuaAnalyzer, LuaReturnPoint, StatementWrite, func_body::analyze_func
 
 pub fn analyze_chunk_return(analyzer: &mut LuaAnalyzer, chunk: LuaChunk) -> Option<()> {
     let block = chunk.get_block()?;
-    let return_exprs = analyze_func_body_returns(block);
+    let return_exprs = analyze_func_body_returns(Some((analyzer.db, analyzer.file_id)), block);
     for point in return_exprs {
         if let LuaReturnPoint::Expr(expr) = point {
             let expr_type = match analyzer.infer_expr(&expr) {

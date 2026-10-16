@@ -2176,7 +2176,8 @@ fn analyze_return(
         }
     };
 
-    let return_points = analyze_func_body_returns(block.clone());
+    let return_points =
+        analyze_func_body_returns(Some((analyzer.db, analyzer.file_id)), block.clone());
     let (return_correlations, returns) = derive_inferred_return_with_reads(
         &analyzer.db,
         analyzer
@@ -2267,7 +2268,8 @@ fn analyze_lambda_returns(
         .get_args()
         .position(|arg| arg.get_position() == pos)?;
     let block = closure.get_block()?;
-    let return_points = analyze_func_body_returns(block.clone());
+    let return_points =
+        analyze_func_body_returns(Some((analyzer.db, analyzer.file_id)), block.clone());
     let unresolved = UnResolveClosureReturn {
         file_id: analyzer.file_id,
         signature_id: *signature_id,
@@ -2328,7 +2330,7 @@ pub fn analyze_return_point(
                     None => LuaType::Nil,
                 });
             }
-            LuaReturnPoint::Error => {}
+            LuaReturnPoint::Error(_) => {}
         }
     }
 
@@ -2385,7 +2387,7 @@ fn return_point_shape(
 ) -> Option<Vec<LuaType>> {
     match point {
         LuaReturnPoint::Nil => Some(vec![LuaType::Nil]),
-        LuaReturnPoint::Error => Some(Vec::new()),
+        LuaReturnPoint::Error(_) => Some(Vec::new()),
         LuaReturnPoint::Expr(expr) => Some(first_class_return_shape(
             infer_expr(db, cache, expr.clone()).ok()?,
         )),

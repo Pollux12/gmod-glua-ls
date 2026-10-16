@@ -155,7 +155,7 @@ fn check_return_block(
     // Check whether error() is called
     for call_expr_stat in block.children::<LuaCallExprStat>() {
         if let Some(call_expr) = call_expr_stat.get_call_expr()
-            && call_expr.is_error()
+            && crate::calls_intrinsic_error(context.db, semantic_model.get_file_id(), &call_expr)
         {
             return Ok(());
         }

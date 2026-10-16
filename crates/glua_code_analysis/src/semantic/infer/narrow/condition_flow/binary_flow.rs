@@ -27,6 +27,7 @@ use crate::{
         member::{
             cached_local_class_table_member_ids, find_members_with_key, infer_raw_member_type,
         },
+        resolve_global_decl_id,
     },
 };
 
@@ -342,6 +343,106 @@ fn try_get_at_gt_or_ge_expr(
     }
 }
 
+/// Whether `call_expr` calls the global intrinsic `type`, directly or through
+/// a local that is never reassigned and holds it.
+fn calls_type_intrinsic(db: &DbIndex, cache: &mut LuaInferCache, call_expr: &LuaCallExpr) -> bool {
+    matches!(
+        call_expr.get_prefix_expr(),
+        Some(LuaExpr::NameExpr(callee)) if names_type_intrinsic(db, cache, &callee)
+    )
+}
+
+fn names_type_intrinsic(db: &DbIndex, cache: &mut LuaInferCache, name_expr: &LuaNameExpr) -> bool {
+    let file_id = cache.get_file_id();
+    let Some(name) = name_expr.get_name_text() else {
+        return false;
+    };
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, name_expr.get_range())
+        .or_else(|| {
+            db.get_decl_index()
+                .get_decl_tree(&file_id)
+                .and_then(|tree| tree.find_local_decl(&name, name_expr.get_position()))
+                .map(|decl| decl.get_id())
+        })
+        .or_else(|| resolve_global_decl_id(db, cache, &name, Some(name_expr)));
+    let Some(decl_id) = decl_id else {
+        return name == "type";
+    };
+    if db
+        .get_reference_index()
+        .decl_references(&decl_id)
+        .is_some_and(|references| references.mutable)
+    {
+        return false;
+    }
+    if let Some(LuaExpr::NameExpr(value)) = decl_value_expr(db, decl_id) {
+        if !db
+            .get_decl_index()
+            .get_decl(&decl_id)
+            .is_some_and(|decl| decl.is_local())
+        {
+            return false;
+        }
+        if value.get_name_text().is_some_and(|name| {
+            db.get_decl_index()
+                .get_decl_tree(&decl_id.file_id)
+                .and_then(|tree| tree.find_local_decl(&name, value.get_position()))
+                .is_some()
+        }) {
+            return names_type_intrinsic(db, cache, &value);
+        }
+        if let Ok(LuaType::Signature(signature_id)) =
+            infer_expr(db, cache, LuaExpr::NameExpr(value.clone()))
+            && crate::signature_is_type_classifier(db, signature_id)
+        {
+            return true;
+        }
+        return names_type_intrinsic(db, cache, &value);
+    }
+    crate::semantic::known_signature_id(db, &crate::LuaSemanticDeclId::LuaDecl(decl_id))
+        .is_some_and(|signature_id| crate::signature_is_type_classifier(db, signature_id))
+}
+
+/// The value and type tested by a comparison with an intrinsic type name.
+pub(crate) fn type_name_test(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> Option<(LuaExpr, LuaType)> {
+    let LuaExpr::BinaryExpr(binary_expr) = expr else {
+        return None;
+    };
+    if !matches!(binary_expr.get_op_token()?.get_op(), BinaryOperator::OpEq) {
+        return None;
+    }
+    let (call_expr, literal_expr) = match binary_expr.get_exprs()? {
+        (LuaExpr::CallExpr(call_expr), LuaExpr::LiteralExpr(literal_expr))
+        | (LuaExpr::LiteralExpr(literal_expr), LuaExpr::CallExpr(call_expr)) => {
+            (call_expr, literal_expr)
+        }
+        _ => return None,
+    };
+    if !calls_type_intrinsic(db, cache, &call_expr) {
+        return None;
+    }
+    let Some(LuaLiteralToken::String(name)) = literal_expr.get_literal() else {
+        return None;
+    };
+    let typ = match name.get_value().as_str() {
+        "number" => LuaType::Number,
+        "string" => LuaType::String,
+        "boolean" => LuaType::Boolean,
+        "table" => LuaType::Table,
+        "function" => LuaType::Function,
+        "thread" => LuaType::Thread,
+        "userdata" => LuaType::Userdata,
+        _ => resolve_class_name_target_type(db, cache, &name.get_value())?,
+    };
+    Some((call_expr.get_args_list()?.get_args().next()?, typ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn maybe_type_guard_binary(
     db: &DbIndex,
@@ -360,7 +461,7 @@ fn maybe_type_guard_binary(
     // The local a `type()` call was stored in, where it is declared and where it is tested.
     let mut type_alias: Option<(TextSize, LuaNameExpr)> = None;
     if let LuaExpr::CallExpr(call_expr) = left_expr {
-        if call_expr.is_type() {
+        if calls_type_intrinsic(db, cache, &call_expr) {
             type_guard_expr = Some(call_expr);
             if let LuaExpr::LiteralExpr(literal_expr) = right_expr {
                 match literal_expr.get_literal() {
@@ -372,7 +473,7 @@ fn maybe_type_guard_binary(
             }
         }
     } else if let LuaExpr::CallExpr(call_expr) = right_expr {
-        if call_expr.is_type() {
+        if calls_type_intrinsic(db, cache, &call_expr) {
             type_guard_expr = Some(call_expr);
             if let LuaExpr::LiteralExpr(literal_expr) = left_expr {
                 match literal_expr.get_literal() {
@@ -403,7 +504,7 @@ fn maybe_type_guard_binary(
         };
 
         if let LuaExpr::CallExpr(call_expr) = expr {
-            if call_expr.is_type() {
+            if calls_type_intrinsic(db, cache, &call_expr) {
                 type_guard_expr = Some(call_expr);
                 type_alias = Some((decl_id.position, name_expr.clone()));
                 match literal_expr.get_literal() {
@@ -433,7 +534,7 @@ fn maybe_type_guard_binary(
         return Ok(ResultTypeOrContinue::Continue);
     };
 
-    let Some(maybe_var_ref_id) = get_var_expr_var_ref_id(db, cache, arg) else {
+    let Some(maybe_var_ref_id) = get_var_expr_var_ref_id(db, cache, arg.clone()) else {
         // If we cannot find a reference declaration ID, we cannot narrow it
         return Ok(ResultTypeOrContinue::Continue);
     };
@@ -457,14 +558,13 @@ fn maybe_type_guard_binary(
         if related_member_query.is_some() {
             related_member_query
         } else {
-            let guard_position = type_guard_expr.get_range().start();
             if !can_narrow_type_guard_through_decl_alias(
                 db,
                 cache,
                 root,
                 var_ref_id,
                 &maybe_var_ref_id,
-                guard_position,
+                &arg,
             ) {
                 return Ok(ResultTypeOrContinue::Continue);
             }
@@ -1114,6 +1214,10 @@ fn maybe_field_literal_eq_narrow(
     };
 
     let right_type = infer_expr(db, cache, LuaExpr::LiteralExpr(literal_expr))?;
+    let Some(index_key) = index_expr.get_index_key() else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
+    let member_key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
     let index = LuaIndexMemberExpr::IndexExpr(index_expr);
     // While the arms' fields are inferred, a walk of a path under the owner
     // stops at this comparison instead of narrowing through it again.
@@ -1123,34 +1227,38 @@ fn maybe_field_literal_eq_narrow(
             .field_literal_narrowing
             .insert(syntax_id, crate::db_index::derivation::scope_mark());
     }
-    let mut opt_result = None;
-    let mut union_types = union_type.into_vec();
-    for (i, sub_type) in union_types.iter().enumerate() {
-        let member_type = match infer_member_by_member_key(db, cache, sub_type, index.clone()) {
-            Ok(member_type) => member_type,
-            Err(_) => continue, // If we cannot infer the member type, skip this type
+    let mut narrowed = Vec::new();
+    let union_types = union_type.into_vec();
+    for sub_type in &union_types {
+        let member_type = super::index_flow::infer_field_guard_member(
+            db,
+            cache,
+            sub_type,
+            &member_key,
+            index.clone(),
+        );
+        let survives = match member_type {
+            Ok(member_type) if condition_flow.is_true() => {
+                crate::check_type_compact(db, &member_type, &right_type).is_ok()
+            }
+            Ok(member_type) => !const_type_eq(&member_type, &right_type),
+            Err(_) => true,
         };
-        if const_type_eq(&member_type, &right_type) {
-            // If the right type matches the member type, we can narrow it
-            opt_result = Some(i);
+        if survives {
+            narrowed.push(sub_type.clone());
         }
     }
     if began {
         cache.field_literal_narrowing.remove(&syntax_id);
     }
 
-    match condition_flow {
-        InferConditionFlow::TrueCondition => {
-            if let Some(i) = opt_result {
-                return Ok(ResultTypeOrContinue::Result(union_types[i].clone()));
-            }
-        }
-        InferConditionFlow::FalseCondition => {
-            if let Some(i) = opt_result {
-                union_types.remove(i);
-                return Ok(ResultTypeOrContinue::Result(LuaType::from_vec(union_types)));
-            }
-        }
+    if narrowed.len() != union_types.len() {
+        let narrowed = if narrowed.is_empty() {
+            LuaType::Never
+        } else {
+            LuaType::from_vec(narrowed)
+        };
+        return Ok(ResultTypeOrContinue::Result(narrowed));
     }
 
     Ok(ResultTypeOrContinue::Continue)

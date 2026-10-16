@@ -204,6 +204,41 @@ mod tests {
     }
 
     #[test]
+    fn shadowed_error_does_not_satisfy_a_required_return() {
+        for (binding, call, warns) in [
+            ("", "error", false),
+            ("local error = function(...) end", "error", true),
+            ("local returning = function(...) end", "returning", true),
+        ] {
+            let source = format!(
+                "{binding}\n---@return string\nlocal function required()\n    {call}('ignored')\nend\n"
+            );
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::MissingReturn);
+            let file = ws.def_file("lua/autorun/server/sv_required_error.lua", &source);
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file, tokio_util::sync::CancellationToken::new())
+                .unwrap();
+            let ranges = diagnostics
+                .into_iter()
+                .map(|diagnostic| diagnostic.range)
+                .collect::<Vec<_>>();
+            let expected = if warns {
+                vec![lsp_types::Range::new(
+                    lsp_types::Position::new(4, 0),
+                    lsp_types::Position::new(4, 3),
+                )]
+            } else {
+                vec![]
+            };
+            assert_eq!(ranges, expected, "{source}");
+        }
+    }
+
+    #[test]
     fn test_missing_return() {
         let mut ws = VirtualWorkspace::new();
 

@@ -2078,7 +2078,7 @@ fn expr_has_prior_correlated_return_guard(
             let Some(if_stat) = LuaIfStat::cast(sibling) else {
                 continue;
             };
-            if !if_body_exits(&if_stat) {
+            if !if_body_exits(semantic_model, &if_stat) {
                 continue;
             }
             let Some(condition) = if_stat.get_condition_expr() else {
@@ -2130,13 +2130,19 @@ fn expr_has_prior_correlated_return_guard(
     false
 }
 
-fn if_body_exits(if_stat: &LuaIfStat) -> bool {
+fn if_body_exits(semantic_model: &SemanticModel, if_stat: &LuaIfStat) -> bool {
     if_stat.get_block().is_some_and(|block| {
         block.syntax().children().any(|child| {
             LuaSyntaxKind::from(child.kind()) == LuaSyntaxKind::ReturnStat
                 || LuaCallExprStat::cast(child)
                     .and_then(|stat| stat.get_call_expr())
-                    .is_some_and(|call_expr| call_expr.is_error())
+                    .is_some_and(|call_expr| {
+                        crate::calls_intrinsic_error(
+                            semantic_model.get_db(),
+                            semantic_model.get_file_id(),
+                            &call_expr,
+                        )
+                    })
         })
     })
 }

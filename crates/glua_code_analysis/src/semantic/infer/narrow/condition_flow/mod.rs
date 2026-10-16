@@ -2,6 +2,9 @@ mod binary_flow;
 mod call_flow;
 mod index_flow;
 
+pub(crate) use binary_flow::{
+    PathWrite, condition_writes_to, guarded_path_references, type_name_test, written_targets_match,
+};
 pub(crate) use call_flow::presence_guard_target;
 
 use std::sync::Arc;

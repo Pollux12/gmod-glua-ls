@@ -267,7 +267,7 @@ pub fn bind_call_expr_stat(
         };
 
         bind_assert_stat(binder, arg_list, current)
-    } else if call_expr.is_error() {
+    } else if crate::calls_intrinsic_error(binder.db, binder.file_id, &call_expr) {
         if let Some(ast) = LuaAst::cast(call_expr.syntax().clone()) {
             bind_each_child(binder, ast, current);
         }
@@ -368,6 +368,8 @@ pub fn bind_return_stat(
     for expr in return_stat.get_expr_list() {
         current = bind_top_level_expr(binder, expr.clone(), current);
     }
+
+    binder.bind_syntax_node(return_stat.get_syntax_id(), current);
 
     // Return statements are typically used to exit a function
     // We can treat them as a flow node that indicates the end of the current flow

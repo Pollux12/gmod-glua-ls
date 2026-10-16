@@ -132,7 +132,7 @@ pub fn special_or_rule(
     right_expr: LuaExpr,
 ) -> Option<LuaType> {
     if let LuaExpr::CallExpr(call_expr) = &right_expr
-        && call_expr.is_error()
+        && crate::calls_intrinsic_error(db, cache.get_file_id(), call_expr)
     {
         let narrowed = remove_false_or_nil(left_type.clone());
         return Some(narrowed);

@@ -68,7 +68,10 @@ pub(crate) fn infer_closure_body_function_type(
         return None;
     }
 
-    let return_points = lua::func_body::analyze_func_body_returns(closure.get_block()?);
+    let return_points = lua::func_body::analyze_func_body_returns(
+        Some((db, cache.get_file_id())),
+        closure.get_block()?,
+    );
     let return_type = lua::analyze_return_point(db, cache, &return_points)
         .ok()?
         .into_iter()

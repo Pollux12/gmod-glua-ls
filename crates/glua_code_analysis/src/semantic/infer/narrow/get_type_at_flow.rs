@@ -1335,7 +1335,7 @@ fn call_expr_returns_never_uncached(
     cache: &mut LuaInferCache,
     call_expr: glua_parser::LuaCallExpr,
 ) -> bool {
-    if call_expr.is_error() {
+    if crate::calls_intrinsic_error(db, cache.get_file_id(), &call_expr) {
         return true;
     }
 

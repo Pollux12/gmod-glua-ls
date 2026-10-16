@@ -14656,6 +14656,53 @@ mod test {
     }
 
     #[gtest]
+    fn shadowed_error_does_not_exit_a_correlated_return_guard() {
+        for (binding, call, warns) in [
+            ("", "error", false),
+            ("local error = function(...) end", "error", true),
+            ("local returning = function(...) end", "returning", true),
+        ] {
+            let source = format!(
+                r#"{binding}
+---@param enabled boolean
+local function lookup(enabled)
+    if enabled then return true, 'ok' end
+    return false, nil
+end
+---@param enabled boolean
+local function use(enabled)
+    local ok, value = lookup(enabled)
+    if not ok then {call}('ignored') end
+    print(value:sub(1))
+end
+"#
+            );
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::NeedCheckNil);
+            let file = ws.def_file("lua/autorun/server/sv_correlated_error.lua", &source);
+            let actual = ws
+                .analysis
+                .diagnose_file(file, CancellationToken::new())
+                .unwrap();
+            let ranges = actual
+                .into_iter()
+                .map(|diagnostic| diagnostic.range)
+                .collect::<Vec<_>>();
+            let expected = if warns {
+                vec![lsp_types::Range::new(
+                    lsp_types::Position::new(10, 10),
+                    lsp_types::Position::new(10, 15),
+                )]
+            } else {
+                vec![]
+            };
+            assert_eq!(ranges, expected, "{source}");
+        }
+    }
+
+    #[gtest]
     fn test_utf8_multi_return_correlated_early_return() {
         let mut ws = VirtualWorkspace::new();
         let diagnostics = diagnostics_for_code(

@@ -696,6 +696,8 @@ fn valid_guard_contributions_for_file(
     found
 }
 
+/// Whether `signature_id` is a validity guard in `call_realm`: annotated as one, or the base
+/// runtime `IsValid` (or another annotated guard name) redeclared in `lua/includes/util.lua`.
 pub fn signature_is_valid_guard_or_base_runtime_isvalid_in_realm(
     db: &DbIndex,
     signature_id: LuaSignatureId,
@@ -709,11 +711,80 @@ pub fn signature_is_valid_guard_or_base_runtime_isvalid_in_realm(
         return false;
     }
 
+    is_base_runtime_util_file(db, signature_id.get_file_id())
+        && global_function_name(db, signature_id).is_some_and(|name| {
+            name == "IsValid" || db.get_signature_index().is_valid_guard_name(&name)
+        })
+}
+
+/// Whether `signature_id` classifies its argument as the `type` intrinsic does: it returns
+/// `std.type`, or it is the base runtime redeclaration in `lua/includes/util.lua` of a global
+/// whose other declarations return `std.type`.
+pub fn signature_is_type_classifier(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    if signature_returns_std_type(db, signature_id) {
+        return true;
+    }
+
+    db.get_emmyrc().gmod.enabled
+        && is_base_runtime_util_file(db, signature_id.get_file_id())
+        && global_function_name(db, signature_id).is_some_and(|name| {
+            db.get_global_index()
+                .get_global_decl_ids(&name)
+                .is_some_and(|decl_ids| {
+                    decl_ids.iter().any(|decl_id| {
+                        signature_id_for_semantic_decl(db, &LuaSemanticDeclId::LuaDecl(*decl_id))
+                            .is_some_and(|declared| signature_returns_std_type(db, declared))
+                    })
+                })
+        })
+}
+
+fn signature_returns_std_type(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    db.get_signature_index()
+        .get(&signature_id)
+        .is_some_and(|signature| {
+            matches!(signature.get_return_type(), LuaType::Ref(id) if id.get_name() == "std.type")
+        })
+}
+
+pub(crate) fn is_base_runtime_panel_file(db: &DbIndex, file_id: FileId) -> bool {
     db.get_vfs()
-        .get_file_path(&signature_id.get_file_id())
+        .get_file_path(&file_id)
+        .and_then(|path| path.to_str())
+        .map(|path| path.replace('\\', "/"))
+        .is_some_and(|path| {
+            ["/lua/includes/", "/lua/vgui/", "/lua/derma/"]
+                .iter()
+                .any(|root| path.contains(root))
+        })
+}
+
+fn is_base_runtime_util_file(db: &DbIndex, file_id: FileId) -> bool {
+    db.get_vfs()
+        .get_file_path(&file_id)
         .and_then(|path| path.to_str())
         .map(|path| path.replace('\\', "/"))
         .is_some_and(|path| path.ends_with("/lua/includes/util.lua"))
+}
+
+/// The global name `function name(...)` gives the closure `signature_id` describes.
+fn global_function_name(db: &DbIndex, signature_id: LuaSignatureId) -> Option<SmolStr> {
+    use glua_parser::{LuaAstNode, LuaClosureExpr, LuaFuncStat, LuaVarExpr};
+    let file_id = signature_id.get_file_id();
+    let position = signature_id.get_position();
+    let closure = db
+        .get_vfs()
+        .syntax_tree_around(&file_id, rowan::TextRange::empty(position))?
+        .get_red_root()
+        .token_at_offset(position)
+        .right_biased()?
+        .parent_ancestors()
+        .find_map(LuaClosureExpr::cast)
+        .filter(|closure| LuaSignatureId::from_closure(file_id, closure) == signature_id)?;
+    match closure.get_parent::<LuaFuncStat>()?.get_func_name()? {
+        LuaVarExpr::NameExpr(name) => Some(name.get_name_token()?.get_name_text().into()),
+        LuaVarExpr::IndexExpr(_) => None,
+    }
 }
 
 /// The name a member's own syntax gives it: the key of `x.name`, `x:name` or

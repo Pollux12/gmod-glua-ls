@@ -1,12 +1,15 @@
 use std::{ops::Deref, sync::Arc};
 
-use glua_parser::{LuaAstNode, LuaCallExpr, LuaChunk, LuaExpr, LuaIndexMemberExpr};
+use glua_parser::{
+    LuaAstNode, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
+    LuaIndexKey, LuaIndexMemberExpr, LuaStat, LuaTableExpr, LuaTableField, LuaVarExpr,
+};
 
 use crate::{
-    DbIndex, FileId, FlowNode, FlowTree, GMOD_ATTR_SELF_GUARD, InferFailReason, InferGuard,
-    LuaAliasCallKind, LuaAliasCallType, LuaFunctionType, LuaInferCache, LuaSignatureCast,
-    LuaSignatureId, LuaType, TypeOps, check_type_compact, find_signature_attribute_use,
-    infer_call_expr_func, infer_expr,
+    DbIndex, FileId, FlowNode, FlowTree, GMOD_ATTR_SELF_GUARD, InFiled, InferFailReason,
+    InferGuard, LuaAliasCallKind, LuaAliasCallType, LuaFunctionType, LuaInferCache, LuaMemberId,
+    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType,
+    TypeOps, check_type_compact, find_signature_attribute_use, infer_call_expr_func, infer_expr,
     semantic::{
         SemanticDeclGuard, SemanticDeclLevel,
         infer::{
@@ -187,7 +190,6 @@ fn get_type_at_call_expr_by_function_type(
                 }
             };
             if matches!(type_guard_result, Ok(ResultTypeOrContinue::Continue))
-                && matches!(condition_flow, InferConditionFlow::TrueCondition)
                 && let Some(signature_id) = prefix_signature_id
                 && let Some(narrowed_type) = try_inferred_positive_guard(
                     db,
@@ -256,19 +258,18 @@ fn get_type_at_call_expr_by_function_type(
                 _ => {}
             }
 
-            if matches!(condition_flow, InferConditionFlow::TrueCondition)
-                && let Some(narrowed_type) = try_inferred_positive_guard(
-                    db,
-                    tree,
-                    cache,
-                    root,
-                    var_ref_id,
-                    flow_node,
-                    &call_expr_ref,
-                    signature_id,
-                    policy,
-                )?
-            {
+            if let Some(narrowed_type) = try_inferred_positive_guard(
+                db,
+                tree,
+                cache,
+                root,
+                var_ref_id,
+                flow_node,
+                &call_expr_ref,
+                signature_id,
+                condition_flow,
+                policy.clone(),
+            )? {
                 return Ok(ResultTypeOrContinue::Result(narrowed_type));
             }
 
@@ -391,6 +392,7 @@ fn try_inferred_positive_guard(
     flow_node: &FlowNode,
     call_expr: &LuaCallExpr,
     signature_id: LuaSignatureId,
+    condition_flow: InferConditionFlow,
     policy: FlowWalkPolicy,
 ) -> Result<Option<LuaType>, InferFailReason> {
     if call_expr.is_colon_call() {
@@ -403,10 +405,12 @@ fn try_inferred_positive_guard(
     else {
         return Ok(None);
     };
-    let Some(argument) = call_expr
-        .get_args_list()
-        .and_then(|args| args.get_args().nth(guard.param_idx))
-    else {
+    if let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr()
+        && typed_literal_field_has_writes(db, cache, &index_expr)
+    {
+        return Ok(None);
+    }
+    let Some(signature) = db.get_signature_index().get(&signature_id) else {
         return Ok(None);
     };
     let Some(argument) = inferred_guard_target_expr(call_expr, signature, guard.param_idx) else {
@@ -1115,11 +1119,42 @@ fn get_callable_expr_signature_id(
         return None;
     }
 
-    if let LuaExpr::NameExpr(name_expr) = &expr
-        && let Some((decl_file_id, value_expr)) =
+    if let LuaExpr::IndexExpr(index_expr) = &expr
+        && typed_literal_field_has_writes(db, cache, index_expr)
+    {
+        return None;
+    }
+
+    if let LuaExpr::NameExpr(name_expr) = &expr {
+        if !declaration_alone_reaches(db, cache.get_file_id(), name_expr) {
+            return None;
+        }
+        if let Some(decl_id) = db
+            .get_reference_index()
+            .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())
+        {
+            let semantic_decl = LuaSemanticDeclId::LuaDecl(decl_id);
+            let owns_contract = db
+                .get_property_index()
+                .get_signature_owner(&semantic_decl)
+                .is_some()
+                || db
+                    .get_type_index()
+                    .get_type_cache(&decl_id.into())
+                    .is_some_and(|type_cache| type_cache.is_doc());
+            if owns_contract && let Some(signature_id) = known_signature_id(db, &semantic_decl) {
+                return Some(signature_id);
+            }
+        }
+        if let Some((decl_file_id, value_expr)) =
             local_name_value(db, cache.get_file_id(), name_expr)
-        && let Some(signature_id) =
-            get_value_expr_signature_id(db, cache, decl_file_id, value_expr, depth)
+        {
+            return get_value_expr_signature_id(db, cache, decl_file_id, value_expr, depth);
+        }
+    }
+
+    if let LuaExpr::IndexExpr(index_expr) = &expr
+        && let Some(signature_id) = table_literal_field_signature_id(db, cache, index_expr, depth)
     {
         return Some(signature_id);
     }
@@ -1130,13 +1165,202 @@ fn get_callable_expr_signature_id(
         expr,
         SemanticDeclGuard::default(),
         SemanticDeclLevel::default(),
-    )?;
+    );
+    semantic_decl.and_then(|semantic_decl| declared_signature_id(db, cache, semantic_decl, depth))
+}
 
+fn declared_signature_id(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    semantic_decl: LuaSemanticDeclId,
+    depth: usize,
+) -> Option<LuaSignatureId> {
     if let Some(signature_id) = known_signature_id(db, &semantic_decl) {
         return Some(signature_id);
     }
     let (file_id, value_expr) = semantic_decl_value(db, semantic_decl)?;
     get_value_expr_signature_id(db, cache, file_id, value_expr, depth)
+}
+
+fn typed_literal_field_has_writes(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let Some(LuaExpr::NameExpr(receiver)) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some((table_file, table, Some(contract))) = receiver_table_literal(db, cache, &receiver)
+    else {
+        return false;
+    };
+    let type_id = match contract {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => type_id,
+        _ => return false,
+    };
+    let member_key = match index_expr.get_index_key() {
+        Some(LuaIndexKey::Name(name)) => LuaMemberKey::Name(name.get_name_text().into()),
+        Some(LuaIndexKey::String(string)) => LuaMemberKey::Name(string.get_value().into()),
+        _ => return false,
+    };
+    let mut owners = vec![LuaMemberOwner::Element(InFiled::new(
+        table_file,
+        table.get_range(),
+    ))];
+    owners.extend(
+        type_id
+            .collect_super_types_with_self(db, LuaType::Ref(type_id.clone()))
+            .into_iter()
+            .filter_map(|typ| match typ {
+                LuaType::Ref(id) | LuaType::Def(id) => Some(LuaMemberOwner::Type(id)),
+                _ => None,
+            }),
+    );
+    owners.iter().any(|owner| {
+        db.get_member_index()
+            .get_members_for_owner_key(owner, &member_key)
+            .iter()
+            .any(|member| {
+                member.get_syntax_id().get_kind() == glua_parser::LuaSyntaxKind::IndexExpr
+            })
+            || crate::dynamic_field_owner_of(db, owner).is_some_and(|owner| match &member_key {
+                LuaMemberKey::Name(name) => db
+                    .get_dynamic_field_index()
+                    .field_definitions(&owner, name.as_str())
+                    .iter()
+                    .any(|definition| {
+                        definition.file_id != table_file
+                            || !table.get_fields().any(|field| {
+                                field.get_field_key().and_then(|key| key.get_range())
+                                    == Some(definition.value)
+                            })
+                    }),
+                _ => false,
+            })
+    })
+}
+
+fn receiver_table_literal(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    receiver: &glua_parser::LuaNameExpr,
+) -> Option<(FileId, LuaTableExpr, Option<LuaType>)> {
+    let file_id = cache.get_file_id();
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, receiver.get_range())?;
+    if let Some((table_file, LuaExpr::TableExpr(table))) = local_name_value(db, file_id, receiver) {
+        let contract = db
+            .get_type_index()
+            .get_type_cache(&decl_id.into())
+            .filter(|cache| cache.is_doc())
+            .map(|cache| cache.as_type().clone());
+        return Some((table_file, table, contract));
+    }
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let crate::LuaDeclExtra::Param {
+        idx: 0,
+        signature_id,
+        owner_member_id: Some(member_id),
+    } = decl.extra
+    else {
+        return None;
+    };
+    let signature = db.get_signature_index().get(&signature_id)?;
+    if decl.get_name() != "self"
+        || signature.is_colon_define
+        || db
+            .get_call_site_param_index()
+            .has_param_evidence(&signature_id, 0)
+    {
+        return None;
+    }
+    let field = db
+        .get_vfs()
+        .syntax_node_around(&member_id.file_id, *member_id.get_syntax_id())
+        .and_then(LuaTableField::cast)?;
+    let LuaExpr::ClosureExpr(closure) = field.get_value_expr()? else {
+        return None;
+    };
+    if LuaSignatureId::from_closure(member_id.file_id, &closure) != signature_id {
+        return None;
+    }
+    let field_type =
+        crate::semantic::infer_table_field_value_should_be(db, cache, field.clone()).ok()?;
+    let contract = match remove_false_or_nil(field_type) {
+        LuaType::DocFunction(function) if !function.is_colon_define() => {
+            function.get_params().first()?.1.clone()?
+        }
+        _ => return None,
+    };
+    if !matches!(contract, LuaType::Ref(_) | LuaType::Def(_))
+        || signature
+            .get_param_info_by_id(0)
+            .is_some_and(|param| param.type_ref != contract)
+    {
+        return None;
+    }
+    let table = field.get_parent::<LuaTableExpr>()?;
+    let table_type = crate::semantic::infer_table_should_be(db, cache, table.clone()).ok()?;
+    check_type_compact(db, &table_type, &contract).ok()?;
+    Some((member_id.file_id, table, Some(contract)))
+}
+
+fn table_literal_field_signature_id(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexExpr,
+    depth: usize,
+) -> Option<LuaSignatureId> {
+    let file_id = cache.get_file_id();
+    let LuaExpr::NameExpr(receiver) = index_expr.get_prefix_expr()? else {
+        return None;
+    };
+    if !declaration_alone_reaches(db, file_id, &receiver) {
+        return None;
+    }
+    let (table_file_id, table, _) = receiver_table_literal(db, cache, &receiver)?;
+    let member_key = match index_expr.get_index_key()? {
+        LuaIndexKey::Name(name) => LuaMemberKey::Name(name.get_name_text().into()),
+        LuaIndexKey::String(string) => LuaMemberKey::Name(string.get_value().into()),
+        _ => return None,
+    };
+    let owner = LuaMemberOwner::Element(InFiled::new(table_file_id, table.get_range()));
+    let member_item = db.get_member_index().get_member_item(&owner, &member_key)?;
+    if !member_item.is_one() {
+        return None;
+    }
+    let semantic_decl = member_item.resolve_semantic_decl_with_realm_at_offset(
+        db,
+        &file_id,
+        index_expr.get_position(),
+    )?;
+    declared_signature_id(db, cache, semantic_decl, depth)
+}
+
+/// Whether the declaration `name_expr` refers to is the only definition reaching it, so the
+/// declaration's value is what the name holds there.
+fn declaration_alone_reaches(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &glua_parser::LuaNameExpr,
+) -> bool {
+    let Some(decl_id) = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, name_expr.get_range())
+    else {
+        return true;
+    };
+    let Some(tree) = db.get_flow_index().get_flow_tree(&file_id) else {
+        return true;
+    };
+    let Some(flow_id) = tree.get_flow_id(name_expr.get_syntax_id()) else {
+        return true;
+    };
+    matches!(
+        tree.reaching_definitions(decl_id, flow_id).as_ref(),
+        [crate::LuaDefinitionId::Declaration(_)]
+    )
 }
 
 fn get_value_expr_signature_id(

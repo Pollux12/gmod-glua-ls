@@ -139,6 +139,17 @@ pub fn infer_expr_narrow_type(
     expr: LuaExpr,
     var_ref_id: VarRefId,
 ) -> InferResult {
+    infer_var_type_at_node(db, cache, &expr, var_ref_id)
+}
+
+/// The type of `var_ref_id` at the flow position bound to `node`: an expression
+/// it is read in or a statement it is observed at.
+pub(crate) fn infer_var_type_at_node(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    node: &impl LuaAstNode,
+    var_ref_id: VarRefId,
+) -> InferResult {
     let file_id = cache.get_file_id();
 
     // Fast path: if this reference can never be narrowed anywhere in the file,
@@ -152,14 +163,14 @@ pub fn infer_expr_narrow_type(
         return get_var_ref_type(db, cache, &var_ref_id);
     };
 
-    let Some(flow_id) = flow_tree.get_flow_id(expr.get_syntax_id()) else {
+    let Some(flow_id) = flow_tree.get_flow_id(node.get_syntax_id()) else {
         return get_var_ref_type(db, cache, &var_ref_id);
     };
 
-    let root = LuaChunk::cast(expr.get_root()).ok_or(InferFailReason::None)?;
+    let root = LuaChunk::cast(node.get_root()).ok_or(InferFailReason::None)?;
     let query_realm = db
         .get_gmod_infer_index()
-        .get_realm_at_offset(&file_id, expr.get_position());
+        .get_realm_at_offset(&file_id, node.get_position());
     let previous_query_realm = cache.set_query_realm(Some(query_realm));
     let result =
         get_type_at_flow::get_type_at_flow(db, flow_tree, cache, &root, &var_ref_id, flow_id);
@@ -173,14 +184,64 @@ pub(crate) fn infer_true_condition_narrowing(
     target_expr: LuaExpr,
     condition: LuaExpr,
 ) -> Option<(LuaType, LuaType)> {
+    infer_condition_narrowing(
+        db,
+        cache,
+        target_expr,
+        condition,
+        InferConditionFlow::TrueCondition,
+    )
+}
+
+pub(crate) fn infer_asserted_argument_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    argument: LuaExpr,
+) -> Option<LuaType> {
+    fn is_concrete(typ: &LuaType) -> bool {
+        match typ {
+            LuaType::Any | LuaType::Unknown => false,
+            LuaType::Union(union) => union.types().all(is_concrete),
+            LuaType::MultiLineUnion(union) => {
+                union.get_unions().iter().all(|(typ, _)| is_concrete(typ))
+            }
+            LuaType::Instance(instance) => is_concrete(instance.get_base()),
+            _ => true,
+        }
+    }
+    let subject = get_var_expr_var_ref_id(db, cache, argument.clone())?;
+    let tree = db.get_flow_index().get_flow_tree(&cache.get_file_id())?;
+    let at = tree.get_flow_id(argument.get_syntax_id())?;
+    let root = LuaChunk::cast(argument.get_root())?;
+    let mut policy = get_type_at_flow::FlowWalkPolicy::normal(FlowOrigin::Real);
+    policy.proof_only = true;
+    let typ =
+        get_type_at_flow::get_type_at_flow_in_mode(db, tree, cache, &root, &subject, at, policy)
+            .ok()?;
+    (is_concrete(&typ) && !typ.is_never()).then_some(typ)
+}
+
+/// The target's type before `condition` and its type on the `edge` of it, when
+/// that edge narrows it.
+pub(crate) fn infer_condition_narrowing(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    target_expr: LuaExpr,
+    condition: LuaExpr,
+    edge: InferConditionFlow,
+) -> Option<(LuaType, LuaType)> {
     let var_ref_id = get_var_expr_var_ref_id(db, cache, target_expr.clone())?;
     let file_id = cache.get_file_id();
     let flow_tree = db.get_flow_index().get_flow_tree(&file_id)?;
     let flow_id = flow_tree.get_flow_id(target_expr.get_syntax_id())?;
     let root = LuaChunk::cast(condition.get_root())?;
+    let kind = match edge {
+        InferConditionFlow::TrueCondition => FlowNodeKind::TrueCondition(condition.to_ptr()),
+        InferConditionFlow::FalseCondition => FlowNodeKind::FalseCondition(condition.to_ptr()),
+    };
     let flow_node = FlowNode {
         id: flow_id,
-        kind: FlowNodeKind::TrueCondition(condition.to_ptr()),
+        kind,
         antecedent: Some(FlowAntecedent::Single(flow_id)),
     };
     let policy = get_type_at_flow::FlowWalkPolicy::normal(FlowOrigin::Real);

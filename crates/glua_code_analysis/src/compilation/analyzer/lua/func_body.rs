@@ -1,14 +1,16 @@
 use glua_parser::{
-    LuaBlock, LuaCallExprStat, LuaDoStat, LuaExpr, LuaForRangeStat, LuaForStat, LuaIfClauseStat,
-    LuaIfStat, LuaRepeatStat, LuaReturnStat, LuaStat, LuaWhileStat,
+    LuaBlock, LuaCallExpr, LuaCallExprStat, LuaDoStat, LuaExpr, LuaForRangeStat, LuaForStat,
+    LuaIfClauseStat, LuaIfStat, LuaRepeatStat, LuaReturnStat, LuaStat, LuaWhileStat,
 };
+
+use crate::{DbIndex, FileId};
 
 #[derive(Debug, Clone)]
 pub enum LuaReturnPoint {
     Expr(LuaExpr),
     MuliExpr(Vec<LuaExpr>),
     Nil,
-    Error,
+    Error(LuaCallExpr),
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -19,10 +21,13 @@ enum ChangeFlow {
     Return,
 }
 
-pub fn analyze_func_body_returns(body: LuaBlock) -> Vec<LuaReturnPoint> {
+pub fn analyze_func_body_returns(
+    context: Option<(&DbIndex, FileId)>,
+    body: LuaBlock,
+) -> Vec<LuaReturnPoint> {
     let mut returns = Vec::new();
 
-    let flow = analyze_block_returns(body, &mut returns);
+    let flow = analyze_block_returns(context, body, &mut returns);
     match flow {
         Some(ChangeFlow::Break) | Some(ChangeFlow::None) => {
             returns.push(LuaReturnPoint::Nil);
@@ -33,37 +38,41 @@ pub fn analyze_func_body_returns(body: LuaBlock) -> Vec<LuaReturnPoint> {
     returns
 }
 
-fn analyze_block_returns(block: LuaBlock, returns: &mut Vec<LuaReturnPoint>) -> Option<ChangeFlow> {
+fn analyze_block_returns(
+    context: Option<(&DbIndex, FileId)>,
+    block: LuaBlock,
+    returns: &mut Vec<LuaReturnPoint>,
+) -> Option<ChangeFlow> {
     for stat in block.get_stats() {
         match stat {
             LuaStat::DoStat(do_stat) => {
-                let flow = analyze_do_stat_returns(do_stat, returns);
+                let flow = analyze_do_stat_returns(context, do_stat, returns);
                 match flow {
                     Some(ChangeFlow::None) => {}
                     _ => return flow,
                 }
             }
             LuaStat::WhileStat(while_stat) => {
-                analyze_while_stat_returns(while_stat, returns);
+                analyze_while_stat_returns(context, while_stat, returns);
             }
             LuaStat::RepeatStat(repeat_stat) => {
-                analyze_repeat_stat_returns(repeat_stat, returns);
+                analyze_repeat_stat_returns(context, repeat_stat, returns);
             }
             LuaStat::IfStat(if_stat) => {
-                let flow = analyze_if_stat_returns(if_stat, returns);
+                let flow = analyze_if_stat_returns(context, if_stat, returns);
                 match flow {
                     Some(ChangeFlow::None) => {}
                     _ => return flow,
                 }
             }
             LuaStat::ForStat(for_stat) => {
-                analyze_for_stat_returns(for_stat, returns);
+                analyze_for_stat_returns(context, for_stat, returns);
             }
             LuaStat::ForRangeStat(for_range_stat) => {
-                analyze_for_range_stat_returns(for_range_stat, returns);
+                analyze_for_range_stat_returns(context, for_range_stat, returns);
             }
             LuaStat::CallExprStat(call_expr) => {
-                let flow = analyze_call_expr_stat_returns(call_expr, returns);
+                let flow = analyze_call_expr_stat_returns(context, call_expr, returns);
                 if let Some(ChangeFlow::Error) = flow {
                     return Some(ChangeFlow::Error);
                 }
@@ -82,17 +91,19 @@ fn analyze_block_returns(block: LuaBlock, returns: &mut Vec<LuaReturnPoint>) -> 
 }
 
 fn analyze_do_stat_returns(
+    context: Option<(&DbIndex, FileId)>,
     do_stat: LuaDoStat,
     returns: &mut Vec<LuaReturnPoint>,
 ) -> Option<ChangeFlow> {
-    analyze_block_returns(do_stat.get_block()?, returns)
+    analyze_block_returns(context, do_stat.get_block()?, returns)
 }
 
 fn analyze_while_stat_returns(
+    context: Option<(&DbIndex, FileId)>,
     while_stat: LuaWhileStat,
     returns: &mut Vec<LuaReturnPoint>,
 ) -> Option<ChangeFlow> {
-    let flow = analyze_block_returns(while_stat.get_block()?, returns);
+    let flow = analyze_block_returns(context, while_stat.get_block()?, returns);
     match flow {
         Some(ChangeFlow::Break) => Some(ChangeFlow::None),
         _ => flow,
@@ -100,10 +111,11 @@ fn analyze_while_stat_returns(
 }
 
 fn analyze_repeat_stat_returns(
+    context: Option<(&DbIndex, FileId)>,
     repeat_stat: LuaRepeatStat,
     returns: &mut Vec<LuaReturnPoint>,
 ) -> Option<ChangeFlow> {
-    let flow = analyze_block_returns(repeat_stat.get_block()?, returns);
+    let flow = analyze_block_returns(context, repeat_stat.get_block()?, returns);
     match flow {
         Some(ChangeFlow::Break) => Some(ChangeFlow::None),
         _ => flow,
@@ -111,10 +123,11 @@ fn analyze_repeat_stat_returns(
 }
 
 fn analyze_for_stat_returns(
+    context: Option<(&DbIndex, FileId)>,
     for_stat: LuaForStat,
     returns: &mut Vec<LuaReturnPoint>,
 ) -> Option<ChangeFlow> {
-    let flow = analyze_block_returns(for_stat.get_block()?, returns);
+    let flow = analyze_block_returns(context, for_stat.get_block()?, returns);
     match flow {
         Some(ChangeFlow::Break) => Some(ChangeFlow::None),
         _ => flow,
@@ -122,12 +135,13 @@ fn analyze_for_stat_returns(
 }
 
 fn analyze_if_stat_returns(
+    context: Option<(&DbIndex, FileId)>,
     if_stat: LuaIfStat,
     returns: &mut Vec<LuaReturnPoint>,
 ) -> Option<ChangeFlow> {
     let mut branch_flow = |block: Option<LuaBlock>| {
         block
-            .and_then(|block| analyze_block_returns(block, returns))
+            .and_then(|block| analyze_block_returns(context, block, returns))
             .unwrap_or(ChangeFlow::None)
     };
     let mut flow = branch_flow(if_stat.get_block());
@@ -141,10 +155,11 @@ fn analyze_if_stat_returns(
 }
 
 fn analyze_for_range_stat_returns(
+    context: Option<(&DbIndex, FileId)>,
     for_range_stat: LuaForRangeStat,
     returns: &mut Vec<LuaReturnPoint>,
 ) -> Option<ChangeFlow> {
-    let flow = analyze_block_returns(for_range_stat.get_block()?, returns);
+    let flow = analyze_block_returns(context, for_range_stat.get_block()?, returns);
     match flow {
         Some(ChangeFlow::Break) => Some(ChangeFlow::None),
         _ => flow,
@@ -152,12 +167,13 @@ fn analyze_for_range_stat_returns(
 }
 
 fn analyze_call_expr_stat_returns(
+    context: Option<(&DbIndex, FileId)>,
     call_expr_stat: LuaCallExprStat,
     returns: &mut Vec<LuaReturnPoint>,
 ) -> Option<ChangeFlow> {
     let call_expr = call_expr_stat.get_call_expr()?;
-    if call_expr.is_error() {
-        returns.push(LuaReturnPoint::Error);
+    if context.is_some_and(|(db, file_id)| crate::calls_intrinsic_error(db, file_id, &call_expr)) {
+        returns.push(LuaReturnPoint::Error(call_expr));
         return Some(ChangeFlow::Error);
     }
     Some(ChangeFlow::None)

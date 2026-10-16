@@ -83,11 +83,40 @@ pub struct LuaSignatureIndex {
     in_file_receiver_out_param_member_names: CowCell<HashMap<FileId, HashSet<String>>>,
 }
 
-/// A conservative true-branch parameter narrowing derived from a function body.
+/// A conservative parameter narrowing derived from a function body: the type
+/// the parameter holds where the call is truthy, and, for a helper that is
+/// exactly one primitive or leaf-class type test, the type removed where it is falsy.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaInferredPositiveGuard {
     pub param_idx: usize,
     pub narrowed_type: LuaType,
+    pub false_removed_type: Option<LuaType>,
+}
+
+impl LuaInferredPositiveGuard {
+    fn payload_types(&self) -> impl Iterator<Item = &LuaType> {
+        std::iter::once(&self.narrowed_type).chain(self.false_removed_type.as_ref())
+    }
+
+    /// Remaps both payload types as one unit; `true` when either names an
+    /// identity the remap lost, leaving the guard untouched.
+    fn remap_payload_types(&mut self, remap: &crate::FileRemap) -> bool {
+        let narrowed = crate::db_index::remap_identities_in_type(&self.narrowed_type, remap);
+        let removed = self
+            .false_removed_type
+            .as_ref()
+            .map(|typ| crate::db_index::remap_identities_in_type(typ, remap));
+        if narrowed.lost || removed.as_ref().is_some_and(|removed| removed.lost) {
+            return true;
+        }
+        if let Some(typ) = narrowed.typ {
+            self.narrowed_type = typ;
+        }
+        if let Some(typ) = removed.and_then(|removed| removed.typ) {
+            self.false_removed_type = Some(typ);
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -668,13 +697,13 @@ impl LuaSignatureIndex {
                 signature.visit_payload_types(&mut |ty| collect(ty));
             }
             if let Some(guard) = self.inferred_positive_guards.get(signature_id) {
-                collect(&guard.narrowed_type);
+                guard.payload_types().for_each(&mut collect);
             }
         }
 
         for owner in &fact_owners {
             if let Some(guard) = self.inferred_guard_facts.get(owner) {
-                collect(&guard.narrowed_type);
+                guard.payload_types().for_each(&mut collect);
             }
         }
 
@@ -761,32 +790,24 @@ impl LuaSignatureIndex {
                         ));
                     }
                 }
-                if let Some(guard) = self.inferred_positive_guards.get_mut(&signature_id) {
-                    let result =
-                        crate::db_index::remap_identities_in_type(&guard.narrowed_type, remap);
-                    if result.lost {
-                        lost.push(crate::LostFact::new(
-                            holder,
-                            FactKey::InferredGuard(signature_id),
-                        ));
-                    } else if let Some(new_ty) = result.typ {
-                        guard.narrowed_type = new_ty;
-                    }
+                if let Some(guard) = self.inferred_positive_guards.get_mut(&signature_id)
+                    && guard.remap_payload_types(remap)
+                {
+                    lost.push(crate::LostFact::new(
+                        holder,
+                        FactKey::InferredGuard(signature_id),
+                    ));
                 }
             }
 
             for owner in fact_owners {
-                if let Some(guard) = self.inferred_guard_facts.get_mut(&owner) {
-                    let result =
-                        crate::db_index::remap_identities_in_type(&guard.narrowed_type, remap);
-                    if result.lost {
-                        lost.push(crate::LostFact::new(
-                            holder,
-                            FactKey::InferredGuard(owner.signature_id()),
-                        ));
-                    } else if let Some(new_ty) = result.typ {
-                        guard.narrowed_type = new_ty;
-                    }
+                if let Some(guard) = self.inferred_guard_facts.get_mut(&owner)
+                    && guard.remap_payload_types(remap)
+                {
+                    lost.push(crate::LostFact::new(
+                        holder,
+                        FactKey::InferredGuard(owner.signature_id()),
+                    ));
                 }
             }
         }
@@ -1109,6 +1130,7 @@ mod tests {
             LuaInferredPositiveGuard {
                 param_idx: 0,
                 narrowed_type: LuaType::String,
+                false_removed_type: None,
             },
         );
         index.set_inferred_guard_dependencies(consumer_file_id, HashSet::from_iter([owner]));
@@ -1216,6 +1238,7 @@ mod tests {
             LuaInferredPositiveGuard {
                 param_idx: 0,
                 narrowed_type: table_ref(source_b, 0, 1),
+                false_removed_type: None,
             },
         );
         let fact_owner = LuaInferredGuardOwner::GlobalPath {
@@ -1229,6 +1252,7 @@ mod tests {
             LuaInferredPositiveGuard {
                 param_idx: 0,
                 narrowed_type: table_ref(source_c, 0, 1),
+                false_removed_type: None,
             },
         );
 

@@ -50,7 +50,8 @@ pub(crate) use infer::infer_bind_value_type;
 pub(crate) use infer::infer_expr_list_types;
 pub use infer::infer_index_expr;
 pub(crate) use infer::local_call_reference_expectations;
-pub(crate) use infer::narrow::infer_true_condition_narrowing;
+#[cfg(test)]
+pub(crate) use infer::narrow::infer_asserted_argument_type;
 pub(crate) use infer::narrow::{InferConditionFlow, apply_cast};
 pub(crate) use infer::narrow::{
     condition_outcome_excludes_null, get_var_ref_type, guarded_path_references,

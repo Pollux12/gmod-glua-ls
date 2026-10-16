@@ -1,4 +1,575 @@
 #[cfg(test)]
+mod nominal_false_edge_tests {
+    use crate::{DiagnosticCode, FileId, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaCallExpr};
+    use tokio_util::sync::CancellationToken;
+
+    const PREDICATE_PATH: &str = "lua/includes/predicates.lua";
+    const PREDICATE: &str =
+        "local classify = type\nfunction isvector(value) return classify(value) == 'Vector' end\n";
+    const SOURCE: &str = r#"
+---@param box ResidualVectorBox
+local function inspect(box)
+    local col = box.value
+    if isvector(box.value) then col = box.value:ToColor() end
+    need_color(col)
+    if not isvector(box.value) then need_color(box.value) end
+    need_color(box.value)
+end
+"#;
+
+    fn workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "annotations/residual_geometry.lua",
+            r#"
+---@meta
+---@class Vector
+local VECTOR = {}
+---@class Color
+local COLOR = {}
+---@return Color
+function VECTOR:ToColor() end
+---@class ResidualVectorBox
+---@field value Color|Vector
+local HOLDER = {}
+---@param value Color
+function need_color(value) end
+"#,
+        );
+        ws
+    }
+
+    fn diagnostics(ws: &mut VirtualWorkspace, file: FileId) -> Vec<(lsp_types::Range, String)> {
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::ParamTypeMismatch);
+        let mut diagnostics = ws
+            .analysis
+            .diagnose_file(file, CancellationToken::new())
+            .unwrap()
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect::<Vec<_>>();
+        diagnostics.sort_by_key(|(range, _)| (range.start.line, range.start.character));
+        diagnostics
+    }
+
+    fn expected(
+        ws: &VirtualWorkspace,
+        file: FileId,
+        guarded: bool,
+    ) -> Vec<(lsp_types::Range, String)> {
+        let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
+        let calls = model
+            .get_root()
+            .descendants::<LuaCallExpr>()
+            .filter(|call| {
+                call.get_prefix_expr()
+                    .is_some_and(|prefix| prefix.syntax().text() == "need_color")
+            })
+            .collect::<Vec<_>>();
+        calls
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !guarded || *index == 2)
+            .map(|(_, call)| {
+                (
+                    model
+                        .get_document()
+                        .to_lsp_range(
+                            call.get_args_list()
+                                .unwrap()
+                                .get_args()
+                                .next()
+                                .unwrap()
+                                .get_range(),
+                        )
+                        .unwrap(),
+                    "expected `Color` but found `(Color|Vector)`. ".to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nominal_false_edge_narrows_a_field_and_its_prebranch_alias() {
+        let mut ws = workspace();
+        ws.def_file(PREDICATE_PATH, PREDICATE);
+        let file = ws.def_file("lua/vgui/prop_vectorcolor.lua", SOURCE);
+        let expected = expected(&ws, file, true);
+        assert_eq!(diagnostics(&mut ws, file), expected);
+    }
+
+    #[test]
+    fn nominal_false_edge_predicate_edits_delete_reopen_and_revert_match_cold() {
+        let mut warm = workspace();
+        let predicate = warm.def_file(PREDICATE_PATH, PREDICATE);
+        let uri = warm.analysis.get_uri(predicate).unwrap();
+        let path = "lua/vgui/prop_vectorcolor.lua";
+        let file = warm.def_file(path, SOURCE);
+        for text in [
+            Some(PREDICATE),
+            Some("function isvector(value) return true end"),
+            None,
+            Some(PREDICATE),
+        ] {
+            if let Some(text) = text {
+                warm.analysis
+                    .update_file_by_uri(&uri, Some(text.to_string()));
+            } else {
+                warm.analysis.remove_file_by_uri(&uri).0.unwrap();
+            }
+            let mut cold = workspace();
+            if let Some(text) = text {
+                cold.def_file(PREDICATE_PATH, text);
+            }
+            let cold_file = cold.def_file(path, SOURCE);
+            let expected = expected(&cold, cold_file, text == Some(PREDICATE));
+            assert_eq!(diagnostics(&mut cold, cold_file), expected, "cold {text:?}");
+            assert_eq!(diagnostics(&mut warm, file), expected, "warm {text:?}");
+        }
+    }
+
+    const EXACT_NAME_CLASSES: &str = r#"
+---@class F1Parent
+local PARENT = {}
+function PARENT:ParentOnly() end
+---@class F1Other
+local OTHER = {}
+function OTHER:OtherOnly() end
+"#;
+    const EXACT_NAME_CHILD: &str =
+        "---@class F1Child: F1Parent\nlocal CHILD = {}\nfunction CHILD:ChildOnly() end\n";
+
+    fn exact_name_workspace(child: bool) -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file("lua/includes/nominal_classes.lua", EXACT_NAME_CLASSES);
+        if child {
+            ws.def_file("lua/includes/nominal_child.lua", EXACT_NAME_CHILD);
+        }
+        ws
+    }
+
+    fn exact_name_diagnostics(
+        ws: &mut VirtualWorkspace,
+        file: FileId,
+    ) -> Vec<(Option<lsp_types::NumberOrString>, lsp_types::Range, String)> {
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::InferUnguardedChild);
+        let mut diagnostics = ws
+            .analysis
+            .diagnose_file(file, CancellationToken::new())
+            .unwrap()
+            .into_iter()
+            .map(|diagnostic| (diagnostic.code, diagnostic.range, diagnostic.message))
+            .collect::<Vec<_>>();
+        diagnostics.sort_by_key(|(_, range, _)| (range.start.line, range.start.character));
+        diagnostics
+    }
+
+    fn exact_name_expected(
+        ws: &VirtualWorkspace,
+        file: FileId,
+        receiver: &str,
+    ) -> Vec<(Option<lsp_types::NumberOrString>, lsp_types::Range, String)> {
+        let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
+        let union = if receiver == "F1Parent" {
+            "F1Other|F1Parent"
+        } else {
+            "F1Child|F1Other"
+        };
+        model.get_root().descendants::<LuaCallExpr>()
+            .filter_map(|call| call.get_prefix_expr())
+            .filter(|prefix| prefix.syntax().text() == "value:OtherOnly")
+            .map(|prefix| (
+                Some(lsp_types::NumberOrString::String("infer-unguarded-child".to_string())),
+                model.get_document().to_lsp_range(prefix.get_range()).unwrap(),
+                format!("expected `F1Other` but found `({union})`. Add a guard to narrow the parent to `F1Other`."),
+            )).collect()
+    }
+
+    #[test]
+    fn negative_exact_nominal_names_keep_declared_parent_and_child_arms() {
+        for predicate in [
+            "local classify = type\n---@param value F1Parent|F1Other\nlocal function notparent(value) return classify(value) ~= 'F1Parent' end",
+            "---@param value F1Parent|F1Other\nlocal function notparent(value) if type(value) == 'F1Parent' then return false end return true end",
+            "local function isparent(value) return type(value) == 'F1Parent' end\nlocal function notparent(value) return not isparent(value) end",
+        ] {
+            let mut ws = exact_name_workspace(true);
+            let source = format!(
+                "{predicate}\n---@param value F1Child|F1Other\nlocal function inspect(value) if notparent(value) then value:OtherOnly() end end\n"
+            );
+            let file = ws.def_file("lua/autorun/server/sv_nominal_negative.lua", &source);
+            let expected = exact_name_expected(&ws, file, "F1Child");
+            assert_eq!(
+                exact_name_diagnostics(&mut ws, file),
+                expected,
+                "{predicate}"
+            );
+        }
+        for condition in ["type(value) ~= 'F1Parent'", "classify(value) ~= 'F1Parent'"] {
+            let mut ws = exact_name_workspace(true);
+            let source = format!(
+                "local classify = type\n---@param value F1Parent|F1Other\nlocal function inspect(value) if {condition} then value:OtherOnly() end end\n"
+            );
+            let file = ws.def_file("lua/autorun/server/sv_nominal_direct.lua", &source);
+            let expected = exact_name_expected(&ws, file, "F1Parent");
+            assert_eq!(
+                exact_name_diagnostics(&mut ws, file),
+                expected,
+                "{condition}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_nominal_name_leaf_false_and_parent_true_edges_still_narrow() {
+        let mut ws = exact_name_workspace(false);
+        let file = ws.def_file(
+            "lua/autorun/server/sv_nominal_controls.lua",
+            r#"
+---@param value F1Parent|F1Other
+local function notparent(value) return type(value) ~= 'F1Parent' end
+---@param value F1Parent|F1Other
+local function inspect(value)
+    if type(value) ~= 'F1Parent' then value:OtherOnly() end
+    if notparent(value) then value:OtherOnly() end
+    if type(value) == 'F1Parent' then value:ParentOnly() end
+end
+"#,
+        );
+        assert_eq!(exact_name_diagnostics(&mut ws, file), Vec::new());
+        ws.def_file("lua/includes/nominal_child.lua", EXACT_NAME_CHILD);
+        let file = ws.def_file(
+            "lua/autorun/server/sv_nominal_positive.lua",
+            r#"
+---@param value F1Parent|F1Other
+local function inspect(value)
+    if type(value) == 'F1Parent' then value:ParentOnly() end
+end
+"#,
+        );
+        assert_eq!(exact_name_diagnostics(&mut ws, file), Vec::new());
+        let file = ws.def_file(
+            "lua/autorun/server/sv_nominal_typeguard.lua",
+            r#"
+---@param value F1Parent|F1Other
+---@return TypeGuard<F1Parent>
+local function isparent(value) end
+---@param value F1Child|F1Other
+local function inspect(value)
+    if not isparent(value) then value:OtherOnly() end
+end
+"#,
+        );
+        let expected = exact_name_expected(&ws, file, "F1Child");
+        assert_eq!(exact_name_diagnostics(&mut ws, file), expected);
+    }
+
+    const TYPE_TEST_CLASSES: &str = r#"
+---@meta
+---@class Entity
+local ENTITY = {}
+---@class Player: Entity
+local PLAYER = {}
+---@class NULL: Entity
+local NULL_ENTITY = {}
+---@class Color
+local COLOR = {}
+---@class DerivedColor: Color
+local DERIVED_COLOR = {}
+---@param value string
+function need_string(value) end
+"#;
+    const ENTITY_TYPE_TEST: &str = "---@meta\n---@param value any\n---@return TypeGuard<Entity>\n---@[exhaustive_type_guard]\nfunction isentity(value) end\n";
+    const TYPE_TEST_PATH: &str = "annotations/entity_guard.lua";
+
+    fn type_test_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file("annotations/type_test_classes.lua", TYPE_TEST_CLASSES);
+        ws
+    }
+
+    fn string_call_expected(
+        ws: &VirtualWorkspace,
+        file: FileId,
+        mismatches: &[(usize, &str)],
+    ) -> Vec<(lsp_types::Range, String)> {
+        let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
+        let calls = model
+            .get_root()
+            .descendants::<LuaCallExpr>()
+            .filter(|call| {
+                call.get_prefix_expr()
+                    .is_some_and(|prefix| prefix.syntax().text() == "need_string")
+            })
+            .collect::<Vec<_>>();
+        mismatches
+            .iter()
+            .map(|(index, found)| {
+                (
+                    model
+                        .get_document()
+                        .to_lsp_range(
+                            calls[*index]
+                                .get_args_list()
+                                .unwrap()
+                                .get_args()
+                                .next()
+                                .unwrap()
+                                .get_range(),
+                        )
+                        .unwrap(),
+                    format!("expected `string` but found `{found}`. "),
+                )
+            })
+            .collect()
+    }
+
+    fn type_test_source(typ: &str, predicate: &str) -> String {
+        format!(
+            "---@param value {typ}\nlocal function inspect(value)\n    if not {predicate}(value) then need_string(value) end\n    need_string(value)\nend\n"
+        )
+    }
+
+    #[test]
+    fn exhaustive_type_guard_false_edge_removes_player_and_null() {
+        for typ in ["Player|string", "NULL|string"] {
+            let mut ws = type_test_workspace();
+            ws.def_file(TYPE_TEST_PATH, ENTITY_TYPE_TEST);
+            let file = ws.def_file(
+                "lua/autorun/server/sv_entity_guard.lua",
+                &type_test_source(typ, "isentity"),
+            );
+            let found = format!("({typ})");
+            let expected = string_call_expected(&ws, file, &[(1, &found)]);
+            assert_eq!(diagnostics(&mut ws, file), expected, "{typ}");
+        }
+    }
+
+    #[test]
+    fn nonexhaustive_type_guard_false_edge_keeps_player_and_null() {
+        for typ in ["Player|string", "NULL|string"] {
+            let mut ws = type_test_workspace();
+            ws.def_file(
+                TYPE_TEST_PATH,
+                &ENTITY_TYPE_TEST.replace("---@[exhaustive_type_guard]\n", ""),
+            );
+            let file = ws.def_file(
+                "lua/autorun/server/sv_entity_subset.lua",
+                &type_test_source(typ, "isentity"),
+            );
+            let found = format!("({typ})");
+            let expected = string_call_expected(&ws, file, &[(0, &found), (1, &found)]);
+            assert_eq!(diagnostics(&mut ws, file), expected, "{typ}");
+        }
+    }
+
+    #[test]
+    fn exact_metatable_type_guard_false_edge_keeps_color_subclasses() {
+        let mut ws = type_test_workspace();
+        ws.def_file(
+            "annotations/color_guard.lua",
+            r#"
+---@meta
+---@param var any
+---@return TypeGuard<Color> isColor
+function IsColor(var) end
+"#,
+        );
+        let file = ws.def_file(
+            "lua/autorun/client/cl_color_guard.lua",
+            &type_test_source("DerivedColor|string", "IsColor"),
+        );
+        let expected = string_call_expected(
+            &ws,
+            file,
+            &[(0, "(DerivedColor|string)"), (1, "(DerivedColor|string)")],
+        );
+        assert_eq!(diagnostics(&mut ws, file), expected);
+    }
+
+    #[test]
+    fn validity_type_guard_false_edge_keeps_null() {
+        let mut ws = type_test_workspace();
+        ws.def_file(
+            "annotations/validity_guard.lua",
+            r#"
+---@meta
+---@param value any
+---@return TypeGuard<any>
+---@return_cast value -NULL
+---@[valid_guard]
+function IsValid(value) end
+---@param value any
+---@return TypeGuard<Entity>
+---@[valid_guard]
+function live_entity(value) return IsValid(value) and isentity(value) end
+"#,
+        );
+        ws.def_file(TYPE_TEST_PATH, ENTITY_TYPE_TEST);
+        for predicate in ["IsValid", "live_entity"] {
+            let file = ws.def_file(
+                "lua/autorun/server/sv_validity_guard.lua",
+                &type_test_source("NULL|string", predicate),
+            );
+            let expected =
+                string_call_expected(&ws, file, &[(0, "(NULL|string)"), (1, "(NULL|string)")]);
+            assert_eq!(diagnostics(&mut ws, file), expected, "{predicate}");
+        }
+    }
+
+    #[test]
+    fn exhaustive_type_guard_is_ingested_on_the_signature() {
+        let attached = ENTITY_TYPE_TEST.replace(
+            "---@return TypeGuard<Entity>
+---@[exhaustive_type_guard]",
+            "---@[exhaustive_type_guard]
+---@return TypeGuard<Entity>",
+        );
+        for text in [ENTITY_TYPE_TEST, attached.as_str()] {
+            let mut ws = type_test_workspace();
+            ws.def_file(TYPE_TEST_PATH, text);
+            let db = ws.analysis.compilation.get_db();
+            let marked = db
+                .get_signature_index()
+                .iter()
+                .filter(|(id, _)| crate::signature_is_exhaustive_type_guard(db, **id))
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            assert_eq!(marked.len(), 1);
+            let uses = crate::signature_attribute_uses(db, marked[0]).unwrap();
+            assert_eq!(
+                uses.iter()
+                    .map(|attribute| attribute.id.get_name())
+                    .collect::<Vec<_>>(),
+                vec![crate::GMOD_ATTR_EXHAUSTIVE_TYPE_GUARD]
+            );
+        }
+    }
+
+    #[test]
+    fn exhaustive_type_guard_attribute_edit_remove_and_revert_match_cold() {
+        let mut warm = type_test_workspace();
+        let predicate = warm.def_file(TYPE_TEST_PATH, ENTITY_TYPE_TEST);
+        let uri = warm.analysis.get_uri(predicate).unwrap();
+        let source = type_test_source("Player|string", "isentity");
+        let path = "lua/autorun/server/sv_type_test_lifecycle.lua";
+        let file = warm.def_file(path, &source);
+        let unmarked = ENTITY_TYPE_TEST.replace("---@[exhaustive_type_guard]\n", "");
+        for text in [
+            Some(ENTITY_TYPE_TEST),
+            Some(unmarked.as_str()),
+            Some(ENTITY_TYPE_TEST),
+            None,
+            Some(ENTITY_TYPE_TEST),
+        ] {
+            if let Some(text) = text {
+                warm.analysis
+                    .update_file_by_uri(&uri, Some(text.to_string()));
+            } else {
+                warm.analysis.remove_file_by_uri(&uri).0.unwrap();
+            }
+            let mut cold = type_test_workspace();
+            if let Some(text) = text {
+                cold.def_file(TYPE_TEST_PATH, text);
+            }
+            let cold_file = cold.def_file(path, &source);
+            let mismatches = if text == Some(ENTITY_TYPE_TEST) {
+                vec![(1, "(Player|string)")]
+            } else {
+                vec![(0, "(Player|string)"), (1, "(Player|string)")]
+            };
+            let expected = string_call_expected(&cold, cold_file, &mismatches);
+            assert_eq!(diagnostics(&mut cold, cold_file), expected, "cold {text:?}");
+            assert_eq!(diagnostics(&mut warm, file), expected, "warm {text:?}");
+        }
+    }
+
+    #[test]
+    fn negative_exact_nominal_names_track_subclass_add_delete_and_reopen() {
+        let source = r#"
+---@param value F1Parent|F1Other
+local function notparent(value) return type(value) ~= 'F1Parent' end
+---@param value F1Parent|F1Other
+local function multireturn(value)
+    if type(value) == 'F1Parent' then return false end
+    return true
+end
+---@param value F1Parent|F1Other
+local function direct(value) if type(value) ~= 'F1Parent' then value:OtherOnly() end end
+---@param value F1Parent|F1Other
+local function helper(value) if notparent(value) then value:OtherOnly() end end
+---@param value F1Parent|F1Other
+local function multi(value) if multireturn(value) then value:OtherOnly() end end
+"#;
+        let path = "lua/autorun/server/sv_nominal_lifecycle.lua";
+        let mut warm = exact_name_workspace(false);
+        let file = warm.def_file(path, source);
+        let mut subclass_uri = None;
+        for present in [false, true, false, true] {
+            if present {
+                let child = warm.def_file("lua/includes/nominal_child.lua", EXACT_NAME_CHILD);
+                subclass_uri = Some(warm.analysis.get_uri(child).unwrap());
+            } else if let Some(uri) = &subclass_uri {
+                warm.analysis.remove_file_by_uri(uri).0.unwrap();
+            }
+            let mut cold = exact_name_workspace(present);
+            let cold_file = cold.def_file(path, source);
+            let expected = if present {
+                exact_name_expected(&cold, cold_file, "F1Parent")
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                exact_name_diagnostics(&mut cold, cold_file),
+                expected,
+                "cold {present}"
+            );
+            assert_eq!(
+                exact_name_diagnostics(&mut warm, file),
+                expected,
+                "warm {present}"
+            );
+        }
+    }
+
+    #[test]
+    fn nominal_false_edge_retracts_when_a_subclass_with_another_runtime_name_is_added() {
+        let mut warm = workspace();
+        warm.def_file(PREDICATE_PATH, PREDICATE);
+        let path = "lua/vgui/prop_vectorcolor.lua";
+        let file = warm.def_file(path, SOURCE);
+        let subclass_path = "lua/includes/custom_vector.lua";
+        let subclass = "---@class CustomVector: Vector\n";
+        let mut subclass_uri = None;
+        for present in [false, true, false, true] {
+            if present {
+                let subclass_file = warm.def_file(subclass_path, subclass);
+                subclass_uri = Some(warm.analysis.get_uri(subclass_file).unwrap());
+            } else if let Some(uri) = &subclass_uri {
+                warm.analysis.remove_file_by_uri(uri).0.unwrap();
+            }
+            let mut cold = workspace();
+            cold.def_file(PREDICATE_PATH, PREDICATE);
+            if present {
+                cold.def_file(subclass_path, subclass);
+            }
+            let cold_file = cold.def_file(path, SOURCE);
+            let expected = expected(&cold, cold_file, !present);
+            assert_eq!(
+                diagnostics(&mut cold, cold_file),
+                expected,
+                "cold {present}"
+            );
+            assert_eq!(diagnostics(&mut warm, file), expected, "warm {present}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod test {
     use std::{ops::Deref, sync::Arc};
 

@@ -163,11 +163,29 @@ fn is_structural_inferred_guard_candidate(closure: &LuaClosureExpr) -> bool {
     let Some(block) = closure.get_block() else {
         return false;
     };
-    let return_points = super::super::lua::func_body::analyze_func_body_returns(block);
-    let [super::super::lua::LuaReturnPoint::Expr(return_expr)] = return_points.as_slice() else {
-        return false;
-    };
-    inferred_guard_candidate_references_param(return_expr, &param_names)
+    let return_points = super::super::lua::func_body::analyze_func_body_returns(None, block);
+    let mut truthy_exprs = Vec::new();
+    for point in &return_points {
+        match point {
+            super::super::lua::LuaReturnPoint::Expr(expr)
+                if !super::super::common::is_falsy_literal_expr(expr) =>
+            {
+                truthy_exprs.push(expr);
+            }
+            super::super::lua::LuaReturnPoint::MuliExpr(_) => return false,
+            _ => {}
+        }
+    }
+    if return_points.len() == 1 {
+        return truthy_exprs
+            .first()
+            .is_some_and(|expr| inferred_guard_candidate_references_param(expr, &param_names));
+    }
+    !truthy_exprs.is_empty()
+        && truthy_exprs.iter().all(|expr| {
+            matches!(expr, LuaExpr::LiteralExpr(_))
+                || inferred_guard_candidate_references_param(expr, &param_names)
+        })
 }
 
 fn inferred_guard_candidate_references_param(expr: &LuaExpr, param_names: &[String]) -> bool {
