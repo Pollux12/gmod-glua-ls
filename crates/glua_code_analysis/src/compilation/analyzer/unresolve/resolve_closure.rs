@@ -479,7 +479,10 @@ pub fn try_resolve_closure_parent_params(
         .get_signature_index()
         .get(&closure_params.signature_id)
         .ok_or(InferFailReason::None)?;
-    if !signature.param_docs.is_empty() && !signature.return_filled_from_slot {
+    if !signature.param_docs.is_empty()
+        && !signature.params_filled_from_slot
+        && !signature.return_filled_from_slot
+    {
         return Ok(());
     }
     let self_type;
@@ -782,6 +785,10 @@ fn resolve_doc_function(
         _ => {}
     }
 
+    let receiver_filled_from_slot = !signature.is_colon_define
+        && doc_params
+            .first()
+            .is_some_and(|(_, typ)| typ.as_ref().is_some_and(LuaType::is_self_infer));
     if let Some(self_type) = self_type
         && let Some((_, Some(typ))) = doc_params.first()
         && typ.is_self_infer()
@@ -791,7 +798,9 @@ fn resolve_doc_function(
 
     let params_before = signature.param_docs.clone();
     let filled_from_slot_before = signature.params_filled_from_slot;
+    let receiver_from_slot_before = signature.receiver_filled_from_slot;
     signature.params_filled_from_slot |= !doc_params.is_empty();
+    signature.receiver_filled_from_slot = receiver_filled_from_slot;
     for (index, param) in doc_params.iter().enumerate() {
         let name = signature
             .params
@@ -814,6 +823,7 @@ fn resolve_doc_function(
     // signature borrow ends.
     let params_changed = signature.param_docs != params_before
         || signature.params_filled_from_slot != filled_from_slot_before
+        || signature.receiver_filled_from_slot != receiver_from_slot_before
         || signature.async_state != async_before;
 
     let return_before = (

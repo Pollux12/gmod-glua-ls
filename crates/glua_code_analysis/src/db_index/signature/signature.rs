@@ -40,6 +40,7 @@ pub struct LuaSignature {
     /// filling the same slot must not inherit them, or its receiver would be
     /// whichever sibling the batch happened to resolve first.
     pub params_filled_from_slot: bool,
+    pub receiver_filled_from_slot: bool,
     /// Whether `return_docs` was filled in from the slot this closure was
     /// assigned into rather than from its own `@return` tags. Slot-filled
     /// returns may be refreshed when the inherited contract settles; explicit
@@ -137,6 +138,7 @@ impl LuaSignature {
             self.is_colon_define,
             self.is_vararg,
             self.params_filled_from_slot,
+            self.receiver_filled_from_slot,
         )
     }
 }
@@ -158,6 +160,7 @@ impl Hash for LuaSignature {
         self.nodiscard.hash(state);
         self.is_vararg.hash(state);
         self.params_filled_from_slot.hash(state);
+        self.receiver_filled_from_slot.hash(state);
         self.return_filled_from_slot.hash(state);
         self.require_guard_param().hash(state);
         self.nil_return_guard_params().hash(state);
@@ -192,6 +195,7 @@ impl LuaSignature {
             nodiscard: None,
             is_vararg: false,
             params_filled_from_slot: false,
+            receiver_filled_from_slot: false,
             return_filled_from_slot: false,
             facts: None,
             return_cast: None,

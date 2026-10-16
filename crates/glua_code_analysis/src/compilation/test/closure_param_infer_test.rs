@@ -22,6 +22,245 @@ mod test {
             .expect("index expression type")
     }
 
+    /// The class a type names, through the instances `vgui.Create` sites wrap it in.
+    fn created_class(typ: LuaType) -> LuaType {
+        match typ {
+            LuaType::Instance(instance) => created_class(instance.get_base().clone()),
+            typ => typ,
+        }
+    }
+
+    fn installed_panel_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut config = Emmyrc::default();
+        config.gmod.enabled = true;
+        ws.update_emmyrc(config);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/installed_panel_api.lua",
+            r#"
+            ---@class Panel
+            ---@field Receive fun(value: number)
+            Panel = {}
+            ---@param width number
+            ---@param height number
+            function Panel:Paint(width, height) end
+            ---@class DLabel: Panel
+            DLabel = {}
+            ---@class DPanel: Panel
+            DPanel = {}
+            ---@class DDragBase: Panel
+            DDragBase = {}
+            ---@param drop number
+            ---@param pnl Panel
+            function DDragBase:UpdateDropTarget(drop, pnl) end
+            ---@class Color
+            local Color = {}
+            ---@param value number
+            function need_number(value) end
+            ---@param value string
+            function need_string(value) end
+            ---@param value Color
+            function need_color(value) end
+        "#,
+        );
+        ws
+    }
+
+    fn installed_param_source(
+        ws: &VirtualWorkspace,
+        file: crate::FileId,
+        name: &str,
+    ) -> crate::semantic::ParamInferenceSource {
+        let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
+        let read = model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|read| read.syntax().text() == name)
+            .unwrap();
+        let decl = model
+            .get_db()
+            .get_decl_index()
+            .get_decl_tree(&file)
+            .unwrap()
+            .find_local_decl(name, read.get_position())
+            .unwrap();
+        let source = crate::semantic::infer_param_source(
+            model.get_db(),
+            &mut model.get_cache().borrow_mut(),
+            decl,
+        )
+        .unwrap();
+        source
+    }
+
+    #[test]
+    fn installed_panel_receivers_are_contextual_and_scalar_contracts_stay_concrete() {
+        use crate::semantic::ParamInferenceSource;
+        for (path, source, receiver) in [
+            (
+                "lua/vgui/dhorizontalscroller.lua",
+                r#"
+                local PANEL = {}
+                function PANEL:Init()
+                    self.pnlCanvas = vgui.Create("DDragBase", self)
+                    self.pnlCanvas.UpdateDropTarget = function(Canvas, drop, pnl)
+                        DDragBase.UpdateDropTarget(Canvas, drop, pnl)
+                    end
+                end
+                vgui.Register("DHorizontalScroller", PANEL, "Panel")
+            "#,
+                "Canvas",
+            ),
+            (
+                "lua/menu/openurl.lua",
+                r#"
+                local PANEL = {}
+                function PANEL:Init()
+                    self.CustomPanel = vgui.Create("DLabel", self)
+                    ---@type Color
+                    local color
+                    self.CustomPanel.Color = color
+                    self.CustomPanel.Paint = function(s, w, h)
+                        need_number(w)
+                        need_number(h)
+                        need_color(s.Color)
+                    end
+                end
+                vgui.Register("OpenURLProbe", PANEL, "Panel")
+            "#,
+                "s",
+            ),
+            (
+                "lua/glide/client/vgui/vehicle_layout_editor_compact.lua",
+                r#"
+                local PANEL = {}
+                function PANEL:Init()
+                    self.resizeHandle = vgui.Create("DPanel", self)
+                    self.resizeHandle.animHover = 0
+                    self.resizeHandle.Paint = function(s, w, h)
+                        s.animHover = s.animHover + 1
+                        need_number(w)
+                        need_number(h)
+                        need_number(s.animHover)
+                    end
+                end
+                vgui.Register("LayoutEditorProbe", PANEL, "Panel")
+            "#,
+                "s",
+            ),
+        ] {
+            let mut ws = installed_panel_workspace();
+            let file = ws.def_file(path, source);
+            assert_eq!(
+                installed_param_source(&ws, file, receiver),
+                ParamInferenceSource::Contextual,
+                "{path}"
+            );
+            let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
+            let read = model
+                .get_root()
+                .descendants::<LuaNameExpr>()
+                .find(|read| read.syntax().text() == receiver)
+                .unwrap();
+            let receiver_type = model.infer_expr(LuaExpr::NameExpr(read)).unwrap();
+            let owner = match receiver {
+                "Canvas" => "self.pnlCanvas",
+                _ if path == "lua/menu/openurl.lua" => "self.CustomPanel",
+                _ => "self.resizeHandle",
+            };
+            assert_eq!(
+                created_class(receiver_type),
+                created_class(index_expr_type(&ws, file, owner)),
+                "{path}"
+            );
+            if receiver == "s" {
+                assert_eq!(
+                    installed_param_source(&ws, file, "w"),
+                    ParamInferenceSource::Explicit,
+                    "{path}"
+                );
+            }
+            let reports = ws
+                .analysis
+                .diagnose_file(file, tokio_util::sync::CancellationToken::new())
+                .unwrap();
+            for code in [
+                crate::DiagnosticCode::InferUnguardedChild,
+                crate::DiagnosticCode::UndefinedField,
+                crate::DiagnosticCode::ParamTypeMismatch,
+            ] {
+                assert!(
+                    reports.iter().all(|report| report.code
+                        != Some(lsp_types::NumberOrString::String(
+                            code.get_name().to_string(),
+                        ))),
+                    "{path}: {reports:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn installed_callbacks_keep_explicit_receivers_and_non_receiver_parameter_contracts() {
+        use crate::semantic::ParamInferenceSource;
+        let mut ws = installed_panel_workspace();
+        let mut config = ws.get_emmyrc();
+        config.strict.strict_type_coercion = true;
+        ws.update_emmyrc(config);
+        let file = ws.def_file(
+            "lua/autorun/client/installed_contract_controls.lua",
+            r#"
+            local label = vgui.Create("DLabel")
+            ---@param explicit Panel
+            label.Paint = function(explicit, w, h)
+                need_number(explicit)
+            end
+            label.Receive = function(value)
+                need_string(value)
+            end
+        "#,
+        );
+        assert_eq!(
+            installed_param_source(&ws, file, "explicit"),
+            ParamInferenceSource::Explicit
+        );
+        assert_eq!(
+            installed_param_source(&ws, file, "value"),
+            ParamInferenceSource::Explicit
+        );
+        assert_eq!(param_mismatches(&mut ws, file), 2);
+    }
+
+    #[test]
+    fn installed_receiver_provenance_follows_annotation_edits_delete_and_reopen() {
+        use crate::semantic::ParamInferenceSource;
+        let mut ws = installed_panel_workspace();
+        let path = "lua/autorun/client/installed_receiver_edit.lua";
+        let borrowed = r#"
+            local label = vgui.Create("DLabel")
+            label.Paint = function(s, w, h)
+                local receiver = s
+            end
+        "#;
+        let annotated = borrowed.replace("label.Paint =", "---@param s Panel\nlabel.Paint =");
+        for (source, expected) in [
+            (borrowed, ParamInferenceSource::Contextual),
+            (annotated.as_str(), ParamInferenceSource::Explicit),
+            (borrowed, ParamInferenceSource::Contextual),
+        ] {
+            let file = ws.def_file(path, source);
+            assert_eq!(installed_param_source(&ws, file, "s"), expected);
+        }
+        let uri = ws.virtual_url_generator.new_uri(path);
+        let _ = ws.analysis.update_file_by_uri(&uri, None);
+        let file = ws.def_file(path, &annotated);
+        assert_eq!(
+            installed_param_source(&ws, file, "s"),
+            ParamInferenceSource::Explicit
+        );
+    }
+
     /// A local function passed by name as a callback takes the callback's
     /// parameter types, as a closure written in its place does; a parameter it
     /// documents itself keeps its own type, and a direct call of it is not

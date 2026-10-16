@@ -1077,7 +1077,12 @@ fn infer_param_inner(
                 typ = TypeOps::Union.apply(db, &typ, &sibling_type);
             }
 
-            return Ok((typ, ParamInferenceSource::Explicit));
+            let source = if param_idx == 0 && signature.receiver_filled_from_slot {
+                ParamInferenceSource::Contextual
+            } else {
+                ParamInferenceSource::Explicit
+            };
+            return Ok((typ, source));
         }
     }
 
