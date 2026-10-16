@@ -478,16 +478,6 @@ impl CallSiteParamIndex {
             .and_then(|params| params.get(&param_idx))
     }
 
-    /// Whether any evidence feeds `signature_id`'s `param_idx`, folded or not.
-    pub fn has_param_evidence(
-        &self,
-        signature_id: &LuaSignatureId,
-        param_idx: usize,
-    ) -> bool {
-        derivation::note_read(|| FactKey::Contrib(*signature_id, param_idx));
-        self.contributors.contains_key(&(*signature_id, param_idx))
-    }
-
     /// The inference events `file_id`'s own evidence carries, each with the
     /// parameter's folded fact.
     pub fn get_inference_events_for_file(
