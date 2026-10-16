@@ -753,18 +753,6 @@ fn signature_returns_std_type(db: &DbIndex, signature_id: LuaSignatureId) -> boo
         })
 }
 
-pub(crate) fn is_base_runtime_panel_file(db: &DbIndex, file_id: FileId) -> bool {
-    db.get_vfs()
-        .get_file_path(&file_id)
-        .and_then(|path| path.to_str())
-        .map(|path| path.replace('\\', "/"))
-        .is_some_and(|path| {
-            ["/lua/includes/", "/lua/vgui/", "/lua/derma/"]
-                .iter()
-                .any(|root| path.contains(root))
-        })
-}
-
 fn is_base_runtime_util_file(db: &DbIndex, file_id: FileId) -> bool {
     db.get_vfs()
         .get_file_path(&file_id)

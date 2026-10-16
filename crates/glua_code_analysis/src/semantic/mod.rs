@@ -50,14 +50,12 @@ pub(crate) use infer::infer_bind_value_type;
 pub(crate) use infer::infer_expr_list_types;
 pub use infer::infer_index_expr;
 pub(crate) use infer::local_call_reference_expectations;
-#[cfg(test)]
-pub(crate) use infer::narrow::infer_asserted_argument_type;
 pub(crate) use infer::narrow::{InferConditionFlow, apply_cast};
-pub(crate) use infer::narrow::{
-    get_var_ref_type, infer_true_condition_narrowing, infer_var_type_at_node, type_name_test,
-};
 pub use infer::narrow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
+};
+pub(crate) use infer::narrow::{
+    get_var_ref_type, infer_true_condition_narrowing, infer_var_type_at_node, type_name_test,
 };
 pub(crate) use infer::pairs_iter_value_registry_path;
 pub(crate) use infer::presence_guard_target;
@@ -79,12 +77,12 @@ pub use member::get_member_map;
 pub use member::get_member_value_expr;
 pub(crate) use member::infer_owner_raw_member_type_with_realm;
 pub(crate) use member::infer_raw_member_type_with_cache;
-pub(crate) use nullable::is_nullable;
 pub(crate) use member::member_key_matches_type;
 pub(crate) use member::merge_open_table_types;
 pub(crate) use member::visible_super_types_in_workspace_for_file_at_offset;
 pub(crate) use member::{MetatableIndexField, find_metatable_index_field};
 pub(crate) use member::{dynamic_field_type_without, resolve_dynamic_field_member};
+pub(crate) use nullable::is_nullable;
 use reference::is_reference_to;
 use rowan::{NodeOrToken, TextRange};
 pub(crate) use semantic_info::{
