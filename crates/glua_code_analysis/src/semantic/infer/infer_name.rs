@@ -1166,7 +1166,17 @@ fn infer_param_inner(
             .get_call_site_param_index()
             .get_inferred_param_fact(&signature_id, param_idx)
             .map_or(ParamInferenceSource::Concrete, |fact| {
-                if fact.confidence() >= crate::LuaInferenceConfidence::Certain {
+                let concrete_provenance = !fact.provenance().is_empty()
+                    && fact.provenance().iter().all(|step| {
+                        matches!(
+                            step.event.kind,
+                            crate::LuaInferenceProvenanceKind::ConcreteValue
+                                | crate::LuaInferenceProvenanceKind::ExplicitAnnotation
+                        )
+                    });
+                if fact.confidence() >= crate::LuaInferenceConfidence::Certain
+                    || (concrete_provenance)
+                {
                     ParamInferenceSource::Concrete
                 } else {
                     ParamInferenceSource::Contextual

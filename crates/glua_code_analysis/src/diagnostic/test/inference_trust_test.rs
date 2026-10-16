@@ -914,6 +914,146 @@ mod tests {
     }
 
     #[test]
+    fn contextual_parameter_evidence_keeps_child_inference_advisory() {
+        for (confidence, annotation, replacement, expected) in [
+            (
+                LuaInferenceConfidence::Anchored,
+                "",
+                "",
+                DiagnosticCode::InferUnknown,
+            ),
+            (
+                LuaInferenceConfidence::Certain,
+                "",
+                "",
+                DiagnosticCode::InferUnguardedChild,
+            ),
+            (
+                LuaInferenceConfidence::Anchored,
+                "---@param attacker L2Parent|L2Child",
+                "",
+                DiagnosticCode::InferUnguardedChild,
+            ),
+            (
+                LuaInferenceConfidence::Anchored,
+                "",
+                "attacker = l2_parent()",
+                DiagnosticCode::InferUnguardedChild,
+            ),
+            (
+                LuaInferenceConfidence::Anchored,
+                "",
+                "---@cast attacker L2Parent|L2Child",
+                DiagnosticCode::InferUnguardedChild,
+            ),
+        ] {
+            let mut ws = gmod_workspace();
+            ws.def_file(
+                "lua/annotations/l2_provenance.lua",
+                r#"
+                ---@class L2Parent
+                local L2Parent = {}
+                ---@class L2Child: L2Parent
+                ---@field ChildOnly fun(self: L2Child)
+                local L2Child = {}
+                ---@return L2Parent
+                function l2_parent() end
+            "#,
+            );
+            let source = format!(
+                "{annotation}
+function L2LockOn(attacker)
+{replacement}
+attacker:ChildOnly()
+end"
+            );
+            let file_id = ws.def_file("lua/autorun/server/l2_provenance.lua", &source);
+            let func = ws.get_node::<LuaFuncStat>(file_id);
+            let closure = func.get_closure().unwrap();
+            let signature_id = crate::LuaSignatureId::from_closure(file_id, &closure);
+            let param = closure
+                .get_params_list()
+                .unwrap()
+                .get_params()
+                .next()
+                .unwrap();
+            let decl_id = crate::LuaDeclId::new(file_id, param.get_position());
+            let read = closure
+                .descendants::<glua_parser::LuaIndexExpr>()
+                .find(|index| index.syntax().text() == "attacker:ChildOnly")
+                .unwrap();
+            let parent = ws.ty("L2Parent|L2Child");
+            let child = ws.ty("L2Child");
+            ws.get_db_mut()
+                .get_call_site_param_index_mut()
+                .set_callback_contributions(
+                    file_id,
+                    vec![(
+                        signature_id,
+                        0,
+                        Some(LuaTypeFact::new(
+                            parent.clone(),
+                            confidence,
+                            Vec::new().into(),
+                        )),
+                    )],
+                );
+            let node = LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(decl_id));
+            ws.get_db_mut().publish_inference_facts(vec![(
+                node.clone(),
+                LuaTypeFact::new(
+                    child.clone(),
+                    LuaInferenceConfidence::Heuristic,
+                    vec![LuaInferenceStep {
+                        event: LuaInferenceEventId {
+                            node: LuaInferenceNodeId::TypeOwner(LuaTypeOwner::SyntaxId(
+                                InFiled::new(file_id, read.get_syntax_id()),
+                            )),
+                            kind: LuaInferenceProvenanceKind::UnguardedChild,
+                            source: InFiled::new(file_id, read.get_syntax_id()),
+                        },
+                        support: Vec::new().into(),
+                        inferred_type: Some(Arc::new(child)),
+                        found_type: Some(Arc::new(parent)),
+                    }]
+                    .into(),
+                ),
+            )]);
+            ws.get_db_mut().flush_inference_derived_state();
+            let found = diagnostics_for(&mut ws, file_id, expected);
+            let read_line = source
+                .lines()
+                .position(|line| line == "attacker:ChildOnly()")
+                .unwrap() as u32;
+            let at_read = found
+                .iter()
+                .filter(|diagnostic| diagnostic.range.start.line == read_line)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                at_read.len(),
+                1,
+                "{confidence:?}: {annotation}: {replacement}: {found:?}"
+            );
+            let severity = if expected == DiagnosticCode::InferUnknown {
+                lsp_types::DiagnosticSeverity::HINT
+            } else {
+                lsp_types::DiagnosticSeverity::WARNING
+            };
+            assert_eq!(at_read[0].severity, Some(severity));
+            let unexpected = if expected == DiagnosticCode::InferUnknown {
+                DiagnosticCode::InferUnguardedChild
+            } else {
+                DiagnosticCode::InferUnknown
+            };
+            assert!(
+                !diagnostics_for(&mut ws, file_id, unexpected)
+                    .iter()
+                    .any(|diagnostic| diagnostic.range.start.line == read_line)
+            );
+        }
+    }
+
+    #[test]
     fn unguarded_child_is_configured_separately_from_generic_unknown_inference() {
         let (mut ws, file_id) = workspace();
         let local = ws
