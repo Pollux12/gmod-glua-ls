@@ -1031,16 +1031,30 @@ fn infer_table_member_owner(
         if !type_is_uninformative(&member_type) {
             return Ok(member_type);
         }
-
-        if let Some(dynamic_member_type) = infer_table_dynamic_key_member_type(
+        if let Some(helper_type) = infer_dynamic_field_helper_type(
             db,
-            &owner,
+            cache,
+            &LuaType::TableConst(inst.clone()),
             &key,
-            cache.get_file_id(),
-            Some(index_expr.get_position()),
-            source_min_position.as_ref(),
-            true,
-        ) && !type_is_uninformative(&dynamic_member_type)
+            index_expr.get_position(),
+        ) && !type_is_uninformative(&helper_type)
+        {
+            return Ok(helper_type);
+        }
+
+        // A named key written with a value of its own keeps that value; only a
+        // cleared slot reads the values the table holds under computed keys.
+        if (!literal_key || type_is_nil_placeholder(&member_type))
+            && let Some(dynamic_member_type) = infer_table_dynamic_key_member_type(
+                db,
+                &owner,
+                &key,
+                cache.get_file_id(),
+                Some(index_expr.get_position()),
+                source_min_position.as_ref(),
+                true,
+            )
+            && !type_is_uninformative(&dynamic_member_type)
         {
             return Ok(dynamic_member_type);
         }
@@ -1481,6 +1495,18 @@ fn type_is_uninformative(typ: &LuaType) -> bool {
             .get_unions()
             .iter()
             .all(|(typ, _)| type_is_uninformative(typ)),
+        _ => false,
+    }
+}
+
+fn type_is_nil_placeholder(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Nil | LuaType::Never => true,
+        LuaType::Union(union) => union.types().all(type_is_nil_placeholder),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .all(|(typ, _)| type_is_nil_placeholder(typ)),
         _ => false,
     }
 }
