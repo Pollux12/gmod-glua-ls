@@ -103,11 +103,20 @@ fn check_call_expr(
         if !is_receiver_known_non_nullable
             && expr_has_invalidated_prior_nil_early_return(semantic_model, &receiver)
         {
-            context.add_diagnostic(
+            let receiver_type = semantic_model.infer_expr(receiver.clone()).ok();
+            let has_gmod_null = receiver_type
+                .as_ref()
+                .is_some_and(|typ| contains_gmod_null_type(semantic_model.get_db(), typ));
+            let created_null = receiver_type
+                .as_ref()
+                .is_some_and(|typ| is_created_instance_or_null(semantic_model.get_db(), typ));
+            add_unsafe_receiver_diagnostic(
+                context,
+                &receiver,
                 DiagnosticCode::NeedCheckNil,
-                receiver.get_range(),
-                format!("{name} may be nil", name = receiver.syntax().text()).to_string(),
-                None,
+                has_gmod_null,
+                created_null,
+                receiver_type.as_ref().is_none_or(LuaType::is_nullable),
             );
             return Some(());
         }
@@ -289,6 +298,7 @@ fn report_unsafe_receiver(
         }
         Err(_) => return false,
     };
+    let has_gmod_null = contains_gmod_null_type(semantic_model.get_db(), &receiver_type);
     if receiver_type.is_nullable() {
         if is_result_of_unguarded_child_call(semantic_model, receiver) {
             return false;
@@ -296,7 +306,6 @@ fn report_unsafe_receiver(
 
         // If the type contains GMod NULL, use TypeGuard-only matching.
         // NULL is truthy, so `not expr` does not prove validity.
-        let has_gmod_null = contains_gmod_null_type(semantic_model.get_db(), &receiver_type);
         let guarded = if has_gmod_null {
             is_expr_guarded_by_prior_null_excluding_type_guard_early_return(
                 semantic_model,
@@ -331,16 +340,20 @@ fn report_unsafe_receiver(
             DiagnosticCode::NeedCheckNil
         };
 
-        context.add_diagnostic(
+        let created_null =
+            has_gmod_null && is_created_instance_or_null(semantic_model.get_db(), &receiver_type);
+        add_unsafe_receiver_diagnostic(
+            context,
+            receiver,
             diagnostic_code,
-            receiver.get_range(),
-            format!("{name} may be nil", name = receiver.syntax().text()).to_string(),
-            None,
+            has_gmod_null,
+            created_null,
+            true,
         );
         return true;
     }
 
-    if !contains_gmod_null_type(semantic_model.get_db(), &receiver_type) {
+    if !has_gmod_null {
         return false;
     }
 
@@ -359,17 +372,63 @@ fn report_unsafe_receiver(
         return false;
     }
 
-    context.add_diagnostic(
+    let created_null = is_created_instance_or_null(semantic_model.get_db(), &receiver_type);
+    add_unsafe_receiver_diagnostic(
+        context,
+        receiver,
         DiagnosticCode::NeedCheckNil,
-        receiver.get_range(),
-        format!(
-            "{name} may be NULL; check IsValid before calling Entity methods",
-            name = receiver.syntax().text()
-        )
-        .to_string(),
-        None,
+        has_gmod_null,
+        created_null,
+        false,
     );
     true
+}
+
+/// Whether `typ` is a created instance (an `(instance)` return) or NULL: what a fallible
+/// constructor such as `ents.Create` returns.
+fn is_created_instance_or_null(db: &crate::DbIndex, typ: &LuaType) -> bool {
+    fn has_instance(typ: &LuaType) -> bool {
+        match typ {
+            LuaType::Instance(_) => true,
+            LuaType::Union(union) => union.types().any(has_instance),
+            LuaType::MultiLineUnion(union) => {
+                union.get_unions().iter().any(|(arm, _)| has_instance(arm))
+            }
+            _ => false,
+        }
+    }
+    has_instance(typ) && contains_gmod_null_type(db, typ)
+}
+
+/// Reports an unsafe receiver; an unchecked NULL from a fallible constructor warns.
+fn add_unsafe_receiver_diagnostic(
+    context: &mut DiagnosticContext,
+    receiver: &LuaExpr,
+    code: DiagnosticCode,
+    has_gmod_null: bool,
+    created_null: bool,
+    nullable: bool,
+) {
+    let severity = created_null.then(|| {
+        context
+            .config
+            .severity
+            .get(&DiagnosticCode::NeedCheckNil)
+            .copied()
+            .unwrap_or(lsp_types::DiagnosticSeverity::WARNING)
+    });
+    let message = match (has_gmod_null, nullable) {
+        (true, true) => format!(
+            "{name} may be nil or NULL; check IsValid before calling Entity methods",
+            name = receiver.syntax().text()
+        ),
+        (true, false) => format!(
+            "{name} may be NULL; check IsValid before calling Entity methods",
+            name = receiver.syntax().text()
+        ),
+        (false, _) => format!("{name} may be nil", name = receiver.syntax().text()),
+    };
+    context.add_diagnostic_with_severity(code, receiver.get_range(), message, severity, None);
 }
 
 fn is_expr_valid_by_enclosing_self_call_context(

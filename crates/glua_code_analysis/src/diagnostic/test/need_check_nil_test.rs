@@ -1,4 +1,604 @@
 #[cfg(test)]
+mod null_accepting_argument_tests {
+    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
+
+    fn creator_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut config = Emmyrc::default();
+        config.gmod.enabled = true;
+        ws.update_emmyrc(config);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/entity_creator.lua",
+            r#"
+            ---@class Entity
+            Entity = {}
+            ---@class NULL: Entity
+            local NullEntity = {}
+            ---@class Player: Entity
+            local Player = {}
+            ---@type NULL
+            NULL = nil
+            ---@realm server
+            ---@param ply Entity|NULL|nil
+            function Entity:SetCreator(ply) end
+            ---@param owner Entity
+            function Entity:SetOwner(owner) end
+            function Entity:GetPos() end
+            ---@param value any
+            ---@return boolean
+            function isentity(value) end
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            ---@[valid_guard]
+            function IsValid(value) end
+        "#,
+        );
+        ws
+    }
+
+    #[test]
+    fn a_truthiness_guard_only_excuses_null_accepting_value_arguments() {
+        for (body, warns) in [
+            ("if ply then vehicle:SetCreator(ply) end", false),
+            (
+                "if ply then vehicle:SetCreator(ply); ply:GetPos() end",
+                true,
+            ),
+            (
+                "if ply then vehicle:SetCreator(ply) end; ply:GetPos()",
+                true,
+            ),
+            (
+                "if ply then if flag then vehicle:SetCreator(ply) else vehicle:SetOwner(ply) end end",
+                true,
+            ),
+            ("if ply then vehicle:SetOwner(ply) end", true),
+            ("if ( ply ) then vehicle:SetCreator( ply ) end", false),
+            (
+                "if ( ply ) then vehicle:SetCreator( ply ) end; if ( IsValid(ply) ) then vehicle:SetOwner(ply) end",
+                false,
+            ),
+            ("if ply ~= nil then vehicle:SetCreator(ply) end", false),
+            ("if ply ~= nil then vehicle:SetOwner(ply) end", true),
+            (
+                "if ply ~= nil then vehicle:SetCreator(ply or NULL) end",
+                false,
+            ),
+            ("if ply ~= nil then vehicle:SetOwner(ply or NULL) end", true),
+            ("if ply ~= nil then local position = ply:GetPos() end", true),
+        ] {
+            let mut ws = creator_workspace();
+            let file = ws.def_file(
+                "gamemodes/sandbox/gamemode/commands.lua",
+                &format!(
+                    r#"
+                    ---@param ply Player|NULL|nil
+                    ---@param vehicle Entity
+                    ---@param flag boolean
+                    function SpawnVehicle(ply, vehicle, flag)
+                        {body}
+                    end
+                "#
+                ),
+            );
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::GmodNullCheck);
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file, CancellationToken::new())
+                .unwrap();
+            let count = diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code
+                        == Some(NumberOrString::String(
+                            DiagnosticCode::GmodNullCheck.get_name().to_string(),
+                        ))
+                })
+                .count();
+            assert_eq!(count, usize::from(warns), "{body}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn a_nil_comparison_followed_only_by_comparisons_still_reports() {
+        let mut ws = creator_workspace();
+        let file = ws.def_file(
+            "gamemodes/sandbox/entities/entities/gmod_wheel.lua",
+            r#"
+            ---@param owner Player|NULL|nil
+            ---@param activator Entity
+            function UseWheel(owner, activator)
+                if owner == nil or owner == activator then
+                    return true
+                end
+            end
+        "#,
+        );
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNullCheck);
+        let reports = ws
+            .analysis
+            .diagnose_file(file, CancellationToken::new())
+            .unwrap();
+        let comparisons = reports
+            .iter()
+            .filter(|report| report.message.contains("comparing to nil"))
+            .count();
+        assert_eq!(comparisons, 1, "{reports:?}");
+    }
+
+    /// The engine's util.lua redefines `isentity` and `type` without annotations; handing the
+    /// value to such a parameter claims nothing about its validity.
+    #[test]
+    fn creator_nil_default_checked_by_an_undocumented_redefinition_does_not_claim_validity() {
+        for (branch, warns) in [("", false), ("else ply:GetPos()", true)] {
+            let mut ws = creator_workspace();
+            ws.def_file(
+                "lua/includes/util.lua",
+                r#"
+                local C_type = type
+                function type( v )
+                    return C_type( v )
+                end
+                function isentity( v )
+                    if ( C_type( v ) == "userdata" ) then
+                        local vMeta = getmetatable( v )
+                        return vMeta ~= nil and vMeta.MetaName == "Entity"
+                    end
+                    return false
+                end
+            "#,
+            );
+            let file = ws.def_file("lua/includes/extensions/entity.lua", &format!(r#"
+                local meta = Entity
+                if SERVER then
+                    ---@param ply Entity|NULL|nil
+                    function meta:SetCreator( ply )
+                        if ( ply == nil ) then
+                            ply = NULL
+                        elseif ( !isentity( ply ) ) then
+                            error( "bad argument #1 to 'SetCreator' (Entity expected, got " .. type( ply ) .. ")", 2 )
+                        {branch}
+                        end
+                        self.m_PlayerCreator = ply
+                    end
+                end
+            "#));
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::GmodNullCheck);
+            let reports = ws
+                .analysis
+                .diagnose_file(file, CancellationToken::new())
+                .unwrap();
+            let comparisons = reports
+                .iter()
+                .filter(|report| report.message.contains("comparing to nil"))
+                .count();
+            assert_eq!(comparisons, usize::from(warns), "{branch}: {reports:?}");
+        }
+    }
+
+    #[test]
+    fn a_null_accepting_declaration_from_another_realm_does_not_describe_the_call() {
+        let contract = "---@param value any
+---@return string
+function AuditSink(value) end";
+        for (path, source) in [
+            ("lua/autorun/client/a_contract.lua", contract.to_string()),
+            (
+                "lua/autorun/a_contract.lua",
+                format!(
+                    "if CLIENT then
+{contract}
+end"
+                ),
+            ),
+        ] {
+            let mut ws = creator_workspace();
+            ws.def_file(path, &source);
+            ws.def_file(
+                "lua/autorun/server/sv_sink.lua",
+                "function AuditSink(v) return v:GetClass() end",
+            );
+            let file = ws.def_file(
+                "lua/includes/extensions/entity.lua",
+                r#"
+                if SERVER then
+                    ---@param ply Entity|NULL|nil
+                    function Entity:AuditCreator(ply)
+                        if ply ~= nil then AuditSink(ply) end
+                    end
+                end
+            "#,
+            );
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::GmodNullCheck);
+            let reports = ws
+                .analysis
+                .diagnose_file(file, CancellationToken::new())
+                .unwrap();
+            let comparisons = reports
+                .iter()
+                .filter(|report| report.message.contains("comparing to nil"))
+                .count();
+            assert_eq!(comparisons, 1, "{path}: {reports:?}");
+        }
+    }
+
+    #[test]
+    fn a_shared_call_requires_null_accepting_contracts_in_every_execution_realm() {
+        let callers = [
+            ("", "AuditSink"),
+            ("local sink = AuditSink", "sink"),
+            ("local box = {sink = AuditSink}", "box.sink"),
+        ];
+        for ((prelude, callee), server_contract) in callers.into_iter().flat_map(|caller| {
+            ["", "---@param v Entity", "---@param v any"].map(|contract| (caller, contract))
+        }) {
+            let mut ws = creator_workspace();
+            ws.def_file(
+                "lua/autorun/client/a_contract.lua",
+                "---@param value any\n---@return string\nfunction AuditSink(value) end",
+            );
+            ws.def_file(
+                "lua/autorun/server/sv_sink.lua",
+                &format!("{server_contract}\nfunction AuditSink(v) return v:GetClass() end"),
+            );
+            let text = format!(
+                "{prelude}\n---@param ply Entity|NULL|nil\nfunction Entity:AuditCreator(ply)\n    if ply ~= nil then {callee}(ply) end\nend"
+            );
+            let file = ws.def_file("lua/includes/extensions/entity.lua", &text);
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::GmodNullCheck);
+            let reports = ws
+                .analysis
+                .diagnose_file(file, CancellationToken::new())
+                .unwrap();
+            let actual = reports
+                .iter()
+                .map(|report| (report.range, report.code.clone(), report.message.clone()))
+                .collect::<Vec<_>>();
+            let expected = if server_contract == "---@param v any" {
+                vec![]
+            } else {
+                vec![(lsp_types::Range::new(lsp_types::Position::new(3, 7), lsp_types::Position::new(3, 17)),
+                    Some(NumberOrString::String(DiagnosticCode::GmodNullCheck.get_name().to_string())),
+                    "ply may be NULL; comparing to nil does not prove entity validity, use IsValid(...) instead".to_string())]
+            };
+            assert_eq!(actual, expected, "{callee} {server_contract}");
+        }
+    }
+
+    #[test]
+    fn every_definition_of_a_realm_dependent_global_must_accept_null() {
+        let definitions = [
+            (
+                "---@param value any
+function _G.AuditSink(value) end",
+                "function _G.AuditSink(v) return v:GetClass() end",
+                "AuditSink",
+            ),
+            (
+                "---@param value any
+local function accepting(value) end
+AuditSink = accepting",
+                "function AuditSink(v) return v:GetClass() end",
+                "AuditSink",
+            ),
+            (
+                "AuditAPI = {}
+---@param value any
+function AuditAPI.Sink(value) end",
+                "AuditAPI = {}
+function AuditAPI.Sink(v) return v:GetClass() end",
+                "AuditAPI.Sink",
+            ),
+        ];
+        let callees = |global: &str| {
+            let mut callees = vec![
+                (String::new(), global.to_string()),
+                (format!("local sink = {global}"), "sink".to_string()),
+                (
+                    format!("local box = {{sink = {global}}}"),
+                    "box.sink".to_string(),
+                ),
+            ];
+            if let Some(key) = global.strip_prefix("AuditAPI.") {
+                callees.push(("local api = AuditAPI".to_string(), format!("api.{key}")));
+            }
+            callees
+        };
+        for (client, server, global) in definitions {
+            for ((prelude, callee), server_contract) in
+                callees(global).into_iter().flat_map(|callee| {
+                    ["", "---@param v any"].map(|contract| (callee.clone(), contract))
+                })
+            {
+                let mut ws = creator_workspace();
+                ws.def_file("lua/autorun/client/a_contract.lua", client);
+                ws.def_file(
+                    "lua/autorun/server/sv_sink.lua",
+                    &server.replace(
+                        "function",
+                        &format!(
+                            "{server_contract}
+function"
+                        ),
+                    ),
+                );
+                let text = format!(
+                    "{prelude}
+---@param ply Entity|NULL|nil
+function Entity:AuditCreator(ply)
+    if ply ~= nil then {callee}(ply) end
+end"
+                );
+                let file = ws.def_file("lua/includes/extensions/entity.lua", &text);
+                ws.analysis
+                    .diagnostic
+                    .enable_only(DiagnosticCode::GmodNullCheck);
+                let ranges = ws
+                    .analysis
+                    .diagnose_file(file, CancellationToken::new())
+                    .unwrap()
+                    .into_iter()
+                    .map(|report| report.range)
+                    .collect::<Vec<_>>();
+                let expected = if server_contract.is_empty() {
+                    vec![lsp_types::Range::new(
+                        lsp_types::Position::new(3, 7),
+                        lsp_types::Position::new(3, 17),
+                    )]
+                } else {
+                    vec![]
+                };
+                assert_eq!(ranges, expected, "{client} | {callee} | {server_contract}");
+            }
+        }
+    }
+
+    #[test]
+    fn creator_nil_default_and_storage_do_not_claim_entity_validity() {
+        for (branch, warns) in [("", false), ("else ply:GetPos()", true)] {
+            let mut ws = creator_workspace();
+            let file = ws.def_file("lua/includes/extensions/entity.lua", &format!(r#"
+                local meta = Entity
+                if SERVER then
+                    ---@param ply Entity|NULL|nil
+                    function meta:SetCreator( ply )
+                        if ( ply == nil ) then
+                            ply = NULL
+                        elseif ( !isentity( ply ) ) then
+                            error( "bad argument #1 to 'SetCreator' (Entity expected, got " .. type( ply ) .. ")", 2 )
+                        {branch}
+                        end
+                        self.m_PlayerCreator = ply
+                    end
+                end
+            "#));
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::GmodNullCheck);
+            let reports = ws
+                .analysis
+                .diagnose_file(file, CancellationToken::new())
+                .unwrap();
+            let comparisons = reports
+                .iter()
+                .filter(|report| report.message.contains("comparing to nil"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                comparisons.len(),
+                usize::from(warns),
+                "{branch}: {reports:?}"
+            );
+            if !warns {
+                assert!(reports.is_empty(), "{reports:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod null_receiver_severity_tests {
+    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace, config::DiagnosticSeveritySetting};
+    use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
+    use tokio_util::sync::CancellationToken;
+
+    fn diagnostics(
+        return_type: &str,
+        body: &str,
+        severity: Option<DiagnosticSeveritySetting>,
+    ) -> Vec<Diagnostic> {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        if let Some(severity) = severity {
+            let mut config = Emmyrc::default();
+            config
+                .diagnostics
+                .severity
+                .insert(DiagnosticCode::NeedCheckNil, severity);
+            ws.update_emmyrc(config);
+        }
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/includes/null_constructor_contract.lua",
+            &format!(
+                r#"
+                ---@class Entity
+                ---@class NULL: Entity
+                ---@class widget_axis_arrow: Entity
+                ---@field SetAxisIndex fun(self: widget_axis_arrow, axis: integer)
+                ents = {{}}
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return {return_type}
+                function ents.Create(class) end
+                ---@param value any
+                ---@return TypeGuard<any>
+                ---@return_cast value -NULL
+                function IsValid(value) end
+                "#
+            ),
+        );
+        let file = ws.def_file("lua/entities/widget_axis/init.lua", body);
+        let receiver_codes = [
+            DiagnosticCode::NeedCheckNil,
+            DiagnosticCode::UncheckedNilAccess,
+            DiagnosticCode::GmodNullCheck,
+        ];
+        ws.analysis
+            .diagnose_file(file, CancellationToken::new())
+            .unwrap()
+            .into_iter()
+            .filter(|diagnostic| {
+                receiver_codes.iter().any(|code| {
+                    diagnostic.code == Some(NumberOrString::String(code.get_name().to_string()))
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unchecked_fallible_constructor_null_receiver_is_warning() {
+        for return_type in ["(instance) T|NULL", "(instance) T|NULL|nil"] {
+            let diagnostics = diagnostics(
+                return_type,
+                "local e = ents.Create('widget_axis_arrow'); e:SetAxisIndex(1)",
+                None,
+            );
+            assert_eq!(diagnostics.len(), 1, "{return_type}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+            assert_eq!(
+                diagnostics[0].code,
+                Some(NumberOrString::String(
+                    DiagnosticCode::NeedCheckNil.get_name().to_string()
+                ))
+            );
+            assert!(diagnostics[0].message.contains("NULL"), "{diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn a_null_receiver_that_is_not_a_created_instance_keeps_the_default_severity() {
+        let diagnostics = diagnostics(
+            "T|NULL",
+            "local e = ents.Create('widget_axis_arrow'); e:SetAxisIndex(1)",
+            None,
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::HINT));
+        assert!(diagnostics[0].message.contains("NULL"), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn isvalid_guarded_fallible_constructor_receiver_is_safe() {
+        for body in [
+            "local e = ents.Create('widget_axis_arrow'); if IsValid(e) then e:SetAxisIndex(1) end",
+            "local e = ents.Create('widget_axis_arrow'); if not IsValid(e) then return end; e:SetAxisIndex(1)",
+        ] {
+            assert!(diagnostics("T|NULL", body, None).is_empty(), "{body}");
+        }
+    }
+
+    #[test]
+    fn plain_nil_receiver_severities_are_unchanged() {
+        for (return_type, code, severity) in [
+            (
+                "T|nil",
+                DiagnosticCode::NeedCheckNil,
+                DiagnosticSeverity::HINT,
+            ),
+            (
+                "nil",
+                DiagnosticCode::UncheckedNilAccess,
+                DiagnosticSeverity::WARNING,
+            ),
+        ] {
+            let diagnostics = diagnostics(
+                return_type,
+                "local e = ents.Create('widget_axis_arrow'); e:SetAxisIndex(1)",
+                None,
+            );
+            assert_eq!(diagnostics.len(), 1, "{return_type}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].severity, Some(severity));
+            assert_eq!(
+                diagnostics[0].code,
+                Some(NumberOrString::String(code.get_name().to_string()))
+            );
+            assert_eq!(diagnostics[0].message, "e may be nil");
+        }
+    }
+
+    #[test]
+    fn invalidated_dynamic_slot_guard_keeps_null_receiver_severity_and_message() {
+        let body = r#"
+            ---@param slots table<string, widget_axis_arrow|NULL>
+            ---@param key string
+            local function replace(slots, key)
+                if not slots[key] then return end
+                slots[key] = ents.Create("widget_axis_arrow")
+                slots[key]:SetAxisIndex(1)
+            end
+        "#;
+        for (configured, expected) in [
+            (None, DiagnosticSeverity::WARNING),
+            (
+                Some(DiagnosticSeveritySetting::Information),
+                DiagnosticSeverity::INFORMATION,
+            ),
+        ] {
+            let diagnostics = diagnostics("(instance) T|NULL", body, configured)
+                .into_iter()
+                .filter(|diagnostic| {
+                    diagnostic.code
+                        == Some(NumberOrString::String(
+                            DiagnosticCode::NeedCheckNil.get_name().to_string(),
+                        ))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            assert_eq!(diagnostics[0].severity, Some(expected));
+            assert_eq!(
+                diagnostics[0].code,
+                Some(NumberOrString::String(
+                    DiagnosticCode::NeedCheckNil.get_name().to_string()
+                ))
+            );
+            assert!(diagnostics[0].message.starts_with("slots[key] may be"));
+            assert!(diagnostics[0].message.contains("NULL"), "{diagnostics:?}");
+            assert!(
+                diagnostics[0].message.contains("IsValid"),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_null_receiver_severity_override_is_preserved() {
+        let diagnostics = diagnostics(
+            "T|NULL",
+            "local e = ents.Create('widget_axis_arrow'); e:SetAxisIndex(1)",
+            Some(DiagnosticSeveritySetting::Information),
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(DiagnosticSeverity::INFORMATION)
+        );
+    }
+}
+
+#[cfg(test)]
 mod test {
     use crate::{DiagnosticCode, Emmyrc, LuaSignatureId, VirtualWorkspace};
     use glua_parser::{LuaAstNode, LuaClosureExpr};
