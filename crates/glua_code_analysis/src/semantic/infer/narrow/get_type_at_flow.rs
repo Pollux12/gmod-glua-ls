@@ -1925,6 +1925,13 @@ fn expr_reads_undefined_global(db: &DbIndex, cache: &LuaInferCache, expr: &LuaEx
     db.get_global_index().get_global_decl_ids(&name).is_none()
 }
 
+/// Whether `typ` is `any|nil`, the type a read of an untyped table yields.
+fn is_nullable_any(typ: &LuaType) -> bool {
+    matches!(typ, LuaType::Union(union)
+        if union.types().any(|member| member.is_any())
+            && union.types().all(|member| member.is_any() || member.is_nil()))
+}
+
 fn get_type_at_assign_stat(
     db: &DbIndex,
     tree: &FlowTree,
@@ -2125,7 +2132,7 @@ fn get_type_at_assign_stat(
                 };
                 // An `any` value takes the type the variable is annotated with, and
                 // is otherwise just `any`: the value it replaces says nothing about it.
-                if expr_type.is_any() {
+                if expr_type.is_any() || is_nullable_any(&expr_type) {
                     annotated_var_type(db, var_ref_id)
                 } else {
                     Some(antecedent_type)
