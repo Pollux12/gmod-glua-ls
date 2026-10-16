@@ -545,7 +545,15 @@ fn maybe_type_guard_binary(
         InferConditionFlow::TrueCondition => {
             narrow_down_type(db, antecedent_type.clone(), narrow.clone(), None).unwrap_or(narrow)
         }
-        InferConditionFlow::FalseCondition => TypeOps::Remove.apply(db, &antecedent_type, &narrow),
+        InferConditionFlow::FalseCondition => {
+            if let LuaType::Ref(id) | LuaType::Def(id) = &narrow
+                && db.get_type_index().direct_sub_types(id).next().is_some()
+            {
+                antecedent_type
+            } else {
+                TypeOps::Remove.apply(db, &antecedent_type, &narrow)
+            }
+        }
     };
 
     if let Some(member_keys) = related_member_query {
@@ -673,22 +681,21 @@ fn infer_local_class_table_member_type(
     }
 }
 
-fn can_narrow_type_guard_through_decl_alias(
+pub(super) fn can_narrow_type_guard_through_decl_alias(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     alias_var_ref_id: &VarRefId,
     guarded_var_ref_id: &VarRefId,
-    guard_position: TextSize,
+    guarded_expr: &LuaExpr,
 ) -> bool {
-    let (VarRefId::VarRef(alias_decl_id), VarRefId::VarRef(guarded_decl_id)) =
-        (alias_var_ref_id, guarded_var_ref_id)
-    else {
+    let guarded_read_end = guarded_expr.get_range().end();
+    let VarRefId::VarRef(alias_decl_id) = alias_var_ref_id else {
         return false;
     };
 
     let file_id = cache.get_file_id();
-    if alias_decl_id.file_id != file_id || guarded_decl_id.file_id != file_id {
+    if alias_decl_id.file_id != file_id {
         return false;
     }
 
@@ -699,7 +706,7 @@ fn can_narrow_type_guard_through_decl_alias(
         return false;
     }
 
-    if alias_decl_id.position >= guard_position {
+    if alias_decl_id.position >= guarded_read_end {
         return false;
     }
 
@@ -712,11 +719,12 @@ fn can_narrow_type_guard_through_decl_alias(
     let Some(alias_expr) = LuaExpr::cast(alias_expr_node) else {
         return false;
     };
-    if !matches!(alias_expr, LuaExpr::NameExpr(_)) {
+    if !matches!(alias_expr, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)) {
         return false;
     }
 
-    let Some(alias_source_var_ref_id) = get_var_expr_var_ref_id(db, cache, alias_expr) else {
+    let Some(alias_source_var_ref_id) = get_var_expr_var_ref_id(db, cache, alias_expr.clone())
+    else {
         return false;
     };
     if alias_source_var_ref_id != *guarded_var_ref_id {
@@ -728,22 +736,21 @@ fn can_narrow_type_guard_through_decl_alias(
         file_id,
         *alias_decl_id,
         alias_decl_id.position,
-        guard_position,
+        guarded_read_end,
     ) {
         return false;
     }
 
-    if has_decl_write_in_open_interval(
+    let mut guarded = guarded_path_references(db, cache, &alias_expr, guarded_var_ref_id);
+    guarded.push(alias_var_ref_id.clone());
+    !has_var_write_in_open_interval(
         db,
-        file_id,
-        *guarded_decl_id,
-        alias_decl_id.position,
-        guard_position,
-    ) {
-        return false;
-    }
-
-    true
+        cache,
+        root,
+        &guarded,
+        alias_expr.get_range().end(),
+        guarded_read_end,
+    )
 }
 
 fn has_decl_write_in_open_interval(
@@ -1438,9 +1445,20 @@ fn try_get_at_and_expr(
     condition_flow: InferConditionFlow,
     policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
-    // False branch of `a and b` is disjunctive: `!a OR (a AND !b)`.
-    // The simple per-side narrowing below is only sound for the true branch.
-    if !matches!(condition_flow, InferConditionFlow::TrueCondition) {
+    if matches!(condition_flow, InferConditionFlow::FalseCondition) {
+        if infer_expr(db, cache, right_expr)?.is_always_truthy() {
+            return get_type_at_condition_flow(
+                db,
+                tree,
+                cache,
+                root,
+                var_ref_id,
+                flow_node,
+                left_expr,
+                condition_flow,
+                policy,
+            );
+        }
         return Ok(ResultTypeOrContinue::Continue);
     }
 

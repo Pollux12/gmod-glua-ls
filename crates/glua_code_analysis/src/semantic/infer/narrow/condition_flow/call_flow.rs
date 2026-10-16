@@ -14,7 +14,10 @@ use crate::{
             infer_index::infer_member_by_member_key,
             narrow::{
                 ResultTypeOrContinue, call_var_ref_root,
-                condition_flow::{InferConditionFlow, get_condition_antecedent_type},
+                condition_flow::{
+                    InferConditionFlow, binary_flow::can_narrow_type_guard_through_decl_alias,
+                    get_condition_antecedent_type,
+                },
                 get_type_at_cast_flow::apply_cast,
                 get_type_at_flow::FlowWalkPolicy,
                 gmod_null_type, narrow_down_type, narrow_false_or_nil, remove_false_or_nil,
@@ -41,7 +44,7 @@ pub fn get_type_at_call_expr(
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return Ok(ResultTypeOrContinue::Continue);
     };
-    if !call_names_var(db, cache, &call_expr, &prefix_expr, var_ref_id) {
+    if !call_names_var(db, cache, root, &call_expr, &prefix_expr, var_ref_id) {
         return Ok(ResultTypeOrContinue::Continue);
     }
 
@@ -324,6 +327,7 @@ fn get_type_at_call_expr_by_function_type(
 fn call_names_var(
     db: &DbIndex,
     cache: &mut LuaInferCache,
+    root: &LuaChunk,
     call_expr: &LuaCallExpr,
     prefix_expr: &LuaExpr,
     var_ref_id: &VarRefId,
@@ -331,14 +335,20 @@ fn call_names_var(
     // A call names at most an entry of its first argument, and finding which
     // takes inferring its callee, so only an entry is looked for in one.
     let names_entry = matches!(var_ref_id, VarRefId::IndexRef(..));
-    let var_ref_of = |cache: &mut LuaInferCache, expr: LuaExpr| {
+    let var_ref_of = |cache: &mut LuaInferCache, mut expr: LuaExpr| {
+        while let LuaExpr::ParenExpr(paren) = expr {
+            expr = paren.get_expr()?;
+        }
         if !names_entry && matches!(expr, LuaExpr::CallExpr(_)) {
             return None;
         }
         get_var_expr_var_ref_id(db, cache, expr)
     };
     let names_var = |cache: &mut LuaInferCache, expr: LuaExpr| {
-        var_ref_of(cache, expr).is_some_and(|id| id == *var_ref_id)
+        var_ref_of(cache, expr.clone()).is_some_and(|id| {
+            id == *var_ref_id
+                || can_narrow_type_guard_through_decl_alias(db, cache, root, var_ref_id, &id, &expr)
+        })
     };
     let object_of = |expr: &LuaExpr| match expr {
         LuaExpr::IndexExpr(index_expr) => index_expr.get_prefix_expr(),
@@ -349,7 +359,10 @@ fn call_names_var(
         .map(|args| args.get_args().collect::<Vec<_>>())
         .unwrap_or_default();
     let first_arg_ref = args.first().and_then(|arg| var_ref_of(cache, arg.clone()));
-    if first_arg_ref.as_ref() == Some(var_ref_id) {
+    if args
+        .first()
+        .is_some_and(|arg| names_var(cache, arg.clone()))
+    {
         return true;
     }
     if let VarRefId::IndexRef(root, _) = var_ref_id
@@ -396,10 +409,22 @@ fn try_inferred_positive_guard(
     else {
         return Ok(None);
     };
-    let Some(argument_ref_id) = get_var_expr_var_ref_id(db, cache, argument) else {
+    let Some(argument) = inferred_guard_target_expr(call_expr, signature, guard.param_idx) else {
         return Ok(None);
     };
-    if argument_ref_id != *var_ref_id {
+    let Some(argument_ref_id) = get_var_expr_var_ref_id(db, cache, argument.clone()) else {
+        return Ok(None);
+    };
+    if argument_ref_id != *var_ref_id
+        && !can_narrow_type_guard_through_decl_alias(
+            db,
+            cache,
+            root,
+            var_ref_id,
+            &argument_ref_id,
+            &argument,
+        )
+    {
         return Ok(None);
     }
 
@@ -668,11 +693,20 @@ fn get_type_at_call_expr_by_type_guard(
         return Ok(ResultTypeOrContinue::Continue);
     };
 
-    let Some(maybe_ref_id) = get_var_expr_var_ref_id(db, cache, target_expr) else {
+    let Some(maybe_ref_id) = get_var_expr_var_ref_id(db, cache, target_expr.clone()) else {
         return Ok(ResultTypeOrContinue::Continue);
     };
 
-    if maybe_ref_id != *var_ref_id {
+    if maybe_ref_id != *var_ref_id
+        && !can_narrow_type_guard_through_decl_alias(
+            db,
+            cache,
+            root,
+            var_ref_id,
+            &maybe_ref_id,
+            &target_expr,
+        )
+    {
         return Ok(ResultTypeOrContinue::Continue);
     }
 
