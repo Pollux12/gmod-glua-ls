@@ -312,7 +312,7 @@ impl StatementWrite {
                 if db
                     .get_type_index()
                     .get_type_cache(&owner)
-                    .is_some_and(|cache| cache.as_type() == fact.typ())
+                    .is_some_and(|cache| !cache.is_doc() && cache.as_type() == fact.typ())
                 {
                     db.publish_inference_facts(vec![(
                         LuaInferenceNodeId::TypeOwner(owner),

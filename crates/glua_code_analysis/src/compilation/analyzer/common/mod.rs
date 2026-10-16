@@ -229,6 +229,9 @@ pub fn bind_type(
     if decl_type_cache.is_none() {
         seed_type_slot(db, type_owner, type_cache);
     } else {
+        // A write that leaves the slot as it is still produces it, so a reset
+        // of the statement's outputs reaches what it seeded on an earlier run.
+        derivation::note_write(|| derivation::FactKey::TypeCache(type_owner.clone()));
         let decl_type_cache = decl_type_cache?;
         let decl_type = decl_type_cache.as_type();
         if should_replace_uninformative_inferred_cache(&type_owner, decl_type_cache, &type_cache) {

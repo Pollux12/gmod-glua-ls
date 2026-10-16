@@ -115,8 +115,9 @@ mod test {
                             UpdateProgress::TextChanged => panic!("no text changed"),
                         }
                     }
-                    if let Some(entry) = texts.iter_mut().find(|(existing, _)| *existing == path) {
-                        entry.1 = text;
+                    match texts.iter_mut().find(|(existing, _)| *existing == path) {
+                        Some(entry) => entry.1 = text,
+                        None => texts.push((path, text)),
                     }
                 }
                 Step::Delete(path) => {
@@ -139,6 +140,71 @@ mod test {
             assert!(
                 only_warm.is_empty() && only_cold.is_empty(),
                 "step {number}: only warm {only_warm:#?}\nonly cold {only_cold:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn installed_callback_receivers_follow_constructor_types_in_slices() {
+        let api = (
+            "annotations/installed_receiver.lua",
+            r#"
+            ---@class Panel
+            Panel = {}
+            ---@param width number
+            ---@param height number
+            function Panel:Paint(width, height) end
+            ---@class DPanel: Panel
+            DPanel = {}
+            ---@class DLabel: Panel
+            DLabel = {}
+        "#,
+        );
+        let builtins = (
+            "annotations/gmod_call_args.lua",
+            crate::test_lib::GMOD_CALL_ARG_BUILTINS_FIXTURE,
+        );
+        let factory = (
+            "lua/glide/client/vgui/resize_handle.lua",
+            r#"
+            function MakeResizeHandle()
+                return vgui.Create("DPanel")
+            end
+        "#,
+        );
+        let changed_factory = factory.1.replace("DPanel", "DLabel");
+        let consumer = (
+            "lua/glide/client/vgui/vehicle_layout_editor_compact.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Init()
+                self.resizeHandle = MakeResizeHandle()
+                self.resizeHandle.animHover = 0
+                self.resizeHandle.Paint = function(s, w, h)
+                    s.animHover = s.animHover + w + h
+                end
+            end
+            vgui.Register("InstalledReceiverEditor", PANEL, "Panel")
+        "#,
+        );
+        let mut reference = workspace();
+        reference.def_files(vec![builtins, api, factory, consumer]);
+        let expected = digest(&reference);
+        for files in [
+            [builtins, api, factory, consumer],
+            [consumer, factory, api, builtins],
+        ] {
+            let mut reordered = workspace();
+            reordered.def_files(files.to_vec());
+            assert_eq!(digest(&reordered), expected);
+            settles_as_cold(
+                &files,
+                &[
+                    Step::WriteInSlices(factory.0, &changed_factory),
+                    Step::WriteInSlices(factory.0, factory.1),
+                    Step::Delete(consumer.0),
+                    Step::WriteInSlices(consumer.0, consumer.1),
+                ],
             );
         }
     }
@@ -447,6 +513,34 @@ end
             &[
                 Step::Delete(ITEM_META.0),
                 Step::Write(ITEM_META.0, ITEM_META.1),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_cyclic_registry_value_loses_its_deleted_table_source() {
+        let support = (
+            "lua/autorun/sh_registry_prototype.lua",
+            "RegistryPrototype = {}",
+        );
+        settles_as_cold(
+            &[
+                ("lua/autorun/sh_registry.lua", "Registry = {}"),
+                support,
+                (
+                    "lua/autorun/sh_registry_writer.lua",
+                    "function Register(key)
+    Entry = Registry[key] or RegistryPrototype or {}
+    Entry.uniqueID = key
+    Registry[Entry.uniqueID] = Entry
+end",
+                ),
+            ],
+            &[
+                Step::Delete(support.0),
+                Step::Write(support.0, support.1),
+                Step::Delete(support.0),
+                Step::WriteInSlices(support.0, support.1),
             ],
         );
     }
