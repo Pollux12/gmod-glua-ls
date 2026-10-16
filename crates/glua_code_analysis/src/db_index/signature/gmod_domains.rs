@@ -141,6 +141,8 @@ pub const GMOD_DOMAIN_VALID_GUARD: &str = "gmod.valid_guard";
 /// static type when one exists.
 pub const GMOD_ATTR_VALID_GUARD: &str = "valid_guard";
 
+pub const GMOD_ATTR_EXHAUSTIVE_TYPE_GUARD: &str = "exhaustive_type_guard";
+
 pub const GMOD_ATTR_FRESH_RESULT: &str = "fresh_result";
 
 /// Signature-level standalone attribute name for calls whose write effects are
@@ -387,6 +389,10 @@ pub fn find_signature_attribute_use<'a>(
     db.get_property_index()
         .get_property(&crate::LuaSemanticDeclId::Signature(signature_id))?
         .find_attribute_use(attribute_name)
+}
+
+pub fn signature_is_exhaustive_type_guard(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    find_signature_attribute_use(db, signature_id, GMOD_ATTR_EXHAUSTIVE_TYPE_GUARD).is_some()
 }
 
 pub fn signature_is_valid_guard_in_realm(

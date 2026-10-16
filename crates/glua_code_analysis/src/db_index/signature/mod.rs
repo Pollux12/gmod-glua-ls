@@ -18,7 +18,8 @@ pub use gmod_domains::{
     GMOD_DOMAIN_NET_PAYLOAD, GMOD_DOMAIN_NETWORK_VAR, GMOD_DOMAIN_SELF_GUARD, GMOD_DOMAIN_TIMER,
     GMOD_DOMAIN_VALID_GUARD, GMOD_DOMAIN_VGUI_PANEL, GMOD_ROLE_EXISTS, GMOD_ROLE_NET_BITS,
     GMOD_ROLE_NET_CALLBACK, GMOD_ROLE_NET_TARGET, GMOD_ROLE_REFERENCE, GMOD_ROLE_VGUI_CHILD_SELF,
-    GMOD_ROLE_VGUI_PARENT, GMOD_ROLE_VGUI_PARENT_SELF, GMOD_SIGNATURE_METADATA_DOMAINS,
+    GMOD_ROLE_VGUI_OWN_CLASS, GMOD_ROLE_VGUI_PARENT, GMOD_ROLE_VGUI_PARENT_SELF,
+    GMOD_SIGNATURE_METADATA_DOMAINS,
     attribute_use_write_global_root, collect_call_arg_roles_for_param,
     compute_valid_guard_signatures, find_best_call_arg_role_for_param,
     find_best_call_arg_role_from_type, find_best_direct_call_arg_role_for_param,
@@ -29,6 +30,10 @@ pub use gmod_domains::{
     signature_net_callback_param_idx, signature_net_payload, signature_net_send,
     signature_owner_for, signature_writes_global_roots, store_valid_guard_signatures,
     type_is_net_read_op,
+};
+pub use gmod_domains::{
+    GMOD_ATTR_EXHAUSTIVE_TYPE_GUARD, signature_is_exhaustive_type_guard,
+    signature_is_type_classifier,
 };
 pub(crate) use signature::callee_signature_ids;
 pub use signature::{

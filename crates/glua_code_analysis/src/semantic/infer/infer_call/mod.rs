@@ -32,9 +32,8 @@ use crate::{
     },
 };
 use crate::{
-    LuaSemanticDeclId, SemanticDeclGuard, SemanticDeclLevel, build_self_type, infer_call_self_type,
-    infer_self_type, instantiate_func_generic, instantiate_func_generic_with_bindings,
-    semantic::infer_expr,
+    SemanticDeclGuard, SemanticDeclLevel, build_self_type, infer_call_self_type, infer_self_type,
+    instantiate_func_generic, instantiate_func_generic_with_bindings, semantic::infer_expr,
 };
 use infer_require::infer_require_call;
 use infer_setmetatable::infer_setmetatable_call;

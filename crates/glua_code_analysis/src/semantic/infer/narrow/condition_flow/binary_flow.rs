@@ -12,7 +12,6 @@ use crate::{
     semantic::{
         infer::{
             VarRefId,
-            infer_index::infer_member_by_member_key,
             narrow::{
                 ResultTypeOrContinue,
                 condition_flow::{
@@ -27,7 +26,7 @@ use crate::{
         member::{
             cached_local_class_table_member_ids, find_members_with_key, infer_raw_member_type,
         },
-        resolve_global_decl_id,
+        decl_value_expr, resolve_global_decl_id,
     },
 };
 
@@ -841,13 +840,11 @@ pub(super) fn can_narrow_type_guard_through_decl_alias(
         return false;
     }
 
-    let mut guarded = guarded_path_references(db, cache, &alias_expr, guarded_var_ref_id);
-    guarded.push(alias_var_ref_id.clone());
     !has_var_write_in_open_interval(
         db,
         cache,
         root,
-        &guarded,
+        guarded_var_ref_id,
         alias_expr.get_range().end(),
         guarded_read_end,
     )

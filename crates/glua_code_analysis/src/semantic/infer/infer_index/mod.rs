@@ -1031,16 +1031,6 @@ fn infer_table_member_owner(
         if !type_is_uninformative(&member_type) {
             return Ok(member_type);
         }
-        if let Some(helper_type) = infer_dynamic_field_helper_type(
-            db,
-            cache,
-            &LuaType::TableConst(inst.clone()),
-            &key,
-            index_expr.get_position(),
-        ) && !type_is_uninformative(&helper_type)
-        {
-            return Ok(helper_type);
-        }
 
         // A named key written with a value of its own keeps that value; only a
         // cleared slot reads the values the table holds under computed keys.

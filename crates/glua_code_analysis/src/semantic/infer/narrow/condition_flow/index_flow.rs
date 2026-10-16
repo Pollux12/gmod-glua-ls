@@ -21,7 +21,7 @@ use crate::{
                 },
             },
         },
-        type_check::is_sub_type_of,
+        resolve_dynamic_field_member, type_check::is_sub_type_of,
     },
 };
 
@@ -307,6 +307,24 @@ fn type_directly_owns_member(
     member_index
         .get_member_item(&global_owner, member_key)
         .is_some()
+}
+
+pub(super) fn infer_field_guard_member(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    prefix: &LuaType,
+    member_key: &LuaMemberKey,
+    index: LuaIndexMemberExpr,
+) -> Result<LuaType, InferFailReason> {
+    let position = index.get_position();
+    match infer_member_by_member_key(db, cache, prefix, index) {
+        Err(InferFailReason::FieldNotFound) => {
+            resolve_dynamic_field_member(db, cache, prefix, member_key, Some(position))?
+                .map(|field| field.typ)
+                .ok_or(InferFailReason::FieldNotFound)
+        }
+        result => result,
+    }
 }
 
 fn collect_field_exist_narrow_candidates(

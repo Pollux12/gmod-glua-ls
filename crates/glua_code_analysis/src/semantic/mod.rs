@@ -54,8 +54,7 @@ pub(crate) use infer::local_call_reference_expectations;
 pub(crate) use infer::narrow::infer_asserted_argument_type;
 pub(crate) use infer::narrow::{InferConditionFlow, apply_cast};
 pub(crate) use infer::narrow::{
-    condition_outcome_excludes_null, get_var_ref_type, guarded_path_references,
-    infer_true_condition_narrowing, infer_var_type_at_node, type_name_test, written_targets_match,
+    get_var_ref_type, infer_true_condition_narrowing, infer_var_type_at_node, type_name_test,
 };
 pub use infer::narrow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,

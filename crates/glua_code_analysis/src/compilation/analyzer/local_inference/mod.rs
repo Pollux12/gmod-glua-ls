@@ -2159,6 +2159,66 @@ fn child_member_visible_at(
         .map(|resolution| resolution.is_some())
 }
 
+/// The classes a union of two or more classes can hold, its nil and `NULL`
+/// arms aside: a member some of them lack is one a guard must narrow to.
+pub(crate) fn class_union_arms(db: &crate::DbIndex, typ: &LuaType) -> Option<Vec<LuaTypeDeclId>> {
+    let LuaType::Union(union) = typ else {
+        return None;
+    };
+    let mut arms = Vec::new();
+    for component in union.types() {
+        match component {
+            LuaType::Nil => {}
+            LuaType::Ref(type_id) | LuaType::Def(type_id)
+                if type_id == &LuaTypeDeclId::global("NULL") => {}
+            LuaType::Ref(type_id) | LuaType::Def(type_id)
+                if db
+                    .get_type_index()
+                    .get_type_decl(type_id)
+                    .is_some_and(|decl| decl.is_class()) =>
+            {
+                arms.push(type_id.clone());
+            }
+            _ => return None,
+        }
+    }
+    arms.sort_by(|left, right| {
+        left.get_name()
+            .cmp(right.get_name())
+            .then_with(|| left.stable_cmp(right))
+    });
+    arms.dedup();
+    (arms.len() >= 2).then_some(arms)
+}
+
+/// The arms of the class union `arms` that have `member_key` for a read at
+/// `position` of `file_id`: declared where the read sees it, or dynamic.
+pub(crate) fn class_union_arms_with_member(
+    db: &crate::DbIndex,
+    cache: &mut LuaInferCache,
+    arms: &[LuaTypeDeclId],
+    member_key: &LuaMemberKey,
+    file_id: crate::FileId,
+    position: rowan::TextSize,
+) -> Vec<LuaTypeDeclId> {
+    let workspace_id = db.get_module_index().get_workspace_id(file_id);
+    arms.iter()
+        .filter(|arm| {
+            let arm_type = LuaType::Ref((*arm).clone());
+            type_has_visible_member_at_use(
+                db,
+                workspace_id,
+                &arm_type,
+                member_key,
+                file_id,
+                position,
+            ) || resolve_dynamic_field_member(db, cache, &arm_type, member_key, Some(position))
+                .is_ok_and(|resolution| resolution.is_some())
+        })
+        .cloned()
+        .collect()
+}
+
 fn unguarded_child_base_id(typ: &LuaType) -> Option<LuaTypeDeclId> {
     match typ {
         LuaType::Ref(type_id) | LuaType::Def(type_id) => Some(type_id.clone()),

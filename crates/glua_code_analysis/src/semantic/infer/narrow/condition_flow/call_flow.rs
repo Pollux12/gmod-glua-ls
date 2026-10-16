@@ -1,14 +1,14 @@
 use std::{ops::Deref, sync::Arc};
 
 use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
-    LuaIndexKey, LuaIndexMemberExpr, LuaStat, LuaTableExpr, LuaTableField, LuaVarExpr,
+    LuaAstNode, LuaCallExpr, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr,
+    LuaTableExpr, LuaTableField,
 };
 
 use crate::{
     DbIndex, FileId, FlowNode, FlowTree, GMOD_ATTR_SELF_GUARD, InFiled, InferFailReason,
-    InferGuard, LuaAliasCallKind, LuaAliasCallType, LuaFunctionType, LuaInferCache, LuaMemberId,
-    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType,
+    InferGuard, LuaAliasCallKind, LuaAliasCallType, LuaFunctionType, LuaInferCache, LuaMemberKey,
+    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType,
     TypeOps, check_type_compact, find_signature_attribute_use, infer_call_expr_func, infer_expr,
     semantic::{
         SemanticDeclGuard, SemanticDeclLevel,
@@ -29,6 +29,7 @@ use crate::{
         },
         infer_expr_semantic_decl, known_signature_id, local_name_value, semantic_decl_value,
     },
+    signature_is_exhaustive_type_guard,
     signature_is_valid_guard_or_base_runtime_isvalid_in_realm,
 };
 
@@ -179,6 +180,8 @@ fn get_type_at_call_expr_by_function_type(
                         call_expr.clone(),
                         f,
                         signature_cast,
+                        prefix_signature_id
+                            .is_some_and(|id| signature_is_exhaustive_type_guard(db, id)),
                         is_valid_guard,
                         condition_flow,
                         policy,
@@ -200,6 +203,7 @@ fn get_type_at_call_expr_by_function_type(
                     flow_node,
                     &call_expr_ref,
                     signature_id,
+                    condition_flow,
                     policy,
                 )?
             {
@@ -232,6 +236,7 @@ fn get_type_at_call_expr_by_function_type(
                         call_expr.clone(),
                         signature.to_doc_func_type(),
                         signature_cast.map(|cast| (cast, signature_id)),
+                        signature_is_exhaustive_type_guard(db, signature_id),
                         is_valid_guard,
                         condition_flow,
                         policy,
@@ -714,6 +719,7 @@ fn get_type_at_call_expr_by_type_guard(
     call_expr: LuaCallExpr,
     func_type: Arc<LuaFunctionType>,
     signature_cast: Option<(&LuaSignatureCast, LuaSignatureId)>,
+    is_exhaustive_type_guard: bool,
     is_valid_guard: bool,
     condition_flow: InferConditionFlow,
     policy: FlowWalkPolicy,
@@ -862,32 +868,92 @@ fn call_type_guard_type(
         // A valid guard answers true only for a valid object, whatever its
         // declared return, as the runtime `IsValid` in `includes/util.lua` does.
         _ if is_valid_guard => LuaType::Any,
-        _ => return Ok(ResultTypeOrContinue::Continue),
+        _ => return Ok(None),
     };
 
-    let antecedent_type =
-        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
+    Ok(Some(guard_type))
+}
 
-    let result_type = match condition_flow {
-        InferConditionFlow::TrueCondition => {
-            narrow_type_guard_true_branch(db, antecedent_type, guard_type, is_valid_guard)
+pub(super) fn call_condition_asserted_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    var_ref_id: &VarRefId,
+) -> Option<LuaType> {
+    let prefix = call_expr.get_prefix_expr()?;
+    let function_type = infer_expr(db, cache, prefix).ok()?;
+    asserted_type_by_function_type(db, cache, call_expr, var_ref_id, function_type)
+}
+
+pub(super) fn call_condition_is_valid_guard(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    get_call_prefix_signature_id(db, cache, call_expr)
+        .is_some_and(|id| call_prefix_signature_is_valid_guard(db, cache, call_expr, id))
+}
+
+fn asserted_type_by_function_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    var_ref_id: &VarRefId,
+    function_type: LuaType,
+) -> Option<LuaType> {
+    if let LuaType::Union(union) = function_type {
+        let mut asserted = LuaType::Never;
+        for candidate in union.types() {
+            let typ =
+                asserted_type_by_function_type(db, cache, call_expr, var_ref_id, candidate.clone())?;
+            asserted = TypeOps::Union.apply(db, &asserted, &typ);
         }
-        InferConditionFlow::FalseCondition => {
-            TypeOps::Remove.apply(db, &antecedent_type, &guard_type)
+        return Some(asserted);
+    }
+    let (function, signature_id) = match function_type {
+        LuaType::Signature(id) => (
+            db.get_signature_index().get(&id)?.to_doc_func_type(),
+            Some(id),
+        ),
+        LuaType::DocFunction(function) => {
+            (function, get_call_prefix_signature_id(db, cache, call_expr))
         }
+        _ => return None,
     };
-
-    let result_type = if let Some((signature_cast, signature_id)) = signature_cast {
-        apply_signature_cast_to_type_guard_result(
-            db,
+    if signature_id.is_some_and(|id| call_prefix_signature_is_valid_guard(db, cache, call_expr, id))
+    {
+        return None;
+    }
+    let targets_var = |cache: &mut LuaInferCache, target: Option<LuaExpr>| {
+        target
+            .and_then(|expr| get_var_expr_var_ref_id(db, cache, expr))
+            .as_ref()
+            == Some(var_ref_id)
+    };
+    if targets_var(cache, type_guard_target_expr(call_expr))
+        && let Some(typ) = call_type_guard_type(db, cache, call_expr, function, false)
+            .ok()
+            .flatten()
+        && !typ.is_any()
+        && !typ.is_unknown()
+    {
+        return Some(typ);
+    }
+    let id = signature_id?;
+    let signature = db.get_signature_index().get(&id)?;
+    if let Some(guard) = db.get_signature_index().inferred_positive_guard(&id)
+        && targets_var(
             cache,
-            &call_expr,
-            var_ref_id,
-            result_type,
-            signature_cast,
-            signature_id,
-            condition_flow,
-        )?
+            inferred_guard_target_expr(call_expr, signature, guard.param_idx),
+        )
+        && !guard.narrowed_type.is_any()
+        && !guard.narrowed_type.is_unknown()
+    {
+        return Some(guard.narrowed_type.clone());
+    }
+    let cast = signature.return_cast.as_ref()?;
+    let target = if cast.name == "self" {
+        signature_self_target_expr(db, call_expr, id)
     } else {
         signature_cast_target_expr(db, call_expr, id, &cast.name)
     };

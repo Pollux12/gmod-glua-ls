@@ -561,6 +561,10 @@ fn remap_call_flows(data: &CallFlows, remap: &FileRemap) -> Remap<CallFlows> {
 }
 
 impl GmodNetworkIndex {
+    pub(crate) fn message_key(name: &str) -> String {
+        name.to_ascii_lowercase()
+    }
+
     pub fn new() -> Self {
         Self {
             call_flows: Default::default(),

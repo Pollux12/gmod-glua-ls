@@ -11,8 +11,10 @@ use crate::{
     DiagnosticCode, GMOD_ATTR_SELF_CALL_VALID, GMOD_CALL_ARG_DOMAINS, GMOD_ROLE_EXISTS,
     GMOD_ROLE_REFERENCE, InferFailReason, LuaDeclId, LuaInferenceProvenanceKind, LuaMemberKey,
     LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType,
-    SemanticDeclLevel, SemanticModel, find_best_direct_call_arg_role_from_type,
-    find_signature_attribute_use, get_var_expr_var_ref_id,
+    SemanticDeclLevel, SemanticModel,
+    compilation::analyzer::gmod::global_call_path_for_signature_closure,
+    find_best_direct_call_arg_role_from_type, find_signature_attribute_use,
+    get_var_expr_var_ref_id,
     semantic::{InferConditionFlow, apply_cast, contains_gmod_null_type, remove_false_or_nil},
     signature_is_valid_guard_in_realm, signature_is_valid_guard_or_base_runtime_isvalid_in_realm,
 };
@@ -4114,6 +4116,339 @@ fn unparen_guard_expr(mut expr: LuaExpr) -> LuaExpr {
         expr = inner;
     }
     expr
+}
+
+fn has_only_null_safe_uses_after(
+    semantic_model: &SemanticModel,
+    target: &LuaExpr,
+    after: rowan::TextSize,
+    allow_unused: bool,
+) -> bool {
+    let target = unparen_guard_expr(target.clone());
+    if !is_stable_guard_expr(&target) {
+        return allow_unused;
+    }
+    let root = target
+        .syntax()
+        .ancestors()
+        .find_map(LuaClosureExpr::cast)
+        .map(|closure| closure.syntax().clone())
+        .unwrap_or_else(|| semantic_model.get_root().syntax().clone());
+    let mut used = false;
+    for value in root.descendants().filter_map(LuaExpr::cast) {
+        if !matches!(value, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_))
+            || value.get_position() < after
+            || !exprs_reference_same_var(semantic_model, &value, &target)
+        {
+            continue;
+        }
+        if null_use_requires_validity(semantic_model, value) {
+            return false;
+        }
+        used = true;
+    }
+    used || allow_unused
+}
+
+/// Whether a use of `target` after `after` hands the value on without needing it valid: an
+/// argument to a parameter that accepts NULL, or the value an assignment stores.
+fn has_null_accepting_use_after(
+    semantic_model: &SemanticModel,
+    target: &LuaExpr,
+    after: rowan::TextSize,
+) -> bool {
+    let target = unparen_guard_expr(target.clone());
+    let root = target
+        .syntax()
+        .ancestors()
+        .find_map(LuaClosureExpr::cast)
+        .map(|closure| closure.syntax().clone())
+        .unwrap_or_else(|| semantic_model.get_root().syntax().clone());
+    root.descendants().filter_map(LuaExpr::cast).any(|value| {
+        if !matches!(value, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_))
+            || value.get_position() < after
+            || !exprs_reference_same_var(semantic_model, &value, &target)
+        {
+            return false;
+        }
+        if let Some(assign) = value.get_parent::<LuaAssignStat>() {
+            let (_, values) = assign.get_var_and_expr_list();
+            return values
+                .iter()
+                .any(|stored| stored.syntax() == value.syntax());
+        }
+        let Some(call) = value.syntax().ancestors().find_map(LuaCallExpr::cast) else {
+            return false;
+        };
+        call.get_args_list()
+            .and_then(|args| {
+                args.get_args()
+                    .enumerate()
+                    .find(|(_, arg)| range_contains(arg.get_range(), value.get_range()))
+            })
+            .is_some_and(|(arg_idx, _)| call_argument_accepts_null(semantic_model, &call, arg_idx))
+    })
+}
+
+fn null_use_requires_validity(semantic_model: &SemanticModel, mut value: LuaExpr) -> bool {
+    if semantic_model.infer_expr(value.clone()).is_ok_and(|typ| {
+        !typ.is_any()
+            && !typ.is_unknown()
+            && !contains_gmod_null_type(semantic_model.get_db(), &typ)
+    }) {
+        return false;
+    }
+    while let Some(paren) = value.get_parent::<glua_parser::LuaParenExpr>() {
+        value = LuaExpr::ParenExpr(paren);
+    }
+    if let Some(index) = value.get_parent::<LuaIndexExpr>()
+        && index
+            .get_prefix_expr()
+            .is_some_and(|prefix| prefix.syntax() == value.syntax())
+    {
+        return true;
+    }
+    let Some(call) = value.syntax().ancestors().find_map(LuaCallExpr::cast) else {
+        return false;
+    };
+    let Some(args) = call.get_args_list() else {
+        return false;
+    };
+    let Some((arg_idx, arg)) = args
+        .get_args()
+        .enumerate()
+        .find(|(_, arg)| range_contains(arg.get_range(), value.get_range()))
+    else {
+        return false;
+    };
+    if semantic_model.infer_expr(arg).is_ok_and(|typ| {
+        !typ.is_any()
+            && !typ.is_unknown()
+            && !contains_gmod_null_type(semantic_model.get_db(), &typ)
+    }) {
+        return false;
+    }
+    !call_argument_accepts_null(semantic_model, &call, arg_idx)
+}
+
+/// Whether the parameter argument `arg_idx` of `call` binds accepts NULL. A global the workspace
+/// redefines without documenting that parameter, as the engine's util.lua redefines `type`, keeps
+/// the contract another declaration of the global documents in a realm the call can run in.
+fn call_argument_accepts_null(
+    semantic_model: &SemanticModel,
+    call: &LuaCallExpr,
+    arg_idx: usize,
+) -> bool {
+    let selected = call_signature_ids(semantic_model, call);
+    if selected.is_empty() {
+        return false;
+    }
+    let db = semantic_model.get_db();
+    let is_colon_call = call.is_colon_call();
+    let infer_index = db.get_gmod_infer_index();
+    let mask_at = |file_id, position| {
+        let mask = infer_index.get_state_mask_at_offset(&file_id, position);
+        if mask.is_empty() {
+            crate::GmodStateMask::SHARED
+        } else {
+            mask
+        }
+    };
+    let call_mask = mask_at(semantic_model.get_file_id(), call.get_position());
+    let mut signatures = selected
+        .iter()
+        .map(|id| (*id, mask_at(id.get_file_id(), id.get_position())))
+        .filter(|(_, mask)| call_mask.is_compatible_with(*mask))
+        .collect::<Vec<_>>();
+    let mut selected_accepts = None;
+    for (id, _) in &signatures {
+        match signature_param_accepts_null(db, *id, is_colon_call, arg_idx) {
+            Some(false) => return false,
+            Some(true) => selected_accepts = Some(true),
+            None => {}
+        }
+    }
+    let mut paths = selected
+        .iter()
+        .filter_map(|id| {
+            let closure = semantic_model.get_signature_closure(*id)?;
+            global_call_path_for_signature_closure(db, *id, &closure)
+        })
+        .chain(
+            call.get_prefix_expr()
+                .and_then(|prefix| global_access_path(semantic_model, &prefix)),
+        )
+        .map(|path| path.strip_prefix("_G.").map(str::to_string).unwrap_or(path))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return selected_accepts.unwrap_or(false);
+    }
+    paths.sort_unstable();
+    paths.dedup();
+    for path in &paths {
+        for (file_id, position, owner) in global_path_definitions(db, path) {
+            let mask = mask_at(file_id, position);
+            if !call_mask.is_compatible_with(mask) {
+                continue;
+            }
+            if let Some(LuaType::Signature(id)) = db
+                .get_type_index()
+                .get_type_cache(&owner)
+                .map(|cache| cache.as_type())
+            {
+                signatures.push((*id, mask));
+            }
+        }
+    }
+    [
+        crate::GmodStateMask::CLIENT,
+        crate::GmodStateMask::SERVER,
+        crate::GmodStateMask::MENU,
+    ]
+    .into_iter()
+    .filter(|realm| call_mask.intersects(*realm))
+    .all(|realm| {
+        let mut accepted = false;
+        for (id, mask) in &signatures {
+            if !realm.is_compatible_with(*mask) {
+                continue;
+            }
+            match signature_param_accepts_null(db, *id, is_colon_call, arg_idx) {
+                Some(false) => return false,
+                Some(true) => accepted = true,
+                None => {}
+            }
+        }
+        accepted
+    })
+}
+
+/// The global slot `expr` reads: its access path when it is rooted at a global name, else the
+/// slot of the value an immutable local or a local table field it names was given, followed
+/// through further such aliases.
+fn global_access_path(semantic_model: &SemanticModel, expr: &LuaExpr) -> Option<String> {
+    aliased_global_path(
+        semantic_model,
+        expr.clone(),
+        &mut rustc_hash::FxHashSet::default(),
+    )
+}
+
+fn aliased_global_path(
+    semantic_model: &SemanticModel,
+    expr: LuaExpr,
+    visited: &mut rustc_hash::FxHashSet<LuaSemanticDeclId>,
+) -> Option<String> {
+    let db = semantic_model.get_db();
+    let file_id = semantic_model.get_file_id();
+    let mut root = expr.clone();
+    while let LuaExpr::IndexExpr(index) = root {
+        root = index.get_prefix_expr()?;
+    }
+    let LuaExpr::NameExpr(name) = root else {
+        return None;
+    };
+    let is_local = db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|references| references.get_decl_id(&name.get_range()))
+        .is_some();
+    if !is_local {
+        return match &expr {
+            LuaExpr::NameExpr(name) => name.get_access_path().map(Into::into),
+            LuaExpr::IndexExpr(index) => index.get_access_path().map(Into::into),
+            _ => None,
+        };
+    }
+    let decl =
+        semantic_model.find_decl(expr.syntax().clone().into(), SemanticDeclLevel::NoTrace)?;
+    if !visited.insert(decl.clone()) {
+        return None;
+    }
+    match &decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => {
+            let local = db.get_decl_index().get_decl(decl_id)?;
+            let mutable = db
+                .get_reference_index()
+                .get_decl_references(&decl_id.file_id, decl_id)
+                .is_some_and(|references| references.mutable);
+            if local.is_param() || !local.is_local() || mutable {
+                return None;
+            }
+        }
+        LuaSemanticDeclId::Member(member_id) => {
+            if let Some(LuaMemberOwner::GlobalPath(owner)) =
+                db.get_member_index().get_current_owner(member_id)
+                && let Some(LuaMemberKey::Name(key)) = db
+                    .get_member_index()
+                    .get_member(member_id)
+                    .map(|member| member.get_key())
+            {
+                return Some(format!("{}.{key}", owner.get_name()));
+            }
+        }
+        LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => return None,
+    }
+    let (value_file_id, value) = crate::semantic::semantic_decl_value(db, decl)?;
+    if value_file_id != file_id {
+        return None;
+    }
+    aliased_global_path(semantic_model, value, visited)
+}
+
+/// Every definition of the global `path`: the global's declarations, `_G` fields of that name,
+/// or the members a global table path holds under its last key.
+fn global_path_definitions(
+    db: &crate::DbIndex,
+    path: &str,
+) -> Vec<(crate::FileId, rowan::TextSize, crate::LuaTypeOwner)> {
+    let (owner, key) = match path.rfind(['.', ':']) {
+        Some(split) => (&path[..split], &path[split + 1..]),
+        None => ("_G", path),
+    };
+    let members = db
+        .get_member_index()
+        .get_member_item(
+            &LuaMemberOwner::GlobalPath(crate::GlobalId::new(owner)),
+            &LuaMemberKey::Name(key.into()),
+        )
+        .map(|item| item.get_member_ids())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| (id.file_id, id.get_position(), id.into()));
+    let globals = (owner == "_G")
+        .then(|| db.get_global_index().get_global_decl_ids(key))
+        .flatten()
+        .into_iter()
+        .flatten()
+        .map(|id| (id.file_id, id.position, (*id).into()));
+    globals.chain(members).collect()
+}
+
+/// Whether the parameter of `signature_id` argument `arg_idx` binds accepts NULL, `None` when
+/// the signature leaves that parameter undocumented.
+fn signature_param_accepts_null(
+    db: &crate::DbIndex,
+    signature_id: LuaSignatureId,
+    is_colon_call: bool,
+    arg_idx: usize,
+) -> Option<bool> {
+    let Some(signature) = db.get_signature_index().get(&signature_id) else {
+        return Some(false);
+    };
+    let param_idx = match (is_colon_call, signature.is_colon_define) {
+        (true, false) => arg_idx + 1,
+        (false, true) => match arg_idx.checked_sub(1) {
+            Some(idx) => idx,
+            None => return Some(false),
+        },
+        _ => arg_idx,
+    };
+    if !signature.overloads.is_empty() {
+        return Some(false);
+    }
+    let param = signature.get_param_info_by_id(param_idx)?;
+    Some(param.type_ref.is_any() || contains_gmod_null_type(db, &param.type_ref))
 }
 
 fn call_semantically_proves_validity_on(

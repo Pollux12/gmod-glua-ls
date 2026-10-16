@@ -17,7 +17,7 @@ use crate::{
 };
 pub(crate) use condition_flow::{
     InferConditionFlow, condition_has_concrete_type_evidence, condition_nominal_type,
-    guarded_path_references, presence_guard_target, type_name_test, written_targets_match,
+    presence_guard_target, type_name_test,
 };
 pub(crate) use get_type_at_cast_flow::apply_cast;
 pub use get_type_at_cast_flow::get_type_at_call_expr_inline_cast;
@@ -25,7 +25,6 @@ pub use get_type_at_flow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
 };
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr};
-pub(crate) use guarded_flow::{FlowGuard, GuardedFlowKey, condition_outcome_excludes_null};
 pub use narrow_type::{
     narrow_direct_name_false_or_nil, narrow_down_type, narrow_false_or_nil, remove_false_or_nil,
 };
@@ -213,8 +212,7 @@ pub(crate) fn infer_asserted_argument_type(
     let tree = db.get_flow_index().get_flow_tree(&cache.get_file_id())?;
     let at = tree.get_flow_id(argument.get_syntax_id())?;
     let root = LuaChunk::cast(argument.get_root())?;
-    let mut policy = get_type_at_flow::FlowWalkPolicy::normal(FlowOrigin::Real);
-    policy.proof_only = true;
+    let policy = get_type_at_flow::FlowWalkPolicy::normal(FlowOrigin::Real);
     let typ =
         get_type_at_flow::get_type_at_flow_in_mode(db, tree, cache, &root, &subject, at, policy)
             .ok()?;

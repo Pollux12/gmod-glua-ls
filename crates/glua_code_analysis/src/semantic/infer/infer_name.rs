@@ -1333,6 +1333,37 @@ fn infer_param_type_from_call_sites(
     )
 }
 
+/// The flow-narrowed type of `arg` when it stays within the nominal `baseline`
+/// the callee's contract gives it: `None` when the baseline is not nominal or
+/// the argument narrows to something the contract does not accept.
+pub(crate) fn call_argument_flow_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    arg: &LuaExpr,
+    baseline: &LuaType,
+) -> Option<LuaType> {
+    fn nominal(db: &DbIndex, typ: &LuaType) -> bool {
+        match crate::get_real_type(db, typ).unwrap_or(typ) {
+            LuaType::Ref(_) | LuaType::Def(_) => true,
+            LuaType::Instance(instance) => nominal(db, instance.get_base()),
+            LuaType::Union(union) => {
+                union.types().all(|arm| arm.is_nil() || nominal(db, arm))
+                    && union.types().any(|arm| nominal(db, arm))
+            }
+            _ => false,
+        }
+    }
+    if !nominal(db, baseline) {
+        return None;
+    }
+    let typ = infer_expr(db, cache, arg.clone()).ok()?;
+    if !nominal(db, &typ) && !typ.is_nil() {
+        return None;
+    }
+    crate::semantic::type_check::check_type_compact(db, baseline, &typ).ok()?;
+    Some(typ)
+}
+
 fn infer_param_type_from_local_call_sites_inner(
     db: &DbIndex,
     cache: &mut LuaInferCache,

@@ -60,8 +60,8 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    FileId, LuaSemanticDeclId, LuaType, LuaTypeDeclId, RenderLevel, SemanticDeclLevel, WorkspaceId,
-    db_index::DbIndex, humanize_type, semantic::SemanticModel,
+    FileId, LuaDecl, LuaSemanticDeclId, LuaType, LuaTypeDeclId, RenderLevel, SemanticDeclLevel,
+    WorkspaceId, db_index::DbIndex, humanize_type, semantic::SemanticModel,
 };
 
 use super::{
