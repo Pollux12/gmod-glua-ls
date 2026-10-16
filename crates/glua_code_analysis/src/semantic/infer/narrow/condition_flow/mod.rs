@@ -27,6 +27,137 @@ use crate::{
     },
 };
 
+pub(crate) fn condition_has_concrete_type_evidence(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+) -> bool {
+    let (condition, outcome) = match &flow_node.kind {
+        crate::FlowNodeKind::TrueCondition(condition) => {
+            (condition, InferConditionFlow::TrueCondition)
+        }
+        crate::FlowNodeKind::FalseCondition(condition) => {
+            (condition, InferConditionFlow::FalseCondition)
+        }
+        _ => return false,
+    };
+    let Some(condition) = condition.to_node(root) else {
+        return false;
+    };
+    if condition_is_valid_guard(db, cache, condition.clone()) {
+        return false;
+    }
+    let policy = FlowWalkPolicy::normal(crate::semantic::cache::FlowOrigin::Real);
+    let Ok(ResultTypeOrContinue::Result(narrowed)) = get_type_at_condition_flow(
+        db,
+        tree,
+        cache,
+        root,
+        var_ref_id,
+        flow_node,
+        condition.clone(),
+        outcome,
+        policy.clone(),
+    ) else {
+        return false;
+    };
+    if condition_asserted_type(db, cache, condition, var_ref_id).is_some() {
+        return true;
+    }
+    let Ok(antecedent) =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy.clone())
+    else {
+        return false;
+    };
+    let narrowed = condition_nominal_type(db, narrowed);
+    !narrowed.is_never()
+        && !narrowed.is_unknown()
+        && !narrowed.is_any()
+        && narrowed != condition_nominal_type(db, antecedent)
+}
+
+fn condition_is_valid_guard(db: &DbIndex, cache: &mut LuaInferCache, condition: LuaExpr) -> bool {
+    match condition {
+        LuaExpr::CallExpr(call) => call_flow::call_condition_is_valid_guard(db, cache, &call),
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|expr| condition_is_valid_guard(db, cache, expr)),
+        LuaExpr::UnaryExpr(unary)
+            if unary
+                .get_op_token()
+                .is_some_and(|op| op.get_op() == UnaryOperator::OpNot) =>
+        {
+            unary
+                .get_expr()
+                .is_some_and(|expr| condition_is_valid_guard(db, cache, expr))
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn condition_nominal_type(db: &DbIndex, typ: crate::LuaType) -> crate::LuaType {
+    use crate::LuaType;
+
+    let typ = crate::get_real_type(db, &typ).cloned().unwrap_or(typ);
+    match typ {
+        LuaType::Nil | LuaType::BooleanConst(false) | LuaType::DocBooleanConst(false) => {
+            LuaType::Never
+        }
+        LuaType::Ref(ref id) | LuaType::Def(ref id)
+            if LuaType::Ref(id.clone()) == super::gmod_null_type() =>
+        {
+            LuaType::Never
+        }
+        LuaType::Union(union) => {
+            let arms = union
+                .types()
+                .cloned()
+                .map(|arm| condition_nominal_type(db, arm))
+                .filter(|arm| !arm.is_never())
+                .collect::<Vec<_>>();
+            if arms.is_empty() {
+                LuaType::Never
+            } else {
+                LuaType::from_vec(arms)
+            }
+        }
+        LuaType::MultiLineUnion(union) => condition_nominal_type(
+            db,
+            LuaType::from_vec(
+                union
+                    .get_unions()
+                    .iter()
+                    .map(|(arm, _)| arm.clone())
+                    .collect(),
+            ),
+        ),
+        _ => remove_false_or_nil(typ),
+    }
+}
+
+fn condition_asserted_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    condition: LuaExpr,
+    var_ref_id: &VarRefId,
+) -> Option<crate::LuaType> {
+    match condition {
+        LuaExpr::CallExpr(call) => {
+            call_flow::call_condition_asserted_type(db, cache, &call, var_ref_id)
+        }
+        LuaExpr::ParenExpr(paren) => {
+            condition_asserted_type(db, cache, paren.get_expr()?, var_ref_id)
+        }
+        LuaExpr::UnaryExpr(unary) if unary.get_op_token()?.get_op() == UnaryOperator::OpNot => {
+            condition_asserted_type(db, cache, unary.get_expr()?, var_ref_id)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InferConditionFlow {
     TrueCondition,

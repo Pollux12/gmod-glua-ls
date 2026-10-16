@@ -7,10 +7,9 @@ pub fn check_goto_label(binder: &mut FlowBinder) {
     for goto_stat_cache in goto_stat_caches {
         let label_token = goto_stat_cache.label_token;
         let label_name = goto_stat_cache.label.as_str();
-        if binder
-            .get_label(goto_stat_cache.closure_id, label_name)
-            .is_none()
-        {
+        if let Some(label) = binder.get_label(goto_stat_cache.closure_id, label_name) {
+            binder.add_antecedent(label, goto_stat_cache.flow_id);
+        } else {
             binder.report_error(AnalyzeError::new(
                 DiagnosticCode::SyntaxError,
                 &format!(

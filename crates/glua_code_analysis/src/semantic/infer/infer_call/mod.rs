@@ -15,7 +15,8 @@ use crate::semantic::{local_name_closure_signature_id, semantic_decl_signature_i
 use crate::{
     CacheEntry, DbIndex, InFiled, LuaArrayType, LuaFunctionType, LuaGenericType, LuaInstanceType,
     LuaIntersectionType, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignature, LuaSignatureId,
-    LuaTupleType, LuaType, LuaTypeDeclId, LuaTypeFlag, LuaUnionType, ReturnTypeKind, VariadicType,
+    LuaTupleType, LuaType, LuaTypeDeclId, LuaTypeFlag, LuaUnionType, ReturnTypeKind,
+    TypeVisitTrait, VariadicType,
 };
 use crate::{GMOD_DOMAIN_CONVAR, GMOD_ROLE_REFERENCE};
 use crate::{GmodConVarKind, GmodLoadEdgeKind, GmodStateMask};
@@ -31,8 +32,9 @@ use crate::{
     },
 };
 use crate::{
-    SemanticDeclGuard, SemanticDeclLevel, build_self_type, infer_self_type,
-    instantiate_func_generic, instantiate_func_generic_with_bindings, semantic::infer_expr,
+    LuaSemanticDeclId, SemanticDeclGuard, SemanticDeclLevel, build_self_type, infer_call_self_type,
+    infer_self_type, instantiate_func_generic, instantiate_func_generic_with_bindings,
+    semantic::infer_expr,
 };
 use infer_require::infer_require_call;
 use infer_setmetatable::infer_setmetatable_call;
@@ -107,7 +109,8 @@ fn infer_call_expr_func_miss(
         && should_prefer_signature_for_call(db, signature_id, &call_expr_type)
     {
         let result =
-            infer_signature_doc_function(db, cache, signature_id, call_expr.clone(), args_count);
+            infer_signature_doc_function(db, cache, signature_id, call_expr.clone(), args_count)
+                .map(|func| instantiate_call_self(db, cache, &call_expr, func));
         let stored = result
             .as_ref()
             .map(|it| CacheEntry::Cache(it.clone()))
@@ -217,6 +220,7 @@ fn infer_call_expr_func_miss(
     };
 
     let result = if let Ok(func_ty) = result {
+        let func_ty = instantiate_call_self(db, cache, &call_expr, func_ty);
         let func_ty = match func_ty.get_ret() {
             LuaType::Call(_) => {
                 match instantiate_func_generic(db, cache, func_ty.as_ref(), call_expr.clone()) {
@@ -262,6 +266,32 @@ fn infer_call_expr_func_miss(
         _ => None,
     };
     (result, stored)
+}
+
+fn instantiate_call_self(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    func: Arc<LuaFunctionType>,
+) -> Arc<LuaFunctionType> {
+    let mut contains_self = false;
+    func.visit_type(&mut |typ| {
+        contains_self |= matches!(typ, LuaType::SelfInfer);
+    });
+    if contains_self && let Some(self_type) = infer_call_self_type(db, cache, call_expr, &func) {
+        let mut substitutor = TypeSubstitutor::new();
+        substitutor.add_self_type(self_type);
+        if let LuaType::DocFunction(instantiated) =
+            instantiate_doc_function(db, &func, &substitutor)
+        {
+            return Arc::new(
+                Arc::unwrap_or_clone(instantiated)
+                    .with_optional_params(func.get_optional_params().to_vec())
+                    .with_call_arg_roles(func.get_call_arg_roles().to_vec()),
+            );
+        }
+    }
+    func
 }
 
 fn refine_known_vgui_panel_return(
@@ -644,7 +674,7 @@ fn infer_doc_function(
     // Handle self-type substitution for functions with SelfInfer in return type
     // (e.g., tableof<self>). This covers cases like `local getTable = Entity.GetTable; getTable(self)`
     if func.contain_self() {
-        let self_type = infer_self_type(db, cache, &call_expr);
+        let self_type = infer_call_self_type(db, cache, &call_expr, func);
         if let Some(self_type) = self_type {
             let mut substitutor = crate::semantic::generic::TypeSubstitutor::new();
             substitutor.add_self_type(self_type);
@@ -2368,6 +2398,91 @@ mod tests {
         LuaUnionType, SignatureReturnStatus, VirtualWorkspace, semantic::infer_call_expr_func,
     };
     use glua_parser::LuaAstNode;
+
+    #[test]
+    fn nested_self_without_a_receiver_does_not_capture_the_enclosing_self() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class UnrelatedSelf
+            local UnrelatedSelf = {}
+            function UnrelatedSelf:Run() unknown_callback() end
+        "#,
+        );
+        let call = ws.get_node::<glua_parser::LuaCallExpr>(file_id);
+        let callback = LuaType::DocFunction(
+            crate::LuaFunctionType::new(
+                crate::AsyncState::None,
+                false,
+                false,
+                vec![("target".to_string(), Some(LuaType::SelfInfer))],
+                LuaType::Nil,
+            )
+            .into(),
+        );
+        let func = std::sync::Arc::new(crate::LuaFunctionType::new(
+            crate::AsyncState::None,
+            false,
+            false,
+            vec![("callback".to_string(), Some(callback.clone()))],
+            callback,
+        ));
+        let model = ws.analysis.compilation.get_semantic_model(file_id).unwrap();
+        let result = super::instantiate_call_self(
+            model.get_db(),
+            &mut model.get_cache().borrow_mut(),
+            &call,
+            func.clone(),
+        );
+        assert!(std::sync::Arc::ptr_eq(&func, &result));
+    }
+
+    #[test]
+    fn nested_self_instantiation_keeps_optional_parameters() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class OptionalReceiver
+            ---@type OptionalReceiver
+            local receiver
+            receiver:Start()
+        "#,
+        );
+        let call = ws.get_node::<glua_parser::LuaCallExpr>(file_id);
+        let expected = ws.ty("OptionalReceiver");
+        let callback = LuaType::DocFunction(
+            crate::LuaFunctionType::new(
+                crate::AsyncState::None,
+                false,
+                false,
+                vec![("target".to_string(), Some(LuaType::SelfInfer))],
+                LuaType::Nil,
+            )
+            .into(),
+        );
+        let func = std::sync::Arc::new(
+            crate::LuaFunctionType::new(
+                crate::AsyncState::None,
+                true,
+                false,
+                vec![("callback".to_string(), Some(callback))],
+                LuaType::Nil,
+            )
+            .with_optional_params(vec![true]),
+        );
+        let model = ws.analysis.compilation.get_semantic_model(file_id).unwrap();
+        let result = super::instantiate_call_self(
+            model.get_db(),
+            &mut model.get_cache().borrow_mut(),
+            &call,
+            func,
+        );
+        assert_eq!(result.get_optional_params(), &[true]);
+        let Some(LuaType::DocFunction(callback)) = &result.get_params()[0].1 else {
+            panic!("expected a callback");
+        };
+        assert_eq!(callback.get_params()[0].1.as_ref(), Some(&expected));
+    }
 
     #[test]
     fn rematerializing_instance_return_replaces_the_call_site_wrapper() {

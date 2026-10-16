@@ -10,8 +10,8 @@ use crate::{
     LuaInstanceType, LuaMappedType, LuaMemberKey, LuaOperatorMetaMethod, LuaSignatureId,
     LuaTupleStatus, LuaTypeDeclId, TypeOps, check_type_compact,
     db_index::{
-        LuaFunctionType, LuaGenericType, LuaIntersectionType, LuaMergedTableType, LuaObjectType,
-        LuaTupleType, LuaType, LuaUnionType, VariadicType,
+        LuaFunctionType, LuaGenericType, LuaIntersectionType, LuaMergedTableType,
+        LuaMultiLineUnion, LuaObjectType, LuaTupleType, LuaType, LuaUnionType, VariadicType,
     },
     semantic::type_check::{TypeCheckCheckLevel, check_type_compact_with_level},
 };
@@ -21,7 +21,8 @@ use crate::TypeVisitTrait;
 use crate::semantic::member::find_members_with_key;
 pub use instantiate_func_generic::{
     FuncGenericBinding, FuncGenericBindingState, GenericFunctionInstantiation, build_self_type,
-    infer_self_type, instantiate_func_generic, instantiate_func_generic_with_bindings,
+    infer_call_self_type, infer_self_type, instantiate_func_generic,
+    instantiate_func_generic_with_bindings,
 };
 pub(crate) use instantiate_func_generic::{check_vgui_panel_ref_role, str_tpl_arg_type};
 pub use instantiate_special_generic::get_keyof_members;
@@ -38,6 +39,19 @@ pub fn instantiate_type_generic(
         LuaType::DocFunction(doc_func) => instantiate_doc_function(db, doc_func, substitutor),
         LuaType::Object(object) => instantiate_object(db, object, substitutor),
         LuaType::Union(union) => instantiate_union(db, union, substitutor),
+        LuaType::MultiLineUnion(union) => {
+            let unions = union
+                .get_unions()
+                .iter()
+                .map(|(typ, description)| {
+                    (
+                        instantiate_type_generic(db, typ, substitutor),
+                        description.clone(),
+                    )
+                })
+                .collect();
+            LuaType::MultiLineUnion(LuaMultiLineUnion::new(unions).into())
+        }
         LuaType::Intersection(intersection) => {
             instantiate_intersection(db, intersection, substitutor)
         }

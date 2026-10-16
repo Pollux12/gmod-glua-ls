@@ -354,7 +354,7 @@ pub fn bind_goto_stat(binder: &mut FlowBinder, goto_stat: LuaGotoStat, current: 
 
     let label_name = label_token.get_name_text();
     let return_flow_id = binder.create_return();
-    binder.cache_goto_flow(closure_id, label_token.clone(), label_name, return_flow_id);
+    binder.cache_goto_flow(closure_id, label_token.clone(), label_name, current);
     binder.add_antecedent(return_flow_id, current);
     return_flow_id
 }

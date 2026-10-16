@@ -34,6 +34,9 @@ fn bind_block(binder: &mut FlowBinder, block: LuaBlock, current: FlowId) -> Flow
     let mut return_flow_id = current;
     let mut can_change_flow = true;
     for node in block.children::<LuaAst>() {
+        if matches!(&node, LuaAst::LuaLabelStat(_)) {
+            can_change_flow = true;
+        }
         let node_flow_id = bind_node(binder, node, return_flow_id);
         if can_change_flow {
             return_flow_id = node_flow_id;

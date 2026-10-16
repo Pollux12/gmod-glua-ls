@@ -507,7 +507,7 @@ pub fn instantiate_func_generic_with_bindings(
         }
     }
 
-    if contain_self && let Some(self_type) = infer_self_type(db, cache, &call_expr) {
+    if contain_self && let Some(self_type) = infer_call_self_type(db, cache, &call_expr, func) {
         substitutor.add_self_type(self_type);
     }
 
@@ -793,6 +793,26 @@ pub fn build_self_type(db: &DbIndex, self_type: &LuaType) -> LuaType {
     self_type.clone()
 }
 
+pub fn infer_call_self_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    func: &LuaFunctionType,
+) -> Option<LuaType> {
+    if !call_expr.is_colon_call()
+        && (func.is_colon_define()
+            || func
+                .get_params()
+                .first()
+                .is_some_and(|(name, _)| name == "self"))
+    {
+        let first_arg = call_expr.get_args_list()?.get_args().next()?;
+        let self_type = infer_alias_self_arg_type(db, cache, first_arg)?;
+        return Some(build_self_type(db, &self_type));
+    }
+    infer_self_type(db, cache, call_expr)
+}
+
 pub fn infer_self_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -814,13 +834,12 @@ pub fn infer_self_type(
                 SemanticDeclLevel::default(),
             )?;
             if let LuaSemanticDeclId::Member(member_id) = semantic_decl_id {
-                if let Some(first_arg) = call_expr.get_args_list()?.get_args().next()
+                if member_takes_self(db, member_id)
+                    && let Some(first_arg) = call_expr.get_args_list()?.get_args().next()
                     && let Some(arg_type) = infer_alias_self_arg_type(db, cache, first_arg)
                 {
-                    let self_type = build_self_type(db, &arg_type);
-                    return Some(self_type);
+                    return Some(build_self_type(db, &arg_type));
                 }
-
                 let owner = db.get_member_index().get_current_owner(&member_id)?;
                 if let LuaMemberOwner::Type(id) = owner {
                     let typ = LuaType::Ref(id.clone());
@@ -834,6 +853,32 @@ pub fn infer_self_type(
     }
 
     None
+}
+
+/// Whether the function `member_id` holds takes its receiver as its first argument: it is
+/// colon-defined or names its first parameter `self`.
+fn member_takes_self(db: &DbIndex, member_id: crate::LuaMemberId) -> bool {
+    match db
+        .get_type_index()
+        .get_type_cache(&member_id.into())
+        .map(|cache| cache.as_type().clone())
+    {
+        Some(LuaType::Signature(signature_id)) => db
+            .get_signature_index()
+            .get_declared(&signature_id)
+            .is_some_and(|signature| {
+                signature.is_colon_define
+                    || signature.params.first().is_some_and(|name| name == "self")
+            }),
+        Some(LuaType::DocFunction(func)) => {
+            func.is_colon_define()
+                || func
+                    .get_params()
+                    .first()
+                    .is_some_and(|(name, _)| name == "self")
+        }
+        _ => false,
+    }
 }
 
 fn infer_alias_self_arg_type(

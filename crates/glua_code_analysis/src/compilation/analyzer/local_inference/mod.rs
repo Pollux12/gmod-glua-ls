@@ -938,19 +938,26 @@ pub(crate) fn publish_unguarded_children(
         }
         support.sort_by(LuaInferenceNodeId::stable_cmp);
         support.dedup();
+        let mut provenance = db
+            .get_inference_fact(&node)
+            .map(|fact| {
+                fact.provenance()
+                    .iter()
+                    .filter(|step| step.event.kind == LuaInferenceProvenanceKind::ContextualUnknown)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        provenance.push(LuaInferenceStep {
+            event,
+            support: support.into(),
+            inferred_type: Some(Arc::new(typ.clone())),
+            found_type: Some(Arc::new(found_type)),
+        });
         update_sources.push(source.clone());
         updates.push((
             node,
-            LuaTypeFact::new(
-                typ.clone(),
-                LuaInferenceConfidence::Heuristic,
-                Arc::from([LuaInferenceStep {
-                    event,
-                    support: support.into(),
-                    inferred_type: Some(Arc::new(typ)),
-                    found_type: Some(Arc::new(found_type)),
-                }]),
-            ),
+            LuaTypeFact::new(typ, LuaInferenceConfidence::Heuristic, provenance.into()),
         ));
     }
 
@@ -1969,6 +1976,10 @@ pub(crate) fn unguarded_child_candidates(
     receiver_type: &LuaType,
     member_key: &LuaMemberKey,
 ) -> Option<Vec<LuaTypeDeclId>> {
+    let mut receiver_type = receiver_type;
+    while let LuaType::Instance(instance) = receiver_type {
+        receiver_type = instance.get_base();
+    }
     let base_id = unguarded_child_base_id(receiver_type)?;
     let children = nearest_subtypes_with_member(
         db,
@@ -2529,6 +2540,18 @@ pub(crate) fn is_guarded_by_enclosing_condition(
     index_expr: &LuaIndexExpr,
 ) -> bool {
     enclosing_guard_covers(db, cache, index_expr, GuardScope::Parent)
+        || is_guarded_by_absence_exit(db, cache, index_expr, GuardScope::Parent)
+}
+
+/// Whether the read of `index_expr` is covered for presence in any way: by an enclosing guard
+/// on a member of the table it indexes, or by `is_member_path_presence_guarded`.
+fn is_presence_covered(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    is_guarded_by_enclosing_condition(db, cache, index_expr)
+        || is_member_path_presence_guarded(db, cache, index_expr)
 }
 
 /// Whether the member path `index_expr` reads is proven present by an enclosing test or earlier exit.
@@ -2539,7 +2562,129 @@ pub(crate) fn is_member_path_presence_guarded(
 ) -> bool {
     enclosing_guard_covers(db, cache, index_expr, GuardScope::Path)
         || is_matching_short_circuit_guard(db, cache, index_expr)
-        || is_guarded_by_absence_exit(db, cache, index_expr)
+        || is_guarded_by_absence_exit(db, cache, index_expr, GuardScope::Path)
+        || is_bound_to_presence_tested_local(db, cache, index_expr)
+}
+
+/// Whether the read only tests its member: compared for (in)equality, or tested for presence
+/// directly or as the argument of a presence-guard call such as `IsValid`.
+fn is_presence_probe(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let value = LuaExpr::IndexExpr(index_expr.clone());
+    is_equality_operand(index_expr)
+        || super::common::is_presence_tested(index_expr.syntax(), &mut |call| {
+            is_presence_guard_target(db, cache, call, &value)
+        })
+}
+
+/// Whether `value` is the expression the presence-guard `call` narrows: its first argument for
+/// a plain call, its receiver for a colon call.
+fn is_presence_guard_target(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
+    call: &LuaCallExpr,
+    value: &LuaExpr,
+) -> bool {
+    crate::semantic::presence_guard_target(db, cache, call).is_some_and(|target| {
+        without_parens(target).syntax() == without_parens(value.clone()).syntax()
+    })
+}
+
+fn without_parens(mut expr: LuaExpr) -> LuaExpr {
+    loop {
+        let LuaExpr::ParenExpr(paren) = &expr else {
+            return expr;
+        };
+        let Some(inner) = paren.get_expr() else {
+            return expr;
+        };
+        expr = inner;
+    }
+}
+
+fn is_equality_operand(index_expr: &LuaIndexExpr) -> bool {
+    let mut node = index_expr.syntax().clone();
+    while let Some(parent) = node.parent() {
+        if LuaParenExpr::can_cast(parent.kind().into()) {
+            node = parent;
+            continue;
+        }
+        return LuaBinaryExpr::cast(parent)
+            .and_then(|binary| binary.get_op_token())
+            .is_some_and(|token| {
+                matches!(token.get_op(), BinaryOperator::OpEq | BinaryOperator::OpNe)
+            });
+    }
+    false
+}
+
+/// Whether the read is the whole value of a `local` that is tested for presence before anything
+/// writes the local again.
+fn is_bound_to_presence_tested_local(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let file_id = cache.get_file_id();
+    let mut value = LuaExpr::IndexExpr(index_expr.clone());
+    while let Some(paren) = value.get_parent::<LuaParenExpr>() {
+        value = LuaExpr::ParenExpr(paren);
+    }
+    let Some(local_stat) = value.get_parent::<LuaLocalStat>() else {
+        return false;
+    };
+    let Some(local_name) = local_stat.get_local_name_by_value(value) else {
+        return false;
+    };
+    let decl_position = local_name.get_position();
+    let Some(references) = db
+        .get_reference_index()
+        .get_decl_references(&file_id, &crate::LuaDeclId::new(file_id, decl_position))
+    else {
+        return false;
+    };
+    let Some(root) = index_expr.syntax().ancestors().last() else {
+        return false;
+    };
+    let bound_closure = index_expr
+        .syntax()
+        .ancestors()
+        .find_map(LuaClosureExpr::cast)
+        .map(|closure| closure.get_syntax_id());
+    let bound_end = local_stat.syntax().text_range().end();
+    let first_rewrite = references
+        .cells
+        .iter()
+        .filter(|cell| cell.is_write && cell.range.start() != decl_position)
+        .map(|cell| cell.range.start())
+        .min();
+    references.cells.iter().any(|cell| {
+        !cell.is_write
+            && cell.range.start() >= bound_end
+            && first_rewrite.is_none_or(|rewrite| cell.range.start() < rewrite)
+            && root
+                .covering_element(cell.range)
+                .ancestors()
+                .find_map(LuaNameExpr::cast)
+                .is_some_and(|name_expr| {
+                    if name_expr
+                        .syntax()
+                        .ancestors()
+                        .find_map(LuaClosureExpr::cast)
+                        .map(|closure| closure.get_syntax_id())
+                        != bound_closure
+                    {
+                        return false;
+                    }
+                    let value = LuaExpr::NameExpr(name_expr.clone());
+                    super::common::is_presence_tested(name_expr.syntax(), &mut |call| {
+                        is_presence_guard_target(db, cache, call, &value)
+                    })
+                })
+    })
 }
 
 /// Whether an earlier `if not path then return end` in an enclosing block covers `index_expr`.
@@ -2547,6 +2692,7 @@ fn is_guarded_by_absence_exit(
     db: &crate::DbIndex,
     cache: &mut crate::semantic::LuaInferCache,
     index_expr: &LuaIndexExpr,
+    scope: GuardScope,
 ) -> bool {
     for block in index_expr.syntax().ancestors() {
         if LuaClosureExpr::can_cast(block.kind().into()) {
@@ -2585,7 +2731,7 @@ fn is_guarded_by_absence_exit(
                 continue;
             }
             let guards = present_after_exit_indexes(db, cache, &condition);
-            if guards_cover(db, cache, guards, index_expr, GuardScope::Path)
+            if guards_cover(db, cache, guards, index_expr, scope)
                 && !root_written_in_block_before(
                     db,
                     cache,
@@ -2799,28 +2945,88 @@ fn guards_cover(
         .collect::<Vec<_>>();
     candidates.into_iter().any(|(guard, (_, key))| {
         (key.is_some() && key == guarded_key)
-            || (matches!(scope, GuardScope::Parent) && proves_child_type(db, cache, &guard))
+            || (matches!(scope, GuardScope::Parent)
+                && proves_child_type(db, cache, &guard, guarded))
     })
 }
 
-/// Whether `guard`'s member is one the table it indexes is not declared to have, so
-/// its presence shows that table holds a child type that defines it.
 fn proves_child_type(
     db: &crate::DbIndex,
     cache: &mut crate::semantic::LuaInferCache,
     guard: &LuaIndexExpr,
+    read: &LuaIndexExpr,
 ) -> bool {
     let (Some(prefix), Some(key)) = (guard.get_prefix_expr(), guard.get_index_key()) else {
-        return true;
+        return false;
     };
-    let (Some(declared), Ok(key)) = (
+    if LuaMemberKey::index_key_is_dynamic(db, cache, &key) {
+        return false;
+    }
+    let (Some(declared), Ok(key), Some(read_key)) = (
         declared_type(db, cache, &prefix),
         LuaMemberKey::from_index_key(db, cache, &key),
+        read.get_index_key(),
     ) else {
-        return true;
+        return false;
     };
-    crate::semantic::find_members_with_key(db, &declared, key, false)
-        .is_none_or(|members| members.is_empty())
+    let (Some(base_id), Ok(read_key)) = (
+        unguarded_child_base_id(&declared),
+        LuaMemberKey::from_index_key(db, cache, &read_key),
+    ) else {
+        return false;
+    };
+    let file_id = cache.get_file_id();
+    if type_has_visible_static_member_at_use(
+        db,
+        &LuaType::Ref(base_id.clone()),
+        &key,
+        file_id,
+        guard.get_position(),
+    ) {
+        return false;
+    }
+    let receiver = get_var_expr_var_ref_id(db, cache, prefix);
+    let Some(children) = nearest_subtypes_with_member(
+        db,
+        cache,
+        &mut SubtypesWithMember::default(),
+        &base_id,
+        &key,
+        false,
+        receiver.as_ref(),
+    ) else {
+        return false;
+    };
+    children.iter().all(|child| {
+        let typ = LuaType::Ref(child.clone());
+        (type_has_visible_static_member_at_use(db, &typ, &key, file_id, guard.get_position())
+            || child_member_visible_at(db, cache, child, &key, file_id, guard.get_position())
+                == Ok(true))
+            && (type_has_visible_static_member_at_use(
+                db,
+                &typ,
+                &read_key,
+                file_id,
+                read.get_position(),
+            ) || child_member_visible_at(
+                db,
+                cache,
+                child,
+                &read_key,
+                file_id,
+                read.get_position(),
+            ) == Ok(true))
+            && crate::semantic::find_members_with_key(db, &typ, key.clone(), false).is_some_and(
+                |members| {
+                    members.iter().any(|member| {
+                        !member.typ.is_always_falsy()
+                            && !member.typ.is_never()
+                            && !member.typ.is_unknown()
+                            && !member.typ.is_any()
+                    })
+                },
+            )
+    })
 }
 
 /// The type `expr`, a variable or a member path off one, is declared with, before any
@@ -2838,7 +3044,15 @@ fn declared_type(
                 LuaExpr::NameExpr(name.clone()),
             )?
             .get_decl_id_ref()?;
-            declaration_base_type(db, cache, decl_id)
+            db.get_type_index()
+                .get_type_fact(&decl_id.into())
+                .and_then(|fact| {
+                    fact.provenance()
+                        .iter()
+                        .find(|step| step.event.kind == LuaInferenceProvenanceKind::UnguardedChild)
+                        .and_then(|step| step.found_type.as_deref().cloned())
+                })
+                .or_else(|| declaration_base_type(db, cache, decl_id))
         }
         LuaExpr::IndexExpr(index) => {
             let table = declared_type(db, cache, &index.get_prefix_expr()?)?;

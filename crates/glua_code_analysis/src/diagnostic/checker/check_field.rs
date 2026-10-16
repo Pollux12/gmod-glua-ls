@@ -11,7 +11,7 @@ use smol_str::SmolStr;
 
 use crate::{
     DbIndex, DiagnosticCode, FileId, GlobalId, InferFailReason, LuaAliasCallKind, LuaAliasCallType,
-    LuaInferenceConfidence, LuaMemberKey, LuaMemberOwner, LuaType, SemanticModel,
+    LuaInferenceConfidence, LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, SemanticModel,
     check_type_compact, enum_variable_is_param, get_keyof_members, get_real_type,
     semantic::{
         infer_owner_raw_member_type_with_realm, infer_param_is_weak, is_doc_tag_table_const,
@@ -141,12 +141,22 @@ fn receiver_is_weak(semantic_model: &SemanticModel, index_expr: &LuaIndexExpr) -
 }
 
 fn is_weak_receiver(semantic_model: &SemanticModel, prefix_expr: &LuaExpr) -> bool {
-    if let Some(decl) = named_param(semantic_model, prefix_expr) {
-        return infer_param_is_weak(
-            semantic_model.get_db(),
-            &mut semantic_model.get_cache().borrow_mut(),
+    if let Some(decl) = super::inference_trust::local_read_declaration(semantic_model, prefix_expr)
+    {
+        if !super::inference_trust::param_read_rests_on_declaration(
+            semantic_model,
+            prefix_expr,
             decl,
-        );
+        ) {
+            return false;
+        }
+        if decl.is_param() {
+            return infer_param_is_weak(
+                semantic_model.get_db(),
+                &mut semantic_model.get_cache().borrow_mut(),
+                decl,
+            );
+        }
     }
 
     semantic_model

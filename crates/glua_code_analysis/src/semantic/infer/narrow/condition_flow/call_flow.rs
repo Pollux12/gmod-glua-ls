@@ -428,14 +428,39 @@ fn try_inferred_positive_guard(
         return Ok(None);
     }
 
-    let antecedent_type =
-        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
-    Ok(Some(narrow_type_guard_true_branch(
+    let antecedent_type = get_condition_antecedent_type(
         db,
-        antecedent_type,
-        guard.narrowed_type,
-        false,
-    )))
+        tree,
+        cache,
+        root,
+        var_ref_id,
+        flow_node,
+        policy.clone(),
+    )?;
+    Ok(match condition_flow {
+        InferConditionFlow::TrueCondition => Some(narrow_type_guard_true_branch(
+            db,
+            antecedent_type,
+            guard.narrowed_type,
+            false,
+        )),
+        InferConditionFlow::FalseCondition => guard
+            .false_removed_type
+            .map(|removed| TypeOps::Remove.apply(db, &antecedent_type, &removed)),
+    })
+}
+
+fn inferred_guard_target_expr(
+    call_expr: &LuaCallExpr,
+    signature: &crate::LuaSignature,
+    param_idx: usize,
+) -> Option<LuaExpr> {
+    let argument_idx = match (call_expr.is_colon_call(), signature.is_colon_define) {
+        (false, true) => Some(param_idx + 1),
+        (true, false) => param_idx.checked_sub(1),
+        _ => Some(param_idx),
+    }?;
+    call_expr.get_args_list()?.get_args().nth(argument_idx)
 }
 
 /// Resolves an alias chain for member-guard predicate callees. When the
@@ -710,6 +735,109 @@ fn get_type_at_call_expr_by_type_guard(
         return Ok(ResultTypeOrContinue::Continue);
     }
 
+    let Some(guard_type) = call_type_guard_type(db, cache, &call_expr, func_type, is_valid_guard)?
+    else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
+
+    let antecedent_type = get_condition_antecedent_type(
+        db,
+        tree,
+        cache,
+        root,
+        var_ref_id,
+        flow_node,
+        policy.clone(),
+    )?;
+
+    let result_type = match condition_flow {
+        InferConditionFlow::TrueCondition => {
+            narrow_type_guard_true_branch(db, antecedent_type, guard_type, is_valid_guard)
+        }
+        InferConditionFlow::FalseCondition => {
+            if is_exhaustive_type_guard && !is_valid_guard {
+                remove_exhaustively_guarded_classes(db, &antecedent_type, &guard_type)
+            } else {
+                TypeOps::Remove.apply(db, &antecedent_type, &guard_type)
+            }
+        }
+    };
+
+    let result_type = if let Some((signature_cast, signature_id)) = signature_cast {
+        apply_signature_cast_to_type_guard_result(
+            db,
+            cache,
+            &call_expr,
+            var_ref_id,
+            result_type,
+            signature_cast,
+            signature_id,
+            condition_flow,
+        )?
+    } else {
+        result_type
+    };
+
+    Ok(ResultTypeOrContinue::Result(result_type))
+}
+
+fn remove_exhaustively_guarded_classes(
+    db: &DbIndex,
+    antecedent: &LuaType,
+    guard: &LuaType,
+) -> LuaType {
+    fn is_guarded_class(db: &DbIndex, candidate: &LuaType, guard: &LuaType) -> bool {
+        match (candidate, guard) {
+            (LuaType::Instance(instance), _) => is_guarded_class(db, instance.get_base(), guard),
+            (_, LuaType::Instance(instance)) => {
+                is_guarded_class(db, candidate, instance.get_base())
+            }
+            (_, LuaType::Union(union)) => union
+                .types()
+                .any(|arm| is_guarded_class(db, candidate, arm)),
+            (
+                LuaType::Ref(child) | LuaType::Def(child),
+                LuaType::Ref(parent) | LuaType::Def(parent),
+            ) => crate::semantic::type_check::is_sub_type_of(db, child, parent),
+            _ => false,
+        }
+    }
+
+    match antecedent {
+        LuaType::Union(union) => {
+            let remaining = union
+                .types()
+                .map(|arm| remove_exhaustively_guarded_classes(db, arm, guard))
+                .filter(|arm| !arm.is_never())
+                .collect::<Vec<_>>();
+            if remaining.is_empty() {
+                LuaType::Never
+            } else {
+                LuaType::from_vec(remaining)
+            }
+        }
+        LuaType::Instance(instance) => {
+            let base = remove_exhaustively_guarded_classes(db, instance.get_base(), guard);
+            if base.is_never() {
+                LuaType::Never
+            } else {
+                LuaType::Instance(
+                    crate::LuaInstanceType::new(base, instance.get_range().clone()).into(),
+                )
+            }
+        }
+        _ if is_guarded_class(db, antecedent, guard) => LuaType::Never,
+        _ => TypeOps::Remove.apply(db, antecedent, guard),
+    }
+}
+
+fn call_type_guard_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    func_type: Arc<LuaFunctionType>,
+    is_valid_guard: bool,
+) -> Result<Option<LuaType>, InferFailReason> {
     let mut return_type = func_type.get_ret().clone();
     if return_type.contain_tpl() {
         let call_expr_type = LuaType::DocFunction(func_type);
@@ -757,23 +885,32 @@ fn get_type_at_call_expr_by_type_guard(
             condition_flow,
         )?
     } else {
-        result_type
+        signature_cast_target_expr(db, call_expr, id, &cast.name)
     };
-
-    Ok(ResultTypeOrContinue::Result(result_type))
+    if !targets_var(cache, target) || cast.cast.action == crate::LuaCastAction::Remove {
+        return None;
+    }
+    match &cast.cast.target {
+        Some(crate::LuaCastTarget::Type(typ)) if !typ.is_any() && !typ.is_unknown() => {
+            Some(typ.clone())
+        }
+        _ => None,
+    }
 }
 
 fn type_guard_target_expr(call_expr: &LuaCallExpr) -> Option<LuaExpr> {
-    if call_expr.is_colon_call()
+    let mut target = if call_expr.is_colon_call()
         && let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr()
         && let Some(self_expr) = index_expr.get_prefix_expr()
     {
-        return Some(self_expr);
+        self_expr
+    } else {
+        call_expr.get_args_list()?.get_args().next()?
+    };
+    while let LuaExpr::ParenExpr(paren) = target {
+        target = paren.get_expr()?;
     }
-
-    call_expr
-        .get_args_list()
-        .and_then(|args| args.get_args().next())
+    Some(target)
 }
 
 fn narrow_type_guard_true_branch(
@@ -1083,6 +1220,23 @@ fn signature_cast_target_expr(
     arg_list.get_args().nth(param_idx)
 }
 
+fn signature_self_target_expr(
+    db: &DbIndex,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+) -> Option<LuaExpr> {
+    if call_expr.is_colon_call() {
+        let LuaExpr::IndexExpr(prefix) = call_expr.get_prefix_expr()? else {
+            return None;
+        };
+        prefix.get_prefix_expr()
+    } else if db.get_signature_index().get(&signature_id)?.is_colon_define {
+        call_expr.get_args_list()?.get_args().next()
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn get_type_at_call_expr_by_signature_self(
     db: &DbIndex,
@@ -1097,23 +1251,7 @@ fn get_type_at_call_expr_by_signature_self(
     condition_flow: InferConditionFlow,
     policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
-    let self_expr = if call_expr.is_colon_call() {
-        let Some(LuaExpr::IndexExpr(call_prefix)) = call_expr.get_prefix_expr() else {
-            return Ok(ResultTypeOrContinue::Continue);
-        };
-        call_prefix.get_prefix_expr()
-    } else if db
-        .get_signature_index()
-        .get(&signature_id)
-        .is_some_and(|signature| signature.is_colon_define)
-    {
-        call_expr
-            .get_args_list()
-            .and_then(|args| args.get_args().next())
-    } else {
-        None
-    };
-    let Some(self_expr) = self_expr else {
+    let Some(self_expr) = signature_self_target_expr(db, &call_expr, signature_id) else {
         return Ok(ResultTypeOrContinue::Continue);
     };
 

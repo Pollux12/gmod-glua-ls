@@ -873,7 +873,8 @@ fn infer_implicit_method_self_type_inner(
     //    This is region-aware, so a reused local resolves `self` to the class
     //    of the table backing the current region.
     let prefix_type = infer_method_prefix_type(db, cache, &func_stat)?;
-    is_concrete_self_receiver_type(&prefix_type).then_some(prefix_type)
+    (prefix_type.is_unknown() || is_concrete_self_receiver_type(&prefix_type))
+        .then_some(prefix_type)
 }
 
 fn infer_implicit_self_type_from_call_site(
