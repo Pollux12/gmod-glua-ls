@@ -132,6 +132,21 @@ end
     }
 
     #[test]
+    fn copying_the_same_reference_does_not_define_new_fields() {
+        let (mut ws, files) = workspace(&[(
+            "lua/autorun/sh_self_copy.lua",
+            r#"
+            local value = { known = 1 }
+            for key, item in pairs(value) do value[key] = item end
+            local missing = value.notWritten
+        "#,
+        )]);
+        let reports = diagnostics(&mut ws, files[0], DiagnosticCode::UndefinedField);
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(reports[0].contains("notWritten"), "{reports:?}");
+    }
+
+    #[test]
     fn a_loop_writing_new_values_back_into_the_table_it_iterates_gives_them_to_its_fields() {
         let (mut ws, file_ids) = workspace(&[(
             "lua/autorun/sh_defaults.lua",

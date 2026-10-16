@@ -343,12 +343,24 @@ fn reach_target(
 ) -> Option<ReachedTarget> {
     let prefix_expr = index_expr.get_prefix_expr()?;
     let definition_range = index_expr.get_index_key().and_then(|k| k.get_range())?;
-    if value_expr
-        .is_some_and(|value_expr| copies_table_into_itself(db, cache, index_expr, value_expr))
+    let copies_own_shape = value_expr
+        .is_some_and(|value_expr| copies_table_into_itself(db, cache, index_expr, value_expr));
+    if copies_own_shape
+        && let Some(LuaExpr::NameExpr(value)) = value_expr
+        && let Some(source) = for_range_pairs_source_for_var(db, cache.get_file_id(), value, 1)
+        && let Some(target) = get_var_expr_var_ref_id(db, cache, prefix_expr.clone())
+        && get_var_expr_var_ref_id(db, cache, source.source_expr).as_ref() == Some(&target)
     {
         return None;
     }
-    let field_names = get_field_names(db, cache, root, sites, index_expr);
+    let field_names = if copies_own_shape {
+        ResolvedDynamicFieldNames {
+            names: Vec::new(),
+            may_have_other_string_names: true,
+        }
+    } else {
+        get_field_names(db, cache, root, sites, index_expr)
+    };
     let collect_finite_direct_assignment = mode.collect_finite_direct_assignments()
         && is_dynamic_index_key(index_expr)
         && !field_names.names.is_empty();
