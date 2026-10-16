@@ -2181,4 +2181,14 @@ mod test {
         let first = ws.local_ty(file_id, "first");
         assert_eq!(ws.humanize_type(first), "number");
     }
+
+    fn param_mismatches(ws: &mut VirtualWorkspace, file_id: crate::FileId) -> usize {
+        ws.analysis
+            .diagnostic
+            .enable_only(crate::DiagnosticCode::ParamTypeMismatch);
+        ws.analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .expect("diagnostics")
+            .len()
+    }
 }

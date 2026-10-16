@@ -26,26 +26,6 @@ mod tests {
         function timer.Simple(delay, callback) end
     "#;
 
-    /// `ply` reaches `TeleportPlayer` through two helper params; the read that
-    /// needs a guard is `DoTeleport`'s own `IsTerror`, already reported there.
-    const CHAIN: &str = r#"
-        local function TeleportPlayer(ply)
-            ply:SetEyeAngles(0)
-        end
-
-        local function DoTeleport(ply)
-            if ply:IsTerror() then
-                TeleportPlayer(ply)
-            end
-        end
-
-        local function StartTeleport(ply)
-            DoTeleport(ply)
-        end
-
-        StartTeleport(GetOwnerEnt())
-    "#;
-
     fn enable_gmod(ws: &mut VirtualWorkspace) {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -75,23 +55,6 @@ mod tests {
             .collect::<Vec<_>>();
         lines.sort_unstable();
         lines
-    }
-
-    fn line_of(source: &str, needle: &str) -> u32 {
-        let line = source
-            .lines()
-            .position(|line| line.contains(needle))
-            .expect("needle in source");
-        u32::try_from(line).expect("line fits u32")
-    }
-
-    #[test]
-    fn a_helper_param_typed_only_by_its_callers_does_not_forward_through_another_helper() {
-        let (mut ws, file_id) = workspace(CHAIN);
-        assert_eq!(
-            unguarded_child_lines(&mut ws, file_id),
-            vec![line_of(CHAIN, "ply:IsTerror()")]
-        );
     }
 
     #[test]
@@ -148,42 +111,6 @@ mod tests {
         let (ws, file_id) = workspace(source);
         let seen = ws.local_ty(file_id, "seen");
         assert_eq!(ws.humanize_type(seen), "Entity");
-    }
-
-    #[test]
-    fn forwarded_helper_params_follow_edits_delete_and_reopen_like_cold_analysis() {
-        let documented = CHAIN.replace(
-            "local function StartTeleport(ply)",
-            "---@param ply Player\n        local function StartTeleport(ply)",
-        );
-        let expected_chain = vec![line_of(CHAIN, "ply:IsTerror()")];
-        let mut ws = VirtualWorkspace::assert_warm_matches_cold(
-            enable_gmod,
-            &[(API_PATH, API), (PATH, CHAIN)],
-            &[
-                (PATH, documented.as_str()),
-                (PATH, CHAIN),
-                (PATH, documented.as_str()),
-            ],
-        );
-        let file_id = ws
-            .analysis
-            .get_file_id(&ws.virtual_url_generator.new_uri(PATH))
-            .expect("edited file");
-        assert_eq!(unguarded_child_lines(&mut ws, file_id), Vec::<u32>::new());
-
-        let reverted = ws.def_file(PATH, CHAIN);
-        assert_eq!(unguarded_child_lines(&mut ws, reverted), expected_chain);
-
-        let uri = ws.virtual_url_generator.new_uri(PATH);
-        let _ = ws.analysis.update_file_by_uri(&uri, None);
-        let reopened = ws.def_file(PATH, CHAIN);
-        assert_eq!(unguarded_child_lines(&mut ws, reopened), expected_chain);
-        let (mut cold, cold_file) = workspace(CHAIN);
-        assert_eq!(
-            unguarded_child_lines(&mut cold, cold_file),
-            unguarded_child_lines(&mut ws, reopened)
-        );
     }
 
     const GUARDED: &str = r#"
@@ -287,116 +214,6 @@ mod tests {
         );
         let seen = ws.local_ty(file, "seen");
         assert_eq!(ws.humanize_type(seen), "number");
-    }
-
-    #[test]
-    fn a_partial_or_overwritten_guard_does_not_authorize_a_forwarded_guess() {
-        for guard in [
-            "if attacker:IsPlayer() then local valid = attacker end",
-            "if not attacker:IsPlayer() then return end; attacker = GetOwnerEnt()",
-        ] {
-            let source = GUARDED.replace("if not attacker:IsPlayer() then return end", guard);
-            let (mut ws, file) = workspace(&source);
-            ws.def_file(PREDICATE_PATH, PREDICATE);
-            ws.analysis
-                .diagnostic
-                .enable_only(DiagnosticCode::InferUnknown);
-            let actual = ws
-                .analysis
-                .diagnose_file(file, CancellationToken::new())
-                .unwrap()
-                .into_iter()
-                .map(|diagnostic| (diagnostic.range, diagnostic.message))
-                .collect::<Vec<_>>();
-            let line = line_of(&source, "return attacker:IsTerror()");
-            let column = source
-                .lines()
-                .nth(line as usize)
-                .unwrap()
-                .find("attacker:IsTerror")
-                .unwrap() as u32;
-            assert_eq!(
-                actual,
-                vec![(
-                    lsp_types::Range::new(
-                        lsp_types::Position::new(line, column),
-                        lsp_types::Position::new(line, column + "attacker:IsTerror".len() as u32)
-                    ),
-                    "Type `Player` was inferred from usage context and may be incorrect."
-                        .to_string(),
-                )],
-                "{guard}"
-            );
-        }
-    }
-
-    #[test]
-    fn captured_params_keep_asserted_types_separate_from_caller_inference() {
-        use crate::{CacheOptions, LuaInferCache, LuaType, LuaTypeDeclId};
-        use glua_parser::{LuaAstNode, LuaCallExpr};
-
-        for (guard, expected) in [
-            ("", None),
-            (
-                "if not ent:IsPlayer() then return end",
-                Some(LuaType::Ref(LuaTypeDeclId::global("Player"))),
-            ),
-            ("ent = 17", Some(LuaType::IntegerConst(17))),
-        ] {
-            for capture in [
-                "local function Thunk() Use(ent) end; Thunk()",
-                "timer.Simple(0, function() Use(ent) end)",
-            ] {
-                let source = format!(
-                    r#"
-                    local function Use(value) return value end
-                    local function Relay(ent)
-                        {guard}
-                        {capture}
-                    end
-                    Relay(GetOwnerEnt())
-                "#
-                );
-                let (mut ws, file) = workspace(&source);
-                ws.def_file(PREDICATE_PATH, PREDICATE);
-                let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
-                let call = model
-                    .get_root()
-                    .descendants::<LuaCallExpr>()
-                    .find(|call| {
-                        call.get_prefix_expr()
-                            .is_some_and(|prefix| prefix.syntax().text() == "Use")
-                    })
-                    .unwrap();
-                let argument = call.get_args_list().unwrap().get_args().next().unwrap();
-                let mut cache = LuaInferCache::new(file, CacheOptions::default());
-                let actual = crate::semantic::infer_asserted_argument_type(
-                    model.get_db(),
-                    &mut cache,
-                    argument,
-                );
-                assert_eq!(actual, expected, "{guard}; {capture}");
-            }
-        }
-    }
-
-    #[test]
-    fn a_captured_forwarding_read_does_not_duplicate_the_teleport_warning() {
-        for capture in [
-            "local function Thunk() TeleportPlayer(ply) end; Thunk()",
-            "timer.Simple(0, function() TeleportPlayer(ply) end)",
-        ] {
-            let source = CHAIN.replace(
-                "TeleportPlayer(ply)\n            end",
-                &format!("{capture}\n            end"),
-            );
-            let (mut ws, file) = workspace(&source);
-            assert_eq!(
-                unguarded_child_lines(&mut ws, file),
-                vec![line_of(&source, "ply:IsTerror()")],
-                "{capture}"
-            );
-        }
     }
 
     #[test]

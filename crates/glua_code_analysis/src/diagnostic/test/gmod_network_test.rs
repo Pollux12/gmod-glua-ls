@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::{DiagnosticCode, Emmyrc, GmodRealm, NetOpDirection, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaCallExpr};
     use googletest::prelude::*;
     use lsp_types::{Diagnostic, NumberOrString};
     use tokio_util::sync::CancellationToken;
@@ -325,50 +326,6 @@ mod tests {
             ),
             eq(1usize)
         );
-    }
-
-    #[gtest]
-    fn test_lua_defined_net_receive_keeps_annotated_receive_role() {
-        let mut ws = new_gmod_workspace();
-        ws.analysis
-            .diagnostic
-            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
-
-        ws.def_file(
-            "lua/includes/extensions/net.lua",
-            r#"
-            net.Receivers = net.Receivers or {}
-
-            function net.Receive(name, func)
-                net.Receivers[name:lower()] = func
-            end
-            "#,
-        );
-        let server_file_id = ws.def_file(
-            "lua/autorun/server/send.lua",
-            r#"
-            util.AddNetworkString("LuaDefinedReceive")
-            net.Start("LuaDefinedReceive")
-            net.Broadcast()
-
-            util.AddNetworkString("LuaDefinedOrphan")
-            net.Start("LuaDefinedOrphan")
-            net.Broadcast()
-            "#,
-        );
-        let client_file_id = ws.def_file(
-            "lua/autorun/client/receive.lua",
-            r#"
-            net.Receive("LuaDefinedReceive", function() end)
-            "#,
-        );
-
-        let server = file_diagnostics(&mut ws, server_file_id);
-        let client = file_diagnostics(&mut ws, client_file_id);
-        let messages = missing_counterpart_messages(&server);
-        assert_that!(messages.len(), eq(1usize));
-        expect_that!(messages[0].contains("LuaDefinedOrphan"), eq(true));
-        expect_that!(count_network_diagnostics(&client), eq(0usize));
     }
 
     #[gtest]

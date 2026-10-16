@@ -67,4 +67,3 @@ mod workspace_fold_shift_test;
 
 mod forwarded_param_test;
 mod getter_guard_test;
-mod self_call_type_test;

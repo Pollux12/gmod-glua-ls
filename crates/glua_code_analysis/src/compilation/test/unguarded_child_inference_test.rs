@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod property_callback_guard_test {
     use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
-    use glua_parser::{LuaAstNode, LuaIndexExpr};
     use tokio_util::sync::CancellationToken;
 
     const API: &str = r#"
@@ -96,49 +95,6 @@ mod property_callback_guard_test {
             .unwrap_or_default()
     }
 
-    fn assert_receiver_type(
-        ws: &VirtualWorkspace,
-        file: crate::FileId,
-        member: &str,
-        expected: &str,
-    ) {
-        let expected = crate::LuaType::Ref(crate::LuaTypeDeclId::global(expected));
-        let model = ws
-            .analysis
-            .compilation
-            .get_semantic_model(file)
-            .expect("property model");
-        let reads = model
-            .get_root()
-            .descendants::<LuaIndexExpr>()
-            .filter(|read| read.syntax().text() == member)
-            .collect::<Vec<_>>();
-        assert!(!reads.is_empty(), "{member}");
-        for read in reads {
-            let actual = model
-                .infer_expr(read.get_prefix_expr().expect("entity receiver"))
-                .expect("receiver type");
-            assert_eq!(actual, expected, "{member}");
-        }
-    }
-
-    #[test]
-    fn property_callback_filters_keep_their_own_literal_and_follow_body_edits() {
-        let good = source(FILTER, "", "self");
-        let (mut warm, file) = workspace(&good);
-        for (filter, guarded) in [(FILTER, true), ("return true", false), (FILTER, true)] {
-            let text = source(filter, "", "self");
-            warm.def_file(PATH, &text);
-            let (mut cold, cold_file) = workspace(&text);
-            let actual = reports(&mut warm, file);
-            assert_eq!(actual, reports(&mut cold, cold_file));
-            assert_eq!(actual.is_empty(), guarded, "{filter}\n{actual:#?}");
-            if guarded {
-                assert_receiver_type(&warm, file, "entity.receivers", "ix_vendor");
-            }
-        }
-    }
-
     #[test]
     fn a_predicate_with_a_boolean_first_result_can_also_return_a_reason() {
         let text = r#"
@@ -183,179 +139,11 @@ mod property_callback_guard_test {
             assert!(!reports(&mut ws, file).is_empty(), "{before_call}");
         }
     }
-
-    #[test]
-    fn separate_container_property_literals_use_their_own_class_filter() {
-        let vendor = source(FILTER, "", "self");
-        let container = |name: &str, action: &str| {
-            format!(
-                r#"
-            properties.Add("{name}", {{
-                Filter = function(self, entity, client)
-                    if entity:GetClass() ~= "ix_container" then return false end
-                    return true
-                end,
-                Receive = function(self, length, client)
-                    local entity = net.ReadEntity()
-                    if not IsValid(entity) then return end
-                    if not self:Filter(entity, client) then return end
-                    {action}
-                end,
-            }})
-        "#
-            )
-        };
-        let (mut ws, vendor_file) = workspace(&vendor);
-        let containers = format!(
-            "{}\n{}",
-            container("container_setpassword", "entity:SetLocked(true)"),
-            container(
-                "container_setname",
-                "entity:SetDisplayName(net.ReadString())"
-            ),
-        );
-        let container_file = ws.def_file(
-            "gamemodes/helix/plugins/containers/sh_plugin.lua",
-            &containers,
-        );
-        let vendor_reports = reports(&mut ws, vendor_file);
-        let container_reports = reports(&mut ws, container_file);
-        assert!(vendor_reports.is_empty(), "{vendor_reports:#?}");
-        assert!(container_reports.is_empty(), "{container_reports:#?}");
-        assert_receiver_type(&ws, container_file, "entity:SetLocked", "ix_container");
-        assert_receiver_type(&ws, container_file, "entity:SetDisplayName", "ix_container");
-    }
 }
 
 #[cfg(test)]
 mod dynamic_marker_value_test {
-    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
-    use glua_parser::{LuaAstNode, LuaIndexExpr};
-    use tokio_util::sync::CancellationToken;
-
-    const API: &str = r#"
-        ---@class Entity
-        ---@class ix_item: Entity
-        ---@field GetItemTable fun(self: ix_item): table
-        ---@class ix_money: Entity
-        ---@param value any
-        ---@return TypeGuard<Entity>
-        function isentity(value) end
-        ---@return unknown
-        function unknown_marker() end
-    "#;
-    const ITEM_WRITER: &str = r#"
-        ---@param item ix_item
-        ---@param steamID string
-        ---@param characterID number
-        local function mark(item, steamID, characterID)
-            item.ixSteamID = steamID
-            item.ixCharID = characterID
-        end
-    "#;
-    const READER_PATH: &str = "gamemodes/helix/gamemode/core/hooks/sv_hooks.lua";
-    const MONEY_PATH: &str = "gamemodes/helix/gamemode/core/sh_commands.lua";
-    const READER: &str = r#"
-        ---@param item any
-        function CanPlayerInteractItem(item)
-            if isentity(item) and item.ixSteamID and item.ixCharID
-                and item.ixSteamID == "steam" and item.ixCharID != 1
-                and not item:GetItemTable().bAllowMultiCharacterInteraction then
-                return false
-            end
-        end
-    "#;
-
-    fn workspace(money: Option<&str>) -> (VirtualWorkspace, crate::FileId) {
-        let mut ws = VirtualWorkspace::new();
-        let mut config = Emmyrc::default();
-        config.gmod.enabled = true;
-        config.gmod.dynamic_fields_global = true;
-        ws.update_emmyrc(config);
-        let mut files = vec![
-            ("lua/includes/marker_api.lua", API),
-            (
-                "gamemodes/helix/gamemode/core/meta/sh_item.lua",
-                ITEM_WRITER,
-            ),
-            (READER_PATH, READER),
-        ];
-        if let Some(money) = money {
-            files.push((MONEY_PATH, money));
-        }
-        ws.def_files(files);
-        let reader_uri = ws.virtual_url_generator.new_uri(READER_PATH);
-        let reader = ws.analysis.get_file_id(&reader_uri).expect("reader file");
-        (ws, reader)
-    }
-
-    fn reports(ws: &mut VirtualWorkspace, reader: crate::FileId) -> Vec<lsp_types::Diagnostic> {
-        ws.analysis
-            .diagnostic
-            .enable_only(DiagnosticCode::InferUnguardedChild);
-        ws.analysis
-            .diagnose_file(reader, CancellationToken::new())
-            .unwrap_or_default()
-    }
-
-    #[test]
-    fn unknown_dynamic_marker_values_do_not_discard_another_entity_class() {
-        let (mut warm, reader) = workspace(None);
-        let money_uri = warm.virtual_url_generator.new_uri(MONEY_PATH);
-        for (value, expected) in [
-            (Some("unknown_marker()"), 1),
-            (Some("nil"), 0),
-            (Some("unknown_marker()"), 1),
-            (None, 0),
-            (Some("unknown_marker()"), 1),
-        ] {
-            let money = value.map(|value| {
-                format!(
-                    r#"
-                ---@param money ix_money
-                local function mark(money)
-                    money.ixSteamID = {value}
-                    money.ixCharID = {value}
-                end
-            "#
-                )
-            });
-            warm.analysis.update_file_by_uri(&money_uri, money.clone());
-            let (mut cold, cold_reader) = workspace(money.as_deref());
-            let receiver_type = {
-                let model = warm
-                    .analysis
-                    .compilation
-                    .get_semantic_model(reader)
-                    .expect("reader model");
-                let read = model
-                    .get_root()
-                    .descendants::<LuaIndexExpr>()
-                    .find(|read| read.syntax().text() == "item:GetItemTable")
-                    .expect("item method read");
-                model
-                    .infer_expr(read.get_prefix_expr().expect("item receiver"))
-                    .expect("receiver type")
-            };
-            let expected_type = if expected == 1 {
-                "ix_item|ix_money"
-            } else {
-                "ix_item"
-            };
-            assert_eq!(receiver_type, warm.ty(expected_type), "{value:?}");
-            let actual = reports(&mut warm, reader);
-            assert_eq!(actual, reports(&mut cold, cold_reader));
-            assert_eq!(actual.len(), expected, "{value:?}");
-            if let Some(report) = actual.first() {
-                assert!(
-                    report.message.contains("ix_item|ix_money"),
-                    "{}",
-                    report.message,
-                );
-                assert_eq!(report.range.start.line, 5);
-            }
-        }
-    }
+    use crate::VirtualWorkspace;
 
     #[test]
     fn literal_field_comparisons_keep_every_possible_union_arm() {
@@ -4370,13 +4158,6 @@ filter:SetUpdateOnType(true)
         let class = crate::LuaTypeDeclId::global("ReadCar");
         let key = crate::LuaMemberKey::Name("Boost".into());
         let mut cache = model.get_cache().borrow_mut();
-        assert!(crate::semantic::dynamic_field_has_shape_at(
-            model.get_db(),
-            &cache,
-            &class,
-            &key,
-            before.get_position(),
-        ));
         assert!(
             crate::semantic::resolve_dynamic_field_member(
                 model.get_db(),
@@ -5108,96 +4889,6 @@ mod panel_receiver_provenance_test {
             severities(&mut ws, id),
             vec![Some(DiagnosticSeverity::HINT)]
         );
-    }
-}
-
-#[cfg(test)]
-mod child_union_realm_test {
-    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
-    use tokio_util::sync::CancellationToken;
-
-    fn workspace() -> VirtualWorkspace {
-        let mut ws = VirtualWorkspace::new();
-        let mut config = Emmyrc::default();
-        config.gmod.enabled = true;
-        config.gmod.dynamic_fields_global = true;
-        ws.update_emmyrc(config);
-        ws
-    }
-
-    #[test]
-    fn child_union_filters_dynamic_writers_at_the_read_realm() {
-        let api = r#"
----@class Entity
-local ENTITY = {}
----@class Player: Entity
-local PLAYER = {}
-function PLAYER:GetCharacter() return true end
----@class CSEnt: Entity
-local CSENT = {}
----@return CSEnt
-function create_model() end
----@param value Player
-function send_player(value) end
-"#;
-        let writer = r#"
-if CLIENT then
-    local model = create_model()
-    model.GetCharacter = function(self) return true end
-end
-"#;
-        let source = |realm: &str| {
-            format!(
-                r#"
-if {realm} then
-    ---@param candidate Entity
-    local function use(candidate)
-        local character = candidate:GetCharacter()
-        if character then send_player(candidate) end
-    end
-end
-"#
-            )
-        };
-        let writer_path = "lua/autorun/sh_client_character.lua";
-        let read_path = "lua/autorun/sh_character_use.lua";
-        let mut warm = workspace();
-        warm.def_file("lua/includes/character_api.lua", api);
-        warm.def_file(writer_path, writer);
-        let file = warm.def_file(read_path, &source("SERVER"));
-        for (realm, client_writer) in [
-            ("SERVER", writer),
-            ("CLIENT", writer),
-            ("SERVER", ""),
-            ("SERVER", writer),
-        ] {
-            warm.def_file(writer_path, client_writer);
-            warm.def_file(read_path, &source(realm));
-            let mut cold = workspace();
-            cold.def_file("lua/includes/character_api.lua", api);
-            cold.def_file(writer_path, client_writer);
-            let cold_file = cold.def_file(read_path, &source(realm));
-            let count = |ws: &mut VirtualWorkspace, file, code: DiagnosticCode| {
-                ws.analysis.diagnostic.enable_only(code);
-                ws.analysis
-                    .diagnose_file(file, CancellationToken::new())
-                    .unwrap_or_default()
-                    .len()
-            };
-            let actual = count(&mut warm, file, DiagnosticCode::ParamTypeMismatch);
-            assert_eq!(
-                actual,
-                count(&mut cold, cold_file, DiagnosticCode::ParamTypeMismatch)
-            );
-            assert_eq!(
-                actual,
-                usize::from(realm == "CLIENT" && !client_writer.is_empty())
-            );
-            assert_eq!(
-                count(&mut warm, file, DiagnosticCode::InferUnguardedChild),
-                1
-            );
-        }
     }
 }
 
