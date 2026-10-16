@@ -510,60 +510,21 @@ fn net_call_fact(
     helper_registry: &HelperRegistry,
     syntax: &FileNetSyntax,
 ) -> Option<NetCallFact> {
-    let call_target = super::super::call_target::call_target_of(db, file_id, call_expr);
-    let signature_id = call_target.and_then(crate::LuaCallTarget::signature_id);
-    let (mut role, mut role_signature_id) = call_target
-        .and_then(|target| named_net_call_role(db, call_expr, target))
-        .unzip();
-    let unresolved_callable = call_expr.get_prefix_expr().is_some_and(|prefix| {
-        NetValueOrigins {
-            expected_role: role.clone(),
-            home_file: Some(file_id),
-            syntax: Some(syntax),
-            target: call_target,
-            ..Default::default()
-        }
-        .value(db, file_id, call_expr, prefix, 0)
-    });
-    let opaque_payload = unresolved_callable
-        || (role.is_none()
-            && call_target.is_some_and(|target| {
-                let signatures = net_target_signatures(target);
-                signatures.len() > 1
-                    && (!common_net_callable_identity(db, &signatures)
-                        || signatures.iter().any(|signature_id| {
-                            net_call_role(db, call_expr, *signature_id).is_some()
-                        }))
-            }));
-    let opaque_start = opaque_payload
-        && call_target.is_some_and(|target| {
-            net_target_signatures(target).iter().any(|signature_id| {
-                matches!(
-                    net_call_role(db, call_expr, *signature_id),
-                    Some(NetCallRole::Start { .. })
-                )
-            })
-        });
-    let target = if opaque_payload {
-        None
-    } else {
-        resolve_call_to_function_block(
-            file_id,
-            call_expr,
-            helper_registry,
-            syntax,
-            signature_id,
-            db,
-        )
-    };
-    if unresolved_callable {
-        role = None;
-        role_signature_id = None;
-    }
-    if role.is_none() && target.is_none() && !opaque_payload {
+    let signature_id = super::super::call_target::call_target_of(db, file_id, call_expr)
+        .and_then(crate::LuaCallTarget::signature_id);
+    let role = signature_id.and_then(|signature_id| net_call_role(db, call_expr, signature_id));
+    let target = resolve_call_to_function_block(
+        file_id,
+        call_expr,
+        helper_registry,
+        syntax,
+        signature_id,
+        db,
+    );
+    if role.is_none() && target.is_none() {
         return None;
     }
-    let bits_param_idx = match (&role, role_signature_id) {
+    let bits_param_idx = match (&role, signature_id) {
         (Some(NetCallRole::Payload(_)), Some(signature_id)) => {
             bits_param_idx(db, call_expr, signature_id)
         }
@@ -1034,64 +995,6 @@ fn resolve_call_to_function_block(
     }
 
     None
-}
-
-fn net_target_signatures(target: &crate::LuaCallTarget) -> Vec<LuaSignatureId> {
-    let mut signatures = target
-        .declared
-        .iter()
-        .chain(&target.inferred)
-        .chain(&target.unique)
-        .copied()
-        .collect::<Vec<_>>();
-    signatures.sort_unstable_by_key(|id| (id.get_file_id().id, id.get_position()));
-    signatures.dedup();
-    signatures
-}
-
-fn common_net_callable_identity(db: &DbIndex, signatures: &[LuaSignatureId]) -> bool {
-    let mut common = None;
-    for &signature_id in signatures {
-        let Some(identity) = db
-            .get_helper_scan::<FileHelperScan>(signature_id.get_file_id())
-            .and_then(|scan| scan.callable_identities.get(&signature_id).cloned())
-        else {
-            return false;
-        };
-        match &common {
-            Some(common) if common != &identity => return false,
-            None => common = Some(identity),
-            _ => {}
-        }
-    }
-    common.is_some()
-}
-
-fn named_net_call_role(
-    db: &DbIndex,
-    call_expr: &LuaCallExpr,
-    target: &crate::LuaCallTarget,
-) -> Option<(NetCallRole, LuaSignatureId)> {
-    let signatures = net_target_signatures(target);
-    let common_identity = signatures.len() > 1 && common_net_callable_identity(db, &signatures);
-    let mut agreed: Option<(NetCallRole, Option<usize>, LuaSignatureId)> = None;
-    for signature_id in signatures {
-        let Some(role) = net_call_role(db, call_expr, signature_id) else {
-            if common_identity {
-                continue;
-            }
-            return None;
-        };
-        let bits = bits_param_idx(db, call_expr, signature_id);
-        match &agreed {
-            Some((agreed_role, agreed_bits, _)) if *agreed_role != role || *agreed_bits != bits => {
-                return None;
-            }
-            Some(_) => {}
-            None => agreed = Some((role, bits, signature_id)),
-        }
-    }
-    agreed.map(|(role, _, signature_id)| (role, signature_id))
 }
 
 /// The net role of `call_expr`, which targets `signature_id`, from signature metadata.
