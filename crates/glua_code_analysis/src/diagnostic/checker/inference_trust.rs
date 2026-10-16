@@ -6,7 +6,7 @@ use crate::{
     semantic::{ParamInferenceSource, infer_param_source},
 };
 
-use super::{Checker, DiagnosticContext, named_param};
+use super::{Checker, DiagnosticContext};
 
 /// A tie lists this many candidate children before it falls back to a count.
 const MAX_LISTED_CHILDREN: usize = 3;
@@ -70,7 +70,20 @@ impl Checker for InferenceTrustChecker {
                 .and_then(|step| step.inferred_type.as_deref())
                 .unwrap_or_else(|| inference.fact.typ());
             let typ = humanize_type(semantic_model.get_db(), inferred_type, RenderLevel::Simple);
-            context.add_diagnostic(
+            let severity = if is_unguarded_child {
+                step.and_then(|step| step.found_type.as_deref())
+                    .and_then(|found| {
+                        let index = use_index_expr(
+                            semantic_model,
+                            context.get_file_id(),
+                            &inference.event.source,
+                        )?;
+                        unguarded_child_severity(context, semantic_model, &index, found)
+                    })
+            } else {
+                None
+            };
+            context.add_diagnostic_with_severity(
                 code,
                 inference.event.source.value.get_range(),
                 if is_unguarded_child {
@@ -91,6 +104,7 @@ impl Checker for InferenceTrustChecker {
                 } else {
                     format!("Type `{typ}` was inferred from usage context and may be incorrect.")
                 },
+                severity,
                 None,
             );
         }

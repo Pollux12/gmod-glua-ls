@@ -445,7 +445,13 @@ fn check_index_expr(
             })
             .collect::<Vec<_>>();
         let found = crate::humanize_type(db, &prefix_typ, crate::RenderLevel::Simple);
-        context.add_diagnostic(
+        let severity = super::inference_trust::unguarded_child_severity(
+            context,
+            semantic_model,
+            index_expr,
+            &prefix_typ,
+        );
+        context.add_diagnostic_with_severity(
             DiagnosticCode::InferUnguardedChild,
             index_expr.get_range(),
             super::inference_trust::unguarded_children_message(
@@ -453,6 +459,7 @@ fn check_index_expr(
                 &found,
                 &children,
             ),
+            severity,
             None,
         );
         return Some(());
