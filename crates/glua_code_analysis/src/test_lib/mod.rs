@@ -374,6 +374,13 @@ function Panel:Add(className) end
 ---@param parent Panel
 function Panel:SetParent(parent) end
 
+---@[call_arg("gmod.vgui_panel", "own_class")]
+---@param class string
+---@param dpropertysheet any
+---@param width number
+---@param height number
+function Panel:GenerateExample(class, dpropertysheet, width, height) end
+
 ---@class DDragBase: Panel
 ---@field GetParent fun(self: DDragBase): Panel
 ---@class DHorizontalScroller: Panel

@@ -2110,6 +2110,7 @@ mod test {
         let file_id = ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
                 ---@class DScrollPanel: Panel
                 ---@class DCategoryList: DScrollPanel
                 ---@class DCollapsibleCategory: Panel
@@ -2164,6 +2165,7 @@ mod test {
         ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
                 ---@class DButton: Panel
 
                 ---@generic T: Panel
@@ -2203,6 +2205,7 @@ mod test {
         ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
 
                 ---@generic T: Panel
                 ---@[call_arg("gmod.vgui_panel", "reference")]
@@ -2241,6 +2244,7 @@ mod test {
         ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
 
                 local PANEL = {}
                 derma.DefineControl("FirstPanel", "", PANEL, "Panel")
@@ -2274,6 +2278,7 @@ mod test {
         ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
 
                 local PANEL = {}
                 derma.DefineControl("FirstPanel", "", PANEL, "Panel")
@@ -2305,6 +2310,7 @@ mod test {
         ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
 
                 ---@param name string
                 function someFunction(name)
@@ -2334,6 +2340,7 @@ mod test {
         ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
 
                 local PANEL = {}
 
@@ -2366,6 +2373,7 @@ mod test {
         ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
                 ---@class DCategoryList: Panel
 
                 local ctrl = vgui.Create("DCategoryList")
@@ -2397,6 +2405,7 @@ mod test {
         ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
                 ---@class DCategoryList: Panel
                 known = vgui.Create("DCategoryList")
                 placeholder = vgui.Create("LatePanel")
@@ -2436,6 +2445,7 @@ mod test {
             "lua/autorun/client/vgui_reassigned_color_mixer.lua",
             r#"
                 ---@class Panel
+                Panel = Panel or {}
                 ---@class DForm: Panel
                 local DForm = {}
 
@@ -2497,6 +2507,442 @@ mod test {
                 .all(|diagnostic| !undefined_member_codes.contains(&diagnostic.code)),
             "DColorMixer reassignment should replace the older local panel type, got {diagnostics:?}"
         );
+    }
+
+    // ── VGUI panel reference: annotation-driven contextual binding ────
+
+    #[gtest]
+    fn test_vgui_panel_ref_does_not_infer_for_arbitrary_method_param() {
+        // `vgui.Create(panelClass)` inside an ordinary method of a registered
+        // panel must NOT resolve to the enclosing class `TF`: a non-literal
+        // class name keeps the generic `Panel` constraint.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+
+                local TF = {}
+
+                function TF:AddTab(panelClass)
+                    local p = vgui.Create(panelClass, self)
+                    a = p
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("Panel");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_still_infers_generate_example_class_param() {
+        // `Panel:GenerateExample`'s `class` parameter carries the
+        // `call_arg("gmod.vgui_panel", "own_class")` role in the test
+        // builtins, so `vgui.Create(ClassName)` inside the override binds the
+        // registered class.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+
+                local TF = {}
+
+                function TF:GenerateExample(ClassName)
+                    local p = vgui.Create(ClassName)
+                    a = p
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("TF");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_literal_reassignment_uses_the_value_at_the_read() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/vgui/own_class_literal_reassignment.lua",
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+                ---@class DScrollPanel: DPanel
+
+                local TF = {}
+                function TF:OnlyTF() end
+
+                function TF:GenerateExample(class)
+                    class = "DScrollPanel"
+                    local panel = vgui.Create(class)
+                    a = panel
+                    panel:OnlyTF()
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let product = ws.expr_ty("a");
+        assert_eq!(unwrap_instance(&product), &ws.ty("DScrollPanel"));
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let invalid_member_codes = [
+            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
+            DiagnosticCode::InferUnguardedChild,
+        ]
+        .map(|code| Some(NumberOrString::String(code.get_name().to_string())));
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                invalid_member_codes.contains(&diagnostic.code)
+                    && diagnostic.message.contains("OnlyTF")
+            }),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_unknown_reassignment_uses_the_value_at_the_read() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/vgui/own_class_unknown_reassignment.lua",
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+                ---@class DScrollPanel: DPanel
+
+                local TF = {}
+                function TF:OnlyTF() end
+
+                ---@param replacement unknown
+                function TF:GenerateExample(class, replacement)
+                    class = replacement
+                    local panel = vgui.Create(class)
+                    a = panel
+                    panel:OnlyTF()
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let product = ws.expr_ty("a");
+        assert_eq!(unwrap_instance(&product), &ws.ty("Panel"));
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let invalid_member_codes = [
+            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
+            DiagnosticCode::InferUnguardedChild,
+        ]
+        .map(|code| Some(NumberOrString::String(code.get_name().to_string())));
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                invalid_member_codes.contains(&diagnostic.code)
+                    && (diagnostic.message.contains("OnlyTF")
+                        || diagnostic.message.contains("expected `TF`"))
+            }),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_survives_a_completed_branch_that_leaves_the_param_unchanged() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/vgui/own_class_completed_branch.lua",
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+
+                local TF = {}
+                function TF:OnlyTF() end
+
+                function TF:GenerateExample(class)
+                    if class == "TF" then print("preview") end
+                    local panel = vgui.Create(class)
+                    a = panel
+                    panel:OnlyTF()
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let product = ws.expr_ty("a");
+        assert_eq!(unwrap_instance(&product), &ws.ty("TF"));
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let invalid_member_codes = [
+            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
+            DiagnosticCode::InferUnguardedChild,
+        ]
+        .map(|code| Some(NumberOrString::String(code.get_name().to_string())));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| invalid_member_codes.contains(&diagnostic.code)),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_branch_narrowing_uses_the_value_at_the_read() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/vgui/own_class_branch_narrowing.lua",
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+                ---@class DScrollPanel: DPanel
+
+                local TF = {}
+                function TF:OnlyTF() end
+
+                function TF:GenerateExample(class)
+                    if class == "DScrollPanel" then
+                        local panel = vgui.Create(class)
+                        a = panel
+                        panel:OnlyTF()
+                    end
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let product = ws.expr_ty("a");
+        assert_eq!(unwrap_instance(&product), &ws.ty("DScrollPanel"));
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let invalid_member_codes = [
+            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
+            DiagnosticCode::InferUnguardedChild,
+        ]
+        .map(|code| Some(NumberOrString::String(code.get_name().to_string())));
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                invalid_member_codes.contains(&diagnostic.code)
+                    && diagnostic.message.contains("OnlyTF")
+            }),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_generate_example_later_param_does_not_bind() {
+        // Only `class` (parameter index 0) carries the `own_class` role on
+        // `Panel:GenerateExample`; a parameter in a later slot names an
+        // arbitrary class and does not bind.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+
+                local TF = {}
+
+                function TF:GenerateExample(PropertySheet, ClassName)
+                    local p = vgui.Create(ClassName)
+                    a = p
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("Panel");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_without_own_class_role_does_not_bind() {
+        // The binding is annotation-driven, not name-driven: a method named
+        // `GenerateExample` whose inherited declaration carries no
+        // `own_class` role must not resolve to the enclosing class.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+                ---@meta
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                vgui = vgui or {}
+
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+
+                ---@generic T: Panel
+                ---@[call_arg("gmod.vgui_panel", "reference")]
+                ---@param className `T`
+                ---@return (instance) T?
+                function vgui.Create(className, parent, name) end
+
+                ---@[call_arg("gmod.vgui_panel", "define")]
+                ---@param name string
+                ---@[call_arg("gmod.vgui_panel", "table")]
+                ---@param panel table
+                ---@[call_arg("gmod.vgui_panel", "base")]
+                ---@param base string
+                function vgui.Register(name, panel, base) end
+
+                ---@param class string
+                ---@param dpropertysheet any
+                function Panel:GenerateExample(class, dpropertysheet) end
+
+                local TF = {}
+
+                function TF:GenerateExample(ClassName)
+                    local p = vgui.Create(ClassName)
+                    a = p
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("Panel");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_literal_inside_registered_method_still_binds() {
+        // A literal class name inside a registered panel's method still binds
+        // the template to the named class.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+                ---@class DScrollPanel: DPanel
+
+                local TF = {}
+
+                function TF:Init()
+                    local p = vgui.Create("DScrollPanel", self)
+                    a = p
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("DScrollPanel");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_local_const_inside_registered_method_still_binds() {
+        // A non-literal argument whose declared value is a constant string
+        // still binds the template to that constant: the class name is known
+        // even though the argument expression is not itself a literal.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+                ---@class DScrollPanel: DPanel
+
+                local TF = {}
+
+                function TF:Init()
+                    local className = "DScrollPanel"
+                    local p = vgui.Create(className)
+                    a = p
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("DScrollPanel");
+        assert_eq!(base, expected);
     }
 
     #[gtest]

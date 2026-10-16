@@ -9,8 +9,8 @@ use smol_str::SmolStr;
 
 use crate::db_index::find_best_direct_call_arg_role_from_type;
 use crate::{
-    DocTypeInferContext, FileId, GenericTpl, GenericTplId, LuaDocDefaultValue, LuaFunctionType,
-    LuaGenericType, LuaSemanticDeclId, TypeVisitTrait,
+    DocTypeInferContext, FileId, GenericTpl, GenericTplId, LuaDefinitionId, LuaDocDefaultValue,
+    LuaFunctionType, LuaGenericType, LuaSemanticDeclId, TypeVisitTrait,
     db_index::{DbIndex, LuaType},
     infer_doc_type,
     semantic::{
@@ -88,13 +88,21 @@ pub(crate) fn str_tpl_arg_type(
     param_idx: usize,
     arg_type: LuaType,
 ) -> LuaType {
-    resolve_vgui_panel_ref_from_arg(db, cache, param_type, arg_expr, call_expr, param_idx)
-        .or_else(|| {
-            matches!(arg_type, LuaType::String)
-                .then(|| resolve_str_default_from_arg(db, cache, param_type, arg_expr))
-                .flatten()
-        })
-        .unwrap_or(arg_type)
+    if matches!(
+        arg_type,
+        LuaType::StringConst(_) | LuaType::DocStringConst(_)
+    ) {
+        return arg_type;
+    }
+    resolve_vgui_panel_ref_from_arg(
+        db, cache, param_type, arg_expr, &arg_type, call_expr, param_idx,
+    )
+    .or_else(|| {
+        matches!(arg_type, LuaType::String)
+            .then(|| resolve_str_default_from_arg(db, cache, param_type, arg_expr))
+            .flatten()
+    })
+    .unwrap_or(arg_type)
 }
 
 /// Resolve a flow-valid inferred string default for a call argument expression.
@@ -317,9 +325,14 @@ pub(crate) fn check_vgui_panel_ref_role(
 
 /// Resolve a VGUI panel class name from the enclosing method context.
 ///
-/// When a call argument annotated with `call_arg("gmod.vgui_panel", "reference")`
-/// is a function-parameter whose enclosing colon-method belongs to a registered
-/// VGUI panel table, resolve the argument to that panel's class name.
+/// Some engine entry points hand a panel method its own registered class
+/// name as a parameter — e.g. `PANEL:GenerateExample(class, ...)`, whose
+/// `class` parameter is annotated `call_arg("gmod.vgui_panel", "own_class")`.
+/// When a call argument annotated `call_arg("gmod.vgui_panel", "reference")`
+/// is such a parameter of the enclosing colon-method on a registered VGUI
+/// panel table, resolve the argument to that panel's class name. Any other
+/// method parameter names an arbitrary class and keeps the generic
+/// constraint.
 ///
 /// The resolution is **declaration-precise**: the enclosing colon-method's
 /// receiver variable must resolve to the same `LuaDeclId` as the registration
@@ -330,6 +343,7 @@ fn resolve_vgui_panel_ref_from_arg(
     cache: &mut LuaInferCache,
     param_type: &LuaType,
     arg_expr: &LuaExpr,
+    arg_type: &LuaType,
     call_expr: &LuaCallExpr,
     param_idx: usize,
 ) -> Option<LuaType> {
@@ -366,7 +380,10 @@ fn resolve_vgui_panel_ref_from_arg(
     let local_ref = db.get_reference_index().get_local_reference(&file_id)?;
     let arg_decl_id = local_ref.get_decl_id(&range)?;
     let decl = db.get_decl_index().get_decl(&arg_decl_id)?;
-    let crate::LuaDeclExtra::Param { signature_id, .. } = &decl.extra else {
+    let crate::LuaDeclExtra::Param {
+        idx, signature_id, ..
+    } = &decl.extra
+    else {
         return None;
     };
 
@@ -374,9 +391,42 @@ fn resolve_vgui_panel_ref_from_arg(
     if *signature_id != context.receiver_signature_id {
         return None;
     }
+    // The parameter binds the registered class name only when the method it
+    // belongs to overrides a signature marking that parameter index with
+    // `call_arg("gmod.vgui_panel", "own_class")` — the annotation contract
+    // that says the engine fills it with the panel's own class name.
+    if !crate::semantic::registered_vgui_method_param_is_own_class(db, &context, *idx) {
+        return None;
+    }
+    if !incoming_param_reaches_read(db, cache, arg_expr, decl, arg_type) {
+        return None;
+    }
+
     Some(LuaType::StringConst(
         SmolStr::new(&context.panel_name).into(),
     ))
+}
+
+/// Whether the read `arg_expr` sees the parameter `decl` as it entered: its
+/// declaration is the only definition reaching the read and no cast or
+/// narrowing in effect there changes `arg_type`, its type at the read.
+fn incoming_param_reaches_read(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    arg_expr: &LuaExpr,
+    decl: &crate::LuaDecl,
+    arg_type: &LuaType,
+) -> bool {
+    let decl_id = decl.get_id();
+    let Some(tree) = db.get_flow_index().get_flow_tree(&cache.get_file_id()) else {
+        return false;
+    };
+    let Some(flow_id) = tree.get_flow_id(arg_expr.get_syntax_id()) else {
+        return false;
+    };
+    tree.reaching_definitions(decl_id, flow_id).as_ref() == [LuaDefinitionId::Declaration(decl_id)]
+        && crate::infer_param_with_cache(db, cache, decl)
+            .is_ok_and(|incoming| &incoming == arg_type)
 }
 
 pub fn instantiate_func_generic_with_bindings(

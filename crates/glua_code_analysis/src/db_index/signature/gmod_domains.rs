@@ -95,6 +95,11 @@ pub const GMOD_ROLE_VGUI_CHILD_SELF: &str = "child_self";
 /// The call receiver is the runtime parent of the constructed VGUI panel.
 pub const GMOD_ROLE_VGUI_PARENT_SELF: &str = "parent_self";
 
+/// The parameter receives the receiver panel's own registered class name
+/// (e.g. the `class` parameter of `PANEL:GenerateExample`, which the
+/// `derma_controls` example UI fills with the registered name).
+pub const GMOD_ROLE_VGUI_OWN_CLASS: &str = "own_class";
+
 // ---------------------------------------------------------------------------
 // Phase 1 reserved metadata names.
 // ---------------------------------------------------------------------------

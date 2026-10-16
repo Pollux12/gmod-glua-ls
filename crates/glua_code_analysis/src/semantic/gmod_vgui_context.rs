@@ -1,14 +1,21 @@
-use crate::{DbIndex, FileId, LuaDeclId, LuaSignatureId, db_index::GmodScriptedClassCallMetadata};
+use crate::{
+    DbIndex, FileId, GMOD_DOMAIN_VGUI_PANEL, GMOD_ROLE_VGUI_OWN_CLASS, LuaDeclId, LuaMemberKey,
+    LuaMemberOwner, LuaSignatureId, LuaType, LuaTypeDeclId,
+    db_index::GmodScriptedClassCallMetadata, find_best_direct_call_arg_role_for_param,
+};
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaNameExpr, LuaVarExpr,
+    LuaAssignStat, LuaAstNode, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey,
+    LuaNameExpr, LuaVarExpr,
 };
 use rowan::{TextRange, TextSize};
+use smol_str::SmolStr;
 
 use super::LuaInferCache;
 
 pub(crate) struct RegisteredVguiMethodContext {
     pub panel_name: String,
     pub receiver_signature_id: LuaSignatureId,
+    pub method_name: String,
 }
 
 pub(crate) fn resolve_registered_vgui_method_context(
@@ -38,7 +45,7 @@ pub(crate) fn resolve_registered_vgui_method_context_for_func(
         .get_vgui_registrations(&file_id)
         .peekable();
     registrations.peek()?;
-    let (receiver_decl_id, receiver_position, receiver_signature_id) =
+    let (receiver_decl_id, receiver_position, receiver_signature_id, method_name) =
         panel_receiver_context_for_func(db, file_id, func_stat)?;
 
     for call in registrations {
@@ -55,6 +62,7 @@ pub(crate) fn resolve_registered_vgui_method_context_for_func(
             return Some(RegisteredVguiMethodContext {
                 panel_name,
                 receiver_signature_id,
+                method_name: method_name.clone(),
             });
         }
     }
@@ -66,7 +74,7 @@ fn panel_receiver_context_for_func(
     db: &DbIndex,
     file_id: FileId,
     func_stat: &LuaFuncStat,
-) -> Option<(LuaDeclId, TextSize, LuaSignatureId)> {
+) -> Option<(LuaDeclId, TextSize, LuaSignatureId, String)> {
     let LuaVarExpr::IndexExpr(index_expr) = func_stat.get_func_name()? else {
         return None;
     };
@@ -76,6 +84,10 @@ fn panel_receiver_context_for_func(
     {
         return None;
     }
+    let Some(LuaIndexKey::Name(method_token)) = index_expr.get_index_key() else {
+        return None;
+    };
+    let method_name = method_token.get_name_text().to_string();
     let LuaExpr::NameExpr(prefix_name) = index_expr.get_prefix_expr()? else {
         return None;
     };
@@ -89,7 +101,86 @@ fn panel_receiver_context_for_func(
         decl_id,
         range.start(),
         LuaSignatureId::from_closure(file_id, &closure),
+        method_name,
     ))
+}
+
+/// Whether the method the context names overrides a signature that marks
+/// `param_idx` with `call_arg("gmod.vgui_panel", "own_class")`.
+///
+/// The method is looked up on the registered panel class's member chain,
+/// nearest declaration first (the same traversal order the self-call contract
+/// helpers use): the user's own override carries no role, so the search falls
+/// through to the inherited declaration it overrides — e.g. the annotated
+/// `Panel:GenerateExample` whose `class` parameter the engine fills with the
+/// panel's registered class name.
+pub(crate) fn registered_vgui_method_param_is_own_class(
+    db: &DbIndex,
+    context: &RegisteredVguiMethodContext,
+    param_idx: usize,
+) -> bool {
+    let class_id = LuaTypeDeclId::global(&context.panel_name);
+    let mut supers = Vec::new();
+    class_id.collect_super_types(db, &mut supers);
+    let member_key = LuaMemberKey::Name(SmolStr::new(context.method_name.as_str()));
+    for class_id in
+        std::iter::once(class_id).chain(supers.into_iter().filter_map(|typ| match typ {
+            LuaType::Ref(id) | LuaType::Def(id) => Some(id),
+            _ => None,
+        }))
+    {
+        let Some(members) = db
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(class_id))
+        else {
+            continue;
+        };
+        for member in members {
+            if member.get_key() != &member_key {
+                continue;
+            }
+            let member_file_id = member.get_file_id();
+            let Some(index_expr) = db
+                .get_vfs()
+                .syntax_node_around(&member_file_id, member.get_syntax_id())
+                .and_then(LuaIndexExpr::cast)
+            else {
+                continue;
+            };
+            let closure = index_expr
+                .get_parent::<LuaFuncStat>()
+                .and_then(|stat| stat.get_closure())
+                .or_else(|| {
+                    let assignment = index_expr.get_parent::<LuaAssignStat>()?;
+                    let (vars, exprs) = assignment.get_var_and_expr_list();
+                    let position = vars
+                        .iter()
+                        .position(|var| var.syntax() == index_expr.syntax())?;
+                    match exprs.get(position)? {
+                        LuaExpr::ClosureExpr(body) => Some(body.clone()),
+                        _ => None,
+                    }
+                });
+            let Some(closure) = closure else {
+                continue;
+            };
+            let signature_id = LuaSignatureId::from_closure(member_file_id, &closure);
+            let Some(signature) = db.get_signature_index().get_declared(&signature_id) else {
+                continue;
+            };
+            if find_best_direct_call_arg_role_for_param(
+                signature,
+                param_idx,
+                GMOD_DOMAIN_VGUI_PANEL,
+                &[GMOD_ROLE_VGUI_OWN_CLASS],
+            )
+            .is_some()
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn registered_panel_name(call: &GmodScriptedClassCallMetadata) -> Option<String> {
