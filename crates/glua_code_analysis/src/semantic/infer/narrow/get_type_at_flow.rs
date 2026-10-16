@@ -480,6 +480,14 @@ fn get_type_at_flow_walk(
             .ok_or(InferFailReason::None)?;
         match &flow_node.kind {
             FlowNodeKind::Start | FlowNodeKind::Unreachable => {
+                if policy.proof_only
+                    && var_ref_id
+                        .get_decl_id_ref()
+                        .and_then(|decl| db.get_decl_index().get_decl(&decl))
+                        .is_some_and(|decl| decl.is_param())
+                {
+                    return Ok(LuaType::Unknown);
+                }
                 return get_var_ref_type(db, cache, var_ref_id);
             }
             FlowNodeKind::ClosureEntry(_) => {
@@ -494,7 +502,8 @@ fn get_type_at_flow_walk(
                     var_ref_id,
                     antecedent_flow_id,
                     policy.with_mode(FlowWalkMode::ClosureBaseline),
-                );
+                )?;
+                return captured_local_baseline(db, cache, root, var_ref_id, *position, baseline);
             }
             FlowNodeKind::LoopLabel | FlowNodeKind::Break | FlowNodeKind::Return => {
                 if let Some(merged_type) = try_get_multi_antecedent_type(

@@ -1014,7 +1014,18 @@ fn name_expr_var_ref_id_uncached(
 }
 
 pub fn infer_param(db: &DbIndex, decl: &LuaDecl) -> InferResult {
-    infer_param_inner(db, None, decl).map(|(typ, _)| typ)
+    infer_param_inner(db, None, decl, true).map(|(typ, _)| typ)
+}
+
+/// What declares or contracts the param `decl`, leaving out what its callers pass.
+fn infer_param_contract(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl: &LuaDecl,
+) -> Option<LuaType> {
+    infer_param_inner(db, Some(cache), decl, false)
+        .ok()
+        .map(|(typ, _)| typ)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1035,6 +1046,7 @@ fn infer_param_inner(
     db: &DbIndex,
     mut cache: Option<&mut LuaInferCache>,
     decl: &LuaDecl,
+    with_callers: bool,
 ) -> Result<(LuaType, ParamInferenceSource), InferFailReason> {
     let (param_idx, signature_id, member_id) = match &decl.extra {
         LuaDeclExtra::Param {
@@ -1158,9 +1170,12 @@ fn infer_param_inner(
         return Ok((contract_type, ParamInferenceSource::Concrete));
     }
 
+    // A closure passed as an argument holds what its callee passes it; any other
+    // function's call-site facts are what its callers pass.
     if let Some(call_site_type) = db
         .get_call_site_param_index()
         .get_inferred_param(&signature_id, param_idx)
+        && (with_callers || is_call_argument_closure(db, signature_id))
     {
         let source = db
             .get_call_site_param_index()
@@ -1183,6 +1198,10 @@ fn infer_param_inner(
                 }
             });
         return Ok((call_site_type.clone(), source));
+    }
+
+    if !with_callers {
+        return Err(InferFailReason::None);
     }
 
     if let Some(cache) = cache.as_mut()
@@ -1340,14 +1359,36 @@ fn infer_param_type_from_local_call_sites_inner(
                 continue;
             };
             arg_type
-        } else if let Some(arg_param_decl) = param_arg_decl(db, file_id, &arg) {
+        } else if let Some(decl) = param_arg_decl(db, file_id, &arg) {
             if !allow_param_args {
                 continue;
             }
-            let Some(arg_type) = infer_forwarded_param_arg_type(db, cache, arg_param_decl) else {
-                continue;
-            };
-            arg_type
+            // A param narrows its contract at the call; one only its callers type
+            // forwards what they pass, never what their own params were passed.
+            let contract = infer_param_contract(db, cache, decl);
+            let narrowed = contract
+                .as_ref()
+                .and_then(|contract| call_argument_flow_type(db, cache, &arg, contract));
+            let asserted = narrowed.or_else(|| {
+                if contract.is_none() {
+                    super::narrow::infer_asserted_argument_type(db, cache, arg.clone())
+                } else {
+                    None
+                }
+            });
+            match asserted {
+                Some(narrowed) => narrowed,
+                None => {
+                    let Some(forwarded) = infer_forwarded_param_arg_type(db, cache, decl) else {
+                        continue;
+                    };
+                    if contract.is_some() {
+                        forwarded
+                    } else {
+                        call_argument_flow_type(db, cache, &arg, &forwarded).unwrap_or(forwarded)
+                    }
+                }
+            }
         } else {
             let Some(arg_type) = infer_supported_non_param_call_arg_type(db, cache, file_id, arg)
             else {
@@ -1501,7 +1542,22 @@ fn infer_forwarded_param_arg_type(
     if decl.get_file_id() != signature_id.get_file_id() {
         return None;
     }
+    let closure = signature_closure(db, signature_id)?;
+    let name = closure.get_parent::<LuaLocalFuncStat>()?.get_local_name()?;
+    let target = LuaDeclId::new(signature_id.get_file_id(), name.get_position());
+    let calls = local_function_call_sites(db, cache, signature_id.get_file_id(), target);
+    infer_param_type_from_local_call_sites_inner(
+        db,
+        cache,
+        calls,
+        idx,
+        false,
+        decl.get_name() == "...",
+    )
+}
 
+/// The closure whose signature `signature_id` is.
+fn signature_closure(db: &DbIndex, signature_id: LuaSignatureId) -> Option<LuaClosureExpr> {
     let root = db
         .get_vfs()
         .syntax_tree_around(
@@ -1509,29 +1565,20 @@ fn infer_forwarded_param_arg_type(
             TextRange::empty(signature_id.get_position()),
         )?
         .get_red_root();
-    // The signature's position is where its closure starts, so descend to that
-    // offset instead of scanning every node in the file.
-    let closure = root
-        .token_at_offset(signature_id.get_position())
+    root.token_at_offset(signature_id.get_position())
         .right_biased()?
         .parent_ancestors()
         .filter_map(LuaClosureExpr::cast)
-        .find(|closure| closure.get_position() == signature_id.get_position())?;
-    let local_func_name = closure
-        .get_parent::<LuaLocalFuncStat>()
-        .and_then(|local_func| local_func.get_local_name())?;
-    let target_decl_id = LuaDeclId::new(signature_id.get_file_id(), local_func_name.get_position());
+        .find(|closure| closure.get_position() == signature_id.get_position())
+}
 
-    let call_sites =
-        local_function_call_sites(db, cache, signature_id.get_file_id(), target_decl_id);
-    infer_param_type_from_local_call_sites_inner(
-        db,
-        cache,
-        call_sites,
-        idx,
-        false,
-        decl.get_name() == "...",
-    )
+/// Whether the closure of `signature_id` is written as an argument of a call.
+fn is_call_argument_closure(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    signature_closure(db, signature_id).is_some_and(|closure| {
+        closure
+            .get_parent::<glua_parser::LuaCallArgList>()
+            .is_some()
+    })
 }
 
 /// The calls of a local function in `file_id`, read out of the file's
@@ -2035,7 +2082,7 @@ pub fn infer_param_with_cache(
     }
 
     cache.param_type_cache.insert(decl_id, CacheEntry::Ready);
-    let result = infer_param_inner(db, Some(cache), decl);
+    let result = infer_param_inner(db, Some(cache), decl, true);
     match &result {
         Ok((typ, source)) => {
             cache
