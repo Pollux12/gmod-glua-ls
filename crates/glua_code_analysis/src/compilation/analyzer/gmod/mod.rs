@@ -466,6 +466,7 @@ type IndexedHelperDefinition = (LuaSignatureId, FileId, LuaSyntaxId, Option<Glob
 pub(crate) struct FileHelperScan {
     role_map: AnnotatedGmodGlobalCallRoleMap,
     definitions: Vec<IndexedHelperDefinition>,
+    callable_identities: HashMap<LuaSignatureId, GlobalId>,
 }
 
 impl crate::db_index::derivation::DerivedFact for FileHelperScan {
@@ -477,7 +478,13 @@ impl crate::db_index::derivation::DerivedFact for FileHelperScan {
                 (signature_id, InFiled::new(*file_id, *syntax_id), global)
             })
             .collect::<Vec<_>>();
-        crate::db_index::derivation::fingerprint_of(&(self.role_map.fingerprint(), definitions))
+        let mut identities = self.callable_identities.iter().collect::<Vec<_>>();
+        identities.sort_unstable_by_key(|(id, _)| (id.get_file_id().id, id.get_position()));
+        crate::db_index::derivation::fingerprint_of(&(
+            self.role_map.fingerprint(),
+            definitions,
+            identities,
+        ))
     }
 }
 
@@ -8040,9 +8047,12 @@ impl AnnotatedGmodGlobalCallRoleMap {
             ..Default::default()
         };
         let mut role_map = Self::default();
+        let mut callable_identities = HashMap::default();
         for signature_id in signature_ids {
             builder.add_signature(db, *signature_id);
-            role_map.add_signature_net_op(db, *signature_id);
+            if let Some(identity) = role_map.add_signature_net_op(db, *signature_id) {
+                callable_identities.insert(*signature_id, identity);
+            }
 
             let Some(signature) = db.get_signature_index().get_declared(signature_id) else {
                 continue;
@@ -8053,36 +8063,47 @@ impl AnnotatedGmodGlobalCallRoleMap {
             let Some(closure) = closure_from_signature_id(db, *signature_id) else {
                 continue;
             };
+            if let Some(path) = global_call_path_for_signature_closure(db, *signature_id, &closure)
+            {
+                let path = path.strip_prefix("_G.").unwrap_or(&path);
+                callable_identities.insert(*signature_id, GlobalId::new(path));
+            }
             role_map.add_signature_closure(db, *signature_id, &closure);
+        }
+        for (signature_id, _, _, identity) in &builder.definitions {
+            if let Some(identity) = identity {
+                callable_identities.insert(*signature_id, identity.clone());
+            }
         }
 
         FileHelperScan {
             role_map,
             definitions: builder.definitions,
+            callable_identities,
         }
     }
 
     /// Records the canonical function name for an annotated payload op.
-    fn add_signature_net_op(&mut self, db: &DbIndex, signature_id: LuaSignatureId) {
+    fn add_signature_net_op(
+        &mut self,
+        db: &DbIndex,
+        signature_id: LuaSignatureId,
+    ) -> Option<GlobalId> {
         let descriptor = crate::db_index::signature_net_payload(db, signature_id);
         let is_send =
             descriptor.is_none() && crate::db_index::signature_net_send(db, signature_id).is_some();
         if descriptor.is_none() && !is_send {
-            return;
+            return None;
         }
 
-        let Some(closure) = closure_from_signature_id(db, signature_id) else {
-            return;
-        };
-        let Some(call_path) = global_call_path_for_signature_closure(db, signature_id, &closure)
-        else {
-            return;
-        };
+        let closure = closure_from_signature_id(db, signature_id)?;
+        let call_path = global_call_path_for_signature_closure(db, signature_id, &closure)?;
         let display_path = call_path
             .strip_prefix("_G.")
             .unwrap_or(&call_path)
             .to_string();
 
+        let identity = GlobalId::new(&display_path);
         if let Some(descriptor) = descriptor {
             // Wrappers are expected to share a wire format with the builtin they
             // wrap, so collisions here are normal rather than exceptional. The
@@ -8105,6 +8126,7 @@ impl AnnotatedGmodGlobalCallRoleMap {
                 })
                 .or_insert(candidate);
         }
+        Some(identity)
     }
 
     /// Canonical op metadata with its ranking dropped, ready to publish.
