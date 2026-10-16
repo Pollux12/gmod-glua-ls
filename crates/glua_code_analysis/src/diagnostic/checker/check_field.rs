@@ -21,7 +21,7 @@ use crate::{
 
 use super::{
     AssignmentPrefixEvents, Checker, DiagnosticContext, humanize_lint_type,
-    is_initialized_assignment_access, is_initialized_assignment_prefix, named_param,
+    is_initialized_assignment_access, is_initialized_assignment_prefix,
 };
 
 pub struct CheckFieldChecker;
@@ -32,6 +32,7 @@ impl Checker for CheckFieldChecker {
         DiagnosticCode::UndefinedField,
         DiagnosticCode::UndefinedMethod,
         DiagnosticCode::InferUnguardedChild,
+        DiagnosticCode::InferUnknown,
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
@@ -217,6 +218,7 @@ fn collect_initialized_assignment_accesses(
 struct CheckFieldState {
     member_infer_cache: HashMap<(LuaType, LuaMemberKey, bool), bool>,
     subtypes_with_member: crate::compilation::analyzer::SubtypesWithMember,
+    unguarded_child_sources: Option<HashSet<crate::InFiled<glua_parser::LuaSyntaxId>>>,
 }
 
 #[derive(Default)]
@@ -404,7 +406,16 @@ fn check_index_expr(
         code,
         DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
     ) && !is_enum_type(db, &prefix_typ)
-        && is_nil_guarded_in_scope(index_expr, weak_receiver)
+        && (is_nil_guarded_in_scope(index_expr, weak_receiver)
+            || (allows_nil_safe_expr_undefined_field_suppression(
+                semantic_model,
+                &prefix_typ,
+                &index_key,
+            ) && crate::compilation::analyzer::is_member_path_presence_guarded(
+                db,
+                &mut semantic_model.get_cache().borrow_mut(),
+                index_expr,
+            )))
     {
         return Some(());
     }
@@ -434,26 +445,50 @@ fn check_index_expr(
         }
     }
 
+    let guessed_receiver =
+        matches!(
+            code,
+            DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+        ) && super::inference_trust::is_guessed_declaration_read(semantic_model, index_expr);
+
     // A member the receiver's class lacks but its children define is a read
     // that needs a guard, as when inference meets it on a local.
     if matches!(
         code,
         DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
-    ) && let Some(children) = crate::compilation::analyzer::unguarded_child_candidates(
-        db,
-        &mut semantic_model.get_cache().borrow_mut(),
-        &mut state.subtypes_with_member,
-        context.get_file_id(),
-        index_expr,
-        &prefix_typ,
-        &LuaMemberKey::Name(field_name.clone()),
-    ) {
-        let children = children
+    ) && let Some(children) = class_union_partial_arms(semantic_model, &prefix_typ, index_expr)
+        .or_else(|| {
+            crate::compilation::analyzer::unguarded_child_candidates(
+                db,
+                &mut semantic_model.get_cache().borrow_mut(),
+                &mut state.subtypes_with_member,
+                context.get_file_id(),
+                index_expr,
+                &prefix_typ,
+                &LuaMemberKey::Name(field_name.clone()),
+            )
+            .map(|children| children.to_vec())
+        })
+    {
+        let mut children = children
             .iter()
             .map(|child| {
                 crate::humanize_type(db, &LuaType::Ref(child.clone()), crate::RenderLevel::Simple)
             })
             .collect::<Vec<_>>();
+        if is_covered_by_inference_event(context, semantic_model, state, index_expr) {
+            return Some(());
+        }
+        if guessed_receiver {
+            children.sort();
+            context.add_diagnostic(
+                DiagnosticCode::InferUnknown,
+                index_expr.get_range(),
+                super::inference_trust::inferred_from_usage_message(&children.join("|")),
+                None,
+            );
+            return Some(());
+        }
         let found = crate::humanize_type(db, &prefix_typ, crate::RenderLevel::Simple);
         let severity = super::inference_trust::unguarded_child_severity(
             context,
@@ -472,6 +507,22 @@ fn check_index_expr(
             severity,
             None,
         );
+        return Some(());
+    }
+
+    if guessed_receiver {
+        if !is_covered_by_inference_event(context, semantic_model, state, index_expr) {
+            context.add_diagnostic(
+                DiagnosticCode::InferUnknown,
+                index_expr.get_range(),
+                super::inference_trust::inferred_from_usage_message(&crate::humanize_type(
+                    db,
+                    &prefix_typ,
+                    crate::RenderLevel::Simple,
+                )),
+                None,
+            );
+        }
         return Some(());
     }
 
@@ -518,6 +569,59 @@ fn check_index_expr(
     }
 
     Some(())
+}
+
+/// Whether an unguarded-child inference event already reports the read at `index_expr`,
+/// which is then where its advisory is emitted.
+fn is_covered_by_inference_event(
+    context: &DiagnosticContext,
+    semantic_model: &SemanticModel,
+    state: &mut CheckFieldState,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let file_id = context.get_file_id();
+    state
+        .unguarded_child_sources
+        .get_or_insert_with(|| {
+            super::inference_trust::unguarded_child_event_sources(semantic_model, file_id)
+        })
+        .contains(&crate::InFiled::new(file_id, index_expr.get_syntax_id()))
+}
+
+/// The arms of the class union `arms` that have the member `index_expr` reads,
+/// or `None` when the read's key is dynamic or unresolved.
+fn class_union_arms_with_member(
+    semantic_model: &SemanticModel,
+    arms: &[LuaTypeDeclId],
+    index_expr: &LuaIndexExpr,
+) -> Option<Vec<LuaTypeDeclId>> {
+    let db = semantic_model.get_db();
+    let mut cache = semantic_model.get_cache().borrow_mut();
+    let index_key = index_expr.get_index_key()?;
+    if LuaMemberKey::index_key_is_dynamic(db, &mut cache, &index_key) {
+        return None;
+    }
+    let member_key = LuaMemberKey::from_index_key(db, &mut cache, &index_key).ok()?;
+    Some(crate::compilation::analyzer::class_union_arms_with_member(
+        db,
+        &mut cache,
+        arms,
+        &member_key,
+        semantic_model.get_file_id(),
+        index_expr.get_position(),
+    ))
+}
+
+/// The arms of a class union receiver that have the member `index_expr` reads,
+/// when some but not all of them do.
+fn class_union_partial_arms(
+    semantic_model: &SemanticModel,
+    prefix_typ: &LuaType,
+    index_expr: &LuaIndexExpr,
+) -> Option<Vec<LuaTypeDeclId>> {
+    let arms = crate::compilation::analyzer::class_union_arms(semantic_model.get_db(), prefix_typ)?;
+    let with_member = class_union_arms_with_member(semantic_model, &arms, index_expr)?;
+    (!with_member.is_empty() && with_member.len() < arms.len()).then_some(with_member)
 }
 
 fn is_invalid_prefix_type(typ: &LuaType) -> bool {
@@ -1859,35 +1963,12 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr, weak_receiver: bool) -> bo
                             if is_truthy_check_in_condition(&condition_expr, &normalized_target) {
                                 return true;
                             }
-                        } else {
-                            // Field is in the body — check if the condition guards it.
+                        } else if if_stat
+                            .get_block()
+                            .is_some_and(|block| block.get_range().contains_range(node_range))
+                        {
+                            // Field is in the guarded block — check if the condition guards it.
                             if condition_nil_guards_field(&condition_expr, &normalized_target) {
-                                if let Some(root_name) = target_root_name
-                                    && has_root_reassignment_before_usage(index_expr, root_name)
-                                {
-                                    break;
-                                }
-                                return true;
-                            }
-                        }
-                    }
-
-                    for elseif_clause in if_stat.get_else_if_clause_list() {
-                        if !elseif_clause.get_range().contains_range(node_range) {
-                            continue;
-                        }
-
-                        if let Some(condition_expr) = elseif_clause.get_condition_expr() {
-                            let cond_range = condition_expr.get_range();
-                            if cond_range.contains_range(node_range) {
-                                if is_truthy_check_in_condition(&condition_expr, &normalized_target)
-                                {
-                                    return true;
-                                }
-                            } else if condition_nil_guards_field(
-                                &condition_expr,
-                                &normalized_target,
-                            ) {
                                 if let Some(root_name) = target_root_name
                                     && has_root_reassignment_before_usage(index_expr, root_name)
                                 {
@@ -1918,7 +1999,7 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr, weak_receiver: bool) -> bo
                         }
                     }
                 }
-                break;
+                continue;
             }
             // `or` default pattern: `field or DEFAULT` — field is nil-checked by the or.
             LuaSyntaxKind::BinaryExpr => {
@@ -2382,13 +2463,17 @@ fn is_local_assign_with_nil_check(index_expr: &LuaIndexExpr, weak_receiver: bool
 
         if kind == LuaSyntaxKind::IfStat {
             // Check if the if-condition references the variable
-            if let Some(if_stat) = LuaIfStat::cast(sibling) {
+            if let Some(if_stat) = LuaIfStat::cast(sibling.clone()) {
                 if let Some(cond) = if_stat.get_condition_expr() {
                     if condition_references_var(&cond, var_name) {
                         return true;
                     }
                 }
             }
+        }
+        // A rewritten variable no longer holds the member's value.
+        if node_reassigns_root_name(&sibling, var_name) {
+            break;
         }
     }
 

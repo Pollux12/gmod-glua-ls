@@ -43,7 +43,7 @@ pub fn is_nil_literal_expr(expr: &LuaExpr) -> bool {
 }
 
 /// Whether `node`'s value is only tested for presence; the left of an untested `or` is a
-/// fallback. `guard_call_arg` decides a first argument of the call it is passed.
+/// fallback. `guard_call_arg` decides whether the call tests this argument.
 pub fn is_presence_tested(
     node: &LuaSyntaxNode,
     guard_call_arg: &mut dyn FnMut(&LuaCallExpr) -> bool,
@@ -77,14 +77,9 @@ pub fn is_presence_tested(
         };
     }
     if let Some(args) = LuaCallArgList::cast(parent.clone()) {
-        let is_first_arg = args
-            .get_args()
-            .next()
-            .is_some_and(|arg| arg.syntax() == node);
-        return is_first_arg
-            && args
-                .get_parent::<LuaCallExpr>()
-                .is_some_and(|call| guard_call_arg(&call));
+        return args
+            .get_parent::<LuaCallExpr>()
+            .is_some_and(|call| guard_call_arg(&call));
     }
     let is_condition_of =
         |condition: Option<LuaExpr>| condition.is_some_and(|condition| condition.syntax() == node);

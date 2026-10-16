@@ -2760,7 +2760,7 @@ end
         let mut ws = VirtualWorkspace::new();
         panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
 
-        expect_true!(ws.check_file_for(
+        expect_false!(ws.check_file_for(
             DiagnosticCode::InferUnguardedChild,
             "gamemodes/cityrp/gamemode/core/derma/cl_any_child.lua",
             r#"
@@ -2768,10 +2768,13 @@ end
             ---@param child any
             function AddAnyChild(parent, child)
                 local panel = parent:Add(child)
+                any_child_result = panel
                 panel:SetBackgroundColor({})
             end
         "#,
         ));
+        let typ = ws.expr_ty("any_child_result");
+        expect_that!(ws.humanize_type(typ), eq("Panel"));
     }
 
     #[gtest]

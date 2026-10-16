@@ -955,8 +955,12 @@ fn calc_presence_tested_global_names(
         .filter(|name_expr| !local_ranges.contains(&name_expr.get_range()))
         .filter(|name_expr| {
             is_presence_tested(name_expr.syntax(), &mut |call: &LuaCallExpr| {
-                call.get_prefix_expr()
-                    .is_some_and(|prefix| call_prefix_returns_type_guard(semantic_model, &prefix))
+                call.get_args_list()
+                    .and_then(|args| args.get_args().next())
+                    .is_some_and(|arg| arg.get_range().contains_range(name_expr.get_range()))
+                    && call.get_prefix_expr().is_some_and(|prefix| {
+                        call_prefix_returns_type_guard(semantic_model, &prefix)
+                    })
             })
         })
         .filter_map(|name_expr| name_expr.get_name_text().map(|name| name.to_string()))

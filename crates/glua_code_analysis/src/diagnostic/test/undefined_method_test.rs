@@ -167,7 +167,7 @@ end
     }
 
     #[test]
-    fn gmod_name_fallback_method_reports_undefined_field_warning() {
+    fn gmod_name_fallback_method_reports_an_inferred_type_advisory() {
         let diagnostics = gmod_diagnostics(
             r#"
             ---@class Panel
@@ -177,16 +177,11 @@ end
             "#,
         );
 
-        let diagnostic = diagnostics
-            .iter()
-            .find(|diagnostic| {
-                diagnostic.code
-                    == Some(NumberOrString::String(
-                        DiagnosticCode::UndefinedField.get_name().to_string(),
-                    ))
-            })
-            .unwrap_or_else(|| panic!("undefined-field diagnostic: {diagnostics:#?}"));
-        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+        assert!(
+            has_code(&diagnostics, DiagnosticCode::InferUnknown),
+            "infer-unknown diagnostic: {diagnostics:#?}"
+        );
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedField));
         assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
     }
 

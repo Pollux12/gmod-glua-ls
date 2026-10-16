@@ -1,4 +1,117 @@
 #[cfg(test)]
+mod optional_child_read_tests {
+    use crate::{DiagnosticCode, FileId, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaIndexExpr};
+    use tokio_util::sync::CancellationToken;
+
+    const PREDICATE_PATH: &str = "lua/includes/predicates.lua";
+    const PREDICATE: &str =
+        "local classify = type\nfunction isstring(value) return classify(value) == 'string' end\n";
+    const SOURCE: &str = r#"
+---@param ent Entity
+local function label(ent)
+    local printName = ent.PrintName
+    if not isstring(printName) then printName = "fallback" end
+    return printName
+end
+---@param ent Entity
+local function unsafe(ent)
+    ent:Only()
+end
+---@param ent Entity
+local function unsafe_call_result(ent)
+    local result = ent:Only()
+    if isstring(result) then return result end
+end
+"#;
+
+    fn workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "annotations/optional_entity.lua",
+            r#"
+---@meta
+---@class Entity
+---@class OptionalEntity: Entity
+---@field PrintName string
+---@field Only fun(self: OptionalEntity): string
+"#,
+        );
+        ws
+    }
+
+    fn diagnostics(ws: &mut VirtualWorkspace, file: FileId) -> Vec<(lsp_types::Range, String)> {
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::InferUnguardedChild);
+        let shared = ws.analysis.precompute_diagnostic_shared_data();
+        let mut diagnostics = ws
+            .analysis
+            .diagnose_file_with_shared(file, CancellationToken::new(), shared)
+            .unwrap()
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect::<Vec<_>>();
+        diagnostics.sort_by_key(|(range, _)| (range.start.line, range.start.character));
+        diagnostics
+    }
+
+    fn expected(
+        ws: &VirtualWorkspace,
+        file: FileId,
+        guarded: bool,
+    ) -> Vec<(lsp_types::Range, String)> {
+        let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
+        model.get_root().descendants::<LuaIndexExpr>()
+            .filter(|index| index.syntax().text() == "ent:Only"
+                || (!guarded && index.syntax().text() == "ent.PrintName"))
+            .map(|index| (
+                model.get_document().to_lsp_range(index.get_range()).unwrap(),
+                "expected `OptionalEntity` but found `Entity`. Add a guard to narrow the parent to `OptionalEntity`.".to_string(),
+            )).collect()
+    }
+
+    #[test]
+    fn optional_child_field_read_accepts_an_inferred_type_test_but_child_calls_still_warn() {
+        let mut ws = workspace();
+        ws.def_file(PREDICATE_PATH, PREDICATE);
+        let file = ws.def_file("lua/autorun/properties/editentity.lua", SOURCE);
+        let expected = expected(&ws, file, true);
+        assert_eq!(diagnostics(&mut ws, file), expected);
+    }
+
+    #[test]
+    fn optional_child_field_predicate_edit_delete_reopen_and_revert_match_cold() {
+        let mut warm = workspace();
+        let predicate = warm.def_file(PREDICATE_PATH, PREDICATE);
+        let uri = warm.analysis.get_uri(predicate).unwrap();
+        let path = "lua/autorun/properties/editentity.lua";
+        let file = warm.def_file(path, SOURCE);
+        for text in [
+            Some(PREDICATE),
+            Some("function isstring(value) return true end"),
+            None,
+            Some(PREDICATE),
+        ] {
+            if let Some(text) = text {
+                warm.analysis
+                    .update_file_by_uri(&uri, Some(text.to_string()));
+            } else {
+                warm.analysis.remove_file_by_uri(&uri).0.unwrap();
+            }
+            let mut cold = workspace();
+            if let Some(text) = text {
+                cold.def_file(PREDICATE_PATH, text);
+            }
+            let cold_file = cold.def_file(path, SOURCE);
+            let expected = expected(&cold, cold_file, text == Some(PREDICATE));
+            assert_eq!(diagnostics(&mut cold, cold_file), expected, "cold {text:?}");
+            assert_eq!(diagnostics(&mut warm, file), expected, "warm {text:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod test {
     use std::{ops::Deref, sync::Arc};
 
@@ -6395,5 +6508,1463 @@ owner:CompletelyMadeUpMethod()
                 "{code:?}"
             );
         }
+    }
+
+    fn local_member_names(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        local_name: &str,
+    ) -> Vec<String> {
+        let ty = ws.local_ty(file_id, local_name);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        semantic_model
+            .get_member_infos(&ty)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|info| info.key.get_name().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn test_unknown_param_or_empty_table_field_read_is_not_undefined() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            function f(p)
+                p = p or {}
+                return p.x
+            end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_nil_name_or_empty_table_is_the_fallback_table() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local p = nil
+            local opts = p or {}
+            opts.answer = 42
+            return opts.mispelt
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_false_name_or_empty_table_is_the_fallback_table() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local p = false
+            local opts = p or {}
+            opts.answer = 42
+            return opts.mispelt
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_unknown_member_or_empty_table_keeps_the_fallback_as_owner() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local function make(src)
+                local opts = src.options or {}
+                opts.answer = 42
+                return opts
+            end
+
+            local built = make()
+            local alias = built
+            local answer = alias.answer
+            "#,
+        );
+
+        assert!(local_member_names(&ws, file_id, "alias").contains(&"answer".to_string()));
+        assert!(holds_number(&ws.local_ty(file_id, "answer")));
+    }
+
+    #[test]
+    fn test_parenthesized_unknown_member_or_empty_table_field_read_is_not_undefined() {
+        for modes in [
+            "(controller.CurrentModes) or {}",
+            "((controller.CurrentModes)) or {}",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(
+                ws.check_code_for(
+                    DiagnosticCode::UndefinedField,
+                    &format!(
+                        r#"
+                        local function render(controller)
+                            local modes = {modes}
+                            return modes.SomeChannel
+                        end
+                        "#
+                    )
+                ),
+                "{modes}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parenthesized_unknown_member_or_empty_table_keeps_the_fallback_as_owner() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local function make(src)
+                local opts = ((src.options)) or {}
+                opts.answer = 42
+                return opts
+            end
+
+            local built = make()
+            local answer = built.answer
+            "#,
+        );
+
+        assert!(local_member_names(&ws, file_id, "built").contains(&"answer".to_string()));
+        assert!(holds_number(&ws.local_ty(file_id, "answer")));
+    }
+
+    #[test]
+    fn test_local_or_empty_table_reassigned_to_itself_keeps_its_written_member() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local t = {}
+            t = t or {}
+            t.answer = 42
+            local answer = t.answer
+            "#,
+        );
+        assert!(holds_number(&ws.local_ty(file_id, "answer")));
+    }
+
+    fn holds_number(ty: &LuaType) -> bool {
+        match ty {
+            LuaType::Union(union) => union.types().any(holds_number),
+            ty => ty.is_number(),
+        }
+    }
+
+    #[test]
+    fn test_unknown_param_or_empty_table_keeps_the_fallback_as_owner() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local function make(opts)
+                opts = opts or {}
+                opts.answer = 42
+                return opts
+            end
+
+            local built = make()
+            local answer = built.answer
+            "#,
+        );
+
+        assert!(local_member_names(&ws, file_id, "built").contains(&"answer".to_string()));
+        assert!(holds_number(&ws.local_ty(file_id, "answer")));
+    }
+
+    #[test]
+    fn test_unknown_member_or_empty_table_field_read_is_not_undefined() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local function render(controller)
+                local modes = controller.CurrentModes or {}
+                return modes.SomeChannel
+            end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_unknown_config_member_or_empty_table_assigned_to_a_field_is_read_open() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local ix = { db = {}, config = {}, yaml = {} }
+
+            ---@return unknown
+            function ix.yaml.Read() end
+
+            ix.config.server = ix.yaml.Read()
+            ix.db.config = ix.config.server.database or {}
+            ix.db.config.adapter = "sqlite"
+            return ix.db.config.host, ix.db.config.user
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_unresolved_global_or_empty_table_keeps_bootstrap_field_writes() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            Registry = Registry or {}
+            Registry.count = 1
+            local n = Registry.count
+            "#,
+        );
+        assert!(holds_number(&ws.local_ty(file_id, "n")));
+    }
+
+    #[test]
+    fn test_known_shape_or_empty_table_still_reports_typo() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@class OrEmptyCfg
+            ---@field a? number
+
+            ---@param t OrEmptyCfg?
+            function f(t)
+                t = t or {}
+                return t.zzz
+            end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_unresolved_call_in_table_is_an_open_array() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            function f(s)
+                local captures = {}
+                if s then
+                    captures = {s:match("(a)(b)")}
+                end
+                captures.input = s
+                return captures[2]
+            end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_lone_unresolved_call_in_table_is_an_open_unknown_array() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local function f(s)
+                local c = {s:match("(a)(b)")}
+                return c
+            end
+            local c = f()
+            "#,
+        );
+        assert!(matches!(ws.local_ty(file_id, "c"), LuaType::Array(_)));
+    }
+
+    #[test]
+    fn test_unresolved_trailing_call_keeps_the_known_prefix() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local c = {123, missing_callee()}
+            return c[1].Typo
+            "#
+        ));
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local c = {123, missing_callee()}
+            return c[2], c[3].Anything
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_declared_unknown_return_in_table_is_one_position() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@type fun(): unknown
+            local one
+
+            local packed = {123, one()}
+            "#,
+        );
+        let LuaType::Tuple(tuple) = ws.local_ty(file_id, "packed") else {
+            panic!("expected a tuple summary");
+        };
+        assert_eq!(tuple.get_types().len(), 2);
+        assert!(
+            !tuple
+                .get_types()
+                .iter()
+                .any(|ty| matches!(ty, LuaType::Variadic(_)))
+        );
+    }
+
+    #[test]
+    fn test_literal_array_summary_stays_a_tuple() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            local c = {1}
+            probe_summary = c
+            "#,
+        );
+        assert!(matches!(ws.expr_ty("probe_summary"), LuaType::Tuple(_)));
+    }
+
+    #[test]
+    fn test_missing_dynamic_member_or_table_keeps_photon_channels_open() {
+        for (receiver, operand) in [
+            ("Entity", "controller.CurrentModes"),
+            ("Entity", "((controller.CurrentModes))"),
+            ("PhotonController", "controller.CurrentModes"),
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            let file_id = ws.def_file(
+                "lua/glide/client/lighting_photon.lua",
+                &format!(
+                    r#"
+                    ---@class Entity
+                    ---@alias PhotonController Entity
+
+                    ---@param controller {receiver}
+                    local function update(controller)
+                        local currentModes = {operand} or {{}}
+                        local directional = currentModes["Emergency.Directional"]
+                        local forward = currentModes["Emergency.SceneForward"]
+                        local left = currentModes["Emergency.SceneLeft"]
+                        local right = currentModes["Emergency.SceneRight"]
+                        local rear = currentModes["Emergency.SceneRear"]
+                        local auxiliary = currentModes["Emergency.Auxiliary"]
+                        local marker = currentModes["Emergency.Marker"]
+                        return directional, forward, left, right, rear, auxiliary, marker
+                    end
+                    "#,
+                ),
+            );
+            let ty = local_name_type(&mut ws, file_id, "currentModes");
+            let LuaType::Union(union) = &ty else {
+                panic!("expected an opaque alternative for {receiver}, {operand}: {ty:?}");
+            };
+            assert!(union.types().any(LuaType::is_unknown));
+            assert!(
+                union
+                    .types()
+                    .any(|arm| matches!(arm, LuaType::TableConst(_)))
+            );
+            assert!(
+                diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField).is_empty(),
+                "{receiver}, {operand}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_declared_absence_or_table_keeps_the_closed_fallback() {
+        for declaration in [
+            "---@class (exact) Controller",
+            "---@class Controller\n---@field CurrentModes nil",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            let file_id = ws.def_file(
+                "lua/autorun/client/cl_declared_modes.lua",
+                &format!(
+                    r#"
+                    {declaration}
+
+                    ---@param controller Controller
+                    local function update(controller)
+                        local currentModes = controller.CurrentModes or {{}}
+                        return currentModes["Emergency.Directional"]
+                    end
+                    "#,
+                ),
+            );
+            assert!(
+                matches!(
+                    local_name_type(&mut ws, file_id, "currentModes"),
+                    LuaType::TableConst(_)
+                ),
+                "{declaration}"
+            );
+            let diagnostics =
+                diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains("Emergency.Directional")),
+                "{declaration}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_explicit_nil_branch_or_table_keeps_the_closed_fallback() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/client/cl_nil_branch_modes.lua",
+            r#"
+            ---@class Controller
+
+            ---@param controller Controller
+            local function update(controller)
+                if controller.CurrentModes == nil then
+                    local modes = controller.CurrentModes or {}
+                    return modes.Typo
+                end
+            end
+            "#,
+        );
+        let typ = local_name_type(&mut ws, file_id, "modes");
+        assert!(matches!(typ, LuaType::TableConst(_)), "{typ:?}");
+        let diagnostics = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Typo")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_explicit_nil_cast_or_table_keeps_the_closed_fallback() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/client/cl_nil_cast_modes.lua",
+            r#"
+            ---@class Controller
+
+            ---@param controller Controller
+            local function update(controller)
+                ---@cast controller.CurrentModes nil
+                local modes = controller.CurrentModes or {}
+                return modes.Typo
+            end
+            "#,
+        );
+        let typ = local_name_type(&mut ws, file_id, "modes");
+        assert!(matches!(typ, LuaType::TableConst(_)), "{typ:?}");
+        let diagnostics = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Typo")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_explicit_nil_assignment_or_table_keeps_the_closed_fallback() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/client/cl_nil_assignment_modes.lua",
+            r#"
+            ---@class Controller
+
+            ---@param controller Controller
+            local function update(controller)
+                controller.CurrentModes = nil
+                local modes = controller.CurrentModes or {}
+                return modes.Typo
+            end
+            "#,
+        );
+        let typ = local_name_type(&mut ws, file_id, "modes");
+        assert!(matches!(typ, LuaType::TableConst(_)), "{typ:?}");
+        let diagnostics = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Typo")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_bare_missing_nominal_member_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/client/cl_bare_modes.lua",
+            r#"
+            ---@class Entity
+
+            ---@param controller Entity
+            local function update(controller)
+                local currentModes = controller.CurrentModes
+                return currentModes
+            end
+            "#,
+        );
+        assert!(local_name_type(&mut ws, file_id, "currentModes").is_nil());
+        let diagnostics = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("CurrentModes"))
+        );
+    }
+
+    #[test]
+    fn test_publishing_opaque_modes_does_not_close_the_input() {
+        for body in [
+            "local modes = controller.CurrentModes or {}\nlocal channel = modes.SomeChannel\ncontroller.CurrentModes = modes\nreturn channel",
+            "local modes = controller.CurrentModes or {}\nlocal function publish(modes)\ncontroller.CurrentModes = modes\nend\nreturn modes.SomeChannel",
+            "local modes = ((controller.CurrentModes)) or {}\ncontroller.CurrentModes = modes\nreturn modes.SomeChannel",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            let file_id = ws.def_file(
+                "lua/autorun/client/cl_modes.lua",
+                &format!(
+                    "---@param controller unknown\nlocal function update(controller)\n{body}\nend"
+                ),
+            );
+            let ty = local_name_type(&mut ws, file_id, "modes");
+            assert!(
+                matches!(ty, LuaType::Union(ref union) if union.types().any(LuaType::is_unknown)),
+                "{ty:?}"
+            );
+            assert!(
+                diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField).is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn test_reassigned_initializer_local_does_not_prove_a_member_cycle() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lua/autorun/sh_modes.lua", "Modes = Modes or {}");
+        for body in [
+            "modes = SomethingUnknown()\nModes.CurrentModes = modes",
+            "local function publish(modes)\nModes.CurrentModes = modes\nend",
+        ] {
+            let file_id = ws.def_file(
+                "lua/autorun/sh_update_modes.lua",
+                &format!(
+                    "local modes = Modes.CurrentModes or {{}}\n{body}\nlocal channel = modes.SomeChannel"
+                ),
+            );
+            let ty = local_name_type(&mut ws, file_id, "modes");
+            assert!(
+                matches!(ty, LuaType::Union(ref union) if union.types().any(LuaType::is_unknown)),
+                "{ty:?}"
+            );
+            assert!(
+                diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField).is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn test_parenthesized_initializer_cycle_keeps_the_literal() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file("lua/autorun/sh_glide.lua", "Glide = Glide or {}");
+        let file_id = ws.def_file(
+            "lua/glide/client/ranged_feature.lua",
+            r#"
+            local RangedFeature = ((Glide.RangedFeature)) or {}
+            RangedFeature.__index = RangedFeature
+            Glide.RangedFeature = RangedFeature
+            "#,
+        );
+        assert!(matches!(
+            local_name_type(&mut ws, file_id, "RangedFeature"),
+            LuaType::TableConst(_)
+        ));
+    }
+
+    #[test]
+    fn test_initializer_cycle_with_independent_opaque_producer_keeps_unknown() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file("lua/autorun/sh_glide.lua", "Glide = Glide or {}");
+        ws.def_file(
+            "lua/glide/client/opaque_feature.lua",
+            "Glide.RangedFeature = SomethingUnknown()",
+        );
+        let file_id = ws.def_file(
+            "lua/glide/client/ranged_feature.lua",
+            r#"
+            local RangedFeature = Glide.RangedFeature or {}
+            RangedFeature.__index = RangedFeature
+            Glide.RangedFeature = RangedFeature
+            local channel = RangedFeature.SomeChannel
+            "#,
+        );
+        let ty = local_name_type(&mut ws, file_id, "RangedFeature");
+        assert!(
+            matches!(ty, LuaType::Union(ref union) if union.types().any(LuaType::is_unknown)),
+            "{ty:?}"
+        );
+        assert!(diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField).is_empty());
+    }
+
+    fn presence_probe_source(body: &str) -> String {
+        format!(
+            r#"
+            ---@class ProbeEnt
+            ---@field Name string
+
+            ---@param value any
+            ---@return TypeGuard<ProbeEnt>
+            function IsValid(value) end
+
+            ---@param ent ProbeEnt
+            ---@param a boolean
+            ---@param b boolean
+            local function probe(ent, a, b)
+            {body}
+            end
+            "#
+        )
+    }
+
+    #[test]
+    fn test_presence_probe_and_guard_forms_suppress_undefined_field() {
+        let bodies = [
+            "if not ent.Armor then return end\n do local x = ent.Armor end",
+            "local armor = ent.Armor\n if not armor then return end",
+            "local rear = ent.Armor == \"rear\"",
+            "local bad = not ent.Armor or ent.Armor > 5",
+            "return not ent.Armor or not IsValid(ent.Armor)",
+            "return IsValid(ent.Armor)",
+            "if ent.Armor ~= nil then\n if a then\n elseif b then\n local x = ent.Armor\n end\n end",
+        ];
+        for body in bodies {
+            let mut ws = VirtualWorkspace::new();
+            assert!(
+                ws.check_code_for(DiagnosticCode::UndefinedField, &presence_probe_source(body)),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unprobed_missing_member_keeps_reporting_undefined_field() {
+        let bodies = [
+            "local x = ent.Armor",
+            "if not ent.Name then return end\n local x = ent.Armor",
+            "if IsValid(ent.Armor) then\n return 1\n else\n local x = ent.Armor\n end",
+            "local armor = ent.Armor\n armor = nil\n if not armor then return end",
+        ];
+        for body in bodies {
+            let mut ws = VirtualWorkspace::new();
+            assert!(
+                !ws.check_code_for(DiagnosticCode::UndefinedField, &presence_probe_source(body)),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_missing_member_on_name_guessed_param_is_advisory_not_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file("annotations/entity.lua", "---@meta\n---@class Entity\n");
+        let guessed = ws.def_file(
+            "lua/autorun/name_guess.lua",
+            "function ProbeNameGuess(ent)\n    return ent.Missing\nend\n",
+        );
+        let typed = ws.def_file(
+            "lua/autorun/typed_param.lua",
+            "---@param ent Entity\nfunction ProbeTyped(ent)\n    return ent.Missing\nend\n",
+        );
+
+        let undefined = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            guessed,
+            DiagnosticCode::UndefinedField,
+        );
+        assert!(undefined.is_empty(), "{undefined:?}");
+        let advisory = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            guessed,
+            DiagnosticCode::InferUnknown,
+        );
+        assert_eq!(advisory.len(), 1, "{advisory:?}");
+        assert_eq!(
+            advisory[0].message,
+            "Type `Entity` was inferred from usage context and may be incorrect."
+        );
+
+        let undefined_typed = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            typed,
+            DiagnosticCode::UndefinedField,
+        );
+        assert_eq!(undefined_typed.len(), 1, "{undefined_typed:?}");
+    }
+
+    #[test]
+    fn test_presence_probe_does_not_excuse_a_member_of_a_primitive_or_mistyped_map() {
+        let sources = [
+            "---@param n number\nlocal function probe(n)\n    return n.Missing == 1\nend",
+            "---@param n number\nlocal function probe(n)\n    return IsValid(n.Missing)\nend",
+            "---@param values table<integer, string>\nlocal function probe(values)\n    return values.Missing == nil\nend",
+        ];
+        for body in sources {
+            let mut ws = VirtualWorkspace::new();
+            let source = format!(
+                "---@class ProbeEnt\n\n---@param value any\n---@return TypeGuard<ProbeEnt>\nfunction IsValid(value) end\n\n{body}"
+            );
+            assert!(
+                !ws.check_code_for(DiagnosticCode::UndefinedField, &source),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_colon_predicate_does_not_probe_its_other_arguments() {
+        let source = |body: &str| {
+            format!(
+                r#"
+                ---@class Probe
+                ---@return TypeGuard<Probe>
+                function Probe:Holds(other) end
+
+                ---@class Closed
+                ---@field known number
+
+                ---@param value any
+                ---@return TypeGuard<Closed>
+                local function holds(value) end
+
+                ---@param probe Probe
+                ---@param other Closed
+                local function check(probe, other)
+                {body}
+                end
+                "#
+            )
+        };
+        for body in [
+            "return probe:Holds(other.Missing)",
+            "return probe:Holds((other.Missing))",
+            "local value = other.Missing\n return probe:Holds(value)",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(
+                !ws.check_code_for(DiagnosticCode::UndefinedField, &source(body)),
+                "{body}"
+            );
+        }
+        for body in [
+            "return holds(other.Missing)",
+            "return holds((other.Missing))",
+            "local value = other.Missing\n return holds(value)",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(
+                ws.check_code_for(DiagnosticCode::UndefinedField, &source(body)),
+                "{body}"
+            );
+        }
+    }
+
+    fn name_guess_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "annotations/entity.lua",
+            "---@meta\n---@class Entity\n---@class Closed\n---@field known number\n",
+        );
+        ws
+    }
+
+    #[test]
+    fn test_name_guess_is_dropped_where_the_receiver_is_no_longer_only_the_guess() {
+        let mut ws = name_guess_workspace();
+        let cases = [
+            (
+                "reassigned",
+                "---@return Closed\nlocal function makeClosed() end\nfunction ProbeReassigned(ent)\n    ent = makeClosed()\n    return ent.Typo\nend\n",
+            ),
+            (
+                "type_guard",
+                "---@param value any\n---@return TypeGuard<Closed>\nlocal function isClosed(value) end\nfunction ProbeTypeGuard(ent)\n    if isClosed(ent) then\n        return ent.Typo\n    end\nend\n",
+            ),
+            (
+                "call_site",
+                "local function inspect(ent)\n    return ent.Typo\nend\n---@return Closed\nlocal function makeClosed() end\nlocal closed = makeClosed()\ninspect(closed)\n",
+            ),
+        ];
+        for (name, source) in cases {
+            let file_id = ws.def_file(&format!("lua/autorun/name_guess_{name}.lua"), source);
+            let undefined = default_diagnostics_for_code_with_shared(
+                &mut ws,
+                file_id,
+                DiagnosticCode::UndefinedField,
+            );
+            assert_eq!(undefined.len(), 1, "{name}: {undefined:?}");
+            let advisory = default_diagnostics_for_code_with_shared(
+                &mut ws,
+                file_id,
+                DiagnosticCode::InferUnknown,
+            );
+            assert!(advisory.is_empty(), "{name}: {advisory:?}");
+        }
+    }
+
+    #[test]
+    fn test_child_union_name_guess_has_one_advisory_per_range() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "annotations/entity.lua",
+            "---@meta\n---@class Entity\n---@class A: Entity\n---@field OnlyA number\n---@class B: Entity\n---@field OnlyB number\n",
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/child_union.lua",
+            "function inspect(ent)\n    local a = ent.OnlyA + 1\n    local b = ent.OnlyB + 1\nend\n",
+        );
+        let advisories = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::InferUnknown,
+        );
+        assert!(!advisories.is_empty(), "{advisories:?}");
+        let unguarded = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::InferUnguardedChild,
+        );
+        assert!(unguarded.is_empty(), "{unguarded:?}");
+        let mut ranges = advisories
+            .iter()
+            .chain(unguarded.iter())
+            .map(|diagnostic| {
+                (
+                    diagnostic.range.start.line,
+                    diagnostic.range.start.character,
+                    diagnostic.range.end.line,
+                    diagnostic.range.end.character,
+                )
+            })
+            .collect::<Vec<_>>();
+        let total = ranges.len();
+        ranges.sort();
+        ranges.dedup();
+        assert_eq!(ranges.len(), total, "{advisories:?}");
+    }
+
+    #[test]
+    fn test_real_is_valid_call_probes_a_missing_member() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        enable_gmod(&mut ws);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/annotations/getter_api.lua",
+            include_str!("../../compilation/test/fixtures/getter_guard/api.lua"),
+        );
+        let probed = ws.def_file(
+            "lua/autorun/real_is_valid_probe.lua",
+            "---@param ent Entity\nfunction ProbeRealIsValid(ent)\n    return IsValid(ent.Armor)\nend\n",
+        );
+        let read = ws.def_file(
+            "lua/autorun/real_is_valid_read.lua",
+            "---@param ent Entity\nfunction ReadRealIsValid(ent)\n    return ent.Armor\nend\n",
+        );
+        let probed_diagnostics = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            probed,
+            DiagnosticCode::UndefinedField,
+        );
+        assert!(probed_diagnostics.is_empty(), "{probed_diagnostics:?}");
+        let read_diagnostics =
+            default_diagnostics_for_code_with_shared(&mut ws, read, DiagnosticCode::UndefinedField);
+        assert_eq!(read_diagnostics.len(), 1, "{read_diagnostics:?}");
+    }
+
+    #[test]
+    fn test_name_guess_is_dropped_for_concrete_evidence_of_the_guessed_type() {
+        let mut ws = name_guess_workspace();
+        let cases = [
+            (
+                "same_type_assignment",
+                "---@return Entity\nlocal function makeEntity() end\nfunction ProbeSameAssign(ent)\n    ent = makeEntity()\n    return ent.Typo\nend\n",
+            ),
+            (
+                "same_type_guard",
+                "---@param value any\n---@return TypeGuard<Entity>\nlocal function isEntity(value) end\nfunction ProbeSameGuard(ent)\n    if isEntity(ent) then\n        return ent.Typo\n    end\nend\n",
+            ),
+            (
+                "mixed_reaching_paths",
+                "---@return Entity\nlocal function makeEntity() end\nfunction ProbeMixed(ent, fresh)\n    if fresh then\n        ent = makeEntity()\n    end\n    return ent.Typo\nend\n",
+            ),
+        ];
+        for (name, source) in cases {
+            let file_id = ws.def_file(&format!("lua/autorun/name_guess_{name}.lua"), source);
+            let undefined = default_diagnostics_for_code_with_shared(
+                &mut ws,
+                file_id,
+                DiagnosticCode::UndefinedField,
+            );
+            assert_eq!(undefined.len(), 1, "{name}: {undefined:?}");
+            let advisory = default_diagnostics_for_code_with_shared(
+                &mut ws,
+                file_id,
+                DiagnosticCode::InferUnknown,
+            );
+            assert!(advisory.is_empty(), "{name}: {advisory:?}");
+        }
+    }
+
+    #[test]
+    fn test_name_guess_survives_truthiness_and_nil_tests() {
+        let mut ws = name_guess_workspace();
+        let cases = [
+            (
+                "truthy",
+                "function ProbeTruthy(ent)\n    if ent then\n        return ent.Typo\n    end\nend\n",
+            ),
+            (
+                "nil_exit",
+                "function ProbeNilExit(ent)\n    if ent == nil then return end\n    return ent.Typo\nend\n",
+            ),
+        ];
+        for (name, source) in cases {
+            let file_id = ws.def_file(&format!("lua/autorun/name_guess_{name}.lua"), source);
+            let undefined = default_diagnostics_for_code_with_shared(
+                &mut ws,
+                file_id,
+                DiagnosticCode::UndefinedField,
+            );
+            assert!(undefined.is_empty(), "{name}: {undefined:?}");
+            let advisory = default_diagnostics_for_code_with_shared(
+                &mut ws,
+                file_id,
+                DiagnosticCode::InferUnknown,
+            );
+            assert_eq!(advisory.len(), 1, "{name}: {advisory:?}");
+        }
+    }
+
+    #[test]
+    fn test_missing_colon_call_is_strict_once_the_param_holds_concrete_evidence() {
+        let mut ws = name_guess_workspace();
+        let cases = [
+            (
+                "reassigned",
+                "---@return Closed\nlocal function makeClosed() end\nfunction ProbeColonReassigned(ent)\n    ent = makeClosed()\n    local result = ent:Missing()\n    if result then print(result) end\nend\n",
+            ),
+            (
+                "guarded",
+                "---@param value any\n---@return TypeGuard<Closed>\nlocal function isClosed(value) end\nfunction ProbeColonGuarded(ent)\n    if isClosed(ent) then\n        local result = ent:Missing()\n        if result then print(result) end\n    end\nend\n",
+            ),
+        ];
+        for (name, source) in cases {
+            let file_id = ws.def_file(&format!("lua/autorun/colon_{name}.lua"), source);
+            let undefined = default_diagnostics_for_code_with_shared(
+                &mut ws,
+                file_id,
+                DiagnosticCode::UndefinedMethod,
+            );
+            assert_eq!(undefined.len(), 1, "{name}: {undefined:?}");
+        }
+
+        let weak = ws.def_file(
+            "lua/autorun/colon_weak.lua",
+            "function ProbeColonWeak(ent)\n    local result = ent:Missing()\n    if result then print(result) end\nend\n",
+        );
+        for code in [
+            DiagnosticCode::UndefinedMethod,
+            DiagnosticCode::UndefinedField,
+        ] {
+            let diagnostics = default_diagnostics_for_code_with_shared(&mut ws, weak, code);
+            assert!(diagnostics.is_empty(), "{code:?}: {diagnostics:?}");
+        }
+    }
+
+    fn predicate_alias_source(body: &str) -> String {
+        format!(
+            r#"
+            ---@class Closed
+            ---@field known number
+
+            ---@param value any
+            ---@return TypeGuard<Closed>
+            local function holds(value) end
+
+            ---@param value any
+            ---@return boolean
+            local function ordinary(value) return true end
+
+            ---@param other Closed
+            local function check(other)
+            {body}
+            end
+            "#
+        )
+    }
+
+    #[test]
+    fn test_reassigned_predicate_alias_does_not_probe() {
+        for body in [
+            "local predicate = holds\n predicate = ordinary\n return predicate(other.Missing)",
+            "local predicate = holds\n predicate = ordinary\n local value = other.Missing\n return predicate(value)",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(
+                !ws.check_code_for(
+                    DiagnosticCode::UndefinedField,
+                    &predicate_alias_source(body)
+                ),
+                "{body}"
+            );
+        }
+        for body in [
+            "local predicate = holds\n return predicate(other.Missing)",
+            "local predicate = holds\n local value = other.Missing\n return predicate(value)",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(
+                ws.check_code_for(
+                    DiagnosticCode::UndefinedField,
+                    &predicate_alias_source(body)
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parenthesized_initializer_is_bound_to_its_local() {
+        let source = |body: &str| {
+            format!(
+                r#"
+                ---@class Closed
+                ---@field known number
+
+                ---@param obj Closed
+                local function check(obj)
+                {body}
+                end
+                "#
+            )
+        };
+        for body in [
+            "local armor = (obj.Missing)\n if not armor then return end",
+            "local armor = ((obj.Missing))\n if not armor then return end",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(
+                ws.check_code_for(DiagnosticCode::UndefinedField, &source(body)),
+                "{body}"
+            );
+        }
+        for body in [
+            "local result = (obj.Missing)()\n if not result then return end",
+            "local result = (obj.Missing())\n if not result then return end",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(
+                !ws.check_code_for(DiagnosticCode::UndefinedField, &source(body)),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deferred_presence_checks_do_not_hide_missing_scrolllabel_members() {
+        for (name, optional, body, expected) in [
+            (
+                "deferred_validity",
+                "",
+                "timer.Simple(0, function() if IsValid(pnl) then pnl:UpdateScrollState() end end)",
+                1,
+            ),
+            (
+                "deferred_truthiness",
+                "",
+                "timer.Simple(0, function() if pnl then pnl:UpdateScrollState() end end)",
+                1,
+            ),
+            (
+                "same_body_probe",
+                "",
+                "if IsValid(pnl) then pnl:UpdateScrollState() end",
+                0,
+            ),
+            (
+                "optional_capture",
+                "---@field Panel ScrollLabel?",
+                "timer.Simple(0, function() if IsValid(pnl) then pnl:UpdateScrollState() end end)",
+                0,
+            ),
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            ws.def_gmod_call_arg_builtins();
+            let file = ws.def_file(
+                &format!("lua/vgui/scrolllabel_{name}.lua"),
+                &format!(
+                    r#"
+                    ---@class Panel
+                    ---@class ScrollLabel: Panel
+                    ---@field Label ScrollLabel
+                    ---@field Scroll ScrollLabel
+                    {optional}
+                    local PANEL = {{}}
+                    function PANEL:UpdateScrollState() end
+                    ---@param value any
+                    ---@return TypeGuard<ScrollLabel>
+                    local function IsValid(value) end
+                    function PANEL:SetText(txt)
+                        if not self.Label then return end
+                        self:UpdateScrollState()
+                        local pnl = self.Panel
+                        {body}
+                    end
+                    "#
+                ),
+            );
+            let diagnostics = default_diagnostics_for_code_with_shared(
+                &mut ws,
+                file,
+                DiagnosticCode::UndefinedField,
+            );
+            assert_eq!(diagnostics.len(), expected, "{name}: {diagnostics:?}");
+            for diagnostic in diagnostics {
+                assert!(
+                    diagnostic.message.contains("`Panel`"),
+                    "{name}: {diagnostic:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_outer_predicate_alias_cannot_recover_a_reassigned_inner_contract() {
+        for body in [
+            "local predicate = holds\n predicate = ordinary\n local alias = predicate\n return alias(other.Missing)",
+            "local predicate = holds\n predicate = ordinary\n local alias = predicate\n local value = other.Missing\n return alias(value)",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(
+                !ws.check_code_for(
+                    DiagnosticCode::UndefinedField,
+                    &predicate_alias_source(body)
+                ),
+                "{body}"
+            );
+        }
+        for body in [
+            "local predicate = holds\n local alias = predicate\n return alias(other.Missing)",
+            "local predicate = holds\n local alias = predicate\n local value = other.Missing\n return alias(value)",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(
+                ws.check_code_for(
+                    DiagnosticCode::UndefinedField,
+                    &predicate_alias_source(body)
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_name_guess_guard_evidence_uses_the_actual_narrowing_target() {
+        for (name, condition, strict) in [
+            ("colon_other", "probe:Holds(ent)", false),
+            ("second_argument", "holds(probe, ent)", false),
+            ("first_argument", "holds((ent), probe)", true),
+            ("receiver", "ent:IsEntity(probe)", true),
+            ("doc_function", "documented(ent)", true),
+        ] {
+            let mut ws = name_guess_workspace();
+            let file = ws.def_file(
+                &format!("lua/autorun/guard_target_{name}.lua"),
+                &format!(
+                    r#"
+                    ---@class Probe
+                    local Probe = {{}}
+                    ---@return TypeGuard<Probe>
+                    function Probe:Holds(other) end
+                    ---@param value any
+                    ---@param other any
+                    ---@return TypeGuard<Entity>
+                    local function holds(value, other) end
+                    ---@return TypeGuard<Entity>
+                    function Entity:IsEntity(other) end
+                    ---@param probe Probe
+                    ---@param documented fun(value: any): TypeGuard<Entity>
+                    function InspectGuardTarget(ent, probe, documented)
+                        if {condition} then
+                            return ent.Typo
+                        end
+                    end
+                    "#
+                ),
+            );
+            let undefined = default_diagnostics_for_code_with_shared(
+                &mut ws,
+                file,
+                DiagnosticCode::UndefinedField,
+            );
+            assert_eq!(
+                undefined.len(),
+                usize::from(strict),
+                "{name}: {undefined:?}"
+            );
+            let advisory = default_diagnostics_for_code_with_shared(
+                &mut ws,
+                file,
+                DiagnosticCode::InferUnknown,
+            );
+            assert_eq!(advisory.len(), usize::from(!strict), "{name}: {advisory:?}");
+        }
+    }
+
+    #[test]
+    fn test_name_guess_is_strict_after_semantic_class_and_capability_guards() {
+        for (name, condition) in [
+            ("return_cast", "ent:IsPlayer()"),
+            ("capability", "ent.Shield"),
+            ("inferred_boolean_guard", "isPlayer(ent)"),
+        ] {
+            for (read, code) in [
+                ("return ent.Typo", DiagnosticCode::UndefinedField),
+                (
+                    "local result = ent:Typo()\n if result then print(result) end",
+                    DiagnosticCode::UndefinedMethod,
+                ),
+            ] {
+                let mut ws = name_guess_workspace();
+                ws.def_file(
+                    "annotations/class_guard_api.lua",
+                    r#"
+                    ---@class Player: Entity
+                    ---@field Shield number
+                    local Player = {}
+                    ---@return boolean
+                    ---@return_cast self Player
+                    function Entity:IsPlayer() end
+                    "#,
+                );
+                let file = ws.def_file(
+                    &format!("lua/autorun/semantic_guard_{name}.lua"),
+                    &format!(
+                        r#"
+                        ---@param value Entity
+                        ---@return boolean
+                        local function isPlayer(value)
+                            return value:IsPlayer()
+                        end
+                        function InspectSemanticGuard(ent)
+                            if not {condition} then return end
+                            {read}
+                        end
+                        "#
+                    ),
+                );
+                let undefined = default_diagnostics_for_code_with_shared(&mut ws, file, code);
+                assert_eq!(undefined.len(), 1, "{name}, {read}: {undefined:?}");
+                let advisory = default_diagnostics_for_code_with_shared(
+                    &mut ws,
+                    file,
+                    DiagnosticCode::InferUnknown,
+                );
+                assert!(advisory.is_empty(), "{name}, {read}: {advisory:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_name_guess_survives_validity_and_pure_removal_casts() {
+        for (name, condition) in [
+            ("valid_guard", "IsValid(ent)"),
+            ("removal_cast", "ent:HasHandle()"),
+        ] {
+            let mut ws = name_guess_workspace();
+            ws.def_file(
+                "annotations/presence_guard_api.lua",
+                r#"
+                ---@class Entity
+                local Entity = {}
+                ---@class NULL
+                local NULL = {}
+
+                ---@attribute valid_guard()
+
+                ---@[valid_guard]
+                ---@param value any
+                ---@return TypeGuard<Entity>
+                function IsValid(value) end
+                ---@return boolean
+                ---@return_cast self -NULL
+                function Entity:HasHandle() end
+                "#,
+            );
+            let file = ws.def_file(
+                &format!("lua/autorun/presence_only_{name}.lua"),
+                &format!(
+                    "function InspectPresenceOnly(ent)\n if {condition} then\n return ent.Typo\n end\nend\n"
+                ),
+            );
+            let undefined = default_diagnostics_for_code_with_shared(
+                &mut ws,
+                file,
+                DiagnosticCode::UndefinedField,
+            );
+            assert!(undefined.is_empty(), "{name}: {undefined:?}");
+            let advisory = default_diagnostics_for_code_with_shared(
+                &mut ws,
+                file,
+                DiagnosticCode::InferUnknown,
+            );
+            assert_eq!(advisory.len(), 1, "{name}: {advisory:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod presence_argument_target_tests {
+    use crate::{DiagnosticCode, FileId, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaIndexExpr};
+    use lsp_types::{NumberOrString, Range};
+    use tokio_util::sync::CancellationToken;
+
+    const PATH: &str = "lua/autorun/server/sv_presence_arguments.lua";
+    const PREDICATE_PATH: &str = "lua/includes/presence_arguments.lua";
+    const PREDICATE: &str = "function accepts(ignored, value) return type(value) == 'string' end";
+    const SOURCE: &str = "---@param ent PresenceBase\nlocal function use(ent)\n    local label = ent.Label\n    if accepts(true, label) then return label end\nend\n";
+
+    fn workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file("annotations/presence_arguments.lua", "---@class PresenceBase\nlocal BASE = {}\n---@class PresenceChild: PresenceBase\n---@field Label string\n---@field Other string\nlocal CHILD = {}\n");
+        ws
+    }
+
+    fn diagnostics(ws: &mut VirtualWorkspace, file: FileId) -> Vec<(String, Range, String)> {
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::InferUnguardedChild);
+        let shared = ws.analysis.precompute_diagnostic_shared_data();
+        let mut result = ws
+            .analysis
+            .diagnose_file_with_shared(file, CancellationToken::new(), shared)
+            .unwrap()
+            .into_iter()
+            .map(|diagnostic| {
+                let Some(NumberOrString::String(code)) = diagnostic.code else {
+                    panic!("missing diagnostic code");
+                };
+                (code, diagnostic.range, diagnostic.message)
+            })
+            .collect::<Vec<_>>();
+        result.sort_by_key(|(_, range, _)| (range.start.line, range.start.character));
+        result
+    }
+
+    fn expected(ws: &VirtualWorkspace, file: FileId, field: &str) -> Vec<(String, Range, String)> {
+        let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
+        let index = model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .find(|index| index.syntax().text() == field)
+            .unwrap();
+        vec![(DiagnosticCode::InferUnguardedChild.get_name().to_string(),
+            model.get_document().to_lsp_range(index.get_range()).unwrap(),
+            "expected `PresenceChild` but found `PresenceBase`. Add a guard to narrow the parent to `PresenceChild`.".to_string())]
+    }
+
+    #[test]
+    fn inferred_presence_targets_cover_second_arguments_and_colon_dot_parameter_mapping() {
+        for (predicate, call) in [
+            (
+                "local function accepts(ignored, value) return type(value) == 'string' end",
+                "accepts(true, label)",
+            ),
+            (
+                "local function accepts(value, ignored) return type(value) == 'string' end",
+                "accepts(label, true)",
+            ),
+            (
+                "local predicates = {}\nfunction predicates:accepts(value) return type(value) == 'string' end",
+                "predicates.accepts(predicates, label)",
+            ),
+            (
+                "local predicates = {}\nfunction predicates.accepts(self, ignored, value) return type(value) == 'string' end",
+                "predicates:accepts(true, label)",
+            ),
+        ] {
+            let text = format!(
+                "{predicate}\n---@param ent PresenceBase\nlocal function use(ent)\n    local label = ent.Label\n    if {call} then return label end\nend\n"
+            );
+            let mut ws = workspace();
+            let file = ws.def_file(PATH, &text);
+            assert_eq!(diagnostics(&mut ws, file), vec![], "{call}");
+        }
+    }
+
+    #[test]
+    fn inferred_presence_target_does_not_suppress_other_argument_reads() {
+        let mut ws = workspace();
+        let text = format!(
+            "{PREDICATE}\n{}",
+            SOURCE.replace(
+                "    if accepts(true, label) then",
+                "    local accepted = accepts(ent.Other, label)\n    if accepted then"
+            )
+        );
+        let file = ws.def_file(PATH, &text);
+        let wanted = expected(&ws, file, "ent.Other");
+        assert_eq!(diagnostics(&mut ws, file), wanted);
+    }
+
+    #[test]
+    fn second_argument_presence_predicate_edits_delete_reopen_and_revert_match_cold() {
+        let mut warm = workspace();
+        warm.def_file(PREDICATE_PATH, PREDICATE);
+        let file = warm.def_file(PATH, SOURCE);
+        assert_eq!(diagnostics(&mut warm, file), vec![]);
+        for predicate in [
+            Some("function accepts(ignored, value) return true end"),
+            Some(PREDICATE),
+            None,
+            Some(PREDICATE),
+        ] {
+            if let Some(predicate) = predicate {
+                warm.def_file(PREDICATE_PATH, predicate);
+            } else {
+                let uri = warm.virtual_url_generator.new_uri(PREDICATE_PATH);
+                warm.analysis.remove_file_by_uri(&uri);
+            }
+            let mut cold = workspace();
+            if let Some(predicate) = predicate {
+                cold.def_file(PREDICATE_PATH, predicate);
+            }
+            let cold_file = cold.def_file(PATH, SOURCE);
+            let wanted = if predicate == Some(PREDICATE) {
+                vec![]
+            } else {
+                expected(&cold, cold_file, "ent.Label")
+            };
+            assert_eq!(
+                diagnostics(&mut cold, cold_file),
+                wanted,
+                "cold {predicate:?}"
+            );
+            assert_eq!(diagnostics(&mut warm, file), wanted, "warm {predicate:?}");
+        }
+        let uri = warm.virtual_url_generator.new_uri(PATH);
+        warm.analysis.remove_file_by_uri(&uri);
+        let reopened = warm.def_file(PATH, SOURCE);
+        assert_eq!(diagnostics(&mut warm, reopened), vec![]);
     }
 }

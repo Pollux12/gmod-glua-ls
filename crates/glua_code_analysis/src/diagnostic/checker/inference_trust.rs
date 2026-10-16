@@ -26,26 +26,11 @@ impl Checker for InferenceTrustChecker {
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let mut events = semantic_model
-            .get_db()
-            .get_type_index()
-            .get_inference_events_for_file(context.get_file_id())
-            .to_vec();
-        events.extend(
-            semantic_model
-                .get_db()
-                .get_call_site_param_index()
-                .get_inference_events_for_file(context.get_file_id()),
-        );
-        events.sort_by(|left, right| left.event.stable_cmp(&right.event));
-        events.dedup_by(|left, right| left.event == right.event);
-        for inference in events {
+        for inference in file_inference_events(semantic_model, context.get_file_id()) {
             let (code, is_unguarded_child) = match inference.event.kind {
                 LuaInferenceProvenanceKind::ContextualUnknown => {
                     (DiagnosticCode::InferUnknown, false)
                 }
-                // A child read off a param only its name types was inferred
-                // from usage: there is no declared parent a guard could narrow.
                 LuaInferenceProvenanceKind::UnguardedChild
                     if reads_guessed_declaration(
                         semantic_model,
@@ -108,7 +93,7 @@ impl Checker for InferenceTrustChecker {
                         &found,
                     )
                 } else {
-                    format!("Type `{typ}` was inferred from usage context and may be incorrect.")
+                    inferred_from_usage_message(&typ)
                 },
                 severity,
                 None,
@@ -278,11 +263,19 @@ fn source_is_presence_guarded(
     else {
         return false;
     };
-    crate::compilation::analyzer::is_guarded_by_enclosing_condition(
-        semantic_model.get_db(),
-        &mut semantic_model.get_cache().borrow_mut(),
-        &index_expr,
-    )
+    let db = semantic_model.get_db();
+    let mut cache = semantic_model.get_cache().borrow_mut();
+    crate::compilation::analyzer::is_guarded_by_enclosing_condition(db, &mut cache, &index_expr)
+        || crate::compilation::analyzer::is_member_path_presence_guarded(
+            db,
+            &mut cache,
+            &index_expr,
+        )
+}
+
+/// The advisory for a type that usage, not a declaration, decided.
+pub(super) fn inferred_from_usage_message(typ: &str) -> String {
+    format!("Type `{typ}` was inferred from usage context and may be incorrect.")
 }
 
 /// A single winning child can be written into a guard, so it is named directly.

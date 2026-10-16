@@ -1296,7 +1296,7 @@ fn collect_unguarded_child_file(
             found_types.insert(source.clone(), current.clone());
             let source = ChildSource {
                 site: source,
-                guarded: is_guarded_by_enclosing_condition(db, &mut infer_cache, index_expr),
+                guarded: is_presence_covered(db, &mut infer_cache, index_expr),
             };
             let mut evidence_recorded = false;
             for child_id in children.iter() {
@@ -1667,7 +1667,7 @@ fn collect_member_path_unguarded_child_evidence(
     };
     let source = ChildSource {
         site: InFiled::new(file_id, index_expr.get_syntax_id()),
-        guarded: is_guarded_by_enclosing_condition(db, cache, index_expr),
+        guarded: is_presence_covered(db, cache, index_expr),
     };
     let receiver = InFiled::new(file_id, receiver.get_syntax_id());
     let candidates =
@@ -2586,6 +2586,15 @@ fn logical_condition_contains_index(expr: &LuaExpr, index_expr: &LuaIndexExpr) -
 }
 
 fn is_assignment_target(index_expr: &LuaIndexExpr) -> bool {
+    if let Some(func_name) = index_expr
+        .syntax()
+        .ancestors()
+        .find_map(glua_parser::LuaFuncStat::cast)
+        .and_then(|func_stat| func_stat.get_func_name())
+        && is_prefix_chain_to(index_expr, func_name.syntax())
+    {
+        return true;
+    }
     let Some(assign_stat) = index_expr
         .syntax()
         .ancestors()
@@ -2595,8 +2604,29 @@ fn is_assignment_target(index_expr: &LuaIndexExpr) -> bool {
     };
     let index_range = index_expr.syntax().text_range();
     let (vars, _) = assign_stat.get_var_and_expr_list();
-    vars.into_iter()
-        .any(|var| var.syntax().text_range().contains_range(index_range))
+    vars.into_iter().any(|var| {
+        var.syntax().text_range().contains_range(index_range)
+            && is_prefix_chain_to(index_expr, var.syntax())
+    })
+}
+
+/// Whether `index_expr` reaches `top` only as the prefix of each index expression between:
+/// a read in a key or a call argument of the written path is not part of the path.
+fn is_prefix_chain_to(index_expr: &LuaIndexExpr, top: &LuaSyntaxNode) -> bool {
+    let mut current = index_expr.syntax().clone();
+    while current != *top {
+        let Some(parent) = current.parent().and_then(LuaIndexExpr::cast) else {
+            return false;
+        };
+        if parent
+            .get_prefix_expr()
+            .is_none_or(|prefix| *prefix.syntax() != current)
+        {
+            return false;
+        }
+        current = parent.syntax().clone();
+    }
+    true
 }
 
 fn is_call_prefix(index_expr: &LuaIndexExpr) -> bool {
@@ -2621,16 +2651,21 @@ fn is_matching_short_circuit_guard(
         let Some(binary) = LuaBinaryExpr::cast(ancestor) else {
             continue;
         };
-        if binary.get_op_token().map(|token| token.get_op()) != Some(BinaryOperator::OpAnd) {
+        let Some(op) = binary
+            .get_op_token()
+            .map(|token| token.get_op())
+            .filter(|op| matches!(op, BinaryOperator::OpAnd | BinaryOperator::OpOr))
+        else {
             continue;
-        }
+        };
         let Some((left, right)) = binary.get_exprs() else {
             continue;
         };
         if left.syntax().text_range().contains_range(index_range) {
-            if positive_guard_indexes(db, cache, &left)
-                .iter()
-                .any(|guard| guard.syntax() == index_expr.syntax())
+            if op == BinaryOperator::OpAnd
+                && positive_guard_indexes(db, cache, &left)
+                    .iter()
+                    .any(|guard| guard.syntax() == index_expr.syntax())
             {
                 return true;
             }
@@ -2639,7 +2674,13 @@ fn is_matching_short_circuit_guard(
         if !right.syntax().text_range().contains_range(index_range) {
             continue;
         }
-        if matching_guard_in_expr(db, cache, &left, index_expr, GuardScope::Path) {
+        // `a and b` runs `b` when `a` holds; `a or b` runs it when `a` fails.
+        let guards = if op == BinaryOperator::OpAnd {
+            positive_guard_indexes(db, cache, &left)
+        } else {
+            present_after_exit_indexes(db, cache, &left)
+        };
+        if guards_cover(db, cache, guards, index_expr, GuardScope::Path) {
             return true;
         }
     }
@@ -2679,13 +2720,15 @@ fn is_presence_covered(
         || is_member_path_presence_guarded(db, cache, index_expr)
 }
 
-/// Whether the member path `index_expr` reads is proven present by an enclosing test or earlier exit.
+/// Whether the read of `index_expr` probes its member for presence or the member path is proven
+/// present there: by an enclosing test, an earlier exit, a short circuit or a tested local.
 pub(crate) fn is_member_path_presence_guarded(
     db: &crate::DbIndex,
     cache: &mut crate::semantic::LuaInferCache,
     index_expr: &LuaIndexExpr,
 ) -> bool {
-    enclosing_guard_covers(db, cache, index_expr, GuardScope::Path)
+    is_presence_probe(db, cache, index_expr)
+        || enclosing_guard_covers(db, cache, index_expr, GuardScope::Path)
         || is_matching_short_circuit_guard(db, cache, index_expr)
         || is_guarded_by_absence_exit(db, cache, index_expr, GuardScope::Path)
         || is_bound_to_presence_tested_local(db, cache, index_expr)
@@ -3342,6 +3385,18 @@ end
         let index_expr = parse_index_expr("result = value.ChildOnly");
 
         assert!(!is_assignment_target(&index_expr));
+    }
+
+    #[test]
+    fn assignment_target_classifier_rejects_index_read_in_a_key() {
+        let chunk = LuaParser::parse("targets[value.ChildOnly] = 1", ParserConfig::default())
+            .get_chunk_node();
+        let key_read = chunk
+            .descendants::<LuaIndexExpr>()
+            .find(|index| index.syntax().text() == "value.ChildOnly")
+            .expect("the key read");
+
+        assert!(!is_assignment_target(&key_read));
     }
 
     #[test]

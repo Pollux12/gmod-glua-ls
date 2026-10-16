@@ -1074,6 +1074,19 @@ pub(crate) fn presence_guard_target(
     call_expr: &LuaCallExpr,
 ) -> Option<LuaExpr> {
     let signature_id = get_call_prefix_signature_id(db, cache, call_expr)?;
+    if let Some(guard) = db
+        .get_signature_index()
+        .inferred_positive_guard(&signature_id)
+        && !guard.narrowed_type.contain_tpl()
+        && !may_be_nil(
+            db,
+            &guard.narrowed_type,
+            &mut rustc_hash::FxHashSet::default(),
+        )
+        && let Some(signature) = db.get_signature_index().get(&signature_id)
+    {
+        return inferred_guard_target_expr(call_expr, signature, guard.param_idx);
+    }
     let guards_presence = call_prefix_signature_is_valid_guard(db, cache, call_expr, signature_id)
         || db
             .get_signature_index()
