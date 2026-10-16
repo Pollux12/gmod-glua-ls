@@ -584,6 +584,112 @@ mod test {
     }
 
     #[test]
+    fn alias_parameters_do_not_bind_later_type_or_parameter_tags() {
+        for usage in [
+            "---@type S13ScopedAlias<T>\nlocal value",
+            "---@param value T\nlocal function consume(value) end",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(!ws.check_code_for(
+                DiagnosticCode::TypeNotFound,
+                &format!("---@alias S13ScopedAlias<T> {{ value: T }}\n{usage}\n"),
+            ));
+        }
+    }
+
+    #[test]
+    fn an_explicit_generic_binder_remains_visible_after_an_alias_tag() {
+        for usage in [
+            "---@type S13ScopedAlias<T>\nlocal value",
+            "---@param value T\nlocal function consume(value) end",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(ws.check_code_for(
+                DiagnosticCode::TypeNotFound,
+                &format!("---@alias S13ScopedAlias<T> {{ value: T }}\n---@generic T\n{usage}\n"),
+            ));
+        }
+        let mut ws = VirtualWorkspace::new();
+        let file = ws.def(
+            r#"
+---@alias S13ScopedAlias<T> { value: T }
+---@generic T
+---@param value T
+---@return S13ScopedAlias<T>
+local function wrap(value)
+    return { value = value }
+end
+---@type string
+local input
+local value = wrap(input).value
+"#,
+        );
+        assert_eq!(ws.local_ty(file, "value"), LuaType::String);
+    }
+
+    #[test]
+    fn two_alias_tags_keep_their_own_generic_parameter_lists() {
+        let mut ws = VirtualWorkspace::new();
+        let file = ws.def(
+            r#"
+---@alias S13FirstAlias<T> { value: T }
+---@alias S13SecondAlias<U> { value: U }
+local aliases
+---@type S13FirstAlias<string>
+local first
+---@type S13SecondAlias<number>
+local second
+local firstValue = first.value
+local secondValue = second.value
+"#,
+        );
+        assert_eq!(ws.local_ty(file, "firstValue"), LuaType::String);
+        assert_eq!(ws.local_ty(file, "secondValue"), LuaType::Number);
+    }
+
+    #[test]
+    fn multiline_alias_origins_keep_the_alias_generic_parameter_in_scope() {
+        let mut ws = VirtualWorkspace::new();
+        let file = ws.def(
+            r#"
+---@alias S13MultilineAlias<T>
+---| { value: T }
+---| { other: T }
+local aliases
+---@type S13MultilineAlias<string>
+local receiver
+local value = receiver.value
+local other = receiver.other
+"#,
+        );
+        let db = ws.analysis.compilation.get_db();
+        for name in ["value", "other"] {
+            assert_eq!(
+                crate::TypeOps::Remove.apply(db, &ws.local_ty(file, name), &LuaType::Nil),
+                LuaType::String
+            );
+        }
+    }
+
+    #[test]
+    fn a_generic_class_after_an_alias_uses_its_own_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let file = ws.def(
+            r#"
+---@class S13AliasPayload
+---@field value string
+---@alias S13Passthrough<T> T
+---@class S13SubstitutedSibling<T> : S13Passthrough<T>
+local classes
+---@type S13SubstitutedSibling<S13AliasPayload>
+local receiver
+local value = receiver.value
+"#,
+        );
+        assert_eq!(ws.local_ty(file, "value"), LuaType::String);
+    }
+
+    #[test]
     fn test_generic_type_extends() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         ws.def(

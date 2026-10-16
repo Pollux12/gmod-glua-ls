@@ -303,8 +303,9 @@ pub fn analyze_alias(analyzer: &mut DocAnalyzer, tag: LuaDocTagAlias) -> Option<
         .get_generic_decl_list()
         .map(|decl_list| get_generic_params(analyzer, decl_list));
     if let Some(generic_params) = &generic_params {
-        let range = analyzer.comment.get_range();
-        let scope_id = analyzer.generic_index.add_generic_scope(vec![range], false);
+        let scope_id = analyzer
+            .generic_index
+            .add_generic_scope(vec![tag.get_range()], false);
         analyzer
             .generic_index
             .append_generic_params(scope_id, generic_params.clone());
