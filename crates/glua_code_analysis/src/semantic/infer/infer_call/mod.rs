@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use glua_parser::{BinaryOperator, LuaAstNode, LuaCallExpr, LuaExpr, LuaSyntaxKind};
 use rowan::TextRange;
+use rustc_hash::FxHashSet;
 
 use super::infer_name::type_decl_is_vgui_panel;
 use super::{
@@ -43,6 +44,283 @@ mod infer_require;
 mod infer_setmetatable;
 
 pub type InferCallFuncResult = Result<Arc<LuaFunctionType>, InferFailReason>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ReturnContractTarget {
+    Wrapped(LuaSemanticDeclId),
+    Constraint(LuaExpr, LuaType),
+}
+
+pub(crate) fn infer_call_return_contract(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: LuaCallExpr,
+    call_expr_type: LuaType,
+    infer_guard: &InferGuardRef,
+) -> InferCallFuncResult {
+    let prefix_expr = call_expr.get_prefix_expr().ok_or(InferFailReason::None)?;
+    infer_call_return_contract_inner(
+        db,
+        cache,
+        call_expr,
+        call_expr_type,
+        infer_guard,
+        prefix_expr,
+        &mut FxHashSet::default(),
+    )
+}
+
+fn infer_call_return_contract_inner(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: LuaCallExpr,
+    call_expr_type: LuaType,
+    infer_guard: &InferGuardRef,
+    prefix_expr: LuaExpr,
+    active_targets: &mut FxHashSet<ReturnContractTarget>,
+) -> InferCallFuncResult {
+    let alias = match &call_expr_type {
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => {
+            infer_call_alias_origin(db, type_id, None)?
+        }
+        LuaType::Generic(generic) => {
+            let substitutor = TypeSubstitutor::from_type_array(generic.get_params().clone());
+            infer_call_alias_origin(db, &generic.get_base_type_id(), Some(&substitutor))?
+        }
+        _ => None,
+    };
+    if let Some((type_id, origin)) = alias {
+        infer_guard.check(&type_id)?;
+        return infer_call_return_contract_inner(
+            db,
+            cache,
+            call_expr,
+            origin,
+            infer_guard,
+            prefix_expr,
+            active_targets,
+        );
+    }
+
+    match &call_expr_type {
+        LuaType::Union(union) => {
+            for arm in union.types() {
+                infer_call_return_contract_inner(
+                    db,
+                    cache,
+                    call_expr.clone(),
+                    arm.clone(),
+                    &infer_guard.fork(),
+                    prefix_expr.clone(),
+                    active_targets,
+                )?;
+            }
+        }
+        LuaType::TplRef(_) | LuaType::ConstTplRef(_) | LuaType::StrTplRef(_) => {
+            let extend =
+                get_tpl_ref_extend_type(db, cache, &call_expr_type, prefix_expr.clone(), 0)
+                    .filter(|extend| extend != &call_expr_type)
+                    .ok_or(InferFailReason::None)?;
+            let target =
+                ReturnContractTarget::Constraint(prefix_expr.clone(), call_expr_type.clone());
+            if !active_targets.insert(target.clone()) {
+                return Err(InferFailReason::RecursiveInfer);
+            }
+            let result = infer_call_return_contract_inner(
+                db,
+                cache,
+                call_expr,
+                extend,
+                infer_guard,
+                prefix_expr,
+                active_targets,
+            );
+            active_targets.remove(&target);
+            return result;
+        }
+        LuaType::Table | LuaType::TableConst(_) | LuaType::Instance(_) => {
+            let direct = match &call_expr_type {
+                LuaType::TableConst(table) => infer_table_type_doc_function(db, table.clone()),
+                LuaType::Instance(instance) => infer_instance_type_doc_function(db, instance),
+                _ => Err(InferFailReason::None),
+            };
+            return direct.or_else(|reason| {
+                let (semantic_decl, target_expr) =
+                    wrapped_callable_target_expr(db, cache, prefix_expr).ok_or(reason)?;
+                let target = ReturnContractTarget::Wrapped(semantic_decl);
+                if !active_targets.insert(target.clone()) {
+                    return Err(InferFailReason::RecursiveInfer);
+                }
+                let target_type = normalize_wrapped_callable_target_type(
+                    db,
+                    infer_expr(db, cache, target_expr.clone())?,
+                );
+                let result = infer_call_return_contract_inner(
+                    db,
+                    cache,
+                    call_expr,
+                    target_type,
+                    infer_guard,
+                    target_expr,
+                    active_targets,
+                );
+                active_targets.remove(&target);
+                result
+            });
+        }
+        LuaType::DocFunction(_)
+        | LuaType::Signature(_)
+        | LuaType::Def(_)
+        | LuaType::Ref(_)
+        | LuaType::Generic(_) => {}
+        _ => return Err(InferFailReason::None),
+    }
+    infer_call_expr_func(db, cache, call_expr, call_expr_type, infer_guard, None)
+}
+
+fn infer_call_alias_origin(
+    db: &DbIndex,
+    type_id: &LuaTypeDeclId,
+    substitutor: Option<&TypeSubstitutor>,
+) -> Result<Option<(LuaTypeDeclId, LuaType)>, InferFailReason> {
+    let type_decl = db
+        .get_type_index()
+        .get_type_decl(type_id)
+        .ok_or_else(|| InferFailReason::UnResolveTypeDecl(type_id.clone()))?;
+    if type_decl.is_alias() {
+        let origin = type_decl
+            .get_alias_origin(db, substitutor)
+            .ok_or(InferFailReason::None)?;
+        Ok(Some((type_id.clone(), origin)))
+    } else if type_decl.is_enum() {
+        Err(InferFailReason::None)
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn call_arg_is_sync(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: LuaCallExpr,
+    callee_type: LuaType,
+    arg_idx: usize,
+    infer_guard: &InferGuardRef,
+) -> Result<bool, InferFailReason> {
+    call_arg_is_sync_inner(
+        db,
+        cache,
+        call_expr,
+        callee_type,
+        arg_idx,
+        infer_guard,
+        &mut FxHashSet::default(),
+    )
+}
+
+fn call_arg_is_sync_inner(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: LuaCallExpr,
+    callee_type: LuaType,
+    arg_idx: usize,
+    infer_guard: &InferGuardRef,
+    active_constraints: &mut FxHashSet<LuaType>,
+) -> Result<bool, InferFailReason> {
+    let alias = match &callee_type {
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => {
+            infer_call_alias_origin(db, type_id, None)?
+        }
+        LuaType::Generic(generic) => {
+            let substitutor = TypeSubstitutor::from_type_array(generic.get_params().clone());
+            infer_call_alias_origin(db, &generic.get_base_type_id(), Some(&substitutor))?
+        }
+        _ => None,
+    };
+    if let Some((type_id, origin)) = alias {
+        infer_guard.check(&type_id)?;
+        return call_arg_is_sync_inner(
+            db,
+            cache,
+            call_expr,
+            origin,
+            arg_idx,
+            infer_guard,
+            active_constraints,
+        );
+    }
+    if let LuaType::Union(union) = &callee_type {
+        for arm in union.types() {
+            if !call_arg_is_sync_inner(
+                db,
+                cache,
+                call_expr.clone(),
+                arm.clone(),
+                arg_idx,
+                &infer_guard.fork(),
+                active_constraints,
+            )? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    if let LuaType::MultiLineUnion(union) = &callee_type {
+        for (arm, _) in union.get_unions() {
+            if !call_arg_is_sync_inner(
+                db,
+                cache,
+                call_expr.clone(),
+                arm.clone(),
+                arg_idx,
+                &infer_guard.fork(),
+                active_constraints,
+            )? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    if matches!(
+        callee_type,
+        LuaType::TplRef(_) | LuaType::ConstTplRef(_) | LuaType::StrTplRef(_)
+    ) {
+        let prefix = call_expr.get_prefix_expr().ok_or(InferFailReason::None)?;
+        let extend = get_tpl_ref_extend_type(db, cache, &callee_type, prefix, 0)
+            .filter(|extend| extend != &callee_type)
+            .ok_or(InferFailReason::None)?;
+        if !active_constraints.insert(callee_type.clone()) {
+            return Err(InferFailReason::RecursiveInfer);
+        }
+        let result = call_arg_is_sync_inner(
+            db,
+            cache,
+            call_expr,
+            extend,
+            arg_idx,
+            infer_guard,
+            active_constraints,
+        );
+        active_constraints.remove(&callee_type);
+        return result;
+    }
+    let function =
+        infer_call_expr_func(db, cache, call_expr.clone(), callee_type, infer_guard, None)?;
+    let param_idx = match (function.is_colon_define(), call_expr.is_colon_call()) {
+        (true, false) => arg_idx.checked_sub(1),
+        (false, true) => Some(arg_idx + 1),
+        _ => Some(arg_idx),
+    };
+    Ok(param_idx
+        .and_then(|param_idx| function.get_params().get(param_idx))
+        .and_then(|(_, param_type)| param_type.as_ref())
+        .is_some_and(|param_type| {
+            matches!(
+                param_type,
+                LuaType::DocFunction(func) if func.get_async_state() == AsyncState::Sync
+            )
+        }))
+}
 
 pub fn infer_call_expr_func(
     db: &DbIndex,
@@ -536,15 +814,7 @@ fn infer_wrapped_setmetatable_call(
         _ => return None,
     }
 
-    let prefix_expr = call_expr.get_prefix_expr()?;
-    let semantic_decl = infer_expr_semantic_decl(
-        db,
-        cache,
-        prefix_expr,
-        SemanticDeclGuard::default(),
-        SemanticDeclLevel::default(),
-    )?;
-    let target_expr = get_wrapped_callable_target_expr(db, semantic_decl)?;
+    let (_, target_expr) = wrapped_callable_target_expr(db, cache, call_expr.get_prefix_expr()?)?;
     let target_type =
         normalize_wrapped_callable_target_type(db, infer_expr(db, cache, target_expr).ok()?);
     Some(infer_call_expr_func(
@@ -555,6 +825,22 @@ fn infer_wrapped_setmetatable_call(
         infer_guard,
         args_count,
     ))
+}
+
+fn wrapped_callable_target_expr(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    prefix_expr: LuaExpr,
+) -> Option<(LuaSemanticDeclId, LuaExpr)> {
+    let semantic_decl = infer_expr_semantic_decl(
+        db,
+        cache,
+        prefix_expr,
+        SemanticDeclGuard::default(),
+        SemanticDeclLevel::default(),
+    )?;
+    let target_expr = get_wrapped_callable_target_expr(db, semantic_decl.clone())?;
+    Some((semantic_decl, target_expr))
 }
 
 fn normalize_wrapped_callable_target_type(db: &DbIndex, target_type: LuaType) -> LuaType {
@@ -1647,14 +1933,7 @@ fn infer_type_doc_function(
     args_count: Option<usize>,
 ) -> InferCallFuncResult {
     infer_guard.check(&type_id)?;
-    let type_decl = db
-        .get_type_index()
-        .get_type_decl(&type_id)
-        .ok_or_else(|| InferFailReason::UnResolveTypeDecl(type_id.clone()))?;
-    if type_decl.is_alias() {
-        let origin_type = type_decl
-            .get_alias_origin(db, None)
-            .ok_or(InferFailReason::None)?;
+    if let Some((_, origin_type)) = infer_call_alias_origin(db, &type_id, None)? {
         return infer_call_expr_func(
             db,
             cache,
@@ -1663,8 +1942,6 @@ fn infer_type_doc_function(
             infer_guard,
             args_count,
         );
-    } else if type_decl.is_enum() {
-        return Err(InferFailReason::None);
     }
 
     let operator_index = db.get_operator_index();
@@ -1728,14 +2005,7 @@ fn infer_generic_type_doc_function(
     let generic_params = generic.get_params();
     let substitutor = TypeSubstitutor::from_type_array(generic_params.clone());
 
-    let type_decl = db
-        .get_type_index()
-        .get_type_decl(&type_id)
-        .ok_or_else(|| InferFailReason::UnResolveTypeDecl(type_id.clone()))?;
-    if type_decl.is_alias() {
-        let origin_type = type_decl
-            .get_alias_origin(db, Some(&substitutor))
-            .ok_or(InferFailReason::None)?;
+    if let Some((_, origin_type)) = infer_call_alias_origin(db, &type_id, Some(&substitutor))? {
         return infer_call_expr_func(
             db,
             cache,
@@ -1744,8 +2014,6 @@ fn infer_generic_type_doc_function(
             infer_guard,
             args_count,
         );
-    } else if type_decl.is_enum() {
-        return Err(InferFailReason::None);
     }
 
     let operator_index = db.get_operator_index();

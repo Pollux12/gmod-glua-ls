@@ -18,6 +18,7 @@ use crate::{
 
 use super::{
     InferFailReason, InferResult,
+    infer_call::infer_call_return_contract,
     infer_index::{infer_member_by_member_key, infer_member_by_operator},
 };
 
@@ -108,10 +109,29 @@ fn infer_table_array_summary(
         }
     }
 
+    let mut unknown_tail = false;
     if let Some(last_field) = fields.last() {
         let last_value_expr = last_field.get_value_expr().ok_or(InferFailReason::None)?;
+        unknown_tail = if let LuaExpr::CallExpr(call_expr) = &last_value_expr {
+            let contract = call_expr
+                .get_prefix_expr()
+                .and_then(|prefix| infer_expr(db, cache, prefix).ok())
+                .and_then(|ty| {
+                    infer_call_return_contract(db, cache, call_expr.clone(), ty, &InferGuard::new())
+                        .ok()
+                });
+            contract.is_none()
+        } else {
+            false
+        };
         let last_expr_type = infer_expr(db, cache, last_value_expr)?;
-        if let LuaType::Variadic(multi) = last_expr_type
+        if unknown_tail && fields.len() == 1 {
+            return Ok(LuaType::Array(
+                LuaArrayType::from_base_type(LuaType::Unknown).into(),
+            ));
+        }
+        if !unknown_tail
+            && let LuaType::Variadic(multi) = last_expr_type
             && let VariadicType::Base(base) = &multi.deref()
         {
             let non_nil_base = TypeOps::Remove.apply(db, base, &LuaType::Nil);
@@ -144,9 +164,16 @@ fn infer_table_array_summary(
     // infer-resolve tuple (a positional-evidence carrier; see the function doc).
     // Mutation leniency is handled in the diagnostic layer.
     let mut types = Vec::new();
-    for field in fields {
+    let last_index = fields.len().saturating_sub(1);
+    for (index, field) in fields.into_iter().enumerate() {
         let value_expr = field.get_value_expr().ok_or(InferFailReason::None)?;
         let typ = infer_expr(db, cache, value_expr)?;
+        if unknown_tail && index == last_index {
+            types.push(LuaType::Variadic(
+                VariadicType::Base(LuaType::Unknown).into(),
+            ));
+            continue;
+        }
         match typ {
             LuaType::Variadic(multi) => flatten_multi_into_tuple(&mut types, &multi),
             _ => {
