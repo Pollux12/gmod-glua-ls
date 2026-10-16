@@ -182,6 +182,567 @@ mod tests {
         );
     }
 
+    fn missing_counterpart_messages(diagnostics: &[Diagnostic]) -> Vec<&str> {
+        let expected_code = diagnostic_code(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == expected_code)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect()
+    }
+
+    #[gtest]
+    fn test_server_receiver_does_not_satisfy_server_send() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/send_and_receive.lua",
+            r#"
+            util.AddNetworkString("SameRealm")
+            net.Start("SameRealm")
+            net.WriteUInt(3, 8)
+            net.Broadcast()
+            net.Receive("SameRealm", function()
+                local n = net.ReadUInt(8)
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        let messages = missing_counterpart_messages(&diagnostics);
+        assert_that!(messages.len(), eq(2usize));
+        expect_that!(
+            messages
+                .iter()
+                .any(|message| message.contains("`net.Receive` counterpart")
+                    && message.contains("client realm")),
+            eq(true)
+        );
+        expect_that!(
+            messages
+                .iter()
+                .any(|message| message.contains("sending counterpart")
+                    && message.contains("client realm")),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_client_receiver_does_not_satisfy_send_to_server() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/send_and_receive.lua",
+            r#"
+            net.Start("ToServer")
+            net.SendToServer()
+            net.Receive("ToServer", function() end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        let messages = missing_counterpart_messages(&diagnostics);
+        assert_that!(messages.len(), eq(2usize));
+        expect_that!(
+            messages
+                .iter()
+                .any(|message| message.contains("`net.Receive` counterpart")
+                    && message.contains("server realm")),
+            eq(true)
+        );
+        expect_that!(
+            messages
+                .iter()
+                .any(|message| message.contains("sending counterpart")
+                    && message.contains("server realm")),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_shared_receiver_satisfies_server_send() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("SharedReceiver")
+            net.Start("SharedReceiver")
+            net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_receive.lua",
+            r#"
+            net.Receive("SharedReceiver", function() end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(
+            count_diagnostic(
+                &diagnostics,
+                DiagnosticCode::GmodNetMissingNetworkCounterpart
+            ),
+            eq(0usize)
+        );
+    }
+
+    #[gtest]
+    fn test_never_called_sending_function_reports_missing_receiver_once() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("NeverCalled")
+
+            function SendNeverCalled()
+                net.Start("NeverCalled")
+                net.WriteString("hello")
+                net.Broadcast()
+            end
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(
+            count_diagnostic(
+                &diagnostics,
+                DiagnosticCode::GmodNetMissingNetworkCounterpart
+            ),
+            eq(1usize)
+        );
+    }
+
+    #[gtest]
+    fn test_lua_defined_net_receive_keeps_annotated_receive_role() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        ws.def_file(
+            "lua/includes/extensions/net.lua",
+            r#"
+            net.Receivers = net.Receivers or {}
+
+            function net.Receive(name, func)
+                net.Receivers[name:lower()] = func
+            end
+            "#,
+        );
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("LuaDefinedReceive")
+            net.Start("LuaDefinedReceive")
+            net.Broadcast()
+
+            util.AddNetworkString("LuaDefinedOrphan")
+            net.Start("LuaDefinedOrphan")
+            net.Broadcast()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("LuaDefinedReceive", function() end)
+            "#,
+        );
+
+        let server = file_diagnostics(&mut ws, server_file_id);
+        let client = file_diagnostics(&mut ws, client_file_id);
+        let messages = missing_counterpart_messages(&server);
+        assert_that!(messages.len(), eq(1usize));
+        expect_that!(messages[0].contains("LuaDefinedOrphan"), eq(true));
+        expect_that!(count_network_diagnostics(&client), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_menu_receiver_does_not_satisfy_server_send() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("MenuReceiver")
+            net.Start("MenuReceiver")
+            net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "lua/menu/receive.lua",
+            r#"
+            ---@realm menu
+
+            net.Receive("MenuReceiver", function() end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(missing_counterpart_messages(&diagnostics).len(), eq(1usize));
+    }
+
+    #[gtest]
+    fn test_menu_receiver_does_not_satisfy_uncalled_start_only_wrapper() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_prepare.lua",
+            r#"
+            util.AddNetworkString("Prepared")
+            function PrepareMessage()
+                net.Start("Prepared")
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/menu/receive.lua",
+            r#"
+            ---@realm menu
+
+            net.Receive("Prepared", function() end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(missing_counterpart_messages(&diagnostics).len(), eq(1usize));
+    }
+
+    #[gtest]
+    fn test_dead_branch_receiver_does_not_satisfy_uncalled_start_only_wrapper() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_prepare.lua",
+            r#"
+            util.AddNetworkString("PreparedDead")
+            function PrepareMessage()
+                net.Start("PreparedDead")
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/server/sv_dead.lua",
+            r#"
+            if CLIENT then
+                net.Receive("PreparedDead", function() end)
+            end
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(missing_counterpart_messages(&diagnostics).len(), eq(1usize));
+    }
+
+    #[gtest]
+    fn test_unreachable_receiver_with_a_live_pair_is_not_reported() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let send_id = ws.def_file(
+            "lua/autorun/server/sv_send.lua",
+            r#"
+            util.AddNetworkString("DeadBranch")
+            net.Start("DeadBranch")
+            net.Broadcast()
+            "#,
+        );
+        let receive_id = ws.def_file(
+            "lua/autorun/client/cl_receive.lua",
+            r#"
+            net.Receive("DeadBranch", function() end)
+            "#,
+        );
+        let dead_id = ws.def_file(
+            "lua/autorun/server/sv_dead.lua",
+            r#"
+            if CLIENT then
+                net.Receive("DeadBranch", function() end)
+            end
+            "#,
+        );
+        let orphan_id = ws.def_file(
+            "lua/autorun/client/cl_orphan.lua",
+            r#"
+            net.Receive("Orphan", function() end)
+            "#,
+        );
+
+        for file_id in [send_id, receive_id, dead_id] {
+            let diagnostics = file_diagnostics(&mut ws, file_id);
+            expect_that!(missing_counterpart_messages(&diagnostics).len(), eq(0usize));
+        }
+        let diagnostics = file_diagnostics(&mut ws, orphan_id);
+        expect_that!(missing_counterpart_messages(&diagnostics).len(), eq(1usize));
+    }
+
+    fn nested_guard_missing_count(send_path: &str, send_text: &str, receive_text: &str) -> usize {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+        let send_id = ws.def_file(send_path, send_text);
+        ws.def_file("lua/autorun/sh_receive.lua", receive_text);
+        let diagnostics = file_diagnostics(&mut ws, send_id);
+        missing_counterpart_messages(&diagnostics).len()
+    }
+
+    #[gtest]
+    fn test_server_inside_client_guard_receiver_does_not_satisfy_server_send() {
+        let missing = nested_guard_missing_count(
+            "lua/autorun/server/sv_send.lua",
+            r#"
+            util.AddNetworkString("NestedDead")
+            net.Start("NestedDead")
+            net.Broadcast()
+            "#,
+            r#"
+            if SERVER then
+                if CLIENT then
+                    net.Receive("NestedDead", function() end)
+                end
+            end
+            "#,
+        );
+        expect_that!(missing, eq(1usize));
+    }
+
+    #[gtest]
+    fn test_client_inside_server_guard_receiver_does_not_satisfy_client_send() {
+        let missing = nested_guard_missing_count(
+            "lua/autorun/client/cl_send.lua",
+            r#"
+            net.Start("NestedDeadUp")
+            net.SendToServer()
+            "#,
+            r#"
+            if CLIENT then
+                if SERVER then
+                    net.Receive("NestedDeadUp", function() end)
+                end
+            end
+            "#,
+        );
+        expect_that!(missing, eq(1usize));
+    }
+
+    #[gtest]
+    fn test_same_realm_nested_guard_receiver_satisfies_send() {
+        let missing = nested_guard_missing_count(
+            "lua/autorun/server/sv_send.lua",
+            r#"
+            util.AddNetworkString("NestedLive")
+            net.Start("NestedLive")
+            net.Broadcast()
+            "#,
+            r#"
+            if CLIENT then
+                if CLIENT then
+                    net.Receive("NestedLive", function() end)
+                end
+            end
+            "#,
+        );
+        expect_that!(missing, eq(0usize));
+    }
+
+    #[gtest]
+    fn test_unreachable_client_branch_receiver_does_not_satisfy_server_send() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_send.lua",
+            r#"
+            util.AddNetworkString("DeadBranch")
+            net.Start("DeadBranch")
+            net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/server/sv_dead.lua",
+            r#"
+            if CLIENT then
+                net.Receive("DeadBranch", function() end)
+            end
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(missing_counterpart_messages(&diagnostics).len(), eq(1usize));
+    }
+
+    #[gtest]
+    fn test_complete_wrapped_server_send_does_not_satisfy_server_receiver() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_example.lua",
+            r#"
+            util.AddNetworkString("Direction")
+            function SendDirection()
+                net.Start("Direction")
+                net.Broadcast()
+            end
+            hook.Add("PlayerInitialSpawn", "Direction", SendDirection)
+            net.Receive("Direction", function() end)
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/cl_example.lua",
+            r#"
+            net.Receive("Direction", function() end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        let messages = missing_counterpart_messages(&diagnostics);
+        assert_that!(messages.len(), eq(1usize));
+        expect_that!(
+            messages[0].contains("sending counterpart") && messages[0].contains("client realm"),
+            eq(true)
+        );
+    }
+
+    /// The call in `file_id` whose callee is the name `callee` names two
+    /// inferred signatures and no declared or unique one.
+    fn assert_ambiguous_callee(ws: &VirtualWorkspace, file_id: crate::FileId, callee: &str) {
+        let db = ws.analysis.compilation.get_db();
+        let root = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("the file is parsed")
+            .get_chunk_node();
+        let call = root
+            .descendants::<LuaCallExpr>()
+            .find(|call| {
+                call.get_prefix_expr()
+                    .is_some_and(|prefix| prefix.syntax().text() == callee)
+            })
+            .expect("the callee is called");
+        let target = db
+            .get_call_target_index()
+            .target(file_id, call.get_range())
+            .expect("the call's target is stored");
+        expect_that!(target.declared, eq(None));
+        expect_that!(target.unique, eq(None));
+        expect_that!(target.inferred.len(), eq(2usize));
+        expect_that!(target.inferred[0] != target.inferred[1], eq(true));
+    }
+
+    fn ambiguous_callee_mismatch_count(writers_first: bool, pairs_reversed: bool) -> usize {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteTypeMismatch);
+
+        let put_text = r#"
+            ---@param value any
+            ---@[net_payload("write", "string")]
+            function PutText(value) net.WriteString(value) end
+        "#;
+        let put_flag = r#"
+            ---@param value any
+            ---@[net_payload("write", "bool")]
+            function PutFlag(value) net.WriteBool(value) end
+        "#;
+        let get_flag = r#"
+            ---@return boolean
+            ---@[net_payload("read", "bool")]
+            function GetFlag() return net.ReadBool() end
+        "#;
+        let get_text = r#"
+            ---@return string
+            ---@[net_payload("read", "string")]
+            function GetText() return net.ReadString() end
+        "#;
+        let (writers, readers) = if pairs_reversed {
+            (
+                format!("{put_flag}{put_text}"),
+                format!("{get_text}{get_flag}"),
+            )
+        } else {
+            (
+                format!("{put_text}{put_flag}"),
+                format!("{get_flag}{get_text}"),
+            )
+        };
+        let library = if writers_first {
+            format!("{writers}{readers}")
+        } else {
+            format!("{readers}{writers}")
+        };
+        ws.def_file("lua/autorun/sh_choice_lib.lua", &library);
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_send.lua",
+            r#"
+            local useText = math.random() > 0.5
+            local writer = useText and PutText or PutFlag
+            util.AddNetworkString("Choice")
+            net.Start("Choice")
+            writer(useText and "hello" or true)
+            net.Broadcast()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/cl_receive.lua",
+            r#"
+            net.Receive("Choice", function()
+                local useText = math.random() > 0.5
+                local reader = useText and GetText or GetFlag
+                local value = reader()
+            end)
+            "#,
+        );
+
+        assert_ambiguous_callee(&ws, server_file_id, "writer");
+        assert_ambiguous_callee(&ws, client_file_id, "reader");
+        let server = file_diagnostics(&mut ws, server_file_id);
+        let client = file_diagnostics(&mut ws, client_file_id);
+        count_diagnostic(&server, DiagnosticCode::GmodNetReadWriteTypeMismatch)
+            + count_diagnostic(&client, DiagnosticCode::GmodNetReadWriteTypeMismatch)
+    }
+
+    #[gtest]
+    fn test_ambiguous_callee_alternatives_report_no_mismatch_writers_first() {
+        expect_that!(ambiguous_callee_mismatch_count(true, false), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_ambiguous_callee_alternatives_report_no_mismatch_readers_first_pairs_reversed() {
+        expect_that!(ambiguous_callee_mismatch_count(false, true), eq(0usize));
+    }
+
     #[gtest]
     fn test_missing_sender_triggers_warning() {
         let mut ws = new_gmod_workspace();

@@ -1164,6 +1164,108 @@ end)
         expect_that!(shared_diagnostics(&warm, caller_of(&warm)), eq(&expected));
     }
 
+    /// A sender's counterpart check reads the realm of each receiver of its
+    /// message: moving a receiver into and out of an `if SERVER then` block, or
+    /// changing only the realm its guard names, leaves the sender showing what a
+    /// cold build shows and scheduled for diagnostics when its report changes.
+    #[gtest]
+    fn a_receivers_realm_changing_matches_a_cold_build() {
+        let guarded = |realm: &str| {
+            format!(
+                "if {realm} then
+    net.Receive(\"Moved\", function() end)
+end
+"
+            )
+        };
+        let shared = "net.Receive(\"Moved\", function() end)
+"
+        .to_string();
+        assert_receiver_edits_match_cold_builds(&[
+            shared.clone(),
+            guarded("SERVER"),
+            shared,
+            guarded("CLIENT"),
+            guarded("SERVER"),
+            guarded("CLIENT"),
+        ]);
+    }
+
+    /// Changing only the realm an inner guard names, at equal width, leaves the
+    /// sender showing what a cold build shows when the guards contradict.
+    #[gtest]
+    fn a_nested_guard_changing_matches_a_cold_build() {
+        let nested = |outer: &str, inner: &str| {
+            format!(
+                "if {outer} then
+    if {inner} then
+        net.Receive(\"Moved\", function() end)
+    end
+end
+"
+            )
+        };
+        assert_receiver_edits_match_cold_builds(&[
+            nested("CLIENT", "CLIENT"),
+            nested("CLIENT", "SERVER"),
+            nested("CLIENT", "CLIENT"),
+            nested("SERVER", "CLIENT"),
+            nested("CLIENT", "CLIENT"),
+        ]);
+    }
+
+    /// Writes each of `receivers` over the receiver of "Moved" in turn, checking
+    /// the sender against a cold build and that it is scheduled when its report changes.
+    fn assert_receiver_edits_match_cold_builds(receivers: &[String]) {
+        let sender = "util.AddNetworkString(\"Moved\")
+net.Start(\"Moved\")
+net.Broadcast()
+";
+        let sender_path = "lua/autorun/server/sv_send.lua";
+        let receiver_path = "lua/autorun/sh_receive.lua";
+        let cold_sender_codes = |receiver: &str| {
+            let mut cold = gmod_workspace_with(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+            let uris = [(sender_path, sender), (receiver_path, receiver)]
+                .iter()
+                .map(|(path, text)| {
+                    (
+                        cold.virtual_url_generator.new_uri(path),
+                        Some(text.to_string()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            cold.analysis.update_files_by_uri(uris);
+            let sender_uri = cold.virtual_url_generator.new_uri(sender_path);
+            let sender_id = cold.analysis.get_file_id(&sender_uri).expect("sender id");
+            shared_diagnostics(&cold, sender_id)
+        };
+        let colds = receivers
+            .iter()
+            .map(|receiver| cold_sender_codes(receiver))
+            .collect::<Vec<_>>();
+        expect_that!(colds[1] != colds[0], eq(true));
+
+        let mut warm = gmod_workspace_with(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+        let sender_uri = warm.virtual_url_generator.new_uri(sender_path);
+        let sender_id = write(&mut warm, &sender_uri, sender);
+        let receiver_uri = warm.virtual_url_generator.new_uri(receiver_path);
+        write(&mut warm, &receiver_uri, &receivers[0]);
+        expect_that!(shared_diagnostics(&warm, sender_id), eq(&colds[0]));
+
+        for (receiver, cold) in receivers.iter().zip(&colds).skip(1) {
+            let before = shared_diagnostics(&warm, sender_id);
+            let affected = warm
+                .analysis
+                .apply_file_system_changes(vec![(receiver_uri.clone(), Some(receiver.clone()))]);
+            let after = shared_diagnostics(&warm, sender_id);
+            let changed = after != before;
+            expect_that!(after, eq(cold));
+            if changed {
+                expect_that!(affected, contains(eq(&sender_id)));
+            }
+        }
+    }
+
     /// A change only diagnostics read leaves the index as built: nothing is
     /// analysed again, and diagnostics follow the new config at once.
     #[gtest]

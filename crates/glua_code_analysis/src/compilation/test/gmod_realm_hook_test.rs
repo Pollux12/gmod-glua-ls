@@ -1506,6 +1506,37 @@ mod test {
     }
 
     #[gtest]
+    fn test_state_mask_intersects_every_containing_branch() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let text = r#"
+            if SERVER then
+                if CLIENT then
+                    print("dead")
+                end
+                if SERVER then
+                    print("live")
+                end
+            end
+            if CLIENT then
+                if SERVER then
+                    print("dead up")
+                end
+            end
+        "#;
+        let file_id = ws.def_file("lua/autorun/sh_nested_masks.lua", text);
+        let infer_index = ws.get_db_mut().get_gmod_infer_index();
+        let mask_at = |needle: &str| {
+            let offset = rowan::TextSize::new(text.find(needle).expect("needle") as u32);
+            infer_index.get_state_mask_at_offset(&file_id, offset)
+        };
+
+        assert_eq!(mask_at("print(\"dead\")"), GmodStateMask::EMPTY);
+        assert_eq!(mask_at("print(\"live\")"), GmodStateMask::SERVER);
+        assert_eq!(mask_at("print(\"dead up\")"), GmodStateMask::EMPTY);
+    }
+
+    #[gtest]
     fn test_branch_realm_narrowing_with_parenthesised_client() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);

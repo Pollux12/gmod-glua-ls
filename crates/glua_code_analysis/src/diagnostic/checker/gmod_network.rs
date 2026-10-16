@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::{
-    DiagnosticCode, FileId, GmodRealm, NetOpEntry, NetReceiveFlow, NetSendFlow, SemanticModel,
-    flows_can_match, is_opposite_strict_realm_pair, is_strict_realm,
+    DiagnosticCode, FileId, GmodRealm, GmodStateMask, NetOpEntry, NetReceiveFlow, NetSendFlow,
+    SemanticModel, flows_can_match, is_opposite_strict_realm_pair, is_strict_realm,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -81,11 +81,6 @@ fn check_read_write_mismatch(
     infer_index: &crate::GmodInferIndex,
 ) {
     for receive_flow in receive_flows {
-        if receive_flow.reads_opaque {
-            // Callback body could not be inspected — counts/types unknown.
-            continue;
-        }
-
         let receive_realm =
             infer_index.get_realm_at_offset(&file_id, receive_flow.receive_range.start());
         if !is_strict_realm(receive_realm) {
@@ -248,9 +243,41 @@ fn sender_sort_key(
     }
 }
 
+fn has_opaque_operations(send_flow: &NetSendFlow, receive_flow: &NetReceiveFlow) -> bool {
+    receive_flow.is_opaque() || send_flow.writes.iter().any(|write| write.opaque)
+}
+
+fn comparison_prefix_len(send_flow: &NetSendFlow, receive_flow: &NetReceiveFlow) -> usize {
+    let known_writes = send_flow
+        .writes
+        .iter()
+        .position(|write| write.opaque)
+        .unwrap_or(send_flow.writes.len());
+    let len = known_writes.min(receive_flow.known_read_count());
+    if has_opaque_operations(send_flow, receive_flow) {
+        return send_flow.writes[..len]
+            .iter()
+            .zip(&receive_flow.reads[..len])
+            .position(|(write, read)| write.dynamic || read.dynamic)
+            .unwrap_or(len);
+    }
+    len
+}
+
+fn diagnostic_flows_can_match(send_flow: &NetSendFlow, receive_flow: &NetReceiveFlow) -> bool {
+    if !has_opaque_operations(send_flow, receive_flow) {
+        return flows_can_match(send_flow, receive_flow);
+    }
+    let len = comparison_prefix_len(send_flow, receive_flow);
+    send_flow.writes[..len]
+        .iter()
+        .zip(&receive_flow.reads[..len])
+        .all(|(write, read)| write.op.pairs_with(&read.op))
+}
+
 fn matching_prefix_len(send_flow: &NetSendFlow, receive_flow: &NetReceiveFlow) -> usize {
     let mut matched = 0;
-    let compared_len = send_flow.writes.len().min(receive_flow.reads.len());
+    let compared_len = comparison_prefix_len(send_flow, receive_flow);
 
     while matched < compared_len {
         if !send_flow.writes[matched]
@@ -266,6 +293,37 @@ fn matching_prefix_len(send_flow: &NetSendFlow, receive_flow: &NetReceiveFlow) -
     matched
 }
 
+/// The state mask of the receiver at `offset`, `None` when its branch and file
+/// realms leave no state that runs it.
+fn receiver_state_mask(
+    infer_index: &crate::GmodInferIndex,
+    file_id: &FileId,
+    offset: rowan::TextSize,
+) -> Option<GmodStateMask> {
+    let mask = infer_index.get_state_mask_at_offset(file_id, offset);
+    let unreachable =
+        mask.is_empty() && infer_index.get_realm_at_offset(file_id, offset) != GmodRealm::Unknown;
+    (!unreachable).then_some(mask)
+}
+
+/// Whether a receiver running in `receiver_mask` can take `send_flow`: the
+/// send's destination realm is compatible with it, or the send is a wrapped
+/// stub whose destination is unknown and the receiver can run in-game.
+fn receiver_accepts(send_flow: &NetSendFlow, receiver_mask: Option<GmodStateMask>) -> bool {
+    let Some(mask) = receiver_mask else {
+        return false;
+    };
+    let unknown_destination = send_flow.is_wrapped && send_flow.send_range == send_flow.start_range;
+    if unknown_destination && (mask.is_empty() || mask.intersects(GmodStateMask::SHARED)) {
+        return true;
+    }
+    send_flow
+        .send_kind
+        .receiver_realm
+        .state_mask()
+        .is_compatible_with(mask)
+}
+
 fn check_missing_send_counterpart(
     context: &mut DiagnosticContext,
     file_id: crate::FileId,
@@ -273,7 +331,14 @@ fn check_missing_send_counterpart(
     network_index: &crate::GmodNetworkIndex,
     infer_index: &crate::GmodInferIndex,
 ) {
-    for send_flow in send_flows {
+    let mut reported = std::collections::HashSet::new();
+    // Wrapped flows come last so a send reported directly is not reported again
+    // by the wrapper definition at the same range.
+    let ordered_flows = send_flows
+        .iter()
+        .filter(|flow| !flow.is_wrapped)
+        .chain(send_flows.iter().filter(|flow| flow.is_wrapped));
+    for send_flow in ordered_flows {
         if network_index.is_replaced_definition(file_id, send_flow) {
             continue;
         }
@@ -282,13 +347,23 @@ fn check_missing_send_counterpart(
             continue;
         }
 
-        let expected_realm = send_flow.send_kind.receiver_realm;
-
         let has_counterpart = network_index
             .get_receive_flows_for_message(&send_flow.message_name)
             .into_iter()
-            .any(|_| true);
-        if has_counterpart {
+            .any(|(receive_file_id, receive_flow)| {
+                let receiver_mask = receiver_state_mask(
+                    infer_index,
+                    &receive_file_id,
+                    receive_flow.receive_range.start(),
+                );
+                receiver_accepts(send_flow, receiver_mask)
+            });
+        if has_counterpart
+            || !reported.insert((
+                crate::GmodNetworkIndex::message_key(&send_flow.message_name),
+                send_flow.start_range,
+            ))
+        {
             continue;
         }
 
@@ -298,7 +373,7 @@ fn check_missing_send_counterpart(
             format!(
                 "No `net.Receive` counterpart found for `{name}` in {realm} realm.",
                 name = send_flow.message_name,
-                realm = realm_label(expected_realm),
+                realm = realm_label(send_flow.send_kind.receiver_realm),
             )
             .to_string(),
             None,
@@ -324,10 +399,15 @@ fn check_missing_receive_counterpart(
             continue;
         };
 
+        let receiver_mask =
+            receiver_state_mask(infer_index, &file_id, receive_flow.receive_range.start());
+        if receiver_mask.is_none() {
+            continue;
+        }
         let has_counterpart = network_index
             .get_send_flows_for_message(&receive_flow.message_name)
             .into_iter()
-            .any(|_| true);
+            .any(|(_, send_flow)| receiver_accepts(send_flow, receiver_mask));
 
         if has_counterpart {
             continue;
@@ -370,7 +450,10 @@ fn first_mismatch_diagnostic(
     // rejected this pair, so the failure is a real structural mismatch — but
     // emitting a precise position is unreliable, so we fall through to the
     // per-position type/order checks below and skip the raw count message.
-    if !has_dynamic && send_flow.writes.len() != receive_flow.reads.len() {
+    if !has_dynamic
+        && !has_opaque_operations(send_flow, receive_flow)
+        && send_flow.writes.len() != receive_flow.reads.len()
+    {
         return Some((
             DiagnosticCode::GmodNetReadWriteOrderMismatch,
             receive_flow.receive_range,
@@ -384,7 +467,7 @@ fn first_mismatch_diagnostic(
         ));
     }
 
-    let compared_len = send_flow.writes.len().min(receive_flow.reads.len());
+    let compared_len = comparison_prefix_len(send_flow, receive_flow);
     for index in 0..compared_len {
         let write = &send_flow.writes[index];
         let read = &receive_flow.reads[index];
@@ -395,7 +478,12 @@ fn first_mismatch_diagnostic(
         let expected = expected_read_label(network_index, write);
         let actual = read.display_name.as_str();
 
-        if is_mispositioned_read(send_flow, index, read) {
+        let writes = if has_opaque_operations(send_flow, receive_flow) {
+            &send_flow.writes[..compared_len]
+        } else {
+            &send_flow.writes
+        };
+        if is_mispositioned_read(writes, index, read) {
             return Some((
                 DiagnosticCode::GmodNetReadWriteOrderMismatch,
                 receive_flow.receive_range,

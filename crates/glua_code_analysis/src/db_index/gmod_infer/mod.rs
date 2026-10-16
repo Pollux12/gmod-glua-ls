@@ -1200,9 +1200,10 @@ fn realm_at(metadata: Option<&GmodRealmFileMetadata>, offset: rowan::TextSize) -
     metadata.annotation_realm.unwrap_or(GmodRealm::Unknown)
 }
 
-/// The state mask at `offset` of a file with realm `metadata`: its branch's
-/// realm within the file's states when the offset sits in a branch-narrowed
-/// block, else the file's.
+/// The state mask at `offset` of a file with realm `metadata`: the
+/// intersection of every branch-narrowed block containing the offset, within
+/// the file's states when they are known, else the file's. An empty mask with
+/// no containing block is unknown; with one it is proved unreachable.
 fn state_mask_at(
     metadata: Option<&GmodRealmFileMetadata>,
     offset: rowan::TextSize,
@@ -1211,14 +1212,19 @@ fn state_mask_at(
         return GmodStateMask::empty();
     };
     let file_mask = file_state_mask(metadata);
-    match metadata
+    let mut containing = metadata
         .branch_realm_ranges
         .iter()
-        .find(|range| range.range.contains(offset))
-    {
-        Some(range) if file_mask.is_empty() => range.realm.state_mask(),
-        Some(range) => range.realm.state_mask().intersection(file_mask),
-        None => file_mask,
+        .filter(|range| range.range.contains(offset))
+        .map(|range| range.realm.state_mask());
+    let Some(first) = containing.next() else {
+        return file_mask;
+    };
+    let branch_mask = containing.fold(first, |acc, mask| acc.intersection(mask));
+    if file_mask.is_empty() {
+        branch_mask
+    } else {
+        branch_mask.intersection(file_mask)
     }
 }
 
