@@ -8626,7 +8626,7 @@ fn closure_from_signature_id(db: &DbIndex, signature_id: LuaSignatureId) -> Opti
         .find(|closure| closure.get_position() == signature_id.get_position())
 }
 
-fn global_call_path_for_signature_closure(
+pub(crate) fn global_call_path_for_signature_closure(
     db: &DbIndex,
     signature_id: LuaSignatureId,
     closure: &LuaClosureExpr,

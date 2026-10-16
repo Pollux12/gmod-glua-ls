@@ -2704,14 +2704,14 @@ mod test {
             local ent = GetEntityOrNULL()
             if not IsValid(ent) then
                 ent = GetEntityOrNULL()
-                if ent ~= nil then print("replaced") end
+                if ent ~= nil then print("replaced"); ent:GetPos() end
             end
             "#,
             r#"
             local holder = { ent = GetEntityOrNULL() }
             if not IsValid(holder.ent) then
                 holder.ent = GetEntityOrNULL()
-                if holder.ent ~= nil then print("replaced") end
+                if holder.ent ~= nil then print("replaced"); holder.ent:GetPos() end
             end
             "#,
         ] {
@@ -2734,7 +2734,7 @@ mod test {
                 local ent = GetEntityOrNULL()
                 if not IsValid(ent) then
                     local ent = GetEntityOrNULL()
-                    if ent ~= nil then print("shadowed") end
+                    if ent ~= nil then print("shadowed"); ent:GetPos() end
                 end
                 "#,
             ),
@@ -2753,7 +2753,7 @@ mod test {
                 r#"
                 local ent = GetEntityOrNULL()
                 if (function() return IsValid(ent) end) then
-                    if ent ~= nil then print("closure") end
+                    if ent ~= nil then print("closure"); ent:GetPos() end
                 end
                 "#,
             ),
@@ -2780,6 +2780,396 @@ mod test {
             ),
             eq(true)
         );
+    }
+
+    #[gtest]
+    fn test_validity_retested_at_head_of_truthy_block_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_entity_or_null_fixture(&mut ws);
+
+        for code in [
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if ( holder.ent ) then
+                if ( !IsValid( holder.ent ) ) then holder.ent = nil return end
+                holder.ent:GetPos()
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if enabled then
+                print("enabled")
+            elseif ( holder.ent ) then
+                if not IsValid( holder.ent ) then error("invalid") end
+                holder.ent:GetPos()
+            end
+            "#,
+        ] {
+            assert_that!(
+                ws.check_code_for(DiagnosticCode::GmodNullCheck, code),
+                eq(true),
+                "{code}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_truthy_block_without_exiting_head_validity_retest_reports_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        for code in [
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent then
+                if not IsValid(holder.ent) then goto use end
+                ::use::
+                holder.ent:GetPos()
+            end
+            "#,
+            r#"
+            local function IsValid(value) return true end
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent then
+                if not IsValid(holder.ent) then return end
+                holder.ent:GetPos()
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if ( holder.ent ) then
+                holder.ent:GetPos()
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if ( holder.ent ) then
+                if ( !IsValid( holder.ent ) ) then print("invalid") end
+                holder.ent:GetPos()
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL(), other = GetEntityOrNULL() }
+            if ( holder.ent ) then
+                if ( !IsValid( holder.other ) ) then return end
+                holder.ent:GetPos()
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if ( holder.ent ) then
+                print("before")
+                if ( !IsValid( holder.ent ) ) then return end
+                holder.ent:GetPos()
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if ( holder.ent ) then
+                if ( IsValid( holder.ent ) ) then return end
+                holder.ent:GetPos()
+            end
+            "#,
+        ] {
+            assert_that!(
+                ws.check_code_for(DiagnosticCode::GmodNullCheck, code),
+                eq(false),
+                "{code}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_nil_sentinel_followed_by_isvalid_exit_guard_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local holder = { ent = GetEntityOrNULL() }
+                if ( holder.ent == nil ) then return end
+                if ( !IsValid( holder.ent ) ) then holder.ent = nil return end
+                holder.ent:GetPos()
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_nil_sentinel_without_adjacent_isvalid_guard_reports_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        for code in [
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent == nil then return end
+            if not IsValid(holder.ent) then print("invalid") end
+            holder.ent:GetPos()
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent == nil then return end
+            if IsValid(holder.ent) then return end
+            holder.ent:GetPos()
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent ~= nil then holder.ent:GetPos() return end
+            if not IsValid(holder.ent) then return end
+            "#,
+            r#"
+            local function IsValid(value) return true end
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent == nil then return end
+            if not IsValid(holder.ent) then return end
+            holder.ent:GetPos()
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if ( holder.ent == nil ) then return end
+            holder.ent:GetPos()
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL(), other = GetEntityOrNULL() }
+            if ( holder.ent == nil ) then return end
+            if ( !IsValid( holder.other ) ) then return end
+            holder.ent:GetPos()
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if ( holder.ent == nil ) then return end
+            print("between")
+            if ( !IsValid( holder.ent ) ) then return end
+            holder.ent:GetPos()
+            "#,
+        ] {
+            assert_that!(
+                ws.check_code_for(DiagnosticCode::GmodNullCheck, code),
+                eq(false),
+                "{code}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_annotated_alternative_validity_exit_guards_do_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_entity_or_null_fixture(&mut ws);
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return boolean
+            ---@[valid_guard]
+            function EntityUsable(value) end
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function EntityPresent(value) end
+
+            ---@return boolean
+            ---@return_cast self -NULL
+            function Entity:IsValid() end
+            "#,
+        );
+
+        for guard in [
+            "EntityUsable(holder.ent)",
+            "EntityPresent(holder.ent)",
+            "holder.ent:IsValid()",
+        ] {
+            for code in [
+                format!(
+                    "local holder = {{ ent = GetEntityOrNULL() }}
+                    if holder.ent == nil then return end
+                    if not {guard} then return end
+                    holder.ent:GetPos()"
+                ),
+                format!(
+                    "local holder = {{ ent = GetEntityOrNULL() }}
+                    if (holder.ent) then
+                        if not {guard} then return end
+                        holder.ent:GetPos()
+                    end"
+                ),
+            ] {
+                assert_that!(
+                    ws.check_code_for(DiagnosticCode::GmodNullCheck, &code),
+                    eq(true),
+                    "{code}"
+                );
+            }
+        }
+    }
+
+    #[gtest]
+    fn test_validity_exit_guard_rejects_nested_jumps_and_ignores_nested_function_exits() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        for (body, safe) in [
+            ("if skip then goto use end\nreturn", false),
+            ("local function cleanup() return end", false),
+            (
+                "local function cleanup() goto done ::done:: return end\nreturn",
+                true,
+            ),
+        ] {
+            for (presence, close) in [
+                ("if holder.ent then", "end"),
+                ("if holder.ent == nil then return end", ""),
+            ] {
+                let code = format!(
+                    "local holder = {{ ent = GetEntityOrNULL() }}
+                    {presence}
+                        if not IsValid(holder.ent) then {body} end
+                        ::use::
+                        holder.ent:GetPos()
+                    {close}"
+                );
+                assert_that!(
+                    ws.check_code_for(DiagnosticCode::GmodNullCheck, &code),
+                    eq(safe),
+                    "{code}"
+                );
+            }
+        }
+    }
+
+    #[gtest]
+    fn test_shadowed_error_does_not_prove_validity_exit() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        for (shadow, finish) in [
+            ("local function error(message) print(message) end", ""),
+            (
+                "---@param error fun(message: any)\nlocal function use(error)",
+                "end",
+            ),
+        ] {
+            for (presence, close) in [
+                ("if holder.ent then", "end"),
+                ("if holder.ent == nil then return end", ""),
+            ] {
+                let code = format!(
+                    "{shadow}
+                    local holder = {{ ent = GetEntityOrNULL() }}
+                    {presence}
+                        if not IsValid(holder.ent) then error('invalid') end
+                        holder.ent:GetPos()
+                    {close}
+                    {finish}"
+                );
+                assert_that!(
+                    ws.check_code_for(DiagnosticCode::GmodNullCheck, &code),
+                    eq(false),
+                    "{code}"
+                );
+            }
+        }
+    }
+
+    #[gtest]
+    fn test_builtin_and_annotated_non_returning_validity_exits_are_accepted() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_entity_or_null_fixture(&mut ws);
+        ws.def(
+            r#"
+            ---@return never
+            function StopInvalid() end
+            "#,
+        );
+
+        for exit in ["error('invalid')", "StopInvalid()"] {
+            for (presence, close) in [
+                ("if (holder.ent) then", "end"),
+                ("if holder.ent == nil then return end", ""),
+            ] {
+                let code = format!(
+                    "local holder = {{ ent = GetEntityOrNULL() }}
+                    {presence}
+                        if not IsValid(holder.ent) then {exit} end
+                        holder.ent:GetPos()
+                    {close}"
+                );
+                assert_that!(
+                    ws.check_code_for(DiagnosticCode::GmodNullCheck, &code),
+                    eq(true),
+                    "{code}"
+                );
+            }
+        }
+    }
+
+    #[gtest]
+    fn test_validity_retest_after_unsafe_use_does_not_exempt_presence_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        for code in [
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent and holder.ent:GetPos() then
+                if not IsValid(holder.ent) then return end
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent then
+                holder.ent:GetPos()
+                if not IsValid(holder.ent) then return end
+            end
+            "#,
+        ] {
+            assert_that!(
+                ws.check_code_for(DiagnosticCode::GmodNullCheck, code),
+                eq(false),
+                "{code}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_validity_loop_exit_requires_enclosing_loop_in_same_function() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        for exit in ["break", "continue"] {
+            for (start, finish, safe) in [
+                ("", "", false),
+                ("while true do", "break\nend", true),
+                (
+                    "while true do\nlocal function use()",
+                    "end\nbreak\nend",
+                    false,
+                ),
+            ] {
+                for (presence, close) in [
+                    ("if holder.ent then", "end"),
+                    ("if holder.ent == nil then return end", ""),
+                ] {
+                    let code = format!(
+                        "{start}
+                        local holder = {{ ent = GetEntityOrNULL() }}
+                        {presence}
+                            if not IsValid(holder.ent) then {exit} end
+                            holder.ent:GetPos()
+                        {close}
+                        {finish}"
+                    );
+                    assert_that!(
+                        ws.check_code_for(DiagnosticCode::GmodNullCheck, &code),
+                        eq(safe),
+                        "{code}"
+                    );
+                }
+            }
+        }
     }
 
     #[gtest]

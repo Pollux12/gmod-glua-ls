@@ -3,7 +3,7 @@ use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaBlock, LuaCallExpr,
     LuaCallExprStat, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexExpr, LuaIndexKey,
     LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaStat, LuaSyntaxKind, LuaSyntaxNode, LuaVarExpr,
-    UnaryOperator,
+    PathTrait, UnaryOperator,
 };
 use rowan::TextRange;
 
@@ -3407,6 +3407,30 @@ fn call_signature_cast<'a>(
     Some((signature_id, signature_cast))
 }
 
+/// Every signature `call` may run: each one a union of signatures its prefix infers as names,
+/// else the one [`call_signature_id`] finds.
+fn call_signature_ids(semantic_model: &SemanticModel, call: &LuaCallExpr) -> Vec<LuaSignatureId> {
+    if let Some(prefix) = call.get_prefix_expr()
+        && let Ok(LuaType::Union(union)) = semantic_model.infer_expr(prefix)
+    {
+        let signatures = union
+            .types()
+            .map(|typ| match typ {
+                LuaType::Signature(id) => Some(*id),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(mut signatures) = signatures {
+            signatures.sort_unstable_by_key(|id| (id.get_file_id().id, id.get_position()));
+            signatures.dedup();
+            return signatures;
+        }
+    }
+    call_signature_id(semantic_model, call)
+        .into_iter()
+        .collect()
+}
+
 fn call_signature_id(
     semantic_model: &SemanticModel,
     guard_call: &LuaCallExpr,
@@ -3628,6 +3652,17 @@ fn check_binary_expr(
                 non_nil_side,
                 op,
             ) || is_validity_tested_by_branch_condition(semantic_model, non_nil_side)
+                || is_sentinel_followed_by_type_guard(semantic_model, non_nil_side)
+                || (has_only_null_safe_uses_after(
+                    semantic_model,
+                    non_nil_side,
+                    binary_expr.get_range().end(),
+                    false,
+                ) && has_null_accepting_use_after(
+                    semantic_model,
+                    non_nil_side,
+                    binary_expr.get_range().end(),
+                ))
             {
                 return Some(());
             }
@@ -3751,6 +3786,13 @@ fn check_condition_expr(
             };
             if is_sentinel_followed_by_type_guard(semantic_model, &truthy_expr)
                 || is_validity_tested_by_branch_condition(semantic_model, &truthy_expr)
+                || is_validity_retested_at_block_head(semantic_model, &truthy_expr)
+                || has_only_null_safe_uses_after(
+                    semantic_model,
+                    &truthy_expr,
+                    truthy_expr.get_range().end(),
+                    false,
+                )
             {
                 return;
             }
@@ -3915,8 +3957,7 @@ fn is_nil_sentinel_comparison_before_type_guard_elseif(
             return false;
         };
 
-        is_type_guard_call_guarding_expr(semantic_model, &guard_call, non_nil_side)
-            || type_guard_call_textually_guards_expr(semantic_model, &guard_call, non_nil_side)
+        call_is_validity_guard_on(semantic_model, &guard_call, non_nil_side)
     })
 }
 
@@ -3973,35 +4014,39 @@ fn is_validity_tested_by_branch_condition(semantic_model: &SemanticModel, expr: 
 }
 
 fn is_sentinel_followed_by_type_guard(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {
+    let expr = &unparen_guard_expr(expr.clone());
     let Some(if_stat) = expr.syntax().ancestors().find_map(LuaIfStat::cast) else {
         return false;
     };
-    if !if_body_has_return(&if_stat) {
+    if !if_body_has_return(&if_stat)
+        || if_stat.get_else_clause().is_some()
+        || if_stat.get_else_if_clause_list().next().is_some()
+    {
+        return false;
+    }
+    let Some(condition) = if_stat.get_condition_expr() else {
+        return false;
+    };
+    let (operand, negated) = split_negation(condition);
+    let is_nil_sentinel = match &operand {
+        LuaExpr::BinaryExpr(binary) if !negated => {
+            binary
+                .get_op_token()
+                .is_some_and(|token| token.get_op() == BinaryOperator::OpEq)
+                && binary.get_exprs().is_some_and(|(left, right)| {
+                    get_null_nil_comparison_operand(semantic_model, &left, &right)
+                        .is_some_and(|value| exprs_reference_same_var(semantic_model, value, expr))
+                })
+        }
+        _ => negated && exprs_reference_same_var(semantic_model, &operand, expr),
+    };
+    if !is_nil_sentinel {
         return false;
     }
     let mut next_sibling = if_stat.syntax().next_sibling();
     while let Some(sibling) = next_sibling {
         if let Some(next_if) = LuaIfStat::cast(sibling.clone()) {
-            if let Some(cond) = next_if.get_condition_expr() {
-                let truthy_cond = match &cond {
-                    LuaExpr::UnaryExpr(unary)
-                        if unary
-                            .get_op_token()
-                            .is_some_and(|t| t.get_op() == UnaryOperator::OpNot) =>
-                    {
-                        unary.get_expr().unwrap_or(cond.clone())
-                    }
-                    _ => cond.clone(),
-                };
-                if let Some(guard_call) = unwrap_paren_call(truthy_cond) {
-                    if is_type_guard_call_guarding_expr(semantic_model, &guard_call, expr)
-                        || type_guard_call_textually_guards_expr(semantic_model, &guard_call, expr)
-                    {
-                        return true;
-                    }
-                }
-            }
-            break;
+            return is_validity_exit_guard_on(semantic_model, &next_if, expr);
         }
         if !sibling.kind().to_token().is_trivia() {
             break;
@@ -4009,6 +4054,211 @@ fn is_sentinel_followed_by_type_guard(semantic_model: &SemanticModel, expr: &Lua
         next_sibling = sibling.next_sibling();
     }
     false
+}
+
+/// Whether the first statement of the block a condition containing `expr` guards is an `if` that exits
+/// when `expr` is invalid, so the condition's truthiness test of `expr` is re-tested for validity before use.
+fn is_validity_retested_at_block_head(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {
+    let Some(if_stat) = expr.syntax().ancestors().find_map(LuaIfStat::cast) else {
+        return false;
+    };
+    let expr = &unparen_guard_expr(expr.clone());
+    let Some(block) = std::iter::once((if_stat.get_condition_expr(), if_stat.get_block()))
+        .chain(
+            if_stat
+                .get_else_if_clause_list()
+                .map(|clause| (clause.get_condition_expr(), clause.get_block())),
+        )
+        .find_map(|(condition, block)| {
+            condition
+                .filter(|condition| unparen_guard_expr(condition.clone()).syntax() == expr.syntax())
+                .and(block)
+        })
+    else {
+        return false;
+    };
+    let Some(LuaStat::IfStat(head_if)) = block.get_stats().next() else {
+        return false;
+    };
+    is_validity_exit_guard_on(semantic_model, &head_if, expr)
+}
+
+fn is_validity_exit_guard_on(
+    semantic_model: &SemanticModel,
+    if_stat: &LuaIfStat,
+    expr: &LuaExpr,
+) -> bool {
+    if !if_body_exits_scope(semantic_model, if_stat) {
+        return false;
+    }
+    if_stat
+        .get_condition_expr()
+        .map(split_negation)
+        .and_then(|(operand, negated)| negated.then(|| unwrap_paren_call(operand))?)
+        .is_some_and(|guard_call| {
+            call_semantically_proves_validity_on(semantic_model, &guard_call, expr)
+        })
+}
+
+fn unparen_guard_expr(mut expr: LuaExpr) -> LuaExpr {
+    while let LuaExpr::ParenExpr(paren) = &expr {
+        let Some(inner) = paren.get_expr() else {
+            break;
+        };
+        expr = inner;
+    }
+    expr
+}
+
+fn call_semantically_proves_validity_on(
+    semantic_model: &SemanticModel,
+    guard_call: &LuaCallExpr,
+    expr: &LuaExpr,
+) -> bool {
+    let expr = &unparen_guard_expr(expr.clone());
+    if !is_stable_guard_expr(expr) {
+        return false;
+    }
+    let Some(signature_id) = call_signature_id(semantic_model, guard_call) else {
+        return false;
+    };
+    let receiver = if guard_call.is_colon_call() {
+        match guard_call.get_prefix_expr() {
+            Some(LuaExpr::IndexExpr(index)) => index.get_prefix_expr(),
+            _ => None,
+        }
+    } else {
+        guard_call
+            .get_args_list()
+            .and_then(|args| args.get_args().next())
+    };
+    if call_signature_has_valid_guard_metadata(semantic_model, guard_call, signature_id)
+        && receiver.as_ref().is_some_and(|value| {
+            is_stable_guard_expr(value) && exprs_reference_same_var(semantic_model, value, expr)
+        })
+    {
+        return true;
+    }
+    let Some((signature_id, signature_cast)) = call_signature_cast(semantic_model, guard_call)
+    else {
+        return false;
+    };
+    if !signature_cast_targets_guarded_expr(
+        semantic_model,
+        guard_call,
+        signature_id,
+        signature_cast,
+        expr,
+    ) || signature_cast.name == "self"
+        && !receiver
+            .as_ref()
+            .is_some_and(|value| exprs_reference_same_var(semantic_model, value, expr))
+    {
+        return false;
+    }
+    let Ok(typ) = semantic_model.infer_expr(expr.clone()) else {
+        return false;
+    };
+    let casted_type = apply_cast(
+        semantic_model.get_db(),
+        &signature_cast.cast,
+        typ,
+        InferConditionFlow::TrueCondition,
+    );
+    !contains_gmod_null_type(semantic_model.get_db(), &casted_type)
+}
+
+/// Strips enclosing parentheses and one `not`, returning the operand and whether it was negated.
+fn split_negation(expr: LuaExpr) -> (LuaExpr, bool) {
+    match expr {
+        LuaExpr::ParenExpr(paren_expr) => match paren_expr.get_expr() {
+            Some(inner) => split_negation(inner),
+            None => (LuaExpr::ParenExpr(paren_expr), false),
+        },
+        LuaExpr::UnaryExpr(unary_expr)
+            if unary_expr
+                .get_op_token()
+                .is_some_and(|token| token.get_op() == UnaryOperator::OpNot) =>
+        {
+            match unary_expr.get_expr() {
+                Some(inner) => (inner, true),
+                None => (LuaExpr::UnaryExpr(unary_expr), false),
+            }
+        }
+        expr => (expr, false),
+    }
+}
+
+fn if_body_exits_scope(semantic_model: &SemanticModel, if_stat: &LuaIfStat) -> bool {
+    if_stat.get_block().is_some_and(|block| {
+        if validity_branch_contains_goto(block.syntax()) {
+            return false;
+        }
+        block
+            .get_stats()
+            .find_map(|stat| match stat {
+                LuaStat::ReturnStat(_) => Some(true),
+                LuaStat::BreakStat(break_stat) => Some(
+                    break_stat
+                        .syntax()
+                        .ancestors()
+                        .skip(1)
+                        .find_map(|node| {
+                            if LuaClosureExpr::cast(node.clone()).is_some() {
+                                Some(false)
+                            } else if is_loop_stat_kind(node.kind().into()) {
+                                Some(true)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(false),
+                ),
+                LuaStat::CallExprStat(call_stat) => call_stat
+                    .get_call_expr()
+                    .filter(|call_expr| validity_exit_call_returns_never(semantic_model, call_expr))
+                    .map(|_| true),
+                _ => None,
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn validity_branch_contains_goto(node: &LuaSyntaxNode) -> bool {
+    if LuaClosureExpr::cast(node.clone()).is_some() {
+        return false;
+    }
+    LuaSyntaxKind::from(node.kind()) == LuaSyntaxKind::GotoStat
+        || node
+            .children()
+            .any(|child| validity_branch_contains_goto(&child))
+}
+
+fn validity_exit_call_returns_never(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    if call_signature_id(semantic_model, call_expr).is_some_and(|signature_id| {
+        semantic_model
+            .get_db()
+            .get_signature_index()
+            .returns_never(&signature_id)
+    }) {
+        return true;
+    }
+    call_expr
+        .get_prefix_expr()
+        .and_then(|prefix| semantic_model.infer_expr(prefix).ok())
+        .is_some_and(|typ| matches!(typ, LuaType::DocFunction(func) if func.get_ret().is_never()))
+}
+
+fn call_is_validity_guard_on(
+    semantic_model: &SemanticModel,
+    guard_call: &LuaCallExpr,
+    expr: &LuaExpr,
+) -> bool {
+    is_type_guard_call_guarding_expr(semantic_model, guard_call, expr)
+        || type_guard_call_textually_guards_expr(semantic_model, guard_call, expr)
 }
 
 fn unwrap_paren_call(expr: LuaExpr) -> Option<LuaCallExpr> {
