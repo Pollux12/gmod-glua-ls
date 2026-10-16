@@ -13100,6 +13100,9 @@ fn infer_realm_from_load_path_hint(db: &DbIndex, file_id: FileId) -> Option<Gmod
     if let Some((_, states)) = engine_load_root_for_relative_path(&rel_path) {
         return Some(states.to_realm(GmodRealm::Shared));
     }
+    if is_menu_relative_path(&rel_path) {
+        return None;
+    }
     if scripted_folder_kind(&parts).is_some() {
         return match file_name.as_str() {
             "init.lua" => Some(GmodRealm::Server),
@@ -13113,6 +13116,16 @@ fn infer_realm_from_load_path_hint(db: &DbIndex, file_id: FileId) -> Option<Gmod
         "shared.lua" => Some(GmodRealm::Shared),
         _ => None,
     }
+}
+
+/// Whether the file sits under `lua/menu/`, which the menu state loads by convention; it names the
+/// realm only of a file no load path reaches, since an include from another state runs it there.
+fn is_menu_directory_path(db: &DbIndex, file_id: FileId) -> bool {
+    gmod_relative_path(db, file_id).is_some_and(|path| is_menu_relative_path(&path))
+}
+
+fn is_menu_relative_path(rel_path: &str) -> bool {
+    rel_path.starts_with("menu/")
 }
 
 fn gmod_relative_path(db: &DbIndex, file_id: FileId) -> Option<String> {
@@ -13308,7 +13321,7 @@ fn rebuild_realm_metadata(
                         .filter(|info| info.status == GmodLoadStatus::EngineLoaded)
                         .map(|info| info.realm)
                 })
-                .or(filename_hint)
+                .or(filename_hint.filter(|realm| *realm != GmodRealm::Menu))
                 .or_else(|| {
                     detect_calls
                         .then_some(())
@@ -13316,6 +13329,7 @@ fn rebuild_realm_metadata(
                         .filter(|info| info.status != GmodLoadStatus::NoKnownLoadPath)
                         .map(|info| info.realm)
                 })
+                .or(filename_hint)
                 .unwrap_or(default_realm)
         };
 
@@ -13414,6 +13428,10 @@ fn infer_realm_from_filename(db: &DbIndex, file_id: FileId) -> Option<GmodRealm>
     }
     if search_str.contains("/shared/") || search_str.contains("/sh/") {
         return Some(GmodRealm::Shared);
+    }
+
+    if is_menu_directory_path(db, file_id) {
+        return Some(GmodRealm::Menu);
     }
 
     // 3. Check GMod special directory patterns (engine-defined realm behavior per GMod loading order)

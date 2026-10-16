@@ -89,6 +89,191 @@ mod test {
         );
     }
 
+    #[test]
+    fn test_files_under_lua_menu_are_in_the_menu_realm() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let files = [
+            ws.def_file("lua/menu/mainmenu.lua", "return {}"),
+            ws.def_file("lua/menu/mount/vgui/workshop.lua", "return {}"),
+            ws.def_file("addons/tool/lua/menu/plugin.lua", "return {}"),
+        ];
+        let not_menu = ws.def_file("lua/menuhelpers/sh_util.lua", "return {}");
+
+        let infer_index = ws.get_db_mut().get_gmod_infer_index();
+        let realm_of = |file_id| {
+            infer_index
+                .get_realm_file_metadata(&file_id)
+                .map(|metadata| metadata.inferred_realm)
+        };
+        for file_id in files {
+            assert_eq!(realm_of(file_id), Some(GmodRealm::Menu));
+        }
+        assert_eq!(realm_of(not_menu), Some(GmodRealm::Shared));
+    }
+
+    #[test]
+    fn test_explicit_realm_names_under_lua_menu_keep_their_realm() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let files = [
+            (
+                ws.def_file("lua/menu/cl_named.lua", "return {}"),
+                GmodRealm::Client,
+            ),
+            (
+                ws.def_file("lua/menu/sv_named.lua", "return {}"),
+                GmodRealm::Server,
+            ),
+            (
+                ws.def_file("lua/menu/sh_named.lua", "return {}"),
+                GmodRealm::Shared,
+            ),
+            (
+                ws.def_file("lua/menu/client/plain.lua", "return {}"),
+                GmodRealm::Client,
+            ),
+            (
+                ws.def_file("lua/menu/server/plain.lua", "return {}"),
+                GmodRealm::Server,
+            ),
+        ];
+
+        let infer_index = ws.get_db_mut().get_gmod_infer_index();
+        for (file_id, expected) in files {
+            let realm = infer_index
+                .get_realm_file_metadata(&file_id)
+                .map(|metadata| metadata.inferred_realm);
+            assert_eq!(realm, Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_a_prefixed_menu_file_without_a_load_path_includes_on_its_own_realm() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let source = ws.def_file(
+            "addons/tool/lua/menu/cl_partial.lua",
+            r#"include("support/helper.lua")"#,
+        );
+        let helper = ws.def_file("addons/tool/lua/support/helper.lua", "return {}");
+
+        let infer_index = ws.get_db_mut().get_gmod_infer_index();
+        for file_id in [source, helper] {
+            let realm = infer_index
+                .get_realm_file_metadata(&file_id)
+                .map(|metadata| metadata.inferred_realm);
+            assert_eq!(realm, Some(GmodRealm::Client));
+        }
+    }
+
+    #[test]
+    fn test_an_unloaded_menu_shared_file_seeds_no_execution_state_for_its_includes() {
+        for source_path in [
+            "addons/tool/lua/menu/shared.lua",
+            "addons/tool/lua/menu/entities/example/shared.lua",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            set_gmod_enabled(&mut ws);
+            let source = ws.def_file(source_path, r#"include("support/helper.lua")"#);
+            let helper = ws.def_file("addons/tool/lua/support/helper.lua", "return {}");
+
+            let db = ws.get_db_mut();
+            let realm = db
+                .get_gmod_infer_index()
+                .get_realm_file_metadata(&source)
+                .map(|metadata| metadata.inferred_realm);
+            assert_eq!(realm, Some(GmodRealm::Menu), "{source_path}");
+            let helper_info = db
+                .get_gmod_load_index()
+                .get_file_info(&helper)
+                .map(|info| (info.state_mask, info.status));
+            assert_eq!(
+                helper_info,
+                Some((GmodStateMask::empty(), GmodLoadStatus::NoKnownLoadPath)),
+                "{source_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_server_include_of_an_addon_menu_file_runs_it_on_the_server() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "addons/tool/lua/autorun/server/sv_boot.lua",
+            r#"include("menu/widget.lua")"#,
+        );
+        let widget = ws.def_file("addons/tool/lua/menu/widget.lua", "return {}");
+
+        let db = ws.get_db_mut();
+        let state_mask = db
+            .get_gmod_load_index()
+            .get_file_info(&widget)
+            .map(|info| info.state_mask);
+        assert_eq!(state_mask, Some(GmodStateMask::SERVER));
+        let realm = db
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&widget)
+            .map(|metadata| metadata.inferred_realm);
+        assert_eq!(realm, Some(GmodRealm::Server));
+    }
+
+    #[test]
+    fn test_a_client_chain_through_an_addon_menu_file_keeps_only_the_client_state() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "addons/tool/lua/autorun/client/cl_boot.lua",
+            r#"include("zz/bridge.lua")"#,
+        );
+        ws.def_file(
+            "addons/tool/lua/zz/bridge.lua",
+            r#"include("menu/widget.lua")"#,
+        );
+        let widget = ws.def_file(
+            "addons/tool/lua/menu/widget.lua",
+            r#"include("support/helper.lua")"#,
+        );
+        let helper = ws.def_file("addons/tool/lua/support/helper.lua", "return {}");
+
+        let db = ws.get_db_mut();
+        for file_id in [widget, helper] {
+            let state_mask = db
+                .get_gmod_load_index()
+                .get_file_info(&file_id)
+                .map(|info| info.state_mask);
+            assert_eq!(state_mask, Some(GmodStateMask::CLIENT));
+            let realm = db
+                .get_gmod_infer_index()
+                .get_realm_file_metadata(&file_id)
+                .map(|metadata| metadata.inferred_realm);
+            assert_eq!(realm, Some(GmodRealm::Client));
+        }
+    }
+
+    #[test]
+    fn test_a_client_include_of_an_addon_menu_file_runs_it_on_the_client() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "addons/tool/lua/autorun/client/cl_boot.lua",
+            r#"include("menu/widget.lua")"#,
+        );
+        let widget = ws.def_file("addons/tool/lua/menu/widget.lua", "return {}");
+
+        let db = ws.get_db_mut();
+        let state_mask = db
+            .get_gmod_load_index()
+            .get_file_info(&widget)
+            .map(|info| info.state_mask);
+        assert_eq!(state_mask, Some(GmodStateMask::CLIENT));
+        let realm = db
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&widget)
+            .map(|metadata| metadata.inferred_realm);
+        assert_eq!(realm, Some(GmodRealm::Client));
+    }
     #[gtest]
     fn test_realm_inference_with_filename_and_dependency_hints() {
         let mut ws = VirtualWorkspace::new();
