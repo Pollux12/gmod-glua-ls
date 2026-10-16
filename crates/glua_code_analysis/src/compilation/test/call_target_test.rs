@@ -1,11 +1,11 @@
 #[cfg(test)]
 mod test {
-    use glua_parser::{LuaAstNode, LuaCallExpr};
+    use glua_parser::{LuaAstNode, LuaCallExpr, LuaClosureExpr};
 
     use crate::compilation::analyzer::call_target::{pass_view, resolve_call_target};
     use crate::db_index::derivation::DerivationKind;
     use crate::profile::work::{Work, counted};
-    use crate::{Emmyrc, FileId, LuaInferCache, VirtualWorkspace};
+    use crate::{Emmyrc, FileId, LuaInferCache, LuaSignatureId, VirtualWorkspace};
 
     fn gmod_workspace() -> VirtualWorkspace {
         let mut ws = VirtualWorkspace::new();
@@ -355,5 +355,164 @@ Greet(Probe())
             assert!(ws.stale_derivations().is_empty(), "{greeter_text}");
             assert_eq!(evaluations, expected, "{greeter_text}");
         }
+    }
+    const ICON_LIB: &str = "lua/autorun/sh_icon.lua";
+    const ICON_LIB_TEXT: &str = "Glide = Glide or {}
+function Glide.DrawIcon(angle) return angle end
+";
+    const ICON_CALLER: &str = "lua/autorun/sh_icon_caller.lua";
+
+    /// The type the call-site evidence gives the parameter of the function the
+    /// caller file's only call targets.
+    fn call_site_param_of_only_call(ws: &VirtualWorkspace, caller: FileId) -> Option<String> {
+        let db = ws.analysis.compilation.get_db();
+        let call = first_call(ws, caller);
+        let signature_id = db
+            .get_call_target_index()
+            .target(caller, call.get_range())
+            .and_then(|target| target.signature_id())?;
+        db.get_call_site_param_index()
+            .get_inferred_param(&signature_id, 0)
+            .map(|typ| format!("{typ:?}"))
+    }
+
+    fn icon_param(caller_text: &str) -> Option<String> {
+        let mut ws = gmod_workspace();
+        let ids = ws.def_files(vec![(ICON_LIB, ICON_LIB_TEXT), (ICON_CALLER, caller_text)]);
+        call_site_param_of_only_call(&ws, ids[1])
+    }
+
+    /// A call through `local f = Lib.Fn` types the parameter from its argument,
+    /// as the direct call does, so the parameter's name does not guess its type.
+    #[test]
+    fn a_call_through_an_unwritten_local_alias_gives_call_site_evidence() {
+        let direct = icon_param(
+            "Glide.DrawIcon(0)
+",
+        );
+        let alias = icon_param(
+            "local DrawIcon = Glide.DrawIcon
+DrawIcon(0)
+",
+        );
+
+        assert!(direct.is_some(), "the direct call contributes");
+        assert_eq!(alias, direct);
+    }
+
+    /// A reassigned alias may hold another function, so its calls give nothing.
+    #[test]
+    fn a_call_through_a_reassigned_local_alias_gives_no_call_site_evidence() {
+        let alias = icon_param(
+            "local DrawIcon = Glide.DrawIcon
+DrawIcon = print
+DrawIcon(0)
+",
+        );
+
+        assert_eq!(alias, None);
+    }
+
+    /// An alias of either of two functions may call any of them.
+    #[test]
+    fn a_call_through_a_local_alias_of_two_functions_gives_no_call_site_evidence() {
+        let alias = icon_param(
+            "local DrawIcon = Glide.DrawIcon or print
+DrawIcon(0)
+",
+        );
+
+        assert_eq!(alias, None);
+    }
+
+    /// Removing the alias call leaves the evidence a cold build of the edit has.
+    #[test]
+    fn removing_a_local_alias_call_re_derives_the_parameter() {
+        const WITH_CALL: &str = "local DrawIcon = Glide.DrawIcon
+DrawIcon(0)
+";
+        const WITHOUT_CALL: &str = "local DrawIcon = Glide.DrawIcon
+";
+        let mut warm = gmod_workspace();
+        warm.def_files(vec![(ICON_LIB, ICON_LIB_TEXT), (ICON_CALLER, WITH_CALL)]);
+        warm.def_file(ICON_CALLER, WITHOUT_CALL);
+        let mut cold = gmod_workspace();
+        cold.def_files(vec![(ICON_LIB, ICON_LIB_TEXT), (ICON_CALLER, WITHOUT_CALL)]);
+
+        assert_eq!(call_site_records(&warm), call_site_records(&cold));
+        assert_eq!(warm.semantic_digest(), cold.semantic_digest());
+        assert!(warm.stale_derivations().is_empty());
+    }
+
+    const TWO_ICON_LIB_TEXT: &str = "Glide = Glide or {}
+function Glide.DrawIcon(angle) return angle end
+Other = Other or {}
+function Other.DrawIcon(angle) return angle end
+";
+
+    /// What the call-site index holds for the first parameter of each function `ICON_LIB`
+    /// defines, once `caller_text` is analysed.
+    fn lib_param_evidence(lib_text: &str, caller_text: &str) -> Vec<(bool, Option<String>)> {
+        let mut ws = gmod_workspace();
+        let ids = ws.def_files(vec![(ICON_LIB, lib_text), (ICON_CALLER, caller_text)]);
+        let db = ws.analysis.compilation.get_db();
+        let index = db.get_call_site_param_index();
+        db.get_vfs()
+            .get_syntax_tree(&ids[0])
+            .expect("the library is parsed")
+            .get_chunk_node()
+            .descendants::<LuaClosureExpr>()
+            .map(|closure| {
+                let signature_id = LuaSignatureId::from_closure(ids[0], &closure);
+                (
+                    index.has_param_evidence(&signature_id, 0),
+                    index
+                        .get_inferred_param(&signature_id, 0)
+                        .map(|typ| format!("{typ:?}")),
+                )
+            })
+            .collect()
+    }
+
+    /// An alias holding one of two functions through another local may call either, so its
+    /// calls give nothing to either.
+    #[test]
+    fn a_call_through_a_local_alias_of_a_local_holding_two_functions_gives_no_evidence() {
+        let direct = lib_param_evidence(
+            TWO_ICON_LIB_TEXT,
+            "Glide.DrawIcon(0)
+",
+        );
+        assert!(
+            direct[0].0,
+            "the direct call contributes to the first function"
+        );
+
+        let alias = lib_param_evidence(
+            TWO_ICON_LIB_TEXT,
+            "local flag = math.random() > 0.5
+local source = flag and Glide.DrawIcon or Other.DrawIcon
+local DrawIcon = source
+DrawIcon(0)
+",
+        );
+
+        assert_eq!(alias, vec![(false, None); 2]);
+    }
+
+    /// A closure that writes the alias may leave it holding another function.
+    #[test]
+    fn a_call_through_a_local_alias_written_by_a_closure_gives_no_evidence() {
+        let alias = lib_param_evidence(
+            ICON_LIB_TEXT,
+            "local DrawIcon = Glide.DrawIcon
+local function swap()
+    DrawIcon = print
+end
+DrawIcon(0)
+",
+        );
+
+        assert_eq!(alias, vec![(false, None)]);
     }
 }

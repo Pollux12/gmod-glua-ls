@@ -1432,6 +1432,14 @@ fn signature_ids_from_call_prefix(
     {
         return (vec![signature_id], SignatureLookupKind::Direct);
     }
+    if let LuaExpr::NameExpr(name_expr) = prefix_expr
+        && is_local_callee
+        && is_unwritten_alias(db, file_id, name_expr, call_position)
+        && let Some(signature_id) = super::call_target::call_target_of(db, file_id, call_expr)
+            .and_then(LuaCallTarget::signature_id)
+    {
+        return (vec![signature_id], SignatureLookupKind::Direct);
+    }
 
     let mut signature_ids = super::call_target::call_target_of(db, file_id, call_expr)
         .map(|target| target.inferred.clone())
@@ -1456,6 +1464,50 @@ fn signature_ids_from_call_prefix(
     });
     signature_ids.dedup();
     (signature_ids, lookup_kind)
+}
+
+/// Whether the local `name_expr` names is declared before `call_position` as `local f = <name or path>` and never written again.
+fn is_unwritten_alias(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+    call_position: TextSize,
+) -> bool {
+    let Some(file_refs) = db.get_reference_index().get_local_reference(&file_id) else {
+        return false;
+    };
+    let Some(decl_id) = file_refs.get_decl_id(&name_expr.get_range()) else {
+        return false;
+    };
+    let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
+        return false;
+    };
+    if !matches!(decl.extra, LuaDeclExtra::Local { .. }) || decl.get_position() > call_position {
+        return false;
+    }
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_red_root())
+    else {
+        return false;
+    };
+    let Some(value) = decl
+        .get_value_syntax_id()
+        .and_then(|syntax_id| syntax_id.to_node_from_root(&root))
+        .and_then(LuaExpr::cast)
+    else {
+        return false;
+    };
+    matches!(value, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_))
+        && !file_refs
+            .get_decl_references(&decl_id)
+            .is_some_and(|references| {
+                references
+                    .cells
+                    .iter()
+                    .any(|cell| cell.is_write && cell.range.start() >= value.get_range().end())
+            })
 }
 
 fn signature_ids_from_include_returned_table_member(

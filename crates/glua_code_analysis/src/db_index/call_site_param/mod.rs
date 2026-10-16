@@ -459,6 +459,20 @@ impl CallSiteParamIndex {
         param_idx: usize,
     ) -> Option<&LuaTypeFact> {
         derivation::note_read(|| FactKey::Contrib(*signature_id, param_idx));
+        self.inferred_param(signature_id, param_idx)
+    }
+
+    /// Whether any call or callback receiver contributed evidence for the parameter, typed or not.
+    pub fn has_param_evidence(&self, signature_id: &LuaSignatureId, param_idx: usize) -> bool {
+        derivation::note_read(|| FactKey::Contrib(*signature_id, param_idx));
+        self.contributors.contains_key(&(*signature_id, param_idx))
+    }
+
+    fn inferred_param(
+        &self,
+        signature_id: &LuaSignatureId,
+        param_idx: usize,
+    ) -> Option<&LuaTypeFact> {
         self.inferred_params
             .get(signature_id)
             .and_then(|params| params.get(&param_idx))
