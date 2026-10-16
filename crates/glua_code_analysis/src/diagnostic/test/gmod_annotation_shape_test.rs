@@ -4,6 +4,38 @@ mod test {
 
     use crate::{DiagnosticCode, VirtualWorkspace};
 
+    #[test]
+    fn addon_photon_capability_contract_accepts_absent_false_and_true_flags() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/glide/annotations/photon.lua",
+            "---@meta\n---@class GlidePhotonCapabilityOverrides\n---@field HasEmergency boolean?\n---@field HasSiren boolean?\n",
+        );
+        let path = "lua/glide/server/lighting_photon.lua";
+        let code = r#"
+            local function capabilities(entTbl)
+                local photonConfig = entTbl.Photon
+                ---@cast photonConfig GlidePhotonCapabilityOverrides
+                local emergency = photonConfig.HasEmergency
+                local siren = photonConfig.HasSiren
+                if emergency == nil or siren == nil then return false end
+                return emergency == true or siren == true
+            end
+            capabilities({Photon = {Standard = {}}})
+            capabilities({Photon = {HasEmergency = false, HasSiren = true}})
+        "#;
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedField, path, code));
+        assert!(ws.check_file_for(DiagnosticCode::ParamTypeMismatch, path, code));
+        assert!(!ws.check_file_for(
+            DiagnosticCode::UndefinedField,
+            path,
+            r#"
+            ---@param config GlidePhotonCapabilityOverrides
+            local function read(config) return config.HasEmergancy end
+            "#,
+        ));
+    }
+
     #[gtest]
     fn string_comma_accepts_number_or_string_and_rejects_table() {
         let mut ws = VirtualWorkspace::new();
