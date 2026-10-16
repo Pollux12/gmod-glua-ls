@@ -30,8 +30,8 @@ pub(crate) use engine::EngineStats;
 pub(crate) use engine::serial_engine;
 pub use engine::{Schedule, Slice};
 pub(crate) use local_inference::{
-    SubtypesWithMember, is_guarded_by_enclosing_condition, is_member_path_presence_guarded,
-    unguarded_child_candidates,
+    SubtypesWithMember, class_union_arms, class_union_arms_with_member,
+    is_guarded_by_enclosing_condition, is_member_path_presence_guarded, unguarded_child_candidates,
 };
 pub use lua::is_member_assignment_in_conditional_branch;
 pub(crate) use lua::{

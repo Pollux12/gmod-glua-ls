@@ -614,6 +614,100 @@ struct MemberPathEvidence<'a> {
     scores: &'a mut HashMap<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>,
 }
 
+/// Evidence for a declaration whose type is a union of classes: a read of a
+/// member only some of them have names those classes as what it holds.
+struct UnionArmEvidence<'a> {
+    file_id: crate::FileId,
+    flow_tree: Option<&'a crate::FlowTree>,
+    decl_id: crate::LuaDeclId,
+    base_type: &'a LuaType,
+    arms: &'a [LuaTypeDeclId],
+    scores: &'a mut HashMap<LuaDefinitionId, UnguardedChildCandidates>,
+    sources: &'a mut HashMap<(LuaDefinitionId, crate::LuaTypeDeclId), ChildSource>,
+    found_types: &'a mut HashMap<InFiled<glua_parser::LuaSyntaxId>, LuaType>,
+}
+
+impl UnionArmEvidence<'_> {
+    fn collect(
+        &mut self,
+        db: &crate::DbIndex,
+        cache: &mut crate::LuaInferCache,
+        name_expr: &LuaNameExpr,
+        index_expr: &LuaIndexExpr,
+    ) {
+        if is_assignment_target(index_expr)
+            || is_condition_evidence(index_expr)
+            || is_matching_short_circuit_guard(db, cache, index_expr)
+        {
+            return;
+        }
+        let Some(index_key) = index_expr.get_index_key() else {
+            return;
+        };
+        if LuaMemberKey::index_key_is_dynamic(db, cache, &index_key) {
+            return;
+        }
+        let Ok(member_key) = LuaMemberKey::from_index_key(db, cache, &index_key) else {
+            return;
+        };
+        let with_member = class_union_arms_with_member(
+            db,
+            cache,
+            self.arms,
+            &member_key,
+            self.file_id,
+            index_expr.get_position(),
+        );
+        if with_member.is_empty() || with_member.len() == self.arms.len() {
+            return;
+        }
+        if member_path_assigned_before(db, cache, self.flow_tree, index_expr) {
+            return;
+        }
+        // A real flow guard wins, as it does for a single declared class.
+        let current =
+            infer_expr(db, cache, LuaExpr::NameExpr(name_expr.clone())).unwrap_or(LuaType::Unknown);
+        if &current != self.base_type {
+            return;
+        }
+        let definitions = self
+            .flow_tree
+            .and_then(|tree| {
+                tree.get_flow_id(name_expr.get_syntax_id())
+                    .map(|flow| tree.reaching_definitions(self.decl_id, flow))
+            })
+            .unwrap_or_else(|| Arc::from([LuaDefinitionId::Declaration(self.decl_id)]));
+        let site = InFiled::new(self.file_id, index_expr.get_syntax_id());
+        self.found_types.insert(site.clone(), current);
+        let source = ChildSource {
+            site,
+            guarded: is_presence_covered(db, cache, index_expr),
+        };
+        for definition in definitions.iter() {
+            for arm in &with_member {
+                self.scores
+                    .entry(definition.clone())
+                    .or_insert_with(|| UnguardedChildCandidates {
+                        parent_type: self.base_type.clone(),
+                        children: HashMap::default(),
+                    })
+                    .children
+                    .entry(arm.clone())
+                    .or_default()
+                    .insert(member_key.clone());
+                self.sources
+                    .entry((definition.clone(), arm.clone()))
+                    .and_modify(|existing| {
+                        if source.precedes(existing) {
+                            *existing = source.clone();
+                        }
+                    })
+                    .or_insert_with(|| source.clone());
+            }
+        }
+    }
+}
+
 /// A read a child inference is reported at, with whether a guard on a member of
 /// the same table encloses it.
 #[derive(Clone)]
@@ -1080,6 +1174,21 @@ fn collect_unguarded_child_file(
             continue;
         };
         let Some(base_id) = unguarded_child_base_id(&base_type) else {
+            if let Some(arms) = class_union_arms(db, &base_type) {
+                let mut union_evidence = UnionArmEvidence {
+                    file_id,
+                    flow_tree,
+                    decl_id,
+                    base_type: &base_type,
+                    arms: &arms,
+                    scores: &mut scores,
+                    sources: &mut sources,
+                    found_types: &mut found_types,
+                };
+                for (name_expr, index_expr) in &all_sites {
+                    union_evidence.collect(db, &mut infer_cache, name_expr, index_expr);
+                }
+            }
             continue;
         };
         for (name_expr, index_expr) in &all_sites {

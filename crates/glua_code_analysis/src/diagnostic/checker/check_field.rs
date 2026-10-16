@@ -732,6 +732,21 @@ fn is_valid_member_inner(
     code: DiagnosticCode,
     mut state: Option<&mut CheckFieldState>,
 ) -> Option<()> {
+    if matches!(
+        code,
+        DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+    ) && let Some(arms) =
+        crate::compilation::analyzer::class_union_arms(semantic_model.get_db(), prefix_typ)
+    {
+        if let Some(with_member) = class_union_arms_with_member(semantic_model, &arms, index_expr) {
+            if with_member.len() == arms.len() {
+                return Some(());
+            }
+            if !with_member.is_empty() {
+                return None;
+            }
+        }
+    }
     match prefix_typ {
         LuaType::Global | LuaType::Userdata => return Some(()),
         LuaType::Array(typ) => {
