@@ -311,6 +311,21 @@ fn get_type_at_condition_flow_uncached(
             condition_flow,
             policy,
         ),
+        LuaExpr::LiteralExpr(literal)
+            if match literal.get_literal() {
+                Some(glua_parser::LuaLiteralToken::Nil(_)) => condition_flow.is_true(),
+                Some(glua_parser::LuaLiteralToken::Bool(token)) => {
+                    !token.is_true() && condition_flow.is_true()
+                }
+                Some(
+                    glua_parser::LuaLiteralToken::String(_)
+                    | glua_parser::LuaLiteralToken::Number(_),
+                ) => condition_flow.is_false(),
+                _ => false,
+            } =>
+        {
+            Ok(ResultTypeOrContinue::Result(crate::LuaType::Never))
+        }
         LuaExpr::TableExpr(_) | LuaExpr::LiteralExpr(_) | LuaExpr::ClosureExpr(_) => {
             Ok(ResultTypeOrContinue::Continue)
         }
