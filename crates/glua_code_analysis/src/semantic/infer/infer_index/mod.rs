@@ -995,6 +995,11 @@ fn infer_table_member_owner(
                 return Err(reason);
             }
         };
+        let member_type = if dynamic_numeric_index_key(&key) {
+            nullable_if_needed(db, member_type)
+        } else {
+            member_type
+        };
         let finite_named_dynamic = is_literal_table_field_access(&index_key)
             && owner_has_finite_named_dynamic_assignment(db, &owner);
         if literal_key && !finite_named_dynamic && !type_is_uninformative(&member_type) {
@@ -1435,7 +1440,13 @@ fn infer_table_dynamic_key_member_type(
     }
 
     let result_type = TypeOps::union_all(db, member_types);
-    (!result_type.is_never()).then_some(result_type)
+    if result_type.is_never() {
+        None
+    } else if access_key_type.is_number() {
+        Some(nullable_if_needed(db, result_type))
+    } else {
+        Some(result_type)
+    }
 }
 
 fn owner_has_precise_dynamic_value(
@@ -1602,6 +1613,28 @@ fn numeric_for_write_covers_integer_access(
         .ancestors()
         .any(|ancestor| ancestor == for_stat.syntax().clone())
     {
+        return false;
+    }
+
+    let writer_body = for_stat
+        .ancestors::<glua_parser::LuaClosureExpr>()
+        .next()
+        .map(|closure| closure.get_syntax_id());
+    let Some(access_tree) = db
+        .get_vfs()
+        .syntax_tree_at_statement(&member.get_file_id(), TextRange::empty(access_position))
+    else {
+        return false;
+    };
+    let access_root = access_tree.get_red_root();
+    let Some(access_token) = access_root.token_at_offset(access_position).right_biased() else {
+        return false;
+    };
+    let access_body = access_token
+        .parent_ancestors()
+        .find_map(glua_parser::LuaClosureExpr::cast)
+        .map(|closure| closure.get_syntax_id());
+    if writer_body != access_body {
         return false;
     }
 
@@ -4570,5 +4603,143 @@ mod access_path_tests {
         assert!(result.is_err());
         ACCESS_PATHS.with(|kept| assert!(kept.borrow().is_none()));
         assert_eq!(Arc::strong_count(&snapshot), 1);
+    }
+}
+
+#[cfg(test)]
+mod numeric_population_origin_tests {
+    use super::*;
+    use crate::{Emmyrc, VirtualWorkspace};
+
+    fn workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        let mut config = Emmyrc::default();
+        config.gmod.enabled = true;
+        config.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(config);
+        ws
+    }
+
+    fn observation(ws: &VirtualWorkspace, file: FileId) -> (String, bool, bool) {
+        let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
+        let read = model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .filter(|index| index.syntax().text() == "COLORS[ROLE]")
+            .last()
+            .unwrap();
+        let raw_nullable = match infer_index_expr(
+            model.get_db(),
+            &mut model.get_cache().borrow_mut(),
+            read.clone(),
+            false,
+        ) {
+            Ok(raw) => raw.is_nullable(),
+            Err(InferFailReason::FieldNotFound) => true,
+            Err(error) => panic!("unexpected raw population lookup failure: {error:?}"),
+        };
+        let flow = match model.infer_expr(LuaExpr::IndexExpr(read)) {
+            Ok(flow) => flow,
+            Err(InferFailReason::FieldNotFound) => LuaType::Nil,
+            Err(error) => panic!("unexpected population flow lookup failure: {error:?}"),
+        };
+        (
+            ws.humanize_type(flow.clone()),
+            raw_nullable,
+            flow.is_nullable(),
+        )
+    }
+
+    #[test]
+    fn helper_numeric_writes_supply_values_while_calls_prove_presence() {
+        let source = |effect: &str, before: &str, after: &str| {
+            format!(
+                r#"
+            ---@class Color
+            ---@field r integer
+            local Color = {{}}
+            local ROLE = 1
+            local COLORS = {{}}
+            ---@return Color
+            local function MakeColor() {effect} return {{r = 0}} end
+            local function Fill(list)
+                for index = 0, 2 do list[index] = MakeColor() end
+            end
+            local function Unknown() end
+            {before}
+            local color = COLORS[ROLE]
+            color.r = 255
+            {after}
+        "#
+            )
+        };
+        let path = "lua/autorun/server/sv_numeric_population_origin.lua";
+        let mut warm = workspace();
+        for (effect, before, after, nullable) in [
+            ("", "Fill(COLORS)", "", false),
+            ("", "", "Fill(COLORS)", true),
+            ("", "Fill(COLORS); ROLE = 99", "", true),
+            ("", "Fill(COLORS); COLORS[ROLE] = nil", "", true),
+            ("ROLE = 99", "Fill(COLORS)", "", true),
+            ("COLORS[ROLE] = nil", "Fill(COLORS)", "", true),
+            ("", "Fill(COLORS); Unknown()", "", true),
+            ("", "Fill(COLORS)", "", false),
+        ] {
+            let text = source(effect, before, after);
+            let file = warm.def_file(path, &text);
+            let actual = observation(&warm, file);
+            let mut cold = workspace();
+            let cold_file = cold.def_file(path, &text);
+            assert_eq!(
+                actual,
+                observation(&cold, cold_file),
+                "{effect}, {before}, {after}"
+            );
+            assert!(
+                actual.1,
+                "raw writer evidence must remain nullable: {actual:?}"
+            );
+            assert_eq!(
+                actual.2, nullable,
+                "{effect}, {before}, {after}: {actual:?}"
+            );
+        }
+        let uri = warm.virtual_url_generator.new_uri(path);
+        warm.analysis.remove_file_by_uri(&uri);
+        let text = source("", "", "Fill(COLORS)");
+        let reopened = warm.def_file(path, &text);
+        let mut cold = workspace();
+        let cold_file = cold.def_file(path, &text);
+        assert_eq!(observation(&warm, reopened), observation(&cold, cold_file));
+        assert!(observation(&warm, reopened).2);
+    }
+
+    #[test]
+    fn literal_members_and_declared_array_contracts_keep_their_presence() {
+        for setup in [
+            "local COLORS = {{r = 0}}",
+            "local COLORS = {}; COLORS[1] = {r = 0}",
+            "---@type table<integer, Color>\nlocal COLORS",
+        ] {
+            let mut ws = workspace();
+            let file = ws.def_file(
+                "lua/autorun/server/sv_numeric_presence_control.lua",
+                &format!(
+                    r#"
+                ---@class Color
+                ---@field r integer
+                local Color = {{}}
+                {setup}
+                local color = COLORS[1]
+                color.r = 255
+            "#
+                ),
+            );
+            let typ = ws.local_ty(file, "color");
+            assert!(
+                !typ.is_nullable() && !typ.is_nil() && !typ.is_unknown(),
+                "{setup}: {typ:?}"
+            );
+        }
     }
 }
