@@ -2752,6 +2752,239 @@ vgui.Register(\"cityrpStoreItem\", PANEL, \"EditablePanel\")
     }
 
     #[gtest]
+    fn a_union_of_class_names_materializes_a_class_for_each_name() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+
+            ents = {}
+
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return T[]
+            function ents.FindByClass(class) end
+
+            local classname = "ttt_union_first"
+            if cond then
+                classname = "ttt_union_second"
+            end
+            found = ents.FindByClass(classname)
+            "#,
+        );
+
+        let entity = LuaType::Ref(LuaTypeDeclId::global("Entity"));
+        for name in ["ttt_union_first", "ttt_union_second"] {
+            let class_id = LuaTypeDeclId::global(name);
+            let supers: Vec<LuaType> = ws
+                .analysis
+                .compilation
+                .get_db()
+                .get_type_index()
+                .get_super_types_iter(&class_id)
+                .map(|iter| iter.cloned().collect())
+                .unwrap_or_default();
+            assert!(
+                supers.contains(&entity),
+                "expected `{name}` to inherit `Entity`, got {supers:?}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn a_union_of_class_names_follows_edits_deletion_and_reopen_of_its_call() {
+        const DEFS: &str = r#"
+            ---@class Entity
+
+            ents = {}
+
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return T[]
+            function ents.FindByClass(class) end
+        "#;
+        fn find_either(first: &str, second: &str) -> String {
+            format!(
+                "local classname = \"{first}\"\nif cond then\n    classname = \"{second}\"\nend\nfound = ents.FindByClass(classname)\n"
+            )
+        }
+        fn class_state(ws: &VirtualWorkspace) -> Vec<String> {
+            let db = ws.analysis.compilation.get_db();
+            let type_index = db.get_type_index();
+            let file_name = |file_id: crate::FileId| {
+                db.get_vfs()
+                    .get_file_path(&file_id)
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+            };
+            ["tpl_a", "tpl_b", "tpl_c"]
+                .into_iter()
+                .map(|name| {
+                    let class_id = LuaTypeDeclId::global(name);
+                    let locations = type_index.get_type_decl(&class_id).map(|decl| {
+                        let mut locations = decl
+                            .get_locations()
+                            .iter()
+                            .map(|location| {
+                                format!("{:?}@{:?}", file_name(location.file_id), location.range)
+                            })
+                            .collect::<Vec<_>>();
+                        locations.sort();
+                        locations
+                    });
+                    let mut supers = type_index
+                        .get_super_type_entries(&class_id)
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .map(|entry| {
+                                    format!(
+                                        "{:?}@{:?} {:?}",
+                                        file_name(entry.file_id),
+                                        entry.value.source_range,
+                                        entry.value.typ
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    supers.sort();
+                    format!("{name}: {locations:?} {supers:?}")
+                })
+                .collect()
+        }
+        fn cold_state(schedule: Schedule, files: &[(&str, &str)]) -> Vec<String> {
+            let mut cold = VirtualWorkspace::new();
+            cold.analysis.compilation.set_schedule(schedule);
+            cold.def_files(files.to_vec());
+            class_state(&cold)
+        }
+        fn has_class(ws: &VirtualWorkspace, name: &str) -> bool {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_type_index()
+                .get_type_decl(&LuaTypeDeclId::global(name))
+                .is_some()
+        }
+
+        let ab = find_either("tpl_a", "tpl_b");
+        let bc = find_either("tpl_b", "tpl_c");
+        let second_b = "found = ents.FindByClass(\"tpl_b\")\n";
+
+        for schedule in [Schedule::Canonical, Schedule::Reversed] {
+            let mut ws = VirtualWorkspace::new();
+            ws.analysis.compilation.set_schedule(schedule);
+            ws.def_files(vec![
+                ("defs.lua", DEFS),
+                ("first.lua", ab.as_str()),
+                ("second.lua", second_b),
+            ]);
+            expect_that!(
+                class_state(&ws),
+                eq(&cold_state(
+                    schedule,
+                    &[
+                        ("defs.lua", DEFS),
+                        ("first.lua", ab.as_str()),
+                        ("second.lua", second_b)
+                    ]
+                )),
+                "{schedule:?}"
+            );
+
+            ws.def_file("first.lua", bc.as_str());
+            let edited = [
+                ("defs.lua", DEFS),
+                ("first.lua", bc.as_str()),
+                ("second.lua", second_b),
+            ];
+            expect_that!(
+                class_state(&ws),
+                eq(&cold_state(schedule, &edited)),
+                "{schedule:?}"
+            );
+            expect_that!(has_class(&ws, "tpl_a"), eq(false), "{schedule:?}");
+
+            let first_uri = ws.virtual_url_generator.new_uri("first.lua");
+            ws.analysis.remove_file_by_uri(&first_uri);
+            let first_deleted = [("defs.lua", DEFS), ("second.lua", second_b)];
+            expect_that!(
+                class_state(&ws),
+                eq(&cold_state(schedule, &first_deleted)),
+                "{schedule:?}"
+            );
+            expect_that!(has_class(&ws, "tpl_b"), eq(true), "{schedule:?}");
+
+            let second_uri = ws.virtual_url_generator.new_uri("second.lua");
+            ws.analysis.remove_file_by_uri(&second_uri);
+            expect_that!(
+                class_state(&ws),
+                eq(&cold_state(schedule, &[("defs.lua", DEFS)])),
+                "{schedule:?}"
+            );
+            expect_that!(has_class(&ws, "tpl_b"), eq(false), "{schedule:?}");
+
+            ws.def_file("second.lua", second_b);
+            expect_that!(
+                class_state(&ws),
+                eq(&cold_state(schedule, &first_deleted)),
+                "{schedule:?}"
+            );
+
+            ws.def_file("first.lua", bc.as_str());
+            expect_that!(
+                class_state(&ws),
+                eq(&cold_state(schedule, &edited)),
+                "{schedule:?}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn a_misspelled_field_on_a_found_class_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field Health number
+
+            ents = {}
+
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return T[]
+            function ents.FindByClass(class) end
+            "#,
+        );
+
+        expect_that!(
+            ws.check_code_for(
+                DiagnosticCode::UndefinedField,
+                r#"
+                local single = ents.FindByClass("ttt_single")
+                local _ = single[1].Helth
+                "#,
+            ),
+            eq(false)
+        );
+        expect_that!(
+            ws.check_code_for(
+                DiagnosticCode::UndefinedField,
+                r#"
+                local classname = "ttt_union_a"
+                if cond then
+                    classname = "ttt_union_b"
+                end
+                local union = ents.FindByClass(classname)
+                local _ = union[1].Helth
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
     fn a_wildcard_class_pattern_binds_the_constraint_without_minting_a_class() {
         let mut ws = VirtualWorkspace::new();
         ws.analysis

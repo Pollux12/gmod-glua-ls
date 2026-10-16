@@ -2235,15 +2235,58 @@ fn materialize_str_tpl_class_from_call(
     let Ok(arg_type) = infer_expr(db, cache, arg_expr.clone()) else {
         return Ok(());
     };
-    let LuaType::StringConst(arg_name) = crate::semantic::str_tpl_arg_type(
+    let arg_type = crate::semantic::str_tpl_arg_type(
         db, cache, param_type, &arg_expr, call_expr, param_idx, arg_type,
-    ) else {
-        return Ok(());
+    );
+    let mut arg_names = match &arg_type {
+        LuaType::StringConst(arg_name) | LuaType::DocStringConst(arg_name) => {
+            vec![arg_name.to_string()]
+        }
+        LuaType::Union(union) => union
+            .types()
+            .filter_map(|member| match member {
+                LuaType::StringConst(arg_name) | LuaType::DocStringConst(arg_name) => {
+                    Some(arg_name.to_string())
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => return Ok(()),
     };
-    if !crate::semantic::str_tpl_value_names_type(&arg_name) {
-        return Ok(());
-    }
+    arg_names.retain(|arg_name| crate::semantic::str_tpl_value_names_type(arg_name));
+    arg_names.sort_unstable();
+    arg_names.dedup();
 
+    for arg_name in &arg_names {
+        materialize_str_tpl_class(
+            db,
+            file_id,
+            call_expr,
+            &arg_expr,
+            &str_tpl,
+            &constraint,
+            arg_name,
+            param_idx,
+            is_colon_define,
+            is_colon_call,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_str_tpl_class(
+    db: &mut DbIndex,
+    file_id: crate::FileId,
+    call_expr: &LuaCallExpr,
+    arg_expr: &LuaExpr,
+    str_tpl: &crate::LuaStringTplType,
+    constraint: &LuaTypeDeclId,
+    arg_name: &str,
+    param_idx: usize,
+    is_colon_define: bool,
+    is_colon_call: bool,
+) -> ResolveResult {
     let class_name = format!(
         "{}{}{}",
         str_tpl.get_prefix(),
@@ -2300,7 +2343,7 @@ fn materialize_str_tpl_class_from_call(
         return Ok(());
     }
 
-    let super_type = LuaType::Ref(constraint);
+    let super_type = LuaType::Ref(constraint.clone());
     let source_range = arg_expr.get_range();
     if db.get_type_index_mut().add_super_type(
         class_decl_id.clone(),
