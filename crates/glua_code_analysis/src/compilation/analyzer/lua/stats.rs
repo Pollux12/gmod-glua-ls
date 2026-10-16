@@ -800,32 +800,37 @@ fn apply_index_expr_member_owner_with_guarded(
         _ => None,
     };
 
+    let cache = analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(analyzer.file_id);
+    let Ok(member_key) = LuaMemberKey::from_index_key_or_unknown(&analyzer.db, cache, &index_key)
+    else {
+        return Some(());
+    };
     let new_member = if analyzer
         .db
         .get_member_index()
         .get_member(&member_id)
         .is_none()
     {
-        let cache = analyzer
-            .context
-            .infer_manager
-            .get_infer_cache(analyzer.file_id);
-        let Ok(member_key) =
-            LuaMemberKey::from_index_key_or_unknown(&analyzer.db, cache, &index_key)
-        else {
-            return Some(());
-        };
         let decl_feature = if analyzer.context.metas.contains(&analyzer.file_id) {
             LuaMemberFeature::MetaDefine
         } else {
             LuaMemberFeature::FileDefine
         };
-        Some(LuaMember::new(member_id, member_key, decl_feature, None))
+        Some(LuaMember::new(
+            member_id,
+            member_key.clone(),
+            decl_feature,
+            None,
+        ))
     } else {
         None
     };
     analyzer.write(StatementWrite::HomeMember(MemberHoming {
         member_id,
+        key: member_key,
         owner: member_owner,
         new_member,
         set_owner_only,

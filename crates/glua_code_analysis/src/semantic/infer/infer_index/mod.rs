@@ -3521,8 +3521,9 @@ fn infer_member_by_index_table(
                 // sequential TableConst rows indexable via the operator path
                 // (MergedTable/Union components), mirroring `infer_table_member`.
                 let mut saw_match = false;
+                let matcher = crate::semantic::member::AccessKeyMatcher::new(&key_type);
                 for member in members {
-                    if !member_key_matches_type(db, &key_type, member.get_key()) {
+                    if !matcher.matches(db, member.get_key()) {
                         continue;
                     }
                     let Some(member_type) = db

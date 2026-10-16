@@ -515,7 +515,7 @@ fn try_infer_pairs_iter_types_from_table_members(
     }
     let keys_are_sampled = member_entries
         .iter()
-        .any(|(key, _, self_feedback)| matches!(key, LuaMemberKey::ExprType(_)) && !self_feedback);
+        .any(|(key, _, self_feedback)| is_sampled_pairs_key(key) && !self_feedback);
 
     for (key, member_infos, self_feedback) in member_entries {
         if !self_feedback {
@@ -732,6 +732,27 @@ fn infer_table_projection_key_type(db: &DbIndex, inner: &LuaType) -> LuaType {
     key_type.unwrap_or_else(|| {
         LuaType::Call(LuaAliasCallType::new(LuaAliasCallKind::KeyOf, vec![inner.clone()]).into())
     })
+}
+
+fn is_sampled_pairs_key(key: &LuaMemberKey) -> bool {
+    match key {
+        LuaMemberKey::ExprType(LuaType::Union(union))
+            if !union.is_empty()
+                && union.types().all(|typ| {
+                    matches!(
+                        typ,
+                        LuaType::StringConst(_)
+                            | LuaType::DocStringConst(_)
+                            | LuaType::IntegerConst(_)
+                            | LuaType::DocIntegerConst(_)
+                    )
+                }) =>
+        {
+            false
+        }
+        LuaMemberKey::ExprType(_) => true,
+        _ => false,
+    }
 }
 
 fn table_projection_member_key_type(key: &LuaMemberKey) -> Option<LuaType> {

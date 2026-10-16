@@ -449,79 +449,68 @@ mod tests {
         }
     }
 
-    /// A union access matches member keys as the two-direction type check does.
     #[test]
-    fn union_access_matches_member_keys_as_the_type_check_does() {
-        use crate::{LuaUnionType, VirtualWorkspace};
-
-        let mut ws = VirtualWorkspace::new();
-        ws.def("---@class UnionKeyFoo");
-        let db = ws.analysis.compilation.get_db();
-        let int = |value| LuaType::IntegerConst(value);
-        let doc_int = |value| LuaType::DocIntegerConst(value);
-        let text = |value: &str| LuaType::StringConst(smol_str::SmolStr::new(value).into());
-        let doc_text = |value: &str| LuaType::DocStringConst(smol_str::SmolStr::new(value).into());
-        let foo = LuaType::Ref(LuaTypeDeclId::global("UnionKeyFoo"));
-        let union = |types: Vec<LuaType>| LuaType::Union(LuaUnionType::from_vec(types).into());
-        let accesses = [
-            union(vec![]),
-            union(vec![int(1)]),
-            union(vec![int(1), int(2)]),
-            union(vec![doc_int(3), doc_int(4)]),
-            union(vec![doc_int(3), int(4)]),
-            union(vec![text("a")]),
-            union(vec![text("a"), text("b")]),
-            union(vec![doc_text("a"), text("b")]),
-            union(vec![doc_int(1), LuaType::Integer]),
-            union(vec![doc_int(1), LuaType::Number]),
-            union(vec![doc_int(1), LuaType::String]),
-            union(vec![doc_int(1), text("a")]),
-            union(vec![doc_int(1), LuaType::Nil]),
-            union(vec![doc_int(1), foo.clone()]),
-            union(vec![doc_int(1), LuaType::FloatConst(1.5)]),
-            union(vec![text("a"), LuaType::Integer]),
-            union(vec![text("a"), LuaType::String]),
-            union(vec![text("a"), foo.clone()]),
-            union(vec![text("a"), LuaType::Nil]),
-        ];
-        let keys = [
-            LuaMemberKey::Integer(1),
-            LuaMemberKey::Integer(9),
-            LuaMemberKey::Name("a".into()),
-            LuaMemberKey::Name("zz".into()),
-            LuaMemberKey::ExprType(int(5)),
-            LuaMemberKey::ExprType(doc_int(2)),
-            LuaMemberKey::ExprType(LuaType::Integer),
-            LuaMemberKey::ExprType(LuaType::String),
-            LuaMemberKey::ExprType(doc_text("a")),
-            LuaMemberKey::ExprType(LuaType::Unknown),
-            LuaMemberKey::ExprType(foo.clone()),
-            LuaMemberKey::ExprType(LuaType::Nil),
-            LuaMemberKey::None,
-        ];
-        for access in &accesses {
-            for key in &keys {
-                let expected = match (key, member_key_as_type(key)) {
-                    (LuaMemberKey::ExprType(typ), _) if typ.is_unknown() => {
-                        super::unknown_index_key_matches_access(access)
-                    }
-                    (_, None) => false,
-                    (_, Some(key_type)) => match super::literal_member_key_match(access, &key_type)
-                    {
-                        Some(is_match) => is_match,
-                        None => {
-                            crate::check_type_compact(db, access, &key_type).is_ok()
-                                || crate::check_type_compact(db, &key_type, access).is_ok()
-                        }
-                    },
-                };
-                assert_eq!(
-                    member_key_matches_type(db, access, key),
-                    expected,
-                    "{access:?} against {key:?}",
-                );
-            }
+    fn literal_union_keys_match_only_their_own_members() {
+        let db = DbIndex::new();
+        let text = |value: &str| LuaType::DocStringConst(smol_str::SmolStr::new(value).into());
+        let access = LuaType::from_vec(vec![text("a"), text("b")]);
+        for (key, expected) in [
+            (LuaMemberKey::Name("a".into()), true),
+            (LuaMemberKey::Name("b".into()), true),
+            (LuaMemberKey::Name("callback".into()), false),
+            (LuaMemberKey::Integer(1), false),
+            (LuaMemberKey::ExprType(LuaType::String), true),
+            (LuaMemberKey::ExprType(LuaType::Table), false),
+            (
+                LuaMemberKey::ExprType(LuaType::from_vec(vec![text("b"), text("c")])),
+                true,
+            ),
+            (
+                LuaMemberKey::ExprType(LuaType::from_vec(vec![text("c"), text("d")])),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                member_key_matches_type(&db, &access, &key),
+                expected,
+                "{key:?}"
+            );
         }
+
+        let access = LuaType::from_vec(vec![LuaType::IntegerConst(1), LuaType::DocIntegerConst(2)]);
+        assert!(member_key_matches_type(
+            &db,
+            &access,
+            &LuaMemberKey::Integer(1)
+        ));
+        assert!(!member_key_matches_type(
+            &db,
+            &access,
+            &LuaMemberKey::Integer(3)
+        ));
+    }
+
+    #[test]
+    fn typed_keys_preserve_domains_and_unknown_key_fallbacks() {
+        let db = DbIndex::new();
+        let numeric = LuaMemberKey::ExprType(LuaType::Integer);
+        let table = LuaMemberKey::ExprType(LuaType::Table);
+        let unknown = LuaMemberKey::ExprType(LuaType::Unknown);
+        assert!(member_key_matches_type(&db, &LuaType::Integer, &numeric));
+        assert!(!member_key_matches_type(&db, &LuaType::Integer, &table));
+        assert!(member_key_matches_type(&db, &LuaType::Table, &table));
+        assert!(!member_key_matches_type(&db, &LuaType::Table, &numeric));
+        let either = LuaType::from_vec(vec![LuaType::Integer, LuaType::Table]);
+        assert!(member_key_matches_type(&db, &either, &numeric));
+        assert!(member_key_matches_type(&db, &either, &table));
+        assert!(member_key_matches_type(&db, &LuaType::Unknown, &numeric));
+        assert!(member_key_matches_type(&db, &LuaType::Unknown, &table));
+        assert!(member_key_matches_type(&db, &LuaType::Integer, &unknown));
+        assert!(!member_key_matches_type(
+            &db,
+            &LuaType::DocIntegerConst(3),
+            &unknown
+        ));
     }
 
     #[test]
@@ -1658,42 +1647,75 @@ pub(crate) fn member_key_matches_type(
 /// An access key prepared once for matching against many member keys.
 pub(crate) struct AccessKeyMatcher<'a> {
     access_key_type: &'a LuaType,
-    integer_literal_union: bool,
+    literal_keys: Option<FxHashSet<LuaMemberKey>>,
 }
 
 impl<'a> AccessKeyMatcher<'a> {
     pub(crate) fn new(access_key_type: &'a LuaType) -> Self {
-        let integer_literal_union = matches!(access_key_type, LuaType::Union(union)
-        if !union.is_empty()
-            && union.types().all(|typ| {
-                matches!(typ, LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_))
-            }));
+        let literal_keys = match access_key_type {
+            LuaType::Union(union) => union.types().map(literal_type_member_key).collect(),
+            _ => None,
+        };
         Self {
             access_key_type,
-            integer_literal_union,
+            literal_keys,
         }
     }
 
     pub(crate) fn matches(&self, db: &DbIndex, member_key: &LuaMemberKey) -> bool {
-        let access_key_type = self.access_key_type;
         if let LuaMemberKey::ExprType(member_key_type) = member_key
             && member_key_type.is_unknown()
         {
-            return unknown_index_key_matches_access(access_key_type);
+            return unknown_index_key_matches_access(self.access_key_type);
+        }
+
+        if let Some(literal_keys) = &self.literal_keys {
+            match member_key {
+                LuaMemberKey::Name(_) | LuaMemberKey::Integer(_) => {
+                    return literal_keys.contains(member_key);
+                }
+                LuaMemberKey::ExprType(typ) => {
+                    if let Some(key) = literal_type_member_key(typ) {
+                        return literal_keys.contains(&key);
+                    }
+                }
+                LuaMemberKey::None => return false,
+            }
         }
 
         let Some(member_key_type) = member_key_as_type(member_key) else {
             return false;
         };
-        if let Some(is_match) = literal_member_key_match(access_key_type, &member_key_type) {
-            return is_match;
+        member_key_types_overlap(db, self.access_key_type, &member_key_type)
+    }
+}
+
+fn literal_type_member_key(typ: &LuaType) -> Option<LuaMemberKey> {
+    match typ {
+        LuaType::StringConst(name) | LuaType::DocStringConst(name) => {
+            Some(LuaMemberKey::Name((**name).clone()))
         }
-        // An integer literal is accepted by every integer literal arm in the reverse check.
-        if self.integer_literal_union && matches!(member_key_type, LuaType::IntegerConst(_)) {
-            return true;
+        LuaType::IntegerConst(value) | LuaType::DocIntegerConst(value) => {
+            Some(LuaMemberKey::Integer(*value))
         }
-        check_type_compact(db, access_key_type, &member_key_type).is_ok()
-            || check_type_compact(db, &member_key_type, access_key_type).is_ok()
+        _ => None,
+    }
+}
+
+fn member_key_types_overlap(db: &DbIndex, access: &LuaType, member: &LuaType) -> bool {
+    match (access, member) {
+        (LuaType::Union(union), _) => union
+            .types()
+            .any(|arm| member_key_types_overlap(db, arm, member)),
+        (_, LuaType::Union(union)) => union
+            .types()
+            .any(|arm| member_key_types_overlap(db, access, arm)),
+        (LuaType::TypeGuard(inner), _) => member_key_types_overlap(db, inner, member),
+        (_, LuaType::TypeGuard(inner)) => member_key_types_overlap(db, access, inner),
+        _ => literal_member_key_match(access, member).unwrap_or_else(|| {
+            check_type_compact(db, access, member).is_ok()
+                || check_type_compact(db, member, access).is_ok()
+        }),
     }
 }
 

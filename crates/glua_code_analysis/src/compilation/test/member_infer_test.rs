@@ -946,6 +946,321 @@ parser:parse()",
         );
     }
 
+    #[test]
+    fn member_write_key_edits_match_cold_analysis() {
+        fn snapshot(
+            ws: &mut VirtualWorkspace,
+            writer: crate::FileId,
+            reader: crate::FileId,
+        ) -> (String, String, String) {
+            let key_domain = {
+                let model = ws.analysis.compilation.get_semantic_model(writer).unwrap();
+                let index = model
+                    .get_root()
+                    .descendants::<glua_parser::LuaIndexExpr>()
+                    .next()
+                    .unwrap();
+                let member_id = LuaMemberId::new(index.get_syntax_id(), writer);
+                let db = ws.analysis.compilation.get_db();
+                let key = db
+                    .get_member_index()
+                    .get_member(&member_id)
+                    .unwrap()
+                    .get_key();
+                match key {
+                    LuaMemberKey::Integer(1) => "integer".to_string(),
+                    LuaMemberKey::ExprType(LuaType::Integer) => "integer".to_string(),
+                    LuaMemberKey::ExprType(typ) if typ.is_table() => "table".to_string(),
+                    LuaMemberKey::Name(name) if name == "named" => "named".to_string(),
+                    _ => panic!("unexpected member key: {key:?}"),
+                }
+            };
+            let numeric = local_name_type(ws, reader, "numeric");
+            assert!(!numeric.is_any() && !numeric.is_unknown());
+            assert!(ws.check_type(
+                &LuaType::from_vec(vec![LuaType::String, LuaType::Nil]),
+                &numeric
+            ));
+            let selected = local_name_type(ws, reader, "selected");
+            assert!(!selected.is_any() && !selected.is_unknown());
+            assert!(ws.check_type(&LuaType::String, &selected));
+            (
+                key_domain,
+                ws.humanize_type(numeric),
+                ws.humanize_type(selected),
+            )
+        }
+
+        let provider_path = "lua/autorun/sh_key_input.lua";
+        let writer_path = "lua/autorun/sh_key_writer.lua";
+        let reader_path = "lua/autorun/sh_key_reader.lua";
+        let provider_integer = "SharedKey = 1";
+        let provider_table = "SharedKey = {}";
+        let writer_source = "KeyedRegistry = {}\nKeyedRegistry[SharedKey] = 'selected'";
+        let named_writer = "KeyedRegistry = {}\nKeyedRegistry['named'] = 'selected'";
+        let reader_source = "local numeric = KeyedRegistry[1]\nlocal selected = KeyedRegistry[SharedKey] or KeyedRegistry.named or 'fallback'";
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(provider_path, provider_integer);
+        let writer = ws.def_file(writer_path, writer_source);
+        let reader = ws.def_file(reader_path, reader_source);
+        let initial = snapshot(&mut ws, writer, reader);
+        assert_eq!(initial.0, "integer");
+        assert_ne!(initial.1, "nil");
+
+        let mut previous_writer = writer_source;
+        for (provider_source, current_writer, domain) in [
+            (provider_table, writer_source, "table"),
+            (provider_integer, writer_source, "integer"),
+            (provider_integer, named_writer, "named"),
+            (provider_table, writer_source, "table"),
+        ] {
+            ws.def_file(provider_path, provider_source);
+            if current_writer != previous_writer {
+                ws.def_file(writer_path, current_writer);
+                previous_writer = current_writer;
+            }
+            let warm = snapshot(&mut ws, writer, reader);
+            assert_eq!(warm.0, domain);
+            if domain != "integer" {
+                assert_eq!(warm.1, "nil");
+            }
+            let mut cold = VirtualWorkspace::new();
+            cold.def_file(provider_path, provider_source);
+            let cold_writer = cold.def_file(writer_path, current_writer);
+            let cold_reader = cold.def_file(reader_path, reader_source);
+            assert_eq!(warm, snapshot(&mut cold, cold_writer, cold_reader));
+        }
+
+        let provider_uri = ws.virtual_url_generator.new_uri(provider_path);
+        ws.analysis.update_file_by_uri(&provider_uri, None).unwrap();
+        ws.def_file(provider_path, provider_integer);
+        assert_eq!(snapshot(&mut ws, writer, reader), initial);
+    }
+
+    #[test]
+    fn bidirectional_table_refs_preserve_inferred_write_key_domains() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_inferred_table_refs.lua",
+            r#"
+            local refs = {}
+            local nextRef = 1
+            function SaveTable(tab)
+                refs[tab] = nextRef
+                nextRef = nextRef + 1
+            end
+            ---@param ref integer
+            function RestoreTable(ref)
+                local tab = {}
+                refs[ref] = tab
+                local restored = refs[ref]
+            end
+            SaveTable({})
+            RestoreTable(1)
+            "#,
+        );
+        let restored = local_name_type(&mut ws, file_id, "restored");
+        assert!(!restored.is_any() && !restored.is_unknown());
+        assert!(ws.check_type(
+            &LuaType::from_vec(vec![LuaType::Table, LuaType::Nil]),
+            &restored
+        ));
+    }
+
+    #[test]
+    fn bidirectional_table_refs_keep_typed_key_domains_separate() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_table_refs.lua",
+            r#"
+            local refs = {}
+            ---@param tab table
+            ---@param ref integer
+            local function save(tab, ref)
+                refs[tab] = ref
+                refs[ref] = tab
+            end
+            ---@param ref integer
+            ---@param tab table
+            ---@param either integer|table
+            local function restore(ref, tab, either)
+                local restored = refs[ref]
+                local saved = refs[tab]
+                local mixed = refs[either]
+            end
+            save({}, 1)
+            restore(1, {}, 1)
+            "#,
+        );
+        let restored = local_name_type(&mut ws, file_id, "restored");
+        assert!(!restored.is_any() && !restored.is_unknown());
+        assert!(ws.check_type(&LuaType::Table, &restored));
+        let saved = local_name_type(&mut ws, file_id, "saved");
+        assert!(!saved.is_any() && !saved.is_unknown());
+        assert!(ws.check_type(&LuaType::Integer, &saved));
+        let mixed = local_name_type(&mut ws, file_id, "mixed");
+        assert!(!ws.check_type(&LuaType::Table, &mixed));
+        assert!(!ws.check_type(&LuaType::Integer, &mixed));
+        assert!(ws.check_type(
+            &LuaType::from_vec(vec![LuaType::Integer, LuaType::Table]),
+            &mixed
+        ));
+    }
+
+    #[test]
+    fn nullable_restore_keeps_the_nil_arm_without_integer_contamination() {
+        let source = |consumer: &str| {
+            format!(
+                r#"
+            local refs = {{}}
+            ---@param tab table
+            ---@param ref integer
+            local function save(tab, ref)
+                refs[tab] = ref
+                refs[ref] = tab
+            end
+            ---@param ref integer
+            local function restore(ref)
+                local value = refs[ref]
+                if not value then return end
+                return value
+            end
+            ---@param target table
+            ---@param source table
+            local function merge(target, source) end
+            save({{}}, 1)
+            local restored = restore(1)
+            {consumer}
+        "#
+            )
+        };
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "lua/autorun/sh_nullable_restore.lua",
+            &source("local defined = refs[1]"),
+        );
+        let restored = local_name_type(&mut ws, file, "restored");
+        assert!(!restored.is_any() && !restored.is_unknown());
+        assert!(restored.is_nullable(), "{restored:?}");
+        assert!(ws.check_type(
+            &LuaType::from_vec(vec![LuaType::Table, LuaType::Nil]),
+            &restored
+        ));
+        let arms = match &restored {
+            LuaType::Union(union) => union.types().cloned().collect::<Vec<_>>(),
+            typ => vec![typ.clone()],
+        };
+        assert!(arms.iter().any(LuaType::is_table), "{restored:?}");
+        assert!(
+            !arms
+                .iter()
+                .any(|typ| matches!(typ, LuaType::Integer | LuaType::IntegerConst(_))),
+            "{restored:?}"
+        );
+        let defined = local_name_type(&mut ws, file, "defined");
+        assert!(!defined.is_nullable());
+        assert!(ws.check_type(&LuaType::Table, &defined));
+    }
+
+    #[test]
+    fn stream_literal_union_keys_exclude_callback_and_flag_values() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/glide/stream_editor_tab.lua",
+            r#"
+            local defaults = { volume = 1, pitch = 2 }
+            local stream = {
+                volume = 1, pitch = 2,
+                callback = function(path, err) end, flag = true
+            }
+            ---@param key "volume"|"pitch"
+            local function read(key)
+                local selected = stream[key]
+            end
+            for key in pairs(defaults) do
+                local sliderValue = stream[key] or defaults[key]
+            end
+            local copiedKeys = {}
+            for key in pairs(defaults) do
+                copiedKeys[key] = 1
+            end
+            for key in pairs(copiedKeys) do
+                local copiedKey = key
+                local copiedValue = stream[key] or 0
+            end
+            read("volume")
+            "#,
+        );
+        let selected = local_name_type(&mut ws, file_id, "selected");
+        assert!(!selected.is_any() && !selected.is_unknown());
+        assert!(ws.check_type(
+            &LuaType::from_vec(vec![LuaType::Number, LuaType::Nil]),
+            &selected
+        ));
+        let copied_key = local_name_type(&mut ws, file_id, "copiedKey");
+        assert_eq!(
+            copied_key,
+            LuaType::from_vec(vec![
+                LuaType::StringConst(SmolStr::new("volume").into()),
+                LuaType::StringConst(SmolStr::new("pitch").into()),
+            ])
+        );
+        for name in ["sliderValue", "copiedValue"] {
+            let typ = local_name_type(&mut ws, file_id, name);
+            assert!(!typ.is_any() && !typ.is_unknown(), "{name}: {typ:?}");
+            assert!(ws.check_type(&LuaType::Number, &typ), "{name}: {typ:?}");
+        }
+    }
+
+    #[test]
+    fn stream_broad_keys_keep_unrelated_values_and_missing_keys_stay_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/glide/sh_stream_keys.lua",
+            r#"
+            local stream = { volume = 1, callback = function() end, flag = true }
+            local copiedKeys = { volume = 1 }
+            ---@param key string
+            local function read(key)
+                local broad = stream[key]
+                copiedKeys[key] = 1
+            end
+            local missing = stream["missing"]
+            read("volume")
+            for key in pairs(copiedKeys) do
+                local sampledValue = stream[key]
+            end
+            "#,
+        );
+        for name in ["broad", "sampledValue"] {
+            let broad = local_name_type(&mut ws, file_id, name);
+            assert!(!broad.is_any() && !broad.is_unknown(), "{name}: {broad:?}");
+            assert!(!ws.check_type(
+                &LuaType::from_vec(vec![LuaType::Number, LuaType::Nil]),
+                &broad
+            ));
+        }
+        let missing = local_name_type(&mut ws, file_id, "missing");
+        assert_eq!(missing, LuaType::Nil);
+    }
+
+    #[test]
+    fn generic_map_key_lookup_keeps_its_declared_value_type() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_generic_map.lua",
+            r#"
+            ---@param values table<integer, string>
+            ---@param key integer
+            local function read(values, key)
+                local value = values[key]
+            end
+            "#,
+        );
+        let value = local_name_type(&mut ws, file_id, "value");
+        assert_eq!(value, LuaType::String);
+    }
+
     #[gtest]
     fn test_missing_plain_table_field_is_nil() {
         let mut ws = VirtualWorkspace::new();

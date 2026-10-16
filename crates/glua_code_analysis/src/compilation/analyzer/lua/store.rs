@@ -8,9 +8,9 @@ use smol_str::SmolStr;
 
 use crate::{
     DbIndex, FileId, GlobalId, InFiled, LuaClassNameReturnAlias, LuaDeclId, LuaDocReturnInfo,
-    LuaInferenceNodeId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberOwner, LuaOperator,
-    LuaReturnCorrelation, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeFact,
-    LuaTypeOwner, SignatureReturnStatus,
+    LuaInferenceNodeId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaMemberOwner,
+    LuaOperator, LuaReturnCorrelation, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeCache,
+    LuaTypeFact, LuaTypeOwner, SignatureReturnStatus,
     compilation::analyzer::{
         common::{
             DeclWrite, TypeCacheWriteMode, add_member, bind_decl_write, bind_type, write_type_cache,
@@ -38,6 +38,7 @@ use super::{
 #[derive(Debug)]
 pub(in crate::compilation::analyzer) struct MemberHoming {
     pub member_id: LuaMemberId,
+    pub key: LuaMemberKey,
     pub owner: LuaMemberOwner,
     /// The member to add when the index holds none under `member_id`; `None`
     /// when the analysis found one, or found no key to add it under.
@@ -85,6 +86,14 @@ impl MemberHoming {
             return;
         }
 
+        if db
+            .get_member_index()
+            .get_member(&member_id)
+            .is_some_and(|member| member.get_key() != &self.key)
+        {
+            db.get_member_index_mut()
+                .rekey_member(member_id, self.key.clone());
+        }
         if self.guarded_table_assignment {
             db.get_member_index_mut()
                 .mark_non_overwriting_assignment_member(member_id);
