@@ -5416,24 +5416,197 @@ end
         let item = local_name_type(&mut ws, file_id, "item");
         assert_eq!(ws.humanize_type(item), "table?");
     }
-}
-
-#[cfg(test)]
-mod undefined_global_reads_as_nil {
-    use crate::{LuaType, VirtualWorkspace};
-
-    /// Reading a name that is declared nowhere yields `nil` at runtime, so an
-    /// assignment from one contributes `nil` to the target — not `unknown`.
-    ///
-    /// The flow walk used to take `unknown` from the failed inference and let it
-    /// swallow everything the other branches had established, so one undefined
-    /// name erased the type of a local for the rest of its life and then rode
-    /// into every member that local was assigned to.
     #[test]
-    fn assignment_from_an_undefined_global_narrows_to_nil() {
+    fn captured_panel_replacement_does_not_reuse_the_initial_table_shape() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        ws.def(
+        ws.def_file(
+            "lua/includes/modules/vgui.lua",
             r#"
+            ---@meta
+            ---@class Entity
+            ---@class NULL: Entity
+            ---@param value any
+            ---@return TypeGuard<table>
+            function istable(value) end
+            ---@param object any
+            ---@return TypeGuard<any> isValid
+            ---@return_cast object -NULL
+            ---@[valid_guard]
+            function IsValid(object) end
+            vgui = {}
+            ---@generic T : table
+            ---@param name `T`
+            ---@return (definition) `T`?
+            function vgui.GetControlTable(name) end
+            "#,
+        );
+        let path = "gamemodes/helix/gamemode/core/derma/cl_overrides.lua";
+        let source = r#"
+            local PANEL = {}
+            local OVERRIDES = {}
+
+            local function OverridePanel(name, func)
+                PANEL = vgui.GetControlTable(name)
+
+                if (!istable(PANEL)) then
+                    return
+                end
+
+                OVERRIDES = {}
+                func()
+
+                for k, _ in pairs(PANEL) do
+                    local overrideName = "ix" .. k
+
+                    if (PANEL[overrideName] and !OVERRIDES[k]) then
+                        print("unhooking override ", overrideName)
+
+                        PANEL[k] = PANEL[overrideName]
+                        PANEL[overrideName] = nil
+                    end
+                end
+            end
+
+            local function Override(name)
+                local oldMethod = "ix" .. name
+                OVERRIDES[name] = true
+
+                if (PANEL[oldMethod]) then
+                    return
+                end
+
+                PANEL[oldMethod] = PANEL[name]
+            end
+
+            OverridePanel("DMenuOption", function()
+                function PANEL:PerformLayout()
+                    self:SizeToContents()
+                    self:SetWide(self:GetWide() + 30)
+                    local width = math.max(self:GetParent():GetWide(), self:GetWide())
+                    self:SetSize(width, self:GetTall() + 4)
+                    if self.SubMenuArrow then
+                        self.SubMenuArrow:SetSize(15, 15)
+                        self.SubMenuArrow:CenterVertical()
+                        self.SubMenuArrow:AlignRight(4)
+                    end
+                end
+            end)
+
+            OverridePanel("DMenu", function()
+                Override("Init")
+                function PANEL:Init(...)
+                    self:ixInit(...)
+                    self.ixAnimation = 0
+                end
+                Override("OnMouseWheeled")
+                function PANEL:OnMouseWheeled(delta)
+                    self:ixOnMouseWheeled(delta)
+                    return true
+                end
+                Override("Open")
+                function PANEL:Open(x, y, skip, ownerPanel)
+                    self.ixX, self.ixY, self.ixOwnerPanel = x, y, ownerPanel
+                    self:ixOpen(x, y, skip, ownerPanel)
+                end
+                Override("AddOption")
+                function PANEL:AddOption(...)
+                    local panel = self:ixAddOption(...)
+                    panel:SetTextColor(color_black)
+                    panel:SetTextInset(6, 0)
+                    return panel
+                end
+                function PANEL:PerformLayout()
+                    self.VBar:SetAlpha(0)
+                    self.VBar:SetAlpha(255)
+                end
+            end)
+
+            OverridePanel("DComboBox", function()
+                function PANEL:OpenMenu()
+                    if IsValid(self.Menu) then
+                        local _, y = self.Menu:LocalToScreen(self.Menu:GetPos())
+                        self.Menu:SetFont(self:GetFont())
+                        self.Menu:SetMaxHeight(ScrH() - y)
+                    end
+                end
+            end)
+
+            OverridePanel("DScrollPanel", function()
+                function PANEL:ScrollToChild(panel)
+                    local _, y = self.pnlCanvas:GetChildPosition(panel)
+                    self.VBar:SetScroll(y)
+                end
+            end)
+        "#;
+        let file = ws.def_file(path, source);
+        let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
+        let receiver = model
+            .get_root()
+            .descendants::<glua_parser::LuaNameExpr>()
+            .find(|expr| expr.get_name_text().as_deref() == Some("self"))
+            .unwrap();
+        assert_eq!(
+            model
+                .infer_expr(glua_parser::LuaExpr::NameExpr(receiver))
+                .unwrap(),
+            LuaType::Unknown
+        );
+        assert_eq!(
+            file_diagnostic_messages(&mut ws, file, DiagnosticCode::UndefinedMethod),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            file_diagnostic_messages(&mut ws, file, DiagnosticCode::UndefinedField),
+            Vec::<String>::new()
+        );
+
+        let edited = ws.def_file(
+            path,
+            &source.replace("PANEL = vgui.GetControlTable(name)", "PANEL = {}"),
+        );
+        let edited_model = ws.analysis.compilation.get_semantic_model(edited).unwrap();
+        let receiver = edited_model
+            .get_root()
+            .descendants::<glua_parser::LuaNameExpr>()
+            .find(|expr| expr.get_name_text().as_deref() == Some("self"))
+            .unwrap();
+        assert!(
+            !edited_model
+                .infer_expr(glua_parser::LuaExpr::NameExpr(receiver))
+                .unwrap()
+                .is_unknown()
+        );
+        let restored = ws.def_file(path, source);
+        assert_eq!(
+            file_diagnostic_messages(&mut ws, restored, DiagnosticCode::UndefinedMethod),
+            Vec::<String>::new()
+        );
+
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis.update_file_by_uri(&uri, None).unwrap();
+        let reopened = ws.def_file(path, source);
+        assert_eq!(
+            file_diagnostic_messages(&mut ws, reopened, DiagnosticCode::UndefinedMethod),
+            Vec::<String>::new()
+        );
+    }
+
+    #[cfg(test)]
+    mod undefined_global_reads_as_nil {
+        use crate::{LuaType, VirtualWorkspace};
+
+        /// Reading a name that is declared nowhere yields `nil` at runtime, so an
+        /// assignment from one contributes `nil` to the target — not `unknown`.
+        ///
+        /// The flow walk used to take `unknown` from the failed inference and let it
+        /// swallow everything the other branches had established, so one undefined
+        /// name erased the type of a local for the rest of its life and then rode
+        /// into every member that local was assigned to.
+        #[test]
+        fn assignment_from_an_undefined_global_narrows_to_nil() {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            ws.def(
+                r#"
             local tax = 1
             if tax > 0 then
                 tax = never_declared_anywhere
@@ -5441,93 +5614,93 @@ mod undefined_global_reads_as_nil {
             after_branch = tax
             bare_read = never_declared_anywhere
             "#,
-        );
+            );
 
-        assert_eq!(
-            ws.expr_ty("after_branch"),
-            ws.ty("integer?"),
-            "an undefined global contributes nil, so the local stays integer?"
-        );
-        assert_eq!(ws.expr_ty("bare_read"), LuaType::Nil);
-    }
-}
-
-#[cfg(test)]
-mod default_value_idiom_is_walk_order_independent {
-    use crate::VirtualWorkspace;
-
-    /// `p = p or DEFAULT` must mean the same thing whichever file declared
-    /// `DEFAULT` first.
-    ///
-    /// `special_or_rule` used to answer `unknown | right` whenever the left arm
-    /// was `unknown`, which contradicted the general rule beneath it ("an
-    /// unresolved left operand has no enumerable truthy half, so it contributes
-    /// nothing"). Whether the left arm had resolved yet is a property of how far
-    /// the walk had run, so the same source read `integer` when the constant's
-    /// file came first and `integer|unknown` when it came second — and a
-    /// re-index of a subset then disagreed with the build that produced it.
-    fn default_type_for_order(files: Vec<(&str, &str)>, probe: &str) -> crate::LuaType {
-        let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        ws.def_files(files);
-        ws.expr_ty(probe)
+            assert_eq!(
+                ws.expr_ty("after_branch"),
+                ws.ty("integer?"),
+                "an undefined global contributes nil, so the local stays integer?"
+            );
+            assert_eq!(ws.expr_ty("bare_read"), LuaType::Nil);
+        }
     }
 
-    const READER: &str = r#"
+    #[cfg(test)]
+    mod default_value_idiom_is_walk_order_independent {
+        use crate::VirtualWorkspace;
+
+        /// `p = p or DEFAULT` must mean the same thing whichever file declared
+        /// `DEFAULT` first.
+        ///
+        /// `special_or_rule` used to answer `unknown | right` whenever the left arm
+        /// was `unknown`, which contradicted the general rule beneath it ("an
+        /// unresolved left operand has no enumerable truthy half, so it contributes
+        /// nothing"). Whether the left arm had resolved yet is a property of how far
+        /// the walk had run, so the same source read `integer` when the constant's
+        /// file came first and `integer|unknown` when it came second — and a
+        /// re-index of a subset then disagreed with the build that produced it.
+        fn default_type_for_order(files: Vec<(&str, &str)>, probe: &str) -> crate::LuaType {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            ws.def_files(files);
+            ws.expr_ty(probe)
+        }
+
+        const READER: &str = r#"
         function SetData(dataType)
             dataType = dataType or DATA_PLAYER
             probe_result = dataType
         end
         "#;
-    const CONST_DEF: &str = "DATA_PLAYER = 2";
+        const CONST_DEF: &str = "DATA_PLAYER = 2";
 
-    #[test]
-    fn constant_declared_after_the_reader() {
-        let ty = default_type_for_order(
-            vec![("a.lua", READER), ("b.lua", CONST_DEF)],
-            "probe_result",
-        );
-        assert_eq!(ty, crate::LuaType::Integer, "got: {ty:?}");
+        #[test]
+        fn constant_declared_after_the_reader() {
+            let ty = default_type_for_order(
+                vec![("a.lua", READER), ("b.lua", CONST_DEF)],
+                "probe_result",
+            );
+            assert_eq!(ty, crate::LuaType::Integer, "got: {ty:?}");
+        }
+
+        #[test]
+        fn constant_declared_before_the_reader() {
+            let ty = default_type_for_order(
+                vec![("a.lua", CONST_DEF), ("b.lua", READER)],
+                "probe_result",
+            );
+            assert_eq!(ty, crate::LuaType::Integer, "got: {ty:?}");
+        }
     }
 
-    #[test]
-    fn constant_declared_before_the_reader() {
-        let ty = default_type_for_order(
-            vec![("a.lua", CONST_DEF), ("b.lua", READER)],
-            "probe_result",
-        );
-        assert_eq!(ty, crate::LuaType::Integer, "got: {ty:?}");
-    }
-}
+    /// Which class a runtime member write may add a field to.
+    #[cfg(test)]
+    mod runtime_member_write_ownership {
+        use crate::{Emmyrc, LuaMemberKey, LuaMemberOwner, LuaTypeDeclId, VirtualWorkspace};
 
-/// Which class a runtime member write may add a field to.
-#[cfg(test)]
-mod runtime_member_write_ownership {
-    use crate::{Emmyrc, LuaMemberKey, LuaMemberOwner, LuaTypeDeclId, VirtualWorkspace};
+        fn gmod_workspace() -> VirtualWorkspace {
+            let mut ws = VirtualWorkspace::new();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+            ws
+        }
 
-    fn gmod_workspace() -> VirtualWorkspace {
-        let mut ws = VirtualWorkspace::new();
-        let mut emmyrc = Emmyrc::default();
-        emmyrc.gmod.enabled = true;
-        ws.update_emmyrc(emmyrc);
-        ws
-    }
+        fn class_member_item_exists(ws: &VirtualWorkspace, class: &str, field: &str) -> bool {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_member_index()
+                .get_member_item(
+                    &LuaMemberOwner::Type(LuaTypeDeclId::global(class)),
+                    &LuaMemberKey::Name(field.into()),
+                )
+                .is_some()
+        }
 
-    fn class_member_item_exists(ws: &VirtualWorkspace, class: &str, field: &str) -> bool {
-        ws.analysis
-            .compilation
-            .get_db()
-            .get_member_index()
-            .get_member_item(
-                &LuaMemberOwner::Type(LuaTypeDeclId::global(class)),
-                &LuaMemberKey::Name(field.into()),
-            )
-            .is_some()
-    }
-
-    /// Both writes sit in branches of one `if`, so neither dominates the other
-    /// and the slot they share is resolved from the pair rather than from the
-    /// last one to arrive.
-    const BRANCH_WRITES: &str = r#"
+        /// Both writes sit in branches of one `if`, so neither dominates the other
+        /// and the slot they share is resolved from the pair rather than from the
+        /// last one to arrive.
+        const BRANCH_WRITES: &str = r#"
         ---@param target RUNTIME_CLASS
         ---@param on boolean
         local function apply(target, on)
@@ -5540,17 +5713,17 @@ mod runtime_member_write_ownership {
         apply(nil, false)
     "#;
 
-    /// The same write must not give a *base* class a field its subclasses
-    /// declare. Doors writes `portal.interior` through a plain `Entity`, which
-    /// gave `Entity` an `interior` every subclass then inherited -- so an
-    /// `Entity`-typed receiver answered `.interior` from the base and nothing
-    /// narrowed to the subclass that really declares it.
-    #[test]
-    fn branch_write_does_not_declare_a_field_its_subclasses_declare() {
-        let mut ws = gmod_workspace();
-        ws.def_file(
-            "lua/entities/base.lua",
-            r#"
+        /// The same write must not give a *base* class a field its subclasses
+        /// declare. Doors writes `portal.interior` through a plain `Entity`, which
+        /// gave `Entity` an `interior` every subclass then inherited -- so an
+        /// `Entity`-typed receiver answered `.interior` from the base and nothing
+        /// narrowed to the subclass that really declares it.
+        #[test]
+        fn branch_write_does_not_declare_a_field_its_subclasses_declare() {
+            let mut ws = gmod_workspace();
+            ws.def_file(
+                "lua/entities/base.lua",
+                r#"
             ---@class Entity
             ---@field GetPos fun(self: Entity): any
 
@@ -5560,112 +5733,112 @@ mod runtime_member_write_ownership {
             ---@class door_interior : Entity
             ---@field exterior door_exterior
             "#,
-        );
-        let writer = ws.def_file(
-            "lua/portals.lua",
-            &BRANCH_WRITES.replace("RUNTIME_CLASS", "Entity"),
-        );
+            );
+            let writer = ws.def_file(
+                "lua/portals.lua",
+                &BRANCH_WRITES.replace("RUNTIME_CLASS", "Entity"),
+            );
 
-        assert!(
-            !class_member_item_exists(&ws, "Entity", "interior"),
-            "a runtime write must not hand a base class a field its subclasses declare"
-        );
-        assert!(
-            class_member_item_exists(&ws, "door_exterior", "interior"),
-            "the subclasses' own declarations are untouched"
-        );
+            assert!(
+                !class_member_item_exists(&ws, "Entity", "interior"),
+                "a runtime write must not hand a base class a field its subclasses declare"
+            );
+            assert!(
+                class_member_item_exists(&ws, "door_exterior", "interior"),
+                "the subclasses' own declarations are untouched"
+            );
 
-        // The settled owner pass must converge with the walk, not mint a
-        // shadowing placement on re-analysis.
-        ws.analysis.reindex_files(vec![writer]);
-        assert!(
-            !class_member_item_exists(&ws, "Entity", "interior"),
-            "re-analysis must not hand a base class a field its subclasses declare"
-        );
-        assert!(
-            class_member_item_exists(&ws, "door_exterior", "interior"),
-            "re-analysis must keep the subclasses' own declarations"
-        );
-    }
+            // The settled owner pass must converge with the walk, not mint a
+            // shadowing placement on re-analysis.
+            ws.analysis.reindex_files(vec![writer]);
+            assert!(
+                !class_member_item_exists(&ws, "Entity", "interior"),
+                "re-analysis must not hand a base class a field its subclasses declare"
+            );
+            assert!(
+                class_member_item_exists(&ws, "door_exterior", "interior"),
+                "re-analysis must keep the subclasses' own declarations"
+            );
+        }
 
-    /// The completion regression the owner settle must not reintroduce: an
-    /// index-expression write onto a bare class-name local keeps the walk's
-    /// placement across re-analysis, so the member survives on the class the
-    /// write named instead of detaching to the parent.
-    #[test]
-    fn bare_class_write_keeps_member_on_named_class_across_reanalysis() {
-        let mut ws = gmod_workspace();
-        ws.def_file(
-            "lua/proxy.lua",
-            r#"
+        /// The completion regression the owner settle must not reintroduce: an
+        /// index-expression write onto a bare class-name local keeps the walk's
+        /// placement across re-analysis, so the member survives on the class the
+        /// write named instead of detaching to the parent.
+        #[test]
+        fn bare_class_write_keeps_member_on_named_class_across_reanalysis() {
+            let mut ws = gmod_workspace();
+            ws.def_file(
+                "lua/proxy.lua",
+                r#"
             ---@alias ProxyHandler.Setter fun(raw: any)
 
             ---@class ProxyHandler
             ---@field set? ProxyHandler.Setter
             "#,
-        );
-        let consumer = ws.def_file(
-            "lua/handler.lua",
-            r#"
+            );
+            let consumer = ws.def_file(
+                "lua/handler.lua",
+                r#"
             ---@class MHandler: ProxyHandler
             local MHandler
 
             MHandler.set = function(raw) end
             "#,
-        );
-        assert!(
-            class_member_item_exists(&ws, "MHandler", "set"),
-            "the walk homes the write onto the named class"
-        );
-        ws.analysis.reindex_files(vec![consumer]);
-        assert!(
-            class_member_item_exists(&ws, "MHandler", "set"),
-            "re-analysis must keep the write homed onto the named class"
-        );
-    }
-}
-
-#[cfg(test)]
-mod multi_site_member_and_alias_inference {
-    use glua_parser::{LuaAstNode, LuaIndexKey, LuaVarExpr};
-    use googletest::assert_that;
-    use googletest::prelude::*;
-    use lsp_types::NumberOrString;
-    use tokio_util::sync::CancellationToken;
-
-    use crate::{
-        DiagnosticCode, LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
-    };
-
-    fn file_diagnostic_messages(
-        ws: &mut VirtualWorkspace,
-        file_id: crate::FileId,
-        diagnostic_code: DiagnosticCode,
-    ) -> Vec<String> {
-        ws.analysis.diagnostic.enable_only(diagnostic_code);
-        let diagnostics = ws
-            .analysis
-            .diagnose_file(file_id, CancellationToken::new())
-            .unwrap_or_default();
-        let code = Some(NumberOrString::String(
-            diagnostic_code.get_name().to_string(),
-        ));
-        diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.code == code)
-            .map(|diagnostic| diagnostic.message.clone())
-            .collect()
+            );
+            assert!(
+                class_member_item_exists(&ws, "MHandler", "set"),
+                "the walk homes the write onto the named class"
+            );
+            ws.analysis.reindex_files(vec![consumer]);
+            assert!(
+                class_member_item_exists(&ws, "MHandler", "set"),
+                "re-analysis must keep the write homed onto the named class"
+            );
+        }
     }
 
-    /// Guarded bootstrap globals across multiple files must merge their table
-    /// fields rather than widening to bare `table`, so fields like `.stored`
-    /// remain defined and non-nil.
-    #[test]
-    fn test_guarded_bootstrap_multi_file_table_fields_not_nil() {
-        let mut ws = VirtualWorkspace::new();
-        ws.def_file(
-            "lua/cityrp/sh_item.lua",
-            r#"
+    #[cfg(test)]
+    mod multi_site_member_and_alias_inference {
+        use glua_parser::{LuaAstNode, LuaIndexKey, LuaVarExpr};
+        use googletest::assert_that;
+        use googletest::prelude::*;
+        use lsp_types::NumberOrString;
+        use tokio_util::sync::CancellationToken;
+
+        use crate::{
+            DiagnosticCode, LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
+        };
+
+        fn file_diagnostic_messages(
+            ws: &mut VirtualWorkspace,
+            file_id: crate::FileId,
+            diagnostic_code: DiagnosticCode,
+        ) -> Vec<String> {
+            ws.analysis.diagnostic.enable_only(diagnostic_code);
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default();
+            let code = Some(NumberOrString::String(
+                diagnostic_code.get_name().to_string(),
+            ));
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == code)
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect()
+        }
+
+        /// Guarded bootstrap globals across multiple files must merge their table
+        /// fields rather than widening to bare `table`, so fields like `.stored`
+        /// remain defined and non-nil.
+        #[test]
+        fn test_guarded_bootstrap_multi_file_table_fields_not_nil() {
+            let mut ws = VirtualWorkspace::new();
+            ws.def_file(
+                "lua/cityrp/sh_item.lua",
+                r#"
 cityrp = cityrp or {}
 if not cityrp.item then
     cityrp.item = {
@@ -5674,10 +5847,10 @@ if not cityrp.item then
     }
 end
 "#,
-        );
-        ws.def_file(
-            "lua/cityrp/sv_item.lua",
-            r#"
+            );
+            ws.def_file(
+                "lua/cityrp/sv_item.lua",
+                r#"
 cityrp = cityrp or {}
 if not cityrp.item then
     cityrp.item = {
@@ -5686,33 +5859,33 @@ if not cityrp.item then
     }
 end
 "#,
-        );
-        let consumer = ws.def_file(
-            "lua/cityrp/consumer.lua",
-            r#"
+            );
+            let consumer = ws.def_file(
+                "lua/cityrp/consumer.lua",
+                r#"
 local stored = cityrp.item.stored
 local count = cityrp.item.count
 "#,
-        );
+            );
 
-        assert_that!(
-            file_diagnostic_messages(&mut ws, consumer, DiagnosticCode::NeedCheckNil),
-            is_empty()
-        );
-        assert_that!(
-            file_diagnostic_messages(&mut ws, consumer, DiagnosticCode::UndefinedField),
-            is_empty()
-        );
-    }
+            assert_that!(
+                file_diagnostic_messages(&mut ws, consumer, DiagnosticCode::NeedCheckNil),
+                is_empty()
+            );
+            assert_that!(
+                file_diagnostic_messages(&mut ws, consumer, DiagnosticCode::UndefinedField),
+                is_empty()
+            );
+        }
 
-    /// Nested table literals inside table fields looped over with `pairs`
-    /// must retain their populated fields on the loop variable.
-    #[test]
-    fn test_pairs_loop_over_table_with_nested_table_literals_preserves_field_types() {
-        let mut ws = VirtualWorkspace::new();
-        let weapon_file = ws.def_file(
-            "lua/weapons/weapon_test.lua",
-            r#"
+        /// Nested table literals inside table fields looped over with `pairs`
+        /// must retain their populated fields on the loop variable.
+        #[test]
+        fn test_pairs_loop_over_table_with_nested_table_literals_preserves_field_types() {
+            let mut ws = VirtualWorkspace::new();
+            let weapon_file = ws.def_file(
+                "lua/weapons/weapon_test.lua",
+                r#"
 SWEP = {}
 SWEP.VElements = {
     ["element1"] = {
@@ -5736,34 +5909,34 @@ for k, v in pairs(SWEP.VElements) do
     local scale = v.scale
 end
 "#,
-        );
+            );
 
-        assert_that!(
-            file_diagnostic_messages(&mut ws, weapon_file, DiagnosticCode::NeedCheckNil),
-            is_empty()
-        );
-        assert_that!(
-            file_diagnostic_messages(&mut ws, weapon_file, DiagnosticCode::UndefinedField),
-            is_empty()
-        );
-    }
+            assert_that!(
+                file_diagnostic_messages(&mut ws, weapon_file, DiagnosticCode::NeedCheckNil),
+                is_empty()
+            );
+            assert_that!(
+                file_diagnostic_messages(&mut ws, weapon_file, DiagnosticCode::UndefinedField),
+                is_empty()
+            );
+        }
 
-    /// Locals aliasing a shared global table across plugins, extended via
-    /// methods and included files, must not have their local read replaced by an
-    /// arbitrary settled global from a different plugin.
-    #[test]
-    fn test_plugin_shared_local_alias_preserves_included_fields_and_methods() {
-        let mut ws = VirtualWorkspace::new();
-        ws.def_file(
-            "lua/plugins/plugin_a/config.lua",
-            r#"
+        /// Locals aliasing a shared global table across plugins, extended via
+        /// methods and included files, must not have their local read replaced by an
+        /// arbitrary settled global from a different plugin.
+        #[test]
+        fn test_plugin_shared_local_alias_preserves_included_fields_and_methods() {
+            let mut ws = VirtualWorkspace::new();
+            ws.def_file(
+                "lua/plugins/plugin_a/config.lua",
+                r#"
 local PLUGIN = PLUGIN_SHARED
 PLUGIN.config = { enabled = true }
 "#,
-        );
-        let plugin_a = ws.def_file(
-            "lua/plugins/plugin_a/sh_init.lua",
-            r#"
+            );
+            let plugin_a = ws.def_file(
+                "lua/plugins/plugin_a/sh_init.lua",
+                r#"
 PLUGIN_SHARED = PLUGIN_SHARED or {}
 local PLUGIN = PLUGIN_SHARED
 include("config.lua")
@@ -5779,237 +5952,237 @@ function PLUGIN:Test()
     local c2 = PLUGIN:IsColor(1)
 end
 "#,
-        );
-        ws.def_file(
-            "lua/plugins/plugin_b/sh_init.lua",
-            r#"
+            );
+            ws.def_file(
+                "lua/plugins/plugin_b/sh_init.lua",
+                r#"
 PLUGIN_SHARED = PLUGIN_SHARED or {}
 local PLUGIN = PLUGIN_SHARED
 PLUGIN.other_field = 123
 "#,
-        );
+            );
 
-        assert_that!(
-            file_diagnostic_messages(&mut ws, plugin_a, DiagnosticCode::UndefinedField),
-            is_empty()
-        );
-        assert_that!(
-            file_diagnostic_messages(&mut ws, plugin_a, DiagnosticCode::UndefinedMethod),
-            is_empty()
-        );
-    }
+            assert_that!(
+                file_diagnostic_messages(&mut ws, plugin_a, DiagnosticCode::UndefinedField),
+                is_empty()
+            );
+            assert_that!(
+                file_diagnostic_messages(&mut ws, plugin_a, DiagnosticCode::UndefinedMethod),
+                is_empty()
+            );
+        }
 
-    #[gtest]
-    fn settled_owner_rederive_keeps_ownerless_class_write_from_shadowing_inherited_field() {
-        // The completion regression `test_field_is_alias_function`: the walk
-        // homes `MHandler.set` onto `MHandler`, and the settled owner pass
-        // must keep that placement across re-analysis (the bug detached it,
-        // leaving `set` resolvable only through the parent).
-        let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        ws.def(
-            r#"
+        #[gtest]
+        fn settled_owner_rederive_keeps_ownerless_class_write_from_shadowing_inherited_field() {
+            // The completion regression `test_field_is_alias_function`: the walk
+            // homes `MHandler.set` onto `MHandler`, and the settled owner pass
+            // must keep that placement across re-analysis (the bug detached it,
+            // leaving `set` resolvable only through the parent).
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            ws.def(
+                r#"
             ---@alias ProxyHandler.Setter fun(raw: any)
 
             ---@class ProxyHandler
             ---@field set? ProxyHandler.Setter
             "#,
-        );
-        let consumer = ws.def(
-            r#"
+            );
+            let consumer = ws.def(
+                r#"
             ---@class MHandler: ProxyHandler
             local MHandler
 
             MHandler.set = function(raw) end
             "#,
-        );
-        // The walk homes the write onto `MHandler`; cold and re-analysis
-        // must agree on that placement.
-        let mhandler_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("MHandler"));
-        let owner_names = |ws: &VirtualWorkspace| -> Vec<String> {
-            ws.analysis
-                .compilation
-                .get_db()
-                .get_member_index()
-                .get_members(&mhandler_owner)
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|member| member.get_key().get_name().map(str::to_string))
-                .collect()
-        };
-        assert_that!(owner_names(&ws), contains(eq(&"set".to_string())));
+            );
+            // The walk homes the write onto `MHandler`; cold and re-analysis
+            // must agree on that placement.
+            let mhandler_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("MHandler"));
+            let owner_names = |ws: &VirtualWorkspace| -> Vec<String> {
+                ws.analysis
+                    .compilation
+                    .get_db()
+                    .get_member_index()
+                    .get_members(&mhandler_owner)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|member| member.get_key().get_name().map(str::to_string))
+                    .collect()
+            };
+            assert_that!(owner_names(&ws), contains(eq(&"set".to_string())));
 
-        ws.analysis.reindex_files(vec![consumer]);
-        assert_that!(owner_names(&ws), contains(eq(&"set".to_string())));
-    }
+            ws.analysis.reindex_files(vec![consumer]);
+            assert_that!(owner_names(&ws), contains(eq(&"set".to_string())));
+        }
 
-    #[gtest]
-    fn settled_owner_rederive_replaces_unknown_key_once_iter_var_settles() {
-        // The `ExprType(Unknown)` collapse: a dynamic write through a
-        // `pairs` loop variable is filed under the unknown key while the
-        // variable settles; once it does, the key must be replaced (not
-        // accreted beside the collapsed one).
-        let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        let file_id = ws.def(
-            r#"
+        #[gtest]
+        fn settled_owner_rederive_replaces_unknown_key_once_iter_var_settles() {
+            // The `ExprType(Unknown)` collapse: a dynamic write through a
+            // `pairs` loop variable is filed under the unknown key while the
+            // variable settles; once it does, the key must be replaced (not
+            // accreted beside the collapsed one).
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let file_id = ws.def(
+                r#"
             local registry = { alpha = 1 }
             local target = {}
             for key, _ in pairs(registry) do
                 target[key] = 1
             end
             "#,
-        );
-        let unknown_key = LuaMemberKey::ExprType(LuaType::Unknown);
-        let collapsed_before: Vec<String> = ws
-            .analysis
-            .compilation
-            .get_db()
-            .get_member_index()
-            .get_current_members_for_key(&unknown_key)
-            .into_iter()
-            .filter(|member| member.get_file_id() == file_id)
-            .filter_map(|member| member.get_key().get_name().map(str::to_string))
-            .collect();
-        ws.analysis.reindex_files(vec![file_id]);
-        let collapsed_after: Vec<String> = ws
-            .analysis
-            .compilation
-            .get_db()
-            .get_member_index()
-            .get_current_members_for_key(&unknown_key)
-            .into_iter()
-            .filter(|member| member.get_file_id() == file_id)
-            .filter_map(|member| member.get_key().get_name().map(str::to_string))
-            .collect();
-        // The collapsed key set must not grow across re-analysis: whatever
-        // the walk filed, the settled re-take converges instead of minting
-        // a second key beside the first.
-        assert_that!(collapsed_after.len(), le(collapsed_before.len()));
-    }
+            );
+            let unknown_key = LuaMemberKey::ExprType(LuaType::Unknown);
+            let collapsed_before: Vec<String> = ws
+                .analysis
+                .compilation
+                .get_db()
+                .get_member_index()
+                .get_current_members_for_key(&unknown_key)
+                .into_iter()
+                .filter(|member| member.get_file_id() == file_id)
+                .filter_map(|member| member.get_key().get_name().map(str::to_string))
+                .collect();
+            ws.analysis.reindex_files(vec![file_id]);
+            let collapsed_after: Vec<String> = ws
+                .analysis
+                .compilation
+                .get_db()
+                .get_member_index()
+                .get_current_members_for_key(&unknown_key)
+                .into_iter()
+                .filter(|member| member.get_file_id() == file_id)
+                .filter_map(|member| member.get_key().get_name().map(str::to_string))
+                .collect();
+            // The collapsed key set must not grow across re-analysis: whatever
+            // the walk filed, the settled re-take converges instead of minting
+            // a second key beside the first.
+            assert_that!(collapsed_after.len(), le(collapsed_before.len()));
+        }
 
-    #[gtest]
-    fn settled_owner_attach_retries_member_write_on_ambiguous_owner_prefix() {
-        let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        let mut emmyrc = crate::Emmyrc::default();
-        emmyrc.gmod.enabled = true;
-        ws.update_emmyrc(emmyrc);
-        ws.def_gmod_call_arg_builtins();
-        ws.def_files(vec![
-            (
-                "lua/weapons/cw_base/shared.lua",
-                r#"
+        #[gtest]
+        fn settled_owner_attach_retries_member_write_on_ambiguous_owner_prefix() {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let mut emmyrc = crate::Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+            ws.def_gmod_call_arg_builtins();
+            ws.def_files(vec![
+                (
+                    "lua/weapons/cw_base/shared.lua",
+                    r#"
 function SWEP:DrawHUD()
     for _, value in pairs(self.Attachments) do
         value.keyText = "x"
     end
 end
 "#,
-            ),
-            (
-                "lua/weapons/cw_ak74/shared.lua",
-                r#"
+                ),
+                (
+                    "lua/weapons/cw_ak74/shared.lua",
+                    r#"
 SWEP.Base = "cw_base"
 SWEP.Attachments = {[1] = {header = "Sight", atts = {"md_kobra", "md_eotech"}}}
 "#,
-            ),
-            (
-                "lua/weapons/cw_ar15/shared.lua",
-                r#"
+                ),
+                (
+                    "lua/weapons/cw_ar15/shared.lua",
+                    r#"
 SWEP.Base = "cw_base"
 SWEP.Attachments = {[1] = {header = "Sight", offset = {800, -500}}}
 "#,
-            ),
-        ]);
-        let base_uri = ws
-            .virtual_url_generator
-            .new_uri("lua/weapons/cw_base/shared.lua");
-        let base_file = ws
-            .analysis
-            .compilation
-            .get_db()
-            .get_vfs()
-            .get_file_id(&base_uri)
-            .expect("base file must be indexed");
+                ),
+            ]);
+            let base_uri = ws
+                .virtual_url_generator
+                .new_uri("lua/weapons/cw_base/shared.lua");
+            let base_file = ws
+                .analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_id(&base_uri)
+                .expect("base file must be indexed");
 
-        let key = LuaMemberKey::Name("keyText".into());
-        let member_owner = |ws: &VirtualWorkspace| -> Option<LuaMemberOwner> {
-            let member_index = ws.analysis.compilation.get_db().get_member_index();
-            let member_id = member_index
-                .get_file_members(base_file)
-                .into_iter()
-                .find(|member| member.get_key() == &key)
-                .map(|member| member.get_id())
-                .expect("keyText write must be indexed");
-            member_index.get_current_owner(&member_id).cloned()
-        };
-        let cold_owner = member_owner(&ws);
-        assert_that!(
-            cold_owner
-                .as_ref()
-                .is_some_and(|owner| !matches!(owner, LuaMemberOwner::LocalUnresolve)),
-            eq(true),
-            "keyText must have a real owner after the cold batch, got {cold_owner:?}"
-        );
+            let key = LuaMemberKey::Name("keyText".into());
+            let member_owner = |ws: &VirtualWorkspace| -> Option<LuaMemberOwner> {
+                let member_index = ws.analysis.compilation.get_db().get_member_index();
+                let member_id = member_index
+                    .get_file_members(base_file)
+                    .into_iter()
+                    .find(|member| member.get_key() == &key)
+                    .map(|member| member.get_id())
+                    .expect("keyText write must be indexed");
+                member_index.get_current_owner(&member_id).cloned()
+            };
+            let cold_owner = member_owner(&ws);
+            assert_that!(
+                cold_owner
+                    .as_ref()
+                    .is_some_and(|owner| !matches!(owner, LuaMemberOwner::LocalUnresolve)),
+                eq(true),
+                "keyText must have a real owner after the cold batch, got {cold_owner:?}"
+            );
 
-        ws.analysis.reindex_files(vec![base_file]);
-        assert_that!(member_owner(&ws), eq(&cold_owner));
-    }
+            ws.analysis.reindex_files(vec![base_file]);
+            assert_that!(member_owner(&ws), eq(&cold_owner));
+        }
 
-    #[gtest]
-    fn settled_dynamic_field_write_fans_out_over_late_element_write() {
-        // `v.keyText = ...` fans the write out over every element table of
-        // `self.Attachments`. One element arm (`self.Attachments[2] = ...`)
-        // cannot attach until `self`'s weapon binding settles, so at dynamic
-        // -field collection time the iterated union only covers the first
-        // arm. The write still lands on a real owner, so nothing flags the
-        // site for the settled retry — the second element table's field
-        // definition must arrive through the tail rather than be lost.
-        let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        let mut emmyrc = crate::Emmyrc::default();
-        emmyrc.gmod.enabled = true;
-        ws.update_emmyrc(emmyrc);
-        ws.def_gmod_call_arg_builtins();
-        ws.def_files(vec![
-            (
-                "lua/weapons/cw_base/shared.lua",
-                r#"
+        #[gtest]
+        fn settled_dynamic_field_write_fans_out_over_late_element_write() {
+            // `v.keyText = ...` fans the write out over every element table of
+            // `self.Attachments`. One element arm (`self.Attachments[2] = ...`)
+            // cannot attach until `self`'s weapon binding settles, so at dynamic
+            // -field collection time the iterated union only covers the first
+            // arm. The write still lands on a real owner, so nothing flags the
+            // site for the settled retry — the second element table's field
+            // definition must arrive through the tail rather than be lost.
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let mut emmyrc = crate::Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+            ws.def_gmod_call_arg_builtins();
+            ws.def_files(vec![
+                (
+                    "lua/weapons/cw_base/shared.lua",
+                    r#"
 function SWEP:DrawHUD()
     for _, value in pairs(self.Attachments) do
         value.keyText = "x"
     end
 end
 "#,
-            ),
-            (
-                "lua/weapons/cw_ak74/shared.lua",
-                r#"
+                ),
+                (
+                    "lua/weapons/cw_ak74/shared.lua",
+                    r#"
 SWEP.Base = "cw_base"
 SWEP.Attachments = {[1] = {header = "Sight", atts = {"md_kobra"}}}
 "#,
-            ),
-            (
-                "lua/weapons/cw_ar15/shared.lua",
-                r#"
+                ),
+                (
+                    "lua/weapons/cw_ar15/shared.lua",
+                    r#"
 SWEP.Base = "cw_base"
 SWEP.Attachments = {[1] = {header = "Irons"}}
 function SWEP:adjust()
     self.Attachments[2] = {header = "Late"}
 end
 "#,
-            ),
-            (
-                // Defined before the reader so `pending`'s global read of
-                // `ATT_LIST` is a settled-tail re-derivation, not an in-phase
-                // bind: `pending[2]`'s element write then lands after the
-                // dynamic-field pass collected the reader's loop.
-                "lua/att_writer.lua",
-                r#"
+                ),
+                (
+                    // Defined before the reader so `pending`'s global read of
+                    // `ATT_LIST` is a settled-tail re-derivation, not an in-phase
+                    // bind: `pending[2]`'s element write then lands after the
+                    // dynamic-field pass collected the reader's loop.
+                    "lua/att_writer.lua",
+                    r#"
 local pending = ATT_LIST
 pending[2] = {header = "Second"}
 "#,
-            ),
-            (
-                "lua/att_reader.lua",
-                r#"
+                ),
+                (
+                    "lua/att_reader.lua",
+                    r#"
 ATT_LIST = ATT_LIST or {}
 ATT_LIST[1] = {header = "First"}
 ATT_LIST[3] = "marker"
@@ -6017,140 +6190,140 @@ for _, value in pairs(ATT_LIST) do
     value.keyText = "x"
 end
 "#,
-            ),
-        ]);
+                ),
+            ]);
 
-        // Every element table iterated by the two `pairs` loops carries a
-        // `keyText` field definition once the workspace settles: the three
-        // `Attachments` literals plus both `ATT_LIST` elements — including
-        // `{header="Second"}`, whose write attaches only after the
-        // `getAtts()` return resolves in the settled tail.
-        let key_text_owners = |ws: &VirtualWorkspace| -> Vec<String> {
-            let mut owners = ws
-                .analysis
-                .compilation
-                .get_db()
-                .get_dynamic_field_index()
-                .iter_all_field_definitions()
-                .flat_map(|(owner, fields)| {
-                    fields
-                        .keys()
-                        .filter(|name| name.as_str() == "keyText")
-                        .map(move |_| format!("{owner:?}"))
-                })
-                .collect::<Vec<_>>();
-            owners.sort();
-            owners.dedup();
-            owners
-        };
-        let cold_owners = key_text_owners(&ws);
-        assert_that!(
-            cold_owners.len(),
-            eq(5),
-            "keyText must be defined on every iterated element table, got {cold_owners:?}"
-        );
-        // `ATT_LIST[1]`'s literal canonicalizes to the global path it
-        // initialized; the other four land on their table literals —
-        // including `{header="Second"}`, which only exists once the deferred
-        // `pending[2]` write attaches in the settled tail.
-        assert_that!(
-            cold_owners
-                .iter()
-                .filter(|owner| owner.starts_with("Table("))
-                .count(),
-            eq(4),
-            "element-table owners expected, got {cold_owners:?}"
-        );
-        assert_that!(
-            cold_owners
-                .iter()
-                .any(|owner| owner == "GlobalPath(GlobalId(\"ATT_LIST.1\"))"),
-            eq(true),
-            "ATT_LIST[1]'s literal must carry keyText, got {cold_owners:?}"
-        );
-    }
+            // Every element table iterated by the two `pairs` loops carries a
+            // `keyText` field definition once the workspace settles: the three
+            // `Attachments` literals plus both `ATT_LIST` elements — including
+            // `{header="Second"}`, whose write attaches only after the
+            // `getAtts()` return resolves in the settled tail.
+            let key_text_owners = |ws: &VirtualWorkspace| -> Vec<String> {
+                let mut owners = ws
+                    .analysis
+                    .compilation
+                    .get_db()
+                    .get_dynamic_field_index()
+                    .iter_all_field_definitions()
+                    .flat_map(|(owner, fields)| {
+                        fields
+                            .keys()
+                            .filter(|name| name.as_str() == "keyText")
+                            .map(move |_| format!("{owner:?}"))
+                    })
+                    .collect::<Vec<_>>();
+                owners.sort();
+                owners.dedup();
+                owners
+            };
+            let cold_owners = key_text_owners(&ws);
+            assert_that!(
+                cold_owners.len(),
+                eq(5),
+                "keyText must be defined on every iterated element table, got {cold_owners:?}"
+            );
+            // `ATT_LIST[1]`'s literal canonicalizes to the global path it
+            // initialized; the other four land on their table literals —
+            // including `{header="Second"}`, which only exists once the deferred
+            // `pending[2]` write attaches in the settled tail.
+            assert_that!(
+                cold_owners
+                    .iter()
+                    .filter(|owner| owner.starts_with("Table("))
+                    .count(),
+                eq(4),
+                "element-table owners expected, got {cold_owners:?}"
+            );
+            assert_that!(
+                cold_owners
+                    .iter()
+                    .any(|owner| owner == "GlobalPath(GlobalId(\"ATT_LIST.1\"))"),
+                eq(true),
+                "ATT_LIST[1]'s literal must carry keyText, got {cold_owners:?}"
+            );
+        }
 
-    #[gtest]
-    fn settled_dynamic_field_write_moves_when_setmetatable_binding_lands_late() {
-        // `t.movedField = ...` reads the setmetatable binding for `t`: the
-        // metatable's `__index` member only attaches in the settled tail
-        // (`lateMeta`'s read of `WEP_META` is a deferred global read), so the
-        // dynamic-field pass files the field on `t`'s own literal. Once the
-        // binding resolves the write's owner is the `__index` target — the
-        // re-derivation must replace the stale contribution, not add beside
-        // it: the literal and the target cannot both keep the definition.
-        let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        let mut emmyrc = crate::Emmyrc::default();
-        emmyrc.gmod.enabled = true;
-        ws.update_emmyrc(emmyrc);
-        ws.def_gmod_call_arg_builtins();
-        ws.def_files(vec![
-            (
-                // Defined before the user so `lateMeta`'s read of `WEP_META`
-                // is a settled-tail re-derivation, not an in-phase bind: the
-                // `__index` member write then lands after the dynamic-field
-                // pass collected the user's write site.
-                "lua/meta_late.lua",
-                r#"
+        #[gtest]
+        fn settled_dynamic_field_write_moves_when_setmetatable_binding_lands_late() {
+            // `t.movedField = ...` reads the setmetatable binding for `t`: the
+            // metatable's `__index` member only attaches in the settled tail
+            // (`lateMeta`'s read of `WEP_META` is a deferred global read), so the
+            // dynamic-field pass files the field on `t`'s own literal. Once the
+            // binding resolves the write's owner is the `__index` target — the
+            // re-derivation must replace the stale contribution, not add beside
+            // it: the literal and the target cannot both keep the definition.
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let mut emmyrc = crate::Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+            ws.def_gmod_call_arg_builtins();
+            ws.def_files(vec![
+                (
+                    // Defined before the user so `lateMeta`'s read of `WEP_META`
+                    // is a settled-tail re-derivation, not an in-phase bind: the
+                    // `__index` member write then lands after the dynamic-field
+                    // pass collected the user's write site.
+                    "lua/meta_late.lua",
+                    r#"
 local lateMeta = WEP_META
 lateMeta["__index"] = INDEX_TARGET
 "#,
-            ),
-            (
-                "lua/meta_user.lua",
-                r#"
+                ),
+                (
+                    "lua/meta_user.lua",
+                    r#"
 WEP_META = {}
 INDEX_TARGET = {}
 local t = {}
 setmetatable(t, WEP_META)
 t.movedField = 1
 "#,
-            ),
-        ]);
+                ),
+            ]);
 
-        let moved_owners = |ws: &VirtualWorkspace| -> Vec<String> {
-            let mut owners = ws
-                .analysis
-                .compilation
-                .get_db()
-                .get_dynamic_field_index()
-                .iter_all_field_definitions()
-                .flat_map(|(owner, fields)| {
-                    fields
-                        .keys()
-                        .filter(|name| name.as_str() == "movedField")
-                        .map(move |_| format!("{owner:?}"))
-                })
-                .collect::<Vec<_>>();
-            owners.sort();
-            owners.dedup();
-            owners
-        };
-        let owners = moved_owners(&ws);
-        assert_that!(
-            owners.as_slice(),
-            eq(&["GlobalPath(GlobalId(\"INDEX_TARGET\"))".to_string()]),
-            "movedField must live only on the metatable's __index target once the binding settles, got {owners:?}"
-        );
-    }
+            let moved_owners = |ws: &VirtualWorkspace| -> Vec<String> {
+                let mut owners = ws
+                    .analysis
+                    .compilation
+                    .get_db()
+                    .get_dynamic_field_index()
+                    .iter_all_field_definitions()
+                    .flat_map(|(owner, fields)| {
+                        fields
+                            .keys()
+                            .filter(|name| name.as_str() == "movedField")
+                            .map(move |_| format!("{owner:?}"))
+                    })
+                    .collect::<Vec<_>>();
+                owners.sort();
+                owners.dedup();
+                owners
+            };
+            let owners = moved_owners(&ws);
+            assert_that!(
+                owners.as_slice(),
+                eq(&["GlobalPath(GlobalId(\"INDEX_TARGET\"))".to_string()]),
+                "movedField must live only on the metatable's __index target once the binding settles, got {owners:?}"
+            );
+        }
 
-    #[gtest]
-    fn dynamic_field_write_after_dynamic_index_read_attributes() {
-        // `attTable = self.Attachments[cur]` reads the element tables through a
-        // dynamic key; `attTable.last = ...` then writes a named field on each.
-        // Reproduces the cw_base `attTable.last` site: the element union is only
-        // reachable once `self.Attachments` (the subclass member accumulation)
-        // resolves, so a collection that infers the index read before the
-        // member settles must not commit the transient `Never`.
-        let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        let mut emmyrc = crate::Emmyrc::default();
-        emmyrc.gmod.enabled = true;
-        ws.update_emmyrc(emmyrc);
-        ws.def_gmod_call_arg_builtins();
-        ws.def_files(vec![
-            (
-                "lua/weapons/cw_base/shared.lua",
-                r#"
+        #[gtest]
+        fn dynamic_field_write_after_dynamic_index_read_attributes() {
+            // `attTable = self.Attachments[cur]` reads the element tables through a
+            // dynamic key; `attTable.last = ...` then writes a named field on each.
+            // Reproduces the cw_base `attTable.last` site: the element union is only
+            // reachable once `self.Attachments` (the subclass member accumulation)
+            // resolves, so a collection that infers the index read before the
+            // member settles must not commit the transient `Never`.
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let mut emmyrc = crate::Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+            ws.def_gmod_call_arg_builtins();
+            ws.def_files(vec![
+                (
+                    "lua/weapons/cw_base/shared.lua",
+                    r#"
 function SWEP:_attach(cur, curPos, inherit)
     local attTable = self.Attachments[cur]
     local att = inherit or self:findAttachment(attTable.atts[curPos])
@@ -6163,70 +6336,70 @@ function SWEP:_attach(cur, curPos, inherit)
     attTable.last = curPos
 end
 "#,
-            ),
-            (
-                "lua/weapons/cw_ak74/shared.lua",
-                r#"
+                ),
+                (
+                    "lua/weapons/cw_ak74/shared.lua",
+                    r#"
 SWEP.Base = "cw_base"
 SWEP.Attachments = {[1] = {header = "Sight", atts = {"md_kobra"}}}
 "#,
-            ),
-            (
-                "lua/weapons/cw_ar15/shared.lua",
-                r#"
+                ),
+                (
+                    "lua/weapons/cw_ar15/shared.lua",
+                    r#"
 SWEP.Base = "cw_base"
 SWEP.Attachments = {[1] = {header = "Irons", atts = {"md_t1"}}}
 "#,
-            ),
-        ]);
+                ),
+            ]);
 
-        let last_owners = |ws: &VirtualWorkspace| -> Vec<String> {
-            let mut owners = ws
-                .analysis
-                .compilation
-                .get_db()
-                .get_dynamic_field_index()
-                .iter_all_field_definitions()
-                .flat_map(|(owner, fields)| {
-                    fields
-                        .keys()
-                        .filter(|name| name.as_str() == "last")
-                        .map(move |_| format!("{owner:?}"))
-                })
-                .collect::<Vec<_>>();
-            owners.sort();
-            owners.dedup();
-            owners
-        };
-        let owners = last_owners(&ws);
-        assert_that!(
-            owners.len(),
-            eq(2),
-            "last must be defined on each Attachments element table, got {owners:?}"
-        );
-    }
+            let last_owners = |ws: &VirtualWorkspace| -> Vec<String> {
+                let mut owners = ws
+                    .analysis
+                    .compilation
+                    .get_db()
+                    .get_dynamic_field_index()
+                    .iter_all_field_definitions()
+                    .flat_map(|(owner, fields)| {
+                        fields
+                            .keys()
+                            .filter(|name| name.as_str() == "last")
+                            .map(move |_| format!("{owner:?}"))
+                    })
+                    .collect::<Vec<_>>();
+                owners.sort();
+                owners.dedup();
+                owners
+            };
+            let owners = last_owners(&ws);
+            assert_that!(
+                owners.len(),
+                eq(2),
+                "last must be defined on each Attachments element table, got {owners:?}"
+            );
+        }
 
-    #[gtest]
-    fn settled_dynamic_field_attribution_keeps_sibling_unattributed_record() {
-        // Two `X.shared` writes in one file. `s.shared` can never attribute —
-        // a string has no owner — so collection files an unattributed record
-        // for it. `value.shared` inside the `pairs` loop attributes, and its
-        // site is re-derived in the settled tail once the late
-        // `self.Attachments[2]` element write lands (the same deferral
-        // `settled_dynamic_field_write_fans_out_over_late_element_write`
-        // relies on). The retry's unattributed bookkeeping is keyed by
-        // (name, file), not by site, so re-deriving the attributed site must
-        // not take `s.shared`'s record with it.
-        let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        let mut emmyrc = crate::Emmyrc::default();
-        emmyrc.gmod.enabled = true;
-        emmyrc.gmod.infer_dynamic_fields = true;
-        ws.update_emmyrc(emmyrc);
-        ws.def_gmod_call_arg_builtins();
-        ws.def_files(vec![
-            (
-                "lua/weapons/cw_base/shared.lua",
-                r#"
+        #[gtest]
+        fn settled_dynamic_field_attribution_keeps_sibling_unattributed_record() {
+            // Two `X.shared` writes in one file. `s.shared` can never attribute —
+            // a string has no owner — so collection files an unattributed record
+            // for it. `value.shared` inside the `pairs` loop attributes, and its
+            // site is re-derived in the settled tail once the late
+            // `self.Attachments[2]` element write lands (the same deferral
+            // `settled_dynamic_field_write_fans_out_over_late_element_write`
+            // relies on). The retry's unattributed bookkeeping is keyed by
+            // (name, file), not by site, so re-deriving the attributed site must
+            // not take `s.shared`'s record with it.
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let mut emmyrc = crate::Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            emmyrc.gmod.infer_dynamic_fields = true;
+            ws.update_emmyrc(emmyrc);
+            ws.def_gmod_call_arg_builtins();
+            ws.def_files(vec![
+                (
+                    "lua/weapons/cw_base/shared.lua",
+                    r#"
 local s = "x"
 s.shared = 1
 function SWEP:DrawHUD()
@@ -6235,104 +6408,104 @@ function SWEP:DrawHUD()
     end
 end
 "#,
-            ),
-            (
-                "lua/weapons/cw_ak74/shared.lua",
-                r#"
+                ),
+                (
+                    "lua/weapons/cw_ak74/shared.lua",
+                    r#"
 SWEP.Base = "cw_base"
 SWEP.Attachments = {[1] = {header = "Sight", atts = {"md_kobra"}}}
 "#,
-            ),
-            (
-                "lua/weapons/cw_ar15/shared.lua",
-                r#"
+                ),
+                (
+                    "lua/weapons/cw_ar15/shared.lua",
+                    r#"
 SWEP.Base = "cw_base"
 SWEP.Attachments = {[1] = {header = "Irons"}}
 function SWEP:adjust()
     self.Attachments[2] = {header = "Late"}
 end
 "#,
-            ),
-        ]);
+                ),
+            ]);
 
-        let shared_owners = |ws: &VirtualWorkspace| -> Vec<String> {
-            let mut owners = ws
-                .analysis
-                .compilation
-                .get_db()
-                .get_dynamic_field_index()
-                .iter_all_field_definitions()
-                .flat_map(|(owner, fields)| {
-                    fields
-                        .keys()
-                        .filter(|name| name.as_str() == "shared")
-                        .map(move |_| format!("{owner:?}"))
-                })
-                .collect::<Vec<_>>();
-            owners.sort();
-            owners.dedup();
-            owners
-        };
-        assert_that!(
-            shared_owners(&ws)
-                .iter()
-                .any(|owner| owner.starts_with("Table(")),
-            eq(true),
-            "value.shared must attribute to the iterated element tables, got {:?}",
-            shared_owners(&ws)
-        );
-        assert_that!(
-            ws.analysis
-                .compilation
-                .get_db()
-                .get_dynamic_field_index()
-                .has_unattributed_field("shared"),
-            eq(true),
-            "s.shared is still written and still ownerless: its unattributed record must survive value.shared's settled attribution"
-        );
+            let shared_owners = |ws: &VirtualWorkspace| -> Vec<String> {
+                let mut owners = ws
+                    .analysis
+                    .compilation
+                    .get_db()
+                    .get_dynamic_field_index()
+                    .iter_all_field_definitions()
+                    .flat_map(|(owner, fields)| {
+                        fields
+                            .keys()
+                            .filter(|name| name.as_str() == "shared")
+                            .map(move |_| format!("{owner:?}"))
+                    })
+                    .collect::<Vec<_>>();
+                owners.sort();
+                owners.dedup();
+                owners
+            };
+            assert_that!(
+                shared_owners(&ws)
+                    .iter()
+                    .any(|owner| owner.starts_with("Table(")),
+                eq(true),
+                "value.shared must attribute to the iterated element tables, got {:?}",
+                shared_owners(&ws)
+            );
+            assert_that!(
+                ws.analysis
+                    .compilation
+                    .get_db()
+                    .get_dynamic_field_index()
+                    .has_unattributed_field("shared"),
+                eq(true),
+                "s.shared is still written and still ownerless: its unattributed record must survive value.shared's settled attribution"
+            );
 
-        // Removing the unattributed site must drop its record while the
-        // attributed definitions on the element tables survive.
-        ws.def_file(
-            "lua/weapons/cw_base/shared.lua",
-            r#"
+            // Removing the unattributed site must drop its record while the
+            // attributed definitions on the element tables survive.
+            ws.def_file(
+                "lua/weapons/cw_base/shared.lua",
+                r#"
 function SWEP:DrawHUD()
     for _, value in pairs(self.Attachments) do
         value.shared = "x"
     end
 end
 "#,
-        );
-        assert_that!(
-            ws.analysis
-                .compilation
-                .get_db()
-                .get_dynamic_field_index()
-                .has_unattributed_field("shared"),
-            eq(false),
-            "removing s.shared must clean up its unattributed record"
-        );
-        assert_that!(
-            shared_owners(&ws)
-                .iter()
-                .any(|owner| owner.starts_with("Table(")),
-            eq(true),
-            "the attributed shared definitions must survive the edit, got {:?}",
-            shared_owners(&ws)
-        );
-    }
+            );
+            assert_that!(
+                ws.analysis
+                    .compilation
+                    .get_db()
+                    .get_dynamic_field_index()
+                    .has_unattributed_field("shared"),
+                eq(false),
+                "removing s.shared must clean up its unattributed record"
+            );
+            assert_that!(
+                shared_owners(&ws)
+                    .iter()
+                    .any(|owner| owner.starts_with("Table(")),
+                eq(true),
+                "the attributed shared definitions must survive the edit, got {:?}",
+                shared_owners(&ws)
+            );
+        }
 
-    #[test]
-    fn an_override_does_not_take_the_return_its_base_body_infers() {
-        let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        let mut emmyrc = crate::Emmyrc::default();
-        emmyrc.gmod.enabled = true;
-        ws.update_emmyrc(emmyrc);
-        ws.def_gmod_call_arg_builtins();
-        ws.def_files(vec![
-            (
-                "lua/weapons/cw_base/shared.lua",
-                r#"
+        #[test]
+        fn an_override_does_not_take_the_return_its_base_body_infers() {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let mut emmyrc = crate::Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+            ws.def_gmod_call_arg_builtins();
+            ws.def_files(vec![
+                (
+                    "lua/weapons/cw_base/shared.lua",
+                    r#"
 function SWEP:DrawHUD()
     for _, value in pairs(self.Attachments) do
         value.keyText = 5
@@ -6345,46 +6518,46 @@ function SWEP:GetSlotText()
     end
 end
 "#,
-            ),
-            (
-                "lua/weapons/cw_child/shared.lua",
-                r#"
+                ),
+                (
+                    "lua/weapons/cw_child/shared.lua",
+                    r#"
 SWEP.Base = "cw_base"
 SWEP.Attachments = {[1] = {header = "Sight", atts = {"md_kobra"}}}
 function SWEP:GetSlotText()
     return "child"
 end
 "#,
-            ),
-        ]);
-        let child_file = ws
-            .analysis
-            .compilation
-            .get_db()
-            .get_vfs()
-            .get_file_id(
-                &ws.virtual_url_generator
-                    .new_uri("lua/weapons/cw_child/shared.lua"),
-            )
-            .expect("child file must be indexed");
-        let base_file = ws
-            .analysis
-            .compilation
-            .get_db()
-            .get_vfs()
-            .get_file_id(
-                &ws.virtual_url_generator
-                    .new_uri("lua/weapons/cw_base/shared.lua"),
-            )
-            .expect("base file must be indexed");
-
-        let child_signature = |ws: &VirtualWorkspace| -> (bool, LuaType) {
-            let semantic_model = ws
+                ),
+            ]);
+            let child_file = ws
                 .analysis
                 .compilation
-                .get_semantic_model(child_file)
-                .expect("expected semantic model");
-            let closure = semantic_model
+                .get_db()
+                .get_vfs()
+                .get_file_id(
+                    &ws.virtual_url_generator
+                        .new_uri("lua/weapons/cw_child/shared.lua"),
+                )
+                .expect("child file must be indexed");
+            let base_file = ws
+                .analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_id(
+                    &ws.virtual_url_generator
+                        .new_uri("lua/weapons/cw_base/shared.lua"),
+                )
+                .expect("base file must be indexed");
+
+            let child_signature = |ws: &VirtualWorkspace| -> (bool, LuaType) {
+                let semantic_model = ws
+                    .analysis
+                    .compilation
+                    .get_semantic_model(child_file)
+                    .expect("expected semantic model");
+                let closure = semantic_model
                 .get_root()
                 .descendants::<glua_parser::LuaFuncStat>()
                 .find(|stat| {
@@ -6396,56 +6569,60 @@ end
                 })
                 .and_then(|stat| stat.get_closure())
                 .expect("expected GetSlotText declaration");
-            let signature_id = crate::LuaSignatureId::from_closure(child_file, &closure);
-            let signature = ws
-                .analysis
-                .compilation
-                .get_db()
-                .get_signature_index()
-                .get(&signature_id)
-                .expect("expected GetSlotText signature");
-            (
-                signature.return_filled_from_slot,
-                signature.get_return_type(),
-            )
-        };
+                let signature_id = crate::LuaSignatureId::from_closure(child_file, &closure);
+                let signature = ws
+                    .analysis
+                    .compilation
+                    .get_db()
+                    .get_signature_index()
+                    .get(&signature_id)
+                    .expect("expected GetSlotText signature");
+                (
+                    signature.return_filled_from_slot,
+                    signature.get_return_type(),
+                )
+            };
 
-        let (filled_from_slot, cold_return) = child_signature(&ws);
-        assert_that!(
-            filled_from_slot,
-            eq(false),
-            "the override's return must be its own, got return {cold_return:?}"
-        );
-        assert_that!(
-            &cold_return,
-            eq(&LuaType::StringConst(
-                smol_str::SmolStr::new("child").into()
-            )),
-            "the override's return must be its own body's"
-        );
+            let (filled_from_slot, cold_return) = child_signature(&ws);
+            assert_that!(
+                filled_from_slot,
+                eq(false),
+                "the override's return must be its own, got return {cold_return:?}"
+            );
+            assert_that!(
+                &cold_return,
+                eq(&LuaType::StringConst(
+                    smol_str::SmolStr::new("child").into()
+                )),
+                "the override's return must be its own body's"
+            );
 
-        ws.analysis.reindex_files(vec![base_file]);
-        let (filled_after, warm_return) = child_signature(&ws);
-        assert_that!(warm_return, eq(&cold_return));
-        assert_that!(filled_after, eq(filled_from_slot));
-    }
+            ws.analysis.reindex_files(vec![base_file]);
+            let (filled_after, warm_return) = child_signature(&ws);
+            assert_that!(warm_return, eq(&cold_return));
+            assert_that!(filled_after, eq(filled_from_slot));
+        }
 
-    /// The types of `names`, each a local of `file_id`, humanized.
-    fn local_types(ws: &VirtualWorkspace, file_id: crate::FileId, names: &[&str]) -> Vec<String> {
-        names
-            .iter()
-            .map(|name| ws.humanize_type(ws.local_ty(file_id, name)))
-            .collect()
-    }
+        /// The types of `names`, each a local of `file_id`, humanized.
+        fn local_types(
+            ws: &VirtualWorkspace,
+            file_id: crate::FileId,
+            names: &[&str],
+        ) -> Vec<String> {
+            names
+                .iter()
+                .map(|name| ws.humanize_type(ws.local_ty(file_id, name)))
+                .collect()
+        }
 
-    /// `T["a"]` and `T.a` name one field; `T["a.b"]` and `T.a.b` name two,
-    /// however the tables are written.
-    #[test]
-    fn a_string_key_holding_a_dot_names_its_own_field() {
-        let mut ws = VirtualWorkspace::new();
-        let literal = ws.def_file(
-            "lua/autorun/sh_literal.lua",
-            r#"
+        /// `T["a"]` and `T.a` name one field; `T["a.b"]` and `T.a.b` name two,
+        /// however the tables are written.
+        #[test]
+        fn a_string_key_holding_a_dot_names_its_own_field() {
+            let mut ws = VirtualWorkspace::new();
+            let literal = ws.def_file(
+                "lua/autorun/sh_literal.lua",
+                r#"
             T = {
                 ["a.b"] = { x = 1 },
                 a = { b = { y = "text" } },
@@ -6455,10 +6632,10 @@ end
             local nested = T.a.b.y
             local same = T["a"].b.y
             "#,
-        );
-        let assigned = ws.def_file(
-            "lua/autorun/sh_assigned.lua",
-            r#"
+            );
+            let assigned = ws.def_file(
+                "lua/autorun/sh_assigned.lua",
+                r#"
             U = {}
             U["a.b"] = {}
             U["a.b"].x = 1
@@ -6470,25 +6647,25 @@ end
             local nested = U.a.b.x
             local same = U["a"].b.y
             "#,
-        );
+            );
 
-        let names = ["own", "leaked", "nested", "same"];
-        assert_eq!(
-            local_types(&ws, literal, &names),
-            ["1", "nil", "\"text\"", "\"text\""]
-        );
-        assert_eq!(
-            local_types(&ws, assigned, &names),
-            ["1", "nil", "nil", "\"text\""]
-        );
-    }
+            let names = ["own", "leaked", "nested", "same"];
+            assert_eq!(
+                local_types(&ws, literal, &names),
+                ["1", "nil", "\"text\"", "\"text\""]
+            );
+            assert_eq!(
+                local_types(&ws, assigned, &names),
+                ["1", "nil", "nil", "\"text\""]
+            );
+        }
 
-    #[test]
-    fn a_string_key_spelling_a_number_names_its_own_field() {
-        let mut ws = VirtualWorkspace::new();
-        let file_id = ws.def_file(
-            "lua/autorun/sh_numeric.lua",
-            r#"
+        #[test]
+        fn a_string_key_spelling_a_number_names_its_own_field() {
+            let mut ws = VirtualWorkspace::new();
+            let file_id = ws.def_file(
+                "lua/autorun/sh_numeric.lua",
+                r#"
             V = {}
             V[1] = { x = 1 }
             V["1"] = { y = "s" }
@@ -6497,116 +6674,117 @@ end
             local str_x = V["1"].x
             local str_y = V["1"].y
             "#,
-        );
+            );
 
-        assert_eq!(
-            local_types(&ws, file_id, &["int_x", "int_y", "str_x", "str_y"]),
-            ["1", "nil", "nil", "\"s\""]
-        );
+            assert_eq!(
+                local_types(&ws, file_id, &["int_x", "int_y", "str_x", "str_y"]),
+                ["1", "nil", "nil", "\"s\""]
+            );
+        }
+
+        #[test]
+        fn editing_the_nested_path_leaves_the_dotted_key_field_alone() {
+            let path = "lua/autorun/sh_dotted.lua";
+            let original = "U = {}\nU[\"a.b\"] = { x = 1 }\nU.a = { b = { y = \"text\" } }\nlocal own = U[\"a.b\"].x\nlocal leaked = U[\"a.b\"].y\n";
+            let edited = "U = {}\nU[\"a.b\"] = { x = 1 }\nU.a = { b = { y = 2 } }\nlocal own = U[\"a.b\"].x\nlocal leaked = U[\"a.b\"].y\nlocal nested = U.a.b.y\n";
+            let ws = VirtualWorkspace::assert_warm_matches_cold(
+                |_| {},
+                &[(path, original)],
+                &[(path, edited)],
+            );
+
+            let file_id = ws
+                .analysis
+                .get_file_id(&ws.virtual_url_generator.new_uri(path))
+                .expect("the file has an id");
+            assert_eq!(
+                local_types(&ws, file_id, &["own", "leaked", "nested"]),
+                ["1", "nil", "2"]
+            );
+        }
     }
 
-    #[test]
-    fn editing_the_nested_path_leaves_the_dotted_key_field_alone() {
-        let path = "lua/autorun/sh_dotted.lua";
-        let original = "U = {}\nU[\"a.b\"] = { x = 1 }\nU.a = { b = { y = \"text\" } }\nlocal own = U[\"a.b\"].x\nlocal leaked = U[\"a.b\"].y\n";
-        let edited = "U = {}\nU[\"a.b\"] = { x = 1 }\nU.a = { b = { y = 2 } }\nlocal own = U[\"a.b\"].x\nlocal leaked = U[\"a.b\"].y\nlocal nested = U.a.b.y\n";
-        let ws = VirtualWorkspace::assert_warm_matches_cold(
-            |_| {},
-            &[(path, original)],
-            &[(path, edited)],
-        );
+    #[cfg(test)]
+    mod localised_library_members {
+        use crate::{DiagnosticCode, VirtualWorkspace};
 
-        let file_id = ws
-            .analysis
-            .get_file_id(&ws.virtual_url_generator.new_uri(path))
-            .expect("the file has an id");
-        assert_eq!(
-            local_types(&ws, file_id, &["own", "leaked", "nested"]),
-            ["1", "nil", "2"]
-        );
-    }
-}
-
-#[cfg(test)]
-mod localised_library_members {
-    use crate::{DiagnosticCode, VirtualWorkspace};
-
-    /// The GMod annotations declare the standard libraries again as plain tables.
-    const LIBRARY_ANNOTATIONS: &str = "---@meta
+        /// The GMod annotations declare the standard libraries again as plain tables.
+        const LIBRARY_ANNOTATIONS: &str = "---@meta
 string = {}
 table = {}
 ";
 
-    fn workspace_with_libraries() -> VirtualWorkspace {
-        let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        ws.def_file("library/string.lua", LIBRARY_ANNOTATIONS);
-        ws
-    }
+        fn workspace_with_libraries() -> VirtualWorkspace {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            ws.def_file("library/string.lua", LIBRARY_ANNOTATIONS);
+            ws
+        }
 
-    const LOCALISED_LIBRARY_EXTENSIONS: &str = "local string = string
+        const LOCALISED_LIBRARY_EXTENSIONS: &str = "local string = string
 local table = table
 function string.Interp(str, tbl) return str end
 function table.HasTable(tbl, needle) return false end
 ";
 
-    #[test]
-    fn a_function_defined_through_a_localised_library_is_a_library_member() {
-        let mut ws = workspace_with_libraries();
-        ws.def_file(
-            "gamemodes/terrortown/gamemode/util.lua",
-            LOCALISED_LIBRARY_EXTENSIONS,
-        );
-        assert!(ws.check_file_for(
-            DiagnosticCode::UndefinedField,
-            "gamemodes/terrortown/gamemode/cl_hud.lua",
-            "local string = string
+        #[test]
+        fn a_function_defined_through_a_localised_library_is_a_library_member() {
+            let mut ws = workspace_with_libraries();
+            ws.def_file(
+                "gamemodes/terrortown/gamemode/util.lua",
+                LOCALISED_LIBRARY_EXTENSIONS,
+            );
+            assert!(ws.check_file_for(
+                DiagnosticCode::UndefinedField,
+                "gamemodes/terrortown/gamemode/cl_hud.lua",
+                "local string = string
 local interp = string.Interp
 local function has(t) return table.HasTable(t, 1) end
 ",
-        ));
-        let hud = ws.def_file(
-            "gamemodes/terrortown/gamemode/cl_hud.lua",
-            "local interp = string.Interp\n",
-        );
-        assert!(ws.local_ty(hud, "interp").is_function());
-    }
+            ));
+            let hud = ws.def_file(
+                "gamemodes/terrortown/gamemode/cl_hud.lua",
+                "local interp = string.Interp\n",
+            );
+            assert!(ws.local_ty(hud, "interp").is_function());
+        }
 
-    #[test]
-    fn a_library_alias_assigned_again_does_not_define_library_members() {
-        let mut ws = workspace_with_libraries();
-        ws.def_file(
-            "gamemodes/terrortown/gamemode/util.lua",
-            "local string = string
+        #[test]
+        fn a_library_alias_assigned_again_does_not_define_library_members() {
+            let mut ws = workspace_with_libraries();
+            ws.def_file(
+                "gamemodes/terrortown/gamemode/util.lua",
+                "local string = string
 string = {}
 function string.Shout(str) return str end
 ",
-        );
-        assert!(!ws.check_file_for(
-            DiagnosticCode::UndefinedField,
-            "gamemodes/terrortown/gamemode/cl_hud.lua",
-            "local shout = string.Shout\n",
-        ));
-    }
+            );
+            assert!(!ws.check_file_for(
+                DiagnosticCode::UndefinedField,
+                "gamemodes/terrortown/gamemode/cl_hud.lua",
+                "local shout = string.Shout\n",
+            ));
+        }
 
-    #[test]
-    fn removing_a_function_defined_through_a_localised_library_settles_as_a_fresh_load() {
-        VirtualWorkspace::assert_warm_matches_cold(
-            |ws| ws.analysis.init_std_lib(),
-            &[
-                ("library/string.lua", LIBRARY_ANNOTATIONS),
-                (
+        #[test]
+        fn removing_a_function_defined_through_a_localised_library_settles_as_a_fresh_load() {
+            VirtualWorkspace::assert_warm_matches_cold(
+                |ws| ws.analysis.init_std_lib(),
+                &[
+                    ("library/string.lua", LIBRARY_ANNOTATIONS),
+                    (
+                        "gamemodes/terrortown/gamemode/util.lua",
+                        LOCALISED_LIBRARY_EXTENSIONS,
+                    ),
+                    (
+                        "gamemodes/terrortown/gamemode/cl_hud.lua",
+                        "local interp = string.Interp\n",
+                    ),
+                ],
+                &[(
                     "gamemodes/terrortown/gamemode/util.lua",
-                    LOCALISED_LIBRARY_EXTENSIONS,
-                ),
-                (
-                    "gamemodes/terrortown/gamemode/cl_hud.lua",
-                    "local interp = string.Interp\n",
-                ),
-            ],
-            &[(
-                "gamemodes/terrortown/gamemode/util.lua",
-                "local string = string\nfunction string.Other(str) return str end\n",
-            )],
-        );
+                    "local string = string\nfunction string.Other(str) return str end\n",
+                )],
+            );
+        }
     }
 }

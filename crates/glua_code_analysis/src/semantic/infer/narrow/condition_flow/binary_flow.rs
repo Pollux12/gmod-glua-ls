@@ -10,6 +10,7 @@ use crate::{
     LuaMemberKey, LuaType, TypeOps, infer_expr,
     semantic::type_check::is_sub_type_of,
     semantic::{
+        decl_value_expr,
         infer::{
             VarRefId,
             narrow::{
@@ -26,7 +27,7 @@ use crate::{
         member::{
             cached_local_class_table_member_ids, find_members_with_key, infer_raw_member_type,
         },
-        decl_value_expr, resolve_global_decl_id,
+        resolve_global_decl_id,
     },
 };
 
@@ -538,7 +539,7 @@ fn maybe_type_guard_binary(
         return Ok(ResultTypeOrContinue::Continue);
     };
     if let Some((decl_position, name_expr)) = &type_alias
-        && !call_alias_holds(
+        && !alias_holds(
             db,
             cache,
             root,
@@ -871,21 +872,22 @@ fn has_decl_write_in_open_interval(
         })
 }
 
-/// Whether what the call a never reassigned local declared at `decl_position` was
+/// Whether what a never reassigned local declared at `decl_position` was
 /// initialised with says of `var_ref_id` still holds where `name_expr` tests that
-/// local: in the call's closure, while nothing reassigns the variable in between.
-pub(super) fn call_alias_holds(
+/// local: in the initializer's closure, while nothing reassigns the variable in
+/// between.
+pub(super) fn alias_holds(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
-    call_expr: &LuaCallExpr,
+    initializer: &impl LuaAstNode,
     decl_position: TextSize,
     name_expr: &LuaNameExpr,
 ) -> bool {
     let enclosing_closure =
         |node: &glua_parser::LuaSyntaxNode| node.ancestors().find_map(LuaClosureExpr::cast);
-    enclosing_closure(call_expr.syntax()) == enclosing_closure(name_expr.syntax())
+    enclosing_closure(initializer.syntax()) == enclosing_closure(name_expr.syntax())
         && !has_var_write_in_open_interval(
             db,
             cache,
@@ -1325,7 +1327,7 @@ fn maybe_type_name_literal_eq_narrow(
         return Ok(ResultTypeOrContinue::Continue);
     }
     if let Some((decl_position, name_expr)) = &alias_interval
-        && !call_alias_holds(
+        && !alias_holds(
             db,
             cache,
             root,

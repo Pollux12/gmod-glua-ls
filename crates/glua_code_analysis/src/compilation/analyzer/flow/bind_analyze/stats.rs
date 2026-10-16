@@ -43,6 +43,7 @@ pub fn bind_local_stat(
 
     for value in values {
         // If there are more values than names, we still need to bind the values
+        binder.bind_syntax_node(value.get_syntax_id(), current);
         current = bind_top_level_expr(binder, value.clone(), current);
     }
 

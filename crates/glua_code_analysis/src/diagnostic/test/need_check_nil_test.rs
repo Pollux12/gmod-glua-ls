@@ -16597,18 +16597,20 @@ end
             end
             "#
         );
-        [DiagnosticCode::NeedCheckNil, DiagnosticCode::UncheckedNilAccess]
-            .into_iter()
-            .any(|diagnostic_code| !ws.check_file_for(diagnostic_code, file_name, &code))
+        [
+            DiagnosticCode::NeedCheckNil,
+            DiagnosticCode::UncheckedNilAccess,
+        ]
+        .into_iter()
+        .any(|diagnostic_code| !ws.check_file_for(diagnostic_code, file_name, &code))
     }
 
     /// A local initialised from a slot an `IsValid` call guards holds the guarded value, as the
     /// slot read directly does, whether or not the table's element type is known.
     #[gtest]
     fn a_local_initialised_from_a_guarded_missing_slot_is_not_nullable() {
-        let guarded = |read: &str| {
-            format!("if IsValid({read}) then local e = {read}; e:Remove() end")
-        };
+        let guarded =
+            |read: &str| format!("if IsValid({read}) then local e = {read}; e:Remove() end");
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         expect_that!(
             slot_alias_warns(

@@ -10,13 +10,13 @@ use std::sync::Arc;
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr, LuaNameExpr, LuaUnaryExpr, UnaryOperator};
 
 use crate::{
-    DbIndex, FlowNode, FlowTree, InferFailReason, LuaInferCache,
+    DbIndex, FlowNode, FlowNodeKind, FlowTree, InferFailReason, LuaInferCache,
     semantic::infer::{
         InferResult, VarRefId,
         narrow::{
             ResultTypeOrContinue,
             condition_flow::{
-                binary_flow::{call_alias_holds, get_type_at_binary_expr},
+                binary_flow::{alias_holds, get_type_at_binary_expr},
                 call_flow::get_type_at_call_expr,
                 index_flow::get_type_at_index_expr,
             },
@@ -396,7 +396,6 @@ fn get_type_at_name_expr(
             cache,
             root,
             var_ref_id,
-            flow_node,
             name_expr,
             condition_flow,
             policy,
@@ -421,7 +420,6 @@ fn get_type_at_name_ref(
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
-    flow_node: &FlowNode,
     name_expr: LuaNameExpr,
     condition_flow: InferConditionFlow,
     policy: FlowWalkPolicy,
@@ -440,32 +438,43 @@ fn get_type_at_name_ref(
         return Ok(ResultTypeOrContinue::Continue);
     };
 
-    let result = get_type_at_condition_flow(
+    if !alias_holds(
+        db,
+        cache,
+        root,
+        var_ref_id,
+        &expr,
+        decl_id.position,
+        &name_expr,
+    ) {
+        return Ok(ResultTypeOrContinue::Continue);
+    }
+    // Evaluate the bound initializer at its own flow position, not at the
+    // condition reading the local: the declaration predates any loop back-edge
+    // that would re-enter this same condition query.
+    let Some(entry) = tree.get_flow_id(expr.get_syntax_id()) else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
+    let declaration_condition = FlowNode {
+        id: entry,
+        kind: if condition_flow.is_true() {
+            FlowNodeKind::TrueCondition(expr.to_ptr())
+        } else {
+            FlowNodeKind::FalseCondition(expr.to_ptr())
+        },
+        antecedent: Some(crate::FlowAntecedent::Single(entry)),
+    };
+    get_type_at_condition_flow(
         db,
         tree,
         cache,
         root,
         var_ref_id,
-        flow_node,
-        expr.clone(),
+        &declaration_condition,
+        expr,
         condition_flow,
         policy,
-    )?;
-    if matches!(result, ResultTypeOrContinue::Result(_))
-        && let LuaExpr::CallExpr(call_expr) = &expr
-        && !call_alias_holds(
-            db,
-            cache,
-            root,
-            var_ref_id,
-            call_expr,
-            decl_id.position,
-            &name_expr,
-        )
-    {
-        return Ok(ResultTypeOrContinue::Continue);
-    }
-    Ok(result)
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

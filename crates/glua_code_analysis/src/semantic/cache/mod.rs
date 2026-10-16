@@ -221,6 +221,10 @@ pub struct LuaInferCache {
     flow_local_keys: Vec<VarRefCacheKey>,
     /// The realm flow queries inherit, and the frame depth its scope began at.
     flow_query_realm: Option<(GmodRealm, u32)>,
+    /// Flow nodes the normal-mode walks in progress are evaluating, so a
+    /// nested query that reaches one answers `RecursiveInfer` instead of
+    /// re-entering the walk through a loop back-edge.
+    pub(crate) normal_flow_in_progress: FxHashSet<(VarRefCacheKey, FlowCacheInnerKey)>,
     /// Scratch memo for one top-level closure-baseline query. Without it that
     /// walk re-derives each merge point once per path into it.
     ///
@@ -419,6 +423,7 @@ impl LuaInferCache {
             condition_flow_cache: Default::default(),
             flow_local_keys: Vec::new(),
             flow_query_realm: None,
+            normal_flow_in_progress: Default::default(),
             baseline_flow_memo: Default::default(),
             baseline_flow_depth: 0,
             baseline_root: None,
@@ -831,6 +836,7 @@ impl LuaInferCache {
         self.condition_flow_cache.clear_local();
         self.member_query_cache.clear_local();
         self.member_query_in_progress.clear();
+        self.normal_flow_in_progress.clear();
         self.member_query_local_cache.clear();
         empty(&mut self.expr_in_progress);
         self.expr_var_ref_id_cache.clear_local();
@@ -930,6 +936,7 @@ impl LuaInferCache {
         self.condition_flow_cache.clear();
         self.member_query_cache.clear();
         self.member_query_in_progress.clear();
+        self.normal_flow_in_progress.clear();
         self.member_query_local_cache.clear();
         self.clear_call_cache();
         self.call_cache_local.clear();
@@ -989,6 +996,7 @@ impl LuaInferCache {
         self.condition_flow_cache.clear();
         self.member_query_cache.clear();
         self.member_query_in_progress.clear();
+        self.normal_flow_in_progress.clear();
         self.member_query_local_cache.clear();
         self.clear_call_cache();
         self.call_cache_local.clear();

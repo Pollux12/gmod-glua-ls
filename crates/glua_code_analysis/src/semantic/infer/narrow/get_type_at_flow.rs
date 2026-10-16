@@ -158,9 +158,14 @@ pub fn get_type_at_flow_with_origin(
         query_realm,
         flow_id,
         &mut visited_flow_ids,
-        policy,
+        policy.clone(),
         true,
     );
+    for visited in &visited_flow_ids {
+        cache
+            .normal_flow_in_progress
+            .remove(&(cache_key.clone(), (*visited, query_realm, policy.origin)));
+    }
     let provenance = cache.close_frame(frame);
     // RecursiveInfer errors are transient (cycle detection) and must NOT be
     // cached — they'd poison future non-recursive queries.
@@ -472,6 +477,13 @@ fn get_type_at_flow_walk(
             }
         }
         if policy.is_normal() {
+            if !cache.normal_flow_in_progress.insert((
+                cache_key.clone(),
+                (antecedent_flow_id, query_realm, policy.origin),
+            )) {
+                crate::db_index::derivation::taint();
+                return Err(InferFailReason::RecursiveInfer);
+            }
             visited_flow_ids.push(antecedent_flow_id);
         }
 
@@ -482,11 +494,11 @@ fn get_type_at_flow_walk(
             FlowNodeKind::Start | FlowNodeKind::Unreachable => {
                 return get_var_ref_type(db, cache, var_ref_id);
             }
-            FlowNodeKind::ClosureEntry(_) => {
+            FlowNodeKind::ClosureEntry(position) => {
                 // Route through the modal entry so the closure-baseline memo
                 // survives nested merge walks.
                 let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-                return get_type_at_flow_in_mode(
+                let baseline = get_type_at_flow_in_mode(
                     db,
                     tree,
                     cache,
@@ -494,7 +506,8 @@ fn get_type_at_flow_walk(
                     var_ref_id,
                     antecedent_flow_id,
                     policy.with_mode(FlowWalkMode::ClosureBaseline),
-                );
+                )?;
+                return captured_local_baseline(db, cache, root, var_ref_id, *position, baseline);
             }
             FlowNodeKind::LoopLabel | FlowNodeKind::Break | FlowNodeKind::Return => {
                 if let Some(merged_type) = try_get_multi_antecedent_type(
@@ -533,6 +546,14 @@ fn get_type_at_flow_walk(
             }
             FlowNodeKind::DeclPosition(position) => {
                 if *position <= var_ref_id.get_position() {
+                    if var_ref_id.is_self_ref()
+                        && cache
+                            .self_base_seed
+                            .as_ref()
+                            .is_some_and(|(seed_ref, _)| seed_ref == var_ref_id)
+                    {
+                        return get_var_ref_type(db, cache, var_ref_id);
+                    }
                     if let Some(decl_id) = var_ref_id.get_decl_id_ref()
                         && should_defer_uninitialized_local_decl_type(db, decl_id)
                     {
@@ -1900,6 +1921,89 @@ fn infer_assigned_value_type_at(
         Ok(Some(typ)) if typ.is_unknown() && is_undefined_global => Ok(Some(LuaType::Nil)),
         other => other,
     }
+}
+
+fn captured_local_baseline(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    closure_position: TextSize,
+    mut baseline: LuaType,
+) -> InferResult {
+    let VarRefId::VarRef(decl_id) = var_ref_id else {
+        return Ok(baseline);
+    };
+    let Some(decl) = db.get_decl_index().get_decl(decl_id) else {
+        return Ok(baseline);
+    };
+    if !matches!(decl.extra, crate::LuaDeclExtra::Local { .. })
+        || db
+            .get_type_index()
+            .get_type_cache(&(*decl_id).into())
+            .is_some_and(|typ| typ.is_doc())
+    {
+        return Ok(baseline);
+    }
+    let Some(references) = db
+        .get_reference_index()
+        .decl_references(decl_id)
+        .filter(|references| references.mutable)
+    else {
+        return Ok(baseline);
+    };
+    let declaration_scope = root
+        .syntax()
+        .token_at_offset(decl_id.position)
+        .right_biased()
+        .and_then(|token| token.parent_ancestors().find_map(LuaClosureExpr::cast))
+        .map(|closure| closure.get_syntax_id());
+    for reference in references
+        .cells
+        .iter()
+        .filter(|reference| reference.is_write)
+    {
+        let Some(name) = root
+            .syntax()
+            .token_at_offset(reference.range.start())
+            .right_biased()
+            .and_then(|token| {
+                token
+                    .parent_ancestors()
+                    .find_map(glua_parser::LuaNameExpr::cast)
+            })
+        else {
+            continue;
+        };
+        let writer = name.ancestors::<LuaClosureExpr>().next();
+        let writer_scope = writer.as_ref().map(LuaAstNode::get_syntax_id);
+        if writer_scope == declaration_scope
+            || writer.is_some_and(|closure| closure.get_position() == closure_position)
+        {
+            continue;
+        }
+        let Some(assignment) = name.get_parent::<LuaAssignStat>() else {
+            continue;
+        };
+        let (vars, exprs) = assignment.get_var_and_expr_list();
+        let Some(index) = vars
+            .iter()
+            .position(|var| var.get_range() == name.get_range())
+        else {
+            continue;
+        };
+        let Some(assigned) = infer_assigned_value_type_at(db, cache, &exprs, index)? else {
+            continue;
+        };
+        if crate::db_index::is_unresolved_type(&baseline)
+            || crate::db_index::is_unresolved_type(&assigned)
+            || assigned.contain_tpl()
+        {
+            return Ok(LuaType::Unknown);
+        }
+        baseline = TypeOps::Union.apply(db, &baseline, &assigned);
+    }
+    Ok(baseline)
 }
 
 /// Whether `expr` is a bare name that resolves to no declaration at all.
