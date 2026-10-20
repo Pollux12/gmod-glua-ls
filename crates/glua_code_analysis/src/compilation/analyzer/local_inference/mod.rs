@@ -1177,7 +1177,12 @@ fn collect_unguarded_child_file(
             }
         }
 
-        let Some(base_type) = base_type else {
+        // A `DEFINE_BASECLASS` local holds the named class's own table, never a subtype of it.
+        let Some(base_type) = base_type.filter(|_| {
+            !db.get_decl_index()
+                .get_decl(&decl_id)
+                .is_some_and(|decl| decl.is_macro_local())
+        }) else {
             continue;
         };
         let Some(base_id) = unguarded_child_base_id(&base_type) else {

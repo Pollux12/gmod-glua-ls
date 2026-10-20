@@ -5075,3 +5075,58 @@ end
         }
     }
 }
+
+#[cfg(test)]
+mod define_baseclass_local_test {
+    use glua_parser::{LuaAstNode, LuaExpr, LuaNameExpr};
+
+    use crate::{Emmyrc, LuaType, VirtualWorkspace};
+
+    /// `BaseClass.X` that only a subclass defines does not retype the local.
+    #[test]
+    fn a_member_only_a_subclass_defines_keeps_baseclass_on_the_named_base() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/entities/base_glide/sv_wheels.lua",
+            "function ENT:CreateWheel(offset) return 1 end
+",
+        );
+        let car = ws.def_file(
+            "lua/entities/base_glide_car/init.lua",
+            r#"
+            DEFINE_BASECLASS("base_glide")
+            function ENT:CreateWheel(offset)
+                local wheel = BaseClass.CreateWheel(self, offset)
+                return wheel
+            end
+            function ENT:TriggerInput(name)
+                BaseClass.TriggerInput(self, name)
+            end
+            "#,
+        );
+
+        let model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(car)
+            .expect("semantic model");
+        let mut types = model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter(|name| name.get_name_text().as_deref() == Some("BaseClass"))
+            .map(|name| {
+                ws.humanize_type(
+                    model
+                        .infer_expr(LuaExpr::NameExpr(name))
+                        .unwrap_or(LuaType::Unknown),
+                )
+            })
+            .collect::<Vec<_>>();
+        types.push(ws.humanize_type(ws.local_ty(car, "wheel")));
+
+        assert_eq!(types, ["base_glide", "base_glide", "1"]);
+    }
+}
