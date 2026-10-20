@@ -264,6 +264,10 @@ pub struct NetSendFlow {
     /// transaction is unknown. These flows are used for counterpart existence
     /// checks only; complete helper calls materialized at a call site are false.
     pub is_wrapped: bool,
+    /// True when the transaction calls a function it receives as a parameter,
+    /// such as a caller-supplied payload writer, so `writes` may be incomplete.
+    /// The flow still counts as a sender but is skipped by payload checks.
+    pub writes_opaque: bool,
     /// Definition-site flow replaced by this materialized call-site transaction.
     /// The index uses this to hide the definition as a duplicate sender while
     /// retaining it when no statically resolvable call site exists.
@@ -281,6 +285,7 @@ impl Hash for NetSendFlow {
             send_display_name,
             send_target,
             is_wrapped,
+            writes_opaque,
             materialized_from,
         } = self;
         message_name.hash(state);
@@ -291,6 +296,7 @@ impl Hash for NetSendFlow {
         send_display_name.hash(state);
         send_target.hash(state);
         is_wrapped.hash(state);
+        writes_opaque.hash(state);
         materialized_from.hash(state);
     }
 }
@@ -1134,6 +1140,7 @@ mod tests {
             send_display_name: SmolStr::new_static("net.Broadcast"),
             send_target: None,
             is_wrapped: false,
+            writes_opaque: false,
             materialized_from: None,
         }
     }

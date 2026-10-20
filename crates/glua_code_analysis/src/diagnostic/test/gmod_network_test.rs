@@ -3665,4 +3665,31 @@ mod tests {
             eq(true)
         );
     }
+
+    #[gtest]
+    fn test_send_calling_a_writer_parameter_is_not_counted_as_empty() {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(
+            "lua/autorun/client/cl_order.lua",
+            r#"
+            function SendOrder(writePayload)
+                net.Start("OrderPlaced")
+                writePayload()
+                net.SendToServer()
+            end
+            "#,
+        );
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_order.lua",
+            r#"
+            util.AddNetworkString("OrderPlaced")
+            net.Receive("OrderPlaced", function(len, ply)
+                local item = net.ReadString()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
 }

@@ -138,7 +138,7 @@ pub fn pair_senders_for_receive<'a>(
             // Pattern check is best-effort: when the receiver is opaque we
             // can't inspect its reads, so we accept all realm-matched
             // candidates rather than dropping all of them.
-            if receive_flow.reads_opaque {
+            if receive_flow.reads_opaque || send_flow.writes_opaque {
                 return true;
             }
             flows_can_match(send_flow, receive_flow)

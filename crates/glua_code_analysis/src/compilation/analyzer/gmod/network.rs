@@ -214,6 +214,9 @@ struct HelperSend {
     message: StringTemplate,
     /// The payload walk of each statement between the start and its end.
     stats: Vec<Vec<NetOpItem>>,
+    /// Whether a statement calls a function received as a parameter, whose
+    /// writes the body cannot show.
+    calls_param: bool,
     send: Option<(NetSendKind, Option<String>)>,
 }
 
@@ -222,6 +225,7 @@ impl Hash for HelperSend {
         crate::db_index::derivation::hash_local(&self.start_range, state);
         self.message.hash(state);
         self.stats.hash(state);
+        self.calls_param.hash(state);
         self.send.hash(state);
     }
 }
@@ -774,6 +778,7 @@ fn helper_sends(site: &NetFileSite<'_>, helper_block: &LuaBlock) -> Vec<HelperSe
             continue;
         }
 
+        let params = enclosing_param_names(&block);
         let stats = block.get_stats().collect::<Vec<_>>();
         for (index, stat) in stats.iter().enumerate() {
             let Some(start_call) = call_expr_from_stat(stat) else {
@@ -791,6 +796,7 @@ fn helper_sends(site: &NetFileSite<'_>, helper_block: &LuaBlock) -> Vec<HelperSe
             };
 
             let mut stat_items = Vec::new();
+            let mut calls_param = false;
             let mut send = None;
             for next_stat in stats.iter().skip(index + 1) {
                 if let Some(next_call) = call_expr_from_stat(next_stat) {
@@ -807,16 +813,32 @@ fn helper_sends(site: &NetFileSite<'_>, helper_block: &LuaBlock) -> Vec<HelperSe
                 let mut items = Vec::new();
                 op_items(site, &block, next_stat.syntax(), &mut items);
                 stat_items.push(items);
+                calls_param |= stat_calls_param(&block, next_stat, &params);
             }
             sends.push(HelperSend {
                 start_range: start_call.get_range(),
                 message,
                 stats: stat_items,
+                calls_param,
                 send,
             });
         }
     }
     sends
+}
+
+/// Whether `stat` calls one of `params` outside the closures it defines.
+fn stat_calls_param(block: &LuaBlock, stat: &LuaStat, params: &HashSet<String>) -> bool {
+    stat.syntax()
+        .descendants()
+        .filter_map(LuaCallExpr::cast)
+        .filter(|call_expr| !is_call_expr_in_nested_closure(block, call_expr))
+        .any(|call_expr| match call_expr.get_prefix_expr() {
+            Some(LuaExpr::NameExpr(name_expr)) => name_expr
+                .get_name_text()
+                .is_some_and(|name| params.contains(name.as_str())),
+            _ => false,
+        })
 }
 
 fn is_block_in_nested_closure(function_block: &LuaBlock, candidate_block: &LuaBlock) -> bool {
@@ -1249,6 +1271,8 @@ struct CachedSendBody {
     writes: Vec<NetOpEntry>,
     send_kind: NetSendKind,
     send_target: Option<String>,
+    /// Whether `writes` may miss what a caller-supplied function writes.
+    writes_opaque: bool,
     materialized_from: Option<crate::db_index::NetFlowOrigin>,
 }
 
@@ -1290,7 +1314,9 @@ fn collect_net_send_flow(
         None => resolve_helper_start_message(ctx, call_expr),
     }?;
 
+    let params = enclosing_param_names(block);
     let mut writes = Vec::new();
+    let mut writes_opaque = false;
     let mut send = None;
 
     for next_stat in stats_after(stat) {
@@ -1328,6 +1354,7 @@ fn collect_net_send_flow(
         }
 
         collect_net_write_ops_from_stat(ctx, block, &next_stat, &mut writes);
+        writes_opaque |= stat_calls_param(block, &next_stat, &params);
     }
 
     let (send_range, send_kind, send_target, send_display_name) = send?;
@@ -1340,8 +1367,19 @@ fn collect_net_send_flow(
         send_display_name,
         send_target,
         is_wrapped: false,
+        writes_opaque,
         materialized_from: None,
     })
+}
+
+/// The parameter names of every closure enclosing `block`.
+fn enclosing_param_names(block: &LuaBlock) -> HashSet<String> {
+    block
+        .syntax()
+        .ancestors()
+        .filter_map(LuaClosureExpr::cast)
+        .flat_map(|closure| get_closure_param_names(&closure))
+        .collect()
 }
 
 fn resolve_helper_start_message(
@@ -1496,6 +1534,7 @@ fn collect_wrapped_net_send_flow(
             send_display_name,
             send_target,
             is_wrapped: true,
+            writes_opaque: false,
             materialized_from: None,
         });
     }
@@ -1516,6 +1555,7 @@ fn collect_wrapped_net_send_flow(
         send_display_name: call_display_name(call_expr),
         send_target: None,
         is_wrapped: true,
+        writes_opaque: false,
         materialized_from: None,
     })
 }
@@ -1552,6 +1592,7 @@ fn collect_unannotated_net_wrapper_send_flows(
             send_display_name: display_name.clone(),
             send_target: body.send_target,
             is_wrapped: false,
+            writes_opaque: body.writes_opaque,
             materialized_from: body.materialized_from,
         })
         .collect()
@@ -1604,6 +1645,7 @@ fn helper_send_body(
             writes,
             send_kind,
             send_target,
+            writes_opaque: send.calls_param,
             materialized_from: Some(crate::db_index::NetFlowOrigin {
                 file_id: helper_id.file_id,
                 start_range: send.start_range,
