@@ -371,4 +371,40 @@ mod tests {
             assert!(index.get_inferred_param(&signature, 0).is_none());
         }
     }
+
+    /// Each fork completes a different call site, so neither fork's own fold
+    /// moves, while the merged evidence is complete.
+    #[test]
+    fn task_forks_completing_different_call_sites_publish_the_merged_type() {
+        use crate::db_index::cow_shards::TaskFork;
+        let signature = signature_id(FileId { id: 1 }, 0);
+        let (left, right) = (FileId { id: 2 }, FileId { id: 3 });
+        let mut frozen = CallSiteParamIndex::new();
+        frozen.set_call_contributions(left, call(0, 10), vec![(signature, 0, None)]);
+        frozen.set_call_contributions(right, call(0, 10), vec![(signature, 0, None)]);
+        let mut left_fork = frozen.task_fork();
+        let mut right_fork = frozen.task_fork();
+        set_call(
+            &mut left_fork,
+            left,
+            call(0, 10),
+            vec![(signature, 0, LuaType::Nil)],
+        );
+        set_call(
+            &mut right_fork,
+            right,
+            call(0, 10),
+            vec![(signature, 0, LuaType::Nil)],
+        );
+        for reverse in [false, true] {
+            let mut index = frozen.clone();
+            let tasks = if reverse {
+                vec![(0, right_fork.clone()), (1, left_fork.clone())]
+            } else {
+                vec![(0, left_fork.clone()), (1, right_fork.clone())]
+            };
+            assert!(index.install_tasks(&frozen, tasks).is_empty());
+            assert_eq!(index.get_inferred_param(&signature, 0), Some(&LuaType::Nil));
+        }
+    }
 }

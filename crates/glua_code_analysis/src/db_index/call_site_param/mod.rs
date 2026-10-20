@@ -313,7 +313,47 @@ impl CallSiteParamIndex {
                 self.contributors
                     .both_changed_keys(&frozen.contributors, &fork.contributors),
             )
+            .chain(self.slots_with_evidence_changed_on_both_sides(frozen, fork))
             .collect()
+    }
+
+    /// The slots `fork` changed a contributing file of while `self` changed
+    /// another: neither side's own fold read both changes, so a fold that
+    /// moved on neither side can still move once both land.
+    fn slots_with_evidence_changed_on_both_sides(
+        &self,
+        frozen: &Self,
+        fork: &Self,
+    ) -> Vec<ParamSlot> {
+        let changed_here = |file_id: &FileId| match (
+            self.file_contributions.get(file_id),
+            frozen.file_contributions.get(file_id),
+        ) {
+            (Some(now), Some(before)) => !Arc::ptr_eq(now, before),
+            (None, None) => false,
+            _ => true,
+        };
+        let mut slots = Vec::new();
+        for file_id in CowShards::changed_keys(&frozen.file_contributions, &fork.file_contributions)
+        {
+            for held in [frozen, fork]
+                .into_iter()
+                .filter_map(|index| index.file_contributions.get(&file_id))
+            {
+                for contribution in held.sources.values().flatten() {
+                    let slot = (contribution.signature_id, contribution.param_idx);
+                    let other_changed = [self, frozen]
+                        .into_iter()
+                        .filter_map(|index| index.contributors.get(&slot))
+                        .flatten()
+                        .any(|(other, _)| *other != file_id && changed_here(other));
+                    if other_changed {
+                        slots.push(slot);
+                    }
+                }
+            }
+        }
+        slots
     }
 
     /// Re-folds `slots` from their contributors' evidence, in file order and
