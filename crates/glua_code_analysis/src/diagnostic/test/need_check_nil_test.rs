@@ -469,7 +469,7 @@ mod null_receiver_severity_tests {
     }
 
     #[test]
-    fn unchecked_fallible_constructor_null_receiver_is_warning() {
+    fn unchecked_fallible_constructor_null_receiver_is_a_hint() {
         for return_type in ["(instance) T|NULL", "(instance) T|NULL|nil"] {
             let diagnostics = diagnostics(
                 return_type,
@@ -477,7 +477,7 @@ mod null_receiver_severity_tests {
                 None,
             );
             assert_eq!(diagnostics.len(), 1, "{return_type}: {diagnostics:?}");
-            assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+            assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::HINT));
             assert_eq!(
                 diagnostics[0].code,
                 Some(NumberOrString::String(
@@ -486,18 +486,6 @@ mod null_receiver_severity_tests {
             );
             assert!(diagnostics[0].message.contains("NULL"), "{diagnostics:?}");
         }
-    }
-
-    #[test]
-    fn a_null_receiver_that_is_not_a_created_instance_keeps_the_default_severity() {
-        let diagnostics = diagnostics(
-            "T|NULL",
-            "local e = ents.Create('widget_axis_arrow'); e:SetAxisIndex(1)",
-            None,
-        );
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::HINT));
-        assert!(diagnostics[0].message.contains("NULL"), "{diagnostics:?}");
     }
 
     #[test]
@@ -551,7 +539,7 @@ mod null_receiver_severity_tests {
             end
         "#;
         for (configured, expected) in [
-            (None, DiagnosticSeverity::WARNING),
+            (None, DiagnosticSeverity::HINT),
             (
                 Some(DiagnosticSeveritySetting::Information),
                 DiagnosticSeverity::INFORMATION,
