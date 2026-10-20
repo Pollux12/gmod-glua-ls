@@ -456,8 +456,8 @@ fn check_index_expr(
     if matches!(
         code,
         DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
-    ) && let Some(children) = class_union_partial_arms(semantic_model, &prefix_typ, index_expr)
-        .or_else(|| {
+    ) && let Some(children) =
+        class_union_partial_arms(semantic_model, state, &prefix_typ, index_expr).or_else(|| {
             crate::compilation::analyzer::unguarded_child_candidates(
                 db,
                 &mut semantic_model.get_cache().borrow_mut(),
@@ -612,16 +612,31 @@ fn class_union_arms_with_member(
     ))
 }
 
-/// The arms of a class union receiver that have the member `index_expr` reads,
-/// when some but not all of them do.
+/// The classes a read through a class union receiver needs a guard to narrow
+/// to, when some of its arms lack the member `index_expr` reads.
 fn class_union_partial_arms(
     semantic_model: &SemanticModel,
+    state: &mut CheckFieldState,
     prefix_typ: &LuaType,
     index_expr: &LuaIndexExpr,
 ) -> Option<Vec<LuaTypeDeclId>> {
-    let arms = crate::compilation::analyzer::class_union_arms(semantic_model.get_db(), prefix_typ)?;
-    let with_member = class_union_arms_with_member(semantic_model, &arms, index_expr)?;
-    (!with_member.is_empty() && with_member.len() < arms.len()).then_some(with_member)
+    let db = semantic_model.get_db();
+    let arms = crate::compilation::analyzer::class_union_arms(db, prefix_typ)?;
+    let mut cache = semantic_model.get_cache().borrow_mut();
+    let index_key = index_expr.get_index_key()?;
+    if LuaMemberKey::index_key_is_dynamic(db, &mut cache, &index_key) {
+        return None;
+    }
+    let member_key = LuaMemberKey::from_index_key(db, &mut cache, &index_key).ok()?;
+    crate::compilation::analyzer::class_union_partial_arms(
+        db,
+        &mut cache,
+        &mut state.subtypes_with_member,
+        &arms,
+        &member_key,
+        semantic_model.get_file_id(),
+        index_expr,
+    )
 }
 
 fn is_invalid_prefix_type(typ: &LuaType) -> bool {

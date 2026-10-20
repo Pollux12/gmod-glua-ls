@@ -5130,3 +5130,79 @@ mod define_baseclass_local_test {
         assert_eq!(types, ["base_glide", "base_glide", "1"]);
     }
 }
+
+#[cfg(test)]
+mod covered_union_arm_test {
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+
+    fn unguarded_reads(receiver_type: &str) -> Vec<String> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/includes/owner_api.lua",
+            r#"
+            ---@class Entity
+            local Entity = {}
+            ---@class NPC: Entity
+            local NPC = {}
+            ---@class Player: Entity
+            local Player = {}
+            ---@class Weapon: Entity
+            local Weapon = {}
+            ---@return number
+            function NPC:GetShootPos() end
+            ---@return number
+            function Player:GetShootPos() end
+            "#,
+        );
+        let file = ws.def_file(
+            "lua/weapons/weapon_knife/shared.lua",
+            &format!(
+                r#"
+                ---@param owner {receiver_type}
+                local function aim(owner)
+                    return owner:GetShootPos()
+                end
+                "#
+            ),
+        );
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::InferUnguardedChild);
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::InferUnguardedChild.get_name().to_string(),
+        ));
+        ws.analysis
+            .diagnose_file(file, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .map(|diagnostic| diagnostic.message)
+            .collect()
+    }
+
+    /// `Entity|NPC` can be any `Entity`, so a `Player` is as likely to hold the member.
+    #[test]
+    fn a_covered_arm_names_the_descendants_of_the_arm_covering_it() {
+        let reads = unguarded_reads("Entity|NPC");
+
+        assert_eq!(reads.len(), 1, "{reads:?}");
+        assert!(
+            reads[0].contains("`NPC`") && reads[0].contains("`Player`"),
+            "{reads:?}"
+        );
+    }
+
+    #[test]
+    fn unrelated_class_arms_name_only_the_arm_with_the_member() {
+        let reads = unguarded_reads("Weapon|NPC");
+
+        assert_eq!(reads.len(), 1, "{reads:?}");
+        assert!(!reads[0].contains("`Player`"), "{reads:?}");
+    }
+}

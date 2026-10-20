@@ -622,6 +622,7 @@ struct UnionArmEvidence<'a> {
     decl_id: crate::LuaDeclId,
     base_type: &'a LuaType,
     arms: &'a [LuaTypeDeclId],
+    subtypes_with_member: &'a mut SubtypesWithMember,
     scores: &'a mut HashMap<LuaDefinitionId, UnguardedChildCandidates>,
     sources: &'a mut HashMap<(LuaDefinitionId, crate::LuaTypeDeclId), ChildSource>,
     found_types: &'a mut HashMap<InFiled<glua_parser::LuaSyntaxId>, LuaType>,
@@ -650,17 +651,17 @@ impl UnionArmEvidence<'_> {
         let Ok(member_key) = LuaMemberKey::from_index_key(db, cache, &index_key) else {
             return;
         };
-        let with_member = class_union_arms_with_member(
+        let Some(with_member) = class_union_partial_arms(
             db,
             cache,
+            self.subtypes_with_member,
             self.arms,
             &member_key,
             self.file_id,
-            index_expr.get_position(),
-        );
-        if with_member.is_empty() || with_member.len() == self.arms.len() {
+            index_expr,
+        ) else {
             return;
-        }
+        };
         if member_path_assigned_before(db, cache, self.flow_tree, index_expr) {
             return;
         }
@@ -1193,6 +1194,7 @@ fn collect_unguarded_child_file(
                     decl_id,
                     base_type: &base_type,
                     arms: &arms,
+                    subtypes_with_member: &mut subtypes_with_member,
                     scores: &mut scores,
                     sources: &mut sources,
                     found_types: &mut found_types,
@@ -2222,6 +2224,58 @@ pub(crate) fn class_union_arms_with_member(
         })
         .cloned()
         .collect()
+}
+
+/// The classes a read of `member_key` through the class union `arms` needs a
+/// guard to narrow to, when some arms lack it: the arms with it, plus the
+/// descendants with it of an arm without it that covers one of them, since
+/// `Entity|NPC` reading `GetShootPos` can as well be a `Player`.
+pub(crate) fn class_union_partial_arms(
+    db: &crate::DbIndex,
+    cache: &mut LuaInferCache,
+    memo: &mut SubtypesWithMember,
+    arms: &[LuaTypeDeclId],
+    member_key: &LuaMemberKey,
+    file_id: crate::FileId,
+    index_expr: &LuaIndexExpr,
+) -> Option<Vec<LuaTypeDeclId>> {
+    let position = index_expr.get_position();
+    let mut children = class_union_arms_with_member(db, cache, arms, member_key, file_id, position);
+    if children.is_empty() || children.len() == arms.len() {
+        return None;
+    }
+    let covering_arms = arms
+        .iter()
+        .filter(|arm| {
+            !children.contains(arm)
+                && children
+                    .iter()
+                    .any(|child| crate::semantic::is_sub_type_of(db, child, arm))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let indexed_into = member_path_parent(index_expr).is_some();
+    for arm in &covering_arms {
+        let Some(descendants) =
+            nearest_subtypes_with_member(db, cache, memo, arm, member_key, indexed_into, None)
+        else {
+            continue;
+        };
+        for descendant in descendants.iter() {
+            if !children.contains(descendant)
+                && child_member_visible_at(db, cache, descendant, member_key, file_id, position)
+                    .unwrap_or(false)
+            {
+                children.push(descendant.clone());
+            }
+        }
+    }
+    children.sort_by(|left, right| {
+        left.get_name()
+            .cmp(right.get_name())
+            .then_with(|| left.stable_cmp(right))
+    });
+    Some(children)
 }
 
 fn unguarded_child_base_id(typ: &LuaType) -> Option<LuaTypeDeclId> {
