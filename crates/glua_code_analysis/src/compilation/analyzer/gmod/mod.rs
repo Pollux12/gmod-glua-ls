@@ -460,7 +460,15 @@ impl HelperRegistry {
     }
 }
 
-type IndexedHelperDefinition = (LuaSignatureId, FileId, LuaSyntaxId, Option<GlobalId>);
+/// A helper body: its signature, where it is, the global it defines, and the
+/// member it is stored under on a table with no global root.
+type IndexedHelperDefinition = (
+    LuaSignatureId,
+    FileId,
+    LuaSyntaxId,
+    Option<GlobalId>,
+    Option<SmolStr>,
+);
 
 /// One file's contribution to the gmod call roles and net-helper registry.
 pub(crate) struct FileHelperScan {
@@ -473,8 +481,13 @@ impl crate::db_index::derivation::DerivedFact for FileHelperScan {
         let definitions = self
             .definitions
             .iter()
-            .map(|(signature_id, file_id, syntax_id, global)| {
-                (signature_id, InFiled::new(*file_id, *syntax_id), global)
+            .map(|(signature_id, file_id, syntax_id, global, member)| {
+                (
+                    signature_id,
+                    InFiled::new(*file_id, *syntax_id),
+                    global,
+                    member,
+                )
             })
             .collect::<Vec<_>>();
         crate::db_index::derivation::fingerprint_of(&(self.role_map.fingerprint(), definitions))
@@ -639,11 +652,16 @@ impl HelperRegistryBuilder {
                 let path = path.strip_prefix("_G.").unwrap_or(&path);
                 GlobalId::new(path)
             });
+        let local_member = global_id
+            .is_none()
+            .then(|| closure_member_name(&closure))
+            .flatten();
         self.definitions.push((
             signature_id,
             file_id,
             LuaSyntaxId::from_node(block.syntax()),
             global_id,
+            local_member,
         ));
     }
 }
@@ -734,6 +752,24 @@ fn closure_declared_name(closure: &LuaClosureExpr) -> Option<SmolStr> {
             .map(|token| SmolStr::new(token.get_name_text()));
     }
     None
+}
+
+/// The member `closure` is stored under when written as `X.name` or `X:name`.
+fn closure_member_name(closure: &LuaClosureExpr) -> Option<SmolStr> {
+    let var_expr = if let Some(func_stat) = closure.get_parent::<LuaFuncStat>() {
+        func_stat.get_func_name()?
+    } else {
+        let assign_stat = closure.get_parent::<LuaAssignStat>()?;
+        let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
+        let idx = value_exprs
+            .iter()
+            .position(|expr| expr.get_position() == closure.get_position())?;
+        vars.get(idx)?.clone()
+    };
+    match var_expr {
+        LuaVarExpr::IndexExpr(_) => var_expr_written_name(&var_expr),
+        LuaVarExpr::NameExpr(_) => None,
+    }
 }
 
 fn var_expr_written_name(var_expr: &LuaVarExpr) -> Option<SmolStr> {
@@ -829,8 +865,8 @@ pub(super) fn net_producing_function_names(
 }
 
 /// One file's contribution for a set of reference sites: the written name of
-/// each site's innermost enclosing closure, and that closure's local binding
-/// when it has one.
+/// each site's innermost named enclosing closure, past the callbacks it
+/// defines, and that closure's local binding when it has one.
 ///
 fn expand_sites(db: &DbIndex, file_id: FileId, sites: &[LuaSyntaxId]) -> NetNameExpansion {
     let mut expansion = NetNameExpansion::default();
@@ -847,10 +883,11 @@ fn expand_sites(db: &DbIndex, file_id: FileId, sites: &[LuaSyntaxId]) -> NetName
         let Some(node) = syntax_id.to_node_from_root(&root) else {
             continue;
         };
-        let Some(closure) = node.ancestors().find_map(LuaClosureExpr::cast) else {
-            continue;
-        };
-        let Some(name) = closure_declared_name(&closure) else {
+        let Some((closure, name)) = node
+            .ancestors()
+            .filter_map(LuaClosureExpr::cast)
+            .find_map(|closure| closure_declared_name(&closure).map(|name| (closure, name)))
+        else {
             continue;
         };
         if let Some(decl_id) = closure_local_decl_id(file_id, &closure) {

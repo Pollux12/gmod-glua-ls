@@ -3666,6 +3666,191 @@ mod tests {
         );
     }
 
+    const PANEL_HELPER_PATH: &str = "gamemodes/cityrp/gamemode/core/libraries/cl_panel_net.lua";
+    const PANEL_CALLER_PATH: &str = "gamemodes/cityrp/plugins/deco/derma/cl_store.lua";
+
+    fn method_helper_receiver_realms(helper: &str, call: &str) -> Vec<GmodRealm> {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(PANEL_HELPER_PATH, helper);
+        let client_file_id = ws.def_file(PANEL_CALLER_PATH, call);
+        ws.get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(client_file_id)
+            .map(|data| {
+                data.send_flows
+                    .iter()
+                    .filter(|flow| flow.message_name == "deco_orderadd")
+                    .map(|flow| flow.send_kind.receiver_realm)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[gtest]
+    fn test_dot_defined_helper_called_as_method_binds_receiver_first() {
+        let realms = method_helper_receiver_realms(
+            r#"
+            PanelNet = {}
+            PanelNet.NetMessage = function(pnl, name)
+                net.Start(name)
+                net.SendToServer()
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd")
+            "#,
+        );
+        expect_that!(realms, elements_are![eq(&GmodRealm::Server)]);
+    }
+
+    #[gtest]
+    fn test_colon_defined_helper_called_with_explicit_receiver_binds_self() {
+        let realms = method_helper_receiver_realms(
+            r#"
+            PanelNet = {}
+            function PanelNet:NetMessage(name)
+                net.Start(name)
+                net.SendToServer()
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            PanelNet.NetMessage(button, "deco_orderadd")
+            "#,
+        );
+        expect_that!(realms, elements_are![eq(&GmodRealm::Server)]);
+    }
+
+    #[gtest]
+    fn test_helper_stored_on_local_table_resolves_as_method() {
+        let realms = method_helper_receiver_realms(
+            r#"
+            local classes = {}
+            classes.NetMessage = function(pnl, name)
+                net.Start(name)
+                net.SendToServer()
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd")
+            "#,
+        );
+        expect_that!(realms, elements_are![eq(&GmodRealm::Server)]);
+    }
+
+    #[gtest]
+    fn test_helper_sending_from_click_handler_counts_as_client_send() {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(
+            PANEL_HELPER_PATH,
+            r#"
+            local classes = {}
+            classes.On = function(pnl, name, fn)
+                pnl[name] = fn
+            end
+            classes.NetMessage = function(pnl, name, data)
+                pnl:On("DoClick", function()
+                    net.Start(name)
+                    data(pnl)
+                    net.SendToServer()
+                end)
+            end
+            "#,
+        );
+        ws.def_file(
+            PANEL_CALLER_PATH,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", function() end)
+            "#,
+        );
+        let server_file_id = ws.def_file(
+            "gamemodes/cityrp/plugins/deco/sv_plugin.lua",
+            r#"
+            util.AddNetworkString("deco_orderadd")
+            net.Receive("deco_orderadd", function(len, ply) end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(
+            count_diagnostic(
+                &diagnostics,
+                DiagnosticCode::GmodNetMissingNetworkCounterpart
+            ),
+            eq(0usize)
+        );
+    }
+
+    #[gtest]
+    fn test_click_handler_parameter_shadowing_helper_parameter_does_not_bind() {
+        let realms = method_helper_receiver_realms(
+            r#"
+            local classes = {}
+            classes.On = function(pnl, name, fn)
+                pnl[name] = fn
+            end
+            classes.NetMessage = function(pnl, name)
+                pnl:On("DoClick", function(name)
+                    net.Start(name)
+                    net.SendToServer()
+                end)
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd")
+            "#,
+        );
+        expect_that!(realms, is_empty());
+    }
+
+    #[gtest]
+    fn test_helper_payload_written_by_caller_callback_is_not_counted_as_empty() {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(
+            PANEL_HELPER_PATH,
+            r#"
+            local classes = {}
+            classes.On = function(pnl, name, fn)
+                pnl[name] = fn
+            end
+            classes.NetMessage = function(pnl, name, data)
+                pnl:On("DoClick", function()
+                    net.Start(name)
+                    data(pnl)
+                    net.SendToServer()
+                end)
+            end
+            "#,
+        );
+        ws.def_file(
+            PANEL_CALLER_PATH,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", function()
+                net.WriteString("chair")
+                net.WriteUInt(2, 16)
+            end)
+            "#,
+        );
+        let server_file_id = ws.def_file(
+            "gamemodes/cityrp/plugins/deco/sv_plugin.lua",
+            r#"
+            util.AddNetworkString("deco_orderadd")
+            net.Receive("deco_orderadd", function(len, ply)
+                local item = net.ReadString()
+                local quantity = net.ReadUInt(16)
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
     #[gtest]
     fn test_send_calling_a_writer_parameter_is_not_counted_as_empty() {
         let mut ws = new_gmod_workspace();

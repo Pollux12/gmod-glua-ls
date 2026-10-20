@@ -136,16 +136,27 @@ fn resolve_arg(
 }
 
 /// The helper's parameters bound to the call's arguments that resolve to a
-/// string under the caller's own bindings.
+/// string under the caller's own bindings. A colon call passes its receiver
+/// first and a colon definition takes it as `self`, so either side may hold
+/// one slot the other writes out.
 fn helper_bindings(
-    params: &[Option<String>],
+    helper: &NetHelper,
     args: &[Option<StringTemplate>],
+    colon_call: bool,
     caller_bindings: &HashMap<String, String>,
 ) -> HashMap<String, String> {
-    params
+    helper
+        .params
         .iter()
-        .zip(args)
-        .filter_map(|(param, arg)| Some((param.clone()?, arg.as_ref()?.resolve(caller_bindings)?)))
+        .enumerate()
+        .filter_map(|(param_idx, param)| {
+            let arg_idx = (param_idx + usize::from(helper.colon_define))
+                .checked_sub(usize::from(colon_call))?;
+            Some((
+                param.clone()?,
+                args.get(arg_idx)?.as_ref()?.resolve(caller_bindings)?,
+            ))
+        })
         .collect()
 }
 
@@ -200,6 +211,8 @@ struct HelperCall {
     role: Option<NetCallRole>,
     target: Option<HelperId>,
     args: Vec<Option<StringTemplate>>,
+    /// Whether the call is written with `:`, passing its receiver first.
+    colon_call: bool,
     /// A send's recipient snippet.
     send_target: Option<String>,
     /// A receive with a literal message name, already indexed where it is.
@@ -236,6 +249,8 @@ struct NetHelper {
     /// Each parameter, by position, named when the body's message or argument
     /// templates read it: a parameter nothing reads binds nothing.
     params: Vec<Option<String>>,
+    /// Whether the function is defined with `:`, taking its receiver as `self`.
+    colon_define: bool,
     /// Every call in the body, in document order.
     calls: Vec<HelperCall>,
     /// The payload walk of the whole body.
@@ -696,8 +711,14 @@ fn summarize_helper(
     calls.shrink_to_fit();
     ops.shrink_to_fit();
     sends.shrink_to_fit();
+    let colon_define = site
+        .db
+        .get_signature_index()
+        .get(&LuaSignatureId::from_closure(site.file_id, closure))
+        .is_some_and(|signature| signature.is_colon_define);
     NetHelper {
         params,
+        colon_define,
         calls,
         ops,
         sends,
@@ -741,6 +762,7 @@ fn summarize_helper_call(
         role,
         target,
         args: Vec::new(),
+        colon_call: call_expr.is_colon_call(),
         send_target: None,
         literal_receive: false,
         receive_reads: NetReceiveReads::default(),
@@ -768,16 +790,18 @@ fn summarize_helper_call(
     call
 }
 
-/// The start-to-send transactions written in `helper_block`'s own blocks.
+/// The `net.Start` .. send transactions in a helper body. A callback the helper
+/// defines, such as a click handler, sends once it runs: its transactions
+/// count when the helper's own parameters name the message, since a literal
+/// name is already indexed where it is written.
 fn helper_sends(site: &NetFileSite<'_>, helper_block: &LuaBlock) -> Vec<HelperSend> {
     let mut sends = Vec::new();
     for block in helper_block.descendants::<LuaBlock>() {
-        if block.syntax() != helper_block.syntax()
-            && is_block_in_nested_closure(helper_block, &block)
-        {
-            continue;
-        }
-
+        let callbacks = closures_between(helper_block, &block);
+        let callback_params = callbacks
+            .iter()
+            .flat_map(get_closure_param_names)
+            .collect::<HashSet<_>>();
         let params = enclosing_param_names(&block);
         let stats = block.get_stats().collect::<Vec<_>>();
         for (index, stat) in stats.iter().enumerate() {
@@ -794,6 +818,12 @@ fn helper_sends(site: &NetFileSite<'_>, helper_block: &LuaBlock) -> Vec<HelperSe
             else {
                 continue;
             };
+            if !callbacks.is_empty()
+                && (message.names().next().is_none()
+                    || message.names().any(|name| callback_params.contains(name)))
+            {
+                continue;
+            }
 
             let mut stat_items = Vec::new();
             let mut calls_param = false;
@@ -841,12 +871,14 @@ fn stat_calls_param(block: &LuaBlock, stat: &LuaStat, params: &HashSet<String>) 
         })
 }
 
-fn is_block_in_nested_closure(function_block: &LuaBlock, candidate_block: &LuaBlock) -> bool {
+/// The closures between `function_block` and `candidate_block`, innermost first.
+fn closures_between(function_block: &LuaBlock, candidate_block: &LuaBlock) -> Vec<LuaClosureExpr> {
     candidate_block
         .syntax()
         .ancestors()
         .take_while(|node| node != function_block.syntax())
-        .any(|node| LuaClosureExpr::can_cast(node.kind().into()))
+        .filter_map(LuaClosureExpr::cast)
+        .collect()
 }
 
 /// The payload walk of `subtree`, in argument-first evaluation order, with
@@ -1388,13 +1420,22 @@ fn resolve_helper_start_message(
 ) -> Option<String> {
     let target = ctx.site.target(call_expr)?;
     let args = arg_templates(call_expr);
-    helper_start_message(ctx, target, &args, &HashMap::default(), &mut Vec::new()).0
+    helper_start_message(
+        ctx,
+        target,
+        &args,
+        call_expr.is_colon_call(),
+        &HashMap::default(),
+        &mut Vec::new(),
+    )
+    .0
 }
 
 fn helper_start_message(
     ctx: &mut NetCollectCtx<'_>,
     helper_id: HelperId,
     args: &[Option<StringTemplate>],
+    colon_call: bool,
     caller_bindings: &HashMap<String, String>,
     stack: &mut Vec<HelperId>,
 ) -> (Option<String>, usize) {
@@ -1404,7 +1445,7 @@ fn helper_start_message(
         return (None, NO_CYCLE);
     }
     let helper = ctx.helper(&helper_id);
-    let bindings = helper_bindings(&helper.params, args, caller_bindings);
+    let bindings = helper_bindings(&helper, args, colon_call, caller_bindings);
     let cache_key = (helper_id, sorted_bindings(&bindings));
     if let Some(cached) = ctx.memo.start_message.get(&cache_key) {
         return (cached.clone(), NO_CYCLE);
@@ -1429,8 +1470,14 @@ fn helper_start_message(
                 let Some(target) = &call.target else {
                     continue;
                 };
-                let (nested_message, nested_low) =
-                    helper_start_message(ctx, target.clone(), &call.args, &bindings, stack);
+                let (nested_message, nested_low) = helper_start_message(
+                    ctx,
+                    target.clone(),
+                    &call.args,
+                    call.colon_call,
+                    &bindings,
+                    stack,
+                );
                 low = low.min(nested_low);
                 if let Some(message) = nested_message {
                     messages.push(message);
@@ -1578,7 +1625,14 @@ fn collect_unannotated_net_wrapper_send_flows(
         return Vec::new();
     };
     let args = arg_templates(call_expr);
-    let (bodies, _) = helper_send_body(ctx, target, &args, &HashMap::default(), &mut Vec::new());
+    let (bodies, _) = helper_send_body(
+        ctx,
+        target,
+        &args,
+        call_expr.is_colon_call(),
+        &HashMap::default(),
+        &mut Vec::new(),
+    );
     let origin_range = call_expr.get_range();
     let display_name = call_display_name(call_expr);
     bodies
@@ -1604,11 +1658,12 @@ fn helper_send_body(
     ctx: &mut NetCollectCtx<'_>,
     helper_id: HelperId,
     args: &[Option<StringTemplate>],
+    colon_call: bool,
     caller_bindings: &HashMap<String, String>,
     stack: &mut Vec<HelperId>,
 ) -> (Vec<CachedSendBody>, usize) {
     let helper = ctx.helper(&helper_id);
-    let bindings = helper_bindings(&helper.params, args, caller_bindings);
+    let bindings = helper_bindings(&helper, args, colon_call, caller_bindings);
     let cache_key = (helper_id, sorted_bindings(&bindings));
     if let Some(cached) = ctx.memo.send_body.get(&cache_key) {
         return (cached.clone(), NO_CYCLE);
@@ -1663,8 +1718,14 @@ fn helper_send_body(
         let Some(target) = &call.target else {
             continue;
         };
-        let (nested_bodies, nested_low) =
-            helper_send_body(ctx, target.clone(), &call.args, &bindings, stack);
+        let (nested_bodies, nested_low) = helper_send_body(
+            ctx,
+            target.clone(),
+            &call.args,
+            call.colon_call,
+            &bindings,
+            stack,
+        );
         low = low.min(nested_low);
         bodies.extend(nested_bodies);
     }
@@ -1725,7 +1786,14 @@ fn collect_receive_flows_from_helper_call(
         return;
     };
     let args = arg_templates(call_expr);
-    let (bodies, _) = helper_receive_body(ctx, target, &args, &HashMap::default(), &mut Vec::new());
+    let (bodies, _) = helper_receive_body(
+        ctx,
+        target,
+        &args,
+        call_expr.is_colon_call(),
+        &HashMap::default(),
+        &mut Vec::new(),
+    );
     let origin_range = call_expr.get_range();
     for body in bodies {
         flows.push(NetReceiveFlow {
@@ -1744,11 +1812,12 @@ fn helper_receive_body(
     ctx: &mut NetCollectCtx<'_>,
     helper_id: HelperId,
     args: &[Option<StringTemplate>],
+    colon_call: bool,
     caller_bindings: &HashMap<String, String>,
     stack: &mut Vec<HelperId>,
 ) -> (Vec<CachedReceiveBody>, usize) {
     let helper = ctx.helper(&helper_id);
-    let bindings = helper_bindings(&helper.params, args, caller_bindings);
+    let bindings = helper_bindings(&helper, args, colon_call, caller_bindings);
     let cache_key = (helper_id, sorted_bindings(&bindings));
     if let Some(cached) = ctx.memo.receive_body.get(&cache_key) {
         return (cached.clone(), NO_CYCLE);
@@ -1790,8 +1859,14 @@ fn helper_receive_body(
                 let Some(target) = &call.target else {
                     continue;
                 };
-                let (nested_bodies, nested_low) =
-                    helper_receive_body(ctx, target.clone(), &call.args, &bindings, stack);
+                let (nested_bodies, nested_low) = helper_receive_body(
+                    ctx,
+                    target.clone(),
+                    &call.args,
+                    call.colon_call,
+                    &bindings,
+                    stack,
+                );
                 low = low.min(nested_low);
                 bodies.extend(nested_bodies);
             }

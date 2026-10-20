@@ -129,7 +129,7 @@ impl Contributions {
             *self.environment_files.entry(*file).or_default() += 1;
             touched.environment_files.insert(*file);
         }
-        for (signature_id, body_file, syntax_id, global_id) in &scan.definitions {
+        for (signature_id, body_file, syntax_id, global_id, local_member) in &scan.definitions {
             let name = global_id
                 .as_ref()
                 .map(|id| id.get_name().to_string())
@@ -148,16 +148,20 @@ impl Contributions {
                 .or_default()
                 .push(definition.clone());
             touched.signatures.insert(*signature_id);
-            let Some(global_id) = global_id else {
-                continue;
-            };
-            if let Some(method) = method_name(global_id) {
+            if let Some(method) = global_id
+                .as_ref()
+                .and_then(method_name)
+                .or(local_member.clone())
+            {
                 self.methods
                     .entry(method.clone())
                     .or_default()
                     .push(definition.clone());
                 touched.methods.insert(method);
             }
+            let Some(global_id) = global_id else {
+                continue;
+            };
             self.globals
                 .entry(global_id.clone())
                 .or_default()
@@ -202,16 +206,20 @@ impl Contributions {
             touched.environment_files.insert(*file);
         }
         let other_file = |(_, (body_file, _)): &(DefinitionRank, Target)| *body_file != file_id;
-        for (signature_id, _, _, global_id) in &scan.definitions {
+        for (signature_id, _, _, global_id, local_member) in &scan.definitions {
             retract(&mut self.signatures, signature_id, other_file);
             touched.signatures.insert(*signature_id);
-            let Some(global_id) = global_id else {
-                continue;
-            };
-            if let Some(method) = method_name(global_id) {
+            if let Some(method) = global_id
+                .as_ref()
+                .and_then(method_name)
+                .or(local_member.clone())
+            {
                 retract(&mut self.methods, &method, other_file);
                 touched.methods.insert(method);
             }
+            let Some(global_id) = global_id else {
+                continue;
+            };
             retract(&mut self.globals, global_id, other_file);
             touched.globals.insert(global_id.clone());
         }
