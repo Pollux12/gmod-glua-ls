@@ -4029,36 +4029,170 @@ mod tests {
         expect_that!(diagnostics, eq(0usize));
     }
 
-    #[gtest]
-    fn test_receive_reading_through_a_reader_parameter_is_not_counted_as_empty() {
-        let mut ws = new_gmod_workspace();
-        let server_file_id = ws.def_file(
-            "lua/autorun/server/sv_listen.lua",
-            r#"
+    const LISTEN_HELPER: &str = r#"
             function Listen(name, reader)
                 net.Receive(name, function(len, ply)
                     reader(ply)
                 end)
             end
+            "#;
+
+    const ORDER_SENDER: &str = r#"
+            net.Start("OrderPlaced")
+            net.WriteString("chair")
+            net.SendToServer()
+            "#;
+
+    /// The network diagnostics across the files once `helper`, `caller` and a
+    /// client sending `OrderPlaced` with one string are loaded, and the reads
+    /// and opacity of the caller's `OrderPlaced` receive flows.
+    fn order_listen_check(helper: &str, caller: &str) -> (usize, Vec<(Vec<String>, bool)>) {
+        let mut ws = new_gmod_workspace();
+        let helper_file_id = ws.def_file("lua/autorun/server/sv_listen.lua", helper);
+        let caller_file_id = ws.def_file("lua/autorun/server/sv_orders.lua", caller);
+        let client_file_id = ws.def_file("lua/autorun/client/cl_order.lua", ORDER_SENDER);
+        let diagnostics = [helper_file_id, caller_file_id, client_file_id]
+            .into_iter()
+            .map(|file_id| count_network_diagnostics(&file_diagnostics(&mut ws, file_id)))
+            .sum::<usize>();
+        let reads = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(caller_file_id)
+            .map(|data| {
+                data.receive_flows
+                    .iter()
+                    .filter(|flow| flow.message_name == "OrderPlaced")
+                    .map(|flow| {
+                        let reads = flow
+                            .reads
+                            .iter()
+                            .map(|read| read.op.wire_format.as_str().to_string())
+                            .collect();
+                        (reads, flow.reads_opaque)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (diagnostics, reads)
+    }
+
+    #[gtest]
+    fn test_receive_reading_through_a_passed_reader_is_checked() {
+        let (diagnostics, reads) = order_listen_check(
+            LISTEN_HELPER,
+            r#"
             Listen("OrderPlaced", function(ply)
                 local item = net.ReadString()
             end)
             "#,
         );
-        let client_file_id = ws.def_file(
-            "lua/autorun/client/cl_order.lua",
+        expect_that!(diagnostics, eq(0usize));
+        expect_that!(
+            reads,
+            elements_are![eq(&(vec!["string".to_string()], false))]
+        );
+    }
+
+    #[gtest]
+    fn test_receive_reading_through_a_passed_reader_reports_a_mismatch() {
+        let (diagnostics, reads) = order_listen_check(
+            LISTEN_HELPER,
             r#"
-            net.Start("OrderPlaced")
-            net.WriteString("chair")
-            net.SendToServer()
+            Listen("OrderPlaced", function(ply)
+                local item = net.ReadString()
+                local quantity = net.ReadUInt(16)
+            end)
             "#,
         );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(
+            reads,
+            elements_are![eq(&(vec!["string".to_string(), "uint".to_string()], false))]
+        );
+    }
 
-        let diagnostics = [server_file_id, client_file_id]
-            .into_iter()
-            .map(|file_id| count_network_diagnostics(&file_diagnostics(&mut ws, file_id)))
-            .sum::<usize>();
+    #[gtest]
+    fn test_receive_reading_through_a_named_local_reader_is_checked() {
+        let (diagnostics, reads) = order_listen_check(
+            LISTEN_HELPER,
+            r#"
+            local function readOrder(ply)
+                local item = net.ReadString()
+                local quantity = net.ReadUInt(16)
+            end
+            Listen("OrderPlaced", readOrder)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(
+            reads,
+            elements_are![eq(&(vec!["string".to_string(), "uint".to_string()], false))]
+        );
+    }
+
+    #[gtest]
+    fn test_receive_reading_through_an_unresolvable_reader_is_not_checked() {
+        let (diagnostics, reads) = order_listen_check(
+            LISTEN_HELPER,
+            r#"
+            local PANEL = {}
+            function PANEL:Init()
+                Listen("OrderPlaced", self.ReadOrder)
+            end
+            "#,
+        );
         expect_that!(diagnostics, eq(0usize));
+        expect_that!(reads, elements_are![eq(&(Vec::<String>::new(), true))]);
+    }
+
+    #[gtest]
+    fn test_reader_forwarded_through_two_helpers_is_checked() {
+        let (diagnostics, reads) = order_listen_check(
+            r#"
+            local function register(name, reader)
+                net.Receive(name, function(len, ply)
+                    reader(ply)
+                end)
+            end
+            function Listen(name, reader)
+                register(name, reader)
+            end
+            "#,
+            r#"
+            Listen("OrderPlaced", function(ply)
+                local item = net.ReadString()
+                local quantity = net.ReadUInt(16)
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(
+            reads,
+            elements_are![eq(&(vec!["string".to_string(), "uint".to_string()], false))]
+        );
+    }
+
+    #[gtest]
+    fn test_reader_passed_as_the_receive_callback_is_checked() {
+        let (diagnostics, reads) = order_listen_check(
+            r#"
+            function Listen(name, reader)
+                net.Receive(name, reader)
+            end
+            "#,
+            r#"
+            Listen("OrderPlaced", function(len, ply)
+                local item = net.ReadString()
+                local quantity = net.ReadUInt(16)
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(
+            reads,
+            elements_are![eq(&(vec!["string".to_string(), "uint".to_string()], false))]
+        );
     }
 
     #[gtest]

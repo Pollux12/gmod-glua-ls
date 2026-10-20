@@ -488,4 +488,100 @@ end
         assert_eq!(warm.settled_digest(), cold.settled_digest());
         assert!(warm.stale_derivations().is_empty());
     }
+
+    const LISTEN: &str = "addons/mytest/lua/autorun/server/sv_listen.lua";
+    const LISTEN_TEXT: &str = "function Listen(name, reader)
+    net.Receive(name, function(len, ply)
+        reader(ply)
+    end)
+end
+";
+    const ORDER_LISTENER: &str = "addons/mytest/lua/autorun/server/sv_order_listener.lua";
+    const ORDER_LISTENER_TEXT: &str = "Listen(\"OrderAdd\", function(ply)
+    net.ReadString()
+end)
+";
+
+    /// The wire formats each receive flow of `file_id` reads, by message.
+    fn received_reads(ws: &VirtualWorkspace, file_id: FileId) -> Vec<(String, Vec<String>)> {
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_gmod_network_index()
+            .get_file_data(file_id)
+            .into_iter()
+            .flat_map(|data| &data.receive_flows)
+            .map(|flow| {
+                let reads = flow
+                    .reads
+                    .iter()
+                    .map(|entry| entry.op.wire_format.to_string())
+                    .collect();
+                (flow.message_name.clone(), reads)
+            })
+            .collect()
+    }
+
+    /// A reader passed to a receive helper keeps the flows of a cold build
+    /// through an edit of the reader and shifts of the caller and the helper,
+    /// and its reads follow a delete and re-create of the helper.
+    #[test]
+    fn a_passed_reader_keeps_the_flows_of_a_cold_build_through_edits() {
+        let wider = ORDER_LISTENER_TEXT.replace(
+            "net.ReadString()
+",
+            "net.ReadString()
+    net.ReadUInt(16)
+",
+        );
+        let shifted_listener = format!(
+            "-- shifted
+{wider}"
+        );
+        let shifted_listen = format!(
+            "-- shifted
+{LISTEN_TEXT}"
+        );
+        let cold = |files: Vec<(&str, &str)>| {
+            let mut cold = gmod_workspace();
+            cold.def_files(files);
+            cold
+        };
+
+        let mut warm = gmod_workspace();
+        warm.def_files(vec![
+            (LISTEN, LISTEN_TEXT),
+            (ORDER_LISTENER, ORDER_LISTENER_TEXT),
+        ]);
+
+        warm.def_file(ORDER_LISTENER, &wider);
+        let edited = cold(vec![
+            (LISTEN, LISTEN_TEXT),
+            (ORDER_LISTENER, wider.as_str()),
+        ]);
+        assert_eq!(
+            received_reads(&edited, path_id(&edited, ORDER_LISTENER)),
+            vec![writes("OrderAdd", &["string", "uint"])]
+        );
+        assert_eq!(warm.settled_digest(), edited.settled_digest());
+
+        warm.def_file(ORDER_LISTENER, &shifted_listener);
+        warm.def_file(LISTEN, &shifted_listen);
+        let shifted = cold(vec![
+            (LISTEN, shifted_listen.as_str()),
+            (ORDER_LISTENER, shifted_listener.as_str()),
+        ]);
+        assert_eq!(warm.settled_digest(), shifted.settled_digest());
+
+        warm.analysis
+            .remove_file_by_uri(&warm.virtual_url_generator.new_uri(LISTEN));
+        assert!(received_reads(&warm, path_id(&warm, ORDER_LISTENER)).is_empty());
+
+        warm.def_file(LISTEN, &shifted_listen);
+        assert_eq!(
+            received_reads(&warm, path_id(&warm, ORDER_LISTENER)),
+            vec![writes("OrderAdd", &["string", "uint"])]
+        );
+        assert!(warm.stale_derivations().is_empty());
+    }
 }

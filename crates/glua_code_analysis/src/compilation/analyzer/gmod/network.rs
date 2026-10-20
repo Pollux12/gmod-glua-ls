@@ -1138,6 +1138,24 @@ fn receive_reads(
     else {
         return NetReceiveReads::default();
     };
+    if let LuaExpr::NameExpr(name_expr) = &callback_expr
+        && let Some(param) = param_ref(site, owner, name_expr)
+    {
+        return match param {
+            ParamRef::Own(idx) => NetReceiveReads {
+                items: Some(vec![NetOpItem::Param {
+                    idx,
+                    dynamic: false,
+                    flow_path: Vec::new(),
+                }]),
+                opaque: false,
+            },
+            ParamRef::Other => NetReceiveReads {
+                items: None,
+                opaque: true,
+            },
+        };
+    }
     match resolve_callback_block(&callback_expr, site) {
         Some(callback_block) => {
             let mut items = Vec::new();
@@ -1472,7 +1490,7 @@ fn helper_summary(db: &DbIndex, id: &HelperId) -> Arc<NetHelper> {
 type HelperBindingsKey = (HelperId, Vec<(String, String)>);
 
 /// A helper's bindings together with the functions bound to its parameters.
-type HelperSendKey = (HelperId, Vec<(String, String)>, Vec<Option<HelperId>>);
+type HelperBoundKey = (HelperId, Vec<(String, String)>, Vec<Option<HelperId>>);
 
 type HelperSendAnswer = (NetSendKind, Option<String>);
 
@@ -1506,8 +1524,8 @@ struct CachedReceiveBody {
 struct HelperMemo {
     /// The consensus `net.Start` message.
     start_message: HashMap<HelperBindingsKey, Option<String>>,
-    send_body: HashMap<HelperSendKey, Vec<CachedSendBody>>,
-    receive_body: HashMap<HelperBindingsKey, Vec<CachedReceiveBody>>,
+    send_body: HashMap<HelperBoundKey, Vec<CachedSendBody>>,
+    receive_body: HashMap<HelperBoundKey, Vec<CachedReceiveBody>>,
 }
 
 /// The transaction written at `call_expr`, a statement of `block`: the
@@ -1943,7 +1961,7 @@ fn collect_net_receive_flow(
     };
     let message_name = extract_static_string_arg_value(call_expr, message_idx)?;
     let reads = receive_reads(&ctx.site, None, call_expr, callback_idx);
-    let (reads, reads_opaque) = compose_receive_reads(ctx, &reads);
+    let (reads, reads_opaque) = compose_receive_reads(ctx, &reads, &[]);
     Some(NetReceiveFlow {
         message_name,
         receive_range: call_expr.get_range(),
@@ -1952,9 +1970,12 @@ fn collect_net_receive_flow(
     })
 }
 
+/// The reads of a receive callback, each call of the walked function's
+/// parameter expanded into the function `fns` binds there.
 fn compose_receive_reads(
     ctx: &mut NetCollectCtx<'_>,
     reads: &NetReceiveReads,
+    fns: &[Option<HelperId>],
 ) -> (Vec<NetOpEntry>, bool) {
     let mut entries = Vec::new();
     let mut opaque = reads.opaque;
@@ -1963,7 +1984,7 @@ fn compose_receive_reads(
             ctx,
             items,
             NetOpDirection::Read,
-            &[],
+            fns,
             &mut entries,
             &mut opaque,
         );
@@ -1980,12 +2001,15 @@ fn collect_receive_flows_from_helper_call(
         return;
     };
     let args = arg_templates(call_expr);
+    let fn_args = call_fn_args(&ctx.site, None, call_expr);
     let (bodies, _) = helper_receive_body(
         ctx,
         target,
         &args,
+        &fn_args,
         call_expr.is_colon_call(),
         &HashMap::default(),
+        &[],
         &mut Vec::new(),
     );
     let origin_range = call_expr.get_range();
@@ -2006,13 +2030,16 @@ fn helper_receive_body(
     ctx: &mut NetCollectCtx<'_>,
     helper_id: HelperId,
     args: &[Option<StringTemplate>],
+    fn_args: &[Option<FnArg>],
     colon_call: bool,
     caller_bindings: &HashMap<String, String>,
+    caller_fns: &[Option<HelperId>],
     stack: &mut Vec<HelperId>,
 ) -> (Vec<CachedReceiveBody>, usize) {
     let helper = ctx.helper(&helper_id);
     let bindings = helper_bindings(&helper, args, colon_call, caller_bindings);
-    let cache_key = (helper_id, sorted_bindings(&bindings));
+    let fns = helper_fns(&helper, fn_args, colon_call, caller_fns);
+    let cache_key = (helper_id, sorted_bindings(&bindings), fns);
     if let Some(cached) = ctx.memo.receive_body.get(&cache_key) {
         return (cached.clone(), NO_CYCLE);
     }
@@ -2041,7 +2068,8 @@ fn helper_receive_body(
                 let Some(message_name) = resolve_arg(&call.args, *message_idx, &bindings) else {
                     continue;
                 };
-                let (reads, reads_opaque) = compose_receive_reads(ctx, &call.receive_reads);
+                let (reads, reads_opaque) =
+                    compose_receive_reads(ctx, &call.receive_reads, &cache_key.2);
                 bodies.push(CachedReceiveBody {
                     message_name,
                     reads,
@@ -2057,8 +2085,10 @@ fn helper_receive_body(
                     ctx,
                     target.clone(),
                     &call.args,
+                    &call.fn_args,
                     call.colon_call,
                     &bindings,
+                    &cache_key.2,
                     stack,
                 );
                 low = low.min(nested_low);
