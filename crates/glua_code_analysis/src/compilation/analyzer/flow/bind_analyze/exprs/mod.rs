@@ -233,8 +233,8 @@ mod tests {
         );
 
         let (tree, errors) = binder.finish();
-        let outer_targets_have_antecedents =
-            [outer_break, outer_continue, outer_true, outer_false].map(|flow_id| {
+        let outer_targets_have_antecedents = [outer_break, outer_continue, outer_true, outer_false]
+            .map(|flow_id| {
                 tree.get_flow_node(flow_id)
                     .is_some_and(|node| node.antecedent.is_some())
             });

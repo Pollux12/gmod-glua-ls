@@ -2381,8 +2381,7 @@ fn find_signature_overload_param_type(
         };
 
         if is_dots
-            && let Some(any_type) =
-                check_dots_param_types(overload.get_params(), adjusted_idx)
+            && let Some(any_type) = check_dots_param_types(overload.get_params(), adjusted_idx)
         {
             return Some(any_type);
         }
@@ -2450,7 +2449,8 @@ fn find_param_type_from_type(
                             };
 
                         if is_dots
-                            && let Some(any_type) = check_dots_param_types(overload.get_params(), adjusted_idx)
+                            && let Some(any_type) =
+                                check_dots_param_types(overload.get_params(), adjusted_idx)
                         {
                             return Some(any_type);
                         }
@@ -2472,8 +2472,7 @@ fn find_param_type_from_type(
             if let Some((_, typ)) = f.get_params().get(adjusted_idx) {
                 let cur_type = typ.clone();
                 if is_dots
-                    && let Some(any_type) =
-                        check_dots_param_types(f.get_params(), adjusted_idx)
+                    && let Some(any_type) = check_dots_param_types(f.get_params(), adjusted_idx)
                 {
                     return Some(any_type);
                 }
@@ -2561,9 +2560,7 @@ fn find_param_type_from_union(
                 return None;
             };
 
-            if is_dots
-                && let Some(any_type) =
-                    check_dots_param_types(f.get_params(), adjusted_idx)
+            if is_dots && let Some(any_type) = check_dots_param_types(f.get_params(), adjusted_idx)
             {
                 return Some(any_type);
             }

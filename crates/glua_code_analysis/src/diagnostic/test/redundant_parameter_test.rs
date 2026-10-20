@@ -928,8 +928,15 @@ mod test {
             ));
             let result = ws.local_ty(file_id, "result");
             assert_eq!(ws.humanize_type(result), "string", "{param_type}");
-            for code in [DiagnosticCode::RedundantParameter, DiagnosticCode::MissingParameter] {
-                assert_eq!(diagnostic_count_in(&mut ws, file_id, code), 0, "{param_type}");
+            for code in [
+                DiagnosticCode::RedundantParameter,
+                DiagnosticCode::MissingParameter,
+            ] {
+                assert_eq!(
+                    diagnostic_count_in(&mut ws, file_id, code),
+                    0,
+                    "{param_type}"
+                );
             }
         }
     }

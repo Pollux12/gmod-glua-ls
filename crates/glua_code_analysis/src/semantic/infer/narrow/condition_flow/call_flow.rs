@@ -8,8 +8,8 @@ use glua_parser::{
 use crate::{
     DbIndex, FileId, FlowNode, FlowTree, GMOD_ATTR_SELF_GUARD, InFiled, InferFailReason,
     InferGuard, LuaAliasCallKind, LuaAliasCallType, LuaFunctionType, LuaInferCache, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType,
-    TypeOps, check_type_compact, find_signature_attribute_use, infer_call_expr_func, infer_expr,
+    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType, TypeOps,
+    check_type_compact, find_signature_attribute_use, infer_call_expr_func, infer_expr,
     semantic::{
         SemanticDeclGuard, SemanticDeclLevel,
         infer::{
@@ -29,8 +29,7 @@ use crate::{
         },
         infer_expr_semantic_decl, known_signature_id, local_name_value, semantic_decl_value,
     },
-    signature_is_exhaustive_type_guard,
-    signature_is_valid_guard_or_base_runtime_isvalid_in_realm,
+    signature_is_exhaustive_type_guard, signature_is_valid_guard_or_base_runtime_isvalid_in_realm,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -904,8 +903,13 @@ fn asserted_type_by_function_type(
     if let LuaType::Union(union) = function_type {
         let mut asserted = LuaType::Never;
         for candidate in union.types() {
-            let typ =
-                asserted_type_by_function_type(db, cache, call_expr, var_ref_id, candidate.clone())?;
+            let typ = asserted_type_by_function_type(
+                db,
+                cache,
+                call_expr,
+                var_ref_id,
+                candidate.clone(),
+            )?;
             asserted = TypeOps::Union.apply(db, &asserted, &typ);
         }
         return Some(asserted);

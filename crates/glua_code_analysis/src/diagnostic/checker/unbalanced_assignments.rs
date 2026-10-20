@@ -128,7 +128,10 @@ fn padded_nil_is_never_read(
     let db = semantic_model.get_db();
     let file_id = semantic_model.get_file_id();
     let decl_id = LuaDeclId::new(file_id, local_name.get_position());
-    let Some(references) = db.get_reference_index().get_decl_references(&file_id, &decl_id) else {
+    let Some(references) = db
+        .get_reference_index()
+        .get_decl_references(&file_id, &decl_id)
+    else {
         return false;
     };
     if !references.is_written_after_declaration(decl_id.position) {
@@ -170,7 +173,10 @@ fn declaring_scope_has_goto(
     *goto_scopes.borrow_mut().entry(key).or_insert_with(|| {
         match &closure {
             Some(closure) => closure.descendants::<LuaGotoStat>().next(),
-            None => semantic_model.get_root().descendants::<LuaGotoStat>().next(),
+            None => semantic_model
+                .get_root()
+                .descendants::<LuaGotoStat>()
+                .next(),
         }
         .is_some()
     })

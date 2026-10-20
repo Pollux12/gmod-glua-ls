@@ -9661,7 +9661,10 @@ _2 = a[1]
 
     #[gtest]
     fn a_continue_in_an_inner_loop_does_not_feed_the_outer_repeat_condition() {
-        for inner in ["while flag do value = string_value continue end", "for _ = 1, 2 do value = string_value continue end"] {
+        for inner in [
+            "while flag do value = string_value continue end",
+            "for _ = 1, 2 do value = string_value continue end",
+        ] {
             let after = local_after_in_function(
                 "---@param value number\n---@param flag boolean\n---@param string_value string",
                 &format!("repeat {inner} until true"),

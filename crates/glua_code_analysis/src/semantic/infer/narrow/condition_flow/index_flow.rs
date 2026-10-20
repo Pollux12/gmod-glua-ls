@@ -21,7 +21,8 @@ use crate::{
                 },
             },
         },
-        resolve_dynamic_field_member, type_check::is_sub_type_of,
+        resolve_dynamic_field_member,
+        type_check::is_sub_type_of,
     },
 };
 

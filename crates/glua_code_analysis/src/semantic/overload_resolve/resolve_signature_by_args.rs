@@ -334,11 +334,7 @@ fn leading_arg_match(
     classify_arg_match(db, &param_type, expr_type)
 }
 
-fn classify_arg_match(
-    db: &DbIndex,
-    param_type: &LuaType,
-    expr_type: &LuaType,
-) -> ParamMatchResult {
+fn classify_arg_match(db: &DbIndex, param_type: &LuaType, expr_type: &LuaType) -> ParamMatchResult {
     if param_type.is_any() {
         ParamMatchResult::Any
     } else if expr_type.is_never() {
