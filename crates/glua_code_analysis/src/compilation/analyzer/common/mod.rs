@@ -57,7 +57,9 @@ pub fn is_presence_tested(
     if let Some(LuaExpr::UnaryExpr(unary)) = LuaExpr::cast(parent.clone()) {
         return unary
             .get_op_token()
-            .is_some_and(|op| op.get_op() == UnaryOperator::OpNot);
+            .is_some_and(|op| op.get_op() == UnaryOperator::OpNot)
+            && (is_short_circuit_left(unary.syntax())
+                || is_presence_tested(unary.syntax(), guard_call_arg));
     }
     if let Some(LuaExpr::BinaryExpr(binary)) = LuaExpr::cast(parent.clone()) {
         let (Some(op), Some((left, right))) = (
@@ -90,6 +92,19 @@ pub fn is_presence_tested(
             .is_some_and(|stat| is_condition_of(stat.get_condition_expr()))
         || LuaRepeatStat::cast(parent)
             .is_some_and(|stat| is_condition_of(stat.get_condition_expr()))
+}
+
+/// Whether `node` is the left operand of an `and` or `or`, whose truthiness picks the result.
+fn is_short_circuit_left(node: &LuaSyntaxNode) -> bool {
+    let Some(LuaExpr::BinaryExpr(binary)) = node.parent().and_then(LuaExpr::cast) else {
+        return false;
+    };
+    binary
+        .get_op_token()
+        .is_some_and(|op| matches!(op.get_op(), BinaryOperator::OpAnd | BinaryOperator::OpOr))
+        && binary
+            .get_exprs()
+            .is_some_and(|(left, _)| left.syntax() == node)
 }
 
 /// Whether `expr` is a `nil` or `false` literal, possibly parenthesized: a value

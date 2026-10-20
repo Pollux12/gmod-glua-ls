@@ -167,6 +167,39 @@ mod test {
         ));
     }
 
+    #[test]
+    fn a_negated_global_used_as_a_value_is_reported() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "lua/autorun/negated_argument.lua",
+            r#"
+            local T = {}
+            function T:Apply() print(not shadowdisable) end
+            function T:Read() local shadowdisable = 1 return shadowdisable end
+            "#,
+            "shadowdisable",
+        ));
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "lua/autorun/negated_local.lua",
+            "local hidden = not missingFlag\nreturn hidden",
+            "missingFlag",
+        ));
+    }
+
+    #[test]
+    fn a_negated_global_tested_by_a_condition_probes_its_presence() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            if not optionalAddon or not (optionalOther) then return end
+            print(optionalAddon, optionalOther)
+            "#
+        ));
+    }
+
     /// Codes of the undefined-global diagnostics `content` produces, with every default check on.
     fn undefined_global_codes(ws: &mut VirtualWorkspace, content: &str) -> Vec<String> {
         let file_id = ws.def(content);
