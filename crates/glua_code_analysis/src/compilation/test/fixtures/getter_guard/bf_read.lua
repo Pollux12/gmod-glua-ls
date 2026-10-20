@@ -90,4 +90,3 @@ function bf_read:ReadVectorNormal() end
 ---@realm client
 ---@source https://wiki.facepunch.com/gmod/bf_read:Reset
 function bf_read:Reset() end
-
