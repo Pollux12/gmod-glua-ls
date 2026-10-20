@@ -136,9 +136,7 @@ fn resolve_arg(
 }
 
 /// The helper's parameters bound to the call's arguments that resolve to a
-/// string under the caller's own bindings. A colon call passes its receiver
-/// first and a colon definition takes it as `self`, so either side may hold
-/// one slot the other writes out.
+/// string under the caller's own bindings.
 fn helper_bindings(
     helper: &NetHelper,
     args: &[Option<StringTemplate>],
@@ -150,14 +148,44 @@ fn helper_bindings(
         .iter()
         .enumerate()
         .filter_map(|(param_idx, param)| {
-            let arg_idx = (param_idx + usize::from(helper.colon_define))
-                .checked_sub(usize::from(colon_call))?;
+            let arg_idx = arg_index(param_idx, helper.colon_define, colon_call)?;
             Some((
                 param.clone()?,
                 args.get(arg_idx)?.as_ref()?.resolve(caller_bindings)?,
             ))
         })
         .collect()
+}
+
+/// The call argument that binds a parameter. A colon call passes its receiver
+/// first and a colon definition takes it as `self`, so either side may hold
+/// one slot the other writes out.
+fn arg_index(param_idx: usize, colon_define: bool, colon_call: bool) -> Option<usize> {
+    (param_idx + usize::from(colon_define)).checked_sub(usize::from(colon_call))
+}
+
+/// The functions bound to a helper's parameters, by position: the bodies the
+/// call passes, and for each of the caller's own parameters it passes on, what
+/// the caller's caller bound there.
+fn helper_fns(
+    helper: &NetHelper,
+    fn_args: &[Option<FnArg>],
+    colon_call: bool,
+    caller_fns: &[Option<HelperId>],
+) -> Vec<Option<HelperId>> {
+    let mut fns = (0..=fn_args.len())
+        .map(|param_idx| {
+            let arg_idx = arg_index(param_idx, helper.colon_define, colon_call)?;
+            match fn_args.get(arg_idx)?.as_ref()? {
+                FnArg::Body(body) => Some(body.clone()),
+                FnArg::Param(idx) => caller_fns.get(*idx)?.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    while fns.last().is_some_and(Option::is_none) {
+        fns.pop();
+    }
+    fns
 }
 
 /// Bindings in a stable order, for memo keys.
@@ -183,8 +211,9 @@ struct NetCallFact {
     candidate: bool,
 }
 
-/// One step of a payload walk, in evaluation order: an op, or a call into a
-/// helper whose own payload walk continues there.
+/// One step of a payload walk, in evaluation order: an op, a call into a
+/// helper whose own payload walk continues there, or a call of a function
+/// passed in as a parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum NetOpItem {
     /// `dynamic` and `flow_path` are relative to the walked block.
@@ -193,7 +222,64 @@ enum NetOpItem {
         target: HelperId,
         dynamic: bool,
         flow_path: Vec<NetFlowFrame>,
+        /// The functions the call passes, by argument position.
+        fn_args: Vec<Option<FnArg>>,
+        /// Whether the call is written with `:`, passing its receiver first.
+        colon_call: bool,
     },
+    /// A call of the walked function's own parameter `idx`: it writes what the
+    /// function its caller passes there writes.
+    Param {
+        idx: usize,
+        dynamic: bool,
+        flow_path: Vec<NetFlowFrame>,
+    },
+    /// A call of another function's parameter, which no caller of the walked
+    /// function binds. Written in a transaction, it runs a function handed to
+    /// it; inside a callee's walk it is that callee's business.
+    Opaque,
+}
+
+/// A function a call passes as an argument, as far as the callee can call it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FnArg {
+    /// A function body in the caller's file: an inline closure, or a function
+    /// the file defines once under a bare name.
+    Body(HelperId),
+    /// The walked function's own parameter, by position, which its caller binds.
+    Param(usize),
+}
+
+/// One step of a composed payload walk: an op, a call of the walked
+/// function's own parameter left for its caller to bind, or a call of a
+/// function handed to the transaction that nothing binds.
+#[derive(Debug, Clone)]
+enum ComposedOp {
+    Op(NetOpEntry),
+    Param {
+        idx: usize,
+        dynamic: bool,
+        flow_path: Vec<NetFlowFrame>,
+    },
+    Opaque,
+}
+
+/// What a call of a callee's parameter becomes in its caller's walk: the bound
+/// function's walk, a call of the caller's own parameter, a function handed to
+/// the transaction that nothing binds, or a callee's callback the transaction
+/// does not hand in, which is no step of its payload.
+enum Binding {
+    Fn(HelperId),
+    Param(usize),
+    Unknown,
+    Dropped,
+}
+
+/// What a called name is among parameters: the walked function's own, by
+/// position, or another function's.
+enum ParamRef {
+    Own(usize),
+    Other,
 }
 
 /// A receive callback's reads: the payload walk of its body when found.
@@ -211,6 +297,8 @@ struct HelperCall {
     role: Option<NetCallRole>,
     target: Option<HelperId>,
     args: Vec<Option<StringTemplate>>,
+    /// The functions the call passes, by argument position.
+    fn_args: Vec<Option<FnArg>>,
     /// Whether the call is written with `:`, passing its receiver first.
     colon_call: bool,
     /// A send's recipient snippet.
@@ -227,9 +315,6 @@ struct HelperSend {
     message: StringTemplate,
     /// The payload walk of each statement between the start and its end.
     stats: Vec<Vec<NetOpItem>>,
-    /// Whether a statement calls a function received as a parameter, whose
-    /// writes the body cannot show.
-    calls_param: bool,
     send: Option<(NetSendKind, Option<String>)>,
 }
 
@@ -238,7 +323,6 @@ impl Hash for HelperSend {
         crate::db_index::derivation::hash_local(&self.start_range, state);
         self.message.hash(state);
         self.stats.hash(state);
-        self.calls_param.hash(state);
         self.send.hash(state);
     }
 }
@@ -259,16 +343,39 @@ struct NetHelper {
 }
 
 impl NetOpItem {
-    fn target(&self) -> Option<&HelperId> {
-        match self {
-            NetOpItem::Helper { target, .. } => Some(target),
-            NetOpItem::Op(_) => None,
-        }
+    /// The helper the step calls into and the bodies it passes.
+    fn targets(&self) -> impl Iterator<Item = &HelperId> {
+        let (target, fn_args) = match self {
+            NetOpItem::Helper {
+                target, fn_args, ..
+            } => (Some(target), fn_args.as_slice()),
+            NetOpItem::Op(_) | NetOpItem::Param { .. } | NetOpItem::Opaque => (None, &[][..]),
+        };
+        target.into_iter().chain(fn_arg_bodies(fn_args))
     }
 
-    fn visit_target(&mut self, visit: &mut impl FnMut(&mut HelperId)) {
-        if let NetOpItem::Helper { target, .. } = self {
+    fn visit_targets(&mut self, visit: &mut impl FnMut(&mut HelperId)) {
+        if let NetOpItem::Helper {
+            target, fn_args, ..
+        } = self
+        {
             visit(target);
+            visit_fn_arg_bodies(fn_args, visit);
+        }
+    }
+}
+
+fn fn_arg_bodies(fn_args: &[Option<FnArg>]) -> impl Iterator<Item = &HelperId> {
+    fn_args.iter().flatten().filter_map(|arg| match arg {
+        FnArg::Body(body) => Some(body),
+        FnArg::Param(_) => None,
+    })
+}
+
+fn visit_fn_arg_bodies(fn_args: &mut [Option<FnArg>], visit: &mut impl FnMut(&mut HelperId)) {
+    for arg in fn_args.iter_mut().flatten() {
+        if let FnArg::Body(body) = arg {
+            visit(body);
         }
     }
 }
@@ -279,20 +386,21 @@ impl NetHelper {
         let mut targets = Vec::new();
         for call in &self.calls {
             targets.extend(call.target.as_ref());
+            targets.extend(fn_arg_bodies(&call.fn_args));
             targets.extend(
                 call.receive_reads
                     .items
                     .iter()
                     .flatten()
-                    .filter_map(NetOpItem::target),
+                    .flat_map(NetOpItem::targets),
             );
         }
-        targets.extend(self.ops.iter().filter_map(NetOpItem::target));
+        targets.extend(self.ops.iter().flat_map(NetOpItem::targets));
         targets.extend(
             self.sends
                 .iter()
                 .flat_map(|send| send.stats.iter().flatten())
-                .filter_map(NetOpItem::target),
+                .flat_map(NetOpItem::targets),
         );
         targets
     }
@@ -303,19 +411,20 @@ impl NetHelper {
             if let Some(target) = &mut call.target {
                 visit(target);
             }
+            visit_fn_arg_bodies(&mut call.fn_args, visit);
             for item in call.receive_reads.items.iter_mut().flatten() {
-                item.visit_target(visit);
+                item.visit_targets(visit);
             }
         }
         for item in &mut self.ops {
-            item.visit_target(visit);
+            item.visit_targets(visit);
         }
         for item in self
             .sends
             .iter_mut()
             .flat_map(|send| send.stats.iter_mut().flatten())
         {
-            item.visit_target(visit);
+            item.visit_targets(visit);
         }
     }
 }
@@ -697,13 +806,14 @@ fn summarize_helper(
     closure: &LuaClosureExpr,
     block: &LuaBlock,
 ) -> NetHelper {
+    let owner = Some(LuaSignatureId::from_closure(site.file_id, closure));
     let mut calls = block
         .descendants::<LuaCallExpr>()
-        .map(|call_expr| summarize_helper_call(site, block, &call_expr))
+        .map(|call_expr| summarize_helper_call(site, owner, block, &call_expr))
         .collect::<Vec<_>>();
     let mut ops = Vec::new();
-    op_items(site, block, block.syntax(), &mut ops);
-    let mut sends = helper_sends(site, block);
+    op_items(site, owner, block, block.syntax(), &mut ops);
+    let mut sends = helper_sends(site, owner, block);
     let params = read_params(closure, &calls, &sends);
     // A call with neither a role nor a target is no net step; only its
     // arguments could name a parameter, which `params` has read.
@@ -711,10 +821,8 @@ fn summarize_helper(
     calls.shrink_to_fit();
     ops.shrink_to_fit();
     sends.shrink_to_fit();
-    let colon_define = site
-        .db
-        .get_signature_index()
-        .get(&LuaSignatureId::from_closure(site.file_id, closure))
+    let colon_define = owner
+        .and_then(|owner| site.db.get_signature_index().get(&owner))
         .is_some_and(|signature| signature.is_colon_define);
     NetHelper {
         params,
@@ -750,6 +858,7 @@ fn read_params(
 
 fn summarize_helper_call(
     site: &NetFileSite<'_>,
+    owner: Option<LuaSignatureId>,
     block: &LuaBlock,
     call_expr: &LuaCallExpr,
 ) -> HelperCall {
@@ -762,6 +871,7 @@ fn summarize_helper_call(
         role,
         target,
         args: Vec::new(),
+        fn_args: Vec::new(),
         colon_call: call_expr.is_colon_call(),
         send_target: None,
         literal_receive: false,
@@ -771,6 +881,9 @@ fn summarize_helper_call(
         return call;
     }
     call.args = arg_templates(call_expr);
+    if call.target.is_some() {
+        call.fn_args = call_fn_args(site, owner, call_expr);
+    }
     match call.role {
         Some(NetCallRole::Send(send_kind)) => {
             call.send_target = extract_send_target_text(call_expr, send_kind);
@@ -782,7 +895,7 @@ fn summarize_helper_call(
             call.literal_receive =
                 extract_static_string_arg_value(call_expr, message_idx).is_some();
             if !call.literal_receive {
-                call.receive_reads = receive_reads(site, call_expr, callback_idx);
+                call.receive_reads = receive_reads(site, owner, call_expr, callback_idx);
             }
         }
         _ => {}
@@ -794,7 +907,11 @@ fn summarize_helper_call(
 /// defines, such as a click handler, sends once it runs: its transactions
 /// count when the helper's own parameters name the message, since a literal
 /// name is already indexed where it is written.
-fn helper_sends(site: &NetFileSite<'_>, helper_block: &LuaBlock) -> Vec<HelperSend> {
+fn helper_sends(
+    site: &NetFileSite<'_>,
+    owner: Option<LuaSignatureId>,
+    helper_block: &LuaBlock,
+) -> Vec<HelperSend> {
     let mut sends = Vec::new();
     for block in helper_block.descendants::<LuaBlock>() {
         let callbacks = closures_between(helper_block, &block);
@@ -802,7 +919,6 @@ fn helper_sends(site: &NetFileSite<'_>, helper_block: &LuaBlock) -> Vec<HelperSe
             .iter()
             .flat_map(get_closure_param_names)
             .collect::<HashSet<_>>();
-        let params = enclosing_param_names(&block);
         let stats = block.get_stats().collect::<Vec<_>>();
         for (index, stat) in stats.iter().enumerate() {
             let Some(start_call) = call_expr_from_stat(stat) else {
@@ -826,7 +942,6 @@ fn helper_sends(site: &NetFileSite<'_>, helper_block: &LuaBlock) -> Vec<HelperSe
             }
 
             let mut stat_items = Vec::new();
-            let mut calls_param = false;
             let mut send = None;
             for next_stat in stats.iter().skip(index + 1) {
                 if let Some(next_call) = call_expr_from_stat(next_stat) {
@@ -841,34 +956,18 @@ fn helper_sends(site: &NetFileSite<'_>, helper_block: &LuaBlock) -> Vec<HelperSe
                     }
                 }
                 let mut items = Vec::new();
-                op_items(site, &block, next_stat.syntax(), &mut items);
+                op_items(site, owner, &block, next_stat.syntax(), &mut items);
                 stat_items.push(items);
-                calls_param |= stat_calls_param(&block, next_stat, &params);
             }
             sends.push(HelperSend {
                 start_range: start_call.get_range(),
                 message,
                 stats: stat_items,
-                calls_param,
                 send,
             });
         }
     }
     sends
-}
-
-/// Whether `stat` calls one of `params` outside the closures it defines.
-fn stat_calls_param(block: &LuaBlock, stat: &LuaStat, params: &HashSet<String>) -> bool {
-    stat.syntax()
-        .descendants()
-        .filter_map(LuaCallExpr::cast)
-        .filter(|call_expr| !is_call_expr_in_nested_closure(block, call_expr))
-        .any(|call_expr| match call_expr.get_prefix_expr() {
-            Some(LuaExpr::NameExpr(name_expr)) => name_expr
-                .get_name_text()
-                .is_some_and(|name| params.contains(name.as_str())),
-            _ => false,
-        })
 }
 
 /// The closures between `function_block` and `candidate_block`, innermost first.
@@ -882,16 +981,18 @@ fn closures_between(function_block: &LuaBlock, candidate_block: &LuaBlock) -> Ve
 }
 
 /// The payload walk of `subtree`, in argument-first evaluation order, with
-/// helper calls left as [`NetOpItem::Helper`] steps.
+/// helper calls left as [`NetOpItem::Helper`] steps and calls of `owner`'s
+/// parameters as [`NetOpItem::Param`] steps.
 fn op_items(
     site: &NetFileSite<'_>,
+    owner: Option<LuaSignatureId>,
     block: &LuaBlock,
     subtree: &LuaSyntaxNode,
     out: &mut Vec<NetOpItem>,
 ) {
     let Some(call_expr) = LuaCallExpr::cast(subtree.clone()) else {
         for child in subtree.children() {
-            op_items(site, block, &child, out);
+            op_items(site, owner, block, &child, out);
         }
         return;
     };
@@ -900,10 +1001,27 @@ fn op_items(
     }
     if let Some(args) = call_expr.get_args_list() {
         for arg in args.get_args() {
-            op_items(site, block, arg.syntax(), out);
+            op_items(site, owner, block, arg.syntax(), out);
         }
     }
-    let Some(fact) = site.call(&call_expr) else {
+    let fact = site.call(&call_expr);
+    // A parameter holds whatever function the caller passes, so its call is
+    // bound per call site rather than to one statically resolved body.
+    if fact.as_ref().is_none_or(|fact| fact.role.is_none())
+        && let Some(LuaExpr::NameExpr(name_expr)) = call_expr.get_prefix_expr()
+        && let Some(param) = param_ref(site, owner, &name_expr)
+    {
+        out.push(match param {
+            ParamRef::Own(idx) => NetOpItem::Param {
+                idx,
+                dynamic: is_call_expr_in_dynamic_control_flow(block, &call_expr),
+                flow_path: extract_flow_path(site.file_id, block, &call_expr),
+            },
+            ParamRef::Other => NetOpItem::Opaque,
+        });
+        return;
+    }
+    let Some(fact) = fact else {
         return;
     };
     // A call the metadata recognizes as a net op is a leaf: it never doubles as
@@ -929,15 +1047,79 @@ fn op_items(
                     target: target.clone(),
                     dynamic: is_call_expr_in_dynamic_control_flow(block, &call_expr),
                     flow_path: extract_flow_path(site.file_id, block, &call_expr),
+                    fn_args: call_fn_args(site, owner, &call_expr),
+                    colon_call: call_expr.is_colon_call(),
                 });
             }
         }
     }
 }
 
+/// What `name_expr` refers to among parameters, `None` for a name that is no
+/// parameter.
+fn param_ref(
+    site: &NetFileSite<'_>,
+    owner: Option<LuaSignatureId>,
+    name_expr: &LuaNameExpr,
+) -> Option<ParamRef> {
+    let decl_id = site
+        .db
+        .get_reference_index()
+        .get_var_reference_decl(&site.file_id, name_expr.get_range())?;
+    let LuaDeclExtra::Param {
+        idx, signature_id, ..
+    } = site.db.get_decl_index().get_decl(&decl_id)?.extra
+    else {
+        return None;
+    };
+    Some(if owner == Some(signature_id) {
+        ParamRef::Own(idx)
+    } else {
+        ParamRef::Other
+    })
+}
+
+/// The functions `call_expr` passes, by argument position: function bodies the
+/// file shows, and `owner`'s own parameters passed on.
+fn call_fn_args(
+    site: &NetFileSite<'_>,
+    owner: Option<LuaSignatureId>,
+    call_expr: &LuaCallExpr,
+) -> Vec<Option<FnArg>> {
+    let Some(args) = call_expr.get_args_list() else {
+        return Vec::new();
+    };
+    let mut fn_args = args
+        .get_args()
+        .map(|arg| fn_arg(site, owner, &arg))
+        .collect::<Vec<_>>();
+    while fn_args.last().is_some_and(Option::is_none) {
+        fn_args.pop();
+    }
+    fn_args.shrink_to_fit();
+    fn_args
+}
+
+fn fn_arg(site: &NetFileSite<'_>, owner: Option<LuaSignatureId>, arg: &LuaExpr) -> Option<FnArg> {
+    if let LuaExpr::NameExpr(name_expr) = arg
+        && let Some(param) = param_ref(site, owner, name_expr)
+    {
+        return match param {
+            ParamRef::Own(idx) => Some(FnArg::Param(idx)),
+            ParamRef::Other => None,
+        };
+    }
+    let block = resolve_callback_block(arg, site)?;
+    Some(FnArg::Body(InFiled::new(
+        site.file_id,
+        block.syntax().text_range(),
+    )))
+}
+
 /// The reads of a receive call's callback.
 fn receive_reads(
     site: &NetFileSite<'_>,
+    owner: Option<LuaSignatureId>,
     call_expr: &LuaCallExpr,
     callback_idx: Option<usize>,
 ) -> NetReceiveReads {
@@ -959,7 +1141,13 @@ fn receive_reads(
     match resolve_callback_block(&callback_expr, site) {
         Some(callback_block) => {
             let mut items = Vec::new();
-            op_items(site, &callback_block, callback_block.syntax(), &mut items);
+            op_items(
+                site,
+                owner,
+                &callback_block,
+                callback_block.syntax(),
+                &mut items,
+            );
             NetReceiveReads {
                 items: Some(items),
                 opaque: false,
@@ -1231,21 +1419,11 @@ impl NetCollectCtx<'_> {
         })
     }
 
-    /// The payload ops of a helper's expansion, in both directions.
-    fn ops(&mut self, id: &HelperId) -> Arc<Vec<NetOpEntry>> {
+    /// The payload walk of a helper's expansion, in both directions.
+    fn ops(&mut self, id: &HelperId) -> Arc<Vec<ComposedOp>> {
         let db = self.site.db;
         composed(&mut self.compositions.ops, id, || {
-            let mut ops = Vec::new();
-            expand_helper_ops(
-                db,
-                id,
-                false,
-                &[],
-                &mut Vec::new(),
-                &mut HashMap::default(),
-                &mut ops,
-            );
-            Arc::new(ops)
+            helper_walk(db, id, &mut Vec::new(), &mut HashMap::default()).0
         })
     }
 }
@@ -1257,7 +1435,7 @@ impl NetCollectCtx<'_> {
 pub(crate) struct NetCompositions {
     reach: HashMap<HelperId, (NetReach, Provenance)>,
     send: HashMap<HelperId, (Option<HelperSendAnswer>, Provenance)>,
-    ops: HashMap<HelperId, (Arc<Vec<NetOpEntry>>, Provenance)>,
+    ops: HashMap<HelperId, (Arc<Vec<ComposedOp>>, Provenance)>,
 }
 
 /// `memo`'s composition of `id` while what it read holds, those reads
@@ -1293,6 +1471,9 @@ fn helper_summary(db: &DbIndex, id: &HelperId) -> Arc<NetHelper> {
 
 type HelperBindingsKey = (HelperId, Vec<(String, String)>);
 
+/// A helper's bindings together with the functions bound to its parameters.
+type HelperSendKey = (HelperId, Vec<(String, String)>, Vec<Option<HelperId>>);
+
 type HelperSendAnswer = (NetSendKind, Option<String>);
 
 /// A helper-derived send transaction without the call-site origin, which the
@@ -1325,7 +1506,7 @@ struct CachedReceiveBody {
 struct HelperMemo {
     /// The consensus `net.Start` message.
     start_message: HashMap<HelperBindingsKey, Option<String>>,
-    send_body: HashMap<HelperBindingsKey, Vec<CachedSendBody>>,
+    send_body: HashMap<HelperSendKey, Vec<CachedSendBody>>,
     receive_body: HashMap<HelperBindingsKey, Vec<CachedReceiveBody>>,
 }
 
@@ -1346,7 +1527,6 @@ fn collect_net_send_flow(
         None => resolve_helper_start_message(ctx, call_expr),
     }?;
 
-    let params = enclosing_param_names(block);
     let mut writes = Vec::new();
     let mut writes_opaque = false;
     let mut send = None;
@@ -1385,8 +1565,7 @@ fn collect_net_send_flow(
             }
         }
 
-        collect_net_write_ops_from_stat(ctx, block, &next_stat, &mut writes);
-        writes_opaque |= stat_calls_param(block, &next_stat, &params);
+        collect_net_write_ops_from_stat(ctx, block, &next_stat, &mut writes, &mut writes_opaque);
     }
 
     let (send_range, send_kind, send_target, send_display_name) = send?;
@@ -1402,16 +1581,6 @@ fn collect_net_send_flow(
         writes_opaque,
         materialized_from: None,
     })
-}
-
-/// The parameter names of every closure enclosing `block`.
-fn enclosing_param_names(block: &LuaBlock) -> HashSet<String> {
-    block
-        .syntax()
-        .ancestors()
-        .filter_map(LuaClosureExpr::cast)
-        .flat_map(|closure| get_closure_param_names(&closure))
-        .collect()
 }
 
 fn resolve_helper_start_message(
@@ -1548,6 +1717,7 @@ fn collect_wrapped_net_send_flow(
     let message_name = extract_static_string_arg_value(call_expr, message_idx)?;
 
     let mut writes = Vec::new();
+    let mut writes_opaque = false;
     let mut send = None;
 
     for next_stat in stats_after(stat) {
@@ -1568,7 +1738,7 @@ fn collect_wrapped_net_send_flow(
             }
         }
 
-        collect_net_write_ops_from_stat(ctx, block, &next_stat, &mut writes);
+        collect_net_write_ops_from_stat(ctx, block, &next_stat, &mut writes, &mut writes_opaque);
     }
 
     if let Some((send_range, send_kind, send_target, send_display_name)) = send {
@@ -1581,7 +1751,7 @@ fn collect_wrapped_net_send_flow(
             send_display_name,
             send_target,
             is_wrapped: true,
-            writes_opaque: false,
+            writes_opaque,
             materialized_from: None,
         });
     }
@@ -1625,12 +1795,15 @@ fn collect_unannotated_net_wrapper_send_flows(
         return Vec::new();
     };
     let args = arg_templates(call_expr);
+    let fn_args = call_fn_args(&ctx.site, None, call_expr);
     let (bodies, _) = helper_send_body(
         ctx,
         target,
         &args,
+        &fn_args,
         call_expr.is_colon_call(),
         &HashMap::default(),
+        &[],
         &mut Vec::new(),
     );
     let origin_range = call_expr.get_range();
@@ -1658,13 +1831,16 @@ fn helper_send_body(
     ctx: &mut NetCollectCtx<'_>,
     helper_id: HelperId,
     args: &[Option<StringTemplate>],
+    fn_args: &[Option<FnArg>],
     colon_call: bool,
     caller_bindings: &HashMap<String, String>,
+    caller_fns: &[Option<HelperId>],
     stack: &mut Vec<HelperId>,
 ) -> (Vec<CachedSendBody>, usize) {
     let helper = ctx.helper(&helper_id);
     let bindings = helper_bindings(&helper, args, colon_call, caller_bindings);
-    let cache_key = (helper_id, sorted_bindings(&bindings));
+    let fns = helper_fns(&helper, fn_args, colon_call, caller_fns);
+    let cache_key = (helper_id, sorted_bindings(&bindings), fns);
     if let Some(cached) = ctx.memo.send_body.get(&cache_key) {
         return (cached.clone(), NO_CYCLE);
     }
@@ -1689,8 +1865,16 @@ fn helper_send_body(
             continue;
         };
         let mut writes = Vec::new();
+        let mut writes_opaque = false;
         for items in &send.stats {
-            compose_ops(ctx, items, NetOpDirection::Write, &mut writes);
+            compose_ops(
+                ctx,
+                items,
+                NetOpDirection::Write,
+                &cache_key.2,
+                &mut writes,
+                &mut writes_opaque,
+            );
         }
         let Some((send_kind, send_target)) = send.send.clone() else {
             continue;
@@ -1700,7 +1884,7 @@ fn helper_send_body(
             writes,
             send_kind,
             send_target,
-            writes_opaque: send.calls_param,
+            writes_opaque,
             materialized_from: Some(crate::db_index::NetFlowOrigin {
                 file_id: helper_id.file_id,
                 start_range: send.start_range,
@@ -1722,8 +1906,10 @@ fn helper_send_body(
             ctx,
             target.clone(),
             &call.args,
+            &call.fn_args,
             call.colon_call,
             &bindings,
+            &cache_key.2,
             stack,
         );
         low = low.min(nested_low);
@@ -1756,7 +1942,7 @@ fn collect_net_receive_flow(
         return None;
     };
     let message_name = extract_static_string_arg_value(call_expr, message_idx)?;
-    let reads = receive_reads(&ctx.site, call_expr, callback_idx);
+    let reads = receive_reads(&ctx.site, None, call_expr, callback_idx);
     let (reads, reads_opaque) = compose_receive_reads(ctx, &reads);
     Some(NetReceiveFlow {
         message_name,
@@ -1771,10 +1957,18 @@ fn compose_receive_reads(
     reads: &NetReceiveReads,
 ) -> (Vec<NetOpEntry>, bool) {
     let mut entries = Vec::new();
+    let mut opaque = reads.opaque;
     if let Some(items) = &reads.items {
-        compose_ops(ctx, items, NetOpDirection::Read, &mut entries);
+        compose_ops(
+            ctx,
+            items,
+            NetOpDirection::Read,
+            &[],
+            &mut entries,
+            &mut opaque,
+        );
     }
-    (entries, reads.opaque)
+    (entries, opaque)
 }
 
 fn collect_receive_flows_from_helper_call(
@@ -1881,47 +2075,152 @@ fn helper_receive_body(
     (bodies, low)
 }
 
+/// The writes of `stat`, setting `opaque` when it calls a function nothing
+/// binds.
 fn collect_net_write_ops_from_stat(
     ctx: &mut NetCollectCtx<'_>,
     block: &LuaBlock,
     stat: &LuaStat,
     writes: &mut Vec<NetOpEntry>,
+    opaque: &mut bool,
 ) {
     let mut items = Vec::new();
-    op_items(&ctx.site, block, stat.syntax(), &mut items);
-    compose_ops(ctx, &items, NetOpDirection::Write, writes);
+    op_items(&ctx.site, None, block, stat.syntax(), &mut items);
+    compose_ops(ctx, &items, NetOpDirection::Write, &[], writes, opaque);
 }
 
 /// The ops of a payload walk in `direction`, with each helper step expanded
-/// into that helper's own walk.
+/// into that helper's own walk and each call of the walked function's
+/// parameter into the function `fns` binds there. A function handed to the
+/// transaction that nothing binds sets `opaque`, since what it does is
+/// unknown.
 fn compose_ops(
     ctx: &mut NetCollectCtx<'_>,
     items: &[NetOpItem],
     direction: NetOpDirection,
+    fns: &[Option<HelperId>],
     out: &mut Vec<NetOpEntry>,
+    opaque: &mut bool,
 ) {
+    let bind_own = |idx: usize| match fns.get(idx) {
+        Some(Some(body)) => Binding::Fn(body.clone()),
+        _ => Binding::Unknown,
+    };
+    let mut composed = Vec::new();
     for item in items {
         match item {
-            NetOpItem::Op(entry) => {
-                if entry.op.direction == direction {
-                    out.push(entry.clone());
-                }
-            }
+            NetOpItem::Op(entry) => composed.push(ComposedOp::Op(entry.clone())),
+            NetOpItem::Opaque => composed.push(ComposedOp::Opaque),
+            NetOpItem::Param {
+                idx,
+                dynamic,
+                flow_path,
+            } => splice(
+                &[ComposedOp::Param {
+                    idx: *idx,
+                    dynamic: false,
+                    flow_path: Vec::new(),
+                }],
+                &bind_own,
+                *dynamic,
+                flow_path,
+                &mut |body| ctx.ops(body),
+                &mut composed,
+            ),
             NetOpItem::Helper {
                 target,
                 dynamic,
                 flow_path,
+                fn_args,
+                colon_call,
             } => {
                 if !ctx.reach(target).payload {
                     continue;
                 }
-                let ops = ctx.ops(target);
-                stamp_ops(
-                    ops.iter().filter(|entry| entry.op.direction == direction),
+                let callee = ctx.helper(target);
+                let walk = ctx.ops(target);
+                let bind = |idx: usize| match callee_fn_arg(&callee, fn_args, *colon_call, idx) {
+                    Some(FnArg::Body(body)) => Binding::Fn(body.clone()),
+                    Some(FnArg::Param(own)) => bind_own(*own),
+                    None => Binding::Dropped,
+                };
+                splice(
+                    &walk,
+                    &bind,
                     *dynamic,
                     flow_path,
-                    out,
+                    &mut |body| ctx.ops(body),
+                    &mut composed,
                 );
+            }
+        }
+    }
+    for op in composed {
+        match op {
+            ComposedOp::Op(entry) => {
+                if entry.op.direction == direction {
+                    out.push(entry);
+                }
+            }
+            ComposedOp::Param { .. } | ComposedOp::Opaque => *opaque = true,
+        }
+    }
+}
+
+/// The function a call passes for the callee's parameter `param_idx`.
+fn callee_fn_arg<'a>(
+    callee: &NetHelper,
+    fn_args: &'a [Option<FnArg>],
+    colon_call: bool,
+    param_idx: usize,
+) -> Option<&'a FnArg> {
+    let arg_idx = arg_index(param_idx, callee.colon_define, colon_call)?;
+    fn_args.get(arg_idx)?.as_ref()
+}
+
+/// Splices a callee's composed walk into its caller's, stamped with the call's
+/// dynamic context and flow prefix, each call of the callee's own parameter
+/// becoming what `bind` makes of it there: the bound function's own walk, a
+/// call of the caller's parameter, or a call nothing binds.
+fn splice(
+    walk: &[ComposedOp],
+    bind: &dyn Fn(usize) -> Binding,
+    dynamic: bool,
+    prefix: &[NetFlowFrame],
+    walk_of: &mut dyn FnMut(&HelperId) -> Arc<Vec<ComposedOp>>,
+    out: &mut Vec<ComposedOp>,
+) {
+    for op in walk {
+        match op {
+            ComposedOp::Op(entry) => out.push(ComposedOp::Op(stamped(entry, dynamic, prefix))),
+            ComposedOp::Opaque => out.push(ComposedOp::Opaque),
+            ComposedOp::Param {
+                idx,
+                dynamic: op_dynamic,
+                flow_path,
+            } => {
+                let dynamic = dynamic || *op_dynamic;
+                let flow_path = prefixed(prefix, flow_path);
+                match bind(*idx) {
+                    Binding::Param(idx) => out.push(ComposedOp::Param {
+                        idx,
+                        dynamic,
+                        flow_path,
+                    }),
+                    Binding::Fn(body) => {
+                        let body_walk = walk_of(&body);
+                        splice(
+                            &body_walk,
+                            &|_| Binding::Dropped,
+                            dynamic,
+                            &flow_path,
+                            walk_of,
+                            out,
+                        );
+                    }
+                    Binding::Unknown => out.push(ComposedOp::Opaque),
+                    Binding::Dropped => {}
+                }
             }
         }
     }
@@ -1987,6 +2286,11 @@ fn reach_walk(
     for call in &helper.calls {
         reach = reach.union(NetReach::of_role(call.role.as_ref()));
     }
+    // A function its caller passes may write anything.
+    reach.payload |= helper
+        .ops
+        .iter()
+        .any(|item| matches!(item, NetOpItem::Param { .. }));
     let mut low = NO_CYCLE;
     for target in helper.calls.iter().filter_map(|call| call.target.as_ref()) {
         if reach == NetReach::ALL {
@@ -2057,76 +2361,99 @@ fn send_walk(
     (answer, low)
 }
 
-/// A helper call's payload ops: the helper's own walk with each helper step
-/// expanded, stamped with the call site's dynamic context and flow prefix.
-/// Returns the lowest open helper the expansion was pruned at.
-fn expand_helper_ops(
+/// A helper's composed payload walk: its own walk with each helper step
+/// expanded, and the calls of its own parameters left for its callers to
+/// bind. The callbacks of its callees that it does not pass on are no steps:
+/// only a function handed to a transaction makes its payload unknown. Returns
+/// the lowest open helper the walk was pruned at.
+fn helper_walk(
     db: &DbIndex,
     helper_id: &HelperId,
-    force_dynamic: bool,
-    prefix: &[NetFlowFrame],
     stack: &mut Vec<HelperId>,
-    memo: &mut HashMap<HelperId, Vec<NetOpEntry>>,
-    out: &mut Vec<NetOpEntry>,
-) -> usize {
+    memo: &mut HashMap<HelperId, Arc<Vec<ComposedOp>>>,
+) -> (Arc<Vec<ComposedOp>>, usize) {
     if let Some(cached) = memo.get(helper_id) {
-        stamp_ops(cached, force_dynamic, prefix, out);
-        return NO_CYCLE;
+        return (cached.clone(), NO_CYCLE);
     }
     if let Some(open_depth) = stack.iter().position(|open| open == helper_id) {
-        return open_depth;
+        return (Arc::default(), open_depth);
     }
 
     let depth = stack.len();
     stack.push(helper_id.clone());
     let helper = helper_summary(db, helper_id);
-    let mut canonical = Vec::new();
-    let mut body_low = NO_CYCLE;
+    let mut walk = Vec::new();
+    let mut low = NO_CYCLE;
     for item in &helper.ops {
         match item {
-            NetOpItem::Op(entry) => canonical.push(entry.clone()),
+            NetOpItem::Op(entry) => walk.push(ComposedOp::Op(entry.clone())),
+            NetOpItem::Param {
+                idx,
+                dynamic,
+                flow_path,
+            } => walk.push(ComposedOp::Param {
+                idx: *idx,
+                dynamic: *dynamic,
+                flow_path: flow_path.clone(),
+            }),
+            NetOpItem::Opaque => {}
             NetOpItem::Helper {
                 target,
                 dynamic,
                 flow_path,
+                fn_args,
+                colon_call,
             } => {
-                let helper_low =
-                    expand_helper_ops(db, target, *dynamic, flow_path, stack, memo, &mut canonical);
-                body_low = body_low.min(helper_low);
+                let (callee_walk, callee_low) = helper_walk(db, target, stack, memo);
+                low = low.min(callee_low);
+                let callee = helper_summary(db, target);
+                let bind = |idx: usize| match callee_fn_arg(&callee, fn_args, *colon_call, idx) {
+                    Some(FnArg::Body(body)) => Binding::Fn(body.clone()),
+                    Some(FnArg::Param(own)) => Binding::Param(*own),
+                    None => Binding::Dropped,
+                };
+                splice(
+                    &callee_walk,
+                    &bind,
+                    *dynamic,
+                    flow_path,
+                    &mut |body| {
+                        let (body_walk, body_low) = helper_walk(db, body, stack, memo);
+                        low = low.min(body_low);
+                        body_walk
+                    },
+                    &mut walk,
+                );
             }
         }
     }
     stack.pop();
-    stamp_ops(&canonical, force_dynamic, prefix, out);
-    // Only cycle-free walks are shared; the current expansion still emits its
-    // pruned ops.
-    if body_low >= depth {
-        memo.insert(helper_id.clone(), canonical);
-        return NO_CYCLE;
+    let walk = Arc::new(walk);
+    // Only cycle-free walks are shared; the current expansion still uses its
+    // pruned walk.
+    if low >= depth {
+        memo.insert(helper_id.clone(), walk.clone());
+        return (walk, NO_CYCLE);
     }
-    body_low
+    (walk, low)
 }
 
-/// Stamps a helper's payload walk with the caller's dynamic context: `dynamic`
-/// is the OR of the outer flag and the op's own, and the outer prefix is
-/// prepended to the op's path.
-fn stamp_ops<'a>(
-    canonical: impl IntoIterator<Item = &'a NetOpEntry>,
-    force_dynamic: bool,
-    prefix: &[NetFlowFrame],
-    out: &mut Vec<NetOpEntry>,
-) {
-    for entry in canonical {
-        let mut stamped = entry.clone();
-        stamped.dynamic = force_dynamic || entry.dynamic;
-        if !prefix.is_empty() {
-            let mut flow_path = Vec::with_capacity(prefix.len() + entry.flow_path.len());
-            flow_path.extend_from_slice(prefix);
-            flow_path.extend_from_slice(&entry.flow_path);
-            stamped.flow_path = flow_path;
-        }
-        out.push(stamped);
+/// `entry` stamped with a caller's dynamic context: `dynamic` is the OR of the
+/// outer flag and the op's own, and the outer prefix is prepended to its path.
+fn stamped(entry: &NetOpEntry, dynamic: bool, prefix: &[NetFlowFrame]) -> NetOpEntry {
+    let mut stamped = entry.clone();
+    stamped.dynamic = dynamic || entry.dynamic;
+    if !prefix.is_empty() {
+        stamped.flow_path = prefixed(prefix, &entry.flow_path);
     }
+    stamped
+}
+
+fn prefixed(prefix: &[NetFlowFrame], flow_path: &[NetFlowFrame]) -> Vec<NetFlowFrame> {
+    let mut path = Vec::with_capacity(prefix.len() + flow_path.len());
+    path.extend_from_slice(prefix);
+    path.extend_from_slice(flow_path);
+    path
 }
 
 #[cfg(test)]

@@ -349,4 +349,143 @@ FinishLoopB(ply)
         assert_eq!(warm.settled_digest(), cold.settled_digest());
         assert!(warm.stale_derivations().is_empty());
     }
+
+    const PANEL_NET: &str = "addons/mytest/lua/autorun/client/cl_panel_net.lua";
+    const PANEL_NET_TEXT: &str = "local classes = {}
+classes.On = function(pnl, name, fn)
+    pnl[name] = fn
+end
+classes.NetMessage = function(pnl, name, data)
+    pnl:On(\"DoClick\", function()
+        net.Start(name)
+        data(pnl)
+        net.SendToServer()
+    end)
+end
+";
+    const STORE: &str = "addons/mytest/lua/autorun/client/cl_store.lua";
+    const STORE_TEXT: &str = "local button = vgui.Create(\"DButton\")
+button:NetMessage(\"OrderAdd\", function()
+    net.WriteString(\"chair\")
+end)
+";
+    const ORDERS: &str = "addons/mytest/lua/autorun/server/sv_orders.lua";
+    const ORDERS_TEXT: &str = "util.AddNetworkString(\"OrderAdd\")
+net.Receive(\"OrderAdd\", function(len, ply)
+    net.ReadString()
+    net.ReadUInt(16)
+end)
+";
+
+    /// A writer passed to a helper keeps the flows of a cold build through an
+    /// edit of the writer and shifts of the caller and the helper, and its
+    /// writes follow a delete and re-create of the helper.
+    #[test]
+    fn a_passed_writer_keeps_the_flows_of_a_cold_build_through_edits() {
+        let wider = STORE_TEXT.replace(
+            "net.WriteString(\"chair\")
+",
+            "net.WriteString(\"chair\")
+    net.WriteUInt(2, 16)
+",
+        );
+        let shifted_store = format!(
+            "-- shifted
+{wider}"
+        );
+        let shifted_panel = format!(
+            "-- shifted
+{PANEL_NET_TEXT}"
+        );
+        let cold = |files: Vec<(&str, &str)>| {
+            let mut cold = gmod_workspace();
+            cold.def_files(files);
+            cold
+        };
+
+        let mut warm = gmod_workspace();
+        warm.def_files(vec![
+            (PANEL_NET, PANEL_NET_TEXT),
+            (STORE, STORE_TEXT),
+            (ORDERS, ORDERS_TEXT),
+        ]);
+
+        warm.def_file(STORE, &wider);
+        let edited = cold(vec![
+            (PANEL_NET, PANEL_NET_TEXT),
+            (STORE, wider.as_str()),
+            (ORDERS, ORDERS_TEXT),
+        ]);
+        assert_eq!(
+            sent_writes(&edited, path_id(&edited, STORE)),
+            vec![writes("OrderAdd", &["string", "uint"])]
+        );
+        assert_eq!(warm.settled_digest(), edited.settled_digest());
+
+        warm.def_file(STORE, &shifted_store);
+        warm.def_file(PANEL_NET, &shifted_panel);
+        let shifted = cold(vec![
+            (PANEL_NET, shifted_panel.as_str()),
+            (STORE, shifted_store.as_str()),
+            (ORDERS, ORDERS_TEXT),
+        ]);
+        assert_eq!(warm.settled_digest(), shifted.settled_digest());
+
+        warm.analysis
+            .remove_file_by_uri(&warm.virtual_url_generator.new_uri(PANEL_NET));
+        assert!(sent_writes(&warm, path_id(&warm, STORE)).is_empty());
+
+        warm.def_file(PANEL_NET, &shifted_panel);
+        assert_eq!(
+            sent_writes(&warm, path_id(&warm, STORE)),
+            vec![writes("OrderAdd", &["string", "uint"])]
+        );
+        assert!(warm.stale_derivations().is_empty());
+    }
+
+    const INLINE_WRITER: &str = "addons/mytest/lua/autorun/server/sv_inline_writer.lua";
+    const INLINE_WRITER_TEXT: &str = "local function writeWith(write)
+    write()
+end
+
+function SendInline(ply)
+    net.Start(\"Inline\")
+    writeWith(function()
+        net.WriteBool(true)
+    end)
+    net.Send(ply)
+end
+";
+    const INLINE_CALLER: &str = "addons/mytest/lua/autorun/server/sv_inline_caller.lua";
+    const INLINE_CALLER_TEXT: &str = "SendInline(ply)
+";
+
+    /// A closure a helper passes to another helper keeps its writes in the
+    /// helper's callers through a shift of the helper's file.
+    #[test]
+    fn a_closure_a_helper_passes_on_keeps_its_writes_through_a_shift() {
+        let shifted = format!(
+            "-- shifted
+{INLINE_WRITER_TEXT}"
+        );
+
+        let mut warm = gmod_workspace();
+        warm.def_files(vec![
+            (INLINE_WRITER, INLINE_WRITER_TEXT),
+            (INLINE_CALLER, INLINE_CALLER_TEXT),
+        ]);
+        warm.def_file(INLINE_WRITER, &shifted);
+        let mut cold = gmod_workspace();
+        cold.def_files(vec![
+            (INLINE_WRITER, shifted.as_str()),
+            (INLINE_CALLER, INLINE_CALLER_TEXT),
+        ]);
+
+        assert_eq!(
+            sent_writes(&cold, path_id(&cold, INLINE_CALLER)),
+            vec![writes("Inline", &["bool"])]
+        );
+        assert_eq!(warm.settled_digest(), cold.settled_digest());
+        assert!(warm.stale_derivations().is_empty());
+    }
 }

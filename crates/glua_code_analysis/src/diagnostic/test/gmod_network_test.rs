@@ -3807,12 +3807,7 @@ mod tests {
         expect_that!(realms, is_empty());
     }
 
-    #[gtest]
-    fn test_helper_payload_written_by_caller_callback_is_not_counted_as_empty() {
-        let mut ws = new_gmod_workspace();
-        ws.def_file(
-            PANEL_HELPER_PATH,
-            r#"
+    const TDLIB_NET_MESSAGE: &str = r#"
             local classes = {}
             classes.On = function(pnl, name, fn)
                 pnl[name] = fn
@@ -3824,10 +3819,51 @@ mod tests {
                     net.SendToServer()
                 end)
             end
-            "#,
+            "#;
+
+    const DECO_ORDER_RECEIVER: &str = r#"
+            util.AddNetworkString("deco_orderadd")
+            net.Receive("deco_orderadd", function(len, ply)
+                local item = net.ReadString()
+                local quantity = net.ReadUInt(16)
+            end)
+            "#;
+
+    /// The network diagnostics on the `deco_orderadd` receiver once `helper`
+    /// and `caller` are loaded, and the writes of the caller's send flows.
+    fn deco_order_check(helper: &str, caller: &str) -> (usize, Vec<Vec<String>>) {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(PANEL_HELPER_PATH, helper);
+        let client_file_id = ws.def_file(PANEL_CALLER_PATH, caller);
+        let server_file_id = ws.def_file(
+            "gamemodes/cityrp/plugins/deco/sv_plugin.lua",
+            DECO_ORDER_RECEIVER,
         );
-        ws.def_file(
-            PANEL_CALLER_PATH,
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        let writes = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(client_file_id)
+            .map(|data| {
+                data.send_flows
+                    .iter()
+                    .filter(|flow| flow.message_name == "deco_orderadd")
+                    .map(|flow| {
+                        flow.writes
+                            .iter()
+                            .map(|write| write.op.wire_format.as_str().to_string())
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (count_network_diagnostics(&diagnostics), writes)
+    }
+
+    #[gtest]
+    fn test_helper_payload_written_by_caller_closure_is_checked() {
+        let (diagnostics, writes) = deco_order_check(
+            TDLIB_NET_MESSAGE,
             r#"
             local button = vgui.Create("DButton")
             button:NetMessage("deco_orderadd", function()
@@ -3836,19 +3872,193 @@ mod tests {
             end)
             "#,
         );
-        let server_file_id = ws.def_file(
-            "gamemodes/cityrp/plugins/deco/sv_plugin.lua",
+        expect_that!(diagnostics, eq(0usize));
+        expect_that!(
+            writes,
+            elements_are![elements_are![eq("string"), eq("uint")]]
+        );
+    }
+
+    #[gtest]
+    fn test_helper_payload_written_by_caller_closure_reports_a_mismatch() {
+        let (diagnostics, writes) = deco_order_check(
+            TDLIB_NET_MESSAGE,
             r#"
-            util.AddNetworkString("deco_orderadd")
-            net.Receive("deco_orderadd", function(len, ply)
-                local item = net.ReadString()
-                local quantity = net.ReadUInt(16)
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", function()
+                net.WriteString("chair")
             end)
             "#,
         );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(writes, elements_are![elements_are![eq("string")]]);
+    }
 
-        let diagnostics = file_diagnostics(&mut ws, server_file_id);
-        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    #[gtest]
+    fn test_helper_payload_written_by_named_local_function_is_checked() {
+        let (diagnostics, writes) = deco_order_check(
+            TDLIB_NET_MESSAGE,
+            r#"
+            local function writeOrder()
+                net.WriteString("chair")
+            end
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", writeOrder)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(writes, elements_are![elements_are![eq("string")]]);
+    }
+
+    #[gtest]
+    fn test_helper_payload_written_by_unresolvable_function_is_not_checked() {
+        let (diagnostics, _) = deco_order_check(
+            TDLIB_NET_MESSAGE,
+            r#"
+            local PANEL = {}
+            function PANEL:Init()
+                local button = vgui.Create("DButton", self)
+                button:NetMessage("deco_orderadd", self.WriteOrder)
+            end
+            "#,
+        );
+        expect_that!(diagnostics, eq(0usize));
+    }
+
+    #[gtest]
+    fn test_writer_forwarded_through_two_helpers_is_checked() {
+        let (diagnostics, writes) = deco_order_check(
+            r#"
+            local classes = {}
+            classes.Send = function(pnl, name, data)
+                net.Start(name)
+                data(pnl)
+                net.SendToServer()
+            end
+            classes.NetMessage = function(pnl, name, data)
+                pnl:Send(name, data)
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", function()
+                net.WriteString("chair")
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(writes, elements_are![elements_are![eq("string")]]);
+    }
+
+    #[gtest]
+    fn test_writer_passed_to_a_payload_helper_is_checked() {
+        let (diagnostics, writes) = deco_order_check(
+            r#"
+            local function writeWith(write)
+                write()
+            end
+            local classes = {}
+            classes.NetMessage = function(pnl, name, data)
+                net.Start(name)
+                writeWith(data)
+                net.SendToServer()
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", function()
+                net.WriteString("chair")
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(writes, elements_are![elements_are![eq("string")]]);
+    }
+
+    #[gtest]
+    fn test_writer_passed_through_two_payload_helpers_is_checked() {
+        let (diagnostics, writes) = deco_order_check(
+            r#"
+            local function writeWith(write)
+                write()
+            end
+            local function writeVia(write)
+                writeWith(write)
+            end
+            local classes = {}
+            classes.NetMessage = function(pnl, name, data)
+                net.Start(name)
+                writeVia(data)
+                net.SendToServer()
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", function()
+                net.WriteString("chair")
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(writes, elements_are![elements_are![eq("string")]]);
+    }
+
+    #[gtest]
+    fn test_callback_parameter_shadowing_the_writer_is_not_bound() {
+        let (diagnostics, _) = deco_order_check(
+            r#"
+            local classes = {}
+            classes.On = function(pnl, name, fn)
+                pnl[name] = fn
+            end
+            classes.NetMessage = function(pnl, name, data)
+                pnl:On("DoClick", function(_, _, data)
+                    net.Start(name)
+                    data(pnl)
+                    net.SendToServer()
+                end)
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", function()
+                net.WriteString("chair")
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(0usize));
+    }
+
+    #[gtest]
+    fn test_receive_reading_through_a_reader_parameter_is_not_counted_as_empty() {
+        let mut ws = new_gmod_workspace();
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_listen.lua",
+            r#"
+            function Listen(name, reader)
+                net.Receive(name, function(len, ply)
+                    reader(ply)
+                end)
+            end
+            Listen("OrderPlaced", function(ply)
+                local item = net.ReadString()
+            end)
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/cl_order.lua",
+            r#"
+            net.Start("OrderPlaced")
+            net.WriteString("chair")
+            net.SendToServer()
+            "#,
+        );
+
+        let diagnostics = [server_file_id, client_file_id]
+            .into_iter()
+            .map(|file_id| count_network_diagnostics(&file_diagnostics(&mut ws, file_id)))
+            .sum::<usize>();
+        expect_that!(diagnostics, eq(0usize));
     }
 
     #[gtest]
@@ -3876,5 +4086,41 @@ mod tests {
 
         let diagnostics = file_diagnostics(&mut ws, server_file_id);
         expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_receive_calling_a_utility_that_runs_an_unbound_callback_is_still_checked() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteOrderMismatch);
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_orders.lua",
+            r#"
+            local function safely(fn)
+                fn()
+            end
+            util.AddNetworkString("OrderPlaced")
+            net.Receive("OrderPlaced", function(len, ply)
+                safely(ply.OnOrder)
+                local item = net.ReadString()
+            end)
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/cl_order.lua",
+            r#"
+            net.Start("OrderPlaced")
+            net.WriteString("chair")
+            net.WriteUInt(2, 16)
+            net.SendToServer()
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(
+            count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteOrderMismatch),
+            eq(1usize)
+        );
     }
 }
