@@ -4640,6 +4640,54 @@ mod tests {
         Ok(())
     }
 
+    /// A gamemode class based on `GM` is offered the hooks `GM` falls back to,
+    /// as `GM` itself is.
+    #[gtest]
+    fn a_class_based_on_gm_completes_the_sandbox_hooks() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            ---@class GM
+            GM = GM or {}
+
+            ---@class SANDBOX
+            SANDBOX = SANDBOX or {}
+
+            function SANDBOX:ZzzSandboxHook(player, class_name) end
+
+            ---@class MYGM : GM
+            local MYGM = {}
+            function MYGM:<??>()
+            end
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let description = items
+            .into_iter()
+            .find(|it| it.label == "ZzzSandboxHook")
+            .and_then(|item| item.label_details)
+            .and_then(|details| details.description);
+        verify_eq!(description, Some("from SANDBOX".to_string()))
+    }
+
     #[gtest]
     fn test_gmod_plugin_function_decl_completion_uses_gm_fallback_with_param_detail() -> Result<()>
     {

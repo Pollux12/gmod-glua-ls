@@ -1472,6 +1472,57 @@ local EscapeStringMap: {
         Ok(())
     }
 
+    /// A hook of a gamemode class based on `GM` shows the docs `GM`'s would.
+    #[gtest]
+    fn a_hook_of_a_class_based_on_gm_shows_the_sandbox_docs() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "library/lua/includes/extensions/sandbox_hooks.lua",
+            r#"
+                ---@class GM
+                GM = GM or {}
+
+                ---@class SANDBOX
+                SANDBOX = SANDBOX or {}
+
+                ---Called when a player attempts to spawn a SENT.
+                ---@param ply Player
+                ---@param class string
+                ---@return boolean
+                function SANDBOX:PlayerSpawnSENT(ply, class)
+                end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class MYGM : GM
+                local MYGM = {}
+
+                function MYGM:PlayerSpawnSE<??>NT(ply, class)
+                    return true
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemodes/mygm/gamemode/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+        verify_that!(
+            markup.value,
+            contains_substring("Called when a player attempts to spawn a SENT")
+        )
+    }
+
     #[gtest]
     fn test_hover_hook_add_string_uses_registered_hook_docs() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();

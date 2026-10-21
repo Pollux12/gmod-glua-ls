@@ -854,8 +854,9 @@ fn extend_gmod_hook_semantic_decls(
         return;
     };
 
-    let fallback_owner_names = gmod_hook_owner_fallbacks(db, owner_type_decl_id);
-    if fallback_owner_names.is_empty() {
+    let owner_name = owner_type_decl_id.get_simple_name();
+    let hook_owners = glua_code_analysis::gmod_hook_owner_group_of(db, owner_type_decl_id);
+    if hook_owners.is_empty() {
         return;
     }
 
@@ -872,7 +873,11 @@ fn extend_gmod_hook_semantic_decls(
         semantic_decls,
     );
 
-    for fallback_owner_name in fallback_owner_names {
+    // The owner's own definitions are the same-owner ones above.
+    for fallback_owner_name in hook_owners
+        .iter()
+        .filter(|name| !name.eq_ignore_ascii_case(owner_name))
+    {
         let fallback_type = LuaType::Ref(LuaTypeDeclId::global(fallback_owner_name));
         let member_infos = match trigger_position {
             Some(trigger_position) => builder.semantic_model.get_member_info_with_key_at_offset(
@@ -1034,45 +1039,6 @@ fn extend_gmod_hook_same_owner_semantic_decls(
         .filter(|(priority, _, _)| *priority == best_priority)
     {
         semantic_decls.push((same_owner_decl, owner_type));
-    }
-}
-
-/// The hook owners whose docs `owner`'s hooks fall back to: those of the
-/// nearest of `owner` and its supertypes that is a hook owner, so a scoped
-/// gamemode class (based on `GM`) falls back as `GM` does.
-fn gmod_hook_owner_fallbacks(db: &DbIndex, owner: &LuaTypeDeclId) -> &'static [&'static str] {
-    let mut pending = vec![owner.clone()];
-    let mut visited = HashSet::new();
-    while let Some(type_id) = pending.pop() {
-        if !visited.insert(type_id.clone()) {
-            continue;
-        }
-        let fallbacks = gmod_hook_owner_name_fallbacks(type_id.get_simple_name());
-        if !fallbacks.is_empty() {
-            return fallbacks;
-        }
-        for super_type in db
-            .get_type_index()
-            .get_super_types(&type_id)
-            .unwrap_or_default()
-        {
-            if let LuaType::Ref(super_id) | LuaType::Def(super_id) = super_type {
-                pending.push(super_id);
-            }
-        }
-    }
-    &[]
-}
-
-fn gmod_hook_owner_name_fallbacks(owner_name: &str) -> &'static [&'static str] {
-    if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
-        &["SANDBOX"]
-    } else if owner_name.eq_ignore_ascii_case("PLUGIN") {
-        &["GM", "GAMEMODE", "SANDBOX"]
-    } else if owner_name.eq_ignore_ascii_case("SANDBOX") {
-        &["GM", "GAMEMODE"]
-    } else {
-        &[]
     }
 }
 

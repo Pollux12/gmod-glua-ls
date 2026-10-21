@@ -2,6 +2,7 @@ mod cache;
 mod decl;
 mod generic;
 pub(crate) mod gmod_call_effect;
+mod gmod_hook_owner;
 mod gmod_vgui_context;
 mod guard;
 mod infer;
@@ -118,6 +119,7 @@ use crate::{
 };
 use crate::{LuaFunctionType, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaTypeOwner};
 pub use generic::*;
+pub use gmod_hook_owner::{BUILTIN_HOOK_OWNERS, gmod_hook_owner_group, gmod_hook_owner_group_of};
 pub use guard::{InferGuard, InferGuardRef};
 pub use infer::InferFailReason;
 pub(crate) use infer::floors_unsettled;

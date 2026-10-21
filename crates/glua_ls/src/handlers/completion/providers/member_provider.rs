@@ -1,7 +1,8 @@
 use glua_code_analysis::{
-    DbIndex, FileId, GmodRealm, GmodStateMask, LuaMemberInfo, LuaMemberKey, LuaMemberOwner,
-    LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticModel, enum_variable_is_param,
-    get_tpl_ref_extend_type,
+    BUILTIN_HOOK_OWNERS, DbIndex, FileId, GmodRealm, GmodStateMask, LuaMemberInfo, LuaMemberKey,
+    LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticModel,
+    enum_variable_is_param, get_tpl_ref_extend_type, gmod_hook_owner_group,
+    gmod_hook_owner_group_of,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaComment, LuaCommentOwner, LuaDocTag, LuaDocTagRealm, LuaExpr,
@@ -70,9 +71,9 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
     extend_global_path_members(builder, &prefix_expr, &mut member_info_map);
     let gmod_owner_name = gmod_hook_owner_name(&prefix_expr, &prefix_type);
     let gmod_fallback_owner = if builder.semantic_model.get_emmyrc().gmod.enabled {
-        gmod_owner_name
-            .as_deref()
-            .and_then(gmod_hook_fallback_owner)
+        gmod_owner_name.as_deref().and_then(|owner_name| {
+            gmod_hook_fallback_owner(builder.semantic_model.get_db(), owner_name, &prefix_type)
+        })
     } else {
         None
     };
@@ -332,8 +333,15 @@ struct GmodFallbackOwner<'a> {
     candidates: &'static [&'static str],
 }
 
-fn gmod_hook_fallback_owner(owner_name: &str) -> Option<GmodFallbackOwner<'_>> {
-    let candidates = gmod_hook_owner_candidates(owner_name);
+fn gmod_hook_fallback_owner<'a>(
+    db: &DbIndex,
+    owner_name: &'a str,
+    owner_type: &LuaType,
+) -> Option<GmodFallbackOwner<'a>> {
+    let candidates = match owner_type {
+        LuaType::Ref(owner) | LuaType::Def(owner) => gmod_hook_owner_group_of(db, owner),
+        _ => gmod_hook_owner_group(owner_name),
+    };
     if candidates.is_empty() {
         None
     } else {
@@ -341,18 +349,6 @@ fn gmod_hook_fallback_owner(owner_name: &str) -> Option<GmodFallbackOwner<'_>> {
             owner_name,
             candidates,
         })
-    }
-}
-
-fn gmod_hook_owner_candidates(owner_name: &str) -> &'static [&'static str] {
-    if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
-        &["GM", "GAMEMODE", "SANDBOX"]
-    } else if owner_name.eq_ignore_ascii_case("PLUGIN") {
-        &["PLUGIN", "GM", "GAMEMODE", "SANDBOX"]
-    } else if owner_name.eq_ignore_ascii_case("SANDBOX") {
-        &["SANDBOX", "GM", "GAMEMODE"]
-    } else {
-        &[]
     }
 }
 
@@ -654,10 +650,9 @@ fn is_gmod_hook_member_info(db: &DbIndex, info: &LuaMemberInfo) -> bool {
     };
 
     let owner_name = owner_type_id.get_simple_name();
-    owner_name.eq_ignore_ascii_case("GM")
-        || owner_name.eq_ignore_ascii_case("GAMEMODE")
-        || owner_name.eq_ignore_ascii_case("SANDBOX")
-        || owner_name.eq_ignore_ascii_case("PLUGIN")
+    BUILTIN_HOOK_OWNERS
+        .iter()
+        .any(|hook_owner| hook_owner.eq_ignore_ascii_case(owner_name))
 }
 
 /// Realm filtering state shared by every candidate member of one request.

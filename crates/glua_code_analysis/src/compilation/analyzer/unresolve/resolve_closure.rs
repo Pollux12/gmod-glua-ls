@@ -410,12 +410,7 @@ pub fn resolve_gmod_hook_callback_doc_function(
 }
 
 fn iter_hook_owner_names(db: &DbIndex) -> Vec<String> {
-    let mut names = vec![
-        "GM".to_string(),
-        "GAMEMODE".to_string(),
-        "SANDBOX".to_string(),
-        "PLUGIN".to_string(),
-    ];
+    let mut names = crate::BUILTIN_HOOK_OWNERS.map(ToString::to_string).to_vec();
     for scoped_hook_owner in db
         .get_emmyrc()
         .gmod

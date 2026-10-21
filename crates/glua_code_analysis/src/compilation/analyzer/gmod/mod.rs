@@ -9793,7 +9793,7 @@ fn extract_param_names_from_closure(closure_expr: glua_parser::LuaClosureExpr) -
 }
 
 fn is_builtin_method_hook_prefix(prefix_name: &str) -> bool {
-    matches!(prefix_name, "GM" | "GAMEMODE" | "PLUGIN" | "SANDBOX")
+    crate::BUILTIN_HOOK_OWNERS.contains(&prefix_name)
 }
 
 fn is_configured_method_hook_prefix(db: &DbIndex, prefix_name: &str) -> bool {
