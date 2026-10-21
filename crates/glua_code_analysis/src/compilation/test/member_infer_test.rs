@@ -76,6 +76,30 @@ mod test {
     }
 
     #[test]
+    fn a_table_generated_in_a_nested_function_drops_the_enclosing_functions_earlier_write() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sh_registry.lua",
+            r#"
+            function SetupRegistry()
+                Registry.Value = 1
+                function ResetRegistry()
+                    Registry = {}
+                end
+            end
+            "#,
+        );
+        let reader = ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sh_registry_reader.lua",
+            "local value = Registry.Value
+",
+        );
+
+        let value = local_name_type(&mut ws, reader, "value");
+        assert_ne!(value, LuaType::IntegerConst(1));
+    }
+
+    #[test]
     fn object_identity_explicit_self_return_colon_call() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file = ws.def_file(

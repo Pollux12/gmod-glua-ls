@@ -498,12 +498,11 @@ pub(crate) fn source_survives_table_generation_cutoff(
         return true;
     }
 
-    let member_index = db.get_member_index();
-    let source_function =
-        member_index.enclosing_function_scope_range(source_file_id, source_position);
-    let generation_function = member_index
-        .enclosing_function_scope_range(source_min_position.file_id, source_min_position.value);
-    source_function.is_some() && source_function != generation_function
+    // A write in a function body that does not enclose the generation runs
+    // whenever that function is called, which may be after the generation.
+    db.get_member_index()
+        .enclosing_function_scope_range(source_file_id, source_position)
+        .is_some_and(|source_function| !source_function.contains(source_min_position.value))
 }
 
 fn infer_custom_type_raw_member_type(
