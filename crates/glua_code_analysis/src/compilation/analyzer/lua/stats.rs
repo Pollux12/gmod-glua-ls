@@ -51,7 +51,7 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
             let decl_id = LuaDeclId::new(analyzer.file_id, position);
             // A deferred-definition attribute is set: skip binding the type and bind it on the first assignment
             if has_delayed_definition_attribute(analyzer, decl_id) {
-                return Some(());
+                continue;
             }
             // Skip Nil binding for mutable locals (those with subsequent write-assignments).
             // This prevents false "cannot assign X to never" diagnostics when a local is used
