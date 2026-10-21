@@ -806,75 +806,24 @@ impl UnguardedChildFileResult {
     }
 }
 
-/// Settles files' unguarded-child evidence into published facts. Returns the
-/// sources of the facts that changed.
+/// Settles a file's unguarded-child evidence into published facts.
 pub(crate) fn publish_unguarded_children(
     db: &mut crate::DbIndex,
     context: &mut AnalyzeContext,
-    results: Vec<UnguardedChildFileResult>,
-) -> Vec<InFiled<glua_parser::LuaSyntaxId>> {
+    result: UnguardedChildFileResult,
+) {
     let mut profile = crate::profile::phase_enabled().then(UnguardedChildProfile::default);
-    let mut scores = HashMap::<LuaDefinitionId, UnguardedChildCandidates>::default();
-    let mut deferred_definitions = FxHashSet::<LuaDefinitionId>::default();
-    let mut nested_scores =
-        HashMap::<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>::default();
-    let mut sources = HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), ChildSource>::new();
-    let mut found_types = HashMap::<InFiled<glua_parser::LuaSyntaxId>, LuaType>::default();
-    let mut initializer_refinements = HashMap::<crate::LuaDeclId, LuaType>::default();
-
-    for result in results {
-        deferred_definitions.extend(result.deferred_definitions);
-        found_types.extend(result.found_types);
-        for (definition, candidates) in result.scores {
-            let entry = scores
-                .entry(definition)
-                .or_insert_with(|| UnguardedChildCandidates {
-                    parent_type: candidates.parent_type.clone(),
-                    children: HashMap::default(),
-                });
-            for (child_id, keys) in candidates.children {
-                entry.children.entry(child_id).or_default().extend(keys);
-            }
-        }
-        for (target, candidates) in result.nested_scores {
-            let entry =
-                nested_scores
-                    .entry(target)
-                    .or_insert_with(|| NestedUnguardedChildCandidates {
-                        parent_type: candidates.parent_type.clone(),
-                        children: HashMap::default(),
-                        receivers: FxHashSet::default(),
-                        sources: HashMap::default(),
-                    });
-            if entry.parent_type != candidates.parent_type {
-                continue;
-            }
-            for (child_id, keys) in candidates.children {
-                entry.children.entry(child_id).or_default().extend(keys);
-            }
-            entry.receivers.extend(candidates.receivers);
-            for (child, source) in candidates.sources {
-                record_child_source(&mut entry.sources, child, source);
-            }
-        }
-        for (source_key, source) in result.sources {
-            sources
-                .entry(source_key)
-                .and_modify(|existing| {
-                    if source.precedes(existing) {
-                        *existing = source.clone();
-                    }
-                })
-                .or_insert(source);
-        }
-        for (decl_id, initializer_type) in result.initializer_refinements {
-            initializer_refinements
-                .entry(decl_id)
-                .or_insert(initializer_type);
-        }
-        if let (Some(profile), Some(file_profile)) = (&mut profile, result.profile) {
-            profile.absorb(file_profile);
-        }
+    let UnguardedChildFileResult {
+        mut scores,
+        deferred_definitions,
+        nested_scores,
+        mut sources,
+        found_types,
+        initializer_refinements,
+        profile: file_profile,
+    } = result;
+    if let (Some(profile), Some(file_profile)) = (&mut profile, file_profile) {
+        profile.absorb(file_profile);
     }
     if !deferred_definitions.is_empty() {
         scores.retain(|definition, _| !deferred_definitions.contains(definition));
@@ -882,7 +831,6 @@ pub(crate) fn publish_unguarded_children(
     }
 
     let mut updates = Vec::new();
-    let mut update_sources = Vec::new();
     // Both score maps are hashed, and their entries decide the order facts are
     // published and reported in.
     let mut scores = scores.into_iter().collect::<Vec<_>>();
@@ -955,7 +903,6 @@ pub(crate) fn publish_unguarded_children(
             inferred_type: Some(Arc::new(typ.clone())),
             found_type: Some(Arc::new(found_type)),
         });
-        update_sources.push(source.clone());
         updates.push((
             node,
             LuaTypeFact::new(typ, LuaInferenceConfidence::Heuristic, provenance.into()),
@@ -1004,7 +951,6 @@ pub(crate) fn publish_unguarded_children(
         else {
             continue;
         };
-        update_sources.push(source.clone());
         let mut receivers = candidates.receivers.into_iter().collect::<Vec<_>>();
         receivers.sort_by_key(in_filed_order);
         let nodes = receivers
@@ -1036,10 +982,9 @@ pub(crate) fn publish_unguarded_children(
 
     let mut refinement_changed_files = FxHashSet::default();
     for (decl_id, initializer_type) in initializer_refinements {
-        let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
+        if db.get_decl_index().get_decl(&decl_id).is_none() {
             continue;
-        };
-        let syntax_id = decl.get_syntax_id();
+        }
         super::common::write_type_cache(
             db,
             decl_id.into(),
@@ -1047,7 +992,6 @@ pub(crate) fn publish_unguarded_children(
             super::common::TypeCacheWriteMode::ForceOverwrite,
         );
         refinement_changed_files.insert(decl_id.file_id);
-        update_sources.push(InFiled::new(decl_id.file_id, syntax_id));
     }
 
     let updates_len = updates.len();
@@ -1075,12 +1019,6 @@ pub(crate) fn publish_unguarded_children(
             updates_len,
             changed.len(),
         );
-    }
-    if changed_any {
-        update_sources.retain(|source| changed.contains(&source.file_id));
-        update_sources
-    } else {
-        Vec::new()
     }
 }
 

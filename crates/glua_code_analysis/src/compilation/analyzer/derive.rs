@@ -384,7 +384,7 @@ impl super::engine::Recipe for Recipes {
                 let scan = scan.into_evidence();
                 self.with_file_context(db, id.file_id, |db, context| {
                     if let Some(scan) = scan {
-                        local_inference::publish_unguarded_children(db, context, vec![scan]);
+                        local_inference::publish_unguarded_children(db, context, scan);
                     }
                     local_inference::stabilize_unknown_locals(db, context);
                 });
