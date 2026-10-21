@@ -259,19 +259,6 @@ pub struct LuaMemberIndex {
     /// mutation preserves the coverage they record, and any future history
     /// write without a paired item merge must clear its slot here.
     preserved_co_writer_reconciled: CowShardSet<(LuaMemberOwner, LuaMemberKey)>,
-    /// Monotonic homing generation for per-`(owner, key)` memos.
-    ///
-    /// The history index retains ids a later owner move left behind, so a raw
-    /// length plus a still-homed decider cannot prove the filtered set is
-    /// unchanged: moving a non-deciding writer away, or moving a historical
-    /// writer back, leaves both checks green while the truth changed. Every
-    /// mutation that can move an id between canonical slots, change what a
-    /// canonical slot names, or otherwise edit history membership bumps this
-    /// counter; pure appends (`add_member` first filings,
-    /// `add_member_to_owner`, `add_member_alias_to_owner`) do not. Memo
-    /// holders record the revision they walked and suffix-fold only on a
-    /// match, rebuilding from scratch otherwise.
-    homing_revision: u64,
     /// Members whose owner was recorded without adding them to the owner's
     /// member list: a write through an instance of a class, not the class.
     /// See [`Self::set_member_owner_only`].
@@ -383,7 +370,6 @@ impl LuaMemberIndex {
             expr_key_members_by_file: Default::default(),
             non_overwriting_assignment_members: Default::default(),
             preserved_co_writer_reconciled: Default::default(),
-            homing_revision: 0,
             owner_only_members: Default::default(),
             member_transfers: CowShards::default(),
             filed_homes: CowShards::default(),
@@ -893,10 +879,6 @@ impl LuaMemberIndex {
         }
     }
 
-    pub fn homing_revision(&self) -> u64 {
-        self.homing_revision
-    }
-
     /// Creates `file_id`'s per-file entries when absent. An empty file keeps
     /// empty per-file entries, which all readers treat exactly like absent ones.
     pub fn add_file_entries(&mut self, file_id: FileId) {
@@ -905,10 +887,6 @@ impl LuaMemberIndex {
             .entry(file_id)
             .or_default();
         self.function_scope_ranges.entry(file_id).or_default();
-    }
-
-    fn bump_homing_revision(&mut self) {
-        self.homing_revision = self.homing_revision.wrapping_add(1);
     }
 
     /// A rewrite, flag change, or drop behind the member's back alters the
@@ -1101,7 +1079,6 @@ impl LuaMemberIndex {
                 });
             member_object_changed = !identical;
             if !identical {
-                self.bump_homing_revision();
                 self.note_member_move(id);
             }
             match old_owner {
@@ -1205,10 +1182,6 @@ impl LuaMemberIndex {
             return Some(());
         }
 
-        // The key names the canonical slot, so the old slot's history keeps a
-        // left-behind entry at the same raw length while the filtered set
-        // changed: memos must rebuild rather than suffix-fold.
-        self.bump_homing_revision();
         self.note_member_move(member_id);
         let owner = self.member_current_owner.get(&member_id).cloned();
         if let Some(owner) = &owner {
@@ -1395,7 +1368,6 @@ impl LuaMemberIndex {
         };
         let current = self.member_current_owner.get(&id).cloned();
         if current != filed.owner {
-            self.bump_homing_revision();
             self.note_home_write(id, Homing::Transferred);
             if let Some(current) = &current {
                 self.remove_member_from_all_owner_key_indexes(current, id);
@@ -1466,7 +1438,6 @@ impl LuaMemberIndex {
         let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
             return;
         };
-        self.bump_homing_revision();
         self.drop_member_path_provenance_on_detach(owner, id);
         self.remove_member_from_all_owner_key_indexes(owner, id);
         self.remove_current_owner_member(owner, id);
@@ -1714,12 +1685,6 @@ impl LuaMemberIndex {
             note_slot_write(owner, key);
             self.fold_history_fingerprint(owner, history_element(key, *id), false);
         }
-        // The sweep edits history membership behind every memo's back: a slot
-        // that lost an entry shrinks, but one that lost nothing keeps its raw
-        // length, so only bump when an entry actually left.
-        if !visible.is_empty() || !history.is_empty() {
-            self.bump_homing_revision();
-        }
     }
 
     /// Drops the removed files' members from `owners`' slots, returning each
@@ -1771,15 +1736,6 @@ impl LuaMemberIndex {
     /// history entry the item does not list, which must clear that slot in
     /// [`Self::preserved_co_writer_reconciled`].
     ///
-    /// Homing invariant: a real owner move leaves the old slot's history
-    /// holding a left-behind entry, so its raw length is unchanged while its
-    /// filtered set shrank; a deferred first homing (no previous owner, but
-    /// the id is already indexed) grows a slot whose history already listed
-    /// the id without changing its raw length either. Both cases bump
-    /// [`Self::homing_revision`] so per-`(owner, key)` memos rebuild instead
-    /// of trusting a length check. Re-homing onto the same owner, or homing
-    /// a brand-new id for the first time, is append-only and leaves the
-    /// revision alone.
     pub fn set_member_owner(
         &mut self,
         owner: LuaMemberOwner,
@@ -1841,11 +1797,9 @@ impl LuaMemberIndex {
         }
         match &previous_owner {
             None if already_indexed => {
-                self.bump_homing_revision();
                 self.note_home_write(id, homing);
             }
             Some(previous) if previous != &owner => {
-                self.bump_homing_revision();
                 self.note_home_write(id, homing);
             }
             _ => {}
@@ -1883,12 +1837,8 @@ impl LuaMemberIndex {
 
     pub fn get_member_mut(&mut self, id: &LuaMemberId) -> Option<&mut LuaMember> {
         self.snapshot_member(*id);
-        // Defensive: the key lives on the member, so any mutable access could
-        // re-home it behind every memo's back. No caller does so today except
-        // through `rekey_member` (which bumps itself), but a future direct
-        // `set_key` would otherwise read stale suffix-folded answers.
+        // The key lives on the member, so a mutable access may move it.
         if self.members.contains_key(id) {
-            self.bump_homing_revision();
             self.note_member_move(*id);
         }
         self.members.get_mut(id)
@@ -1910,12 +1860,7 @@ impl LuaMemberIndex {
         if self.definition_site_owner.get(&site) == Some(&owner) {
             return;
         }
-        // Remapping what a canonical slot names re-homes every member filed
-        // under the affected literal: memos keyed by the old canonical slot
-        // must rebuild. `forget_definition_site` bumps for the unmap; bump
-        // again for the remap itself (a fresh site has no unmap to bump on).
         self.forget_definition_site(&site);
-        self.bump_homing_revision();
         Self::note_canonical_write(&path, Some(&site), &[]);
         self.definition_site_owner.insert(site.clone(), owner);
         let sites = self.path_definition_sites.entry(path.clone()).or_default();
@@ -2250,7 +2195,6 @@ impl LuaMemberIndex {
             return;
         }
         Self::note_canonical_write(path, None, &[old.as_ref(), winner.as_ref()]);
-        self.bump_homing_revision();
         // Moving the members is the index's own placement: whichever write
         // changed the candidates did not read where they lived, nor produce
         // them.
@@ -2422,9 +2366,6 @@ impl LuaMemberIndex {
             return;
         };
         Self::note_canonical_write(&path, Some(site), &[]);
-        // Unmapping what a canonical slot names re-homes the literal's
-        // members back onto the literal itself.
-        self.bump_homing_revision();
         if let Some(sites) = self.path_definition_sites.get_mut(&path) {
             sites.retain(|held| held != site);
             if sites.is_empty() {
@@ -2993,36 +2934,17 @@ impl LuaMemberIndex {
         members
     }
 
-    /// History-slot ids still homed under `owner`/`key`, in insertion order.
+    /// History-slot ids still homed under `owner`/`key`, in the slot's id
+    /// order.
     ///
     /// The unsorted form of
     /// [`get_current_owner_members_for_key`](Self::get_current_owner_members_for_key):
     /// per-write callers that only need membership or a minimum must not pay
-    /// that sort on every write.
+    /// its sort on every write.
     pub fn get_current_owner_member_ids_for_key_unsorted(
         &self,
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
-    ) -> Vec<LuaMemberId> {
-        self.get_current_owner_member_ids_for_key_unsorted_from(owner, key, 0)
-    }
-
-    /// The tail of the history slot
-    /// [`get_current_owner_member_ids_for_key_unsorted`](Self::get_current_owner_member_ids_for_key_unsorted)
-    /// would return: same insertion order and same homed-under-`owner`/`key`
-    /// filter, skipping the first `skip` raw history entries.
-    ///
-    /// Per-write callers that memoize the slot walk the new suffix only, so N
-    /// appends cost O(N) total instead of O(N^2). The caller must key its memo
-    /// off the canonical `(owner, key)` and the raw length from
-    /// [`owner_key_history_len`](Self::owner_key_history_len): any owner or key
-    /// mutation files the member under a different canonical slot (a miss), and
-    /// removals and rekeys never run while a per-pass memo is alive.
-    pub fn get_current_owner_member_ids_for_key_unsorted_from(
-        &self,
-        owner: &LuaMemberOwner,
-        key: &LuaMemberKey,
-        skip: usize,
     ) -> Vec<LuaMemberId> {
         let owner = self.canonical(owner);
         note_slot_read(owner, key);
@@ -3037,7 +2959,6 @@ impl LuaMemberIndex {
         member_ids
             .iter()
             .copied()
-            .skip(skip)
             .filter(|member_id| {
                 self.member_current_owner
                     .get(member_id)
@@ -3047,23 +2968,6 @@ impl LuaMemberIndex {
                         .is_some_and(|member| member.get_key() == key)
             })
             .collect()
-    }
-
-    /// Raw history-slot length for `owner`/`key`: O(1), no filtering or allocation.
-    ///
-    /// Counts every id ever filed under the canonical slot, including entries a
-    /// later owner move left behind (those fail the homed filter above). A memo
-    /// hit on this length plus the homed checks its caller performs means the
-    /// filtered set is unchanged: within one analysis pass history slots only
-    /// grow by append.
-    pub fn owner_key_history_len(&self, owner: &LuaMemberOwner, key: &LuaMemberKey) -> usize {
-        let owner = self.canonical(owner);
-        note_slot_read(owner, key);
-        self.member_owner_key_history_index
-            .get(owner)
-            .and_then(|owner_items| owner_items.get(key))
-            .map(|member_ids| member_ids.len())
-            .unwrap_or(0)
     }
 
     /// Returns every still-current member ever indexed under `owner`, including
@@ -3254,12 +3158,7 @@ impl LuaMemberIndex {
     /// themselves, so a new table cannot be added to the index and forgotten
     /// by one path but not the other.
     fn forget_member(&mut self, member_id: LuaMemberId) {
-        // Dropping the member edits the history membership its old slot's
-        // memos walked: the raw slot keeps no tombstone for it, but a memo
-        // holding the old length would otherwise trust a prefix that lost an
-        // entry in the middle.
         if self.members.contains_key(&member_id) {
-            self.bump_homing_revision();
             self.note_member_move(member_id);
         } else {
             self.note_member_home_write(member_id);
@@ -3723,7 +3622,6 @@ impl LuaIndex for LuaMemberIndex {
         self.expr_key_members_by_file.clear();
         self.non_overwriting_assignment_members.clear();
         self.preserved_co_writer_reconciled.clear();
-        self.homing_revision = 0;
         self.owner_only_members.clear();
         self.member_transfers.clear();
         self.filed_homes.clear();
@@ -3766,7 +3664,6 @@ crate::db_index::cow_shards::task_fork_fields!(LuaMemberIndex {
     expr_key_members_by_file => crate::db_index::cow_shards::merge_set,
     non_overwriting_assignment_members,
     preserved_co_writer_reconciled,
-    homing_revision => crate::db_index::cow_shards::merge_sum,
     owner_only_members,
     member_transfers,
     filed_homes,

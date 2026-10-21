@@ -26,8 +26,8 @@ use module::analyze_chunk_return;
 pub use module::compute_module_semantic_id;
 pub use stats::is_member_assignment_in_conditional_branch;
 use stats::{
-    GuardedSlotMemo, analyze_assign_stat, analyze_func_stat, analyze_local_func_stat,
-    analyze_local_stat, analyze_table_field, flush_pending_dynamic_key_collection_widenings,
+    analyze_assign_stat, analyze_func_stat, analyze_local_func_stat, analyze_local_stat,
+    analyze_table_field, flush_pending_dynamic_key_collection_widenings,
 };
 pub(crate) use stats::{
     dominating_guarded_table_bootstrap_range, is_guarded_table_definition_site,
@@ -39,7 +39,7 @@ pub(in crate::compilation::analyzer) use stats::{
 };
 
 use crate::{
-    Emmyrc, FileId, InferFailReason, LuaDeclId, LuaMemberId, LuaMemberKey, LuaMemberOwner,
+    Emmyrc, FileId, InferFailReason, LuaDeclId, LuaMemberId, LuaMemberOwner,
     compilation::analyzer::lua::call::analyze_call,
     db_index::{DbIndex, LuaType},
     semantic::infer_expr,
@@ -197,20 +197,6 @@ struct LuaAnalyzer<'a> {
     is_scripted_class_scope: bool,
     special_call_direct_matcher: &'a call::SpecialCallDirectMatcher,
     pending_dynamic_key_collection_widenings: FxHashMap<DynamicKeyCollectionWideningKey, LuaType>,
-    /// Whether each member is a guarded `x.y = x.y or {}` self-assignment.
-    ///
-    /// The answer derives from the member's own statement syntax alone, which
-    /// cannot change while the member is indexed (an edit forgets and
-    /// recreates it), and a `LuaAnalyzer` lives for one file pass over a
-    /// stable VFS — so each member's syntax is walked once per pass instead
-    /// of once per writer sharing its slot.
-    guarded_table_assignment_member_check_cache: FxHashMap<LuaMemberId, bool>,
-    /// Per-`(owner, key)` guarded-bootstrap slot memo for this file pass.
-    ///
-    /// The canonical bootstrap used to walk the whole slot on every write; N
-    /// same-key appends were O(N^2). The memo re-walks only appended entries,
-    /// so the pass costs O(N) total for identical answers.
-    guarded_table_assignment_slot_cache: FxHashMap<(LuaMemberOwner, LuaMemberKey), GuardedSlotMemo>,
     direct_local_table_member_owner_cache: FxHashMap<LuaDeclId, Option<LuaMemberOwner>>,
     /// A closure's own `return` statements (excluding nested closures').
     closure_own_returns_cache:
@@ -237,8 +223,6 @@ impl LuaAnalyzer<'_> {
             is_scripted_class_scope,
             special_call_direct_matcher,
             pending_dynamic_key_collection_widenings: FxHashMap::default(),
-            guarded_table_assignment_member_check_cache: FxHashMap::default(),
-            guarded_table_assignment_slot_cache: FxHashMap::default(),
             direct_local_table_member_owner_cache: FxHashMap::default(),
             closure_own_returns_cache: FxHashMap::default(),
         }

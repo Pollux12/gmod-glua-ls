@@ -338,7 +338,7 @@ impl StatementWrite {
             } => {
                 let member_id = *member_id;
                 let canonical = if is_guarded_table_assignment_member(db, member_id) {
-                    canonical_guarded_table_bootstrap_type(db, member_id, None)
+                    canonical_guarded_table_bootstrap_type(db, member_id)
                 } else {
                     None
                 };

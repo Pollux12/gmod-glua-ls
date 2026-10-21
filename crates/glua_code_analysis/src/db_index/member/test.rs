@@ -1268,6 +1268,15 @@ mod tests {
         assert_eq!(owner_member_ids(&index, &owner), vec![member_id]);
     }
 
+    /// How many ids `owner`'s history slot for `key` holds, homed or not.
+    fn history_len(index: &LuaMemberIndex, owner: &LuaMemberOwner, key: &LuaMemberKey) -> usize {
+        index
+            .member_owner_key_history_index
+            .get(owner)
+            .and_then(|items| items.get(key))
+            .map_or(0, |ids| ids.len())
+    }
+
     #[test]
     fn refiling_under_a_former_owner_does_not_duplicate_history() {
         let file_id = FileId::new(1);
@@ -1293,7 +1302,7 @@ mod tests {
             vec![member_id],
             "a returning member must occupy its owner/key slot once"
         );
-        assert_eq!(index.owner_key_history_len(&owner, &key), 1);
+        assert_eq!(history_len(&index, &owner, &key), 1);
         assert_eq!(
             index
                 .get_current_owner_members_for_key(&owner, &key)
@@ -1331,7 +1340,7 @@ mod tests {
             vec![member_id],
             "a member returning to a former key must occupy the slot once"
         );
-        assert_eq!(index.owner_key_history_len(&owner, &first_key), 1);
+        assert_eq!(history_len(&index, &owner, &first_key), 1);
         assert_eq!(owner_member_ids(&index, &owner), vec![member_id]);
     }
     /// The installed state a batch install has to reproduce, in a stable order.
