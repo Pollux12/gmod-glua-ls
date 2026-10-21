@@ -1047,11 +1047,7 @@ impl Engine {
         keys.par_iter()
             .with_min_len(KEYS_PER_JOB)
             .map(|key| {
-                (!matches!(
-                    key.key(),
-                    FactKey::ReceiverAuthority(_) | FactKey::CallbackParams(_)
-                ))
-                .then(|| {
+                (!key.key().is_query_output()).then(|| {
                     graph
                         .stale_readers_seen(key, holds(db, edits, before_edits, key))
                         .collect()
@@ -3490,10 +3486,7 @@ impl Engine {
         for (id, (result, computing)) in batch.iter().zip(computed) {
             let started = profiling.then(std::time::Instant::now);
             let valid = result.evaluation.validate(db.reader_graph(), |key, slot| {
-                if matches!(
-                    key.key(),
-                    FactKey::ReceiverAuthority(_) | FactKey::CallbackParams(_)
-                ) {
+                if key.key().is_query_output() {
                     db.queries().ready_fingerprint(key)
                 } else if let Some(slot) = slot {
                     Some(
