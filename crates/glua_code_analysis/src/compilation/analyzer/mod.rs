@@ -438,13 +438,11 @@ impl Reanalysis {
         edits: derivation::EditMaps,
     ) {
         // What a pending pass's rebuild moved follows these edits with what
-        // this rebuild moves; source layers are rebuilt at the stage outside
-        // a run.
+        // this rebuild moves.
         let pending = match &mut self.pass {
-            Some(Pass::Replaced { touched, .. }) if !file_ids.is_empty() => std::mem::take(touched),
+            Some(Pass::Replaced { touched, .. }) => std::mem::take(touched),
             _ => HashSet::default(),
         };
-        db.set_analysis_stage(derivation::AnalysisStage::Closed);
         self.wrapped = false;
         self.stale = None;
         refresh_payload_refs(db, self.engine.payload_holders());
@@ -681,6 +679,8 @@ fn start_pass(
     if file_ids.is_empty() {
         return None;
     }
+    // Source layers are rebuilt at the stage outside a run.
+    db.set_analysis_stage(derivation::AnalysisStage::Closed);
     let (scopes, rescoped) = crate::profile::phase("reanalyze: scopes", || scopes.get(db));
     let repathed = repathed_files(db, engine, &file_ids, &rescoped);
     // A file whose scope changed with its own or other files' paths is

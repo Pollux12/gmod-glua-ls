@@ -3903,6 +3903,12 @@ impl EngineStats {
         self.cycle_members
     }
 
+    /// Each stage the run entered, with how much it queued.
+    #[cfg(test)]
+    pub(crate) fn stages(&self) -> &[(AnalysisStage, usize)] {
+        &self.stages
+    }
+
     pub(crate) fn total_evaluations(&self) -> usize {
         self.evaluations.values().sum()
     }

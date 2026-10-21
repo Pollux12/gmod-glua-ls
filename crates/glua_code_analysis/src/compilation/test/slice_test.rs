@@ -456,6 +456,31 @@ local directional = state.directional
         assert_settled(&ws, &cold(&[(CONFIG, EDITED_CONFIG)]), "no files taken");
     }
 
+    /// Taking no file mid-run changes nothing: the run enters the same
+    /// stages and evaluates as much as it does without the take.
+    #[test]
+    fn taking_no_files_mid_reanalysis_leaves_the_run_as_it_was() {
+        let run = |taken_after: usize, take_nothing: bool| {
+            let mut ws = workspace();
+            let config = stage_text(&mut ws, CONFIG, EDITED_CONFIG);
+            ws.analysis.begin_reindex(vec![config]);
+            ws.analysis.advance_reindex(Slice::Evaluations(taken_after));
+            if take_nothing {
+                ws.analysis.begin_reindex(Vec::new());
+            }
+            settle(&mut ws, 1, |_| {});
+            let stats = ws.analysis.compilation.last_stats();
+            (stats.stages().to_vec(), stats.total_evaluations())
+        };
+        for taken_after in [0, 1, 2, 5, 10, 20, 40, 80] {
+            assert_eq!(
+                run(taken_after, true),
+                run(taken_after, false),
+                "no files taken after {taken_after}"
+            );
+        }
+    }
+
     #[test]
     fn a_comment_typed_mid_reanalysis_re_analyses_no_other_file() {
         let config_text = files()[0].1;

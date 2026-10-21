@@ -157,6 +157,9 @@ impl LuaCompilation {
         file_ids.dedup();
         self.file_diagnostic_reads();
         self.install_detached();
+        if file_ids.is_empty() {
+            return;
+        }
         self.index_revision += 1;
         if let Some(log) = &mut self.batch_log {
             log.push(file_ids.clone());
