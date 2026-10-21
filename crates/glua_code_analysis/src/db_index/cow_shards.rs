@@ -19,7 +19,7 @@ use crate::db_index::derivation::DerivationId;
 use crate::{
     DynamicFieldOwner, FileId, GlobalId, InFiled, LuaDeclId, LuaDefinitionId, LuaMemberId,
     LuaMemberKey, LuaMemberOwner, LuaOperatorId, LuaOperatorOwner, LuaSignatureId, LuaTypeDeclId,
-    LuaTypeOwner, SpecialCallFact,
+    LuaTypeOwner,
 };
 
 /// The number of hash pages workspace-owned keys are spread over.
@@ -135,7 +135,6 @@ file_keys! {
     (FileId, rowan::TextRange) => |key| key.0;
     (LuaTypeDeclId, FileId, rowan::TextRange) => |key| key.1;
     (LuaTypeDeclId, InFiled<crate::LuaSuperType>) => |key| key.1.file_id;
-    SpecialCallFact => |key| key.site_file();
     (GlobalId, crate::db_index::member::GlobalPathClassCandidate) => |key| key.1.file_id();
 }
 
@@ -952,10 +951,6 @@ impl<K: ShardKey + Clone> CowShardSet<K> {
         Q: ShardKey + ?Sized,
     {
         self.0.remove(key).is_some()
-    }
-
-    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
-        self.0.retain(|key, _| keep(key));
     }
 }
 

@@ -1,7 +1,7 @@
 mod flow_node;
 mod flow_tree;
 
-use crate::db_index::cow_shards::{CowCell, CowShardSet, CowShards};
+use crate::db_index::cow_shards::{CowCell, CowShards};
 use rowan::{TextRange, TextSize};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet};
 
@@ -27,15 +27,13 @@ pub struct LuaFlowIndex {
     /// [`FlowTree::content_fingerprint`] of each stored tree.
     flow_tree_fingerprints: CowCell<HashMap<FileId, Fingerprint>>,
     special_call_effects: CowShards<FileId, HashMap<TextSize, Vec<LuaSpecialCallEffect>>>,
-    /// Every special-call fact installed, keyed canonically.
+    /// Every special-call fact installed, by the call site that installed it.
     /// One call-site can install several facts (a synthesized class plus its
     /// super edge, say), and several call-sites can install facts for the same
     /// class, so neither the call-site nor the installed identity alone tells
     /// a replay from a novel fact: the pair does. Re-settling an identical
     /// fact set hits this record in any visit order and adds nothing.
-    settled_special_call_facts: CowShardSet<SpecialCallFact>,
-    /// Multiset fingerprint of `settled_special_call_facts` per site.
-    special_call_fact_fingerprints: CowShards<(FileId, TextSize), Fingerprint>,
+    settled_special_calls: CowShards<(FileId, TextSize), SettledSpecialCall>,
     /// File -> the holders whose special-call effect types name a position in
     /// it.
     special_call_holders: CowShards<FileId, FxHashSet<FileId>>,
@@ -53,8 +51,7 @@ impl LuaFlowIndex {
             file_flow_tree: Default::default(),
             flow_tree_fingerprints: Default::default(),
             special_call_effects: Default::default(),
-            settled_special_call_facts: Default::default(),
-            special_call_fact_fingerprints: Default::default(),
+            settled_special_calls: Default::default(),
             special_call_holders: Default::default(),
         }
     }
@@ -133,12 +130,14 @@ impl LuaFlowIndex {
         let mut novel = false;
         for fact in facts {
             let site = fact.site();
-            let fingerprint = derivation::fingerprint_of(&fact);
-            if self.settled_special_call_facts.insert(fact) {
+            if self
+                .settled_special_calls
+                .entry(site)
+                .or_default()
+                .insert(fact)
+            {
                 novel = true;
                 derivation::note_write(|| FactKey::SpecialCall(site.0, site.1));
-                let sum = self.special_call_fact_fingerprints.entry(site).or_default();
-                *sum = sum.wrapping_add(fingerprint);
             }
         }
         if novel {
@@ -233,10 +232,7 @@ impl LuaFlowIndex {
             }
             self.unlink_special_call_holder(file_id, linked);
         }
-        self.settled_special_call_facts
-            .retain(|fact| fact.site() != (file_id, position));
-        self.special_call_fact_fingerprints
-            .remove(&(file_id, position));
+        self.settled_special_calls.remove(&(file_id, position));
     }
 
     pub fn get_special_call_effects(
@@ -264,7 +260,9 @@ impl LuaFlowIndex {
     }
 
     pub fn settled_special_call_facts(&self) -> impl Iterator<Item = &SpecialCallFact> {
-        self.settled_special_call_facts.iter()
+        self.settled_special_calls
+            .values()
+            .flat_map(|settled| settled.facts.iter())
     }
 
     /// The special-call effects of `file_id`, with their positions.
@@ -348,20 +346,10 @@ impl LuaFlowIndex {
                     .special_call_effects
                     .get(file_id)
                     .and_then(|effects| effects.get(position));
-                // The sums are folded as the facts were installed; mapped
-                // back, each fact hashes as it stood before the edits.
-                let facts = if derivation::mapping_back() {
-                    self.settled_special_call_facts
-                        .iter()
-                        .filter(|fact| fact.site() == (*file_id, *position))
-                        .map(derivation::fingerprint_of)
-                        .fold(0, Fingerprint::wrapping_add)
-                } else {
-                    self.special_call_fact_fingerprints
-                        .get(&(*file_id, *position))
-                        .copied()
-                        .unwrap_or(0)
-                };
+                let facts = self
+                    .settled_special_calls
+                    .get(&(*file_id, *position))
+                    .map_or(0, SettledSpecialCall::fingerprint);
                 if effects.is_none() && facts == 0 {
                     return derivation::ABSENT;
                 }
@@ -380,15 +368,15 @@ impl LuaIndex for LuaFlowIndex {
         derivation::note_write(|| FactKey::FlowTree(file_id));
         self.file_flow_tree.remove(&file_id);
         self.flow_tree_fingerprints.remove(&file_id);
-        self.settled_special_call_facts
-            .retain(|fact| fact.site_file() != file_id);
-        self.special_call_fact_fingerprints.retain(|site, _| {
-            let keep = site.0 != file_id;
-            if !keep {
-                derivation::note_write(|| FactKey::SpecialCall(site.0, site.1));
-            }
-            keep
-        });
+        let settled = self
+            .settled_special_calls
+            .file_entries(file_id)
+            .map(|(site, _)| *site)
+            .collect::<Vec<_>>();
+        for site in settled {
+            derivation::note_write(|| FactKey::SpecialCall(site.0, site.1));
+            self.settled_special_calls.remove(&site);
+        }
         // Dropping the effects is a novel fact for their readers, mirroring
         // the signature index's removal tombstones.
         let linked = self.special_call_files(file_id);
@@ -413,15 +401,14 @@ impl LuaIndex for LuaFlowIndex {
                     derivation::note_write(|| FactKey::SpecialCall(*file_id, *position));
                 }
             }
-            for site in self.special_call_fact_fingerprints.keys() {
+            for site in self.settled_special_calls.keys() {
                 derivation::note_write(|| FactKey::SpecialCall(site.0, site.1));
             }
         }
         self.file_flow_tree.clear();
         self.flow_tree_fingerprints.clear();
-        self.special_call_fact_fingerprints.clear();
         self.special_call_effects.clear();
-        self.settled_special_call_facts.clear();
+        self.settled_special_calls.clear();
         self.special_call_holders.clear();
     }
 }
@@ -456,6 +443,41 @@ impl LuaSpecialCallEffect {
                     VarRefId::IndexRef(crate::VarRefRootId::SelfRef(_), _)
                 )
             )
+    }
+}
+
+/// The facts one call site settled, with the multiset fingerprint of their
+/// hashes as they were installed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SettledSpecialCall {
+    facts: Vec<SpecialCallFact>,
+    installed: Fingerprint,
+}
+
+impl SettledSpecialCall {
+    /// Records `fact`, reporting whether it is novel.
+    fn insert(&mut self, fact: SpecialCallFact) -> bool {
+        if self.facts.contains(&fact) {
+            return false;
+        }
+        self.installed = self
+            .installed
+            .wrapping_add(derivation::fingerprint_of(&fact));
+        self.facts.push(fact);
+        true
+    }
+
+    /// The facts' fingerprint: folded as they were installed, or, mapped back,
+    /// with each fact hashed as it stood before the edits.
+    fn fingerprint(&self) -> Fingerprint {
+        if derivation::mapping_back() {
+            self.facts
+                .iter()
+                .map(derivation::fingerprint_of)
+                .fold(0, Fingerprint::wrapping_add)
+        } else {
+            self.installed
+        }
     }
 }
 
@@ -667,15 +689,6 @@ impl SpecialCallFact {
                 site_position,
                 ..
             } => (*site_file, *site_position),
-        }
-    }
-
-    pub(crate) fn site_file(&self) -> FileId {
-        match self {
-            Self::StrTplDecl { site_file, .. }
-            | Self::SuperEdge { site_file, .. }
-            | Self::CallOperator { site_file, .. }
-            | Self::FlowEffect { site_file, .. } => *site_file,
         }
     }
 }
@@ -989,8 +1002,17 @@ mod tests {
         for ((file_id, position), facts) in &pass_b {
             assert!(second_order.install_special_call_facts(*file_id, *position, facts.clone()));
         }
+        let settled = |index: &LuaFlowIndex| {
+            let mut facts = index
+                .settled_special_call_facts()
+                .map(|fact| format!("{fact:?}"))
+                .collect::<Vec<_>>();
+            facts.sort();
+            facts
+        };
         assert_eq!(
-            second_order.settled_special_call_facts, first_order.settled_special_call_facts,
+            settled(&second_order),
+            settled(&first_order),
             "the fact set must not depend on visit order"
         );
         for ((file_id, position), facts) in &pass_a {
@@ -1089,7 +1111,6 @@ crate::db_index::cow_shards::task_fork_fields!(LuaFlowIndex {
     file_flow_tree,
     flow_tree_fingerprints,
     special_call_effects,
-    settled_special_call_facts,
-    special_call_fact_fingerprints,
+    settled_special_calls,
     special_call_holders => crate::db_index::cow_shards::merge_set,
 });
