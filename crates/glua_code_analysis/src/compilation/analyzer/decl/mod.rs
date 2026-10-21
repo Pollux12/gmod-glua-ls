@@ -289,7 +289,7 @@ impl<'a> DeclAnalyzer<'a> {
             name_assignments: std::cell::OnceCell::new(),
             scopes: Vec::new(),
             is_meta: false,
-            file_namespace: db.get_type_index().get_file_namespace(&file_id).cloned(),
+            file_namespace: None,
             references: FileReferenceBatch::new(file_id),
             ops: Vec::new(),
             delta: ContextDelta::default(),

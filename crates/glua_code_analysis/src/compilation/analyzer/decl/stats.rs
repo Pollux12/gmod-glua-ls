@@ -311,7 +311,7 @@ fn analyze_maybe_global_index_expr(
     }
     let range = index_expr.get_range();
     let decl_id = crate::LuaDeclId::new(file_id, range.start());
-    if let Some(decl) = analyzer.db.get_decl_index().get_decl(&decl_id)
+    if let Some(decl) = analyzer.decl.get_decl(&decl_id)
         && decl.is_global()
     {
         let decl_id = decl.get_id();
