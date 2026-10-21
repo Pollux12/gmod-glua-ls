@@ -10811,6 +10811,12 @@ fn rebuild_gmod_load_index(
         );
         record_load_site_edge(&mut file_infos, &mut unresolved_edges, site, source_states);
     }
+    record_dynamic_loader_edges(
+        &mut file_infos,
+        &fallback_masks,
+        &resolved_branch_ranges,
+        &dynamic_loaders,
+    );
     drop(_p_fix);
 
     let _p_shadow = crate::profile::PhaseGuard::new("gmodload/shadows_and_publish");
@@ -12509,59 +12515,90 @@ fn apply_dynamic_loaders(
 ) -> bool {
     let mut changed = false;
     for loader in dynamic_loaders {
-        let operation_source_states = loader
-            .operations
-            .iter()
-            .filter_map(|operation| {
-                let source_states = source_states_for_dynamic_operation(
-                    file_infos,
-                    fallback_masks,
-                    branch_realm_ranges,
-                    loader.source_file_id,
-                    &operation.ranges,
-                );
-                (!source_states.is_empty()).then_some((operation, source_states))
-            })
-            .collect::<Vec<_>>();
-        if operation_source_states.is_empty() {
-            continue;
+        for (target_file_id, _, operation, target_states) in
+            dynamic_loader_reaches(file_infos, fallback_masks, branch_realm_ranges, loader)
+        {
+            let target_info = file_infos
+                .entry(target_file_id)
+                .or_insert_with(GmodFileLoadInfo::fallback_shared);
+            if operation.kind == DynamicLoadOperationKind::AddCSLuaFile {
+                target_info.client_send_available = true;
+            }
+            changed |= target_info.mark_states(
+                target_states,
+                GmodLoadStatus::MaybeDynamic,
+                GmodLoadConfidence::Dynamic,
+            );
         }
+    }
+    changed
+}
 
-        for (target_file_id, target_path) in &loader.targets {
-            for (operation, source_states) in &operation_source_states {
-                if !dynamic_operation_matches_target(target_path, loader, operation) {
-                    continue;
-                }
-                let target_states =
-                    dynamic_operation_target_states(target_path, *source_states, loader, operation);
-                if target_states.is_empty() {
-                    continue;
-                }
-
-                let target_info = file_infos
-                    .entry(*target_file_id)
-                    .or_insert_with(GmodFileLoadInfo::fallback_shared);
-                if operation.kind == DynamicLoadOperationKind::AddCSLuaFile {
-                    target_info.client_send_available = true;
-                }
-                target_info.add_incoming_edge(GmodLoadEdge {
+/// Records the edge of each target the dynamic loaders reach, with the states
+/// their sources settled on.
+fn record_dynamic_loader_edges(
+    file_infos: &mut HashMap<FileId, GmodFileLoadInfo>,
+    fallback_masks: &HashMap<FileId, GmodStateMask>,
+    branch_realm_ranges: &HashMap<FileId, Vec<GmodRealmRange>>,
+    dynamic_loaders: &[DynamicLoadPattern],
+) {
+    for loader in dynamic_loaders {
+        for (target_file_id, target_path, operation, target_states) in
+            dynamic_loader_reaches(file_infos, fallback_masks, branch_realm_ranges, loader)
+        {
+            file_infos
+                .entry(target_file_id)
+                .or_insert_with(GmodFileLoadInfo::fallback_shared)
+                .add_incoming_edge(GmodLoadEdge {
                     source_file_id: loader.source_file_id,
-                    target_file_id: Some(*target_file_id),
+                    target_file_id: Some(target_file_id),
                     kind: dynamic_load_edge_kind(operation.kind),
                     states: target_states,
                     path: Some(target_path.clone()),
                     original_expr: Some("gmod.file_find".to_string()),
                     range: operation.ranges.first().copied().or(Some(loader.range)),
                 });
-                changed |= target_info.mark_states(
-                    target_states,
-                    GmodLoadStatus::MaybeDynamic,
-                    GmodLoadConfidence::Dynamic,
-                );
+        }
+    }
+}
+
+/// Each target `loader` reaches, with its path, the operation that reaches it
+/// and the states it is loaded in, from its source's states as `file_infos`
+/// holds them.
+fn dynamic_loader_reaches<'a>(
+    file_infos: &HashMap<FileId, GmodFileLoadInfo>,
+    fallback_masks: &HashMap<FileId, GmodStateMask>,
+    branch_realm_ranges: &HashMap<FileId, Vec<GmodRealmRange>>,
+    loader: &'a DynamicLoadPattern,
+) -> Vec<(FileId, &'a String, &'a DynamicLoadOperation, GmodStateMask)> {
+    let operation_source_states = loader
+        .operations
+        .iter()
+        .filter_map(|operation| {
+            let source_states = source_states_for_dynamic_operation(
+                file_infos,
+                fallback_masks,
+                branch_realm_ranges,
+                loader.source_file_id,
+                &operation.ranges,
+            );
+            (!source_states.is_empty()).then_some((operation, source_states))
+        })
+        .collect::<Vec<_>>();
+    let mut reaches = Vec::new();
+    for (target_file_id, target_path) in &loader.targets {
+        for (operation, source_states) in &operation_source_states {
+            if !dynamic_operation_matches_target(target_path, loader, operation) {
+                continue;
+            }
+            let target_states =
+                dynamic_operation_target_states(target_path, *source_states, loader, operation);
+            if !target_states.is_empty() {
+                reaches.push((*target_file_id, target_path, *operation, target_states));
             }
         }
     }
-    changed
+    reaches
 }
 
 fn dynamic_operation_matches_target(

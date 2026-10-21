@@ -3186,6 +3186,44 @@ print(\"server-only\")
         );
     }
 
+    /// A dynamic loader whose file settles its realm over several fixpoint
+    /// rounds records its edge once, with the states its file settled on.
+    #[gtest]
+    fn test_load_index_dynamic_loader_reached_late_records_one_settled_edge() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let part_id = ws.def_file("lua/myaddon/parts/part.lua", "return true");
+        ws.def_file(
+            "lua/myaddon/sh_loader.lua",
+            r#"
+            local files = file.Find("myaddon/parts/*.lua", "LUA")
+            for _, file_name in ipairs(files) do
+                include("myaddon/parts/" .. file_name)
+            end
+            "#,
+        );
+        ws.def_file("lua/aaa/mid.lua", r#"include("myaddon/sh_loader.lua")"#);
+        ws.def_file(
+            "lua/autorun/server/sv_boot.lua",
+            r#"include("aaa/mid.lua")"#,
+        );
+
+        let db = ws.get_db_mut();
+        let dynamic_edges = db
+            .get_gmod_load_index()
+            .get_file_info(&part_id)
+            .map(|info| {
+                info.incoming_edges
+                    .iter()
+                    .filter(|edge| edge.original_expr.as_deref() == Some("gmod.file_find"))
+                    .map(|edge| edge.states)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert_eq!(dynamic_edges, vec![GmodStateMask::SERVER]);
+    }
+
     #[gtest]
     fn test_load_index_dynamic_file_find_prefix_dispatch_loader() {
         let mut ws = VirtualWorkspace::new();
