@@ -122,6 +122,19 @@ mod test {
 
     /// A file another includes by path is found at its new path once moved,
     /// as a cold build of the moved layout finds it.
+    /// A file removed through its text forgets its path as one deleted on
+    /// disk does, so its path names no file any more.
+    #[test]
+    fn a_file_removed_through_its_text_forgets_its_path() {
+        let mut ws = gmod_workspace();
+        ws.def_file("lua/autorun/sh_gone.lua", "Gone = 1\n");
+        let uri = ws.virtual_url_generator.new_uri("lua/autorun/sh_gone.lua");
+
+        ws.analysis.update_file_by_uri(&uri, None);
+
+        assert_eq!(file_id(&ws, "lua/autorun/sh_gone.lua"), None);
+    }
+
     #[test]
     fn a_moved_file_is_loaded_from_its_new_path() {
         const BOOT: &str = "lua/sv_boot.lua";

@@ -384,6 +384,9 @@ impl Vfs {
     ) -> Option<Staged> {
         self.content_revision += 1;
         let revision = self.content_revision;
+        if content.is_none() && !is_remote {
+            self.deleted.insert(fid);
+        }
         let content = content.map(|content| FileContent {
             content,
             is_remote,
@@ -466,7 +469,6 @@ impl Vfs {
     pub fn delete_file_content(&mut self, uri: &Uri) -> Option<FileId> {
         let fid = self.get_file_id(uri)?;
         self.set_file_content(uri, None);
-        self.deleted.insert(fid);
         Some(fid)
     }
 

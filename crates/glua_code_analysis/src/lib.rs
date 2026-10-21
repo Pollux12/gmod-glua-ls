@@ -370,12 +370,13 @@ impl EmmyLuaAnalysis {
         uri: &Uri,
         text: Option<String>,
     ) -> Option<(FileId, Vec<FileId>)> {
+        let Some(text) = text else {
+            let (file_id, affected) = self.remove_file_by_uri(uri);
+            return file_id.map(|file_id| (file_id, affected));
+        };
         let existing = self.compilation.get_db().get_vfs().get_file_id(uri);
-        if existing.is_none() && text.is_none() {
-            return None;
-        }
         if let Some(file_id) = existing
-            && self.text_is_indexed(file_id, text.as_deref())
+            && self.text_is_indexed(file_id, Some(&text))
         {
             return Some((file_id, Vec::new()));
         }
@@ -383,7 +384,7 @@ impl EmmyLuaAnalysis {
             .compilation
             .get_db_mut()
             .get_vfs_mut()
-            .set_file_content(uri, text);
+            .set_file_content(uri, Some(text));
         let affected = self.reindex_files(vec![file_id]);
         Some((file_id, affected))
     }
