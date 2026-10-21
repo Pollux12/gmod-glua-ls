@@ -6766,6 +6766,24 @@ function string.Shout(str) return str end
         }
 
         #[test]
+        fn a_library_alias_assigned_again_later_does_not_define_library_members() {
+            let mut ws = workspace_with_libraries();
+            ws.def_file(
+                "gamemodes/terrortown/gamemode/util.lua",
+                "local string = string
+function string.Shout(str) return str end
+string = {}
+",
+            );
+            assert!(!ws.check_file_for(
+                DiagnosticCode::UndefinedField,
+                "gamemodes/terrortown/gamemode/cl_hud.lua",
+                "local shout = string.Shout
+",
+            ));
+        }
+
+        #[test]
         fn removing_a_function_defined_through_a_localised_library_settles_as_a_fresh_load() {
             VirtualWorkspace::assert_warm_matches_cold(
                 |ws| ws.analysis.init_std_lib(),

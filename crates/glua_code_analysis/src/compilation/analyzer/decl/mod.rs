@@ -12,7 +12,7 @@ use crate::db_index::{
 
 use super::{ScriptedScopes, common::estimate_file_index_entries};
 use glua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaChunk, LuaFuncStat, LuaNameExpr, LuaSyntaxKind,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaBlock, LuaChunk, LuaFuncStat, LuaNameExpr, LuaSyntaxKind,
     LuaVarExpr,
 };
 use rowan::{TextRange, TextSize, WalkEvent};
@@ -253,6 +253,8 @@ pub struct DeclAnalyzer<'a> {
     seeded_scoped_class_decl: bool,
     legacy_module_envs: Vec<LegacyModuleEnv>,
     assignment_sites: Vec<LuaAssignStat>,
+    /// Where each bare name is assigned in the file, built on first use.
+    name_assignments: std::cell::OnceCell<rustc_hash::FxHashMap<SmolStr, Vec<TextSize>>>,
     scopes: Vec<LuaScopeId>,
     is_meta: bool,
     file_namespace: Option<String>,
@@ -284,6 +286,7 @@ impl<'a> DeclAnalyzer<'a> {
             seeded_scoped_class_decl: false,
             legacy_module_envs: Vec::new(),
             assignment_sites: Vec::new(),
+            name_assignments: std::cell::OnceCell::new(),
             scopes: Vec::new(),
             is_meta: false,
             file_namespace: db.get_type_index().get_file_namespace(&file_id).cloned(),
@@ -442,17 +445,50 @@ impl<'a> DeclAnalyzer<'a> {
         else {
             return false;
         };
-        let file_reference = self.references.file_reference();
         value.get_name_text().as_deref() == Some(decl.get_name())
-            && file_reference
+            && self
+                .references
+                .file_reference()
                 .get_decl_id(&value.get_range())
                 .and_then(|source| self.decl.get_decl(&source))
                 .is_none_or(|source| source.is_global())
-            && !file_reference
-                .get_decl_references(&decl.get_id())
-                .is_some_and(|references| {
-                    references.is_written_after_declaration(decl.get_position())
-                })
+            && !self.is_assigned_in_its_block(decl)
+    }
+
+    /// Whether `decl`'s name is assigned after it anywhere in the block that
+    /// declares it, including writes the walk has not reached yet.
+    fn is_assigned_in_its_block(&self, decl: &LuaDecl) -> bool {
+        let Some(block) = decl
+            .get_syntax_id()
+            .to_node_from_root(self.root.syntax())
+            .and_then(|node| node.ancestors().find_map(LuaBlock::cast))
+        else {
+            return true;
+        };
+        let block = block.get_range();
+        let name_assignments = self.name_assignments.get_or_init(|| {
+            let mut sites = rustc_hash::FxHashMap::<SmolStr, Vec<TextSize>>::default();
+            for assign_stat in self.root.descendants::<LuaAssignStat>() {
+                for var in assign_stat.get_var_and_expr_list().0 {
+                    if let LuaVarExpr::NameExpr(name_expr) = var
+                        && let Some(name) = name_expr.get_name_text()
+                    {
+                        sites
+                            .entry(name)
+                            .or_default()
+                            .push(name_expr.get_position());
+                    }
+                }
+            }
+            sites
+        });
+        name_assignments
+            .get(decl.get_name())
+            .is_some_and(|positions| {
+                positions
+                    .iter()
+                    .any(|position| *position > decl.get_position() && block.contains(*position))
+            })
     }
 
     pub fn is_scoped_class_global_name(&self, name: &str) -> bool {
