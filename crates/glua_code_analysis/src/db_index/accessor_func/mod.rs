@@ -231,21 +231,47 @@ impl LuaIndex for AccessorFuncAnnotationIndex {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AccessorFuncCallMetadata {
     pub syntax_id: LuaSyntaxId,
     pub members: Vec<AccessorMember>,
 }
 
+/// Positions hash as ones of the file whose calls are fingerprinted, so a
+/// fingerprint taken with edits mapped back sees them where they stood.
+impl std::hash::Hash for AccessorFuncCallMetadata {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        derivation::hash_local(&self.syntax_id, state);
+        self.members.hash(state);
+    }
+}
+
 /// A method an accessor generator call makes, declared at `syntax_id` of the call in
 /// `slot`, which tells apart the members one node declares.
-#[derive(Debug, Clone, Hash, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AccessorMember {
     pub owner_type_id: LuaTypeDeclId,
     pub name: SmolStr,
     pub signature: AccessorSignature,
     pub syntax_id: LuaSyntaxId,
     pub slot: u32,
+}
+
+impl std::hash::Hash for AccessorMember {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let Self {
+            owner_type_id,
+            name,
+            signature,
+            syntax_id,
+            slot,
+        } = self;
+        owner_type_id.hash(state);
+        name.hash(state);
+        signature.hash(state);
+        derivation::hash_local(syntax_id, state);
+        slot.hash(state);
+    }
 }
 
 /// The callable shape of a synthesized accessor.

@@ -474,6 +474,13 @@ function Entity:DTVar(type, slot, name) end
 ---@param name string
 ---@param extended? table
 function Entity:NetworkVarElement(type, slot, element, name, extended) end
+
+---@accessorfunc 3
+---@param tab table
+---@param key any
+---@param name string
+---@param force? number
+function _G.AccessorFunc(tab, key, name, force) end
 "#;
 
 #[cfg(test)]
