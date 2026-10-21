@@ -1166,6 +1166,19 @@ impl Engine {
         self.held.retain(|id, _| !replaced(*id));
         self.stale_sources
             .retain(|file_id| !files.contains(file_id));
+        // A rebuilt file's derivations start over, even those whose id an
+        // edit after them leaves as it was.
+        for derivations in [
+            &mut self.ran,
+            &mut self.from_before,
+            &mut self.cleared,
+            &mut self.cleared_parked,
+            &mut self.settled_early,
+        ] {
+            derivations.retain(|id| !replaced(*id));
+        }
+        self.moved_from.retain(|id, _| !replaced(*id));
+        self.settled_on.retain(|id, _| !replaced(*id));
     }
 
     /// Notes that `file_id`'s derivations are removed and built again.
