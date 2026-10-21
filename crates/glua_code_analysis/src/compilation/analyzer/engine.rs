@@ -2277,9 +2277,10 @@ impl Engine {
             }
         }
         for component in loops_of(&reaches) {
-            let alternates = component
-                .iter()
-                .any(|member| self.outputs_alternate(db, *member));
+            // Every member's history advances, whichever alternates first.
+            let alternates = component.iter().fold(false, |any, member| {
+                self.outputs_alternate(db, *member) | any
+            });
             if alternates {
                 self.stats.cycle_members += component
                     .into_iter()
@@ -4385,7 +4386,9 @@ fn loops_of(reaches: &FxHashMap<DerivationId, Vec<DerivationId>>) -> Vec<Vec<Der
     let mut loops = Vec::new();
     let mut next_index = 0;
     let empty = Vec::new();
-    for &start in reaches.keys() {
+    let mut starts = reaches.keys().copied().collect::<Vec<_>>();
+    starts.sort_unstable();
+    for start in starts {
         if visits.contains_key(&start) {
             continue;
         }
