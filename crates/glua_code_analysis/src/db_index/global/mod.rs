@@ -146,6 +146,25 @@ impl LuaGlobalIndex {
             .wrapping_add(after);
     }
 
+    /// The globals whose declarations both `self` and `fork`, a task fork of
+    /// `frozen`, changed: once merged, their lists are put back in order.
+    fn globals_to_reorder(&self, frozen: &Self, fork: &Self) -> Vec<GlobalId> {
+        self.global_decl
+            .both_changed_keys(&frozen.global_decl, &fork.global_decl)
+    }
+
+    /// Puts each of `globals`' declarations back in canonical order.
+    fn reorder_globals(&mut self, globals: Vec<GlobalId>) {
+        let file_order = &self.file_order;
+        for id in globals {
+            if let Some(decl_ids) = self.global_decl.get_mut(&id) {
+                decl_ids.sort_by(|left, right| {
+                    decl_sort_key(file_order, *left).cmp(&decl_sort_key(file_order, *right))
+                });
+            }
+        }
+    }
+
     /// Drops one declaration of `name`.
     pub(crate) fn remove_global_decl(&mut self, name: &str, decl_id: LuaDeclId) {
         let id = GlobalId::new(name);
@@ -607,10 +626,40 @@ mod tests {
         assert!(scoped_a.contains(&decl_a));
         assert!(scoped_a.contains(&decl_b));
     }
+
+    #[test]
+    fn tasks_declaring_one_global_both_land_in_canonical_order() {
+        use crate::db_index::cow_shards::TaskFork;
+        let decl = |file: u32| LuaDeclId::new(FileId::new(file), TextSize::new(0));
+        let mut base = LuaGlobalIndex::new();
+        base.add_global_decl("PANEL", decl(3), Arc::from("c.lua"));
+        let frozen = base.task_fork();
+        let forks = [(1, "b.lua"), (2, "a.lua")]
+            .into_iter()
+            .map(|(file, order_key)| {
+                let mut fork = frozen.task_fork();
+                fork.add_global_decl("PANEL", decl(file), Arc::from(order_key));
+                fork
+            })
+            .enumerate()
+            .collect::<Vec<_>>();
+        let mut index = base.clone();
+        let mut conflicts = vec![Vec::new(); forks.len()];
+
+        index.install_tasks_reporting(&frozen, forks, &mut conflicts);
+
+        assert_eq!(
+            (index.get_global_decl_ids("PANEL").cloned(), conflicts),
+            (
+                Some(vec![decl(2), decl(1), decl(3)]),
+                vec![Vec::new(), Vec::new()]
+            )
+        );
+    }
 }
 
 crate::db_index::cow_shards::task_fork_fields!(LuaGlobalIndex {
-    global_decl,
+    global_decl => crate::db_index::cow_shards::merge_list,
     file_order,
     scan_fingerprint => crate::db_index::cow_shards::merge_sum,
-});
+} prepare globals_to_reorder then reorder_globals);
