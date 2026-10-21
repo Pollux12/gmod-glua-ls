@@ -866,8 +866,9 @@ fn collect_assignment_prefix_events_from_assigns(
 /// offset it is in force from.
 ///
 /// Only an absence guard qualifies: its branch runs exactly when the target is
-/// missing, so the target is a table afterwards whichever way the test went. A
-/// plain `if cond then t.k = {} end` guarantees nothing after the `if`.
+/// missing, so the target is present afterwards whichever way the test went,
+/// as long as nothing else in the `if` writes it. A plain
+/// `if cond then t.k = {} end` guarantees nothing after the `if`.
 fn absence_guard_seed_scope(
     assign_syntax: &LuaSyntaxNode,
     prefix_text: &str,
@@ -879,6 +880,21 @@ fn absence_guard_seed_scope(
         return None;
     }
     if !condition_tests_absence(&if_stat.get_condition_expr()?, prefix_text) {
+        return None;
+    }
+    let writes_prefix_again = if_stat
+        .syntax()
+        .descendants()
+        .filter_map(LuaAssignStat::cast)
+        .filter(|assign| assign.syntax() != assign_syntax)
+        .any(|assign| {
+            assign
+                .get_var_and_expr_list()
+                .0
+                .iter()
+                .any(|var| syntax_text_eq_normalized(var.syntax(), prefix_text))
+        });
+    if writes_prefix_again {
         return None;
     }
 

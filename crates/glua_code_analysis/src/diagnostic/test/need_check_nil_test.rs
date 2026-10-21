@@ -16652,3 +16652,40 @@ end
         expect_that!(warm_after_edit, eq(cold_after_edit));
     }
 }
+
+#[cfg(test)]
+mod table_seed_tests {
+    use crate::{DiagnosticCode, VirtualWorkspace};
+
+    fn reports_field_write(body: &str) -> bool {
+        let mut ws = VirtualWorkspace::new();
+        !ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            &format!(
+                r#"
+                ---@class Holder
+                ---@field k table?
+                ---@param t Holder
+                ---@param c boolean
+                ---@param d boolean
+                local function f(t, c, d)
+                    {body}
+                end
+                "#
+            ),
+        )
+    }
+
+    #[test]
+    fn an_absence_guard_seeds_the_field_only_when_nothing_else_in_the_if_writes_it() {
+        assert!(!reports_field_write(
+            "if not t.k then t.k = {} end t.k.x = 1"
+        ));
+        assert!(reports_field_write(
+            "if not t.k then t.k = {} else t.k = nil end t.k.x = 1"
+        ));
+        assert!(reports_field_write(
+            "if not t.k then t.k = {} t.k = nil end t.k.x = 1"
+        ));
+    }
+}
