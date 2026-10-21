@@ -3741,6 +3741,28 @@ mod tests {
     }
 
     #[gtest]
+    fn test_a_local_tables_method_leaves_a_unique_global_helper_resolvable() {
+        let realms = method_helper_receiver_realms(
+            r#"
+            PanelNet = {}
+            PanelNet.NetMessage = function(pnl, name)
+                net.Start(name)
+                net.SendToServer()
+            end
+            local logger = {}
+            function logger:NetMessage(text)
+                print(text)
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd")
+            "#,
+        );
+        expect_that!(realms, elements_are![eq(&GmodRealm::Server)]);
+    }
+
+    #[gtest]
     fn test_helper_sending_from_click_handler_counts_as_client_send() {
         let mut ws = new_gmod_workspace();
         ws.def_file(

@@ -54,7 +54,11 @@ struct Contributions {
     net_ops: HashMap<(SmolStr, NetOpDirection), Vec<(FileRank, FileId)>>,
     environment_files: HashMap<FileId, usize>,
     globals: HashMap<GlobalId, Vec<(DefinitionRank, Target)>>,
+    /// Global functions by the method name their path ends in.
     methods: HashMap<SmolStr, Vec<(DefinitionRank, Target)>>,
+    /// Functions stored on a local table, by member name: a method name's
+    /// fallback when no global function ends in it.
+    local_methods: HashMap<SmolStr, Vec<(DefinitionRank, Target)>>,
     signatures: HashMap<LuaSignatureId, Vec<(DefinitionRank, Target)>>,
 }
 
@@ -148,12 +152,14 @@ impl Contributions {
                 .or_default()
                 .push(definition.clone());
             touched.signatures.insert(*signature_id);
-            if let Some(method) = global_id
-                .as_ref()
-                .and_then(method_name)
-                .or(local_member.clone())
-            {
-                self.methods
+            let method = match global_id {
+                Some(global_id) => method_name(global_id).map(|name| (&mut self.methods, name)),
+                None => local_member
+                    .clone()
+                    .map(|name| (&mut self.local_methods, name)),
+            };
+            if let Some((methods, method)) = method {
+                methods
                     .entry(method.clone())
                     .or_default()
                     .push(definition.clone());
@@ -209,12 +215,14 @@ impl Contributions {
         for (signature_id, _, _, global_id, local_member) in &scan.definitions {
             retract(&mut self.signatures, signature_id, other_file);
             touched.signatures.insert(*signature_id);
-            if let Some(method) = global_id
-                .as_ref()
-                .and_then(method_name)
-                .or(local_member.clone())
-            {
-                retract(&mut self.methods, &method, other_file);
+            let method = match global_id {
+                Some(global_id) => method_name(global_id).map(|name| (&mut self.methods, name)),
+                None => local_member
+                    .clone()
+                    .map(|name| (&mut self.local_methods, name)),
+            };
+            if let Some((methods, method)) = method {
+                retract(methods, &method, other_file);
                 touched.methods.insert(method);
             }
             let Some(global_id) = global_id else {
@@ -414,7 +422,11 @@ impl GmodCallRoles {
             };
         }
         for method in &touched.methods {
-            match contributions.methods.get(method).map(Vec::as_slice) {
+            let definitions = contributions
+                .methods
+                .get(method)
+                .or_else(|| contributions.local_methods.get(method));
+            match definitions.map(Vec::as_slice) {
                 Some([(_, target)]) => registry.methods.insert(method.clone(), *target),
                 _ => registry.methods.remove(method),
             };
