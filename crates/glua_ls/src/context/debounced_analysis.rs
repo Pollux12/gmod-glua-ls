@@ -33,9 +33,10 @@ pub struct FreshWaitBreakdown {
 /// Outcome of a freshness wait.
 ///
 /// `Fresh` means the analysis caught up with the client's text. `Cancelled`
-/// means the request's token fired first. `LoopDead` means the debounce
-/// supervisor gave up ([`Self::note_debounce_loop_dead`]), so freshness can
-/// never arrive and the caller must not diagnose stale data.
+/// means the request's token fired first. `LoopDead` means the debounce loop
+/// is gone, given up on by its supervisor
+/// ([`DebouncedAnalysis::note_debounce_loop_dead`]) or stopped by shutdown, so
+/// freshness can never arrive and the caller must not diagnose stale data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Freshness {
     Fresh,
@@ -434,16 +435,16 @@ impl DebouncedAnalysis {
         self.notify.notify_waiters();
     }
 
-    /// Check whether document changes are pending reindex.
-    ///
-    /// Handlers that need consistent tree + index data (e.g. semantic tokens)
-    /// can use this to decide whether to serve stale results or return `None`
-    /// so the client keeps its previous state.
     /// Cancelled when the server shuts down.
     pub fn shutdown_token(&self) -> CancellationToken {
         self.shutdown.clone()
     }
 
+    /// Check whether document changes are pending reindex.
+    ///
+    /// Handlers that need consistent tree + index data (e.g. semantic tokens)
+    /// can use this to decide whether to serve stale results or return `None`
+    /// so the client keeps its previous state.
     pub fn is_dirty(&self) -> bool {
         self.has_pending_changes.load(Ordering::Acquire)
     }
@@ -589,6 +590,7 @@ impl DebouncedAnalysis {
             let ended = tokio::select! {
                 _ = notified => None,
                 _ = cancel_token.cancelled() => Some(Freshness::Cancelled),
+                _ = self.shutdown.cancelled() => Some(Freshness::LoopDead),
                 _ = tokio::time::sleep(remaining), if !warned_stuck => {
                     self.log_freshness_stuck(request_method, started_at).await;
                     warned_stuck = true;
@@ -1652,6 +1654,37 @@ mod tests {
             .expect("freshness wait must fail fast once the loop is dead");
             verify_that!(fresh, eq(Freshness::LoopDead))?;
             Ok(())
+        })
+    }
+
+    /// Shutdown stops the loop for good, so a waiter parked on it is released
+    /// and its request answered.
+    #[gtest]
+    fn shutdown_releases_a_parked_freshness_waiter() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            debounced_analysis
+                .has_pending_changes
+                .store(true, Ordering::Release);
+            let token = CancellationToken::new();
+            let waiter = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                async move {
+                    debounced_analysis
+                        .wait_until_fresh_for(&token, "test")
+                        .await
+                }
+            });
+            while debounced_analysis.freshness_wait_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+            debounced_analysis.shutdown.cancel();
+            let fresh = tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .expect("parked waiter must be released at shutdown")
+                .expect("waiter task must not panic");
+            verify_that!(fresh, eq(Freshness::LoopDead))
         })
     }
 
