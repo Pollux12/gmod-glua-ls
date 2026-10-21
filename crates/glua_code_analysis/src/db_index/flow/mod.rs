@@ -151,7 +151,8 @@ impl LuaFlowIndex {
         derivation::note_write(|| FactKey::SpecialCall(file_id, position));
     }
 
-    /// Rewrites the types stored on special-call effects.
+    /// Rewrites the types stored on special-call effects, and on the settled
+    /// facts that mirror them.
     ///
     /// `type_ref` is the callee's declared out-param type, so it can name a
     /// table literal or signature in a file other than the caller this effect
@@ -176,6 +177,7 @@ impl LuaFlowIndex {
             let Some(effects) = self.special_call_effects.get_mut(&holder) else {
                 continue;
             };
+            let mut moved = Vec::new();
             for (position, effects) in effects.iter_mut() {
                 for effect in effects.iter_mut() {
                     let result = crate::db_index::remap_identities_in_type(&effect.type_ref, remap);
@@ -185,10 +187,19 @@ impl LuaFlowIndex {
                             FactKey::SpecialCall(holder, *position),
                         ));
                     } else if let Some(typ) = result.typ {
-                        effect.type_ref = typ;
+                        let old = std::mem::replace(&mut effect.type_ref, typ.clone());
+                        moved.push((*position, effect.target.clone(), old, typ));
                         derivation::note_write(|| FactKey::SpecialCall(holder, *position));
                         derivation::note_write(|| FactKey::FlowTree(holder));
                     }
+                }
+            }
+            for (position, target, old, new) in moved {
+                if let Some(settled) = self.settled_special_calls.get_mut(&(holder, position)) {
+                    settled.replace(
+                        &SpecialCallFact::flow_effect(holder, position, target.clone(), old),
+                        SpecialCallFact::flow_effect(holder, position, target, new),
+                    );
                 }
             }
         }
@@ -465,6 +476,18 @@ impl SettledSpecialCall {
             .wrapping_add(derivation::fingerprint_of(&fact));
         self.facts.push(fact);
         true
+    }
+
+    /// Puts `new` where `old` stood.
+    fn replace(&mut self, old: &SpecialCallFact, new: SpecialCallFact) {
+        let Some(at) = self.facts.iter().position(|fact| fact == old) else {
+            return;
+        };
+        self.installed = self
+            .installed
+            .wrapping_sub(derivation::fingerprint_of(old))
+            .wrapping_add(derivation::fingerprint_of(&new));
+        self.facts[at] = new;
     }
 
     /// The facts' fingerprint: folded as they were installed, or, mapped back,
@@ -917,6 +940,46 @@ mod tests {
         });
 
         assert_eq!(held, seen);
+    }
+
+    /// Moving what an effect's type names in another file moves the settled
+    /// fact that mirrors it, so the call site fingerprints as one settled
+    /// after the edit.
+    #[test]
+    fn a_remapped_effect_type_moves_the_fact_it_settled() {
+        let holder = FileId::new(1);
+        let named = FileId::new(2);
+        let text = "0123456789abcdefghijklmnopqrstuv";
+        let table = |start: u32| {
+            LuaType::TableConst(InFiled::new(
+                named,
+                TextRange::new(TextSize::new(start), TextSize::new(start + 4)),
+            ))
+        };
+        let position = TextSize::new(16);
+        let mut index = LuaFlowIndex::new();
+        index.add_special_call_effect(holder, position, effect_target(holder), table(8));
+        let mut settled_after = LuaFlowIndex::new();
+        settled_after.add_special_call_effect(holder, position, effect_target(holder), table(9));
+        let remap = crate::FileRemap::unvalidated(
+            named,
+            crate::PositionMap::new(
+                text,
+                &format!(
+                    "
+{text}"
+                ),
+            ),
+        );
+
+        let lost = index.remap_special_call_effect_types(&remap);
+
+        assert!(lost.is_empty());
+        let key = FactKey::SpecialCall(holder, position);
+        let fingerprint = |index: &LuaFlowIndex| {
+            derivation::in_file(Some(holder), || index.fact_fingerprint(&key))
+        };
+        assert_eq!(fingerprint(&index), fingerprint(&settled_after));
     }
 
     fn str_tpl_decl_fact(site: (FileId, TextSize)) -> SpecialCallFact {
