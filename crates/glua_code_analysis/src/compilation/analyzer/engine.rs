@@ -2090,11 +2090,13 @@ impl Engine {
         drop(canonicalising);
         let mut released = Vec::new();
         let mut on_root = Vec::new();
+        let mut unowned = Vec::new();
         let mut records = Vec::with_capacity(filed.iter().map(|task| task.records.len()).sum());
         touched.reserve(filed.iter().map(|task| task.touched.len()).sum());
         for task in filed {
             touched.extend(task.touched);
             on_root.extend(task.on_root);
+            unowned.extend(task.unowned);
             records.extend(task.records);
         }
         let ran = tasks
@@ -2173,6 +2175,35 @@ impl Engine {
                 self.stats
                     .requeue_cause(*id, "wrote a type under a fallback it may have read");
                 self.worklist.insert(*id, Reason::Changed);
+            }
+        }
+        // What a group sent to the root list wrote went in with its task but
+        // no record owns it, so no reset would take it back: it starts over
+        // from the source layer, computed again by the group and every other
+        // producer of it.
+        if !unowned.is_empty() {
+            derivation::dedup_keys(&mut unowned);
+            let rerun = on_root
+                .iter()
+                .flat_map(|(members, _)| members)
+                .collect::<FxHashSet<_>>();
+            let producers = unowned
+                .iter()
+                .flat_map(|key| db.reader_graph().producers(key))
+                .filter(|producer| {
+                    producer.kind != DerivationKind::Source && !rerun.contains(producer)
+                })
+                .collect::<BTreeSet<_>>();
+            let reset = derivation::capture_writes(|| {
+                for key in &unowned {
+                    db.reset_fact(key);
+                }
+            });
+            self.readers_of(db, unowned.iter().chain(reset.iter()));
+            for producer in producers {
+                self.stats
+                    .requeue_cause(producer, "produces a key a root-list group wrote");
+                self.worklist.insert(producer, Reason::Changed);
             }
         }
         // A group that read a query the snapshot had no answer for runs again
@@ -4456,6 +4487,9 @@ fn loops_of(reaches: &FxHashMap<DerivationId, Vec<DerivationId>>) -> Vec<Vec<Der
 struct FiledTask {
     records: Vec<derivation::KeptRecord>,
     on_root: Vec<(Vec<DerivationId>, Vec<HashedKey>)>,
+    /// The primary keys the runs of the groups sent to the root list wrote:
+    /// installed with the task, they belong to no record.
+    unowned: Vec<HashedKey>,
     touched: Vec<HashedKey>,
 }
 
@@ -4474,6 +4508,7 @@ fn file_task(
     let mut filed = FiledTask {
         records: Vec::new(),
         on_root: Vec::new(),
+        unowned: Vec::new(),
         touched: Vec::new(),
     };
     let mut kept = Vec::new();
@@ -4483,12 +4518,20 @@ fn file_task(
                 .as_ref()
                 .is_some_and(|(_, canonical)| *canonical)
         }) {
-            let queries = group
+            let discarded = group
                 .records
                 .iter()
-                .filter_map(|(at, _)| evaluations[*at].as_ref())
+                .filter_map(|(at, _)| evaluations[*at].as_ref());
+            let queries = discarded
+                .clone()
                 .flat_map(|(evaluation, _)| table.read_queries(evaluation))
                 .collect();
+            filed.unowned.extend(
+                discarded
+                    .flat_map(|(evaluation, _)| evaluation.outputs())
+                    .filter(|key| key.is_primary())
+                    .cloned(),
+            );
             filed.on_root.push((group.members.clone(), queries));
             continue;
         }
