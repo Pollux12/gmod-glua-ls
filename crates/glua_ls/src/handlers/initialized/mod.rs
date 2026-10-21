@@ -203,8 +203,9 @@ pub async fn initialized_handler(
 }
 
 /// Loads the workspace `loaded` describes: every file it collects is read,
-/// and every other loaded file except std and `open_files` is removed, so the
-/// result equals a cold load.
+/// except an open one the analysis already holds the editor's text of, and
+/// every other loaded file except std and `open_files` is removed, so the
+/// result equals a cold load of the editor's view.
 pub async fn init_analysis(
     analysis: &RwLock<EmmyLuaAnalysis>,
     client: &crate::context::ClientProxy,
@@ -330,9 +331,20 @@ pub async fn init_analysis(
 
     apply_workspace_diagnostic_configs(&mut mut_analysis, &workspace_diagnostic_configs);
 
+    // The editor owns an open document's text: disk text would replace the
+    // unsaved edits it holds.
+    let open_file_ids = open_files
+        .iter()
+        .filter_map(|uri| mut_analysis.get_file_id(uri))
+        .collect::<HashSet<_>>();
     let mut changes = files
         .into_iter()
         .filter_map(|(path, text)| Some((file_path_to_uri(&path)?, text)))
+        .filter(|(uri, _)| {
+            mut_analysis
+                .get_file_id(uri)
+                .is_none_or(|file_id| !open_file_ids.contains(&file_id))
+        })
         .collect::<Vec<_>>();
     let uncollected = uncollected_files(&mut_analysis, &changes, &open_files);
     changes.extend(uncollected.iter().map(|(_, uri)| (uri.clone(), None)));
@@ -682,5 +694,71 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    /// A reload reads the workspace from disk, but an open document's text is
+    /// the editor's.
+    #[gtest]
+    fn init_analysis_keeps_the_editor_text_of_an_open_document() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (proxy_connection, _peer_connection) = Connection::memory();
+        let client = Arc::new(ClientProxy::new(proxy_connection));
+        let lsp_features = LspFeatures::new(ClientCapabilities::default());
+        let root = crate::util::TempDir::new("glua_ls_reload_open_document");
+        let path = root.join("lua/autorun/open.lua");
+        std::fs::create_dir_all(path.parent().expect("a parent folder"))
+            .expect("folders should be created");
+        std::fs::write(
+            &path,
+            "Disk = 1
+",
+        )
+        .expect("file should be written");
+        let uri = glua_code_analysis::file_path_to_uri(&path).expect("URI should parse");
+        let mut analysis = EmmyLuaAnalysis::new();
+        analysis.add_main_workspace(root.to_path_buf());
+        analysis.update_file_by_uri(
+            &uri,
+            Some(
+                "Editor = 1
+"
+                .to_string(),
+            ),
+        );
+        let analysis = Arc::new(RwLock::new(analysis));
+        let status_bar = Arc::new(StatusBar::new(client.clone(), true));
+        let file_diagnostic = Arc::new(FileDiagnostic::new(
+            analysis.clone(),
+            status_bar.clone(),
+            client.clone(),
+        ));
+
+        runtime.block_on(init_analysis(
+            &analysis,
+            client.as_ref(),
+            &status_bar,
+            &file_diagnostic,
+            &lsp_features,
+            vec![glua_code_analysis::WorkspaceFolder::new(
+                root.to_path_buf(),
+                false,
+            )],
+            LoadedConfig::default(),
+            std::collections::HashSet::from([uri.clone()]),
+            LongRunningWatchdogStatus::new("test"),
+        ));
+
+        let analysis = runtime.block_on(analysis.read());
+        let file_id = analysis.get_file_id(&uri).expect("the open document");
+        verify_that!(
+            analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_content(&file_id)
+                .map(String::as_str),
+            some(eq("Editor = 1
+"))
+        )
     }
 }
