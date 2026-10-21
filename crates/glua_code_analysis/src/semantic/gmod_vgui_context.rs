@@ -108,12 +108,12 @@ fn panel_receiver_context_for_func(
 /// Whether the method the context names overrides a signature that marks
 /// `param_idx` with `call_arg("gmod.vgui_panel", "own_class")`.
 ///
-/// The method is looked up on the registered panel class's member chain,
-/// nearest declaration first (the same traversal order the self-call contract
-/// helpers use): the user's own override carries no role, so the search falls
-/// through to the inherited declaration it overrides — e.g. the annotated
-/// `Panel:GenerateExample` whose `class` parameter the engine fills with the
-/// panel's registered class name.
+/// The method is looked up on the registered panel class and every class it
+/// inherits from, nearest first. Any declaration on that chain decides it:
+/// the engine fills the parameter whatever an override declares, so the
+/// user's own override (which carries no role) still gets the inherited
+/// declaration's — e.g. the annotated `Panel:GenerateExample` whose `class`
+/// parameter the engine fills with the panel's registered class name.
 pub(crate) fn registered_vgui_method_param_is_own_class(
     db: &DbIndex,
     context: &RegisteredVguiMethodContext,
@@ -131,14 +131,11 @@ pub(crate) fn registered_vgui_method_param_is_own_class(
     {
         let Some(members) = db
             .get_member_index()
-            .get_members(&LuaMemberOwner::Type(class_id))
+            .get_members_with_key(&LuaMemberOwner::Type(class_id), &member_key)
         else {
             continue;
         };
         for member in members {
-            if member.get_key() != &member_key {
-                continue;
-            }
             let member_file_id = member.get_file_id();
             let Some(index_expr) = db
                 .get_vfs()
