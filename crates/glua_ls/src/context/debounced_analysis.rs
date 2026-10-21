@@ -163,6 +163,15 @@ pub(crate) fn expedites_debounce(method: &str) -> bool {
     )
 }
 
+/// What a freshness wait waits for.
+#[derive(Clone, Copy)]
+enum Wait<'a> {
+    /// Every pending change reindexed.
+    Settled,
+    /// The document at the URI, for what it needs.
+    Document(&'a Uri, DocumentNeed),
+}
+
 /// What a request aimed at one document waits for.
 #[derive(Clone, Copy)]
 enum DocumentNeed {
@@ -452,45 +461,13 @@ impl DebouncedAnalysis {
     ///
     /// Returns `Fresh` when the analysis is current, `Cancelled` if the cancel
     /// token fired first, and `LoopDead` if the debounce loop is dead.
-    /// Uses `enable()` so that `notify_waiters()` wakeups are
-    /// not lost between creating the `Notified` future and polling it.
     pub async fn wait_until_fresh_for(
         &self,
         cancel_token: &CancellationToken,
         request_method: &'static str,
     ) -> Freshness {
-        #[cfg(test)]
-        self.freshness_waits.fetch_add(1, Ordering::AcqRel);
-
-        let started_at = Instant::now();
-        let mut warned_stuck = false;
-
-        loop {
-            // Register (`enable()`) before testing the condition: unpolled
-            // Notified futures are invisible to `notify_waiters()`.
-            let notified = self.reindex_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            if !self.has_pending_changes.load(Ordering::Acquire) {
-                return Freshness::Fresh;
-            }
-
-            if !self.debounce_loop_alive() {
-                return Freshness::LoopDead;
-            }
-
-            let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
-
-            tokio::select! {
-                _ = notified => {} // re-check
-                _ = cancel_token.cancelled() => return Freshness::Cancelled,
-                _ = tokio::time::sleep(remaining), if !warned_stuck => {
-                    self.log_freshness_stuck(request_method, started_at).await;
-                    warned_stuck = true;
-                }
-            }
-        }
+        self.wait(cancel_token, request_method, Wait::Settled, None)
+            .await
     }
 
     /// Wait until the document at `uri` has index entries matching its text.
@@ -512,8 +489,8 @@ impl DebouncedAnalysis {
         request_method: &'static str,
         uri: &Uri,
     ) -> Freshness {
-        self.wait_for_document(cancel_token, request_method, uri, DocumentNeed::Answerable)
-            .await
+        let what = Wait::Document(uri, DocumentNeed::Answerable);
+        self.wait(cancel_token, request_method, what, None).await
     }
 
     /// Wait until the re-analysis has taken the text of the document at
@@ -525,16 +502,53 @@ impl DebouncedAnalysis {
         request_method: &'static str,
         uri: &Uri,
     ) -> Freshness {
-        self.wait_for_document(cancel_token, request_method, uri, DocumentNeed::TakenText)
-            .await
+        let what = Wait::Document(uri, DocumentNeed::TakenText);
+        self.wait(cancel_token, request_method, what, None).await
     }
 
-    async fn wait_for_document(
+    /// Profiled form of [`Self::wait_until_fresh_for`]: the same wait, plus
+    /// time accumulated by observed state.
+    pub async fn wait_until_fresh_for_profiled(
+        &self,
+        cancel_token: &CancellationToken,
+        request_method: &'static str,
+    ) -> (Freshness, FreshWaitBreakdown) {
+        let mut breakdown = FreshWaitBreakdown::default();
+        let freshness = self
+            .wait(
+                cancel_token,
+                request_method,
+                Wait::Settled,
+                Some(&mut breakdown),
+            )
+            .await;
+        (freshness, breakdown)
+    }
+
+    /// Profiled form of [`Self::wait_until_file_fresh_for`]: the same wait,
+    /// plus time accumulated by observed state.
+    pub async fn wait_until_file_fresh_for_profiled(
         &self,
         cancel_token: &CancellationToken,
         request_method: &'static str,
         uri: &Uri,
-        need: DocumentNeed,
+    ) -> (Freshness, FreshWaitBreakdown) {
+        let mut breakdown = FreshWaitBreakdown::default();
+        let what = Wait::Document(uri, DocumentNeed::Answerable);
+        let freshness = self
+            .wait(cancel_token, request_method, what, Some(&mut breakdown))
+            .await;
+        (freshness, breakdown)
+    }
+
+    /// Waits until `what` holds, `cancel_token` fires or the debounce loop is
+    /// dead; `breakdown` accumulates where the time went.
+    async fn wait(
+        &self,
+        cancel_token: &CancellationToken,
+        request_method: &'static str,
+        what: Wait<'_>,
+        mut breakdown: Option<&mut FreshWaitBreakdown>,
     ) -> Freshness {
         #[cfg(test)]
         self.freshness_waits.fetch_add(1, Ordering::AcqRel);
@@ -543,38 +557,60 @@ impl DebouncedAnalysis {
         let mut warned_stuck = false;
         let mut waiting = None;
 
-        loop {
+        let freshness = loop {
+            // Register (`enable()`) before testing the condition: unpolled
+            // Notified futures are invisible to `notify_waiters()`.
             let notified = self.reindex_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let met = match need {
-                DocumentNeed::Answerable => self.file_is_answerable(uri).await,
-                DocumentNeed::TakenText => self.text_is_taken(uri).await,
+            let met = match what {
+                Wait::Settled => !self.has_pending_changes.load(Ordering::Acquire),
+                Wait::Document(uri, DocumentNeed::Answerable) => self.file_is_answerable(uri).await,
+                Wait::Document(uri, DocumentNeed::TakenText) => self.text_is_taken(uri).await,
             };
             if met {
-                return Freshness::Fresh;
+                break Freshness::Fresh;
             }
 
             if !self.debounce_loop_alive() {
-                return Freshness::LoopDead;
+                break Freshness::LoopDead;
             }
 
-            // Only a request that has to wait needs the re-analysis now.
-            if expedites_debounce(request_method) {
+            // Only a request that has to wait on its document needs the
+            // re-analysis now.
+            if matches!(what, Wait::Document(..)) && expedites_debounce(request_method) {
                 waiting.get_or_insert_with(|| self.request_waiting());
             }
+            let parked_at = Instant::now();
+            let observed_in_flight = self.in_flight_change_count() > 0;
             let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
 
-            tokio::select! {
-                _ = notified => {}
-                _ = cancel_token.cancelled() => return Freshness::Cancelled,
+            let ended = tokio::select! {
+                _ = notified => None,
+                _ = cancel_token.cancelled() => Some(Freshness::Cancelled),
                 _ = tokio::time::sleep(remaining), if !warned_stuck => {
                     self.log_freshness_stuck(request_method, started_at).await;
                     warned_stuck = true;
+                    None
+                }
+            };
+            if let Some(breakdown) = breakdown.as_deref_mut() {
+                let parked = parked_at.elapsed();
+                if observed_in_flight {
+                    breakdown.in_flight += parked;
+                } else {
+                    breakdown.blocked += parked;
                 }
             }
+            if let Some(freshness) = ended {
+                break freshness;
+            }
+        };
+        if let Some(breakdown) = breakdown {
+            breakdown.total = started_at.elapsed();
         }
+        freshness
     }
 
     /// Whether the analysis reads the newest text of the document at `uri`:
@@ -597,160 +633,6 @@ impl DebouncedAnalysis {
             prioritised.push(file_id);
         }
         settling
-    }
-
-    /// Profiled form of [`Self::wait_until_fresh_for`]: identical wake-up
-    /// behavior, plus time accumulated by observed state.
-    pub async fn wait_until_fresh_for_profiled(
-        &self,
-        cancel_token: &CancellationToken,
-        request_method: &'static str,
-    ) -> (Freshness, FreshWaitBreakdown) {
-        #[cfg(test)]
-        self.freshness_waits.fetch_add(1, Ordering::AcqRel);
-
-        let started_at = Instant::now();
-        let mut warned_stuck = false;
-        let mut in_flight = Duration::ZERO;
-        let mut blocked = Duration::ZERO;
-
-        loop {
-            let notified = self.reindex_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            if !self.has_pending_changes.load(Ordering::Acquire) {
-                return (
-                    Freshness::Fresh,
-                    FreshWaitBreakdown {
-                        total: started_at.elapsed(),
-                        in_flight,
-                        blocked,
-                    },
-                );
-            }
-
-            if !self.debounce_loop_alive() {
-                return (
-                    Freshness::LoopDead,
-                    FreshWaitBreakdown {
-                        total: started_at.elapsed(),
-                        in_flight,
-                        blocked,
-                    },
-                );
-            }
-
-            let iter_start = Instant::now();
-            let observed_in_flight = self.in_flight_changes.load(Ordering::Acquire) > 0;
-            let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
-
-            let cancelled = tokio::select! {
-                _ = notified => false,
-                _ = cancel_token.cancelled() => true,
-                _ = tokio::time::sleep(remaining), if !warned_stuck => {
-                    self.log_freshness_stuck(request_method, started_at).await;
-                    warned_stuck = true;
-                    false
-                }
-            };
-            let elapsed = iter_start.elapsed();
-            if observed_in_flight {
-                in_flight += elapsed;
-            } else {
-                blocked += elapsed;
-            }
-            if cancelled {
-                return (
-                    Freshness::Cancelled,
-                    FreshWaitBreakdown {
-                        total: started_at.elapsed(),
-                        in_flight,
-                        blocked,
-                    },
-                );
-            }
-        }
-    }
-
-    /// Profiled form of [`Self::wait_until_file_fresh_for`]: identical
-    /// wake-up behavior, plus time accumulated by observed state.
-    pub async fn wait_until_file_fresh_for_profiled(
-        &self,
-        cancel_token: &CancellationToken,
-        request_method: &'static str,
-        uri: &Uri,
-    ) -> (Freshness, FreshWaitBreakdown) {
-        #[cfg(test)]
-        self.freshness_waits.fetch_add(1, Ordering::AcqRel);
-
-        let started_at = Instant::now();
-        let mut warned_stuck = false;
-        let mut in_flight = Duration::ZERO;
-        let mut blocked = Duration::ZERO;
-        let mut waiting = None;
-
-        loop {
-            let notified = self.reindex_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            if self.file_is_answerable(uri).await {
-                return (
-                    Freshness::Fresh,
-                    FreshWaitBreakdown {
-                        total: started_at.elapsed(),
-                        in_flight,
-                        blocked,
-                    },
-                );
-            }
-
-            if !self.debounce_loop_alive() {
-                return (
-                    Freshness::LoopDead,
-                    FreshWaitBreakdown {
-                        total: started_at.elapsed(),
-                        in_flight,
-                        blocked,
-                    },
-                );
-            }
-
-            // Only a request that has to wait needs the re-analysis now.
-            if expedites_debounce(request_method) {
-                waiting.get_or_insert_with(|| self.request_waiting());
-            }
-            let iter_start = Instant::now();
-            let observed_in_flight = self.in_flight_changes.load(Ordering::Acquire) > 0;
-            let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
-
-            let cancelled = tokio::select! {
-                _ = notified => false,
-                _ = cancel_token.cancelled() => true,
-                _ = tokio::time::sleep(remaining), if !warned_stuck => {
-                    self.log_freshness_stuck(request_method, started_at).await;
-                    warned_stuck = true;
-                    false
-                }
-            };
-            let elapsed = iter_start.elapsed();
-            if observed_in_flight {
-                in_flight += elapsed;
-            } else {
-                blocked += elapsed;
-            }
-            if cancelled {
-                return (
-                    Freshness::Cancelled,
-                    FreshWaitBreakdown {
-                        total: started_at.elapsed(),
-                        in_flight,
-                        blocked,
-                    },
-                );
-            }
-        }
     }
 
     /// Whether a request aimed at `uri` can be answered against entries that
