@@ -76,13 +76,8 @@ pub struct LuaSignatureIndex {
     inferred_guard_owners: CowCell<HashMap<LuaSignatureId, LuaInferredGuardOwner>>,
     inferred_guard_facts: CowCell<HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>>,
     inferred_guard_owners_by_file: CowCell<HashMap<FileId, HashSet<LuaInferredGuardOwner>>>,
-    inferred_guard_consumers: CowCell<HashMap<LuaInferredGuardOwner, HashSet<FileId>>>,
-    inferred_guard_dependencies: CowCell<HashMap<FileId, HashSet<LuaInferredGuardOwner>>>,
-    inferred_return_dependencies: CowCell<HashMap<LuaSignatureId, HashSet<FileId>>>,
-    inferred_return_consumers: CowCell<HashMap<FileId, HashSet<LuaSignatureId>>>,
     payload_sources_by_holder: CowCell<HashMap<FileId, HashSet<FileId>>>,
     payload_holders_by_source: CowCell<HashMap<FileId, HashSet<FileId>>>,
-    inferred_positive_guards_changed: bool,
     receiver_out_param_member_names: CowCell<HashMap<String, usize>>,
     in_file_receiver_out_param_member_names: CowCell<HashMap<FileId, HashSet<String>>>,
 }
@@ -203,13 +198,8 @@ impl LuaSignatureIndex {
             inferred_guard_owners: Default::default(),
             inferred_guard_facts: Default::default(),
             inferred_guard_owners_by_file: Default::default(),
-            inferred_guard_consumers: Default::default(),
-            inferred_guard_dependencies: Default::default(),
-            inferred_return_dependencies: Default::default(),
-            inferred_return_consumers: Default::default(),
             payload_sources_by_holder: Default::default(),
             payload_holders_by_source: Default::default(),
-            inferred_positive_guards_changed: false,
             receiver_out_param_member_names: Default::default(),
             in_file_receiver_out_param_member_names: Default::default(),
         }
@@ -460,9 +450,6 @@ impl LuaSignatureIndex {
         signature_id: LuaSignatureId,
         guard: LuaInferredPositiveGuard,
     ) {
-        if self.inferred_positive_guards.get(&signature_id) != Some(&guard) {
-            self.inferred_positive_guards_changed = true;
-        }
         derivation::note_write(|| FactKey::InferredGuard(signature_id));
         self.inferred_positive_guards.insert(signature_id, guard);
     }
@@ -473,9 +460,6 @@ impl LuaSignatureIndex {
         owner: LuaInferredGuardOwner,
         guard: LuaInferredPositiveGuard,
     ) {
-        if self.inferred_guard_facts.get(&owner) != Some(&guard) {
-            self.inferred_positive_guards_changed = true;
-        }
         derivation::note_write(|| FactKey::InferredGuard(signature_id));
         self.inferred_positive_guards
             .insert(signature_id, guard.clone());
@@ -491,9 +475,7 @@ impl LuaSignatureIndex {
     /// Drops the inferred guard a derivation published for `signature_id`,
     /// before that derivation runs again.
     pub(crate) fn reset_inferred_guard(&mut self, signature_id: &LuaSignatureId) {
-        if self.inferred_positive_guards.remove(signature_id).is_some() {
-            self.inferred_positive_guards_changed = true;
-        }
+        self.inferred_positive_guards.remove(signature_id);
         let Some(owner) = self.inferred_guard_owners.remove(signature_id) else {
             return;
         };
@@ -523,6 +505,7 @@ impl LuaSignatureIndex {
         self.inferred_guard_owners.get(signature_id)
     }
 
+    #[cfg(test)]
     pub fn inferred_guard_facts_for_files(
         &self,
         file_ids: &HashSet<FileId>,
@@ -538,98 +521,6 @@ impl LuaSignatureIndex {
                     .map(|guard| (owner.clone(), guard))
             })
             .collect()
-    }
-
-    pub fn inferred_guard_consumers_for_files(
-        &self,
-        file_ids: &HashSet<FileId>,
-    ) -> HashSet<FileId> {
-        file_ids
-            .iter()
-            .filter_map(|file_id| self.inferred_guard_owners_by_file.get(file_id))
-            .flatten()
-            .filter_map(|owner| self.inferred_guard_consumers.get(owner))
-            .flatten()
-            .copied()
-            .collect()
-    }
-
-    pub fn inferred_guard_consumers(
-        &self,
-        owner: &LuaInferredGuardOwner,
-    ) -> impl Iterator<Item = FileId> + '_ {
-        self.inferred_guard_consumers
-            .get(owner)
-            .into_iter()
-            .flatten()
-            .copied()
-    }
-
-    pub fn migrate_inferred_guard_consumers(
-        &mut self,
-        owner: LuaInferredGuardOwner,
-        consumers: &HashSet<FileId>,
-        reindexed_file_ids: &HashSet<FileId>,
-    ) {
-        for consumer_file_id in consumers
-            .iter()
-            .filter(|file_id| !reindexed_file_ids.contains(file_id))
-        {
-            self.inferred_guard_consumers
-                .entry(owner.clone())
-                .or_default()
-                .insert(*consumer_file_id);
-            self.inferred_guard_dependencies
-                .entry(*consumer_file_id)
-                .or_default()
-                .insert(owner.clone());
-        }
-    }
-
-    pub fn set_inferred_guard_dependencies(
-        &mut self,
-        consumer_file_id: FileId,
-        owners: HashSet<LuaInferredGuardOwner>,
-    ) {
-        self.clear_inferred_guard_dependencies(consumer_file_id);
-        for owner in &owners {
-            self.inferred_guard_consumers
-                .entry(owner.clone())
-                .or_default()
-                .insert(consumer_file_id);
-        }
-        if !owners.is_empty() {
-            self.inferred_guard_dependencies
-                .insert(consumer_file_id, owners);
-        }
-    }
-
-    fn clear_inferred_guard_dependencies(&mut self, consumer_file_id: FileId) {
-        let Some(owners) = self.inferred_guard_dependencies.remove(&consumer_file_id) else {
-            return;
-        };
-        for owner in owners {
-            if let Some(consumers) = self.inferred_guard_consumers.get_mut(&owner) {
-                consumers.remove(&consumer_file_id);
-                if consumers.is_empty() {
-                    self.inferred_guard_consumers.remove(&owner);
-                }
-            }
-        }
-    }
-
-    fn clear_inferred_return_dependencies(&mut self, signature_id: LuaSignatureId) {
-        let Some(source_file_ids) = self.inferred_return_dependencies.remove(&signature_id) else {
-            return;
-        };
-        for source_file_id in source_file_ids {
-            if let Some(consumers) = self.inferred_return_consumers.get_mut(&source_file_id) {
-                consumers.remove(&signature_id);
-                if consumers.is_empty() {
-                    self.inferred_return_consumers.remove(&source_file_id);
-                }
-            }
-        }
     }
 
     /// Indexed per-holder payload population shared by snapshot and remap.
@@ -823,21 +714,8 @@ impl LuaSignatureIndex {
             .inferred_guard_owners_by_file
             .remove(&file_id)
             .unwrap_or_default();
-        let changed = !old_owners.is_empty();
         for owner in old_owners {
             self.inferred_guard_facts.remove(&owner);
-            if let Some(consumers) = self.inferred_guard_consumers.remove(&owner) {
-                for consumer_file_id in consumers {
-                    if let Some(dependencies) =
-                        self.inferred_guard_dependencies.get_mut(&consumer_file_id)
-                    {
-                        dependencies.remove(&owner);
-                        if dependencies.is_empty() {
-                            self.inferred_guard_dependencies.remove(&consumer_file_id);
-                        }
-                    }
-                }
-            }
         }
         let retain = |signature_id: &LuaSignatureId| {
             let keep = signature_id.get_file_id() != file_id;
@@ -850,11 +728,6 @@ impl LuaSignatureIndex {
             .retain(|signature_id, _| retain(signature_id));
         self.inferred_guard_owners
             .retain(|signature_id, _| retain(signature_id));
-        self.inferred_positive_guards_changed |= changed;
-    }
-
-    pub fn take_inferred_positive_guards_changed(&mut self) -> bool {
-        std::mem::take(&mut self.inferred_positive_guards_changed)
     }
 
     pub fn add_receiver_out_param_member_name(&mut self, file_id: FileId, member_name: String) {
@@ -978,12 +851,10 @@ impl LuaIndex for LuaSignatureIndex {
         // Drop only the removed file's holder edges. Reverse edges where it is
         // the referenced source stay so a later remap can still report loss.
         self.drop_payload_holder_edges(file_id);
-        self.clear_inferred_guard_dependencies(file_id);
         if let Some(signature_ids) = self.in_file_signatures.remove(&file_id) {
             derivation::note_write(|| FactKey::SignatureFile(file_id));
             for signature_id in signature_ids {
                 derivation::note_write(|| FactKey::Signature(signature_id));
-                self.clear_inferred_return_dependencies(signature_id);
                 self.source_signatures.remove(&signature_id);
                 if self.signatures.remove(&signature_id).is_some() {
                     self.note_return_write(signature_id);
@@ -1069,13 +940,8 @@ impl LuaIndex for LuaSignatureIndex {
         self.inferred_guard_owners.clear();
         self.inferred_guard_facts.clear();
         self.inferred_guard_owners_by_file.clear();
-        self.inferred_guard_consumers.clear();
-        self.inferred_guard_dependencies.clear();
-        self.inferred_return_dependencies.clear();
-        self.inferred_return_consumers.clear();
         self.payload_sources_by_holder.clear();
         self.payload_holders_by_source.clear();
-        self.inferred_positive_guards_changed = false;
         self.receiver_out_param_member_names.clear();
         self.in_file_receiver_out_param_member_names.clear();
     }
@@ -1094,34 +960,8 @@ mod tests {
     }
 
     #[test]
-    fn removing_consumer_clears_reverse_inferred_guard_dependency() {
+    fn removing_guard_source_clears_its_guard_facts() {
         let source_file_id = FileId::new(1);
-        let consumer_file_id = FileId::new(2);
-        let owner = owner(source_file_id);
-        let mut index = LuaSignatureIndex::new();
-        index
-            .inferred_guard_owners_by_file
-            .entry(source_file_id)
-            .or_default()
-            .insert(owner.clone());
-        index
-            .set_inferred_guard_dependencies(consumer_file_id, HashSet::from_iter([owner.clone()]));
-
-        index.remove(consumer_file_id);
-
-        assert!(index.inferred_guard_dependencies.is_empty());
-        assert!(index.inferred_guard_consumers.is_empty());
-        assert!(
-            index
-                .inferred_guard_consumers_for_files(&HashSet::from_iter([source_file_id]))
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn removing_guard_source_clears_consumer_forward_dependency() {
-        let source_file_id = FileId::new(1);
-        let consumer_file_id = FileId::new(2);
         let owner = owner(source_file_id);
         let mut index = LuaSignatureIndex::new();
         index
@@ -1137,14 +977,11 @@ mod tests {
                 false_removed_type: None,
             },
         );
-        index.set_inferred_guard_dependencies(consumer_file_id, HashSet::from_iter([owner]));
 
         index.remove(source_file_id);
 
         assert!(index.inferred_guard_facts.is_empty());
         assert!(index.inferred_guard_owners_by_file.is_empty());
-        assert!(index.inferred_guard_dependencies.is_empty());
-        assert!(index.inferred_guard_consumers.is_empty());
     }
 
     fn returning(type_ref: LuaType) -> Vec<LuaDocReturnInfo> {
@@ -1446,13 +1283,8 @@ crate::db_index::cow_shards::task_fork_fields!(LuaSignatureIndex {
     inferred_guard_owners_by_file => |current, frozen, fork| {
         crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::merge_set)
     },
-    inferred_guard_consumers,
-    inferred_guard_dependencies,
-    inferred_return_dependencies,
-    inferred_return_consumers,
     payload_sources_by_holder,
     payload_holders_by_source,
-    inferred_positive_guards_changed,
     receiver_out_param_member_names,
     in_file_receiver_out_param_member_names,
 });

@@ -1690,8 +1690,6 @@ pub(super) fn prepare_inferred_positive_guards(db: &mut crate::DbIndex, context:
         db.get_signature_index_mut()
             .clear_inferred_positive_guards_for_file(*file_id);
     }
-    db.get_signature_index_mut()
-        .take_inferred_positive_guards_changed();
 }
 
 pub(super) fn publish_inferred_positive_guards(
