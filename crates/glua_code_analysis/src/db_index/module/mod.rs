@@ -1506,15 +1506,16 @@ impl LuaIndex for LuaModuleIndex {
                 self.relink_export(file_id, export_files(&module_info));
                 self.module_files.remove(&module_files_entry(&module_info));
                 let module_id = module_info.module_id;
-                let node = match self.module_nodes.get_mut(&module_id) {
-                    Some(node) => node,
-                    None => return,
-                };
-                node.file_ids.retain(|id| *id != file_id);
-                if node.file_ids.is_empty() && node.children.is_empty() {
-                    (node.parent, Some(module_id))
-                } else {
-                    (None, None)
+                match self.module_nodes.get_mut(&module_id) {
+                    Some(node) => {
+                        node.file_ids.retain(|id| *id != file_id);
+                        if node.file_ids.is_empty() && node.children.is_empty() {
+                            (node.parent, Some(module_id))
+                        } else {
+                            (None, None)
+                        }
+                    }
+                    None => (None, None),
                 }
             } else {
                 (None, None)
