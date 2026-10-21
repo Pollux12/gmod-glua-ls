@@ -1,9 +1,38 @@
 #[cfg(test)]
 mod tests {
-    use crate::handlers::rename::{prepare_rename, rename};
+    use crate::handlers::rename::{prepare_rename, rename, versioned_edit};
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, check};
     use googletest::prelude::*;
     use lsp_types::{Position, Range, TextEdit};
+
+    /// Each file's edits name the version of the text they were computed on.
+    #[gtest]
+    fn test_rename_edits_name_the_version_they_were_computed_on() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local <??>value = 1
+                print(value)
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        ws.analysis
+            .compilation
+            .get_db_mut()
+            .get_vfs_mut()
+            .update_file_version(&file_id, Some(7));
+        let edit = rename(&ws.analysis, file_id, position, "renamed".to_string())
+            .expect("a local renames");
+
+        let Some(lsp_types::DocumentChanges::Edits(document_edits)) =
+            versioned_edit(&ws.analysis, edit).document_changes
+        else {
+            panic!("versioned edits");
+        };
+        verify_that!(document_edits.len(), eq(1))?;
+        verify_that!(document_edits[0].text_document.version, eq(Some(7)))?;
+        verify_that!(document_edits[0].edits.len(), eq(2))
+    }
 
     /// A written `self` has a declaration to carry the new name; only a colon
     /// method's implicit receiver does not.

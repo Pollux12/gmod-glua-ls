@@ -10,8 +10,9 @@ use glua_parser::{
     LuaSyntaxToken, LuaTokenKind,
 };
 use lsp_types::{
-    ClientCapabilities, OneOf, PrepareRenameResponse, RenameOptions, RenameParams,
-    ServerCapabilities, TextDocumentPositionParams, WorkspaceEdit,
+    ClientCapabilities, DocumentChanges, OneOf, OneOf3, OptionalVersionedTextDocumentIdentifier,
+    PrepareRenameResponse, RenameOptions, RenameParams, ServerCapabilities, TextDocumentEdit,
+    TextDocumentPositionParams, WorkspaceEdit,
 };
 use rename_decl::rename_decl_references;
 use rename_member::rename_member_references;
@@ -32,7 +33,43 @@ pub async fn on_rename_handler(
     let analysis = context.read_analysis(&cancel_token).await?;
     let file_id = analysis.get_file_id(&uri)?;
     let position = params.text_document_position.position;
-    rename(&analysis, file_id, position, params.new_name)
+    let edit = rename(&analysis, file_id, position, params.new_name)?;
+    if !context.lsp_features().supports_document_changes() {
+        return Some(edit);
+    }
+    Some(versioned_edit(&analysis, edit))
+}
+
+/// `edit` with each file's edits naming the version of the text they were
+/// computed on, so a client holding newer text refuses them instead of
+/// applying them at shifted places.
+pub(crate) fn versioned_edit(
+    analysis: &glua_code_analysis::EmmyLuaAnalysis,
+    edit: WorkspaceEdit,
+) -> WorkspaceEdit {
+    let vfs = analysis.compilation.get_db().get_vfs();
+    let mut changes = edit
+        .changes
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<Vec<_>>();
+    changes.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+    let document_edits = changes
+        .into_iter()
+        .map(|(uri, edits)| TextDocumentEdit {
+            text_document: OptionalVersionedTextDocumentIdentifier {
+                version: vfs
+                    .get_file_id(&uri)
+                    .and_then(|file_id| vfs.get_file_version(&file_id)),
+                uri,
+            },
+            edits: edits.into_iter().map(OneOf3::Left).collect(),
+        })
+        .collect();
+    WorkspaceEdit {
+        document_changes: Some(DocumentChanges::Edits(document_edits)),
+        ..Default::default()
+    }
 }
 
 pub async fn on_prepare_rename_handler(
