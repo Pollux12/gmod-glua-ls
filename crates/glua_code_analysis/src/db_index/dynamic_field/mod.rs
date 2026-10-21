@@ -111,8 +111,10 @@ pub struct DynamicFieldIndex {
     /// them. Keyed by index key, so two same-name writes in one file each own
     /// their record.
     unattributed_fields: CowShards<SmolStr, HashSet<InFiled<TextRange>>>,
-    /// field_name → the types that hold a direct definition of the name.
-    declaring_types: CowShards<SmolStr, HashSet<LuaTypeDeclId>>,
+    /// field_name → the types that hold a direct definition of the name,
+    /// each with how many it holds, so tasks that each drop one merge to the
+    /// count left.
+    declaring_types: CowShards<SmolStr, HashMap<LuaTypeDeclId, u32>>,
     /// Write site → what its derivation filed, so retracting the site or
     /// removing its file visits only the owners it touched. Keyed by the
     /// site's statement or call range.
@@ -282,11 +284,16 @@ impl DynamicFieldIndex {
             .or_default();
         let is_new_direct = insert_definition(direct_definitions, definition);
         if is_new_direct && let DynamicFieldOwner::Type(type_id) = &owner {
-            self.declaring_types
+            let held = self
+                .declaring_types
                 .entry(field_name.clone())
                 .or_default()
-                .insert(type_id.clone());
-            derivation::note_write(|| FactKey::DynamicFieldName(field_name.clone()));
+                .entry(type_id.clone())
+                .or_default();
+            *held += 1;
+            if *held == 1 {
+                derivation::note_write(|| FactKey::DynamicFieldName(field_name.clone()));
+            }
         }
         let is_new_definition =
             self.add_field_inner(site, owner.clone(), field_name.clone(), range);
@@ -460,20 +467,20 @@ impl DynamicFieldIndex {
         let old_slot = self.named_slot_fingerprint(owner, field_name);
         let definition = InFiled::new(file_id, range);
         remove_field_definition(&mut self.field_definitions, owner, field_name, &definition);
-        remove_field_definition(
+        let removed_direct = remove_field_definition(
             &mut self.direct_field_definitions,
             owner,
             field_name,
             &definition,
         );
-        if let DynamicFieldOwner::Type(type_id) = owner
-            && !self
-                .direct_field_definitions
-                .get(owner)
-                .is_some_and(|fields| fields.contains_key(field_name.as_str()))
+        if removed_direct
+            && let DynamicFieldOwner::Type(type_id) = owner
             && let Some(types) = self.declaring_types.get_mut(field_name.as_str())
+            && let Some(held) = types.get_mut(type_id)
         {
-            if types.remove(type_id) {
+            *held -= 1;
+            if *held == 0 {
+                types.remove(type_id);
                 derivation::note_write(|| FactKey::DynamicFieldName(field_name.clone()));
             }
             if types.is_empty() {
@@ -815,7 +822,7 @@ impl DynamicFieldIndex {
         let mut types = self
             .declaring_types
             .get(field_name)
-            .map(|types| types.iter().cloned().collect::<Vec<_>>())
+            .map(|types| types.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         types.sort_by(|left, right| {
             left.get_name()
@@ -1332,7 +1339,7 @@ impl DynamicFieldIndex {
                     .map_or(derivation::ABSENT, |types| {
                         derivation::fingerprint_of(
                             &types
-                                .iter()
+                                .keys()
                                 .map(derivation::fingerprint_of)
                                 .fold(0u64, u64::wrapping_add),
                         )
@@ -1355,25 +1362,30 @@ impl DynamicFieldIndex {
 
 /// Drops one definition entry filed under `(owner, field_name)`, pruning the
 /// emptied levels so no owner or field outlives its last definition.
+/// Drops `definition` from `owner`'s `field_name`. Returns whether it was
+/// there.
 fn remove_field_definition(
     definitions: &mut CowShards<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
     owner: &DynamicFieldOwner,
     field_name: &str,
     definition: &InFiled<TextRange>,
-) {
+) -> bool {
     let Some(fields) = definitions.get_mut(owner) else {
-        return;
+        return false;
     };
     let Some(entries) = fields.get_mut(field_name) else {
-        return;
+        return false;
     };
+    let before = entries.len();
     entries.retain(|existing| existing != definition);
+    let removed = entries.len() != before;
     if entries.is_empty() {
         fields.remove(field_name);
     }
     if fields.is_empty() {
         definitions.remove(owner);
     }
+    removed
 }
 
 #[cfg(test)]
@@ -1551,6 +1563,36 @@ mod tests {
         assert_eq!(
             (installed_state(&by_field), by_field_conflicts),
             (installed_state(&one_by_one), one_by_one_conflicts)
+        );
+    }
+
+    #[test]
+    fn tasks_retracting_a_types_last_two_definitions_leave_it_declaring_nothing() {
+        use crate::db_index::cow_shards::TaskFork;
+        let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("Player"));
+        let sites = [1, 2].map(|file| InFiled::new(FileId::new(file), range(file, file + 1)));
+        let mut base = DynamicFieldIndex::new();
+        for site in &sites {
+            base.add_field(site, owner.clone(), SmolStr::new("a"), site.value);
+        }
+        let frozen = base.task_fork();
+        let forks = sites
+            .iter()
+            .map(|site| {
+                let mut fork = frozen.task_fork();
+                fork.retract_site(site);
+                fork
+            })
+            .enumerate()
+            .collect::<Vec<_>>();
+        let mut index = base.clone();
+        let mut conflicts = vec![Vec::new(); forks.len()];
+
+        index.install_tasks_reporting(&frozen, forks, &mut conflicts);
+
+        assert_eq!(
+            index.types_declaring_field("a"),
+            Vec::<LuaTypeDeclId>::new()
         );
     }
 
@@ -2263,7 +2305,9 @@ crate::db_index::cow_shards::task_fork_fields!(DynamicFieldIndex {
     finite_named_members => crate::db_index::cow_shards::merge_set,
     wildcard_definitions => merge_definitions,
     unattributed_fields => crate::db_index::cow_shards::merge_set,
-    declaring_types => crate::db_index::cow_shards::merge_set,
+    declaring_types => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::merge_sum)
+    },
     site_contributions,
     owner_named_fingerprints => crate::db_index::cow_shards::rebuilt,
 } prepare owners_to_rebuild then rebuild_owner_named
