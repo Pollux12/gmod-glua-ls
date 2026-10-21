@@ -243,6 +243,40 @@ CONFIG.colors = { red = 1 }
         assert!(!ws.check_type(&colors, &literal));
     }
 
+    fn empty_colors_written_by_two_files() -> (VirtualWorkspace, LuaType) {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/autorun/a.lua",
+            "CONFIG = {}
+CONFIG.colors = {}
+",
+        );
+        ws.def_file(
+            "lua/autorun/b.lua",
+            "CONFIG.colors = {}
+",
+        );
+        let colors = ws.expr_ty("CONFIG.colors");
+        assert!(matches!(colors, LuaType::MergedTable(_)));
+        (ws, colors)
+    }
+
+    #[test]
+    fn a_merged_table_of_empty_literals_accepts_another_empty_literal() {
+        let (mut ws, colors) = empty_colors_written_by_two_files();
+        let literal = ws.expr_ty("{}");
+
+        assert!(ws.check_type(&colors, &literal));
+    }
+
+    #[test]
+    fn a_merged_table_of_empty_literals_rejects_a_string() {
+        let (mut ws, colors) = empty_colors_written_by_two_files();
+        let string = ws.expr_ty("\"red\"");
+
+        assert!(!ws.check_type(&colors, &string));
+    }
+
     fn merged_table_with_field(name: &str, typ: LuaType) -> LuaType {
         merged_table_from_object(object_with_field(name, typ))
     }

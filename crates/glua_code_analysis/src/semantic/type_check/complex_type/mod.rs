@@ -182,9 +182,7 @@ fn check_merged_table_type_compact(
         }
     }
 
-    let Some(object) = open_table_object(context, source) else {
-        return Err(TypeCheckFailReason::DonotCheck);
-    };
+    let object = open_table_object(context, source);
 
     if matches!(compact_type, LuaType::MergedTable(_))
         && let Some(compact_object) = structural_object_from_members(context, compact_type)
@@ -234,24 +232,27 @@ pub(super) fn structural_object_from_members(
 }
 
 /// The structural object of a table its writers' literals merge into: every
-/// field one writer spells is a field the table can have, so none is required.
-fn open_table_object(context: &TypeCheckContext, typ: &LuaType) -> Option<LuaType> {
-    let LuaType::Object(object) = structural_object_from_members(context, typ)? else {
-        return None;
-    };
-    let fields = object
-        .get_fields()
-        .iter()
-        .map(|(key, typ)| {
-            (
-                key.clone(),
-                TypeOps::Union.apply(context.db, typ, &LuaType::Nil),
-            )
-        })
-        .collect();
-    Some(LuaType::Object(
-        LuaObjectType::new_with_fields(fields, object.get_index_access().to_vec()).into(),
-    ))
+/// field one writer spells is a field the table can have, so none is required,
+/// and a table no writer gave a field is an empty object any literal fits.
+fn open_table_object(context: &TypeCheckContext, typ: &LuaType) -> LuaType {
+    let (fields, index_access): (BTreeMap<_, _>, Vec<_>) =
+        match structural_object_from_members(context, typ) {
+            Some(LuaType::Object(object)) => (
+                object
+                    .get_fields()
+                    .iter()
+                    .map(|(key, typ)| {
+                        (
+                            key.clone(),
+                            TypeOps::Union.apply(context.db, typ, &LuaType::Nil),
+                        )
+                    })
+                    .collect(),
+                object.get_index_access().to_vec(),
+            ),
+            _ => (BTreeMap::new(), Vec::new()),
+        };
+    LuaType::Object(LuaObjectType::new_with_fields(fields, index_access).into())
 }
 
 fn collect_index_access_from_type(typ: &LuaType, index_access: &mut Vec<(LuaType, LuaType)>) {

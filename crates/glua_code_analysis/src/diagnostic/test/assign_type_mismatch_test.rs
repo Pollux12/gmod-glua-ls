@@ -4156,3 +4156,127 @@ fn closure_without_returns_stays_rejected_as_a_callback_argument() {
     let code = format!("{HOOK_CLASS}\ntakes_callback(function() end)");
     assert!(!ws.check_code_for(crate::DiagnosticCode::ParamTypeMismatch, &code));
 }
+
+#[cfg(test)]
+fn def_bsp_object_class(ws: &mut crate::VirtualWorkspace) {
+    ws.def_file(
+        "gamemode/core/libraries/thirdparty/niknaks/modules/sh_bsp_brushes.lua",
+        r#"
+        ---@class BSPObject
+        BSPObject = {}
+        "#,
+    );
+}
+
+/// Regression (CityRP niknaks `sh_bsp_staticprops.lua`): the earlier `{}`
+/// writes of a class field merge into a table no writer gave a field, and a
+/// later annotated `{}` write to it still fits.
+#[test]
+fn annotated_empty_literal_fits_a_class_field_earlier_empty_literals_wrote() {
+    let mut ws = crate::VirtualWorkspace::new();
+    def_bsp_object_class(&mut ws);
+    assert!(ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "gamemode/core/libraries/thirdparty/niknaks/modules/sh_bsp_models.lua",
+        r#"
+        local meta = BSPObject
+
+        ---@param empty boolean
+        ---@param unknown boolean
+        function meta:LoadModels(empty, unknown)
+            if empty then
+                self._staticprops_mdl = {}
+                return
+            end
+
+            if unknown then
+                self._staticprops_mdl = {}
+                return
+            end
+
+            ---@type string[]
+            self._staticprops_mdl = {}
+        end
+        "#,
+    ));
+}
+
+/// Regression (CityRP niknaks `sh_bsp_staticprops.lua`): an array-typed class
+/// field re-assigned `{}` later in the function, plainly and annotated.
+#[test]
+fn array_typed_class_field_accepts_empty_literal_reassigned_later() {
+    let mut ws = crate::VirtualWorkspace::new();
+    def_bsp_object_class(&mut ws);
+    assert!(ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "gamemode/core/libraries/thirdparty/niknaks/modules/sh_bsp_staticprops.lua",
+        r#"
+        ---@class StaticProp
+        ---@field Index number
+
+        local meta = BSPObject
+
+        ---@param empty boolean
+        ---@param unknown boolean
+        ---@param count integer
+        ---@return StaticProp[]
+        function meta:GetStaticProps(empty, unknown, count)
+            if self._staticprops then return self._staticprops end
+
+            if empty then
+                self._staticprops = {}
+                return self._staticprops
+            end
+
+            if unknown then
+                self._staticprops = {}
+                return self._staticprops
+            end
+
+            if count > 16384 then
+                self._staticprops = {}
+                return self._staticprops
+            end
+
+            ---@type StaticProp[]
+            self._staticprops = {}
+            return self._staticprops
+        end
+        "#,
+    ));
+}
+
+/// Regression (CityRP `rp_evocity_v2d.lua`): an integer slot of a plain table
+/// that map files each set to `{}` accepts `{}` again, including a file that
+/// writes the slot twice.
+#[test]
+fn empty_literal_fits_an_integer_slot_other_files_set_to_empty_literals() {
+    let mut ws = crate::VirtualWorkspace::new();
+    ws.def_file(
+        "plugins/propertysystem/sh_plugin.lua",
+        r#"
+        property = property or {}
+        property.access = property.access or {}
+        property.teams = property.teams or {}
+        "#,
+    );
+    ws.def_file(
+        "plugins/propertysystem/mapsettings/rp_evocity2_v5p.lua",
+        r#"
+        property.access[38] = {}
+        property.teams[38] = {}
+        "#,
+    );
+    assert!(ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "plugins/propertysystem/mapsettings/rp_evocity_v2d.lua",
+        r#"
+        property.access[38] = {}
+        property.teams[38] = {}
+        property.access[39] = {}
+        property.teams[39] = {}
+        property.access[38] = {}
+        property.teams[38] = {}
+        "#,
+    ));
+}
