@@ -237,48 +237,38 @@ pub(super) fn analyze_call(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) -
     collect_gmod_scripted_class_call(analyzer, &call_expr);
     collect_accessorfunc_annotated_call(analyzer, &call_expr);
 
-    let special_call_reason = get_special_call_followup_reason(analyzer, &call_expr);
-    if let Some(reason) = special_call_reason {
+    if special_call_followup(analyzer, &call_expr).is_some() {
         analyzer.context.add_unresolve(
             UnResolveSpecialCall {
                 file_id: analyzer.file_id,
                 call_expr,
             }
             .into(),
-            reason,
         );
     }
 
     Some(())
 }
 
-fn get_special_call_followup_reason(
-    analyzer: &mut LuaAnalyzer,
-    call_expr: &LuaCallExpr,
-) -> Option<InferFailReason> {
+/// Whether `call_expr` may reach a special call, which a follow-up resolves.
+fn special_call_followup(analyzer: &mut LuaAnalyzer, call_expr: &LuaCallExpr) -> Option<()> {
     let prefix_expr = call_expr.get_prefix_expr()?;
-    get_expr_special_call_reason(analyzer, &prefix_expr)
+    expr_special_call_followup(analyzer, &prefix_expr)
 }
 
-fn get_expr_special_call_reason(
-    analyzer: &mut LuaAnalyzer,
-    expr: &LuaExpr,
-) -> Option<InferFailReason> {
+fn expr_special_call_followup(analyzer: &mut LuaAnalyzer, expr: &LuaExpr) -> Option<()> {
     match expr {
-        LuaExpr::NameExpr(name_expr) => get_name_expr_special_call_reason(analyzer, name_expr),
-        LuaExpr::IndexExpr(index_expr) => get_index_expr_special_call_reason(analyzer, index_expr),
+        LuaExpr::NameExpr(name_expr) => name_expr_special_call_followup(analyzer, name_expr),
+        LuaExpr::IndexExpr(index_expr) => index_expr_special_call_followup(analyzer, index_expr),
         LuaExpr::ParenExpr(paren_expr) => {
             let inner_expr = paren_expr.get_expr()?;
-            get_expr_special_call_reason(analyzer, &inner_expr)
+            expr_special_call_followup(analyzer, &inner_expr)
         }
-        _ => get_generic_expr_special_call_reason(analyzer, expr),
+        _ => generic_expr_special_call_followup(analyzer, expr),
     }
 }
 
-fn get_generic_expr_special_call_reason(
-    analyzer: &mut LuaAnalyzer,
-    expr: &LuaExpr,
-) -> Option<InferFailReason> {
+fn generic_expr_special_call_followup(analyzer: &mut LuaAnalyzer, expr: &LuaExpr) -> Option<()> {
     let typ = analyzer.infer_expr(expr).ok()?;
     if type_has_special_call_signature(&analyzer.db, &typ)
         || type_has_special_call_operator_signature(
@@ -288,20 +278,18 @@ fn get_generic_expr_special_call_reason(
             &typ,
         )
     {
-        return Some(InferFailReason::None);
+        return Some(());
     }
 
     None
 }
 
-fn get_name_expr_special_call_reason(
+fn name_expr_special_call_followup(
     analyzer: &mut LuaAnalyzer,
     name_expr: &LuaNameExpr,
-) -> Option<InferFailReason> {
+) -> Option<()> {
     match resolve_cached_name_expr_type(analyzer, name_expr) {
-        Ok(Some(typ)) if type_has_special_call_signature(&analyzer.db, &typ) => {
-            Some(InferFailReason::None)
-        }
+        Ok(Some(typ)) if type_has_special_call_signature(&analyzer.db, &typ) => Some(()),
         Ok(Some(typ))
             if type_has_special_call_operator_signature(
                 &analyzer.db,
@@ -310,12 +298,12 @@ fn get_name_expr_special_call_reason(
                 &typ,
             ) =>
         {
-            Some(InferFailReason::None)
+            Some(())
         }
         Ok(Some(_)) => None,
         Ok(None) => {
             match local_decl_special_call_state(analyzer, name_expr) {
-                Some(true) => return Some(InferFailReason::None),
+                Some(true) => return Some(()),
                 Some(false) => return None,
                 None => {}
             }
@@ -329,9 +317,9 @@ fn get_name_expr_special_call_reason(
                     name_expr.get_position(),
                     &name,
                 )
-                .then_some(InferFailReason::None)
+                .then_some(())
         }
-        Err(reason) => unresolved_name_expr_special_call_reason(analyzer, name_expr, reason),
+        Err(_) => unresolved_name_expr_special_call_followup(analyzer, name_expr),
     }
 }
 
@@ -408,18 +396,16 @@ fn local_decl_special_call_state(analyzer: &LuaAnalyzer, name_expr: &LuaNameExpr
     ))
 }
 
-fn get_index_expr_special_call_reason(
+fn index_expr_special_call_followup(
     analyzer: &mut LuaAnalyzer,
     index_expr: &LuaIndexExpr,
-) -> Option<InferFailReason> {
+) -> Option<()> {
     if index_expr_has_receiver_special_call_signature(analyzer, index_expr) {
-        return Some(InferFailReason::None);
+        return Some(());
     }
 
     match resolve_cached_index_expr_type(analyzer, index_expr) {
-        Ok(Some(typ)) if type_has_special_call_signature(&analyzer.db, &typ) => {
-            Some(InferFailReason::None)
-        }
+        Ok(Some(typ)) if type_has_special_call_signature(&analyzer.db, &typ) => Some(()),
         Ok(Some(typ))
             if type_has_special_call_operator_signature(
                 &analyzer.db,
@@ -428,10 +414,10 @@ fn get_index_expr_special_call_reason(
                 &typ,
             ) =>
         {
-            Some(InferFailReason::None)
+            Some(())
         }
         Ok(Some(_)) => None,
-        Ok(None) => index_expr
+        Ok(None) | Err(_) => index_expr
             .get_access_path()
             .filter(|access_path| {
                 analyzer.special_call_direct_matcher.matches_access_path(
@@ -441,28 +427,16 @@ fn get_index_expr_special_call_reason(
                     access_path,
                 )
             })
-            .map(|_| InferFailReason::None),
-        Err(reason) => index_expr
-            .get_access_path()
-            .filter(|access_path| {
-                analyzer.special_call_direct_matcher.matches_access_path(
-                    &analyzer.db,
-                    analyzer.file_id,
-                    index_expr.get_position(),
-                    access_path,
-                )
-            })
-            .map(|_| reason),
+            .map(|_| ()),
     }
 }
 
-fn unresolved_name_expr_special_call_reason(
+fn unresolved_name_expr_special_call_followup(
     analyzer: &mut LuaAnalyzer,
     name_expr: &LuaNameExpr,
-    reason: InferFailReason,
-) -> Option<InferFailReason> {
+) -> Option<()> {
     match local_decl_special_call_state(analyzer, name_expr) {
-        Some(true) => return Some(reason),
+        Some(true) => return Some(()),
         Some(false) => return None,
         None => {}
     }
@@ -474,7 +448,7 @@ fn unresolved_name_expr_special_call_reason(
         name_expr.get_position(),
         &name,
     ) {
-        return Some(reason);
+        return Some(());
     }
 
     let decl_id = analyzer
@@ -482,7 +456,7 @@ fn unresolved_name_expr_special_call_reason(
         .get_reference_index()
         .get_var_reference_decl(&analyzer.file_id, name_expr.get_range())?;
     decl_value_matches_direct_special_call(analyzer, decl_id, name_expr.get_position())
-        .then_some(reason)
+        .then_some(())
 }
 
 fn decl_value_matches_direct_special_call(

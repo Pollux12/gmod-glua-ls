@@ -15,12 +15,12 @@ pub fn analyze_chunk_return(analyzer: &mut LuaAnalyzer, chunk: LuaChunk) -> Opti
             let expr_type = match analyzer.infer_expr(&expr) {
                 Ok(expr_type) => expr_type,
                 Err(InferFailReason::None) => LuaType::Unknown,
-                Err(reason) => {
+                Err(_) => {
                     let unresolve = UnResolveModule {
                         file_id: analyzer.file_id,
                         expr,
                     };
-                    analyzer.context.add_unresolve(unresolve.into(), reason);
+                    analyzer.context.add_unresolve(unresolve.into());
                     return None;
                 }
             };

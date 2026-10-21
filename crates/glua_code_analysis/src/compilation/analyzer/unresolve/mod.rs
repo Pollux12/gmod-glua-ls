@@ -52,15 +52,13 @@ pub(in crate::compilation::analyzer) fn resolve_inline(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
 ) {
-    while !context.unresolves.is_empty() {
-        let mut items = std::mem::take(&mut context.unresolves);
-        items.sort_unstable_by(|(a, _), (b, _)| unresolve_stable_cmp(a, b));
-        for (mut item, _) in items {
-            let Some(file_id) = item.get_file_id() else {
-                continue;
-            };
-            let _ = attempt_resolve(db, &mut context.infer_manager, file_id, &mut item);
-        }
+    let mut items = std::mem::take(&mut context.unresolves);
+    items.sort_unstable_by(unresolve_stable_cmp);
+    for mut item in items {
+        let Some(file_id) = item.get_file_id() else {
+            continue;
+        };
+        let _ = attempt_resolve(db, &mut context.infer_manager, file_id, &mut item);
     }
 }
 

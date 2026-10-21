@@ -1731,9 +1731,7 @@ fn analyze_lambda_params(
                 param_idx: founded_idx,
             };
 
-            analyzer
-                .context
-                .add_unresolve(unresolved.into(), InferFailReason::None);
+            analyzer.context.add_unresolve(unresolved.into());
         }
         LuaAst::LuaFuncStat(func_stat) => {
             // `try_resolve_closure_parent_params` returns `Ok` without reading
@@ -1753,9 +1751,7 @@ fn analyze_lambda_params(
                 last_source_return: None,
             };
 
-            analyzer
-                .context
-                .add_unresolve(unresolved.into(), InferFailReason::None);
+            analyzer.context.add_unresolve(unresolved.into());
         }
         LuaAst::LuaTableField(table_field) => {
             let unresolved = UnResolveParentClosureParams {
@@ -1767,9 +1763,7 @@ fn analyze_lambda_params(
                 last_source_return: None,
             };
 
-            analyzer
-                .context
-                .add_unresolve(unresolved.into(), InferFailReason::None);
+            analyzer.context.add_unresolve(unresolved.into());
         }
         LuaAst::LuaAssignStat(assign_stat) => {
             // Same no-op rule as the `FuncStat` arm: an assignment whose slot for
@@ -1788,9 +1782,7 @@ fn analyze_lambda_params(
                 last_source_return: None,
             };
 
-            analyzer
-                .context
-                .add_unresolve(unresolved.into(), InferFailReason::None);
+            analyzer.context.add_unresolve(unresolved.into());
         }
         _ => {}
     }
@@ -2198,14 +2190,14 @@ fn analyze_return(
                 return_kind: ReturnTypeKind::default(),
             }]
         }
-        Err(reason) => {
+        Err(_) => {
             let unresolve = UnResolveReturn {
                 file_id: analyzer.file_id,
                 signature_id: *signature_id,
                 return_points,
             };
 
-            analyzer.context.add_unresolve(unresolve.into(), reason);
+            analyzer.context.add_unresolve(unresolve.into());
             return None;
         }
     };
@@ -2278,9 +2270,7 @@ fn analyze_lambda_returns(
         return_points,
     };
 
-    analyzer
-        .context
-        .add_unresolve(unresolved.into(), InferFailReason::None);
+    analyzer.context.add_unresolve(unresolved.into());
 
     Some(())
 }

@@ -45,9 +45,9 @@ use std::sync::Arc;
 
 use crate::db_index::derivation;
 use crate::{
-    AnalyzeError, AsyncState, FileId, FlowTree, GmodScopedClassInfo, InFiled, InferFailReason,
-    LuaDeclId, LuaFunctionType, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey,
-    LuaSignatureId, LuaType, LuaTypeCache, WorkspaceId,
+    AnalyzeError, AsyncState, FileId, FlowTree, GmodScopedClassInfo, InFiled, LuaDeclId,
+    LuaFunctionType, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignatureId,
+    LuaType, LuaTypeCache, WorkspaceId,
     compilation::analyzer::common::{TypeCacheWriteMode, write_type_cache},
     db_index::{DbIndex, LuaMemberOwner},
 };
@@ -1502,7 +1502,7 @@ pub struct AnalyzeContext {
     tree_list: Vec<InFiled<LuaChunk>>,
     metas: HashSet<FileId>,
     scripted_scope_files: Option<Arc<HashSet<FileId>>>,
-    unresolves: Vec<(UnResolve, InferFailReason)>,
+    unresolves: Vec<UnResolve>,
     pending_unresolve_decl_ids: HashSet<LuaDeclId>,
     infer_manager: InferCacheManager,
     inferred_guard_candidates: Vec<InFiled<LuaSyntaxId>>,
@@ -1558,11 +1558,11 @@ impl AnalyzeContext {
         self.tree_list.push(tree);
     }
 
-    pub fn add_unresolve(&mut self, un_resolve: UnResolve, reason: InferFailReason) {
+    pub fn add_unresolve(&mut self, un_resolve: UnResolve) {
         if let UnResolve::Decl(decl) = &un_resolve {
             self.pending_unresolve_decl_ids.insert(decl.decl_id);
         }
-        self.unresolves.push((un_resolve, reason));
+        self.unresolves.push(un_resolve);
     }
 
     pub fn add_inferred_guard_candidate(&mut self, candidate: InFiled<LuaSyntaxId>) {
