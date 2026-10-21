@@ -572,6 +572,7 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
     let mut else_label = binder.create_condition_label(current);
     let then_label = binder.create_condition_label(current);
 
+    let pre_condition = binder.save_modification_counts();
     if let Some(condition_expr) = if_stat.get_condition_expr() {
         bind_condition_expr(binder, condition_expr, current, then_label, else_label);
     }
@@ -579,7 +580,10 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
     // Snapshot modification counters before binding any branch blocks.
     // The outer condition belongs to the split itself; including it in the
     // branch capability leaks temporary guards past ordinary non-terminal ifs.
+    // A branch that ends is the exception: the branches left to merge are the
+    // ones the condition narrowed, so its narrowing reaches past the if.
     let saved = binder.save_modification_counts();
+    let mut a_branch_ends = false;
 
     // We track inner conditions per-block to avoid counting elseif
     // condition expressions (which are structural, not in-block modifications).
@@ -591,6 +595,7 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
         let block_id = bind_block(binder, then_block, then_label);
         let (_, _, _, blk_cond) = binder.check_new_modifications(pre_block);
         blocks_have_inner_conditions |= blk_cond;
+        a_branch_ends |= block_id == binder.unreachable;
         binder.add_antecedent(post_if_label, block_id);
     } else {
         let then_label = finish_flow_label(binder, then_label, current);
@@ -618,6 +623,7 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
             let block_id = bind_block(binder, elseif_block, current);
             let (_, _, _, blk_cond) = binder.check_new_modifications(pre_block);
             blocks_have_inner_conditions |= blk_cond;
+            a_branch_ends |= block_id == binder.unreachable;
             binder.add_antecedent(post_if_label, block_id);
         } else {
             let current = finish_flow_label(binder, elseif_then_label, pre_elseif_label);
@@ -632,6 +638,7 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
             let block_id = bind_block(binder, else_block, else_label);
             let (_, _, _, blk_cond) = binder.check_new_modifications(pre_block);
             blocks_have_inner_conditions |= blk_cond;
+            a_branch_ends |= block_id == binder.unreachable;
             binder.add_antecedent(post_if_label, block_id);
         }
     } else {
@@ -641,7 +648,8 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
     // Record BranchLabel metadata so the flow walk can skip merges for
     // variables that were not modified inside any branch.
     let (has_name, has_index, has_casts, _) = binder.check_new_modifications(saved);
-    let narrowing_capability = binder.narrowing_capability_since(saved);
+    let narrowing_capability =
+        binder.narrowing_capability_since(if a_branch_ends { pre_condition } else { saved });
     let written_capability = binder.written_capability_since(saved);
     binder.set_branch_label_info(
         post_if_label,

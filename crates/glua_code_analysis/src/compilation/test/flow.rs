@@ -9695,6 +9695,22 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn a_guard_that_returns_keeps_narrowing_the_elseif_branches_after_the_if() {
+        expect_that!(
+            local_after_in_function(
+                "---@param value string?
+---@param flag boolean",
+                r#"if value == nil then
+                    return
+                elseif flag then
+                    print(value)
+                end"#
+            ),
+            eq("string")
+        );
+    }
+
+    #[gtest]
     fn a_repeat_without_an_exit_leaves_the_following_code_unreachable() {
         expect_that!(
             local_after_in_function(
