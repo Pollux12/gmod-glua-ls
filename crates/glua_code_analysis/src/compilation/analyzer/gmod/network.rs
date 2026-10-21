@@ -179,6 +179,7 @@ fn helper_fns(
             match fn_args.get(arg_idx)?.as_ref()? {
                 FnArg::Body(body) => Some(body.clone()),
                 FnArg::Param(idx) => caller_fns.get(*idx)?.clone(),
+                FnArg::Unknown => None,
             }
         })
         .collect::<Vec<_>>();
@@ -234,9 +235,8 @@ enum NetOpItem {
         dynamic: bool,
         flow_path: Vec<NetFlowFrame>,
     },
-    /// A call of another function's parameter, which no caller of the walked
-    /// function binds. Written in a transaction, it runs a function handed to
-    /// it; inside a callee's walk it is that callee's business.
+    /// A call of an enclosing function's parameter, which no caller of the
+    /// walked function binds: it runs a function handed to the transaction.
     Opaque,
 }
 
@@ -248,6 +248,8 @@ enum FnArg {
     Body(HelperId),
     /// The walked function's own parameter, by position, which its caller binds.
     Param(usize),
+    /// Another function's parameter: a function the walk cannot see.
+    Unknown,
 }
 
 /// One step of a composed payload walk: an op, a call of the walked
@@ -368,7 +370,7 @@ impl NetOpItem {
 fn fn_arg_bodies(fn_args: &[Option<FnArg>]) -> impl Iterator<Item = &HelperId> {
     fn_args.iter().flatten().filter_map(|arg| match arg {
         FnArg::Body(body) => Some(body),
-        FnArg::Param(_) => None,
+        FnArg::Param(_) | FnArg::Unknown => None,
     })
 }
 
@@ -1106,7 +1108,7 @@ fn fn_arg(site: &NetFileSite<'_>, owner: Option<LuaSignatureId>, arg: &LuaExpr) 
     {
         return match param {
             ParamRef::Own(idx) => Some(FnArg::Param(idx)),
-            ParamRef::Other => None,
+            ParamRef::Other => Some(FnArg::Unknown),
         };
     }
     let block = resolve_callback_block(arg, site)?;
@@ -2172,6 +2174,7 @@ fn compose_ops(
                 let bind = |idx: usize| match callee_fn_arg(&callee, fn_args, *colon_call, idx) {
                     Some(FnArg::Body(body)) => Binding::Fn(body.clone()),
                     Some(FnArg::Param(own)) => bind_own(*own),
+                    Some(FnArg::Unknown) => Binding::Unknown,
                     None => Binding::Dropped,
                 };
                 splice(
@@ -2426,7 +2429,7 @@ fn helper_walk(
                 dynamic: *dynamic,
                 flow_path: flow_path.clone(),
             }),
-            NetOpItem::Opaque => {}
+            NetOpItem::Opaque => walk.push(ComposedOp::Opaque),
             NetOpItem::Helper {
                 target,
                 dynamic,
@@ -2440,6 +2443,7 @@ fn helper_walk(
                 let bind = |idx: usize| match callee_fn_arg(&callee, fn_args, *colon_call, idx) {
                     Some(FnArg::Body(body)) => Binding::Fn(body.clone()),
                     Some(FnArg::Param(own)) => Binding::Param(*own),
+                    Some(FnArg::Unknown) => Binding::Unknown,
                     None => Binding::Dropped,
                 };
                 splice(
