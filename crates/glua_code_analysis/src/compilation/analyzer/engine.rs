@@ -635,6 +635,9 @@ pub(crate) struct Engine {
     /// How cold builds are driven; see [`superstep_mode`].
     superstep: SuperstepMode,
     pending_slot_notifications: FxHashSet<HashedKey>,
+    /// While a superstep's root list runs, the derivations its groups ran:
+    /// a co-member's own entry in the list is the same group's run.
+    root_list_ran: Option<FxHashSet<DerivationId>>,
     /// Queries only a pending slot notification marked stale: the flush finds
     /// whether their reads moved after all, and those it does not queue hold.
     pending_stale_queries: FxHashSet<DerivationId>,
@@ -1718,6 +1721,7 @@ impl Engine {
             self.install_tasks(db, recipe, rank, plans, tasks);
         }
         let _root = crate::profile::PhaseGuard::new("superstep: root list");
+        self.root_list_ran = Some(FxHashSet::default());
         for (file_id, entries) in on_root {
             if stop.reached() {
                 for (id, reason) in entries {
@@ -1745,6 +1749,14 @@ impl Engine {
             }
             self.run_root(db, recipe, &stop, vec![(id, reason)]);
         }
+        self.root_list_ran = None;
+    }
+
+    /// Whether `id`'s group already ran in the root list running now.
+    fn ran_in_root_list(&self, id: DerivationId) -> bool {
+        self.root_list_ran
+            .as_ref()
+            .is_some_and(|ran| ran.contains(&id))
     }
 
     /// Evaluates `entries` of the root list one at a time on the index, until
@@ -1757,6 +1769,9 @@ impl Engine {
         entries: Vec<(DerivationId, Reason)>,
     ) {
         for (id, reason) in entries {
+            if self.ran_in_root_list(id) {
+                continue;
+            }
             if stop.reached() {
                 self.worklist.insert(id, reason);
                 continue;
@@ -2372,7 +2387,9 @@ impl Engine {
     ) -> Vec<DerivationId> {
         let mut local = Queue::new(self.worklist.schedule);
         for (id, reason) in entries {
-            local.insert(id, reason);
+            if !self.ran_in_root_list(id) {
+                local.insert(id, reason);
+            }
         }
         let mut ran = Vec::new();
         self.task = Some(file_id);
@@ -2424,6 +2441,9 @@ impl Engine {
                     .requeue_cause(*member, "run with a queued co-producer");
             }
             self.unqueue(*member);
+            if let Some(ran) = &mut self.root_list_ran {
+                ran.insert(*member);
+            }
             self.stats.evaluated(*member);
             if member.kind.is_statement()
                 && self.ran.insert(*member)
