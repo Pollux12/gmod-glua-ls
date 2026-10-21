@@ -28,9 +28,17 @@ pub struct ClientProxy {
 
 #[derive(Default)]
 struct RefreshRequestGates {
-    semantic_tokens: Option<RequestId>,
-    inlay_hints: Option<RequestId>,
-    code_lens: Option<RequestId>,
+    semantic_tokens: RefreshGate,
+    inlay_hints: RefreshGate,
+    code_lens: RefreshGate,
+}
+
+/// One kind of refresh: at most one request in flight, and whether another
+/// was wanted while it was, which is sent once it is answered.
+#[derive(Default)]
+struct RefreshGate {
+    in_flight: Option<RequestId>,
+    wanted_again: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -49,7 +57,9 @@ impl RefreshRequestKind {
         }
     }
 
-    fn gate(self, gates: &mut RefreshRequestGates) -> &mut Option<RequestId> {
+    const ALL: [Self; 3] = [Self::SemanticTokens, Self::InlayHints, Self::CodeLens];
+
+    fn gate(self, gates: &mut RefreshRequestGates) -> &mut RefreshGate {
         match self {
             Self::SemanticTokens => &mut gates.semantic_tokens,
             Self::InlayHints => &mut gates.inlay_hints,
@@ -156,12 +166,13 @@ impl ClientProxy {
         };
 
         let gate = kind.gate(&mut gates);
-        if gate.is_some() {
+        if gate.in_flight.is_some() {
+            gate.wanted_again = true;
             return;
         }
 
         let request_id = self.next_id();
-        *gate = Some(request_id.clone());
+        gate.in_flight = Some(request_id.clone());
         drop(gates);
 
         let params = match serde_json::to_value(()) {
@@ -198,42 +209,30 @@ impl ClientProxy {
         };
 
         let gate = kind.gate(&mut gates);
-        if gate
-            .as_ref()
-            .is_some_and(|in_flight| in_flight == request_id)
-        {
-            *gate = None;
+        if gate.in_flight.as_ref() == Some(request_id) {
+            *gate = RefreshGate::default();
         }
     }
 
+    /// Opens the gate `request_id` held, sending the refresh again when one
+    /// was wanted meanwhile.
     fn clear_completed_refresh_request(&self, request_id: &RequestId) {
-        let Ok(mut gates) = self.refresh_request_gates.lock() else {
-            log::error!("Failed to lock refresh request gates for response cleanup");
-            return;
+        let again = {
+            let Ok(mut gates) = self.refresh_request_gates.lock() else {
+                log::error!("Failed to lock refresh request gates for response cleanup");
+                return;
+            };
+            RefreshRequestKind::ALL.into_iter().find(|kind| {
+                let gate = kind.gate(&mut gates);
+                if gate.in_flight.as_ref() != Some(request_id) {
+                    return false;
+                }
+                gate.in_flight = None;
+                std::mem::take(&mut gate.wanted_again)
+            })
         };
-
-        if gates
-            .semantic_tokens
-            .as_ref()
-            .is_some_and(|in_flight| in_flight == request_id)
-        {
-            gates.semantic_tokens = None;
-        }
-
-        if gates
-            .inlay_hints
-            .as_ref()
-            .is_some_and(|in_flight| in_flight == request_id)
-        {
-            gates.inlay_hints = None;
-        }
-
-        if gates
-            .code_lens
-            .as_ref()
-            .is_some_and(|in_flight| in_flight == request_id)
-        {
-            gates.code_lens = None;
+        if let Some(kind) = again {
+            self.send_deduped_refresh_request(kind);
         }
     }
 
@@ -474,6 +473,47 @@ mod tests {
         )?;
         assert_ne!(second_request.id, request.id);
         Ok(())
+    }
+
+    #[gtest]
+    fn a_refresh_wanted_while_one_is_in_flight_is_sent_once_it_is_answered() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (client, peer) = create_client_proxy();
+
+        client.refresh_semantic_tokens();
+        let request = recv_request(&peer);
+        client.refresh_semantic_tokens();
+        client.refresh_semantic_tokens();
+
+        runtime.block_on(client.on_response(Response {
+            id: request.id.clone(),
+            result: Some(serde_json::Value::Null),
+            error: None,
+        }));
+
+        let again = recv_request(&peer);
+        verify_that!(
+            again.method.as_str(),
+            eq("workspace/semanticTokens/refresh")
+        )?;
+        assert_ne!(again.id, request.id);
+        verify_that!(peer.receiver.try_recv().is_err(), eq(true))
+    }
+
+    #[gtest]
+    fn an_answered_refresh_nothing_else_wanted_is_not_sent_again() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (client, peer) = create_client_proxy();
+
+        client.refresh_code_lens();
+        let request = recv_request(&peer);
+        runtime.block_on(client.on_response(Response {
+            id: request.id,
+            result: Some(serde_json::Value::Null),
+            error: None,
+        }));
+
+        verify_that!(peer.receiver.try_recv().is_err(), eq(true))
     }
 
     #[gtest]
