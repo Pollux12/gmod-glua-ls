@@ -1553,7 +1553,7 @@ fn try_get_at_and_expr(
     policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     if matches!(condition_flow, InferConditionFlow::FalseCondition) {
-        if infer_expr(db, cache, right_expr)?.is_always_truthy() {
+        if infer_expr(db, cache, right_expr).is_ok_and(|typ| typ.is_always_truthy()) {
             return get_type_at_condition_flow(
                 db,
                 tree,
