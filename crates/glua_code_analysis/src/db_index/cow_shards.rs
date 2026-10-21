@@ -136,13 +136,10 @@ file_keys! {
     (LuaTypeDeclId, FileId, rowan::TextRange) => |key| key.1;
     (LuaTypeDeclId, InFiled<crate::LuaSuperType>) => |key| key.1.file_id;
     SpecialCallFact => |key| key.site_file();
+    (GlobalId, crate::db_index::member::GlobalPathClassCandidate) => |key| key.1.file_id();
 }
 
-workspace_keys!(
-    LuaTypeDeclId,
-    GlobalId,
-    (GlobalId, crate::db_index::member::GlobalPathClassCandidate),
-);
+workspace_keys!(LuaTypeDeclId, GlobalId);
 
 impl ShardKey for InFiled<rowan::TextRange> {
     const PAGED: bool = false;

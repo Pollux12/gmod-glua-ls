@@ -1,3 +1,4 @@
+mod function_scopes;
 mod lua_member;
 mod lua_member_feature;
 mod lua_member_item;
@@ -17,6 +18,7 @@ use crate::db_index::derivation::{
     self, ABSENT, DerivationId, FactKey, Fingerprint, fingerprint_of,
 };
 use crate::{FileId, GlobalId, db_index::member::lua_owner_members::LuaOwnerMembers};
+use function_scopes::FunctionScopes;
 use slot_ids::SlotIds;
 
 pub use lua_member::{LuaMember, LuaMemberId, LuaMemberKey};
@@ -282,7 +284,7 @@ pub struct LuaMemberIndex {
     /// Members `try_resolve_member` had to create itself, from a prefix
     /// type read mid-fixpoint.
     deferred_index_expr_members: CowCell<HashSet<LuaMemberId>>,
-    function_scope_ranges: CowCell<HashMap<FileId, Vec<TextRange>>>,
+    function_scope_ranges: CowCell<HashMap<FileId, FunctionScopes>>,
     member_function_scope_ranges: CowShards<LuaMemberId, TextRange>,
     /// The owner a table literal that initialises a global path resolves to:
     /// the `{}` of `X = {}` or of the GLua-idiomatic `X = X or {}`, at any
@@ -335,6 +337,13 @@ pub(crate) struct GlobalPathClassCandidate {
     class_name: Box<str>,
     file_id: FileId,
     class: crate::LuaTypeDeclId,
+}
+
+impl GlobalPathClassCandidate {
+    /// The file whose annotation proposed the class.
+    pub(crate) fn file_id(&self) -> FileId {
+        self.file_id
+    }
 }
 
 impl Ord for GlobalPathClassCandidate {
@@ -687,7 +696,7 @@ impl LuaMemberIndex {
             .function_scope_ranges
             .get(&file_id)
             .into_iter()
-            .flatten()
+            .flat_map(FunctionScopes::ranges)
             .map(|range| file_scope_element(file_id, *range));
         let element_owners = self
             .owner_members
@@ -2837,10 +2846,10 @@ impl LuaMemberIndex {
     }
 
     pub fn add_function_scope_range(&mut self, file_id: FileId, range: TextRange) {
-        let ranges = self.function_scope_ranges.entry(file_id).or_default();
-        match ranges.binary_search_by_key(&range.start(), |range| range.start()) {
-            Ok(index) | Err(index) => ranges.insert(index, range),
-        }
+        self.function_scope_ranges
+            .entry(file_id)
+            .or_default()
+            .insert(range);
         self.fold_file_fingerprint(file_id, file_scope_element(file_id, range), true);
     }
 
@@ -2854,16 +2863,9 @@ impl LuaMemberIndex {
     }
 
     fn innermost_function_scope(&self, file_id: FileId, position: TextSize) -> Option<TextRange> {
-        let ranges = self.function_scope_ranges.get(&file_id)?;
-        let mut index = ranges.partition_point(|range| range.start() <= position);
-        while index > 0 {
-            index -= 1;
-            let range = ranges[index];
-            if range.contains(position) {
-                return Some(range);
-            }
-        }
-        None
+        self.function_scope_ranges
+            .get(&file_id)?
+            .innermost(position)
     }
 
     pub fn set_member_function_scope_range(
@@ -3308,11 +3310,11 @@ impl LuaMemberIndex {
         if let Some(owners) = owners {
             self.unlist_from_owners(owners, |id| id.file_id == file_id);
         }
-        for range in self
+        let scopes = self
             .function_scope_ranges
             .remove(&file_id)
-            .unwrap_or_default()
-        {
+            .unwrap_or_default();
+        for &range in scopes.ranges() {
             self.fold_file_fingerprint(file_id, file_scope_element(file_id, range), false);
         }
         self.remove_file_definition_sites(file_id);
@@ -3371,10 +3373,8 @@ impl LuaMemberIndex {
     fn recompute_global_path_class_winners(&mut self, file_id: FileId) {
         let mut sourced = self
             .path_class_holders
-            .iter()
-            .filter(|((_, candidate), holders)| {
-                candidate.file_id == file_id && holders.contains(&None)
-            })
+            .file_entries(file_id)
+            .filter(|(_, holders)| holders.contains(&None))
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         sourced.sort_unstable_by(|left, right| {
@@ -3690,13 +3690,17 @@ impl LuaIndex for LuaMemberIndex {
         }
         let removed: HashSet<FileId> = file_ids.iter().copied().collect();
         self.remove_files_members_from_owner_key_indexes(&removed);
-        self.member_function_scope_ranges.retain(|member_id, _| {
-            let keep = !removed.contains(&member_id.file_id);
-            if !keep {
-                derivation::note_write(|| FactKey::Member(*member_id));
+        for &file_id in file_ids {
+            let scoped = self
+                .member_function_scope_ranges
+                .file_entries(file_id)
+                .map(|(member_id, _)| *member_id)
+                .collect::<Vec<_>>();
+            for member_id in scoped {
+                derivation::note_write(|| FactKey::Member(member_id));
+                self.member_function_scope_ranges.remove(&member_id);
             }
-            keep
-        });
+        }
     }
 
     fn clear(&mut self) {
