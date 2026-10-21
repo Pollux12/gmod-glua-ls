@@ -367,17 +367,18 @@ pub fn remap_identities_in_type(typ: &LuaType, remap: &crate::FileRemap) -> Type
                 TypeRemapResult::unchanged()
             }
         }
-        LuaType::Union(union) => match union.as_ref() {
-            crate::LuaUnionType::Multi(types) => TypeRemapResult::from_child_list(
-                remap_child_types(types.iter(), remap),
-                LuaType::from_vec,
-            ),
-            crate::LuaUnionType::Nullable(inner) => {
-                TypeRemapResult::from_single(remap_identities_in_type(inner, remap), |new_inner| {
-                    LuaType::from_vec(vec![new_inner, LuaType::Nil])
-                })
+        LuaType::Union(union) => {
+            match union.as_ref() {
+                crate::LuaUnionType::Multi(types) => TypeRemapResult::from_child_list(
+                    remap_child_types(types.iter(), remap),
+                    |new| LuaType::Union(Arc::new(crate::LuaUnionType::Multi(new))),
+                ),
+                crate::LuaUnionType::Nullable(inner) => TypeRemapResult::from_single(
+                    remap_identities_in_type(inner, remap),
+                    |new_inner| LuaType::Union(Arc::new(crate::LuaUnionType::Nullable(new_inner))),
+                ),
             }
-        },
+        }
         LuaType::Intersection(inter) => TypeRemapResult::from_child_list(
             remap_child_types(inter.get_types().iter(), remap),
             |new_types| LuaType::Intersection(Arc::new(crate::LuaIntersectionType::new(new_types))),

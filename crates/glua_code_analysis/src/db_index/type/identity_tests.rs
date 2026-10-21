@@ -185,6 +185,31 @@ fn nested_identities_move_revert_and_report_loss() {
     }
 }
 
+/// A remap moves a union's members and keeps its shape: a monotone shift
+/// leaves which members it holds, and their order, as they were.
+#[test]
+fn a_remapped_union_keeps_the_members_it_was_built_with() {
+    let provider = FileId::new(1);
+    let shifted = FileRemap::unvalidated(
+        provider,
+        PositionMap::new(
+            "abcdefghij",
+            "
+abcdefghij",
+        ),
+    );
+    let union = |position: u32| {
+        LuaType::Union(Arc::new(LuaUnionType::Multi(vec![
+            LuaType::Function,
+            LuaType::Signature(LuaSignatureId::new(provider, position.into())),
+        ])))
+    };
+
+    let moved = remap_identities_in_type(&union(8), &shifted).typ;
+
+    assert_eq!(moved, Some(union(9)));
+}
+
 #[test]
 fn table_merges_preserve_precise_components() {
     let named = LuaType::Object(Arc::new(LuaObjectType::new_with_fields(
