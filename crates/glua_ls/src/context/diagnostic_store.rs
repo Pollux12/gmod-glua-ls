@@ -607,10 +607,12 @@ impl DiagnosticStore {
                     state.invalidate(job.file_id, priority);
                     None
                 }
-                Computed::Gone => {
-                    state.entries.remove(&job.file_id);
-                    None
-                }
+                // What the client showed no longer holds, and nothing replaces
+                // it until the file is invalidated again.
+                Computed::Gone => state
+                    .entries
+                    .remove(&job.file_id)
+                    .map(|entry| Published::Cleared(entry.stored.uri)),
                 Computed::Diagnostics { revision, .. }
                     if !analysis.compilation.has_taken_text(job.file_id)
                         || analysis
@@ -658,19 +660,31 @@ impl DiagnosticStore {
                             config_gen: job.config_gen,
                         },
                     );
-                    changed.then_some((stored, version, moved_from))
+                    changed.then_some(Published::Stored {
+                        stored,
+                        version,
+                        moved_from,
+                    })
                 }
             }
         };
-        if let Some((stored, version, moved_from)) = published {
-            if let Some(moved_from) = moved_from {
-                self.cleared(moved_from);
-            }
-            self.client.publish_diagnostics(PublishDiagnosticsParams {
-                uri: stored.uri,
-                diagnostics: stored.diagnostics.to_vec(),
+        match published {
+            Some(Published::Stored {
+                stored,
                 version,
-            });
+                moved_from,
+            }) => {
+                if let Some(moved_from) = moved_from {
+                    self.cleared(moved_from);
+                }
+                self.client.publish_diagnostics(PublishDiagnosticsParams {
+                    uri: stored.uri,
+                    diagnostics: stored.diagnostics.to_vec(),
+                    version,
+                });
+            }
+            Some(Published::Cleared(uri)) => self.cleared(uri),
+            None => {}
         }
         drop(analysis);
         if self.is_idle() {
@@ -817,6 +831,18 @@ impl DiagnosticStore {
             Computed::Gone
         })
     }
+}
+
+/// What one computation sends the client.
+enum Published {
+    /// The file's diagnostics, and the URI it showed them at before a move.
+    Stored {
+        stored: StoredDiagnostics,
+        version: Option<i32>,
+        moved_from: Option<Uri>,
+    },
+    /// The diagnostics the client shows at this URI no longer hold.
+    Cleared(Uri),
 }
 
 enum Computed {
@@ -1038,6 +1064,44 @@ mod tests {
             store.invalidate([file_id], &[]);
             let computed = store.get(file_id, Priority::Edited, &cancel).await;
             verify_that!(computed.is_some(), eq(true))
+        })
+    }
+
+    /// Diagnostics shown for text a failed computation can no longer speak
+    /// for are cleared rather than left in place.
+    #[gtest]
+    fn a_failed_computation_clears_what_the_client_shows() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, peer) = Connection::memory();
+        runtime.block_on(async {
+            let context = ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_diagnostic_store_cleared");
+            let uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/cleared.lua"))
+                .expect("file URI should parse");
+            let file_id = {
+                let mut analysis = snapshot.analysis().write().await;
+                analysis.add_main_workspace(workspace);
+                analysis
+                    .update_file_by_uri(&uri, Some("local unused = UndefinedGlobal".to_string()))
+                    .map(|(file_id, _)| file_id)
+                    .expect("file id")
+            };
+            let store = snapshot.file_diagnostic().store();
+            let cancel = CancellationToken::new();
+            store.get(file_id, Priority::Edited, &cancel).await;
+
+            store
+                .panic_computes
+                .store(true, std::sync::atomic::Ordering::Release);
+            store.invalidate([file_id], &[]);
+            store.get(file_id, Priority::Edited, &cancel).await;
+
+            let published = published(&peer)
+                .into_iter()
+                .map(|params| params.diagnostics.is_empty())
+                .collect::<Vec<_>>();
+            verify_that!(published, eq(&vec![false, true]))
         })
     }
 
