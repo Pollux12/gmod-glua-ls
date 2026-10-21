@@ -175,20 +175,8 @@ thread_local! {
         std::cell::RefCell::new(node_memo::NodeMemo::default());
 }
 
-/// Runs `f` with lazily created root resolvers on the current thread.
-///
-/// Resolution is backed by the thread's bounded MRU memo, so resolved nodes
-/// stay warm across files and passes rather than being rebuilt and dropped at
-/// each scope boundary.
-pub fn with_syntax_resolvers<R>(f: impl FnOnce() -> R) -> R {
-    f()
-}
-
-/// Runs `f` with `root` marked hot in the current thread's resolver memo.
-///
-/// Resolution is shared through the same bounded memo as
-/// [`with_syntax_resolvers`]; marking the root only protects it from eviction
-/// while the callback runs.
+/// Runs `f` with `root` the most recently used root of the current thread's
+/// bounded resolver memo, so resolved nodes stay warm across files and passes.
 pub fn with_syntax_resolver<R>(root: &LuaSyntaxNode, f: impl FnOnce() -> R) -> R {
     NODE_MEMO.with(|memo| memo.borrow_mut().touch(root));
     f()
@@ -303,10 +291,8 @@ end
         let second_root = tree.get_red_root();
         let id = LuaSyntaxId::from_node(&first_root.descendants().next().unwrap());
 
-        with_syntax_resolvers(|| {
-            assert!(id.to_node_from_root(&first_root).is_some());
-            assert!(id.to_node_from_root(&second_root).is_some());
-        });
+        assert!(id.to_node_from_root(&first_root).is_some());
+        assert!(id.to_node_from_root(&second_root).is_some());
     }
 
     #[test]
@@ -314,15 +300,13 @@ end
         let roots = (0..8)
             .map(|index| parsed_root(&format!("local value{index} = {index}\n")))
             .collect::<Vec<_>>();
-        with_syntax_resolvers(|| {
-            for root in roots.iter().chain(roots.iter().rev()) {
-                let id = LuaSyntaxId::from_node(&root.descendants().next().unwrap());
-                assert!(id.to_node_from_root(root).is_some());
-            }
-            for root in &roots {
-                assert_eq!(memo_entries(root), Some(1));
-            }
-        });
+        for root in roots.iter().chain(roots.iter().rev()) {
+            let id = LuaSyntaxId::from_node(&root.descendants().next().unwrap());
+            assert!(id.to_node_from_root(root).is_some());
+        }
+        for root in &roots {
+            assert_eq!(memo_entries(root), Some(1));
+        }
         assert!(memo_roots_len() <= roots.len());
     }
 }
