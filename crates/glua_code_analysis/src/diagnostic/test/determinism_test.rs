@@ -647,12 +647,9 @@ mod tests {
         assert_that!(engine_type, eq("any"));
     }
 
-    /// The doc walker bakes a `type-not-found` entry into the diagnostic index
-    /// when a `---@class` super name has no declaration yet. Files are not all
-    /// analysed in one batch — a ripple can re-analyse a consumer while its
-    /// provider's decl is removed, and the initial load may be split — so the
-    /// verdict must be re-checked against the settled index when diagnostics
-    /// are collected rather than replayed verbatim.
+    /// The doc walker records a `type-not-found` entry when a `---@class`
+    /// super name has no declaration yet; a consumer analysed before its
+    /// provider is analysed again once the provider declares the name.
     #[gtest]
     fn type_not_found_suppressed_when_super_decl_lands_after_consumer() {
         let mut ws = VirtualWorkspace::new();
@@ -683,8 +680,46 @@ mod tests {
         );
     }
 
-    /// The same staleness applies to a generic base whose declaration arrives
-    /// after the consumer file was analysed.
+    /// A consumer whose super's declaration goes away reports the missing
+    /// type, as a cold load of the same files does.
+    #[gtest]
+    fn type_not_found_appears_when_super_decl_is_removed_after_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::TypeNotFound);
+
+        let consumer = ws.def_file(
+            "lua/autorun/shared/consumer.lua",
+            r#"
+            ---@class DeterminismDerived : DeterminismBase
+            local Derived = {}
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/shared/provider.lua",
+            r#"
+            ---@class DeterminismBase
+            local Base = {}
+            "#,
+        );
+        ws.run_diagnostics_with_shared_snapshots(&[consumer]);
+        ws.def_file(
+            "lua/autorun/shared/provider.lua",
+            "local Base = {}
+",
+        );
+
+        let snapshots = ws.run_diagnostics_with_shared_snapshots(&[consumer]);
+        assert!(
+            snapshots.iter().any(|snapshot| snapshot.code
+                == Some(DiagnosticCode::TypeNotFound.get_name().to_string())),
+            "type-not-found must appear once the class decl is gone: {snapshots:?}"
+        );
+    }
+
+    /// The same holds for a generic base whose declaration arrives after the
+    /// consumer file was analysed.
     #[gtest]
     fn type_not_found_suppressed_when_generic_decl_lands_after_consumer() {
         let mut ws = VirtualWorkspace::new();
