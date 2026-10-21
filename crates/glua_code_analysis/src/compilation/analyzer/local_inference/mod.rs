@@ -109,7 +109,7 @@ pub(super) fn stabilize_unknown_locals(
             } else {
                 candidate
             };
-            if super::type_is_uninformative(&candidate) {
+            if super::is_uninformative_or_template_leak(&candidate) {
                 continue;
             }
             let definitions = if is_function_definition {
@@ -2301,18 +2301,10 @@ fn refined_initializer_type_for_decl(
     } else if initializer.get_ret_idx() != 0 {
         return None;
     }
-    if type_is_uninformative(&initializer_type) {
+    if !crate::db_index::is_informative_type(&initializer_type) {
         return None;
     }
     Some(initializer_type)
-}
-
-fn type_is_uninformative(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
-        LuaType::Union(union) => union.types().all(type_is_uninformative),
-        _ => false,
-    }
 }
 
 fn is_strict_nominal_refinement(

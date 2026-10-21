@@ -1491,19 +1491,7 @@ fn supplement_function_assignment_shape_members(
 fn member_type_is_uninformative(db: &DbIndex, member_id: LuaMemberId) -> bool {
     db.get_type_index()
         .get_type_cache(&member_id.into())
-        .is_none_or(|cache| type_is_uninformative(cache.as_type()))
-}
-
-fn type_is_uninformative(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
-        LuaType::Union(union) => union.types().all(type_is_uninformative),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .all(|(typ, _)| type_is_uninformative(typ)),
-        _ => false,
-    }
+        .is_none_or(|cache| !crate::db_index::is_informative_type(cache.as_type()))
 }
 
 fn sort_member_ids_for_caller(

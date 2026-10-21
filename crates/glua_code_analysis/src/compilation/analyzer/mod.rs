@@ -1435,7 +1435,7 @@ pub(crate) fn local_initializer_expr(
     Some((initializer.get_ret_idx(), LuaExpr::cast(node)?))
 }
 
-fn type_is_uninformative(typ: &LuaType) -> bool {
+fn is_uninformative_or_template_leak(typ: &LuaType) -> bool {
     !crate::db_index::is_informative_type(typ) || crate::db_index::leaks_unsubstituted_tpl(typ)
 }
 

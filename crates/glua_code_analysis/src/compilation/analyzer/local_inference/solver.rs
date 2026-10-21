@@ -38,7 +38,7 @@ pub(crate) fn solve_local_inference_graph(
                     continue;
                 };
                 for item in evidence {
-                    if type_is_uninformative(&item.candidate) {
+                    if is_any_unknown_or_never(&item.candidate) {
                         continue;
                     }
                     let external_ready = item
@@ -110,7 +110,7 @@ pub(crate) fn solve_local_inference_graph(
     }
 }
 
-fn type_is_uninformative(typ: &LuaType) -> bool {
+fn is_any_unknown_or_never(typ: &LuaType) -> bool {
     matches!(typ, LuaType::Any | LuaType::Unknown | LuaType::Never)
 }
 

@@ -1002,7 +1002,10 @@ fn infer_table_member_owner(
         };
         let finite_named_dynamic = is_literal_table_field_access(&index_key)
             && owner_has_finite_named_dynamic_assignment(db, &owner);
-        if literal_key && !finite_named_dynamic && !type_is_uninformative(&member_type) {
+        if literal_key
+            && !finite_named_dynamic
+            && crate::db_index::is_informative_type(&member_type)
+        {
             exact_member_memo_insert(
                 cache,
                 memo_key,
@@ -1024,11 +1027,11 @@ fn infer_table_member_owner(
                 Some(index_expr.get_position()),
             )
             .unwrap_or_default()
-            && !type_is_uninformative(&dynamic_field.typ)
+            && crate::db_index::is_informative_type(&dynamic_field.typ)
         {
             return Ok(dynamic_field.typ);
         }
-        if !type_is_uninformative(&member_type) {
+        if crate::db_index::is_informative_type(&member_type) {
             return Ok(member_type);
         }
 
@@ -1044,7 +1047,7 @@ fn infer_table_member_owner(
                 source_min_position.as_ref(),
                 true,
             )
-            && !type_is_uninformative(&dynamic_member_type)
+            && crate::db_index::is_informative_type(&dynamic_member_type)
         {
             return Ok(dynamic_member_type);
         }
@@ -1096,7 +1099,7 @@ fn infer_table_member_owner(
             Some(index_expr.get_position()),
         )
         .unwrap_or_default()
-            && !type_is_uninformative(&dynamic_field.typ)
+            && crate::db_index::is_informative_type(&dynamic_field.typ)
         {
             return Ok(dynamic_field.typ);
         }
@@ -1125,7 +1128,7 @@ fn infer_table_member_owner(
     );
     match raw_member_type {
         Ok(typ) => {
-            if type_is_uninformative(&typ)
+            if !crate::db_index::is_informative_type(&typ)
                 && let Some(dynamic_member_type) = infer_table_dynamic_key_member_type(
                     db,
                     &owner,
@@ -1135,7 +1138,7 @@ fn infer_table_member_owner(
                     source_min_position.as_ref(),
                     true,
                 )
-                && !type_is_uninformative(&dynamic_member_type)
+                && crate::db_index::is_informative_type(&dynamic_member_type)
             {
                 return Ok(dynamic_member_type);
             }
@@ -1144,7 +1147,7 @@ fn infer_table_member_owner(
             // last-resort value evidence the not-found tail uses, so a read of
             // a registry does not lose its nil just because the key-specific
             // lookup resolved to `unknown`.
-            if type_is_uninformative(&typ)
+            if !crate::db_index::is_informative_type(&typ)
                 && let Some(member_type) = infer_cross_file_matching_expr_key_member_type(
                     db,
                     &owner,
@@ -1168,7 +1171,7 @@ fn infer_table_member_owner(
             )
             .unwrap_or_default()
             {
-                if !type_is_uninformative(&dynamic_field.typ) {
+                if crate::db_index::is_informative_type(&dynamic_field.typ) {
                     return Ok(dynamic_field.typ);
                 }
 
@@ -1180,7 +1183,7 @@ fn infer_table_member_owner(
                     Some(index_expr.get_position()),
                     source_min_position.as_ref(),
                     true,
-                ) && !type_is_uninformative(&dynamic_member_type)
+                ) && crate::db_index::is_informative_type(&dynamic_member_type)
                 {
                     return Ok(dynamic_member_type);
                 }
@@ -1195,7 +1198,7 @@ fn infer_table_member_owner(
                 Some(index_expr.get_position()),
                 source_min_position.as_ref(),
                 false,
-            ) && !type_is_uninformative(&dynamic_member_type)
+            ) && crate::db_index::is_informative_type(&dynamic_member_type)
             {
                 return Ok(dynamic_member_type);
             }
@@ -1475,18 +1478,6 @@ fn owner_has_precise_dynamic_value(
         )
         .is_ok_and(|typ| is_precise_unknown_wildcard_value_type(&typ))
     })
-}
-
-fn type_is_uninformative(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
-        LuaType::Union(union) => union.types().all(type_is_uninformative),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .all(|(typ, _)| type_is_uninformative(typ)),
-        _ => false,
-    }
 }
 
 fn type_is_nil_placeholder(typ: &LuaType) -> bool {
