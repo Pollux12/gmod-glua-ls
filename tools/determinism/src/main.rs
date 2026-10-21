@@ -294,14 +294,15 @@ fn build_cold(
     analysis
 }
 
-fn collect(analysis: &EmmyLuaAnalysis, label: &str) -> BTreeSet<Snapshot> {
+/// The diagnostics of the main workspace, sorted, each one as often as the
+/// server would show it.
+fn collect(analysis: &EmmyLuaAnalysis, label: &str) -> Vec<Snapshot> {
     let t = Instant::now();
-    let out = diagnose(
+    let mut out = diagnose(
         analysis,
         analysis.get_main_workspace_file_ids_for_diagnostics(),
-    )
-    .into_iter()
-    .collect::<BTreeSet<_>>();
+    );
+    out.sort_unstable();
     let (errors, warnings) = counts(&out);
     eprintln!(
         "[{label}] total={} errors={errors} warnings={warnings} ({:.2}s)",
@@ -1813,7 +1814,7 @@ fn clip(text: &str, chars: usize) -> String {
     text.chars().take(chars).collect()
 }
 
-fn counts(set: &BTreeSet<Snapshot>) -> (usize, usize) {
+fn counts(set: &[Snapshot]) -> (usize, usize) {
     let errors = set.iter().filter(|s| s.severity == 1).count();
     let warnings = set.iter().filter(|s| s.severity == 2).count();
     (errors, warnings)
@@ -1829,9 +1830,21 @@ fn file_label(analysis: &EmmyLuaAnalysis, file_id: FileId) -> String {
         .unwrap_or_else(|| format!("{file_id:?}"))
 }
 
-fn diff(base_label: &str, base: &BTreeSet<Snapshot>, label: &str, other: &BTreeSet<Snapshot>) {
-    let removed = base.difference(other).collect::<Vec<_>>();
-    let added = other.difference(base).collect::<Vec<_>>();
+/// The entries of sorted `of` left once each entry of sorted `without`
+/// cancels one equal entry, so a repeated diagnostic counts every time.
+fn sorted_difference<'a>(of: &'a [Snapshot], without: &[Snapshot]) -> Vec<&'a Snapshot> {
+    let mut without = without.iter().peekable();
+    of.iter()
+        .filter(|entry| {
+            while without.next_if(|other| other < entry).is_some() {}
+            without.next_if(|other| other == entry).is_none()
+        })
+        .collect()
+}
+
+fn diff(base_label: &str, base: &[Snapshot], label: &str, other: &[Snapshot]) {
+    let removed = sorted_difference(base, other);
+    let added = sorted_difference(other, base);
     if removed.is_empty() && added.is_empty() {
         println!(
             "DIFF {base_label} -> {label}: IDENTICAL ({} entries)",
@@ -2036,8 +2049,10 @@ impl Warm {
     }
 
     /// The diagnostics the server shows now.
-    fn shown(&self) -> BTreeSet<Snapshot> {
-        self.shown.values().flatten().cloned().collect()
+    fn shown(&self) -> Vec<Snapshot> {
+        let mut shown = self.shown.values().flatten().cloned().collect::<Vec<_>>();
+        shown.sort_unstable();
+        shown
     }
 }
 
@@ -2308,11 +2323,8 @@ fn check_reach(label: &str, base: &Snap, expected: &Snap, reached: &Reached) {
 }
 
 /// The files whose diagnostics differ between `before` and `after`.
-fn files_with_changed_diagnostics(
-    before: &BTreeSet<Snapshot>,
-    after: &BTreeSet<Snapshot>,
-) -> BTreeSet<String> {
-    let by_file = |diagnostics: &BTreeSet<Snapshot>| {
+fn files_with_changed_diagnostics(before: &[Snapshot], after: &[Snapshot]) -> BTreeSet<String> {
+    let by_file = |diagnostics: &[Snapshot]| {
         let mut by_file = BTreeMap::<String, Vec<Snapshot>>::new();
         for diagnostic in diagnostics {
             by_file
@@ -2372,7 +2384,7 @@ fn replay(analysis: &mut EmmyLuaAnalysis, log: &[Vec<FileId>]) {
 /// Index and diagnostics of one analysis.
 struct Snap {
     index: IndexSnapshot,
-    diagnostics: BTreeSet<Snapshot>,
+    diagnostics: Vec<Snapshot>,
 }
 
 fn snapshot(analysis: &EmmyLuaAnalysis, label: &str) -> Snap {
