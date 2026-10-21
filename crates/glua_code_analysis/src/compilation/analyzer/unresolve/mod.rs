@@ -77,6 +77,18 @@ fn attempt_resolve(
             })
         }
         UnResolve::Member(un_resolve_member) => {
+            // The prefix's writes land before the value is inferred, so a
+            // value that reads the member (`self.x = self.x or {}`) sees it
+            // attached, as it would through a separate attach item.
+            if un_resolve_member.prefix.is_some()
+                && let Some(expr) = un_resolve_member.expr.take()
+            {
+                let attached = buffered_attempt(db, infer_manager, file_id, |db, writes, cache| {
+                    try_resolve_member(db, writes, cache, un_resolve_member)
+                });
+                un_resolve_member.expr = Some(expr);
+                attached?;
+            }
             buffered_attempt(db, infer_manager, file_id, |db, writes, cache| {
                 try_resolve_member(db, writes, cache, un_resolve_member)
             })
