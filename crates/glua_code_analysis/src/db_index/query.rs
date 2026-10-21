@@ -119,12 +119,13 @@ thread_local! {
     static COMPUTING: std::cell::RefCell<Vec<DerivationId>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Runs `f` with `id` on this thread's query stack.
+/// Runs `f` with `id` on this thread's query stack, unwinding included.
 fn computing<T>(id: DerivationId, f: impl FnOnce() -> T) -> T {
     COMPUTING.with(|stack| stack.borrow_mut().push(id));
-    let result = f();
-    COMPUTING.with(|stack| stack.borrow_mut().pop());
-    result
+    let _pop = derivation::OnDrop(|| {
+        COMPUTING.with(|stack| stack.borrow_mut().pop());
+    });
+    f()
 }
 
 fn is_computing(id: DerivationId) -> bool {
@@ -703,6 +704,19 @@ mod transport_tests {
             },
         );
         fingerprint
+    }
+
+    /// A query whose computation panics leaves the thread's query stack, so
+    /// a later read on the thread computes it instead of taking it for a
+    /// cycle.
+    #[test]
+    fn a_query_that_panicked_is_not_left_computing() {
+        let id = QueryTable::<TestQuery>::id(key());
+
+        let unwound = std::panic::catch_unwind(|| computing(id, || panic!("compute failed")));
+
+        assert!(unwound.is_err());
+        assert!(!is_computing(id));
     }
 
     /// Removing files forgets exactly their queries and writes each one's
