@@ -167,9 +167,6 @@ pub(crate) fn local_class_table_member_ids(
             .or_default()
             .push(decl_id);
     }
-    if decls_by_file.is_empty() {
-        return Vec::new();
-    }
     let mut files: Vec<FileId> = decls_by_file.keys().copied().collect();
     files.sort_by_key(|file_id| file_id.id);
 
