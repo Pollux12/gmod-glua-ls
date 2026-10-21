@@ -1,7 +1,7 @@
 mod schema_file;
 
 use crate::db_index::cow_shards::CowCell;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use url::Url;
 
@@ -11,13 +11,34 @@ pub use schema_file::*;
 #[derive(Debug, Clone)]
 pub struct JsonSchemaIndex {
     schema_files: CowCell<FxHashMap<Url, JsonSchemaFile>>,
+    /// The files whose `---@schema` tags name each URL.
+    users: CowCell<FxHashMap<Url, FxHashSet<FileId>>>,
 }
 
 impl JsonSchemaIndex {
     pub fn new() -> Self {
         Self {
             schema_files: Default::default(),
+            users: Default::default(),
         }
+    }
+
+    /// Notes that a `---@schema` tag in `file_id` names `url`.
+    pub fn add_user(&mut self, url: &Url, file_id: FileId) {
+        if !self
+            .users
+            .get(url)
+            .is_some_and(|users| users.contains(&file_id))
+        {
+            let mut users = self.users.get(url).cloned().unwrap_or_default();
+            users.insert(file_id);
+            self.users.insert(url.clone(), users);
+        }
+    }
+
+    /// The files whose `---@schema` tags name `url`.
+    pub fn users_of(&self, url: &Url) -> impl Iterator<Item = FileId> + '_ {
+        self.users.get(url).into_iter().flatten().copied()
     }
 
     pub fn get_schema_file(&self, url: &Url) -> Option<&JsonSchemaFile> {
@@ -66,8 +87,22 @@ impl JsonSchemaIndex {
 }
 
 impl LuaIndex for JsonSchemaIndex {
-    fn remove(&mut self, _file_id: FileId) {
-        // TODO remove schema index by file_id
+    fn remove(&mut self, file_id: FileId) {
+        let named = self
+            .users
+            .iter()
+            .filter(|(_, users)| users.contains(&file_id))
+            .map(|(url, _)| url.clone())
+            .collect::<Vec<_>>();
+        for url in named {
+            let mut users = self.users.get(&url).cloned().unwrap_or_default();
+            users.remove(&file_id);
+            if users.is_empty() {
+                self.users.remove(&url);
+            } else {
+                self.users.insert(url, users);
+            }
+        }
     }
 
     fn clear(&mut self) {
@@ -75,4 +110,7 @@ impl LuaIndex for JsonSchemaIndex {
     }
 }
 
-crate::db_index::cow_shards::task_fork_fields!(JsonSchemaIndex { schema_files });
+crate::db_index::cow_shards::task_fork_fields!(JsonSchemaIndex {
+    schema_files,
+    users
+});

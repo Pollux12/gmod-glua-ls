@@ -1556,6 +1556,26 @@ local value = receiver.value
         );
     }
 
+    /// A local whose `---@schema` was read before its schema was fetched is
+    /// typed once the schema resolves.
+    #[test]
+    fn a_schema_fetched_after_its_tag_was_read_types_the_local() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_config.lua",
+            "---@schema https://example.com/config.json\nlocal config = {}\n",
+        );
+        let url = url::Url::parse("https://example.com/config.json").expect("a URL");
+        let schema =
+            r#"{"title":"Config","type":"object","properties":{"port":{"type":"integer"}}}"#;
+
+        ws.analysis
+            .apply_fetched_schemas(std::collections::HashMap::from([(url, schema.to_string())]));
+
+        let typ = ws.local_ty(file_id, "config");
+        assert!(matches!(typ, LuaType::Ref(_)), "{typ:?}");
+    }
+
     /// A receiver out-param added to or taken from a method in another file
     /// reaches its callers as a cold build of the same text does.
     #[test]

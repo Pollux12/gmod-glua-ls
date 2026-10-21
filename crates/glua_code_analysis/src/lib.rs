@@ -891,6 +891,7 @@ impl EmmyLuaAnalysis {
         }
 
         let converter = SchemaConverter::new(true);
+        let mut users = Vec::new();
         for (url, json_content) in url_contents {
             // let short_name = get_schema_short_name(&url);
             match converter.convert_from_str(&json_content) {
@@ -915,6 +916,12 @@ impl EmmyLuaAnalysis {
                             &convert_result.root_type_name,
                         ));
                     }
+                    users.extend(
+                        self.compilation
+                            .get_db()
+                            .get_json_schema_index()
+                            .users_of(&url),
+                    );
                 }
                 Err(e) => {
                     log::error!("Failed to convert schema from URL {:?}: {}", url, e);
@@ -926,6 +933,10 @@ impl EmmyLuaAnalysis {
             .get_db_mut()
             .get_json_schema_index_mut()
             .reset_rest_schemas();
+        // Their tags bound nothing while the schema was unresolved.
+        if !users.is_empty() {
+            self.reindex_files(users);
+        }
     }
 
     pub async fn update_schema(&mut self) {
