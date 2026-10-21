@@ -62,16 +62,14 @@ impl LuaTypeDecl {
                 flag,
             }],
             id,
-            extra: match kind {
-                LuaDeclTypeKind::Enum => LuaTypeExtra::Enum {
-                    base: None,
-                    flat: false,
-                },
-                LuaDeclTypeKind::Class => LuaTypeExtra::Class,
-                LuaDeclTypeKind::Alias => LuaTypeExtra::Alias { origin: None },
-                LuaDeclTypeKind::Attribute => LuaTypeExtra::Attribute { typ: None },
-            },
+            extra: LuaTypeExtra::of_kind(kind),
         }
+    }
+
+    /// Makes the declaration one of `kind`, its payload left for the winning
+    /// site's sources to install.
+    pub(super) fn set_kind(&mut self, kind: LuaDeclTypeKind) {
+        self.extra = LuaTypeExtra::of_kind(kind);
     }
 
     /// Where the type is declared, each location with its flags.
@@ -726,4 +724,19 @@ pub enum LuaTypeExtra {
     Class,
     Alias { origin: Option<LuaType> },
     Attribute { typ: Option<LuaType> },
+}
+
+impl LuaTypeExtra {
+    /// The payload of a declaration of `kind` no site has filled in.
+    fn of_kind(kind: LuaDeclTypeKind) -> Self {
+        match kind {
+            LuaDeclTypeKind::Enum => Self::Enum {
+                base: None,
+                flat: false,
+            },
+            LuaDeclTypeKind::Class => Self::Class,
+            LuaDeclTypeKind::Alias => Self::Alias { origin: None },
+            LuaDeclTypeKind::Attribute => Self::Attribute { typ: None },
+        }
+    }
 }

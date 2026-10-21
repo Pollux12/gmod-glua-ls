@@ -149,4 +149,47 @@ end
             ],
         );
     }
+
+    /// A type declared with two kinds is of the kind its first declaration
+    /// in canonical order gives it, so once that declaration goes it is of
+    /// the kind the rest give it, as a cold build of what is left is.
+    #[test]
+    fn a_type_takes_the_kind_of_the_declarations_left_when_one_goes() {
+        let foo = LuaTypeDeclId::global("Foo");
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/sh_a.lua",
+            "---@alias Foo string
+",
+        );
+        ws.def_file(
+            "lua/autorun/sh_b.lua",
+            "---@class Foo
+local Foo = {}
+",
+        );
+        let kind = |ws: &VirtualWorkspace| {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_type_index()
+                .get_type_decl(&foo)
+                .map(|decl| decl.kind())
+        };
+        let with_alias = kind(&ws);
+
+        ws.def_file(
+            "lua/autorun/sh_a.lua",
+            "print(1)
+",
+        );
+
+        assert_eq!(
+            (with_alias, kind(&ws)),
+            (
+                Some(crate::LuaDeclTypeKind::Alias),
+                Some(crate::LuaDeclTypeKind::Class)
+            )
+        );
+    }
 }

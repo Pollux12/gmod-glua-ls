@@ -1466,6 +1466,9 @@ pub struct LuaTypeIndex {
     /// location's flags are its holders' union; it leaves with its last one.
     location_holders:
         CowShards<(LuaTypeDeclId, FileId, TextRange), Vec<(Holder, FlagSet<LuaTypeFlag>)>>,
+    /// The kind each declaration location declares. A declaration is of the
+    /// kind of its first location in canonical order, whichever arrived first.
+    location_kinds: CowShards<(LuaTypeDeclId, FileId, TextRange), LuaDeclTypeKind>,
     /// Who holds each super edge; an edge leaves with its last holder.
     super_holders: CowShards<(LuaTypeDeclId, InFiled<LuaSuperType>), Vec<Holder>>,
     /// Table literals a registration turned into a class (a vgui panel
@@ -1581,6 +1584,7 @@ impl LuaTypeIndex {
             source_decl_locations: Default::default(),
             derived_contributions: Default::default(),
             location_holders: Default::default(),
+            location_kinds: Default::default(),
             super_holders: Default::default(),
             table_classes: Default::default(),
             fallbacks: Default::default(),
@@ -1667,12 +1671,50 @@ impl LuaTypeIndex {
         &mut self,
         decl_id: &LuaTypeDeclId,
         location: &LuaDeclLocation,
+        kind: LuaDeclTypeKind,
         holder: Holder,
     ) {
+        let site = (decl_id.clone(), location.file_id, location.range);
+        self.location_kinds.insert(site.clone(), kind);
         self.location_holders
-            .entry((decl_id.clone(), location.file_id, location.range))
+            .entry(site)
             .or_default()
             .push((holder, location.flag));
+    }
+
+    /// Makes `decl_id` of the kind its first location in canonical order
+    /// declares, its payload re-installed from that kind's sources.
+    fn reselect_kind(&mut self, decl_id: &LuaTypeDeclId) {
+        let Some(decl) = self.full_name_type_map.get(decl_id) else {
+            return;
+        };
+        let Some(kind) = decl
+            .locations()
+            .iter()
+            .min_by_key(|location| {
+                (
+                    location.file_id,
+                    location.range.start(),
+                    location.range.end(),
+                )
+            })
+            .and_then(|location| {
+                self.location_kinds
+                    .get(&(decl_id.clone(), location.file_id, location.range))
+            })
+            .copied()
+        else {
+            return;
+        };
+        if decl.kind() == kind {
+            return;
+        }
+        if let Some(decl) = self.full_name_type_map.get_mut(decl_id) {
+            decl.set_kind(kind);
+        }
+        note_decl_written(decl_id);
+        self.reselect_extra_source(decl_id);
+        self.reselect_alias_source(decl_id);
     }
 
     /// Drops `holder`'s hold on `location`, removing it once nothing holds it.
@@ -1694,6 +1736,7 @@ impl LuaTypeIndex {
         let remaining = (!holders.is_empty()).then(|| union_flags(holders));
         if remaining.is_none() {
             self.location_holders.remove(&site);
+            self.location_kinds.remove(&site);
         }
         let Some(decl) = self.full_name_type_map.get_mut(decl_id) else {
             return;
@@ -1722,6 +1765,8 @@ impl LuaTypeIndex {
                 derivation::note_write(|| FactKey::TypeGenericParams(decl_id.clone()));
             }
             self.alias_sources.remove(decl_id);
+        } else {
+            self.reselect_kind(decl_id);
         }
     }
 
@@ -1775,8 +1820,9 @@ impl LuaTypeIndex {
         let id = type_decl.get_id();
         note_decl_written(&id);
         let holder = current_holder();
+        let kind = type_decl.kind();
         for location in type_decl.locations() {
-            self.hold_location(&id, location, holder);
+            self.hold_location(&id, location, kind, holder);
         }
         if derivation::writes_source() {
             for location in type_decl.locations() {
@@ -1795,6 +1841,9 @@ impl LuaTypeIndex {
         if let Some(old_decl) = self.full_name_type_map.get_mut(&id) {
             for location in type_decl.locations() {
                 old_decl.add_location(location.clone());
+            }
+            if old_decl.kind() != kind {
+                self.reselect_kind(&id);
             }
         } else {
             self.add_to_decl_scan(&id);
@@ -1821,7 +1870,8 @@ impl LuaTypeIndex {
             self.add_source_location(decl_id, location.clone());
             self.add_source_site(file_id, decl_id, std::slice::from_ref(&location));
         }
-        self.hold_location(decl_id, &location, holder);
+        let kind = self.full_name_type_map[decl_id].kind();
+        self.hold_location(decl_id, &location, kind, holder);
         if let Some(decl) = self.full_name_type_map.get_mut(decl_id) {
             note_decl_written(decl_id);
             decl.add_location(location);
@@ -4038,6 +4088,7 @@ impl LuaIndex for LuaTypeIndex {
         self.source_decl_locations.clear();
         self.derived_contributions.clear();
         self.location_holders.clear();
+        self.location_kinds.clear();
         self.super_holders.clear();
         self.table_classes.clear();
         self.fallbacks.clear();
@@ -4093,17 +4144,20 @@ impl LuaTypeIndex {
                 let mut remove_type = false;
                 if let Some(decl) = self.full_name_type_map.get_mut(&id) {
                     let location_holders = &mut self.location_holders;
+                    let location_kinds = &mut self.location_kinds;
                     decl.get_mut_locations().retain_mut(|loc| {
                         if loc.file_id != file_id {
                             return true;
                         }
                         let site = (id.clone(), file_id, loc.range);
                         let Some(holders) = location_holders.get_mut(&site) else {
+                            location_kinds.remove(&site);
                             return false;
                         };
                         holders.retain(|(holder, _)| holder.is_some());
                         if holders.is_empty() {
                             location_holders.remove(&site);
+                            location_kinds.remove(&site);
                             return false;
                         }
                         loc.flag = union_flags(holders);
@@ -4119,6 +4173,9 @@ impl LuaTypeIndex {
                             file_id,
                         );
                     }
+                }
+                if !remove_type {
+                    self.reselect_kind(&id);
                 }
 
                 if let Some(sources) = self.extra_sources.get_mut(&id) {
@@ -5546,6 +5603,7 @@ crate::db_index::cow_shards::task_fork_fields!(LuaTypeIndex {
     source_decl_locations,
     derived_contributions,
     location_holders,
+    location_kinds,
     super_holders,
     table_classes,
     fallbacks,
