@@ -44,18 +44,11 @@ pub async fn on_did_change_watched_files(
         for file_event in params.changes.into_iter() {
             let file_type = get_file_type(&file_event.uri);
             match file_type {
+                // The editor owns an open document's text, deleted on disk
+                // or not: closing it reads the disk again. Library files
+                // (e.g. downloaded annotations) may receive spurious delete
+                // events and must not be purged from the index.
                 Some(WatchedFileType::Lua) => {
-                    if file_event.typ == FileChangeType::DELETED {
-                        // Only remove files that belong to this workspace.
-                        // Library files (e.g. downloaded annotations) may
-                        // receive spurious delete events and must not be
-                        // purged from the index.
-                        if workspace.is_workspace_file(&file_event.uri) {
-                            lua_events.push((file_event.uri, FileChangeType::DELETED));
-                        }
-                        continue;
-                    }
-
                     if !workspace.current_open_files.contains(&file_event.uri)
                         && workspace.is_workspace_file(&file_event.uri)
                     {
@@ -333,6 +326,50 @@ mod tests {
                 .is_indexed(data);
             assert!(still_indexed);
             assert!(snapshot.debounced_analysis().is_dirty());
+        });
+    }
+
+    /// A file deleted on disk while open keeps the editor's text until the
+    /// document closes.
+    #[test]
+    fn a_watched_deletion_of_an_open_document_waits_for_its_close() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = lsp_server::Connection::memory();
+        runtime.block_on(async {
+            let context = crate::context::ServerContext::new(
+                connection,
+                lsp_types::ClientCapabilities::default(),
+            );
+            let snapshot = context.snapshot();
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_watched_open_deletion");
+            let data_uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/sh_data.lua"))
+                .expect("data URI should parse");
+            {
+                let mut analysis = snapshot.analysis().write().await;
+                analysis.add_main_workspace(workspace.clone());
+                analysis
+                    .update_file_by_uri(&data_uri, Some("Data = {}\n".to_string()))
+                    .expect("data file is added");
+            }
+            snapshot
+                .workspace_manager()
+                .write()
+                .await
+                .current_open_files
+                .insert(data_uri.clone());
+
+            super::on_did_change_watched_files(
+                snapshot.clone(),
+                lsp_types::DidChangeWatchedFilesParams {
+                    changes: vec![lsp_types::FileEvent {
+                        uri: data_uri,
+                        typ: lsp_types::FileChangeType::DELETED,
+                    }],
+                },
+            )
+            .await;
+
+            assert!(!snapshot.debounced_analysis().is_dirty());
         });
     }
 
