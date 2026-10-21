@@ -3007,14 +3007,14 @@ impl Engine {
         }
         self.stats.focus_settled(queued);
         self.cursor = None;
+        // Files prioritised while the loops settled become the focus now,
+        // whether or not the release queued anything.
         let after_loops = std::mem::take(&mut self.after_loops);
-        if queued == 0 {
-            return false;
-        }
         if !after_loops.is_empty() {
             self.prioritise(&after_loops);
+            return true;
         }
-        true
+        queued > 0
     }
 
     /// Whether `id`, queued for `reason`, has to run: a reader runs only if a
