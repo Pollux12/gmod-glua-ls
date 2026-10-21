@@ -172,10 +172,7 @@ fn check_merged_table_type_compact(
     compact_type: &LuaType,
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
-    if matches!(
-        compact_type,
-        LuaType::Any | LuaType::Table | LuaType::TableConst(_)
-    ) {
+    if matches!(compact_type, LuaType::Any | LuaType::Table) {
         return Ok(());
     }
 
@@ -185,7 +182,7 @@ fn check_merged_table_type_compact(
         }
     }
 
-    let Some(object) = structural_object_from_members(context, source) else {
+    let Some(object) = open_table_object(context, source) else {
         return Err(TypeCheckFailReason::DonotCheck);
     };
 
@@ -233,6 +230,27 @@ pub(super) fn structural_object_from_members(
 
     Some(LuaType::Object(
         LuaObjectType::new_with_fields(fields, index_access).into(),
+    ))
+}
+
+/// The structural object of a table its writers' literals merge into: every
+/// field one writer spells is a field the table can have, so none is required.
+fn open_table_object(context: &TypeCheckContext, typ: &LuaType) -> Option<LuaType> {
+    let LuaType::Object(object) = structural_object_from_members(context, typ)? else {
+        return None;
+    };
+    let fields = object
+        .get_fields()
+        .iter()
+        .map(|(key, typ)| {
+            (
+                key.clone(),
+                TypeOps::Union.apply(context.db, typ, &LuaType::Nil),
+            )
+        })
+        .collect();
+    Some(LuaType::Object(
+        LuaObjectType::new_with_fields(fields, object.get_index_access().to_vec()).into(),
     ))
 }
 

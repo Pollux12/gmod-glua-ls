@@ -209,6 +209,40 @@ mod test {
         assert!(check_type_compact(&db, &source, &compact).is_ok());
     }
 
+    fn colors_written_by_two_files() -> (VirtualWorkspace, LuaType) {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/autorun/a.lua",
+            "CONFIG = {}
+CONFIG.colors = { red = 1 }
+",
+        );
+        ws.def_file(
+            "lua/autorun/b.lua",
+            "CONFIG.colors = { blue = 2 }
+",
+        );
+        let colors = ws.expr_ty("CONFIG.colors");
+        assert!(matches!(colors, LuaType::MergedTable(_)));
+        (ws, colors)
+    }
+
+    #[test]
+    fn a_merged_table_accepts_a_literal_spelling_only_some_of_its_fields() {
+        let (mut ws, colors) = colors_written_by_two_files();
+        let literal = ws.expr_ty("{ red = 1 }");
+
+        assert!(ws.check_type(&colors, &literal));
+    }
+
+    #[test]
+    fn a_merged_table_rejects_a_literal_whose_field_has_another_type() {
+        let (mut ws, colors) = colors_written_by_two_files();
+        let literal = ws.expr_ty("{ red = \"crimson\" }");
+
+        assert!(!ws.check_type(&colors, &literal));
+    }
+
     fn merged_table_with_field(name: &str, typ: LuaType) -> LuaType {
         merged_table_from_object(object_with_field(name, typ))
     }
