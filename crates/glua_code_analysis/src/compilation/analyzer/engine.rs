@@ -3030,9 +3030,15 @@ impl Engine {
             }
             let mut queued = 0;
             let reached = self.held.extract_if(|id| id.kind.first_stage() <= stage);
+            // Work outside a settling focus waits for it, as it would queued
+            // any other way.
             for (id, reason) in reached {
-                self.worklist.insert(id, reason);
-                queued += 1;
+                if self.waits(id) {
+                    self.wait(id, reason);
+                } else {
+                    self.worklist.insert(id, reason);
+                    queued += 1;
+                }
             }
             for reader in waited {
                 self.stats.stage_requeued(reader);
@@ -3046,6 +3052,7 @@ impl Engine {
                     DerivationKind::Source => {
                         self.stale_sources.insert(reader.file_id);
                     }
+                    _ if self.waits(reader) => self.wait(reader, Reason::Changed),
                     _ => {
                         self.worklist.insert(reader, Reason::Changed);
                         queued += 1;
