@@ -635,6 +635,9 @@ pub(crate) struct Engine {
     /// How cold builds are driven; see [`superstep_mode`].
     superstep: SuperstepMode,
     pending_slot_notifications: FxHashSet<HashedKey>,
+    /// Queries only a pending slot notification marked stale: the flush finds
+    /// whether their reads moved after all, and those it does not queue hold.
+    pending_stale_queries: FxHashSet<DerivationId>,
     /// In a superstep, the file whose superstep task is running:
     /// its batches take no other file's work.
     task: Option<crate::FileId>,
@@ -1080,8 +1083,9 @@ impl Engine {
             let readers = readers.unwrap_or_else(|| self.stale_readers(db, key));
             for (reader, seen) in readers {
                 self.remember_moved_read(db, key, reader, seen);
-                if reader.kind.is_query() {
+                if reader.kind.is_query() && !db.queries().is_stale(reader) {
                     db.queries().set_stale(reader, true);
+                    self.pending_stale_queries.insert(reader);
                 }
             }
             self.pending_slot_notifications.insert(key.clone());
@@ -1125,6 +1129,10 @@ impl Engine {
         let found = self.stale_readers_of(db, &pending.iter().collect::<Vec<_>>());
         for (key, readers) in pending.iter().zip(found) {
             self.queue_readers_now(db, key, readers);
+        }
+        // What the flush did not queue read what it read before.
+        for query in std::mem::take(&mut self.pending_stale_queries) {
+            db.queries().set_stale(query, false);
         }
     }
 
@@ -1173,6 +1181,7 @@ impl Engine {
             self.remember_moved_read(db, key, reader, seen);
             if reader.kind.is_query() {
                 db.queries().set_stale(reader, true);
+                self.pending_stale_queries.remove(&reader);
             }
             if crate::profile::tracing_evaluations() {
                 self.queued_by

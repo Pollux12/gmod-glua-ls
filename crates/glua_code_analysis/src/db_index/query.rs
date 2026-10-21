@@ -434,6 +434,12 @@ impl<F: QueryFamily> QueryTable<F> {
         }
     }
 
+    fn is_stale(&self, id: DerivationId) -> bool {
+        self.memos()
+            .get(&Self::key(id))
+            .is_some_and(|memo| memo.stale)
+    }
+
     /// Forgets `file_id`'s queries, writing their outputs so their readers
     /// check them again.
     fn remove_file(&self, file_id: FileId) {
@@ -567,6 +573,15 @@ impl Queries {
         match id.kind {
             DerivationKind::ReceiverAuthority => self.receiver_authority.set_stale(id, stale),
             DerivationKind::CallbackParams => self.callback_params.set_stale(id, stale),
+            kind => unreachable!("{kind:?} is not a query"),
+        }
+    }
+
+    /// Whether `id`'s answer is marked as one a read of it moved under.
+    pub(crate) fn is_stale(&self, id: DerivationId) -> bool {
+        match id.kind {
+            DerivationKind::ReceiverAuthority => self.receiver_authority.is_stale(id),
+            DerivationKind::CallbackParams => self.callback_params.is_stale(id),
             kind => unreachable!("{kind:?} is not a query"),
         }
     }
