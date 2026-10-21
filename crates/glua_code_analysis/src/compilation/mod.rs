@@ -44,7 +44,7 @@ pub struct LuaCompilation {
     /// Set while an edit waits to be taken in: a slice in progress stops
     /// between two evaluations.
     interrupt: Arc<AtomicBool>,
-    /// Bumped whenever the index may change; see [`Self::index_revision`].
+    /// Drawn afresh whenever the index may change; see [`Self::index_revision`].
     index_revision: u64,
     /// The scripted scopes, lent to each re-analysis.
     scopes: analyzer::ScopesCache,
@@ -84,7 +84,7 @@ impl LuaCompilation {
             schedule: Schedule::default(),
             reanalysis: Mutex::default(),
             interrupt: Arc::default(),
-            index_revision: 0,
+            index_revision: next_index_revision(),
             scopes: analyzer::ScopesCache::default(),
             memos: Mutex::default(),
             detach_tasks: false,
@@ -160,7 +160,7 @@ impl LuaCompilation {
         if file_ids.is_empty() {
             return;
         }
-        self.index_revision += 1;
+        self.index_revision = next_index_revision();
         if let Some(log) = &mut self.batch_log {
             log.push(file_ids.clone());
         }
@@ -207,7 +207,7 @@ impl LuaCompilation {
         let Some(reanalysis) = session else {
             return UpdateProgress::Settled(Vec::new());
         };
-        self.index_revision += 1;
+        self.index_revision = next_index_revision();
         if self.db.get_vfs().holds_untaken_text() {
             reanalysis.install_detached(&mut self.db);
             return UpdateProgress::TextChanged;
@@ -507,12 +507,12 @@ impl LuaCompilation {
     pub fn remove_index(&mut self, file_ids: Vec<FileId>) {
         self.file_diagnostic_reads();
         self.install_detached();
-        self.index_revision += 1;
+        self.index_revision = next_index_revision();
         self.db.remove_index(file_ids);
     }
 
     pub fn clear_index(&mut self) {
-        self.index_revision += 1;
+        self.index_revision = next_index_revision();
         *self
             .reanalysis
             .get_mut()
@@ -580,12 +580,14 @@ impl LuaCompilation {
     pub fn get_db_mut(&mut self) -> &mut DbIndex {
         self.file_diagnostic_reads();
         self.install_detached();
-        self.index_revision += 1;
+        self.index_revision = next_index_revision();
         &mut self.db
     }
 
     /// Changes whenever the index may have changed since it was last read:
-    /// every path that writes it bumps the revision first.
+    /// every path that writes it draws a new revision first. No two
+    /// compilations in the process hold one revision unless one is a fork of
+    /// the other that neither has written since.
     pub fn index_revision(&self) -> u64 {
         self.index_revision
     }
@@ -596,10 +598,16 @@ impl LuaCompilation {
         self.file_diagnostic_reads();
         self.install_detached();
         if affects_index {
-            self.index_revision += 1;
+            self.index_revision = next_index_revision();
             self.scopes = analyzer::ScopesCache::default();
         }
         self.emmyrc = config.clone();
         self.db.update_config(config);
     }
+}
+
+/// A revision no compilation in the process has held.
+fn next_index_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }

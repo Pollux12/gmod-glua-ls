@@ -770,6 +770,33 @@ mod tests {
         assert!(shared.sorted_send_flows.contains_key("Ping"));
     }
 
+    /// Two compilations built through the same steps reach the same number of
+    /// index writes, yet hold different files.
+    #[test]
+    fn a_cache_built_for_one_compilation_is_not_fresh_for_another() {
+        let (mut first, mut second) = (workspace(), workspace());
+        let uri = first
+            .virtual_url_generator
+            .new_uri("lua/autorun/shared/a.lua");
+        let file = write(
+            &mut first,
+            &uri,
+            "function Alpha() return 1 end
+",
+        );
+        write(
+            &mut second,
+            &uri,
+            "function Beta() return 2 end
+",
+        );
+        let cache = SharedDiagnosticComponentCache::new();
+        build_matching_cold(&first, &cache, &[file]);
+
+        assert!(cache.is_fresh(&first.analysis.compilation));
+        assert!(!cache.is_fresh(&second.analysis.compilation));
+    }
+
     #[test]
     fn invalidation_drops_every_unit() {
         let mut ws = workspace();
