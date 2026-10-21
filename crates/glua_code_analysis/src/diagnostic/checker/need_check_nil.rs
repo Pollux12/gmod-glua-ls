@@ -3742,42 +3742,34 @@ fn check_condition_expr(
             }
         }
         expr => {
-            let truthy_expr = match &expr {
-                LuaExpr::UnaryExpr(unary)
-                    if unary
-                        .get_op_token()
-                        .is_some_and(|t| t.get_op() == UnaryOperator::OpNot) =>
-                {
-                    unary.get_expr().unwrap_or(expr.clone())
-                }
-                _ => expr.clone(),
-            };
-            if is_sentinel_followed_by_type_guard(semantic_model, &truthy_expr)
-                || is_validity_tested_by_branch_condition(semantic_model, &truthy_expr)
-                || is_validity_retested_at_block_head(semantic_model, &truthy_expr)
+            let can_be_null = semantic_model
+                .infer_expr(expr.clone())
+                .is_ok_and(|expr_type| {
+                    contains_gmod_null_type(semantic_model.get_db(), &expr_type)
+                });
+            if !can_be_null
+                || is_sentinel_followed_by_type_guard(semantic_model, &expr)
+                || is_validity_tested_by_branch_condition(semantic_model, &expr)
+                || is_validity_retested_at_block_head(semantic_model, &expr)
                 || has_only_null_safe_uses_after(
                     semantic_model,
-                    &truthy_expr,
-                    truthy_expr.get_range().end(),
+                    &expr,
+                    expr.get_range().end(),
                     false,
                 )
             {
                 return;
             }
-            if let Ok(expr_type) = semantic_model.infer_expr(expr.clone())
-                && contains_gmod_null_type(semantic_model.get_db(), &expr_type)
-            {
-                context.add_diagnostic(
-                    DiagnosticCode::GmodNullCheck,
-                    expr.get_range(),
-                    format!(
-                        "{name} may be NULL; NULL is truthy, use IsValid(...) to check entity validity",
-                        name = expr.syntax().text()
-                    )
-                    .to_string(),
-                    None,
-                );
-            }
+            context.add_diagnostic(
+                DiagnosticCode::GmodNullCheck,
+                expr.get_range(),
+                format!(
+                    "{name} may be NULL; NULL is truthy, use IsValid(...) to check entity validity",
+                    name = expr.syntax().text()
+                )
+                .to_string(),
+                None,
+            );
         }
     }
 }
