@@ -18,14 +18,6 @@ use std::time::{Duration, Instant};
 pub static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// True while a `Profile` whose name matches `GLUALS_PROFILE_SAMPLE` is alive.
-/// An allocation sampler can gate on this to profile one phase instead of the
-/// whole process — which is what makes sampling affordable, since the phase
-/// worth sampling (`lua analyze`) is single-threaded and the parallel phases
-/// would otherwise swamp the sample set and contend on the sampler's lock.
-/// A count rather than a flag: the same phase name can be entered more than
-/// once at a time, and a plain flag would let the first exit turn sampling off
-/// underneath the others.
 /// Estimated heap bytes of a hash table with `capacity` entries of
 /// `entry_size` bytes: its buckets and their control bytes.
 pub(crate) fn hash_table_bytes(capacity: usize, entry_size: usize) -> usize {
@@ -40,6 +32,14 @@ pub(crate) fn megabytes(bytes: usize) -> usize {
     bytes / 1_048_576
 }
 
+/// True while a `Profile` whose name matches `GLUALS_PROFILE_SAMPLE` is alive.
+/// An allocation sampler can gate on this to profile one phase instead of the
+/// whole process — which is what makes sampling affordable, since the phase
+/// worth sampling (`lua analyze`) is single-threaded and the parallel phases
+/// would otherwise swamp the sample set and contend on the sampler's lock.
+/// A count rather than a flag: the same phase name can be entered more than
+/// once at a time, and a plain flag would let the first exit turn sampling off
+/// underneath the others.
 static SAMPLE_PHASE_DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether the phase named by `GLUALS_PROFILE_SAMPLE` is currently running.
