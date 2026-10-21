@@ -1,6 +1,5 @@
 use std::{collections::HashMap, fmt};
 
-use glua_parser::LineIndex;
 use lsp_types::{Position, Range, TextDocumentContentChangeEvent, Uri};
 
 /// The text of each open document as the editor holds it, kept by applying
@@ -93,30 +92,56 @@ fn apply_ranged_change(text: &mut String, range: Range, new_text: &str) -> Resul
     if as_tuple(range.start) > as_tuple(range.end) {
         return Err(SyncError::InvertedRange(range));
     }
-    let line_index = LineIndex::parse(text);
-    let start = byte_offset(text, &line_index, range.start)?;
-    let end = byte_offset(text, &line_index, range.end)?;
+    let start_line = line_start(text, 0, 0, range.start)?;
+    let start = column_offset(text, start_line, range.start)?;
+    let end_line = line_start(text, start_line, range.start.line, range.end)?;
+    let end = column_offset(text, end_line, range.end)?;
     text.replace_range(start..end, new_text);
     Ok(())
 }
 
-/// Byte offset of a UTF-16 position; a column past the line end means the line end.
-fn byte_offset(text: &str, line_index: &LineIndex, position: Position) -> Result<usize, SyncError> {
-    let line = position.line as usize;
-    if line >= line_index.line_count() {
-        return Err(SyncError::LineOutOfRange(position));
+/// Byte offset where `position`'s line starts, scanning on from `from`, the
+/// start of line `from_line` at or before it.
+fn line_start(
+    text: &str,
+    from: usize,
+    from_line: u32,
+    position: Position,
+) -> Result<usize, SyncError> {
+    let mut start = from;
+    for _ in from_line..position.line {
+        let newline = text[start..]
+            .find('\n')
+            .ok_or(SyncError::LineOutOfRange(position))?;
+        start += newline + 1;
     }
-    let col = position.character as usize;
-    let offset = line_index.get_offset(line, col, text);
-    let reached = line_index
-        .get_col(offset, text)
-        .is_some_and(|reached| reached == col);
-    let rest = &text[usize::from(offset)..];
-    let at_line_end = rest.is_empty() || rest.starts_with('\n') || rest.starts_with("\r\n");
-    if reached || at_line_end {
-        Ok(usize::from(offset))
-    } else {
+    Ok(start)
+}
+
+/// Byte offset of `position`'s UTF-16 column on the line starting at
+/// `line_start`; a column past the line end means the line end.
+fn column_offset(text: &str, line_start: usize, position: Position) -> Result<usize, SyncError> {
+    let rest = &text[line_start..];
+    let line = match rest.find('\n') {
+        Some(end) => rest[..end].strip_suffix('\r').unwrap_or(&rest[..end]),
+        None => rest,
+    };
+    let column = position.character as usize;
+    let mut units = 0;
+    for (offset, ch) in line.char_indices() {
+        if units >= column {
+            return if units == column {
+                Ok(line_start + offset)
+            } else {
+                Err(SyncError::SplitsCharacter(position))
+            };
+        }
+        units += ch.len_utf16();
+    }
+    if units > column {
         Err(SyncError::SplitsCharacter(position))
+    } else {
+        Ok(line_start + line.len())
     }
 }
 
