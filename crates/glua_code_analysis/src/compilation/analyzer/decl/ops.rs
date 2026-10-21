@@ -19,8 +19,6 @@ use crate::{
     },
 };
 
-use super::exprs::check_assign_value_is_package_seeall;
-
 /// A write the declaration walk makes to the index, kept for
 /// [`DeclWalk::apply`] to make in the order the walk found it.
 pub(super) enum DeclOp {
@@ -85,9 +83,6 @@ pub(super) enum DeclOp {
         /// The path argument's range, or the call's when it has no argument.
         range: TextRange,
     },
-    /// The globals a `module` call's option arguments name, whose declarations
-    /// are checked for `package.seeall`.
-    SeeallProbe(Vec<String>),
 }
 
 /// What the walk adds to the file's [`AnalyzeContext`].
@@ -141,7 +136,7 @@ impl DeclWalk {
         db.get_type_index_mut()
             .set_table_literal_decls(file_id, table_literal_decls);
         for op in self.ops {
-            op.apply(db, file_id, context);
+            op.apply(db, file_id);
         }
         if self.scoped_class_info.is_some() {
             ensure_scoped_class_type_decl_for_file(db, file_id, self.chunk_range);
@@ -167,7 +162,7 @@ impl DeclWalk {
 }
 
 impl DeclOp {
-    fn apply(self, db: &mut DbIndex, file_id: FileId, context: &AnalyzeContext) {
+    fn apply(self, db: &mut DbIndex, file_id: FileId) {
         match self {
             Self::FunctionScopeRange(range) => db
                 .get_member_index_mut()
@@ -264,27 +259,6 @@ impl DeclOp {
                         range,
                     });
             }
-            Self::SeeallProbe(names) => {
-                for name in names {
-                    if names_package_seeall(db, context, &name) {
-                        break;
-                    }
-                }
-            }
         }
     }
-}
-
-/// Whether global `name` is declared in the file as `package.seeall`.
-fn names_package_seeall(db: &DbIndex, context: &AnalyzeContext, name: &str) -> bool {
-    let Some(decl_ids) = db.get_global_index().get_global_decl_ids(name) else {
-        return false;
-    };
-    decl_ids.iter().any(|decl_id| {
-        context
-            .tree_list
-            .iter()
-            .find(|tree| tree.file_id == decl_id.file_id)
-            .is_some_and(|tree| check_assign_value_is_package_seeall(&tree.value, decl_id.position))
-    })
 }

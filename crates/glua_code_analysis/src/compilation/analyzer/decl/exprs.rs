@@ -519,13 +519,8 @@ fn try_analyze_legacy_module_call(analyzer: &mut DeclAnalyzer, expr: &LuaCallExp
         _ => return Some(()),
     };
 
-    let remaining_args: Vec<_> = args_iter.collect();
-    let seeall = !remaining_args.is_empty();
-    analyzer
-        .ops
-        .push(DeclOp::SeeallProbe(seeall_alias_candidates(
-            &remaining_args,
-        )));
+    // Any option argument makes the module see all globals.
+    let seeall = args_iter.next().is_some();
     let call_range = expr.get_range();
     let activation_position = call_range.end();
 
@@ -566,91 +561,6 @@ fn try_analyze_legacy_module_call(analyzer: &mut DeclAnalyzer, expr: &LuaCallExp
     }
 
     Some(())
-}
-
-/// The globals among a `module()` call's option arguments that may alias
-/// `package.seeall`: the names before the first argument that is it. Any
-/// option argument makes the module see all globals, whether or not it
-/// resolves, so the check is for the reads it makes.
-fn seeall_alias_candidates(args: &[LuaExpr]) -> Vec<String> {
-    let mut names = Vec::new();
-    for arg in args {
-        if is_package_seeall_expr(arg) {
-            break;
-        }
-        if let LuaExpr::NameExpr(name_expr) = arg
-            && let Some(name) = name_expr.get_name_text()
-            && !name.is_empty()
-        {
-            names.push(name.to_string());
-        }
-    }
-    names
-}
-
-/// Finds the assignment/local statement at `position` and checks if its value is `package.seeall`.
-pub(super) fn check_assign_value_is_package_seeall(
-    tree: &glua_parser::LuaChunk,
-    position: rowan::TextSize,
-) -> bool {
-    use glua_parser::{LuaAssignStat, LuaLocalStat};
-
-    let token = match tree.syntax().token_at_offset(position) {
-        rowan::TokenAtOffset::Single(t) => t,
-        rowan::TokenAtOffset::Between(_, right) => right,
-        rowan::TokenAtOffset::None => return false,
-    };
-
-    for ancestor in token.parent_ancestors() {
-        if let Some(assign_stat) = LuaAssignStat::cast(ancestor.clone()) {
-            let (vars, exprs) = assign_stat.get_var_and_expr_list();
-            for (i, var) in vars.iter().enumerate() {
-                if var.get_position() == position {
-                    if let Some(value) = exprs.get(i) {
-                        return is_package_seeall_expr(value);
-                    }
-                }
-            }
-            return false;
-        }
-
-        if let Some(local_stat) = LuaLocalStat::cast(ancestor.clone()) {
-            let names: Vec<_> = local_stat.get_local_name_list().collect();
-            let values: Vec<_> = local_stat.get_value_exprs().collect();
-            for (i, local_name) in names.iter().enumerate() {
-                if let Some(name_token) = local_name.get_name_token() {
-                    if name_token.get_position() == position {
-                        if let Some(value) = values.get(i) {
-                            return is_package_seeall_expr(value);
-                        }
-                    }
-                }
-            }
-            return false;
-        }
-    }
-
-    false
-}
-
-fn is_package_seeall_expr(expr: &LuaExpr) -> bool {
-    let LuaExpr::IndexExpr(index_expr) = expr else {
-        return false;
-    };
-    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
-        return false;
-    };
-    let LuaExpr::NameExpr(prefix_name) = prefix_expr else {
-        return false;
-    };
-    if prefix_name.get_name_text().as_deref() != Some("package") {
-        return false;
-    }
-
-    matches!(
-        index_expr.get_index_key(),
-        Some(LuaIndexKey::Name(name)) if name.get_name_text() == "seeall"
-    )
 }
 
 fn get_dependency_call_info(expr: &LuaCallExpr) -> Option<(LuaDependencyKind, Option<String>)> {
