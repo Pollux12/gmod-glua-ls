@@ -736,6 +736,16 @@ impl EmmyLuaAnalysis {
     /// Applies `config`, re-analysing every file when the change reaches the
     /// index: facts are derived under the config they were built with.
     pub fn update_config(&mut self, config: Arc<Emmyrc>) -> EmmyrcChange {
+        let change = self.apply_config(config);
+        if change.affects_index() {
+            self.reindex();
+        }
+        change
+    }
+
+    /// Applies `config` without re-analysing: a change that reaches the index
+    /// leaves it to be rebuilt, as [`Self::begin_full_reindex`] does.
+    pub fn apply_config(&mut self, config: Arc<Emmyrc>) -> EmmyrcChange {
         let mut refreshed_config = (*config).clone();
         refreshed_config
             .gmod
@@ -747,9 +757,6 @@ impl EmmyLuaAnalysis {
         self.compilation
             .update_config(config.clone(), change.affects_index());
         self.diagnostic.update_config(config);
-        if change.affects_index() {
-            self.reindex();
-        }
         change
     }
 

@@ -3,7 +3,7 @@ use std::hash::Hash;
 use std::path::Path;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use super::{ClientProxy, FileDiagnostic, StatusBar};
+use super::{ClientProxy, DebouncedAnalysis, FileDiagnostic, StatusBar};
 use crate::codestyle::apply_workspace_code_style_off_workers;
 use crate::context::ServerContextSnapshot;
 use crate::context::lsp_features::LspFeatures;
@@ -37,6 +37,7 @@ pub struct WorkspaceManager {
     config_apply: Arc<Mutex<()>>,
     file_diagnostic: Arc<FileDiagnostic>,
     lsp_features: Arc<LspFeatures>,
+    debounced_analysis: Arc<DebouncedAnalysis>,
     pub client_config: ClientConfig,
     pub workspace_folders: Vec<WorkspaceFolder>,
     pub watcher: Option<notify::RecommendedWatcher>,
@@ -59,6 +60,7 @@ impl WorkspaceManager {
         status_bar: Arc<StatusBar>,
         file_diagnostic: Arc<FileDiagnostic>,
         lsp_features: Arc<LspFeatures>,
+        debounced_analysis: Arc<DebouncedAnalysis>,
     ) -> Self {
         Self {
             analysis,
@@ -71,6 +73,7 @@ impl WorkspaceManager {
             config_apply: Arc::new(Mutex::new(())),
             file_diagnostic,
             lsp_features,
+            debounced_analysis,
             watcher: None,
             current_open_files: HashSet::new(),
             match_file_pattern: WorkspaceFileMatcher::default(),
@@ -119,7 +122,7 @@ impl WorkspaceManager {
     pub async fn reload_config(workspace_manager: Arc<RwLock<WorkspaceManager>>) -> EmmyrcChange {
         let config_apply = workspace_manager.read().await.config_apply.clone();
         let _applying = config_apply.lock().await;
-        let (analysis, client, status_bar, file_diagnostic, lsp_features) = {
+        let (analysis, client, status_bar, file_diagnostic, lsp_features, debounced_analysis) = {
             let manager = workspace_manager.read().await;
             (
                 manager.analysis.clone(),
@@ -127,6 +130,7 @@ impl WorkspaceManager {
                 manager.status_bar.clone(),
                 manager.file_diagnostic.clone(),
                 manager.lsp_features.clone(),
+                manager.debounced_analysis.clone(),
             )
         };
         let (workspace_folders, client_config) = {
@@ -191,21 +195,28 @@ impl WorkspaceManager {
                     )
                     .await;
                 }
-                {
+                let affects_index = {
                     let mut analysis = analysis.write().await;
-                    analysis.update_config(loaded.emmyrc.clone());
+                    let applied = analysis.apply_config(loaded.emmyrc.clone());
                     apply_workspace_diagnostic_configs(
                         &mut analysis,
                         &loaded.workspace_diagnostic_configs,
                     );
-                }
-                if change != EmmyrcChange::Diagnostics {
-                    refresh_open_document_features(&client, &lsp_features);
-                }
-                if change >= EmmyrcChange::Diagnostics {
-                    file_diagnostic
-                        .add_workspace_diagnostic_task(0, false)
-                        .await;
+                    applied.affects_index()
+                };
+                if affects_index {
+                    // The rebuild re-diagnoses every file and refreshes the
+                    // open documents' views once it settles.
+                    debounced_analysis.request_rebuild();
+                } else {
+                    if change != EmmyrcChange::Diagnostics {
+                        refresh_open_document_features(&client, &lsp_features);
+                    }
+                    if change >= EmmyrcChange::Diagnostics {
+                        file_diagnostic
+                            .add_workspace_diagnostic_task(0, false)
+                            .await;
+                    }
                 }
             }
         }

@@ -163,14 +163,6 @@ impl ServerContext {
             status_bar.clone(),
             client.clone(),
         ));
-        let workspace_manager_inner = WorkspaceManager::new(
-            analysis.clone(),
-            client.clone(),
-            status_bar.clone(),
-            file_diagnostic.clone(),
-            lsp_features.clone(),
-        );
-        let workspace_manager = Arc::new(RwLock::new(workspace_manager_inner));
         let debounced_shutdown = CancellationToken::new();
         let debounced_analysis = Arc::new(DebouncedAnalysis::new(
             analysis.clone(),
@@ -180,6 +172,15 @@ impl ServerContext {
             file_diagnostic.clone(),
             lsp_features.clone(),
         ));
+        let workspace_manager_inner = WorkspaceManager::new(
+            analysis.clone(),
+            client.clone(),
+            status_bar.clone(),
+            file_diagnostic.clone(),
+            lsp_features.clone(),
+            debounced_analysis.clone(),
+        );
+        let workspace_manager = Arc::new(RwLock::new(workspace_manager_inner));
 
         file_diagnostic.store().start(
             file_diagnostic::workspace_diagnostic_parallelism(),

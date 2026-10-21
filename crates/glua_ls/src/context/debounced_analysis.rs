@@ -101,6 +101,9 @@ pub struct DebouncedAnalysis {
     at_once: AtomicBool,
     /// Whether the user was told a re-analysis failed: once is enough.
     failure_reported: AtomicBool,
+    /// A change the index was derived under asks for every file to be
+    /// analysed again; see [`DebouncedAnalysis::request_rebuild`].
+    rebuild_requested: AtomicBool,
     notify: Notify,
     reindex_notify: Notify,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
@@ -223,6 +226,7 @@ impl DebouncedAnalysis {
             refused_request: AtomicBool::new(false),
             at_once: AtomicBool::new(false),
             failure_reported: AtomicBool::new(false),
+            rebuild_requested: AtomicBool::new(false),
             notify: Notify::new(),
             reindex_notify: Notify::new(),
             analysis,
@@ -358,6 +362,18 @@ impl DebouncedAnalysis {
         self.has_pending_changes.store(true, Ordering::Release);
         self.notify.notify_waiters();
         InFlightChangeGuard::new(self.clone(), documents, 1)
+    }
+
+    /// Has the loop rebuild the analysis of every file from its text, settling
+    /// in slices as an edit does: what a config change that reaches the index
+    /// needs, without holding the analysis for the whole build.
+    pub fn request_rebuild(&self) {
+        self.rebuild_requested.store(true, Ordering::Release);
+        if let Some(interrupt) = self.interrupt.get() {
+            interrupt.store(true, Ordering::Release);
+        }
+        self.has_pending_changes.store(true, Ordering::Release);
+        self.notify.notify_waiters();
     }
 
     fn in_flight_documents(&self) -> std::sync::MutexGuard<'_, HashMap<Uri, usize>> {
@@ -1114,6 +1130,19 @@ impl DebouncedAnalysis {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
+            if self.rebuild_requested.swap(false, Ordering::AcqRel) {
+                if self.begin_rebuild().await {
+                    rebuild = Rebuild::Running;
+                } else if self.shutdown.is_cancelled() {
+                    return;
+                } else {
+                    rebuild = Rebuild::Owed;
+                }
+                self.refresh_dirty_state().await;
+                self.reindex_notify.notify_waiters();
+                continue;
+            }
+
             let scheduled = !self.pending_files.lock().await.is_empty();
             let settling = self.settling.load(Ordering::Acquire);
             if !scheduled && (!settling || text_changed) {
@@ -1252,8 +1281,10 @@ impl DebouncedAnalysis {
         let pending = self.pending_files.lock().await;
         let reindexing = self.reindexing_files.lock().await;
 
-        let has_pending_file_work =
-            !pending.is_empty() || !reindexing.is_empty() || self.settling.load(Ordering::Acquire);
+        let has_pending_file_work = !pending.is_empty()
+            || !reindexing.is_empty()
+            || self.settling.load(Ordering::Acquire)
+            || self.rebuild_requested.load(Ordering::Acquire);
         let has_in_flight_changes = self.in_flight_changes.load(Ordering::Acquire) > 0;
 
         self.has_pending_changes.store(
@@ -2891,6 +2922,73 @@ mod tests {
                     .unwrap_or_default()
             })
             .collect()
+    }
+
+    /// A requested rebuild analyses every file again on the loop, in slices,
+    /// and publishes them once it settles; a freshness waiter waits for it.
+    #[gtest]
+    fn a_requested_rebuild_settles_on_the_loop_and_publishes_every_file() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut analysis = EmmyLuaAnalysis::new();
+            analysis.compilation.set_detached_tasks(true);
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_requested_rebuild");
+            analysis.add_main_workspace(workspace.clone());
+            analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::UndefinedGlobal);
+            let consumer_uri = file_path_to_uri(&workspace.join("lua/autorun/consumer.lua"))
+                .expect("consumer URI should parse");
+            analysis.update_file_by_uri(
+                &consumer_uri,
+                Some(
+                    "Missing()
+"
+                    .to_string(),
+                ),
+            );
+            let analysis = Arc::new(RwLock::new(analysis));
+            let (debounced_analysis, peer) = loop_test_debounced_analysis(analysis.clone());
+            let loop_task = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                async move { debounced_analysis.run().await }
+            });
+
+            debounced_analysis.request_rebuild();
+            verify_that!(debounced_analysis.is_dirty(), eq(true))?;
+            let freshness = tokio::time::timeout(
+                Duration::from_secs(10),
+                debounced_analysis.wait_until_fresh_for(&CancellationToken::new(), "test"),
+            )
+            .await
+            .expect("the freshness waiter should return");
+            verify_that!(freshness, eq(Freshness::Fresh))?;
+            let receiver = peer.receiver.clone();
+            let published = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::task::spawn_blocking(move || {
+                    loop {
+                        let message = receiver.recv().expect("peer channel should stay open");
+                        if let Some(params) = publish_params(&message)
+                            && params.uri == consumer_uri
+                        {
+                            return params.diagnostics;
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("the consumer should be published")
+            .expect("the publish reader task must not panic");
+            verify_that!(
+                has_diagnostic_code(&published, DiagnosticCode::UndefinedGlobal),
+                eq(true)
+            )?;
+
+            debounced_analysis.shutdown.cancel();
+            let _ = loop_task.await;
+            Ok(())
+        })
     }
 
     /// A slice that panics leaves the loop serving: the analysis is rebuilt
