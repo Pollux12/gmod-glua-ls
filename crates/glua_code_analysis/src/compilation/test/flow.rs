@@ -9711,6 +9711,34 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn a_condition_inside_a_closure_in_a_condition_narrows_its_own_branches() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@param callback fun(): boolean
+            local function run(callback) end
+
+            ---@param value string?
+            ---@param flag boolean
+            local function use(value, flag)
+                if run(function()
+                    if value == nil then
+                        return false
+                    elseif flag then
+                        print(value)
+                    end
+                    local after = value
+                    return true
+                end) and flag then
+                end
+            end
+            "#,
+        );
+        let after = ws.local_ty(file_id, "after");
+        expect_that!(ws.humanize_type(after), eq("string"));
+    }
+
+    #[gtest]
     fn a_repeat_without_an_exit_leaves_the_following_code_unreachable() {
         expect_that!(
             local_after_in_function(

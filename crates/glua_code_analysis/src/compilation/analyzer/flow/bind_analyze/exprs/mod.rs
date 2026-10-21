@@ -31,13 +31,20 @@ pub fn bind_condition_expr(
 
     // Condition expressions can narrow any variable they mention; record all
     // referenced names / index paths so the flow-walk skip stays sound.
-    binder.record_condition_refs_in_expr(&condition_expr);
+    let records_refs = !binder.condition_refs_recorded;
+    if records_refs {
+        binder.record_condition_refs_in_expr(&condition_expr);
+        binder.condition_refs_recorded = true;
+    }
 
     binder.true_target = true_target;
     binder.false_target = false_target;
     bind_expr(binder, condition_expr.clone(), current);
     binder.true_target = old_true_target;
     binder.false_target = old_false_target;
+    if records_refs {
+        binder.condition_refs_recorded = false;
+    }
 
     if !is_binary_logical(&condition_expr) {
         let true_condition =
@@ -104,11 +111,15 @@ pub fn bind_closure_expr(
     let old_continue = binder.continue_target_label;
     let old_true = binder.true_target;
     let old_false = binder.false_target;
+    let old_condition_refs_recorded = binder.condition_refs_recorded;
     binder.loop_label = binder.unreachable;
     binder.break_target_label = binder.unreachable;
     binder.continue_target_label = binder.unreachable;
     binder.true_target = binder.unreachable;
     binder.false_target = binder.unreachable;
+    // The body's statements take their own snapshots, so its conditions record
+    // their references again.
+    binder.condition_refs_recorded = false;
 
     bind_each_child(binder, LuaAst::LuaClosureExpr(closure_expr), entry);
 
@@ -117,6 +128,7 @@ pub fn bind_closure_expr(
     binder.continue_target_label = old_continue;
     binder.true_target = old_true;
     binder.false_target = old_false;
+    binder.condition_refs_recorded = old_condition_refs_recorded;
     Some(())
 }
 

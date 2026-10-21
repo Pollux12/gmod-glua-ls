@@ -58,6 +58,9 @@ pub struct FlowBinder<'a> {
     pub continue_target_label: FlowId,
     pub true_target: FlowId,
     pub false_target: FlowId,
+    /// Whether the condition being bound already recorded its references,
+    /// which cover every operand an `and`/`or` binds as a condition of its own.
+    pub condition_refs_recorded: bool,
     flow_nodes: Vec<FlowNode>,
     multiple_antecedents: Vec<Vec<FlowId>>,
     /// Each block's labels by name, with where each is written.
@@ -97,6 +100,7 @@ impl<'a> FlowBinder<'a> {
             loop_label: FlowId::default(),
             true_target: FlowId::default(),
             false_target: FlowId::default(),
+            condition_refs_recorded: false,
             branch_label_info: FxHashMap::default(),
             condition_label_entries: FxHashMap::default(),
             assignment_flow_info: Vec::new(),
