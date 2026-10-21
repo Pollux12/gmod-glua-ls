@@ -475,8 +475,7 @@ fn refine_known_vgui_panel_return(
     };
     let is_registered = db
         .get_gmod_class_metadata_index()
-        .get_vgui_panel_base(type_id.get_name())
-        .is_some();
+        .has_vgui_panel(type_id.get_name());
     // String-template inference also creates auto-generated placeholders; those
     // do not prove that the engine can construct the named panel.
     let is_placeholder = db
@@ -552,8 +551,7 @@ fn refine_known_vgui_parent_return(
         )
     } else {
         child_ids.iter().any(|child_id| {
-            type_decl_is_vgui_panel(db, child_id, 0)
-                || metadata.get_vgui_panel_base(child_id.get_name()).is_some()
+            type_decl_is_vgui_panel(db, child_id, 0) || metadata.has_vgui_panel(child_id.get_name())
         })
     };
     if !is_vgui_receiver {

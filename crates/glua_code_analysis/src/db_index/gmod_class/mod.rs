@@ -9,7 +9,7 @@ use smol_str::SmolStr;
 
 use super::LuaIndex;
 use crate::{
-    FileId, LuaTypeDeclId,
+    FileId, LuaTypeDeclId, Vfs,
     db_index::derivation::{self, FactKey, Fingerprint},
 };
 
@@ -948,8 +948,11 @@ impl GmodClassMetadataIndex {
         file_ids
     }
 
+    /// `name`'s panel registrations, in [`Vfs::file_order_key`] order and then
+    /// by where each sits in its file.
     pub fn find_vgui_panel_definitions(
         &self,
+        vfs: &Vfs,
         name: &str,
     ) -> Vec<(FileId, &GmodScriptedClassCallMetadata)> {
         derivation::note_read(|| FactKey::GmodMeta(SmolStr::new(name)));
@@ -977,12 +980,15 @@ impl GmodClassMetadataIndex {
             }
         }
 
-        definitions.sort_by_key(|(file_id, call)| (file_id.id, call.syntax_id.get_range().start()));
+        Self::sort_definitions(vfs, &mut definitions);
         definitions
     }
 
+    /// `name`'s skin registrations, in [`Vfs::file_order_key`] order and then
+    /// by where each sits in its file.
     pub fn find_derma_skin_definitions(
         &self,
+        vfs: &Vfs,
         name: &str,
     ) -> Vec<(FileId, &GmodScriptedClassCallMetadata)> {
         derivation::note_read(|| FactKey::GmodMeta(SmolStr::new(name)));
@@ -1006,16 +1012,39 @@ impl GmodClassMetadataIndex {
             }
         }
 
-        definitions.sort_by_key(|(file_id, call)| (file_id.id, call.syntax_id.get_range().start()));
+        Self::sort_definitions(vfs, &mut definitions);
         definitions
     }
 
-    pub fn get_vgui_panel_base(&self, name: &str) -> Option<Option<String>> {
+    fn sort_definitions(vfs: &Vfs, definitions: &mut [(FileId, &GmodScriptedClassCallMetadata)]) {
+        definitions.sort_by_cached_key(|(file_id, call)| {
+            (
+                vfs.file_order_key(file_id),
+                call.syntax_id.get_range().start(),
+            )
+        });
+    }
+
+    /// Whether some file registers a panel named `name`.
+    pub fn has_vgui_panel(&self, name: &str) -> bool {
+        derivation::note_read(|| FactKey::GmodMeta(SmolStr::new(name)));
+        self.vgui_panels.contains_key(name)
+    }
+
+    /// The base of `name`'s first registration in [`Vfs::file_order_key`]
+    /// order: `None` when no file registers it, `Some(None)` when that
+    /// registration names no base.
+    pub fn get_vgui_panel_base(&self, vfs: &Vfs, name: &str) -> Option<Option<String>> {
         derivation::note_read(|| FactKey::GmodMeta(SmolStr::new(name)));
         self.vgui_panels.get(name).map(|definitions| {
             definitions
                 .iter()
-                .min_by_key(|definition| (definition.file_id.id, definition.range_start))
+                .min_by_key(|definition| {
+                    (
+                        vfs.file_order_key(&definition.file_id),
+                        definition.range_start,
+                    )
+                })
                 .and_then(|definition| definition.base_name.clone())
         })
     }
@@ -1117,7 +1146,7 @@ mod tests {
         GmodClassCallArg, GmodClassCallLiteral, GmodClassMetadataIndex, GmodScriptedClassCallKind,
         GmodScriptedClassCallMetadata,
     };
-    use crate::FileId;
+    use crate::{FileId, Vfs};
 
     fn range(start: u32) -> TextRange {
         TextRange::new(TextSize::new(start), TextSize::new(start + 1))
@@ -1157,26 +1186,48 @@ mod tests {
         }
     }
 
+    /// Two files registering one panel elect the base of the file earlier in
+    /// `Vfs::file_order_key`, though its id is the larger, and list their
+    /// registrations in that order.
     #[test]
-    fn duplicate_vgui_panel_base_prefers_deterministic_file_order() {
-        let mut index = GmodClassMetadataIndex::new();
-        let canonical_file = FileId::new(1);
-        let shadow_file = FileId::new(2);
+    fn duplicate_vgui_panel_base_follows_file_order_not_file_id() {
+        let mut vfs = Vfs::new();
+        let later_file = vfs.file_id(
+            &"file:///addons/panels/lua/vgui/b_panel.lua"
+                .parse::<lsp_types::Uri>()
+                .expect("valid test uri"),
+        );
+        let earlier_file = vfs.file_id(
+            &"file:///addons/panels/lua/vgui/a_panel.lua"
+                .parse::<lsp_types::Uri>()
+                .expect("valid test uri"),
+        );
+        assert!(earlier_file.id > later_file.id);
+        assert!(vfs.file_order_key(&earlier_file) < vfs.file_order_key(&later_file));
 
+        let mut index = GmodClassMetadataIndex::new();
         index.add_call(
-            canonical_file,
+            later_file,
             GmodScriptedClassCallKind::VguiRegister,
-            vgui_register_call("DeterministicPanel", "DFrame", 10),
+            vgui_register_call("SharedPanel", "DPanel", 10),
         );
         index.add_call(
-            shadow_file,
+            earlier_file,
             GmodScriptedClassCallKind::VguiRegister,
-            vgui_register_call("DeterministicPanel", "EditablePanel", 20),
+            vgui_register_call("SharedPanel", "DFrame", 20),
         );
 
         assert_eq!(
-            index.get_vgui_panel_base("DeterministicPanel"),
+            index.get_vgui_panel_base(&vfs, "SharedPanel"),
             Some(Some("DFrame".to_string()))
+        );
+        assert_eq!(
+            index
+                .find_vgui_panel_definitions(&vfs, "SharedPanel")
+                .into_iter()
+                .map(|(file_id, _)| file_id)
+                .collect::<Vec<_>>(),
+            vec![earlier_file, later_file]
         );
     }
 
@@ -1199,11 +1250,12 @@ mod tests {
             vgui_register_call("Panel", "DFrame", 10),
         );
 
+        let vfs = Vfs::new();
         assert_eq!(
-            index.get_vgui_panel_base("Panel"),
+            index.get_vgui_panel_base(&vfs, "Panel"),
             Some(Some("DFrame".to_string()))
         );
-        assert_eq!(index.find_vgui_panel_definitions("Panel").len(), 1);
+        assert_eq!(index.find_vgui_panel_definitions(&vfs, "Panel").len(), 1);
     }
 
     #[test]
@@ -1225,9 +1277,10 @@ mod tests {
             vgui_register_call("NewPanel", "EditablePanel", 10),
         );
 
-        assert_eq!(index.get_vgui_panel_base("OldPanel"), None);
+        let vfs = Vfs::new();
+        assert_eq!(index.get_vgui_panel_base(&vfs, "OldPanel"), None);
         assert_eq!(
-            index.get_vgui_panel_base("NewPanel"),
+            index.get_vgui_panel_base(&vfs, "NewPanel"),
             Some(Some("EditablePanel".to_string()))
         );
     }

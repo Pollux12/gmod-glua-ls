@@ -3057,11 +3057,11 @@ end
         let db = ws.get_db_mut();
         let definitions = db
             .get_gmod_class_metadata_index()
-            .find_vgui_panel_definitions("AnnotatedPanel");
+            .find_vgui_panel_definitions(db.get_vfs(), "AnnotatedPanel");
         assert_eq!(definitions.len(), 1);
         assert_eq!(
             db.get_gmod_class_metadata_index()
-                .get_vgui_panel_base("AnnotatedPanel"),
+                .get_vgui_panel_base(db.get_vfs(), "AnnotatedPanel"),
             Some(Some("DFrame".to_string()))
         );
 
@@ -3116,11 +3116,11 @@ end
         let db = ws.get_db_mut();
         let definitions = db
             .get_gmod_class_metadata_index()
-            .find_vgui_panel_definitions("CrossFilePanel");
+            .find_vgui_panel_definitions(db.get_vfs(), "CrossFilePanel");
         assert_eq!(definitions.len(), 1);
         assert_eq!(
             db.get_gmod_class_metadata_index()
-                .get_vgui_panel_base("CrossFilePanel"),
+                .get_vgui_panel_base(db.get_vfs(), "CrossFilePanel"),
             Some(Some("DFrame".to_string()))
         );
 
@@ -3170,11 +3170,11 @@ end
         let db = ws.get_db_mut();
         let definitions = db
             .get_gmod_class_metadata_index()
-            .find_vgui_panel_definitions("ColonPanel");
+            .find_vgui_panel_definitions(db.get_vfs(), "ColonPanel");
         assert_eq!(definitions.len(), 1);
         assert_eq!(
             db.get_gmod_class_metadata_index()
-                .get_vgui_panel_base("ColonPanel"),
+                .get_vgui_panel_base(db.get_vfs(), "ColonPanel"),
             Some(Some("DFrame".to_string()))
         );
 
@@ -3186,6 +3186,118 @@ end
             paint_member.is_some(),
             "expected colon-call annotated wrapper to synthesize panel members"
         );
+    }
+
+    const SHARED_PANEL_A: &str = "lua/vgui/a_panel.lua";
+    const SHARED_PANEL_A_TEXT: &str = r#"
+            local PANEL = {}
+            function PANEL:Init() end
+            vgui.Register("SharedPanel", PANEL, "DFrame")
+        "#;
+    const SHARED_PANEL_B: &str = "lua/vgui/b_panel.lua";
+    const SHARED_PANEL_B_TEXT: &str = r#"
+            local PANEL = {}
+            function PANEL:Init() end
+            vgui.Register("SharedPanel", PANEL, "DPanel")
+        "#;
+
+    fn shared_panel_workspace(ws: &mut VirtualWorkspace) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+    }
+
+    fn shared_panel_base(ws: &VirtualWorkspace) -> Option<Option<String>> {
+        let db = ws.analysis.compilation.get_db();
+        db.get_gmod_class_metadata_index()
+            .get_vgui_panel_base(db.get_vfs(), "SharedPanel")
+    }
+
+    fn shared_panel_definition_files(ws: &VirtualWorkspace) -> Vec<crate::FileId> {
+        let db = ws.analysis.compilation.get_db();
+        db.get_gmod_class_metadata_index()
+            .find_vgui_panel_definitions(db.get_vfs(), "SharedPanel")
+            .into_iter()
+            .map(|(file_id, _)| file_id)
+            .collect()
+    }
+
+    /// Two files registering one panel elect the base of the one first by
+    /// path, whichever was defined first.
+    #[gtest]
+    fn test_duplicate_vgui_panel_base_follows_file_path_not_definition_order() {
+        for files in [
+            [
+                (SHARED_PANEL_A, SHARED_PANEL_A_TEXT),
+                (SHARED_PANEL_B, SHARED_PANEL_B_TEXT),
+            ],
+            [
+                (SHARED_PANEL_B, SHARED_PANEL_B_TEXT),
+                (SHARED_PANEL_A, SHARED_PANEL_A_TEXT),
+            ],
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            shared_panel_workspace(&mut ws);
+            for (path, text) in files {
+                ws.def_file(path, text);
+            }
+            let a_panel = ws
+                .analysis
+                .get_file_id(&ws.virtual_url_generator.new_uri(SHARED_PANEL_A))
+                .expect("a_panel file id");
+            let b_panel = ws
+                .analysis
+                .get_file_id(&ws.virtual_url_generator.new_uri(SHARED_PANEL_B))
+                .expect("b_panel file id");
+
+            assert_eq!(shared_panel_base(&ws), Some(Some("DFrame".to_string())));
+            assert_eq!(shared_panel_definition_files(&ws), vec![a_panel, b_panel]);
+        }
+    }
+
+    /// Deleting and re-creating the file first by path gives it the larger
+    /// id; its base still wins, and the workspace matches a cold build.
+    #[gtest]
+    fn test_duplicate_vgui_panel_base_survives_recreating_the_earlier_file() {
+        let shifted_a = format!("\n{SHARED_PANEL_A_TEXT}");
+        let mut warm = VirtualWorkspace::assert_warm_matches_cold(
+            shared_panel_workspace,
+            &[
+                (SHARED_PANEL_A, SHARED_PANEL_A_TEXT),
+                (SHARED_PANEL_B, SHARED_PANEL_B_TEXT),
+            ],
+            &[(SHARED_PANEL_A, shifted_a.as_str())],
+        );
+        assert_eq!(shared_panel_base(&warm), Some(Some("DFrame".to_string())));
+
+        let a_uri = warm.virtual_url_generator.new_uri(SHARED_PANEL_A);
+        let old_a_panel = warm
+            .analysis
+            .remove_file_by_uri(&a_uri)
+            .0
+            .expect("a_panel should be removed");
+        assert_eq!(shared_panel_base(&warm), Some(Some("DPanel".to_string())));
+
+        let a_panel = warm.def_file(SHARED_PANEL_A, SHARED_PANEL_A_TEXT);
+        let b_panel = warm
+            .analysis
+            .get_file_id(&warm.virtual_url_generator.new_uri(SHARED_PANEL_B))
+            .expect("b_panel file id");
+        assert_ne!(a_panel, old_a_panel);
+        assert!(a_panel.id > b_panel.id);
+        assert_eq!(shared_panel_base(&warm), Some(Some("DFrame".to_string())));
+        assert_eq!(shared_panel_definition_files(&warm), vec![a_panel, b_panel]);
+
+        let mut cold = VirtualWorkspace::new();
+        shared_panel_workspace(&mut cold);
+        cold.def_files(vec![
+            (SHARED_PANEL_A, SHARED_PANEL_A_TEXT),
+            (SHARED_PANEL_B, SHARED_PANEL_B_TEXT),
+        ]);
+        assert_eq!(shared_panel_base(&cold), shared_panel_base(&warm));
+        assert_eq!(warm.semantic_digest(), cold.semantic_digest());
+        assert!(warm.stale_derivations().is_empty());
     }
 
     #[gtest]
@@ -3390,10 +3502,10 @@ end
         "#,
         );
 
-        let definitions = ws
-            .get_db_mut()
+        let db = ws.get_db_mut();
+        let definitions = db
             .get_gmod_class_metadata_index()
-            .find_derma_skin_definitions("AnnotatedSkin");
+            .find_derma_skin_definitions(db.get_vfs(), "AnnotatedSkin");
 
         assert_eq!(definitions.len(), 1);
     }
@@ -3429,17 +3541,17 @@ end
         );
         assert!(
             db.get_gmod_class_metadata_index()
-                .find_vgui_panel_definitions("LookalikePanel")
+                .find_vgui_panel_definitions(db.get_vfs(), "LookalikePanel")
                 .is_empty()
         );
         assert!(
             db.get_gmod_class_metadata_index()
-                .find_vgui_panel_definitions("LookalikeControl")
+                .find_vgui_panel_definitions(db.get_vfs(), "LookalikeControl")
                 .is_empty()
         );
         assert!(
             db.get_gmod_class_metadata_index()
-                .find_derma_skin_definitions("LookalikeSkin")
+                .find_derma_skin_definitions(db.get_vfs(), "LookalikeSkin")
                 .is_empty()
         );
     }

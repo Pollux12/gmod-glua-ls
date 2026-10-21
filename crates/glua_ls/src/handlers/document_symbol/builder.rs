@@ -576,7 +576,7 @@ impl<'a> DocumentSymbolBuilder<'a> {
             if let Some(base_name) = self
                 .db
                 .get_gmod_class_metadata_index()
-                .get_vgui_panel_base(decl_id.get_simple_name())
+                .get_vgui_panel_base(self.db.get_vfs(), decl_id.get_simple_name())
             {
                 let detail = if let Some(base_name) = base_name {
                     format!(

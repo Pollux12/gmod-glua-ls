@@ -505,7 +505,7 @@ fn goto_vgui_panel_definition(
     let definitions = semantic_model
         .get_db()
         .get_gmod_class_metadata_index()
-        .find_vgui_panel_definitions(&panel_name);
+        .find_vgui_panel_definitions(semantic_model.get_db().get_vfs(), &panel_name);
 
     let mut locations = Vec::new();
     for (file_id, call) in definitions {
@@ -561,7 +561,7 @@ fn goto_derma_skin_definition(
     let definitions = semantic_model
         .get_db()
         .get_gmod_class_metadata_index()
-        .find_derma_skin_definitions(&context.name);
+        .find_derma_skin_definitions(semantic_model.get_db().get_vfs(), &context.name);
 
     let mut locations = Vec::new();
     for (file_id, call) in definitions {

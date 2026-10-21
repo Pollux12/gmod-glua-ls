@@ -813,7 +813,7 @@ fn get_vgui_panel_name(db: &DbIndex, typ: &LuaType) -> Option<(String, Option<St
             let type_name = type_decl_id.get_simple_name();
             let base_name = db
                 .get_gmod_class_metadata_index()
-                .get_vgui_panel_base(type_name)?;
+                .get_vgui_panel_base(db.get_vfs(), type_name)?;
             Some((type_name.to_string(), base_name))
         }
         LuaType::Generic(generic) => {
@@ -821,7 +821,7 @@ fn get_vgui_panel_name(db: &DbIndex, typ: &LuaType) -> Option<(String, Option<St
             let type_name = type_decl_id.get_simple_name();
             let base_name = db
                 .get_gmod_class_metadata_index()
-                .get_vgui_panel_base(type_name)?;
+                .get_vgui_panel_base(db.get_vfs(), type_name)?;
             Some((type_name.to_string(), base_name))
         }
         LuaType::Instance(instance) => get_vgui_panel_name(db, instance.get_base()),

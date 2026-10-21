@@ -511,7 +511,7 @@ fn search_vgui_panel_string_references(
     for (file_id, call) in semantic_model
         .get_db()
         .get_gmod_class_metadata_index()
-        .find_vgui_panel_definitions(&context.name)
+        .find_vgui_panel_definitions(semantic_model.get_db().get_vfs(), &context.name)
     {
         let definition_range = call.define_arg_range(GmodScriptedClassCallKind::VguiRegister);
         let Some(document) = semantic_model.get_document_by_file_id(file_id) else {
@@ -670,7 +670,7 @@ fn search_derma_skin_string_references(
     for (file_id, call) in semantic_model
         .get_db()
         .get_gmod_class_metadata_index()
-        .find_derma_skin_definitions(&context.name)
+        .find_derma_skin_definitions(semantic_model.get_db().get_vfs(), &context.name)
     {
         let definition_range = call.define_arg_range(GmodScriptedClassCallKind::DermaDefineSkin);
         let Some(document) = semantic_model.get_document_by_file_id(file_id) else {

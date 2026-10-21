@@ -568,7 +568,7 @@ fn get_vgui_panel_name(
             let base_name = semantic_model
                 .get_db()
                 .get_gmod_class_metadata_index()
-                .get_vgui_panel_base(type_name)?;
+                .get_vgui_panel_base(semantic_model.get_db().get_vfs(), type_name)?;
 
             Some((type_name.to_string(), base_name))
         }
@@ -578,7 +578,7 @@ fn get_vgui_panel_name(
             let base_name = semantic_model
                 .get_db()
                 .get_gmod_class_metadata_index()
-                .get_vgui_panel_base(type_name)?;
+                .get_vgui_panel_base(semantic_model.get_db().get_vfs(), type_name)?;
 
             Some((type_name.to_string(), base_name))
         }
@@ -1201,7 +1201,7 @@ fn get_scripted_entity_suffix(
     if let Some(base_name) = semantic_model
         .get_db()
         .get_gmod_class_metadata_index()
-        .get_vgui_panel_base(type_name)
+        .get_vgui_panel_base(semantic_model.get_db().get_vfs(), type_name)
     {
         return Some(match base_name {
             Some(base) => format!(" ({type_name} : {base})"),
