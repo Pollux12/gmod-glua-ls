@@ -108,9 +108,9 @@ struct FileEvidence {
 /// Call-site parameter evidence. Each call's `CallSiteParam` derivation
 /// replaces that call's evidence ([`FactKey::CallSiteParam`]) and a file's
 /// `CallSiteParams` derivation its callback receivers'
-/// ([`FactKey::CallSiteCallbacks`]); a parameter's inferred fact
-/// ([`FactKey::Contrib`]) is the fold of every source's evidence for it, in
-/// file order and then source order.
+/// ([`FactKey::CallSiteCallbacks`]); a parameter's fact
+/// ([`FactKey::Contrib`]) is whether any source has evidence for it and the
+/// fold of that evidence, in file order and then source order.
 #[derive(Debug, Default, Clone)]
 pub struct CallSiteParamIndex {
     /// file → the evidence its sources contributed. No empty entries.
@@ -562,11 +562,18 @@ impl CallSiteParamIndex {
 
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
         match key {
-            FactKey::Contrib(signature_id, param_idx) => derivation::fingerprint_opt(
-                self.inferred_params
-                    .get(signature_id)
-                    .and_then(|params| params.get(param_idx)),
-            ),
+            FactKey::Contrib(signature_id, param_idx) => {
+                if self.contributors.contains_key(&(*signature_id, *param_idx)) {
+                    derivation::fingerprint_of(
+                        &self
+                            .inferred_params
+                            .get(signature_id)
+                            .and_then(|params| params.get(param_idx)),
+                    )
+                } else {
+                    derivation::ABSENT
+                }
+            }
             FactKey::CallSiteParam(site) => derivation::fingerprint_opt(
                 self.source_contributions(site.file_id, EvidenceSource::call(site.value)),
             ),
@@ -621,10 +628,8 @@ impl LuaIndex for CallSiteParamIndex {
     }
 
     fn clear(&mut self) {
-        for (signature_id, params) in &self.inferred_params {
-            for param_idx in params.keys() {
-                derivation::note_write(|| FactKey::Contrib(*signature_id, *param_idx));
-            }
+        for (signature_id, param_idx) in self.contributors.keys() {
+            derivation::note_write(|| FactKey::Contrib(*signature_id, *param_idx));
         }
         for (file_id, held) in self.file_contributions.iter() {
             derivation::note_write(|| FactKey::CallSiteFile(*file_id));

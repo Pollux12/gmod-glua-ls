@@ -407,4 +407,18 @@ mod tests {
             assert_eq!(index.get_inferred_param(&signature, 0), Some(&LuaType::Nil));
         }
     }
+
+    #[test]
+    fn untyped_evidence_moves_the_fact_its_presence_is_read_through() {
+        let caller = FileId::new(1);
+        let signature = signature_id(FileId::new(10), 0);
+        let key = FactKey::Contrib(signature, 0);
+        let empty = CallSiteParamIndex::new();
+        let mut untyped = CallSiteParamIndex::new();
+        untyped.set_call_contributions(caller, call(0, 10), vec![(signature, 0, None)]);
+
+        assert!(!empty.has_param_evidence(&signature, 0));
+        assert!(untyped.has_param_evidence(&signature, 0));
+        assert_ne!(empty.fact_fingerprint(&key), untyped.fact_fingerprint(&key));
+    }
 }
