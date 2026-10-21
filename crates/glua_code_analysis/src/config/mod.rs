@@ -21,8 +21,8 @@ pub use configs::{
     EmmyrcGmodScriptedClassDefinition, EmmyrcGmodScriptedClassScaffold,
     EmmyrcGmodScriptedClassScaffoldFile, EmmyrcGmodScriptedClassScopeEntry,
     EmmyrcGmodScriptedClassScopes, EmmyrcHover, EmmyrcInlayHint, EmmyrcInlineValues,
-    EmmyrcLuaVersion, EmmyrcReference, EmmyrcReformat, EmmyrcResource, EmmyrcRuntime,
-    EmmyrcSemanticToken, EmmyrcStrict, EmmyrcWorkspace, EmmyrcWorkspaceModuleMap,
+    EmmyrcLuaVersion, EmmyrcNonStdSymbol, EmmyrcReference, EmmyrcReformat, EmmyrcResource,
+    EmmyrcRuntime, EmmyrcSemanticToken, EmmyrcStrict, EmmyrcWorkspace, EmmyrcWorkspaceModuleMap,
     IgnoreDirDefaultDefinition, IgnoreDirDefaultEntry, ResolvedGmodScriptedClassDefinition,
     ResolvedGmodScriptedClassMatch,
 };

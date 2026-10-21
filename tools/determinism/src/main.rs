@@ -37,8 +37,10 @@
 //!   the edited text.
 //! - `noop`: re-index each target with unchanged text; the oracle is the base.
 //!   Any evaluated file outside the targets is a locality divergence.
-//! - `reload`: the configuration applied again and every file submitted again
-//!   on the settled analysis, as a configuration reload does.
+//! - `reload`: the settled analysis reloaded as the server reloads its
+//!   configuration, to the configuration `reconfigure` makes (an analysis
+//!   setting and a parse setting changed), compared with a cold build of it,
+//!   then back (`reload+back`), compared with the base.
 //! - `exact`: remove and re-add exactly the targets in one batch (a bisect
 //!   aid).
 //! - `schedule`: cold build taking files in reverse order within each rank,
@@ -96,8 +98,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, FileId, Schedule, Slice, UpdateProgress, WorkspaceFolder,
-    collect_workspace_files, load_configs,
+    EmmyLuaAnalysis, Emmyrc, EmmyrcNonStdSymbol, FileId, Schedule, Slice, UpdateProgress,
+    WorkspaceFolder, collect_workspace_files, load_configs,
 };
 use glua_parser::{LineIndex, LuaParser};
 use lsp_types::{DiagnosticSeverity, NumberOrString};
@@ -176,6 +178,8 @@ struct ColdInput {
     /// Files moved from the first path to the second with their text, each
     /// keeping its id as the server's move does.
     moved: Vec<(PathBuf, PathBuf, String)>,
+    /// Whether the configuration is the one [`reconfigure`] makes.
+    reconfigured: bool,
 }
 
 /// The codebase's configuration, as the server loads it.
@@ -189,6 +193,16 @@ fn workspace_config(codebase: &Path) -> Emmyrc {
     emmyrc.gmod.enabled = true;
     emmyrc.pre_process_emmyrc(codebase);
     emmyrc
+}
+
+/// The configuration the `reload` stage moves to: one setting that changes
+/// what the index derives and one that changes how every file parses.
+fn reconfigure(emmyrc: &mut Emmyrc) {
+    emmyrc.strict.array_index = !emmyrc.strict.array_index;
+    emmyrc
+        .runtime
+        .nonstandard_symbol
+        .retain(|symbol| *symbol != EmmyrcNonStdSymbol::Continue);
 }
 
 /// Adds the annotations, the codebase and the configured libraries as
@@ -228,7 +242,10 @@ fn build_cold(
     batches: usize,
     schedule: Schedule,
 ) -> EmmyLuaAnalysis {
-    let emmyrc = workspace_config(codebase);
+    let mut emmyrc = workspace_config(codebase);
+    if input.reconfigured {
+        reconfigure(&mut emmyrc);
+    }
     let mut analysis = EmmyLuaAnalysis::new();
     analysis.compilation.set_schedule(schedule);
     analysis.update_config(Arc::new(emmyrc.clone()));
@@ -2056,6 +2073,35 @@ impl Warm {
     }
 }
 
+/// The cold input the `reload` stage compares with before reloading back.
+fn reload_input() -> ColdInput {
+    ColdInput {
+        reconfigured: true,
+        ..ColdInput::default()
+    }
+}
+
+/// Reloads `warm` with `emmyrc` as the server reloads its configuration: the
+/// configuration applied, the workspaces added again and the collected files
+/// submitted, in one rebuild when the change reaches the index; then every
+/// file diagnosed again.
+fn reload_with(warm: &mut Warm, codebase: &Path, annotations: &Path, emmyrc: Emmyrc) -> Reach {
+    let rebuild = warm.apply_config(Arc::new(emmyrc.clone())).affects_index();
+    let changes = add_workspaces(warm, codebase, annotations, &emmyrc)
+        .into_iter()
+        .map(|(path, text)| (file_uri(&path), text))
+        .collect::<Vec<_>>();
+    if rebuild {
+        warm.stage_file_system_changes(changes);
+        warm.begin_full_reindex();
+        warm.advance_reindex(Slice::Whole);
+    } else {
+        warm.update_files_by_uri(changes);
+    }
+    let every_file = warm.get_main_workspace_file_ids_for_diagnostics();
+    warm.settled(every_file)
+}
+
 fn settle(
     warm: &mut Warm,
     uri: &lsp_types::Uri,
@@ -2880,6 +2926,7 @@ impl Harness<'_> {
                         .map(|target_file| self.edit_input(std::slice::from_ref(target_file))),
                 ),
                 "burst" => inputs.push(self.edit_input(targets)),
+                "reload" => inputs.push(reload_input()),
                 "gate" => inputs.extend(
                     targets
                         .iter()
@@ -2973,18 +3020,36 @@ impl Harness<'_> {
         self.finish("burst", warm, &ids, &reach, false, &input);
     }
 
-    /// Reloads the workspace as the server does when its configuration
-    /// changes: the configuration applied again, the workspaces added again and
-    /// every file submitted again, on the settled analysis. The oracle is the
+    /// Reloads the settled workspace as the server does when its
+    /// configuration changes, to the configuration [`reconfigure`] makes and
+    /// back. The oracles are a cold build of that configuration, then the
     /// base.
     fn reload(&mut self) {
-        let mut warm = self.warm();
         let emmyrc = workspace_config(&self.codebase);
-        warm.update_config(Arc::new(emmyrc.clone()));
-        let files = add_workspaces(&mut warm, &self.codebase, &self.annotations, &emmyrc);
-        let affected = warm.update_files_by_path(files);
-        let reach = warm.settled(affected);
-        self.finish("reload", warm, &[], &reach, false, &ColdInput::default());
+        let mut reconfigured = emmyrc.clone();
+        reconfigure(&mut reconfigured);
+        assert!(
+            emmyrc.change_to(&reconfigured).affects_index(),
+            "the reload stage's configuration change should reach the index"
+        );
+        let mut warm = self.warm();
+        let reach = reload_with(&mut warm, &self.codebase, &self.annotations, reconfigured);
+        let mut back = Warm {
+            analysis: warm.fork(),
+            shown: warm.shown.clone(),
+        };
+        back.compilation.start_batch_log();
+        self.finish("reload", warm, &[], &reach, false, &reload_input());
+        self.warm_started = Instant::now();
+        let reach = reload_with(&mut back, &self.codebase, &self.annotations, emmyrc);
+        self.finish(
+            "reload+back",
+            back,
+            &[],
+            &reach,
+            false,
+            &ColdInput::default(),
+        );
     }
 
     /// Types the edit into each target as the language server takes it; see
@@ -3516,8 +3581,7 @@ fn run() {
     let started = Instant::now();
     let jobs = env_usize("DET_JOBS", 2).max(1);
     // Every other stage compares with a cold build other than the base.
-    let base_only =
-        |stage: &str| matches!(stage, "revert" | "noop" | "reload" | "exact" | "unrewrite");
+    let base_only = |stage: &str| matches!(stage, "revert" | "noop" | "exact" | "unrewrite");
     assert!(
         jobs >= 2 || stages.iter().all(|stage| base_only(stage)),
         "a cold-build comparison stage needs DET_JOBS of at least 2: its cold build waits for a slot the live base holds"
