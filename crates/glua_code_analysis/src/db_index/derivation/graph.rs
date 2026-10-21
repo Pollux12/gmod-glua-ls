@@ -1252,10 +1252,11 @@ pub struct ReaderGraph {
     derivations: Paged<DerivSlot>,
     free_derivations: Vec<DerivIdx>,
     by_file: FxHashMap<FileId, FxHashSet<DerivIdx>>,
-    /// Derivations that produced a key owned by another file, by that file.
-    /// Removing the file's facts removes their outputs too, so they must run
-    /// again when it is re-analysed.
-    foreign_producers: FxHashMap<FileId, FxHashSet<DerivIdx>>,
+    /// Derivations that produce keys owned by another file, by that file,
+    /// with how many such keys each produces. Removing the file's facts
+    /// removes their outputs too, so they must run again when it is
+    /// re-analysed.
+    foreign_producers: FxHashMap<FileId, FxHashMap<DerivIdx, u32>>,
     /// Cached fingerprints taken in an older generation are forgotten.
     generation: u32,
     /// Slots [`Self::file_viewed_part`] left unreferenced, kept until every
@@ -1795,10 +1796,12 @@ impl ReaderGraph {
             if let Some(owner) = self.key(key).owning_file()
                 && owner != id.file_id
             {
-                self.foreign_producers
+                *self
+                    .foreign_producers
                     .entry(owner)
                     .or_default()
-                    .insert(deriv);
+                    .entry(deriv)
+                    .or_default() += 1;
             }
         }
         let dropped = dropped
@@ -1874,7 +1877,7 @@ impl ReaderGraph {
             .foreign_producers
             .get(&file_id)
             .into_iter()
-            .flatten()
+            .flat_map(FxHashMap::keys)
             .map(|deriv| self.derivations[*deriv as usize].id)
             .collect();
         ids.sort();
@@ -2815,10 +2818,14 @@ impl ReaderGraph {
         if let Some(owner) = self.key(key).owning_file()
             && owner != file_id
             && let Some(derivs) = self.foreign_producers.get_mut(&owner)
+            && let Some(count) = derivs.get_mut(&deriv)
         {
-            derivs.remove(&deriv);
-            if derivs.is_empty() {
-                self.foreign_producers.remove(&owner);
+            *count -= 1;
+            if *count == 0 {
+                derivs.remove(&deriv);
+                if derivs.is_empty() {
+                    self.foreign_producers.remove(&owner);
+                }
             }
         }
     }
@@ -3318,6 +3325,20 @@ mod tests {
         graph.replace(id(2, 0), vec![], vec![key(2)], |_| 0);
 
         assert!(graph.foreign_producers(FileId::new(1)).is_empty());
+    }
+
+    #[test]
+    fn a_derivation_still_writing_another_files_key_stays_its_foreign_producer() {
+        let other_key = HashedKey::new(FactKey::LoadSites(FileId::new(1)));
+        let mut kept = ReaderGraph::default();
+        kept.replace(id(2, 0), vec![], vec![key(1), other_key.clone()], |_| 0);
+        kept.replace(id(2, 0), vec![], vec![other_key.clone()], |_| 0);
+        let mut swapped = ReaderGraph::default();
+        swapped.replace(id(2, 0), vec![], vec![key(1)], |_| 0);
+        swapped.replace(id(2, 0), vec![], vec![other_key], |_| 0);
+
+        assert_eq!(kept.foreign_producers(FileId::new(1)), vec![id(2, 0)]);
+        assert_eq!(swapped.foreign_producers(FileId::new(1)), vec![id(2, 0)]);
     }
 
     #[test]
