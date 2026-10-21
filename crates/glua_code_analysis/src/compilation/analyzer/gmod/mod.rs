@@ -4888,8 +4888,6 @@ struct NetworkVarWrapper {
     is_local: bool,
 }
 
-/// Detect wrapper functions that internally call NetworkVar/NetworkVarElement
-/// and synthesize Get/Set members from their call sites.
 /// Synthesizes the members a scripted-scope file's network-var wrapper calls
 /// define.
 fn synthesize_network_var_wrappers(
