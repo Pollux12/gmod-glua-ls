@@ -52,7 +52,6 @@ struct Contributions {
     files: HashMap<FileId, (Arc<FileHelperScan>, FileRank)>,
     paths: HashMap<String, Vec<(FileRank, FileId)>>,
     net_ops: HashMap<(SmolStr, NetOpDirection), Vec<(FileRank, FileId)>>,
-    environment_files: HashMap<FileId, usize>,
     globals: HashMap<GlobalId, Vec<(DefinitionRank, Target)>>,
     /// Global functions by the method name their path ends in.
     methods: HashMap<SmolStr, Vec<(DefinitionRank, Target)>>,
@@ -67,7 +66,6 @@ struct Contributions {
 struct Touched {
     paths: HashSet<String>,
     net_ops: HashSet<(SmolStr, NetOpDirection)>,
-    environment_files: HashSet<FileId>,
     globals: HashSet<GlobalId>,
     methods: HashSet<SmolStr>,
     signatures: HashSet<LuaSignatureId>,
@@ -128,10 +126,6 @@ impl Contributions {
                 .or_default()
                 .push((rank.clone(), file_id));
             touched.net_ops.insert(key.clone());
-        }
-        for file in &role_map.environment_role_source_files {
-            *self.environment_files.entry(*file).or_default() += 1;
-            touched.environment_files.insert(*file);
         }
         for (signature_id, body_file, syntax_id, global_id, local_member) in &scan.definitions {
             let name = global_id
@@ -201,15 +195,6 @@ impl Contributions {
         for key in role_map.canonical_net_ops.keys() {
             retract(&mut self.net_ops, key, |(_, file)| *file != file_id);
             touched.net_ops.insert(key.clone());
-        }
-        for file in &role_map.environment_role_source_files {
-            if let Some(count) = self.environment_files.get_mut(file) {
-                *count -= 1;
-                if *count == 0 {
-                    self.environment_files.remove(file);
-                }
-            }
-            touched.environment_files.insert(*file);
         }
         let other_file = |(_, (body_file, _)): &(DefinitionRank, Target)| *body_file != file_id;
         for (signature_id, _, _, global_id, local_member) in &scan.definitions {
@@ -405,13 +390,6 @@ impl GmodCallRoles {
                 None => {
                     roles.canonical_net_ops.remove(key);
                 }
-            }
-        }
-        for file_id in &touched.environment_files {
-            if contributions.environment_files.contains_key(file_id) {
-                roles.environment_role_source_files.insert(*file_id);
-            } else {
-                roles.environment_role_source_files.remove(file_id);
             }
         }
         let registry = Arc::make_mut(&mut self.registry);

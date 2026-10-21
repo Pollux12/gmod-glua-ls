@@ -7270,7 +7270,6 @@ pub(crate) struct AnnotatedGmodGlobalCallRoleMap {
     receiver_paths: HashMap<SmolStr, HashSet<String>>,
     /// Each path's roles fingerprinted once, when its file's scan is built.
     path_fingerprints: HashMap<String, crate::db_index::derivation::Fingerprint>,
-    environment_role_source_files: HashSet<FileId>,
     /// Canonical function metadata per `(wire_format, direction)`, published to
     /// the network index for features that must emit a net call. Values keep
     /// their precedence rank so the winner does not depend on the signature
@@ -8063,11 +8062,6 @@ impl AnnotatedGmodGlobalCallRoleMap {
     fn fingerprint(&self) -> crate::db_index::derivation::Fingerprint {
         let mut roles = self.roles_by_path.iter().collect::<Vec<_>>();
         roles.sort_by(|a, b| a.0.cmp(b.0));
-        let mut environment_files = self
-            .environment_role_source_files
-            .iter()
-            .collect::<Vec<_>>();
-        environment_files.sort();
         // Readers see the selected op. Its rank only orders duplicates within
         // one file, which an edit that shifts them cannot reorder.
         let mut net_ops = self
@@ -8076,7 +8070,7 @@ impl AnnotatedGmodGlobalCallRoleMap {
             .map(|((name, direction), (_, op))| (name, format!("{direction:?}"), op))
             .collect::<Vec<_>>();
         net_ops.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-        crate::db_index::derivation::fingerprint_of(&(roles, environment_files, net_ops))
+        crate::db_index::derivation::fingerprint_of(&(roles, net_ops))
     }
 
     /// One file's contribution to the role map, plus the helper definitions its
@@ -8218,10 +8212,6 @@ impl AnnotatedGmodGlobalCallRoleMap {
             return;
         };
         if let Some(roles) = roles_from_signature(db, signature_id) {
-            if roles.candidate_presence().has_environment {
-                self.environment_role_source_files
-                    .insert(signature_id.get_file_id());
-            }
             let fingerprint = crate::db_index::derivation::fingerprint_of(&roles);
             self.roles_by_path.insert(call_path.clone(), roles.clone());
             self.path_fingerprints
