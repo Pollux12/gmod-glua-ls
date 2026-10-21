@@ -501,6 +501,15 @@ impl super::engine::Recipe for Recipes {
     }
 }
 
+/// `cache`'s view with the call-site parameter index hidden: what a call's
+/// target and its contributions are derived under, since they feed it.
+fn without_call_site_params(cache: &crate::LuaInferCache) -> crate::CacheOptions {
+    crate::CacheOptions {
+        call_site_params_visible: false,
+        ..cache.get_config().clone()
+    }
+}
+
 /// Whether a file's locals are guessed from their uses: only once the run has
 /// closed, since a local still waiting on its initializer is not one the
 /// initializer left without a type.
@@ -605,15 +614,15 @@ impl Recipes {
             }
             DerivationKind::CallTarget => {
                 let cache = context.infer_manager.get_infer_cache(id.file_id);
-                cache.config_mut().call_site_params_visible = false;
-                call_target::derive_call_target(db, cache, id.syntax_id());
-                cache.config_mut().call_site_params_visible = true;
+                cache.with_config(without_call_site_params(cache), |cache| {
+                    call_target::derive_call_target(db, cache, id.syntax_id());
+                });
             }
             DerivationKind::CallSiteParam => {
                 let cache = context.infer_manager.get_infer_cache(id.file_id);
-                cache.config_mut().call_site_params_visible = false;
-                call_site_params::derive_call_site_param(db, cache, id.syntax_id());
-                cache.config_mut().call_site_params_visible = true;
+                cache.with_config(without_call_site_params(cache), |cache| {
+                    call_site_params::derive_call_site_param(db, cache, id.syntax_id());
+                });
             }
             DerivationKind::CallSiteParams => {
                 let contributions =
