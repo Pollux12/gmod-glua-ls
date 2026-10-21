@@ -259,8 +259,15 @@ impl LuaCompilation {
             let Some(reanalysis) = session.as_mut() else {
                 return;
             };
-            if reanalysis.needs_stale_check() {
-                reanalysis.check_stale(&self.db);
+            if let Some(files) = reanalysis.stale_check_files() {
+                // Checked off the lock, which every freshness question takes.
+                drop(session);
+                let stale = crate::profile::phase("reanalyze: stale diagnostics", || {
+                    analyzer::stale_among(&self.db, files)
+                });
+                if let Some(reanalysis) = self.session().as_mut() {
+                    reanalysis.keep_stale(&self.db, stale);
+                }
                 return;
             }
             reanalysis.take_detached()

@@ -362,6 +362,41 @@ local directional = state.directional
         assert!(affected.contains(&label), "{affected:?}");
     }
 
+    /// The check of which diagnostics went stale, left to readers sharing the
+    /// index, reports what a run that checks it itself reports.
+    #[test]
+    fn a_stale_check_run_by_readers_reports_what_the_run_would() {
+        let settled_affected = |detach: bool| {
+            let mut ws = workspace();
+            let label = {
+                let uri = ws.virtual_url_generator.new_uri(LABEL);
+                ws.analysis.get_file_id(&uri).expect("a workspace file")
+            };
+            ws.analysis
+                .diagnose_file(label, tokio_util::sync::CancellationToken::new());
+            ws.analysis.compilation.set_detached_tasks(detach);
+            let config = stage_text(&mut ws, CONFIG, EDITED_CONFIG);
+            ws.analysis.begin_reindex(vec![config]);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+            loop {
+                if ws.analysis.compilation.has_detached_tasks() {
+                    ws.analysis.compilation.run_detached_tasks();
+                }
+                if let UpdateProgress::Settled(affected) =
+                    ws.analysis.advance_reindex(Slice::Until(deadline))
+                {
+                    break (label, affected);
+                }
+            }
+        };
+
+        let (label, detached) = settled_affected(true);
+        let (_, inline) = settled_affected(false);
+
+        assert!(detached.contains(&label), "{detached:?}");
+        assert_eq!(detached, inline);
+    }
+
     /// A file still settling ahead of the rest keeps doing so when another
     /// file's edit is taken in: its document must not answer half evaluated.
     #[test]

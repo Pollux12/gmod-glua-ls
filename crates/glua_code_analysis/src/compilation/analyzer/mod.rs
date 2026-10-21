@@ -28,6 +28,7 @@ pub(crate) use dynamic_field::{
 pub(crate) use engine::EngineStats;
 #[cfg(test)]
 pub(crate) use engine::serial_engine;
+pub(crate) use engine::stale_among;
 pub use engine::{Schedule, Slice};
 pub(crate) use local_inference::{
     SubtypesWithMember, class_union_arms, class_union_arms_with_member, class_union_partial_arms,
@@ -608,6 +609,22 @@ impl Reanalysis {
     /// Whether the run is wrapped up and its stale diagnostics not checked.
     pub(crate) fn needs_stale_check(&self) -> bool {
         self.wrapped && self.stale.is_none()
+    }
+
+    /// The files to check for stale diagnostics off the session's lock, when
+    /// the check is due; [`Self::keep_stale`] takes the result.
+    pub(crate) fn stale_check_files(&self) -> Option<Vec<FileId>> {
+        self.needs_stale_check()
+            .then(|| self.engine.diagnosed_files())
+    }
+
+    /// Keeps `stale`, checked on the wrapped-up index, unless a check landed
+    /// meanwhile.
+    pub(crate) fn keep_stale(&mut self, db: &DbIndex, stale: Vec<FileId>) {
+        if self.needs_stale_check() {
+            self.engine.note_stale_diagnostics(db, &stale);
+            self.stale = Some(stale);
+        }
     }
 
     /// Checks which files' diagnostics went stale, on the wrapped-up index.

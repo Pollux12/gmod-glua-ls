@@ -1338,25 +1338,21 @@ impl Engine {
     /// The files whose diagnostics read a fact that moved and holds neither
     /// as it is nor with the edits mapped back, sorted.
     pub(crate) fn stale_diagnostics(&self, db: &DbIndex) -> Vec<crate::FileId> {
-        let graph = db.reader_graph();
-        let stale = self
-            .diagnostics
-            .iter()
-            .copied()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .filter(|file_id| {
-                graph.is_stale(
-                    DerivationId::diagnostics(*file_id),
-                    |key| db.fact_fingerprint(key),
-                    |_, _| false,
-                )
-            })
-            .collect::<Vec<_>>();
-        if crate::profile::tracing_evaluations() && !stale.is_empty() {
-            self.report_stale_diagnostics(db, &stale);
-        }
+        let stale = stale_among(db, self.diagnosed_files());
+        self.note_stale_diagnostics(db, &stale);
         stale
+    }
+
+    /// The files whose diagnostics were filed, for [`stale_among`].
+    pub(crate) fn diagnosed_files(&self) -> Vec<crate::FileId> {
+        self.diagnostics.iter().copied().collect()
+    }
+
+    /// Under `GLUALS_TRACE_EVALUATIONS`, reports what made `stale` stale.
+    pub(crate) fn note_stale_diagnostics(&self, db: &DbIndex, stale: &[crate::FileId]) {
+        if crate::profile::tracing_evaluations() && !stale.is_empty() {
+            self.report_stale_diagnostics(db, stale);
+        }
     }
 
     /// Under `GLUALS_TRACE_EVALUATIONS`, prints which kinds of moved facts made
@@ -5228,6 +5224,21 @@ enum SuperstepMode {
 /// `GLUALS_SUPERSTEP`: `off` runs the serial engine; unset or any other value
 /// runs each rank whose work spans files a superstep at a time with the tasks
 /// on worker threads.
+/// Which of `files`' diagnostics read a fact that has moved since.
+pub(crate) fn stale_among(db: &DbIndex, files: Vec<crate::FileId>) -> Vec<crate::FileId> {
+    let graph = db.reader_graph();
+    files
+        .into_par_iter()
+        .filter(|file_id| {
+            graph.is_stale(
+                DerivationId::diagnostics(*file_id),
+                |key| db.fact_fingerprint(key),
+                |_, _| false,
+            )
+        })
+        .collect()
+}
+
 fn superstep_mode() -> SuperstepMode {
     static MODE: std::sync::OnceLock<SuperstepMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("GLUALS_SUPERSTEP").as_deref() {
