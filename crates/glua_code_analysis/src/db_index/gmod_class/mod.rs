@@ -701,11 +701,23 @@ impl GmodClassMetadataIndex {
         old_metadata: &GmodScriptedClassCallMetadata,
         new_metadata: &GmodScriptedClassCallMetadata,
     ) {
-        let range_start = old_metadata.syntax_id.get_range().start();
+        self.remove_cached_call(file_id, kind, old_metadata);
+        self.update_vgui_panels_from_call(file_id, kind, new_metadata);
+        self.update_derma_skins_from_call(file_id, kind, new_metadata);
+    }
+
+    /// Removes one call site's contribution to the panel/skin caches.
+    fn remove_cached_call(
+        &mut self,
+        file_id: FileId,
+        kind: GmodScriptedClassCallKind,
+        metadata: &GmodScriptedClassCallMetadata,
+    ) {
+        let range_start = metadata.syntax_id.get_range().start();
         match kind {
             GmodScriptedClassCallKind::VguiRegister
             | GmodScriptedClassCallKind::DermaDefineControl => {
-                if let Some((panel_name, _)) = Self::maybe_extract_vgui_panel(kind, old_metadata) {
+                if let Some((panel_name, _)) = Self::maybe_extract_vgui_panel(kind, metadata) {
                     Self::remove_cached_entry(
                         &mut self.vgui_panels,
                         &panel_name,
@@ -714,12 +726,11 @@ impl GmodClassMetadataIndex {
                         |definition| (definition.file_id, definition.range_start),
                     );
                 }
-                self.update_vgui_panels_from_call(file_id, kind, new_metadata);
             }
             GmodScriptedClassCallKind::DermaDefineSkin => {
                 if let Some(skin_name) = Self::extract_non_empty_string_arg(
-                    old_metadata,
-                    old_metadata.derma_skin_define_arg_idx(),
+                    metadata,
+                    metadata.derma_skin_define_arg_idx(),
                 ) {
                     Self::remove_cached_entry(
                         &mut self.derma_skins,
@@ -729,7 +740,6 @@ impl GmodClassMetadataIndex {
                         |definition| (definition.file_id, definition.range_start),
                     );
                 }
-                self.update_derma_skins_from_call(file_id, kind, new_metadata);
             }
             _ => {}
         }
@@ -752,36 +762,6 @@ impl GmodClassMetadataIndex {
                 cache.remove(name);
             }
         }
-    }
-
-    fn recompute_derived_caches(&mut self) {
-        let mut vgui_panels = CowShards::default();
-        let mut derma_skins = CowShards::default();
-
-        for (file_id, file_metadata) in &self.file_metadata {
-            for call in &file_metadata.vgui_register_calls {
-                Self::insert_vgui_panel_from_call(
-                    &mut vgui_panels,
-                    *file_id,
-                    GmodScriptedClassCallKind::VguiRegister,
-                    call,
-                );
-            }
-            for call in &file_metadata.derma_define_control_calls {
-                Self::insert_vgui_panel_from_call(
-                    &mut vgui_panels,
-                    *file_id,
-                    GmodScriptedClassCallKind::DermaDefineControl,
-                    call,
-                );
-            }
-            for call in &file_metadata.derma_define_skin_calls {
-                Self::insert_derma_skin_from_call(&mut derma_skins, *file_id, call);
-            }
-        }
-
-        self.vgui_panels = vgui_panels;
-        self.derma_skins = derma_skins;
     }
 
     pub fn add_call(
@@ -1160,10 +1140,10 @@ impl GmodClassMetadataIndex {
                         call,
                         false,
                     );
+                    self.remove_cached_call(file_id, kind, call);
                 }
             }
         }
-        self.recompute_derived_caches();
     }
 
     fn clear_metadata(&mut self) {
