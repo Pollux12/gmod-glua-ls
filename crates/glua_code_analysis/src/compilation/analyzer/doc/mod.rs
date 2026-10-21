@@ -11,7 +11,6 @@ mod type_ref_tags;
 pub(crate) use type_ref_tags::register_inferred_accessor_generators;
 
 use super::AnalyzeContext;
-use super::common::estimate_file_index_entries;
 use crate::{
     FileId, LuaDocDefaultValue, LuaSemanticDeclId, LuaType, TypeOps, WorkspaceId,
     compilation::analyzer::AnalysisPipeline,
@@ -59,23 +58,6 @@ impl AnalysisPipeline for DocAnalysisPipeline {
         for in_filed_tree in tree_list.iter() {
             let root = &in_filed_tree.value;
             register_property_merge_order(db, in_filed_tree.file_id);
-            // Pre-size the member and reference tables for this file's writes.
-            // The decl phase already ran for this batch, so its decl count is
-            // a known per-file fact; the text length bounds the comment/tag
-            // walk without walking it. Either may over- or under-shoot; both
-            // only change rehashing, never indexed facts.
-            let decl_count = db
-                .get_decl_index()
-                .get_decl_tree(&in_filed_tree.file_id)
-                .map(|decl_tree| decl_tree.get_decls().len())
-                .unwrap_or(0);
-            let estimate =
-                estimate_file_index_entries(usize::from(root.syntax().text_range().len()))
-                    .max(decl_count.saturating_add(8).min(4096));
-            db.get_member_index_mut()
-                .add_file_entries(in_filed_tree.file_id);
-            db.get_reference_index_mut()
-                .reserve_for_file(in_filed_tree.file_id, estimate);
             let mut generic_index = FileGenericIndex::new();
             for comment in root.descendants::<LuaComment>() {
                 let mut analyzer = DocAnalyzer::new(
