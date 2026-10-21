@@ -1247,23 +1247,8 @@ fn collect_accessorfunc_annotated_call(
         return None;
     }
 
-    // A name a local binds reaches only the generator that local holds.
-    let local_callee = match &prefix_expr {
-        LuaExpr::NameExpr(name_expr) => {
-            local_callee_signature(analyzer.db, analyzer.file_id, name_expr)
-        }
-        _ => None,
-    };
-    let annotation = analyzer
-        .db
-        .get_accessor_func_index()
-        .get_annotations(&func_name)?
-        .iter()
-        .find(|annotation| match local_callee {
-            None => true,
-            Some(signature_id) => signature_id.is_some() && annotation.signature_id == signature_id,
-        })
-        .cloned()?;
+    let annotation =
+        accessor_generator(analyzer.db, analyzer.file_id, &prefix_expr, &func_name)?.clone();
 
     let args_list = call_expr.get_args_list()?;
     let args = args_list.get_args().collect::<Vec<_>>();
@@ -1411,6 +1396,28 @@ fn named_class_type_id(
 /// The function a local that `name_expr` reads was declared with and still holds;
 /// `Some(None)` for a local holding something else or reassigned, and `None` for a
 /// global name.
+/// The accessor generator a call of `func_name` through `prefix_expr`
+/// reaches: a name a local binds reaches only the generator that local holds,
+/// any other the first registered under the name.
+pub(in crate::compilation::analyzer) fn accessor_generator<'a>(
+    db: &'a DbIndex,
+    file_id: FileId,
+    prefix_expr: &LuaExpr,
+    func_name: &str,
+) -> Option<&'a crate::AccessorFuncAnnotation> {
+    let local_callee = match prefix_expr {
+        LuaExpr::NameExpr(name_expr) => local_callee_signature(db, file_id, name_expr),
+        _ => None,
+    };
+    db.get_accessor_func_index()
+        .get_annotations(func_name)?
+        .iter()
+        .find(|annotation| match local_callee {
+            None => true,
+            Some(signature_id) => signature_id.is_some() && annotation.signature_id == signature_id,
+        })
+}
+
 fn local_callee_signature(
     db: &DbIndex,
     file_id: FileId,

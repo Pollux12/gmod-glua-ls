@@ -3831,24 +3831,17 @@ fn synthesize_scripted_class_members(
             let class_decl_id =
                 get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
             for call in &metadata.accessor_func_calls {
-                if scripted_call_targets_scope_class(db, file_id, scope_match, call, "AccessorFunc")
-                {
+                if scripted_call_targets_scope_class(db, file_id, scope_match, call) {
                     synthesize_accessor_func(db, file_id, &class_decl_id, call);
                 }
             }
             for call in &metadata.network_var_calls {
-                if scripted_call_targets_scope_class(db, file_id, scope_match, call, "NetworkVar") {
+                if scripted_call_targets_scope_class(db, file_id, scope_match, call) {
                     synthesize_network_var(db, file_id, &class_decl_id, call);
                 }
             }
             for call in &metadata.network_var_element_calls {
-                if scripted_call_targets_scope_class(
-                    db,
-                    file_id,
-                    scope_match,
-                    call,
-                    "NetworkVarElement",
-                ) {
+                if scripted_call_targets_scope_class(db, file_id, scope_match, call) {
                     synthesize_network_var_element(db, file_id, &class_decl_id, call);
                 }
             }
@@ -3866,21 +3859,21 @@ fn synthesize_scripted_class_members(
 ///
 /// The target is the receiver of a `:` call (`self:NetworkVar(...)` targets
 /// `self`, whatever table it is — annotated wrappers invoked with `:` behave
-/// the same way). For a plain call the target is arg0, but only when the
-/// callee is the builtin helper itself: annotated wrappers
-/// (`addNetworkVar("Enabled", "Bool")`) and other callee names implicitly
-/// author the file's scripted class and carry no target argument.
+/// the same way). For a plain call the target is arg0 when the callee is an
+/// accessor generator whose accessors land on the table passed first
+/// (`AccessorFunc` and `@accessorfunc` wrappers); any other callee, such as
+/// an annotated network-var wrapper (`addNetworkVar("Enabled", "Bool")`),
+/// implicitly authors the file's scripted class and carries no target
+/// argument.
 ///
 /// When the target cannot be resolved — including calls copied in from
 /// another file's metadata by `copy_network_var_calls_from`, whose
-/// `syntax_id` does not exist in this file's tree — the call is kept
-/// (preserving prior behavior).
+/// `syntax_id` does not exist in this file's tree — the call is kept.
 fn scripted_call_targets_scope_class(
     db: &DbIndex,
     file_id: FileId,
     scope_match: &GmodScopedClassInfo,
     call: &GmodScriptedClassCallMetadata,
-    builtin_name: &str,
 ) -> bool {
     let Some(root) = db
         .get_vfs()
@@ -3906,12 +3899,10 @@ fn scripted_call_targets_scope_class(
         }
     } else {
         match call_expr.get_prefix_expr() {
-            // `Helper(target, ...)`: arg0 names the target table — but only
-            // for the builtin helper; an annotated wrapper or a shadowing
-            // local has no explicit target.
-            Some(LuaExpr::NameExpr(name_expr))
-                if name_expr.get_name_text().as_deref() == Some(builtin_name)
-                    && !name_expr_resolves_to_local(db, file_id, &name_expr) =>
+            // `Helper(target, ...)`: arg0 names the target table when the
+            // callee's accessors land on the table passed first.
+            Some(prefix @ LuaExpr::NameExpr(_))
+                if accessors_take_target_first(db, file_id, &prefix) =>
             {
                 call.args
                     .first()
@@ -3949,6 +3940,23 @@ fn scripted_call_targets_scope_class(
         // No target expression at all — keep the member.
         None => true,
     }
+}
+
+/// Whether a plain call through `prefix` reaches an accessor generator whose
+/// accessors land on the table it is passed first.
+fn accessors_take_target_first(db: &DbIndex, file_id: FileId, prefix: &LuaExpr) -> bool {
+    let LuaExpr::NameExpr(name_expr) = prefix else {
+        return false;
+    };
+    name_expr.get_name_text().is_some_and(|name| {
+        crate::compilation::analyzer::lua::call::accessor_generator(db, file_id, prefix, &name)
+            .is_some_and(|generator| {
+                generator
+                    .accessors
+                    .iter()
+                    .any(|template| template.owner == crate::AccessorOwner::Receiver)
+            })
+    })
 }
 
 /// The globals a scoped file's `self`/name references author members on:
