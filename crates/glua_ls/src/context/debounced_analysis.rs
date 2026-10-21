@@ -1,4 +1,4 @@
-use glua_code_analysis::{EmmyLuaAnalysis, FileId, Slice, UpdateProgress};
+use glua_code_analysis::{EmmyLuaAnalysis, FileId, Slice, UpdateProgress, uri_to_file_path};
 use lsp_types::{MessageType, ShowMessageParams, Uri};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -53,12 +53,12 @@ pub struct DebouncedAnalysis {
     /// because their edit is still queued or because the batch re-indexing them
     /// has not reached them.
     ///
-    /// Holds the URI the *client* used, so a request can be tested against its
-    /// own params without taking the analysis lock — which the re-index holds
-    /// for its whole duration, so resolving a file id first would wait out
-    /// exactly what this exists to avoid. Keyed by file id so entries are
-    /// cleared by identity rather than by matching that URI against the one the
-    /// VFS derived from a path, which need not be spelled the same way.
+    /// Holds a URI of the document, so a request can be tested against its own
+    /// params without taking the analysis lock — which the re-index holds for
+    /// its whole duration, so resolving a file id first would wait out exactly
+    /// what this exists to avoid. The client and the VFS need not spell one
+    /// document's URI the same way, so a request matches by the path both name;
+    /// entries are keyed by file id and cleared by identity.
     blocked_documents: Mutex<HashMap<FileId, Uri>>,
     /// True when document changes have arrived but reindex has not yet completed.
     /// Set synchronously by `begin_in_flight_change()` (called inline in the
@@ -770,12 +770,13 @@ impl DebouncedAnalysis {
             return true;
         }
         // Only ever a handful of documents are mid-edit at once.
+        let path = uri_to_file_path(uri);
         !self
             .blocked_documents
             .lock()
             .await
             .values()
-            .any(|blocked| blocked == uri)
+            .any(|blocked| blocked == uri || path.is_some() && uri_to_file_path(blocked) == path)
     }
 
     /// Whether a change to the document at `uri`, or one that may touch any
@@ -2922,6 +2923,24 @@ mod tests {
                     .unwrap_or_default()
             })
             .collect()
+    }
+
+    /// A document scheduled under one spelling of its URI is blocked for a
+    /// request that spells it another way.
+    #[gtest]
+    fn a_scheduled_document_is_blocked_whatever_its_uri_spelling() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
+            let (debounced_analysis, _peer) = loop_test_debounced_analysis(analysis);
+            let scheduled = Uri::from_str("file:///work/A.lua").expect("URI should parse");
+            let requested = Uri::from_str("file:///work/%41.lua").expect("URI should parse");
+            debounced_analysis.schedule(FileId::new(1), scheduled).await;
+            verify_that!(
+                debounced_analysis.file_is_answerable(&requested).await,
+                eq(false)
+            )
+        })
     }
 
     /// A requested rebuild analyses every file again on the loop, in slices,
