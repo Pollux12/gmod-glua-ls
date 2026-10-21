@@ -1133,42 +1133,50 @@ impl QuietPeriod {
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceFileMatcher {
-    include: Vec<String>,
-    exclude: Vec<String>,
+    /// `None` when a pattern is invalid: every file is included.
+    include: Option<wax::Any<'static>>,
+    /// `None` when a pattern is invalid: no file is excluded.
+    exclude: Option<wax::Any<'static>>,
     exclude_dir: Vec<PathBuf>,
 }
 
 impl WorkspaceFileMatcher {
     pub fn new(include: Vec<String>, exclude: Vec<String>, exclude_dir: Vec<PathBuf>) -> Self {
         Self {
-            include,
-            exclude,
+            include: compile_globs(&include, "include"),
+            exclude: compile_globs(&exclude, "exclude"),
             exclude_dir,
         }
     }
+
     pub fn is_match(&self, path: &Path, relative_path: &Path) -> bool {
         if self.exclude_dir.iter().any(|dir| path.starts_with(dir)) {
             return false;
         }
-
-        // let path_str = path.to_string_lossy().to_string().replace("\\", "/");
-        let exclude_matcher = wax::any(self.exclude.iter().map(|s| s.as_str()));
-        if let Ok(exclude_set) = exclude_matcher {
-            if exclude_set.is_match(relative_path) {
-                return false;
-            }
-        } else {
-            log::error!("Invalid exclude pattern");
+        if self
+            .exclude
+            .as_ref()
+            .is_some_and(|exclude| exclude.is_match(relative_path))
+        {
+            return false;
         }
+        self.include
+            .as_ref()
+            .is_none_or(|include| include.is_match(relative_path))
+    }
+}
 
-        let include_matcher = wax::any(self.include.iter().map(|s| s.as_str()));
-        if let Ok(include_set) = include_matcher {
-            return include_set.is_match(relative_path);
-        } else {
-            log::error!("Invalid include pattern");
+fn compile_globs(patterns: &[String], kind: &str) -> Option<wax::Any<'static>> {
+    let globs = patterns
+        .iter()
+        .map(|pattern| wax::Glob::new(pattern).map(wax::Glob::into_owned))
+        .collect::<Result<Vec<_>, _>>();
+    match globs.and_then(wax::any) {
+        Ok(globs) => Some(globs),
+        Err(err) => {
+            log::error!("Invalid {kind} pattern: {err}");
+            None
         }
-
-        true
     }
 }
 
