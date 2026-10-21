@@ -1553,4 +1553,65 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn refiling_a_member_under_another_owner_and_key_leaves_nothing_current_behind() {
+        let id = make_member_id(FileId::new(1), 10);
+        let old_key = LuaMemberKey::Name("old".into());
+        let mut index = LuaMemberIndex::new();
+        index.add_member(path("A"), make_member(id, "old"));
+
+        index.add_member(path("B"), make_member(id, "new"));
+
+        let current_history = index
+            .get_current_owner_member_history(&path("A"))
+            .iter()
+            .map(|member| member.get_id())
+            .collect::<Vec<_>>();
+        let current_for_old_key = index.get_current_members_for_key(&old_key).len();
+        let visible_under_old_slot = index.visible_member_count_for_owner_key(&path("A"), &old_key);
+        assert_eq!(
+            (current_history, current_for_old_key, visible_under_old_slot),
+            (Vec::new(), 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_member_forgotten_with_its_literal_is_unlisted_from_its_aliases() {
+        let literal = site(1, 10, 30);
+        let alias = LuaMemberOwner::Type(LuaTypeDeclId::global("Alias"));
+        let key = LuaMemberKey::Name("field".into());
+        let own = make_index_member_id(FileId::new(3), 5);
+        let homed = make_index_member_id(FileId::new(2), 20);
+        let mut index = LuaMemberIndex::new();
+        index.add_member(alias.clone(), make_member(own, "field"));
+        index.add_member(
+            LuaMemberOwner::Element(literal.clone()),
+            make_member(homed, "field"),
+        );
+        index.add_member_alias_to_owner(alias.clone(), homed);
+
+        let forgotten = index.remove_deleted_element_owners(&[literal]);
+
+        assert_eq!(
+            (forgotten, index.get_member_item(&alias, &key)),
+            (vec![homed], Some(&LuaMemberIndexItem::One(own)))
+        );
+    }
+
+    #[test]
+    fn removing_a_file_unlists_its_members_from_every_owner_they_were_listed_under() {
+        let away = LuaMemberOwner::Type(LuaTypeDeclId::global("Away"));
+        let member_id = make_member_id(FileId::new(2), 20);
+        let mut index = LuaMemberIndex::new();
+        index.add_member(path("Home"), make_member(member_id, "field"));
+        index.add_member_to_owner(away.clone(), member_id);
+
+        index.remove(FileId::new(2));
+
+        assert_eq!(
+            index.get_member_item(&away, &LuaMemberKey::Name("field".into())),
+            None
+        );
+    }
 }

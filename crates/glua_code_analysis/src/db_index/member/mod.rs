@@ -1095,11 +1095,20 @@ impl LuaMemberIndex {
                 self.bump_homing_revision();
                 self.note_member_move(id);
             }
-            if same_owner
-                && key_changed
-                && let Some(old_owner) = old_owner
-            {
-                self.remove_member_from_owner_slot(&old_owner, id);
+            match old_owner {
+                Some(old_owner) if same_owner && key_changed => {
+                    self.remove_member_from_owner_slot(&old_owner, id);
+                }
+                // The old owner keeps listing the id, but it is no longer the
+                // member's current home, so its current-only views let it go.
+                Some(old_owner) if !same_owner => {
+                    self.remove_member_from_visible_owner_key_index(&old_owner, id);
+                    self.remove_current_owner_member(&old_owner, id);
+                    if key_changed {
+                        self.remove_current_member_key(id);
+                    }
+                }
+                _ => {}
             }
             // A re-file under the same owner and key is a rewrite, not a new
             // membership: the owner-key indexes already hold the id, and
@@ -1239,6 +1248,7 @@ impl LuaMemberIndex {
         if self.owner_only_members.remove(&id) {
             self.note_object_write(id, homing);
         }
+        self.add_file_owner(id.file_id, owner.clone());
         self.merge_member_into_owner_item(owner, key, id);
         Some(())
     }
@@ -3296,64 +3306,7 @@ impl LuaMemberIndex {
             derivation::note_write(|| FactKey::MemberTransfer(member_id));
         }
         if let Some(owners) = owners {
-            let mut need_removed_owner = Vec::new();
-            for owner in owners {
-                // `iter_mut` invalidates the owner's revision on entry, so an
-                // owner holding none of this file's members must not be
-                // touched: an immutable peek keeps its reads fresh.
-                let affected = self.owner_members.get(&owner).is_some_and(|member_items| {
-                    member_items.get_member_items().any(|item| match item {
-                        LuaMemberIndexItem::One(id) => id.file_id == file_id,
-                        LuaMemberIndexItem::Many(ids) => ids.iter().any(|id| id.file_id == file_id),
-                    })
-                });
-                if !affected {
-                    continue;
-                }
-                if let Some(member_items) = self.owner_members.get_mut(&owner) {
-                    let mut need_removed_key = Vec::new();
-                    let mut unlisted = Vec::new();
-                    for (key, item) in member_items.iter_mut() {
-                        match item {
-                            LuaMemberIndexItem::One(id) => {
-                                if id.file_id == file_id {
-                                    need_removed_key.push(key.clone());
-                                }
-                            }
-                            LuaMemberIndexItem::Many(_) => {
-                                let left = item.retain_ids(|id| {
-                                    let keep = id.file_id != file_id;
-                                    if !keep {
-                                        unlisted.push((key.clone(), id));
-                                    }
-                                    keep
-                                });
-                                if !left {
-                                    need_removed_key.push(key.clone());
-                                }
-                            }
-                        }
-                    }
-
-                    for (key, id) in &unlisted {
-                        note_slot_write(&owner, key);
-                        member_items.note_id_removed(key, *id);
-                    }
-                    for key in need_removed_key {
-                        note_slot_write(&owner, &key);
-                        member_items.remove_member(&key);
-                    }
-                    note_owner_map_write(&owner);
-
-                    if member_items.is_empty() {
-                        need_removed_owner.push(owner);
-                    }
-                }
-            }
-
-            for owner in need_removed_owner {
-                self.remove_owner_entry(&owner);
-            }
+            self.unlist_from_owners(owners, |id| id.file_id == file_id);
         }
         for range in self
             .function_scope_ranges
@@ -3364,6 +3317,46 @@ impl LuaMemberIndex {
         }
         self.remove_file_definition_sites(file_id);
         self.recompute_global_path_class_winners(file_id);
+    }
+
+    /// Unlists every id `gone` accepts from `owners`' items, dropping the keys
+    /// and owners left empty.
+    fn unlist_from_owners(
+        &mut self,
+        owners: impl IntoIterator<Item = LuaMemberOwner>,
+        gone: impl Fn(LuaMemberId) -> bool,
+    ) {
+        for owner in owners {
+            // Taking an owner mutably invalidates its revision, so an owner
+            // listing none of the ids must not be touched: an immutable peek
+            // finds what to unlist and keeps the others' reads fresh.
+            let unlisted = self
+                .owner_members
+                .get(&owner)
+                .into_iter()
+                .flat_map(LuaOwnerMembers::iter)
+                .flat_map(|(key, item)| {
+                    item.member_ids_slice()
+                        .iter()
+                        .filter(|id| gone(**id))
+                        .map(move |id| (key.clone(), *id))
+                })
+                .collect::<Vec<_>>();
+            if unlisted.is_empty() {
+                continue;
+            }
+            let Some(member_items) = self.owner_members.get_mut(&owner) else {
+                continue;
+            };
+            for (key, id) in &unlisted {
+                note_slot_write(&owner, key);
+                member_items.remove_id(key, *id);
+            }
+            note_owner_map_write(&owner);
+            if member_items.is_empty() {
+                self.remove_owner_entry(&owner);
+            }
+        }
     }
 
     /// Recomputes the class winner of every global path this file proposed.
@@ -3411,15 +3404,30 @@ impl LuaMemberIndex {
         }
     }
 
-    /// Drops an owner entry from every file that registered it.
+    /// Drops an owner entry from the files of `member_ids`, the members it
+    /// held.
     ///
-    /// `set_member_owner` files it under the contributing member's file, so a
+    /// An owner is registered under each contributing member's file, so a
     /// single Element owner can be registered by several files at once.
-    fn remove_owner_from_all_files(&mut self, owner: &LuaMemberOwner) {
-        self.in_filed.retain(|_, set| {
-            set.remove(owner);
-            !set.is_empty()
-        });
+    fn remove_owner_from_files(
+        &mut self,
+        owner: &LuaMemberOwner,
+        member_ids: impl IntoIterator<Item = LuaMemberId>,
+    ) {
+        let mut files = member_ids
+            .into_iter()
+            .map(|id| id.file_id)
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        files.dedup();
+        for file_id in files {
+            if let Some(owners) = self.in_filed.get_mut(&file_id) {
+                owners.remove(owner);
+                if owners.is_empty() {
+                    self.in_filed.remove(&file_id);
+                }
+            }
+        }
     }
 
     /// Re-homes every table-literal owner in the edited file onto its new
@@ -3508,6 +3516,13 @@ impl LuaMemberIndex {
             })
             .collect();
         self.remap_definition_sites(map);
+        let mut moved_from: HashMap<LuaMemberOwner, Vec<LuaMemberId>> = HashMap::default();
+        for (member_id, old_owner, _) in &to_move {
+            moved_from
+                .entry(old_owner.clone())
+                .or_default()
+                .push(*member_id);
+        }
         for (member_id, old_owner, new_owner) in to_move {
             self.write_filed(member_id, |index| {
                 index.detach_filed_member(&old_owner, member_id);
@@ -3531,7 +3546,8 @@ impl LuaMemberIndex {
                 // exists for they are different files, and clearing the wrong
                 // one leaves a dead owner in the member file's set for the next
                 // sweep to act on.
-                self.remove_owner_from_all_files(&old_owner);
+                let moved = moved_from.remove(&old_owner).unwrap_or_default();
+                self.remove_owner_from_files(&old_owner, moved);
             }
         }
     }
@@ -3617,22 +3633,23 @@ impl LuaMemberIndex {
             // path's members.
             self.forget_definition_site(range);
             let owner = LuaMemberOwner::Element(range.clone());
+            let mut held = Vec::new();
             if let Some(member_items) = self.remove_owner_entry(&owner) {
                 let member_ids: Vec<LuaMemberId> = member_items
                     .get_member_items()
-                    .flat_map(|item| match item {
-                        LuaMemberIndexItem::One(id) => vec![*id],
-                        LuaMemberIndexItem::Many(ids) => ids.clone(),
-                    })
+                    .flat_map(|item| item.member_ids_slice().iter().copied())
                     .collect();
                 for id in member_ids {
                     self.forget_member(id);
                     forgotten.push(id);
+                    held.push(id);
                 }
             }
             let visible = self.member_owner_key_index.remove(&owner);
             let history = self.member_owner_key_history_index.remove(&owner);
-            self.current_owner_member_history.remove(&owner);
+            if let Some(current) = self.current_owner_member_history.remove(&owner) {
+                held.extend(current.iter().copied());
+            }
             if derivation::recording() {
                 for key in visible.iter().chain(history.iter()).flat_map(HashMap::keys) {
                     note_slot_write(&owner, key);
@@ -3640,7 +3657,21 @@ impl LuaMemberIndex {
             }
             note_owner_map_write(&owner);
             self.owner_history_fingerprints.remove(&owner);
-            self.remove_owner_from_all_files(&owner);
+            self.remove_owner_from_files(&owner, held);
+        }
+        // Members forgotten with their literal may still be listed under
+        // other owners, which are registered under the members' files.
+        let gone = forgotten.iter().copied().collect::<HashSet<_>>();
+        let mut files = forgotten.iter().map(|id| id.file_id).collect::<Vec<_>>();
+        files.sort_unstable();
+        files.dedup();
+        for file_id in files {
+            let owners = self
+                .in_filed
+                .get(&file_id)
+                .map(|owners| owners.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            self.unlist_from_owners(owners, |id| gone.contains(&id));
         }
         forgotten
     }
