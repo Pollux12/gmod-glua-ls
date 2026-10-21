@@ -517,14 +517,16 @@ pub fn bind_repeat_stat(
     binder.add_antecedent(until_label, block_flow_id);
     let until_entry = finish_flow_label(binder, until_label, block_flow_id);
 
-    // The loop is left either by the until condition turning true or by a `break`.
+    // The loop is left either by the until condition turning true or by a
+    // `break`; with neither, the code after it is unreachable.
     bind_repeat_exit(
         binder,
         repeat_stat.get_condition_expr(),
         until_entry,
         post_repeat_label,
     );
-    finish_flow_label(binder, post_repeat_label, until_entry)
+    let unreachable = binder.unreachable;
+    finish_flow_label(binder, post_repeat_label, unreachable)
 }
 
 fn bind_repeat_exit(

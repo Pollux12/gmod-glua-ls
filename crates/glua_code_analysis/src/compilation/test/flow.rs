@@ -9695,6 +9695,20 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn a_repeat_without_an_exit_leaves_the_following_code_unreachable() {
+        expect_that!(
+            local_after_in_function(
+                "---@param value string?
+---@param string_value string",
+                r#"repeat
+                    value = string_value
+                until false"#
+            ),
+            eq("string?")
+        );
+    }
+
+    #[gtest]
     fn a_repeat_continue_carries_its_state_through_the_until_condition_to_the_exit() {
         let params = "---@param value string?";
         let guard = "if value == nil then continue end";
