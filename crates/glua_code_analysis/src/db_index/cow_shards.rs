@@ -436,21 +436,23 @@ impl<K: ShardKey + Clone + Send + Sync + 'static, V: Clone + PartialEq + Send + 
                 let before = was.and_then(|was| was.get(&key));
                 let value = forked.remove(&key);
                 let now = target.get(&key);
-                if now == value.as_ref() {
-                    continue;
-                }
+                let identical = now == value.as_ref();
                 let value = if now == before {
                     value
                 } else if let Some(merge) = merge {
+                    // Merged even when both wrote the same value: two tasks'
+                    // equal sums are two changes.
                     let mut merged = target.remove(&key);
                     match merge(&mut merged, before, value.as_ref()) {
                         Ok(()) => merged,
                         Err(Conflict) => {
-                            conflicted = true;
+                            conflicted |= !identical;
                             replaced.values.extend(merged);
                             value
                         }
                     }
+                } else if identical {
+                    continue;
                 } else {
                     conflicted = true;
                     value
@@ -567,21 +569,23 @@ impl<K: ShardKey + Clone + Send + Sync + 'static, V: Clone + PartialEq + Send + 
                 let before = was.and_then(|was| was.get(&key));
                 let value = forked.remove(&key);
                 let now = target.get(&key);
-                if now == value.as_ref() {
-                    continue;
-                }
+                let identical = now == value.as_ref();
                 let value = if now == before {
                     value
                 } else if let Some(merge) = merge {
+                    // Merged even when both wrote the same value: two tasks'
+                    // equal sums are two changes.
                     let mut merged = target.remove(&key);
                     match merge(&mut merged, before, value.as_ref()) {
                         Ok(()) => merged,
                         Err(Conflict) => {
-                            fork_conflicted = true;
+                            fork_conflicted |= !identical;
                             replaced.values.extend(merged);
                             value
                         }
                     }
+                } else if identical {
+                    continue;
                 } else {
                     fork_conflicted = true;
                     value
@@ -1274,10 +1278,11 @@ impl<T: Clone + Default + PartialEq> MergeFork for CowCell<T> {
         if Arc::ptr_eq(&fork.0, &frozen.0) || fork == *frozen {
             return false;
         }
-        if Arc::ptr_eq(&self.0, &frozen.0) || *self == fork || *self == *frozen {
+        if Arc::ptr_eq(&self.0, &frozen.0) || *self == *frozen {
             *self = fork;
             return false;
         }
+        let identical = *self == fork;
         let mut merged = Some(std::mem::take(&mut **self));
         match merge(&mut merged, Some(&**frozen), Some(&*fork)) {
             Ok(()) => {
@@ -1286,7 +1291,7 @@ impl<T: Clone + Default + PartialEq> MergeFork for CowCell<T> {
             }
             Err(Conflict) => {
                 *self = fork;
-                true
+                !identical
             }
         }
     }
@@ -1298,13 +1303,14 @@ macro_rules! merge_fork_scalars {
             type Value = $ty;
 
             fn install_merging(&mut self, frozen: &Self, fork: Self, merge: Merge<$ty>) -> bool {
-                if fork == *frozen || *self == fork {
+                if fork == *frozen {
                     return false;
                 }
                 if *self == *frozen {
                     *self = fork;
                     return false;
                 }
+                let identical = *self == fork;
                 let mut merged = Some(*self);
                 match merge(&mut merged, Some(frozen), Some(&fork)) {
                     Ok(()) => {
@@ -1313,7 +1319,7 @@ macro_rules! merge_fork_scalars {
                     }
                     Err(Conflict) => {
                         *self = fork;
-                        true
+                        !identical
                     }
                 }
             }
@@ -1532,9 +1538,6 @@ pub(crate) fn merge_map<M: MapOf>(
     for key in changed {
         let (before, value) = (entry(frozen, key), entry(fork, key));
         let now = merged.entry_of(key);
-        if now == value {
-            continue;
-        }
         if now == before {
             match value {
                 Some(value) => merged.put_entry(key.clone(), value.clone()),
@@ -1542,10 +1545,20 @@ pub(crate) fn merge_map<M: MapOf>(
             }
             continue;
         }
+        let identical = now == value;
         let mut slot = merged.take_entry(key);
-        inner(&mut slot, before, value)?;
-        if let Some(slot) = slot {
-            merged.put_entry(key.clone(), slot);
+        match inner(&mut slot, before, value) {
+            Ok(()) => {
+                if let Some(slot) = slot {
+                    merged.put_entry(key.clone(), slot);
+                }
+            }
+            Err(Conflict) if identical => {
+                if let Some(value) = value {
+                    merged.put_entry(key.clone(), value.clone());
+                }
+            }
+            Err(conflict) => return Err(conflict),
         }
     }
     prune(current, M::is_empty);
@@ -2251,6 +2264,42 @@ mod tests {
         let (mut base, frozen) = (13u64, 10u64);
         assert!(!base.install_merging(&frozen, 11, merge_sum));
         assert_eq!(base, 14);
+    }
+
+    #[test]
+    fn two_tasks_making_the_same_change_to_a_sum_both_count() {
+        let mut base: CowShards<LuaMemberKey, u64> = CowShards::default();
+        base.insert(path_key("a"), 10);
+        let frozen = base.clone();
+        let forks = [1, 2].map(|_| {
+            let mut fork = frozen.fork();
+            *fork.get_mut(&path_key("a")).unwrap() += 1;
+            fork
+        });
+        let mut one_by_one = base.clone();
+        for fork in forks.clone() {
+            assert!(!one_by_one.install_merging(&frozen, fork, merge_sum));
+        }
+        let mut together = base.clone();
+        let conflicts = together.install_all(
+            &frozen,
+            forks.into_iter().enumerate().collect(),
+            Some(merge_sum),
+        );
+        let (mut scalar, scalar_frozen) = (10u64, 10u64);
+        for fork in [11, 11] {
+            assert!(!scalar.install_merging(&scalar_frozen, fork, merge_sum));
+        }
+
+        assert_eq!(
+            (
+                one_by_one.get(&path_key("a")),
+                together.get(&path_key("a")),
+                conflicts,
+                scalar
+            ),
+            (Some(&12), Some(&12), Vec::new(), 12)
+        );
     }
 
     #[test]
