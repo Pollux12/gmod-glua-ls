@@ -32,30 +32,12 @@ impl NetSiteKind {
 }
 
 /// One file's net sites, and how many of them name a position in each other
-/// file.
-#[derive(Debug, Clone, Default)]
+/// file. Two are the same when they file the same stored facts.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct FileNetSites {
     calls: FxHashMap<TextRange, NetSite>,
     helpers: FxHashMap<TextRange, NetSite>,
     named: FxHashMap<FileId, usize>,
-}
-
-/// Two files' net sites are the same when they file the same ranges with the
-/// same fingerprints.
-impl PartialEq for FileNetSites {
-    fn eq(&self, other: &Self) -> bool {
-        let same = |left: &FxHashMap<TextRange, NetSite>, right: &FxHashMap<TextRange, NetSite>| {
-            left.len() == right.len()
-                && left.iter().all(|(range, (_, fingerprint))| {
-                    right
-                        .get(range)
-                        .is_some_and(|(_, other)| other == fingerprint)
-                })
-        };
-        same(&self.calls, &other.calls)
-            && same(&self.helpers, &other.helpers)
-            && self.named == other.named
-    }
 }
 
 impl FileNetSites {
@@ -167,5 +149,41 @@ impl FileNetSites {
                 .fold(0u64, u64::wrapping_add)
                 .max(1)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fact;
+
+    impl DerivedFact for Fact {
+        fn fingerprint(&self) -> Fingerprint {
+            1
+        }
+    }
+
+    fn sites_with(fact: Arc<dyn DerivedFact>) -> FileNetSites {
+        let mut sites = FileNetSites::default();
+        sites.insert(
+            FileId::new(1),
+            NetSiteKind::Call,
+            TextRange::new(0.into(), 4.into()),
+            (fact, 1),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        sites
+    }
+
+    /// Sites that file another fact under the same fingerprint are not the
+    /// same: an install that took them for unchanged would keep the old fact.
+    #[test]
+    fn sites_filing_another_fact_with_the_same_fingerprint_differ() {
+        let fact: Arc<dyn DerivedFact> = Arc::new(Fact);
+
+        assert_eq!(sites_with(fact.clone()), sites_with(fact));
+        assert_ne!(sites_with(Arc::new(Fact)), sites_with(Arc::new(Fact)));
     }
 }
