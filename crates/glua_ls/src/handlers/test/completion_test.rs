@@ -3068,6 +3068,65 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_net_read_completion_skips_a_sender_whose_payload_is_opaque() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.network.completion.smart_read_suggestions = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "addons/test/lua/autorun/server/send.lua",
+            r#"
+            function SendWith(writer)
+                net.Start("MyMsg")
+                net.WriteString("hello")
+                writer()
+                net.Broadcast()
+            end
+            "#,
+        );
+
+        let (receive_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            net.Receive("MyMsg", function()
+                local x = net.<??>
+            end)
+            "#,
+        )?;
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/client/receive.lua",
+            receive_content.as_str(),
+        );
+
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        verify_that!(
+            items.iter().any(|item| {
+                item.sort_text
+                    .as_deref()
+                    .is_some_and(|sort_text| sort_text.starts_with("000_gmod_net_read"))
+            }),
+            eq(false)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_net_read_completion_rejects_unrelated_named_prefix() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

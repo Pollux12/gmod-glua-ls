@@ -100,7 +100,7 @@ fn check_read_write_mismatch(
         let mut best_mismatch: Option<CandidateMismatch> = None;
 
         for (send_file_id, send_flow, sender_sort_key) in matching_send_flows {
-            if send_flow.is_wrapped || send_flow.writes_opaque {
+            if !send_flow.payload_known() {
                 continue;
             }
 
@@ -549,7 +549,7 @@ fn check_bits_mismatch(
         let mut reported: FxHashSet<(usize, u32, u32)> = FxHashSet::default();
 
         for (send_file_id, send_flow, _) in matching_send_flows {
-            if send_flow.is_wrapped || send_flow.writes_opaque {
+            if !send_flow.payload_known() {
                 continue;
             }
 

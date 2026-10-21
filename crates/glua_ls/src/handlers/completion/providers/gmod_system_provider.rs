@@ -369,7 +369,7 @@ fn choose_preferred_send_flow<'a>(
 ) -> Option<(FileId, &'a NetSendFlow)> {
     send_flows
         .into_iter()
-        .filter(|(_, flow)| !flow.writes.is_empty())
+        .filter(|(_, flow)| flow.payload_known() && !flow.writes.is_empty())
         .max_by_key(|(send_file_id, flow)| {
             let sender_realm =
                 infer_index.get_realm_at_offset(send_file_id, flow.start_range.start());

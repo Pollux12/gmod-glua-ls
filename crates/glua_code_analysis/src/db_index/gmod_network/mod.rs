@@ -274,6 +274,14 @@ pub struct NetSendFlow {
     pub materialized_from: Option<NetFlowOrigin>,
 }
 
+impl NetSendFlow {
+    /// Whether `writes` is the transaction's whole payload, for payload
+    /// checks to compare against.
+    pub fn payload_known(&self) -> bool {
+        !self.is_wrapped && !self.writes_opaque
+    }
+}
+
 impl Hash for NetSendFlow {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let Self {

@@ -567,7 +567,7 @@ fn pattern_from_ops(ops: &[NetOpEntry]) -> Vec<PatternEntry> {
 fn group_send_flows_by_pattern(flows: &[(FileId, &NetSendFlow)]) -> Vec<PatternGroup> {
     let mut groups: HashMap<Vec<PatternEntry>, PatternGroup> = HashMap::new();
     for (file_id, flow) in flows {
-        if flow.is_wrapped || flow.writes_opaque {
+        if !flow.payload_known() {
             continue;
         }
         let pattern = pattern_from_ops(&flow.writes);
