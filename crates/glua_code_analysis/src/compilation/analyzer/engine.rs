@@ -2209,7 +2209,10 @@ impl Engine {
                 for key in &unowned {
                     db.reset_fact(key);
                 }
-            });
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+            self.forget_installed(db, &unowned, &reset);
             self.readers_of(db, unowned.iter().chain(reset.iter()));
             for producer in producers {
                 self.stats
