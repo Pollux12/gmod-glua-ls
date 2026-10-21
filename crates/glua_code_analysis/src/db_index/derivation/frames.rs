@@ -791,14 +791,12 @@ pub fn reuse(
                 if Arc::ptr_eq(&provenance.0.log, &evaluation.log_handle) {
                     // Computed by this evaluation: its reads are in the log already,
                     // within the innermost frame if it opened before them.
-                    if provenance.0.since <= super::last_write() {
-                        match provenance.freshness(table, &evaluation.log[range.clone()]) {
-                            Freshness::Unwritten => {}
-                            Freshness::Recomputing => return Reuse::Elsewhere,
-                            Freshness::Written => {
-                                count(|stats| stats.stale += 1);
-                                return Reuse::Stale;
-                            }
+                    match provenance.freshness(table, &evaluation.log[range.clone()]) {
+                        Freshness::Unwritten => {}
+                        Freshness::Recomputing => return Reuse::Elsewhere,
+                        Freshness::Written => {
+                            count(|stats| stats.stale += 1);
+                            return Reuse::Stale;
                         }
                     }
                     if provenance.0.since < evaluation.frame_stamp()
@@ -1779,6 +1777,23 @@ mod tests {
             ),
             (Reuse::Stale, Reuse::Stale, Reuse::Stale)
         );
+    }
+
+    /// A value this evaluation computed is stale once a key it read is marked
+    /// written, though this thread noted no write since.
+    #[test]
+    fn a_value_computed_here_is_stale_once_a_key_it_read_is_marked_written() {
+        let key = || FactKey::GmodRealm(FileId::new(1));
+        derivation::lend_keys(KeyTable::default());
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let frame = open_frame().expect("a table is lent");
+        derivation::note_read(key);
+        let value = close_frame(frame, 0).expect("the frame saw no taint");
+        note_written([derivation::HashedKey::new(key())]);
+        let result = reuse(&value, 0, &[], None);
+        derivation::end();
+        derivation::take_keys();
+        assert_eq!(result, Reuse::Stale);
     }
 
     /// A write of a key the evaluation read only through a reused value

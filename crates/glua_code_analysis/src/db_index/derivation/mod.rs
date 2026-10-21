@@ -1655,7 +1655,6 @@ fn contains_hashed(sorted: &[HashedKey], key: &HashedKey) -> bool {
 
 thread_local! {
     static KEYS: RefCell<Option<KeyTable>> = const { RefCell::new(None) };
-    static LAST_WRITE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CURRENT: RefCell<Option<Evaluation>> = const { RefCell::new(None) };
     /// Evaluations suspended on this thread by one begun inside them.
     static SUSPENDED: RefCell<Vec<Evaluation>> = const { RefCell::new(Vec::new()) };
@@ -2108,11 +2107,6 @@ static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0
 
 fn next_stamp() -> u64 {
     STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
-}
-
-/// The stamp of the latest write an evaluation made on this thread.
-fn last_write() -> u64 {
-    LAST_WRITE.with(std::cell::Cell::get)
 }
 
 fn latest_stamp() -> u64 {
@@ -2782,7 +2776,6 @@ pub fn note_write(key: impl FnOnce() -> FactKey) {
                 return;
             }
             let written = next_stamp();
-            LAST_WRITE.with(|last| last.set(written));
             // Inference memoised during an evaluation read only keys the
             // evaluation recorded, so a write it did not read leaves it valid.
             let read_here =

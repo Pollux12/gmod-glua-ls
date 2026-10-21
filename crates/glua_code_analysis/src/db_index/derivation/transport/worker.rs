@@ -502,7 +502,6 @@ pub(in super::super) struct SavedRecording {
     suspended: usize,
     untracked: u32,
     rehoming: u32,
-    last_write: Option<u64>,
     thread: PhantomData<Rc<()>>,
 }
 
@@ -516,15 +515,8 @@ impl SavedRecording {
             suspended: derivation::SUSPENDED.with(|suspended| suspended.borrow().len()),
             untracked: derivation::UNTRACKED.with(|depth| depth.replace(0)),
             rehoming: derivation::REHOMING.with(|depth| depth.replace(0)),
-            last_write: None,
             thread: PhantomData,
         }
-    }
-
-    fn worker() -> Self {
-        let mut saved = Self::take();
-        saved.last_write = Some(derivation::LAST_WRITE.with(|stamp| stamp.replace(0)));
-        saved
     }
 }
 
@@ -537,9 +529,6 @@ impl Drop for SavedRecording {
         WORKER.with(|worker| *worker.borrow_mut() = self.worker.take());
         derivation::UNTRACKED.with(|depth| depth.set(self.untracked));
         derivation::REHOMING.with(|depth| depth.set(self.rehoming));
-        if let Some(stamp) = self.last_write {
-            derivation::LAST_WRITE.with(|last| last.set(stamp));
-        }
     }
 }
 
@@ -549,7 +538,7 @@ pub(crate) fn compute_recorded<T>(
     compute: impl FnOnce() -> T,
     fingerprint: impl Fn(&HashedKey) -> Fingerprint,
 ) -> WorkerResult<T> {
-    let saved = SavedRecording::worker();
+    let saved = SavedRecording::take();
     let requires_canonical = Arc::new(AtomicBool::new(false));
     let query_scope = QueryScope(QUERY_VIEW.with(|view| {
         view.replace(Some(QueryView {
@@ -628,7 +617,7 @@ pub(crate) struct TaskRecorder {
 
 impl TaskRecorder {
     pub(crate) fn start(snapshot: &RecordingSnapshot) -> Self {
-        let saved = SavedRecording::worker();
+        let saved = SavedRecording::take();
         let requires_canonical = Arc::new(AtomicBool::new(false));
         let query_scope = QueryScope(QUERY_VIEW.with(|view| {
             view.replace(Some(QueryView {
