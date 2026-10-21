@@ -1,7 +1,7 @@
 use fern::Dispatch;
 use glua_code_analysis::{
     EmmyLibraryItem, EmmyLuaAnalysis, Emmyrc, WorkspaceFolder, collect_workspace_files,
-    detect_gamemode_base_libraries, load_configs, update_code_style,
+    detect_gamemode_base_libraries, load_configs, update_code_style, workspace_collection_folders,
 };
 use log::LevelFilter;
 use std::collections::HashSet;
@@ -107,67 +107,23 @@ pub async fn load_workspace(
         }
     }
 
-    let mut workspace_folders = cmd_workspace_folders
-        .iter()
-        .map(|path| WorkspaceFolder::new(path.clone(), false))
-        .collect::<Vec<WorkspaceFolder>>();
     let mut analysis = EmmyLuaAnalysis::new();
     analysis.update_config(emmyrc.clone().into());
     analysis.init_std_lib();
 
-    // Canonicalize main workspace root for self-overlap detection.
-    let main_root_canon = main_path.canonicalize().ok();
-
-    for lib in &emmyrc.workspace.library {
-        let configured = lib.get_path();
-        let path = PathBuf::from(configured);
-
-        // Filter invalid library paths: empty, nonexistent, not a directory,
-        // or resolves to the same path as the main workspace root (self-overlap
-        // would cause a redundant full re-scan of the workspace).
-        if configured.trim().is_empty() {
-            log::warn!(
-                "Skipping empty library path from config entry: {:?}",
-                configured
-            );
-            continue;
-        }
-        if !path.exists() {
-            log::warn!("Skipping library path that does not exist: {:?}", path);
-            continue;
-        }
-        if !path.is_dir() {
-            log::warn!("Skipping library path that is not a directory: {:?}", path);
-            continue;
-        }
-        if let (Ok(lib_canon), Some(ws_canon)) = (path.canonicalize(), &main_root_canon)
-            && lib_canon == *ws_canon
-        {
-            log::warn!(
-                "Skipping library path that resolves to the workspace root (self-overlap): {:?}",
-                path
-            );
-            continue;
-        }
-
-        analysis.add_library_workspace(path.clone());
-        workspace_folders.push(WorkspaceFolder::new(path.clone(), true));
-    }
-
-    for path in &workspace_folders {
-        if path.is_library {
-            continue;
-        }
-        analysis.add_main_workspace(path.root.clone());
-    }
-
-    for root in &emmyrc.workspace.workspace_roots {
-        analysis.add_main_workspace(PathBuf::from(root));
-    }
+    // Registered as the server registers them, so load order and library
+    // precedence match.
+    let workspace_folders = cmd_workspace_folders
+        .iter()
+        .flat_map(|root| workspace_collection_folders(Some(root.clone()), &emmyrc))
+        .collect::<Vec<WorkspaceFolder>>();
+    analysis.set_workspace_roots(&workspace_folders);
 
     let file_infos = collect_workspace_files(&workspace_folders, &analysis.emmyrc, None, ignore);
+    let mut loaded_paths = HashSet::new();
     let files = file_infos
         .into_iter()
+        .filter(|file| loaded_paths.insert(file.path.clone()))
         .filter_map(|file| {
             if file.path.ends_with(".editorconfig") {
                 let file_path = PathBuf::from(file.path);
@@ -464,5 +420,46 @@ mod tests {
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(annotations);
         let _ = fs::remove_dir_all(library);
+    }
+
+    /// A package directory loads as the server loads it.
+    #[tokio::test]
+    async fn loads_configured_package_dirs() {
+        let root = make_workspace();
+        let packages = make_workspace();
+        let package = packages.join("mypackage");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("init.lua"),
+            "PackageGlobal = 1
+",
+        )
+        .unwrap();
+        let config_path = root.join(".gluarc.json");
+        fs::write(
+            &config_path,
+            format!(
+                r#"{{"workspace":{{"packageDirs":["{}"]}}}}"#,
+                package.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+
+        let analysis = load_workspace(
+            root.clone(),
+            vec![root.clone()],
+            Some(vec![config_path]),
+            None,
+            None,
+        )
+        .await
+        .expect("workspace should load");
+
+        let uri = glua_code_analysis::file_path_to_uri(&package.join("init.lua"))
+            .expect("URI should parse");
+        assert!(analysis.get_file_id(&uri).is_some());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(packages);
     }
 }
