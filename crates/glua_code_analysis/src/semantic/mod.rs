@@ -41,8 +41,9 @@ use glua_parser::{
     LuaSyntaxKind, LuaSyntaxNode, LuaSyntaxToken, LuaTableExpr, LuaTokenKind, LuaVarExpr,
 };
 pub(crate) use gmod_vgui_context::{
-    find_latest_decl_write_before_position, registered_vgui_method_param_is_own_class,
-    resolve_registered_vgui_method_context, resolve_registered_vgui_method_context_for_func,
+    find_latest_decl_write_before_position, is_broad_panel_type,
+    registered_vgui_method_param_is_own_class, resolve_registered_vgui_method_context,
+    resolve_registered_vgui_method_context_for_func,
 };
 pub(crate) use infer::check_iter_var_range;
 pub(crate) use infer::get_prefix_expr_signature_id;

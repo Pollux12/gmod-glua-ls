@@ -105,6 +105,19 @@ fn panel_receiver_context_for_func(
     ))
 }
 
+/// Whether `typ` is the bare base panel, alone or with `nil`: the contract a
+/// lookup that cannot tell which panel it returns falls back to.
+pub(crate) fn is_broad_panel_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Ref(id) | LuaType::Def(id) => id.get_name() == "Panel",
+        LuaType::Union(union) => {
+            let mut types = union.types().filter(|typ| !typ.is_nil());
+            types.next().is_some_and(is_broad_panel_type) && types.all(is_broad_panel_type)
+        }
+        _ => false,
+    }
+}
+
 /// Whether the method the context names overrides a signature that marks
 /// `param_idx` with `call_arg("gmod.vgui_panel", "own_class")`.
 ///

@@ -115,22 +115,11 @@ pub(super) fn unguarded_child_severity(
     {
         return Some(*severity);
     }
-    (is_broad_panel_contract(found_type)
+    (crate::semantic::is_broad_panel_type(found_type)
         && index_expr.get_prefix_expr().is_some_and(|receiver| {
             receiver_has_broad_panel_contract(semantic_model, receiver, &mut FxHashSet::default())
         }))
     .then_some(lsp_types::DiagnosticSeverity::HINT)
-}
-
-fn is_broad_panel_contract(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Ref(id) | LuaType::Def(id) => id.get_name() == "Panel",
-        LuaType::Union(union) => {
-            let mut types = union.types().filter(|typ| !typ.is_nil());
-            types.next().is_some_and(is_broad_panel_contract) && types.all(is_broad_panel_contract)
-        }
-        _ => false,
-    }
 }
 
 fn receiver_has_broad_panel_contract(
@@ -175,14 +164,15 @@ fn receiver_has_broad_panel_contract(
                 return false;
             };
             match semantic_model.infer_expr(prefix) {
-                Ok(LuaType::DocFunction(func)) => is_broad_panel_contract(func.get_ret()),
+                Ok(LuaType::DocFunction(func)) => {
+                    crate::semantic::is_broad_panel_type(func.get_ret())
+                }
                 Ok(LuaType::Signature(id)) => {
                     db.get_signature_index().get(&id).is_some_and(|signature| {
                         signature.resolve_return == crate::SignatureReturnStatus::DocResolve
-                            && signature
-                                .return_docs
-                                .first()
-                                .is_some_and(|ret| is_broad_panel_contract(&ret.type_ref))
+                            && signature.return_docs.first().is_some_and(|ret| {
+                                crate::semantic::is_broad_panel_type(&ret.type_ref)
+                            })
                     })
                 }
                 _ => false,
@@ -216,7 +206,9 @@ fn receiver_has_broad_panel_contract(
             };
             db.get_type_index()
                 .get_type_cache(&id.into())
-                .is_some_and(|cache| cache.is_doc() && is_broad_panel_contract(cache.as_type()))
+                .is_some_and(|cache| {
+                    cache.is_doc() && crate::semantic::is_broad_panel_type(cache.as_type())
+                })
         }
         _ => false,
     }

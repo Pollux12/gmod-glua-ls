@@ -563,26 +563,26 @@ fn refine_known_vgui_parent_return(
     let mut parent_id = None;
     for child_id in &child_ids {
         if !metadata.vgui_panel_parent_chain_is_complete(child_id) {
-            if is_broad_panel_type(&return_type) {
+            if crate::semantic::is_broad_panel_type(&return_type) {
                 cache.mark_vgui_parent_fallback(call_expr.get_syntax_id());
             }
             return return_type;
         }
         let Some(chain) = metadata.get_vgui_panel_parent_chain(child_id) else {
-            if is_broad_panel_type(&return_type) {
+            if crate::semantic::is_broad_panel_type(&return_type) {
                 cache.mark_vgui_parent_fallback(call_expr.get_syntax_id());
             }
             return return_type;
         };
         let Some(candidate) = chain.get(depth - 1) else {
-            if is_broad_panel_type(&return_type) {
+            if crate::semantic::is_broad_panel_type(&return_type) {
                 cache.mark_vgui_parent_fallback(call_expr.get_syntax_id());
             }
             return return_type;
         };
         match &parent_id {
             Some(existing) if existing != candidate => {
-                if is_broad_panel_type(&return_type) {
+                if crate::semantic::is_broad_panel_type(&return_type) {
                     cache.mark_vgui_parent_fallback(call_expr.get_syntax_id());
                 }
                 return return_type;
@@ -599,32 +599,11 @@ fn refine_known_vgui_parent_return(
             LuaType::Ref(parent_id)
         }
         None => {
-            if is_broad_panel_type(&return_type) {
+            if crate::semantic::is_broad_panel_type(&return_type) {
                 cache.mark_vgui_parent_fallback(call_expr.get_syntax_id());
             }
             return_type
         }
-    }
-}
-
-fn is_broad_panel_type(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Ref(id) | LuaType::Def(id) => id.get_name() == "Panel",
-        LuaType::Union(union) => {
-            let mut has_panel = false;
-            for t in union.types() {
-                if t.is_nil() {
-                    continue;
-                }
-                if matches!(t, LuaType::Ref(id) | LuaType::Def(id) if id.get_name() == "Panel") {
-                    has_panel = true;
-                } else {
-                    return false;
-                }
-            }
-            has_panel
-        }
-        _ => false,
     }
 }
 
