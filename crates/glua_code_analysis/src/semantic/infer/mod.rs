@@ -410,6 +410,11 @@ where
         }
 
         let expr_type = infer(db, cache, expr.clone())?;
+        // Lua truncates every expression but the last to its first value.
+        if idx + 1 != exprs.len() {
+            value_types.push((first_value(db, expr_type), expr.get_range()));
+            continue;
+        }
         match expr_type {
             LuaType::Variadic(variadic) => {
                 if let Some(var_count) = var_count {
@@ -426,11 +431,7 @@ where
                     match variadic.deref() {
                         // The last expression in the list forwards every value
                         // it produces: `f(g())`, `f(...)` and `return f()` all
-                        // pass the whole pack on. In earlier positions Lua
-                        // truncates the expression to its first value.
-                        VariadicType::Base(base) if idx + 1 != exprs.len() => {
-                            value_types.push((base.clone(), expr.get_range()));
-                        }
+                        // pass the whole pack on.
                         VariadicType::Base(_) => {
                             value_types
                                 .push((LuaType::Variadic(variadic.clone()), expr.get_range()));
@@ -505,6 +506,28 @@ where
     }
 
     Ok(value_types)
+}
+
+/// The value an expression of type `typ` gives where Lua keeps only its first:
+/// the first slot of a multi-return, `nil` when it returns nothing. As where
+/// a union spreads, only its multi-return arms decide the slot.
+fn first_value(db: &DbIndex, typ: LuaType) -> LuaType {
+    let first_slot =
+        |variadic: &VariadicType| variadic.get_type(0).cloned().unwrap_or(LuaType::Nil);
+    match typ {
+        LuaType::Variadic(variadic) => first_slot(&variadic),
+        LuaType::Union(union) if union.types().any(|typ| matches!(typ, LuaType::Variadic(_))) => {
+            union
+                .types()
+                .filter_map(|typ| match typ {
+                    LuaType::Variadic(variadic) => Some(first_slot(variadic)),
+                    _ => None,
+                })
+                .reduce(|left, right| crate::TypeOps::Union.apply(db, &left, &right))
+                .unwrap_or(LuaType::Nil)
+        }
+        typ => typ,
+    }
 }
 
 /// Infers the type a value is already bound to (not the type of the value itself). For example, inferring the left value type from the right value, or the function parameter type from call arguments

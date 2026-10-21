@@ -363,12 +363,13 @@ fn infer_expr_list_types(
             .infer_expr(expr.clone())
             .unwrap_or(LuaType::Unknown);
         match expr_type {
+            // Earlier positions keep only the first value.
+            LuaType::Variadic(variadic) if idx + 1 != exprs.len() => {
+                let first = variadic.get_type(0).cloned().unwrap_or(LuaType::Nil);
+                value_types.push((first, expr.clone()));
+            }
+            // The last expression forwards its whole pack.
             LuaType::Variadic(variadic) => match variadic.deref() {
-                // The last expression forwards its whole pack; earlier
-                // positions keep only the first value.
-                VariadicType::Base(base) if idx + 1 != exprs.len() => {
-                    value_types.push((base.clone(), expr.clone()));
-                }
                 VariadicType::Base(_) => {
                     value_types.push((LuaType::Variadic(variadic.clone()), expr.clone()));
                 }
