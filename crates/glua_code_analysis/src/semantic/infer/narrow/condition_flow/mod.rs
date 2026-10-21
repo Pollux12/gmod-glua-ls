@@ -396,6 +396,7 @@ fn get_type_at_name_expr(
             cache,
             root,
             var_ref_id,
+            flow_node,
             name_expr,
             condition_flow,
             policy,
@@ -420,6 +421,7 @@ fn get_type_at_name_ref(
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
     name_expr: LuaNameExpr,
     condition_flow: InferConditionFlow,
     policy: FlowWalkPolicy,
@@ -449,9 +451,25 @@ fn get_type_at_name_ref(
     ) {
         return Ok(ResultTypeOrContinue::Continue);
     }
-    // Evaluate the bound initializer at its own flow position, not at the
-    // condition reading the local: the declaration predates any loop back-edge
-    // that would re-enter this same condition query.
+    // Nothing writes the guarded variable between the declaration and the
+    // test, so the initializer holds at the test, over the narrowing that
+    // reaches it there.
+    match get_type_at_condition_flow(
+        db,
+        tree,
+        cache,
+        root,
+        var_ref_id,
+        flow_node,
+        expr.clone(),
+        condition_flow,
+        policy.clone(),
+    ) {
+        Err(InferFailReason::RecursiveInfer) => {}
+        at_test => return at_test,
+    }
+    // A loop back-edge re-entered this query: evaluate the initializer at its
+    // own flow position, which predates the loop.
     let Some(entry) = tree.get_flow_id(expr.get_syntax_id()) else {
         return Ok(ResultTypeOrContinue::Continue);
     };

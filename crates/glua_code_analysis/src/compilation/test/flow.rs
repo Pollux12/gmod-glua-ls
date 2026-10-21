@@ -6724,6 +6724,30 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_guard_alias_keeps_narrowing_applied_after_its_declaration() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@param s string
+            local function takes_string(s) end
+
+            ---@param x string|number|nil
+            local function f(x)
+                local ok = x ~= nil
+                if type(x) == "string" then
+                    if ok then
+                        takes_string(x)
+                    end
+                end
+            end
+            "#,
+        );
+
+        let x = nth_name_expr_type_from_end(&mut ws, file_id, "x", 0);
+        expect_that!(x, eq(&LuaType::String));
+    }
+
+    #[gtest]
     fn test_type_guard_alias_name_does_not_narrow() {
         let mut ws = VirtualWorkspace::new();
         assert!(!ws.check_code_for(
