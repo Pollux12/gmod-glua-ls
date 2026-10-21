@@ -597,11 +597,14 @@ impl DynamicFieldIndex {
                 let Some(entries) = self.site_contributions.get_mut(&site) else {
                     continue;
                 };
-                let before = entries.named.len() + entries.wildcards.len();
+                let contributions = |entries: &SiteContributions| {
+                    entries.named.len() + entries.wildcards.len() + entries.finite.len()
+                };
+                let before = contributions(entries);
                 entries.named.retain(|(owner, _, _)| !lost.contains(owner));
                 entries.wildcards.retain(|(owner, _)| !lost.contains(owner));
                 entries.finite.retain(|(owner, _)| !lost.contains(owner));
-                if entries.named.len() + entries.wildcards.len() != before {
+                if contributions(entries) != before {
                     dirty.push(crate::LostFact::new(
                         site.file_id,
                         FactKey::DynamicFieldSite(site.clone()),
@@ -1703,6 +1706,34 @@ mod tests {
                 .get(&InFiled::new(bystander, range(5, 6)))
                 .map(|entries| &entries.named[0].0),
             Some(&moved)
+        );
+    }
+
+    /// A site whose only contribution to a destroyed literal is a finite mark
+    /// is analysed again like any other.
+    #[test]
+    fn a_destroyed_literal_reports_a_site_that_only_marked_it_finite() {
+        let (edited, contributor) = (FileId::new(1), FileId::new(2));
+        let lost = DynamicFieldOwner::Table(InFiled::new(edited, range(2, 6)));
+        let site = InFiled::new(contributor, range(1, 2));
+        let member_id = LuaMemberId::new(
+            LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), range(1, 2)),
+            contributor,
+        );
+        let mut index = DynamicFieldIndex::new();
+        index.add_finite_named_member(&site, lost.clone(), member_id);
+
+        let dirty = index.remap_file_table_owners(&crate::FileRemap::unvalidated(
+            edited,
+            crate::PositionMap::new("abcdefgh", "abXh"),
+        ));
+
+        assert_eq!(
+            dirty,
+            [crate::LostFact::new(
+                contributor,
+                FactKey::DynamicFieldSite(site)
+            )]
         );
     }
 
