@@ -1214,6 +1214,14 @@ impl DbIndex {
         Arc::make_mut(&mut self.operator_index)
     }
 
+    /// Installs `operator` where its file's path orders it, reporting whether
+    /// it was new.
+    pub fn add_operator(&mut self, operator: LuaOperator) -> bool {
+        let file_order_key = self.get_vfs().file_order_key(&operator.get_id().file_id);
+        self.get_operator_index_mut()
+            .add_operator(operator, file_order_key)
+    }
+
     pub fn get_flow_index_mut(&mut self) -> &mut LuaFlowIndex {
         Arc::make_mut(&mut self.flow_index)
     }

@@ -405,7 +405,7 @@ impl StatementWrite {
                     .add_factory_binding(binding.clone());
             }
             StatementWrite::AddOperator(operator) => {
-                db.get_operator_index_mut().add_operator(operator.clone());
+                db.add_operator(operator.clone());
             }
             StatementWrite::SetModuleExport {
                 file_id,

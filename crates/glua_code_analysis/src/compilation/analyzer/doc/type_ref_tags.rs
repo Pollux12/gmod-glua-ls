@@ -499,7 +499,7 @@ pub fn analyze_overload(analyzer: &mut DocAnalyzer, tag: LuaDocTagOverload) -> O
                 tag.get_range(),
                 OperatorFunction::Func(func.clone()),
             );
-            analyzer.db.get_operator_index_mut().add_operator(operator);
+            analyzer.db.add_operator(operator);
         }
     } else if let Some(closure) = find_owner_closure_or_report(analyzer, &tag) {
         let type_ref = infer_type(analyzer, tag.get_type()?);

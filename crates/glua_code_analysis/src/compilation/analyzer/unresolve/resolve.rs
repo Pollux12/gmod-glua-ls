@@ -2559,7 +2559,7 @@ fn set_signature_to_default_call(
         },
     );
     let operator_id = operator.get_id();
-    let installed = db.get_operator_index_mut().add_operator(operator);
+    let installed = db.add_operator(operator);
     if installed {
         db.get_flow_index_mut().install_special_call_facts(
             site_file,
@@ -2710,7 +2710,7 @@ mod tests {
             ))),
         );
         let id = operator.get_id();
-        db.get_operator_index_mut().add_operator(operator);
+        db.add_operator(operator);
         id
     }
 

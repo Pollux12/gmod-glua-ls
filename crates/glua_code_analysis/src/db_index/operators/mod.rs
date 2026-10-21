@@ -1,6 +1,8 @@
 mod lua_operator;
 mod lua_operator_meta_method;
 
+use std::sync::Arc;
+
 use crate::db_index::cow_shards::CowShards;
 use rustc_hash::FxHashMap;
 
@@ -17,6 +19,9 @@ pub struct LuaOperatorIndex {
     type_operators_map:
         CowShards<LuaOperatorOwner, FxHashMap<LuaOperatorMetaMethod, Vec<LuaOperatorId>>>,
     in_filed_operator_map: CowShards<FileId, Vec<LuaOperatorId>>,
+    /// Each operator file's `Vfs::file_order_key`, which orders an owner's
+    /// operators: file ids follow load history, and readers take the first.
+    file_order: CowShards<FileId, Arc<str>>,
     /// Who installed each operator: `None` for the source layer, else the
     /// derivation. An operator leaves with its last holder.
     holders: CowShards<LuaOperatorId, Vec<Option<DerivationId>>>,
@@ -36,14 +41,16 @@ impl LuaOperatorIndex {
             operators: Default::default(),
             type_operators_map: Default::default(),
             in_filed_operator_map: Default::default(),
+            file_order: Default::default(),
             holders: Default::default(),
             derived: Default::default(),
         }
     }
 
     /// Installs `operator`, reporting whether it was new. Re-settling an
-    /// identical operator moves nothing observable.
-    pub fn add_operator(&mut self, operator: LuaOperator) -> bool {
+    /// identical operator moves nothing observable. `file_order_key` is the
+    /// operator file's `Vfs::file_order_key`.
+    pub fn add_operator(&mut self, operator: LuaOperator, file_order_key: Arc<str>) -> bool {
         let id = operator.get_id();
         let holder = if derivation::writes_source() {
             None
@@ -61,18 +68,23 @@ impl LuaOperatorIndex {
         let owner = operator.get_owner().clone();
         let op = operator.get_op();
         self.operators.insert(id, operator);
-        insert_sorted(
-            self.type_operators_map
-                .entry(owner.clone())
-                .or_default()
-                .entry(op)
-                .or_default(),
-            id,
-        );
-        insert_sorted(
-            self.in_filed_operator_map.entry(id.file_id).or_default(),
-            id,
-        );
+        self.file_order.entry(id.file_id).or_insert(file_order_key);
+        let file_order = &self.file_order;
+        let ids = self
+            .type_operators_map
+            .entry(owner.clone())
+            .or_default()
+            .entry(op)
+            .or_default();
+        if let Err(at) = ids.binary_search_by(|existing| {
+            operator_sort_key(file_order, existing).cmp(&operator_sort_key(file_order, &id))
+        }) {
+            ids.insert(at, id);
+        }
+        let ids = self.in_filed_operator_map.entry(id.file_id).or_default();
+        if let Err(at) = ids.binary_search_by_key(&id.position, |existing| existing.position) {
+            ids.insert(at, id);
+        }
         derivation::note_write(|| FactKey::OperatorOwner(owner.clone()));
         derivation::note_write(|| FactKey::OperatorFile(id.file_id));
         true
@@ -111,6 +123,7 @@ impl LuaOperatorIndex {
             ids.retain(|existing| *existing != id);
             if ids.is_empty() {
                 self.in_filed_operator_map.remove(&id.file_id);
+                self.file_order.remove(&id.file_id);
             }
         }
         let owner = operator.get_owner();
@@ -126,6 +139,48 @@ impl LuaOperatorIndex {
         }
         if operators_map.is_empty() {
             self.type_operators_map.remove(owner);
+        }
+    }
+
+    /// Files each of `order_keys`' files under its new order key: its
+    /// operators take the place in each owner's list that the key gives them.
+    pub(crate) fn rekey_files(&mut self, order_keys: &[(FileId, Arc<str>)]) {
+        for (file_id, order_key) in order_keys {
+            if self
+                .file_order
+                .get(file_id)
+                .is_none_or(|held| held == order_key)
+            {
+                continue;
+            }
+            self.file_order.insert(*file_id, order_key.clone());
+            let mut owners = Vec::new();
+            for operator in self
+                .in_filed_operator_map
+                .get(file_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|id| self.operators.get(id))
+            {
+                let owner = (operator.get_owner().clone(), operator.get_op());
+                if !owners.contains(&owner) {
+                    owners.push(owner);
+                }
+            }
+            let file_order = &self.file_order;
+            for (owner, op) in owners {
+                let Some(ids) = self
+                    .type_operators_map
+                    .get_mut(&owner)
+                    .and_then(|map| map.get_mut(&op))
+                else {
+                    continue;
+                };
+                ids.sort_by(|left, right| {
+                    operator_sort_key(file_order, left).cmp(&operator_sort_key(file_order, right))
+                });
+                derivation::note_write(|| FactKey::OperatorOwner(owner.clone()));
+            }
         }
     }
 
@@ -188,12 +243,17 @@ impl LuaOperatorIndex {
     }
 }
 
-/// Files `id` in canonical order unless the list already holds it.
-fn insert_sorted(ids: &mut Vec<LuaOperatorId>, id: LuaOperatorId) {
-    let key = |id: &LuaOperatorId| (id.file_id, id.position);
-    if let Err(at) = ids.binary_search_by_key(&key(&id), key) {
-        ids.insert(at, id);
-    }
+/// Canonical order for an owner's operators: source position, with the
+/// file's path as the outer key.
+fn operator_sort_key<'a>(
+    file_order: &'a CowShards<FileId, Arc<str>>,
+    id: &LuaOperatorId,
+) -> (&'a str, u32, u32) {
+    (
+        file_order.get(&id.file_id).map_or("", |key| key),
+        u32::from(id.position),
+        id.file_id.id,
+    )
 }
 
 impl LuaIndex for LuaOperatorIndex {
@@ -224,8 +284,55 @@ impl LuaIndex for LuaOperatorIndex {
         self.operators.clear();
         self.type_operators_map.clear();
         self.in_filed_operator_map.clear();
+        self.file_order.clear();
         self.holders.clear();
         self.derived.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rowan::{TextRange, TextSize};
+
+    use super::*;
+
+    fn call_operator(file_id: FileId) -> LuaOperator {
+        LuaOperator::new(
+            LuaOperatorOwner::Type(crate::LuaTypeDeclId::global("Foo")),
+            LuaOperatorMetaMethod::Call,
+            file_id,
+            TextRange::new(TextSize::new(4), TextSize::new(8)),
+            OperatorFunction::DefaultClassCtor {
+                id: crate::LuaSignatureId::new(file_id, TextSize::new(4)),
+                strip_self: false,
+                return_self: false,
+            },
+        )
+    }
+
+    fn first_call_file(index: &LuaOperatorIndex) -> Option<FileId> {
+        index
+            .get_operators(
+                &LuaOperatorOwner::Type(crate::LuaTypeDeclId::global("Foo")),
+                LuaOperatorMetaMethod::Call,
+            )?
+            .first()
+            .map(|id| id.file_id)
+    }
+
+    /// An owner's operators are ordered by their files' paths, not by the
+    /// ids load history gave the files, and follow a file that moves.
+    #[test]
+    fn an_owners_operators_follow_their_files_paths() {
+        let (loaded_first, loaded_later) = (FileId::new(1), FileId::new(2));
+        let mut index = LuaOperatorIndex::new();
+        index.add_operator(call_operator(loaded_first), Arc::from("b.lua"));
+        index.add_operator(call_operator(loaded_later), Arc::from("a.lua"));
+        assert_eq!(first_call_file(&index), Some(loaded_later));
+
+        index.rekey_files(&[(loaded_later, Arc::from("c.lua"))]);
+
+        assert_eq!(first_call_file(&index), Some(loaded_first));
     }
 }
 
@@ -233,6 +340,7 @@ crate::db_index::cow_shards::task_fork_fields!(LuaOperatorIndex {
     operators,
     type_operators_map,
     in_filed_operator_map,
+    file_order,
     holders,
     derived,
 });

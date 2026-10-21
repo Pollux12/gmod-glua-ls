@@ -112,7 +112,7 @@ pub fn analyze_field(analyzer: &mut DocAnalyzer, tag: LuaDocTagField) -> Option<
                     field_type.clone(),
                 ))),
             );
-            analyzer.db.get_operator_index_mut().add_operator(operator);
+            analyzer.db.add_operator(operator);
             LuaMemberKey::ExprType(key_type_ref)
         }
     };
@@ -223,7 +223,7 @@ pub fn analyze_operator(analyzer: &mut DocAnalyzer, tag: LuaDocTagOperator) -> O
         ))),
     );
 
-    analyzer.db.get_operator_index_mut().add_operator(operator);
+    analyzer.db.add_operator(operator);
 
     Some(())
 }
