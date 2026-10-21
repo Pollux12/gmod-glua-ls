@@ -50,6 +50,7 @@ workspace = true
 optional = true
 
 [dev-dependencies]
+crossbeam-channel.workspace = true
 googletest.workspace = true
 
 

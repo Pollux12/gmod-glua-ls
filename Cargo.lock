@@ -974,6 +974,7 @@ version = "0.1.5"
 dependencies = [
  "chrono",
  "clap",
+ "crossbeam-channel",
  "dirs",
  "emmy_lsp_types",
  "fern",
