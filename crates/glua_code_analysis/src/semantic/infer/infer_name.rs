@@ -370,8 +370,26 @@ fn try_in_place_ipairs_transform_element_type(
         .get(&decl_id)?
         .clone()?;
 
-    (name_expr.get_position() >= loop_end)
-        .then(|| LuaType::Array(Arc::new(LuaArrayType::new(element_type, LuaArrayLen::None))))
+    let read_position = name_expr.get_position();
+    if read_position < loop_end || is_written_between(db, decl_id, loop_end, read_position) {
+        return None;
+    }
+    Some(LuaType::Array(Arc::new(LuaArrayType::new(
+        element_type,
+        LuaArrayLen::None,
+    ))))
+}
+
+/// Whether `decl_id` is assigned anywhere from `start` up to `end`.
+fn is_written_between(db: &DbIndex, decl_id: LuaDeclId, start: TextSize, end: TextSize) -> bool {
+    db.get_reference_index()
+        .get_local_reference(&decl_id.file_id)
+        .and_then(|references| references.get_decl_references(&decl_id))
+        .is_some_and(|references| {
+            references.cells.iter().any(|cell| {
+                cell.is_write && cell.range.start() >= start && cell.range.start() < end
+            })
+        })
 }
 
 /// Scans the array local's declaring block once for the in-place `ipairs`

@@ -158,6 +158,30 @@ mod test {
     }
 
     #[test]
+    fn test_reassignment_after_in_place_ipairs_transform_wins() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@return string[]
+            local function explode() end
+            ---@param v string
+            ---@return number?
+            local function tonum(v) end
+
+            local arr = explode()
+            for i, v in ipairs(arr) do
+                arr[i] = tonum(v)
+            end
+            arr = explode()
+            local after = arr
+        "#,
+        );
+
+        let after = local_name_type(&mut ws, file_id, "after");
+        assert_eq!(after, ws.ty("string[]"));
+    }
+
+    #[test]
     fn test_guarded_element_write_leaves_array_element_type_unchanged() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def(
