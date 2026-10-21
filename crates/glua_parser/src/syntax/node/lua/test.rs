@@ -97,6 +97,25 @@ mod tests {
         assert!(matches!(key, LuaIndexKey::Integer(_)));
     }
 
+    /// Which fields of each table spread: only a last positional call or
+    /// `...` of an object literal, whatever comment follows it.
+    #[test]
+    fn only_the_last_positional_call_of_an_object_literal_spreads() {
+        let spreads = |code: &str| {
+            get_tree(code)
+                .get_chunk_node()
+                .descendants::<LuaTableField>()
+                .map(|field| field.is_trailing_spread())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(spreads("t = { a = 1, 'x', f() }"), [false, false, true]);
+        assert_eq!(spreads("t = { a = 1, f(), 'x' }"), [false, false, false]);
+        assert_eq!(spreads("t = { a = 1, f() -- last\n}"), [false, true]);
+        assert_eq!(spreads("t = { a = 1, f(), b = 2 }"), [false, false, false]);
+        assert_eq!(spreads("t = { f() }"), [false]);
+    }
+
     #[test]
     fn test_table_field_get_field_key_compact() {
         let code = "local a = { [1] = 'x' }";
