@@ -3493,4 +3493,61 @@ vgui.Register(\"cityrpStoreItem\", PANEL, \"EditablePanel\")
             .unwrap_or_default();
         expect_that!(diagnostics, is_empty());
     }
+
+    #[gtest]
+    fn a_callee_gaining_or_losing_a_class_template_retypes_its_callers_like_a_cold_run() {
+        let class = "---@class Foo
+---@field foo_field integer
+local Foo = {}
+";
+        let template = "---@generic T
+---@param name `T`
+---@return T
+";
+        let plain = "---@param name string
+---@return string
+";
+        let callees = [
+            (
+                "{docs}function MyNet(name) end
+",
+                "MyNet",
+            ),
+            (
+                "{docs}MyNet = function(name) end
+",
+                "MyNet",
+            ),
+            (
+                "Lib = {}
+{docs}function Lib.Make(name) end
+",
+                "Lib.Make",
+            ),
+        ];
+        for (callee, call) in callees {
+            let caller = format!(
+                "local x = {call}(\"Foo\")
+Y = x
+"
+            );
+            let templated = callee.replace("{docs}", template);
+            let plain = callee.replace("{docs}", plain);
+            for (from, to, expected) in
+                [(&templated, &plain, "string"), (&plain, &templated, "Foo")]
+            {
+                let mut ws = VirtualWorkspace::assert_warm_matches_cold(
+                    |_| {},
+                    &[
+                        ("lua/autorun/c.lua", class),
+                        ("lua/autorun/a.lua", from),
+                        ("lua/autorun/b.lua", &caller),
+                    ],
+                    &[("lua/autorun/a.lua", to)],
+                );
+                let y = ws.expr_ty("Y");
+                expect_that!(ws.humanize_type(y), eq(expected), "{call} edited to {to}");
+            }
+        }
+    }
 }
