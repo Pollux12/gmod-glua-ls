@@ -407,10 +407,7 @@ impl EmmyLuaAnalysis {
                 return None;
             }
             if self.text_is_indexed(file_id, text.as_deref()) {
-                self.compilation
-                    .get_db_mut()
-                    .get_vfs_mut()
-                    .update_file_version(&file_id, version);
+                self.compilation.set_file_version(&file_id, version);
                 return Some((file_id, Vec::new()));
             }
         } else if text.is_none() {
@@ -444,10 +441,7 @@ impl EmmyLuaAnalysis {
                 return None;
             }
             if self.vfs_text_equals(file_id, text.as_deref()) {
-                self.compilation
-                    .get_db_mut()
-                    .get_vfs_mut()
-                    .update_file_version(&file_id, version);
+                self.compilation.set_file_version(&file_id, version);
                 return Some((file_id, DeferredVfsDrop::default()));
             }
         } else if text.is_none() {
@@ -462,9 +456,8 @@ impl EmmyLuaAnalysis {
     /// Forgets `uri`'s editor version, which orders the edits of one
     /// open-document session only.
     pub fn forget_document_version(&mut self, uri: &Uri) {
-        let vfs = self.compilation.get_db_mut().get_vfs_mut();
-        if let Some(file_id) = vfs.get_file_id(uri) {
-            vfs.forget_file_version(&file_id);
+        if let Some(file_id) = self.compilation.get_db().get_vfs().get_file_id(uri) {
+            self.compilation.forget_file_version(&file_id);
         }
     }
 

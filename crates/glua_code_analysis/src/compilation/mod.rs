@@ -584,6 +584,34 @@ impl LuaCompilation {
         &self.db
     }
 
+    /// Stores `file_id`'s editor version, which no fact reads, so the index
+    /// stays as it is.
+    pub fn set_file_version(&mut self, file_id: &FileId, version: Option<i32>) {
+        self.vfs_metadata_mut()
+            .update_file_version(file_id, version);
+    }
+
+    /// Forgets `file_id`'s editor version; see [`Self::set_file_version`].
+    pub fn forget_file_version(&mut self, file_id: &FileId) {
+        self.vfs_metadata_mut().forget_file_version(file_id);
+    }
+
+    /// The VFS, for writing what no fact reads. Tasks left to run outside a
+    /// slice share it, so they are installed first, which writes the index.
+    fn vfs_metadata_mut(&mut self) -> &mut crate::Vfs {
+        let detached = self
+            .reanalysis
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|reanalysis| reanalysis.has_detached());
+        if detached {
+            self.get_db_mut().get_vfs_mut()
+        } else {
+            self.db.get_vfs_mut()
+        }
+    }
+
     pub fn get_db_mut(&mut self) -> &mut DbIndex {
         self.file_diagnostic_reads();
         self.install_detached();

@@ -797,6 +797,29 @@ mod tests {
         assert!(!cache.is_fresh(&second.analysis.compilation));
     }
 
+    /// An editor version stored for text the index already holds writes no
+    /// fact, so the cache built before it stays fresh.
+    #[test]
+    fn a_new_version_of_unchanged_text_keeps_the_cache_fresh() {
+        let mut ws = workspace();
+        let uri = ws.virtual_url_generator.new_uri("lua/autorun/shared/a.lua");
+        let text = "function Alpha() return 1 end\n";
+        let file = write(&mut ws, &uri, text);
+        let cache = SharedDiagnosticComponentCache::new();
+        build_matching_cold(&ws, &cache, &[file]);
+
+        ws.analysis.update_file_preparsed_deferred(
+            uri.clone(),
+            Some(text.to_string()),
+            glua_parser::LuaParser::parse(text, glua_parser::ParserConfig::default()),
+            glua_parser::LineIndex::parse(text),
+            Some(7),
+        );
+        ws.analysis.forget_document_version(&uri);
+
+        assert!(cache.is_fresh(&ws.analysis.compilation));
+    }
+
     #[test]
     fn invalidation_drops_every_unit() {
         let mut ws = workspace();
