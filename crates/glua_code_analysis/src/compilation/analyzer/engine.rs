@@ -2952,6 +2952,13 @@ impl Engine {
         false
     }
 
+    /// Takes back a run [`Self::admit_run`] counted that did not happen.
+    fn unadmit_run(&mut self, id: DerivationId) {
+        if let Some(runs) = self.stage_runs.get_mut(&id) {
+            runs.on_index = runs.on_index.saturating_sub(1);
+        }
+    }
+
     /// Moves the run to `stage`. Returns the keys of the rules that moved.
     fn enter_stage(&mut self, db: &mut DbIndex, stage: AnalysisStage) -> Vec<HashedKey> {
         self.stage_runs.clear();
@@ -3202,8 +3209,13 @@ impl Engine {
             if !self.needs_evaluation(db, id, reason) {
                 continue;
             }
+            // A member left out is counted when it is stepped.
+            let joins = co_producers(db, id).len() == 1;
+            if joins && !self.admit_run(id) {
+                continue;
+            }
             self.trace_evaluation(db, id, reason);
-            if co_producers(db, id).len() == 1 {
+            if joins {
                 batch.push(id);
             } else {
                 alone.push(id);
@@ -3352,18 +3364,24 @@ impl Engine {
                 continue;
             }
             self.cursor = Some((id, Some(reason)));
-            if !self.needs_evaluation(db, id, reason) || !self.admit_run(id) {
+            let runs = self.needs_evaluation(db, id, reason);
+            let batched = runs && co_producers(db, id).len() == 1;
+            // A query left out of the batch is counted when it is stepped.
+            if !runs || (batched && !self.admit_run(id)) {
                 self.moved_from.remove(&id);
                 db.queries().set_stale(id, false);
                 continue;
             }
-            let batched = co_producers(db, id).len() == 1;
             if batched {
                 batch.push(id);
             }
             popped.push((id, reason, batched));
         }
         if super::parallel::runs_inline(batch.len()) {
+            // Stepped one by one, each is counted there.
+            for id in &batch {
+                self.unadmit_run(*id);
+            }
             return popped
                 .into_iter()
                 .map(|(id, reason, _)| (id, reason))
