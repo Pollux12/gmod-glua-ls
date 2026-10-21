@@ -1503,7 +1503,6 @@ pub struct AnalyzeContext {
     metas: HashSet<FileId>,
     scripted_scope_files: Option<Arc<HashSet<FileId>>>,
     unresolves: Vec<UnResolve>,
-    pending_unresolve_decl_ids: HashSet<LuaDeclId>,
     infer_manager: InferCacheManager,
     inferred_guard_candidates: Vec<InFiled<LuaSyntaxId>>,
     early_callable_signatures: Vec<(crate::LuaTypeOwner, LuaSignatureId)>,
@@ -1518,7 +1517,6 @@ impl AnalyzeContext {
             metas: HashSet::default(),
             scripted_scope_files: None,
             unresolves: Vec::new(),
-            pending_unresolve_decl_ids: HashSet::default(),
             infer_manager: InferCacheManager::new(),
             inferred_guard_candidates: Vec::new(),
             early_callable_signatures: Vec::new(),
@@ -1559,9 +1557,6 @@ impl AnalyzeContext {
     }
 
     pub fn add_unresolve(&mut self, un_resolve: UnResolve) {
-        if let UnResolve::Decl(decl) = &un_resolve {
-            self.pending_unresolve_decl_ids.insert(decl.decl_id);
-        }
         self.unresolves.push(un_resolve);
     }
 
@@ -1583,9 +1578,6 @@ impl AnalyzeContext {
             .push((member_id, decl_id));
     }
 
-    pub fn has_pending_decl_unresolve(&self, decl_id: LuaDeclId) -> bool {
-        self.pending_unresolve_decl_ids.contains(&decl_id)
-    }
     pub fn get_or_compute_scripted_scope_files(&mut self, db: &DbIndex) -> Arc<HashSet<FileId>> {
         self.ensure_scripted_scope_cache(db);
 

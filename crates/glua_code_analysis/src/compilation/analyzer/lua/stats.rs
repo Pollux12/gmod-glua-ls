@@ -117,16 +117,6 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                     analyzer.context.add_unresolve(unresolve.into());
                     continue;
                 }
-                if should_defer_pending_local_alias(analyzer, &expr, &expr_type) {
-                    let unresolve = UnResolveDecl {
-                        file_id: analyzer.file_id,
-                        decl_id,
-                        expr: expr.clone(),
-                        ret_idx: 0,
-                    };
-                    analyzer.context.add_unresolve(unresolve.into());
-                    continue;
-                }
                 if should_defer_weak_gmod_call_expr(analyzer, &expr, &expr_type) {
                     let unresolve = UnResolveDecl {
                         file_id: analyzer.file_id,
@@ -926,10 +916,6 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                     add_unresolve_for_assignment(analyzer, type_owner, &var, expr.clone());
                     continue;
                 }
-                if should_defer_pending_local_alias(analyzer, expr, &expr_type) {
-                    add_unresolve_for_assignment(analyzer, type_owner, &var, expr.clone());
-                    continue;
-                }
                 if should_defer_weak_gmod_call_expr(analyzer, expr, &expr_type) {
                     add_unresolve_for_assignment(analyzer, type_owner, &var, expr.clone());
                     continue;
@@ -1538,30 +1524,6 @@ fn weak_call_is_scoped_method_call(call_expr: &glua_parser::LuaCallExpr) -> bool
         prefix_expr,
         LuaExpr::NameExpr(name_expr) if name_expr.get_name_text().as_deref() == Some("self")
     )
-}
-
-fn should_defer_pending_local_alias(
-    analyzer: &LuaAnalyzer,
-    expr: &LuaExpr,
-    expr_type: &LuaType,
-) -> bool {
-    if !(expr_type.is_any() || expr_type.is_unknown() || expr_type.is_nil()) {
-        return false;
-    }
-
-    let LuaExpr::NameExpr(name_expr) = expr else {
-        return false;
-    };
-    let Some(decl_id) = analyzer
-        .db
-        .get_reference_index()
-        .get_local_reference(&analyzer.file_id)
-        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
-    else {
-        return false;
-    };
-
-    analyzer.context.has_pending_decl_unresolve(decl_id)
 }
 
 /// Whether `expr` is the default-value idiom for `decl_id` — `p = p or DEFAULT`.
