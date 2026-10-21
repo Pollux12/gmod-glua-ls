@@ -732,14 +732,8 @@ fn closure_declared_name(closure: &LuaClosureExpr) -> Option<SmolStr> {
             .position(|expr| expr.get_position() == closure.get_position())?;
         return var_expr_written_name(vars.get(idx)?);
     }
-    if let Some(table_field) = closure.get_parent::<LuaTableField>()
-        && let Some(field_key) = table_field.get_field_key()
-    {
-        return match field_key {
-            LuaIndexKey::Name(name) => Some(SmolStr::new(name.get_name_text())),
-            LuaIndexKey::String(string) => Some(SmolStr::new(string.get_value())),
-            _ => None,
-        };
+    if let Some(table_field) = closure.get_parent::<LuaTableField>() {
+        return table_field_name(&table_field);
     }
     if let Some(local_stat) = closure.get_parent::<LuaLocalStat>() {
         let idx = local_stat
@@ -754,10 +748,13 @@ fn closure_declared_name(closure: &LuaClosureExpr) -> Option<SmolStr> {
     None
 }
 
-/// The member `closure` is stored under when written as `X.name` or `X:name`.
+/// The member `closure` is stored under when written as `X.name`, `X:name`
+/// or a `name = closure` table field.
 fn closure_member_name(closure: &LuaClosureExpr) -> Option<SmolStr> {
     let var_expr = if let Some(func_stat) = closure.get_parent::<LuaFuncStat>() {
         func_stat.get_func_name()?
+    } else if let Some(table_field) = closure.get_parent::<LuaTableField>() {
+        return table_field_name(&table_field);
     } else {
         let assign_stat = closure.get_parent::<LuaAssignStat>()?;
         let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
@@ -769,6 +766,14 @@ fn closure_member_name(closure: &LuaClosureExpr) -> Option<SmolStr> {
     match var_expr {
         LuaVarExpr::IndexExpr(_) => var_expr_written_name(&var_expr),
         LuaVarExpr::NameExpr(_) => None,
+    }
+}
+
+fn table_field_name(table_field: &LuaTableField) -> Option<SmolStr> {
+    match table_field.get_field_key()? {
+        LuaIndexKey::Name(name) => Some(SmolStr::new(name.get_name_text())),
+        LuaIndexKey::String(string) => Some(SmolStr::new(string.get_value())),
+        _ => None,
     }
 }
 

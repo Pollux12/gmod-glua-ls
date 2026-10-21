@@ -3741,6 +3741,25 @@ mod tests {
     }
 
     #[gtest]
+    fn test_helper_in_a_local_table_constructor_resolves_as_method() {
+        let realms = method_helper_receiver_realms(
+            r#"
+            local classes = {
+                NetMessage = function(pnl, name)
+                    net.Start(name)
+                    net.SendToServer()
+                end,
+            }
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd")
+            "#,
+        );
+        expect_that!(realms, elements_are![eq(&GmodRealm::Server)]);
+    }
+
+    #[gtest]
     fn test_a_local_tables_method_leaves_a_unique_global_helper_resolvable() {
         let realms = method_helper_receiver_realms(
             r#"
