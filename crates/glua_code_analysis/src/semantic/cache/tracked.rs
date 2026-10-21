@@ -113,11 +113,6 @@ impl<K: Hash + Eq + Clone, V> TrackedMap<K, V> {
         }
     }
 
-    /// Stores `value` for this evaluation only.
-    pub fn insert_local(&mut self, key: K, value: V) {
-        self.local.insert(key, value);
-    }
-
     pub fn remove(&mut self, key: &K) {
         self.local.remove(key);
         self.remove_shared(key);

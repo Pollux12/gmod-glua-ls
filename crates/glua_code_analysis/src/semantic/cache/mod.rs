@@ -20,8 +20,8 @@ use crate::db_index::derivation::{
     Gates, ORDERED_PHASE_GATE, OpenFrame, Provenance, Reuse,
 };
 use crate::{
-    DbIndex, FileId, FlowId, GmodRealm, InFiled, LuaDeclId, LuaFunctionType, LuaMemberId,
-    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, VarRefId, VarRefRootId,
+    FileId, FlowId, GmodRealm, InFiled, LuaDeclId, LuaFunctionType, LuaMemberId, LuaMemberKey,
+    LuaMemberOwner, LuaSemanticDeclId, VarRefId, VarRefRootId,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::{
         generic::FuncGenericBinding,
@@ -928,124 +928,6 @@ impl LuaInferCache {
         );
     }
 
-    /// Discards the inference a wave of deferred resolution can have
-    /// invalidated.
-    pub fn clear_deferred_inference_results(&mut self) {
-        self.clear_keyed_flow_locals();
-        self.expr_cache.clear();
-        self.condition_flow_cache.clear();
-        self.member_query_cache.clear();
-        self.member_query_in_progress.clear();
-        self.normal_flow_in_progress.clear();
-        self.member_query_local_cache.clear();
-        self.clear_call_cache();
-        self.call_cache_local.clear();
-        self.call_arg_types_cache.clear();
-        self.numeric_table_index_query_cache.clear();
-        self.unambiguous_int_const_cache.clear();
-        self.decl_name_index = None;
-        // A resolved signature return is exactly what turns this answer from
-        // `false` to `true`, so it cannot survive a wave.
-        self.call_returns_never_cache.clear();
-        self.signature_is_generic_cache.clear();
-        self.generic_call_bindings.clear();
-        self.owner_raw_member_type_cache.clear();
-        if let Some(undo) = Self::active_undo(&mut self.transaction) {
-            let removed = self
-                .flow_node_cache
-                .iter_mut()
-                .filter_map(|(key, inner)| {
-                    if inner.retain_with_changes(|_, entry| !matches!(entry, CacheEntry::Error(_)))
-                    {
-                        undo.touch_flow(key);
-                    }
-                    inner.is_empty().then(|| key.clone())
-                })
-                .collect::<Vec<_>>();
-            for key in removed {
-                self.capture_flow(&key);
-                self.flow_node_cache.remove(&key);
-            }
-        } else {
-            self.flow_node_cache.retain(|_, inner| {
-                inner.retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
-                !inner.is_empty()
-            });
-        }
-        self.param_type_cache
-            .retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
-        self.param_type_source_cache
-            .retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
-        self.for_range_iter_var_type_cache
-            .retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
-        // The transform's element type comes from inferring the loop body's
-        // right-hand side, which a resolved signature return can change.
-        self.in_place_ipairs_transform_cache.clear();
-        self.dynamic_field_resolution_cache.clear();
-        self.exact_table_member_cache.clear();
-        self.dynamic_field_type_cache.clear();
-    }
-
-    /// Clears inference results that can become stale as deferred declarations,
-    /// members, signatures, and dynamic fields are resolved. Structural caches
-    /// derived only from the immutable syntax/reference/flow indexes survive the
-    /// phase transition so unresolve does not rebuild them for every expression.
-    pub fn clear_for_unresolve(&mut self, db: &DbIndex) {
-        self.clear_keyed_flow_locals();
-        self.expr_cache.clear();
-        self.condition_flow_cache.clear();
-        self.member_query_cache.clear();
-        self.member_query_in_progress.clear();
-        self.normal_flow_in_progress.clear();
-        self.member_query_local_cache.clear();
-        self.clear_call_cache();
-        self.call_cache_local.clear();
-        self.call_arg_types_cache.clear();
-        self.numeric_table_index_query_cache.clear();
-        self.unambiguous_int_const_cache.clear();
-        self.clear_flow_cache();
-        self.flow_query_realm = None;
-        self.baseline_flow_memo.clear();
-        self.baseline_flow_depth = 0;
-        self.baseline_root = None;
-        self.index_ref_origin_type_cache.clear();
-        self.keyed.clear();
-        self.param_type_cache.clear();
-        self.param_type_source_cache.clear();
-        self.call_returns_never_cache.clear();
-        self.signature_is_generic_cache.clear();
-        self.generic_call_bindings.clear();
-        self.owner_raw_member_type_cache.clear();
-        // Local reference identities come directly from immutable reference
-        // indexes and are safe to retain. Global/member/self roots can be
-        // selected through types and overloads that unresolve is about to
-        // materialize, so discard only those semantic entries.
-        self.expr_var_ref_id_cache
-            .retain(|syntax_id, var_ref_id| var_ref_is_phase_stable(db, syntax_id, var_ref_id));
-        self.field_literal_narrowing.clear();
-        self.self_type_cache.clear();
-        self.self_base_seed = None;
-        self.decl_cache.clear();
-        self.for_range_iter_var_type_cache.clear();
-        self.in_place_ipairs_transform_cache.clear();
-        self.dynamic_field_resolution_cache.clear();
-        self.exact_table_member_cache.clear();
-        self.dynamic_field_type_cache.clear();
-        self.dynamic_field_definition_syntax_cache.clear();
-        self.dynamic_field_resolving.clear();
-        self.vgui_parent_fallback_calls.clear();
-        self.vgui_parent_chain_calls.clear();
-    }
-
-    pub fn get_flow_cache(
-        &mut self,
-        var_ref_id: &VarRefId,
-        flow_id: FlowId,
-        query_realm: GmodRealm,
-    ) -> Option<&CacheEntry<Arc<LuaType>>> {
-        self.get_flow_cache_with_origin(var_ref_id, flow_id, query_realm, FlowOrigin::Real)
-    }
-
     pub fn get_flow_cache_with_origin(
         &mut self,
         var_ref_id: &VarRefId,
@@ -1055,16 +937,6 @@ impl LuaInferCache {
     ) -> Option<&CacheEntry<Arc<LuaType>>> {
         let cache_key = VarRefCacheKey::from(var_ref_id);
         self.get_flow_cache_with_origin_by_key(&cache_key, flow_id, query_realm, origin)
-    }
-
-    pub fn set_flow_cache(
-        &mut self,
-        var_ref_id: &VarRefId,
-        flow_id: FlowId,
-        query_realm: GmodRealm,
-        entry: CacheEntry<Arc<LuaType>>,
-    ) {
-        self.set_flow_cache_with_origin(var_ref_id, flow_id, query_realm, FlowOrigin::Real, entry);
     }
 
     pub fn set_flow_cache_with_origin(
@@ -1415,35 +1287,6 @@ impl LuaInferCache {
             self.unkey(std::iter::once(Self::flow_context_key(&cache_key)));
         }
     }
-
-    pub fn flow_cache_entry_count(&self) -> usize {
-        self.flow_node_cache
-            .values()
-            .map(|entries| entries.len())
-            .sum()
-    }
-}
-
-fn var_ref_is_phase_stable(db: &DbIndex, syntax_id: &LuaSyntaxId, var_ref_id: &VarRefId) -> bool {
-    let local_decl_is_stable = |decl_id: &LuaDeclId| {
-        db.get_decl_index()
-            .get_decl(decl_id)
-            .is_some_and(|decl| decl.is_local())
-    };
-
-    match var_ref_id {
-        VarRefId::VarRef(decl_id) => local_decl_is_stable(decl_id),
-        VarRefId::IndexRef(VarRefRootId::Decl(decl_id), _) => {
-            // A call annotated as rawget can also produce an IndexRef rooted at
-            // a local, but that identity depends on its resolved signature.
-            // Only a syntactic index expression is structural across unresolve.
-            syntax_id.get_kind() == glua_parser::LuaSyntaxKind::IndexExpr
-                && local_decl_is_stable(decl_id)
-        }
-        VarRefId::SelfRef(_)
-        | VarRefId::IndexRef(VarRefRootId::Member(_) | VarRefRootId::SelfRef(_), _)
-        | VarRefId::GlobalName(_, _) => false,
-    }
 }
 
 #[cfg(test)]
@@ -1456,44 +1299,7 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::{CacheEntry, FlowOrigin, LuaInferCache, VarRefCacheKey};
-    use crate::{
-        DbIndex, FileId, FlowId, GmodRealm, InferFailReason, LuaDecl, LuaDeclExtra, LuaDeclId,
-        LuaDeclarationTree, LuaType, VarRefId, VarRefRootId,
-    };
-
-    #[test]
-    fn clear_for_unresolve_preserves_only_structural_lookup_caches() {
-        let file_id = FileId { id: 7 };
-        let syntax_id = LuaSyntaxId::new(
-            LuaSyntaxKind::NameExpr.into(),
-            TextRange::new(TextSize::from(3), TextSize::from(4)),
-        );
-        let decl_id = LuaDeclId::new(file_id, TextSize::from(3));
-        let mut cache = LuaInferCache::new(file_id, Default::default());
-
-        cache
-            .expr_cache
-            .insert(syntax_id, CacheEntry::Cache(LuaType::Integer), None);
-        cache
-            .expr_var_ref_id_cache
-            .insert(syntax_id, VarRefId::VarRef(decl_id), None);
-        cache
-            .flow_node_realm_cache
-            .insert(FlowId(1), GmodRealm::Server, None);
-        cache
-            .field_literal_narrowing
-            .insert(syntax_id, crate::db_index::derivation::ScopeMark::default());
-
-        cache.clear_for_unresolve(&DbIndex::new());
-
-        assert!(cache.expr_cache.is_empty());
-        assert!(cache.expr_var_ref_id_cache.is_empty());
-        assert_eq!(
-            cache.flow_node_realm_cache.peek(&FlowId(1)),
-            Some(&GmodRealm::Server)
-        );
-        assert!(cache.field_literal_narrowing.is_empty());
-    }
+    use crate::{FileId, FlowId, GmodRealm, InferFailReason, LuaType};
 
     #[test]
     fn clear_discards_literal_narrowing_stop_markers() {
@@ -1510,55 +1316,6 @@ mod tests {
         cache.clear();
 
         assert!(cache.field_literal_narrowing.is_empty());
-    }
-
-    #[test]
-    fn clear_for_unresolve_discards_semantic_call_expression_var_refs() {
-        let file_id = FileId { id: 7 };
-        let local_range = TextRange::new(TextSize::from(3), TextSize::from(4));
-        let local_decl = LuaDecl::new(
-            "value",
-            file_id,
-            local_range,
-            LuaDeclExtra::Local {
-                kind: LuaSyntaxKind::LocalName.into(),
-                attrib: None,
-            },
-            None,
-        );
-        let decl_id = local_decl.get_id();
-        let mut decl_tree = LuaDeclarationTree::new(file_id);
-        decl_tree.add_decl(local_decl);
-        let mut db = DbIndex::new();
-        db.get_decl_index_mut().add_decl_tree(decl_tree);
-
-        let call_expr_id = LuaSyntaxId::new(
-            LuaSyntaxKind::CallExpr.into(),
-            TextRange::new(TextSize::from(10), TextSize::from(20)),
-        );
-        let index_expr_id = LuaSyntaxId::new(
-            LuaSyntaxKind::IndexExpr.into(),
-            TextRange::new(TextSize::from(21), TextSize::from(30)),
-        );
-        let index_ref = VarRefId::IndexRef(
-            VarRefRootId::Decl(decl_id),
-            ArcIntern::new(SmolStr::new("value.key")),
-        );
-        let mut cache = LuaInferCache::new(file_id, Default::default());
-        cache
-            .expr_var_ref_id_cache
-            .insert(call_expr_id, index_ref.clone(), None);
-        cache
-            .expr_var_ref_id_cache
-            .insert(index_expr_id, index_ref.clone(), None);
-
-        cache.clear_for_unresolve(&db);
-
-        assert!(cache.expr_var_ref_id_cache.peek(&call_expr_id).is_none());
-        assert_eq!(
-            cache.expr_var_ref_id_cache.peek(&index_expr_id),
-            Some(&index_ref)
-        );
     }
 
     #[test]

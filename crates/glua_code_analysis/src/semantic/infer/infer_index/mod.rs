@@ -4378,8 +4378,6 @@ mod member_query_memo_tests {
         assert!(cache.member_query_in_progress.is_empty());
         derivation::end();
         derivation::take_keys();
-        cache.clear_deferred_inference_results();
-        assert!(cache.member_query_cache.is_empty());
     }
 
     #[test]

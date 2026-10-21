@@ -142,15 +142,6 @@ impl LuaInferCache {
         }
     }
 
-    pub(super) fn clear_call_cache(&mut self) {
-        if self.active_transaction() {
-            for key in self.call_cache.keys().copied().collect::<Vec<_>>() {
-                self.capture_call(&key);
-            }
-        }
-        self.call_cache.clear();
-    }
-
     pub(super) fn capture_flow(&mut self, key: &VarRefCacheKey) {
         if let Some(undo) = Self::active_undo(&mut self.transaction) {
             capture(
@@ -183,15 +174,6 @@ impl LuaInferCache {
                 FlowEntries::rollback_transaction,
             );
         }
-    }
-
-    pub(super) fn clear_flow_cache(&mut self) {
-        if self.active_transaction() {
-            for key in self.flow_node_cache.keys().cloned().collect::<Vec<_>>() {
-                self.capture_flow(&key);
-            }
-        }
-        self.flow_node_cache.clear();
     }
 
     fn finish_tracked_transaction(&mut self, rollback: bool) {

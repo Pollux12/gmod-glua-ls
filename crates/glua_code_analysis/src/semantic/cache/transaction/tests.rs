@@ -164,7 +164,6 @@ fn parallel_cache_rollback_preserves_raw_call_bucket_and_old_lookup_during_compu
         Some(provisional),
     );
     cache.remove_call_func_cache(syntax(1), None, &LuaType::String);
-    cache.clear_call_cache();
     drop(transaction);
     cache.rollback_transaction();
     assert_eq!(cache.call_cache[&(syntax(1), None)].len(), 1);
@@ -541,54 +540,6 @@ fn parallel_cache_sparse_finish_restores_flow_stale_removal() {
     assert!(
         matches!(cache.flow_node_cache[&flow_key(2)].peek(&inner), Some(CacheEntry::Cache(value)) if value.as_ref() == &LuaType::String)
     );
-    finish();
-}
-
-#[test]
-fn parallel_cache_sparse_finish_restores_partial_flow_retain() {
-    begin();
-    let mut cache = cache();
-    let old = proof(&cache);
-    put_flow(
-        &mut cache,
-        &flow_key(1),
-        1,
-        CacheEntry::Cache(Arc::new(LuaType::Integer)),
-        old.clone(),
-    );
-    put_flow(
-        &mut cache,
-        &flow_key(1),
-        2,
-        CacheEntry::error(super::super::InferFailReason::FieldNotFound),
-        old.clone(),
-    );
-    put_flow(
-        &mut cache,
-        &flow_key(2),
-        1,
-        CacheEntry::Cache(Arc::new(LuaType::String)),
-        old,
-    );
-    derivation::end();
-    next();
-    let transaction = cache.begin_transaction();
-    cache.clear_deferred_inference_results();
-    let undo = cache.transaction.as_ref().unwrap();
-    assert_eq!(undo.touched_flows.len(), 1);
-    assert!(undo.touched_flows.contains(&flow_key(1)));
-    assert!(undo.flows.is_empty());
-    drop(transaction);
-    cache.rollback_transaction();
-    assert!(matches!(
-        cache.flow_node_cache[&flow_key(1)].peek(&(
-            FlowId(2),
-            GmodRealm::Server,
-            super::super::FlowOrigin::Real
-        )),
-        Some(CacheEntry::Error(_))
-    ));
-    assert_eq!(cache.flow_node_cache[&flow_key(2)].len(), 1);
     finish();
 }
 

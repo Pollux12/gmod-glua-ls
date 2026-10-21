@@ -44,37 +44,20 @@ impl InferCacheManager {
         })
     }
 
-    /// Called once the dynamic-field index has been populated for this batch.
-    /// Until then inference must not read it — see [`crate::CacheOptions`].
+    /// Lets the caches this manager creates read the dynamic-field index — see
+    /// [`crate::CacheOptions`].
     pub fn set_dynamic_fields_visible(&mut self) {
         self.dynamic_fields_visible = true;
-        for infer_cache in self.infer_map.values_mut() {
-            infer_cache.config_mut().dynamic_fields_visible = true;
-            infer_cache.clear();
-        }
     }
 
-    /// Called once the call-site parameter index has been populated for this batch.
-    /// Until then early syntactic and body passes must not read it.
+    /// Lets the caches this manager creates read the call-site parameter index.
     pub fn set_call_site_params_visible(&mut self) {
         self.call_site_params_visible = true;
-        for infer_cache in self.infer_map.values_mut() {
-            infer_cache.config_mut().call_site_params_visible = true;
-            infer_cache.clear();
-        }
     }
 
+    /// Has the caches this manager creates floor what has not resolved.
     pub fn set_force(&mut self) {
         self.current_phase = LuaAnalysisPhase::Force;
-        for infer_cache in self.infer_map.values_mut() {
-            infer_cache.set_phase(LuaAnalysisPhase::Force);
-            // The force phase answers a failed inference with a floor instead
-            // of an error, so a failure recorded under the previous phase is
-            // not the answer this one would give. Replaying it lets whichever
-            // expression in a chain happened to be walked first decide the
-            // result, which is the batch's settling order leaking into a type.
-            infer_cache.clear_deferred_inference_results();
-        }
     }
 
     pub fn clear(&mut self) {
@@ -99,10 +82,10 @@ mod tests {
     use super::*;
 
     /// The two halves of the dynamic-field gate pull in opposite directions and
-    /// only work together: a batch starts with the index invisible and opens it
-    /// once populated, while everything outside a batch (hover, completion,
-    /// diagnostics) must see it. Flipping either default silently changes what a
-    /// cold build infers.
+    /// only work together: an analysis context's manager starts with the index
+    /// invisible until it is opened, while everything outside one (hover,
+    /// completion, diagnostics) must see it. Flipping either default silently
+    /// changes what a cold build infers.
     #[test]
     fn dynamic_field_visibility_defaults_are_opposite() {
         assert!(crate::CacheOptions::default().dynamic_fields_visible);
