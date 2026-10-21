@@ -142,12 +142,99 @@ impl Slice {
     }
 }
 
+/// How many entries of a collection of derivations each file has.
+#[derive(Default)]
+struct FileCounts(FxHashMap<crate::FileId, u32>);
+
+impl FileCounts {
+    fn add(&mut self, file_id: crate::FileId) {
+        *self.0.entry(file_id).or_default() += 1;
+    }
+
+    fn sub(&mut self, file_id: crate::FileId) {
+        if let std::collections::hash_map::Entry::Occupied(mut count) = self.0.entry(file_id) {
+            *count.get_mut() -= 1;
+            if *count.get() == 0 {
+                count.remove();
+            }
+        }
+    }
+
+    fn contains(&self, file_id: crate::FileId) -> bool {
+        self.0.contains_key(&file_id)
+    }
+}
+
+/// Derivations set aside with why each was queued, by id.
+#[derive(Default)]
+struct Parked {
+    entries: BTreeMap<DerivationId, Reason>,
+    files: FileCounts,
+}
+
+impl Parked {
+    /// Parks `id`; a changed entry stays changed.
+    fn park(&mut self, id: DerivationId, reason: Reason) {
+        match self.entries.entry(id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(reason);
+                self.files.add(id.file_id);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let parked = entry.get_mut();
+                *parked = (*parked).min(reason);
+            }
+        }
+    }
+
+    fn remove(&mut self, id: &DerivationId) -> Option<Reason> {
+        let reason = self.entries.remove(id)?;
+        self.files.sub(id.file_id);
+        Some(reason)
+    }
+
+    #[cfg(test)]
+    fn get(&self, id: &DerivationId) -> Option<&Reason> {
+        self.entries.get(id)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&DerivationId, &Reason)> {
+        self.entries.iter()
+    }
+
+    /// Takes out every entry `take` accepts, in id order.
+    fn extract_if(
+        &mut self,
+        mut take: impl FnMut(&DerivationId) -> bool,
+    ) -> Vec<(DerivationId, Reason)> {
+        let taken = self
+            .entries
+            .extract_if(.., |id, _| take(id))
+            .collect::<Vec<_>>();
+        for (id, _) in &taken {
+            self.files.sub(id.file_id);
+        }
+        taken
+    }
+
+    /// Takes out every entry, in id order.
+    fn take(&mut self) -> BTreeMap<DerivationId, Reason> {
+        self.files = FileCounts::default();
+        std::mem::take(&mut self.entries)
+    }
+
+    fn holds_file(&self, file_id: crate::FileId) -> bool {
+        self.files.contains(file_id)
+    }
+}
+
 /// Queued derivations in the order a round takes them.
 #[derive(Default)]
 struct Queue {
     schedule: Schedule,
     order: BTreeSet<(u8, Reason, u64, DerivationId)>,
     reasons: FxHashMap<DerivationId, Reason>,
+    files: FileCounts,
 }
 
 impl Queue {
@@ -176,12 +263,15 @@ impl Queue {
             let entry = self.entry(id, *queued);
             self.order.remove(&entry);
         }
-        self.reasons.insert(id, reason);
+        if self.reasons.insert(id, reason).is_none() {
+            self.files.add(id.file_id);
+        }
         self.order.insert(self.entry(id, reason));
     }
 
     fn remove(&mut self, id: DerivationId) {
         if let Some(reason) = self.reasons.remove(&id) {
+            self.files.sub(id.file_id);
             let entry = self.entry(id, reason);
             self.order.remove(&entry);
         }
@@ -190,6 +280,7 @@ impl Queue {
     fn pop_first(&mut self) -> Option<(DerivationId, Reason)> {
         let (_, reason, _, id) = self.order.pop_first()?;
         self.reasons.remove(&id);
+        self.files.sub(id.file_id);
         Some((id, reason))
     }
 
@@ -266,6 +357,7 @@ impl Queue {
         let mut by_file = BTreeMap::<_, Vec<_>>::new();
         for (_, reason, file_key, id) in taken {
             self.reasons.remove(&id);
+            self.files.sub(id.file_id);
             by_file
                 .entry((file_key, id.file_id))
                 .or_default()
@@ -304,6 +396,7 @@ impl Queue {
                 continue;
             }
             self.reasons.remove(&id);
+            self.files.sub(id.file_id);
             by_file
                 .entry((file_key, id.file_id))
                 .or_default()
@@ -385,8 +478,13 @@ impl Queue {
         taken
     }
 
+    #[cfg(test)]
     fn files(&self) -> impl Iterator<Item = crate::FileId> + '_ {
         self.reasons.keys().map(|id| id.file_id)
+    }
+
+    fn holds_file(&self, file_id: crate::FileId) -> bool {
+        self.files.contains(file_id)
     }
 }
 
@@ -450,10 +548,10 @@ pub(crate) struct Engine {
     interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Work in other files queued while the focus settles, with why it was
     /// queued.
-    waiting: BTreeMap<DerivationId, Reason>,
+    waiting: Parked,
     /// Work queued before its kind's first stage, held until the run
     /// reaches it.
-    held: BTreeMap<DerivationId, Reason>,
+    held: Parked,
     /// The files whose derivations this engine evaluated.
     evaluated: FxHashSet<crate::FileId>,
     /// Where the edits being re-analysed moved positions: a read of a fact
@@ -1120,8 +1218,7 @@ impl Engine {
         self.requeue_carried();
         let resumed = self
             .waiting
-            .extract_if(.., |id, _| self.focus.contains(&id.file_id))
-            .collect::<Vec<_>>();
+            .extract_if(|id| self.focus.contains(&id.file_id));
         for (id, reason) in resumed {
             self.queue(id, reason);
         }
@@ -1147,8 +1244,7 @@ impl Engine {
 
     /// Parks `id` until the focus settles; a changed entry stays changed.
     fn wait(&mut self, id: DerivationId, reason: Reason) {
-        let parked = self.waiting.entry(id).or_insert(reason);
-        *parked = (*parked).min(reason);
+        self.waiting.park(id, reason);
     }
 
     /// Forgets the queued work of `file_ids`, whose derivations are about to
@@ -1162,8 +1258,8 @@ impl Engine {
         let replaced = |id: DerivationId| files.contains(&id.file_id);
         self.worklist.take_where(replaced);
         self.next_round.take_where(replaced);
-        self.waiting.retain(|id, _| !replaced(*id));
-        self.held.retain(|id, _| !replaced(*id));
+        self.waiting.extract_if(|id| replaced(*id));
+        self.held.extract_if(|id| replaced(*id));
         self.stale_sources
             .retain(|file_id| !files.contains(file_id));
         // A rebuilt file's derivations start over, even those whose id an
@@ -1196,15 +1292,12 @@ impl Engine {
     /// source layer to rebuild.
     fn has_work(&self, file_id: crate::FileId) -> bool {
         self.stale_sources.contains(&file_id)
-            || self
-                .worklist
-                .files()
-                .chain(self.next_round.files())
-                .chain(self.waiting.keys().map(|id| id.file_id))
-                .chain(self.held.keys().map(|id| id.file_id))
-                .chain(self.carried.iter().flat_map(TaskPlan::files))
-                .chain(self.detached_files.iter().copied())
-                .any(|queued| queued == file_id)
+            || self.worklist.holds_file(file_id)
+            || self.next_round.holds_file(file_id)
+            || self.waiting.holds_file(file_id)
+            || self.held.holds_file(file_id)
+            || self.detached_files.contains(&file_id)
+            || self.carried.iter().any(|plan| plan.touches_file(file_id))
     }
 
     /// Whether `file_id` is in the focus that is still settling and has work
@@ -1675,8 +1768,7 @@ impl Engine {
         if db.analysis_stage() >= id.kind.first_stage() {
             return false;
         }
-        let held = self.held.entry(id).or_insert(reason);
-        *held = (*held).min(reason);
+        self.held.park(id, reason);
         true
     }
 
@@ -2893,10 +2985,7 @@ impl Engine {
                 waited.extend(db.reader_graph().stale_readers(key, |seen| seen == current));
             }
             let mut queued = 0;
-            let reached = self
-                .held
-                .extract_if(.., |id, _| id.kind.first_stage() <= stage)
-                .collect::<Vec<_>>();
+            let reached = self.held.extract_if(|id| id.kind.first_stage() <= stage);
             for (id, reason) in reached {
                 self.worklist.insert(id, reason);
                 queued += 1;
@@ -2959,9 +3048,7 @@ impl Engine {
                 .map(|(reader, _)| *reader),
             |key| db.fact_fingerprint(key),
         );
-        let waiting = std::mem::take(&mut self.waiting)
-            .into_iter()
-            .collect::<Vec<_>>();
+        let waiting = self.waiting.take().into_iter().collect::<Vec<_>>();
         drop(_warm);
         let _staleness = crate::profile::PhaseGuard::new("release: staleness");
         let checked = {
@@ -4068,6 +4155,14 @@ struct TaskPlan {
 impl TaskPlan {
     /// The files the task covers: its own and those of its groups' members,
     /// in order.
+    fn touches_file(&self, file_id: crate::FileId) -> bool {
+        self.file_id == file_id
+            || self
+                .groups
+                .iter()
+                .any(|group| group.members.iter().any(|member| member.file_id == file_id))
+    }
+
     fn files(&self) -> Vec<crate::FileId> {
         let mut files = vec![self.file_id];
         files.extend(
@@ -5691,6 +5786,26 @@ print(tuned{index})"
             let reason = engine.waiting.get(&in_file(parked));
             assert_eq!(reason, Some(&Reason::Changed));
         }
+    }
+
+    /// A file has work while it has an entry queued or waiting, and none once
+    /// its last entry is taken or its derivations are replaced.
+    #[test]
+    fn a_file_has_work_exactly_while_it_has_entries_queued_or_waiting() {
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        engine.prioritise(&[FileId::new(FILE)]);
+        engine.changed(in_file(FILE));
+        engine.changed(in_file(FILE + 1));
+        let queued_and_waiting = [FILE, FILE + 1].map(|file| engine.has_work(FileId::new(file)));
+
+        engine.worklist.pop_first();
+        engine.replacing(&[FileId::new(FILE + 1)]);
+        let emptied = [FILE, FILE + 1].map(|file| engine.has_work(FileId::new(file)));
+
+        assert_eq!(
+            (queued_and_waiting, emptied),
+            ([true, true], [false, false])
+        );
     }
 
     fn in_file(file: u32) -> DerivationId {
