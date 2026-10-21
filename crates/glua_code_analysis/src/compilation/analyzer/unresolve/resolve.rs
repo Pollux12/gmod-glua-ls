@@ -678,6 +678,13 @@ fn inferred_return_improves(current: &LuaType, new: &LuaType) -> bool {
             true
         }
         (LuaType::Unknown | LuaType::Any | LuaType::Never, _) => !is_unsettled_inferred_return(new),
+        (LuaType::Union(union), _)
+            if union
+                .nullable_inner()
+                .is_some_and(is_unsettled_inferred_return) =>
+        {
+            !is_unsettled_inferred_return(new)
+        }
         (LuaType::Variadic(current_variadic), LuaType::Variadic(new_variadic)) => {
             match (current_variadic.as_ref(), new_variadic.as_ref()) {
                 (VariadicType::Multi(current_types), VariadicType::Multi(new_types)) => {
@@ -3284,6 +3291,20 @@ mod tests {
         assert!(!super::inferred_return_improves(
             &variadic_multi(vec![LuaType::Unknown, LuaType::Integer]),
             &variadic_multi(vec![LuaType::Unknown, LuaType::Integer])
+        ));
+    }
+
+    #[test]
+    fn inferred_return_refines_a_nullable_unsettled_return() {
+        let nullable =
+            |typ| LuaType::Union(Arc::new(LuaUnionType::from_vec(vec![typ, LuaType::Nil])));
+        assert!(super::inferred_return_improves(
+            &nullable(LuaType::Unknown),
+            &nullable(LuaType::String)
+        ));
+        assert!(!super::inferred_return_improves(
+            &nullable(LuaType::Unknown),
+            &nullable(LuaType::Any)
         ));
     }
 
