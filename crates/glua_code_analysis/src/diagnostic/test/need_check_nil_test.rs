@@ -16688,4 +16688,15 @@ mod table_seed_tests {
             "if not t.k then t.k = {} t.k = nil end t.k.x = 1"
         ));
     }
+
+    #[test]
+    fn a_nested_reset_of_the_field_outlasts_an_earlier_seed() {
+        assert!(!reports_field_write("t.k = {} if d then t.k.x = 1 end"));
+        assert!(reports_field_write(
+            "t.k = {} if c then t.k = nil end t.k.x = 1"
+        ));
+        assert!(reports_field_write(
+            "t.k = {} if c then t.k = nil end if d then t.k.x = 1 end"
+        ));
+    }
 }

@@ -845,6 +845,22 @@ fn collect_assignment_prefix_events_from_assigns(
                         is_table_literal,
                     });
             }
+            // A write that may leave something other than a table reaches out
+            // of its block too: after `if c then t.k = nil end`, `t.k` may be
+            // nil whatever an earlier `t.k = {}` in an enclosing block set.
+            if !is_table_literal {
+                for (start, end) in enclosing_assignment_block_ranges(assign_stat.syntax()) {
+                    if (start, end) != (block_start, block_end) {
+                        events
+                            .entry((start, end, prefix_text.clone()))
+                            .or_default()
+                            .push(AssignmentPrefixEvent {
+                                offset,
+                                is_table_literal,
+                            });
+                    }
+                }
+            }
             events
                 .entry((block_start, block_end, prefix_text))
                 .or_default()
