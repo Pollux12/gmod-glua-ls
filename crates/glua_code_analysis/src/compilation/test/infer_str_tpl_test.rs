@@ -3198,6 +3198,34 @@ vgui.Register(\"cityrpStoreItem\", PANEL, \"EditablePanel\")
     }
 
     #[gtest]
+    fn a_class_overload_materializes_the_class_its_first_argument_names() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/registry.lua",
+            r#"
+            ---@class Entity
+
+            ---@class Registry
+            ---@overload fun<T: Entity>(class: `T`): T
+            Registry = {}
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/server/sv_spawn.lua",
+            r#"
+            local entity = Registry("npc_registered")
+            "#,
+        );
+
+        let declared = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_type_decl(&LuaTypeDeclId::global("npc_registered"))
+            .map(|decl| decl.is_auto_generated());
+        verify_that!(declared, some(eq(true)))
+    }
+
+    #[gtest]
     fn a_union_of_class_names_materializes_a_class_for_each_name() {
         let mut ws = VirtualWorkspace::new();
         ws.def(

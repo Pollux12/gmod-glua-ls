@@ -1243,10 +1243,10 @@ fn collect_special_call_param_infos_from_operator_owner(
                         )
                     })
                     .unwrap_or_default(),
-                LuaType::DocFunction(func) => adjust_operator_special_call_param_infos(
-                    collect_doc_function_special_call_params(func.as_ref()),
-                    should_strip_first_operator_param(func.is_colon_define(), owner),
-                ),
+                // A doc call operator's operands are the call's arguments.
+                LuaType::DocFunction(func) => {
+                    collect_doc_function_special_call_params(func.as_ref())
+                }
                 _ => Vec::new(),
             }
         })
