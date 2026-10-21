@@ -133,12 +133,9 @@ impl KeySlot {
 
     /// Whether the key is a query's output.
     fn is_query(&self) -> bool {
-        self.key.as_ref().is_some_and(|key| {
-            matches!(
-                key.key(),
-                FactKey::ReceiverAuthority(_) | FactKey::CallbackParams(_)
-            )
-        })
+        self.key
+            .as_ref()
+            .is_some_and(|key| key.key().is_query_output())
     }
 }
 

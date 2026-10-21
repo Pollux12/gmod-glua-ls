@@ -656,19 +656,7 @@ pub fn scope_mark() -> ScopeMark {
 /// frames inside it depend on it; once closed, every open frame does.
 #[track_caller]
 pub fn consult_scope(mark: ScopeMark) {
-    let open = CURRENT.with(|current| {
-        current.borrow().as_ref().is_some_and(|evaluation| {
-            let stamp = match mark.depth {
-                0 => evaluation.stamp,
-                depth => match evaluation.frames.get(depth as usize - 1) {
-                    Some(frame) => frame.stamp,
-                    None => return false,
-                },
-            };
-            stamp == mark.stamp && evaluation.frames.len() as u32 >= mark.depth
-        })
-    });
-    if open {
+    if scope_open(mark) {
         taint_scoped(mark.depth);
     } else {
         taint();

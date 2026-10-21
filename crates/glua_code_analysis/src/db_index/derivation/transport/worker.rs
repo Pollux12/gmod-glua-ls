@@ -158,7 +158,7 @@ impl WorkerContext {
             let Some(key) = self.graph().keys().live_key(*slot) else {
                 return false;
             };
-            !query_key(key.key())
+            !key.key().is_query_output()
                 || (!derivation::mapping_back() && self.snapshot.queries.contains_key(key))
         })
     }
@@ -166,7 +166,7 @@ impl WorkerContext {
     pub(in super::super) fn local_queries_hold(&self, reads: &[u32]) -> bool {
         reads.iter().all(|local| {
             let key = self.key(*local);
-            !query_key(key.key())
+            !key.key().is_query_output()
                 || (!derivation::mapping_back()
                     && self.queries.get(local).is_some_and(|witness| {
                         !witness.mixed && self.snapshot.queries.get(key) == Some(&witness.seen)
@@ -349,13 +349,6 @@ pub(crate) struct ComputeInputs {
     complete: bool,
 }
 
-fn query_key(key: &FactKey) -> bool {
-    matches!(
-        key,
-        FactKey::ReceiverAuthority(_) | FactKey::CallbackParams(_)
-    )
-}
-
 impl ComputeInputs {
     fn capture(worker: &WorkerContext, fingerprint: impl Fn(&HashedKey) -> Fingerprint) -> Self {
         let mut inputs = Self {
@@ -369,7 +362,7 @@ impl ComputeInputs {
         let mut absent_bases = FxHashSet::default();
         for local in 0..worker.keys.entries.len() {
             let key = worker.key(local as u32);
-            if query_key(key.key()) {
+            if key.key().is_query_output() {
                 if let Some(witness) = worker.queries.get(&(local as u32)) {
                     inputs.complete &= !witness.mixed;
                     inputs.reads.push((local as u32, witness.seen));
@@ -711,7 +704,7 @@ impl TaskRecorder {
                     {
                         return ReadState::Unseen;
                     }
-                    if query_key(key.key()) {
+                    if key.key().is_query_output() {
                         return ReadState::Query(
                             worker
                                 .queries

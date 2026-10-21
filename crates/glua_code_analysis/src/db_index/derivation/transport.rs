@@ -87,11 +87,7 @@ impl WorkerKeys {
             WorkerKey::Known(slot) => (snapshot.key(slot), snapshot.keys().is_query(slot)),
             WorkerKey::New(index) => {
                 let stored = &self.new_keys[index as usize];
-                let query = matches!(
-                    stored.key(),
-                    super::FactKey::ReceiverAuthority(_) | super::FactKey::CallbackParams(_)
-                );
-                (stored, query)
+                (stored, stored.key().is_query_output())
             }
         };
         let flags = u8::from(self.snapshot_taints(local, snapshot)) | (u8::from(query) << 1);

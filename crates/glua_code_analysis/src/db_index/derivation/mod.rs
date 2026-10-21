@@ -50,8 +50,6 @@ pub trait DerivedFact: std::any::Any + Send + Sync {
     }
 }
 
-/// The workspace call roles and net-helper registry: the folds read it whole,
-/// a per-file pass entry by entry, as [`FactKey::CallRole`].
 /// Two stored facts are the same when they are one allocation.
 impl PartialEq for dyn DerivedFact {
     fn eq(&self, other: &Self) -> bool {
@@ -59,6 +57,8 @@ impl PartialEq for dyn DerivedFact {
     }
 }
 
+/// The workspace call roles and net-helper registry: the folds read it whole,
+/// a per-file pass entry by entry, as [`FactKey::CallRole`].
 pub trait CallRoles: DerivedFact {
     /// Every entry.
     fn entries(&self) -> Vec<CallRoleKey>;
@@ -603,6 +603,12 @@ pub fn fingerprint_opt<T: std::hash::Hash>(value: Option<&T>) -> Fingerprint {
 }
 
 impl FactKey {
+    /// Whether the key is the output of a query derivation
+    /// ([`DerivationKind::is_query`]).
+    pub fn is_query_output(&self) -> bool {
+        matches!(self, Self::ReceiverAuthority(_) | Self::CallbackParams(_))
+    }
+
     /// Whether the key holds one value that writes overwrite, as opposed to a
     /// view other keys determine (a member slot is the members filed under
     /// it; a scan is every entry) or a set that writers add to independently
@@ -2410,10 +2416,7 @@ pub fn note_global_path_read(path: &GlobalId) {
 
 /// Records a read of the owner the table literal `site` initialises.
 pub fn note_definition_site_read(site: &InFiled<TextRange>) {
-    let identity = u128::from(site.file_id.id) << 64
-        | u128::from(u32::from(site.value.start())) << 32
-        | u128::from(u32::from(site.value.end()));
-    note_read_by((u8::MAX - 15, identity), || {
+    note_read_by((u8::MAX - 15, site_identity(site)), || {
         FactKey::DefinitionSite(site.clone())
     });
 }
