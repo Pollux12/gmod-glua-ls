@@ -4343,6 +4343,8 @@ struct PlannedGroup {
 /// only between supersteps, where [`Engine::run`] counts them: counted across
 /// workers, which groups ran would depend on timing.
 struct StopSignal {
+    /// A slice of no evaluations: it only installs what the tasks ran.
+    exhausted: bool,
     deadline: Option<std::time::Instant>,
     interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     progressed: std::sync::atomic::AtomicBool,
@@ -4354,6 +4356,7 @@ impl StopSignal {
         interrupt: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Self {
         Self {
+            exhausted: matches!(slice, Slice::Evaluations(0)),
             deadline: match slice {
                 Slice::Until(deadline) => Some(deadline),
                 Slice::Whole | Slice::Evaluations(_) => None,
@@ -4371,14 +4374,14 @@ impl StopSignal {
 
     /// Whether the groups not yet started wait for the next superstep.
     fn reached(&self) -> bool {
-        self.progressed.load(std::sync::atomic::Ordering::Relaxed)
-            && (self
-                .deadline
-                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-                || self
-                    .interrupt
-                    .as_ref()
-                    .is_some_and(|interrupt| interrupt.load(std::sync::atomic::Ordering::Acquire)))
+        self.exhausted
+            || self.progressed.load(std::sync::atomic::Ordering::Relaxed)
+                && (self
+                    .deadline
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                    || self.interrupt.as_ref().is_some_and(|interrupt| {
+                        interrupt.load(std::sync::atomic::Ordering::Acquire)
+                    }))
     }
 }
 
