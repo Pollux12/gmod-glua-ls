@@ -228,8 +228,8 @@ pub async fn on_notification_handler(
 
 /// Runs the handler of a change to files on disk with the change pending
 /// from the moment it arrives, for the documents in `scope` or for every
-/// document when `None`: a diagnostics pull answered before the handler
-/// applies it would report the files as they were.
+/// document when `None`: a request answered before the handler applies it
+/// would read the files as they were.
 fn spawn_pending_file_change<F>(
     server_context: &ServerContext,
     method: &'static str,
@@ -308,8 +308,8 @@ mod tests {
     use super::*;
 
     /// A watched-file change is pending from the moment it arrives, so a
-    /// diagnostics pull waits for it instead of reporting the files as they
-    /// were before it.
+    /// request waits for it instead of reading the files as they were before
+    /// it.
     #[test]
     fn a_watched_file_change_is_pending_once_received() {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");

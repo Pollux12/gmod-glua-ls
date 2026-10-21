@@ -185,9 +185,8 @@ pub async fn output_result(
     }
 
     // The channel closes early only when worker tasks died before sending
-    // (see the `drop(sender)` above the spawn loop): never report a partial
-    // file set as a complete result. Bail loudly instead of hanging (before)
-    // or passing CI on partial diagnostics (worse).
+    // (see the `drop(sender)` above the spawn loop): a partial file set is an
+    // error, never a complete result that passes CI on partial diagnostics.
     if count != total_count {
         eprintln!(
             "glua_check: only {count} of {total_count} file results arrived; a worker task likely panicked"

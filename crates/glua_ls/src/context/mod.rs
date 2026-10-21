@@ -33,16 +33,19 @@ pub use workspace_manager::*;
 
 use crate::context::snapshot::ServerContextInner;
 
-// LOCK ORDER (acquire low → high; never a lower lock while holding a higher):
-// 1. workspace_diagnostic_token  2. recheck_token  3. analysis(read)
-// 4. workspace_manager(read)  5. workspace_manager(write)  6. analysis(write)
+// LOCK ORDER (take top to bottom; never one above while holding one below):
+// 1. `WorkspaceManager::config_apply`, held across a whole config reload.
+// 2. workspace_manager (read or write).
+// 3. analysis (read or write).
 // Within `DebouncedAnalysis`: pending_files before reindexing_files, and both
 // are released before anything above is taken.
-// Leaves: document_versions, renamed_uris, the diagnostic store's publishing
-// then state, and
-// `DebouncedAnalysis::in_flight_documents` — synchronous
-// locks, so they can never be held across an `.await`. Never upgrade read→write in place; avoid holding any lock across
-// `.await`. Atomics are exempt.
+// Leaves, taking nothing while held: workspace_diagnostic_token,
+// `WorkspaceManager`'s recheck_token and config_token (taken under
+// workspace_manager), document_versions, renamed_uris, the diagnostic store's
+// publishing then state, and `DebouncedAnalysis::in_flight_documents`. The
+// synchronous ones are never held across an `.await`. Never upgrade
+// read→write in place; avoid holding any lock across `.await`. Atomics are
+// exempt.
 
 /// Panics the debounce supervisor will restart before it stops trying.
 const DEBOUNCE_RESTART_LIMIT: u32 = 5;

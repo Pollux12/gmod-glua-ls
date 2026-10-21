@@ -43,7 +43,6 @@ impl LspFeatures {
             .unwrap_or(false)
     }
 
-    /// Gates `workspace/applyEdit`.
     /// Whether a workspace edit can name the document version it was made for.
     pub fn supports_document_changes(&self) -> bool {
         self.client_capabilities
@@ -54,6 +53,7 @@ impl LspFeatures {
             .unwrap_or(false)
     }
 
+    /// Gates `workspace/applyEdit`.
     pub fn supports_apply_edit(&self) -> bool {
         self.client_capabilities
             .workspace
