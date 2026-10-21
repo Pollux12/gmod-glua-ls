@@ -40,16 +40,12 @@ fn push_owner_key_id_unique(
     key: LuaMemberKey,
     id: LuaMemberId,
 ) -> bool {
-    let member_ids = target.entry(owner).or_default().entry(key).or_default();
-    match member_ids.binary_search_by_key(&member_id_sort_key(id), |existing| {
-        member_id_sort_key(*existing)
-    }) {
-        Ok(_) => false,
-        Err(at) => {
-            member_ids.insert(at, id);
-            true
-        }
-    }
+    target
+        .entry(owner)
+        .or_default()
+        .entry(key)
+        .or_default()
+        .insert_sorted(id)
 }
 
 /// Merges two tasks' changes to one owner-key slot, which stays sorted by
@@ -91,9 +87,7 @@ fn remove_owner_key_id(
     };
     let mut removed = false;
     if let Some(member_ids) = owner_items.get_mut(key) {
-        let before = member_ids.len();
-        member_ids.retain(|member_id| *member_id != id);
-        removed = member_ids.len() != before;
+        removed = member_ids.remove_sorted(id);
         if member_ids.is_empty() {
             owner_items.remove(key);
         }
@@ -318,9 +312,6 @@ pub struct LuaMemberIndex {
     /// follow the path when its winning `---@class` changes; members homed
     /// onto a class by any other route stay where they are.
     member_path_provenance: CowShards<LuaMemberId, GlobalId>,
-    /// Member reads that found nothing, by the file that read. A file whose
-    /// read failed cached no type and so left no dependency edge; when another
-    /// file later defines that key, this is how the reader is found.
     /// Per-owner multiset fingerprint of its history-index entries and
     /// current-owner history, for [`FactKey::MemberOwnerMap`].
     owner_history_fingerprints: CowShards<LuaMemberOwner, Fingerprint>,
@@ -1685,56 +1676,46 @@ impl LuaMemberIndex {
             .filter_map(|file_id| self.owner_key_index_owners_by_file.remove(file_id))
             .flatten()
             .collect::<HashSet<_>>();
-        let mut affected = HashSet::default();
-        let mut removed_entries = Vec::new();
-        let visible_removed = Self::remove_files_members_from_owner_key_map(
+        let visible = Self::remove_files_members_from_owner_key_map(
             &mut self.member_owner_key_index,
             removed,
             &owners,
-            &mut affected,
-            &mut removed_entries,
         );
         if derivation::recording() {
-            for (owner, key, _) in &removed_entries {
+            for (owner, key, _) in &visible {
                 note_slot_write(owner, key);
             }
         }
-        removed_entries.clear();
-        let history_removed = Self::remove_files_members_from_owner_key_map(
+        let history = Self::remove_files_members_from_owner_key_map(
             &mut self.member_owner_key_history_index,
             removed,
             &owners,
-            &mut affected,
-            &mut removed_entries,
         );
-        for (owner, key, id) in &removed_entries {
+        for (owner, key, id) in &history {
             note_slot_write(owner, key);
             self.fold_history_fingerprint(owner, history_element(key, *id), false);
         }
         // The sweep edits history membership behind every memo's back: a slot
         // that lost an entry shrinks, but one that lost nothing keeps its raw
         // length, so only bump when an entry actually left.
-        if visible_removed || history_removed {
+        if !visible.is_empty() || !history.is_empty() {
             self.bump_homing_revision();
-            if !affected.is_empty() {}
         }
     }
 
+    /// Drops the removed files' members from `owners`' slots, returning each
+    /// `(owner, key, id)` dropped.
     fn remove_files_members_from_owner_key_map(
         owner_key_index: &mut OwnerKeyMap,
         removed: &HashSet<FileId>,
         owners: &HashSet<LuaMemberOwner>,
-        affected: &mut HashSet<LuaMemberOwner>,
-        removed_entries: &mut Vec<(LuaMemberOwner, LuaMemberKey, LuaMemberId)>,
-    ) -> bool {
-        let mut removed_any = false;
+    ) -> Vec<(LuaMemberOwner, LuaMemberKey, LuaMemberId)> {
+        let mut removed_entries = Vec::new();
         for owner in owners {
             let Some(key_members) = owner_key_index.get_mut(owner) else {
                 continue;
             };
-            let mut owner_removed = false;
             key_members.retain(|key, member_ids| {
-                let before = member_ids.len();
                 member_ids.retain(|member_id| {
                     let keep = !removed.contains(&member_id.file_id);
                     if !keep {
@@ -1742,20 +1723,13 @@ impl LuaMemberIndex {
                     }
                     keep
                 });
-                if member_ids.len() != before {
-                    removed_any = true;
-                    owner_removed = true;
-                }
                 !member_ids.is_empty()
             });
             if key_members.is_empty() {
                 owner_key_index.remove(owner);
             }
-            if owner_removed {
-                affected.insert(owner.clone());
-            }
         }
-        removed_any
+        removed_entries
     }
 
     fn is_assignment_file_define_member(&self, id: LuaMemberId) -> bool {
@@ -1901,8 +1875,6 @@ impl LuaMemberIndex {
         self.members.get_mut(id)
     }
 
-    /// Every global path that currently has members parked on it, in a
-    /// stable order.
     /// Records `site` as a table literal that initialises the global `path`.
     ///
     /// A path's members all live on [`LuaMemberOwner::GlobalPath`]; its literals
@@ -2595,17 +2567,12 @@ impl LuaMemberIndex {
             note_owner_presence_read(owner);
             return None;
         };
-        let mut member_ids = match owner_members.get_member(key) {
-            Some(LuaMemberIndexItem::One(id)) => vec![*id],
-            Some(LuaMemberIndexItem::Many(ids)) => ids.clone(),
-            None => {
-                note_owner_presence_read(owner);
-                return Some(Vec::new());
-            }
+        let Some(item) = owner_members.get_member(key) else {
+            note_owner_presence_read(owner);
+            return Some(Vec::new());
         };
-        member_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
         Some(
-            member_ids
+            item.member_ids_slice()
                 .iter()
                 .filter_map(|member_id| self.get_member(member_id))
                 .collect(),
