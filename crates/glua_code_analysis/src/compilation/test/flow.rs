@@ -6724,6 +6724,31 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_captured_counter_written_by_two_closures_reads_the_same_in_either_order() {
+        let code = r#"
+            local count = 0
+            local function inc() count = count + 1 end
+            local function dec() count = count - 1 end
+        "#;
+        // `count` inside `inc` is the second read from the end, inside `dec` the first.
+        let reads_in = |first: usize| {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let file_id = ws.def(code);
+            let first_read = nth_name_expr_type_from_end(&mut ws, file_id, "count", first);
+            let second_read = nth_name_expr_type_from_end(&mut ws, file_id, "count", 2 - first);
+            [ws.humanize_type(first_read), ws.humanize_type(second_read)]
+        };
+        expect_that!(
+            reads_in(0),
+            eq(&["integer".to_string(), "integer".to_string()])
+        );
+        expect_that!(
+            reads_in(2),
+            eq(&["integer".to_string(), "integer".to_string()])
+        );
+    }
+
+    #[gtest]
     fn test_guard_alias_keeps_narrowing_applied_after_its_declaration() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def(

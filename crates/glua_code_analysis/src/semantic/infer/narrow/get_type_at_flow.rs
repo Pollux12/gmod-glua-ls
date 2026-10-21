@@ -1995,6 +1995,15 @@ fn captured_local_baseline(
         let Some(assigned) = infer_assigned_value_type_at(db, cache, &exprs, index)? else {
             continue;
         };
+        // A value computed from the local itself (`count = count + 1`) reads
+        // the baseline being built: unresolved, it adds nothing to it.
+        if crate::db_index::is_unresolved_type(&assigned)
+            && exprs
+                .get(index)
+                .is_some_and(|expr| expr_reads_decl(db, cache.get_file_id(), expr, *decl_id))
+        {
+            continue;
+        }
         if crate::db_index::is_unresolved_type(&baseline)
             || crate::db_index::is_unresolved_type(&assigned)
             || assigned.contain_tpl()
@@ -2004,6 +2013,18 @@ fn captured_local_baseline(
         baseline = TypeOps::Union.apply(db, &baseline, &assigned);
     }
     Ok(baseline)
+}
+
+/// Whether `expr` reads `decl_id` anywhere within it.
+fn expr_reads_decl(db: &DbIndex, file_id: FileId, expr: &LuaExpr, decl_id: LuaDeclId) -> bool {
+    std::iter::once(expr.syntax().clone())
+        .chain(expr.syntax().descendants())
+        .filter_map(glua_parser::LuaNameExpr::cast)
+        .any(|name| {
+            db.get_reference_index()
+                .get_var_reference_decl(&file_id, name.get_range())
+                == Some(decl_id)
+        })
 }
 
 /// Whether `expr` is a bare name that resolves to no declaration at all.
