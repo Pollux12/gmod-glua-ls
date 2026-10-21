@@ -96,6 +96,19 @@ fn extract_uri_from_value(value: &serde_json::Value) -> Option<Uri> {
     .find_map(|uri| Uri::from_str(uri.as_str()?).ok())
 }
 
+/// Whether a request's result points into documents other than its own: any
+/// document mid-edit, not only its own, would leave those places wrong.
+fn result_spans_documents(method: &str) -> bool {
+    matches!(
+        method,
+        <References as LspRequest>::METHOD
+            | <Rename as LspRequest>::METHOD
+            | <GotoImplementation as LspRequest>::METHOD
+            | <CallHierarchyIncomingCalls as LspRequest>::METHOD
+            | <CallHierarchyOutgoingCalls as LspRequest>::METHOD
+    )
+}
+
 fn content_modified(id: lsp_server::RequestId) -> Option<Response> {
     Some(Response::new_err(
         id,
@@ -168,12 +181,16 @@ macro_rules! dispatch_request {
                     if let Ok((id, params)) = $request.extract::<<$fresh_req_type as LspRequest>::Params>(<$fresh_req_type>::METHOD) {
                         let snapshot = $context.snapshot();
                         let task_metadata = request_task_metadata(<$fresh_req_type>::METHOD, &params);
-                        let target_uri = task_metadata.uri.clone();
+                        let target_uri = task_metadata
+                            .uri
+                            .clone()
+                            .filter(|_| !result_spans_documents(<$fresh_req_type>::METHOD));
                         $context.task(id.clone(), task_metadata, |cancel_token| async move {
                             if !crate::util::ls_profile::ls_profile_enabled() {
                                 // Symbol resolution against a stale index silently
                                 // returns empty; wait for the reindex. A request
-                                // aimed at one file waits only for that file.
+                                // whose result stays in its own file waits only
+                                // for that file.
                                 let freshness = match target_uri.as_ref() {
                                     Some(uri) => {
                                         snapshot
