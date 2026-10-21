@@ -1,5 +1,7 @@
-//! The server process exits after `shutdown` and `exit`, whether its
-//! workspace diagnostics have settled or are still being computed.
+//! The server process driven over stdio as an editor drives it: it exits
+//! after `shutdown` and `exit`, whether its workspace diagnostics have
+//! settled or are still being computed, and it analyses an edit on the same
+//! stack depth as the workspace load and `glua_check`.
 
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -242,4 +244,59 @@ fn a_server_still_diagnosing_exits_after_shutdown() {
     let exited = server.shuts_down_within(Duration::from_secs(10));
     let _ = std::fs::remove_dir_all(root);
     assert!(exited, "the server did not exit");
+}
+
+/// An edit is parsed on a runtime thread, which nests as deep as the analysis
+/// pool that loaded the workspace: text the load parses cleanly stays clean.
+#[test]
+fn an_edit_nests_as_deep_as_the_workspace_load() {
+    let (root, workspace, annotations) = workspace("gmod_glua_ls_deep_edit", 1);
+    let mut server = Server::start(&workspace, &annotations);
+    server.wait_for_status("workspaceLoaded");
+    let uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/autorun/sh_busy_0.lua"))
+        .expect("document URI");
+    let depth = 20_000;
+    let deep = format!("{}x = 1{}\n", "do ".repeat(depth), " end".repeat(depth));
+    server.notify(
+        "textDocument/didOpen",
+        json!({ "textDocument": { "uri": uri, "languageId": "lua", "version": 1, "text": "local a = 1\n" } }),
+    );
+    server.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": deep }],
+        }),
+    );
+
+    let messages = server.receive_until(STARTUP, |message| match message {
+        Message::Notification(notification)
+            if notification.method == "textDocument/publishDiagnostics"
+                && notification.params["uri"] == json!(uri)
+                && notification.params["version"] == 2 =>
+        {
+            Some(
+                notification.params["diagnostics"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|diagnostic| diagnostic["message"].as_str().map(str::to_string))
+                    .collect::<Vec<_>>(),
+            )
+        }
+        _ => None,
+    });
+    drop(server);
+    let _ = std::fs::remove_dir_all(root);
+    let messages = messages.expect("the edit's diagnostics are published");
+    let too_deep = messages
+        .iter()
+        .filter(|message| message.contains("too deeply nested"))
+        .count();
+    assert_eq!(
+        too_deep,
+        0,
+        "first diagnostics: {:?}",
+        &messages[..messages.len().min(3)]
+    );
 }

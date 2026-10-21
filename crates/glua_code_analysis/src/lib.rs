@@ -49,9 +49,9 @@ pub use vfs::*;
 ///
 /// Inference and the type-graph walks recurse to the depth of the source, which
 /// a generated or deeply nested GLua file can push past a default thread stack.
-/// The binaries spawn their analysis thread with this; the worker pool uses it
-/// too, so how deep a file may nest does not depend on which thread picked it
-/// up. The reservation is virtual and committed lazily, so a worker that never
+/// Every thread the binaries analyse on gets it: their runtime's threads, the
+/// thread driving that runtime and the worker pool, so how deep a file may nest
+/// does not depend on which thread picked it up. The reservation is virtual and committed lazily, so a worker that never
 /// recurses costs nothing.
 pub const ANALYSIS_STACK_SIZE: usize = 256 * 1024 * 1024;
 

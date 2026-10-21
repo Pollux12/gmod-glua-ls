@@ -544,9 +544,9 @@ fn load_env_file_beside_exe() {
     }
 }
 
-/// Analysis recurses over deeply nested syntax. The server does that work on
-/// spawned threads, which get a far larger stack than a process main thread does
-/// on Windows, so the tools have to ask for one explicitly.
+/// Analysis recurses over deeply nested syntax and runs on every runtime
+/// thread, so each one, like the thread driving the runtime, gets
+/// [`glua_code_analysis::ANALYSIS_STACK_SIZE`], as in the server.
 fn main() {
     load_env_file_beside_exe();
     std::thread::Builder::new()
@@ -554,6 +554,7 @@ fn main() {
         .spawn(|| {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
+                .thread_stack_size(glua_code_analysis::ANALYSIS_STACK_SIZE)
                 .build()
                 .expect("tokio runtime should build")
                 .block_on(run());
