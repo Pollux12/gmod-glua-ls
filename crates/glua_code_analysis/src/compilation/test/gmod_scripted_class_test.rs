@@ -4227,6 +4227,32 @@ end
         }
     }
 
+    /// A table a loader publishes under two scope globals is the base of
+    /// both scopes' classes.
+    #[gtest]
+    fn test_a_table_published_under_two_scope_globals_declares_both_classes() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "gamemode/core/libs/sh_plugin.lua",
+            r#"
+            local PLUGIN = {}
+            _G["PLUGIN"] = PLUGIN
+            _G["SCHEMA"] = PLUGIN
+            "#,
+        );
+
+        let type_index = ws.get_db_mut().get_type_index();
+        let declared = ["PLUGIN", "SCHEMA"].map(|name| {
+            type_index
+                .get_type_decl(&LuaTypeDeclId::global(name))
+                .is_some()
+        });
+        expect_that!(declared, eq([true, true]));
+    }
+
     #[gtest]
     fn test_scoped_class_helpers_target_only_scope_table() {
         // A gamemode-scope file can author other scripted tables (panels,

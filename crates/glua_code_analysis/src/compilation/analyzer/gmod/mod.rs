@@ -1219,7 +1219,7 @@ fn collect_published_scope_bases(
                 continue;
             };
             if !matches!(prefix.get_name_text().as_deref(), Some("_G" | "_ENV"))
-                || references.get_decl_id(&prefix.get_range()).is_some()
+                || name_expr_resolves_to_local(db, file_id, &prefix)
             {
                 continue;
             }
@@ -1929,12 +1929,19 @@ pub(crate) fn bind_published_scope_bases(
     file_id: FileId,
     published_bases: &[(LuaDeclId, String)],
 ) {
+    // Decided before any is typed: the loop types each table it publishes,
+    // which is not an annotation of it.
+    let annotated = published_bases
+        .iter()
+        .map(|(decl_id, _)| *decl_id)
+        .filter(|decl_id| {
+            db.get_type_index()
+                .get_type_cache(&(*decl_id).into())
+                .is_some_and(|cache| cache.is_doc())
+        })
+        .collect::<HashSet<_>>();
     for (decl_id, global) in published_bases {
-        if db
-            .get_type_index()
-            .get_type_cache(&(*decl_id).into())
-            .is_some_and(|cache| cache.is_doc())
-        {
+        if annotated.contains(decl_id) {
             continue;
         }
         let Some(range) = db
