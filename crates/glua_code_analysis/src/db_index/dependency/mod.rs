@@ -65,6 +65,30 @@ impl Hash for LuaDependencySite {
     }
 }
 
+impl LuaDependencySite {
+    /// Whether `other` is the same load site, whatever each resolves to now:
+    /// removing or re-indexing a target flips a site's resolution in place.
+    fn is_same_site(&self, other: &Self) -> bool {
+        let Self {
+            source_file_id,
+            target_file_id: _,
+            kind,
+            path,
+            path_keys,
+            original_expr,
+            call_range,
+            range,
+        } = self;
+        *source_file_id == other.source_file_id
+            && *kind == other.kind
+            && *path == other.path
+            && *path_keys == other.path_keys
+            && *original_expr == other.original_expr
+            && *call_range == other.call_range
+            && *range == other.range
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct DependencySiteLocation {
     source_file_id: FileId,
@@ -193,7 +217,10 @@ impl LuaDependencyIndex {
         self.unindex_source_sites(file_id, &sites);
         self.remove_source_dependency_edges(file_id);
         for site in sites {
-            if let Some(at) = derived.iter().position(|existing| *existing == site) {
+            if let Some(at) = derived
+                .iter()
+                .position(|existing| existing.is_same_site(&site))
+            {
                 derived.swap_remove(at);
                 continue;
             }
@@ -366,23 +393,22 @@ impl LuaDependencyIndex {
         }
     }
 
-    /// The exact inverse of [`transition_target_sites_to_unresolved`]: a file
-    /// that is indexed again re-resolves the sites its removal unresolved.
-    ///
-    /// Removing a file unresolves its callers' sites in place, and only the
-    /// caller's own re-analysis used to put the target back. A path that
-    /// re-indexes the target alone therefore left every includer pointing at
-    /// nothing - invisible in diagnostics, wrong in the index. Only the sites
-    /// the removal actually flipped are restored, so this cannot resolve a
-    /// site a build would have left unresolved on its own.
-    ///
-    /// [`transition_target_sites_to_unresolved`]: Self::transition_target_sites_to_unresolved
     /// Forgets the sites `target_file_id`'s removal left unresolved: the file
     /// came back at another path, so the paths they name are resolved anew.
     pub fn forget_unresolved_target(&mut self, target_file_id: FileId) {
         self.unresolved_by_removal.remove(&target_file_id);
     }
 
+    /// The exact inverse of [`transition_target_sites_to_unresolved`]: a file
+    /// that is indexed again re-resolves the sites its removal unresolved.
+    ///
+    /// Removing a file unresolves its callers' sites in place, so a path that
+    /// re-indexes the target alone would leave every includer pointing at
+    /// nothing. Only the sites the removal actually flipped are restored, so
+    /// this cannot resolve a site a build would have left unresolved on its
+    /// own.
+    ///
+    /// [`transition_target_sites_to_unresolved`]: Self::transition_target_sites_to_unresolved
     pub fn relink_unresolved_target(&mut self, target_file_id: FileId) {
         let Some(unresolved_by_removal) = self.unresolved_by_removal.remove(&target_file_id) else {
             return;
@@ -695,6 +721,31 @@ mod tests {
             index.collect_unresolved_path_dependents(["target.lua".to_string()]),
             vec![matched]
         );
+    }
+
+    #[test]
+    fn a_derived_site_whose_target_was_removed_is_taken_back_with_its_derivation() {
+        use crate::db_index::derivation::{self, DerivationId, DerivationKind};
+        let source = FileId::new(1);
+        let target = FileId::new(2);
+        let mut index = LuaDependencyIndex::new();
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        index.add_dependency_site(LuaDependencySite {
+            source_file_id: source,
+            target_file_id: Some(target),
+            kind: LuaDependencyKind::Include,
+            path: Some("target.lua".to_string()),
+            path_keys: vec!["target.lua".to_string()],
+            original_expr: "MyInclude(\"target.lua\")".to_string(),
+            call_range: TextRange::new(TextSize::new(0), TextSize::new(1)),
+            range: TextRange::new(TextSize::new(0), TextSize::new(1)),
+        });
+        derivation::end();
+
+        index.remove(target);
+        index.reset_derived_sites(source);
+
+        assert_eq!(index.get_dependency_sites(&source), None);
     }
 
     #[test]
