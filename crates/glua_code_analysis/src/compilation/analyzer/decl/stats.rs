@@ -179,15 +179,23 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                     value_expr_id,
                 );
 
-                analyzer.add_decl(decl);
+                let decl_id = analyzer.add_decl(decl);
 
                 // Record the `{}` this global is written with while the value
                 // expression is already in hand: it is a definition site of the
                 // path, and the path owns the literal's members.
                 if let Some(table_expr) = value_exprs.get(idx).and_then(initializer_table_expr) {
+                    let path = match analyzer
+                        .decl
+                        .get_decl(&decl_id)
+                        .and_then(LuaDecl::get_module_path)
+                    {
+                        Some(module_path) => format!("{module_path}.{name}"),
+                        None => name.to_string(),
+                    };
                     set_definition_sites(
                         &mut analyzer.ops,
-                        GlobalId::new(name),
+                        GlobalId::new(&path),
                         &table_expr,
                         file_id,
                     );
