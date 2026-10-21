@@ -440,23 +440,24 @@ impl<F: QueryFamily> QueryTable<F> {
             .is_some_and(|memo| memo.stale)
     }
 
-    /// Forgets `file_id`'s queries, writing their outputs so their readers
-    /// check them again.
-    fn remove_file(&self, file_id: FileId) {
+    /// Forgets the queries of `file_ids`, sorted, writing their outputs so
+    /// their readers check them again.
+    fn remove_files(&self, file_ids: &[FileId]) {
+        let removing = |file_id: &FileId| file_ids.binary_search(file_id).is_ok();
         let mut removed = Vec::new();
         self.memos().retain(|key, _| {
-            let keep = key.get_file_id() != file_id;
+            let keep = !removing(&key.get_file_id());
             if !keep {
                 removed.push(*key);
             }
             keep
         });
-        removed.sort_by_key(|key| key.get_position());
+        removed.sort_by_key(|key| (key.get_file_id(), key.get_position()));
         for key in removed {
             derivation::note_write(|| F::output(key));
         }
         let mut pending = self.pending();
-        pending.retain(|filing| filing.id.file_id != file_id);
+        pending.retain(|filing| !removing(&filing.id.file_id));
         self.pending_count.store(pending.len(), Ordering::Relaxed);
     }
 
@@ -586,9 +587,10 @@ impl Queries {
         }
     }
 
-    pub(crate) fn remove_file(&self, file_id: FileId) {
-        self.receiver_authority.remove_file(file_id);
-        self.callback_params.remove_file(file_id);
+    /// Forgets the queries of `file_ids`, sorted.
+    pub(crate) fn remove_files(&self, file_ids: &[FileId]) {
+        self.receiver_authority.remove_files(file_ids);
+        self.callback_params.remove_files(file_ids);
     }
 
     /// Whether a query was computed since [`Self::take_pending`] last ran.
@@ -701,6 +703,38 @@ mod transport_tests {
             },
         );
         fingerprint
+    }
+
+    /// Removing files forgets exactly their queries and writes each one's
+    /// output, so its readers check it again.
+    #[test]
+    fn removing_files_forgets_only_their_queries() {
+        let table = QueryTable::<TestQuery>::default();
+        let id = |file: u32, position: u32| LuaSignatureId::new(FileId::new(file), position.into());
+        for key in [id(3, 1), id(1, 5), id(2, 4), id(1, 2)] {
+            table.memos().insert(
+                key,
+                Memo {
+                    value: Arc::new(13),
+                    fingerprint: 1,
+                    stale: false,
+                },
+            );
+        }
+
+        let written =
+            derivation::capture_writes(|| table.remove_files(&[FileId::new(1), FileId::new(3)]));
+
+        let outputs = |keys: &[LuaSignatureId]| {
+            keys.iter()
+                .map(|key| HashedKey::new(TestQuery::output(*key)))
+                .collect::<rustc_hash::FxHashSet<_>>()
+        };
+        assert_eq!(written, outputs(&[id(1, 2), id(1, 5), id(3, 1)]));
+        assert_eq!(
+            table.memos().keys().copied().collect::<Vec<_>>(),
+            [id(2, 4)]
+        );
     }
 
     #[test]

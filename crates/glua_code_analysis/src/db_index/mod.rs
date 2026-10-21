@@ -1050,8 +1050,8 @@ impl DbIndex {
             if self.function_summaries.remove(&file_id).is_some() {
                 derivation::note_write(|| derivation::FactKey::FunctionSummaries(file_id));
             }
-            self.queries.remove_file(file_id);
         }
+        self.queries.remove_files(&file_ids);
         for &file_id in &file_ids {
             if let Some(path) = self.get_vfs().get_file_path(&file_id) {
                 log::debug!(
@@ -1868,6 +1868,7 @@ impl LuaIndex for DbIndex {
         self.net_helper_refs.clear();
         self.function_summaries.clear();
         self.derivations = Arc::default();
+        self.queries = Arc::default();
         self.gmod_call_roles = None;
         self.call_role_fingerprints.clear();
         self.role_mentions.clear();
