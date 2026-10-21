@@ -398,7 +398,6 @@ pub struct GmodClassMetadataIndex {
     /// The set of files whose metadata has vgui parent calls.
     vgui_parent_call_files: derivation::SetFingerprint,
     vgui_panels: CowShards<String, Vec<VguiPanelDefinition>>,
-    derma_skins: CowShards<String, Vec<DermaSkinDefinition>>,
     vgui_panel_parent_chains: CowCell<HashMap<LuaTypeDeclId, Vec<LuaTypeDeclId>>>,
     incomplete_vgui_panel_parent_chains: CowCell<HashSet<LuaTypeDeclId>>,
     /// Incremental multiset fingerprint, per panel/skin name, of the
@@ -415,19 +414,12 @@ struct VguiPanelDefinition {
     base_name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DermaSkinDefinition {
-    file_id: FileId,
-    range_start: TextSize,
-}
-
 impl GmodClassMetadataIndex {
     pub fn new() -> Self {
         Self {
             file_metadata: Default::default(),
             vgui_parent_call_files: derivation::SetFingerprint::default(),
             vgui_panels: Default::default(),
-            derma_skins: Default::default(),
             vgui_panel_parent_chains: Default::default(),
             incomplete_vgui_panel_parent_chains: Default::default(),
             meta_fingerprints: Default::default(),
@@ -436,7 +428,7 @@ impl GmodClassMetadataIndex {
     }
 
     /// The names under which name-keyed reads observe `call`: the literal
-    /// define argument (`find_*_definitions`) and the cached panel/skin name.
+    /// define argument (`find_*_definitions`) and the extracted panel or skin name.
     fn meta_names(
         kind: GmodScriptedClassCallKind,
         call: &GmodScriptedClassCallMetadata,
@@ -658,39 +650,7 @@ impl GmodClassMetadataIndex {
         }
     }
 
-    fn insert_derma_skin_from_call(
-        derma_skins: &mut CowShards<String, Vec<DermaSkinDefinition>>,
-        file_id: FileId,
-        call_metadata: &GmodScriptedClassCallMetadata,
-    ) {
-        let Some(skin_name) = Self::extract_non_empty_string_arg(
-            call_metadata,
-            call_metadata.derma_skin_define_arg_idx(),
-        ) else {
-            return;
-        };
-
-        derma_skins
-            .entry(skin_name)
-            .or_default()
-            .push(DermaSkinDefinition {
-                file_id,
-                range_start: call_metadata.syntax_id.get_range().start(),
-            });
-    }
-
-    fn update_derma_skins_from_call(
-        &mut self,
-        file_id: FileId,
-        kind: GmodScriptedClassCallKind,
-        call_metadata: &GmodScriptedClassCallMetadata,
-    ) {
-        if kind == GmodScriptedClassCallKind::DermaDefineSkin {
-            Self::insert_derma_skin_from_call(&mut self.derma_skins, file_id, call_metadata);
-        }
-    }
-
-    /// Incrementally refresh the panel/skin caches for a single re-added call
+    /// Incrementally refresh the panel cache for a single re-added call
     /// site. Both the old and new metadata share the same syntax range (they
     /// describe the same call), so the previous contribution is located by
     /// `(file_id, range_start)` and removed before the new one is inserted.
@@ -703,45 +663,23 @@ impl GmodClassMetadataIndex {
     ) {
         self.remove_cached_call(file_id, kind, old_metadata);
         self.update_vgui_panels_from_call(file_id, kind, new_metadata);
-        self.update_derma_skins_from_call(file_id, kind, new_metadata);
     }
 
-    /// Removes one call site's contribution to the panel/skin caches.
+    /// Removes one call site's contribution to the panel cache.
     fn remove_cached_call(
         &mut self,
         file_id: FileId,
         kind: GmodScriptedClassCallKind,
         metadata: &GmodScriptedClassCallMetadata,
     ) {
-        let range_start = metadata.syntax_id.get_range().start();
-        match kind {
-            GmodScriptedClassCallKind::VguiRegister
-            | GmodScriptedClassCallKind::DermaDefineControl => {
-                if let Some((panel_name, _)) = Self::maybe_extract_vgui_panel(kind, metadata) {
-                    Self::remove_cached_entry(
-                        &mut self.vgui_panels,
-                        &panel_name,
-                        file_id,
-                        range_start,
-                        |definition| (definition.file_id, definition.range_start),
-                    );
-                }
-            }
-            GmodScriptedClassCallKind::DermaDefineSkin => {
-                if let Some(skin_name) = Self::extract_non_empty_string_arg(
-                    metadata,
-                    metadata.derma_skin_define_arg_idx(),
-                ) {
-                    Self::remove_cached_entry(
-                        &mut self.derma_skins,
-                        &skin_name,
-                        file_id,
-                        range_start,
-                        |definition| (definition.file_id, definition.range_start),
-                    );
-                }
-            }
-            _ => {}
+        if let Some((panel_name, _)) = Self::maybe_extract_vgui_panel(kind, metadata) {
+            Self::remove_cached_entry(
+                &mut self.vgui_panels,
+                &panel_name,
+                file_id,
+                metadata.syntax_id.get_range().start(),
+                |definition| (definition.file_id, definition.range_start),
+            );
         }
     }
 
@@ -807,7 +745,6 @@ impl GmodClassMetadataIndex {
         }
 
         self.update_vgui_panels_from_call(file_id, kind, &call_metadata);
-        self.update_derma_skins_from_call(file_id, kind, &call_metadata);
         Self::update_meta_fingerprints(
             &mut self.meta_fingerprints,
             file_id,
@@ -1165,7 +1102,6 @@ impl GmodClassMetadataIndex {
         self.file_metadata.clear();
         self.vgui_parent_call_files = derivation::SetFingerprint::default();
         self.vgui_panels.clear();
-        self.derma_skins.clear();
         self.vgui_panel_parent_chains.clear();
         self.incomplete_vgui_panel_parent_chains.clear();
     }
@@ -1345,7 +1281,6 @@ mod tests {
 
         assert_eq!(index.file_metadata, expected.file_metadata);
         assert_eq!(index.vgui_panels, expected.vgui_panels);
-        assert_eq!(index.derma_skins, expected.derma_skins);
     }
 
     /// Readers of a file's panel registrations record those, read out of the
@@ -1414,7 +1349,6 @@ crate::db_index::cow_shards::task_fork_fields!(GmodClassMetadataIndex {
     file_metadata,
     vgui_parent_call_files,
     vgui_panels => crate::db_index::cow_shards::merge_list,
-    derma_skins,
     vgui_panel_parent_chains,
     incomplete_vgui_panel_parent_chains,
     meta_fingerprints => crate::db_index::cow_shards::merge_sum,
