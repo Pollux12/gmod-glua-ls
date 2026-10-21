@@ -216,11 +216,6 @@ where
     // alone while every other worker idled. Only the order in which files are
     // picked up changes; each result carries its own index, so callers see the
     // same index-aligned `Vec` as before.
-    let report_step = if crate::progress::is_active() {
-        (n / 50).max(1)
-    } else {
-        0
-    };
     let done = AtomicUsize::new(0);
 
     // Every worker, the calling thread among them, takes the next file in
@@ -234,9 +229,6 @@ where
             let Some(&idx) = dispatch.get(seq) else {
                 break;
             };
-            if report_step != 0 && seq.is_multiple_of(report_step) {
-                crate::progress::advance_current_phase(seq, n, "files");
-            }
             local.push((idx, f(db, items[idx])));
         }
         computed

@@ -458,6 +458,7 @@ impl Reanalysis {
     /// Evaluates until the re-analysis settles or `slice` is over. Returns
     /// whether it settled.
     pub(crate) fn run(&mut self, db: &mut DbIndex, slice: engine::Slice) -> bool {
+        crate::progress::enter_phase("Inferring types", 0, "");
         db.set_analysis_stage(self.stage);
         crate::semantic::keep_access_paths(std::mem::take(&mut self.access_paths));
         let unwinding = Unwinding;
@@ -1008,7 +1009,9 @@ fn replace_files(
     // every recording evaluation, then written file by file in canonical
     // order, each inside its file's source evaluation.
     let batch = parallel::analysis_threads().saturating_mul(SOURCE_TAILS_PER_THREAD);
-    let mut declared = Vec::with_capacity(registered.len());
+    let total = registered.len();
+    crate::progress::enter_phase("Collecting declarations", total, "files");
+    let mut declared = Vec::with_capacity(total);
     let mut registered = registered.into_iter();
     loop {
         let declaring = registered.by_ref().take(batch).collect::<Vec<_>>();
@@ -1031,7 +1034,10 @@ fn replace_files(
                 declare_source(db, file_id, evaluation, scopes, walk),
             ));
         }
+        crate::progress::advance_current_phase(declared.len(), total, "files");
     }
+    crate::progress::enter_phase("Reading annotations", total, "files");
+    let mut documented_count = 0;
     // Each batch's tails are computed together on the pool, outside every
     // recording evaluation, then published file by file in canonical order.
     let mut declared = declared.into_iter();
@@ -1048,6 +1054,7 @@ fn replace_files(
         let tails = crate::profile::phase("source tails", || {
             parallel::map_files_collect(db, &file_ids, source_tail)
         });
+        documented_count += documented.len();
         for ((file_id, (evaluation, context)), tail) in documented.into_iter().zip(tails) {
             let (outputs, derivations) = document_source(db, file_id, evaluation, context, tail);
             touched.extend(outputs);
@@ -1055,6 +1062,7 @@ fn replace_files(
                 engine.changed(id);
             }
         }
+        crate::progress::advance_current_phase(documented_count, total, "files");
     }
     if let Some(edits) = engine.edits_to_apply() {
         engine.follow_removed_outputs(&edits);
@@ -1483,18 +1491,9 @@ fn run_analysis<T: AnalysisPipeline>(db: &mut DbIndex, context: &mut AnalyzeCont
         .rsplit("::")
         .next()
         .unwrap_or_default();
-    if context.tree_list.len() > 1 {
-        crate::progress::enter_phase(
-            crate::progress::phase_label(name),
-            context.tree_list.len(),
-            "files",
-        );
-    }
-    // Timed through the phase accumulator rather than a `Profile`: several
-    // pipelines already carry their own `Profile`, and an unconditional one
-    // here would add a log line per pipeline per batch on a live server.
+    // Timed through the phase accumulator, which the re-analysis reports
+    // whole: a report per file would split it.
     crate::profile::phase(name, || T::analyze(db, context));
-    crate::profile::phase_report(name);
 }
 
 #[derive(Debug)]

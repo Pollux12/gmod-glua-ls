@@ -6,17 +6,49 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use glua_code_analysis::VirtualWorkspace;
 use glua_code_analysis::progress::{
-    PhaseProgress, advance_current_phase, clear_sink, enter_phase, is_active, phase_label, set_sink,
+    PhaseProgress, advance_current_phase, clear_sink, enter_phase, is_active, set_sink,
 };
 
 /// The sink is process-global, so these must not run concurrently.
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// A load reports each phase it passes through, counting the files of the
+/// whole load rather than of the batch a worker happens to hold.
 #[test]
-fn phase_label_maps_known_pipelines_and_passes_through_others() {
-    assert_eq!(phase_label("LuaAnalysisPipeline"), "Inferring types");
-    assert_eq!(phase_label("SomeNewPipeline"), "SomeNewPipeline");
+fn a_load_reports_its_phases_against_every_file_it_loads() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let reports = Arc::new(Mutex::new(Vec::new()));
+    let sink_reports = reports.clone();
+    set_sink(Arc::new(move |progress: PhaseProgress<'_>| {
+        if let Ok(mut reports) = sink_reports.lock() {
+            reports.push((progress.phase.to_string(), progress.done, progress.total));
+        }
+    }));
+
+    let mut ws = VirtualWorkspace::new();
+    ws.def_files(vec![
+        ("lua/autorun/sh_a.lua", "A = 1"),
+        ("lua/autorun/sh_b.lua", "B = A"),
+        ("lua/autorun/sh_c.lua", "C = B"),
+    ]);
+    clear_sink();
+
+    let reports = reports.lock().unwrap().clone();
+    let finished = |phase: &str| {
+        reports
+            .iter()
+            .any(|(seen, done, total)| seen == phase && *total == 3 && *done == 3)
+    };
+    assert!(
+        finished("Collecting declarations")
+            && finished("Reading annotations")
+            && reports
+                .iter()
+                .any(|(phase, _, _)| phase == "Inferring types"),
+        "{reports:?}"
+    );
 }
 
 #[test]

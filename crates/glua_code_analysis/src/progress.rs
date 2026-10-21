@@ -96,23 +96,3 @@ fn emit(progress: PhaseProgress<'_>) {
         sink(progress);
     }
 }
-
-/// A phase name to show a user, given the pipeline's Rust type name. An
-/// unmapped pipeline falls back to its own name.
-pub fn phase_label(pipeline_type_name: &str) -> &str {
-    match pipeline_type_name {
-        "DeclAnalysisPipeline" => "Collecting declarations",
-        "DocAnalysisPipeline" => "Reading annotations",
-        "GmodPreAnalysisPipeline" => "Resolving GMod metadata",
-        "LuaAnalysisPipeline" => "Inferring types",
-        "EarlyDynamicFieldAnalysisPipeline" | "DynamicFieldAnalysisPipeline" => {
-            "Resolving dynamic fields"
-        }
-        "PreDynamicUnResolveAnalysisPipeline" | "UnResolveAnalysisPipeline" => {
-            "Resolving deferred types"
-        }
-        "GmodNetworkAnalysisPipeline" => "Analysing net messages",
-        "GmodPostAnalysisPipeline" => "Finishing GMod analysis",
-        other => other,
-    }
-}
