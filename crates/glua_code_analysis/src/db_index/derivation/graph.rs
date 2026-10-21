@@ -2795,7 +2795,9 @@ impl ReaderGraph {
         };
         entry.written = u64::MAX;
         entry.set_mark(HELD, false);
+        entry.set_mark(WINDOWED, false);
         self.table.held.remove(&slot);
+        self.table.windows.remove(&slot);
         self.table.last_written = super::new_stamp();
         self.table.unfile(&key, slot);
         self.table.retire(slot);
