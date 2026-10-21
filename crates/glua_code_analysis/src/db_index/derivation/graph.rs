@@ -47,6 +47,11 @@ impl Record {
     fn with_reads(&self, reads: &[KeyIdx]) -> Self {
         Self::new(reads.iter().copied(), self.outputs())
     }
+
+    /// This record with `outputs` in place of its outputs.
+    fn with_outputs(&self, outputs: &[KeyIdx]) -> Self {
+        Self::new(self.reads().iter().copied(), outputs)
+    }
 }
 
 /// The files whose positions `key` names, which an edit of one of them
@@ -521,7 +526,7 @@ impl Readers {
 
 /// The sorted `reads` with each source of `moves`, sorted by source, replaced
 /// by its target, sorted and without repeats.
-fn renamed_reads(reads: &[KeyIdx], moves: &[(KeyIdx, KeyIdx)]) -> Box<[KeyIdx]> {
+fn renamed_slots(reads: &[KeyIdx], moves: &[(KeyIdx, KeyIdx)]) -> Box<[KeyIdx]> {
     let mut kept = Vec::with_capacity(reads.len());
     let mut renamed = Vec::with_capacity(moves.len());
     let mut next = 0;
@@ -1792,17 +1797,7 @@ impl ReaderGraph {
             record,
         } = diffed;
         for key in added {
-            self.table.add_producer(key, deriv);
-            if let Some(owner) = self.key(key).owning_file()
-                && owner != id.file_id
-            {
-                *self
-                    .foreign_producers
-                    .entry(owner)
-                    .or_default()
-                    .entry(deriv)
-                    .or_default() += 1;
-            }
+            self.produce(key, deriv, id.file_id);
         }
         let dropped = dropped
             .into_iter()
@@ -2039,8 +2034,8 @@ impl ReaderGraph {
         }
     }
 
-    /// Renames every recorded read of a key `edits` moved to the key's new
-    /// position, keeping the fingerprint the reader saw.
+    /// Renames every recorded read and write of a key `edits` moved to the
+    /// key's new position, keeping the fingerprint the reader saw.
     pub fn apply_edits(&mut self, edits: &EditMaps) -> AppliedEdits {
         use rayon::prelude::*;
         let files: FxHashSet<FileId> = edits.files().collect();
@@ -2053,7 +2048,10 @@ impl ReaderGraph {
                 .par_iter()
                 .filter_map(|slot| {
                     let entry = &keys[*slot as usize];
-                    let key = entry.key.as_ref().filter(|_| !entry.readers.is_empty())?;
+                    let key = entry
+                        .key
+                        .as_ref()
+                        .filter(|_| !entry.readers.is_empty() || entry.producer() != NO_PRODUCER)?;
                     match edits.map_key(key) {
                         Some(moved) if moved == **key => None,
                         moved => Some((*slot, moved.map(HashedKey::new))),
@@ -2082,12 +2080,22 @@ impl ReaderGraph {
         lost.sort();
         lost.dedup();
         let moved_to = new_keys.par_iter().cloned().collect::<Vec<_>>();
-        // Every moved key gives up its readers before any takes new ones:
-        // positions shift in chains, where one key's new place is another's
-        // old one.
+        // Every moved key gives up its readers and producers before any takes
+        // new ones: positions shift in chains, where one key's new place is
+        // another's old one.
         let taken = sources
             .iter()
             .map(|slot| std::mem::take(&mut self.table.keys[*slot as usize].readers))
+            .collect::<Vec<_>>();
+        let produced = sources
+            .iter()
+            .map(|slot| {
+                let producers = self.table.producers(*slot).collect::<Vec<_>>();
+                for deriv in &producers {
+                    self.unproduce(*slot, *deriv, self.derivations[*deriv as usize].id.file_id);
+                }
+                producers
+            })
             .collect::<Vec<_>>();
         let now = super::new_stamp();
         let targets = crate::profile::phase("rename reads: intern moved keys", || {
@@ -2119,11 +2127,37 @@ impl ReaderGraph {
                         .iter()
                         .map(|&(_, source, target)| (source, target))
                         .collect::<Vec<_>>();
-                    Some((deriv, renamed_reads(record.reads(), &shifts)))
+                    Some((deriv, renamed_slots(record.reads(), &shifts)))
                 })
                 .collect::<Vec<_>>();
             (moves.len(), rewritten)
         });
+        let mut output_moves = sources
+            .iter()
+            .zip(&targets)
+            .zip(&produced)
+            .flat_map(|((source, target), producers)| {
+                producers
+                    .iter()
+                    .map(move |deriv| (*deriv, *source, *target))
+            })
+            .collect::<Vec<_>>();
+        output_moves.sort_unstable();
+        for group in output_moves.chunk_by(|left, right| left.0 == right.0) {
+            let deriv = group[0].0;
+            let shifts = group
+                .iter()
+                .map(|&(_, source, target)| (source, target))
+                .collect::<Vec<_>>();
+            if let Some(record) = self.derivations[deriv as usize].record.as_mut() {
+                *record = record.with_outputs(&renamed_slots(record.outputs(), &shifts));
+            }
+        }
+        for (target, producers) in targets.iter().zip(produced) {
+            for deriv in producers {
+                self.produce(*target, deriv, self.derivations[deriv as usize].id.file_id);
+            }
+        }
         let rewrite_stats = crate::profile::phase_enabled().then(|| {
             let reads = rewritten
                 .iter()
@@ -2810,6 +2844,25 @@ impl ReaderGraph {
                 deriv_hash(&derivations[*deriv as usize].id)
             });
         slot
+    }
+
+    /// Adds `deriv`, a derivation of `file_id`, to `key`'s producers unless it
+    /// is one.
+    fn produce(&mut self, key: KeyIdx, deriv: DerivIdx, file_id: FileId) {
+        if self.table.producers(key).any(|producer| producer == deriv) {
+            return;
+        }
+        self.table.add_producer(key, deriv);
+        if let Some(owner) = self.key(key).owning_file()
+            && owner != file_id
+        {
+            *self
+                .foreign_producers
+                .entry(owner)
+                .or_default()
+                .entry(deriv)
+                .or_default() += 1;
+        }
     }
 
     /// Removes `deriv` from `key`'s producers, leaving the slot allocated.
@@ -3540,6 +3593,39 @@ mod tests {
         graph.remove_files(&[FileId::new(2)]);
 
         assert_eq!(graph.stale_readers(&decl(20), |_| false).count(), 0);
+    }
+
+    /// A key a derivation writes follows an edit that moves it, as its reads
+    /// do, even through a chain where one key moves onto another's place.
+    #[test]
+    fn a_written_key_moves_with_its_producer_when_an_edit_shifts_it() {
+        use crate::{LuaDeclId, PositionMap};
+        let decl = |position: u32| {
+            HashedKey::new(FactKey::Decl(LuaDeclId::new(
+                FileId::new(1),
+                TextSize::new(position),
+            )))
+        };
+        let mut graph = ReaderGraph::default();
+        graph.replace(id(2, 0), vec![], vec![decl(20), decl(30)], |_| 0);
+        let old_text = "a".repeat(40);
+        let new_text = format!("{}{}", "b".repeat(10), "a".repeat(40));
+
+        graph.apply_edits(&EditMaps::new([(
+            FileId::new(1),
+            PositionMap::new(&old_text, &new_text),
+        )]));
+
+        let mut outputs = graph.outputs_of(id(2, 0)).cloned().collect::<Vec<_>>();
+        outputs.sort_by_key(|key| format!("{key:?}"));
+        let producers = [20, 30, 40].map(|at| graph.producers(&decl(at)).collect::<Vec<_>>());
+        assert_eq!(
+            (outputs, producers),
+            (
+                vec![decl(30), decl(40)],
+                [vec![], vec![id(2, 0)], vec![id(2, 0)]]
+            )
+        );
     }
 
     /// A key read after an edit built the positional index is renamed by the
