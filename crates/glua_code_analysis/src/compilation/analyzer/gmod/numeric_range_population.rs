@@ -554,6 +554,7 @@ fn numeric_range_population_from_helper_call(
         write_roots,
         alias_roots: Vec::new(),
         file_id,
+        file_order: db.get_vfs().file_order_key(&file_id),
         call_range: call_expr.get_range(),
     })
 }

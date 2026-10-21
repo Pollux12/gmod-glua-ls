@@ -1,7 +1,7 @@
-use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
-use crate::db_index::cow_shards::{CowCell, CowShards};
-use rowan::TextRange;
+use crate::db_index::cow_shards::CowShards;
+use rowan::{TextRange, TextSize};
 
 use smol_str::SmolStr;
 
@@ -10,7 +10,7 @@ use crate::{
     db_index::derivation::{self, FactKey, Fingerprint},
 };
 
-#[derive(Debug, Clone, Hash, PartialEq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct TableNumericRangePopulation {
     pub table_global: String,
     pub start: i64,
@@ -19,13 +19,23 @@ pub struct TableNumericRangePopulation {
     pub write_roots: Vec<String>,
     pub alias_roots: Vec<String>,
     pub file_id: FileId,
+    /// The file's place in the stable cross-file order, which orders a
+    /// global's populations whatever order files were analysed in.
+    pub file_order: Arc<str>,
     pub call_range: TextRange,
+}
+
+impl TableNumericRangePopulation {
+    fn order(&self) -> (Arc<str>, TextSize, i64) {
+        (self.file_order.clone(), self.call_range.start(), self.start)
+    }
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct NumericRangePopulationIndex {
     by_file: CowShards<FileId, Vec<TableNumericRangePopulation>>,
-    by_global: CowCell<FxHashMap<String, Vec<TableNumericRangePopulation>>>,
+    /// Each global's populations, in [`TableNumericRangePopulation::order`].
+    by_global: CowShards<String, Vec<TableNumericRangePopulation>>,
 }
 
 impl NumericRangePopulationIndex {
@@ -43,10 +53,12 @@ impl NumericRangePopulationIndex {
             derivation::note_write(|| {
                 FactKey::NumericPopulation(SmolStr::new(&population.table_global))
             });
-            self.by_global
+            let entries = self
+                .by_global
                 .entry(population.table_global.clone())
-                .or_default()
-                .push(population.clone());
+                .or_default();
+            let at = entries.partition_point(|entry| entry.order() <= population.order());
+            entries.insert(at, population.clone());
         }
         if !populations.is_empty() {
             self.by_file.insert(file_id, populations);
@@ -125,4 +137,74 @@ impl NumericRangePopulationIndex {
     }
 }
 
-crate::db_index::cow_shards::task_fork_fields!(NumericRangePopulationIndex { by_file, by_global });
+crate::db_index::cow_shards::task_fork_fields!(NumericRangePopulationIndex {
+    by_file,
+    by_global => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_sorted_by(
+            current,
+            frozen,
+            fork,
+            TableNumericRangePopulation::order,
+        )
+    },
+});
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db_index::cow_shards::TaskFork;
+
+    fn population(file: u32, file_order: &str) -> TableNumericRangePopulation {
+        TableNumericRangePopulation {
+            table_global: "Ranks".to_string(),
+            start: 1,
+            end: 3,
+            value_type: LuaType::Integer,
+            write_roots: Vec::new(),
+            alias_roots: Vec::new(),
+            file_id: FileId::new(file),
+            file_order: Arc::from(file_order),
+            call_range: TextRange::default(),
+        }
+    }
+
+    fn populating_files(index: &NumericRangePopulationIndex) -> Vec<FileId> {
+        index
+            .get_for_global("Ranks")
+            .iter()
+            .map(|population| population.file_id)
+            .collect()
+    }
+
+    #[test]
+    fn two_tasks_populating_one_global_both_land() {
+        let frozen = NumericRangePopulationIndex::new();
+        let mut first = frozen.task_fork();
+        first.set_file_populations(FileId::new(1), vec![population(1, "b")]);
+        let mut second = frozen.task_fork();
+        second.set_file_populations(FileId::new(2), vec![population(2, "a")]);
+        let mut index = frozen.clone();
+        let mut conflicts = vec![Vec::new(), Vec::new()];
+
+        index.install_tasks_reporting(&frozen, vec![(0, first), (1, second)], &mut conflicts);
+
+        assert_eq!(
+            populating_files(&index),
+            vec![FileId::new(2), FileId::new(1)]
+        );
+    }
+
+    #[test]
+    fn a_globals_populations_follow_file_order_whatever_order_files_were_set_in() {
+        let mut index = NumericRangePopulationIndex::new();
+        index.set_file_populations(FileId::new(1), vec![population(1, "a")]);
+        index.set_file_populations(FileId::new(2), vec![population(2, "b")]);
+
+        index.set_file_populations(FileId::new(1), vec![population(1, "a")]);
+
+        assert_eq!(
+            populating_files(&index),
+            vec![FileId::new(1), FileId::new(2)]
+        );
+    }
+}
