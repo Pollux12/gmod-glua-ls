@@ -817,6 +817,23 @@ impl Vfs {
             .collect()
     }
 
+    /// The URIs of the files with text, staged or taken, whose path lies under
+    /// the directory `dir`, compared by whole path components; sorted.
+    pub fn file_uris_under(&self, dir: &Path) -> Vec<Uri> {
+        let mut uris = self
+            .file_id_map
+            .iter()
+            .filter(|(path, id)| {
+                path.as_path() != dir
+                    && path.starts_with(dir)
+                    && self.latest(&FileId { id: **id }).is_some()
+            })
+            .filter_map(|(path, _)| file_path_to_uri(path))
+            .collect::<Vec<_>>();
+        uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        uris
+    }
+
     pub fn is_remote_file(&self, id: &FileId) -> bool {
         if let Some(opt_content) = self.file_data.get(id.id as usize) {
             if let Some(content) = opt_content {
@@ -895,6 +912,35 @@ mod tests {
 
         assert!(vfs.file_order_key(&local) < vfs.file_order_key(&remote));
         assert!(vfs.file_order_key(&remote) < vfs.file_order_key(&unknown));
+    }
+
+    /// A directory holds the files under it by whole path components: not
+    /// itself, not a sibling sharing its name prefix, and not a file whose
+    /// deletion is staged.
+    #[test]
+    fn the_files_under_a_directory_match_whole_path_components() {
+        let mut vfs = new_vfs();
+        let uri = |path: &str| -> Uri { path.parse().expect("valid test uri") };
+        let config = uri("file:///C:/addon/lua/autorun/sh_config.lua");
+        let init = uri("file:///C:/addon/lua/autorun/server/sv_init.lua");
+        let deleted = uri("file:///C:/addon/lua/autorun/sh_deleted.lua");
+        for file in [
+            &config,
+            &init,
+            &deleted,
+            &uri("file:///C:/addon/lua/autorun_extra/sh_extra.lua"),
+            &uri("file:///C:/addon/lua/sh_other.lua"),
+        ] {
+            vfs.set_file_content(file, Some("x = 1\n".to_string()));
+        }
+        vfs.delete_file_content(&deleted);
+
+        let dir = super::uri_to_file_path(&uri("file:///C:/addon/lua/autorun")).expect("a path");
+        let mut expected = vec![config, init];
+        expected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(vfs.file_uris_under(&dir), expected);
+        let file = super::uri_to_file_path(&expected[0]).expect("a path");
+        assert!(vfs.file_uris_under(&file).is_empty());
     }
 
     /// Readers see the text a take installed, never text staged after it,

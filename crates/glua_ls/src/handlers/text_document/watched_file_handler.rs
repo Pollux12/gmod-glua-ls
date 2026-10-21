@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use glua_code_analysis::{read_file_with_encoding, uri_to_file_path};
-use lsp_types::{DidChangeWatchedFilesParams, FileChangeType, Uri};
+use glua_code_analysis::{file_path_to_uri, read_file_with_encoding, uri_to_file_path};
+use lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent, Uri};
+use walkdir::WalkDir;
 
 use crate::{
     codestyle::{apply_editorconfig_file, should_apply_editorconfig_updates},
@@ -25,14 +26,36 @@ pub async fn on_did_change_watched_files(
     // Classify events and read files from disk WITHOUT
     // the analysis write lock so that slow disk I/O does not block
     // hover, completion, and diagnostic handlers.
-    let (encoding, apply_editorconfig_updates) = {
+    let (encoding, apply_editorconfig_updates, indexed_under) = {
         let analysis = context.analysis().read().await;
         let emmyrc = analysis.get_emmyrc();
+        let vfs = analysis.compilation.get_db().get_vfs();
+        // A deleted folder's files get no events of their own. A path the
+        // VFS holds as a file has nothing under it.
+        let indexed_under = params
+            .changes
+            .iter()
+            .map(|change| match (change.typ, uri_to_file_path(&change.uri)) {
+                (FileChangeType::DELETED, Some(path)) if vfs.get_file_id(&change.uri).is_none() => {
+                    vfs.file_uris_under(&path)
+                }
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
         (
             emmyrc.workspace.encoding.clone(),
             should_apply_editorconfig_updates(&emmyrc),
+            indexed_under,
         )
     };
+
+    let changes = params.changes;
+    let Ok(changes) =
+        tokio::task::spawn_blocking(move || expand_folder_events(changes, indexed_under)).await
+    else {
+        return None;
+    };
+    stage("folders", &mut at);
 
     let mut lua_events: Vec<(Uri, FileChangeType)> = Vec::new();
     let mut editorconfig_paths: Vec<PathBuf> = Vec::new();
@@ -41,7 +64,7 @@ pub async fn on_did_change_watched_files(
     {
         let workspace = context.workspace_manager().read().await;
 
-        for file_event in params.changes.into_iter() {
+        for file_event in changes {
             let file_type = get_file_type(&file_event.uri);
             match file_type {
                 // The editor owns an open document's text, deleted on disk
@@ -210,6 +233,44 @@ fn finally_deleted_uris(batch: &[(Uri, Option<String>)]) -> Vec<Uri> {
     deleted
 }
 
+/// The batch's events with each folder's files in place of the folder's: a
+/// created folder's files on disk as creations, and the files `indexed_under`
+/// each deleted path as deletions right after it, in event order.
+fn expand_folder_events(changes: Vec<FileEvent>, indexed_under: Vec<Vec<Uri>>) -> Vec<FileEvent> {
+    let mut events = Vec::with_capacity(changes.len());
+    for (change, indexed) in changes.into_iter().zip(indexed_under) {
+        let created_dir = (change.typ == FileChangeType::CREATED)
+            .then(|| uri_to_file_path(&change.uri))
+            .flatten()
+            .filter(|path| path.is_dir());
+        match created_dir {
+            Some(dir) => {
+                events.extend(files_on_disk_under(&dir).into_iter().map(|uri| FileEvent {
+                    uri,
+                    typ: FileChangeType::CREATED,
+                }))
+            }
+            None => events.push(change),
+        }
+        events.extend(indexed.into_iter().map(|uri| FileEvent {
+            uri,
+            typ: FileChangeType::DELETED,
+        }));
+    }
+    events
+}
+
+/// The URIs of the files under the directory `dir` on disk, sorted.
+fn files_on_disk_under(dir: &Path) -> Vec<Uri> {
+    WalkDir::new(dir)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| file_path_to_uri(&entry.into_path()))
+        .collect()
+}
+
 /// Reads the text of each created or changed file, in event order, for the batch.
 fn read_lua_events(
     events: Vec<(Uri, FileChangeType)>,
@@ -239,15 +300,16 @@ enum WatchedFileType {
 }
 
 /// The documents a batch of watched-file changes can change: its own Lua
-/// files, or every document (`None`) when a config or `.editorconfig` file is
-/// among them.
+/// files, or every document (`None`) when a config or `.editorconfig` file, or
+/// a path without an extension such as a folder, is among them.
 pub(crate) fn watched_change_scope(params: &DidChangeWatchedFilesParams) -> Option<Vec<Uri>> {
     params
         .changes
         .iter()
         .map(|change| {
-            matches!(get_file_type(&change.uri), Some(WatchedFileType::Lua))
-                .then(|| change.uri.clone())
+            let lua_file = matches!(get_file_type(&change.uri), Some(WatchedFileType::Lua))
+                && uri_to_file_path(&change.uri).is_some_and(|path| path.extension().is_some());
+            lua_file.then(|| change.uri.clone())
         })
         .collect()
 }
@@ -373,6 +435,297 @@ mod tests {
         });
     }
 
+    /// Indexes `files` under `root`, registered as the main workspace the
+    /// watcher admits files from, and returns their URIs in order.
+    async fn index_workspace(
+        snapshot: &crate::context::ServerContextSnapshot,
+        root: &std::path::Path,
+        files: &[(&str, &str)],
+    ) -> Vec<Uri> {
+        snapshot.workspace_manager().write().await.workspace_folders =
+            vec![glua_code_analysis::WorkspaceFolder::new(
+                root.to_path_buf(),
+                false,
+            )];
+        let mut analysis = snapshot.analysis().write().await;
+        analysis.add_main_workspace(root.to_path_buf());
+        files
+            .iter()
+            .map(|(path, text)| {
+                let uri = glua_code_analysis::file_path_to_uri(&root.join(path))
+                    .expect("file URI should parse");
+                analysis
+                    .update_file_by_uri(&uri, Some(text.to_string()))
+                    .expect("file is added");
+                uri
+            })
+            .collect()
+    }
+
+    fn folder_event(
+        root: &std::path::Path,
+        folder: &str,
+        typ: lsp_types::FileChangeType,
+    ) -> lsp_types::FileEvent {
+        lsp_types::FileEvent {
+            uri: glua_code_analysis::file_path_to_uri(&root.join(folder))
+                .expect("folder URI should parse"),
+            typ,
+        }
+    }
+
+    /// The newest text the server holds for `uri`, staged or taken.
+    async fn latest_text(
+        snapshot: &crate::context::ServerContextSnapshot,
+        uri: &Uri,
+    ) -> Option<String> {
+        let analysis = snapshot.analysis().read().await;
+        let vfs = analysis.compilation.get_db().get_vfs();
+        vfs.get_file_id(uri)
+            .and_then(|file_id| vfs.latest_content(&file_id))
+            .cloned()
+    }
+
+    /// A deleted folder gets one event; every file indexed under it goes
+    /// with it, as if each had its own deletion.
+    #[test]
+    fn a_watched_folder_deletion_removes_the_files_under_it() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = lsp_server::Connection::memory();
+        runtime.block_on(async {
+            let context = crate::context::ServerContext::new(
+                connection,
+                lsp_types::ClientCapabilities::default(),
+            );
+            let snapshot = context.snapshot();
+            let root = crate::util::unique_temp_dir("gmod_glua_ls_watched_folder_deletion");
+            let uris = index_workspace(
+                &snapshot,
+                &root,
+                &[
+                    ("lua/autorun/sh_config.lua", "Config = {}\n"),
+                    ("lua/autorun/server/sv_init.lua", "Config.ready = true\n"),
+                    ("lua/sh_other.lua", "Other = {}\n"),
+                ],
+            )
+            .await;
+
+            super::on_did_change_watched_files(
+                snapshot.clone(),
+                lsp_types::DidChangeWatchedFilesParams {
+                    changes: vec![folder_event(
+                        &root,
+                        "lua/autorun",
+                        lsp_types::FileChangeType::DELETED,
+                    )],
+                },
+            )
+            .await;
+
+            assert_eq!(latest_text(&snapshot, &uris[0]).await, None);
+            assert_eq!(latest_text(&snapshot, &uris[1]).await, None);
+            assert_eq!(
+                latest_text(&snapshot, &uris[2]).await.as_deref(),
+                Some("Other = {}\n")
+            );
+            assert!(snapshot.debounced_analysis().is_dirty());
+        });
+    }
+
+    /// An open document under a deleted folder keeps the editor's text until
+    /// it closes, as an open document deleted on its own does.
+    #[test]
+    fn a_watched_folder_deletion_keeps_an_open_document_under_it() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = lsp_server::Connection::memory();
+        runtime.block_on(async {
+            let context = crate::context::ServerContext::new(
+                connection,
+                lsp_types::ClientCapabilities::default(),
+            );
+            let snapshot = context.snapshot();
+            let root = crate::util::unique_temp_dir("gmod_glua_ls_watched_folder_open_deletion");
+            let uris = index_workspace(
+                &snapshot,
+                &root,
+                &[
+                    ("lua/autorun/sh_config.lua", "Config = {}\n"),
+                    ("lua/autorun/client/cl_hud.lua", "Hud = {}\n"),
+                ],
+            )
+            .await;
+            snapshot
+                .workspace_manager()
+                .write()
+                .await
+                .current_open_files
+                .insert(uris[1].clone());
+
+            super::on_did_change_watched_files(
+                snapshot.clone(),
+                lsp_types::DidChangeWatchedFilesParams {
+                    changes: vec![folder_event(
+                        &root,
+                        "lua/autorun",
+                        lsp_types::FileChangeType::DELETED,
+                    )],
+                },
+            )
+            .await;
+
+            assert_eq!(latest_text(&snapshot, &uris[0]).await, None);
+            assert_eq!(
+                latest_text(&snapshot, &uris[1]).await.as_deref(),
+                Some("Hud = {}\n")
+            );
+        });
+    }
+
+    /// A folder's deletion reaches only what lies under it, not a sibling
+    /// folder whose name starts with the deleted one's.
+    #[test]
+    fn a_watched_folder_deletion_spares_a_sibling_sharing_its_name_prefix() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = lsp_server::Connection::memory();
+        runtime.block_on(async {
+            let context = crate::context::ServerContext::new(
+                connection,
+                lsp_types::ClientCapabilities::default(),
+            );
+            let snapshot = context.snapshot();
+            let root = crate::util::unique_temp_dir("gmod_glua_ls_watched_folder_prefix");
+            let uris = index_workspace(
+                &snapshot,
+                &root,
+                &[
+                    ("lua/autorun/sh_config.lua", "Config = {}\n"),
+                    ("lua/autorun_extra/sh_extra.lua", "Extra = {}\n"),
+                ],
+            )
+            .await;
+
+            super::on_did_change_watched_files(
+                snapshot.clone(),
+                lsp_types::DidChangeWatchedFilesParams {
+                    changes: vec![folder_event(
+                        &root,
+                        "lua/autorun",
+                        lsp_types::FileChangeType::DELETED,
+                    )],
+                },
+            )
+            .await;
+
+            assert_eq!(latest_text(&snapshot, &uris[0]).await, None);
+            assert_eq!(
+                latest_text(&snapshot, &uris[1]).await.as_deref(),
+                Some("Extra = {}\n")
+            );
+        });
+    }
+
+    /// A created folder gets one event; every Lua file the workspace collects
+    /// under it is read from disk and added, and other files are not.
+    #[test]
+    fn a_watched_folder_creation_adds_the_files_under_it() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = lsp_server::Connection::memory();
+        runtime.block_on(async {
+            let context = crate::context::ServerContext::new(
+                connection,
+                lsp_types::ClientCapabilities::default(),
+            );
+            let snapshot = context.snapshot();
+            let root = crate::util::TempDir::new("gmod_glua_ls_watched_folder_creation");
+            index_workspace(&snapshot, &root, &[]).await;
+            let server = root.join("lua/autorun/server");
+            std::fs::create_dir_all(&server).expect("folder should be created");
+            std::fs::write(root.join("lua/autorun/sh_config.lua"), "Config = {}\n")
+                .expect("file should be written");
+            std::fs::write(server.join("sv_init.lua"), "Config.ready = true\n")
+                .expect("file should be written");
+            std::fs::write(server.join("notes.txt"), "not Lua\n").expect("file should be written");
+
+            super::on_did_change_watched_files(
+                snapshot.clone(),
+                lsp_types::DidChangeWatchedFilesParams {
+                    changes: vec![folder_event(
+                        &root,
+                        "lua/autorun",
+                        lsp_types::FileChangeType::CREATED,
+                    )],
+                },
+            )
+            .await;
+
+            let uri = |path: &str| {
+                glua_code_analysis::file_path_to_uri(&root.join(path)).expect("URI should parse")
+            };
+            assert_eq!(
+                latest_text(&snapshot, &uri("lua/autorun/sh_config.lua"))
+                    .await
+                    .as_deref(),
+                Some("Config = {}\n")
+            );
+            assert_eq!(
+                latest_text(&snapshot, &uri("lua/autorun/server/sv_init.lua"))
+                    .await
+                    .as_deref(),
+                Some("Config.ready = true\n")
+            );
+            assert_eq!(
+                latest_text(&snapshot, &uri("lua/autorun/server/notes.txt")).await,
+                None
+            );
+            assert!(snapshot.debounced_analysis().is_dirty());
+        });
+    }
+
+    /// A folder renamed outside the editor arrives as the old folder's
+    /// deletion and the new one's creation; its files move with it.
+    #[test]
+    fn a_watched_folder_rename_moves_the_files_under_it() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = lsp_server::Connection::memory();
+        runtime.block_on(async {
+            let context = crate::context::ServerContext::new(
+                connection,
+                lsp_types::ClientCapabilities::default(),
+            );
+            let snapshot = context.snapshot();
+            let root = crate::util::TempDir::new("gmod_glua_ls_watched_folder_rename");
+            let uris = index_workspace(
+                &snapshot,
+                &root,
+                &[("lua/autorun/sh_config.lua", "Config = {}\n")],
+            )
+            .await;
+            std::fs::create_dir_all(root.join("lua/startup")).expect("folder should be created");
+            std::fs::write(root.join("lua/startup/sh_config.lua"), "Config = {}\n")
+                .expect("file should be written");
+
+            super::on_did_change_watched_files(
+                snapshot.clone(),
+                lsp_types::DidChangeWatchedFilesParams {
+                    changes: vec![
+                        folder_event(&root, "lua/autorun", lsp_types::FileChangeType::DELETED),
+                        folder_event(&root, "lua/startup", lsp_types::FileChangeType::CREATED),
+                    ],
+                },
+            )
+            .await;
+
+            let moved =
+                glua_code_analysis::file_path_to_uri(&root.join("lua/startup/sh_config.lua"))
+                    .expect("URI should parse");
+            assert_eq!(latest_text(&snapshot, &uris[0]).await, None);
+            assert_eq!(
+                latest_text(&snapshot, &moved).await.as_deref(),
+                Some("Config = {}\n")
+            );
+        });
+    }
+
     /// A file changed on disk is diagnosed as soon as its own re-analysis
     /// settles, ahead of the files its change ripples into.
     #[test]
@@ -409,6 +762,31 @@ mod tests {
                 Some(crate::context::diagnostic_store::Priority::Edited)
             );
         });
+    }
+
+    /// A batch of Lua files keeps requests waiting on those files only; a
+    /// folder among them changes files the batch does not name, so every
+    /// request waits.
+    #[test]
+    fn a_folder_event_widens_the_change_scope_to_every_document() {
+        let params = |uris: &[&str]| lsp_types::DidChangeWatchedFilesParams {
+            changes: uris
+                .iter()
+                .map(|s| lsp_types::FileEvent {
+                    uri: uri(s),
+                    typ: lsp_types::FileChangeType::DELETED,
+                })
+                .collect(),
+        };
+        let files = ["file:///C:/addon/lua/autorun/sh_config.lua"];
+        assert_eq!(
+            super::watched_change_scope(&params(&files)),
+            Some(vec![uri(files[0])])
+        );
+        assert_eq!(
+            super::watched_change_scope(&params(&[files[0], "file:///C:/addon/lua/autorun"])),
+            None
+        );
     }
 
     #[test]
