@@ -337,6 +337,37 @@ abc",
     assert_eq!(mapped, before_edit);
 }
 
+/// A value whose hash fingerprints a part of itself keeps mapping the
+/// positions it hashes after that part back.
+#[test]
+fn a_position_hashed_after_a_nested_fingerprint_still_maps_back() {
+    use crate::db_index::derivation::{EditMaps, fingerprint_before_edits, fingerprint_of};
+    use std::hash::{Hash, Hasher};
+
+    struct WithPart(crate::LuaDeclId);
+    impl Hash for WithPart {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            fingerprint_of(&0u8).hash(state);
+            self.0.hash(state);
+        }
+    }
+    let file_id = FileId::new(7);
+    let edits = EditMaps::new([(
+        file_id,
+        PositionMap::new(
+            "abc", "
+abc",
+        ),
+    )]);
+    let before_edit = fingerprint_of(&WithPart(crate::LuaDeclId::new(file_id, TextSize::new(0))));
+
+    let mapped = fingerprint_before_edits(&edits, || {
+        fingerprint_of(&WithPart(crate::LuaDeclId::new(file_id, TextSize::new(1))))
+    });
+
+    assert_eq!(mapped, before_edit);
+}
+
 // --- Export map ---
 
 fn workspace() -> VirtualWorkspace {

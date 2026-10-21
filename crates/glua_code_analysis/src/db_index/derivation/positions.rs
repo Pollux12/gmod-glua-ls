@@ -389,13 +389,9 @@ pub fn unmapped<T>(f: impl FnOnce() -> T) -> T {
 pub(super) fn hash_value<T: Hash + ?Sized, H: Hasher>(value: &T, state: &mut H) {
     let outer = FINGERPRINTING.with(|flag| flag.replace(true));
     let mapping = mapping_back();
-    if mapping {
-        HASHING.with(|hashing| hashing.set(true));
-    }
+    let outer_hashing = HASHING.with(|hashing| hashing.replace(mapping || hashing.get()));
     let _restore = super::OnDrop(|| {
-        if mapping {
-            HASHING.with(|hashing| hashing.set(false));
-        }
+        HASHING.with(|hashing| hashing.set(outer_hashing));
         FINGERPRINTING.with(|flag| flag.set(outer));
     });
     value.hash(state);
