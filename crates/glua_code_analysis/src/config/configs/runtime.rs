@@ -41,6 +41,16 @@ impl Default for EmmyrcRuntime {
     }
 }
 
+impl EmmyrcRuntime {
+    /// Whether text parses the same under `other`: the settings the parser
+    /// config is built from agree.
+    pub fn parses_like(&self, other: &Self) -> bool {
+        self.special == other.special
+            && self.require_like_function == other.require_like_function
+            && self.nonstandard_symbol == other.nonstandard_symbol
+    }
+}
+
 fn default_nonstandard_symbols() -> Vec<EmmyrcNonStdSymbol> {
     vec![
         EmmyrcNonStdSymbol::DoubleSlash,

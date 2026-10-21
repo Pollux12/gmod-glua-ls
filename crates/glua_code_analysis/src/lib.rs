@@ -1235,4 +1235,30 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_parse_config_change_reparses_loaded_files() {
+        let mut ws = crate::VirtualWorkspace::new();
+        let file_id = ws.def(
+            "local x = 1 // note
+",
+        );
+        let parse_errors = |ws: &crate::VirtualWorkspace| {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_syntax_tree(&file_id)
+                .expect("tree")
+                .get_errors()
+                .len()
+        };
+        assert_eq!(parse_errors(&ws), 0);
+
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.runtime.nonstandard_symbol.clear();
+        ws.update_emmyrc(emmyrc);
+
+        assert_ne!(parse_errors(&ws), 0);
+    }
 }

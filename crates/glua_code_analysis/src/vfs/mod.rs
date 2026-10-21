@@ -600,8 +600,59 @@ impl Vfs {
         maps
     }
 
+    /// Applies `emmyrc`, parsing every held text again when it parses
+    /// differently: a tree is only ever the parse of its text under the
+    /// current config.
     pub fn update_config(&mut self, emmyrc: Arc<Emmyrc>) {
+        let reparse = self
+            .emmyrc
+            .as_ref()
+            .is_some_and(|old| !old.runtime.parses_like(&emmyrc.runtime));
         self.emmyrc = Some(emmyrc);
+        if reparse {
+            self.reparse_all();
+        }
+    }
+
+    fn reparse_all(&mut self) {
+        let (ids, trees) = {
+            let mut taken = self
+                .tree_map
+                .keys()
+                .filter_map(|id| {
+                    let data = self.file_data.get(id.id as usize)?.as_ref()?;
+                    Some((*id, data.content.as_str()))
+                })
+                .collect::<Vec<_>>();
+            taken.sort_by_key(|(id, _)| *id);
+            let texts = taken.iter().map(|(_, text)| *text).collect::<Vec<_>>();
+            let trees = self.parse_concurrently(&texts).unwrap_or_else(|| {
+                texts
+                    .iter()
+                    .map(|text| self.parse(text))
+                    .collect::<Vec<_>>()
+            });
+            (
+                taken.into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
+                trees,
+            )
+        };
+        for (id, (tree, _)) in ids.into_iter().zip(trees) {
+            self.tree_map.insert(id, tree);
+        }
+        let staged = self
+            .staged
+            .iter()
+            .filter_map(|(id, staged)| {
+                let content = staged.content.as_ref()?;
+                Some((*id, self.parse(&content.content)))
+            })
+            .collect::<Vec<_>>();
+        for (id, parsed) in staged {
+            if let Some(staged) = self.staged.get_mut(&id) {
+                staged.parsed = Some(parsed);
+            }
+        }
     }
 
     pub fn get_file_content(&self, id: &FileId) -> Option<&String> {
