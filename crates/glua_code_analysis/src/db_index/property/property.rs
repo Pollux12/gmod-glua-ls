@@ -13,6 +13,8 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaCommonProperty {
     pub visibility: VisibilityKind,
+    /// Whether a tag stated `visibility`, rather than it being the default.
+    visibility_stated: bool,
     pub description: Option<Box<String>>,
     pub default_value: Option<LuaDocDefaultValue>,
     pub source: Option<Box<String>>,
@@ -34,6 +36,7 @@ impl LuaCommonProperty {
     pub fn new() -> Self {
         Self {
             visibility: VisibilityKind::Public,
+            visibility_stated: false,
             description: None,
             default_value: None,
             source: None,
@@ -72,6 +75,11 @@ impl LuaCommonProperty {
 
     pub fn default_value(&self) -> Option<&LuaDocDefaultValue> {
         self.default_value.as_ref()
+    }
+
+    pub fn set_visibility(&mut self, visibility: VisibilityKind) {
+        self.visibility = visibility;
+        self.visibility_stated = true;
     }
 
     pub fn add_extra_description(&mut self, description: String) {
@@ -126,8 +134,9 @@ impl LuaCommonProperty {
     /// Folds a later contributor's documentation into an earlier one's. Scalar fields keep the
     /// first value supplied; the additive fields union in contributor order.
     pub fn merge_from(&mut self, other: &LuaCommonProperty) {
-        if self.visibility == VisibilityKind::Public {
+        if !self.visibility_stated {
             self.visibility = other.visibility;
+            self.visibility_stated = other.visibility_stated;
         }
         // A bare `---@class Foo` records an empty description, which must not mask the docs
         // another file wrote for the same class.

@@ -302,7 +302,7 @@ impl LuaPropertyIndex {
         visibility: VisibilityKind,
     ) -> Option<()> {
         self.contribute(file_id, owner_id, |property| {
-            property.visibility = visibility;
+            property.set_visibility(visibility)
         })
     }
 
@@ -737,6 +737,27 @@ mod tests {
     /// A file's owner set holds both an alias and its source. Removing the file has to unmap
     /// both: a leftover mapping to a deleted property makes every later write to that owner
     /// disappear, because `get_or_create_property` finds the id and no value behind it.
+    /// The first contributor to state a visibility decides it, an explicit
+    /// `public` included.
+    #[test]
+    fn a_stated_public_is_kept_over_a_later_contributors_private() {
+        let (first, later) = (FileId::new(1), FileId::new(2));
+        let owner = LuaSemanticDeclId::LuaDecl(LuaDeclId::new(first, TextSize::new(0)));
+        let mut index = LuaPropertyIndex::new();
+        index.set_file_merge_order(first, 0, Arc::from("a.lua"));
+        index.set_file_merge_order(later, 0, Arc::from("b.lua"));
+
+        index.add_visibility(later, owner.clone(), VisibilityKind::Private);
+        index.add_visibility(first, owner.clone(), VisibilityKind::Public);
+
+        assert_eq!(
+            index
+                .get_property(&owner)
+                .map(|property| property.visibility),
+            Some(VisibilityKind::Public)
+        );
+    }
+
     #[test]
     fn removing_a_file_unmaps_every_alias_of_its_property() {
         let file_id = FileId::new(1);
