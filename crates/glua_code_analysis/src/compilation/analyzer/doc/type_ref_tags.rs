@@ -711,6 +711,7 @@ pub fn analyze_other(analyzer: &mut DocAnalyzer, other: LuaDocTagOther) -> Optio
             LuaAst::LuaLocalFuncStat(func) => func.get_closure(),
             _ => None,
         };
+        let file_order_key = analyzer.db.get_vfs().file_order_key(&analyzer.file_id);
         analyzer.db.get_accessor_func_index_mut().register(
             name.into(),
             AccessorFuncAnnotation {
@@ -721,6 +722,7 @@ pub fn analyze_other(analyzer: &mut DocAnalyzer, other: LuaDocTagOther) -> Optio
                     .map(|closure| LuaSignatureId::from_closure(analyzer.file_id, &closure)),
                 inferred: false,
             },
+            file_order_key,
         );
     }
 
@@ -818,6 +820,7 @@ pub(crate) fn register_inferred_accessor_generators(
         if name_params.any(|name_param| name_param != name_param_index) {
             continue;
         }
+        let file_order_key = scan_db.get_vfs().file_order_key(&file_id);
         scan_db.get_accessor_func_index_mut().register(
             candidate.name.as_str().into(),
             AccessorFuncAnnotation {
@@ -827,6 +830,7 @@ pub(crate) fn register_inferred_accessor_generators(
                 signature_id: Some(LuaSignatureId::from_closure(file_id, &candidate.closure)),
                 inferred: true,
             },
+            file_order_key,
         );
     }
 }

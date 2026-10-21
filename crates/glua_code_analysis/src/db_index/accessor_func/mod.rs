@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use rustc_hash::FxHashMap;
 
 use crate::db_index::cow_shards::{CowCell, CowShards};
@@ -64,8 +66,12 @@ impl AccessorTemplate {
 
 #[derive(Debug, Default, Clone)]
 pub struct AccessorFuncAnnotationIndex {
+    /// Each name's generators in canonical order: a call takes the first.
     by_name: CowCell<FxHashMap<SmolStr, Vec<AccessorFuncAnnotation>>>,
     by_file: CowCell<FxHashMap<FileId, Vec<SmolStr>>>,
+    /// Each declaring file's `Vfs::file_order_key`, which orders its
+    /// generators among those of the same name.
+    file_order: CowCell<FxHashMap<FileId, Arc<str>>>,
 }
 
 impl AccessorFuncAnnotationIndex {
@@ -73,14 +79,53 @@ impl AccessorFuncAnnotationIndex {
         Self::default()
     }
 
-    pub fn register(&mut self, name: SmolStr, annotation: AccessorFuncAnnotation) {
+    /// Registers a generator under `name`. `file_order_key` is the declaring
+    /// file's `Vfs::file_order_key`.
+    pub fn register(
+        &mut self,
+        name: SmolStr,
+        annotation: AccessorFuncAnnotation,
+        file_order_key: Arc<str>,
+    ) {
         derivation::note_write(|| FactKey::AccessorFunc(name.clone()));
         let file_id = annotation.file_id;
-        self.by_name
-            .entry(name.clone())
-            .or_default()
-            .push(annotation);
+        self.file_order.entry(file_id).or_insert(file_order_key);
+        let file_order = &self.file_order;
+        let annotations = self.by_name.entry(name.clone()).or_default();
+        let at = annotations.partition_point(|existing| {
+            annotation_sort_key(file_order, existing)
+                <= annotation_sort_key(file_order, &annotation)
+        });
+        annotations.insert(at, annotation);
         self.by_file.entry(file_id).or_default().push(name);
+    }
+
+    /// Files each of `order_keys`' files under its new order key: its
+    /// generators take the place among their names' that the key gives them.
+    pub(crate) fn rekey_files(&mut self, order_keys: &[(FileId, Arc<str>)]) {
+        for (file_id, order_key) in order_keys {
+            if self
+                .file_order
+                .get(file_id)
+                .is_none_or(|held| held == order_key)
+            {
+                continue;
+            }
+            self.file_order.insert(*file_id, order_key.clone());
+            let mut names = self.by_file.get(file_id).cloned().unwrap_or_default();
+            names.sort();
+            names.dedup();
+            let file_order = &self.file_order;
+            for name in names {
+                if let Some(annotations) = self.by_name.get_mut(&name) {
+                    annotations.sort_by(|left, right| {
+                        annotation_sort_key(file_order, left)
+                            .cmp(&annotation_sort_key(file_order, right))
+                    });
+                }
+                derivation::note_write(|| FactKey::AccessorFunc(name.clone()));
+            }
+        }
     }
 
     /// The `@accessorfunc` annotations this file declares, as
@@ -143,8 +188,24 @@ impl AccessorFuncAnnotationIndex {
     }
 }
 
+/// Canonical order for a name's generators: the declaring file's path, then
+/// the generator's position in it.
+fn annotation_sort_key<'a>(
+    file_order: &'a FxHashMap<FileId, Arc<str>>,
+    annotation: &AccessorFuncAnnotation,
+) -> (&'a str, Option<u32>, u32) {
+    (
+        file_order.get(&annotation.file_id).map_or("", |key| key),
+        annotation
+            .signature_id
+            .map(|signature_id| u32::from(signature_id.get_position())),
+        annotation.file_id.id,
+    )
+}
+
 impl LuaIndex for AccessorFuncAnnotationIndex {
     fn remove(&mut self, file_id: FileId) {
+        self.file_order.remove(&file_id);
         if let Some(names) = self.by_file.remove(&file_id) {
             for name in names {
                 derivation::note_write(|| FactKey::AccessorFunc(name.clone()));
@@ -166,6 +227,7 @@ impl LuaIndex for AccessorFuncAnnotationIndex {
         }
         self.by_name.clear();
         self.by_file.clear();
+        self.file_order.clear();
     }
 }
 
@@ -258,6 +320,55 @@ impl LuaIndex for AccessorFuncCallIndex {
     }
 }
 
-crate::db_index::cow_shards::task_fork_fields!(AccessorFuncAnnotationIndex { by_name, by_file });
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn generator(file_id: FileId, name_param_index: usize) -> AccessorFuncAnnotation {
+        AccessorFuncAnnotation {
+            name_param_index,
+            file_id,
+            accessors: AccessorTemplate::receiver_get_set_pair(),
+            signature_id: Some(LuaSignatureId::new(file_id, 4.into())),
+            inferred: false,
+        }
+    }
+
+    fn first_generator_file(index: &AccessorFuncAnnotationIndex) -> Option<FileId> {
+        index
+            .get_annotations("AddAccessor")?
+            .first()
+            .map(|annotation| annotation.file_id)
+    }
+
+    /// A name's generators are ordered by their files' paths, whatever order
+    /// the files registered in, and follow a file that moves.
+    #[test]
+    fn a_names_generators_follow_their_files_paths() {
+        let (registered_first, registered_later) = (FileId::new(1), FileId::new(2));
+        let mut index = AccessorFuncAnnotationIndex::new();
+        index.register(
+            "AddAccessor".into(),
+            generator(registered_first, 1),
+            Arc::from("b.lua"),
+        );
+        index.register(
+            "AddAccessor".into(),
+            generator(registered_later, 2),
+            Arc::from("a.lua"),
+        );
+        assert_eq!(first_generator_file(&index), Some(registered_later));
+
+        index.rekey_files(&[(registered_later, Arc::from("c.lua"))]);
+
+        assert_eq!(first_generator_file(&index), Some(registered_first));
+    }
+}
+
+crate::db_index::cow_shards::task_fork_fields!(AccessorFuncAnnotationIndex {
+    by_name,
+    by_file,
+    file_order,
+});
 
 crate::db_index::cow_shards::task_fork_fields!(AccessorFuncCallIndex { calls });

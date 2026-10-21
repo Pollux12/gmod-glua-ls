@@ -797,6 +797,7 @@ fn repath_files(db: &mut DbIndex, file_ids: &[FileId]) -> Vec<derivation::Hashed
     db.get_property_index_mut().rekey_files(&order_keys);
     db.get_type_index_mut().rekey_files(&order_keys);
     db.get_operator_index_mut().rekey_files(&order_keys);
+    db.get_accessor_func_index_mut().rekey_files(&order_keys);
     let refresh = derivation::end();
     let mut touched = refresh.moved().cloned().collect::<Vec<_>>();
     let (_, _, written) = refresh.into_parts(|_| derivation::ABSENT);
