@@ -703,7 +703,7 @@ fn valid_guard_contributions_for_file(
 }
 
 /// Whether `signature_id` is a validity guard in `call_realm`: annotated as one, or the base
-/// runtime `IsValid` (or another annotated guard name) redeclared in `lua/includes/util.lua`.
+/// runtime redeclaration in `lua/includes/util.lua` of a global annotated as one.
 pub fn signature_is_valid_guard_or_base_runtime_isvalid_in_realm(
     db: &DbIndex,
     signature_id: LuaSignatureId,
@@ -718,9 +718,8 @@ pub fn signature_is_valid_guard_or_base_runtime_isvalid_in_realm(
     }
 
     is_base_runtime_util_file(db, signature_id.get_file_id())
-        && global_function_name(db, signature_id).is_some_and(|name| {
-            name == "IsValid" || db.get_signature_index().is_valid_guard_name(&name)
-        })
+        && global_function_name(db, signature_id)
+            .is_some_and(|name| db.get_signature_index().is_valid_guard_name(&name))
 }
 
 /// Whether `signature_id` classifies its argument as the `type` intrinsic does: it returns

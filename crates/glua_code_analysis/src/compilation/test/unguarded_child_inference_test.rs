@@ -4268,6 +4268,24 @@ filter:SetUpdateOnType(true)
     fn the_runtime_isvalid_in_util_lua_narrows_like_the_annotated_one() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_library_annotations");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("global.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@param object any
+                ---@return boolean
+                ---@[valid_guard]
+                function IsValid(object) end
+                "#
+                .to_string(),
+            ),
+        );
         ws.def_file(
             "lua/includes/util.lua",
             r#"
