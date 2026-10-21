@@ -523,8 +523,9 @@ pub(crate) fn compute_helper_scan(db: &DbIndex, file_id: FileId) -> Option<FileH
 }
 
 pub(crate) fn apply_helper_scan(db: &mut DbIndex, file_id: FileId, scan: Option<FileHelperScan>) {
-    if let Some(scan) = scan {
-        db.set_helper_scan(file_id, Arc::new(scan));
+    match scan {
+        Some(scan) => db.set_helper_scan(file_id, Arc::new(scan)),
+        None => db.remove_helper_scan(file_id),
     }
 }
 

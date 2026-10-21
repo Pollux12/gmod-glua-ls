@@ -785,7 +785,7 @@ impl DbIndex {
         }
     }
 
-    fn remove_helper_scan(&mut self, file_id: FileId) {
+    pub(crate) fn remove_helper_scan(&mut self, file_id: FileId) {
         if self.helper_scans.remove(&file_id).is_some() {
             self.helper_scan_files.remove(&file_id);
             derivation::note_write(|| derivation::FactKey::HelperScan(file_id));
