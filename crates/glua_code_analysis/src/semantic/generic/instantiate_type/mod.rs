@@ -720,7 +720,9 @@ fn collect_infer_assignments(
                             }
                         } else if let Some(pattern_ty) = pattern_param {
                             if contains_conditional_infer(pattern_ty)
-                                || !is_optional_param_type(db, pattern_ty)
+                                || !crate::semantic::nullable::is_optional_param_type(
+                                    db, pattern_ty,
+                                )
                             {
                                 return false;
                             }
@@ -932,43 +934,6 @@ fn strict_type_match(db: &DbIndex, source: &LuaType, pattern: &LuaType) -> bool 
     }
 
     check_type_compact(db, pattern, source).is_ok()
-}
-
-fn is_optional_param_type(db: &DbIndex, ty: &LuaType) -> bool {
-    let mut stack = vec![ty.clone()];
-    let mut visited = HashSet::default();
-
-    while let Some(current) = stack.pop() {
-        if !visited.insert(current.clone()) {
-            continue;
-        }
-
-        match current {
-            LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Variadic(_) => {
-                return true;
-            }
-            LuaType::Ref(decl_id) => {
-                if let Some(decl) = db.get_type_index().get_type_decl(&decl_id)
-                    && decl.is_alias()
-                    && let Some(alias_origin) = decl.get_alias_ref()
-                {
-                    stack.push(alias_origin.clone());
-                }
-            }
-            LuaType::Union(union) => {
-                for t in union.into_vec() {
-                    stack.push(t);
-                }
-            }
-            LuaType::MultiLineUnion(multi) => {
-                for (t, _) in multi.get_unions() {
-                    stack.push(t.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-    false
 }
 
 // Records the type inferred for an infer name and keeps repeated matches consistent
