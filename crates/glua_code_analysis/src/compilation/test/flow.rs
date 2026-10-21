@@ -9683,4 +9683,51 @@ _2 = a[1]
         expect_that!(with("continue"), eq("nil"));
         expect_that!(with("break"), eq("string?"));
     }
+
+    fn local_in_function(body: &str, name: &str) -> String {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&format!(
+            r#"
+            ---@param value string?
+            local function use(value)
+                {body}
+            end
+            "#
+        ));
+        let local = ws.local_ty(file_id, name);
+        ws.humanize_type(local)
+    }
+
+    #[gtest]
+    fn a_goto_reaches_the_label_of_its_own_block_when_a_sibling_block_reuses_the_name() {
+        let first_block = r#"
+            do
+                if value == nil then goto skip end
+                ::skip::
+                local first = value
+            end"#;
+        expect_that!(local_in_function(first_block, "first"), eq("string?"));
+        let with_sibling = format!("{first_block}\ndo ::skip:: end");
+        expect_that!(local_in_function(&with_sibling, "first"), eq("string?"));
+    }
+
+    #[gtest]
+    fn a_backward_goto_reads_at_its_label_as_a_loop_reads_at_its_head() {
+        let goto_loop = r#"
+            ::retry::
+            local seen = value
+            if value == nil then
+                value = 1
+                goto retry
+            end"#;
+        let while_loop = r#"
+            while true do
+                local seen = value
+                if value ~= nil then break end
+                value = 1
+            end"#;
+        let at_label = local_in_function(goto_loop, "seen");
+        expect_that!(at_label, not(eq("unknown")));
+        expect_that!(at_label, eq(&local_in_function(while_loop, "seen")));
+    }
 }

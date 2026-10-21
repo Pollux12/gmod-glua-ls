@@ -7,8 +7,7 @@ use smol_str::SmolStr;
 
 use crate::{
     AnalyzeError, AssignVarHint, AssignmentFlowInfo, BranchLabelInfo, DbIndex, FileId,
-    FileNarrowingCapability, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree,
-    LuaClosureId, LuaDeclId,
+    FileNarrowingCapability, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree, LuaDeclId,
 };
 
 /// Snapshot of the modification counters, used to detect what was created
@@ -61,7 +60,8 @@ pub struct FlowBinder<'a> {
     pub false_target: FlowId,
     flow_nodes: Vec<FlowNode>,
     multiple_antecedents: Vec<Vec<FlowId>>,
-    labels: FxHashMap<LuaClosureId, FxHashMap<SmolStr, FlowId>>,
+    /// Each block's labels by name, with where each is written.
+    labels: FxHashMap<LuaSyntaxId, FxHashMap<SmolStr, (FlowId, TextSize)>>,
     goto_stats: Vec<GotoCache>,
     bindings: FxHashMap<LuaSyntaxId, FlowId>,
     branch_label_info: FxHashMap<FlowId, BranchLabelInfo>,
@@ -168,19 +168,26 @@ impl<'a> FlowBinder<'a> {
         self.create_node(FlowNodeKind::LoopLabel)
     }
 
-    pub fn create_name_label(&mut self, name: &str, closure_id: LuaClosureId) -> FlowId {
+    /// A label named `name` written at `position` in `block`.
+    pub fn create_name_label(
+        &mut self,
+        name: &str,
+        block: LuaSyntaxId,
+        position: TextSize,
+    ) -> FlowId {
         let label_id = self.create_node(FlowNodeKind::NamedLabel);
         self.labels
-            .entry(closure_id)
+            .entry(block)
             .or_default()
-            .insert(SmolStr::new(name), label_id);
+            .insert(SmolStr::new(name), (label_id, position));
 
         label_id
     }
 
-    pub fn get_label(&self, closure_id: LuaClosureId, name: &str) -> Option<FlowId> {
+    /// The label named `name` that `block` declares, with where it is written.
+    pub fn get_label(&self, block: LuaSyntaxId, name: &str) -> Option<(FlowId, TextSize)> {
         self.labels
-            .get(&closure_id)
+            .get(&block)
             .and_then(|labels| labels.get(name).copied())
     }
 
@@ -247,15 +254,8 @@ impl<'a> FlowBinder<'a> {
         self.bindings.get(&syntax_id).copied()
     }
 
-    pub fn cache_goto_flow(
-        &mut self,
-        closure_id: LuaClosureId,
-        label_token: LuaNameToken,
-        label: &str,
-        flow_id: FlowId,
-    ) {
+    pub fn cache_goto_flow(&mut self, label_token: LuaNameToken, label: &str, flow_id: FlowId) {
         self.goto_stats.push(GotoCache {
-            closure_id,
             label_token,
             label: SmolStr::new(label),
             flow_id,
@@ -506,7 +506,6 @@ impl<'a> FlowBinder<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GotoCache {
-    pub closure_id: LuaClosureId,
     pub label_token: LuaNameToken,
     pub label: SmolStr,
     pub flow_id: FlowId,

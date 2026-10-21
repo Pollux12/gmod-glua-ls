@@ -2,12 +2,13 @@ use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaBlock, LuaBreakStat, LuaCallArgList,
     LuaCallExprStat, LuaDoStat, LuaExpr, LuaForRangeStat, LuaForStat, LuaFuncStat, LuaGotoStat,
     LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLabelStat, LuaLiteralToken, LuaLocalStat,
-    LuaRepeatStat, LuaReturnStat, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait, UnaryOperator,
+    LuaRepeatStat, LuaReturnStat, LuaSyntaxId, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
+    UnaryOperator,
 };
 
 use crate::{
     AnalyzeError, AssignVarHint, AssignmentFlowInfo, AssignmentNameTarget, BranchLabelInfo,
-    DiagnosticCode, FlowId, FlowNodeKind, LuaClosureId, LuaDeclId, analysis_stack_exhausted,
+    DiagnosticCode, FlowId, FlowNodeKind, LuaDeclId, analysis_stack_exhausted,
     compilation::analyzer::flow::{
         bind_analyze::{
             bind_block, bind_each_child, bind_node,
@@ -307,8 +308,14 @@ pub fn bind_label_stat(
         return current; // If there's no label token, just return the current flow
     };
     let label_name = label_name_token.get_name_text();
-    let closure_id = LuaClosureId::from_node(label_stat.syntax());
-    let name_label = binder.create_name_label(label_name, closure_id);
+    let Some(block) = label_stat.get_parent::<LuaBlock>() else {
+        return current;
+    };
+    let name_label = binder.create_name_label(
+        label_name,
+        LuaSyntaxId::from_node(block.syntax()),
+        label_stat.get_position(),
+    );
     binder.add_antecedent(name_label, current);
 
     name_label
@@ -344,18 +351,16 @@ pub fn bind_break_stat(
     break_flow_id
 }
 
+/// Ends the flow at a `goto`; its label is joined once every label is bound,
+/// see [`check_goto_label`](super::check_goto_label).
 pub fn bind_goto_stat(binder: &mut FlowBinder, goto_stat: LuaGotoStat, current: FlowId) -> FlowId {
-    // Goto statements are handled separately in the flow analysis
-    // They will be processed when we analyze the labels
-    // For now, we just return None to indicate no flow node is created
-    let closure_id = LuaClosureId::from_node(goto_stat.syntax());
     let Some(label_token) = goto_stat.get_label_name_token() else {
         return current; // If there's no label token, just return the current flow
     };
 
     let label_name = label_token.get_name_text();
     let return_flow_id = binder.create_return();
-    binder.cache_goto_flow(closure_id, label_token.clone(), label_name, current);
+    binder.cache_goto_flow(label_token.clone(), label_name, current);
     binder.add_antecedent(return_flow_id, current);
     return_flow_id
 }
