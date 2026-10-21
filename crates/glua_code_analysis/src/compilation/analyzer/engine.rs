@@ -1329,6 +1329,7 @@ impl Engine {
                     self.detach_superstep(db, slice);
                 }
                 self.flush_slot_notifications(db);
+                self.cursor = None;
                 return false;
             }
             if self.focus.is_empty() && (!self.worklist.is_empty() || !self.carried.is_empty()) {
@@ -1356,6 +1357,7 @@ impl Engine {
                         self.focus.clear();
                         self.handed_back = true;
                         crate::profile::phase_report("focus");
+                        self.cursor = None;
                         return false;
                     }
                     if crate::profile::phase("engine: release", || self.release_waiting(db)) {
@@ -1363,6 +1365,7 @@ impl Engine {
                         // for it; loops cleared ahead of it settle first.
                         if slice.yields() && !self.released_unrun && self.loop_focus.is_empty() {
                             self.released_unrun = true;
+                            self.cursor = None;
                             return false;
                         }
                         continue;
@@ -2733,6 +2736,7 @@ impl Engine {
         debug_assert!(self.worklist.is_empty() && self.next_round.is_empty());
         self.worklist = Queue::new(Schedule::Canonical);
         self.next_round = Queue::new(Schedule::Canonical);
+        self.cursor = None;
         self.readers_of(db, touched.iter());
         for member in members {
             // The loop's own reset is not a fact from outside it.
@@ -2742,7 +2746,6 @@ impl Engine {
             self.queue(member, Reason::Changed);
         }
         self.enter_stage(db, AnalysisStage::Open);
-        self.cursor = None;
     }
 
     /// Under `GLUALS_TRACE_EVALUATIONS`, prints each loop about to be cleared:
@@ -3003,6 +3006,7 @@ impl Engine {
             queued += 1;
         }
         self.stats.focus_settled(queued);
+        self.cursor = None;
         let after_loops = std::mem::take(&mut self.after_loops);
         if queued == 0 {
             return false;
@@ -3010,7 +3014,6 @@ impl Engine {
         if !after_loops.is_empty() {
             self.prioritise(&after_loops);
         }
-        self.cursor = None;
         true
     }
 
