@@ -442,45 +442,25 @@ impl LuaReferenceIndex {
             .collect()
     }
 
-    /// Every site in `file_id` that references one of `names`, including the
-    /// index references derivations resolved: [`Self::get_global_references`]
-    /// and [`Self::get_index_references`] narrowed to one file, read as that
+    /// Whether `syntax_id` in `file_id` references `name`, the index
+    /// references derivations resolved included: [`Self::get_global_references`]
+    /// and [`Self::get_index_references`] narrowed to one site, read as that
     /// file's facts alone.
-    pub fn name_sites_in_file<'a>(
-        &self,
-        names: impl IntoIterator<Item = &'a SmolStr>,
-        file_id: FileId,
-    ) -> Vec<LuaSyntaxId> {
+    pub fn is_name_site(&self, name: &SmolStr, file_id: FileId, syntax_id: LuaSyntaxId) -> bool {
         derivation::note_file_fact_read(derivation::FileFact::References, file_id);
         derivation::note_read(|| FactKey::DerivedReferences(file_id));
-        let mut sites = Vec::new();
-        for name in names {
-            let member_key = LuaMemberKey::Name(name.clone());
-            sites.extend(
-                self.global_references
-                    .get(name)
-                    .and_then(|references| references.get(&file_id))
-                    .into_iter()
-                    .flatten()
-                    .chain(
-                        self.index_reference
-                            .get(&member_key)
-                            .and_then(|references| references.get(&file_id))
-                            .into_iter()
-                            .flatten(),
-                    )
-                    .copied(),
-            );
-            sites.extend(
-                self.derived_index_reference
-                    .get(&member_key)
-                    .into_iter()
-                    .flat_map(|derived| derived.keys())
-                    .filter(|(site_file, _)| *site_file == file_id)
-                    .map(|(_, syntax_id)| *syntax_id),
-            );
-        }
-        sites
+        let in_file = |sites: Option<&HashMap<FileId, Vec<LuaSyntaxId>>>| {
+            sites
+                .and_then(|sites| sites.get(&file_id))
+                .is_some_and(|ids| ids.contains(&syntax_id))
+        };
+        let member_key = LuaMemberKey::Name(name.clone());
+        in_file(self.global_references.get(name))
+            || in_file(self.index_reference.get(&member_key))
+            || self
+                .derived_index_reference
+                .get(&member_key)
+                .is_some_and(|derived| derived.contains_key(&(file_id, syntax_id)))
     }
 
     /// `file_id`'s derived reference fingerprints summed afresh, which is what

@@ -690,10 +690,11 @@ fn is_net_helper_call(
     let network = db.get_gmod_network_index();
     let helper_name = network.is_helper_name(&name);
     if helper_name
-        && db
-            .get_reference_index()
-            .name_sites_in_file([&name], file_id)
-            .contains(&LuaSyntaxId::from_node(prefix.syntax()))
+        && db.get_reference_index().is_name_site(
+            &name,
+            file_id,
+            LuaSyntaxId::from_node(prefix.syntax()),
+        )
     {
         return true;
     }
