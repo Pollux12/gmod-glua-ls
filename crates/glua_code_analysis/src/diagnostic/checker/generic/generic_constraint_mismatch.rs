@@ -48,6 +48,14 @@ impl Findings {
         });
     }
 
+    /// Whether every finding only informs (such as an auto-created class), so
+    /// the argument is as good as accepted.
+    fn is_hint_only(&self) -> bool {
+        self.0
+            .iter()
+            .all(|finding| finding.severity == Some(DiagnosticSeverity::HINT))
+    }
+
     fn report(self, context: &mut DiagnosticContext) {
         for finding in self.0 {
             context.add_diagnostic_with_severity(
@@ -291,8 +299,9 @@ fn check_param(
             );
         }
         LuaType::Union(union_type) if !from_union => {
-            // An argument is valid when any arm accepts it; otherwise the first rejecting arm speaks.
-            let mut first_rejection = None;
+            // An argument is valid when any arm accepts it; otherwise the mildest
+            // rejection speaks, the first of equals.
+            let mut mildest_rejection: Option<Findings> = None;
             for union_member_type in union_type.types() {
                 match check_param(
                     semantic_model,
@@ -305,12 +314,16 @@ fn check_param(
                 ) {
                     ParamVerdict::Accepted => return ParamVerdict::Accepted,
                     ParamVerdict::Rejected(rejection) => {
-                        first_rejection.get_or_insert(rejection);
+                        if mildest_rejection.as_ref().is_none_or(|mildest| {
+                            rejection.is_hint_only() && !mildest.is_hint_only()
+                        }) {
+                            mildest_rejection = Some(rejection);
+                        }
                     }
                     ParamVerdict::NotApplicable => {}
                 }
             }
-            return first_rejection.map_or(ParamVerdict::NotApplicable, ParamVerdict::Rejected);
+            return mildest_rejection.map_or(ParamVerdict::NotApplicable, ParamVerdict::Rejected);
         }
         _ => return ParamVerdict::NotApplicable,
     }

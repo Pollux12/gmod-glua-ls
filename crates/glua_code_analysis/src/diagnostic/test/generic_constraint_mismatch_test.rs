@@ -788,4 +788,46 @@ mod test {
 
         Position::new(line, character)
     }
+
+    #[test]
+    fn a_template_union_reports_the_auto_created_class_in_either_arm_order() {
+        for param in ["`T`|T", "T|`T`"] {
+            let mut ws = VirtualWorkspace::new();
+            ws.enable_check(DiagnosticCode::GenericConstraintMismatch);
+            let file_id = ws.def(&format!(
+                r#"
+                ---@class Foo
+                ---@generic T: Foo
+                ---@param name {param}
+                ---@return T
+                local function make(name) end
+                Made = make("Baz")
+                "#
+            ));
+            let messages = ws
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|diagnostic| {
+                    diagnostic.code
+                        == Some(NumberOrString::String(
+                            DiagnosticCode::GenericConstraintMismatch
+                                .get_name()
+                                .to_string(),
+                        ))
+                })
+                .map(|diagnostic| (diagnostic.severity, diagnostic.message))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                messages,
+                [(
+                    Some(DiagnosticSeverity::HINT),
+                    "Type `Baz` is not explicitly defined; auto-created inheriting `Foo`"
+                        .to_string()
+                )],
+                "{param}"
+            );
+        }
+    }
 }
