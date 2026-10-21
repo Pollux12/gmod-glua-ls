@@ -3622,8 +3622,6 @@ impl Engine {
         }
     }
 
-    /// Resets the primary outputs of `members` to the source layer. Returns
-    /// every key that moved or may move: their previous outputs.
     /// Resets `members`' primary outputs and the primary keys in `also`, but
     /// `deferred`, and takes the fingerprints each of them had before. Returns
     /// them with what the reset wrote, which `written` also takes. `owners`,
@@ -4219,12 +4217,6 @@ impl EngineStats {
     }
 }
 
-/// `id` and every derivation that shares a primary output key with it,
-/// transitively, in canonical order.
-/// Which keys a run of `group` resets when: each later member's primary
-/// outputs no other member writes (by the records, and not in `shared`), reset
-/// when it runs; and, for a group of several, the keys reset before any member
-/// runs, the rest of their primary outputs and those in `discarded`.
 /// The groups one file's task runs in a worker superstep, in order.
 struct TaskPlan {
     file_id: crate::FileId,
@@ -4428,10 +4420,6 @@ struct GroupRun {
     elapsed: Option<std::time::Duration>,
 }
 
-/// What canonicalising a task's recording leaves to file: the records of the
-/// evaluations to keep, in order, the groups that read a query the snapshot
-/// had no answer for, each with the query outputs it read, and the keys its
-/// kept evaluations moved or produced.
 /// The loops of `reaches`: its strongly connected components of more than
 /// one node.
 fn loops_of(reaches: &FxHashMap<DerivationId, Vec<DerivationId>>) -> Vec<Vec<DerivationId>> {
@@ -4514,6 +4502,10 @@ fn loops_of(reaches: &FxHashMap<DerivationId, Vec<DerivationId>>) -> Vec<Vec<Der
     loops
 }
 
+/// What canonicalising a task's recording leaves to file: the records of the
+/// evaluations to keep, in order, the groups that read a query the snapshot
+/// had no answer for, each with the query outputs it read, and the keys its
+/// kept evaluations moved or produced.
 struct FiledTask {
     records: Vec<derivation::KeptRecord>,
     on_root: Vec<(Vec<DerivationId>, Vec<HashedKey>)>,
@@ -4944,6 +4936,10 @@ impl GroupResets {
     }
 }
 
+/// Which keys a run of `group` resets when: each later member's primary
+/// outputs no other member writes (by the records, and not in `shared`), reset
+/// when it runs; and, for a group of several, the keys reset before any member
+/// runs, the rest of their primary outputs and those in `discarded`.
 fn group_resets(
     db: &DbIndex,
     group: &[DerivationId],
@@ -5058,8 +5054,6 @@ fn run_group<E>(
     (evaluations, FxHashSet::default())
 }
 
-/// Files the reads of the queries computed since this last ran, which makes
-/// each a reader of what it read. Returns the outputs their computation moved.
 /// Drops what `key` and every key read out of it held before the edits.
 fn forget_before_edits(
     before_edits: &mut FxHashMap<HashedKey, derivation::Fingerprint>,
@@ -5082,9 +5076,10 @@ pub(super) fn file_queries(db: &mut DbIndex) -> Vec<HashedKey> {
     moved
 }
 
-/// [`file_queries`], the slots the filed records no longer keep added to
-/// `released` for the caller to free once the evaluations it holds, which may
-/// read them, are filed too.
+/// Files the reads of the queries computed since this last ran, which makes
+/// each a reader of what it read. Returns the outputs their computation moved;
+/// the slots the filed records no longer keep go to `released` for the caller
+/// to free once the evaluations it holds, which may read them, are filed too.
 fn file_queries_into(db: &mut DbIndex, released: &mut Vec<derivation::KeyIdx>) -> Vec<HashedKey> {
     if !db.queries().has_pending() {
         return Vec::new();
@@ -5165,6 +5160,8 @@ fn with_co_producers(
         .collect()
 }
 
+/// `id` and every derivation that shares a primary output key with it,
+/// transitively, in canonical order.
 fn co_producers(db: &DbIndex, id: DerivationId) -> Vec<DerivationId> {
     let graph = db.reader_graph();
     let mut group = BTreeSet::from([id]);
