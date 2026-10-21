@@ -336,7 +336,20 @@ impl<'a> DeclAnalyzer<'a> {
         }
     }
 
-    pub fn add_decl(&mut self, mut decl: LuaDecl) -> LuaDeclId {
+    pub fn add_decl(&mut self, decl: LuaDecl) -> LuaDeclId {
+        self.insert_decl(decl, true)
+    }
+
+    /// Adds the global a `_G.name` write declares, leaving the name to a local
+    /// of it still in scope.
+    pub fn add_global_table_decl(&mut self, decl: LuaDecl) -> LuaDeclId {
+        let shadowed_by_local = self
+            .find_decl(decl.get_name(), decl.get_position())
+            .is_some_and(LuaDecl::is_local);
+        self.insert_decl(decl, !shadowed_by_local)
+    }
+
+    fn insert_decl(&mut self, mut decl: LuaDecl, in_scope: bool) -> LuaDeclId {
         if let Some(scoped_class_info) = self.scoped_class_info.as_ref()
             && decl.get_name() == scoped_class_info.global_name
             && !scoped_class_info.is_global_singleton
@@ -363,7 +376,9 @@ impl<'a> DeclAnalyzer<'a> {
         let name = decl.get_name().to_string();
         let syntax_id = decl.get_syntax_id();
         let id = self.decl.add_decl(decl);
-        self.add_decl_to_current_scope(id);
+        if in_scope {
+            self.add_decl_to_current_scope(id);
+        }
 
         if is_global {
             self.references.add_global_reference(&name, syntax_id);

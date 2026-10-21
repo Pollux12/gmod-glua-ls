@@ -319,7 +319,7 @@ fn analyze_maybe_global_index_expr(
         },
         value_expr_id,
     );
-    Some(analyzer.add_decl(decl))
+    Some(analyzer.add_global_table_decl(decl))
 }
 
 pub fn analyze_for_stat(analyzer: &mut DeclAnalyzer, stat: LuaForStat) -> Option<()> {

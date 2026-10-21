@@ -2671,7 +2671,7 @@ local EscapeStringMap: {
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
                 ---@class Vector
-                local Vector = {}
+                local VectorMeta = {}
                 ---@return Vector
                 function _G.Vector() end
 
@@ -2732,7 +2732,7 @@ local EscapeStringMap: {
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
                 ---@class Vector
-                local Vector = {}
+                local VectorMeta = {}
                 ---@return Vector
                 function _G.Vector() end
 
@@ -3977,7 +3977,7 @@ local EscapeStringMap: {
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
                 ---@class Vector
-                local Vector = {}
+                local VectorMeta = {}
                 ---@param x? number
                 ---@param y? number
                 ---@param z? number
@@ -4049,7 +4049,7 @@ local EscapeStringMap: {
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
                 ---@class Vector
-                local Vector = {}
+                local VectorMeta = {}
                 ---@param x? number
                 ---@param y? number
                 ---@param z? number
@@ -4114,7 +4114,7 @@ local EscapeStringMap: {
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
                 ---@class Vector
-                local Vector = {}
+                local VectorMeta = {}
                 ---@param x? number
                 ---@param y? number
                 ---@param z? number

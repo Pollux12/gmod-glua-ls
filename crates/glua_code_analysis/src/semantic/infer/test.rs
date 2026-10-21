@@ -1182,7 +1182,7 @@ mod test {
             "lua/glide/client/network.lua",
             r#"
             ---@class Vector
-            local Vector = {}
+            local VectorMeta = {}
             ---@return Vector
             function _G.Vector() end
 

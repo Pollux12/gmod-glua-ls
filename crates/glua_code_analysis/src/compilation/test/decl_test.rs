@@ -547,6 +547,21 @@ mod test {
         assert_that!(resolved, some(eq(0)));
     }
 
+    #[test]
+    fn a_local_keeps_its_name_after_a_global_table_write_of_it() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            "local PLUGIN = {}
+_G.PLUGIN = PLUGIN
+local copy = PLUGIN
+",
+        );
+
+        let plugin_use = last_name_expr(&ws, file_id, "PLUGIN");
+        let resolved = referenced_decl(&ws, file_id, &plugin_use).map(LuaDecl::is_local);
+        assert_that!(resolved, some(eq(true)));
+    }
+
     /// Assignment targets file their global declarations when the statement is
     /// entered, before the walk reaches a closure nested in an earlier target,
     /// so the statement scope lists `a` and `b` ahead of that closure's scope.
