@@ -22,7 +22,7 @@ use crate::{
 };
 pub use client_config::{ClientConfig, client_config_sections, get_client_config};
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, FileId, LuaDiagnosticConfig, WorkspaceFolder,
+    EmmyLuaAnalysis, Emmyrc, FileId, LuaDiagnosticConfig, Slice, WorkspaceFolder,
     calculate_include_and_exclude, collect_workspace_files, fetch_schema_urls, file_path_to_uri,
     uri_to_file_path,
 };
@@ -327,10 +327,7 @@ pub async fn init_analysis(
             .iter()
             .flat_map(|(_, workspace_group)| workspace_group),
     );
-    let reindexed = mut_analysis.update_config(emmyrc.clone()).affects_index();
-    if roots_moved && !reindexed {
-        mut_analysis.reindex();
-    }
+    let rebuild = mut_analysis.apply_config(emmyrc.clone()).affects_index() || roots_moved;
 
     apply_workspace_diagnostic_configs(&mut mut_analysis, &workspace_diagnostic_configs);
 
@@ -352,7 +349,7 @@ pub async fn init_analysis(
     let uncollected = uncollected_files(&mut_analysis, &changes, &open_files);
     changes.extend(uncollected.iter().map(|(_, uri)| (uri.clone(), None)));
 
-    if !changes.is_empty() {
+    if rebuild || !changes.is_empty() {
         watchdog_status.set_progress("Analyzing Lua files", 0, file_count);
         status_bar.update_startup_phase(
             ProgressTask::LoadWorkspace,
@@ -361,11 +358,18 @@ pub async fn init_analysis(
         );
         log::info!("analyzing {} Lua files", file_count);
 
-        // `update_files_by_uri` blocks for the whole index, so the phases it
-        // reports are the only progress the client can be given.
+        // The analysis blocks for the whole index, so the phases it reports
+        // are the only progress the client can be given. A config or roots
+        // change rebuilds the index once, from the collected text with it.
         let _progress =
             AnalysisProgressReporter::install(status_bar.clone(), watchdog_status.clone());
-        mut_analysis.update_files_by_uri(changes);
+        if rebuild {
+            mut_analysis.stage_file_system_changes(changes);
+            mut_analysis.begin_full_reindex();
+            mut_analysis.advance_reindex(Slice::Whole);
+        } else {
+            mut_analysis.update_files_by_uri(changes);
+        }
         drop(_progress);
 
         watchdog_status.set_progress("Analyzing Lua files", file_count, file_count);
@@ -623,6 +627,56 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    /// A reload that rebuilds the index rebuilds it from the text it collected,
+    /// not from what was indexed before.
+    #[gtest]
+    fn a_reload_that_moves_the_roots_indexes_the_text_collected_with_it() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (proxy_connection, _peer_connection) = Connection::memory();
+        let client = Arc::new(ClientProxy::new(proxy_connection));
+        let lsp_features = LspFeatures::new(ClientCapabilities::default());
+        let root = crate::util::TempDir::new("glua_ls_reload_moved_roots");
+        let path = root.join("lua/autorun/sh_reloaded.lua");
+        std::fs::create_dir_all(path.parent().expect("a parent folder"))
+            .expect("folders should be created");
+        std::fs::write(&path, "Collected = 1\n").expect("file should be written");
+        let uri = glua_code_analysis::file_path_to_uri(&path).expect("URI should parse");
+        let mut analysis = EmmyLuaAnalysis::new();
+        analysis.update_file_by_uri(&uri, Some("Indexed = 1\n".to_string()));
+        let analysis = Arc::new(RwLock::new(analysis));
+        let status_bar = Arc::new(StatusBar::new(client.clone(), true));
+        let file_diagnostic = Arc::new(FileDiagnostic::new(
+            analysis.clone(),
+            status_bar.clone(),
+            client.clone(),
+        ));
+
+        runtime.block_on(init_analysis(
+            &analysis,
+            client.as_ref(),
+            &status_bar,
+            &file_diagnostic,
+            &lsp_features,
+            vec![glua_code_analysis::WorkspaceFolder::new(
+                root.to_path_buf(),
+                false,
+            )],
+            LoadedConfig::default(),
+            std::collections::HashSet::new(),
+            LongRunningWatchdogStatus::new("test"),
+        ));
+
+        let analysis = runtime.block_on(analysis.read());
+        let globals = analysis.compilation.get_db().get_global_index();
+        verify_that!(
+            (
+                globals.is_exist_global_decl("Collected"),
+                globals.is_exist_global_decl("Indexed"),
+            ),
+            eq((true, false))
+        )
     }
 
     /// A reload reads the workspace from disk, but an open document's text is
