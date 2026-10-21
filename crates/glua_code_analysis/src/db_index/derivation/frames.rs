@@ -592,9 +592,11 @@ pub fn consult_unkeyed(key: u64) {
     });
 }
 
+/// Logs the context read `key` for the open frames; a frame closing sorts
+/// and dedups what it logged ([`unkeyed_since`]).
 fn note_unkeyed(evaluation: &mut Evaluation, key: u64) {
     if let Some(frame) = evaluation.frames.last()
-        && !evaluation.unkeyed[frame.unkeyed as usize..].contains(&key)
+        && evaluation.unkeyed[frame.unkeyed as usize..].last() != Some(&key)
     {
         evaluation.unkeyed.push(key);
     }
