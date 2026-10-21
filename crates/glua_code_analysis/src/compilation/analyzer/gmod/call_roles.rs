@@ -86,12 +86,29 @@ impl Touched {
         let globals = self.globals.iter().cloned().map(CallRoleKey::Global);
         let methods = self.methods.iter().cloned().map(CallRoleKey::Method);
         let signatures = self.signatures.iter().copied().map(CallRoleKey::Signature);
-        paths
+        let mut keys = paths
             .chain(receiver_methods)
             .chain(globals)
             .chain(methods)
             .chain(signatures)
-            .collect()
+            .collect::<Vec<_>>();
+        keys.sort_by(|a, b| key_order(a).cmp(&key_order(b)));
+        keys
+    }
+}
+
+/// A total order over call-role keys, so their writes do not follow hash order.
+fn key_order(key: &CallRoleKey) -> (u8, &str, Option<(FileId, TextSize)>) {
+    match key {
+        CallRoleKey::Path(path) => (0, path.as_str(), None),
+        CallRoleKey::ReceiverMethod(method) => (1, method.as_str(), None),
+        CallRoleKey::Global(global_id) => (2, global_id.get_name(), None),
+        CallRoleKey::Method(method) => (3, method.as_str(), None),
+        CallRoleKey::Signature(signature_id) => (
+            4,
+            "",
+            Some((signature_id.get_file_id(), signature_id.get_position())),
+        ),
     }
 }
 
