@@ -1212,6 +1212,16 @@ impl KeyTable {
         freshness
     }
 
+    /// The stamp `slot` was last logged under.
+    pub(super) fn log_stamp(&self, slot: KeyIdx) -> u64 {
+        self.keys[slot as usize].stamp
+    }
+
+    /// Puts back the log stamp a nested evaluation overwrote.
+    pub(super) fn restore_log_stamp(&mut self, slot: KeyIdx, stamp: u64) {
+        self.keys[slot as usize].stamp = stamp;
+    }
+
     /// Whether a read of `slot` goes into a log whose innermost open frame
     /// began at stamp `frame`: `None` if it was logged since, else whether
     /// this is its first log since the evaluation began at stamp

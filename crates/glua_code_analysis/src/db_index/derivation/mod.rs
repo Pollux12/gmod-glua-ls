@@ -1280,6 +1280,21 @@ pub struct Evaluation {
     /// Fingerprints taken when an earlier stage of a staged evaluation ended:
     /// other evaluations write between its stages.
     staged: rustc_hash::FxHashMap<HashedKey, Fingerprint>,
+    /// Set while the evaluation runs nested in one it suspended on the same
+    /// lent table; see [`SharedTable`].
+    shared: Option<SharedTable>,
+}
+
+/// What an evaluation nested in another on one lent [`KeyTable`] owes it: a
+/// slot's log stamp says which evaluation logged it since when, so the
+/// stamps it overwrote go back once the suspended one resumes, and a write
+/// of a key either read counts as read here.
+#[derive(Debug)]
+struct SharedTable {
+    /// The stamp of the outermost evaluation sharing the table.
+    since: u64,
+    /// The log stamps it overwrote, oldest first.
+    overwritten: Vec<(KeyIdx, u64)>,
 }
 
 /// An evaluation a superstep task ended, kept until the barrier files it: its
@@ -1336,6 +1351,7 @@ impl EndedEvaluation {
             outputs: self.outputs,
             moved: rare.moved,
             staged: rare.staged,
+            shared: None,
         }
     }
 }
@@ -1859,6 +1875,7 @@ pub fn begin(id: DerivationId) -> Recording {
         outputs: spare.outputs,
         moved: spare.moved,
         staged: spare.staged,
+        shared: None,
     })
 }
 
@@ -1983,10 +2000,21 @@ impl Spare {
 /// Makes `evaluation` the one recording on this thread. One already recording
 /// is suspended until `evaluation` ends: a thread waiting in the pool runs
 /// other work, which may record its own evaluation.
-fn start(evaluation: Evaluation) -> Recording {
+fn start(mut evaluation: Evaluation) -> Recording {
     let stamp = evaluation.stamp;
     let suspended = SUSPENDED.with(|suspended| suspended.borrow().len());
-    let previous = CURRENT.with(|current| current.borrow_mut().replace(evaluation));
+    let previous = CURRENT.with(|current| current.borrow_mut().take());
+    evaluation.shared = previous
+        .as_ref()
+        .filter(|_| KEYS.with(|keys| keys.borrow().is_some()))
+        .map(|previous| SharedTable {
+            since: previous
+                .shared
+                .as_ref()
+                .map_or(previous.stamp, |shared| shared.since),
+            overwritten: Vec::new(),
+        });
+    CURRENT.with(|current| *current.borrow_mut() = Some(evaluation));
     let suspends = previous.is_some();
     if let Some(previous) = previous {
         SUSPENDED.with(|suspended| suspended.borrow_mut().push(previous));
@@ -2029,7 +2057,16 @@ pub fn resume(mut evaluation: Evaluation) -> Recording {
 pub fn suspend() -> Evaluation {
     CURRENT.with(|current| {
         let mut current = current.borrow_mut();
-        let evaluation = current.take().expect("derivation::suspend without begin");
+        let mut evaluation = current.take().expect("derivation::suspend without begin");
+        if let Some(shared) = evaluation.shared.take() {
+            KEYS.with(|keys| {
+                if let Some(table) = keys.borrow_mut().as_mut() {
+                    for (slot, stamp) in shared.overwritten.into_iter().rev() {
+                        table.restore_log_stamp(slot, stamp);
+                    }
+                }
+            });
+        }
         *current = SUSPENDED.with(|suspended| suspended.borrow_mut().pop());
         evaluation
     })
@@ -2120,7 +2157,11 @@ impl Evaluation {
     }
 
     fn log_slot(&mut self, table: &mut KeyTable, slot: KeyIdx) {
+        let overwritten = self.shared.as_ref().map(|_| table.log_stamp(slot));
         let (first, is_query) = table.log(slot, self.frame_stamp(), self.stamp);
+        if let (Some(shared), Some(stamp), Some(_)) = (&mut self.shared, overwritten, first) {
+            shared.overwritten.push((slot, stamp));
+        }
         if is_query && let Some(frame) = self.frames.last_mut() {
             frame.has_query = true;
         }
@@ -2778,15 +2819,18 @@ pub fn note_write(key: impl FnOnce() -> FactKey) {
             let written = next_stamp();
             // Inference memoised during an evaluation read only keys the
             // evaluation recorded, so a write it did not read leaves it valid.
-            let read_here =
-                transport::with_keys(|worker| worker.note_write(&key, evaluation.stamp, written))
-                    .unwrap_or_else(|| {
-                        KEYS.with(|keys| {
-                            keys.borrow_mut().as_mut().is_none_or(|table| {
-                                table.mark_written_logged(&key, evaluation.stamp, written)
-                            })
-                        })
-                    });
+            let since = evaluation
+                .shared
+                .as_ref()
+                .map_or(evaluation.stamp, |shared| shared.since);
+            let read_here = transport::with_keys(|worker| worker.note_write(&key, since, written))
+                .unwrap_or_else(|| {
+                    KEYS.with(|keys| {
+                        keys.borrow_mut()
+                            .as_mut()
+                            .is_none_or(|table| table.mark_written_logged(&key, since, written))
+                    })
+                });
             if read_here {
                 WRITE_GENERATION.with(|generation| generation.set(generation.get() + 1));
             }

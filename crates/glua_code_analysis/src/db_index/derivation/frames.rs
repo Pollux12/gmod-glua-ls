@@ -1779,6 +1779,28 @@ mod tests {
         );
     }
 
+    /// A key an evaluation nested on the same lent table read is still
+    /// logged by the frame of the evaluation it suspended reading it after.
+    #[test]
+    fn a_read_after_a_nested_evaluation_read_the_same_key_is_logged_by_the_outer_frame() {
+        let key = || FactKey::GmodRealm(FileId::new(1));
+        derivation::lend_keys(KeyTable::default());
+        let _outer = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        let frame = open_frame().expect("a table is lent");
+        let _nested = derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
+        derivation::note_read(key);
+        derivation::end();
+        derivation::note_read(key);
+        let value = close_frame(frame, 0).expect("the frame saw no taint");
+        derivation::end();
+        let _writer = derivation::begin(DerivationId::workspace(DerivationKind::NetHelperNames));
+        derivation::note_write(key);
+        let result = reuse(&value, 0, &[], None);
+        derivation::end();
+        derivation::take_keys();
+        assert_eq!(result, Reuse::Stale);
+    }
+
     /// A value this evaluation computed is stale once a key it read is marked
     /// written, though this thread noted no write since.
     #[test]
