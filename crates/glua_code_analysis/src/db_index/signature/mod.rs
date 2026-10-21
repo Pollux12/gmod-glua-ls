@@ -710,24 +710,25 @@ impl LuaSignatureIndex {
     }
 
     pub fn clear_inferred_positive_guards_for_file(&mut self, file_id: FileId) {
-        let old_owners = self
+        for owner in self
             .inferred_guard_owners_by_file
             .remove(&file_id)
-            .unwrap_or_default();
-        for owner in old_owners {
+            .unwrap_or_default()
+        {
             self.inferred_guard_facts.remove(&owner);
         }
-        let retain = |signature_id: &LuaSignatureId| {
-            let keep = signature_id.get_file_id() != file_id;
-            if !keep {
-                derivation::note_write(|| FactKey::InferredGuard(*signature_id));
-            }
-            keep
-        };
-        self.inferred_positive_guards
-            .retain(|signature_id, _| retain(signature_id));
-        self.inferred_guard_owners
-            .retain(|signature_id, _| retain(signature_id));
+        // A signature's guard lives in its file's shard, and every owned guard
+        // has one there.
+        let signature_ids = self
+            .inferred_positive_guards
+            .file_entries(file_id)
+            .map(|(signature_id, _)| *signature_id)
+            .collect::<Vec<_>>();
+        for signature_id in signature_ids {
+            derivation::note_write(|| FactKey::InferredGuard(signature_id));
+            self.inferred_positive_guards.remove(&signature_id);
+            self.inferred_guard_owners.remove(&signature_id);
+        }
     }
 
     pub fn add_receiver_out_param_member_name(&mut self, file_id: FileId, member_name: String) {
