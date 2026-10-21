@@ -817,10 +817,12 @@ impl FileRemap {
         u32::from(position) < self.map.first_change()
     }
 
-    /// The range counterpart: `map_range` keeps a range unchanged exactly
-    /// when its end lies at or before the hunk start.
+    /// The range counterpart, which also needs the byte after the range
+    /// unchanged: a node ending where an insertion starts keeps its bytes but
+    /// may have grown into the insertion, so its old range is checked against
+    /// the index.
     fn range_is_before_the_hunk(&self, range: TextRange) -> bool {
-        u32::from(range.end()) <= self.map.first_change()
+        u32::from(range.end()) < self.map.first_change()
     }
 
     /// Resolves a mapped identity against the re-indexed file.

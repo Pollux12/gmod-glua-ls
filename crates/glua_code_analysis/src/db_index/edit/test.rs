@@ -787,6 +787,32 @@ fn deleted_covering_decl_still_loses_the_synthesized_id() {
     assert!(remap.syntax_id(provider_id, id).is_lost());
 }
 
+/// A node ending where an insertion starts keeps its bytes but grows into
+/// the insertion: its old range names nothing in the re-indexed file.
+#[gtest]
+fn a_statement_typed_onto_at_its_end_is_not_kept_at_its_old_range() {
+    use glua_parser::{LuaKind, LuaSyntaxKind};
+    use rowan::TextRange;
+    let provider = "X = 1
+";
+    let typed = "X = 12
+";
+    let mut ws = workspace();
+    let provider_uri = ws.virtual_url_generator.new_uri("lua/typed_provider.lua");
+    let provider_id = write(&mut ws, &provider_uri, provider);
+    ws.analysis
+        .update_file_text_only(&provider_uri, typed.to_string());
+    ws.analysis.compilation.remove_index(vec![provider_id]);
+    ws.analysis.compilation.update_index(vec![provider_id]);
+    let map = PositionMap::new(provider, typed);
+    let remap = FileRemap::validated(ws.analysis.compilation.get_db(), provider_id, map);
+    let statement = glua_parser::LuaSyntaxId::new(
+        LuaKind::Syntax(LuaSyntaxKind::AssignStat),
+        TextRange::new(TextSize::new(0), TextSize::new(5)),
+    );
+    assert!(remap.syntax_id(provider_id, statement).is_lost());
+}
+
 // --- Remap ---
 
 /// Writes `new_text` over `uri` and re-indexes it through the ordinary
