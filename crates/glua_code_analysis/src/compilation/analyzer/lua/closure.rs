@@ -1699,22 +1699,9 @@ fn analyze_lambda_params(
     signature_id: &LuaSignatureId,
     closure: &LuaClosureExpr,
 ) -> Option<()> {
-    // A3-remnant decision (language-server-performance §3): the general
-    // attempt-once-at-enqueue for ClosureParams/ClosureReturn/ClosureParentParams
-    // is deliberately NOT landed. An enqueue-time `try_resolve` would run against
-    // a partially walked batch (later files' lua passes, gmod post, and the
-    // dynamic-field seal have not run yet), while the first wave sees all of
-    // them. `try_resolve_call_closure_params` inserts param docs first-writer-wins
-    // (`contains_key` skip), so an early write from a still-Unknown prefix would
-    // pin `any` over the concrete contract the wave would have installed; an
-    // early no-op `Ok` (callback not found yet) would retire an item the wave
-    // would have filled once a later file's facts landed. Either changes
-    // diagnostics without moving the `moved` counters (params are not type
-    // writes), so the stop rule cannot catch it. A failed enqueue-time attempt
-    // also doubles cost for the majority that do not resolve immediately: the
-    // infer caches are cleared before the waves (`clear_for_unresolve`), so the
-    // pre-warm is wiped. The only provably identical skips are the syntactic
-    // no-ops below, which read no index state and write nothing.
+    // Each item is attempted once the statement's walk is done. The only
+    // items not enqueued are the syntactic no-ops below, which read no index
+    // state and write nothing.
     let ast_node = closure.get_parent::<LuaAst>()?;
     match ast_node {
         LuaAst::LuaCallArgList(call_arg_list) => {
@@ -1735,10 +1722,8 @@ fn analyze_lambda_params(
         }
         LuaAst::LuaFuncStat(func_stat) => {
             // `try_resolve_closure_parent_params` returns `Ok` without reading
-            // or writing anything unless the defined name is an index expression.
-            // A plain `function foo() end` therefore retires on its first wave
-            // attempt with no state change; skipping the enqueue leaves the
-            // `moved == 0` termination and every floor identical.
+            // or writing anything unless the defined name is an index expression,
+            // so a plain `function foo() end` is not enqueued.
             if !func_stat_defines_index_target(&func_stat) {
                 return Some(());
             }
@@ -1746,9 +1731,6 @@ fn analyze_lambda_params(
                 file_id: analyzer.file_id,
                 signature_id: *signature_id,
                 parent_ast: UnResolveParentAst::LuaFuncStat(func_stat.clone()),
-                needs_settled_retry: false,
-                source_signature_id: None,
-                last_source_return: None,
             };
 
             analyzer.context.add_unresolve(unresolved.into());
@@ -1758,9 +1740,6 @@ fn analyze_lambda_params(
                 file_id: analyzer.file_id,
                 signature_id: *signature_id,
                 parent_ast: UnResolveParentAst::LuaTableField(table_field.clone()),
-                needs_settled_retry: false,
-                source_signature_id: None,
-                last_source_return: None,
             };
 
             analyzer.context.add_unresolve(unresolved.into());
@@ -1777,9 +1756,6 @@ fn analyze_lambda_params(
                 file_id: analyzer.file_id,
                 signature_id: *signature_id,
                 parent_ast: UnResolveParentAst::LuaAssignStat(assign_stat.clone()),
-                needs_settled_retry: false,
-                source_signature_id: None,
-                last_source_return: None,
             };
 
             analyzer.context.add_unresolve(unresolved.into());
@@ -1791,17 +1767,15 @@ fn analyze_lambda_params(
 }
 
 /// Whether a `FuncStat` parent can contribute a parameter contract: only an
-/// `a.b.c` / `a:b()` definition reads the prefix type. A missing name fails
-/// the retry with `None` rather than retiring, so it still enqueues.
+/// `a.b.c` / `a:b()` definition reads the prefix type.
 fn func_stat_defines_index_target(func_stat: &LuaFuncStat) -> bool {
     matches!(func_stat.get_func_name(), Some(LuaVarExpr::IndexExpr(_)))
 }
 
 /// Whether the assignment slot holding the closure at `closure_pos` is a plain
-/// name. Mirrors the `UnResolveParentClosureParams::LuaAssignStat` retry, which
-/// returns `Ok` without reads or writes for any non-index target. `None` (slot
-/// not found) preserves the enqueue: the retry fails with `None` and stays
-/// queued rather than retiring.
+/// name. Mirrors the `UnResolveParentClosureParams::LuaAssignStat` attempt,
+/// which returns `Ok` without reads or writes for any non-index target. A slot
+/// that cannot be found is enqueued.
 fn assign_slot_is_plain_name(assign_stat: &LuaAssignStat, closure_pos: rowan::TextSize) -> bool {
     let (vars, exprs) = assign_stat.get_var_and_expr_list();
     exprs

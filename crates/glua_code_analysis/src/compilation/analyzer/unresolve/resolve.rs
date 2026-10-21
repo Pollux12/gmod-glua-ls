@@ -304,11 +304,9 @@ pub fn try_resolve_member(
                     // not settled: the lookup misses for the lowercase locals the
                     // real scripts use (`player._Sleeping`), and on a cold build
                     // the walk reaches the write before the prefix carries a type
-                    // at all. Answering `Ok` there retires the member from every
-                    // retry with nothing attached, which is what made its owner a
-                    // function of how far the batch had run. Report it unresolved
-                    // instead, so the caller keeps it queued until a pass that can
-                    // still settle the prefix has run.
+                    // at all. Answering `Ok` there would settle the member with
+                    // nothing attached. Report it unresolved instead: the engine
+                    // re-evaluates the site once a fact its prefix read moves.
                     let LuaExpr::NameExpr(name_expr) = prefix_expr else {
                         return Err(InferFailReason::FieldNotFound);
                     };
@@ -542,8 +540,7 @@ pub fn try_resolve_return_point(
     // function, and `should_apply_resolved_return_docs` then discards the
     // result whenever the signature already holds a concrete inferred return —
     // it can only ever upgrade `unknown`/`any`. Asking that question first
-    // costs two field reads instead of a full inference, and this pass
-    // re-attempts the same signatures across waves.
+    // costs two field reads instead of a full inference.
     if let Some(signature) = db.get_signature_index().get(&return_.signature_id)
         && signature.resolve_return == SignatureReturnStatus::InferResolve
     {
@@ -648,7 +645,7 @@ fn should_apply_resolved_return_docs(
 /// An inferred return that says nothing yet. `never` belongs here: a function
 /// whose body returns an expression cannot return no value, so a `never`
 /// return is an operand that had not resolved when the body was read.
-pub(crate) fn is_unsettled_inferred_return(return_type: &LuaType) -> bool {
+fn is_unsettled_inferred_return(return_type: &LuaType) -> bool {
     match return_type {
         LuaType::Unknown | LuaType::Any | LuaType::Never => true,
         LuaType::Variadic(variadic) => match variadic.as_ref() {

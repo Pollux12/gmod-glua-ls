@@ -6,7 +6,7 @@ mod writes;
 use std::cmp::Ordering;
 
 use crate::{
-    FileId, InferFailReason, LuaInferCache, LuaType,
+    FileId, InferFailReason, LuaInferCache,
     compilation::analyzer::unresolve::resolve::try_resolve_special_call,
     db_index::{DbIndex, LuaDeclId, LuaMemberId, LuaSignatureId},
 };
@@ -15,7 +15,6 @@ use resolve::{try_resolve_decl, try_resolve_module};
 use resolve_closure::{try_resolve_call_closure_params, try_resolve_closure_return};
 
 pub(crate) use resolve::get_wrapped_callable_target_expr;
-pub(crate) use resolve::is_unsettled_inferred_return;
 pub(crate) use resolve::iter_var_updates;
 pub(crate) use resolve::{try_resolve_member, try_resolve_return_point};
 pub(crate) use resolve_closure::callback_contract_for_arg;
@@ -340,17 +339,6 @@ pub struct UnResolveParentClosureParams {
     pub file_id: FileId,
     pub signature_id: LuaSignatureId,
     pub parent_ast: UnResolveParentAst,
-    /// Set when the inherited contract was installed while the source
-    /// signature's return still held unsettled slots; the item retired with a
-    /// partial answer and joins the settled-tail retry queue.
-    pub needs_settled_retry: bool,
-    /// The signature the contract was copied from, and the source return as
-    /// seen when the candidate was queued or last retried. The source's own
-    /// inferred return can keep moving through slot values that read as
-    /// settled (a transient `nil`), so the retry stays queued until the
-    /// source is stable and the copy mirrors it.
-    pub source_signature_id: Option<LuaSignatureId>,
-    pub last_source_return: Option<LuaType>,
 }
 
 impl From<UnResolveParentClosureParams> for UnResolve {

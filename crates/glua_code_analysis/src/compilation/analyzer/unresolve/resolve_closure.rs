@@ -17,7 +17,7 @@ use crate::{
 use super::{
     ResolveResult, UnResolveCallClosureParams, UnResolveClosureReturn, UnResolveParentAst,
     UnResolveParentClosureParams, UnResolveReturn, find_decl_function::find_decl_function_type,
-    is_unsettled_inferred_return, resolve::try_resolve_return_point, writes::ResolveWrites,
+    resolve::try_resolve_return_point, writes::ResolveWrites,
 };
 
 pub fn try_resolve_call_closure_params(
@@ -627,22 +627,16 @@ fn resolve_closure_member_type(
                 if signature.params_filled_from_slot && !signature.param_docs.is_empty() {
                     return Ok(());
                 }
-                // The base contract is readable, but its return can still hold
-                // unsettled slots. Copying it stamps `DocResolve` on this
-                // signature, which no later pass reopens, so queue a settled
-                // retry that can refresh the slot-filled return once the base
-                // settles.
                 // A return inferred from the base's body describes that body, not
                 // a contract its overrides keep, so only a documented one carries.
+                // The base's signature read is recorded, so an unsettled return
+                // re-runs this copy once the base settles.
                 let documented = signature.resolve_return == SignatureReturnStatus::DocResolve;
                 let source_return = if documented {
                     signature.get_return_type()
                 } else {
                     LuaType::Unknown
                 };
-                let source_return_unsettled =
-                    documented && is_unsettled_inferred_return(&source_return);
-                let source_id = *id;
                 let target = db
                     .get_signature_index()
                     .get(&closure_params.signature_id)
@@ -652,19 +646,13 @@ fn resolve_closure_member_type(
                     signature,
                     source_return.clone(),
                 ));
-                let result = defer_resolve_doc_function(
+                defer_resolve_doc_function(
                     db,
                     writes,
                     closure_params.signature_id,
                     &contract_for_target(db, target, &source_contract),
                     self_type,
-                );
-                if result.is_ok() && source_return_unsettled {
-                    closure_params.needs_settled_retry = true;
-                    closure_params.source_signature_id = Some(source_id);
-                    closure_params.last_source_return = Some(source_return);
-                }
-                result
+                )
             } else {
                 Ok(())
             }

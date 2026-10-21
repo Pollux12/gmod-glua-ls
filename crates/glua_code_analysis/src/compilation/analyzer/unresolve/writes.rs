@@ -1,25 +1,20 @@
-//! Deferred index writes for speculative wave resolution.
+//! Index writes an unresolve attempt defers until it has finished computing.
 //!
-//! Wave attempts mutate the shared indexes inline, which is what keeps the
-//! drain serial: item *i*+1 must observe item *i*'s writes. To run the
-//! compute half on workers, each attempt instead records its writes as
-//! closures here; the caller then replays them in the original item order
-//! against the real index.
+//! An attempt computes against `&DbIndex` and records each write as a
+//! closure here; the caller replays them, in push order, right after the
+//! attempt returns and before the next item is attempted.
 //!
-//! Replaying the real write path (`bind_type`, `add_member`, …) at apply
-//! time preserves the read-modify-write semantics of the serial drain — a
-//! deferred `bind_type` merges against whatever the slot holds when it
-//! lands, exactly as it would have inline. The only difference is *when*
-//! the closure runs, so an item whose reads were invalidated by an
-//! earlier-applied write must be recomputed rather than applied.
+//! Replaying the real write path (`bind_type`, `add_member`, …) keeps its
+//! read-modify-write semantics: a deferred `bind_type` merges against
+//! whatever the slot holds when it lands.
 
 use std::collections::VecDeque;
 
 use crate::{DbIndex, compilation::analyzer::infer_cache_manager::InferCacheManager};
 
-/// One index mutation deferred from a speculative attempt. The boxed closure
-/// replays the same call the serial path would have made, in the same order,
-/// against the live index and the real per-file infer caches.
+/// One index mutation an attempt deferred. The boxed closure makes the call
+/// the attempt would have made, against the live index and the real per-file
+/// infer caches.
 type DeferredWrite = Box<dyn FnOnce(&mut DbIndex, &mut InferCacheManager) + Send>;
 
 /// Accumulates an attempt's index writes in call order.
