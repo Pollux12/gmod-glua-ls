@@ -4320,4 +4320,64 @@ mod tests {
         let diagnostics = file_diagnostics(&mut ws, server_file_id);
         expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
     }
+
+    #[gtest]
+    fn test_a_start_helper_that_writes_after_its_start_leaves_the_payload_unchecked() {
+        let mut ws = new_gmod_workspace();
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_orders.lua",
+            r#"
+            util.AddNetworkString("OrderPlaced")
+            net.Receive("OrderPlaced", function(len, ply)
+                local version = net.ReadUInt(8)
+                local item = net.ReadString()
+            end)
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/cl_order.lua",
+            r#"
+            local function Begin(name)
+                net.Start(name)
+                net.WriteUInt(1, 8)
+            end
+            Begin("OrderPlaced")
+            net.WriteString("chair")
+            net.SendToServer()
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_a_send_helper_that_writes_before_its_send_leaves_the_payload_unchecked() {
+        let mut ws = new_gmod_workspace();
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_orders.lua",
+            r#"
+            util.AddNetworkString("OrderPlaced")
+            net.Receive("OrderPlaced", function(len, ply)
+                local item = net.ReadString()
+                local count = net.ReadUInt(8)
+            end)
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/cl_order.lua",
+            r#"
+            local function Finish()
+                net.WriteUInt(1, 8)
+                net.SendToServer()
+            end
+            net.Start("OrderPlaced")
+            net.WriteString("chair")
+            Finish()
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
 }

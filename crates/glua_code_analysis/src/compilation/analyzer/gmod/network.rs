@@ -1548,7 +1548,9 @@ fn collect_net_send_flow(
     }?;
 
     let mut writes = Vec::new();
-    let mut writes_opaque = false;
+    // A start or send helper's own writes, around the start or send it makes,
+    // are not composed: one that can write leaves the payload unknown.
+    let mut writes_opaque = helper_writes(ctx, call_expr);
     let mut send = None;
 
     for next_stat in stats_after(stat) {
@@ -1573,6 +1575,7 @@ fn collect_net_send_flow(
                     if let Some((send_kind, send_target)) =
                         resolve_helper_send(ctx, &next_call_expr)
                     {
+                        writes_opaque |= helper_writes(ctx, &next_call_expr);
                         send = Some((
                             next_call_expr.get_range(),
                             send_kind,
@@ -1601,6 +1604,13 @@ fn collect_net_send_flow(
         writes_opaque,
         materialized_from: None,
     })
+}
+
+/// Whether `call_expr` calls a helper whose expansion can write a payload.
+fn helper_writes(ctx: &mut NetCollectCtx<'_>, call_expr: &LuaCallExpr) -> bool {
+    ctx.site
+        .target(call_expr)
+        .is_some_and(|target| ctx.reach(&target).payload)
 }
 
 fn resolve_helper_start_message(
