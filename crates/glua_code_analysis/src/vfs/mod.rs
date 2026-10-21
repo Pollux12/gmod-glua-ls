@@ -135,6 +135,8 @@ impl Vfs {
             None => {
                 log::warn!("uri {} can not cover to file path", uri.as_str());
                 let id = self.file_data.len() as u32;
+                self.file_order_keys
+                    .insert(id, Arc::from(self.order_key_for_uri(uri)));
                 self.file_data.push(None);
                 return FileId { id };
             }
@@ -158,6 +160,8 @@ impl Vfs {
         } else {
             let id = self.file_data.len() as u32;
             self.remote_file_id_map.insert(uri.clone(), FileId { id });
+            self.file_order_keys
+                .insert(id, Arc::from(self.order_key_for_uri(uri)));
             self.file_data.push(None);
             FileId { id }
         }
@@ -236,13 +240,14 @@ impl Vfs {
     /// they are not the same between a cold build and an incremental session.
     /// Anything that has to elect one file's write over another's — merged
     /// documentation, table writers, load sites — orders on this instead. A file
-    /// the VFS does not know sorts last.
+    /// known by a URI that names no path sorts after every file with one, and a
+    /// file the VFS does not know sorts last.
     pub fn file_order_key(&self, id: &FileId) -> Arc<str> {
         crate::db_index::derivation::note_file_path_read(*id);
         self.file_order_keys
             .get(&id.id)
             .cloned()
-            .unwrap_or_else(|| Arc::from(""))
+            .unwrap_or_else(|| Arc::from((WorkspaceKind::MERGE_RANK_NONE + 2).to_string()))
     }
 
     /// Sets the workspace roots with their load tier and re-keys every file.
@@ -874,6 +879,22 @@ mod tests {
         let mut vfs = Vfs::new();
         vfs.update_config(Arc::new(Emmyrc::default()));
         vfs
+    }
+
+    /// A file with a path sorts before a remote one, and both before a file the
+    /// VFS does not know, so where they land never depends on their ids.
+    #[test]
+    fn files_without_a_path_sort_after_every_file_with_one() {
+        let mut vfs = new_vfs();
+        let remote_uri: Uri = "https://example.com/schema.json"
+            .parse()
+            .expect("valid remote uri");
+        let remote = vfs.set_remote_file_content(&remote_uri, Some("{}".to_string()));
+        let local = vfs.set_file_content(&file_uri(), Some(String::new()));
+        let unknown = super::FileId { id: 999 };
+
+        assert!(vfs.file_order_key(&local) < vfs.file_order_key(&remote));
+        assert!(vfs.file_order_key(&remote) < vfs.file_order_key(&unknown));
     }
 
     /// Readers see the text a take installed, never text staged after it,
