@@ -263,6 +263,22 @@ impl<K, V> CowShards<K, V> {
         (0..self.end()).filter_map(|at| self.shard(at))
     }
 
+    /// Takes the shard at `at` out of a fork that is being installed.
+    fn take_held_shard(&mut self, at: usize) -> Option<Arc<Shard<K, V>>> {
+        self.dirty
+            .remove(&(at as u32))
+            .or_else(|| self.take_slot(at))
+    }
+
+    /// Takes the shard the slot table holds at `at`: moved out when the table
+    /// is this map's alone, else shared with the maps holding it too.
+    fn take_slot(&mut self, at: usize) -> Option<Arc<Shard<K, V>>> {
+        match Arc::get_mut(&mut self.slots) {
+            Some(slots) => slots.get_mut(at)?.take(),
+            None => self.slots.get(at).cloned().flatten(),
+        }
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
         self.shards().flat_map(|shard| shard.iter())
     }
@@ -599,13 +615,6 @@ impl<K: ShardKey + Clone + Send + Sync + 'static, V: Clone + PartialEq + Send + 
         (held.unwrap_or_default(), conflicted, replaced)
     }
 
-    /// Takes the shard at `at` out of a fork that is being installed.
-    fn take_held_shard(&mut self, at: usize) -> Option<Arc<Shard<K, V>>> {
-        self.dirty
-            .remove(&(at as u32))
-            .or_else(|| self.slots.get(at).cloned().flatten())
-    }
-
     /// Whether writes go to `dirty`: a fork's always, and an installing
     /// map's while its slot table is shared, so the table is not copied.
     fn writes_apart(&self) -> bool {
@@ -850,11 +859,7 @@ impl<K: Clone, V: Clone> IntoIterator for CowShards<K, V> {
     fn into_iter(mut self) -> Self::IntoIter {
         let end = self.end();
         let shards: Vec<Shard<K, V>> = (0..end)
-            .filter_map(|at| {
-                self.dirty
-                    .remove(&(at as u32))
-                    .or_else(|| self.slots.get(at).cloned().flatten())
-            })
+            .filter_map(|at| self.take_held_shard(at))
             .map(Arc::unwrap_or_clone)
             .collect();
         shards.into_iter().flatten()
@@ -1808,6 +1813,33 @@ mod tests {
 
     fn owner(file: u32, position: u32) -> LuaTypeOwner {
         LuaTypeOwner::Decl(LuaDeclId::new(FileId { id: file }, position.into()))
+    }
+
+    /// A value that counts how often it is copied.
+    #[derive(Debug, PartialEq)]
+    struct Counted(std::rc::Rc<std::cell::Cell<usize>>);
+
+    impl Clone for Counted {
+        fn clone(&self) -> Self {
+            self.0.set(self.0.get() + 1);
+            Self(self.0.clone())
+        }
+    }
+
+    /// Consuming a map no other map shares moves its entries out instead of
+    /// copying them.
+    #[test]
+    fn consuming_an_unshared_map_copies_no_entry() {
+        let copies = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut map = CowShards::<FileId, Counted>::default();
+        for file in 0..4 {
+            map.insert(FileId { id: file }, Counted(copies.clone()));
+        }
+
+        let entries = map.into_iter().count();
+
+        assert_eq!(entries, 4);
+        assert_eq!(copies.get(), 0);
     }
 
     fn path_key(name: &str) -> LuaMemberKey {
