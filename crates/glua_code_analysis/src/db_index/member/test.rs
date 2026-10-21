@@ -1532,4 +1532,25 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn removing_a_co_writer_leaves_the_slot_as_a_build_of_the_rest_files_it() {
+        let kept = make_member_id(FileId::new(1), 10);
+        let key = LuaMemberKey::Name("x".into());
+        let mut cold = LuaMemberIndex::new();
+        cold.add_member(path("Holder"), make_member(kept, "x"));
+        for removed_start in [5, 20] {
+            let mut index = LuaMemberIndex::new();
+            index.add_member(path("Holder"), make_member(kept, "x"));
+            let removed = make_member_id(FileId::new(2), removed_start);
+            index.add_member(path("Holder"), make_member(removed, "x"));
+
+            index.remove(FileId::new(2));
+
+            assert_eq!(
+                index.get_member_item(&path("Holder"), &key),
+                cold.get_member_item(&path("Holder"), &key)
+            );
+        }
+    }
 }

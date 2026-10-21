@@ -20,6 +20,27 @@ pub enum LuaMemberIndexItem {
     Many(Vec<LuaMemberId>),
 }
 
+impl LuaMemberIndexItem {
+    /// Keeps the ids `keep` accepts, a single one left as `One`, the shape a
+    /// build files it in. Returns whether any id is left.
+    pub(crate) fn retain_ids(&mut self, mut keep: impl FnMut(LuaMemberId) -> bool) -> bool {
+        match self {
+            Self::One(id) => keep(*id),
+            Self::Many(ids) => {
+                ids.retain(|id| keep(*id));
+                match *ids.as_slice() {
+                    [] => false,
+                    [only] => {
+                        *self = Self::One(only);
+                        true
+                    }
+                    _ => true,
+                }
+            }
+        }
+    }
+}
+
 /// Where a member is read from. Visibility takes the offset only through
 /// [`Self::position`], which notes it: an answer that never took it holds at
 /// every offset of the file with the same realm.

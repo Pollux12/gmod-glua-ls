@@ -3353,15 +3353,15 @@ impl LuaMemberIndex {
                                     need_removed_key.push(key.clone());
                                 }
                             }
-                            LuaMemberIndexItem::Many(ids) => {
-                                ids.retain(|id| {
+                            LuaMemberIndexItem::Many(_) => {
+                                let left = item.retain_ids(|id| {
                                     let keep = id.file_id != file_id;
                                     if !keep {
-                                        unlisted.push((key.clone(), *id));
+                                        unlisted.push((key.clone(), id));
                                     }
                                     keep
                                 });
-                                if ids.is_empty() {
+                                if !left {
                                     need_removed_key.push(key.clone());
                                 }
                             }

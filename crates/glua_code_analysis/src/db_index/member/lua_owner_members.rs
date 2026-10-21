@@ -206,10 +206,7 @@ impl LuaOwnerMembers {
             _ => return false,
         };
         let drop_key = match self.get_member_mut(key) {
-            Some(LuaMemberIndexItem::Many(ids)) => {
-                ids.retain(|held| *held != id);
-                ids.is_empty()
-            }
+            Some(item @ LuaMemberIndexItem::Many(_)) => !item.retain_ids(|held| held != id),
             _ => true,
         };
         if many {
