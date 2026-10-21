@@ -278,7 +278,7 @@ mod tests {
     }
 
     #[gtest]
-    fn shared_data_precompute_contains_sorted_workspace_files_and_callee_realms() {
+    fn shared_data_precompute_contains_library_callee_realms() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -299,7 +299,7 @@ mod tests {
             "#,
         );
 
-        let server_id = ws.def_file(
+        ws.def_file(
             "lua/autorun/server/sv_api.lua",
             r#"
             function ServerOnlyApi()
@@ -314,11 +314,7 @@ mod tests {
             "#,
         );
 
-        let mut expected_file_ids = vec![server_id, client_id];
-        expected_file_ids.sort_unstable();
-
         let shared_data = ws.analysis.precompute_diagnostic_shared_data();
-        assert_eq!(shared_data.workspace_file_ids.as_ref(), &expected_file_ids);
 
         let workspace_id = ws
             .analysis

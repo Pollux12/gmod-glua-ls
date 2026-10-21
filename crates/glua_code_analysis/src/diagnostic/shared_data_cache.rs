@@ -136,7 +136,6 @@ struct CacheState {
     /// The index revision every unit was last found current at.
     checked: Option<u64>,
     shared: Option<Arc<SharedDiagnosticData>>,
-    workspace_file_ids: Option<Arc<Vec<FileId>>>,
     realms: RealmState,
     required_fields: RequiredFieldsState,
     sorted_send_flows: Option<Recorded<Arc<SortedSendFlowCache>>>,
@@ -219,10 +218,8 @@ impl SharedDiagnosticComponentCache {
 /// Brings every unit of `state` up to `db` and assembles the shared data.
 fn refresh(db: &DbIndex, state: &mut CacheState) -> Arc<SharedDiagnosticData> {
     let module_index = db.get_module_index();
-    let workspace_file_ids = module_index.get_main_workspace_file_ids();
     // Callee resolution for a main workspace can select declarations from
-    // compatible library and std workspaces, so realms cover every local file
-    // while `workspace_file_ids` stays limited to main files.
+    // compatible library and std workspaces, so realms cover every local file.
     let mut local_file_ids = db.get_vfs().get_all_local_file_ids();
     local_file_ids.sort_unstable();
     let mut main_workspace_ids = module_index.get_main_workspace_ids();
@@ -297,10 +294,6 @@ fn refresh(db: &DbIndex, state: &mut CacheState) -> Arc<SharedDiagnosticData> {
         },
     );
 
-    let workspace_file_ids = match state.workspace_file_ids.take() {
-        Some(held) if *held == workspace_file_ids => held,
-        _ => Arc::new(workspace_file_ids),
-    };
     let mut gm_method_realms = HashMap::default();
     let mut callee_realms_by_workspace = HashMap::default();
     let mut realm_call_candidates_by_workspace = HashMap::default();
@@ -311,7 +304,6 @@ fn refresh(db: &DbIndex, state: &mut CacheState) -> Arc<SharedDiagnosticData> {
             .insert(*workspace_id, workspace.realm_call_candidates.clone());
     }
     let shared = Arc::new(SharedDiagnosticData {
-        workspace_file_ids: workspace_file_ids.clone(),
         gm_method_realms,
         callee_realms_by_workspace,
         realm_call_candidates_by_workspace,
@@ -322,7 +314,6 @@ fn refresh(db: &DbIndex, state: &mut CacheState) -> Arc<SharedDiagnosticData> {
         property_name_candidates,
         sorted_send_flows: sorted_send_flows.value.clone(),
     });
-    state.workspace_file_ids = Some(workspace_file_ids);
     state.realms = realms;
     state.required_fields = required_fields;
     state.sorted_send_flows = Some(sorted_send_flows);

@@ -538,8 +538,6 @@ pub fn check_file(
 /// Precomputed data shared across all diagnostic files in a batch run.
 /// Computing this once instead of per-file saves ~60s on large workspaces.
 pub struct SharedDiagnosticData {
-    /// Main-workspace file IDs sorted by stable FileId order.
-    pub workspace_file_ids: Arc<Vec<FileId>>,
     /// Maps workspace_id -> precomputed GM method realm annotations.
     /// GmodRealmMisuseChecker uses this to avoid re-scanning all annotations per file.
     pub gm_method_realms: HashMap<WorkspaceId, Arc<GmMethodRealmMap>>,
@@ -550,8 +548,6 @@ pub struct SharedDiagnosticData {
         HashMap<WorkspaceId, Arc<PrecomputedRealmCallCandidates>>,
     /// Required non-method fields for each type declaration, including inherited fields.
     pub missing_required_fields: Arc<PrecomputedMissingRequiredFields>,
-    /// Whether any indexed signature/type cache can produce an async callable.
-    /// Static callee names whose callable metadata has parameter types worth checking.
     /// Names the deprecated, readonly and visibility checkers could report on.
     pub property_name_candidates: Arc<PrecomputedPropertyNameCandidates>,
     /// Precomputed sorted send flows by message name. Built once per batch
