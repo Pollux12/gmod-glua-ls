@@ -80,7 +80,7 @@ impl Touched {
         let receiver_methods = self
             .paths
             .iter()
-            .filter_map(|path| method_name(&GlobalId::new(path)).map(CallRoleKey::ReceiverMethod))
+            .filter_map(|path| method_name(path).map(CallRoleKey::ReceiverMethod))
             .collect::<HashSet<_>>()
             .into_iter();
         let globals = self.globals.iter().cloned().map(CallRoleKey::Global);
@@ -113,8 +113,8 @@ fn key_order(key: &CallRoleKey) -> (u8, &str, Option<(FileId, TextSize)>) {
 }
 
 /// The method name a global function path ends in, if it names a method.
-fn method_name(global_id: &GlobalId) -> Option<SmolStr> {
-    let (_, method) = glua_parser::split_last_path_segment(global_id.get_name())?;
+pub(super) fn method_name(path: &str) -> Option<SmolStr> {
+    let (_, method) = glua_parser::split_last_path_segment(path)?;
     Some(
         glua_parser::path_segment_string_key(method)
             .map_or_else(|| SmolStr::new(method), SmolStr::from),
@@ -164,7 +164,9 @@ impl Contributions {
                 .push(definition.clone());
             touched.signatures.insert(*signature_id);
             let method = match global_id {
-                Some(global_id) => method_name(global_id).map(|name| (&mut self.methods, name)),
+                Some(global_id) => {
+                    method_name(global_id.get_name()).map(|name| (&mut self.methods, name))
+                }
                 None => local_member
                     .clone()
                     .map(|name| (&mut self.local_methods, name)),
@@ -218,7 +220,9 @@ impl Contributions {
             retract(&mut self.signatures, signature_id, other_file);
             touched.signatures.insert(*signature_id);
             let method = match global_id {
-                Some(global_id) => method_name(global_id).map(|name| (&mut self.methods, name)),
+                Some(global_id) => {
+                    method_name(global_id.get_name()).map(|name| (&mut self.methods, name))
+                }
                 None => local_member
                     .clone()
                     .map(|name| (&mut self.local_methods, name)),
@@ -382,7 +386,7 @@ impl GmodCallRoles {
                     roles.path_fingerprints.remove(path);
                 }
             }
-            if let Some(name) = method_name(&GlobalId::new(path)) {
+            if let Some(name) = method_name(path) {
                 if roles.roles_by_path.contains_key(path) {
                     roles
                         .receiver_paths

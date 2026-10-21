@@ -8596,7 +8596,7 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
         if !matches!(call_expr.get_prefix_expr(), Some(LuaExpr::IndexExpr(_)))
             || self
                 .global_roles
-                .receiver_presence(call_path.rsplit('.').next()?)
+                .receiver_presence(&call_roles::method_name(call_path)?)
                 == AnnotatedGmodCandidatePresence::default()
         {
             return None;
