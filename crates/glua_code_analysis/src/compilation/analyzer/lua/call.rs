@@ -29,7 +29,8 @@ struct SpecialCallDirectBinding {
 pub(in crate::compilation::analyzer) struct SpecialCallDirectMatcher {
     name_expr_names: FxHashMap<String, Vec<SpecialCallDirectBinding>>,
     access_paths: FxHashMap<String, Vec<SpecialCallDirectBinding>>,
-    receiver_member_names: FxHashSet<String>,
+    /// The last segment of every access path in `access_paths`.
+    member_names: FxHashSet<String>,
 }
 
 impl SpecialCallDirectMatcher {
@@ -40,11 +41,12 @@ impl SpecialCallDirectMatcher {
         caller_position: TextSize,
         name: &str,
     ) -> bool {
-        self.name_expr_names
-            .get(name)
-            .into_iter()
-            .flatten()
-            .any(|binding| binding.is_visible_to(db, caller_file_id, caller_position))
+        visible_binding(
+            db,
+            self.name_expr_names.get(name),
+            caller_file_id,
+            caller_position,
+        )
     }
 
     fn matches_access_path(
@@ -54,16 +56,42 @@ impl SpecialCallDirectMatcher {
         caller_position: TextSize,
         access_path: &str,
     ) -> bool {
-        self.access_paths
-            .get(access_path)
-            .into_iter()
-            .flatten()
-            .any(|binding| binding.is_visible_to(db, caller_file_id, caller_position))
+        visible_binding(
+            db,
+            self.access_paths.get(access_path),
+            caller_file_id,
+            caller_position,
+        )
     }
 
-    fn may_have_receiver_member_signature(&self, member_name: &str) -> bool {
-        self.receiver_member_names.contains(member_name)
+    /// Whether a member named `member_name` may have a signature the
+    /// receiver's call is special through: one with a receiver out-param, or
+    /// one bound at an access path ending in it.
+    fn may_have_receiver_member_signature(&self, db: &DbIndex, member_name: &str) -> bool {
+        db.get_signature_index()
+            .has_receiver_out_param_member_name(member_name)
+            || self.member_names.contains(member_name)
     }
+}
+
+/// Whether one of `bindings` is visible to the caller; the hit is a read of
+/// its file's signatures, so the caller goes again once they change.
+fn visible_binding(
+    db: &DbIndex,
+    bindings: Option<&Vec<SpecialCallDirectBinding>>,
+    caller_file_id: FileId,
+    caller_position: TextSize,
+) -> bool {
+    bindings
+        .into_iter()
+        .flatten()
+        .find(|binding| binding.is_visible_to(db, caller_file_id, caller_position))
+        .inspect(|binding| {
+            crate::db_index::derivation::note_read(|| {
+                crate::db_index::derivation::FactKey::SignatureFile(binding.file_id)
+            })
+        })
+        .is_some()
 }
 
 impl SpecialCallDirectBinding {
@@ -107,7 +135,6 @@ fn is_workspace_visible_to(
 
 pub(in crate::compilation::analyzer) fn build_special_call_direct_matcher(
     db: &DbIndex,
-    roots: &FxHashMap<FileId, glua_parser::LuaChunk>,
 ) -> SpecialCallDirectMatcher {
     let special_signatures = db
         .get_signature_index()
@@ -116,19 +143,18 @@ pub(in crate::compilation::analyzer) fn build_special_call_direct_matcher(
             signature.has_special_call_params().then_some(*signature_id)
         })
         .collect::<Vec<_>>();
-    let mut matcher = SpecialCallDirectMatcher {
-        receiver_member_names: db
-            .get_signature_index()
-            .receiver_out_param_member_names()
-            .map(str::to_string)
-            .collect(),
-        ..Default::default()
-    };
+    let mut matcher = SpecialCallDirectMatcher::default();
+    let mut roots = FxHashMap::default();
 
     for signature_id in special_signatures {
         let file_id = signature_id.get_file_id();
-        let Some(closure) = roots
-            .get(&file_id)
+        let root = roots.entry(file_id).or_insert_with(|| {
+            db.get_vfs()
+                .get_syntax_tree(&file_id)
+                .map(|tree| tree.get_chunk_node())
+        });
+        let Some(closure) = root
+            .as_ref()
             .and_then(|root| closure_at(root, signature_id.get_position()))
         else {
             continue;
@@ -212,9 +238,7 @@ fn add_direct_special_call_var_expr(
             if let Some(member_name) = access_path.rsplit('.').next()
                 && !member_name.is_empty()
             {
-                matcher
-                    .receiver_member_names
-                    .insert(member_name.to_string());
+                matcher.member_names.insert(member_name.to_string());
             }
             matcher
                 .access_paths
@@ -338,7 +362,7 @@ fn index_expr_has_receiver_special_call_signature(
     };
     if !analyzer
         .special_call_direct_matcher
-        .may_have_receiver_member_signature(member_name.as_str())
+        .may_have_receiver_member_signature(&analyzer.db, member_name.as_str())
     {
         return false;
     }

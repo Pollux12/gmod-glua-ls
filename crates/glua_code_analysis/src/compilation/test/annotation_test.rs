@@ -1556,6 +1556,44 @@ local value = receiver.value
         );
     }
 
+    /// A receiver out-param added to or taken from a method in another file
+    /// reaches its callers as a cold build of the same text does.
+    #[test]
+    fn an_edited_receiver_outparam_reaches_its_callers_like_a_cold_run() {
+        const WITHOUT: &str = r#"
+                ---@class Panel
+                ---@class Node
+                ---@field ChildNodes? Panel
+                local Node = {}
+
+                ---@param x Panel
+                function Node:CreateChildNodes(x) end
+            "#;
+        const WITH: &str = r#"
+                ---@class Panel
+                ---@class Node
+                ---@field ChildNodes? Panel
+                local Node = {}
+
+                ---@outparam self.ChildNodes Panel
+                function Node:CreateChildNodes(x) end
+            "#;
+        const CALLER: &str = r#"
+                ---@type Node
+                local node = {}
+
+                node:CreateChildNodes()
+                local children = node.ChildNodes
+            "#;
+        for (before, after) in [(WITHOUT, WITH), (WITH, WITHOUT)] {
+            VirtualWorkspace::assert_warm_matches_cold(
+                |_| {},
+                &[("lib.lua", before), ("test.lua", CALLER)],
+                &[("lib.lua", after)],
+            );
+        }
+    }
+
     #[test]
     fn test_outparam_self_receiver_updates_field_after_colon_call() {
         let mut ws = VirtualWorkspace::new();

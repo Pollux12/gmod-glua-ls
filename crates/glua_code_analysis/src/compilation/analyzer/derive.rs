@@ -174,17 +174,8 @@ struct ComputedDynamicFields {
 
 impl Recipes {
     pub(super) fn new(db: &DbIndex, scopes: ScriptedScopes) -> Self {
-        let roots = db
-            .get_vfs()
-            .get_all_local_file_ids()
-            .into_iter()
-            .filter_map(|file_id| {
-                let tree = db.get_vfs().get_syntax_tree(&file_id)?;
-                Some((file_id, tree.get_chunk_node()))
-            })
-            .collect::<FxHashMap<_, _>>();
         Self {
-            special_call_direct_matcher: lua::call::build_special_call_direct_matcher(db, &roots),
+            special_call_direct_matcher: lua::call::build_special_call_direct_matcher(db),
             scopes,
             caches: std::sync::Mutex::default(),
             unsettled: std::sync::Mutex::default(),
