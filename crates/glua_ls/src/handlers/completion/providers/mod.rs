@@ -19,7 +19,7 @@ pub use function_provider::get_function_remove_nil;
 use glua_parser::LuaAstToken;
 use glua_parser::LuaStringToken;
 pub use gmod_system_provider::apply_staged_call_snippet;
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 
 pub fn add_completions(builder: &mut CompletionBuilder) -> Option<()> {
     postfix_provider::add_completion(builder);
@@ -102,20 +102,33 @@ fn get_text_edit_range_in_string(
         return None;
     }
 
-    let mut start_offset = u32::from(range.start());
-    let mut end_offset = u32::from(range.end());
-    if text.starts_with('"') || text.starts_with('\'') {
-        start_offset += 1;
-    }
-
-    if text.ends_with('"') || text.ends_with('\'') {
-        end_offset -= 1;
-    }
-
-    let new_text_range = TextRange::new(start_offset.into(), end_offset.into());
+    let (open_len, close_len) = string_delimiter_lens(text);
+    let new_text_range = TextRange::new(
+        range.start() + TextSize::from(open_len as u32),
+        range.end() - TextSize::from(close_len as u32),
+    );
 
     builder
         .semantic_model
         .get_document()
         .to_lsp_range(new_text_range)
+}
+
+fn string_delimiter_lens(text: &str) -> (usize, usize) {
+    if let Some(quote) = text.chars().next().filter(|c| matches!(c, '"' | '\'')) {
+        let closed = text.len() > 1 && text.ends_with(quote);
+        return (1, usize::from(closed));
+    }
+
+    if let Some(rest) = text.strip_prefix('[') {
+        let level = rest.bytes().take_while(|&b| b == b'=').count();
+        if rest[level..].starts_with('[') {
+            let open_len = level + 2;
+            let close = format!("]{}]", "=".repeat(level));
+            let closed = text.len() >= open_len + close.len() && text.ends_with(&close);
+            return (open_len, if closed { close.len() } else { 0 });
+        }
+    }
+
+    (0, 0)
 }

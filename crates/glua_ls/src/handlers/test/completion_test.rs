@@ -3845,6 +3845,58 @@ mod tests {
     }
 
     #[gtest]
+    fn test_string_completion_range_excludes_quotes_even_when_unclosed() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+        ws.def(
+            r#"
+            util.AddNetworkString("known_message")
+            "#,
+        );
+
+        for source in [
+            "\n            net.Start(\"<??>",
+            "\n            net.Start(\"<??>\")\n",
+        ] {
+            let (content, position) = ProviderVirtualWorkspace::handle_file_content(source)?;
+            let file_id = ws.def(content.as_str());
+            let result = completion(
+                &ws.analysis,
+                file_id,
+                position,
+                CompletionTriggerKind::INVOKED,
+                CancellationToken::new(),
+            )
+            .ok_or("failed to get completion")
+            .or_fail()?;
+            let items = match result {
+                CompletionResponse::Array(items) => items,
+                CompletionResponse::List(list) => list.items,
+            };
+
+            let item = items
+                .iter()
+                .find(|item| item.label == "known_message")
+                .ok_or("missing known_message completion")
+                .or_fail()?;
+            let Some(lsp_types::CompletionTextEdit::Edit(text_edit)) = item.text_edit.as_ref()
+            else {
+                return fail!("expected text edit for net.Start string completion");
+            };
+
+            verify_that!(text_edit.range.start.line, eq(1))?;
+            verify_that!(text_edit.range.start.character, eq(23))?;
+            verify_that!(text_edit.range.end.line, eq(1))?;
+            verify_that!(text_edit.range.end.character, eq(23))?;
+        }
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_hook_add_string_completion_expands_full_call_snippet() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
