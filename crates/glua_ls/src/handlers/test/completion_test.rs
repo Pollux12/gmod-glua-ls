@@ -517,6 +517,40 @@ mod tests {
     }
 
     #[gtest]
+    fn test_member_access_on_unknown_receiver_offers_no_keywords() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut labels_at = |source: &str| -> Result<Vec<String>> {
+            let (content, position) = ProviderVirtualWorkspace::handle_file_content(source)?;
+            let file_id = ws.def(&content);
+            let items = match completion(
+                &ws.analysis,
+                file_id,
+                position,
+                CompletionTriggerKind::INVOKED,
+                CancellationToken::new(),
+            ) {
+                Some(CompletionResponse::Array(items)) => items,
+                Some(CompletionResponse::List(list)) => list.items,
+                None => Vec::new(),
+            };
+            Ok(items.into_iter().map(|item| item.label).collect())
+        };
+
+        verify_that!(
+            labels_at("local function f(client)\n    client:Re<??>\nend\n")?,
+            not(contains(eq("repeat")))
+        )?;
+        verify_that!(
+            labels_at("local function f(client)\n    client.Re<??>\nend\n")?,
+            not(contains(eq("repeat")))
+        )?;
+        verify_that!(
+            labels_at("local function f(client)\n    re<??>\nend\n")?,
+            contains(eq("repeat"))
+        )
+    }
+
+    #[gtest]
     fn test_type_comparison() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         ws.def(
