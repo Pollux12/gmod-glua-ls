@@ -340,6 +340,77 @@ mod test {
     }
 
     #[test]
+    fn test_helix_character_keeps_meta_methods_through_return_and_map() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "annotations/core.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@class Player : Entity
+
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return (definition) T
+            function FindMetaTable(metaName) end
+
+            ---@return any
+            function Entity:GetNetVar(key) end
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/helix/gamemode/core/meta/sh_character.lua",
+            r#"
+            ix = ix or {}
+            ix.meta = ix.meta or {}
+            ix.char = ix.char or {}
+            ix.char.loaded = ix.char.loaded or {}
+
+            local CHAR = ix.meta.character or {}
+            CHAR.__index = CHAR
+            ---@return integer
+            function CHAR:GetID() return self.id end
+            ---@return string
+            function CHAR:GetInventory() return self.inv end
+            ix.meta.character = CHAR
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/helix/gamemode/core/libs/sh_character.lua",
+            r#"
+            function ix.char.New(data, id)
+                local character = setmetatable({vars = {}}, ix.meta.character)
+                character.id = id
+                return character
+            end
+
+            function ix.char.Load(data, id)
+                ix.char.loaded[id] = ix.char.New(data, id)
+            end
+
+            do
+                local playerMeta = FindMetaTable("Player")
+                function playerMeta:GetCharacter()
+                    return ix.char.loaded[self:GetNetVar("char")]
+                end
+            end
+            "#,
+        );
+        let probe = ws.def_file(
+            "gamemodes/ixhl2rp/schema/sh_probe.lua",
+            r#"
+            ---@type Player
+            local p
+            local returned_id = ix.char.New({}, 1):GetID()
+            local mapped_inventory = p:GetCharacter():GetInventory()
+            "#,
+        );
+
+        assert_eq!(ws.local_ty(probe, "returned_id"), LuaType::Integer);
+        assert_eq!(ws.local_ty(probe, "mapped_inventory"), LuaType::String);
+    }
+
+    #[test]
     fn test_mutual_anonymous_metatable_index_cycle_does_not_overflow() {
         let mut ws = VirtualWorkspace::new();
         ws.enable_check(DiagnosticCode::UndefinedField);
