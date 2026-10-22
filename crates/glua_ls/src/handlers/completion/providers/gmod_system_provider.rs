@@ -12,7 +12,7 @@ use glua_parser::{
 use lsp_types::{
     Command, CompletionItem, CompletionTextEdit, InsertTextFormat, InsertTextMode, TextEdit,
 };
-use rowan::TextSize;
+use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
 use crate::handlers::completion::add_completions::CompletionTriggerStatus;
@@ -653,16 +653,22 @@ fn count_label(count: usize, singular: &str, plural: &str) -> String {
 fn collect_net_message_stats(builder: &CompletionBuilder) -> Vec<(String, (usize, usize))> {
     let infer_index = builder.semantic_model.get_db().get_gmod_infer_index();
     let mut net_name_stats: HashMap<String, (usize, usize)> = HashMap::new();
-    for (_, metadata) in infer_index.iter_system_file_metadata() {
+    for (file_id, metadata) in infer_index.iter_system_file_metadata() {
         if builder.is_cancelled() {
             return Vec::new();
         }
         for net_registration in &metadata.net_add_string_calls {
+            if is_name_being_completed(builder, file_id, net_registration.name_range) {
+                continue;
+            }
             if let Some(name) = normalize_name(net_registration.name.as_deref()) {
                 net_name_stats.entry(name.to_string()).or_default().0 += 1;
             }
         }
         for net_receive in &metadata.net_receive_calls {
+            if is_name_being_completed(builder, file_id, net_receive.name_range) {
+                continue;
+            }
             if let Some(name) = normalize_name(net_receive.message_name.as_deref()) {
                 net_name_stats.entry(name.to_string()).or_default().1 += 1;
             }
@@ -690,6 +696,9 @@ fn collect_hook_completion_entries(
             return Vec::new();
         }
         for hook_site in &metadata.sites {
+            if is_name_being_completed(builder, file_id, hook_site.name_range) {
+                continue;
+            }
             if should_filter_realm {
                 let hook_realm =
                     resolve_hook_site_realm(&builder.semantic_model, file_id, hook_site);
@@ -746,6 +755,15 @@ fn collect_hook_completion_entries(
             (name, stats, data)
         })
         .collect()
+}
+
+fn is_name_being_completed(
+    builder: &CompletionBuilder,
+    file_id: &FileId,
+    name_range: Option<TextRange>,
+) -> bool {
+    *file_id == builder.semantic_model.get_file_id()
+        && name_range.is_some_and(|range| range.contains_inclusive(builder.position_offset))
 }
 
 fn literal_arg_index(call_expr: &LuaCallExpr, literal_expr: &LuaLiteralExpr) -> Option<usize> {

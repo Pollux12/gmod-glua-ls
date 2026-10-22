@@ -3659,6 +3659,44 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_hook_and_net_completion_skip_the_name_being_typed() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+        ws.def(
+            r#"
+            function GM:PlayerSpawn(ply, transition) end
+            util.AddNetworkString("known_message")
+            "#,
+        );
+
+        check!(ws.check_completion(
+            r#"
+            hook.Add("PlayerSp<??>", "id", function() end)
+            "#,
+            vec![VirtualCompletionItem {
+                label: "PlayerSpawn".to_string(),
+                kind: CompletionItemKind::EVENT,
+                label_detail: Some("(1 method; args: ply, transition)".to_string()),
+            }],
+        ));
+        check!(ws.check_completion(
+            r#"
+            net.Receive("known_mes<??>", function() end)
+            "#,
+            vec![VirtualCompletionItem {
+                label: "known_message".to_string(),
+                kind: CompletionItemKind::EVENT,
+                label_detail: Some("(1 registration, 0 receivers)".to_string()),
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_hook_completion_requires_annotated_call_arg_role() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
