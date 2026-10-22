@@ -1,6 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Workspace roots, libraries, ignores and file handling.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcWorkspace {
@@ -160,9 +161,12 @@ impl EmmyrcWorkspace {
     }
 }
 
+/// A require path rewrite rule.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub struct EmmyrcWorkspaceModuleMap {
+    /// Regex matched against the require path.
     pub pattern: String,
+    /// Replacement path; may use capture groups such as `$1`.
     pub replace: String,
 }
 
