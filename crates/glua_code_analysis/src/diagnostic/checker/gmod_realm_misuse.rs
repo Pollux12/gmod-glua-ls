@@ -257,8 +257,8 @@ impl Checker for GmodRealmMisuseChecker {
                     mismatch_message(
                         DiagnosticCode::GmodUnknownRealm,
                         &call_name,
-                        call_realm.realm,
-                        callee_realm.realm,
+                        call_realm,
+                        callee_realm,
                     ),
                     None,
                 );
@@ -311,7 +311,7 @@ impl Checker for GmodRealmMisuseChecker {
             context.add_diagnostic(
                 code,
                 call_expr.get_range(),
-                mismatch_message(code, &call_name, call_realm.realm, callee_realm.realm),
+                mismatch_message(code, &call_name, call_realm, callee_realm),
                 None,
             );
             if let Some(profile) = profile.as_mut() {
@@ -1502,11 +1502,11 @@ fn is_cross_realm_misuse(call_realm: ResolvedRealm, callee_realm: ResolvedRealm)
 fn mismatch_message(
     code: DiagnosticCode,
     call_name: &str,
-    call_realm: GmodRealm,
-    callee_realm: GmodRealm,
+    call: ResolvedRealm,
+    callee: ResolvedRealm,
 ) -> String {
-    let call_realm = realm_label(call_realm);
-    let callee_realm = realm_label(callee_realm);
+    let call_realm = realm_label(call.realm);
+    let callee_realm = realm_label(callee.realm);
 
     match code {
         DiagnosticCode::GmodRealmMismatch => format!(
@@ -1517,10 +1517,12 @@ fn mismatch_message(
         )
         .to_string(),
         DiagnosticCode::GmodRealmMismatchHeuristic => format!(
-            "Potential realm mismatch (heuristic): `{name}` is called in inferred {call_realm} realm while declaration is inferred {decl_realm}.",
+            "Possible realm mismatch: `{name}` is called in {call_realm} realm ({call_source}) but declaration is {decl_realm} ({decl_source}).",
             name = call_name,
             call_realm = call_realm,
+            call_source = evidence_label(call.evidence),
             decl_realm = callee_realm,
+            decl_source = evidence_label(callee.evidence),
         )
         .to_string(),
         DiagnosticCode::GmodUnknownRealm => format!(
@@ -1530,6 +1532,17 @@ fn mismatch_message(
         )
         .to_string(),
         _ => format!("Realm mismatch for `{name}`.", name = call_name).to_string(),
+    }
+}
+
+fn evidence_label(evidence: RealmEvidence) -> &'static str {
+    match evidence {
+        RealmEvidence::ExplicitBranch => "from a CLIENT/SERVER branch",
+        RealmEvidence::ExplicitAnnotation => "from a @realm annotation",
+        RealmEvidence::InferredFilename => "inferred from the file path",
+        RealmEvidence::InferredDependency => "inferred from how the file is loaded",
+        RealmEvidence::InferredDefault => "the default realm",
+        RealmEvidence::Unknown => "unknown",
     }
 }
 

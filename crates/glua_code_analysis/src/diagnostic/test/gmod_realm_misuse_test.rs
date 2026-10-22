@@ -284,6 +284,48 @@ mod tests {
     }
 
     #[gtest]
+    fn test_risky_mismatch_message_names_the_evidence_for_each_side() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
+
+        ws.def_file(
+            "lua/myaddon/api.lua",
+            r#"
+                ---@realm server
+                function ServerOnlyApi()
+                    return true
+                end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/myaddon/cl_hud.lua",
+            r#"
+                ServerOnlyApi()
+            "#,
+        );
+
+        let messages = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            messages,
+            elements_are![eq(
+                "Possible realm mismatch: `ServerOnlyApi` is called in client realm (inferred from the file path) but declaration is server (from a @realm annotation)."
+            )]
+        );
+    }
+
+    #[gtest]
     fn test_does_not_report_unknown_realm_when_callsite_has_default_menu_realm() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
