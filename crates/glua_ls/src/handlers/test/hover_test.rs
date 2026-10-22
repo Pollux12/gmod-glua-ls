@@ -756,6 +756,32 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_unresolved_method_names_the_member() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@class Ent
+                local Ent = {}
+                ---@return Ent
+                function GetWorld() end
+                local force = GetWorld():Get<??>Force()
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nGetForce: nil\n```".to_string(),
+            },
+        ));
+        check!(ws.check_hover(
+            r#"
+                local value = Some<??>Global()
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nSomeGlobal: unknown\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_dynamic_key_read_from_known_table_fields_stays_table() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = ws.get_emmyrc();

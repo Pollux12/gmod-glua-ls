@@ -141,7 +141,14 @@ fn build_hover_without_property(
     let render_level = RenderLevel::Detailed;
 
     let type_text = humanize_type(db, &typ, render_level);
-    let hover = format_type_label_hover(type_label, type_text);
+    let hover = if token.kind() == LuaTokenKind::TkName.into() {
+        format!(
+            "```lua\n{}: {type_text}\n```",
+            type_label.format(token.text().to_string())
+        )
+    } else {
+        format_type_label_hover(type_label, type_text)
+    };
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: lsp_types::MarkupKind::Markdown,
