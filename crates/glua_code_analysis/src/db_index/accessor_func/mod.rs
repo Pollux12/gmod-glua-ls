@@ -8,7 +8,7 @@ use smol_str::SmolStr;
 
 use super::traits::LuaIndex;
 use crate::{
-    FileId, LuaSignatureId, LuaTypeDeclId,
+    FileId, InFiled, LuaMemberOwner, LuaSignatureId,
     db_index::derivation::{self, FactKey, Fingerprint},
 };
 
@@ -25,7 +25,7 @@ pub struct AccessorFuncAnnotation {
 }
 
 /// Whose method an accessor generator makes.
-#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum AccessorOwner {
     /// The table a call passes first, or the one it is called on.
     Receiver,
@@ -34,6 +34,42 @@ pub enum AccessorOwner {
         callee: SmolStr,
         class_name: SmolStr,
     },
+    /// The table literal a local the generator closes over holds.
+    Table(InFiled<rowan::TextRange>),
+}
+
+impl AccessorOwner {
+    fn sort_key(
+        &self,
+    ) -> (
+        u8,
+        Option<(&str, &str)>,
+        Option<(u32, rowan::TextSize, rowan::TextSize)>,
+    ) {
+        match self {
+            Self::Receiver => (0, None, None),
+            Self::NamedClass { callee, class_name } => {
+                (1, Some((callee.as_str(), class_name.as_str())), None)
+            }
+            Self::Table(table) => (
+                2,
+                None,
+                Some((table.file_id.id, table.value.start(), table.value.end())),
+            ),
+        }
+    }
+}
+
+impl PartialOrd for AccessorOwner {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AccessorOwner {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sort_key().cmp(&other.sort_key())
+    }
 }
 
 /// What an accessor generator puts before the name it is given.
@@ -49,6 +85,8 @@ pub enum AccessorPrefix {
 pub struct AccessorTemplate {
     pub owner: AccessorOwner,
     pub prefix: AccessorPrefix,
+    /// Whether the name is capitalised after the prefix, `Get` .. `Name` for `"name"`.
+    pub capitalized: bool,
 }
 
 impl AccessorTemplate {
@@ -59,6 +97,7 @@ impl AccessorTemplate {
             .map(|prefix| Self {
                 owner: AccessorOwner::Receiver,
                 prefix: AccessorPrefix::Literal(prefix.into()),
+                capitalized: false,
             })
             .collect()
     }
@@ -250,7 +289,7 @@ impl std::hash::Hash for AccessorFuncCallMetadata {
 /// `slot`, which tells apart the members one node declares.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccessorMember {
-    pub owner_type_id: LuaTypeDeclId,
+    pub owner: LuaMemberOwner,
     pub name: SmolStr,
     pub signature: AccessorSignature,
     pub syntax_id: LuaSyntaxId,
@@ -260,13 +299,13 @@ pub struct AccessorMember {
 impl std::hash::Hash for AccessorMember {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let Self {
-            owner_type_id,
+            owner,
             name,
             signature,
             syntax_id,
             slot,
         } = self;
-        owner_type_id.hash(state);
+        owner.hash(state);
         name.hash(state);
         signature.hash(state);
         derivation::hash_local(syntax_id, state);
@@ -317,6 +356,57 @@ impl AccessorFuncCallIndex {
     pub fn calls_in(&self, file_id: FileId) -> &[AccessorFuncCallMetadata] {
         derivation::note_read(|| FactKey::AccessorCalls(file_id));
         self.calls.get(&file_id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Moves the table owners other files' calls give their accessors onto where the edit
+    /// put the edited file's literals, and returns the calls whose literal it destroyed.
+    pub fn remap_file_table_owners(&mut self, remap: &crate::FileRemap) -> Vec<crate::LostFact> {
+        let names_edited_table = |member: &AccessorMember| matches!(&member.owner, LuaMemberOwner::Element(table) if table.file_id == remap.file_id);
+        let mut call_files = self
+            .calls
+            .iter()
+            .filter(|(file_id, calls)| {
+                **file_id != remap.file_id
+                    && calls
+                        .iter()
+                        .flat_map(|call| &call.members)
+                        .any(names_edited_table)
+            })
+            .map(|(file_id, _)| *file_id)
+            .collect::<Vec<_>>();
+        call_files.sort_unstable_by_key(|file_id| file_id.id);
+
+        let mut lost = Vec::new();
+        for file_id in call_files {
+            let Some(calls) = self.calls.get_mut(&file_id) else {
+                continue;
+            };
+            let mut moved_any = false;
+            let mut destroyed = false;
+            for member in calls.iter_mut().flat_map(|call| &mut call.members) {
+                let LuaMemberOwner::Element(table) = &member.owner else {
+                    continue;
+                };
+                match remap.table_range(table) {
+                    crate::Remap::Moved(moved) if moved != *table => {
+                        member.owner = LuaMemberOwner::Element(moved);
+                        moved_any = true;
+                    }
+                    crate::Remap::Moved(_) | crate::Remap::Unrelated => {}
+                    crate::Remap::Lost => destroyed = true,
+                }
+            }
+            if moved_any {
+                derivation::note_write(|| FactKey::AccessorCalls(file_id));
+            }
+            if destroyed {
+                lost.push(crate::LostFact::new(
+                    file_id,
+                    FactKey::AccessorCalls(file_id),
+                ));
+            }
+        }
+        lost
     }
 
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {

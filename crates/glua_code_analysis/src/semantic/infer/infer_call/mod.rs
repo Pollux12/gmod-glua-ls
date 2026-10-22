@@ -39,7 +39,9 @@ use crate::{
 };
 use infer_require::infer_require_call;
 use infer_setmetatable::infer_setmetatable_call;
-pub(crate) use infer_setmetatable::{MetatableIndexCandidate, classify_metatable_index_candidate};
+pub(crate) use infer_setmetatable::{
+    MetatableIndexCandidate, classify_metatable_index_candidate, table_backing_range_from_expr,
+};
 
 mod infer_require;
 mod infer_setmetatable;

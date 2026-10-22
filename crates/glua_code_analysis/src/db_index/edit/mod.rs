@@ -76,6 +76,10 @@ pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> Vec<LostFact> {
             .remap_file_table_owners(remap),
     );
     lost.extend(db.get_metatable_index_mut().remap_file_ranges(remap));
+    lost.extend(
+        db.get_accessor_func_call_index_mut()
+            .remap_file_table_owners(remap),
+    );
     lost.extend(db.get_module_index_mut().remap_file_exports(remap));
     lost.extend(
         db.get_flow_index_mut()

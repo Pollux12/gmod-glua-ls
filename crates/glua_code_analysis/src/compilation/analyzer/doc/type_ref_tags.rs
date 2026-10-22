@@ -884,10 +884,10 @@ fn direct_accessor_pairs(scan: &GeneratorScan, candidate: &GeneratorCandidate) -
             let Some(LuaIndexKey::Expr(key)) = index.get_index_key() else {
                 continue;
             };
-            let Some((prefix, name)) = accessor_key(scan, candidate, key) else {
+            let Some((prefix, name, capitalized)) = accessor_key(scan, candidate, key) else {
                 continue;
             };
-            pairs.extend(accessor_pair(candidate, owner, prefix, name));
+            pairs.extend(accessor_pair(candidate, owner, prefix, name, capitalized));
         }
     }
     pairs
@@ -988,7 +988,13 @@ fn forwarded_accessor_pairs(
                     }
                 },
             };
-            pairs.extend(accessor_pair(candidate, owner, prefix, name));
+            pairs.extend(accessor_pair(
+                candidate,
+                owner,
+                prefix,
+                name,
+                template.capitalized,
+            ));
         }
     }
     pairs
@@ -1001,9 +1007,16 @@ fn accessor_pair(
     owner: AccessorOwner,
     prefix: AccessorPrefix,
     name: usize,
+    capitalized: bool,
 ) -> Option<(usize, AccessorTemplate)> {
-    (owner != AccessorOwner::Receiver || candidate.is_method || name != 0)
-        .then_some((name, AccessorTemplate { owner, prefix }))
+    (owner != AccessorOwner::Receiver || candidate.is_method || name != 0).then_some((
+        name,
+        AccessorTemplate {
+            owner,
+            prefix,
+            capitalized,
+        },
+    ))
 }
 
 fn accessor_owner(
@@ -1024,6 +1037,11 @@ fn accessor_owner(
         {
             return Some(AccessorOwner::Receiver);
         }
+        crate::LuaDeclExtra::Local { .. } => {
+            if let Some(table) = closed_over_table(scan, candidate, decl_id, decl) {
+                return Some(AccessorOwner::Table(table));
+            }
+        }
         _ => {}
     }
     let LuaExpr::CallExpr(call) = local_value(scan, candidate, owner)? else {
@@ -1042,13 +1060,37 @@ fn accessor_owner(
     })
 }
 
-/// The prefix and name parameter of an accessor key `prefix .. name`, read through
-/// the local the key is held in; the prefix is a literal or `(param or literal)`.
+/// The table literal a never reassigned local declared outside `candidate` holds.
+fn closed_over_table(
+    scan: &GeneratorScan,
+    candidate: &GeneratorCandidate,
+    decl_id: LuaDeclId,
+    decl: &crate::LuaDecl,
+) -> Option<crate::InFiled<rowan::TextRange>> {
+    if !never_reassigned(scan, decl_id) {
+        return None;
+    }
+    let root = candidate.closure.syntax().ancestors().last()?;
+    let value = LuaExpr::cast(decl.get_value_syntax_id()?.to_node_from_root(&root)?)?;
+    if candidate
+        .closure
+        .syntax()
+        .text_range()
+        .contains_range(value.syntax().text_range())
+    {
+        return None;
+    }
+    crate::semantic::table_backing_range_from_expr(scan.file_id, &value)
+}
+
+/// The prefix and name parameter of an accessor key `prefix .. name`, and whether the
+/// name is capitalised, read through the local the key is held in; the prefix is a
+/// literal or `(param or literal)`.
 fn accessor_key(
     scan: &GeneratorScan,
     candidate: &GeneratorCandidate,
     key: LuaExpr,
-) -> Option<(AccessorPrefix, usize)> {
+) -> Option<(AccessorPrefix, usize, bool)> {
     let key = match key {
         LuaExpr::NameExpr(local) => local_value(scan, candidate, &local)?,
         key => key,
@@ -1060,7 +1102,7 @@ fn accessor_key(
         return None;
     }
     let (prefix, name) = concat.get_exprs()?;
-    let name = passed_param(scan, candidate, &name)?;
+    let (name, capitalized) = accessor_name_param(scan, candidate, &name)?;
     let accessor_prefix = |expr: &LuaExpr| {
         string_literal(expr).filter(|prefix| ACCESSOR_PREFIXES.contains(&prefix.as_str()))
     };
@@ -1076,7 +1118,101 @@ fn accessor_key(
         }
         prefix => AccessorPrefix::Literal(accessor_prefix(&prefix)?.into()),
     };
-    Some((prefix, name))
+    Some((prefix, name, capitalized))
+}
+
+/// The parameter an accessor's name is, and whether it is capitalised first, read
+/// through the local the name is held in.
+fn accessor_name_param(
+    scan: &GeneratorScan,
+    candidate: &GeneratorCandidate,
+    name: &LuaExpr,
+) -> Option<(usize, bool)> {
+    if let Some(param) = passed_param(scan, candidate, name) {
+        return Some((param, false));
+    }
+    let name = match name {
+        LuaExpr::NameExpr(local) => local_value(scan, candidate, local)?,
+        name => name.clone(),
+    };
+    capitalized_param(scan, candidate, name).map(|param| (param, true))
+}
+
+/// The parameter `expr` capitalises, as `p:sub(1, 1):upper() .. p:sub(2)` does, or
+/// the same through `string.upper` and `string.sub`.
+fn capitalized_param(
+    scan: &GeneratorScan,
+    candidate: &GeneratorCandidate,
+    expr: LuaExpr,
+) -> Option<usize> {
+    let LuaExpr::BinaryExpr(concat) = unparenthesized(expr) else {
+        return None;
+    };
+    if concat.get_op_token()?.get_op() != glua_parser::BinaryOperator::OpConcat {
+        return None;
+    }
+    let (first, rest) = concat.get_exprs()?;
+    let (upper_subject, upper_args) = string_call(scan, first, "upper")?;
+    let (first_subject, first_args) = string_call(scan, upper_subject, "sub")?;
+    let (rest_subject, rest_args) = string_call(scan, rest, "sub")?;
+    if !upper_args.is_empty()
+        || !int_literals(&first_args, &[1, 1])
+        || !int_literals(&rest_args, &[2])
+    {
+        return None;
+    }
+    let param = passed_param(scan, candidate, &first_subject)?;
+    (passed_param(scan, candidate, &rest_subject)? == param).then_some(param)
+}
+
+/// The string `expr` calls the string library's `method` on, as `s:method(...)` or
+/// `string.method(s, ...)`, with the arguments after it.
+fn string_call(
+    scan: &GeneratorScan,
+    expr: LuaExpr,
+    method: &str,
+) -> Option<(LuaExpr, Vec<LuaExpr>)> {
+    let LuaExpr::CallExpr(call) = unparenthesized(expr) else {
+        return None;
+    };
+    let Some(LuaExpr::IndexExpr(callee)) = call.get_prefix_expr() else {
+        return None;
+    };
+    let Some(LuaIndexKey::Name(key)) = callee.get_index_key() else {
+        return None;
+    };
+    if key.get_name_text() != method {
+        return None;
+    }
+    let mut args = call.get_args_list()?.get_args().collect::<Vec<_>>();
+    if call.is_colon_call() {
+        return Some((callee.get_prefix_expr()?, args));
+    }
+    let Some(LuaExpr::NameExpr(library)) = callee.get_prefix_expr() else {
+        return None;
+    };
+    if library.get_name_text()? != "string"
+        || read_decl(scan, &library).is_some_and(|(_, decl)| !decl.is_global())
+        || args.is_empty()
+    {
+        return None;
+    }
+    let subject = args.remove(0);
+    Some((subject, args))
+}
+
+fn int_literals(args: &[LuaExpr], expected: &[i64]) -> bool {
+    args.len() == expected.len()
+        && args.iter().zip(expected).all(|(arg, expected)| {
+            let LuaExpr::LiteralExpr(literal) = arg else {
+                return false;
+            };
+            matches!(
+                literal.get_literal(),
+                Some(glua_parser::LuaLiteralToken::Number(number))
+                    if number.get_number_value() == glua_parser::NumberResult::Int(*expected)
+            )
+        })
 }
 
 /// The declaration `name_expr` reads.

@@ -1631,6 +1631,181 @@ end
         );
     }
 
+    const HELIX_CHARACTER_META: &str = r#"
+        ix = ix or {}
+        ix.meta = ix.meta or {}
+        ix.char = ix.char or {}
+        ix.char.vars = ix.char.vars or {}
+
+        local CHAR = ix.meta.character or {}
+        CHAR.__index = CHAR
+
+        function CHAR:GetID() return self.id end
+
+        function ix.char.RegisterVar(key, data)
+            ix.char.vars[key] = data
+            local upperName = key:sub(1, 1):upper() .. key:sub(2)
+            if (SERVER) then
+                if (data.bNoNetworking) then
+                    CHAR["Set" .. upperName] = function(self, value) self.vars[key] = value end
+                else
+                    CHAR["Set" .. upperName] = function(self, value) self.vars[key] = value end
+                end
+            end
+            if (data.OnGet) then
+                CHAR["Get" .. upperName] = data.OnGet
+            else
+                CHAR["Get" .. upperName] = function(self, default) return self.vars[key] end
+            end
+        end
+
+        ix.meta.character = CHAR
+    "#;
+    const HELIX_CHARACTER_META_PATH: &str = "gamemodes/helix/gamemode/core/meta/sh_character.lua";
+    const HELIX_CHARACTER_LIB: &str = r#"
+        function ix.char.New(data, id)
+            local character = setmetatable({vars = {}}, ix.meta.character)
+            character.id = id
+            return character
+        end
+
+        ix.char.RegisterVar("name", { default = "" })
+        ix.char.RegisterVar("Inventory", {
+            OnGet = function(character, index) return character.vars.inv end
+        })
+    "#;
+    const HELIX_CHARACTER_LIB_PATH: &str = "gamemodes/helix/gamemode/core/libs/sh_character.lua";
+    const HELIX_CHARACTER_PROBE: &str = r#"
+        local character = ix.char.New({}, 1)
+        local get_name = character.GetName
+        local set_name = character.SetName
+        local get_inventory = character.GetInventory
+        local uncapitalised = character.Getname
+    "#;
+    const HELIX_CHARACTER_PROBE_PATH: &str = "gamemodes/ixhl2rp/schema/sh_probe.lua";
+
+    fn is_function_type(typ: &LuaType) -> bool {
+        matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
+    }
+
+    /// A generator that writes capitalised accessors on a table it closes over, as
+    /// Helix's `ix.char.RegisterVar` does on `CHAR`, makes them on that table at
+    /// each call, so instances of the table's metatable see them.
+    #[gtest]
+    fn test_generator_on_a_closed_over_table_makes_capitalised_accessors() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(HELIX_CHARACTER_META_PATH, HELIX_CHARACTER_META);
+        ws.def_file(HELIX_CHARACTER_LIB_PATH, HELIX_CHARACTER_LIB);
+        let probe = ws.def_file(HELIX_CHARACTER_PROBE_PATH, HELIX_CHARACTER_PROBE);
+
+        for accessor in ["get_name", "set_name", "get_inventory"] {
+            let typ = ws.local_ty(probe, accessor);
+            assert!(is_function_type(&typ), "{accessor}: {typ:?}");
+        }
+        let uncapitalised = ws.local_ty(probe, "uncapitalised");
+        assert!(!is_function_type(&uncapitalised), "{uncapitalised:?}");
+    }
+
+    /// The capitalisation may be written inline with `string.upper` and
+    /// `string.sub`.
+    #[gtest]
+    fn test_generator_capitalises_a_name_through_the_string_library() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/autorun/sh_things.lua",
+            r#"
+            local Thing = {}
+            function RegisterThing(name)
+                Thing["Get" .. string.upper(string.sub(name, 1, 1)) .. string.sub(name, 2)] = function() end
+            end
+            RegisterThing("health")
+            THING = Thing
+            "#,
+        );
+        let probe = ws.def_file(
+            "lua/autorun/sh_probe.lua",
+            "local get_health = THING.GetHealth\n",
+        );
+
+        let typ = ws.local_ty(probe, "get_health");
+        assert!(is_function_type(&typ), "{typ:?}");
+    }
+
+    /// A table the generator makes afresh, or a closed-over local that is later
+    /// replaced, is not a table the accessors can land on.
+    #[gtest]
+    fn test_generator_on_a_fresh_or_reassigned_table_makes_no_accessors() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/autorun/sh_things.lua",
+            r#"
+            function MakeFresh(name)
+                local fresh = {}
+                fresh["Get" .. name] = function() end
+                return fresh
+            end
+
+            local Swapped = {}
+            function RegisterSwapped(name)
+                Swapped["Get" .. name] = function() end
+            end
+            Swapped = {}
+            "#,
+        );
+
+        let generators = ws.get_db_mut().get_accessor_func_index();
+        assert!(generators.get_annotations("MakeFresh").is_none());
+        assert!(generators.get_annotations("RegisterSwapped").is_none());
+    }
+
+    /// The accessors follow an edit that renames a call's variable and a later one
+    /// that moves the generator's table, as a cold analysis of the edited text has them.
+    #[gtest]
+    fn test_closed_over_table_accessors_settle_across_shift_and_rename() {
+        let shifted_meta = format!("\n\n{HELIX_CHARACTER_META}");
+        let renamed_lib = HELIX_CHARACTER_LIB.replace("\"name\"", "\"title\"");
+        let probe_text =
+            "local character = ix.char.New({}, 1)\nlocal get_title = character.GetTitle\n";
+        let mut ws = VirtualWorkspace::assert_warm_matches_cold(
+            |_| {},
+            &[
+                (HELIX_CHARACTER_META_PATH, HELIX_CHARACTER_META),
+                (HELIX_CHARACTER_LIB_PATH, HELIX_CHARACTER_LIB),
+                (HELIX_CHARACTER_PROBE_PATH, probe_text),
+            ],
+            &[
+                (HELIX_CHARACTER_LIB_PATH, &renamed_lib),
+                (HELIX_CHARACTER_META_PATH, &shifted_meta),
+            ],
+        );
+        let probe = ws.def_file(HELIX_CHARACTER_PROBE_PATH, probe_text);
+        let typ = ws.local_ty(probe, "get_title");
+        assert!(is_function_type(&typ), "{typ:?}");
+    }
+
+    /// Removing the file that calls the generator takes its accessors away, and
+    /// reopening it brings them back.
+    #[gtest]
+    fn test_closed_over_table_accessors_follow_delete_and_reopen_of_the_call() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(HELIX_CHARACTER_META_PATH, HELIX_CHARACTER_META);
+        ws.def_file(HELIX_CHARACTER_LIB_PATH, HELIX_CHARACTER_LIB);
+        let probe = ws.def_file(HELIX_CHARACTER_PROBE_PATH, HELIX_CHARACTER_PROBE);
+        assert!(is_function_type(&ws.local_ty(probe, "get_name")));
+
+        let lib_uri = ws.virtual_url_generator.new_uri(HELIX_CHARACTER_LIB_PATH);
+        ws.analysis
+            .remove_file_by_uri(&lib_uri)
+            .0
+            .expect("character library must be removed");
+        let removed = ws.local_ty(probe, "get_name");
+        assert!(!is_function_type(&removed), "{removed:?}");
+
+        ws.def_file(HELIX_CHARACTER_LIB_PATH, HELIX_CHARACTER_LIB);
+        let reopened = ws.local_ty(probe, "get_name");
+        assert!(is_function_type(&reopened), "{reopened:?}");
+    }
+
     /// An inferred generator's accessors take whatever its functions do, whichever
     /// prefix a call gives them.
     #[gtest]

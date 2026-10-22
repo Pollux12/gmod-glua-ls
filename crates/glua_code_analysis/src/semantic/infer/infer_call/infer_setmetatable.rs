@@ -104,7 +104,8 @@ fn resolve_table_backing_range(
     table_backing_range_from_expr(value_file_id, &value_expr)
 }
 
-fn table_backing_range_from_expr(
+/// The table literal `expr` evaluates to, read through parentheses and the right of `or`.
+pub(crate) fn table_backing_range_from_expr(
     file_id: crate::FileId,
     expr: &LuaExpr,
 ) -> Option<InFiled<rowan::TextRange>> {

@@ -1257,9 +1257,9 @@ fn collect_accessorfunc_annotated_call(
     }
 
     let mut receiver_type_id = None;
-    let mut made: Vec<(LuaTypeDeclId, SmolStr, bool)> = Vec::new();
+    let mut made: Vec<(LuaMemberOwner, SmolStr, bool)> = Vec::new();
     for template in &annotation.accessors {
-        let owner_type_id = match &template.owner {
+        let owner = match &template.owner {
             AccessorOwner::Receiver => receiver_type_id
                 .get_or_insert_with(|| {
                     let receiver = if receiver_is_first_arg {
@@ -1272,12 +1272,15 @@ fn collect_accessorfunc_annotated_call(
                     };
                     receiver.and_then(|receiver| find_owner_type_for_prefix(analyzer, &receiver))
                 })
-                .clone(),
+                .clone()
+                .map(LuaMemberOwner::Type),
             AccessorOwner::NamedClass { callee, class_name } => {
                 named_class_type_id(analyzer.db, analyzer.file_id, callee, class_name)
+                    .map(LuaMemberOwner::Type)
             }
+            AccessorOwner::Table(table) => Some(LuaMemberOwner::Element(table.clone())),
         };
-        let Some(owner_type_id) = owner_type_id else {
+        let Some(owner) = owner else {
             continue;
         };
         let prefix: SmolStr = match &template.prefix {
@@ -1292,12 +1295,16 @@ fn collect_accessorfunc_annotated_call(
                 _ => default.clone(),
             },
         };
-        let name = SmolStr::from(format!("{prefix}{accessor_name}"));
+        let name = if template.capitalized {
+            SmolStr::from(format!("{prefix}{}", lua_capitalized(&accessor_name)))
+        } else {
+            SmolStr::from(format!("{prefix}{accessor_name}"))
+        };
         if !made
             .iter()
-            .any(|(owner, made_name, _)| *owner == owner_type_id && *made_name == name)
+            .any(|(made_owner, made_name, _)| *made_owner == owner && *made_name == name)
         {
-            made.push((owner_type_id, name, prefix == "Set"));
+            made.push((owner, name, prefix == "Set"));
         }
     }
 
@@ -1309,7 +1316,7 @@ fn collect_accessorfunc_annotated_call(
     let mut next_slot = 1;
     let members = made
         .into_iter()
-        .map(|(owner_type_id, name, is_setter)| {
+        .map(|(owner, name, is_setter)| {
             let (syntax_id, slot) = if !is_setter && std::mem::take(&mut getter_at_name) {
                 (name_arg.get_syntax_id(), 0)
             } else if is_setter && std::mem::take(&mut setter_at_call) {
@@ -1319,7 +1326,7 @@ fn collect_accessorfunc_annotated_call(
                 (call_expr.get_syntax_id(), next_slot - 1)
             };
             AccessorMember {
-                owner_type_id,
+                owner,
                 name,
                 signature: match (annotation.inferred, is_setter) {
                     (true, _) => AccessorSignature::Any,
@@ -1344,6 +1351,16 @@ fn collect_accessorfunc_annotated_call(
     });
 
     Some(())
+}
+
+/// `name` with its first byte upper-cased, as `name:sub(1, 1):upper() .. name:sub(2)`
+/// makes it.
+fn lua_capitalized(name: &str) -> String {
+    let mut name = name.to_string();
+    if let Some(first) = name.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    name
 }
 
 /// The class a call to the global `callee` names by the literal `class_name`, when

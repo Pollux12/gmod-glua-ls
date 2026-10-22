@@ -1481,7 +1481,7 @@ fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
                 ),
             };
             db.get_member_index_mut().add_member(
-                LuaMemberOwner::Type(member.owner_type_id),
+                member.owner,
                 LuaMember::new(
                     member_id,
                     LuaMemberKey::Name(member.name),
