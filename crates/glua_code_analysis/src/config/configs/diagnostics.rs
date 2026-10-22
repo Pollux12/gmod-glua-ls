@@ -28,9 +28,6 @@ pub struct EmmyrcDiagnostic {
     /// A list of diagnostic codes that are enabled.
     #[serde(default)]
     pub enables: Vec<DiagnosticCode>,
-    /// Delay between opening/changing a file and scanning it for errors, in milliseconds.
-    #[schemars(extend("x-vscode-setting" = true))]
-    pub diagnostic_interval: Option<u64>,
 }
 
 impl Default for EmmyrcDiagnostic {
@@ -42,7 +39,6 @@ impl Default for EmmyrcDiagnostic {
             globals_regex: Vec::new(),
             severity: HashMap::default(),
             enables: Vec::new(),
-            diagnostic_interval: Some(500),
         }
     }
 }

@@ -19,7 +19,6 @@ The `diagnostics` section controls which checks run and how severe they appear. 
 | `diagnostics.globals` | `string[]` | `[]` | Global variable names to whitelist (suppress `undefined-global`) |
 | `diagnostics.globalsRegex` | `string[]` | `[]` | Regex patterns matching global names to whitelist |
 | `diagnostics.severity` | `object` | `{}` | Map of code → severity level |
-| `diagnostics.diagnosticInterval` | `integer` | `500` | Delay in milliseconds between a file change and diagnostics scan |
 
 ---
 
@@ -169,7 +168,6 @@ You can also configure these settings in VS Code settings with the `gluals.*` pr
 
 | VS Code setting | .gluarc.json key | Type | Default | Description |
 |---|---|---|---|---|
-| `gluals.diagnostics.diagnosticInterval` | `diagnostics.diagnosticInterval` | `integer` | `500` | Scan delay in milliseconds |
 | `gluals.strict.inferredTypeMismatch` | `strict.inferredTypeMismatch` | `boolean` | `false` | Stricter type checking for inferred values |
 | `gluals.codeAction.insertSpace` | `codeAction.insertSpace` | `boolean` | `false` | Space after --- in diagnostic comments |
 
@@ -181,7 +179,6 @@ You can also configure these settings in VS Code settings with the `gluals.*` pr
 {
   "diagnostics": {
     "enable": true,
-    "diagnosticInterval": 500,
     "globals": ["GAMEMODE", "PLUGIN", "GM"],
     "globalsRegex": ["^PLUGIN_"],
     "enables": ["missing-return", "return-type-mismatch"],

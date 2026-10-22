@@ -42,7 +42,6 @@ const PATH_CHANGES: &[(&str, EmmyrcChange)] = &[
     ("codeAction", EmmyrcChange::Editor),
     ("inlineValues", EmmyrcChange::Editor),
     ("diagnostics", EmmyrcChange::Diagnostics),
-    ("diagnostics.diagnosticInterval", EmmyrcChange::Editor),
     // The code style it generates is what the code-style-check diagnostic reports against.
     ("format", EmmyrcChange::Diagnostics),
     ("workspace", EmmyrcChange::Workspace),
@@ -137,10 +136,6 @@ mod tests {
     fn request_settings_reach_only_the_editor() -> Result<()> {
         verify_that!(
             change(|config| config.hover.enable = !config.hover.enable),
-            eq(EmmyrcChange::Editor)
-        )?;
-        verify_that!(
-            change(|config| config.diagnostics.diagnostic_interval = Some(1)),
             eq(EmmyrcChange::Editor)
         )?;
         verify_that!(
