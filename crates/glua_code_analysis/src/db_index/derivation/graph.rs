@@ -1724,30 +1724,38 @@ impl ReaderGraph {
         drop(ids);
         let mut ops = Vec::with_capacity(records.len());
         if distinct {
-            let known = records
-                .par_iter()
-                .map(|record| self.deriv_slot(&record.id))
-                .collect::<Vec<_>>();
-            let prepared = records
-                .into_iter()
-                .zip(known)
-                .map(|(record, known)| {
-                    let now = stamp();
-                    let deriv = known.unwrap_or_else(|| self.new_derivation(record.id));
-                    self.prepare_kept(record, deriv, now)
-                })
-                .collect::<Vec<_>>();
+            let known = crate::profile::phase("records: kept known", || {
+                records
+                    .par_iter()
+                    .map(|record| self.deriv_slot(&record.id))
+                    .collect::<Vec<_>>()
+            });
+            let prepared = crate::profile::phase("records: kept prepare", || {
+                records
+                    .into_iter()
+                    .zip(known)
+                    .map(|(record, known)| {
+                        let now = stamp();
+                        let deriv = known.unwrap_or_else(|| self.new_derivation(record.id));
+                        self.prepare_kept(record, deriv, now)
+                    })
+                    .collect::<Vec<_>>()
+            });
             let (derivations, table) = (&self.derivations, &self.table);
-            let diffed = prepared
-                .into_par_iter()
-                .map(|prepared| {
-                    let old = derivations[prepared.deriv as usize].record.as_ref();
-                    prepared.diff(old, Some(table))
-                })
-                .collect::<Vec<_>>();
-            for diffed in diffed {
-                ops.push(self.finish_kept(diffed, released).1);
-            }
+            let diffed = crate::profile::phase("records: kept diff", || {
+                prepared
+                    .into_par_iter()
+                    .map(|prepared| {
+                        let old = derivations[prepared.deriv as usize].record.as_ref();
+                        prepared.diff(old, Some(table))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            crate::profile::phase("records: kept finish", || {
+                for diffed in diffed {
+                    ops.push(self.finish_kept(diffed, released).1);
+                }
+            });
         } else {
             for record in records {
                 // A later record of the same derivation diffs against
@@ -1759,7 +1767,9 @@ impl ReaderGraph {
                 ops.push(self.finish_kept(diffed, released).1);
             }
         }
-        self.table.apply_reader_ops(ops);
+        crate::profile::phase("records: apply reader ops", || {
+            self.table.apply_reader_ops(ops)
+        });
     }
 
     /// Interns the outputs of `record`, which is `deriv`'s, at `now`.

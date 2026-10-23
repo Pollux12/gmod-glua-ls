@@ -1639,8 +1639,10 @@ impl Engine {
         // Each member of a planned group, with the plan and position of its
         // group: the files of a group that spans several share one.
         let mut grouped = FxHashMap::<DerivationId, (usize, usize)>::default();
-        let taken = self.worklist.take_rank_bounded(rank, SUPERSTEP_ENTRIES);
-        let checked = self.check_dispatch(db, &taken);
+        let taken = crate::profile::phase("dispatch: take rank", || {
+            self.worklist.take_rank_bounded(rank, SUPERSTEP_ENTRIES)
+        });
+        let checked = crate::profile::phase("dispatch: check", || self.check_dispatch(db, &taken));
         for ((file_id, entries), checked) in taken.into_iter().zip(checked) {
             if file_id == crate::FileId::VIRTUAL {
                 workspace = entries;
@@ -2099,6 +2101,7 @@ impl Engine {
             .collect::<Vec<_>>();
         db.reader_graph_mut().restore_keys(table);
         drop(canonicalising);
+        let merging = crate::profile::PhaseGuard::new("records: merge filed");
         let mut released = Vec::new();
         let mut on_root = Vec::new();
         let mut unowned = Vec::new();
@@ -2115,6 +2118,8 @@ impl Engine {
             .flat_map(|(_, groups, ..)| groups.iter().flat_map(|group| &group.members))
             .copied()
             .collect::<FxHashSet<_>>();
+        drop(merging);
+        let producing = crate::profile::PhaseGuard::new("records: produced before");
         // What the derivations that ran produced before their records are
         // replaced: a fact one stops producing still came from it.
         let produced_before = {
@@ -2127,8 +2132,11 @@ impl Engine {
             }
             produced
         };
-        db.reader_graph_mut()
-            .replace_all_kept(records, &mut released, derivation::new_stamp);
+        drop(producing);
+        crate::profile::phase("records: replace all kept", || {
+            db.reader_graph_mut()
+                .replace_all_kept(records, &mut released, derivation::new_stamp)
+        });
         if !self.removed_outputs.is_empty() {
             for member in tasks
                 .iter()
@@ -2151,20 +2159,30 @@ impl Engine {
                 }
             }
         }
-        db.reader_graph_mut().release_keys(released);
-        let mut table = db.reader_graph_mut().lend_keys();
-        quarantine.finish(&mut table);
-        db.reader_graph_mut().restore_keys(table);
-        db.reader_graph_mut().mark_written(&written);
+        crate::profile::phase("records: release keys", || {
+            db.reader_graph_mut().release_keys(released)
+        });
+        crate::profile::phase("records: quarantine finish", || {
+            let mut table = db.reader_graph_mut().lend_keys();
+            quarantine.finish(&mut table);
+            db.reader_graph_mut().restore_keys(table);
+        });
+        crate::profile::phase("records: mark written", || {
+            db.reader_graph_mut().mark_written(&written)
+        });
         drop(filing);
         let checking = crate::profile::PhaseGuard::new("superstep: readers of");
         derivation::dedup_keys(&mut touched);
-        self.forget_installed(db, &touched, &written);
+        crate::profile::phase("readers: forget installed", || {
+            self.forget_installed(db, &touched, &written)
+        });
         db.reader_graph().uncheck_derived(&touched);
         self.queued_while_installing = Some(Vec::new());
-        self.readers_of(db, touched.iter());
+        crate::profile::phase("readers: touched", || self.readers_of(db, touched.iter()));
         let queued = self.queued_while_installing.take().unwrap_or_default();
-        self.note_cycles(db, &ran, &produced_before, queued);
+        crate::profile::phase("readers: note cycles", || {
+            self.note_cycles(db, &ran, &produced_before, queued)
+        });
         drop(checking);
         let _after = crate::profile::PhaseGuard::new("superstep: after");
         let widened = tasks
