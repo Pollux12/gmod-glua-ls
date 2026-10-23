@@ -3072,28 +3072,46 @@ const _: () = assert!(PAGE.is_multiple_of(READER_CHUNK));
 
 impl KeyTable {
     /// Applies each record's `ops`, each slot's together in record order:
-    /// every op is sorted by slot on worker threads, a slot's keeping record
-    /// order, then each chunk of slots they reach takes its ops on a worker.
+    /// worker threads split runs of records by the chunk of slots each op
+    /// reaches, then each chunk gathers its ops from the runs in order, sorts
+    /// them by slot, a slot's keeping record order, and takes them on a
+    /// worker.
     fn apply_reader_ops(&mut self, ops: Vec<Vec<(KeyIdx, ReaderOp)>>) {
         use rayon::prelude::*;
-        let mut flat = Vec::with_capacity(ops.iter().map(Vec::len).sum::<usize>());
-        for record_ops in ops {
-            flat.extend(record_ops);
-        }
-        let mut ops = flat;
-        ops.par_sort_by_key(|(slot, _)| *slot);
-        let ops: &[(KeyIdx, ReaderOp)] = &ops;
-        self.par_reached_chunks(
-            ops,
-            |(slot, _)| *slot,
-            |first, chunk, range| {
-                for same_slot in ops[range].chunk_by(|(left, _), (right, _)| left == right) {
-                    chunk[same_slot[0].0 as usize - first]
-                        .readers
-                        .apply_all(same_slot);
+        let chunks = self.keys.len().div_ceil(READER_CHUNK);
+        let records_per_run = ops.len().div_ceil(rayon::current_num_threads()).max(1);
+        let runs = ops
+            .par_chunks(records_per_run)
+            .map(|records| {
+                let mut by_chunk = vec![Vec::new(); chunks];
+                for &(slot, op) in records.iter().flatten() {
+                    by_chunk[slot as usize / READER_CHUNK].push((slot, op));
                 }
-            },
-        );
+                by_chunk
+            })
+            .collect::<Vec<_>>();
+        let reached = self
+            .keys
+            .pages_mut()
+            .iter_mut()
+            .flat_map(|page| page.chunks_mut(READER_CHUNK))
+            .enumerate()
+            .filter(|(index, _)| runs.iter().any(|run| !run[*index].is_empty()))
+            .collect::<Vec<_>>();
+        reached.into_par_iter().for_each(|(index, chunk)| {
+            let mut ops = runs
+                .iter()
+                .flat_map(|run| &run[index])
+                .copied()
+                .collect::<Vec<_>>();
+            ops.sort_by_key(|(slot, _)| *slot);
+            let first = index * READER_CHUNK;
+            for same_slot in ops.chunk_by(|(left, _), (right, _)| left == right) {
+                chunk[same_slot[0].0 as usize - first]
+                    .readers
+                    .apply_all(same_slot);
+            }
+        });
     }
 
     /// Runs `apply` on worker threads for each chunk of slots that `items`,
