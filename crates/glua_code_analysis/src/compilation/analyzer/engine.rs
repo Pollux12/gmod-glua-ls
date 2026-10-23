@@ -152,8 +152,12 @@ impl FileCounts {
     }
 
     fn sub(&mut self, file_id: crate::FileId) {
+        self.sub_n(file_id, 1);
+    }
+
+    fn sub_n(&mut self, file_id: crate::FileId, n: u32) {
         if let std::collections::hash_map::Entry::Occupied(mut count) = self.0.entry(file_id) {
-            *count.get_mut() -= 1;
+            *count.get_mut() -= n;
             if *count.get() == 0 {
                 count.remove();
             }
@@ -399,20 +403,30 @@ impl Queue {
     /// round takes the files.
     fn by_file(
         &mut self,
-        taken: Vec<(u8, Reason, u64, DerivationId)>,
+        mut taken: Vec<(u8, Reason, u64, DerivationId)>,
     ) -> Vec<(crate::FileId, Vec<(DerivationId, Reason)>)> {
-        let mut by_file = BTreeMap::<_, Vec<_>>::new();
-        for (_, reason, file_key, id) in taken {
-            self.reasons.remove(&id);
-            self.files.sub(id.file_id);
-            by_file
-                .entry((file_key, id.file_id))
-                .or_default()
-                .push((id, reason));
-        }
-        by_file
-            .into_iter()
-            .map(|((_, file_id), entries)| (file_id, entries))
+        // Each reason's entries come out in file order: a stable sort merges
+        // the runs and keeps each file's in the order they were taken.
+        taken.sort_by_key(|(_, _, file_key, id)| (*file_key, id.file_id));
+        taken
+            .chunk_by(|(_, _, left_key, left), (_, _, right_key, right)| {
+                (left_key, left.file_id) == (right_key, right.file_id)
+            })
+            .map(|file| {
+                let file_id = file[0].3.file_id;
+                let entries = file
+                    .iter()
+                    .map(|(_, reason, _, id)| {
+                        self.reasons.remove(id);
+                        (*id, *reason)
+                    })
+                    .collect::<Vec<_>>();
+                self.files.sub_n(
+                    file_id,
+                    u32::try_from(entries.len()).expect("fewer than 2^32 entries of a file"),
+                );
+                (file_id, entries)
+            })
             .collect()
     }
 
