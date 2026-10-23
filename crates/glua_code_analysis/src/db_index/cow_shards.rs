@@ -298,7 +298,7 @@ impl<K, V> CowShards<K, V> {
             .fold(self.slots.len(), usize::max)
     }
 
-    #[cfg(test)]
+    /// Whether no shard holds an entry; stops at the first that does.
     pub(crate) fn is_empty(&self) -> bool {
         self.shards().all(|shard| shard.is_empty())
     }

@@ -254,7 +254,7 @@ impl DynamicFieldIndex {
 
     /// Whether no write site filed anything.
     pub(crate) fn is_empty(&self) -> bool {
-        self.site_contributions.len() == 0
+        self.site_contributions.is_empty()
     }
 
     /// The record of what `site` filed, created on its first contribution.
