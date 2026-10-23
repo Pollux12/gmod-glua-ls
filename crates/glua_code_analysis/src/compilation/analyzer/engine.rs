@@ -1745,7 +1745,7 @@ impl Engine {
             tasks,
         } = superstep;
         if let Some(tasks) = tasks {
-            self.install_tasks(db, recipe, rank, plans, tasks);
+            self.install_tasks(db, recipe, slice, rank, plans, tasks);
         }
         let _root = crate::profile::PhaseGuard::new("superstep: root list");
         self.root_list_ran = Some(FxHashSet::default());
@@ -2005,6 +2005,7 @@ impl Engine {
         &mut self,
         db: &mut DbIndex,
         recipe: &dyn Recipe,
+        slice: Slice,
         rank: u8,
         plans: Vec<TaskPlan>,
         tasks: StartedTasks,
@@ -2268,29 +2269,41 @@ impl Engine {
             }
         }
         // A group that read a query the snapshot had no answer for runs again
-        // in the next superstep, once the queries it read are computed here;
-        // one still lacking an answer after that runs here, where queries are
-        // computed as they are read.
+        // in the next superstep, once the queries it read are computed here,
+        // together; one still lacking an answer after that runs here, where
+        // queries are computed as they are read.
+        let mut unanswered = Vec::new();
+        let mut on_root_runs = Vec::new();
         for (members, queries) in on_root {
             let deferrals = self.query_deferrals.entry(members[0]).or_default();
             if !queries.is_empty() && *deferrals < QUERY_DEFERRALS {
                 *deferrals += 1;
-                for key in &queries {
-                    if db.queries().ready_fingerprint(key.key()).is_none() {
-                        self.file_queries(db);
-                        let query = db.queries().id_of(key.key());
-                        self.step(db, recipe, query, Reason::Changed);
-                    }
-                }
+                unanswered.extend(
+                    queries
+                        .iter()
+                        .filter(|key| db.queries().ready_fingerprint(key.key()).is_none())
+                        .map(|key| db.queries().id_of(key.key())),
+                );
                 self.stats
                     .requeue_cause(members[0], "read a query the snapshot had no answer for");
                 self.worklist.insert(members[0], Reason::Changed);
                 continue;
             }
-            for id in members {
-                self.file_queries(db);
-                self.step(db, recipe, id, Reason::Changed);
-            }
+            on_root_runs.push(members);
+        }
+        unanswered.sort_unstable();
+        unanswered.dedup();
+        let unanswered = unanswered
+            .into_iter()
+            .map(|query| (query, Reason::Changed))
+            .collect();
+        for (query, reason) in self.run_recorded_queries(db, recipe, slice, unanswered) {
+            self.file_queries(db);
+            self.step(db, recipe, query, reason);
+        }
+        for id in on_root_runs.into_iter().flatten() {
+            self.file_queries(db);
+            self.step(db, recipe, id, Reason::Changed);
         }
         // A task installed over an earlier task's change left a value that
         // lacks what one of them wrote: every producer of a primary key both
