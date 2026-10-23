@@ -4301,6 +4301,7 @@ impl Superstep {
         let cost = tasks.cost.take();
         let snapshot = tasks.snapshot.take().expect("a superstep's tasks run once");
         let (frozen, profiling, stop) = (&tasks.frozen, tasks.profiling, &self.stop);
+        let started = std::time::Instant::now();
         let mut outcomes = super::parallel::map_tasks_collect(db, &files, cost, |_, file_id| {
             let started = std::time::Instant::now();
             let outcome = run_task_on_worker(
@@ -4319,6 +4320,7 @@ impl Superstep {
             }
             (outcome, elapsed)
         });
+        let wall = started.elapsed();
         let (longest, longest_file) = *lock(&longest);
         crate::profile::add_phase("superstep: longest task", longest, 0);
         if crate::profile::phase_enabled() && longest > std::time::Duration::from_millis(20) {
@@ -4330,8 +4332,13 @@ impl Superstep {
                 }
             }
             eprintln!(
-                "[superstep] longest {}ms {longest_file:?} groups={} of {} tasks {kinds:?}",
+                "[superstep] longest {}ms of {}ms {longest_file:?} {} groups={} of {} tasks {kinds:?}",
                 longest.as_millis(),
+                wall.as_millis(),
+                db.get_vfs()
+                    .get_file_path(&longest_file)
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_default(),
                 plan.groups.len(),
                 files.len(),
             );
