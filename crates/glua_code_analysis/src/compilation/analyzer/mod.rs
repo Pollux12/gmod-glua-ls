@@ -1055,6 +1055,7 @@ fn replace_files(
     }
     crate::progress::enter_phase("Reading annotations", total, "files");
     let mut documented_count = 0;
+    let mut changed = Vec::new();
     // Each batch's tails are computed together on the pool, outside every
     // recording evaluation, then published file by file in canonical order.
     let mut declared = declared.into_iter();
@@ -1075,12 +1076,11 @@ fn replace_files(
         for ((file_id, (evaluation, context)), tail) in documented.into_iter().zip(tails) {
             let (outputs, derivations) = document_source(db, file_id, evaluation, context, tail);
             touched.extend(outputs);
-            for id in derivations {
-                engine.changed(id);
-            }
+            changed.extend(derivations);
         }
         crate::progress::advance_current_phase(documented_count, total, "files");
     }
+    engine.changed_all(changed);
     if let Some(edits) = engine.edits_to_apply() {
         engine.follow_removed_outputs(&edits);
         touched = crate::profile::phase("reanalyze: follow edits", || {

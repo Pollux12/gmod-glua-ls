@@ -269,6 +269,22 @@ impl Queue {
         self.order.insert(self.entry(id, reason));
     }
 
+    /// [`Self::insert`] for each of `ids`, those not yet queued added to the
+    /// order at once.
+    fn insert_all(&mut self, ids: Vec<DerivationId>, reason: Reason) {
+        let mut added = Vec::with_capacity(ids.len());
+        for id in ids {
+            if self.reasons.contains_key(&id) {
+                self.insert(id, reason);
+                continue;
+            }
+            self.reasons.insert(id, reason);
+            self.files.add(id.file_id);
+            added.push(self.entry(id, reason));
+        }
+        self.order.append(&mut added.into_iter().collect());
+    }
+
     fn remove(&mut self, id: DerivationId) {
         if let Some(reason) = self.reasons.remove(&id) {
             self.files.sub(id.file_id);
@@ -938,6 +954,27 @@ impl Engine {
         } else {
             self.queue(id, Reason::Changed);
         }
+    }
+
+    /// [`Self::changed`] for each of `ids`, queued together.
+    pub(crate) fn changed_all(&mut self, ids: Vec<DerivationId>) {
+        if self.cursor.is_some() {
+            for id in ids {
+                self.changed(id);
+            }
+            return;
+        }
+        let mut queued = Vec::with_capacity(ids.len());
+        for id in ids {
+            self.stats
+                .requeue_cause(id, "changed: its file re-analysed or a producer removed");
+            if self.waits(id) {
+                self.wait(id, Reason::Changed);
+            } else {
+                queued.push(id);
+            }
+        }
+        self.worklist.insert_all(queued, Reason::Changed);
     }
 
     /// Queues `id` in this round unless it comes before the derivation being
@@ -5990,6 +6027,28 @@ print(tuned{index})"
                 true
             )
         );
+    }
+
+    #[test]
+    fn inserting_entries_together_queues_them_as_inserting_one_by_one() {
+        let ids = [FILE + 2, FILE, FILE + 1, FILE]
+            .into_iter()
+            .enumerate()
+            .map(|(at, file)| statement_in(FileId::new(file), at as u32 * 4))
+            .collect::<Vec<_>>();
+        let queued_before = |queue: &mut Queue| queue.insert(ids[1], Reason::Read);
+        let rank = DerivationKind::LocalStat.rank();
+
+        let mut one_by_one = Queue::new(Schedule::Canonical);
+        queued_before(&mut one_by_one);
+        for id in &ids {
+            one_by_one.insert(*id, Reason::Changed);
+        }
+        let mut together = Queue::new(Schedule::Canonical);
+        queued_before(&mut together);
+        together.insert_all(ids.clone(), Reason::Changed);
+
+        assert_eq!(together.take_rank(rank), one_by_one.take_rank(rank));
     }
 
     /// A split kind whose reader in `FILE` computes from `WRITTEN`, which its
