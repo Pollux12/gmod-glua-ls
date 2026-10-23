@@ -347,26 +347,13 @@ impl Queue {
     /// Takes out every entry at `rank`, file by file in the order a round
     /// takes the files, each file's as [`Self::take_file_at`] takes them.
     fn take_rank(&mut self, rank: u8) -> Vec<(crate::FileId, Vec<(DerivationId, Reason)>)> {
-        let mut taken = self
-            .order
-            .split_off(&(rank, Reason::Changed, 0, DerivationId::floor()));
-        if let Some(next) = rank.checked_add(1) {
-            let mut after = taken.split_off(&(next, Reason::Changed, 0, DerivationId::floor()));
-            self.order.append(&mut after);
-        }
-        let mut by_file = BTreeMap::<_, Vec<_>>::new();
-        for (_, reason, file_key, id) in taken {
-            self.reasons.remove(&id);
-            self.files.sub(id.file_id);
-            by_file
-                .entry((file_key, id.file_id))
-                .or_default()
-                .push((id, reason));
-        }
-        by_file
-            .into_iter()
-            .map(|((_, file_id), entries)| (file_id, entries))
-            .collect()
+        use std::ops::Bound;
+        let from = Bound::Included((rank, Reason::Changed, 0, DerivationId::floor()));
+        let to = rank.checked_add(1).map_or(Bound::Unbounded, |next| {
+            Bound::Excluded((next, Reason::Changed, 0, DerivationId::floor()))
+        });
+        let taken = self.order.extract_if((from, to), |_| true).collect();
+        self.by_file(taken)
     }
 
     /// [`Self::take_rank`] bounded to the files, in order, whose entries come
@@ -382,19 +369,24 @@ impl Queue {
         };
         let mut taken = Vec::new();
         for reason in [Reason::Changed, Reason::Read] {
-            let mut from = self
-                .order
-                .split_off(&(rank, reason, 0, DerivationId::floor()));
-            let mut after = from.split_off(&(rank, reason, cut, DerivationId::floor()));
-            self.order.append(&mut after);
-            taken.extend(from);
+            let range = (rank, reason, 0, DerivationId::floor())
+                ..(rank, reason, cut, DerivationId::floor());
+            taken.extend(
+                self.order
+                    .extract_if(range, |(.., id)| id.file_id != crate::FileId::VIRTUAL),
+            );
         }
+        self.by_file(taken)
+    }
+
+    /// The entries `taken` out of the order, file by file in the order a
+    /// round takes the files.
+    fn by_file(
+        &mut self,
+        taken: Vec<(u8, Reason, u64, DerivationId)>,
+    ) -> Vec<(crate::FileId, Vec<(DerivationId, Reason)>)> {
         let mut by_file = BTreeMap::<_, Vec<_>>::new();
-        for (entry_rank, reason, file_key, id) in taken {
-            if id.file_id == crate::FileId::VIRTUAL {
-                self.order.insert((entry_rank, reason, file_key, id));
-                continue;
-            }
+        for (_, reason, file_key, id) in taken {
             self.reasons.remove(&id);
             self.files.sub(id.file_id);
             by_file
@@ -5942,6 +5934,55 @@ print(tuned{index})"
                 TextRange::at(TextSize::new(0), TextSize::new(1)),
             ),
         )
+    }
+
+    fn statement_in(file_id: FileId, start: u32) -> DerivationId {
+        DerivationId::new(
+            DerivationKind::LocalStat,
+            file_id,
+            LuaSyntaxId::new(
+                LuaSyntaxKind::LocalStat.into(),
+                TextRange::at(TextSize::new(start), TextSize::new(1)),
+            ),
+        )
+    }
+
+    #[test]
+    fn a_bounded_take_takes_whole_files_in_order_and_leaves_the_rest_queued() {
+        let (first, second, third) = (
+            FileId::new(FILE),
+            FileId::new(FILE + 1),
+            FileId::new(FILE + 2),
+        );
+        let workspace = statement_in(FileId::VIRTUAL, 0);
+        let mut queue = Queue::new(Schedule::Canonical);
+        for file_id in [third, first, second] {
+            queue.insert(statement_in(file_id, 0), Reason::Read);
+            queue.insert(statement_in(file_id, 4), Reason::Changed);
+        }
+        queue.insert(workspace, Reason::Changed);
+        let rank = DerivationKind::LocalStat.rank();
+
+        let bounded = queue.take_rank_bounded(rank, 3);
+        let rest = queue.take_rank(rank);
+
+        let entries = |file_id| {
+            vec![
+                (statement_in(file_id, 4), Reason::Changed),
+                (statement_in(file_id, 0), Reason::Read),
+            ]
+        };
+        assert_eq!(
+            (bounded, rest, queue.is_empty()),
+            (
+                vec![(first, entries(first)), (second, entries(second))],
+                vec![
+                    (third, entries(third)),
+                    (FileId::VIRTUAL, vec![(workspace, Reason::Changed)])
+                ],
+                true
+            )
+        );
     }
 
     /// A split kind whose reader in `FILE` computes from `WRITTEN`, which its
