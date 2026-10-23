@@ -152,8 +152,9 @@ pub(crate) struct Recipes {
     special_call_direct_matcher: lua::call::SpecialCallDirectMatcher,
     scopes: ScriptedScopes,
     /// Each file's inference memo, reused across its evaluations: an entry
-    /// holds for as long as the reads it was computed from do.
-    caches: std::sync::Mutex<FxHashMap<FileId, crate::LuaInferCache>>,
+    /// holds for as long as the reads it was computed from do. Sharded by
+    /// file, so concurrent tasks on different files rarely share a lock.
+    caches: Box<[std::sync::Mutex<FxHashMap<FileId, crate::LuaInferCache>>]>,
     /// Memos of applied results, committed and stored by [`Self::settle_caches`].
     unsettled: std::sync::Mutex<Vec<(FileId, crate::LuaInferCache)>>,
     /// Each file's dynamic-field write targets, read off its syntax when its
@@ -177,7 +178,9 @@ impl Recipes {
         Self {
             special_call_direct_matcher: lua::call::build_special_call_direct_matcher(db),
             scopes,
-            caches: std::sync::Mutex::default(),
+            caches: (0..CACHE_SHARDS)
+                .map(|_| std::sync::Mutex::default())
+                .collect(),
             unsettled: std::sync::Mutex::default(),
             write_sites: std::sync::Mutex::default(),
             net_syntax: std::sync::Mutex::default(),
@@ -186,12 +189,24 @@ impl Recipes {
     }
 }
 
+const CACHE_SHARDS: usize = 64;
+
 impl Recipes {
+    /// The shard of the cache store that holds `file_id`'s memo.
+    fn cache_shard(
+        &self,
+        file_id: FileId,
+    ) -> std::sync::MutexGuard<'_, FxHashMap<FileId, crate::LuaInferCache>> {
+        self.caches[file_id.id as usize % CACHE_SHARDS]
+            .lock()
+            .expect("cache store")
+    }
+
     /// The file's inference memo, taken out of the store for one computation,
     /// or a new one under the view a file derivation infers with.
     fn take_cache(&self, db: &DbIndex, file_id: FileId) -> crate::LuaInferCache {
         let mut context = AnalyzeContext::for_files(db, vec![file_id], &self.scopes);
-        if let Some(cache) = self.caches.lock().expect("cache store").remove(&file_id) {
+        if let Some(cache) = self.cache_shard(file_id).remove(&file_id) {
             context.infer_manager.restore_file(file_id, cache);
         }
         context.infer_manager.get_infer_cache(file_id);
@@ -242,10 +257,7 @@ impl Recipes {
 
     /// Returns the file's inference memo to the store.
     fn store_cache(&self, file_id: FileId, cache: crate::LuaInferCache) {
-        self.caches
-            .lock()
-            .expect("cache store")
-            .insert(file_id, cache);
+        self.cache_shard(file_id).insert(file_id, cache);
     }
 
     /// Holds the memo of a result just applied until [`Self::settle_caches`].
@@ -285,8 +297,14 @@ impl Recipes {
     pub(super) fn into_memos(self) -> FxHashMap<FileId, crate::LuaInferCache> {
         let memos = self
             .caches
-            .into_inner()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .into_vec()
+            .into_iter()
+            .flat_map(|shard| {
+                shard
+                    .into_inner()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
+            .collect::<FxHashMap<_, _>>();
         if crate::profile::profiling() {
             let mut footprint = crate::semantic::MemoFootprint::default();
             for cache in memos.values() {
@@ -518,17 +536,14 @@ impl Recipes {
         f: impl FnOnce(&mut DbIndex, &mut AnalyzeContext),
     ) {
         let mut context = AnalyzeContext::for_files(db, vec![file_id], &self.scopes);
-        if let Some(cache) = self.caches.lock().expect("cache store").remove(&file_id) {
+        if let Some(cache) = self.cache_shard(file_id).remove(&file_id) {
             context.infer_manager.restore_file(file_id, cache);
         }
         f(db, &mut context);
         unresolve::resolve_inline(db, &mut context);
         if let Some(mut cache) = context.infer_manager.take_file(file_id) {
             cache.park();
-            self.caches
-                .lock()
-                .expect("cache store")
-                .insert(file_id, cache);
+            self.store_cache(file_id, cache);
         }
     }
 
@@ -671,12 +686,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [peer]
         );
-        assert!(
-            recipes
-                .caches
-                .lock()
-                .expect("cache store")
-                .contains_key(&own)
-        );
+        assert!(recipes.cache_shard(own).contains_key(&own));
     }
 }
