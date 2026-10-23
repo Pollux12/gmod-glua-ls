@@ -420,6 +420,11 @@ pub struct GmodNetworkIndex {
     file_data: CowShards<FileId, FileNetworkData>,
     send_flows_by_message: CowShards<String, Vec<(FileId, usize)>>,
     receive_flows_by_message: CowShards<String, Vec<(FileId, usize)>>,
+    /// Each message's sum of its send flows' fingerprints, without edits
+    /// mapped back: what [`messages_fingerprint`] adds up.
+    send_fingerprints: CowShards<String, Fingerprint>,
+    /// [`Self::send_fingerprints`] for the receive flows.
+    receive_fingerprints: CowShards<String, Fingerprint>,
     materialized_definition_counts: CowShards<(FileId, TextRange), usize>,
     /// Each file with the other files whose flows name its positions.
     referencing: CowShards<FileId, FxHashSet<FileId>>,
@@ -460,11 +465,31 @@ fn messages_fingerprint<T: std::hash::Hash>(
         .flatten()
         .filter_map(|(file_id, flow_idx)| {
             let flow = flows(file_data.get(file_id)?).get(*flow_idx)?;
-            Some(derivation::in_file(Some(*file_id), || {
-                derivation::fingerprint_of(&(file_id, flow))
-            }))
+            Some(flow_fingerprint(*file_id, flow))
         })
         .fold(derivation::ABSENT, Fingerprint::wrapping_add)
+}
+
+/// The fingerprint of `file_id`'s `flow`, hashed as its file's positions.
+fn flow_fingerprint<T: std::hash::Hash>(file_id: FileId, flow: &T) -> Fingerprint {
+    derivation::in_file(Some(file_id), || {
+        derivation::fingerprint_of(&(file_id, flow))
+    })
+}
+
+/// Moves the sum of `name`'s flows in `sums` by `shift`; a zero sum is
+/// absent, as [`crate::db_index::cow_shards::merge_sum`] leaves it.
+fn shift_message_sum(
+    sums: &mut CowShards<String, Fingerprint>,
+    name: &str,
+    shift: impl FnOnce(Fingerprint) -> Fingerprint,
+) {
+    let sum = shift(sums.get(name).copied().unwrap_or_default());
+    if sum == 0 {
+        sums.remove(name);
+    } else {
+        sums.insert(name.to_string(), sum);
+    }
 }
 
 fn note_definition_uses_write(file_id: FileId, start_range: TextRange) {
@@ -585,6 +610,8 @@ impl GmodNetworkIndex {
             file_data: Default::default(),
             send_flows_by_message: Default::default(),
             receive_flows_by_message: Default::default(),
+            send_fingerprints: Default::default(),
+            receive_fingerprints: Default::default(),
             materialized_definition_counts: Default::default(),
             referencing: Default::default(),
             canonical_ops: Default::default(),
@@ -631,15 +658,27 @@ impl GmodNetworkIndex {
             FactKey::NetworkScan => self
                 .flows_fingerprint
                 .wrapping_add(self.canonical_ops_fingerprint),
-            FactKey::NetSends(name) => messages_fingerprint(
+            FactKey::NetSends(name) if derivation::mapping_back() => messages_fingerprint(
                 &self.file_data,
                 self.send_flows_by_message.get(name.as_str()),
                 |data| &data.send_flows,
             ),
-            FactKey::NetReceives(name) => messages_fingerprint(
+            FactKey::NetReceives(name) if derivation::mapping_back() => messages_fingerprint(
                 &self.file_data,
                 self.receive_flows_by_message.get(name.as_str()),
                 |data| &data.receive_flows,
+            ),
+            FactKey::NetSends(name) => derivation::ABSENT.wrapping_add(
+                self.send_fingerprints
+                    .get(name.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+            ),
+            FactKey::NetReceives(name) => derivation::ABSENT.wrapping_add(
+                self.receive_fingerprints
+                    .get(name.as_str())
+                    .copied()
+                    .unwrap_or_default(),
             ),
             FactKey::NetDefinitionUses(site) => {
                 if self
@@ -973,6 +1012,8 @@ impl GmodNetworkIndex {
         self.file_data.clear();
         self.send_flows_by_message.clear();
         self.receive_flows_by_message.clear();
+        self.send_fingerprints.clear();
+        self.receive_fingerprints.clear();
         self.materialized_definition_counts.clear();
         self.referencing.clear();
         self.canonical_ops.clear();
@@ -998,6 +1039,12 @@ impl GmodNetworkIndex {
         }
         for (flow_idx, send_flow) in data.send_flows.iter().enumerate() {
             note_sends_write(&send_flow.message_name);
+            let term = flow_fingerprint(file_id, send_flow);
+            shift_message_sum(
+                &mut self.send_fingerprints,
+                &send_flow.message_name,
+                |sum| sum.wrapping_add(term),
+            );
             self.send_flows_by_message
                 .entry(send_flow.message_name.clone())
                 .or_default()
@@ -1016,6 +1063,12 @@ impl GmodNetworkIndex {
 
         for (flow_idx, receive_flow) in data.receive_flows.iter().enumerate() {
             note_receives_write(&receive_flow.message_name);
+            let term = flow_fingerprint(file_id, receive_flow);
+            shift_message_sum(
+                &mut self.receive_fingerprints,
+                &receive_flow.message_name,
+                |sum| sum.wrapping_add(term),
+            );
             self.receive_flows_by_message
                 .entry(receive_flow.message_name.clone())
                 .or_default()
@@ -1038,6 +1091,12 @@ impl GmodNetworkIndex {
         }
         for send_flow in &data.send_flows {
             note_sends_write(&send_flow.message_name);
+            let term = flow_fingerprint(file_id, send_flow);
+            shift_message_sum(
+                &mut self.send_fingerprints,
+                &send_flow.message_name,
+                |sum| sum.wrapping_sub(term),
+            );
             if let Some(origin) = send_flow.materialized_from {
                 let key = (origin.file_id, origin.start_range);
                 if let Some(count) = self.materialized_definition_counts.get_mut(&key) {
@@ -1061,6 +1120,12 @@ impl GmodNetworkIndex {
 
         for receive_flow in &data.receive_flows {
             note_receives_write(&receive_flow.message_name);
+            let term = flow_fingerprint(file_id, receive_flow);
+            shift_message_sum(
+                &mut self.receive_fingerprints,
+                &receive_flow.message_name,
+                |sum| sum.wrapping_sub(term),
+            );
             let mut remove_message_entry = false;
             if let Some(indexed_flows) = self
                 .receive_flows_by_message
@@ -1237,6 +1302,71 @@ mod tests {
     }
 
     #[test]
+    fn message_fingerprint_sums_match_hashing_every_flow_after_adds_removes_and_installs() {
+        use crate::db_index::cow_shards::TaskFork;
+        let mut index = GmodNetworkIndex::new();
+        for file in 1..4 {
+            index.add_file_data(
+                FileId::new(file),
+                FileNetworkData {
+                    send_flows: vec![send_flow("Shared", file), send_flow("Own", file * 20)],
+                    receive_flows: vec![receive_flow("Shared", file * 10 + 5)],
+                },
+            );
+        }
+        index.remove_file(FileId::new(2));
+        let frozen = index.task_fork();
+        let forks = [1, 5]
+            .map(|file| {
+                let mut fork = frozen.task_fork();
+                fork.add_file_data(
+                    FileId::new(file),
+                    FileNetworkData {
+                        send_flows: vec![send_flow("Shared", file * 10)],
+                        receive_flows: vec![receive_flow("Other", file * 10 + 5)],
+                    },
+                );
+                fork
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        index.install_tasks_reporting(
+            &frozen,
+            forks.into_iter().enumerate().collect(),
+            &mut vec![Vec::new(); 2],
+        );
+
+        let names = ["Shared", "Own", "Other", "Absent"];
+        let summed = names
+            .iter()
+            .flat_map(|name| {
+                [
+                    index.fact_fingerprint(&FactKey::NetSends(SmolStr::new(name))),
+                    index.fact_fingerprint(&FactKey::NetReceives(SmolStr::new(name))),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let hashed = names
+            .iter()
+            .flat_map(|name| {
+                [
+                    messages_fingerprint(
+                        &index.file_data,
+                        index.send_flows_by_message.get(*name),
+                        |data| &data.send_flows,
+                    ),
+                    messages_fingerprint(
+                        &index.file_data,
+                        index.receive_flows_by_message.get(*name),
+                        |data| &data.receive_flows,
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(summed, hashed);
+    }
+
+    #[test]
     fn add_file_data_replaces_previous_message_indexes_for_same_file() {
         let file_id = FileId::new(1);
         let mut index = GmodNetworkIndex::new();
@@ -1355,6 +1485,8 @@ crate::db_index::cow_shards::task_fork_fields!(GmodNetworkIndex {
     file_data,
     send_flows_by_message => crate::db_index::cow_shards::merge_list,
     receive_flows_by_message => crate::db_index::cow_shards::merge_list,
+    send_fingerprints => crate::db_index::cow_shards::merge_sum,
+    receive_fingerprints => crate::db_index::cow_shards::merge_sum,
     materialized_definition_counts => crate::db_index::cow_shards::merge_sum,
     referencing => crate::db_index::cow_shards::merge_set,
     canonical_ops,
