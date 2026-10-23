@@ -2299,7 +2299,11 @@ impl Engine {
         let _repairing = crate::profile::PhaseGuard::new("superstep: conflict repair");
         let mut touched_before = FxHashSet::default();
         let mut again = BTreeSet::new();
-        for (_, _, touched, _, conflicted) in &tasks {
+        let last_conflicted = tasks
+            .iter()
+            .rposition(|(.., conflicted)| *conflicted)
+            .map_or(0, |at| at + 1);
+        for (_, _, touched, _, conflicted) in &tasks[..last_conflicted] {
             if *conflicted {
                 for key in touched
                     .intersection(&touched_before)
