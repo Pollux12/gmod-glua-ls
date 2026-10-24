@@ -540,4 +540,90 @@ result = {
             "#
         ));
     }
+
+    #[test]
+    fn pcall_callable_table_constructor_resolves_return_type_and_methods() {
+        let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "starfall/preprocessor.lua",
+            r#"
+            SF = SF or {}
+            SF.Preprocessor = {
+                __index = {
+                    GetSendData = function(self, sfdata)
+                        return { mainfile = self.mainfile }, nil
+                    end,
+                },
+                __call = function(t, files)
+                    local self = setmetatable({
+                        files = {},
+                        mainfile = "",
+                    }, t)
+                    return self
+                end,
+            }
+            setmetatable(SF.Preprocessor, SF.Preprocessor)
+            "#,
+        );
+        ws.def_file(
+            "starfall/instance.lua",
+            r#"
+            SF = SF or {}
+            SF.Instance = {}
+            SF.Instance.__index = SF.Instance
+
+            function SF.Instance.Compile(code)
+                local instance = setmetatable({}, SF.Instance)
+                local ok, ppdata = pcall(SF.Preprocessor, code)
+                if not ok then
+                    return false, { message = ppdata, traceback = "" }
+                end
+                instance.ppdata = ppdata
+                return true, instance
+            end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local ok, instance = SF.Instance.Compile({})
+            if not ok then return end
+            local senddata, ownerdata = instance.ppdata:GetSendData({})
+            "#,
+        ));
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local ok, ppdata = pcall(SF.Preprocessor, {})
+            "#,
+        ));
+    }
+
+    #[test]
+    fn pcall_callable_class_operator_resolves_return_type() {
+        let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@class CallableBuilder
+            ---@field value number
+            ---@operator call(number): CallableBuilder
+            local Builder = {}
+
+            local ok, built = pcall(Builder, 42)
+            result = built
+            "#,
+        );
+
+        let ty = ws.expr_ty("result");
+        assert_eq!(ty, ws.ty("CallableBuilder|string"));
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@type CallableBuilder
+            local b
+            local ok, built = pcall(b, 42)
+            "#,
+        ));
+    }
 }

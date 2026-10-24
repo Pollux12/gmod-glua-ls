@@ -1,10 +1,16 @@
+use rowan::TextRange;
+
 use crate::{
-    TypeSubstitutor,
+    InFiled, LuaInstanceType, LuaOperatorOwner, TypeSubstitutor,
     db_index::{
         LuaFunctionType, LuaOperatorMetaMethod, LuaSignatureId, LuaType, LuaTypeDeclId,
         VariadicType,
     },
-    semantic::type_check::type_check_context::TypeCheckContext,
+    semantic::{
+        generic::{build_self_type, instantiate_doc_function},
+        infer::normalize_call_operator_doc_function,
+        type_check::type_check_context::TypeCheckContext,
+    },
 };
 
 use super::{
@@ -54,6 +60,12 @@ pub fn check_doc_func_type_compact(
         }
         LuaType::Def(type_id) => {
             check_doc_func_type_compact_for_custom_type(context, source_func, type_id, check_guard)
+        }
+        LuaType::TableConst(table) => {
+            check_doc_func_type_compact_for_table(context, source_func, table, check_guard)
+        }
+        LuaType::Instance(instance) => {
+            check_doc_func_type_compact_for_instance(context, source_func, instance, check_guard)
         }
         LuaType::Union(union) => {
             for union_type in union.types() {
@@ -445,7 +457,18 @@ fn check_doc_func_type_compact_for_custom_type(
                 .ok_or(TypeCheckFailReason::TypeNotMatch)?;
             let call_type = operator.get_operator_func(context.db);
             match call_type {
-                LuaType::DocFunction(doc_func) => {
+                LuaType::DocFunction(mut doc_func) => {
+                    if doc_func.contain_self() {
+                        let mut substitutor = TypeSubstitutor::new();
+                        let self_type =
+                            build_self_type(context.db, &LuaType::Ref(custom_type_id.clone()));
+                        substitutor.add_self_type(self_type);
+                        if let LuaType::DocFunction(instantiated) =
+                            instantiate_doc_function(context.db, &doc_func, &substitutor)
+                        {
+                            doc_func = instantiated;
+                        }
+                    }
                     match check_doc_func_type_compact_for_params(
                         context,
                         source_func,
@@ -463,7 +486,18 @@ fn check_doc_func_type_compact_for_custom_type(
                         .get_signature_index()
                         .get(&signature_id)
                         .ok_or(TypeCheckFailReason::TypeNotMatch)?;
-                    let doc_f = signature.to_call_operator_func_type();
+                    let mut doc_f = signature.to_call_operator_func_type();
+                    if doc_f.contain_self() {
+                        let mut substitutor = TypeSubstitutor::new();
+                        let self_type =
+                            build_self_type(context.db, &LuaType::Ref(custom_type_id.clone()));
+                        substitutor.add_self_type(self_type);
+                        if let LuaType::DocFunction(instantiated) =
+                            instantiate_doc_function(context.db, &doc_f, &substitutor)
+                        {
+                            doc_f = instantiated;
+                        }
+                    }
                     match check_doc_func_type_compact_for_params(
                         context,
                         source_func,
@@ -481,6 +515,95 @@ fn check_doc_func_type_compact_for_custom_type(
     }
 
     Err(TypeCheckFailReason::TypeNotMatch)
+}
+
+fn check_doc_func_type_compact_for_table(
+    context: &mut TypeCheckContext,
+    source_func: &LuaFunctionType,
+    table: &InFiled<TextRange>,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    let meta_table = context
+        .db
+        .get_metatable_index()
+        .get(table)
+        .ok_or(TypeCheckFailReason::TypeNotMatch)?;
+    let meta_table_owner = LuaOperatorOwner::Table(meta_table.clone());
+    let call_operators = context
+        .db
+        .get_operator_index()
+        .get_operators(&meta_table_owner, LuaOperatorMetaMethod::Call)
+        .ok_or(TypeCheckFailReason::TypeNotMatch)?;
+
+    for operator_id in call_operators {
+        let operator = context
+            .db
+            .get_operator_index()
+            .get_operator(operator_id)
+            .ok_or(TypeCheckFailReason::TypeNotMatch)?;
+        let call_type = operator.get_operator_func(context.db);
+        match call_type {
+            LuaType::DocFunction(doc_func) => {
+                let normalized = normalize_call_operator_doc_function(doc_func.as_ref());
+                match check_doc_func_type_compact_for_params(
+                    context,
+                    source_func,
+                    &normalized,
+                    check_guard.next_level()?,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if e.is_type_not_match() => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            LuaType::Signature(signature_id) => {
+                let signature = context
+                    .db
+                    .get_signature_index()
+                    .get(&signature_id)
+                    .ok_or(TypeCheckFailReason::TypeNotMatch)?;
+                let doc_f = signature.to_call_operator_func_type();
+                match check_doc_func_type_compact_for_params(
+                    context,
+                    source_func,
+                    &doc_f,
+                    check_guard.next_level()?,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if e.is_type_not_match() => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Err(TypeCheckFailReason::TypeNotMatch)
+}
+
+fn check_doc_func_type_compact_for_instance(
+    context: &mut TypeCheckContext,
+    source_func: &LuaFunctionType,
+    instance: &LuaInstanceType,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    match check_doc_func_type_compact_for_table(
+        context,
+        source_func,
+        instance.get_range(),
+        check_guard.next_level()?,
+    ) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.is_type_not_match() => {}
+        Err(e) => return Err(e),
+    }
+
+    check_doc_func_type_compact(
+        context,
+        source_func,
+        instance.get_base(),
+        check_guard.next_level()?,
+    )
 }
 
 pub fn check_sig_type_compact(

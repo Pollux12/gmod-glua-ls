@@ -23,6 +23,10 @@ use infer_call::infer_call_expr;
 pub use infer_call::infer_call_expr_func;
 pub(crate) use infer_call::signature_call_selects_declared_overload;
 pub(crate) use infer_call::table_backing_range_from_expr;
+pub(crate) use infer_call::{
+    infer_instance_type_doc_function, infer_table_type_doc_function,
+    normalize_call_operator_doc_function,
+};
 pub use infer_doc_type::{DocTypeInferContext, infer_doc_type};
 pub use infer_fail_reason::InferFailReason;
 pub(crate) use infer_index::check_iter_var_range;

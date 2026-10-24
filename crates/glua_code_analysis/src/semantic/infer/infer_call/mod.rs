@@ -1913,10 +1913,16 @@ fn infer_generic_type_doc_function(
     resolve_signature(db, cache, overloads, call_expr.clone(), false, args_count)
 }
 
-fn infer_instance_type_doc_function(
+pub(crate) fn infer_instance_type_doc_function(
     db: &DbIndex,
     instance: &LuaInstanceType,
 ) -> InferCallFuncResult {
+    match infer_table_type_doc_function(db, instance.get_range().clone()) {
+        Ok(func) => return Ok(func),
+        Err(InferFailReason::None) => {}
+        Err(err) => return Err(err),
+    }
+
     let base = instance.get_base();
     let base_table = match &base {
         LuaType::TableConst(meta_table) => meta_table.clone(),
@@ -1929,7 +1935,10 @@ fn infer_instance_type_doc_function(
     infer_table_type_doc_function(db, base_table)
 }
 
-fn infer_table_type_doc_function(db: &DbIndex, table: InFiled<TextRange>) -> InferCallFuncResult {
+pub(crate) fn infer_table_type_doc_function(
+    db: &DbIndex,
+    table: InFiled<TextRange>,
+) -> InferCallFuncResult {
     let meta_table = db
         .get_metatable_index()
         .get(&table)
@@ -1974,7 +1983,7 @@ fn infer_table_type_doc_function(db: &DbIndex, table: InFiled<TextRange>) -> Inf
     Err(InferFailReason::None)
 }
 
-fn normalize_call_operator_doc_function(func: &LuaFunctionType) -> Arc<LuaFunctionType> {
+pub(crate) fn normalize_call_operator_doc_function(func: &LuaFunctionType) -> Arc<LuaFunctionType> {
     let mut params = func.get_params().to_vec();
     let mut optional_params = func.get_optional_params().to_vec();
     if !params.is_empty() && !func.is_colon_define() {
