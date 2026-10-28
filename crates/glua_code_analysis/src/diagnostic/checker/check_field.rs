@@ -878,6 +878,19 @@ fn is_valid_member_inner(
     }
     match prefix_typ {
         LuaType::Global | LuaType::Userdata => return Some(()),
+        // `type-not-found` already reports the missing class, so its members are not judged.
+        LuaType::Ref(id)
+            if matches!(
+                code,
+                DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+            ) && semantic_model
+                .get_db()
+                .get_type_index()
+                .get_type_decl(id)
+                .is_none() =>
+        {
+            return Some(());
+        }
         LuaType::Array(typ) => {
             if typ.get_base().is_unknown() {
                 return Some(());

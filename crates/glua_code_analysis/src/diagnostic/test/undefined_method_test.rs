@@ -189,6 +189,9 @@ end
     fn explicit_parameter_type_keeps_undefined_method_error() {
         let diagnostics = gmod_diagnostics(
             r#"
+            ---@class Panel
+            local Panel = {}
+
             ---@param panel Panel
             local function update_panel(panel)
                 panel:MissingMethod()
@@ -2248,6 +2251,20 @@ end
             DiagnosticCode::UndefinedMethod,
             "lua/autorun/client/cl_panel.lua",
             "local a = CreatePanel()\nfunction a:Custom() end\n---@param b Panel\nlocal function Use(b) b:Custom() end\nprint(Use)\n",
+        ));
+    }
+
+    #[test]
+    fn method_on_a_class_that_does_not_exist_is_left_to_type_not_found() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            ---@return Missing
+            local function get() end
+
+            get():Update()
+            "#,
         ));
     }
 }
