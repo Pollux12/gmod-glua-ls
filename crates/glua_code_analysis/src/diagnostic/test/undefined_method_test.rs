@@ -2367,4 +2367,37 @@ end
             .collect::<Vec<_>>();
         assert_eq!(undefined_methods, ["Undefined method `Missing`. "]);
     }
+
+    #[test]
+    fn instance_methods_resolve_through_a_metatable_a_function_returns() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            local methods = {}
+            function methods:Known() end
+
+            local function GetClass()
+                return { __index = methods }
+            end
+
+            local function create()
+                local t = {}
+                setmetatable(t, GetClass())
+                t:Known()
+                t:Missing()
+            end
+            "#,
+        );
+
+        let undefined_methods = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(undefined_methods, ["Undefined method `Missing`. "]);
+    }
 }

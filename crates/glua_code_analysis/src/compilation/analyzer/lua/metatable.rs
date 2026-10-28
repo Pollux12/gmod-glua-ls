@@ -25,7 +25,12 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
     let metatable = args[1].clone();
 
     let file_id = analyzer.file_id;
-    let Some(metatable_range) = resolve_metatable_backing_table(analyzer, &metatable) else {
+    let metatable_range = resolve_metatable_backing_table(analyzer, &metatable).or_else(|| {
+        matches!(metatable, LuaExpr::CallExpr(_))
+            .then(|| inferred_table_range(analyzer, &metatable))
+            .flatten()
+    });
+    let Some(metatable_range) = metatable_range else {
         if let Some(backing_table) = resolve_metatable_backing_table(analyzer, &table) {
             let sort_key = writer_sort_key(analyzer);
             analyzer.write(StatementWrite::AddMetatable {
@@ -229,9 +234,24 @@ fn inferred_table_range(
     analyzer: &mut LuaAnalyzer,
     expr: &LuaExpr,
 ) -> Option<InFiled<rowan::TextRange>> {
-    match analyzer.infer_expr(expr).ok()? {
-        crate::LuaType::TableConst(range) => Some(range),
-        crate::LuaType::Instance(instance) => Some(instance.get_range().clone()),
+    single_table_range(&analyzer.infer_expr(expr).ok()?)
+}
+
+/// The one table literal every arm of `typ` is, or is an instance of.
+fn single_table_range(typ: &crate::LuaType) -> Option<InFiled<rowan::TextRange>> {
+    match typ {
+        crate::LuaType::TableConst(range) => Some(range.clone()),
+        crate::LuaType::Instance(instance) => match instance.get_base() {
+            crate::LuaType::TableConst(range) => Some(range.clone()),
+            _ => Some(instance.get_range().clone()),
+        },
+        crate::LuaType::Union(union) => {
+            let mut ranges = union.types().map(single_table_range);
+            let first = ranges.next()??;
+            ranges
+                .all(|range| range.as_ref() == Some(&first))
+                .then_some(first)
+        }
         _ => None,
     }
 }
