@@ -905,10 +905,9 @@ mod test {
     }
 
     #[test]
-    fn test_colon_receiver_contribution_requires_leading_self_name() {
+    fn test_colon_receiver_contribution_requires_leading_self_name_leaves_methods_open() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedMethod,
+        let file_id = ws.def(
             r#"
             local Class = {
                 __index = {
@@ -926,15 +925,16 @@ mod test {
             setmetatable(Class, Class)
 
             Class():create():makeDirty()
+            local probe = Class():create().makeDirty
             "#,
-        ));
+        );
+        assert!(!is_function_type(&ws.local_ty(file_id, "probe")));
     }
 
     #[test]
-    fn test_colon_receiver_contribution_rejects_nonleading_self() {
+    fn test_colon_receiver_contribution_rejects_nonleading_self_leaves_methods_open() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedMethod,
+        let file_id = ws.def(
             r#"
             local Class = {
                 __index = {
@@ -952,15 +952,16 @@ mod test {
             setmetatable(Class, Class)
 
             Class():create(nil):makeDirty()
+            local probe = Class():create(nil).makeDirty
             "#,
-        ));
+        );
+        assert!(!is_function_type(&ws.local_ty(file_id, "probe")));
     }
 
     #[test]
-    fn test_colon_receiver_contribution_rejects_mutated_self() {
+    fn test_colon_receiver_contribution_rejects_mutated_self_leaves_methods_open() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedMethod,
+        let file_id = ws.def(
             r#"
             local Class = {
                 __index = {
@@ -979,8 +980,10 @@ mod test {
             setmetatable(Class, Class)
 
             Class():create():makeDirty()
+            local probe = Class():create().makeDirty
             "#,
-        ));
+        );
+        assert!(!is_function_type(&ws.local_ty(file_id, "probe")));
     }
 
     #[test]
@@ -1074,10 +1077,9 @@ mod test {
     }
 
     #[test]
-    fn test_callable_table_nonreceiver_parameter_is_not_used_as_instance_metatable() {
+    fn test_callable_table_nonreceiver_parameter_leaves_instance_methods_open_but_unattributed() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedMethod,
+        let file_id = ws.def(
             r#"
             local Setting = {
                 __index = {
@@ -1086,12 +1088,14 @@ mod test {
                 __call = function(class, metatable)
                     local self = setmetatable({}, metatable)
                     self:known()
+                    local probe = self.known
                 end,
             }
 
             setmetatable(Setting, Setting)
             "#,
-        ));
+        );
+        assert!(!is_function_type(&ws.local_ty(file_id, "probe")));
     }
 
     #[test]
@@ -1190,10 +1194,9 @@ mod test {
     }
 
     #[test]
-    fn test_arbitrary_factory_parameter_is_not_treated_as_metatable_owner() {
+    fn test_arbitrary_factory_parameter_leaves_instance_methods_open_but_unattributed() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedMethod,
+        let file_id = ws.def(
             r#"
             local Class = {}
             Class.__index = Class
@@ -1204,8 +1207,10 @@ mod test {
             end
 
             make(Class):known()
+            local probe = make(Class).known
             "#,
-        ));
+        );
+        assert!(!is_function_type(&ws.local_ty(file_id, "probe")));
     }
 
     #[test]
@@ -2048,5 +2053,9 @@ mod test {
             end
             "#,
         ));
+    }
+
+    fn is_function_type(typ: &LuaType) -> bool {
+        matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }
 }

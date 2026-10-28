@@ -699,6 +699,47 @@ fn is_colon_method_call(index_expr: &LuaIndexExpr) -> bool {
             })
 }
 
+/// Whether nothing is known about the metatable written as `expr`, so its `__index`
+/// can provide any field at runtime.
+fn metatable_expr_type_is_unknown(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    expr: &crate::InFiled<rowan::TextRange>,
+) -> bool {
+    fn is_unknown_like(typ: &LuaType) -> bool {
+        match typ {
+            LuaType::Union(union) => union.types().any(is_unknown_like),
+            _ => typ.is_unknown() || typ.is_any(),
+        }
+    }
+    let Some(tree) = db.get_vfs().syntax_tree_around(&expr.file_id, expr.value) else {
+        return false;
+    };
+    let Some(metatable) = tree
+        .get_red_root()
+        .token_at_offset(expr.value.start())
+        .right_biased()
+        .and_then(|token| {
+            token
+                .parent_ancestors()
+                .filter_map(glua_parser::LuaExpr::cast)
+                .find(|candidate| candidate.get_range() == expr.value)
+        })
+    else {
+        return false;
+    };
+    let inferred = if expr.file_id == semantic_model.get_file_id() {
+        semantic_model.infer_expr(metatable)
+    } else {
+        let mut cache = crate::LuaInferCache::new(
+            expr.file_id,
+            semantic_model.get_cache().borrow_mut().get_config().clone(),
+        );
+        crate::infer_expr(db, &mut cache, metatable)
+    };
+    inferred.map_or(true, |typ| is_unknown_like(&typ))
+}
+
 fn has_unresolved_metatable_index(
     db: &DbIndex,
     semantic_model: &SemanticModel,
@@ -721,6 +762,14 @@ fn has_unresolved_metatable_index_inner(
     }
     match prefix_typ {
         LuaType::TableConst(table_range) => {
+            if db
+                .get_metatable_index()
+                .opaque_metatable_exprs(table_range)
+                .iter()
+                .any(|expr| metatable_expr_type_is_unknown(db, semantic_model, expr))
+            {
+                return true;
+            }
             let Some(metatable) = db.get_metatable_index().get(table_range) else {
                 return false;
             };

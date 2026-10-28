@@ -7,8 +7,8 @@ use super::StatementWrite;
 use super::stats::register_positional_instance_members;
 use crate::semantic::decl_value_expr;
 use crate::{
-    InFiled, LuaDeclExtra, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId,
-    OperatorFunction, SetmetatableFactoryBinding,
+    BoundMetatable, InFiled, LuaDeclExtra, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner,
+    LuaSignatureId, OperatorFunction, SetmetatableFactoryBinding,
 };
 
 use super::LuaAnalyzer;
@@ -26,6 +26,15 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
 
     let file_id = analyzer.file_id;
     let Some(metatable_range) = resolve_metatable_backing_table(analyzer, &metatable) else {
+        if let Some(backing_table) = resolve_metatable_backing_table(analyzer, &table) {
+            let sort_key = writer_sort_key(analyzer);
+            analyzer.write(StatementWrite::AddMetatable {
+                table: backing_table,
+                metatable: BoundMetatable::Opaque(InFiled::new(file_id, metatable.get_range())),
+                file_id,
+                sort_key,
+            });
+        }
         return Some(());
     };
     if let Some(instance_range) = resolve_metatable_backing_table(analyzer, &table)
@@ -37,7 +46,7 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
 
     analyzer.write(StatementWrite::AddMetatable {
         table: InFiled::new(file_id, table.get_range()),
-        metatable: metatable_range.clone(),
+        metatable: BoundMetatable::Table(metatable_range.clone()),
         file_id,
         sort_key: writer_sort_key.clone(),
     });
@@ -55,7 +64,7 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
     if let Some(backing_table) = resolve_metatable_backing_table(analyzer, &table) {
         analyzer.write(StatementWrite::AddMetatable {
             table: backing_table,
-            metatable: metatable_range.clone(),
+            metatable: BoundMetatable::Table(metatable_range.clone()),
             file_id,
             sort_key: writer_sort_key,
         });

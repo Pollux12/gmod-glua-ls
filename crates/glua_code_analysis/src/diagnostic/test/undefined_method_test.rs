@@ -2298,4 +2298,73 @@ end
             .collect::<Vec<_>>();
         assert_eq!(undefined_methods, ["Undefined method `Missing`. "]);
     }
+
+    #[test]
+    fn methods_of_an_instance_whose_metatable_is_not_a_table_literal_are_not_undefined() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            local function GetClass(name)
+                return _G[name]
+            end
+
+            local function create(name)
+                local part = setmetatable({}, GetClass(name))
+                part:SetUniqueID(1)
+                return part
+            end
+            "#,
+        );
+
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
+    fn methods_of_a_local_table_given_an_unresolved_metatable_are_not_undefined() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            local function GetClass(name)
+                return _G[name]
+            end
+
+            local function create(name)
+                local t = {}
+                setmetatable(t, GetClass(name))
+                t:GetNorm()
+                return t
+            end
+            "#,
+        );
+
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
+    fn methods_missing_from_an_instance_whose_metatable_is_a_table_literal_are_undefined() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            local META = {}
+            META.__index = META
+            function META:Known() end
+
+            local function create()
+                local part = setmetatable({}, META)
+                part:Known()
+                part:Missing()
+                return part
+            end
+            "#,
+        );
+
+        let undefined_methods = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(undefined_methods, ["Undefined method `Missing`. "]);
+    }
 }

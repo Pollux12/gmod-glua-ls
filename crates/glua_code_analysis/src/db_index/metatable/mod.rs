@@ -34,9 +34,40 @@ pub struct LuaMetatableIndex {
     factory_writers_by_file: CowShards<FileId, HashSet<FileId>>,
 }
 
+/// What a table's metatable is known as.
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub enum BoundMetatable {
+    /// The table literal backing the metatable.
+    Table(InFiled<TextRange>),
+    /// The expression of a metatable no table literal backs.
+    Opaque(InFiled<TextRange>),
+}
+
+impl BoundMetatable {
+    fn range(&self) -> &InFiled<TextRange> {
+        match self {
+            BoundMetatable::Table(range) | BoundMetatable::Opaque(range) => range,
+        }
+    }
+
+    fn table(&self) -> Option<&InFiled<TextRange>> {
+        match self {
+            BoundMetatable::Table(range) => Some(range),
+            BoundMetatable::Opaque(_) => None,
+        }
+    }
+
+    fn with_range(&self, range: InFiled<TextRange>) -> Self {
+        match self {
+            BoundMetatable::Table(_) => BoundMetatable::Table(range),
+            BoundMetatable::Opaque(_) => BoundMetatable::Opaque(range),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetatableBinding {
-    pub metatable: InFiled<TextRange>,
+    pub metatable: BoundMetatable,
     pub writer_file_id: FileId,
     /// Normalized path of the writing file. File ids are not stable between a cold build and an
     /// incremental session, so the winner among several writers is ordered by path.
@@ -83,6 +114,38 @@ impl LuaMetatableIndex {
         writer_file_id: FileId,
         writer_sort_key: Arc<str>,
     ) {
+        self.bind(
+            table,
+            BoundMetatable::Table(metatable),
+            writer_file_id,
+            writer_sort_key,
+        );
+    }
+
+    /// Records that `table` was given the metatable written as `expr`, which
+    /// no table literal backs.
+    pub fn add_opaque(
+        &mut self,
+        table: InFiled<TextRange>,
+        expr: InFiled<TextRange>,
+        writer_file_id: FileId,
+        writer_sort_key: Arc<str>,
+    ) {
+        self.bind(
+            table,
+            BoundMetatable::Opaque(expr),
+            writer_file_id,
+            writer_sort_key,
+        );
+    }
+
+    fn bind(
+        &mut self,
+        table: InFiled<TextRange>,
+        metatable: BoundMetatable,
+        writer_file_id: FileId,
+        writer_sort_key: Arc<str>,
+    ) {
         derivation::note_write(|| FactKey::Metatable(table.clone()));
         let linked = self.site_files(&table);
         let bindings = self.metatables.entry(table.clone()).or_default();
@@ -117,7 +180,7 @@ impl LuaMetatableIndex {
             .get(table)
             .into_iter()
             .flatten()
-            .map(|binding| binding.metatable.file_id)
+            .map(|binding| binding.metatable.range().file_id)
             .filter(|file_id| *file_id != table.file_id)
             .collect()
     }
@@ -176,10 +239,26 @@ impl LuaMetatableIndex {
 
     pub fn get(&self, table: &InFiled<TextRange>) -> Option<&InFiled<TextRange>> {
         derivation::note_read(|| FactKey::Metatable(table.clone()));
+        self.metatables.get(table).and_then(|bindings| {
+            bindings
+                .iter()
+                .find_map(|binding| binding.metatable.table())
+        })
+    }
+
+    /// The expressions of the metatables `table` was given that no table
+    /// literal backs.
+    pub fn opaque_metatable_exprs(&self, table: &InFiled<TextRange>) -> Vec<InFiled<TextRange>> {
+        derivation::note_read(|| FactKey::Metatable(table.clone()));
         self.metatables
             .get(table)
-            .and_then(|bindings| bindings.first())
-            .map(|binding| &binding.metatable)
+            .into_iter()
+            .flatten()
+            .filter_map(|binding| match &binding.metatable {
+                BoundMetatable::Opaque(expr) => Some(expr.clone()),
+                BoundMetatable::Table(_) => None,
+            })
+            .collect()
     }
 
     /// Every recorded binding, paired with the table literal it is keyed on.
@@ -251,9 +330,10 @@ impl LuaMetatableIndex {
                 if let Some(tables) = self.by_writer.get_mut(&binding.writer_file_id) {
                     tables.retain(|existing| existing != &table);
                 }
-                match (new_table.clone(), map_range(remap, &binding.metatable)) {
+                let new_metatable = map_range(remap, binding.metatable.range());
+                match (new_table.clone(), new_metatable) {
                     (Some(_), Some(new_metatable)) => kept.push(MetatableBinding {
-                        metatable: new_metatable,
+                        metatable: binding.metatable.with_range(new_metatable),
                         ..binding
                     }),
                     // Only the writer can record this binding again.
@@ -334,8 +414,13 @@ impl LuaMetatableIndex {
             FactKey::Metatable(table) => derivation::fingerprint_opt(
                 self.metatables
                     .get(table)
-                    .and_then(|bindings| bindings.first())
-                    .map(|binding| &binding.metatable),
+                    .map(|bindings| {
+                        bindings
+                            .iter()
+                            .map(|binding| &binding.metatable)
+                            .collect::<Vec<_>>()
+                    })
+                    .as_ref(),
             ),
             FactKey::MetatableFactory(file_id) => {
                 derivation::fingerprint_opt(self.factory_bindings.get(file_id))
@@ -447,9 +532,10 @@ mod tests {
     fn assert_reverse_indexes_match_a_scan(index: &LuaMetatableIndex) {
         let mut sites: FxHashMap<FileId, FxHashSet<InFiled<TextRange>>> = FxHashMap::default();
         for (table, binding) in index.iter_bindings() {
-            if binding.metatable.file_id != table.file_id {
+            let metatable = binding.metatable.range();
+            if metatable.file_id != table.file_id {
                 sites
-                    .entry(binding.metatable.file_id)
+                    .entry(metatable.file_id)
                     .or_default()
                     .insert(table.clone());
             }
@@ -472,6 +558,33 @@ mod tests {
             .map(|(file_id, writers)| (*file_id, writers.clone()))
             .collect();
         assert_eq!(indexed, writers);
+    }
+
+    #[test]
+    fn an_opaque_metatable_binding_belongs_to_its_writer_and_survives_remaps() {
+        let (table_file, writer) = (FileId::new(1), FileId::new(2));
+        let range = |start: u32| TextRange::new(TextSize::new(start), TextSize::new(start + 4));
+        let table = InFiled::new(table_file, range(10));
+        let mut index = LuaMetatableIndex::new();
+        let expr = InFiled::new(writer, range(40));
+        index.add_opaque(table.clone(), expr.clone(), writer, key("w.lua"));
+        assert_eq!(index.opaque_metatable_exprs(&table), [expr]);
+        assert_eq!(index.get(&table), None);
+
+        let shifted = index.remap_file_ranges(&FileRemap::unvalidated(
+            table_file,
+            PositionMap::new(
+                "abc", "
+abc",
+            ),
+        ));
+        assert!(shifted.is_empty());
+        let shifted_table = InFiled::new(table_file, range(11));
+        assert!(index.opaque_metatable_exprs(&table).is_empty());
+        assert_eq!(index.opaque_metatable_exprs(&shifted_table).len(), 1);
+
+        index.remove(writer);
+        assert!(index.opaque_metatable_exprs(&shifted_table).is_empty());
     }
 
     #[test]

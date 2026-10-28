@@ -7,10 +7,10 @@ use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
 use crate::{
-    DbIndex, FileId, GlobalId, InFiled, LuaClassNameReturnAlias, LuaDeclId, LuaDocReturnInfo,
-    LuaInferenceNodeId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaMemberOwner,
-    LuaOperator, LuaReturnCorrelation, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeCache,
-    LuaTypeFact, LuaTypeOwner, SignatureReturnStatus,
+    BoundMetatable, DbIndex, FileId, GlobalId, InFiled, LuaClassNameReturnAlias, LuaDeclId,
+    LuaDocReturnInfo, LuaInferenceNodeId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey,
+    LuaMemberOwner, LuaOperator, LuaReturnCorrelation, LuaSemanticDeclId, LuaSignatureId, LuaType,
+    LuaTypeCache, LuaTypeFact, LuaTypeOwner, SignatureReturnStatus,
     compilation::analyzer::{
         common::{
             DeclWrite, TypeCacheWriteMode, add_member, bind_decl_write, bind_type, write_type_cache,
@@ -270,7 +270,7 @@ pub(in crate::compilation::analyzer) enum StatementWrite {
     },
     AddMetatable {
         table: InFiled<TextRange>,
-        metatable: InFiled<TextRange>,
+        metatable: BoundMetatable,
         file_id: FileId,
         sort_key: Arc<str>,
     },
@@ -393,12 +393,15 @@ impl StatementWrite {
                 file_id,
                 sort_key,
             } => {
-                db.get_metatable_index_mut().add(
-                    table.clone(),
-                    metatable.clone(),
-                    *file_id,
-                    sort_key.clone(),
-                );
+                let index = db.get_metatable_index_mut();
+                match metatable {
+                    BoundMetatable::Table(metatable) => {
+                        index.add(table.clone(), metatable.clone(), *file_id, sort_key.clone())
+                    }
+                    BoundMetatable::Opaque(expr) => {
+                        index.add_opaque(table.clone(), expr.clone(), *file_id, sort_key.clone())
+                    }
+                }
             }
             StatementWrite::AddFactoryBinding(binding) => {
                 db.get_metatable_index_mut()

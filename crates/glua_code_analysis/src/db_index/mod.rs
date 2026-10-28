@@ -59,7 +59,7 @@ pub use gmod_infer::*;
 pub use gmod_load::*;
 pub use gmod_network::*;
 pub use member::*;
-pub use metatable::{LuaMetatableIndex, SetmetatableFactoryBinding};
+pub use metatable::{BoundMetatable, LuaMetatableIndex, SetmetatableFactoryBinding};
 pub use module::*;
 pub use numeric_range_population::*;
 pub use operators::*;
