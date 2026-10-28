@@ -2339,6 +2339,26 @@ end
     }
 
     #[test]
+    fn methods_of_a_table_whose_metatable_index_is_a_function_are_not_undefined() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            local proxy = {}
+            proxy.__index = function(self, key)
+                return rawget(self, "_target")[key]
+            end
+
+            local function create()
+                local t = setmetatable({}, proxy)
+                t:EmitSound()
+                return t
+            end
+            "#,
+        );
+
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
     fn methods_missing_from_an_instance_whose_metatable_is_a_table_literal_are_undefined() {
         let diagnostics = gmod_diagnostics(
             r#"

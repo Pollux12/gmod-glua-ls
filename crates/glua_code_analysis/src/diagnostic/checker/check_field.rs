@@ -785,9 +785,12 @@ fn has_unresolved_metatable_index_inner(
                 None,
             );
 
-            // A present but unresolved Lua `__index` can provide fields at runtime, so field
-            // absence cannot be proven. Known `__index` types still flow through normal checks.
-            index_type.is_ok_and(|typ| typ.is_unknown())
+            // A present but unresolved Lua `__index`, or one that is a function, can provide any
+            // field at runtime, so field absence cannot be proven. Known table `__index` types
+            // still flow through normal checks.
+            index_type.is_ok_and(|typ| {
+                typ.is_unknown() || matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
+            })
         }
         LuaType::Instance(instance) => has_unresolved_metatable_index_inner(
             db,

@@ -1304,9 +1304,9 @@ mod test {
     }
 
     #[test]
-    fn test_literal_index_later_function_overwrite_rejects_factory_recovery() {
+    fn test_literal_index_later_function_overwrite_leaves_methods_open() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
+        assert!(ws.check_code_for(
             DiagnosticCode::UndefinedMethod,
             r#"
             local Class = {}
@@ -1480,12 +1480,10 @@ mod test {
             value:known()
         "#;
         let unsupported_content = r#"
+            local Other = {}
             local Class = {}
             function Class:known() end
-            local Meta = { __index = Class }
-            Meta.__index = function(_, key)
-                return rawget(Class, key)
-            end
+            local Meta = { __index = Other }
             local value = setmetatable({}, Meta)
             value:known()
         "#;
