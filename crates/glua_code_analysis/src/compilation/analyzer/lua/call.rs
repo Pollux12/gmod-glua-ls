@@ -1568,7 +1568,7 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
     analyzer.write(StatementWrite::AddGmodClassCall {
         file_id: analyzer.file_id,
         kind,
-        metadata: GmodScriptedClassCallMetadata {
+        metadata: Box::new(GmodScriptedClassCallMetadata {
             syntax_id: call_expr.get_syntax_id(),
             literal_args,
             args,
@@ -1578,7 +1578,7 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
             vgui_panel_roles: None,
             derma_skin_roles: None,
             register_roles: None,
-        },
+        }),
     });
 }
 

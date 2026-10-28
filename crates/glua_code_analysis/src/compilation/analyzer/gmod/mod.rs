@@ -202,7 +202,10 @@ fn formatted_hook_prefixes(db: &DbIndex) -> Vec<String> {
 /// applied afterwards in the original file-then-call order.
 pub(crate) enum PendingCallSite {
     VguiParent(GmodVguiParentCallMetadata),
-    ScriptedClass(GmodScriptedClassCallKind, GmodScriptedClassCallMetadata),
+    ScriptedClass(
+        GmodScriptedClassCallKind,
+        Box<GmodScriptedClassCallMetadata>,
+    ),
     Dependency(LuaDependencySite),
     LoadScan(GmodFileLoadScan),
 }
@@ -366,7 +369,7 @@ pub(crate) fn apply_annotated_call_sites(
                 .add_vgui_parent_call(file_id, call),
             PendingCallSite::ScriptedClass(kind, call) => db
                 .get_gmod_class_metadata_index_mut()
-                .add_call(file_id, kind, call),
+                .add_call(file_id, kind, *call),
             PendingCallSite::Dependency(site) => db
                 .get_file_dependencies_index_mut()
                 .add_dependency_site(site),
@@ -836,7 +839,7 @@ impl ForwardedArg {
         else {
             return None;
         };
-        if !inner.field_path.is_empty() && !(prefix.is_empty() && suffix.is_empty()) {
+        if !inner.field_path.is_empty() && (!prefix.is_empty() || !suffix.is_empty()) {
             return None;
         }
         Some(AnnotatedGmodCallArgRole {
@@ -9368,7 +9371,7 @@ fn collect_annotated_scripted_class_call_metadata(
             extract_gmod_class_call_args(db, file_id, &call_expr, &[]);
         pending.push(PendingCallSite::ScriptedClass(
             kind,
-            GmodScriptedClassCallMetadata {
+            Box::new(GmodScriptedClassCallMetadata {
                 syntax_id: call_expr.get_syntax_id(),
                 literal_args,
                 args,
@@ -9378,7 +9381,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 vgui_panel_roles: None,
                 derma_skin_roles: None,
                 register_roles: None,
-            },
+            }),
         ));
         return Some(());
     }
@@ -9390,7 +9393,7 @@ fn collect_annotated_scripted_class_call_metadata(
             extract_gmod_class_call_args(db, file_id, &call_expr, &[]);
         pending.push(PendingCallSite::ScriptedClass(
             kind,
-            GmodScriptedClassCallMetadata {
+            Box::new(GmodScriptedClassCallMetadata {
                 syntax_id: call_expr.get_syntax_id(),
                 literal_args,
                 args,
@@ -9400,7 +9403,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 vgui_panel_roles: None,
                 derma_skin_roles: None,
                 register_roles: None,
-            },
+            }),
         ));
         return Some(());
     }
@@ -9413,7 +9416,7 @@ fn collect_annotated_scripted_class_call_metadata(
             extract_gmod_class_call_args(db, file_id, &call_expr, &field_sources);
         pending.push(PendingCallSite::ScriptedClass(
             kind,
-            GmodScriptedClassCallMetadata {
+            Box::new(GmodScriptedClassCallMetadata {
                 syntax_id: call_expr.get_syntax_id(),
                 literal_args,
                 args,
@@ -9423,7 +9426,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 vgui_panel_roles: Some(vgui_panel_roles),
                 derma_skin_roles: None,
                 register_roles: None,
-            },
+            }),
         ));
         return Some(());
     }
@@ -9435,7 +9438,7 @@ fn collect_annotated_scripted_class_call_metadata(
             extract_gmod_class_call_args(db, file_id, &call_expr, &[]);
         pending.push(PendingCallSite::ScriptedClass(
             kind,
-            GmodScriptedClassCallMetadata {
+            Box::new(GmodScriptedClassCallMetadata {
                 syntax_id: call_expr.get_syntax_id(),
                 literal_args,
                 args,
@@ -9445,7 +9448,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 vgui_panel_roles: None,
                 derma_skin_roles: None,
                 register_roles: Some(register_roles),
-            },
+            }),
         ));
         return Some(());
     }
@@ -9457,7 +9460,7 @@ fn collect_annotated_scripted_class_call_metadata(
             extract_gmod_class_call_args(db, file_id, &call_expr, &[]);
         pending.push(PendingCallSite::ScriptedClass(
             GmodScriptedClassCallKind::DermaDefineSkin,
-            GmodScriptedClassCallMetadata {
+            Box::new(GmodScriptedClassCallMetadata {
                 syntax_id: call_expr.get_syntax_id(),
                 literal_args,
                 args,
@@ -9467,7 +9470,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 vgui_panel_roles: None,
                 derma_skin_roles: Some(derma_skin_roles),
                 register_roles: None,
-            },
+            }),
         ));
         return Some(());
     }

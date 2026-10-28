@@ -464,7 +464,7 @@ fn check_index_expr(
                 &mut state.subtypes_with_member,
                 context.get_file_id(),
                 index_expr,
-                &prefix_typ,
+                &placeholder_constraint(db, &prefix_typ).unwrap_or_else(|| prefix_typ.clone()),
                 &LuaMemberKey::Name(field_name.clone()),
             )
             .map(|children| children.to_vec())
@@ -2907,6 +2907,19 @@ fn owner_wildcard_covers_any_field(db: &DbIndex, owner: &crate::DynamicFieldOwne
             .get_fields(owner)
             .is_some_and(|fields| !fields.is_empty())
         || crate::is_pure_wildcard_registry(db, owner)
+}
+
+/// The constraint a call-site string template stood in for when `typ` is the
+/// class generated from it and nothing defines that name.
+fn placeholder_constraint(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
+    let LuaType::Ref(id) = typ else {
+        return None;
+    };
+    let type_index = db.get_type_index();
+    if type_index.has_non_auto_declaration(id) {
+        return None;
+    }
+    type_index.get_super_types_iter(id)?.next().cloned()
 }
 
 #[cfg(test)]

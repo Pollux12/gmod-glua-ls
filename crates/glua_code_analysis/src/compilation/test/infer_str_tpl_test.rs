@@ -3550,4 +3550,51 @@ Y = x
             }
         }
     }
+
+    #[gtest]
+    fn a_member_read_on_a_never_defined_materialized_name_is_a_guard_warning_not_an_error() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/tools/materialized_panel_name.lua",
+            r#"
+                ---@class Panel
+                local Panel = {}
+                ---@generic T : Panel
+                ---@param class `T`
+                ---@return T
+                function Panel:Add(class) end
+
+                ---@class DListLayout: Panel
+                local DListLayout = {}
+                function DListLayout:SetContents(contents) end
+
+                local function Populate(name, pnl)
+                    local list = pnl:Add(name)
+                    list:SetContents(1)
+                end
+                ---@type Panel
+                local root
+                Populate("General", root)
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let has = |code: DiagnosticCode| {
+            let code = Some(NumberOrString::String(code.get_name().to_string()));
+            diagnostics.iter().any(|diagnostic| diagnostic.code == code)
+        };
+        expect_that!(
+            has(DiagnosticCode::UndefinedMethod),
+            eq(false),
+            "{diagnostics:?}"
+        );
+        expect_that!(
+            has(DiagnosticCode::InferUnguardedChild),
+            eq(true),
+            "{diagnostics:?}"
+        );
+    }
 }

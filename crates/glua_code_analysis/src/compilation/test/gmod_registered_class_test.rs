@@ -414,7 +414,7 @@ function PANEL:Init() self:Missing() end
 
     #[gtest]
     fn registering_a_swep_table_raises_no_parameter_mismatch_on_the_call() {
-        let mut ws = weapon_workspace(&[(HANDS_PATH, HANDS)]);
+        let ws = weapon_workspace(&[(HANDS_PATH, HANDS)]);
         let file_id = ws
             .analysis
             .get_file_id(&ws.virtual_url_generator.new_uri(HANDS_PATH))

@@ -288,7 +288,7 @@ pub(in crate::compilation::analyzer) enum StatementWrite {
     AddGmodClassCall {
         file_id: FileId,
         kind: GmodScriptedClassCallKind,
-        metadata: GmodScriptedClassCallMetadata,
+        metadata: Box<GmodScriptedClassCallMetadata>,
     },
     Signature {
         signature_id: LuaSignatureId,
@@ -430,8 +430,11 @@ impl StatementWrite {
                 kind,
                 metadata,
             } => {
-                db.get_gmod_class_metadata_index_mut()
-                    .add_call(*file_id, *kind, metadata.clone());
+                db.get_gmod_class_metadata_index_mut().add_call(
+                    *file_id,
+                    *kind,
+                    (**metadata).clone(),
+                );
             }
             StatementWrite::Signature {
                 signature_id,
