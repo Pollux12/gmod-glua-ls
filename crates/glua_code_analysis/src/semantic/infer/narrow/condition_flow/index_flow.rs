@@ -186,7 +186,7 @@ fn maybe_field_exist_narrow(
         }
     }
 
-    let result = drop_subtypes_of_arms_holding_the_field(db, &left_type, result);
+    let result = drop_subtypes_of_arms_holding_the_field(db, &left_type, &member_key, result);
 
     match condition_flow {
         InferConditionFlow::TrueCondition => {
@@ -240,18 +240,26 @@ fn maybe_field_exist_narrow(
     Ok(ResultTypeOrContinue::Continue)
 }
 
-/// An antecedent arm that already holds the field, directly or inherited,
-/// stands for its subtypes: the guard tells nothing more about them, and
-/// narrowing the arm to a subclass that overrides the field would replace a
-/// base class with one of its own derived panels.
+/// An antecedent arm that declares the field, directly or inherited, stands
+/// for its subtypes: the guard tells nothing more about them, and narrowing
+/// the arm to a subclass that overrides the field would replace a base class
+/// with one of its own derived panels. An arm whose field only infers as
+/// present, as on an open entity, still narrows to the subtypes declaring it.
 fn drop_subtypes_of_arms_holding_the_field(
     db: &DbIndex,
     left_type: &LuaType,
+    member_key: &LuaMemberKey,
     result: Vec<LuaType>,
 ) -> Vec<LuaType> {
     let arms = collect_antecedent_nominal_arms(left_type)
         .into_iter()
         .filter(|arm| result.contains(arm))
+        .filter(|arm| match arm {
+            LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+                type_or_super_owns_member(db, type_id, member_key)
+            }
+            _ => false,
+        })
         .collect::<Vec<_>>();
     if arms.is_empty() {
         return result;
@@ -336,6 +344,30 @@ fn type_directly_owns_member(
     member_index
         .get_member_item(&global_owner, member_key)
         .is_some()
+}
+
+fn type_or_super_owns_member(
+    db: &DbIndex,
+    type_id: &LuaTypeDeclId,
+    member_key: &LuaMemberKey,
+) -> bool {
+    let mut seen = FxHashSet::default();
+    let mut pending = vec![type_id.clone()];
+    while let Some(type_id) = pending.pop() {
+        if !seen.insert(type_id.clone()) {
+            continue;
+        }
+        if type_directly_owns_member(db, &type_id, member_key) {
+            return true;
+        }
+        if let Some(super_types) = db.get_type_index().get_super_types_iter(&type_id) {
+            pending.extend(super_types.filter_map(|super_type| match super_type {
+                LuaType::Ref(id) | LuaType::Def(id) => Some(id.clone()),
+                _ => None,
+            }));
+        }
+    }
+    false
 }
 
 pub(super) fn infer_field_guard_member(

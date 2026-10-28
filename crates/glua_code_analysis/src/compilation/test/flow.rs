@@ -3155,6 +3155,55 @@ _2 = a[1]
     }
 
     #[test]
+    fn field_guard_narrows_a_weapon_to_the_scripted_weapon_declaring_the_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_files(vec![
+            (
+                "annotations/entity.lua",
+                r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@class Weapon: Entity
+                local Weapon = {}
+
+                ---@class Player: Entity
+                local Player = {}
+
+                ---@return Weapon
+                function Player:GetActiveWeapon() end
+
+                ---@param value any
+                ---@return boolean
+                function IsValid(value) end
+                "#,
+            ),
+            (
+                "lua/weapons/cw_base/shared.lua",
+                r#"
+                SWEP.CW20Weapon = true
+                function SWEP:MakeRecoil() end
+                "#,
+            ),
+            (
+                "lua/autorun/client/cw_hooks.lua",
+                r#"
+                ---@param ply Player
+                local function Recoil(ply)
+                    local wep = ply:GetActiveWeapon()
+                    if IsValid(wep) and wep.CW20Weapon then
+                        A = wep
+                    end
+                end
+                "#,
+            ),
+        ]);
+
+        let a = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(a), "cw_base");
+    }
+
+    #[test]
     fn test_isfunction_member_guard_narrows_base_entity_to_callable_member_subtypes() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 
