@@ -106,6 +106,42 @@ mod null_accepting_argument_tests {
     }
 
     #[test]
+    fn a_truthiness_test_on_a_variant_holding_null_is_not_an_entity_validity_test() {
+        let mut ws = creator_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::GmodNullCheck,
+            r#"
+            ---@return number|boolean|string|Entity|NULL
+            function GetSetting() end
+
+            local function save()
+                if GetSetting() then
+                    return true
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_truthiness_test_on_a_false_or_null_entity_still_reports() {
+        let mut ws = creator_workspace();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::GmodNullCheck,
+            r#"
+            ---@return Entity|NULL|false
+            function GetEntityOrFalse() end
+
+            local function save()
+                if GetEntityOrFalse() then
+                    return true
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[test]
     fn a_nil_comparison_followed_only_by_comparisons_still_reports() {
         let mut ws = creator_workspace();
         let file = ws.def_file(

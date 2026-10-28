@@ -84,6 +84,39 @@ pub(crate) fn contains_gmod_null_type(db: &DbIndex, typ: &LuaType) -> bool {
     }
 }
 
+/// Whether `typ` can hold NULL and every other arm is an entity, nil or a
+/// boolean. A union that also carries numbers, strings or other plain values is
+/// a variant: its truthiness tests those values, so it is not an entity whose
+/// validity the caller confuses with truthiness.
+pub(crate) fn is_gmod_null_entity_candidate(db: &DbIndex, typ: &LuaType) -> bool {
+    contains_gmod_null_type(db, typ) && is_entity_nil_or_boolean(db, typ)
+}
+
+fn is_entity_nil_or_boolean(db: &DbIndex, typ: &LuaType) -> bool {
+    let entity_id = LuaTypeDeclId::global("Entity");
+    match get_real_type(db, typ).unwrap_or(typ) {
+        LuaType::Nil
+        | LuaType::Boolean
+        | LuaType::BooleanConst(_)
+        | LuaType::DocBooleanConst(_)
+        | LuaType::Unknown
+        | LuaType::Any => true,
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            type_id == &entity_id
+                || super::super::type_check::is_sub_type_of(db, type_id, &entity_id)
+        }
+        LuaType::Union(union_type) => union_type
+            .types()
+            .all(|member| is_entity_nil_or_boolean(db, member)),
+        LuaType::MultiLineUnion(multi_union) => multi_union
+            .get_unions()
+            .iter()
+            .all(|(member, _)| is_entity_nil_or_boolean(db, member)),
+        LuaType::Instance(instance_type) => is_entity_nil_or_boolean(db, instance_type.get_base()),
+        _ => false,
+    }
+}
+
 /// Whether the backward flow walk could possibly change `var_ref_id`'s type from
 /// its declared/origin type, given the file-wide narrowing capability. When this
 /// returns `false`, the walk is guaranteed to be a no-op and can be skipped.

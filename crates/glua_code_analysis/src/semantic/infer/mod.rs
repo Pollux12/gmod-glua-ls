@@ -57,8 +57,8 @@ use infer_unary::infer_unary_expr;
 pub use narrow::{SelfRefId, VarRefId, VarRefRootId};
 pub(crate) use narrow::{
     condition_has_concrete_type_evidence, condition_nominal_type, contains_gmod_null_type,
-    get_var_expr_var_ref_id, getter_access_path, presence_guard_target, raw_get_access_path,
-    remove_false_or_nil,
+    get_var_expr_var_ref_id, getter_access_path, is_gmod_null_entity_candidate,
+    presence_guard_target, raw_get_access_path, remove_false_or_nil,
 };
 
 use rowan::TextRange;

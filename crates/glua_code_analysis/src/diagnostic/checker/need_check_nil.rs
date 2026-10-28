@@ -15,7 +15,10 @@ use crate::{
     compilation::analyzer::gmod::global_call_path_for_signature_closure,
     find_best_direct_call_arg_role_from_type, find_signature_attribute_use,
     get_var_expr_var_ref_id,
-    semantic::{InferConditionFlow, apply_cast, contains_gmod_null_type, remove_false_or_nil},
+    semantic::{
+        InferConditionFlow, apply_cast, contains_gmod_null_type, is_gmod_null_entity_candidate,
+        remove_false_or_nil,
+    },
     signature_is_valid_guard_in_realm, signature_is_valid_guard_or_base_runtime_isvalid_in_realm,
 };
 
@@ -3745,7 +3748,7 @@ fn check_condition_expr(
             let can_be_null = semantic_model
                 .infer_expr(expr.clone())
                 .is_ok_and(|expr_type| {
-                    contains_gmod_null_type(semantic_model.get_db(), &expr_type)
+                    is_gmod_null_entity_candidate(semantic_model.get_db(), &expr_type)
                 });
             if !can_be_null
                 || is_sentinel_followed_by_type_guard(semantic_model, &expr)
@@ -4637,7 +4640,7 @@ fn is_nil_expr(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {
 fn expr_can_be_gmod_null(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {
     semantic_model
         .infer_expr(expr.clone())
-        .is_ok_and(|expr_type| contains_gmod_null_type(semantic_model.get_db(), &expr_type))
+        .is_ok_and(|expr_type| is_gmod_null_entity_candidate(semantic_model.get_db(), &expr_type))
 }
 
 #[cfg(test)]

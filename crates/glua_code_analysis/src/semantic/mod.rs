@@ -136,7 +136,8 @@ pub(crate) use infer::{ParamInferenceSource, infer_param_is_weak, infer_param_so
 pub use infer::{SelfRefId, VarRefId, VarRefRootId};
 pub(crate) use infer::{
     condition_has_concrete_type_evidence, condition_nominal_type, contains_gmod_null_type,
-    get_var_expr_var_ref_id, getter_access_path, raw_get_access_path,
+    get_var_expr_var_ref_id, getter_access_path, is_gmod_null_entity_candidate,
+    raw_get_access_path,
 };
 pub use infer::{infer_param, infer_param_with_cache};
 use overload_resolve::resolve_signature;
