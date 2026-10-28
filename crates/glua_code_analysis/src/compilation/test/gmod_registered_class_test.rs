@@ -411,4 +411,24 @@ function PANEL:Init() self:Missing() end
             elements_are![contains_substring("Missing")]
         );
     }
+
+    #[gtest]
+    fn registering_a_swep_table_raises_no_parameter_mismatch_on_the_call() {
+        let mut ws = weapon_workspace(&[(HANDS_PATH, HANDS)]);
+        let file_id = ws
+            .analysis
+            .get_file_id(&ws.virtual_url_generator.new_uri(HANDS_PATH))
+            .expect("file");
+        let mismatches = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("param-type-mismatch".to_string()))
+            })
+            .count();
+
+        expect_that!(mismatches, eq(0));
+    }
 }
