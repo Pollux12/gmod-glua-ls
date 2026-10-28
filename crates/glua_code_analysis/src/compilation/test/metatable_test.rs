@@ -1959,4 +1959,28 @@ mod test {
             "#,
         ));
     }
+
+    #[test]
+    fn test_class_annotated_metatable_factory_fields_are_class_fields() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@class Weather
+            local meta = {}
+            meta.__index = meta
+
+            ---@return Weather
+            function Create(name)
+                local t = {}
+                t.Name = name
+                setmetatable(t, meta)
+                return t
+            end
+
+            local w = Create("rain")
+            print(w.Name)
+            "#,
+        ));
+    }
 }
