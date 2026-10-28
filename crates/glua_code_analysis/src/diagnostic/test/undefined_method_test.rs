@@ -2267,4 +2267,35 @@ end
             "#,
         ));
     }
+
+    #[test]
+    fn methods_installed_on_a_created_panel_reach_the_callers_of_its_factory() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            local function Make(parent)
+                local p = vgui.Create("DPanel", parent)
+                function p:SetVal(n) self.val = n end
+                return p
+            end
+
+            local function Use()
+                local p = Make()
+                p:SetVal(1)
+                p:Missing()
+            end
+            "#,
+        );
+
+        let undefined_methods = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(undefined_methods, ["Undefined method `Missing`. "]);
+    }
 }

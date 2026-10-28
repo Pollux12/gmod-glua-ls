@@ -10,6 +10,7 @@ use super::{
     InferFailReason, InferResult,
 };
 use crate::AsyncState;
+use crate::LuaMemberOwner;
 use crate::compilation::analyzer::unresolve::get_wrapped_callable_target_expr;
 use crate::db_index::callee_signature_ids;
 use crate::semantic::{local_name_closure_signature_id, semantic_decl_signature_id};
@@ -2141,7 +2142,9 @@ pub(crate) fn unwrapp_return_type(
                     value: call_expr.get_range(),
                 };
 
-                let base = if matches!(inst.get_base(), LuaType::Instance(_)) {
+                let base = if matches!(inst.get_base(), LuaType::Instance(_))
+                    && !instance_has_installed_members(db, inst)
+                {
                     inst.get_base().clone()
                 } else {
                     return_type.clone()
@@ -2177,6 +2180,14 @@ pub(crate) fn unwrapp_return_type(
     }
 
     Ok(return_type)
+}
+
+/// Whether writes through the instance's own value installed members on it,
+/// which a caller of the function returning it must still see.
+fn instance_has_installed_members(db: &DbIndex, instance: &LuaInstanceType) -> bool {
+    db.get_member_index()
+        .get_members(&LuaMemberOwner::Element(instance.get_range().clone()))
+        .is_some_and(|members| !members.is_empty())
 }
 
 fn materialize_instance_return(base: LuaType, range: InFiled<TextRange>) -> LuaType {
