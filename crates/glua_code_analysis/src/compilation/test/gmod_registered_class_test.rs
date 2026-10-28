@@ -276,4 +276,112 @@ function pace.RegisterPanel(PANEL) end
 
         expect_true!(has_member(&mut ws, "pace_browser", "Init"));
     }
+
+    const WEAPON_CLASSES_PATH: &str = "lua/includes/weapon_classes.lua";
+    const WEAPON_CLASSES: &str = r#"
+        ---@meta
+        ---@class Entity
+        function Entity:DrawShadow(draw) end
+        ---@class Weapon : Entity
+        ---@class weapon_base : Weapon
+        ---@class weapon_hl2 : Weapon
+    "#;
+    const HANDS_PATH: &str = "addons/pac3/lua/pac3/extra/shared/hands.lua";
+    const HANDS: &str = r#"
+        local SWEP = { Primary = {} }
+
+        function SWEP:Initialize()
+            self:DrawShadow(false)
+            self:NotAWeaponMethod()
+        end
+
+        weapons.Register(SWEP, "none", true)
+    "#;
+
+    fn weapon_workspace(files: &[(&str, &str)]) -> VirtualWorkspace {
+        let mut ws = gmod_workspace();
+        ws.def_file(WEAPON_CLASSES_PATH, WEAPON_CLASSES);
+        ws.def_files(files.to_vec());
+        ws
+    }
+
+    #[gtest]
+    fn weapons_register_binds_the_swep_table_to_the_weapon_base_class() {
+        let mut ws = weapon_workspace(&[(HANDS_PATH, HANDS)]);
+
+        expect_that!(
+            super_types(&mut ws, "none"),
+            contains(eq(&LuaType::Ref(LuaTypeDeclId::global("weapon_base"))))
+        );
+        expect_true!(has_member(&mut ws, "none", "Initialize"));
+        expect_that!(
+            undefined_methods(&mut ws, HANDS_PATH),
+            elements_are![contains_substring("NotAWeaponMethod")]
+        );
+    }
+
+    #[gtest]
+    fn weapons_register_prefers_the_base_the_swep_table_names() {
+        let named = HANDS.replace(
+            "local SWEP = { Primary = {} }",
+            "local SWEP = { Primary = {} }
+        SWEP.Base = \"weapon_hl2\"",
+        );
+        let mut ws = weapon_workspace(&[(HANDS_PATH, named.as_str())]);
+
+        expect_that!(
+            super_types(&mut ws, "none"),
+            contains(eq(&LuaType::Ref(LuaTypeDeclId::global("weapon_hl2"))))
+        );
+    }
+
+    #[gtest]
+    fn a_wrapper_annotated_with_the_weapon_role_registers_the_same_way() {
+        let wrapper = r#"
+            ---@[call_arg("gmod.scripted_class", "weapon_table")]
+            ---@param tbl table
+            ---@[call_arg("gmod.scripted_class", "define")]
+            ---@param name string
+            function RegisterMyWeapon(tbl, name) end
+        "#;
+        let user = HANDS.replace(
+            "weapons.Register(SWEP, \"none\", true)",
+            "RegisterMyWeapon(SWEP, \"mine\")",
+        );
+        let mut ws = weapon_workspace(&[
+            ("addons/pac3/lua/pac3/extra/shared/register.lua", wrapper),
+            (HANDS_PATH, user.as_str()),
+        ]);
+
+        expect_true!(has_member(&mut ws, "mine", "Initialize"));
+    }
+
+    #[gtest]
+    fn editing_the_weapon_class_name_moves_the_registration() {
+        let renamed = HANDS.replace("\"none\"", "\"renamed\"");
+        let mut ws = VirtualWorkspace::assert_warm_matches_cold(
+            |ws| {
+                setup(ws);
+                ws.def_file(WEAPON_CLASSES_PATH, WEAPON_CLASSES);
+            },
+            &[(HANDS_PATH, HANDS)],
+            &[(HANDS_PATH, renamed.as_str())],
+        );
+
+        expect_true!(has_member(&mut ws, "renamed", "Initialize"));
+        expect_false!(has_member(&mut ws, "none", "Initialize"));
+    }
+
+    #[gtest]
+    fn deleting_and_reopening_the_weapon_file_drops_and_restores_the_class() {
+        let mut ws = weapon_workspace(&[(HANDS_PATH, HANDS)]);
+        let uri = ws.virtual_url_generator.new_uri(HANDS_PATH);
+        expect_true!(has_member(&mut ws, "none", "Initialize"));
+
+        ws.analysis.remove_file_by_uri(&uri);
+        expect_false!(has_member(&mut ws, "none", "Initialize"));
+
+        ws.def_file(HANDS_PATH, HANDS);
+        expect_true!(has_member(&mut ws, "none", "Initialize"));
+    }
 }

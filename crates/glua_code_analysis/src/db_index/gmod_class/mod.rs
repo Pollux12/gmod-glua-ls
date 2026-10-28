@@ -21,6 +21,7 @@ pub enum GmodScriptedClassCallKind {
     NetworkVar,
     NetworkVarElement,
     ScriptedEntRegister,
+    ScriptedWeaponRegister,
     VguiRegister,
     VguiRegisterFile,
     VguiRegisterTable,
@@ -136,6 +137,7 @@ pub struct GmodScriptedClassCallMetadata {
     pub network_var_roles: Option<GmodNetworkVarCallRoles>,
     pub vgui_panel_roles: Option<GmodVguiPanelCallRoles>,
     pub derma_skin_roles: Option<GmodDermaSkinCallRoles>,
+    pub register_roles: Option<GmodScriptedClassRegisterRoles>,
 }
 
 impl Hash for GmodScriptedClassCallMetadata {
@@ -149,6 +151,7 @@ impl Hash for GmodScriptedClassCallMetadata {
             network_var_roles,
             vgui_panel_roles,
             derma_skin_roles,
+            register_roles,
         } = self;
         hash_local(syntax_id, state);
         literal_args.hash(state);
@@ -158,6 +161,7 @@ impl Hash for GmodScriptedClassCallMetadata {
         network_var_roles.hash(state);
         vgui_panel_roles.hash(state);
         derma_skin_roles.hash(state);
+        register_roles.hash(state);
     }
 }
 
@@ -185,7 +189,22 @@ pub struct GmodDermaSkinCallRoles {
     pub define_arg_idx: usize,
 }
 
+/// Where a registration call takes the registered table and its class name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GmodScriptedClassRegisterRoles {
+    pub table_arg_idx: usize,
+    pub name_arg_idx: usize,
+}
+
 impl GmodScriptedClassCallMetadata {
+    pub fn register_table_arg_idx(&self) -> usize {
+        self.register_roles.map_or(0, |roles| roles.table_arg_idx)
+    }
+
+    pub fn register_name_arg_idx(&self) -> usize {
+        self.register_roles.map_or(1, |roles| roles.name_arg_idx)
+    }
+
     pub fn inheritance_name_arg_idx(&self) -> usize {
         self.inheritance_roles
             .map(|roles| roles.name_arg_idx)
@@ -275,7 +294,8 @@ impl GmodScriptedClassCallMetadata {
             | GmodScriptedClassCallKind::NetworkVarElement => {
                 self.network_var_name_arg_idx().unwrap_or(0)
             }
-            GmodScriptedClassCallKind::ScriptedEntRegister => 1,
+            GmodScriptedClassCallKind::ScriptedEntRegister
+            | GmodScriptedClassCallKind::ScriptedWeaponRegister => self.register_name_arg_idx(),
             GmodScriptedClassCallKind::DermaDefineSkin => self.derma_skin_define_arg_idx(),
             _ => self.vgui_panel_define_arg_idx(),
         };
@@ -294,6 +314,7 @@ pub struct GmodScriptedClassFileMetadata {
     pub network_var_calls: Vec<GmodScriptedClassCallMetadata>,
     pub network_var_element_calls: Vec<GmodScriptedClassCallMetadata>,
     pub scripted_ent_register_calls: Vec<GmodScriptedClassCallMetadata>,
+    pub scripted_weapon_register_calls: Vec<GmodScriptedClassCallMetadata>,
     pub vgui_register_calls: Vec<GmodScriptedClassCallMetadata>,
     pub vgui_register_file_calls: Vec<GmodScriptedClassCallMetadata>,
     pub vgui_register_table_calls: Vec<GmodScriptedClassCallMetadata>,
@@ -394,6 +415,9 @@ impl GmodScriptedClassFileMetadata {
             GmodScriptedClassCallKind::NetworkVar => &mut self.network_var_calls,
             GmodScriptedClassCallKind::NetworkVarElement => &mut self.network_var_element_calls,
             GmodScriptedClassCallKind::ScriptedEntRegister => &mut self.scripted_ent_register_calls,
+            GmodScriptedClassCallKind::ScriptedWeaponRegister => {
+                &mut self.scripted_weapon_register_calls
+            }
             GmodScriptedClassCallKind::VguiRegister => &mut self.vgui_register_calls,
             GmodScriptedClassCallKind::VguiRegisterFile => &mut self.vgui_register_file_calls,
             GmodScriptedClassCallKind::VguiRegisterTable => &mut self.vgui_register_table_calls,
@@ -1194,6 +1218,7 @@ mod tests {
             network_var_roles: None,
             vgui_panel_roles: None,
             derma_skin_roles: None,
+            register_roles: None,
         }
     }
 

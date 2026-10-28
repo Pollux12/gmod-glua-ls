@@ -52,6 +52,8 @@ concommand = concommand or {}
 vgui = vgui or {}
 derma = derma or {}
 file = file or {}
+scripted_ents = scripted_ents or {}
+weapons = weapons or {}
 
 Entity = Entity or {}
 
@@ -407,6 +409,18 @@ function vgui.CreateFromTable(metatable, parent, name) end
 ---@[call_arg("gmod.vgui_panel", "base")]
 ---@param base string
 function vgui.Register(name, panel, base) end
+
+---@[call_arg("gmod.scripted_class", "entity_table")]
+---@param ENT table
+---@[call_arg("gmod.scripted_class", "define")]
+---@param classname string
+function scripted_ents.Register(ENT, classname) end
+
+---@[call_arg("gmod.scripted_class", "weapon_table")]
+---@param SWEP table
+---@[call_arg("gmod.scripted_class", "define")]
+---@param classname string
+function weapons.Register(SWEP, classname) end
 
 ---@generic T: table
 ---@[call_arg("gmod.vgui_panel", "register_table")]

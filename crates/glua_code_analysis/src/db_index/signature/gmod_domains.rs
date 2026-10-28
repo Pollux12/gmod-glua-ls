@@ -57,6 +57,9 @@ pub const GMOD_DOMAIN_VGUI_PANEL: &str = "gmod.vgui_panel";
 /// Derma skin definition/reference domain.
 pub const GMOD_DOMAIN_DERMA_SKIN: &str = "gmod.derma_skin";
 
+/// Scripted entity/weapon registration domain (e.g. `scripted_ents.Register`).
+pub const GMOD_DOMAIN_SCRIPTED_CLASS: &str = "gmod.scripted_class";
+
 /// Net message definition/start/receive domain.
 pub const GMOD_DOMAIN_NET_MESSAGE: &str = "gmod.net_message";
 
@@ -196,6 +199,7 @@ pub const GMOD_CALL_ARG_DOMAINS: &[&str] = &[
     GMOD_DOMAIN_NET_MESSAGE,
     GMOD_DOMAIN_NET_PAYLOAD,
     GMOD_DOMAIN_NETWORK_VAR,
+    GMOD_DOMAIN_SCRIPTED_CLASS,
     GMOD_DOMAIN_TIMER,
     GMOD_DOMAIN_VGUI_PANEL,
 ];

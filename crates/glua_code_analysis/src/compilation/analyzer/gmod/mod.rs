@@ -22,11 +22,11 @@ use crate::{
     EmmyrcGmodRealm, FileId, GlobalId, GmodClassCallArg, GmodClassCallArgSource,
     GmodClassCallLiteral, GmodDermaSkinCallRoles, GmodNamedStringCallRoles,
     GmodNetworkVarCallRoles, GmodScriptedClassCallKind, GmodScriptedClassCallMetadata,
-    GmodScriptedClassFileMetadata, GmodVguiPanelCallRoles, GmodVguiParentCallMetadata,
-    GmodVguiParentSource, InFiled, LuaCallArgRole, LuaDecl, LuaDeclExtra, LuaDeclId,
-    LuaDeclTypeKind, LuaFunctionType, LuaInferCache, LuaMember, LuaMemberFeature, LuaMemberId,
-    LuaMemberKey, LuaSignature, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId,
-    LuaTypeFlag, LuaTypeOwner,
+    GmodScriptedClassFileMetadata, GmodScriptedClassRegisterRoles, GmodVguiPanelCallRoles,
+    GmodVguiParentCallMetadata, GmodVguiParentSource, InFiled, LuaCallArgRole, LuaDecl,
+    LuaDeclExtra, LuaDeclId, LuaDeclTypeKind, LuaFunctionType, LuaInferCache, LuaMember,
+    LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignature, LuaSignatureId, LuaType,
+    LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{
         AnalyzeContext,
         common::{TypeCacheWriteMode, write_type_cache},
@@ -4549,21 +4549,33 @@ fn synthesize_scripted_ent_registrations(db: &mut DbIndex, file_ids: &[FileId]) 
             None => continue,
         };
 
-        for call in &metadata.scripted_ent_register_calls {
-            synthesize_scripted_ent_registration(db, file_id, &metadata, call);
+        for (kind, calls) in [
+            (
+                GmodScriptedClassCallKind::ScriptedEntRegister,
+                &metadata.scripted_ent_register_calls,
+            ),
+            (
+                GmodScriptedClassCallKind::ScriptedWeaponRegister,
+                &metadata.scripted_weapon_register_calls,
+            ),
+        ] {
+            for call in calls {
+                synthesize_scripted_class_registration(db, file_id, &metadata, call, kind);
+            }
         }
     }
 }
 
-fn synthesize_scripted_ent_registration(
+fn synthesize_scripted_class_registration(
     db: &mut DbIndex,
     file_id: FileId,
     metadata: &GmodScriptedClassFileMetadata,
     call: &GmodScriptedClassCallMetadata,
+    kind: GmodScriptedClassCallKind,
 ) {
     let Some(class_name) = call
         .literal_args
-        .get(1)
+        .get(call.register_name_arg_idx())
         .and_then(|arg| arg.as_ref())
         .and_then(|arg| match arg {
             GmodClassCallLiteral::String(name) if !name.is_empty() => Some(name.as_str()),
@@ -4597,9 +4609,10 @@ fn synthesize_scripted_ent_registration(
     let register_position = call.syntax_id.get_range().start();
     let class_type = LuaType::Def(class_decl_id.clone());
 
+    let table_arg_idx = call.register_table_arg_idx();
     let (registered_table, region_start, decl_id) = match call
         .literal_args
-        .first()
+        .get(table_arg_idx)
         .and_then(|arg| arg.as_ref())
     {
         Some(GmodClassCallLiteral::NameRef(var_name)) => {
@@ -4622,7 +4635,12 @@ fn synthesize_scripted_ent_registration(
             )
         }
         _ => (
-            find_table_expr_for_arg_source(db, file_id, call, &GmodClassCallArgSource::direct(0)),
+            find_table_expr_for_arg_source(
+                db,
+                file_id,
+                call,
+                &GmodClassCallArgSource::direct(table_arg_idx),
+            ),
             TextSize::new(0),
             None,
         ),
@@ -4680,12 +4698,16 @@ fn synthesize_scripted_ent_registration(
     db.get_type_index_mut()
         .register_table_class(table_range.clone(), class_type.clone());
 
-    let entity_type = registered_table_string_field(db, &source_owner, "Type", register_position);
-    let base = resolve_registered_scripted_ent_base(
+    let entity_type = (kind == GmodScriptedClassCallKind::ScriptedEntRegister)
+        .then(|| registered_table_string_field(db, &source_owner, "Type", register_position))
+        .flatten();
+    let base = resolve_registered_class_base(
         db,
         &source_owner,
         metadata,
         register_position,
+        kind,
+        call.syntax_id.get_range(),
         entity_type.as_ref(),
     );
     if let Some((base_name, source_range)) = base {
@@ -4738,13 +4760,16 @@ fn synthesize_scripted_ent_registration(
     );
 }
 
-/// The base `scripted_ents.Register` gives the table: its `Base`, the last
-/// `DEFINE_BASECLASS` before the call, or the base its `Type` names.
-fn resolve_registered_scripted_ent_base(
+/// The base a registration call gives the table: its `Base`, the last
+/// `DEFINE_BASECLASS` before the call, or the default of its kind (a weapon's
+/// `weapon_base`, an entity's base by its `Type`).
+fn resolve_registered_class_base(
     db: &DbIndex,
     table_owner: &LuaMemberOwner,
     metadata: &GmodScriptedClassFileMetadata,
     register_position: TextSize,
+    kind: GmodScriptedClassCallKind,
+    register_range: TextRange,
     entity_type: Option<&(String, TextRange)>,
 ) -> Option<(String, TextRange)> {
     if let Some(base) = registered_table_string_field(db, table_owner, "Base", register_position) {
@@ -4765,6 +4790,9 @@ fn resolve_registered_scripted_ent_base(
             },
         )
         .or_else(|| {
+            if kind == GmodScriptedClassCallKind::ScriptedWeaponRegister {
+                return Some(("weapon_base".to_string(), register_range));
+            }
             let (type_name, source_range) = entity_type?;
             default_base_for_entity_type(type_name).map(|base| (base.to_string(), *source_range))
         })
@@ -7558,6 +7586,9 @@ struct AnnotatedGmodCallRoles {
     vgui_panel_parent_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_parent_self_roles: Vec<AnnotatedGmodCallArgRole>,
     derma_skin_define_roles: Vec<AnnotatedGmodCallArgRole>,
+    scripted_class_kind: Option<GmodScriptedClassCallKind>,
+    scripted_class_define_roles: Vec<AnnotatedGmodCallArgRole>,
+    scripted_class_table_roles: Vec<AnnotatedGmodCallArgRole>,
 }
 
 impl AnnotatedGmodCallRoles {
@@ -7721,6 +7752,17 @@ impl AnnotatedGmodCallRoles {
             ("gmod.derma_skin", "define") => {
                 self.derma_skin_define_roles.push(arg_role);
             }
+            ("gmod.scripted_class", "define") => {
+                self.scripted_class_define_roles.push(arg_role);
+            }
+            ("gmod.scripted_class", "entity_table") => {
+                self.scripted_class_kind = Some(GmodScriptedClassCallKind::ScriptedEntRegister);
+                self.scripted_class_table_roles.push(arg_role);
+            }
+            ("gmod.scripted_class", "weapon_table") => {
+                self.scripted_class_kind = Some(GmodScriptedClassCallKind::ScriptedWeaponRegister);
+                self.scripted_class_table_roles.push(arg_role);
+            }
             _ => {}
         }
     }
@@ -7765,6 +7807,10 @@ impl AnnotatedGmodCallRoles {
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.derma_skin_define_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
+        self.scripted_class_define_roles
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
+        self.scripted_class_table_roles
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
     }
 
     fn has_any_roles(&self) -> bool {
@@ -7795,6 +7841,7 @@ impl AnnotatedGmodCallRoles {
                 )
             )
             || !self.derma_skin_define_roles.is_empty()
+            || !self.scripted_class_table_roles.is_empty()
     }
 
     fn select_for_call(&self, call_expr: &LuaCallExpr) -> Option<AnnotatedGmodCallRoles> {
@@ -7921,7 +7968,8 @@ impl AnnotatedGmodCallRoles {
                             | GmodScriptedClassCallKind::VguiRegisterTable
                     )
                 )
-                || !self.derma_skin_define_roles.is_empty(),
+                || !self.derma_skin_define_roles.is_empty()
+                || !self.scripted_class_table_roles.is_empty(),
         }
     }
 
@@ -8113,6 +8161,30 @@ impl AnnotatedGmodCallRoles {
             }
         };
         Some(AnnotatedVguiParentCallRoles { child, parent })
+    }
+
+    fn scripted_class_register_call(
+        &self,
+        is_colon_call: bool,
+    ) -> Option<(GmodScriptedClassCallKind, GmodScriptedClassRegisterRoles)> {
+        let kind = self.scripted_class_kind?;
+        let table_role = self.scripted_class_table_roles.first()?;
+        let define_role = self.scripted_class_define_roles.first()?;
+        Some((
+            kind,
+            GmodScriptedClassRegisterRoles {
+                table_arg_idx: param_idx_to_call_arg_idx(
+                    table_role.param_idx,
+                    is_colon_call,
+                    self.is_colon_define,
+                )?,
+                name_arg_idx: param_idx_to_call_arg_idx(
+                    define_role.param_idx,
+                    is_colon_call,
+                    self.is_colon_define,
+                )?,
+            },
+        ))
     }
 
     fn derma_skin_call_roles(&self, is_colon_call: bool) -> Option<GmodDermaSkinCallRoles> {
@@ -8751,6 +8823,17 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             .and_then(|roles| roles.network_var_call(call_expr.is_colon_call()))
     }
 
+    fn scripted_class_register_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<(GmodScriptedClassCallKind, GmodScriptedClassRegisterRoles)> {
+        self.roles_for_call(db, file_id, call_expr, call_path)
+            .and_then(|roles| roles.scripted_class_register_call(call_expr.is_colon_call()))
+    }
+
     fn derma_skin_call(
         &self,
         db: &DbIndex,
@@ -9294,6 +9377,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 network_var_roles: None,
                 vgui_panel_roles: None,
                 derma_skin_roles: None,
+                register_roles: None,
             },
         ));
         return Some(());
@@ -9315,6 +9399,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 network_var_roles: Some(network_var_roles),
                 vgui_panel_roles: None,
                 derma_skin_roles: None,
+                register_roles: None,
             },
         ));
         return Some(());
@@ -9337,6 +9422,29 @@ fn collect_annotated_scripted_class_call_metadata(
                 network_var_roles: None,
                 vgui_panel_roles: Some(vgui_panel_roles),
                 derma_skin_roles: None,
+                register_roles: None,
+            },
+        ));
+        return Some(());
+    }
+
+    if let Some((kind, register_roles)) =
+        annotated_roles.scripted_class_register_call(db, file_id, &call_expr, &call_path)
+    {
+        let (literal_args, args, field_args) =
+            extract_gmod_class_call_args(db, file_id, &call_expr, &[]);
+        pending.push(PendingCallSite::ScriptedClass(
+            kind,
+            GmodScriptedClassCallMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                literal_args,
+                args,
+                field_args,
+                inheritance_roles: None,
+                network_var_roles: None,
+                vgui_panel_roles: None,
+                derma_skin_roles: None,
+                register_roles: Some(register_roles),
             },
         ));
         return Some(());
@@ -9358,6 +9466,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 network_var_roles: None,
                 vgui_panel_roles: None,
                 derma_skin_roles: Some(derma_skin_roles),
+                register_roles: None,
             },
         ));
         return Some(());
