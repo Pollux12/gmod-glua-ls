@@ -536,13 +536,17 @@ pub fn bind_decl_write(
             // `bind_resolved_type` will trade in either direction, so between
             // two ordered writes it is ranked rather than positioned: whichever
             // determined something takes the slot, and the winner is then a
-            // function of the write set instead of which one resolved first. The
+            // function of the write set instead of which one resolved first. A
+            // union with an `any` arm ranks as `any`: it determines no more, and
+            // a loop over a table holding an `any` element binds one. The
             // other bottoms are left alone — `unknown` on a declaration is what
             // lets a use narrow it, not a give-up to be overwritten.
-            let outranks_any =
-                comparable && is_informative_type(seeded.as_type()) && existing.as_type().is_any();
-            let outranked_by_any =
-                comparable && seeded.as_type().is_any() && is_informative_type(existing.as_type());
+            let outranks_any = comparable
+                && is_informative_type(seeded.as_type())
+                && has_any_arm(existing.as_type());
+            let outranked_by_any = comparable
+                && has_any_arm(seeded.as_type())
+                && is_informative_type(existing.as_type());
             if outranks_any {
                 true
             } else if outranked_by_any {
@@ -598,6 +602,18 @@ pub fn bind_decl_write(
         .record_decl_write_claim(decl_id, position, may_narrow_uninformative);
     seed_type_slot(db, type_owner, type_cache);
     Some(())
+}
+
+/// Whether `typ` is `any` or a union with an `any` arm.
+fn has_any_arm(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Any => true,
+        LuaType::Union(union) => union.types().any(has_any_arm),
+        LuaType::MultiLineUnion(union) => {
+            union.get_unions().iter().any(|(typ, _)| has_any_arm(typ))
+        }
+        _ => false,
+    }
 }
 
 /// Replays the acceptance rule the slot's current holder would have faced had
@@ -960,6 +976,77 @@ mod tests {
             db.get_type_index().get_type_cache(&owner),
             Some(LuaTypeCache::InferType(LuaType::Integer))
         ));
+    }
+
+    /// A loop variable over a table with an `any` element, reassigned a string
+    /// in the body, holds the string whichever of the two writes reaches the
+    /// slot first.
+    #[test]
+    fn union_with_an_any_arm_ranks_as_any_against_a_later_assignment() {
+        let loop_element = LuaType::Union(
+            crate::LuaUnionType::from_vec(vec![
+                LuaType::StringConst(smol_str::SmolStr::new("a.mp3").into()),
+                LuaType::Any,
+            ])
+            .into(),
+        );
+        for loop_write_first in [true, false] {
+            let mut ws = VirtualWorkspace::new();
+            let file_id = ws.def(
+                "local snd
+snd = string.sub('x', 1)
+",
+            );
+            let db = ws.get_db_mut();
+            let decl_id = db
+                .get_decl_index()
+                .get_decl_tree(&file_id)
+                .expect("decl tree")
+                .get_decls()
+                .values()
+                .find(|decl| decl.get_name() == "snd")
+                .map(|decl| decl.get_id())
+                .expect("snd decl");
+            let owner = LuaTypeOwner::Decl(decl_id);
+            db.get_type_index_mut().reset_type_cache(&owner);
+            let loop_write = |db: &mut DbIndex| {
+                write_type_cache(
+                    db,
+                    owner.clone(),
+                    LuaTypeCache::InferType(loop_element.clone()),
+                    TypeCacheWriteMode::InsertOnly,
+                );
+            };
+            let assignment = |db: &mut DbIndex| {
+                bind_decl_write(
+                    db,
+                    decl_id,
+                    LuaTypeCache::InferType(LuaType::String),
+                    DeclWrite {
+                        position: 20.into(),
+                        may_improve_after_resolve: true,
+                        reads_out_of_decl: false,
+                        fills_own_default: false,
+                        may_narrow_uninformative: true,
+                        resolved_initializer: false,
+                    },
+                );
+            };
+            if loop_write_first {
+                loop_write(db);
+                assignment(db);
+            } else {
+                assignment(db);
+                loop_write(db);
+            }
+            assert_eq!(
+                db.get_type_index()
+                    .get_type_cache(&owner)
+                    .map(|cache| cache.as_type().clone()),
+                Some(LuaType::String),
+                "loop write first: {loop_write_first}"
+            );
+        }
     }
 
     #[test]
