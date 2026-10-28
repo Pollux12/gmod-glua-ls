@@ -515,4 +515,68 @@ DrawIcon(0)
 
         assert_eq!(alias, vec![(false, None)]);
     }
+
+    #[test]
+    fn methods_a_hook_callback_installs_reach_the_table_the_hook_emits() {
+        let mut ws = gmod_workspace();
+        ws.def_file(
+            "lua/autorun/sh_emitter.lua",
+            r#"
+            ---@class Weather
+            local weather = {}
+            weather.__index = weather
+
+            hook.Run("custom.preload", weather)
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/cl_installer.lua",
+            r#"
+            hook.Add("custom.preload", "install", function(weather)
+                function weather:AddAmbience() end
+            end)
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            crate::DiagnosticCode::UndefinedMethod,
+            r#"
+            ---@type Weather
+            local rain
+            rain:AddAmbience()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_hook_callback_that_never_installs_leaves_the_emitted_table_closed() {
+        let mut ws = gmod_workspace();
+        ws.def_file(
+            "lua/autorun/sh_emitter.lua",
+            r#"
+            ---@class Weather
+            local weather = {}
+            weather.__index = weather
+
+            hook.Run("custom.preload", weather)
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/cl_listener.lua",
+            r#"
+            hook.Add("custom.preload", "listen", function(weather)
+                print(weather)
+            end)
+            "#,
+        );
+
+        assert!(!ws.check_code_for(
+            crate::DiagnosticCode::UndefinedMethod,
+            r#"
+            ---@type Weather
+            local rain
+            rain:AddAmbience()
+            "#,
+        ));
+    }
 }

@@ -698,6 +698,15 @@ fn collect_call_site_param_types(
 
     let call_args = args.get_args().collect::<Vec<_>>();
     let colon_call_arg_shift = usize::from(call_expr.is_colon_call());
+    collect_hook_callback_param_types(
+        db,
+        cache,
+        scope,
+        file_id,
+        &call_expr,
+        &call_args,
+        contributions,
+    );
     let (mut signature_ids, lookup_kind) =
         signature_ids_from_call_prefix(db, cache, scope, file_id, &call_expr, &prefix_expr);
     if signature_ids.is_empty()
@@ -828,38 +837,111 @@ fn collect_call_site_param_types(
                 continue;
             };
 
-            let node = LuaInferenceNodeId::SignatureParam {
-                signature_id,
-                param_idx: u16::try_from(param_idx).ok()?,
+            let kind = if is_implicit_receiver || is_explicit_receiver || is_exact_include_receiver
+            {
+                LuaInferenceProvenanceKind::ContextualUnknown
+            } else {
+                provenance_kind
             };
-            let event = LuaInferenceEventId {
-                node,
-                kind: if is_implicit_receiver || is_explicit_receiver || is_exact_include_receiver {
-                    LuaInferenceProvenanceKind::ContextualUnknown
-                } else {
-                    provenance_kind
-                },
-                source: InFiled::new(file_id, arg_syntax_id),
-            };
-            contributions.push((
+            contributions.push(anchored_arg_contribution(
                 signature_id,
                 param_idx,
-                Some(LuaTypeFact::new(
-                    arg_type.clone(),
-                    LuaInferenceConfidence::Anchored,
-                    vec![LuaInferenceStep {
-                        event,
-                        support: vec![].into(),
-                        inferred_type: Some(Arc::new(arg_type)),
-                        found_type: None,
-                    }]
-                    .into(),
-                )),
-            ));
+                InFiled::new(file_id, arg_syntax_id),
+                arg_type,
+                kind,
+            )?);
         }
     }
 
     Some(())
+}
+
+fn anchored_arg_contribution(
+    signature_id: LuaSignatureId,
+    param_idx: usize,
+    source: InFiled<LuaSyntaxId>,
+    arg_type: LuaType,
+    kind: LuaInferenceProvenanceKind,
+) -> Option<Contribution> {
+    let node = LuaInferenceNodeId::SignatureParam {
+        signature_id,
+        param_idx: u16::try_from(param_idx).ok()?,
+    };
+    let event = LuaInferenceEventId { node, kind, source };
+    Some((
+        signature_id,
+        param_idx,
+        Some(LuaTypeFact::new(
+            arg_type.clone(),
+            LuaInferenceConfidence::Anchored,
+            vec![LuaInferenceStep {
+                event,
+                support: vec![].into(),
+                inferred_type: Some(Arc::new(arg_type)),
+                found_type: None,
+            }]
+            .into(),
+        )),
+    ))
+}
+
+/// What a hook emission hands the installers registered under its name: the
+/// payload after the name (and, for `hook.Call`, the gamemode table).
+fn collect_hook_callback_param_types(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    scope: &mut CallScope,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+    call_args: &[LuaExpr],
+    contributions: &mut Vec<Contribution>,
+) {
+    let Some(target) = super::call_target::call_target_of(db, file_id, call_expr) else {
+        return;
+    };
+    if target.hook_callbacks.is_empty() {
+        return;
+    }
+    let payload_start = match call_expr.get_access_path() {
+        Some(path) if path.starts_with("hook.") && path.ends_with(".Call") => 2,
+        _ => 1,
+    };
+    for &signature_id in &target.hook_callbacks {
+        if !is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
+            continue;
+        }
+        let Some(signature) = db.get_signature_index().get_declared(&signature_id) else {
+            continue;
+        };
+        for (param_idx, arg) in call_args.iter().skip(payload_start).enumerate() {
+            if param_idx >= signature.params.len()
+                || signature.param_docs.contains_key(&param_idx)
+                || !is_installer_param(db, signature_id, param_idx)
+                || is_param_mutated(db, signature_id, param_idx)
+            {
+                continue;
+            }
+            let Some((arg_type, kind)) = infer_supported_call_site_arg_type(
+                db,
+                cache,
+                scope,
+                file_id,
+                arg.clone(),
+                true,
+                is_filled_param(db, signature_id, param_idx),
+            )
+            .filter(|(typ, _)| argument_type_is_usable(signature, param_idx, typ)) else {
+                continue;
+            };
+            contributions.extend(anchored_arg_contribution(
+                signature_id,
+                param_idx,
+                InFiled::new(file_id, arg.get_syntax_id()),
+                arg_type,
+                kind,
+            ));
+        }
+    }
 }
 
 fn collect_direct_callback_param_types(

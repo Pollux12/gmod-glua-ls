@@ -22,6 +22,9 @@ pub struct LuaCallTarget {
     /// The one signature every callable member of the prefix's inferred type
     /// names, through type guards and `TableOf`.
     pub unique: Option<LuaSignatureId>,
+    /// For a call that emits a hook by a literal name, the callbacks `hook.Add`
+    /// registers under that name, sorted.
+    pub hook_callbacks: Vec<LuaSignatureId>,
 }
 
 impl LuaCallTarget {
@@ -40,7 +43,18 @@ impl LuaCallTarget {
             declared,
             inferred,
             unique: prefix_type.and_then(unique_signature_id),
+            hook_callbacks: Vec::new(),
         }
+    }
+
+    /// The target with the hook callbacks the call emits to.
+    pub fn with_hook_callbacks(mut self, mut hook_callbacks: Vec<LuaSignatureId>) -> Self {
+        hook_callbacks.sort_unstable_by_key(|signature_id| {
+            (signature_id.get_file_id().id, signature_id.get_position())
+        });
+        hook_callbacks.dedup();
+        self.hook_callbacks = hook_callbacks;
+        self
     }
 
     /// The one signature the call targets: the declared one, else the one
@@ -54,6 +68,7 @@ impl LuaCallTarget {
             .iter()
             .chain(self.inferred.iter())
             .chain(self.unique.iter())
+            .chain(self.hook_callbacks.iter())
     }
 
     fn signature_ids_mut(&mut self) -> impl Iterator<Item = &mut LuaSignatureId> {
@@ -61,6 +76,7 @@ impl LuaCallTarget {
             .iter_mut()
             .chain(self.inferred.iter_mut())
             .chain(self.unique.iter_mut())
+            .chain(self.hook_callbacks.iter_mut())
     }
 }
 
