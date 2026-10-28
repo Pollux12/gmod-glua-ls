@@ -384,4 +384,51 @@ function pace.RegisterPanel(PANEL) end
         ws.def_file(HANDS_PATH, HANDS);
         expect_true!(has_member(&mut ws, "none", "Initialize"));
     }
+
+    #[gtest]
+    fn a_panel_registered_under_a_runtime_name_takes_members_from_its_base() {
+        let dynamic = BROWSER.replace(
+            "PANEL.ClassName = \"browser\"",
+            "PANEL.ClassName = \"properties_\" .. pace.Kind()",
+        );
+        let mut ws = panel_workspace(&[(WRAPPER_PATH, WRAPPER), (BROWSER_PATH, dynamic.as_str())]);
+
+        expect_false!(is_registered(&mut ws, "pace_browser"));
+        expect_that!(undefined_methods(&mut ws, BROWSER_PATH), is_empty());
+    }
+
+    #[gtest]
+    fn a_table_never_registered_as_a_panel_still_reports_missing_methods() {
+        let mut ws = panel_workspace(&[(
+            BROWSER_PATH,
+            "local PANEL = {}
+function PANEL:Init() self:Missing() end
+",
+        )]);
+
+        expect_that!(
+            undefined_methods(&mut ws, BROWSER_PATH),
+            elements_are![contains_substring("Missing")]
+        );
+    }
+
+    #[gtest]
+    fn registering_a_swep_table_raises_no_parameter_mismatch_on_the_call() {
+        let mut ws = weapon_workspace(&[(HANDS_PATH, HANDS)]);
+        let file_id = ws
+            .analysis
+            .get_file_id(&ws.virtual_url_generator.new_uri(HANDS_PATH))
+            .expect("file");
+        let mismatches = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("param-type-mismatch".to_string()))
+            })
+            .count();
+
+        expect_that!(mismatches, eq(0));
+    }
 }

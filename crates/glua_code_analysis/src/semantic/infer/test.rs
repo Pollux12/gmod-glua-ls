@@ -181,6 +181,57 @@ mod test {
     }
 
     #[test]
+    fn arithmetic_between_an_unresolved_operand_and_a_class_picks_no_operator_overload() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "addons/arith_unresolved/lua/autorun/sh_arith_unresolved.lua",
+            r#"
+            ---@class Offset
+            ---@class Frame
+            ---@operator mul(Offset): Offset
+            ---@operator mul(Frame): Frame
+
+            ---@param frame Frame
+            local function combine(unresolved, frame)
+                local scaled = unresolved * frame
+                local scaled_back = frame * unresolved
+                return scaled, scaled_back
+            end
+            "#,
+        );
+        for name in ["scaled", "scaled_back"] {
+            let typ = infer_last_name_expr_type_in_file(&ws, file, name);
+            assert!(
+                typ.is_unknown(),
+                "{name} should stay unresolved, got {typ:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arithmetic_between_two_resolved_class_operands_still_picks_the_matching_overload() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "addons/arith_resolved/lua/autorun/sh_arith_resolved.lua",
+            r#"
+            ---@class Offset2
+            ---@class Frame2
+            ---@operator mul(Offset2): Offset2
+            ---@operator mul(Frame2): Frame2
+
+            ---@param frame Frame2
+            ---@param other Frame2
+            local function combine(frame, other)
+                local combined = frame * other
+                return combined
+            end
+            "#,
+        );
+        let typ = infer_last_name_expr_type_in_file(&ws, file, "combined");
+        assert_eq!(ws.humanize_type(typ), "Frame2");
+    }
+
+    #[test]
     fn pairs_over_an_alias_that_may_be_a_string_enumerates_only_its_table_arm() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file = ws.def_file(

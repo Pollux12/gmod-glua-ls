@@ -2053,6 +2053,62 @@ mod test {
         ));
     }
 
+    #[test]
+    fn test_metatable_index_taken_from_a_function_defined_elsewhere_leaves_methods_open() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local methods = {}
+            function methods:Known() end
+
+            local shared = {
+                __index = function(_, key)
+                    return methods[key]
+                end,
+            }
+
+            local object = setmetatable({}, { __index = shared.__index })
+            object:Known()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_named_metatable_index_taken_from_a_function_defined_elsewhere_leaves_methods_open() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local methods = {}
+            function methods:Known() end
+
+            local shared = {
+                __index = function(_, key)
+                    return methods[key]
+                end,
+            }
+
+            local metatable = { __index = shared.__index }
+            local object = setmetatable({}, metatable)
+            object:Known()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_metatable_without_index_still_reports_undefined_methods() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local shared = { __call = function() end }
+            local object = setmetatable({}, { __call = shared.__call })
+            object:Known()
+            "#,
+        ));
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }

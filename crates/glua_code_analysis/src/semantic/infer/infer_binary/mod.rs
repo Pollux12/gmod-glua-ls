@@ -300,8 +300,10 @@ fn infer_binary_custom_operator(
     right: &LuaType,
     op: LuaOperatorMetaMethod,
 ) -> InferResult {
+    // An operand we could not resolve matches every overload, so it picks none.
     // Check whether left is a custom type first to avoid unnecessary clones
     if left.is_custom_type()
+        && !right.is_unknown()
         && let Some(operators) = get_custom_type_operator(db, left.clone(), op)
     {
         for operator in operators {
@@ -314,6 +316,7 @@ fn infer_binary_custom_operator(
 
     // Then check whether right is a custom type, cloning only when needed
     if right.is_custom_type()
+        && !left.is_unknown()
         && let Some(operators) = get_custom_type_operator(db, right.clone(), op)
     {
         for operator in operators {

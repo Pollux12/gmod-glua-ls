@@ -174,7 +174,11 @@ fn infer_metatable_index_type(
                     | LuaExpr::IndexExpr(_)
                     | LuaExpr::NameExpr(_)
             ) {
-                return Ok(MetatableIndex::Index(infer_expr(db, cache, index_value)?));
+                let index_type = infer_expr(db, cache, index_value)?;
+                if index_type.is_function() {
+                    return Ok(MetatableIndex::NoIndex(LuaType::Unknown));
+                }
+                return Ok(MetatableIndex::Index(index_type));
             }
 
             let inferred_type = infer_expr(db, cache, index_value.clone()).ok();
