@@ -806,7 +806,7 @@ fn metatable_leaves_members_open(
     })
 }
 
-fn has_unresolved_metatable_index(
+pub(super) fn has_unresolved_metatable_index(
     db: &DbIndex,
     semantic_model: &SemanticModel,
     prefix_typ: &LuaType,

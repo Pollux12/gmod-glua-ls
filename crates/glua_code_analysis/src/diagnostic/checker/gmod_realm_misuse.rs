@@ -551,6 +551,21 @@ fn resolve_callee_realms(
         return Vec::new();
     }
 
+    // A table whose metatable can provide any field has no definitive callee for a member it
+    // lacks in this realm: the call may be served by the metatable, whatever other realms declare.
+    if let Some(index_expr) = LuaIndexExpr::cast(prefix_expr.syntax().clone())
+        && let Some(owner_expr) = index_expr.get_prefix_expr()
+        && let Ok(owner_type) = semantic_model.infer_expr(owner_expr)
+        && super::check_field::has_unresolved_metatable_index(
+            semantic_model.get_db(),
+            semantic_model,
+            &owner_type,
+            Some(call_expr.get_position()),
+        )
+    {
+        return Vec::new();
+    }
+
     let semantic_decl = semantic_model.find_decl(
         NodeOrToken::Node(prefix_expr.syntax().clone()),
         SemanticDeclLevel::default(),

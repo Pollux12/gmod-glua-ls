@@ -1606,4 +1606,58 @@ mod tests {
         let reports = guarded_call_realm_reports(&guarded);
         assert_eq!(reports.len(), 1, "{reports:?}");
     }
+    const SERVER_DECLARED_TOOL: &str = r#"
+        local TOOL = {}
+        if SERVER then
+            function TOOL:SendFunc() end
+        else
+            function TOOL:Spawn()
+                self.SendFunc()
+            end
+        end
+        return TOOL
+    "#;
+
+    fn realm_reports_in_tool(with_proxy_includer: bool) -> usize {
+        let mut ws = VirtualWorkspace::new();
+        enable_only_realm_mismatch_diagnostics(&mut ws);
+        ws.def_gmod_call_arg_builtins();
+        if with_proxy_includer {
+            ws.def_file(
+                "lua/weapons/sf2_tool/shared.lua",
+                r#"
+                local t_meta = {}
+                t_meta.__index = function(self, key)
+                    return self._swep[key]
+                end
+                local tool = include("weapons/sf2_tool/settings/light_editor.lua")
+                setmetatable(tool, t_meta)
+                "#,
+            );
+            ws.def_file("lua/weapons/sf2_tool/init.lua", "include(\"shared.lua\")");
+        }
+        let file_id = ws.def_file(
+            "lua/weapons/sf2_tool/settings/light_editor.lua",
+            SERVER_DECLARED_TOOL,
+        );
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
+        ));
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .count()
+    }
+
+    #[gtest]
+    fn a_member_declared_only_in_another_realm_is_a_mismatch_on_a_closed_table() {
+        assert_eq!(realm_reports_in_tool(false), 1);
+    }
+
+    #[gtest]
+    fn a_member_declared_only_in_another_realm_may_come_from_a_function_index() {
+        assert_eq!(realm_reports_in_tool(true), 0);
+    }
 }
