@@ -1938,4 +1938,25 @@ mod test {
             "#,
         ));
     }
+
+    #[test]
+    fn test_accessor_func_on_unannotated_metatable_table_keeps_accessors() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local meta = {}
+            meta.__index = meta
+            AccessorFunc(meta, "iMat", "Material")
+
+            local function Create()
+                local t = {}
+                setmetatable(t, meta)
+                t:SetMaterial("a")
+                return t:GetMaterial()
+            end
+            "#,
+        ));
+    }
 }

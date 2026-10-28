@@ -1256,11 +1256,11 @@ fn collect_accessorfunc_annotated_call(
         return None;
     }
 
-    let mut receiver_type_id = None;
+    let mut receiver_owner = None;
     let mut made: Vec<(LuaMemberOwner, SmolStr, bool)> = Vec::new();
     for template in &annotation.accessors {
         let owner = match &template.owner {
-            AccessorOwner::Receiver => receiver_type_id
+            AccessorOwner::Receiver => receiver_owner
                 .get_or_insert_with(|| {
                     let receiver = if receiver_is_first_arg {
                         args.first().cloned()
@@ -1270,10 +1270,9 @@ fn collect_accessorfunc_annotated_call(
                             _ => None,
                         }
                     };
-                    receiver.and_then(|receiver| find_owner_type_for_prefix(analyzer, &receiver))
+                    receiver.and_then(|receiver| find_owner_for_prefix(analyzer, &receiver))
                 })
-                .clone()
-                .map(LuaMemberOwner::Type),
+                .clone(),
             AccessorOwner::NamedClass { callee, class_name } => {
                 named_class_type_id(analyzer.db, analyzer.file_id, callee, class_name)
                     .map(LuaMemberOwner::Type)
@@ -1472,6 +1471,17 @@ fn extract_string_literal(expr: &LuaExpr) -> Option<String> {
             LuaLiteralToken::String(string_token) => Some(string_token.get_value().to_string()),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn find_owner_for_prefix(analyzer: &mut LuaAnalyzer, prefix: &LuaExpr) -> Option<LuaMemberOwner> {
+    if let Some(type_decl_id) = find_owner_type_for_prefix(analyzer, prefix) {
+        return Some(LuaMemberOwner::Type(type_decl_id));
+    }
+
+    match analyzer.infer_expr(prefix).ok()? {
+        LuaType::TableConst(range) => Some(LuaMemberOwner::Element(range)),
         _ => None,
     }
 }
