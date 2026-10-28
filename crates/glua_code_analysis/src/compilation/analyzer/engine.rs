@@ -767,6 +767,19 @@ struct ClearedLoop {
     wave: usize,
 }
 
+/// Folds the cleared loop `lp`, reaching `reach`, into `group`.
+fn absorb(
+    group: &mut (ClearedLoop, BTreeSet<DerivationId>),
+    lp: ClearedLoop,
+    reach: BTreeSet<DerivationId>,
+) {
+    group.0.members.extend(lp.members);
+    group.0.members.sort_unstable();
+    group.0.members.dedup();
+    group.0.at_quiescence |= lp.at_quiescence;
+    group.1.extend(reach);
+}
+
 /// A fact that moved under a statement: what the statement had seen of it,
 /// and whether it moved once the run was settled, at the last stage.
 #[derive(Debug, Clone)]
@@ -2914,6 +2927,87 @@ impl Engine {
         true
     }
 
+    /// The loops `loops` clears, with the loops cleared before that it takes
+    /// along, as one loop wherever they share a derivation, and every
+    /// derivation they clear. Loops overlap when the derivations that share a
+    /// key with the members of one run as a group with members of another:
+    /// clearing either resets part of the other, which then starts over with
+    /// it, so cleared apart each would clear the other again without end.
+    fn merge_overlapping_loops(
+        &mut self,
+        db: &DbIndex,
+        loops: Vec<Vec<DerivationId>>,
+        at_quiescence: bool,
+        wave: usize,
+    ) -> (Vec<ClearedLoop>, BTreeSet<DerivationId>) {
+        let expand = |members: &[DerivationId]| {
+            members
+                .iter()
+                .flat_map(|statement| co_producers(db, *statement))
+                .collect::<BTreeSet<_>>()
+        };
+        let mut groups = loops
+            .into_iter()
+            .map(|members| {
+                let reach = expand(&members);
+                (
+                    ClearedLoop {
+                        members,
+                        at_quiescence,
+                        wave,
+                    },
+                    reach,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut pending = std::mem::take(&mut self.pending_loops);
+        loop {
+            let mut merged = false;
+            let mut at = 0;
+            while at < groups.len() {
+                let mut other = at + 1;
+                while other < groups.len() {
+                    if groups[at].1.is_disjoint(&groups[other].1) {
+                        other += 1;
+                        continue;
+                    }
+                    let (lp, reach) = groups.swap_remove(other);
+                    absorb(&mut groups[at], lp, reach);
+                    merged = true;
+                }
+                at += 1;
+            }
+            let mut index = 0;
+            while index < pending.len() {
+                let Some(group) = groups.iter_mut().find(|(_, reach)| {
+                    pending[index]
+                        .members
+                        .iter()
+                        .any(|member| reach.contains(member))
+                }) else {
+                    index += 1;
+                    continue;
+                };
+                let lp = pending.swap_remove(index);
+                let reach = expand(&lp.members);
+                absorb(group, lp, reach);
+                merged = true;
+            }
+            if !merged {
+                break;
+            }
+        }
+        self.pending_loops = pending;
+        let mut members = BTreeSet::new();
+        let mut cleared = Vec::new();
+        for (lp, reach) in groups {
+            members.extend(reach);
+            cleared.push(lp);
+        }
+        cleared.sort_by(|a, b| a.members.cmp(&b.members));
+        (cleared, members)
+    }
+
     /// Clears `loops`, at quiescence or before waiting work is released:
     /// each member's primary outputs, and those of whatever shares them, go
     /// back to the source layer, they run again before any other work, and
@@ -2925,11 +3019,9 @@ impl Engine {
             self.trace_loop_edges(db, &loops);
         }
         self.stats.loop_waves += 1;
-        self.stats.loops_cleared += loops.len();
-        let mut members = BTreeSet::new();
-        for statement in loops.iter().flatten() {
-            members.extend(co_producers(db, *statement));
-        }
+        let wave = self.stats.loop_waves;
+        let (cleared, members) = self.merge_overlapping_loops(db, loops, at_quiescence, wave);
+        self.stats.loops_cleared += cleared.len();
 
         if crate::profile::tracing_evaluations() {
             for member in &members {
@@ -2941,15 +3033,7 @@ impl Engine {
         for member in &members {
             touched.extend(db.reader_graph().outputs_of(*member).cloned());
         }
-        self.pending_loops
-            .retain(|lp| !lp.members.iter().any(|member| members.contains(member)));
-        let wave = self.stats.loop_waves;
-        self.pending_loops
-            .extend(loops.into_iter().map(|lp| ClearedLoop {
-                members: lp,
-                at_quiescence,
-                wave,
-            }));
+        self.pending_loops.extend(cleared);
         self.loop_before = touched
             .iter()
             .map(|key| (key.clone(), self.fingerprint(db, key)))
