@@ -1429,7 +1429,61 @@ fn check_table_const_member(
         return TableConstMemberCheck::Valid;
     }
 
+    if is_unresolved_panel_registration_table(semantic_model, id) {
+        return TableConstMemberCheck::Valid;
+    }
+
     TableConstMemberCheck::NotFound
+}
+
+/// Whether `id` is a table handed to a panel registration whose class could
+/// not be resolved, such as a name built at runtime. The panel still takes
+/// the members of its base, so the table's own members are not all it has.
+fn is_unresolved_panel_registration_table(
+    semantic_model: &SemanticModel,
+    id: &crate::InFiled<rowan::TextRange>,
+) -> bool {
+    if id.file_id != semantic_model.get_file_id() {
+        return false;
+    }
+    let db = semantic_model.get_db();
+    let Some(metadata) = db
+        .get_gmod_class_metadata_index()
+        .get_file_metadata(&id.file_id)
+    else {
+        return false;
+    };
+    let Some(tree) = db.get_vfs().get_syntax_tree(&id.file_id) else {
+        return false;
+    };
+    let root = tree.get_red_root();
+    [
+        (&metadata.vgui_register_calls, 1),
+        (&metadata.vgui_register_table_calls, 0),
+        (&metadata.derma_define_control_calls, 2),
+    ]
+    .into_iter()
+    .flat_map(|(calls, default_table_arg_idx)| {
+        calls.iter().map(move |call| {
+            (
+                call.vgui_panel_table_arg_source(default_table_arg_idx),
+                call,
+            )
+        })
+    })
+    .filter(|(source, _)| !source.is_derived())
+    .any(|(source, call)| {
+        call.args
+            .get(source.arg_idx)
+            .and_then(|arg| arg.syntax_id.to_node_from_root(&root))
+            .and_then(LuaExpr::cast)
+            .is_some_and(|expr| {
+                matches!(
+                    semantic_model.infer_expr(expr),
+                    Ok(LuaType::TableConst(table)) if &table == id
+                )
+            })
+    })
 }
 
 fn table_const_is_empty(db: &DbIndex, id: &crate::InFiled<rowan::TextRange>) -> bool {
