@@ -1726,7 +1726,7 @@ mod test {
                 return setmetatable({}, self)
             end
 
-            Class:new():known()
+            Class:new():missing()
             "#,
         ));
     }
@@ -1907,5 +1907,35 @@ mod test {
             ws.humanize_type_detailed(signature_return_type(&ws, returner_file, "GetRankMissing"));
         assert_eq!(warm_icon, "IMaterial");
         assert_eq!(warm_missing, "nil");
+    }
+
+    #[test]
+    fn test_class_annotated_metatable_keeps_methods_after_in_place_setmetatable() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local settings = {}
+
+            ---@class Convar
+            local meta = {}
+            meta.__index = meta
+
+            function meta:GetValue()
+                return self.value
+            end
+
+            local function Add(name)
+                local t = {}
+                setmetatable(t, meta)
+                t:GetValue()
+                settings[name] = t
+                return t
+            end
+
+            local obj = settings["a"]
+            obj:GetValue()
+            "#,
+        ));
     }
 }

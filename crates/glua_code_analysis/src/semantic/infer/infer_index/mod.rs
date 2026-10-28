@@ -1301,7 +1301,7 @@ fn infer_table_metatable_member(
         .get(table_range)
         .ok_or(InferFailReason::FieldNotFound)?;
 
-    let meta_owner = LuaMemberOwner::Element(metatable.clone());
+    let meta_owner = crate::semantic::metatable_member_owner(db, metatable);
     let index_member_key = LuaMemberKey::Name("__index".into());
     // Writers that disagree (one table here, another there) are looked up
     // through each of them, the way the runtime reads whichever one is set.

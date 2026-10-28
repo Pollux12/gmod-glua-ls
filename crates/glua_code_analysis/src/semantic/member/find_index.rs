@@ -496,7 +496,7 @@ impl IndexLookup<'_> {
             return;
         };
         if let Some(index_item) = db.get_member_index().get_member_item(
-            &LuaMemberOwner::Element(metatable.clone()),
+            &crate::semantic::metatable_member_owner(db, metatable),
             &LuaMemberKey::Name("__index".into()),
         ) {
             let Ok(index_type) = index_item.resolve_type(db) else {

@@ -32,8 +32,8 @@ pub use cache::{
 };
 pub(crate) use decl::value::{
     decl_value_expr, known_signature_id, local_initializer_expr, local_name_closure_signature_id,
-    local_name_value, semantic_decl_closure_signature_id, semantic_decl_signature_id,
-    semantic_decl_value, semantic_decl_value_expr,
+    local_name_value, metatable_member_owner, semantic_decl_closure_signature_id,
+    semantic_decl_signature_id, semantic_decl_value, semantic_decl_value_expr,
 };
 pub use decl::{enum_variable_is_param, parse_require_module_info};
 use glua_parser::{

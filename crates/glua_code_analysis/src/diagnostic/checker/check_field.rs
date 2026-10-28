@@ -726,7 +726,7 @@ fn has_unresolved_metatable_index_inner(
             };
 
             let index_member_key = LuaMemberKey::Name("__index".into());
-            let meta_owner = LuaMemberOwner::Element(metatable.clone());
+            let meta_owner = crate::semantic::metatable_member_owner(db, metatable);
             let index_type = infer_owner_raw_member_type_with_realm(
                 db,
                 meta_owner,

@@ -1,8 +1,8 @@
-use glua_parser::{LuaAstNode, LuaExpr, LuaNameExpr};
+use glua_parser::{LuaAstNode, LuaExpr, LuaLocalStat, LuaNameExpr, LuaTableExpr};
 
 use crate::{
-    DbIndex, FileId, LuaDeclId, LuaSemanticDeclId, LuaSignatureId, LuaType,
-    semantic::get_member_value_expr,
+    DbIndex, FileId, InFiled, LuaDeclId, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId,
+    LuaType, semantic::get_member_value_expr,
 };
 
 pub(crate) fn decl_value_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<LuaExpr> {
@@ -14,6 +14,47 @@ pub(crate) fn decl_value_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<LuaExp
         db.get_vfs()
             .syntax_node_around(&decl_id.file_id, value_syntax_id)?,
     )
+}
+
+/// The owner of a metatable literal's members: the `---@class` its local is
+/// annotated with, else the literal itself.
+pub(crate) fn metatable_member_owner(
+    db: &DbIndex,
+    metatable: &InFiled<rowan::TextRange>,
+) -> LuaMemberOwner {
+    annotated_local_class(db, metatable)
+        .map(LuaMemberOwner::Type)
+        .unwrap_or_else(|| LuaMemberOwner::Element(metatable.clone()))
+}
+
+fn annotated_local_class(
+    db: &DbIndex,
+    table: &InFiled<rowan::TextRange>,
+) -> Option<crate::LuaTypeDeclId> {
+    let root = db
+        .get_vfs()
+        .syntax_tree_around(&table.file_id, table.value)?
+        .get_red_root();
+    let table_expr = root
+        .token_at_offset(table.value.start())
+        .right_biased()?
+        .parent_ancestors()
+        .find_map(LuaTableExpr::cast)
+        .filter(|table_expr| table_expr.get_range() == table.value)?;
+    let local_stat = LuaLocalStat::cast(table_expr.syntax().parent()?)?;
+    let index = local_stat
+        .get_value_exprs()
+        .position(|value| value.get_range() == table.value)?;
+    let local_name = local_stat.get_local_name_list().nth(index)?;
+    let decl_id = LuaDeclId::new(table.file_id, local_name.get_position());
+    match db
+        .get_type_index()
+        .get_type_cache(&decl_id.into())?
+        .as_type()
+    {
+        LuaType::Def(id) | LuaType::Ref(id) => Some(id.clone()),
+        _ => None,
+    }
 }
 
 pub(crate) fn semantic_decl_value(
