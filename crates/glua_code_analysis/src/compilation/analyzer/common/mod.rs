@@ -584,7 +584,8 @@ pub fn bind_decl_write(
             && type_cache.is_infer()
             && is_informative_type(type_cache.as_type())
             && (union_widens_cached_type(type_cache.as_type(), existing.as_type())
-                || settled_covers_cached_type(type_cache.as_type(), existing.as_type()))
+                || settled_covers_cached_type(type_cache.as_type(), existing.as_type())
+                || settled_extends_cached_classes(db, type_cache.as_type(), existing.as_type()))
             && type_cache.as_type() != existing.as_type()
         {
             db.get_type_index_mut()
@@ -830,6 +831,45 @@ pub(crate) fn settled_covers_cached_type(inferred: &LuaType, current: &LuaType) 
         && current_arms.iter().all(|cached| {
             inferred_arms.iter().any(|settled| {
                 settled == cached || crate::db_index::widens_primitive(settled, cached)
+            })
+        })
+}
+
+/// Whether the settled answer holds everything the cache holds once a class
+/// instance arm counts as held by a class it extends: `NULL` against
+/// `Entity|Foo`. A
+/// cache of subclasses is as much a subset snapshot as a cache of fewer arms,
+/// and a rule that took the answer for one and not the other would accept
+/// whichever the writers produced first.
+pub(crate) fn settled_extends_cached_classes(
+    db: &DbIndex,
+    inferred: &LuaType,
+    current: &LuaType,
+) -> bool {
+    fn arms(typ: &LuaType) -> Vec<LuaType> {
+        match typ {
+            LuaType::Union(union) => known_arms(union),
+            other => vec![other.clone()],
+        }
+    }
+    fn instance_class(typ: &LuaType) -> Option<&LuaTypeDeclId> {
+        match typ {
+            LuaType::Ref(id) => Some(id),
+            _ => None,
+        }
+    }
+    let inferred_arms = arms(inferred);
+    let current_arms = arms(current);
+    !current_arms.is_empty()
+        && current_arms.iter().all(|cached| {
+            inferred_arms.iter().any(|settled| {
+                settled == cached
+                    || crate::db_index::widens_primitive(settled, cached)
+                    || instance_class(settled)
+                        .zip(instance_class(cached))
+                        .is_some_and(|(settled, cached)| {
+                            crate::semantic::is_sub_type_of(db, cached, settled)
+                        })
             })
         })
 }

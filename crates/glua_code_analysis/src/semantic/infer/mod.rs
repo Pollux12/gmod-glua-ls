@@ -562,6 +562,26 @@ fn declared_as_copy_of(
         == Some(source_decl)
 }
 
+/// Whether `target` names a local declared with neither a value nor a type:
+/// what it holds is the merge of the values stored into it, the one `expr`
+/// stores included, so reading it back is the stored value deriving itself,
+/// not evidence of its type.
+fn typed_only_by_stores(db: &DbIndex, file_id: crate::FileId, target: &LuaNameExpr) -> bool {
+    let Some(decl_id) = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, target.get_range())
+    else {
+        return false;
+    };
+    db.get_decl_index().get_decl(&decl_id).is_some_and(|decl| {
+        matches!(decl.extra, crate::LuaDeclExtra::Local { .. })
+            && decl.get_value_syntax_id().is_none()
+    }) && !db
+        .get_type_index()
+        .get_type_cache(&decl_id.into())
+        .is_some_and(|cache| cache.is_doc())
+}
+
 pub fn infer_bind_value_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -591,7 +611,8 @@ pub fn infer_bind_value_type(
                     let var = vars.get(idx);
                     if let Some(var) = var {
                         if let LuaVarExpr::NameExpr(target) = var
-                            && declared_as_copy_of(db, cache.get_file_id(), target, &expr)
+                            && (declared_as_copy_of(db, cache.get_file_id(), target, &expr)
+                                || typed_only_by_stores(db, cache.get_file_id(), target))
                         {
                             return None;
                         }
