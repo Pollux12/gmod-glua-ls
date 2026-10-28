@@ -186,6 +186,8 @@ fn maybe_field_exist_narrow(
         }
     }
 
+    let result = drop_subtypes_of_arms_holding_the_field(db, &left_type, result);
+
     match condition_flow {
         InferConditionFlow::TrueCondition => {
             let direct_definers =
@@ -236,6 +238,32 @@ fn maybe_field_exist_narrow(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+/// An antecedent arm that already holds the field, directly or inherited,
+/// stands for its subtypes: the guard tells nothing more about them, and
+/// narrowing the arm to a subclass that overrides the field would replace a
+/// base class with one of its own derived panels.
+fn drop_subtypes_of_arms_holding_the_field(
+    db: &DbIndex,
+    left_type: &LuaType,
+    result: Vec<LuaType>,
+) -> Vec<LuaType> {
+    let arms = collect_antecedent_nominal_arms(left_type)
+        .into_iter()
+        .filter(|arm| result.contains(arm))
+        .collect::<Vec<_>>();
+    if arms.is_empty() {
+        return result;
+    }
+    result
+        .into_iter()
+        .filter(|candidate| {
+            !arms
+                .iter()
+                .any(|arm| is_strict_sub_type_of(db, candidate, arm))
+        })
+        .collect()
 }
 
 /// The variable whose entity table `table_expr` names: a local whose only

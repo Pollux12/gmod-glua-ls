@@ -3127,6 +3127,34 @@ _2 = a[1]
     }
 
     #[test]
+    fn field_guard_keeps_a_base_that_inherits_the_field_over_a_subclass_that_overrides_it() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Panel
+            local Panel = {}
+            function Panel:Init() end
+
+            ---@class Label: Panel
+
+            ---@class ScriptedLabel: Label
+            local ScriptedLabel = {}
+            function ScriptedLabel:Init() end
+
+            ---@type Label
+            local label
+            if label.Init then
+                A = label
+            end
+        "#,
+        );
+
+        let a = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(a), "Label");
+    }
+
+    #[test]
     fn test_isfunction_member_guard_narrows_base_entity_to_callable_member_subtypes() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 
