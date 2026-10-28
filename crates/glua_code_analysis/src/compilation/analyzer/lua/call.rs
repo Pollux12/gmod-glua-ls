@@ -14,7 +14,9 @@ use crate::{
     DbIndex, FileId, GlobalId, GmodClassCallArg, GmodClassCallLiteral, GmodScriptedClassCallKind,
     GmodScriptedClassCallMetadata, InFiled, InferFailReason, LuaMemberKey, LuaMemberOwner,
     LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId, LuaType, LuaTypeDeclId,
-    compilation::analyzer::{lua::LuaAnalyzer, unresolve::UnResolveSpecialCall},
+    compilation::analyzer::{
+        gmod::static_call_arg_string, lua::LuaAnalyzer, unresolve::UnResolveSpecialCall,
+    },
     get_member_value_expr,
     semantic::find_members_with_key,
 };
@@ -1579,7 +1581,7 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
         return;
     }
 
-    let (literal_args, args) = extract_call_args(call_expr);
+    let (literal_args, args) = extract_call_args(analyzer.db, analyzer.file_id, call_expr);
 
     analyzer.write(StatementWrite::AddGmodClassCall {
         file_id: analyzer.file_id,
@@ -1598,6 +1600,8 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
 }
 
 fn extract_call_args(
+    db: &DbIndex,
+    file_id: FileId,
     call_expr: &LuaCallExpr,
 ) -> (Vec<Option<GmodClassCallLiteral>>, Vec<GmodClassCallArg>) {
     let Some(args_list) = call_expr.get_args_list() else {
@@ -1609,7 +1613,10 @@ fn extract_call_args(
 
     for arg_expr in args_list.get_args() {
         let syntax_id = arg_expr.get_syntax_id();
-        let value = extract_literal_or_name(&arg_expr);
+        let value = extract_literal_or_name(&arg_expr).or_else(|| {
+            static_call_arg_string(db, file_id, call_expr, &arg_expr)
+                .map(GmodClassCallLiteral::String)
+        });
         literal_args.push(value.clone());
         args.push(GmodClassCallArg { syntax_id, value });
     }

@@ -9244,7 +9244,10 @@ fn extract_gmod_class_call_args(
     let arg_exprs = args_list.get_args().collect::<Vec<_>>();
     for arg_expr in &arg_exprs {
         let syntax_id = arg_expr.get_syntax_id();
-        let value = extract_gmod_class_literal_or_name(arg_expr);
+        let value = extract_gmod_class_literal_or_name(arg_expr).or_else(|| {
+            static_call_arg_string(db, file_id, call_expr, arg_expr)
+                .map(GmodClassCallLiteral::String)
+        });
         literal_args.push(value.clone());
         args.push(crate::GmodClassCallArg { syntax_id, value });
     }
@@ -12536,6 +12539,79 @@ fn apply_dynamic_loaders(
             changed |= target_info.mark_states(
                 target_states,
                 GmodLoadStatus::MaybeDynamic,
+/// The string `expr` holds, read from the file's text alone: a string literal,
+/// a field of a table assigned one before `call_expr`, or a concatenation of
+/// those.
+pub(crate) fn static_call_arg_string(
+    db: &DbIndex,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+    expr: &LuaExpr,
+) -> Option<String> {
+    static_string_value(db, file_id, call_expr, expr, &mut Vec::new())
+}
+
+fn static_string_value(
+    db: &DbIndex,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+    expr: &LuaExpr,
+    visiting: &mut Vec<LuaSyntaxId>,
+) -> Option<String> {
+    match expr {
+        LuaExpr::LiteralExpr(_) => static_literal_string(expr),
+        LuaExpr::ParenExpr(paren_expr) => {
+            static_string_value(db, file_id, call_expr, &paren_expr.get_expr()?, visiting)
+        }
+        LuaExpr::BinaryExpr(binary_expr)
+            if binary_expr.get_op_token()?.get_op() == BinaryOperator::OpConcat =>
+        {
+            let (left, right) = binary_expr.get_exprs()?;
+            Some(format!(
+                "{}{}",
+                static_string_value(db, file_id, call_expr, &left, visiting)?,
+                static_string_value(db, file_id, call_expr, &right, visiting)?
+            ))
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            let syntax_id = index_expr.get_syntax_id();
+            if visiting.contains(&syntax_id) {
+                return None;
+            }
+            let (root, field_path) = index_expr_root_and_field_path(index_expr)?;
+            let value = resolve_static_field_path_expr(db, file_id, call_expr, root, &field_path)?;
+            visiting.push(syntax_id);
+            let string = static_string_value(db, file_id, call_expr, &value, visiting);
+            visiting.pop();
+            string
+        }
+        _ => None,
+    }
+}
+
+/// The name an index chain starts at and the keys it reads from there.
+fn index_expr_root_and_field_path(
+    index_expr: &glua_parser::LuaIndexExpr,
+) -> Option<(LuaExpr, Vec<String>)> {
+    let mut field_path = Vec::new();
+    let mut current = index_expr.clone();
+    loop {
+        field_path.push(match current.get_index_key()? {
+            LuaIndexKey::Name(name) => name.get_name_text().to_string(),
+            LuaIndexKey::String(string) => string.get_value(),
+            _ => return None,
+        });
+        match current.get_prefix_expr()? {
+            LuaExpr::IndexExpr(prefix) => current = prefix,
+            root @ LuaExpr::NameExpr(_) => {
+                field_path.reverse();
+                return Some((root, field_path));
+            }
+            _ => return None,
+        }
+    }
+}
+
                 GmodLoadConfidence::Dynamic,
             );
         }
