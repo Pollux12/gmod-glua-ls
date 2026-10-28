@@ -1488,29 +1488,51 @@ fn infer_supported_non_param_call_arg_type(
             infer_expr(db, cache, arg).ok()
         }
         LuaExpr::NameExpr(name_expr) => {
-            let decl_id = db
-                .get_reference_index()
-                .get_local_reference(&file_id)
-                .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))?;
-            let decl = db.get_decl_index().get_decl(&decl_id)?;
-            if !matches!(decl.extra, LuaDeclExtra::Local { .. }) {
-                return None;
-            }
-            let value_syntax_id = decl.get_value_syntax_id()?;
-            let root = db
-                .get_vfs()
-                .syntax_tree_around(&file_id, value_syntax_id.get_range())?
-                .get_red_root();
-            let value_node = value_syntax_id.to_node_from_root(&root)?;
-            let value_expr = LuaExpr::cast(value_node)?;
-            match &value_expr {
-                LuaExpr::LiteralExpr(_) => {}
-                LuaExpr::CallExpr(call_expr) if is_zero_arg_call(call_expr) => {}
-                _ => return None,
-            }
+            let value_expr = supported_local_value_expr(db, file_id, name_expr)?;
             infer_expr(db, cache, value_expr).ok()
         }
         _ => None,
+    }
+}
+
+/// The value of the local `name_expr` names when local param inference reads
+/// it from there: a literal or a zero-argument call.
+fn supported_local_value_expr(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaExpr> {
+    let decl_id = db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    if !matches!(decl.extra, LuaDeclExtra::Local { .. }) {
+        return None;
+    }
+    let value_syntax_id = decl.get_value_syntax_id()?;
+    let root = db
+        .get_vfs()
+        .syntax_tree_around(&file_id, value_syntax_id.get_range())?
+        .get_red_root();
+    let value_expr = LuaExpr::cast(value_syntax_id.to_node_from_root(&root)?)?;
+    match &value_expr {
+        LuaExpr::LiteralExpr(_) => Some(value_expr),
+        LuaExpr::CallExpr(call_expr) if is_zero_arg_call(call_expr) => Some(value_expr),
+        _ => None,
+    }
+}
+
+/// Whether local param inference reads `arg` itself rather than leaving it
+/// to the fallback a parameter name hint consults.
+fn is_local_call_site_arg_read(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> bool {
+    match arg {
+        LuaExpr::NameExpr(name_expr) => {
+            param_arg_decl(db, file_id, arg).is_some()
+                || is_global_pairs_for_range_var_arg(db, file_id, arg)
+                || supported_local_value_expr(db, file_id, name_expr).is_some()
+        }
+        _ => is_local_call_site_arg_shape_supported(arg),
     }
 }
 
@@ -1530,12 +1552,12 @@ fn infer_unread_local_call_site_args(
     let unread_args =
         local_function_call_sites(db, cache, signature_id.get_file_id(), target_decl_id)
             .into_iter()
-            .filter_map(|(_, call_expr)| {
+            .filter_map(|(file_id, call_expr)| {
                 call_expr
                     .get_args_list()
                     .and_then(|args| args.get_args().nth(param_idx))
-            })
-            .filter(|arg| !is_local_call_site_arg_shape_supported(arg));
+                    .filter(|arg| !is_local_call_site_arg_read(db, file_id, arg))
+            });
 
     let mut inferred_type: Option<LuaType> = None;
     for arg in unread_args {

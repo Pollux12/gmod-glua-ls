@@ -2930,6 +2930,40 @@ _2 = a[1]
     }
 
     #[test]
+    fn test_gmod_param_name_hint_yields_to_local_arg_holding_a_call_result() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Panel
+            ---@class DCategoryList: Panel
+
+            ---@param parent Panel
+            ---@return DCategoryList
+            local function make_list(parent) end
+
+            local function populate(pnl)
+                B = pnl
+            end
+
+            ---@type Panel
+            local root
+            local master_list = make_list(root)
+            populate(master_list)
+        "#;
+
+        ws.def(code);
+        let param_type = ws.expr_ty("B");
+        let param = ws.humanize_type(param_type);
+        assert_eq!(
+            param, "DCategoryList",
+            "a name guess must not beat a local the call site fills from a call"
+        );
+    }
+
+    #[test]
     fn test_gmod_func_param_name_hint_infers_function_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
