@@ -177,12 +177,22 @@ fn check_call_expr(
             }
 
             if let Some(variadic_type) = param.1.clone() {
+                let receiver_slots =
+                    usize::from(matches!((colon_call, colon_define), (true, false)));
+                let variadic_exprs = (idx..arg_types.len())
+                    .map(|arg_idx| {
+                        arg_idx
+                            .checked_sub(receiver_slots)
+                            .and_then(|expr_idx| arg_exprs.get(expr_idx))
+                    })
+                    .collect::<Vec<_>>();
                 check_variadic_param_match_args(
                     context,
                     semantic_model,
                     &variadic_type,
                     &arg_types[idx..],
                     &arg_ranges[idx..],
+                    &variadic_exprs,
                 );
             }
 
@@ -391,6 +401,7 @@ fn check_variadic_param_match_args(
     variadic_type: &LuaType,
     arg_types: &[LuaType],
     arg_ranges: &[TextRange],
+    arg_exprs: &[Option<&LuaExpr>],
 ) {
     if let LuaType::Variadic(variadic) = variadic_type
         && let VariadicType::Multi(types) = variadic.as_ref()
@@ -410,7 +421,7 @@ fn check_variadic_param_match_args(
                     *arg_range,
                     expected_type,
                     arg_type,
-                    None,
+                    arg_exprs.get(idx).copied().flatten(),
                     result,
                 );
             }
@@ -418,7 +429,7 @@ fn check_variadic_param_match_args(
         return;
     }
 
-    for (arg_type, arg_range) in arg_types.iter().zip(arg_ranges.iter()) {
+    for (idx, (arg_type, arg_range)) in arg_types.iter().zip(arg_ranges.iter()).enumerate() {
         if context.is_cancelled() {
             return;
         }
@@ -430,7 +441,7 @@ fn check_variadic_param_match_args(
                 *arg_range,
                 variadic_type,
                 arg_type,
-                None,
+                arg_exprs.get(idx).copied().flatten(),
                 result,
             );
         }

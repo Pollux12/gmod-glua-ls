@@ -93,6 +93,29 @@ function need_color(value) end
     }
 
     #[test]
+    fn test_variadic_arg_narrowed_inside_loop_is_not_nil() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param ... number
+            local function smallest(...) end
+
+            local function scan()
+                local best
+                for i = 1, 3 do
+                    if not best then
+                        best = i
+                    else
+                        smallest(best, i)
+                    end
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[test]
     fn nominal_false_edge_narrows_a_field_and_its_prebranch_alias() {
         let mut ws = workspace();
         ws.def_file(PREDICATE_PATH, PREDICATE);
