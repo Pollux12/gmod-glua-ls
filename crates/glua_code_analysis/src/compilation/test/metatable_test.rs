@@ -2005,4 +2005,48 @@ mod test {
             "#,
         ));
     }
+
+    #[test]
+    fn test_metatable_factory_positional_constructor_fields_are_instance_fields() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local meta = {}
+            meta.__index = meta
+
+            function meta:First()
+                return self[1], self[2]
+            end
+
+            local function create(ent, center)
+                local t = { ent, center }
+                setmetatable(t, meta)
+                return t
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_metatable_factory_positional_constructor_does_not_open_other_indices() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local meta = {}
+            meta.__index = meta
+
+            function meta:Third()
+                return self[3]
+            end
+
+            local function create(ent, center)
+                local t = { ent, center }
+                setmetatable(t, meta)
+                return t
+            end
+            "#,
+        ));
+    }
 }

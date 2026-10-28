@@ -4,6 +4,7 @@ use glua_parser::{
 };
 
 use super::StatementWrite;
+use super::stats::register_positional_instance_members;
 use crate::semantic::decl_value_expr;
 use crate::{
     InFiled, LuaDeclExtra, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId,
@@ -27,6 +28,11 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
     let Some(metatable_range) = resolve_metatable_backing_table(analyzer, &metatable) else {
         return Some(());
     };
+    if let Some(instance_range) = resolve_metatable_backing_table(analyzer, &table)
+        && let Some(instance_literal) = table_expr_from_range(analyzer, &instance_range)
+    {
+        register_positional_instance_members(analyzer, &instance_literal);
+    }
     let writer_sort_key = writer_sort_key(analyzer);
 
     analyzer.write(StatementWrite::AddMetatable {

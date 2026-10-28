@@ -2380,61 +2380,111 @@ fn is_shaped_array_value_field(field: &LuaTableField) -> bool {
             .is_some_and(|table_expr| table_expr.is_shaped_array_literal())
 }
 
+/// Registers the positional elements of a plain array literal that
+/// `setmetatable` makes an instance, which the declaration pass leaves as an
+/// element-typed array: the instance carries them as `[n]` members its class
+/// table is read through.
+pub(super) fn register_positional_instance_members(
+    analyzer: &mut LuaAnalyzer,
+    table_expr: &LuaTableExpr,
+) {
+    if !table_expr.is_array() || table_expr.is_shaped_array_literal() {
+        return;
+    }
+    let owner = LuaMemberOwner::Element(InFiled::new(analyzer.file_id, table_expr.get_range()));
+    let feature = if analyzer.context.metas.contains(&analyzer.file_id) {
+        LuaMemberFeature::MetaDefine
+    } else {
+        LuaMemberFeature::FileDefine
+    };
+    for field in table_expr.get_fields() {
+        if !field.is_value_field() || field.is_trailing_spread() {
+            continue;
+        }
+        let Some(LuaIndexKey::Idx(idx)) = field.get_field_key() else {
+            continue;
+        };
+        let member_id = LuaMemberId::new(field.get_syntax_id(), analyzer.file_id);
+        if analyzer
+            .db
+            .get_member_index()
+            .get_member(&member_id)
+            .is_some()
+        {
+            continue;
+        }
+        analyzer.write(StatementWrite::AddMember {
+            owner: owner.clone(),
+            member: LuaMember::new(member_id, LuaMemberKey::Integer(idx as i64), feature, None),
+        });
+        bind_table_field_value_type(analyzer, &field, false);
+    }
+}
+
 pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> Option<()> {
     register_expr_key_member(analyzer, &field);
 
     let trailing_spread = field.is_trailing_spread();
     if field.is_assign_field() || is_shaped_array_value_field(&field) || trailing_spread {
-        let value_expr = field.get_value_expr()?;
-        let member_id = LuaMemberId::new(field.get_syntax_id(), analyzer.file_id);
-        let inferred = analyzer.infer_expr(&value_expr.clone());
-        let value_type = match inferred {
-            Ok(value_type) => match value_type {
-                LuaType::Def(ref_id) => LuaType::Ref(ref_id),
-                other => {
-                    if other.is_unknown() && is_undefined_global_name_expr(analyzer, &value_expr) {
-                        LuaType::Nil
-                    } else {
-                        other
-                    }
-                }
-            },
-            // Same rationale as `analyze_assign_stat`: a missing/undefined
-            // RHS evaluates to `nil` at runtime.
-            Err(InferFailReason::None) => LuaType::Nil,
-            Err(_) => {
-                let unresolve = UnResolveMember {
-                    file_id: analyzer.file_id,
-                    member_id,
-                    expr: Some(value_expr.clone()),
-                    prefix: None,
-                    ret_idx: 0,
-                };
+        bind_table_field_value_type(analyzer, &field, trailing_spread)?;
+    }
+    Some(())
+}
 
-                analyzer.context.add_unresolve(unresolve.into());
-                return None;
+fn bind_table_field_value_type(
+    analyzer: &mut LuaAnalyzer,
+    field: &LuaTableField,
+    trailing_spread: bool,
+) -> Option<()> {
+    let value_expr = field.get_value_expr()?;
+    let member_id = LuaMemberId::new(field.get_syntax_id(), analyzer.file_id);
+    let inferred = analyzer.infer_expr(&value_expr.clone());
+    let value_type = match inferred {
+        Ok(value_type) => match value_type {
+            LuaType::Def(ref_id) => LuaType::Ref(ref_id),
+            other => {
+                if other.is_unknown() && is_undefined_global_name_expr(analyzer, &value_expr) {
+                    LuaType::Nil
+                } else {
+                    other
+                }
             }
-        };
-        if trailing_spread && !matches!(value_type, LuaType::Variadic(_)) {
+        },
+        // Same rationale as `analyze_assign_stat`: a missing/undefined
+        // RHS evaluates to `nil` at runtime.
+        Err(InferFailReason::None) => LuaType::Nil,
+        Err(_) => {
+            let unresolve = UnResolveMember {
+                file_id: analyzer.file_id,
+                member_id,
+                expr: Some(value_expr.clone()),
+                prefix: None,
+                ret_idx: 0,
+            };
+
+            analyzer.context.add_unresolve(unresolve.into());
             return None;
         }
-        // A table-valued field of a guarded `x = x or { ... }` literal
-        // bootstraps the same member `x.y = x.y or {}` does: when every writer
-        // of the slot is a guard they all name one table — the earliest
-        // writer's literal — so the field binds that literal, not its own.
-        // Binding the field literal instead leaves whichever file re-walked
-        // last in the cache, and reads taken between the writes disagree with
-        // the settled answer.
-        let value_type = if is_guarded_table_assignment_member(&analyzer.db, member_id) {
-            canonical_guarded_table_bootstrap_type(&analyzer.db, member_id).unwrap_or(value_type)
-        } else {
-            value_type
-        };
-        analyzer.write(StatementWrite::BindType {
-            owner: member_id.into(),
-            cache: LuaTypeCache::InferType(value_type),
-        });
+    };
+    if trailing_spread && !matches!(value_type, LuaType::Variadic(_)) {
+        return None;
     }
+    // A table-valued field of a guarded `x = x or { ... }` literal
+    // bootstraps the same member `x.y = x.y or {}` does: when every writer
+    // of the slot is a guard they all name one table — the earliest
+    // writer's literal — so the field binds that literal, not its own.
+    // Binding the field literal instead leaves whichever file re-walked
+    // last in the cache, and reads taken between the writes disagree with
+    // the settled answer.
+    let value_type = if is_guarded_table_assignment_member(&analyzer.db, member_id) {
+        canonical_guarded_table_bootstrap_type(&analyzer.db, member_id).unwrap_or(value_type)
+    } else {
+        value_type
+    };
+    analyzer.write(StatementWrite::BindType {
+        owner: member_id.into(),
+        cache: LuaTypeCache::InferType(value_type),
+    });
     Some(())
 }
 
