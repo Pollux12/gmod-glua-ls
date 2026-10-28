@@ -54,14 +54,16 @@ fn transferable_factory_member_ids(
         }
 
         let member_scope = db.get_member_index().member_function_scope_range(member_id);
-        let direct_member = member_defined_via_variable_strict(
-            db,
-            binding.file_id,
-            member_position,
-            binding.local_name.as_str(),
-        );
+        let in_constructor = binding.table_range.value.contains(member_position);
+        let direct_member = in_constructor
+            || member_defined_via_variable_strict(
+                db,
+                binding.file_id,
+                member_position,
+                binding.local_name.as_str(),
+            );
 
-        if member_scope != Some(binding.function_scope) || !direct_member {
+        if !direct_member || (!in_constructor && member_scope != Some(binding.function_scope)) {
             // Any field collected for the factory table through an alias or a
             // nested closure makes the constructor ambiguous. Transfer nothing.
             return None;

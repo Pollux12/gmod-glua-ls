@@ -1983,4 +1983,26 @@ mod test {
             "#,
         ));
     }
+
+    #[test]
+    fn test_metatable_factory_constructor_fields_are_instance_fields() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local meta = {}
+            meta.__index = meta
+
+            function meta:Describe()
+                return self.name, self[1]
+            end
+
+            local function create(name, first)
+                local t = { first, name = name }
+                setmetatable(t, meta)
+                return t
+            end
+            "#,
+        ));
+    }
 }
