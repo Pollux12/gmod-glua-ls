@@ -90,4 +90,62 @@ mod test {
             "#,
         ));
     }
+
+    /// A local that caches the entity the function creates is assigned from a
+    /// local that reads the cache first.
+    #[test]
+    fn a_cached_local_read_before_its_assignment_settles() {
+        let digest = settled_digest(
+            r#"
+            ---@meta
+            ---@class Entity
+            local Entity = {}
+            ---@return boolean
+            ---@return_cast self Entity
+            ---@[self_guard("gmod.entity")]
+            function Entity:IsValid() end
+
+            ---@class NULL : Entity
+            ---@type NULL
+            NULL = nil
+
+            ents = {}
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return (instance) T|NULL
+            function ents.Create(class) end
+
+            local cached = NULL
+            local function make(typ)
+                local ent = cached:IsValid() and cached or ents.Create("env_entity_dissolver")
+                ent:Spawn()
+                cached = ent
+            end
+            "#,
+        );
+        assert!(digest.is_some(), "the analysis settles");
+    }
+
+    #[test]
+    fn a_local_written_after_a_guarded_write_of_its_own_comparison_settles() {
+        let digest = settled_digest(
+            r#"
+            ---@class filelib
+            file = {}
+            ---@param name string
+            ---@param content string
+            function file.Write(name, content) end
+
+            local last_backup
+            function f(data)
+                local str = pace.luadata.Encode(data)
+                if str ~= last_backup then
+                    file.Write("x", str)
+                    last_backup = str
+                end
+            end
+            "#,
+        );
+        assert!(digest.is_some(), "the analysis settles");
+    }
 }
