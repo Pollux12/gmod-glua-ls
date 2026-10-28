@@ -356,7 +356,7 @@ fn table_arg_range(
     call: &GmodScriptedClassCallMetadata,
     table_source: &GmodClassCallArgSource,
 ) -> Option<rowan::TextRange> {
-    if table_source.field_path.is_empty() {
+    if !table_source.is_derived() {
         return call
             .args
             .get(table_source.arg_idx)

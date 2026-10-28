@@ -80,10 +80,14 @@ impl Hash for GmodClassCallArg {
     }
 }
 
+/// Where a call's role value is written: an argument, a field read from it,
+/// and the fixed text a wrapper puts around the result.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodClassCallArgSource {
     pub arg_idx: usize,
     pub field_path: Vec<String>,
+    pub prefix: String,
+    pub suffix: String,
 }
 
 impl GmodClassCallArgSource {
@@ -91,7 +95,14 @@ impl GmodClassCallArgSource {
         Self {
             arg_idx,
             field_path: Vec::new(),
+            prefix: String::new(),
+            suffix: String::new(),
         }
+    }
+
+    /// Whether the value is something other than the argument as written.
+    pub fn is_derived(&self) -> bool {
+        !self.field_path.is_empty() || !self.prefix.is_empty() || !self.suffix.is_empty()
     }
 }
 
@@ -240,7 +251,7 @@ impl GmodScriptedClassCallMetadata {
         &self,
         source: &GmodClassCallArgSource,
     ) -> Option<&GmodClassCallLiteral> {
-        if source.field_path.is_empty() {
+        if !source.is_derived() {
             return self.args.get(source.arg_idx)?.value.as_ref();
         }
 

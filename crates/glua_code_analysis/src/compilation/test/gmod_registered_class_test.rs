@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod test {
     use googletest::prelude::*;
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
 
     use crate::{Emmyrc, LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace};
 
@@ -114,5 +116,164 @@ mod test {
 
         ws.def_file(PROJECTILES_PATH, PROJECTILES);
         expect_true!(has_member(&mut ws, "pac_projectile", "Initialize"));
+    }
+
+    const PANEL_CLASSES_PATH: &str = "lua/includes/panels.lua";
+    const PANEL_CLASSES: &str = r#"
+        ---@meta
+        ---@class Panel
+        function Panel:Dock() end
+        ---@class DPanel : Panel
+        ---@class DButton : DPanel
+    "#;
+    const WRAPPER_PATH: &str = "addons/pac3/lua/pac3/editor/client/panels.lua";
+    const WRAPPER: &str = r#"
+        pace = pace or {}
+        pace.RegisteredPanels = {}
+
+        function pace.RegisterPanel(PANEL)
+            pace.RegisteredPanels[PANEL.ClassName] = PANEL
+            vgui.Register("pace_" .. PANEL.ClassName, PANEL, PANEL.Base)
+        end
+    "#;
+    const BROWSER_PATH: &str = "addons/pac3/lua/pac3/editor/client/panels/browser.lua";
+    const BROWSER: &str = r#"
+        local PANEL = {}
+
+        PANEL.ClassName = "browser"
+        PANEL.Base = "DButton"
+
+        function PANEL:Init()
+            self:Dock()
+            self:NotAPanelMethod()
+        end
+
+        pace.RegisterPanel(PANEL)
+    "#;
+
+    fn panel_workspace(files: &[(&str, &str)]) -> VirtualWorkspace {
+        let mut ws = gmod_workspace();
+        ws.def_file(PANEL_CLASSES_PATH, PANEL_CLASSES);
+        ws.def_files(files.to_vec());
+        ws
+    }
+
+    fn undefined_methods(ws: &mut VirtualWorkspace, path: &str) -> Vec<String> {
+        let file_id = ws
+            .analysis
+            .get_file_id(&ws.virtual_url_generator.new_uri(path))
+            .expect("file");
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("undefined-method".to_string()))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect()
+    }
+
+    #[gtest]
+    fn a_function_that_registers_the_panel_it_is_given_binds_the_panel_to_its_class() {
+        let mut ws = panel_workspace(&[(WRAPPER_PATH, WRAPPER), (BROWSER_PATH, BROWSER)]);
+
+        expect_that!(
+            super_types(&mut ws, "pace_browser"),
+            contains(eq(&LuaType::Ref(LuaTypeDeclId::global("DButton"))))
+        );
+        expect_true!(has_member(&mut ws, "pace_browser", "Init"));
+        expect_that!(
+            undefined_methods(&mut ws, BROWSER_PATH),
+            elements_are![contains_substring("NotAPanelMethod")]
+        );
+    }
+
+    #[gtest]
+    fn a_wrapper_given_a_panel_without_a_class_name_leaves_it_unregistered() {
+        let nameless = BROWSER.replace(
+            "PANEL.ClassName = \"browser\"",
+            "PANEL.ClassName = pace.Name()",
+        );
+        let mut ws = panel_workspace(&[(WRAPPER_PATH, WRAPPER), (BROWSER_PATH, nameless.as_str())]);
+
+        expect_false!(is_registered(&mut ws, "pace_browser"));
+        expect_false!(has_member(&mut ws, "pace_browser", "Init"));
+    }
+
+    #[gtest]
+    fn editing_the_wrapper_or_the_panel_moves_the_registration() {
+        let renamed_panel = BROWSER.replace("\"browser\"", "\"renamed\"");
+        let mut ws = VirtualWorkspace::assert_warm_matches_cold(
+            |ws| {
+                setup(ws);
+                ws.def_file(PANEL_CLASSES_PATH, PANEL_CLASSES);
+            },
+            &[(WRAPPER_PATH, WRAPPER), (BROWSER_PATH, BROWSER)],
+            &[(BROWSER_PATH, renamed_panel.as_str())],
+        );
+        expect_true!(has_member(&mut ws, "pace_renamed", "Init"));
+        expect_false!(has_member(&mut ws, "pace_browser", "Init"));
+
+        let prefixed = WRAPPER.replace("\"pace_\"", "\"ui_\"");
+        let mut ws = VirtualWorkspace::assert_warm_matches_cold(
+            |ws| {
+                setup(ws);
+                ws.def_file(PANEL_CLASSES_PATH, PANEL_CLASSES);
+            },
+            &[(WRAPPER_PATH, WRAPPER), (BROWSER_PATH, BROWSER)],
+            &[(WRAPPER_PATH, prefixed.as_str())],
+        );
+        expect_true!(has_member(&mut ws, "ui_browser", "Init"));
+        expect_false!(has_member(&mut ws, "pace_browser", "Init"));
+
+        let unwrapped = "pace = pace or {}
+function pace.RegisterPanel(PANEL) end
+";
+        let mut ws = VirtualWorkspace::assert_warm_matches_cold(
+            |ws| {
+                setup(ws);
+                ws.def_file(PANEL_CLASSES_PATH, PANEL_CLASSES);
+            },
+            &[(WRAPPER_PATH, WRAPPER), (BROWSER_PATH, BROWSER)],
+            &[(WRAPPER_PATH, unwrapped)],
+        );
+        expect_false!(has_member(&mut ws, "pace_browser", "Init"));
+    }
+
+    #[gtest]
+    fn deleting_and_reopening_the_wrapper_unbinds_and_rebinds_its_panels() {
+        let mut ws = panel_workspace(&[(WRAPPER_PATH, WRAPPER), (BROWSER_PATH, BROWSER)]);
+        let wrapper_uri = ws.virtual_url_generator.new_uri(WRAPPER_PATH);
+        expect_true!(has_member(&mut ws, "pace_browser", "Init"));
+
+        ws.analysis.remove_file_by_uri(&wrapper_uri);
+        expect_false!(has_member(&mut ws, "pace_browser", "Init"));
+
+        ws.def_file(WRAPPER_PATH, WRAPPER);
+        expect_true!(has_member(&mut ws, "pace_browser", "Init"));
+    }
+
+    #[gtest]
+    fn a_function_wrapping_a_wrapper_registers_the_same_way() {
+        let outer = r#"
+            function pace.RegisterEditorPanel(P)
+                pace.RegisterPanel(P)
+            end
+        "#;
+        let user = BROWSER.replace(
+            "pace.RegisterPanel(PANEL)",
+            "pace.RegisterEditorPanel(PANEL)",
+        );
+        let mut ws = panel_workspace(&[
+            (WRAPPER_PATH, WRAPPER),
+            (
+                "addons/pac3/lua/pac3/editor/client/editor_panels.lua",
+                outer,
+            ),
+            (BROWSER_PATH, user.as_str()),
+        ]);
+
+        expect_true!(has_member(&mut ws, "pace_browser", "Init"));
     }
 }

@@ -61,6 +61,27 @@ struct Contributions {
     signatures: HashMap<LuaSignatureId, Vec<(DefinitionRank, Target)>>,
 }
 
+impl AnnotatedGmodGlobalCallRoleMap {
+    /// Files `path` under its method name while it has roles, and takes it out
+    /// when it has none.
+    fn set_receiver_path(&mut self, path: &str) {
+        let Some(name) = method_name(path) else {
+            return;
+        };
+        if self.roles_by_path.contains_key(path) {
+            self.receiver_paths
+                .entry(name)
+                .or_default()
+                .insert(path.to_string());
+        } else if let Some(paths) = self.receiver_paths.get_mut(&name) {
+            paths.remove(path);
+            if paths.is_empty() {
+                self.receiver_paths.remove(&name);
+            }
+        }
+    }
+}
+
 /// The entries a fold step may have moved.
 #[derive(Default)]
 struct Touched {
@@ -69,6 +90,8 @@ struct Touched {
     globals: HashSet<GlobalId>,
     methods: HashSet<SmolStr>,
     signatures: HashSet<LuaSignatureId>,
+    /// Whether a file's forwarded calls moved.
+    forwarded_calls: bool,
 }
 
 impl Touched {
@@ -130,6 +153,7 @@ impl Contributions {
         touched: &mut Touched,
     ) {
         let role_map = &scan.role_map;
+        touched.forwarded_calls |= !scan.forwarded_calls.is_empty();
         for path in role_map.roles_by_path.keys() {
             self.paths
                 .entry(path.clone())
@@ -207,6 +231,7 @@ impl Contributions {
             }
         }
         let role_map = &scan.role_map;
+        touched.forwarded_calls |= !scan.forwarded_calls.is_empty();
         for path in role_map.roles_by_path.keys() {
             retract(&mut self.paths, path, |(_, file)| *file != file_id);
             touched.paths.insert(path.clone());
@@ -283,6 +308,9 @@ pub(crate) struct GmodCallRoles {
     pub(super) registry: Arc<HelperRegistry>,
     pub(super) roles: Arc<AnnotatedGmodGlobalCallRoleMap>,
     contributions: Arc<Contributions>,
+    /// The paths whose roles come from the calls their function forwards
+    /// rather than from a file's own contribution.
+    forwarded_paths: HashSet<String>,
     /// The sum of every entry's [`entry_term`], kept as entries move.
     entries_fingerprint: Fingerprint,
 }
@@ -342,12 +370,33 @@ impl GmodCallRoles {
             }
         }
 
+        let net_ops = !touched.net_ops.is_empty() || !touched.paths.is_empty();
+        let mut keys = self.apply_moving_fingerprint(&touched, Self::apply);
+        if touched.forwarded_calls || !touched.paths.is_empty() {
+            let desired = self.derive_forwarded_roles();
+            let moved = self.forwarded_changes(&desired);
+            keys.extend(self.apply_moving_fingerprint(&moved, |roles, moved| {
+                roles.apply_forwarded(moved, &desired)
+            }));
+            keys.sort_by(|a, b| key_order(a).cmp(&key_order(b)));
+            keys.dedup_by(|a, b| key_order(a) == key_order(b));
+        }
+        CallRoleChanges { net_ops, keys }
+    }
+
+    /// Applies `touched` through `apply`, keeping the sum of entry terms.
+    /// Returns the keys the step may have moved.
+    fn apply_moving_fingerprint(
+        &mut self,
+        touched: &Touched,
+        apply: impl FnOnce(&mut Self, &Touched),
+    ) -> Vec<CallRoleKey> {
         let keys = touched.keys();
         let before = keys
             .iter()
             .map(|key| entry_term(key, self.unmapped_entry_fingerprint(key)))
             .fold(0, Fingerprint::wrapping_add);
-        self.apply(&touched);
+        apply(self, touched);
         let after = keys
             .iter()
             .map(|key| entry_term(key, self.unmapped_entry_fingerprint(key)))
@@ -356,9 +405,107 @@ impl GmodCallRoles {
             .entries_fingerprint
             .wrapping_sub(before)
             .wrapping_add(after);
-        CallRoleChanges {
-            net_ops: !touched.net_ops.is_empty() || !touched.paths.is_empty(),
-            keys,
+        keys
+    }
+
+    /// The roles of every function that registers a panel by passing its
+    /// parameters on, for the paths no file contributes roles for. Wrappers of
+    /// wrappers settle round by round.
+    fn derive_forwarded_roles(&self) -> HashMap<String, (AnnotatedGmodCallRoles, Fingerprint)> {
+        let contributions = &*self.contributions;
+        let mut files = contributions
+            .files
+            .values()
+            .filter(|(scan, _)| !scan.forwarded_calls.is_empty())
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.1.cmp(&right.1));
+        let forwarded_calls = files
+            .iter()
+            .flat_map(|(scan, _)| scan.forwarded_calls.iter())
+            .collect::<Vec<_>>();
+
+        let mut derived: HashMap<String, AnnotatedGmodCallRoles> = HashMap::default();
+        loop {
+            let mut grew = false;
+            for forward in &forwarded_calls {
+                let path = &forward.wrapper_path;
+                if derived.contains_key(path) || contributions.path_winner(path).is_some() {
+                    continue;
+                }
+                let callee = forward
+                    .callee_path
+                    .strip_prefix("_G.")
+                    .unwrap_or(&forward.callee_path);
+                let inner = derived.get(callee).or_else(|| {
+                    contributions
+                        .path_winner(callee)
+                        .and_then(|_| self.roles.roles_by_path.get(callee))
+                });
+                let Some(roles) =
+                    inner.and_then(|inner| inner.forwarded_vgui_panel_registration(forward))
+                else {
+                    continue;
+                };
+                derived.insert(path.clone(), roles);
+                grew = true;
+            }
+            if !grew {
+                break;
+            }
+        }
+        derived
+            .into_iter()
+            .map(|(path, roles)| {
+                let fingerprint = derivation::fingerprint_of(&roles);
+                (path, (roles, fingerprint))
+            })
+            .collect()
+    }
+
+    /// The paths whose forwarded roles differ from those in place.
+    fn forwarded_changes(
+        &self,
+        desired: &HashMap<String, (AnnotatedGmodCallRoles, Fingerprint)>,
+    ) -> Touched {
+        let mut moved = Touched::default();
+        for path in &self.forwarded_paths {
+            if !desired.contains_key(path) {
+                moved.paths.insert(path.clone());
+            }
+        }
+        for (path, (_, fingerprint)) in desired {
+            if self.roles.path_fingerprints.get(path) != Some(fingerprint) {
+                moved.paths.insert(path.clone());
+            }
+        }
+        moved
+    }
+
+    /// Puts the forwarded roles of the paths in `moved` in place, or takes the
+    /// ones that no longer hold out, unless a file now contributes the path.
+    fn apply_forwarded(
+        &mut self,
+        moved: &Touched,
+        desired: &HashMap<String, (AnnotatedGmodCallRoles, Fingerprint)>,
+    ) {
+        let contributions = &*self.contributions;
+        let roles = Arc::make_mut(&mut self.roles);
+        for path in &moved.paths {
+            match desired.get(path) {
+                Some((path_roles, fingerprint)) => {
+                    roles.roles_by_path.insert(path.clone(), path_roles.clone());
+                    roles.path_fingerprints.insert(path.clone(), *fingerprint);
+                    self.forwarded_paths.insert(path.clone());
+                }
+                None => {
+                    if contributions.path_winner(path).is_none() {
+                        roles.roles_by_path.remove(path);
+                        roles.path_fingerprints.remove(path);
+                    }
+                    self.forwarded_paths.remove(path);
+                }
+            }
+            roles.set_receiver_path(path);
         }
     }
 
@@ -386,20 +533,7 @@ impl GmodCallRoles {
                     roles.path_fingerprints.remove(path);
                 }
             }
-            if let Some(name) = method_name(path) {
-                if roles.roles_by_path.contains_key(path) {
-                    roles
-                        .receiver_paths
-                        .entry(name)
-                        .or_default()
-                        .insert(path.clone());
-                } else if let Some(paths) = roles.receiver_paths.get_mut(&name) {
-                    paths.remove(path);
-                    if paths.is_empty() {
-                        roles.receiver_paths.remove(&name);
-                    }
-                }
-            }
+            roles.set_receiver_path(path);
         }
         for key in &touched.net_ops {
             match contributions.net_op_winner(key) {

@@ -474,6 +474,7 @@ type IndexedHelperDefinition = (
 pub(crate) struct FileHelperScan {
     role_map: AnnotatedGmodGlobalCallRoleMap,
     definitions: Vec<IndexedHelperDefinition>,
+    forwarded_calls: Vec<ForwardedCall>,
 }
 
 impl crate::db_index::derivation::DerivedFact for FileHelperScan {
@@ -490,7 +491,11 @@ impl crate::db_index::derivation::DerivedFact for FileHelperScan {
                 )
             })
             .collect::<Vec<_>>();
-        crate::db_index::derivation::fingerprint_of(&(self.role_map.fingerprint(), definitions))
+        crate::db_index::derivation::fingerprint_of(&(
+            self.role_map.fingerprint(),
+            definitions,
+            &self.forwarded_calls,
+        ))
     }
 }
 
@@ -622,6 +627,7 @@ fn call_role_mentions(db: &DbIndex, file_id: FileId, root: &LuaChunk) -> Arc<[Sm
 #[derive(Default)]
 struct HelperRegistryBuilder {
     definitions: Vec<IndexedHelperDefinition>,
+    forwarded_calls: Vec<ForwardedCall>,
     /// Whether the scanned file contains any call expression at all. Computed
     /// once per file so annotation libraries full of empty stubs are rejected
     /// before resolving every signature back to a red-tree closure.
@@ -648,11 +654,13 @@ impl HelperRegistryBuilder {
         if block.get_stats().next().is_none() {
             return;
         }
-        let global_id =
-            global_call_path_for_signature_closure(db, signature_id, &closure).map(|path| {
-                let path = path.strip_prefix("_G.").unwrap_or(&path);
-                GlobalId::new(path)
-            });
+        let global_path = global_call_path_for_signature_closure(db, signature_id, &closure)
+            .map(|path| path.strip_prefix("_G.").unwrap_or(&path).to_string());
+        if let Some(path) = &global_path {
+            self.forwarded_calls
+                .extend(collect_forwarded_calls(db, signature_id, &block, path));
+        }
+        let global_id = global_path.as_deref().map(GlobalId::new);
         let local_member = global_id
             .is_none()
             .then(|| closure_member_name(&closure))
@@ -664,6 +672,184 @@ impl HelperRegistryBuilder {
             global_id,
             local_member,
         ));
+    }
+}
+
+/// A call inside a global function that passes the function's parameters on.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ForwardedCall {
+    /// The path the function is called by.
+    wrapper_path: String,
+    callee_path: String,
+    callee_is_colon: bool,
+    args: Vec<ForwardedArg>,
+}
+
+/// An argument of a [`ForwardedCall`], written in terms of the function's
+/// parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ForwardedArg {
+    /// A parameter, or a field read from it, with fixed text around it.
+    Param {
+        param_idx: usize,
+        field_path: Vec<String>,
+        prefix: String,
+        suffix: String,
+    },
+    Other,
+}
+
+/// The calls in a global function's body that pass its parameters on. A colon
+/// function is left out: where its `self` falls among the arguments depends on
+/// how it is called.
+fn collect_forwarded_calls(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+    block: &LuaBlock,
+    wrapper_path: &str,
+) -> Vec<ForwardedCall> {
+    let file_id = signature_id.get_file_id();
+    let Some(signature) = db.get_signature_index().get_declared(&signature_id) else {
+        return Vec::new();
+    };
+    if signature.is_colon_define || signature.params.is_empty() {
+        return Vec::new();
+    }
+    let Some(closure) = block.get_parent::<LuaClosureExpr>() else {
+        return Vec::new();
+    };
+
+    let mut forwarded_calls = Vec::new();
+    for call_expr in block.descendants::<LuaCallExpr>() {
+        if call_expr.ancestors::<LuaClosureExpr>().next().as_ref() != Some(&closure) {
+            continue;
+        }
+        let Some(callee_path) = call_expr.get_access_path() else {
+            continue;
+        };
+        if call_expr_local_root_decl_id(db, file_id, &call_expr).is_some() {
+            continue;
+        }
+        let Some(args_list) = call_expr.get_args_list() else {
+            continue;
+        };
+        let args = args_list
+            .get_args()
+            .map(|arg| forwarded_arg(&arg, &signature.params))
+            .collect::<Vec<_>>();
+        if args.iter().all(|arg| matches!(arg, ForwardedArg::Other)) {
+            continue;
+        }
+        forwarded_calls.push(ForwardedCall {
+            wrapper_path: wrapper_path.to_string(),
+            callee_path: callee_path.to_string(),
+            callee_is_colon: call_expr.is_colon_call(),
+            args,
+        });
+    }
+    forwarded_calls
+}
+
+fn forwarded_arg(expr: &LuaExpr, params: &[SmolStr]) -> ForwardedArg {
+    enum Piece {
+        Text(String),
+        Param(usize, Vec<String>),
+        Other,
+    }
+
+    fn push_pieces(expr: &LuaExpr, params: &[SmolStr], pieces: &mut Vec<Piece>) {
+        let param_idx = |name: &str| params.iter().position(|param| param == name);
+        match expr {
+            LuaExpr::LiteralExpr(_) => {
+                pieces.push(static_literal_string(expr).map_or(Piece::Other, Piece::Text));
+            }
+            LuaExpr::ParenExpr(paren_expr) => match paren_expr.get_expr() {
+                Some(inner) => push_pieces(&inner, params, pieces),
+                None => pieces.push(Piece::Other),
+            },
+            LuaExpr::BinaryExpr(binary_expr)
+                if binary_expr
+                    .get_op_token()
+                    .is_some_and(|op| op.get_op() == BinaryOperator::OpConcat) =>
+            {
+                match binary_expr.get_exprs() {
+                    Some((left, right)) => {
+                        push_pieces(&left, params, pieces);
+                        push_pieces(&right, params, pieces);
+                    }
+                    None => pieces.push(Piece::Other),
+                }
+            }
+            LuaExpr::NameExpr(name_expr) => pieces.push(
+                name_expr
+                    .get_name_text()
+                    .and_then(|name| param_idx(&name))
+                    .map_or(Piece::Other, |idx| Piece::Param(idx, Vec::new())),
+            ),
+            LuaExpr::IndexExpr(index_expr) => {
+                pieces.push(match index_expr_root_and_field_path(index_expr) {
+                    Some((LuaExpr::NameExpr(root), field_path)) => root
+                        .get_name_text()
+                        .and_then(|name| param_idx(&name))
+                        .map_or(Piece::Other, |idx| Piece::Param(idx, field_path)),
+                    _ => Piece::Other,
+                });
+            }
+            _ => pieces.push(Piece::Other),
+        }
+    }
+
+    let mut pieces = Vec::new();
+    push_pieces(expr, params, &mut pieces);
+    let mut prefix = String::new();
+    let mut suffix = String::new();
+    let mut param = None;
+    for piece in pieces {
+        match (piece, &param) {
+            (Piece::Text(text), None) => prefix.push_str(&text),
+            (Piece::Text(text), Some(_)) => suffix.push_str(&text),
+            (Piece::Param(param_idx, field_path), None) => param = Some((param_idx, field_path)),
+            _ => return ForwardedArg::Other,
+        }
+    }
+    match param {
+        Some((param_idx, field_path)) => ForwardedArg::Param {
+            param_idx,
+            field_path,
+            prefix,
+            suffix,
+        },
+        None => ForwardedArg::Other,
+    }
+}
+
+impl ForwardedArg {
+    /// The role of the wrapper's parameter that supplies what `inner` reads
+    /// from this argument.
+    fn forward_role(&self, inner: &AnnotatedGmodCallArgRole) -> Option<AnnotatedGmodCallArgRole> {
+        let Self::Param {
+            param_idx,
+            field_path,
+            prefix,
+            suffix,
+        } = self
+        else {
+            return None;
+        };
+        if !inner.field_path.is_empty() && !(prefix.is_empty() && suffix.is_empty()) {
+            return None;
+        }
+        Some(AnnotatedGmodCallArgRole {
+            param_idx: *param_idx,
+            priority: inner.priority,
+            field_path: field_path
+                .iter()
+                .chain(&inner.field_path)
+                .cloned()
+                .collect(),
+            prefix: format!("{}{prefix}", inner.prefix),
+            suffix: format!("{suffix}{}", inner.suffix),
+        })
     }
 }
 
@@ -4337,7 +4523,7 @@ fn resolve_vgui_registration_name(
         return (!name.is_empty()).then(|| name.clone());
     }
 
-    let syntax_id = if source.field_path.is_empty() {
+    let syntax_id = if !source.is_derived() {
         call.args.get(source.arg_idx)?.syntax_id
     } else {
         call.field_args
@@ -6752,7 +6938,7 @@ fn find_table_expr_for_arg_source(
     call: &GmodScriptedClassCallMetadata,
     table_source: &GmodClassCallArgSource,
 ) -> Option<LuaTableExpr> {
-    let arg_range = if table_source.field_path.is_empty() {
+    let arg_range = if !table_source.is_derived() {
         call.args.get(table_source.arg_idx)?.syntax_id.get_range()
     } else {
         call.field_args
@@ -7011,7 +7197,7 @@ fn synthesize_panel_baseclass_member(
     let syntax_id = base_arg_source
         .as_ref()
         .and_then(|source| {
-            if source.field_path.is_empty() {
+            if !source.is_derived() {
                 call.args.get(source.arg_idx).map(|arg| arg.syntax_id)
             } else {
                 call.field_args
@@ -7295,6 +7481,8 @@ struct AnnotatedGmodCallArgRole {
     param_idx: usize,
     priority: i64,
     field_path: Vec<String>,
+    prefix: String,
+    suffix: String,
 }
 
 enum AnnotatedVguiParentSource {
@@ -7316,6 +7504,8 @@ impl AnnotatedGmodCallArgRole {
             param_idx: role.param_idx,
             priority: role.priority.unwrap_or(0),
             field_path: role.field_path.clone(),
+            prefix: String::new(),
+            suffix: String::new(),
         }
     }
 
@@ -7331,6 +7521,8 @@ impl AnnotatedGmodCallArgRole {
         Some(crate::GmodClassCallArgSource {
             arg_idx: param_idx_to_call_arg_idx(self.param_idx, is_colon_call, is_colon_define)?,
             field_path: self.field_path.clone(),
+            prefix: self.prefix.clone(),
+            suffix: self.suffix.clone(),
         })
     }
 }
@@ -7828,6 +8020,46 @@ impl AnnotatedGmodCallRoles {
         ))
     }
 
+    /// The roles of a function that registers a panel by passing its
+    /// parameters to a call with these roles.
+    fn forwarded_vgui_panel_registration(&self, forward: &ForwardedCall) -> Option<Self> {
+        let kind = self.vgui_panel_kind?;
+        if kind == GmodScriptedClassCallKind::VguiRegisterFile
+            || (self.vgui_panel_define_roles.is_empty()
+                && kind != GmodScriptedClassCallKind::VguiRegisterTable)
+        {
+            return None;
+        }
+        let forwarded = |role: &AnnotatedGmodCallArgRole| {
+            let arg_idx = param_idx_to_call_arg_idx(
+                role.param_idx,
+                forward.callee_is_colon,
+                self.is_colon_define,
+            )?;
+            forward.args.get(arg_idx)?.forward_role(role)
+        };
+        let table = forwarded(self.vgui_panel_table_roles.first()?).filter(|role| {
+            role.field_path.is_empty() && role.prefix.is_empty() && role.suffix.is_empty()
+        })?;
+        let define = match self.vgui_panel_define_roles.first() {
+            Some(role) => vec![forwarded(role)?],
+            None => Vec::new(),
+        };
+        let base = self
+            .vgui_panel_base_roles
+            .first()
+            .and_then(forwarded)
+            .into_iter()
+            .collect();
+        Some(Self {
+            vgui_panel_kind: self.vgui_panel_kind,
+            vgui_panel_define_roles: define,
+            vgui_panel_table_roles: vec![table],
+            vgui_panel_base_roles: base,
+            ..Self::default()
+        })
+    }
+
     fn vgui_panel_call(
         &self,
         is_colon_call: bool,
@@ -8109,6 +8341,7 @@ impl AnnotatedGmodGlobalCallRoleMap {
         FileHelperScan {
             role_map,
             definitions: builder.definitions,
+            forwarded_calls: builder.forwarded_calls,
         }
     }
 
@@ -9139,7 +9372,7 @@ fn vgui_parent_field_sources(roles: &AnnotatedVguiParentCallRoles) -> Vec<GmodCl
         let AnnotatedVguiParentSource::Arg(source) = source else {
             continue;
         };
-        if !source.field_path.is_empty() && !sources.iter().any(|existing| existing == source) {
+        if source.is_derived() && !sources.iter().any(|existing| existing == source) {
             sources.push(source.clone());
         }
     }
@@ -9154,7 +9387,7 @@ fn vgui_parent_call_source(
 ) -> Option<GmodVguiParentSource> {
     match source {
         AnnotatedVguiParentSource::Arg(source) => {
-            let arg = if source.field_path.is_empty() {
+            let arg = if !source.is_derived() {
                 args.get(source.arg_idx)
                     .map(|arg| (arg.syntax_id, arg.value.as_ref()))
             } else {
@@ -9254,7 +9487,7 @@ fn extract_gmod_class_call_args(
 
     let mut field_args = Vec::new();
     for source in field_sources {
-        if source.field_path.is_empty() {
+        if !source.is_derived() {
             continue;
         }
         let Some(arg_expr) = arg_exprs.get(source.arg_idx).cloned() else {
@@ -9265,10 +9498,19 @@ fn extract_gmod_class_call_args(
         else {
             continue;
         };
+        let static_string = || static_call_arg_string(db, file_id, call_expr, &value_expr);
+        let value = if source.prefix.is_empty() && source.suffix.is_empty() {
+            extract_gmod_class_literal_or_name(&value_expr)
+                .or_else(|| static_string().map(GmodClassCallLiteral::String))
+        } else {
+            static_string().map(|text| {
+                GmodClassCallLiteral::String(format!("{}{text}{}", source.prefix, source.suffix))
+            })
+        };
         field_args.push(crate::GmodClassCallFieldArg {
             source: source.clone(),
             syntax_id: value_expr.get_syntax_id(),
-            value: extract_gmod_class_literal_or_name(&value_expr),
+            value,
         });
     }
 
@@ -9281,7 +9523,7 @@ fn vgui_panel_field_sources(roles: &GmodVguiPanelCallRoles) -> Vec<crate::GmodCl
         .chain(roles.table.as_ref())
         .chain(roles.base.as_ref())
     {
-        if !source.field_path.is_empty() && !sources.iter().any(|existing| existing == source) {
+        if source.is_derived() && !sources.iter().any(|existing| existing == source) {
             sources.push(source.clone());
         }
     }
@@ -12305,6 +12547,79 @@ fn collect_static_string_bindings(root: &LuaChunk) -> HashMap<String, String> {
     bindings
 }
 
+/// The string `expr` holds, read from the file's text alone: a string literal,
+/// a field of a table assigned one before `call_expr`, or a concatenation of
+/// those.
+pub(crate) fn static_call_arg_string(
+    db: &DbIndex,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+    expr: &LuaExpr,
+) -> Option<String> {
+    static_string_value(db, file_id, call_expr, expr, &mut Vec::new())
+}
+
+fn static_string_value(
+    db: &DbIndex,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+    expr: &LuaExpr,
+    visiting: &mut Vec<LuaSyntaxId>,
+) -> Option<String> {
+    match expr {
+        LuaExpr::LiteralExpr(_) => static_literal_string(expr),
+        LuaExpr::ParenExpr(paren_expr) => {
+            static_string_value(db, file_id, call_expr, &paren_expr.get_expr()?, visiting)
+        }
+        LuaExpr::BinaryExpr(binary_expr)
+            if binary_expr.get_op_token()?.get_op() == BinaryOperator::OpConcat =>
+        {
+            let (left, right) = binary_expr.get_exprs()?;
+            Some(format!(
+                "{}{}",
+                static_string_value(db, file_id, call_expr, &left, visiting)?,
+                static_string_value(db, file_id, call_expr, &right, visiting)?
+            ))
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            let syntax_id = index_expr.get_syntax_id();
+            if visiting.contains(&syntax_id) {
+                return None;
+            }
+            let (root, field_path) = index_expr_root_and_field_path(index_expr)?;
+            let value = resolve_static_field_path_expr(db, file_id, call_expr, root, &field_path)?;
+            visiting.push(syntax_id);
+            let string = static_string_value(db, file_id, call_expr, &value, visiting);
+            visiting.pop();
+            string
+        }
+        _ => None,
+    }
+}
+
+/// The name an index chain starts at and the keys it reads from there.
+fn index_expr_root_and_field_path(
+    index_expr: &glua_parser::LuaIndexExpr,
+) -> Option<(LuaExpr, Vec<String>)> {
+    let mut field_path = Vec::new();
+    let mut current = index_expr.clone();
+    loop {
+        field_path.push(match current.get_index_key()? {
+            LuaIndexKey::Name(name) => name.get_name_text().to_string(),
+            LuaIndexKey::String(string) => string.get_value(),
+            _ => return None,
+        });
+        match current.get_prefix_expr()? {
+            LuaExpr::IndexExpr(prefix) => current = prefix,
+            root @ LuaExpr::NameExpr(_) => {
+                field_path.reverse();
+                return Some((root, field_path));
+            }
+            _ => return None,
+        }
+    }
+}
+
 fn static_literal_string(expr: &LuaExpr) -> Option<String> {
     let LuaExpr::LiteralExpr(literal) = expr else {
         return None;
@@ -12539,79 +12854,6 @@ fn apply_dynamic_loaders(
             changed |= target_info.mark_states(
                 target_states,
                 GmodLoadStatus::MaybeDynamic,
-/// The string `expr` holds, read from the file's text alone: a string literal,
-/// a field of a table assigned one before `call_expr`, or a concatenation of
-/// those.
-pub(crate) fn static_call_arg_string(
-    db: &DbIndex,
-    file_id: FileId,
-    call_expr: &LuaCallExpr,
-    expr: &LuaExpr,
-) -> Option<String> {
-    static_string_value(db, file_id, call_expr, expr, &mut Vec::new())
-}
-
-fn static_string_value(
-    db: &DbIndex,
-    file_id: FileId,
-    call_expr: &LuaCallExpr,
-    expr: &LuaExpr,
-    visiting: &mut Vec<LuaSyntaxId>,
-) -> Option<String> {
-    match expr {
-        LuaExpr::LiteralExpr(_) => static_literal_string(expr),
-        LuaExpr::ParenExpr(paren_expr) => {
-            static_string_value(db, file_id, call_expr, &paren_expr.get_expr()?, visiting)
-        }
-        LuaExpr::BinaryExpr(binary_expr)
-            if binary_expr.get_op_token()?.get_op() == BinaryOperator::OpConcat =>
-        {
-            let (left, right) = binary_expr.get_exprs()?;
-            Some(format!(
-                "{}{}",
-                static_string_value(db, file_id, call_expr, &left, visiting)?,
-                static_string_value(db, file_id, call_expr, &right, visiting)?
-            ))
-        }
-        LuaExpr::IndexExpr(index_expr) => {
-            let syntax_id = index_expr.get_syntax_id();
-            if visiting.contains(&syntax_id) {
-                return None;
-            }
-            let (root, field_path) = index_expr_root_and_field_path(index_expr)?;
-            let value = resolve_static_field_path_expr(db, file_id, call_expr, root, &field_path)?;
-            visiting.push(syntax_id);
-            let string = static_string_value(db, file_id, call_expr, &value, visiting);
-            visiting.pop();
-            string
-        }
-        _ => None,
-    }
-}
-
-/// The name an index chain starts at and the keys it reads from there.
-fn index_expr_root_and_field_path(
-    index_expr: &glua_parser::LuaIndexExpr,
-) -> Option<(LuaExpr, Vec<String>)> {
-    let mut field_path = Vec::new();
-    let mut current = index_expr.clone();
-    loop {
-        field_path.push(match current.get_index_key()? {
-            LuaIndexKey::Name(name) => name.get_name_text().to_string(),
-            LuaIndexKey::String(string) => string.get_value(),
-            _ => return None,
-        });
-        match current.get_prefix_expr()? {
-            LuaExpr::IndexExpr(prefix) => current = prefix,
-            root @ LuaExpr::NameExpr(_) => {
-                field_path.reverse();
-                return Some((root, field_path));
-            }
-            _ => return None,
-        }
-    }
-}
-
                 GmodLoadConfidence::Dynamic,
             );
         }
