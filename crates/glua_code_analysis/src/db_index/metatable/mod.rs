@@ -246,6 +246,17 @@ impl LuaMetatableIndex {
         })
     }
 
+    /// Every metatable `table` was given, in binding order.
+    pub fn bound_metatables(&self, table: &InFiled<TextRange>) -> Vec<BoundMetatable> {
+        derivation::note_read(|| FactKey::Metatable(table.clone()));
+        self.metatables
+            .get(table)
+            .into_iter()
+            .flatten()
+            .map(|binding| binding.metatable.clone())
+            .collect()
+    }
+
     /// The expressions of the metatables `table` was given that no table
     /// literal backs.
     pub fn opaque_metatable_exprs(&self, table: &InFiled<TextRange>) -> Vec<InFiled<TextRange>> {

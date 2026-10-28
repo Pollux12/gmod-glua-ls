@@ -2358,6 +2358,70 @@ end
         assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
     }
 
+    fn proxy_tool_workspace(include_expr: &str) -> (VirtualWorkspace, &'static str) {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/weapons/sf2_tool/shared.lua",
+            &format!(
+                r#"
+                local t_meta = {{}}
+                t_meta.__index = function(self, key)
+                    return self._swep[key]
+                end
+
+                SWEP.Tool = {{}}
+                local files = file.Find("weapons/sf2_tool/settings/*.lua", "LUA")
+                for _, fil in ipairs(files) do
+                    local tool = ({include_expr})
+                    setmetatable(tool, t_meta)
+                    table.insert(SWEP.Tool, tool)
+                end
+                "#
+            ),
+        );
+        ws.def_file("lua/weapons/sf2_tool/init.lua", "include(\"shared.lua\")");
+        (ws, "lua/weapons/sf2_tool/settings/light_editor.lua")
+    }
+
+    const PROXY_TOOL: &str = r#"
+        local TOOL = {}
+        function TOOL:Use()
+            self:EmitSound("beep")
+        end
+        return TOOL
+    "#;
+
+    #[test]
+    fn methods_of_a_file_whose_includer_gives_its_table_a_function_index_are_not_undefined() {
+        let (mut ws, tool_path) =
+            proxy_tool_workspace(r#"include("weapons/sf2_tool/settings/light_editor.lua")"#);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, tool_path, PROXY_TOOL));
+    }
+
+    #[test]
+    fn methods_of_a_file_a_computed_include_path_loads_are_not_undefined() {
+        let (mut ws, tool_path) =
+            proxy_tool_workspace(r#"include("weapons/sf2_tool/settings/" .. fil)"#);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, tool_path, PROXY_TOOL));
+    }
+
+    #[test]
+    fn methods_of_a_file_nothing_includes_stay_undefined() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        assert!(!ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "lua/weapons/sf2_tool/settings/light_editor.lua",
+            PROXY_TOOL,
+        ));
+    }
+
     #[test]
     fn methods_missing_from_an_instance_whose_metatable_is_a_table_literal_are_undefined() {
         let diagnostics = gmod_diagnostics(

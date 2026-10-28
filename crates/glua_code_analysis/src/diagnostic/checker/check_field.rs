@@ -740,6 +740,72 @@ fn metatable_expr_type_is_unknown(
     inferred.map_or(true, |typ| is_unknown_like(&typ))
 }
 
+/// Every metatable the table literal `table_range` was given, including those the files that
+/// `include` it gave the table it returns.
+fn table_metatables(
+    db: &DbIndex,
+    table_range: &crate::InFiled<rowan::TextRange>,
+) -> Vec<crate::BoundMetatable> {
+    let metatables = db.get_metatable_index();
+    let mut bound = metatables.bound_metatables(table_range);
+    let file_id = table_range.file_id;
+    let returns_table = db
+        .get_module_index()
+        .get_module(file_id)
+        .is_some_and(|module| module.export_type == Some(LuaType::TableConst(table_range.clone())));
+    if !returns_table {
+        return bound;
+    }
+    let static_includes = db
+        .get_file_dependencies_index()
+        .get_sites_loading(file_id)
+        .filter(|site| site.kind == crate::LuaDependencyKind::Include)
+        .map(|site| crate::InFiled::new(site.source_file_id, site.call_range));
+    let dynamic_includes = db
+        .get_gmod_load_index()
+        .get_file_info(&file_id)
+        .into_iter()
+        .flat_map(|info| info.incoming_edges.iter())
+        .filter(|edge| edge.original_expr.as_deref() == Some("gmod.file_find"))
+        .filter_map(|edge| Some(crate::InFiled::new(edge.source_file_id, edge.range?)));
+    for include_call in static_includes.chain(dynamic_includes) {
+        bound.extend(metatables.bound_metatables(&include_call));
+    }
+    bound
+}
+
+/// Whether `metatable` can provide fields the table's own members do not name.
+fn metatable_leaves_members_open(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    metatable: &crate::BoundMetatable,
+    position: Option<rowan::TextSize>,
+) -> bool {
+    let metatable = match metatable {
+        crate::BoundMetatable::Opaque(expr) => {
+            return metatable_expr_type_is_unknown(db, semantic_model, expr);
+        }
+        crate::BoundMetatable::Table(metatable) => metatable,
+    };
+    let index_member_key = LuaMemberKey::Name("__index".into());
+    let meta_owner = crate::semantic::metatable_member_owner(db, metatable);
+    let index_type = infer_owner_raw_member_type_with_realm(
+        db,
+        meta_owner,
+        &index_member_key,
+        semantic_model.get_file_id(),
+        position,
+        None,
+    );
+
+    // A present but unresolved Lua `__index`, or one that is a function, can provide any
+    // field at runtime, so field absence cannot be proven. Known table `__index` types
+    // still flow through normal checks.
+    index_type.is_ok_and(|typ| {
+        typ.is_unknown() || matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
+    })
+}
+
 fn has_unresolved_metatable_index(
     db: &DbIndex,
     semantic_model: &SemanticModel,
@@ -762,34 +828,8 @@ fn has_unresolved_metatable_index_inner(
     }
     match prefix_typ {
         LuaType::TableConst(table_range) => {
-            if db
-                .get_metatable_index()
-                .opaque_metatable_exprs(table_range)
-                .iter()
-                .any(|expr| metatable_expr_type_is_unknown(db, semantic_model, expr))
-            {
-                return true;
-            }
-            let Some(metatable) = db.get_metatable_index().get(table_range) else {
-                return false;
-            };
-
-            let index_member_key = LuaMemberKey::Name("__index".into());
-            let meta_owner = crate::semantic::metatable_member_owner(db, metatable);
-            let index_type = infer_owner_raw_member_type_with_realm(
-                db,
-                meta_owner,
-                &index_member_key,
-                semantic_model.get_file_id(),
-                position,
-                None,
-            );
-
-            // A present but unresolved Lua `__index`, or one that is a function, can provide any
-            // field at runtime, so field absence cannot be proven. Known table `__index` types
-            // still flow through normal checks.
-            index_type.is_ok_and(|typ| {
-                typ.is_unknown() || matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
+            table_metatables(db, table_range).iter().any(|metatable| {
+                metatable_leaves_members_open(db, semantic_model, metatable, position)
             })
         }
         LuaType::Instance(instance) => has_unresolved_metatable_index_inner(

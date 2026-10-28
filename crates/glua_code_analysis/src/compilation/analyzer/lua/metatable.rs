@@ -30,18 +30,32 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
             .then(|| inferred_table_range(analyzer, &metatable))
             .flatten()
     });
+    let included_table = included_table_call_range(analyzer, &table);
     let Some(metatable_range) = metatable_range else {
-        if let Some(backing_table) = resolve_metatable_backing_table(analyzer, &table) {
+        let opaque = BoundMetatable::Opaque(InFiled::new(file_id, metatable.get_range()));
+        for table in resolve_metatable_backing_table(analyzer, &table)
+            .into_iter()
+            .chain(included_table)
+        {
             let sort_key = writer_sort_key(analyzer);
             analyzer.write(StatementWrite::AddMetatable {
-                table: backing_table,
-                metatable: BoundMetatable::Opaque(InFiled::new(file_id, metatable.get_range())),
+                table,
+                metatable: opaque.clone(),
                 file_id,
                 sort_key,
             });
         }
         return Some(());
     };
+    if let Some(included_table) = included_table {
+        let sort_key = writer_sort_key(analyzer);
+        analyzer.write(StatementWrite::AddMetatable {
+            table: included_table,
+            metatable: BoundMetatable::Table(metatable_range.clone()),
+            file_id,
+            sort_key,
+        });
+    }
     if let Some(instance_range) = resolve_metatable_backing_table(analyzer, &table)
         && let Some(instance_literal) = table_expr_from_range(analyzer, &instance_range)
     {
@@ -136,6 +150,43 @@ fn setmetatable_factory_binding(
         call_position: call_expr.get_position(),
         function_scope,
     })
+}
+
+/// The range of the `include(...)` call whose result `table` is, directly or through a local
+/// that is never reassigned. The included file's returned table is the one the metatable lands on.
+fn included_table_call_range(
+    analyzer: &LuaAnalyzer,
+    table: &LuaExpr,
+) -> Option<InFiled<rowan::TextRange>> {
+    match table {
+        LuaExpr::ParenExpr(paren_expr) => {
+            included_table_call_range(analyzer, &paren_expr.get_expr()?)
+        }
+        LuaExpr::CallExpr(call_expr) => {
+            let Some(LuaExpr::NameExpr(callee)) = call_expr.get_prefix_expr() else {
+                return None;
+            };
+            (callee.get_name_text()? == "include")
+                .then(|| InFiled::new(analyzer.file_id, call_expr.get_range()))
+        }
+        LuaExpr::NameExpr(name_expr) => {
+            let decl_id = analyzer
+                .db
+                .get_reference_index()
+                .get_var_reference_decl(&analyzer.file_id, name_expr.get_range())?;
+            let decl = analyzer.db.get_decl_index().get_decl(&decl_id)?;
+            let is_mutated = analyzer
+                .db
+                .get_reference_index()
+                .get_decl_references(&analyzer.file_id, &decl_id)
+                .is_some_and(|references| references.mutable);
+            if !decl.is_local() || is_mutated {
+                return None;
+            }
+            included_table_call_range(analyzer, &decl_value_expr(&analyzer.db, decl_id)?)
+        }
+        _ => None,
+    }
 }
 
 fn resolve_metatable_backing_table(
