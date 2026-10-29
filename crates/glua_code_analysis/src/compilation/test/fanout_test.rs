@@ -1726,6 +1726,29 @@ Foo = {}
         assert_eq!(stats.evaluations(DerivationKind::GmodLoad), 0);
     }
 
+    const GROUPS_OWNER: &str = "lua/pac3/parts/clip.lua";
+    const GROUPS_OWNER_TEXT: &str = "Parts.Groups = {'model', 'modifiers'}\n";
+
+    /// Each file assigns its own collection to a field of a table every file
+    /// shares, as pac3's part files do.
+    #[test]
+    fn a_comment_appended_to_a_file_assigning_a_collection_another_file_also_assigns_re_runs_nothing_in_it()
+     {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_files(vec![
+            ("lua/pac3/parts.lua", "Parts = {}\n"),
+            (GROUPS_OWNER, GROUPS_OWNER_TEXT),
+            (
+                "lua/pac3/parts/effect.lua",
+                "Parts.Groups = {'effects', 'model', 'entity'}\n",
+            ),
+        ]);
+
+        let owner = ws.def_file(GROUPS_OWNER, &format!("{GROUPS_OWNER_TEXT}\n-- touch\n"));
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![owner]);
+    }
+
     const HOOK_ADDER: &str = "lua/autorun/client/cl_menu_tabs.lua";
     const HOOK_ADDER_TEXT: &str = "local tabs = {}\n\nhook.Add(\"CreateMenuButtons\", \"probe\", function(buttons)\n    buttons.probe = true\nend)\n";
 

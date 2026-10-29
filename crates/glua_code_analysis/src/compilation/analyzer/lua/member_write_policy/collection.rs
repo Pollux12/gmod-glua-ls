@@ -108,8 +108,12 @@ pub(in crate::compilation::analyzer::lua) fn widen_existing_member_collection_ty
         && let Some(mut member_ids) = find_related_member_ids(analyzer, index_expr.clone())
     {
         // The written member holds this value, not a collection it joins.
+        // Another file's member takes this one in when its own write reads
+        // the slot, so widening it here would only make that file's facts
+        // depend on this statement.
         let written = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
-        member_ids.retain(|member_id| *member_id != written);
+        member_ids
+            .retain(|member_id| *member_id != written && member_id.file_id == analyzer.file_id);
         widen_member_collections_with_collection_type(analyzer, &member_ids, value_type);
     }
 
