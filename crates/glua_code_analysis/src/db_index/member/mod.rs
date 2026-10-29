@@ -2608,6 +2608,13 @@ impl LuaMemberIndex {
         self.member_current_owner.get(id)
     }
 
+    /// Whether `id` was written through an instance of its owner class and so
+    /// is not listed among the class's members.
+    pub fn is_member_owner_only(&self, id: &LuaMemberId) -> bool {
+        derivation::note_member_home_read(*id);
+        self.owner_only_members.contains(id)
+    }
+
     pub fn get_member_owner(&self, id: &LuaMemberId) -> Option<&LuaMemberOwner> {
         derivation::note_member_home_read(*id);
         self.member_current_owner.get(id)

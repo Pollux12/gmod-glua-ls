@@ -163,20 +163,46 @@ fn field_definition_sites(
     indexed_targets(node)
         .into_iter()
         .filter(|(_, index_expr)| {
-            let owner = db
-                .get_member_index()
-                .get_current_owner(&LuaMemberId::new(index_expr.get_syntax_id(), file_id));
+            let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
+            let owner = db.get_member_index().get_current_owner(&member_id);
             let dotted = index_expr
                 .get_index_token()
                 .is_some_and(|token| !token.is_colon());
             match owner {
                 None if dotted => true,
+                Some(owner) if extends_prototype_class(db, owner, member_id) => true,
                 Some(crate::LuaMemberOwner::Type(_)) => false,
                 _ => prefix_holds_call_result(db, file_id, index_expr),
             }
         })
         .map(|(var, index_expr)| (var, index_expr, None))
         .collect()
+}
+
+/// Whether a method is written through an instance of a prototype class, one
+/// whose table is its own `__index`: the tables built from such a class are
+/// ordinary tables each carrying the methods written on it, so a method one
+/// carries is one the class's instances may carry.
+fn extends_prototype_class(
+    db: &DbIndex,
+    owner: &crate::LuaMemberOwner,
+    member_id: LuaMemberId,
+) -> bool {
+    let crate::LuaMemberOwner::Type(type_id) = owner else {
+        return false;
+    };
+    db.get_member_index().is_member_owner_only(&member_id)
+        && db
+            .get_member_index()
+            .get_current_owner_members_for_key(owner, &LuaMemberKey::Name("__index".into()))
+            .into_iter()
+            .any(|member| {
+                db.get_type_index()
+                    .get_type_cache(&member.get_id().into())
+                    .is_some_and(|cache| {
+                        matches!(cache.as_type(), LuaType::Def(id) | LuaType::Ref(id) if id == type_id)
+                    })
+            })
 }
 
 /// Whether the prefix of `index_expr` is a name every declaration of which
@@ -512,13 +538,12 @@ fn collect_statement_fields(
             LuaType::Instance(instance) => instance.get_base(),
             typ => typ,
         };
+        let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
+        let owner = db.get_member_index().get_current_owner(&member_id);
         if value_expr.is_none()
             && LuaFuncStat::cast(node.clone()).is_some()
             && !matches!(made_table, LuaType::TableConst(_))
-            && db
-                .get_member_index()
-                .get_current_owner(&LuaMemberId::new(index_expr.get_syntax_id(), file_id))
-                .is_some()
+            && owner.is_some_and(|owner| !extends_prototype_class(db, owner, member_id))
         {
             continue;
         }

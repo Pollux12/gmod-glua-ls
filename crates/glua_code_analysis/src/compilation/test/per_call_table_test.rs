@@ -267,3 +267,40 @@ fn editing_the_factory_matches_a_cold_analysis() {
         )],
     );
 }
+
+#[test]
+fn a_method_written_on_a_value_of_a_declared_class_is_found_through_the_class() {
+    let mut ws = VirtualWorkspace::new_with_init_std_lib();
+    ws.def_file(
+        "lua/stormfox2/lib/sh_weather_meta.lua",
+        r#"
+        ---@class SF2_WeatherType
+        local w_meta = {}
+        w_meta.__index = w_meta
+
+        ---@return SF2_WeatherType
+        function WeatherAdd(name)
+            return {}
+        end
+
+        ---@return SF2_WeatherType
+        function WeatherGet(name) end
+        "#,
+    );
+    ws.def_file(
+        "lua/stormfox2/weathers/clear.lua",
+        r#"
+        local clear = WeatherAdd("Clear")
+        function clear:GetName() return "Clear" end
+        function clear.GetIcon() return 1 end
+        "#,
+    );
+    assert!(undefined_method_free(
+        &mut ws,
+        "lua/stormfox2/functions/user.lua",
+        r#"
+        local w = WeatherGet("Clear")
+        w:GetName()
+        "#
+    ));
+}
