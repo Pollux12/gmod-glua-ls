@@ -14,7 +14,9 @@ use glua_parser::{
 use super::super::{LuaAnalyzer, stats::is_local_mutable};
 
 /// The collection type `member_id` holds once `incoming` joins the collections
-/// the other members of its slot hold, when any of them holds one.
+/// the other members of its slot in its own file hold, when any of them holds
+/// one. Another file's member of the slot is its own write: taking it in would
+/// make two files' members each widen with the other's and settle together.
 pub(in crate::compilation::analyzer) fn widened_member_assignment_collection_type(
     db: &DbIndex,
     member_id: LuaMemberId,
@@ -29,6 +31,7 @@ pub(in crate::compilation::analyzer) fn widened_member_assignment_collection_typ
     for related_member in member_index.get_members_for_owner_key(&owner, &key) {
         let related_member_id = related_member.get_id();
         if related_member_id == member_id
+            || related_member_id.file_id != member_id.file_id
             || !is_member_realm_compatible(db, member_id, related_member_id)
         {
             continue;

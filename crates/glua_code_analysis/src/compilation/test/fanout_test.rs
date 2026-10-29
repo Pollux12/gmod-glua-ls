@@ -1749,6 +1749,26 @@ Foo = {}
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![owner]);
     }
 
+    /// Each file's member of a shared table's field holds the list that file
+    /// assigns; a read of the field from elsewhere still sees every file's.
+    #[test]
+    fn a_collection_one_file_assigns_to_a_shared_field_takes_in_no_other_files_elements() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_files(vec![
+            ("lua/parts.lua", "Parts = {}\n"),
+            ("lua/parts/names.lua", "Parts.Groups = { tostring(1) }\n"),
+            (
+                "lua/parts/numbers.lua",
+                "Parts.Groups = { math.random() }\n",
+            ),
+        ]);
+        let reader = ws.def_file("lua/parts/reader.lua", "local seen = Parts.Groups\n");
+
+        let seen = ws.local_ty(reader, "seen");
+
+        assert_eq!(ws.humanize_type(seen), "((number)|(string))");
+    }
+
     const HOOK_ADDER: &str = "lua/autorun/client/cl_menu_tabs.lua";
     const HOOK_ADDER_TEXT: &str = "local tabs = {}\n\nhook.Add(\"CreateMenuButtons\", \"probe\", function(buttons)\n    buttons.probe = true\nend)\n";
 
