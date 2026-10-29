@@ -266,6 +266,28 @@
 --- - `method`: Method name that is valid when called on callback `self`.
 ---@attribute self_call_valid(method: string)
 
+--- Marks the class returned by a named method on callback `self`, independently of validity.
+---
+--- The contract holds in the callback and synchronous callees whose every entry is described.
+--- Deferred or unknown entries keep the declared return type in helper bodies.
+--- A callback may carry several of these to name each class the method can return.
+---
+--- Parameters:
+--- - `method`: Method name called on callback `self`.
+--- - `class`: Class the method returns; nil/NULL remain unless separately proven valid.
+--- - `realm`: Contract realm; omitted uses the hook signature's client/server realm, otherwise every realm.
+---@attribute self_call_type(method: string, class: string, realm: "client"|"server"|nil)
+
+--- Marks a hook whose stock implementation calls the named method on `self` when a scripted
+--- class does not override the hook, such as `NPCShoot_Primary` calling `PrimaryAttack`.
+---
+--- Parameters:
+--- - `method`: Method the stock implementation calls on `self`.
+---@attribute default_self_call(method: string)
+
+--- Marks a Lua utility the engine never calls, so it adds no engine entry by itself.
+---@attribute not_engine_called()
+
 --- Marks a predicate that proves the guarded value is a valid/truthy runtime
 --- object without changing the value's static type to the predicate's return
 --- TypeGuard inner type.
