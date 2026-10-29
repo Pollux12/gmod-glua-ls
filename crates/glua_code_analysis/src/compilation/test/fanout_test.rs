@@ -1726,6 +1726,46 @@ Foo = {}
         assert_eq!(stats.evaluations(DerivationKind::GmodLoad), 0);
     }
 
+    const HOOK_ADDER: &str = "lua/autorun/client/cl_menu_tabs.lua";
+    const HOOK_ADDER_TEXT: &str = "local tabs = {}\n\nhook.Add(\"CreateMenuButtons\", \"probe\", function(buttons)\n    buttons.probe = true\nend)\n";
+
+    /// A file running a hook that another file adds a callback to.
+    fn hook_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![
+            (HOOK_ADDER, HOOK_ADDER_TEXT),
+            (
+                "lua/autorun/client/cl_menu.lua",
+                "local tabs = {}\nhook.Run(\"CreateMenuButtons\", tabs)\n",
+            ),
+        ]);
+        ws
+    }
+
+    /// The hook call's targets read the `hook.Add` statement, not the whole
+    /// file holding it.
+    #[test]
+    fn a_comment_appended_to_a_file_adding_a_hook_another_file_runs_re_runs_nothing_in_it() {
+        let mut ws = hook_workspace();
+
+        let adder = ws.def_file(HOOK_ADDER, &format!("{HOOK_ADDER_TEXT}\n-- touch\n"));
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![adder]);
+    }
+
+    #[test]
+    fn a_shift_in_a_file_adding_a_hook_another_file_runs_re_runs_nothing_in_it() {
+        let mut ws = hook_workspace();
+
+        let adder = ws.def_file(HOOK_ADDER, &format!("\n{HOOK_ADDER_TEXT}"));
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![adder]);
+    }
+
     /// The load fold resolves an included file by path, not by what it
     /// exports, so the export landing later does not run it again.
     #[test]

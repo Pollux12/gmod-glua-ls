@@ -20,14 +20,14 @@ pub(crate) fn pass_view() -> CacheOptions {
     }
 }
 
-/// The call `syntax_id` names in `file_id`, if the file still has it.
+/// The call `syntax_id` names in `file_id`, if the file still has it, reading
+/// only the top-level statement that holds it.
 pub(super) fn call_at(
     db: &DbIndex,
     file_id: FileId,
     syntax_id: LuaSyntaxId,
 ) -> Option<LuaCallExpr> {
-    let root = db.get_vfs().get_syntax_tree(&file_id)?.get_chunk_node();
-    LuaCallExpr::cast(syntax_id.to_node_from_root(root.syntax())?)
+    LuaCallExpr::cast(db.get_vfs().syntax_node_around(&file_id, syntax_id)?)
 }
 
 /// Resolves the call `syntax_id` names with `cache`, which infers under the
