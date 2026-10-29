@@ -301,12 +301,6 @@ pub struct LuaInferCache {
     /// Avoids repeated ancestor walks and type resolution for each `self` reference
     /// within the same method body.
     pub self_type_cache: TrackedMap<LuaSyntaxId, Option<LuaType>>,
-    /// The owner entries that reach a class's method body, keyed by the class
-    /// the body is defined on, the method, and the queried getter.
-    pub(crate) self_call_owner_cache: TrackedMap<
-        (LuaTypeDeclId, LuaMemberKey, SmolStr),
-        Arc<[super::gmod_self_call::OwnerEntry]>,
-    >,
     /// Region-aware base type seed for an implicit `self` flow query, set by
     /// `infer_self` for the duration of a single `infer_expr_narrow_type_with_self_base`
     /// call. When the flow walk reaches the origin for the matching `SelfRef`,
@@ -450,7 +444,6 @@ impl LuaInferCache {
             scripted_global_singleton_type_cache: None,
             root_gamemode_class_cache: Default::default(),
             self_type_cache: Default::default(),
-            self_call_owner_cache: Default::default(),
             self_base_seed: None,
             self_base_seed_mark: derivation::ScopeMark::default(),
             keyed_flow_node_cache: Default::default(),
@@ -876,7 +869,6 @@ impl LuaInferCache {
         empty(&mut self.param_type_source_cache.0);
         empty(&mut self.field_literal_narrowing);
         self.self_type_cache.clear_local();
-        self.self_call_owner_cache.clear_local();
         self.self_base_seed = None;
         self.root_gamemode_class_cache.clear_local();
 
@@ -925,7 +917,6 @@ impl LuaInferCache {
             constant_expr_cache,
             expr_var_ref_id_cache,
             self_type_cache,
-            self_call_owner_cache,
             dynamic_field_resolution_cache,
             exact_table_member_cache,
             local_class_table_member_ids_cache,

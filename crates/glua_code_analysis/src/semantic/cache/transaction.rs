@@ -197,7 +197,6 @@ impl LuaInferCache {
             constant_expr_cache,
             expr_var_ref_id_cache,
             self_type_cache,
-            self_call_owner_cache,
             dynamic_field_resolution_cache,
             exact_table_member_cache,
             local_class_table_member_ids_cache,

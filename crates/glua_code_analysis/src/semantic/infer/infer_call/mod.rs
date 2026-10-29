@@ -2372,9 +2372,6 @@ pub fn infer_call_expr(
     )?
     .get_ret()
     .clone();
-    let ret_type =
-        crate::semantic::gmod_self_call::self_call_contract_type(db, cache, &call_expr, &ret_type)
-            .unwrap_or(ret_type);
 
     if let Some(tree) = db.get_flow_index().get_flow_tree(&cache.get_file_id())
         && let Some(flow_id) = tree.get_flow_id(call_expr.get_syntax_id())

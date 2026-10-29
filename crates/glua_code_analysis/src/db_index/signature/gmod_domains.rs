@@ -132,20 +132,6 @@ pub const GMOD_ATTR_SELF_GUARD: &str = "self_guard";
 /// `Weapon:GetOwner()` return type.
 pub const GMOD_ATTR_SELF_CALL_VALID: &str = "self_call_valid";
 
-/// Signature-level attribute naming the class a method called on callback `self`
-/// returns, independently of validity.
-///
-/// Example: `---@[self_call_type("GetOwner", "Player")]` on weapon callbacks
-/// types `self:GetOwner()` as `Player` there.
-pub const GMOD_ATTR_SELF_CALL_TYPE: &str = "self_call_type";
-
-/// Signature-level attribute marking a hook whose stock implementation calls the
-/// named method on `self` when a scripted class does not override the hook.
-pub const GMOD_ATTR_DEFAULT_SELF_CALL: &str = "default_self_call";
-
-/// Signature-level attribute marking a Lua utility the engine never calls.
-pub const GMOD_ATTR_NOT_ENGINE_CALLED: &str = "not_engine_called";
-
 /// Reserved for validity guards: predicates that prove the guarded value is a
 /// valid/truthy runtime object without reclassifying it to the guard return's
 /// inner type.

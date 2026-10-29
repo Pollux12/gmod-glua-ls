@@ -3,7 +3,6 @@ mod decl;
 mod generic;
 pub(crate) mod gmod_call_effect;
 mod gmod_hook_owner;
-mod gmod_self_call;
 mod gmod_vgui_context;
 mod guard;
 mod infer;
