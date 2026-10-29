@@ -7,8 +7,8 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
     DbIndex, GenericTpl, GenericTplId, LuaAliasCallKind, LuaArrayType, LuaConditionalType,
-    LuaInstanceType, LuaMappedType, LuaMemberKey, LuaOperatorMetaMethod, LuaSignatureId,
-    LuaTupleStatus, LuaTypeDeclId, TypeOps, check_type_compact,
+    LuaMappedType, LuaMemberKey, LuaOperatorMetaMethod, LuaSignatureId, LuaTupleStatus,
+    LuaTypeDeclId, TypeOps, check_type_compact,
     db_index::{
         LuaFunctionType, LuaGenericType, LuaIntersectionType, LuaMergedTableType,
         LuaMultiLineUnion, LuaObjectType, LuaTupleType, LuaType, LuaUnionType, VariadicType,
@@ -81,7 +81,7 @@ pub fn instantiate_type_generic(
         }
         LuaType::Instance(inst) => {
             let base = instantiate_type_generic(db, inst.get_base(), substitutor);
-            LuaType::Instance(LuaInstanceType::new(base, inst.get_range().clone()).into())
+            LuaType::Instance(inst.rebased(base).into())
         }
         LuaType::Conditional(conditional) => instantiate_conditional(db, conditional, substitutor),
         LuaType::Mapped(mapped) => instantiate_mapped_type(db, mapped.deref(), substitutor),

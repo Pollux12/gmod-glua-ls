@@ -278,6 +278,11 @@
 
 ---@attribute fresh_result()
 
+--- Marks a function that returns a new table starting with the contents of its
+--- first argument, such as `table.Copy`. Writes to the copy never reach the
+--- original table, and the copy still has the original's members.
+---@attribute copy_result()
+
 --- Marks a function that terminates a net message and sends it, such as `net.Send` or
 --- `net.Broadcast`. Language server features use this to pair senders with receivers without
 --- matching the callable by name, so aliases and annotated replacement APIs are recognized too.

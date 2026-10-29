@@ -973,6 +973,20 @@ impl DynamicFieldIndex {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// The definitions of one field written on `owner` itself, in canonical
+    /// order, leaving out those propagated to it from other owners.
+    pub fn direct_definitions_of(
+        &self,
+        owner: &DynamicFieldOwner,
+        field_name: &str,
+    ) -> &[InFiled<TextRange>] {
+        derivation::note_dynamic_field_read(owner, Some(field_name));
+        self.direct_field_definitions
+            .get(owner)
+            .and_then(|fields| fields.get(field_name))
+            .map_or(&[], Vec::as_slice)
+    }
+
     pub fn get_wildcard_definitions(&self, owner: &DynamicFieldOwner) -> Vec<InFiled<TextRange>> {
         derivation::note_read(|| FactKey::DynamicFieldWildcards(owner.clone()));
         self.wildcard_definitions

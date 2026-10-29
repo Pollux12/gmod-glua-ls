@@ -63,6 +63,10 @@ struct SignatureFacts {
     returns_receiver: bool,
     falsy_param_nil_free_return_slots: Vec<LuaFalsyParamNilFreeReturnSlot>,
     falsy_param_return_aliases: Vec<LuaFalsyParamReturnAlias>,
+    /// The table constructors and calls whose value the function returns and
+    /// which each call of it evaluates anew, relative to the function's start
+    /// so a shift of its file leaves the fact unchanged.
+    fresh_returned_values: Vec<TextRange>,
 }
 
 /// A call whose result the function returns and which is handed some of the
@@ -170,6 +174,7 @@ impl Hash for LuaSignature {
         self.returns_receiver().hash(state);
         self.falsy_param_nil_free_return_slots().hash(state);
         self.falsy_param_return_aliases().hash(state);
+        self.fresh_returned_values().hash(state);
         self.return_cast.hash(state);
     }
 }
@@ -322,6 +327,17 @@ impl LuaSignature {
     pub fn falsy_param_return_aliases(&self) -> &[LuaFalsyParamReturnAlias] {
         match &self.facts {
             Some(facts) => &facts.falsy_param_return_aliases,
+            None => &[],
+        }
+    }
+
+    pub fn set_fresh_returned_values(&mut self, tables: Vec<TextRange>) {
+        self.facts_mut().fresh_returned_values = tables;
+    }
+
+    pub fn fresh_returned_values(&self) -> &[TextRange] {
+        match &self.facts {
+            Some(facts) => &facts.fresh_returned_values,
             None => &[],
         }
     }

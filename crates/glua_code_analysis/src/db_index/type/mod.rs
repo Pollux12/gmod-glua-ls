@@ -361,7 +361,11 @@ pub fn remap_identities_in_type(typ: &LuaType, remap: &crate::FileRemap) -> Type
                 TypeRemapResult::lost()
             } else if changed {
                 TypeRemapResult::moved(LuaType::Instance(Arc::new(
-                    crate::db_index::r#type::types::LuaInstanceType::new(new_base, new_range),
+                    crate::db_index::r#type::types::LuaInstanceType::with_kind(
+                        new_base,
+                        new_range,
+                        inst.get_kind(),
+                    ),
                 )))
             } else {
                 TypeRemapResult::unchanged()

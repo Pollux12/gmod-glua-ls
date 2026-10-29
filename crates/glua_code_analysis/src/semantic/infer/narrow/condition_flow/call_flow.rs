@@ -830,9 +830,7 @@ fn remove_exhaustively_guarded_classes(
             if base.is_never() {
                 LuaType::Never
             } else {
-                LuaType::Instance(
-                    crate::LuaInstanceType::new(base, instance.get_range().clone()).into(),
-                )
+                LuaType::Instance(instance.rebased(base).into())
             }
         }
         _ if is_guarded_class(db, antecedent, guard) => LuaType::Never,

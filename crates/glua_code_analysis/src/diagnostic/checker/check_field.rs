@@ -2834,7 +2834,7 @@ fn has_dynamic_field_for_type(
     field_name: &SmolStr,
 ) -> bool {
     let mut visited = rustc_hash::FxHashSet::default();
-    has_dynamic_field_for_type_inner(db, index, typ, field_name, &mut visited)
+    has_dynamic_field_for_type_inner(db, index, typ, field_name, false, &mut visited)
 }
 
 fn has_dynamic_field_for_type_inner(
@@ -2842,6 +2842,7 @@ fn has_dynamic_field_for_type_inner(
     index: &crate::DynamicFieldIndex,
     typ: &LuaType,
     field_name: &SmolStr,
+    direct_only: bool,
     visited: &mut rustc_hash::FxHashSet<LuaType>,
 ) -> bool {
     if !visited.insert(typ.clone()) {
@@ -2873,25 +2874,52 @@ fn has_dynamic_field_for_type_inner(
                 db,
                 crate::DynamicFieldOwner::Table(table_range.clone()),
             );
-            index.has_field(&owner, field_name) || owner_wildcard_covers_any_field(db, &owner)
+            let has_field = if direct_only {
+                index.has_direct_field(&owner, field_name)
+            } else {
+                index.has_field(&owner, field_name)
+            };
+            has_field || owner_wildcard_covers_any_field(db, &owner)
         }
-        LuaType::Instance(instance) => {
-            has_dynamic_field_for_type_inner(db, index, instance.get_base(), field_name, visited)
+        // A table one call made, or a copy of one, has its own writes and
+        // those into the table it was made from, not those into the other
+        // tables made from it.
+        LuaType::Instance(instance) if instance.get_kind() != crate::LuaInstanceKind::Shared => {
+            let owner = crate::canonical_dynamic_field_owner(
+                db,
+                crate::DynamicFieldOwner::Table(instance.get_range().clone()),
+            );
+            index.has_field(&owner, field_name)
+                || owner_wildcard_covers_any_field(db, &owner)
+                || has_dynamic_field_for_type_inner(
+                    db,
+                    index,
+                    instance.get_base(),
+                    field_name,
+                    true,
+                    visited,
+                )
         }
+        LuaType::Instance(instance) => has_dynamic_field_for_type_inner(
+            db,
+            index,
+            instance.get_base(),
+            field_name,
+            direct_only,
+            visited,
+        ),
         LuaType::TableOf(inner) => {
-            has_dynamic_field_for_type_inner(db, index, inner, field_name, visited)
+            has_dynamic_field_for_type_inner(db, index, inner, field_name, direct_only, visited)
         }
-        LuaType::Union(union_type) => union_type
-            .types()
-            .any(|t| has_dynamic_field_for_type_inner(db, index, t, field_name, visited)),
-        LuaType::MergedTable(merged) => merged
-            .get_types()
-            .iter()
-            .any(|t| has_dynamic_field_for_type_inner(db, index, t, field_name, visited)),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .any(|(t, _)| has_dynamic_field_for_type_inner(db, index, t, field_name, visited)),
+        LuaType::Union(union_type) => union_type.types().any(|t| {
+            has_dynamic_field_for_type_inner(db, index, t, field_name, direct_only, visited)
+        }),
+        LuaType::MergedTable(merged) => merged.get_types().iter().any(|t| {
+            has_dynamic_field_for_type_inner(db, index, t, field_name, direct_only, visited)
+        }),
+        LuaType::MultiLineUnion(union) => union.get_unions().iter().any(|(t, _)| {
+            has_dynamic_field_for_type_inner(db, index, t, field_name, direct_only, visited)
+        }),
         _ => false,
     }
 }

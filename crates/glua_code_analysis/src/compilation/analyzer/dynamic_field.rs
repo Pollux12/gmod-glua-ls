@@ -9,7 +9,8 @@ use rowan::TextSize;
 use smol_str::SmolStr;
 
 use crate::{
-    InFiled, LuaDeclId, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType, LuaTypeOwner, VarRefId,
+    InFiled, LuaDeclId, LuaInstanceKind, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType,
+    LuaTypeOwner, VarRefId,
     db_index::{DbIndex, DynamicFieldOwner, LuaMemberOwner, LuaSemanticDeclId, WorkspaceKind},
     find_signature_attribute_use,
     semantic::{
@@ -550,6 +551,7 @@ fn collect_statement_fields(
         // Target-local buffers: super-type propagation runs per target.
         let mut target_named: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
             Vec::new();
+        let mut per_call_bases: Vec<CollectedField> = Vec::new();
         for field_name in field_names.names {
             if mode.collect_declared_member_table_fields()
                 && let Some(value_expr) = value_expr
@@ -569,13 +571,14 @@ fn collect_statement_fields(
             }
             if mode.collect_direct_assignments() || collect_finite_direct_assignment {
                 let before = target_named.len();
-                collect_for_type(
+                collect_for_written_type(
                     db,
                     &effective_type,
                     &field_name,
                     file_id,
                     definition_range,
                     &mut target_named,
+                    &mut per_call_bases,
                 );
                 // The write is real but landed on no owner the index can
                 // name, so record that the field exists somewhere even
@@ -591,7 +594,11 @@ fn collect_statement_fields(
             fields
                 .propagated
                 .extend(propagate_dynamic_fields_to_super_types(db, &target_named));
+            fields
+                .propagated
+                .extend(propagate_dynamic_fields_to_super_types(db, &per_call_bases));
         }
+        fields.propagated.extend(per_call_bases);
         fields.named.extend(target_named);
     }
 }
@@ -2141,16 +2148,54 @@ fn collect_wildcard_for_type_inner(
     }
 }
 
+type CollectedField = (DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange);
+
 fn collect_for_type(
     db: &DbIndex,
     typ: &LuaType,
     field_name: &SmolStr,
     file_id: crate::FileId,
     range: rowan::TextRange,
-    result: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    result: &mut Vec<CollectedField>,
 ) {
     let mut visited = rustc_hash::FxHashSet::default();
-    collect_for_type_inner(db, typ, field_name, file_id, range, result, &mut visited);
+    collect_for_type_inner(
+        db,
+        typ,
+        field_name,
+        file_id,
+        range,
+        result,
+        None,
+        &mut visited,
+    );
+}
+
+/// [`collect_for_type`] for a write through an expression: a field written on
+/// a table one call made, or on a copy of one, is the field of that table
+/// alone. A table a function builds also stands for every table that
+/// constructor builds, whose code runs with any of them as `self`, so its
+/// owners are filed in `propagated`.
+fn collect_for_written_type(
+    db: &DbIndex,
+    typ: &LuaType,
+    field_name: &SmolStr,
+    file_id: crate::FileId,
+    range: rowan::TextRange,
+    result: &mut Vec<CollectedField>,
+    propagated: &mut Vec<CollectedField>,
+) {
+    let mut visited = rustc_hash::FxHashSet::default();
+    collect_for_type_inner(
+        db,
+        typ,
+        field_name,
+        file_id,
+        range,
+        result,
+        Some(propagated),
+        &mut visited,
+    );
 }
 
 fn collect_for_type_inner(
@@ -2159,7 +2204,8 @@ fn collect_for_type_inner(
     field_name: &SmolStr,
     file_id: crate::FileId,
     range: rowan::TextRange,
-    result: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    result: &mut Vec<CollectedField>,
+    mut per_call: Option<&mut Vec<CollectedField>>,
     visited: &mut rustc_hash::FxHashSet<LuaType>,
 ) {
     if !visited.insert(typ.clone()) {
@@ -2193,22 +2239,63 @@ fn collect_for_type_inner(
             ));
         }
         LuaType::Instance(instance) => {
-            collect_for_type_inner(
-                db,
-                instance.get_base(),
-                field_name,
-                file_id,
-                range,
-                result,
-                visited,
-            );
+            let kind = instance.get_kind();
+            if let Some(propagated) = per_call.as_deref_mut()
+                && kind != LuaInstanceKind::Shared
+            {
+                result.push((
+                    crate::canonical_dynamic_field_owner(
+                        db,
+                        DynamicFieldOwner::Table(instance.get_range().clone()),
+                    ),
+                    field_name.clone(),
+                    file_id,
+                    range,
+                ));
+                if kind == LuaInstanceKind::Made {
+                    let mut base_propagated = Vec::new();
+                    collect_for_type_inner(
+                        db,
+                        instance.get_base(),
+                        field_name,
+                        file_id,
+                        range,
+                        propagated,
+                        Some(&mut base_propagated),
+                        visited,
+                    );
+                    propagated.extend(base_propagated);
+                }
+            } else {
+                collect_for_type_inner(
+                    db,
+                    instance.get_base(),
+                    field_name,
+                    file_id,
+                    range,
+                    result,
+                    per_call,
+                    visited,
+                );
+            }
         }
         LuaType::TableOf(inner) => {
-            collect_for_type_inner(db, inner, field_name, file_id, range, result, visited);
+            collect_for_type_inner(
+                db, inner, field_name, file_id, range, result, per_call, visited,
+            );
         }
         LuaType::Union(union_type) => {
             for t in union_type.types() {
-                collect_for_type_inner(db, t, field_name, file_id, range, result, visited);
+                collect_for_type_inner(
+                    db,
+                    t,
+                    field_name,
+                    file_id,
+                    range,
+                    result,
+                    per_call.as_deref_mut(),
+                    visited,
+                );
             }
         }
         // A merged table is the same runtime table seen through several
@@ -2216,7 +2303,16 @@ fn collect_for_type_inner(
         // does when inference answers with the literals unmerged.
         LuaType::MergedTable(merged) => {
             for t in merged.get_types() {
-                collect_for_type_inner(db, t, field_name, file_id, range, result, visited);
+                collect_for_type_inner(
+                    db,
+                    t,
+                    field_name,
+                    file_id,
+                    range,
+                    result,
+                    per_call.as_deref_mut(),
+                    visited,
+                );
             }
         }
         _ => {}

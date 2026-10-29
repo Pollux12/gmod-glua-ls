@@ -15,12 +15,12 @@ use crate::compilation::analyzer::unresolve::get_wrapped_callable_target_expr;
 use crate::db_index::callee_signature_ids;
 use crate::semantic::{local_name_closure_signature_id, semantic_decl_signature_id};
 use crate::{
-    CacheEntry, DbIndex, InFiled, LuaArrayType, LuaFunctionType, LuaGenericType, LuaInstanceType,
-    LuaIntersectionType, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignature, LuaSignatureId,
-    LuaTupleType, LuaType, LuaTypeDeclId, LuaTypeFlag, LuaUnionType, ReturnTypeKind,
-    TypeVisitTrait, VariadicType,
+    CacheEntry, DbIndex, InFiled, LuaArrayType, LuaFunctionType, LuaGenericType, LuaInstanceKind,
+    LuaInstanceType, LuaIntersectionType, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignature,
+    LuaSignatureId, LuaTupleType, LuaType, LuaTypeDeclId, LuaTypeFlag, LuaUnionType,
+    ReturnTypeKind, TypeVisitTrait, VariadicType,
 };
-use crate::{GMOD_DOMAIN_CONVAR, GMOD_ROLE_REFERENCE};
+use crate::{GMOD_DOMAIN_CONVAR, GMOD_ROLE_REFERENCE, signature_copies_result};
 use crate::{GmodConVarKind, GmodLoadEdgeKind, GmodStateMask};
 use crate::{
     InferGuardRef,
@@ -401,17 +401,23 @@ fn infer_call_expr_func_miss(
             {
                 Ok(func_ty)
             }
-            _ => unwrapp_return_type(db, cache, func_ret, call_expr).map(|new_ret| {
-                LuaFunctionType::new(
-                    func_ty.get_async_state(),
-                    func_ty.is_colon_define(),
-                    func_ty.is_variadic(),
-                    func_ty.get_params().to_vec(),
-                    new_ret,
-                )
-                .with_optional_params(func_ty.get_optional_params().to_vec())
-                .into()
-            }),
+            _ => {
+                let callee = match &call_expr_type {
+                    LuaType::Signature(signature_id) => Some(*signature_id),
+                    _ => None,
+                };
+                unwrapp_return_type(db, cache, func_ret, call_expr, callee).map(|new_ret| {
+                    LuaFunctionType::new(
+                        func_ty.get_async_state(),
+                        func_ty.is_colon_define(),
+                        func_ty.is_variadic(),
+                        func_ty.get_params().to_vec(),
+                        new_ret,
+                    )
+                    .with_optional_params(func_ty.get_optional_params().to_vec())
+                    .into()
+                })
+            }
         }
     } else {
         result
@@ -646,11 +652,9 @@ fn collect_non_nil_type_ids(typ: &LuaType, type_ids: &mut Vec<LuaTypeDeclId>) {
 fn remove_nested_nil(typ: LuaType) -> LuaType {
     match typ {
         LuaType::Instance(instance) => LuaType::Instance(
-            LuaInstanceType::new(
-                remove_nested_nil(instance.get_base().clone()),
-                instance.get_range().clone(),
-            )
-            .into(),
+            instance
+                .rebased(remove_nested_nil(instance.get_base().clone()))
+                .into(),
         ),
         LuaType::Union(union) => {
             LuaType::from_vec(union.types().filter(|typ| !typ.is_nil()).cloned().collect())
@@ -1772,9 +1776,7 @@ fn remove_nil_from_type(t: LuaType) -> LuaType {
             if new_base.is_unknown() {
                 LuaType::Unknown
             } else {
-                LuaType::Instance(
-                    LuaInstanceType::new(new_base, instance_type.get_range().clone()).into(),
-                )
+                LuaType::Instance(instance_type.rebased(new_base).into())
             }
         }
         _ => t,
@@ -2119,23 +2121,43 @@ pub(crate) fn unwrapp_return_type(
     cache: &mut LuaInferCache,
     return_type: LuaType,
     call_expr: LuaCallExpr,
+    callee: Option<LuaSignatureId>,
 ) -> InferResult {
     match &return_type {
         LuaType::TableConst(inst) => {
-            if is_need_wrap_instance(cache, &call_expr, inst) {
-                let id = InFiled {
-                    file_id: cache.get_file_id(),
-                    value: call_expr.get_range(),
-                };
-
-                return Ok(LuaType::Instance(
-                    LuaInstanceType::new(return_type.clone(), id).into(),
-                ));
-            }
-
-            return Ok(return_type);
+            return Ok(match per_call_table_kind(db, callee, inst) {
+                Some(kind) if is_need_wrap_instance(cache, &call_expr, inst) => {
+                    per_call_instance(cache, &call_expr, return_type.clone(), kind)
+                }
+                _ => return_type,
+            });
+        }
+        LuaType::Union(union)
+            if union
+                .types()
+                .any(|arm| matches!(arm, LuaType::TableConst(_))) =>
+        {
+            return Ok(LuaType::from_vec(
+                union
+                    .types()
+                    .map(|arm| match arm {
+                        LuaType::TableConst(inst) => match per_call_table_kind(db, callee, inst) {
+                            Some(kind) if is_need_wrap_instance(cache, &call_expr, inst) => {
+                                per_call_instance(cache, &call_expr, arm.clone(), kind)
+                            }
+                            _ => arm.clone(),
+                        },
+                        _ => arm.clone(),
+                    })
+                    .collect(),
+            ));
         }
         LuaType::Instance(inst) => {
+            if inst.get_kind() != LuaInstanceKind::Shared
+                && !returned_value_is_fresh(db, callee, inst.get_range())
+            {
+                return Ok(return_type);
+            }
             if is_need_wrap_instance(cache, &call_expr, inst.get_range()) {
                 let id = InFiled {
                     file_id: cache.get_file_id(),
@@ -2149,7 +2171,7 @@ pub(crate) fn unwrapp_return_type(
                 } else {
                     return_type.clone()
                 };
-                return Ok(materialize_instance_return(base, id));
+                return Ok(materialize_instance_return(base, id, inst.get_kind()));
             }
 
             return Ok(return_type);
@@ -2190,12 +2212,69 @@ fn instance_has_installed_members(db: &DbIndex, instance: &LuaInstanceType) -> b
         .is_some_and(|members| !members.is_empty())
 }
 
-fn materialize_instance_return(base: LuaType, range: InFiled<TextRange>) -> LuaType {
+/// The kind of table a call of `callee` makes for itself when it returns
+/// `table`: one its body constructs, or a copy of its argument.
+fn per_call_table_kind(
+    db: &DbIndex,
+    callee: Option<LuaSignatureId>,
+    table: &InFiled<TextRange>,
+) -> Option<LuaInstanceKind> {
+    let callee = callee?;
+    if returned_value_is_fresh(db, Some(callee), table) {
+        Some(LuaInstanceKind::Made)
+    } else if signature_copies_result(db, callee) {
+        Some(LuaInstanceKind::Copy)
+    } else {
+        None
+    }
+}
+
+/// Whether the expression at `range` is one `callee` returns and evaluates
+/// anew on every call.
+fn returned_value_is_fresh(
+    db: &DbIndex,
+    callee: Option<LuaSignatureId>,
+    range: &InFiled<TextRange>,
+) -> bool {
+    let Some(callee) = callee else {
+        return false;
+    };
+    if callee.get_file_id() != range.file_id || range.value.start() < callee.get_position() {
+        return false;
+    }
+    db.get_signature_index()
+        .get(&callee)
+        .is_some_and(|signature| {
+            signature
+                .fresh_returned_values()
+                .contains(&(range.value - callee.get_position()))
+        })
+}
+
+fn per_call_instance(
+    cache: &LuaInferCache,
+    call_expr: &LuaCallExpr,
+    base: LuaType,
+    kind: LuaInstanceKind,
+) -> LuaType {
+    let id = InFiled {
+        file_id: cache.get_file_id(),
+        value: call_expr.get_range(),
+    };
+    LuaType::Instance(LuaInstanceType::with_kind(base, id, kind).into())
+}
+
+fn materialize_instance_return(
+    base: LuaType,
+    range: InFiled<TextRange>,
+    kind: LuaInstanceKind,
+) -> LuaType {
     let (non_nil_base, nullable) = separate_nested_instance_nil(base);
     let Some(non_nil_base) = non_nil_base else {
         return LuaType::Nil;
     };
-    let materialized = LuaType::Instance(LuaInstanceType::new(non_nil_base, range).into());
+    let materialized =
+        LuaType::Instance(LuaInstanceType::with_kind(non_nil_base, range, kind).into());
     if nullable {
         LuaType::from_vec(vec![materialized, LuaType::Nil])
     } else {
@@ -2223,11 +2302,8 @@ fn separate_nested_instance_nil(base: LuaType) -> (Option<LuaType>, bool) {
         LuaType::Instance(instance) => {
             let (non_nil_base, nullable) =
                 separate_nested_instance_nil(instance.get_base().clone());
-            let non_nil_instance = non_nil_base.map(|non_nil_base| {
-                LuaType::Instance(
-                    LuaInstanceType::new(non_nil_base, instance.get_range().clone()).into(),
-                )
-            });
+            let non_nil_instance = non_nil_base
+                .map(|non_nil_base| LuaType::Instance(instance.rebased(non_nil_base).into()));
             (non_nil_instance, nullable)
         }
         _ => (Some(base), false),
@@ -2647,8 +2723,9 @@ mod tests {
         let db = semantic_model.get_db();
         let mut cache = semantic_model.get_cache().borrow_mut();
 
-        let result = super::unwrapp_return_type(db, &mut cache, return_type, call_expr.clone())
-            .expect("call return should materialize");
+        let result =
+            super::unwrapp_return_type(db, &mut cache, return_type, call_expr.clone(), None)
+                .expect("call return should materialize");
         let LuaType::Instance(instance) = result else {
             panic!("expected an instance return");
         };

@@ -65,7 +65,35 @@ use super::{
     infer_name::{contains_self_infer, infer_global_type},
 };
 
-type TableMemberLookupGuard = FxHashSet<InFiled<TextRange>>;
+/// The tables a member lookup is walking, and the per-call table whose base
+/// the lookup is reading through.
+#[derive(Default)]
+struct TableMemberLookupGuard {
+    tables: FxHashSet<InFiled<TextRange>>,
+    instance: Option<Arc<LuaInstanceType>>,
+}
+
+impl TableMemberLookupGuard {
+    fn insert(&mut self, table: InFiled<TextRange>) -> bool {
+        self.tables.insert(table)
+    }
+
+    fn remove(&mut self, table: &InFiled<TextRange>) {
+        self.tables.remove(table);
+    }
+
+    /// The type the dynamic fields of `table` are read through: the per-call
+    /// table when the lookup reads that table's base, so fields written through
+    /// the tables other calls made stay out.
+    fn dynamic_field_prefix(&self, table: &InFiled<TextRange>) -> LuaType {
+        match &self.instance {
+            Some(instance) if instance.get_base() == &LuaType::TableConst(table.clone()) => {
+                LuaType::Instance(instance.clone())
+            }
+            _ => LuaType::TableConst(table.clone()),
+        }
+    }
+}
 
 /// A member declared `---@field x self` yields the receiver's own type, so
 /// `ent.Entity` resolves to whatever `ent` is (including a narrowed class).
@@ -1022,7 +1050,7 @@ fn infer_table_member_owner(
             && let Some(dynamic_field) = resolve_dynamic_field_member(
                 db,
                 cache,
-                &LuaType::TableConst(inst.clone()),
+                &table_member_lookup_guard.dynamic_field_prefix(&inst),
                 &key,
                 Some(index_expr.get_position()),
             )
@@ -1094,7 +1122,7 @@ fn infer_table_member_owner(
         if let Some(dynamic_field) = resolve_dynamic_field_member(
             db,
             cache,
-            &LuaType::TableConst(inst.clone()),
+            &table_member_lookup_guard.dynamic_field_prefix(&inst),
             &key,
             Some(index_expr.get_position()),
         )
@@ -1165,7 +1193,7 @@ fn infer_table_member_owner(
             if let Some(dynamic_field) = resolve_dynamic_field_member(
                 db,
                 cache,
-                &LuaType::TableConst(inst.clone()),
+                &table_member_lookup_guard.dynamic_field_prefix(&inst),
                 &key,
                 Some(index_expr.get_position()),
             )
@@ -3140,6 +3168,11 @@ fn infer_instance_member(
     let range = inst.get_range();
 
     let origin_type = inst.get_base();
+    let previous_instance = (inst.get_kind() != crate::LuaInstanceKind::Shared).then(|| {
+        table_member_lookup_guard
+            .instance
+            .replace(Arc::new(inst.clone()))
+    });
     let base_result = infer_member_by_member_key_with_table_guard(
         db,
         cache,
@@ -3148,6 +3181,9 @@ fn infer_instance_member(
         infer_guard,
         table_member_lookup_guard,
     );
+    if let Some(previous) = previous_instance {
+        table_member_lookup_guard.instance = previous;
+    }
     match base_result {
         Ok(typ) => match infer_table_member(
             db,

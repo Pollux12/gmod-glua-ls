@@ -148,6 +148,10 @@ pub const GMOD_ATTR_EXHAUSTIVE_TYPE_GUARD: &str = "exhaustive_type_guard";
 
 pub const GMOD_ATTR_FRESH_RESULT: &str = "fresh_result";
 
+/// Signature-level standalone attribute for functions returning a new table
+/// that starts as a copy of their first argument.
+pub const GMOD_ATTR_COPY_RESULT: &str = "copy_result";
+
 /// Signature-level standalone attribute name for calls whose write effects are
 /// bounded to the listed global/root identities.
 ///
@@ -574,6 +578,10 @@ fn attribute_string_param(attribute_use: &crate::LuaAttributeUse, name: &str) ->
         LuaType::DocStringConst(value) | LuaType::StringConst(value) => Some(value.to_string()),
         _ => None,
     }
+}
+
+pub fn signature_copies_result(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    find_signature_attribute_use(db, signature_id, GMOD_ATTR_COPY_RESULT).is_some()
 }
 
 pub fn signature_has_fresh_result(db: &DbIndex, signature_id: LuaSignatureId) -> bool {

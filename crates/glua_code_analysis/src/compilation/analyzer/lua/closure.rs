@@ -1,4 +1,4 @@
-use super::{SignatureChange, StatementWrite};
+use super::{SignatureChange, StatementWrite, stats::is_local_mutable};
 use glua_parser::LuaSyntaxNodeExt;
 use std::ops::Deref;
 
@@ -6,7 +6,7 @@ use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallArgList,
     LuaCallExpr, LuaClosureExpr, LuaComment, LuaDocTagReturn, LuaExpr, LuaFuncStat, LuaIfStat,
     LuaIndexExpr, LuaIndexKey, LuaLiteralToken, LuaLocalStat, LuaReturnStat, LuaStat,
-    LuaSyntaxKind, LuaVarExpr, PathTrait, UnaryOperator,
+    LuaSyntaxKind, LuaTableExpr, LuaVarExpr, PathTrait, UnaryOperator,
 };
 use rowan::{TextRange, TextSize};
 
@@ -61,6 +61,7 @@ pub fn analyze_closure(analyzer: &mut LuaAnalyzer, closure: LuaClosureExpr) -> O
     analyze_direct_param_return_alias(analyzer, &signature_id, &closure);
     analyze_class_name_param_return_alias(analyzer, &signature_id, &closure);
     analyze_returns_receiver(analyzer, &signature_id, &closure);
+    analyze_fresh_returned_values(analyzer, &signature_id, &closure);
     analyze_return(analyzer, &signature_id, &closure);
     Some(())
 }
@@ -263,6 +264,74 @@ fn analyze_returns_receiver(
         change: SignatureChange::ReturnsReceiver,
     });
     Some(())
+}
+
+/// Records the table constructors and calls a function returns on its own,
+/// which every call of it evaluates anew: the expression of a `return`, or the
+/// initializer of a never-reassigned local of the function. A value the
+/// function takes from outside its body, such as a module-level local, is one
+/// value for every call and is left out.
+fn analyze_fresh_returned_values(
+    analyzer: &mut LuaAnalyzer,
+    signature_id: &LuaSignatureId,
+    closure: &LuaClosureExpr,
+) -> Option<()> {
+    let block = closure.get_block()?;
+    let closure_range = closure.get_range();
+    let mut values = Vec::new();
+    for return_stat in closure_own_return_stats(analyzer, closure, &block).iter() {
+        let mut exprs = return_stat.get_expr_list();
+        let (Some(expr), None) = (exprs.next(), exprs.next()) else {
+            continue;
+        };
+        if let Some(value) = fresh_value_range(analyzer, closure_range, expr) {
+            values.push(value - closure_range.start());
+        }
+    }
+    if values.is_empty() {
+        return Some(());
+    }
+    values.sort_by_key(|range| (range.start(), range.end()));
+    values.dedup();
+    analyzer.write(StatementWrite::Signature {
+        signature_id: *signature_id,
+        change: SignatureChange::FreshReturnedValues(values),
+    });
+    Some(())
+}
+
+fn fresh_value_range(
+    analyzer: &LuaAnalyzer,
+    closure_range: TextRange,
+    expr: LuaExpr,
+) -> Option<TextRange> {
+    match expr {
+        LuaExpr::TableExpr(table_expr) => Some(table_expr.get_range()),
+        LuaExpr::CallExpr(call_expr) => Some(call_expr.get_range()),
+        LuaExpr::ParenExpr(paren_expr) => {
+            fresh_value_range(analyzer, closure_range, paren_expr.get_expr()?)
+        }
+        LuaExpr::NameExpr(name_expr) => {
+            let decl_id = analyzer
+                .db
+                .get_reference_index()
+                .get_local_reference(&analyzer.file_id)?
+                .get_decl_id(&name_expr.get_range())?;
+            if !closure_range.contains(decl_id.position) || is_local_mutable(analyzer, decl_id) {
+                return None;
+            }
+            let initializer = analyzer
+                .db
+                .get_decl_index()
+                .get_decl(&decl_id)?
+                .get_initializer()?;
+            (initializer.get_ret_idx() == 0
+                && (LuaTableExpr::can_cast(initializer.get_expr_syntax_id().get_kind())
+                    || LuaCallExpr::can_cast(initializer.get_expr_syntax_id().get_kind())))
+            .then(|| initializer.get_expr_syntax_id().get_range())
+        }
+        _ => None,
+    }
 }
 
 struct ClassNameCreateCall {

@@ -1748,10 +1748,27 @@ impl VariadicType {
     }
 }
 
+/// How the table an instance stands for relates to its base type.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Default)]
+pub enum LuaInstanceKind {
+    /// A value of the base type: fields written on it belong to the base.
+    #[default]
+    Shared,
+    /// A table one call of a function built from the constructor the base
+    /// names. Fields written on it are its own; the constructor's other
+    /// tables and the function's own code, which sees any of them, see them
+    /// through the base.
+    Made,
+    /// A copy one call made of the base table: it starts with the base's
+    /// contents and writes to it never reach the base.
+    Copy,
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct LuaInstanceType {
     base: LuaType,
     range: InFiled<TextRange>,
+    kind: LuaInstanceKind,
 }
 
 impl TypeVisitTrait for LuaInstanceType {
@@ -1765,7 +1782,20 @@ impl TypeVisitTrait for LuaInstanceType {
 
 impl LuaInstanceType {
     pub fn new(base: LuaType, range: InFiled<TextRange>) -> Self {
-        Self { base, range }
+        Self::with_kind(base, range, LuaInstanceKind::Shared)
+    }
+
+    pub fn with_kind(base: LuaType, range: InFiled<TextRange>, kind: LuaInstanceKind) -> Self {
+        Self { base, range, kind }
+    }
+
+    /// The same table seen through `base`.
+    pub fn rebased(&self, base: LuaType) -> Self {
+        Self::with_kind(base, self.range.clone(), self.kind)
+    }
+
+    pub fn get_kind(&self) -> LuaInstanceKind {
+        self.kind
     }
 
     pub fn get_base(&self) -> &LuaType {

@@ -8,8 +8,8 @@ use std::sync::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    DbIndex, FileId, GmodStateMask, InFiled, LuaDecl, LuaMemberFeature, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, TypeOps,
+    DbIndex, FileId, GmodStateMask, InFiled, LuaDecl, LuaInstanceKind, LuaMemberFeature,
+    LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, TypeOps,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::type_check::check_type_compact,
 };
@@ -1299,6 +1299,30 @@ fn dynamic_field_definitions(
     field_name: &str,
     access_position: Option<TextSize>,
 ) -> Vec<VisibleDynamicFieldDefinition> {
+    dynamic_field_definitions_of(
+        db,
+        cache,
+        caller_file_id,
+        prefix_type,
+        field_name,
+        access_position,
+        false,
+    )
+}
+
+/// The dynamic writers of `field_name` on `prefix_type`. `direct_only` leaves
+/// out, on a table, the writes other tables propagated to it: a table one call
+/// made sees the writes through itself and those into the constructor's own
+/// table, not those into the tables other calls made.
+fn dynamic_field_definitions_of(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    caller_file_id: FileId,
+    prefix_type: &LuaType,
+    field_name: &str,
+    access_position: Option<TextSize>,
+    direct_only: bool,
+) -> Vec<VisibleDynamicFieldDefinition> {
     match prefix_type {
         LuaType::Ref(type_id) | LuaType::Def(type_id) => dynamic_field_definitions_for_owner(
             db,
@@ -1308,32 +1332,74 @@ fn dynamic_field_definitions(
             field_name,
             access_position,
             None,
+            false,
         ),
-        LuaType::TableConst(table_range) => {
-            let table_owner = crate::DynamicFieldOwner::Table(table_range.clone());
-            let owner = crate::canonical_dynamic_field_owner(db, table_owner.clone());
-            let source_min_position = (owner != table_owner)
-                .then(|| InFiled::new(table_range.file_id, table_range.value.start()));
-            dynamic_field_definitions_for_owner(
+        LuaType::TableConst(table_range) => dynamic_field_definitions_for_table(
+            db,
+            cache,
+            caller_file_id,
+            table_range,
+            field_name,
+            access_position,
+            direct_only,
+        ),
+        LuaType::Instance(instance) if instance.get_kind() != LuaInstanceKind::Shared => {
+            let mut definitions = dynamic_field_definitions_for_table(
                 db,
                 cache,
                 caller_file_id,
-                &owner,
+                instance.get_range(),
                 field_name,
                 access_position,
-                source_min_position.as_ref(),
-            )
+                false,
+            );
+            definitions.extend(dynamic_field_definitions_of(
+                db,
+                cache,
+                caller_file_id,
+                instance.get_base(),
+                field_name,
+                access_position,
+                true,
+            ));
+            definitions
         }
-        LuaType::Instance(instance) => dynamic_field_definitions(
+        LuaType::Instance(instance) => dynamic_field_definitions_of(
             db,
             cache,
             caller_file_id,
             instance.get_base(),
             field_name,
             access_position,
+            direct_only,
         ),
         _ => Vec::new(),
     }
+}
+
+fn dynamic_field_definitions_for_table(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    caller_file_id: FileId,
+    table_range: &InFiled<TextRange>,
+    field_name: &str,
+    access_position: Option<TextSize>,
+    direct_only: bool,
+) -> Vec<VisibleDynamicFieldDefinition> {
+    let table_owner = crate::DynamicFieldOwner::Table(table_range.clone());
+    let owner = crate::canonical_dynamic_field_owner(db, table_owner.clone());
+    let source_min_position = (owner != table_owner)
+        .then(|| InFiled::new(table_range.file_id, table_range.value.start()));
+    dynamic_field_definitions_for_owner(
+        db,
+        cache,
+        caller_file_id,
+        &owner,
+        field_name,
+        access_position,
+        source_min_position.as_ref(),
+        direct_only,
+    )
 }
 /// Reads `owner`'s `key` slot and its dynamic field, which register a lookup
 /// as their reader; the pass collecting dynamic fields never sees them, so it
@@ -1378,6 +1444,13 @@ fn record_dynamic_field_read_for_prefix(db: &DbIndex, prefix_type: &LuaType, fie
             flag_masked_if_present(db, &owner, field_name);
         }
         LuaType::Instance(instance) => {
+            if instance.get_kind() != LuaInstanceKind::Shared {
+                let owner = crate::canonical_dynamic_field_owner(
+                    db,
+                    crate::DynamicFieldOwner::Table(instance.get_range().clone()),
+                );
+                flag_masked_if_present(db, &owner, field_name);
+            }
             record_dynamic_field_read_for_prefix(db, instance.get_base(), field_name);
         }
         _ => {}
@@ -1392,6 +1465,7 @@ fn dynamic_field_definitions_for_owner(
     field_name: &str,
     access_position: Option<TextSize>,
     source_min_position: Option<&InFiled<TextSize>>,
+    direct_only: bool,
 ) -> Vec<VisibleDynamicFieldDefinition> {
     let dynamic_fields_global = db.get_emmyrc().gmod.dynamic_fields_global;
     let caller_mask = effective_dynamic_field_state_mask(db, caller_file_id, access_position);
@@ -1402,10 +1476,13 @@ fn dynamic_field_definitions_for_owner(
     let mut visible = Vec::new();
     // Consulted in the index's canonical order, unfiltered and unsorted: the
     // elected arm and the elected semantic decl both follow it.
-    for definition in db
-        .get_dynamic_field_index()
-        .field_definitions(owner, field_name)
-    {
+    let index = db.get_dynamic_field_index();
+    let definitions = if direct_only {
+        index.direct_definitions_of(owner, field_name)
+    } else {
+        index.field_definitions(owner, field_name)
+    };
+    for definition in definitions {
         if source_min_position.is_some_and(|source_min_position| {
             !source_survives_table_generation_cutoff(
                 db,
