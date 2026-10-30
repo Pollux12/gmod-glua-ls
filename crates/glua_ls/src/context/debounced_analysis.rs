@@ -197,7 +197,7 @@ enum Rebuild {
 /// Takes `count` from `counter`, stopping at zero and logging an underflow.
 fn release(counter: &AtomicUsize, count: usize) {
     let previous = counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             Some(current.saturating_sub(count))
         })
         .unwrap_or_else(|current| current);

@@ -540,7 +540,7 @@ fn refresh_required_fields(
         .map(|(type_id, chain, held)| {
             let owns = chain
                 .iter()
-                .map(|typ| own_fields_owner(typ).and_then(&own))
+                .map(|typ| own_fields_owner(typ).and_then(own))
                 .collect::<Vec<_>>();
             match held {
                 Some(held) if Arc::ptr_eq(&held.chain, chain) && same_owns(&held.owns, &owns) => {
