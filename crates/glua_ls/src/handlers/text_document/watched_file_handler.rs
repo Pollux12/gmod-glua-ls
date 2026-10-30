@@ -328,67 +328,16 @@ fn get_file_type(uri: &Uri) -> Option<WatchedFileType> {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{str::FromStr, time::Duration};
 
     use super::finally_deleted_uris;
-    use lsp_types::Uri;
+    use crate::context::diagnostic_store::Priority;
+    use glua_code_analysis::{DiagnosticCode, FileId};
+    use lsp_types::{NumberOrString, Uri};
+    use tokio_util::sync::CancellationToken;
 
     fn uri(s: &str) -> Uri {
         Uri::from_str(s).expect("uri should parse")
-    }
-
-    /// A watched deletion only takes the file's text away under the write
-    /// lock; the debounced loop re-analyses it in slices, so requests are
-    /// answered while it settles.
-    #[test]
-    fn a_watched_deletion_is_left_to_the_debounced_loop() {
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-        let (connection, _peer) = lsp_server::Connection::memory();
-        runtime.block_on(async {
-            let context = crate::context::ServerContext::new(
-                connection,
-                lsp_types::ClientCapabilities::default(),
-            );
-            let snapshot = context.snapshot();
-            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_watched_deletion");
-            let data_uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/sh_data.lua"))
-                .expect("data URI should parse");
-            let data = {
-                let mut analysis = snapshot.analysis().write().await;
-                analysis.add_main_workspace(workspace.clone());
-                analysis
-                    .update_file_by_uri(
-                        &data_uri,
-                        Some(
-                            "Data = {}
-"
-                            .to_string(),
-                        ),
-                    )
-                    .expect("data file is added")
-                    .0
-            };
-
-            super::on_did_change_watched_files(
-                snapshot.clone(),
-                lsp_types::DidChangeWatchedFilesParams {
-                    changes: vec![lsp_types::FileEvent {
-                        uri: data_uri,
-                        typ: lsp_types::FileChangeType::DELETED,
-                    }],
-                },
-            )
-            .await;
-
-            let still_indexed = snapshot
-                .analysis()
-                .read()
-                .await
-                .compilation
-                .is_indexed(data);
-            assert!(still_indexed);
-            assert!(snapshot.debounced_analysis().is_dirty());
-        });
     }
 
     /// A file deleted on disk while open keeps the editor's text until the
@@ -486,6 +435,141 @@ mod tests {
             .cloned()
     }
 
+    /// The id of an indexed file, so a test can wait on its diagnostics.
+    async fn indexed_file_id(
+        snapshot: &crate::context::ServerContextSnapshot,
+        uri: &Uri,
+    ) -> FileId {
+        snapshot
+            .analysis()
+            .read()
+            .await
+            .get_file_id(uri)
+            .expect("file is indexed")
+    }
+
+    fn reports_undefined_global(diagnostics: &[lsp_types::Diagnostic]) -> bool {
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedGlobal.get_name().to_string(),
+        ));
+        diagnostics.iter().any(|diagnostic| diagnostic.code == code)
+    }
+
+    /// A change the watcher reports is re-analysed by the debounced loop, and
+    /// the file's diagnostics come up to date.
+    #[test]
+    fn a_watched_change_is_rediagnosed() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = lsp_server::Connection::memory();
+        runtime.block_on(async {
+            let context = crate::context::ServerContext::new(
+                connection,
+                lsp_types::ClientCapabilities::default(),
+            );
+            let snapshot = context.snapshot();
+            let root = crate::util::unique_temp_dir("gmod_glua_ls_watched_rediagnosed");
+            let uris =
+                index_workspace(&snapshot, &root, &[("lua/sh_data.lua", "local a = 1\n")]).await;
+            snapshot
+                .analysis()
+                .write()
+                .await
+                .diagnostic
+                .enable_only(DiagnosticCode::UndefinedGlobal);
+            let data = indexed_file_id(&snapshot, &uris[0]).await;
+            let store = snapshot.file_diagnostic().store();
+
+            super::apply_file_system_changes(
+                &snapshot,
+                vec![(uris[0].clone(), Some("Missing()\n".to_string()))],
+            )
+            .await;
+
+            let diagnosed = tokio::time::timeout(
+                Duration::from_secs(60),
+                store.get(data, Priority::Edited, &CancellationToken::new()),
+            )
+            .await
+            .expect("the change is re-analysed")
+            .expect("the file still has diagnostics");
+            assert!(
+                reports_undefined_global(&diagnosed.diagnostics),
+                "expected an undefined global, got {:?}",
+                diagnosed.diagnostics
+            );
+        });
+    }
+
+    /// A file deleted on disk is re-analysed out of the index, and the files
+    /// that used what it defined are diagnosed again.
+    #[test]
+    fn a_watched_deletion_is_rediagnosed_in_its_dependents() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = lsp_server::Connection::memory();
+        runtime.block_on(async {
+            let context = crate::context::ServerContext::new(
+                connection,
+                lsp_types::ClientCapabilities::default(),
+            );
+            let snapshot = context.snapshot();
+            let root = crate::util::unique_temp_dir("gmod_glua_ls_watched_dependent_deletion");
+            let uris = index_workspace(
+                &snapshot,
+                &root,
+                &[
+                    ("lua/sh_api.lua", "function Shared() end\n"),
+                    ("lua/sh_consumer.lua", "Shared()\n"),
+                ],
+            )
+            .await;
+            snapshot
+                .analysis()
+                .write()
+                .await
+                .diagnostic
+                .enable_only(DiagnosticCode::UndefinedGlobal);
+            let consumer = indexed_file_id(&snapshot, &uris[1]).await;
+            let store = snapshot.file_diagnostic().store();
+            let cancel = CancellationToken::new();
+
+            let before = tokio::time::timeout(
+                Duration::from_secs(60),
+                store.get(consumer, Priority::Edited, &cancel),
+            )
+            .await
+            .expect("the consumer is diagnosed")
+            .expect("the consumer has diagnostics");
+            assert!(!reports_undefined_global(&before.diagnostics));
+
+            super::apply_file_system_changes(&snapshot, vec![(uris[0].clone(), None)]).await;
+
+            // The deletion is staged and scheduled; wait for the re-analysis
+            // it scheduled before reading the dependents' diagnostics.
+            let fresh = tokio::time::timeout(
+                Duration::from_secs(60),
+                snapshot
+                    .debounced_analysis()
+                    .wait_until_fresh_for(&cancel, "test"),
+            )
+            .await
+            .expect("the deletion settles");
+            assert_eq!(fresh, crate::context::Freshness::Fresh);
+
+            let after = tokio::time::timeout(
+                Duration::from_secs(60),
+                store.get(consumer, Priority::Edited, &cancel),
+            )
+            .await
+            .expect("the consumer is diagnosed again")
+            .expect("the consumer has diagnostics");
+            assert!(
+                reports_undefined_global(&after.diagnostics),
+                "expected an undefined global, got {:?}",
+                after.diagnostics
+            );
+        });
+    }
+
     /// A deleted folder gets one event; every file indexed under it goes
     /// with it, as if each had its own deletion.
     #[test]
@@ -528,7 +612,6 @@ mod tests {
                 latest_text(&snapshot, &uris[2]).await.as_deref(),
                 Some("Other = {}\n")
             );
-            assert!(snapshot.debounced_analysis().is_dirty());
         });
     }
 
@@ -677,7 +760,6 @@ mod tests {
                 latest_text(&snapshot, &uri("lua/autorun/server/notes.txt")).await,
                 None
             );
-            assert!(snapshot.debounced_analysis().is_dirty());
         });
     }
 
@@ -726,14 +808,14 @@ mod tests {
         });
     }
 
-    /// A file changed on disk is diagnosed as soon as its own re-analysis
-    /// settles, ahead of the files its change ripples into.
+    /// A file changed on disk is queued for diagnosis ahead of the files its
+    /// change ripples into.
     #[test]
     fn a_file_changed_on_disk_is_diagnosed_first() {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         let (connection, _peer) = lsp_server::Connection::memory();
         runtime.block_on(async {
-            let context = crate::context::ServerContext::new(
+            let context = crate::context::ServerContext::new_idle(
                 connection,
                 lsp_types::ClientCapabilities::default(),
             );

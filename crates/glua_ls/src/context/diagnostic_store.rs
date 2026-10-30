@@ -1086,9 +1086,13 @@ mod tests {
             };
             let store = snapshot.file_diagnostic().store();
             store.invalidate([file_id], &[file_id]);
-            while !store.state().entries.contains_key(&file_id) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !store.state().entries.contains_key(&file_id) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the store records a computation for the file");
 
             let write = tokio::time::timeout(Duration::from_secs(2), snapshot.analysis().write())
                 .await

@@ -149,6 +149,21 @@ pub struct ServerContext {
 
 impl ServerContext {
     pub fn new(conn: Connection, client_capabilities: ClientCapabilities) -> Self {
+        Self::build(conn, client_capabilities, true)
+    }
+
+    /// A context that starts no background task, so what it stages stays
+    /// staged until the test takes it.
+    #[cfg(test)]
+    pub(crate) fn new_idle(conn: Connection, client_capabilities: ClientCapabilities) -> Self {
+        Self::build(conn, client_capabilities, false)
+    }
+
+    fn build(
+        conn: Connection,
+        client_capabilities: ClientCapabilities,
+        background_tasks: bool,
+    ) -> Self {
         let client = Arc::new(ClientProxy::new(Connection {
             sender: conn.sender.clone(),
             receiver: conn.receiver.clone(),
@@ -186,15 +201,17 @@ impl ServerContext {
         );
         let workspace_manager = Arc::new(RwLock::new(workspace_manager_inner));
 
-        file_diagnostic.store().start(
-            file_diagnostic::workspace_diagnostic_parallelism(),
-            debounced_analysis.clone(),
-        );
+        if background_tasks {
+            file_diagnostic.store().start(
+                file_diagnostic::workspace_diagnostic_parallelism(),
+                debounced_analysis.clone(),
+            );
+        }
 
         // Supervise the debounce loop: freshness waiters park on it with no
         // deadline, so if it dies the waiters fail fast via the alive flag
         // instead of the whole server silently going quiet.
-        {
+        if background_tasks {
             let da = debounced_analysis.clone();
             let shutdown = debounced_shutdown.clone();
             tokio::spawn(async move {
