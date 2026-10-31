@@ -81,7 +81,9 @@ pub async fn on_notification_handler(
                 }
             };
             let snapshot = server_context.snapshot();
-            snapshot.note_document_seen_version(&uri, document.version);
+            let Some(session) = snapshot.note_document_seen_version(&uri, document.version) else {
+                return Ok(());
+            };
             // Only this document's requests are superseded. Exempted ones
             // wait for fresh data instead of being cancelled: a cancelled
             // executeCommand drops the user's command.
@@ -107,6 +109,7 @@ pub async fn on_notification_handler(
             server_context.did_change_coalescer().enqueue(
                 document,
                 text,
+                session,
                 in_flight,
                 enqueue_profile,
             );
@@ -125,7 +128,7 @@ pub async fn on_notification_handler(
                 .editor_documents()
                 .open(uri.clone(), params.text_document.text.clone());
             let snapshot = server_context.snapshot();
-            snapshot.note_document_seen_version(&uri, params.text_document.version);
+            let session = snapshot.note_document_opened(&uri, params.text_document.version);
             {
                 let mut workspace = snapshot.workspace_manager().write().await;
                 workspace.current_open_files.insert(uri.clone());
@@ -138,7 +141,7 @@ pub async fn on_notification_handler(
             tokio::spawn(async move {
                 let handler_snapshot = task_snapshot.clone();
                 let handle = tokio::spawn(async move {
-                    on_did_open_text_document(handler_snapshot, params).await;
+                    on_did_open_text_document(handler_snapshot, params, session).await;
                 });
                 if let Err(err) = handle.await {
                     log::error!("LS_DID_OPEN_PANIC didOpen handler failed: {}", err);
@@ -158,7 +161,7 @@ pub async fn on_notification_handler(
             let uri = params.text_document.uri.clone();
             server_context.editor_documents().close(&uri);
             let snapshot = server_context.snapshot();
-            snapshot.mark_document_closed(&uri);
+            let session = snapshot.mark_document_closed(&uri);
             {
                 let mut workspace = snapshot.workspace_manager().write().await;
                 workspace.current_open_files.remove(&uri);
@@ -171,7 +174,7 @@ pub async fn on_notification_handler(
             tokio::spawn(async move {
                 let handler_snapshot = task_snapshot.clone();
                 let handle = tokio::spawn(async move {
-                    on_did_close_document(handler_snapshot, params).await;
+                    on_did_close_document(handler_snapshot, params, session).await;
                 });
                 if let Err(err) = handle.await {
                     log::error!("LS_DID_CLOSE_PANIC didClose handler failed: {}", err);

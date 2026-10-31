@@ -21,34 +21,14 @@ fn spawn_deferred_drop(deferred_drop: DeferredVfsDrop) {
     tokio::task::spawn_blocking(move || drop(deferred_drop));
 }
 
-/// Whether an update opens the document, starting a new editor session, or
-/// changes it within the session.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DocumentUpdate {
-    Open,
-    Change,
-}
-
-fn should_drop_stale_version(
-    context: &ServerContextSnapshot,
-    uri: &lsp_types::Uri,
-    version: i32,
-) -> bool {
-    context.has_newer_seen_document_version(uri, version)
-}
-
 async fn apply_document_update_without_queuing(
     context: &ServerContextSnapshot,
     uri: &lsp_types::Uri,
     text: String,
     version: i32,
-    update: DocumentUpdate,
+    session: u64,
     mut preparsed: Option<PreparsedDocument>,
 ) -> Option<FileId> {
-    if should_drop_stale_version(context, uri, version) {
-        return None;
-    }
-
     // Fair-queued `write().await`, not a `try_write` spin, which can starve
     // for seconds under a stream of readers.
     //
@@ -67,42 +47,43 @@ async fn apply_document_update_without_queuing(
     }
     let hold_start = profile.then(std::time::Instant::now);
 
-    // The lock wait is unbounded, so re-check staleness now that we hold it.
-    if should_drop_stale_version(context, uri, version) {
-        drop(analysis);
-        if let Some(start) = hold_start {
-            crate::util::ls_profile::record_did_change_write_hold(start.elapsed());
-        }
-        return None;
-    }
-
-    // Versions order one session's edits: a reopened document starts over,
-    // even if the close never got to forget the last session's version.
-    if update == DocumentUpdate::Open {
-        analysis.forget_document_version(uri);
-    }
-
-    // Only the text is stored; the debounced loop re-analyses it and
-    // invalidates the shared diagnostic data under its own write lock.
+    // The lock wait is unbounded, so re-check now that we hold it. Every
+    // later edit or close of this document applies under this lock too, so
+    // the check holds for the rest of the write.
     let mut deferred_drop = None;
-    let outcome = if let Some(preparsed) = preparsed.take() {
-        let Some((file_id, drop)) = analysis.update_file_preparsed_deferred(
-            uri.clone(),
-            Some(text),
-            preparsed.tree,
-            preparsed.line_index,
-            Some(version),
-        ) else {
-            drop(analysis);
-            if let Some(start) = hold_start {
-                crate::util::ls_profile::record_did_change_write_hold(start.elapsed());
-            }
-            return None;
+    let outcome = if context.is_current_document_update(uri, session, version) {
+        // Versions order one session's edits: its first write starts over,
+        // whether that is the didOpen or a change that superseded it.
+        if !context.has_applied_document_version(uri, session) {
+            analysis.forget_document_version(uri);
+        }
+
+        // Only the text is stored; the debounced loop re-analyses it and
+        // invalidates the shared diagnostic data under its own write lock.
+        let file_id = if let Some(preparsed) = preparsed.take() {
+            analysis
+                .update_file_preparsed_deferred(
+                    uri.clone(),
+                    Some(text),
+                    preparsed.tree,
+                    preparsed.line_index,
+                    Some(version),
+                )
+                .map(|(file_id, replaced)| {
+                    deferred_drop = Some(replaced);
+                    file_id
+                })
+        } else {
+            analysis.update_file_text_only(uri, text)
         };
-        deferred_drop = Some(drop);
-        Some(file_id)
+        // Opened under the lock, so a close handler, which marks the file
+        // closed under it, always runs after.
+        if let Some(file_id) = file_id {
+            context.file_diagnostic().store().set_open(file_id, true);
+        }
+        file_id
     } else {
-        analysis.update_file_text_only(uri, text)
+        None
     };
     drop(analysis);
     if let Some(start) = hold_start {
@@ -153,6 +134,7 @@ async fn preparse_document(text: String, emmyrc: Arc<Emmyrc>) -> Option<Preparse
 pub async fn on_did_open_text_document(
     context: ServerContextSnapshot,
     params: DidOpenTextDocumentParams,
+    session: u64,
 ) -> Option<()> {
     let uri = params.text_document.uri;
     let text = params.text_document.text;
@@ -172,11 +154,11 @@ pub async fn on_did_open_text_document(
     };
 
     if !should_process {
-        context.mark_document_closed(&uri);
+        context.mark_document_closed_if_current(&uri, session);
         return None;
     }
 
-    if should_drop_stale_version(&context, &uri, version) {
+    if !context.is_current_document_update(&uri, session, version) {
         return Some(());
     }
 
@@ -185,25 +167,19 @@ pub async fn on_did_open_text_document(
         analysis.get_emmyrc()
     };
     let preparsed = preparse_document(text.clone(), emmyrc).await;
-    if should_drop_stale_version(&context, &uri, version) {
+    if !context.is_current_document_update(&uri, session, version) {
         return Some(());
     }
 
-    let file_id = apply_document_update_without_queuing(
-        &context,
-        &uri,
-        text,
-        version,
-        DocumentUpdate::Open,
-        preparsed,
-    )
-    .await;
+    let file_id =
+        apply_document_update_without_queuing(&context, &uri, text, version, session, preparsed)
+            .await;
     if let Some(file_id) = file_id {
-        context.note_document_applied_version(&uri, version);
+        if !context.note_document_applied_version(&uri, session, version) {
+            return Some(());
+        }
         // Text that differs from what is indexed settles through the
         // debounced loop, as an edit does.
-        let store = context.file_diagnostic().store();
-        store.set_open(file_id, true);
         let analysis = context.analysis().read().await;
         if analysis.has_untaken_text(file_id) {
             drop(analysis);
@@ -212,7 +188,10 @@ pub async fn on_did_open_text_document(
                 .schedule_at_once(file_id, uri.clone())
                 .await;
         } else {
-            store.publish_opened(file_id, version);
+            context
+                .file_diagnostic()
+                .store()
+                .publish_opened(file_id, version);
         }
     }
 
@@ -240,6 +219,7 @@ pub async fn on_did_change_text_document(
     context: ServerContextSnapshot,
     document: VersionedTextDocumentIdentifier,
     text: String,
+    session: u64,
 ) -> Option<()> {
     let VersionedTextDocumentIdentifier { uri, version } = document;
 
@@ -259,11 +239,11 @@ pub async fn on_did_change_text_document(
     };
 
     if !should_process {
-        context.mark_document_closed(&uri);
+        context.mark_document_closed_if_current(&uri, session);
         return None;
     }
 
-    if should_drop_stale_version(&context, &uri, version) {
+    if !context.is_current_document_update(&uri, session, version) {
         return Some(());
     }
 
@@ -279,31 +259,19 @@ pub async fn on_did_change_text_document(
     if let Some(start) = preparse_start {
         crate::util::ls_profile::record_did_change_preparse(start.elapsed());
     }
-    if should_drop_stale_version(&context, &uri, version) {
+    if !context.is_current_document_update(&uri, session, version) {
         return Some(());
     }
 
-    let file_id = apply_document_update_without_queuing(
-        &context,
-        &uri,
-        text,
-        version,
-        DocumentUpdate::Change,
-        preparsed,
-    )
-    .await;
-    if file_id.is_some() {
-        context.note_document_applied_version(&uri, version);
-    }
-
-    if should_drop_stale_version(&context, &uri, version) {
+    let file_id =
+        apply_document_update_without_queuing(&context, &uri, text, version, session, preparsed)
+            .await;
+    if file_id.is_some() && !context.note_document_applied_version(&uri, session, version) {
         return Some(());
     }
 
-    // Only an open document is changed, and its didOpen may have been
-    // superseded by this change before it took the document's ownership.
-    if let Some(file_id) = file_id {
-        context.file_diagnostic().store().set_open(file_id, true);
+    if !context.is_current_document_update(&uri, session, version) {
+        return Some(());
     }
 
     // Schedule debounced reindex — rapid edits into a single reindex.
@@ -338,10 +306,16 @@ pub async fn on_did_change_text_document(
 pub async fn on_did_close_document(
     context: ServerContextSnapshot,
     params: DidCloseTextDocumentParams,
+    session: u64,
 ) -> Option<()> {
     let uri = &params.text_document.uri;
+    // Checked under the analysis lock: a reopen opens the file under the
+    // write lock, so it cannot slip between the check and the store update.
     let encoding = {
         let analysis = context.analysis().read().await;
+        if !context.is_document_closed_for(uri, session) {
+            return Some(());
+        }
         if let Some(file_id) = analysis.get_file_id(uri) {
             context.file_diagnostic().store().set_open(file_id, false);
         }
@@ -365,16 +339,16 @@ pub async fn on_did_close_document(
     })
     .await
     .ok()??;
-    if !context.is_document_closed(uri) {
+    if !context.is_document_closed_for(uri, session) {
         return Some(());
     }
 
     // Only the text changes under the write lock; the debounced loop
     // re-analyses the file and whatever read what moved.
     let deleted = text.is_none();
-    let (staged, file_id) = {
+    let staged = {
         let mut analysis = context.analysis().write().await;
-        if !context.is_document_closed(uri) {
+        if !context.is_document_closed_for(uri, session) {
             return Some(());
         }
         analysis.forget_document_version(uri);
@@ -382,14 +356,11 @@ pub async fn on_did_close_document(
             .stage_file_system_changes(vec![(uri.clone(), text)])
             .into_iter()
             .next();
-        (staged, analysis.get_file_id(uri))
-    };
-    let store = context.file_diagnostic().store();
-    if deleted {
-        if let Some(file_id) = file_id {
-            store.remove(file_id, uri);
+        if deleted && let Some(file_id) = analysis.get_file_id(uri) {
+            context.file_diagnostic().store().remove(file_id, uri);
         }
-    }
+        staged
+    };
     if let Some(staged) = staged {
         context
             .debounced_analysis()
@@ -478,8 +449,13 @@ mod tests {
         (context, peer, uri, folder)
     }
 
-    async fn open(snapshot: &ServerContextSnapshot, uri: &Uri, version: i32, text: &str) {
-        snapshot.note_document_seen_version(uri, version);
+    async fn did_open(
+        snapshot: &ServerContextSnapshot,
+        uri: &Uri,
+        session: u64,
+        version: i32,
+        text: &str,
+    ) {
         on_did_open_text_document(
             snapshot.clone(),
             DidOpenTextDocumentParams {
@@ -490,12 +466,21 @@ mod tests {
                     text: text.to_string(),
                 },
             },
+            session,
         )
         .await;
     }
 
+    async fn open(snapshot: &ServerContextSnapshot, uri: &Uri, version: i32, text: &str) -> u64 {
+        let session = snapshot.note_document_opened(uri, version);
+        did_open(snapshot, uri, session, version, text).await;
+        session
+    }
+
     async fn change(snapshot: &ServerContextSnapshot, uri: &Uri, version: i32, text: &str) {
-        snapshot.note_document_seen_version(uri, version);
+        let session = snapshot
+            .note_document_seen_version(uri, version)
+            .expect("the document is open");
         on_did_change_text_document(
             snapshot.clone(),
             VersionedTextDocumentIdentifier {
@@ -503,31 +488,43 @@ mod tests {
                 version,
             },
             text.to_string(),
+            session,
         )
         .await;
     }
 
-    async fn close(snapshot: &ServerContextSnapshot, uri: &Uri) {
+    async fn did_close(snapshot: &ServerContextSnapshot, uri: &Uri, session: u64) {
         on_did_close_document(
             snapshot.clone(),
             DidCloseTextDocumentParams {
                 text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
             },
+            session,
         )
         .await;
+    }
+
+    async fn close(snapshot: &ServerContextSnapshot, uri: &Uri) {
+        let session = snapshot.mark_document_closed(uri);
+        did_close(snapshot, uri, session).await;
+    }
+
+    /// The text the VFS holds for `uri`, staged or taken.
+    async fn held_text(snapshot: &ServerContextSnapshot, uri: &Uri) -> Option<String> {
+        let analysis = snapshot.analysis().read().await;
+        let vfs = analysis.compilation.get_db().get_vfs();
+        analysis
+            .get_file_id(uri)
+            .and_then(|file_id| vfs.latest_content(&file_id).cloned())
     }
 
     /// The reopened session's edit is indexed, and a request waiting for the
     /// latest version (as semantic tokens do) is answered.
     async fn verify_new_session_applied(snapshot: &ServerContextSnapshot, uri: &Uri) -> Result<()> {
-        let held = {
-            let analysis = snapshot.analysis().read().await;
-            let vfs = analysis.compilation.get_db().get_vfs();
-            analysis
-                .get_file_id(uri)
-                .and_then(|file_id| vfs.latest_content(&file_id).cloned())
-        };
-        verify_that!(held.as_deref(), some(eq(NEW_TEXT)))?;
+        verify_that!(
+            held_text(snapshot, uri).await.as_deref(),
+            some(eq(NEW_TEXT))
+        )?;
         let answered = tokio::time::timeout(
             Duration::from_secs(5),
             snapshot.wait_until_latest_document_version_applied(uri, &CancellationToken::new()),
@@ -546,7 +543,6 @@ mod tests {
             let snapshot = context.snapshot();
             open(&snapshot, &uri, 1, DISK_TEXT).await;
             change(&snapshot, &uri, 3, DISK_TEXT).await;
-            snapshot.mark_document_closed(&uri);
             close(&snapshot, &uri).await;
 
             open(&snapshot, &uri, 1, DISK_TEXT).await;
@@ -567,14 +563,128 @@ mod tests {
             let snapshot = context.snapshot();
             open(&snapshot, &uri, 1, DISK_TEXT).await;
             change(&snapshot, &uri, 3, "local x = 3\n").await;
-            snapshot.mark_document_closed(&uri);
-            snapshot.note_document_seen_version(&uri, 1);
-            close(&snapshot, &uri).await;
 
-            open(&snapshot, &uri, 1, DISK_TEXT).await;
+            let closing = snapshot.mark_document_closed(&uri);
+            let reopened = snapshot.note_document_opened(&uri, 1);
+            did_close(&snapshot, &uri, closing).await;
+            did_open(&snapshot, &uri, reopened, 1, DISK_TEXT).await;
             change(&snapshot, &uri, 2, NEW_TEXT).await;
 
             verify_new_session_applied(&snapshot, &uri).await
+        })
+    }
+
+    /// A reopen whose didOpen is superseded by the first change still resets
+    /// the previous session's version before that change is applied.
+    #[gtest]
+    fn a_reopen_whose_open_is_superseded_takes_its_new_edits() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (context, _peer, uri, _folder) =
+                context_with_disk_file("reopen_open_superseded").await;
+            let snapshot = context.snapshot();
+            open(&snapshot, &uri, 100, DISK_TEXT).await;
+            change(&snapshot, &uri, 100, "local x = 100\n").await;
+
+            let closing = snapshot.mark_document_closed(&uri);
+            let reopened = snapshot.note_document_opened(&uri, 1);
+            did_close(&snapshot, &uri, closing).await;
+
+            let file_id = snapshot
+                .analysis()
+                .read()
+                .await
+                .get_file_id(&uri)
+                .expect("the document is indexed");
+            verify_that!(
+                snapshot.file_diagnostic().store().any_open(&[file_id], &[]),
+                eq(true)
+            )?;
+
+            let change_session = snapshot
+                .note_document_seen_version(&uri, 2)
+                .expect("the reopened document is open");
+            verify_that!(change_session, eq(reopened))?;
+            on_did_change_text_document(
+                snapshot.clone(),
+                VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2,
+                },
+                NEW_TEXT.to_string(),
+                change_session,
+            )
+            .await;
+            did_open(&snapshot, &uri, reopened, 1, DISK_TEXT).await;
+
+            verify_new_session_applied(&snapshot, &uri).await
+        })
+    }
+
+    /// A change queued for the previous session never reaches the VFS after
+    /// the document reopens, even though its version is higher.
+    #[gtest]
+    fn an_old_sessions_change_does_not_apply_after_a_reopen() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (context, _peer, uri, _folder) = context_with_disk_file("old_session_change").await;
+            let snapshot = context.snapshot();
+            let old_session = open(&snapshot, &uri, 100, DISK_TEXT).await;
+            change(&snapshot, &uri, 100, "local x = 100\n").await;
+            close(&snapshot, &uri).await;
+            open(&snapshot, &uri, 1, DISK_TEXT).await;
+
+            on_did_change_text_document(
+                snapshot.clone(),
+                VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 101,
+                },
+                "local x = 101\n".to_string(),
+                old_session,
+            )
+            .await;
+
+            verify_that!(
+                held_text(&snapshot, &uri).await.as_deref(),
+                some(eq(DISK_TEXT))
+            )
+        })
+    }
+
+    /// A close handler left over from the previous session must not close the
+    /// reopened document in the diagnostic store or stage disk text over its
+    /// buffer.
+    #[gtest]
+    fn a_close_that_overtakes_a_reopen_leaves_the_document_open() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (context, _peer, uri, _folder) =
+                context_with_disk_file("close_overtakes_reopen").await;
+            let snapshot = context.snapshot();
+            open(&snapshot, &uri, 1, DISK_TEXT).await;
+
+            let closing = snapshot.mark_document_closed(&uri);
+            let reopened_text = "local x = 2\n";
+            open(&snapshot, &uri, 1, reopened_text).await;
+
+            did_close(&snapshot, &uri, closing).await;
+
+            let file_id = snapshot
+                .analysis()
+                .read()
+                .await
+                .get_file_id(&uri)
+                .expect("the document is indexed");
+            verify_that!(
+                snapshot.file_diagnostic().store().any_open(&[file_id], &[]),
+                eq(true)
+            )?;
+
+            verify_that!(
+                held_text(&snapshot, &uri).await.as_deref(),
+                some(eq(reopened_text))
+            )
         })
     }
 
@@ -586,19 +696,9 @@ mod tests {
         runtime.block_on(async {
             let (context, _peer, uri, _folder) = context_with_disk_file("open_superseded").await;
             let snapshot = context.snapshot();
+            let session = snapshot.note_document_opened(&uri, 1);
             snapshot.note_document_seen_version(&uri, 2);
-            on_did_open_text_document(
-                snapshot.clone(),
-                DidOpenTextDocumentParams {
-                    text_document: TextDocumentItem {
-                        uri: uri.clone(),
-                        language_id: "lua".to_string(),
-                        version: 1,
-                        text: DISK_TEXT.to_string(),
-                    },
-                },
-            )
-            .await;
+            did_open(&snapshot, &uri, session, 1, DISK_TEXT).await;
             change(&snapshot, &uri, 2, NEW_TEXT).await;
 
             let file_id = snapshot

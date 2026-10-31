@@ -31,7 +31,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 pub use workspace_manager::*;
 
-use crate::context::snapshot::ServerContextInner;
+use crate::context::snapshot::{DocumentVersions, ServerContextInner};
 
 // LOCK ORDER (take top to bottom; never one above while holding one below):
 // 1. `WorkspaceManager::config_apply`, held across a whole config reload.
@@ -260,7 +260,7 @@ impl ServerContext {
             status_bar,
             lsp_features,
             debounced_analysis,
-            document_versions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            document_versions: Arc::new(std::sync::Mutex::new(DocumentVersions::default())),
             document_version_notify: Arc::new(Notify::new()),
             renamed_uris: Default::default(),
         });

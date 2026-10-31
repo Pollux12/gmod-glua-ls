@@ -8,6 +8,7 @@ use crate::handlers::on_did_change_text_document;
 struct QueuedDidChange {
     document: VersionedTextDocumentIdentifier,
     text: String,
+    session: u64,
     in_flight: InFlightChangeGuard,
     enqueue_profile: Option<crate::util::ls_profile::DidChangeEnqueue>,
 }
@@ -44,12 +45,14 @@ impl DidChangeCoalescer {
         &self,
         document: VersionedTextDocumentIdentifier,
         text: String,
+        session: u64,
         in_flight: InFlightChangeGuard,
         enqueue_profile: Option<crate::util::ls_profile::DidChangeEnqueue>,
     ) {
         if let Err(err) = self.tx.send(QueuedDidChange {
             document,
             text,
+            session,
             in_flight,
             enqueue_profile,
         }) {
@@ -94,8 +97,13 @@ impl DidChangeCoalescer {
                 {
                     let task_context = context.clone();
                     let handle = tokio::spawn(async move {
-                        on_did_change_text_document(task_context, queued.document, queued.text)
-                            .await;
+                        on_did_change_text_document(
+                            task_context,
+                            queued.document,
+                            queued.text,
+                            queued.session,
+                        )
+                        .await;
                     });
                     if let Err(err) = handle.await {
                         log::error!(
@@ -121,11 +129,12 @@ impl DidChangeCoalescer {
                 let accum_scope = accum.clone();
                 let document = queued.document;
                 let text = queued.text;
+                let session = queued.session;
                 let in_flight = queued.in_flight;
                 let handle = tokio::spawn(crate::util::ls_profile::LS_DID_CHANGE_ACCUM.scope(
                     accum_scope,
                     async move {
-                        on_did_change_text_document(task_context, document, text).await;
+                        on_did_change_text_document(task_context, document, text, session).await;
                     },
                 ));
                 if let Err(err) = handle.await {
