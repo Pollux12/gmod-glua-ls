@@ -420,15 +420,23 @@ fn find_custom_type_members(
         }
     }
 
-    if members.is_empty()
-        && let Some(global_members) = find_owner_members(
-            db,
-            ctx,
-            &LuaMemberOwner::GlobalPath(GlobalId::new(type_decl_id.get_name())),
-            filter,
-        )
-    {
-        members.extend(global_members);
+    // The class's global holds the members written through it outside the
+    // class's own declaration; a key the class declares itself wins.
+    if let Some(global_members) = find_owner_members(
+        db,
+        ctx,
+        &LuaMemberOwner::GlobalPath(GlobalId::new(type_decl_id.get_name())),
+        filter,
+    ) {
+        let declared_keys = members
+            .iter()
+            .map(|member| member.key.clone())
+            .collect::<HashSet<_>>();
+        members.extend(
+            global_members
+                .into_iter()
+                .filter(|member| !declared_keys.contains(&member.key)),
+        );
 
         if should_stop_collecting(members.len(), filter) {
             return Some(members);

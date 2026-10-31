@@ -1544,6 +1544,52 @@ parser:parse()",
             .collect()
     }
 
+    /// A class declared apart from its global's table, as the GMod annotations
+    /// declare `GM`, lists the members written through the global the way a
+    /// by-key lookup reads them: alongside its own, which win on a shared key.
+    #[gtest]
+    fn test_class_members_include_writes_through_its_detached_global() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Hooks
+            ---@field Name string
+            ---@field Run fun(self: Hooks): string
+
+            Hooks = {}
+
+            function Hooks:Run() return "" end
+            function Hooks:Think() end
+            "#,
+        );
+        let db = ws.analysis.compilation.get_db();
+        let members = crate::get_member_map(db, &LuaType::Ref(LuaTypeDeclId::global("Hooks")))
+            .unwrap_or_default();
+        let owners = |name: &str| {
+            members
+                .get(&LuaMemberKey::Name(name.into()))
+                .into_iter()
+                .flatten()
+                .map(|info| match &info.property_owner_id {
+                    Some(crate::LuaSemanticDeclId::Member(id)) => {
+                        db.get_member_index().get_current_owner(id).cloned()
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        verify_eq!(
+            owners("Think"),
+            vec![Some(LuaMemberOwner::GlobalPath(GlobalId::new("Hooks")))]
+        )?;
+        verify_eq!(
+            owners("Run"),
+            vec![Some(LuaMemberOwner::Type(LuaTypeDeclId::global("Hooks")))]
+        )?;
+        verify_eq!(owners("Name").len(), 1)
+    }
+
     #[gtest]
     fn test_guarded_dynamic_key_assignment_preserves_shaped_table_value() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
