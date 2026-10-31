@@ -885,7 +885,11 @@ fn extend_gmod_hook_semantic_decls(
         .iter()
         .filter(|name| !name.eq_ignore_ascii_case(owner_name))
     {
-        let fallback_type = LuaType::Ref(LuaTypeDeclId::global(fallback_owner_name));
+        let fallback_type = LuaType::Ref(
+            builder
+                .semantic_model
+                .resolve_global_class(fallback_owner_name),
+        );
         let member_infos = match trigger_position {
             Some(trigger_position) => builder.semantic_model.get_member_info_with_key_at_offset(
                 &fallback_type,

@@ -204,7 +204,7 @@ impl LuaInferCache {
             dynamic_field_definition_syntax_cache,
             call_returns_never_cache,
             owner_raw_member_type_cache,
-            root_gamemode_class_cache
+            gamemode_class_cache
         );
         if let Some(undo) = &self.transaction {
             for key in undo.touched_flows.iter().chain(undo.flows.keys()) {

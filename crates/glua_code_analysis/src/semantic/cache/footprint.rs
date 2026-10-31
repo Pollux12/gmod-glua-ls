@@ -90,7 +90,7 @@ impl MemoFootprint {
             dynamic_field_definition_syntax_cache,
             call_returns_never_cache,
             owner_raw_member_type_cache,
-            root_gamemode_class_cache,
+            gamemode_class_cache,
         );
         let call_cache = &cache.call_cache;
         self.table(

@@ -18,7 +18,7 @@ use crate::{
     LuaTypeDeclId, ScriptedSingletons, SemanticDeclLevel, TypeOps,
     compilation::analyzer::{
         gmod::{
-            detect_root_gamemode_scope, get_scripted_class_type_decl_id,
+            detect_file_gamemode_scope, get_scripted_class_type_decl_id,
             name_expr_resolves_to_scoped_authoring_table,
         },
         infer_for_range_iter_expr_func,
@@ -167,7 +167,7 @@ pub fn infer_name_expr(
     result
 }
 
-fn resolve_global_singleton_scripted_type_decl_id(
+pub(crate) fn resolve_global_singleton_scripted_type_decl_id(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     name: &str,
@@ -175,8 +175,8 @@ fn resolve_global_singleton_scripted_type_decl_id(
     let singletons = cache
         .scripted_global_singleton_type_cache
         .get_or_insert_with(|| scripted_singletons(db));
-    if singletons.root_gamemode_names.contains(name)
-        && let Some(type_decl_id) = root_gamemode_class(db, cache)
+    if singletons.gamemode_names.contains(name)
+        && let Some(type_decl_id) = file_gamemode_class(db, cache)
     {
         return Some(type_decl_id);
     }
@@ -217,41 +217,38 @@ fn scripted_singletons(db: &DbIndex) -> ScriptedSingletons {
                 .insert(alias.clone(), type_decl_id.clone());
         }
     }
-    // A workspace rooted at a gamemode folder scopes `GM`/`GAMEMODE` to that
-    // gamemode's class workspace-wide: the runtime global `GAMEMODE` is the
-    // gamemode table, so plugin and entity files see the same members
-    // `gamemode/**` files author.
+    // A file inside a gamemode folder scopes `GM`/`GAMEMODE` to that
+    // gamemode's class: the runtime global `GAMEMODE` is the gamemode table,
+    // so plugin and entity files see the same members `gamemode/**` files
+    // author.
     if let Some(definition) = definitions
         .iter()
         .find(|definition| definition.id == "gamemodes")
     {
         singletons
-            .root_gamemode_names
+            .gamemode_names
             .insert(definition.class_global.clone());
         singletons
-            .root_gamemode_names
+            .gamemode_names
             .extend(definition.aliases.iter().cloned());
         if definition.class_global == "GM" {
-            singletons
-                .root_gamemode_names
-                .insert("GAMEMODE".to_string());
+            singletons.gamemode_names.insert("GAMEMODE".to_string());
         }
     }
     singletons
 }
 
-/// The gamemode class of the cache's file's workspace when it is rooted at a
-/// gamemode folder.
-fn root_gamemode_class(db: &DbIndex, cache: &mut LuaInferCache) -> Option<LuaTypeDeclId> {
-    if let Some(class) = cache.tracked_get(|cache| &mut cache.root_gamemode_class_cache, &()) {
+/// The class of the gamemode the cache's file belongs to.
+fn file_gamemode_class(db: &DbIndex, cache: &mut LuaInferCache) -> Option<LuaTypeDeclId> {
+    if let Some(class) = cache.tracked_get(|cache| &mut cache.gamemode_class_cache, &()) {
         return class;
     }
     let frame = crate::db_index::derivation::open_frame();
-    let class = detect_root_gamemode_scope(db, cache.get_file_id()).map(|(_, scope_match)| {
+    let class = detect_file_gamemode_scope(db, cache.get_file_id()).map(|(_, scope_match)| {
         get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name)
     });
     cache.tracked_insert(
-        |cache| &mut cache.root_gamemode_class_cache,
+        |cache| &mut cache.gamemode_class_cache,
         (),
         class.clone(),
         frame,

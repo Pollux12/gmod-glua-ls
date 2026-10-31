@@ -165,7 +165,7 @@ fn expr_root_name(expr: &LuaExpr) -> Option<LuaNameExpr> {
 
 fn extend_gmod_hook_fallback_members(
     builder: &CompletionBuilder,
-    fallback_owner: Option<GmodFallbackOwner<'_>>,
+    fallback_owner: Option<HookOwnerGroup>,
     members: &mut HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
 ) {
     let Some(fallback_owner) = fallback_owner else {
@@ -175,7 +175,7 @@ fn extend_gmod_hook_fallback_members(
     let mut existing = collect_member_identities(members);
 
     for owner_candidate in fallback_owner.candidates {
-        let owner_type = LuaType::Ref(LuaTypeDeclId::global(owner_candidate));
+        let owner_type = LuaType::Ref(builder.semantic_model.resolve_global_class(owner_candidate));
         let Some(fallback_map) = builder
             .semantic_model
             .get_member_info_map_at_offset(&owner_type, builder.position_offset)
@@ -327,29 +327,27 @@ fn gmod_hook_owner_name(prefix_expr: &LuaExpr, prefix_type: &LuaType) -> Option<
     }
 }
 
+/// A hook owner's completion: the hook owner it is written through, and the
+/// owners whose hooks it also offers.
 #[derive(Clone, Copy)]
-struct GmodFallbackOwner<'a> {
-    owner_name: &'a str,
+struct HookOwnerGroup {
+    owner: &'static str,
     candidates: &'static [&'static str],
 }
 
-fn gmod_hook_fallback_owner<'a>(
+fn gmod_hook_fallback_owner(
     db: &DbIndex,
-    owner_name: &'a str,
+    owner_name: &str,
     owner_type: &LuaType,
-) -> Option<GmodFallbackOwner<'a>> {
+) -> Option<HookOwnerGroup> {
     let candidates = match owner_type {
         LuaType::Ref(owner) | LuaType::Def(owner) => gmod_hook_owner_group_of(db, owner),
         _ => gmod_hook_owner_group(owner_name),
     };
-    if candidates.is_empty() {
-        None
-    } else {
-        Some(GmodFallbackOwner {
-            owner_name,
-            candidates,
-        })
-    }
+    let owner = gmod_hook_owner_group(owner_name)
+        .first()
+        .or(candidates.first())?;
+    Some(HookOwnerGroup { owner, candidates })
 }
 
 pub fn add_completions_for_members(
@@ -364,7 +362,7 @@ fn add_completions_for_members_with_gmod_owner(
     builder: &mut CompletionBuilder,
     members: &HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
     completion_status: CompletionTriggerStatus,
-    gmod_fallback_owner: Option<GmodFallbackOwner<'_>>,
+    gmod_fallback_owner: Option<HookOwnerGroup>,
 ) -> Option<()> {
     // Sort
     let mut sorted_entries: Vec<_> = members.iter().collect();
@@ -388,7 +386,7 @@ fn add_resolve_member_infos(
     builder: &mut CompletionBuilder,
     member_infos: &Vec<LuaMemberInfo>,
     completion_status: CompletionTriggerStatus,
-    gmod_fallback_owner: Option<GmodFallbackOwner<'_>>,
+    gmod_fallback_owner: Option<HookOwnerGroup>,
     realm_filter: &mut RealmFilter,
 ) -> Option<()> {
     if member_infos.len() == 1 {
@@ -485,22 +483,26 @@ fn add_resolve_member_infos(
 
 fn gmod_fallback_description_hint(
     builder: &CompletionBuilder,
-    fallback_owner: Option<GmodFallbackOwner<'_>>,
+    fallback_owner: Option<HookOwnerGroup>,
     member_info: &LuaMemberInfo,
 ) -> Option<String> {
-    let fallback_owner = fallback_owner?;
-    let source_owner = get_owner_type_id(builder.semantic_model.get_db(), member_info)?;
-    let source_owner_name = source_owner.get_simple_name();
-    if source_owner_name.eq_ignore_ascii_case(fallback_owner.owner_name)
-        || !fallback_owner
-            .candidates
-            .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(source_owner_name))
-    {
-        return None;
-    }
+    let prefix_owner = fallback_owner?.owner;
+    let source_owner = member_hook_owner(builder.semantic_model.get_db(), member_info)?;
+    (source_owner != prefix_owner).then(|| format!("from {source_owner}"))
+}
 
-    Some(format!("from {source_owner_name}"))
+/// The hook owner whose hooks `info` is among: that of the class or global
+/// the member is written on.
+fn member_hook_owner(db: &DbIndex, info: &LuaMemberInfo) -> Option<&'static str> {
+    let Some(LuaSemanticDeclId::Member(member_id)) = &info.property_owner_id else {
+        return None;
+    };
+    let group = match db.get_member_index().get_current_owner(member_id)? {
+        LuaMemberOwner::Type(owner) => gmod_hook_owner_group_of(db, owner),
+        LuaMemberOwner::GlobalPath(path) => gmod_hook_owner_group(path.get_name()),
+        _ => return None,
+    };
+    group.first().copied()
 }
 
 /// Filters member info, returning the needed member list and the overload count

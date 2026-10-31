@@ -4870,6 +4870,85 @@ mod tests {
         Ok(())
     }
 
+    /// The hooks `function <prefix>:` offers in a plugin of a Helix schema at
+    /// `root` ([`ProviderVirtualWorkspace::def_helix_schema`]).
+    fn derived_gamemode_hook_completions(
+        root: &str,
+        prefix: &str,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_helix_schema(root);
+        let (content, position) =
+            ProviderVirtualWorkspace::handle_file_content(&format!("function {prefix}:<??>\n"))?;
+        let file_id = ws.def_file(&format!("{root}plugins/writing/sv_hooks.lua"), &content);
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let mut hooks = items
+            .into_iter()
+            .filter(|item| item.label == "PlayerSpawn" || item.label == "CanPlayerTakeItem")
+            .map(|item| {
+                let description = item.label_details.and_then(|details| details.description);
+                (item.label, description)
+            })
+            .collect::<Vec<_>>();
+        hooks.sort();
+        Ok(hooks)
+    }
+
+    #[gtest]
+    fn test_gmod_plugin_completion_offers_derived_gamemode_hooks_in_schema_workspace() -> Result<()>
+    {
+        verify_eq!(
+            derived_gamemode_hook_completions("", "PLUGIN")?,
+            vec![
+                ("CanPlayerTakeItem".to_string(), Some("from GM".to_string())),
+                ("PlayerSpawn".to_string(), Some("from GM".to_string())),
+            ]
+        )
+    }
+
+    #[gtest]
+    fn test_gmod_plugin_completion_offers_derived_gamemode_hooks_in_game_root_workspace()
+    -> Result<()> {
+        verify_eq!(
+            derived_gamemode_hook_completions("gamemodes/ixhl2rp/", "PLUGIN")?,
+            vec![
+                ("CanPlayerTakeItem".to_string(), Some("from GM".to_string())),
+                ("PlayerSpawn".to_string(), Some("from GM".to_string())),
+            ]
+        )
+    }
+
+    #[gtest]
+    fn test_gmod_gamemode_completion_in_plugin_offers_derived_gamemode_hooks() -> Result<()> {
+        for root in ["", "gamemodes/ixhl2rp/"] {
+            let labels = derived_gamemode_hook_completions(root, "GAMEMODE")?
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect::<Vec<_>>();
+            verify_eq!(
+                labels,
+                vec!["CanPlayerTakeItem".to_string(), "PlayerSpawn".to_string()]
+            )?;
+        }
+        Ok(())
+    }
+
     #[gtest]
     fn test_gmod_color_global_completion_includes_preview_metadata() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();

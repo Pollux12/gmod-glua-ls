@@ -160,6 +160,49 @@ impl ProviderVirtualWorkspace {
         )
     }
 
+    /// The annotated `GM` and `GAMEMODE` in a library, laid out as the GMod
+    /// annotations ship them, the Helix gamemode with a hook of its own, and a
+    /// schema at `schema_root` (`""` when the workspace is the schema folder)
+    /// that derives from Helix.
+    pub fn def_helix_schema(&mut self, schema_root: &str) {
+        let annotations_root = self.virtual_url_generator.base.join("annotations");
+        self.analysis.add_library_workspace(annotations_root);
+        self.def_file(
+            "annotations/gm.lua",
+            r#"
+            ---@meta
+
+            ---@class GM
+            ---@field FolderName string
+
+            GM = {}
+
+            ---Called whenever a player spawns.
+            ---@realm server
+            ---@param ply Player
+            function GM:PlayerSpawn(ply) end
+
+            ---@type GM
+            GAMEMODE = nil
+            "#,
+        );
+        self.def_file(
+            "gamemodes/helix/gamemode/init.lua",
+            "DeriveGamemode(\"sandbox\")\n",
+        );
+        self.def_file(
+            "gamemodes/helix/gamemode/core/hooks/sh_hooks.lua",
+            r#"
+            ---Whether a player can take an item.
+            function GM:CanPlayerTakeItem(client, item) end
+            "#,
+        );
+        self.def_file(
+            &format!("{schema_root}gamemode/init.lua"),
+            "DeriveGamemode(\"helix\")\n",
+        );
+    }
+
     pub fn def_files(&mut self, files: Vec<(&str, &str)>) -> Vec<FileId> {
         let mut removed_files = HashSet::new();
         let mut updated_files = HashSet::new();

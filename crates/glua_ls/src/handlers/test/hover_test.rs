@@ -1549,6 +1549,59 @@ local EscapeStringMap: {
         )
     }
 
+    /// The hover of `source` in a plugin of a Helix schema at `root`
+    /// ([`ProviderVirtualWorkspace::def_helix_schema`]).
+    fn helix_plugin_hover(root: &str, source: &str) -> Result<String> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_helix_schema(root);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(source)?;
+        let file_id = ws.def_file(&format!("{root}plugins/writing/sv_hooks.lua"), &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return Err(
+                googletest::internal::test_outcome::TestAssertionFailure::create(
+                    "expected HoverContents::Markup".to_string(),
+                ),
+            );
+        };
+        Ok(markup.value)
+    }
+
+    #[gtest]
+    fn test_hover_plugin_hook_definition_shows_derived_gamemode_hook_docs() -> Result<()> {
+        for root in ["", "gamemodes/ixhl2rp/"] {
+            verify_that!(
+                helix_plugin_hover(
+                    root,
+                    "function PLUGIN:CanPlayerTake<??>Item(client, item) end\n",
+                )?,
+                contains_substring("Whether a player can take an item.")
+            )?;
+        }
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_hook_add_string_in_plugin_shows_derived_gamemode_hook_docs() -> Result<()> {
+        for root in ["", "gamemodes/ixhl2rp/"] {
+            verify_that!(
+                helix_plugin_hover(
+                    root,
+                    "hook.Add(\"CanPlayerTake<??>Item\", \"test\", function() end)\n",
+                )?,
+                contains_substring("Whether a player can take an item.")
+            )?;
+        }
+        Ok(())
+    }
+
     #[gtest]
     fn test_hover_hook_add_string_uses_registered_hook_docs() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();

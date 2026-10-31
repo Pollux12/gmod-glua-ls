@@ -7364,6 +7364,34 @@ pub(crate) fn detect_root_gamemode_scope(
     root_gamemode_scope(db, db.get_module_index().get_workspace_id(file_id)?)
 }
 
+/// The gamemode `file_id` belongs to: the `gamemodes/<name>` folder its path
+/// runs through below its main workspace root, else the workspace root
+/// itself when that is a gamemode folder ([`root_gamemode_scope`]).
+pub(crate) fn detect_file_gamemode_scope(
+    db: &DbIndex,
+    file_id: FileId,
+) -> Option<(PathBuf, GmodScopedClassMatch)> {
+    let module_index = db.get_module_index();
+    let workspace_id = module_index.get_workspace_id(file_id)?;
+    if !module_index.is_main_workspace_id(workspace_id) {
+        return None;
+    }
+    let root = module_index.get_workspace_root(workspace_id)?;
+    let folder_scope = db
+        .get_vfs()
+        .get_file_path(&file_id)
+        .and_then(|path| path.strip_prefix(root).ok())
+        .and_then(|relative| {
+            let parts = relative.iter().collect::<Vec<_>>();
+            let at = parts
+                .windows(3)
+                .rposition(|window| window[0].eq_ignore_ascii_case("gamemodes"))?;
+            let folder = root.join(parts[..at + 2].iter().collect::<PathBuf>());
+            gamemode_folder_scope(db, &folder)
+        });
+    folder_scope.or_else(|| root_gamemode_scope(db, workspace_id))
+}
+
 /// Detect the "workspace root *is* a gamemode folder" layout: `gamemode/`
 /// sits directly under the workspace root (e.g. opening a `gamemodes/<name>`
 /// checkout itself in the editor), so no `gamemodes/<name>` segment exists
@@ -7384,7 +7412,13 @@ pub(crate) fn root_gamemode_scope(
         return None;
     }
     let root = db.get_module_index().get_workspace_root(workspace_id)?;
-    let gamemode_dir = root.join("gamemode");
+    gamemode_folder_scope(db, &root)
+}
+
+/// The scope match of the gamemode folder `folder` when an entry file sits in
+/// its `gamemode/` directory, with that directory.
+fn gamemode_folder_scope(db: &DbIndex, folder: &Path) -> Option<(PathBuf, GmodScopedClassMatch)> {
+    let gamemode_dir = folder.join("gamemode");
     let has_entry = ["init.lua", "shared.lua", "cl_init.lua"]
         .iter()
         .any(|name| {
@@ -7396,7 +7430,7 @@ pub(crate) fn root_gamemode_scope(
         return None;
     }
 
-    let name = root.file_name()?.to_str()?;
+    let name = folder.file_name()?.to_str()?;
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')

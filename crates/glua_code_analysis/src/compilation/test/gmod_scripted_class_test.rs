@@ -4412,6 +4412,77 @@ end
         }
     }
 
+    /// A workspace rooted at `garrysmod/` holds many gamemodes. `GAMEMODE` in
+    /// a file under `gamemodes/<name>/` outside `gamemode/**` (a schema
+    /// plugin) is that gamemode's table, so the hooks its base gamemode
+    /// defines resolve there.
+    #[gtest]
+    fn test_gamemode_global_in_game_root_plugin_resolves_derived_gamemode_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+        let annotations_root = ws.virtual_url_generator.base.join("annotations");
+        ws.analysis.add_library_workspace(annotations_root);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "annotations/gm.lua",
+                r#"
+                ---@meta
+                ---@class GM
+                GM = {}
+
+                ---@type GM
+                GAMEMODE = nil
+                "#,
+            ),
+            (
+                "gamemodes/helix/gamemode/init.lua",
+                r#"
+                function GM:CanPlayerTakeItem(client, item) return true end
+                "#,
+            ),
+            (
+                "gamemodes/ixhl2rp/gamemode/init.lua",
+                r#"
+                DeriveGamemode("helix")
+                "#,
+            ),
+            (
+                "gamemodes/ixhl2rp/plugins/writing/sv_hooks.lua",
+                r#"
+                function PLUGIN:Init()
+                    return GAMEMODE:CanPlayerTakeItem(nil, nil)
+                end
+                "#,
+            ),
+        ]);
+
+        let checked_codes = [
+            NumberOrString::String(DiagnosticCode::UndefinedField.get_name().to_string()),
+            NumberOrString::String(DiagnosticCode::UndefinedMethod.get_name().to_string()),
+        ];
+        let flagged: Vec<_> = ws
+            .analysis
+            .diagnose_file(file_ids[3], CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diag| {
+                diag.code
+                    .as_ref()
+                    .is_some_and(|code| checked_codes.contains(code))
+            })
+            .collect();
+        assert!(
+            flagged.is_empty(),
+            "unexpected gamemode diagnostics in the plugin: {flagged:?}"
+        );
+    }
+
     /// `DeriveGamemode` runs once per realm entry file (`init.lua`
     /// server-side, `cl_init.lua` client-side). The synthesized `BaseClass`
     /// member must exist per realm: a bare existence dedup lets whichever

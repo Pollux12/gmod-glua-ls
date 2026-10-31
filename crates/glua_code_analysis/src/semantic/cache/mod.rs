@@ -56,9 +56,9 @@ pub type FlowEntries = TrackedMap<FlowCacheInnerKey, CacheEntry<Arc<LuaType>>>;
 pub struct ScriptedSingletons {
     /// The class each global singleton name names.
     pub classes: FxHashMap<String, LuaTypeDeclId>,
-    /// The names a workspace rooted at a gamemode folder binds to its
-    /// gamemode class instead.
-    pub root_gamemode_names: FxHashSet<String>,
+    /// The names a file inside a gamemode folder binds to its gamemode class
+    /// instead.
+    pub gamemode_names: FxHashSet<String>,
 }
 
 /// The syntax-derived facts about one dynamic-field definition site.
@@ -294,9 +294,8 @@ pub struct LuaInferCache {
     /// there.
     pub(crate) field_literal_narrowing: FxHashMap<LuaSyntaxId, derivation::ScopeMark>,
     pub scripted_global_singleton_type_cache: Option<ScriptedSingletons>,
-    /// The gamemode class of the file's workspace when it is rooted at a
-    /// gamemode folder.
-    pub root_gamemode_class_cache: TrackedMap<(), Option<LuaTypeDeclId>>,
+    /// The class of the gamemode the file belongs to.
+    pub gamemode_class_cache: TrackedMap<(), Option<LuaTypeDeclId>>,
     /// Cache for `self` type per enclosing method (keyed by LuaFuncStat syntax_id).
     /// Avoids repeated ancestor walks and type resolution for each `self` reference
     /// within the same method body.
@@ -442,7 +441,7 @@ impl LuaInferCache {
             expr_var_ref_id_cache: Default::default(),
             field_literal_narrowing: Default::default(),
             scripted_global_singleton_type_cache: None,
-            root_gamemode_class_cache: Default::default(),
+            gamemode_class_cache: Default::default(),
             self_type_cache: Default::default(),
             self_base_seed: None,
             self_base_seed_mark: derivation::ScopeMark::default(),
@@ -870,7 +869,7 @@ impl LuaInferCache {
         empty(&mut self.field_literal_narrowing);
         self.self_type_cache.clear_local();
         self.self_base_seed = None;
-        self.root_gamemode_class_cache.clear_local();
+        self.gamemode_class_cache.clear_local();
 
         empty(&mut self.decl_cache.0);
         empty(&mut self.for_range_iter_var_type_cache.0);
@@ -924,7 +923,7 @@ impl LuaInferCache {
             dynamic_field_definition_syntax_cache,
             call_returns_never_cache,
             owner_raw_member_type_cache,
-            root_gamemode_class_cache,
+            gamemode_class_cache,
         );
     }
 

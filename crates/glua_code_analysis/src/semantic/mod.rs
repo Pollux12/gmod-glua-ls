@@ -504,6 +504,18 @@ impl<'a> SemanticModel<'a> {
         find_members_with_key(self.db, prefix_type, member_key, find_all)
     }
 
+    /// The class the global `name` names in this file: the one a
+    /// scripted-class scope binds it to, such as the gamemode class `GM` names
+    /// inside a gamemode folder, else the global class of that name.
+    pub fn resolve_global_class(&self, name: &str) -> LuaTypeDeclId {
+        infer::resolve_global_singleton_scripted_type_decl_id(
+            self.db,
+            &mut self.infer_cache.borrow_mut(),
+            name,
+        )
+        .unwrap_or_else(|| LuaTypeDeclId::global(name))
+    }
+
     pub fn get_member_info_map(
         &self,
         prefix_type: &LuaType,
