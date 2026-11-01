@@ -1,109 +1,85 @@
 ---
 title: Garry's Mod settings
-description: Language server settings for realm analysis, scripted classes, networking, VGUI, and annotations.
+description: Settings for realms, scripted classes, hooks, net messages and VGUI.
 ---
 
-## Overview
+These settings live under `gmod` in `.gluarc.json`. The defaults suit most addons and gamemodes.
 
-Garry's Mod Lua settings live under the `gmod` key in `.gluarc.json`. These settings control realm detection, network message analysis, scripted class behavior, VGUI support, annotations, and more.
+## Realms
 
----
+| Option | Default | Description |
+|---|---|---|
+| `gmod.defaultRealm` | `"shared"` | Realm for files with no realm signal: `"client"`, `"server"` or `"shared"` |
+| `gmod.detectRealmFromFilename` | `true` | Use `cl_`, `sv_` and `sh_` file prefixes and `client`/`server` folders |
+| `gmod.detectRealmFromCalls` | `true` | Use `include`, `AddCSLuaFile` and `IncludeCS` calls |
 
-## Top-level options
+See [Wrong realm warnings](/getting-started/common-fixes#wrong-realm-warnings) for how realms are decided.
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `gmod.enabled` | `boolean` | `true` | Enable Garry's Mod Lua analysis. Keep this enabled for normal use; set `false` only when isolating compatibility or debugging issues |
-| `gmod.defaultRealm` | `string` | `"shared"` | Realm assumed for files with no realm signal. Use `"client"`, `"server"`, or `"shared"` |
-| `gmod.detectRealmFromFilename` | `boolean \| null` | `null` (resolves to `true`) | Detect realm from `cl_`, `sv_`, `sh_` filename prefixes and `/client/`, `/server/` parent directories |
-| `gmod.detectRealmFromCalls` | `boolean \| null` | `null` (resolves to `true`) | Infer realm from calls like `include`, `AddCSLuaFile`, `IncludeCS`, `require`, and annotated wrappers |
-| `gmod.inferDynamicFields` | `boolean` | `true` | Track fields dynamically assigned to Garry's Mod objects |
-| `gmod.dynamicFieldsGlobal` | `boolean` | `true` | Share inferred dynamic fields across all files. Set `false` to scope them per-file |
-| `gmod.fileParamDefaults` | `object` | built-in map | Default types for common parameter names when a parameter has no `@param`. Editable in the Settings UI. Set a value to `""` to remove a built-in default |
+## General
 
----
+| Option | Default | Description |
+|---|---|---|
+| `gmod.enabled` | `true` | Garry's Mod analysis. Do not turn this off, it is only for isolating bugs |
+| `gmod.autoDetectGamemodeBase` | `true` | Load the base gamemode named in your gamemode's `.txt` file as a library |
+| `gmod.inferDynamicFields` | `true` | Track fields you add to entities, players and other objects, such as `ply.Money = 0` |
+| `gmod.dynamicFieldsGlobal` | `true` | Share those fields across all files. Set `false` to keep them per file |
+| `gmod.fileParamDefaults` | built-in list | Types for common parameter names that have no `@param`, such as `ply` → `Player`. Set a name to `""` to remove a built-in entry |
+| `gmod.outline.verbosity` | `"normal"` | Detail in the **Outline** view: `"minimal"`, `"normal"` or `"verbose"` |
+| `gmod.templatePath` | none | Folder of your own templates for **New** in the Class Explorer. Built-in templates are used when a name is missing |
 
 ## Annotations
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `gmod.annotationsPath` | `string \| null` | `null` | Custom path to Garry's Mod annotation `.lua` files. When `null`, the VS Code extension can provide its downloaded annotations |
-| `gmod.autoLoadAnnotations` | `boolean \| null` | `null` | Override workspace annotation auto-loading. Set `false` to disable even if the extension or CLI provides annotations |
+| Option | Default | Description |
+|---|---|---|
+| `gmod.annotationsPath` | none | Load the Garry's Mod annotations from this folder instead of the downloaded ones |
+| `gmod.autoLoadAnnotations` | none | Set `false` to load no Garry's Mod annotations for this project |
 
----
+See [Garry's Mod annotations](/configuration/annotations-management) for download options.
 
-## Scaffolding
+## Net messages
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `gmod.templatePath` | `string \| null` | `null` | Path to a folder of custom scaffolding templates (`.lua` files). Relative to workspace root. Built-in templates are used as fallback |
+| Option | Default | Description |
+|---|---|---|
+| `gmod.network.enabled` | `true` | Check `net.Start` / `net.Receive` pairs and their reads and writes |
+| `gmod.network.completion.smartReadSuggestions` | `true` | Suggest the next expected `net.Read*` call inside a receiver |
+| `gmod.network.completion.mismatchHints` | `true` | Mark suggestions that do not match the expected read |
+| `gmod.network.codeLensEnabled` | `true` | Show a code lens above net message receivers |
 
----
+To turn off one net check, add its code to `diagnostics.disable`. The codes are listed in [Diagnostics settings](/configuration/diagnostics#garrys-mod).
 
-## Gamemode inheritance
+## VGUI
 
-GLuaLS supports gamemode inheritance. `DeriveGamemode("...")` keeps inherited `GM` members working. The `gmod.autoDetectGamemodeBase` setting loads parent gamemode folders from your gamemode's `<name>.txt` `base` value so parent files are available for completions, definitions, and diagnostics. The `base` and `sandbox` gamemodes are never loaded this way: the GMod annotations already declare them.
+| Option | Default | Description |
+|---|---|---|
+| `gmod.vgui.codeLensEnabled` | `true` | Show a code lens above `vgui.Register` calls |
+| `gmod.vgui.inlayHintEnabled` | `false` | Show the panel type after `:Add()` calls |
 
-This setting controls the `.txt` file lookup. `DeriveGamemode("...")` support remains active.
+## Hooks
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `gmod.autoDetectGamemodeBase` | `boolean \| null` | `null` (enabled) | Automatically loads parent gamemode folders from the gamemode `.txt` `base` value, except `base` and `sandbox`, which the annotations provide. Set to `false` to turn this off. |
+Use these when your project calls hooks through its own functions.
 
----
+| Option | Default | Description |
+|---|---|---|
+| `gmod.hookMappings.methodToHook` | `{}` | Treat a method name as a hook, such as `{ "Think": "Think" }` |
+| `gmod.hookMappings.emitterToHook` | `{}` | Treat a function that runs a hook as `hook.Run` for that hook |
+| `gmod.hookMappings.methodPrefixes` | `[]` | Extra tables whose methods are gamemode hooks, such as `COMPONENT` |
 
 ## Scripted classes
 
-`gmod.scriptedClassScopes.include` defines the scripted class groups used for class analysis, the Class Explorer, and scaffolding.
+GLuaLS recognizes entities, weapons, effects, tools, player classes, gamemodes, and plugins and schemas for frameworks such as Helix, based on their folders. Each type is a *scope* in `gmod.scriptedClassScopes.include`. You only need this setting to add your own class type or change a built-in one.
 
-Built-in groups: `entities`, `weapons`, `effects`, `stools`, `player_classes`, `plugins`, `schemas`, `gamemodes`.
+Built-in scope ids: `entities`, `weapons`, `effects`, `stools`, `player_classes`, `plugins`, `schemas`, `gamemodes`.
 
-The `schemas` group is enabled by default for any framework or gamemode. Files beneath a `schema/` directory, plus single-file `gamemode/schema.lua` entrypoints, contribute to one global `SCHEMA` class. `Schema` is recognized as an alias throughout the project, and schema methods are analyzed as gamemode hooks inherited from `GM`. No framework-specific configuration is required.
-
-Each definition supports:
-
-| Field | Type | Description |
-|---|---|---|
-| `id` | `string` | Name used to change or remove this entry |
-| `label` | `string` | Display name in Class Explorer and Settings UI |
-| `classGlobal` | `string` | Global variable the class uses (`ENT`, `SWEP`, etc.) |
-| `fixedClassName` | `string` | Fixed internal class name used instead of deriving one from the path |
-| `isGlobalSingleton` | `boolean` | Merge every matching file into one workspace-wide global class |
-| `aliases` | `string[]` | Additional global names that refer to the same class |
-| `superTypes` | `string[]` | Types inherited by the class, such as `GM` for gamemode hooks |
-| `path` | `string[]` | Path segments to detect class from file path |
-| `include` | `string[]` | Glob patterns for files to analyse |
-| `exclude` | `string[]` | Optional per-definition exclude globs |
-| `parentId` | `string` | Parent definition ID for nested grouping in Explorer |
-| `icon` | `string` | VS Code icon ID for Class Explorer display |
-| `rootDir` | `string` | Default root used by the scaffold action |
-| `scaffold.files` | `array` | Scaffold output entries: `{ path, template }` with `{{name}}` variable |
-| `classNamePrefix` | `string` | Optional prefix prepended to the folder-derived class name. Used by the `gamemodes` scope to produce runtime-accurate names like `gamemode_sandbox` |
-| `disabled` | `boolean` | Disable this definition (useful for turning off built-in groups) |
-
-The `gamemodes` group detects files under `gamemodes/<name>/gamemode/**` and types the `GM` global as the class `gamemode_<name>`. This lets `DEFINE_BASECLASS("gamemode_sandbox")` and cross-gamemode field access, such as `self.Sandbox.SetupMove`, resolve in derived gamemodes.
-
-To change a built-in definition, add an entry with its `id` and only the fields you want to change. To turn off a built-in group, set `{ "id": "effects", "disabled": true }`.
-
-### Example
+To change a built-in scope, add an entry with its `id` and only the fields you want to change. To add a new one, use a new `id`:
 
 ```json .gluarc.json
 {
   "gmod": {
     "scriptedClassScopes": {
       "include": [
+        { "id": "effects", "disabled": true },
         {
-          "id": "plugins",
-          "scaffold": {
-            "files": [{ "path": "{{name}}/sh_plugin.lua", "template": "plugin_sh.lua" }]
-          }
-        },
-        {
-          "id": "effects",
-          "disabled": true
-        },
-        {
-          "id": "my-controllers",
+          "id": "controllers",
           "label": "Controllers",
           "classGlobal": "CTRL",
           "path": ["lua", "controllers"],
@@ -119,81 +95,21 @@ To change a built-in definition, add an entry with its `id` and only the fields 
 }
 ```
 
----
-
-## Hooks
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `gmod.hookMappings.methodToHook` | `object` | `{}` | Map method names to hook names (e.g. `{ "Think": "Think" }`) |
-| `gmod.hookMappings.emitterToHook` | `object` | `{}` | Map custom emitter functions to hook names |
-| `gmod.hookMappings.methodPrefixes` | `string[]` | `[]` | Additional method name prefixes for auto hook detection |
-
----
-
-## Network analysis
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `gmod.network.enabled` | `boolean` | `true` | Enable all network flow analysis |
-| `gmod.network.completion.smartReadSuggestions` | `boolean` | `true` | Suggest net.Read* calls in expected order inside receive callbacks |
-| `gmod.network.codeLensEnabled` | `boolean` | `true` | Show code lens actions on net message receivers |
-| `gmod.network.completion.mismatchHints` | `boolean` | `true` | Annotate suggestions with hints when expected read doesn't match current |
-
-<Note>
-To disable individual network diagnostics, use the primary `diagnostics.disable` list with the relevant code name (e.g. `"gmod-net-read-write-type-mismatch"`). See the [Diagnostics configuration](/configuration/diagnostics) page for the full list of network diagnostic codes and severity options.
-</Note>
-
-### Example
-
-```json .gluarc.json
-{
-  "gmod": {
-    "network": {
-      "enabled": true
-    }
-  },
-  "diagnostics": {
-    "disable": ["gmod-net-read-write-bits-mismatch"]
-  }
-}
-```
-
----
-
-## VGUI
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `gmod.vgui.codeLensEnabled` | `boolean` | `true` | Show code lens actions on `vgui.Register()` calls |
-| `gmod.vgui.inlayHintEnabled` | `boolean` | `false` | Show inlay hints for VGUI panel types |
-
----
-
-## Outline verbosity
-
-`gmod.outline.verbosity` controls what appears in the **Outline** view for Lua files:
-
-| Value | Behavior |
+| Field | Description |
 |---|---|
-| `"minimal"` | Functions, classes, hooks, net receivers, timers, concommands only |
-| `"normal"` (default) | Same as minimal, plus typed non-primitive tables and variables |
-| `"verbose"` | All locals, assignments, and code blocks |
-
----
-
-## VS Code extension settings
-
-You can also configure these settings in VS Code settings with the `gluals.*` prefix:
-
-| VS Code setting | .gluarc.json key | Type | Default | Description |
-|---|---|---|---|---|
-| `gluals.gmod.autoLoadAnnotations` | `gmod.autoLoadAnnotations` | `boolean` (`boolean \| null` in workspace) | `true` (`null` in workspace) | Auto-download Garry's Mod annotations |
-| `gluals.gmod.annotationsRepository` | VS Code only | `string` | `Pollux12/annotations-gmod-glua-ls` | GitHub repository for automatic annotation downloads |
-| `gluals.gmod.annotationsChannel` | VS Code only | `auto \| stable \| prerelease` | `auto` | Annotation channel. `auto` follows the extension build |
-| `gluals.gmod.annotationsBranch` | VS Code only | `string` | `gluals-annotations` | Advanced setting for downloading from a specific branch |
-| `gluals.gmod.annotationsCommit` | VS Code only | `string` | `""` | Advanced setting for downloading one exact commit hash; stops annotation update checks |
-| `gluals.gmod.autoDetectGamemodeBase` | `gmod.autoDetectGamemodeBase` | `boolean \| null` | `null` (enabled) | Auto-detect base gamemodes from the gamemode `.txt` file |
-| `gluals.gmod.templatePath` | `gmod.templatePath` | `string` | `null` | Custom scaffolding template path |
-| `gluals.gmod.vgui.codeLensEnabled` | `gmod.vgui.codeLensEnabled` | `boolean` | `true` | VGUI code lens |
-| `gluals.gmod.vgui.inlayHintEnabled` | `gmod.vgui.inlayHintEnabled` | `boolean` | `false` | VGUI inlay hints |
+| `id` | Name of the scope. Use a built-in id to change that scope |
+| `label` | Name shown in the Class Explorer and settings panel |
+| `classGlobal` | Global the class uses in its files, such as `ENT` or `SWEP` |
+| `path` | Folder names that mark a file as this class type |
+| `include` | Glob patterns for the class files |
+| `exclude` | Glob patterns to skip |
+| `rootDir` | Folder where **New** creates classes |
+| `scaffold.files` | Files **New** creates: `{ "path", "template" }`, where `{{name}}` is the class name |
+| `fixedClassName` | Use this class name instead of one taken from the folder name |
+| `classNamePrefix` | Text added before the folder name, such as `gamemode_` |
+| `isGlobalSingleton` | Merge every matching file into one class |
+| `aliases` | Other globals that refer to the same class |
+| `superTypes` | Types the class inherits, such as `GM` |
+| `parentId` | Scope to nest this one under in the Class Explorer |
+| `icon` | VS Code icon id for the Class Explorer |
+| `disabled` | Set `true` to turn the scope off |

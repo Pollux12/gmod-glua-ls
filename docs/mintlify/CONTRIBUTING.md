@@ -20,8 +20,6 @@ Thank you for your interest in contributing to our documentation! This guide wil
 6. Preview your changes at `http://localhost:3000`
 7. Commit your changes and submit a pull request
 
-For more details on local development, see our [development guide](development.mdx).
-
 ## Writing guidelines
 
 Write so a new GMod developer can follow the page, while still being clear and useful for experienced developers.

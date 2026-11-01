@@ -1,125 +1,36 @@
 ---
-title: Annotations management
-description: GLuaLS automatically downloads and keeps Garry's Mod wiki annotations up to date.
----
-import ConfigTip from "/snippets/config-tip.mdx"
-
-## Overview
-
-GLuaLS ships without bundled Garry's Mod API definitions. The VS Code extension downloads the latest annotations generated from the Garry's Mod wiki, so your API definitions stay current without extension updates.
-
+title: Garry's Mod annotations
+description: How the Garry's Mod annotations are downloaded and how to change them.
 ---
 
-## How it works
+GLuaLS knows the Garry's Mod API (every function, hook, class and enum, with types and realms) from annotations generated from the [Garry's Mod wiki](https://wiki.facepunch.com/gmod/). The VS Code extension downloads them on first launch, checks for updates in the background, and shares one copy between all your projects.
 
-On first launch and on later checks, the extension:
+To update them now, run **GLuaLS: Update GLuaLS Annotations** from the Command Palette (`Ctrl+Shift+P`).
 
-1. Chooses which annotation branch to use
-2. Checks if that branch has a newer version
-3. Downloads annotations when they are missing or out of date
-4. Gives the annotation folder to the language server
+## VS Code settings
 
-VS Code stores annotations in global extension storage, separate from your project. All workspaces share them.
-
-GLuaLS loads these API definitions before other library folders. This lets framework and addon libraries use Garry's Mod types and wrapper behavior correctly.
-
----
-
-## Annotation source
-
-By default, the extension downloads annotations from `Pollux12/annotations-gmod-glua-ls`. Keep `annotationsChannel` set to `auto` for normal use. Stable extension builds use `gluals-annotations`. Pre-release extension builds use `gluals-annotations-prerelease`.
-
-You can change the repository, channel, branch, or commit hash in VS Code settings:
-
-| VS Code setting | Default | Description |
+| Setting | Default | Description |
 |---|---|---|
-| `gluals.gmod.annotationsRepository` | `Pollux12/annotations-gmod-glua-ls` | GitHub repository in `owner/repository` format, or a GitHub repository URL |
-| `gluals.gmod.annotationsChannel` | `auto` | `auto` follows the extension build. `stable` uses `gluals-annotations`. `prerelease` uses `gluals-annotations-prerelease` |
-| `gluals.gmod.annotationsBranch` | `gluals-annotations` | Advanced setting. Download from this branch instead of the selected channel. Plugin branches are not supported |
-| `gluals.gmod.annotationsCommit` | `""` | Advanced setting. Download this exact commit hash. Automatic annotation update checks stop until you remove it |
-| `gluals.gmod.autoCheckAnnotationUpdates` | `true` | Check for annotation updates in the background |
-| `gluals.gmod.annotationUpdateCheckIntervalMinutes` | `60` | Minutes between background update checks |
+| `gluals.gmod.autoLoadAnnotations` | `true` | Download and load the annotations |
+| `gluals.gmod.autoCheckAnnotationUpdates` | `true` | Check for updates to the annotations and the debugger in the background |
+| `gluals.gmod.annotationUpdateCheckIntervalMinutes` | `60` | Minutes between update checks |
+| `gluals.gmod.annotationsChannel` | `"auto"` | `"stable"`, `"prerelease"`, or `"auto"` to match your extension version |
+| `gluals.gmod.annotationsRepository` | `"Pollux12/annotations-gmod-glua-ls"` | GitHub repository to download from |
+| `gluals.gmod.annotationsBranch` | `"gluals-annotations"` | Download a specific branch instead of using the channel |
+| `gluals.gmod.annotationsCommit` | `""` | Download one exact commit. This turns off update checks |
 
-```json VS Code settings
-{
-  "gluals.gmod.annotationsRepository": "Pollux12/annotations-gmod-glua-ls",
-  "gluals.gmod.annotationsChannel": "auto"
-}
-```
+Keep the defaults unless you are testing changes to the annotations.
 
-If more than one setting is set, GLuaLS uses the first one in this list: custom local path, commit hash, branch, channel, extension build.
+## Use your own copy
 
----
-
-## Manual update
-
-To force an annotations update:
-
-1. Open the Command Palette (`Ctrl+Shift+P`)
-2. Run **GLuaLS: Update GLuaLS Annotations**
-
----
-
-## Disabling auto-download
-
-If you need to use a custom annotations build or are in an environment without internet access:
-
-| VS Code setting | .gluarc.json key | Default | Description |
-|---|---|---|---|
-| `gluals.gmod.autoLoadAnnotations` | `gmod.autoLoadAnnotations` | `true` (`null` in workspace) | Auto-download and load Garry's Mod wiki annotations |
-
-### Via VS Code settings
-
-```json VS Code settings
-{
-  "gluals.gmod.autoLoadAnnotations": false
-}
-```
-
-### Via .gluarc.json (per-workspace)
-
-<ConfigTip />
-```json .gluarc.json
-{
-  "gmod": {
-    "autoLoadAnnotations": false
-  }
-}
-```
-
----
-
-## Using a custom annotations path
-
-Point GLuaLS at your own annotations folder instead of the auto-downloaded ones:
-
-| .gluarc.json Key | Type | Default | Description |
-|---|---|---|---|
-| `gmod.annotationsPath` | `string \| null` | `null` | Path to custom annotations folder |
+To use a local folder of annotations for one project, set `gmod.annotationsPath` in `.gluarc.json`. The path can be absolute or relative to the project folder.
 
 ```json .gluarc.json
 {
   "gmod": {
-    "annotationsPath": "./my-custom-annotations"
+    "annotationsPath": "../my-annotations"
   }
 }
 ```
 
-The path can be absolute or relative to the workspace root. When you set `annotationsPath`, GLuaLS does not use the downloaded annotations for that workspace.
-
-<Note>
-If `gmod.annotationsPath` is set, GLuaLS uses that folder for the workspace. Set `gmod.autoLoadAnnotations: false` in `.gluarc.json` to turn annotation auto-loading off for that workspace.
-</Note>
-
----
-
-## What the annotations contain
-
-The annotations are generated from the official Garry's Mod wiki and include:
-
-- All Garry's Mod global functions with parameter types, return types, and descriptions
-- All class methods (Entity, Player, Weapon, etc.)
-- All enumerations
-- All hooks with parameter types
-- Realm badges indicating where each function is available
-- Metadata for wrappers, callbacks, and validity guards used by type checks
+To load no Garry's Mod annotations for a project, set `gmod.autoLoadAnnotations` to `false`.

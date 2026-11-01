@@ -1,123 +1,74 @@
 ---
 title: Installation
-description: Install the Garry's Mod Language Server extension and open your first project.
+description: Install the GLuaLS extension for VS Code and check that it works.
 ---
 
-## Install the VS Code extension
-
-The VS Code extension downloads and updates the language server and Garry's Mod API definitions for you. It also includes the settings panel, Class Explorer, debugger, and runtime tools.
+## Install the extension
 
 <Steps>
   <Step title="Install from the marketplace">
-    Search for **Garry's Mod Language Server** in the VS Code Extensions panel (`Ctrl+Shift+X`) or install it from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=Pollux.gmod-glua-ls).
+    Search for **Garry's Mod Language Server** in the VS Code Extensions panel (`Ctrl+Shift+X`), or install it from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=Pollux.gmod-glua-ls) or [Open VSX](https://open-vsx.org/extension/Pollux/gmod-glua-ls).
   </Step>
-  <Step title="Open your project">
-    Open your addon or gamemode folder in VS Code. Use the folder that directly contains `lua/`, `addon.json`, or the gamemode files.
-
-    For working on multiple addons at once, use a [multi-root workspace](https://code.visualstudio.com/docs/editing/workspaces/multi-root-workspaces).
+  <Step title="Open your addon or gamemode">
+    Open the addon or gamemode folder itself, not the whole `garrysmod/` folder. See [Open your project](/getting-started/workspace-setup) if you work on several at once.
   </Step>
-  <Step title="Let the extension initialize">
-    On first launch, the extension downloads the language server and Garry's Mod API definitions. Wait for the GLuaLS status item to show that the server is running.
+  <Step title="Wait for the first download">
+    On first launch the extension downloads the language server and the Garry's Mod annotations. The **GLuaLS** item in the status bar shows when the server is running.
   </Step>
 </Steps>
 
-<Warning>
-Do not install other Lua language server extensions alongside GLuaLS. Extensions such as EmmyLua, LuaLS, and GLua Enhanced will conflict. Create a dedicated VS Code profile for GMod development if you need other Lua tools for unrelated projects.
-</Warning>
+The extension keeps the server and annotations up to date for you.
 
-## Choose the right folder
-
-Open one addon or gamemode per workspace folder. If your project uses several addons, add each one to a [multi-root workspace](https://code.visualstudio.com/docs/editing/workspaces/multi-root-workspaces).
-
-<Warning>
-Do not open the whole `garrysmod/` directory. It contains game files and unrelated addons that should not be part of your project analysis.
-</Warning>
-
-See [Workspace setup](/getting-started/workspace-setup) for example layouts, libraries, and ignore rules.
-
----
-
-## Verify everything is working
+## Check that it works
 
 Open any `.lua` file in your project. You should see:
 
-- **Syntax highlighting** with semantic token coloring
-- **Autocomplete** as you type (press `Ctrl+Space` to trigger manually)
-- **Hover documentation** when you hover over GMod API functions
-- **Realm labels** in GMod API hover and completion details
-- **Diagnostics** as squiggly underlines for potential issues
+- Suggestions as you type, with documentation for each function
+- Documentation when you hover a function, including the realm it runs in
+- Squiggly underlines on likely mistakes
 
-<Tip>
-If you expected diagnostics but do not see any, check the Garry's Mod Language Server section in the output panel for errors.
-</Tip>
+If nothing happens, check the language mode in the bottom right of VS Code. It should say **GLua**. If it says **Lua**, click it and choose **GLua**.
 
----
+## Other Lua extensions
 
-## Next steps
+GLuaLS uses its own `glua` language mode, so a standard Lua extension can stay installed for non-GMod projects. It handles files set to `lua` and GLuaLS handles files set to `glua`.
 
-<CardGroup cols={2}>
-  <Card title="Set up your workspace" icon="folder" href="/getting-started/workspace-setup">
-    Add shared libraries, ignore generated files, or configure a multi-root project.
-  </Card>
-  <Card title="Set up the debugger" icon="bug" href="/debugger/setup">
-    Install `gm_rdb` and connect VS Code to a running SRCDS server.
-  </Card>
-  <Card title="Use the main features" icon="sparkles" href="/features/overview">
-    Browse editor, Garry's Mod, and debugger features.
-  </Card>
-  <Card title="Configuration" icon="sliders" href="/configuration/overview">
-    Change completion, diagnostics, formatting, and workspace settings.
-  </Card>
-</CardGroup>
+- `.lua` files open as GLua by default. To keep a file on standard Lua, such as a build script, add it to `files.associations`:
 
----
+  ```json VS Code settings
+  {
+    "files.associations": {
+      "premake5.lua": "lua"
+    }
+  }
+  ```
+
+- Put editor settings for GMod files under `[glua]`, not `[lua]`.
+- Disable **GLua Enhanced**. It handles the same `glua` files, and GLuaLS will not start while it is enabled.
+
+## Status bar menu
+
+Click **GLuaLS** in the status bar for quick actions:
+
+- Restart or stop the server
+- Open the settings panel
+- Set up the debugger
+- Show the server output, which helps when reporting a bug
 
 ## Other editors
 
-The `glua_ls` server can run in editors that support the Language Server Protocol. The debugger, Class Explorer, settings panel, and automatic downloads require the VS Code extension.
+The `glua_ls` server works in any editor that supports the Language Server Protocol. The settings panel, debugger and automatic downloads need the VS Code extension.
 
-### Install the binary
-
-```bash
-cargo install glua_ls glua_check
-```
-
-Point your LSP client to the `glua_ls` binary. Most editors accept a `cmd` or `command` setting in their LSP configuration.
-
-### Build from source
+Download `glua_ls` from the [GitHub releases](https://github.com/Pollux12/gmod-glua-ls/releases) or install it with Cargo:
 
 ```bash
-git clone https://github.com/Pollux12/gmod-glua-ls.git
-cd gmod-glua-ls
-cargo build --release
+cargo install glua_ls
 ```
 
-The binary is at `target/release/glua_ls` (or `glua_ls.exe` on Windows).
-
-### Standalone language server configuration
-
-When you run `glua_ls` outside of the VS Code extension, specify the GMod annotations path with the `--gmod-annotations-path` flag:
+Outside VS Code you need to provide the Garry's Mod annotations yourself. Download the [`gluals-annotations` branch](https://github.com/Pollux12/annotations-gmod-glua-ls/tree/gluals-annotations) and pass its folder to the server:
 
 ```bash
-glua_ls --gmod-annotations-path /path/to/gmod/annotations
+glua_ls --gmod-annotations-path /path/to/annotations
 ```
 
-<Note>
-  The `--gmod-annotations-path` flag accepts a path to the folder containing the GMod API annotations. The VS Code extension usually downloads these files. Use `none` to disable annotation loading.
-</Note>
-
-**Annotation path priority:**
-1. `gmod.annotationsPath` in `.gluarc.json` (highest priority)
-2. `--gmod-annotations-path` CLI flag
-3. Path provided by the VS Code extension
-
-**Example editor configuration:**
-
-```json
-{
-  "command": ["glua_ls", "--gmod-annotations-path", "/path/to/gmod/annotations"],
-  "filetypes": ["lua"]
-}
-```
-
----
+You can also set `gmod.annotationsPath` in `.gluarc.json`. It takes priority over the command-line flag.

@@ -1,96 +1,51 @@
 ---
 title: Workspace settings
-description: Configure library paths, ignore patterns, module maps, and file encoding.
+description: Choose which files GLuaLS reads, skips or uses as libraries.
 ---
 
-## Overview
-
-The `workspace` section tells the language server which files to analyze, which files to ignore, and where to find external libraries. It also controls module resolution and file encoding.
-
----
+These settings live under `workspace` in `.gluarc.json`. For the common cases, see [Open your project](/getting-started/workspace-setup).
 
 ## Options
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `workspace.library` | `array` | `[]` | External library paths to include in analysis (strings or objects) |
-| `workspace.workspaceRoots` | `string[]` | `[]` | Additional workspace root directories for multi-root setups |
-| `workspace.ignoreDir` | `string[]` | `[]` | Directory names to exclude from analysis |
-| `workspace.ignoreDirDefaults` | `(string \| object)[]` | built-in list | Built-in directories and patterns to ignore. Accepts strings or the objects described below. |
-| `workspace.useDefaultIgnores` | `boolean` | `true` | Whether to apply `workspace.ignoreDirDefaults` |
-| `workspace.enableIsolation` | `boolean` | `false` | Keep multi-root main workspaces isolated. Set to `false` to merge workspace configs into one global baseline (first workspace config wins scalar conflicts, arrays are unioned) while still allowing per-workspace file-scoped overrides. |
-| `workspace.ignoreGlobs` | `string[]` | `[]` | Glob patterns of files to exclude from analysis |
-| `workspace.moduleMap` | `array` | `[]` | Module path rewrite rules (regex patterns) |
-| `workspace.encoding` | `string` | `"utf-8"` | File encoding for all Lua files in the workspace |
-| `workspace.enableReindex` | `boolean` | `false` | After a save, once edits pause, drop files deleted outside the editor and re-diagnose every file |
-| `workspace.reindexDuration` | `integer` | `5000` | How long edits must pause before that recheck runs, in ms (at least 1000) |
-| `workspace.packageDirs` | `string[]` | `[]` | Partial library load; only load package declarations from these dirs, not full analysis |
+| Option | Default | Description |
+|---|---|---|
+| `workspace.library` | `[]` | Folders outside your project to read for types and functions, without showing their warnings |
+| `workspace.ignoreDir` | `[]` | Folders to skip |
+| `workspace.ignoreGlobs` | `[]` | Glob patterns of files to skip |
+| `workspace.useDefaultIgnores` | `true` | Skip the built-in list of folders below |
+| `workspace.ignoreDirDefaults` | built-in list | Change the built-in list |
+| `workspace.enableIsolation` | `false` | In a multi-root workspace, analyze each folder on its own instead of together |
+| `workspace.workspaceRoots` | `[]` | Extra folders to treat as roots for `require` paths |
+| `workspace.packageDirs` | `[]` | Load only these folders from their parent library |
+| `workspace.moduleMap` | `[]` | Rewrite `require` paths with regex rules |
+| `workspace.encoding` | `"utf-8"` | Text encoding of your Lua files |
+| `workspace.enableReindex` | `false` | After you save and stop typing, recheck every file and drop files deleted outside VS Code |
+| `workspace.reindexDuration` | `5000` | How long to wait after typing stops before that recheck, in milliseconds |
 
----
+## Libraries
 
-## Library paths
-
-`workspace.library` adds directories to analysis without treating them as project source. Use this for annotation files, dependencies, or other code you need to reference from your project.
-
-<Note>
-This helps gamemodes such as Helix, where your schema needs to reference the "core" Helix gamemode. Add `../helix` as a library path in your schema gamemode.
-</Note>
-
-Each entry is either a path string or an object with per-library ignore options:
+Each library is a path, or an object with its own skip rules. Relative paths start from your project folder.
 
 ```json .gluarc.json
 {
   "workspace": {
     "library": [
-      "./types",
+      "../shared-library",
       {
-        "path": "./vendor/stubs",
-        "ignoreDir": ["test"],
-        "ignoreGlobs": ["**/*.spec.lua"]
+        "path": "C:/srcds/garrysmod/addons/some-framework",
+        "ignoreDir": ["tests"],
+        "ignoreGlobs": ["**/*_old.lua"]
       }
     ]
   }
 }
 ```
 
----
+## Built-in skip list
 
-## Ignore patterns
+GLuaLS skips these by default:
 
-Exclude directories or files from analysis:
-
-```json .gluarc.json
-{
-  "workspace": {
-    "ignoreDir": ["node_modules", ".git", "tests"],
-    "ignoreGlobs": [
-      "**/*.min.lua",
-      "legacy/**"
-    ]
-  }
-}
-```
-
-Common directories to ignore for GMod projects:
-- `garrysmod` (Steam engine files)
-- `addons` (other addons' source, if not relevant to your project)
-- `.git`
-- `out`, `build`, `dist`
-
----
-
-## Ignore default overrides
-
-`workspace.ignoreDirDefaults` lets you override, disable, or extend the built-in ignore defaults without replacing the whole list.
-
-The list accepts two forms:
-
-- **Strings** replace the built-in list with your own patterns.
-- **Objects** change, remove, or add individual entries while keeping the rest of the built-in list.
-
-Built-in default ids:
-
-| id | Default glob |
+| id | Pattern |
 |---|---|
 | `git` | `**/.git/**` |
 | `github` | `**/.github/**` |
@@ -107,108 +62,31 @@ Built-in default ids:
 | `tests` | `**/tests/**` |
 | `test` | `**/test/**` |
 
-Object entry fields:
-
-| Field | Type | Description |
-|---|---|---|
-| `id` | `string` | Stable identifier matching a built-in or a custom id. |
-| `label` | `string` | Optional human-readable label (informational only). |
-| `glob` | `string` | Glob pattern to apply. Omit when only using `disabled`. |
-| `disabled` | `boolean` | Set `true` to remove this built-in default from the workspace. |
-
-**Disable a single built-in:**
+To change one entry, list it by `id` in `ignoreDirDefaults`. Entries you leave out keep their default.
 
 ```json .gluarc.json
 {
   "workspace": {
     "ignoreDirDefaults": [
-      { "id": "tests", "disabled": true }
+      { "id": "tests", "disabled": true },
+      { "id": "legacy", "glob": "**/legacy/**" }
     ]
   }
 }
 ```
 
-**Override a built-in pattern and add a custom entry:**
+Use `disabled: true` to stop skipping a built-in entry, a new `id` to add an entry, or an existing `id` with a new `glob` to change its pattern. To turn off the whole list, set `useDefaultIgnores` to `false`.
 
-```json .gluarc.json
-{
-  "workspace": {
-    "ignoreDirDefaults": [
-      { "id": "test", "glob": "**/my_tests/**" },
-      { "id": "legacy-stuff", "glob": "**/legacy/**" }
-    ]
-  }
-}
-```
+## Module map
 
-**Disable all built-in defaults globally:**
-
-```json .gluarc.json
-{
-  "workspace": {
-    "useDefaultIgnores": false
-  }
-}
-```
-
----
-
-`moduleMap` rewrites require paths to file paths using regex replacement. Use it when your project uses non-standard require patterns.
+If your project loads modules from non-standard paths, rewrite them with regex rules:
 
 ```json .gluarc.json
 {
   "workspace": {
     "moduleMap": [
-      {
-        "pattern": "^libs/(.*)",
-        "replace": "lua/libs/$1"
-      }
+      { "pattern": "^libs/(.*)", "replace": "lua/libs/$1" }
     ]
   }
 }
 ```
-
----
-
-## Workspace roots
-
-If your Lua files are not at the repository root, specify the Lua root:
-
-```json .gluarc.json
-{
-  "workspace": {
-    "workspaceRoots": ["lua"]
-  }
-}
-```
-
-This affects require path resolution. GLuaLS resolves `require("mymodule")` relative to `lua/mymodule.lua`.
-
----
-
-## File encoding
-
-Most Lua files use UTF-8, but older addons may use a legacy encoding:
-
-```json .gluarc.json
-{
-  "workspace": {
-    "encoding": "utf-8"
-  }
-}
-```
-
-Available values: `"utf-8"`, `"utf-16"`, `"gbk"`, `"latin1"`, `"ascii"`.
-
----
-
-## VS Code extension settings
-
-You can also configure these settings in VS Code settings with the `gluals.*` prefix:
-
-| VS Code setting | .gluarc.json key | Type | Default | Description |
-|---|---|---|---|---|
-| `gluals.workspace.enableReindex` | `workspace.enableReindex` | `boolean` | `false` | Recheck deleted files and diagnostics after a save |
-| `gluals.workspace.reindexDuration` | `workspace.reindexDuration` | `integer` | `5000` | Quiet period before that recheck (ms) |
-| `gluals.workspace.enableIsolation` | `workspace.enableIsolation` | `boolean \| null` | `null` | Override multi-root isolation |
-| `gluals.workspace.useDefaultIgnores` | `workspace.useDefaultIgnores` | `boolean \| null` | `null` | Override built-in ignore rules |

@@ -1,194 +1,150 @@
 ---
-title: "Diagnostics Configuration"
-description: Enable, disable, and tune the severity of every diagnostic code.
+title: Diagnostics settings
+description: Turn warnings on or off and change how they show.
 ---
 
-## Overview
+These settings live under `diagnostics` in `.gluarc.json`. For quick fixes from the editor, see [Fix common warnings](/getting-started/common-fixes).
 
-The `diagnostics` section controls which checks run and how severe they appear. You can enable, disable, or re-level each diagnostic code.
+## Options
 
----
-
-## Top-level options
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `diagnostics.enable` | `boolean` | `true` | Enable diagnostics globally |
-| `diagnostics.disable` | `string[]` | `[]` | Codes to disable entirely |
-| `diagnostics.enables` | `string[]` | `[]` | Codes to explicitly enable (for codes that are Off by default) |
-| `diagnostics.globals` | `string[]` | `[]` | Global variable names to whitelist (suppress `undefined-global`) |
-| `diagnostics.globalsRegex` | `string[]` | `[]` | Regex patterns matching global names to whitelist |
-| `diagnostics.severity` | `object` | `{}` | Map of code → severity level |
-
----
-
-## Severity levels
-
-| Level | Appearance |
-|---|---|
-| `"error"` | Red error indicator, blocks type resolution display |
-| `"warning"` | Yellow warning indicator |
-| `"information"` | Blue information indicator |
-| `"hint"` | Subtle underline hint |
-
----
-
-## Full diagnostic reference
-
-Codes marked **Off** start disabled. Add them to `enables` to turn them on.
-
-### Syntax & annotations
-
-| Code | Default | Severity | Description |
-|---|---|---|---|
-| `syntax-error` | On | Error | Lua syntax errors |
-| `doc-syntax-error` | On | Error | Annotation syntax errors |
-| `annotation-usage-error` | On | Error | Incorrect annotation usage (e.g. `@class` inside a function) |
-| `unknown-doc-tag` | **Off** | Warning | Unrecognised annotation tag |
-| `incomplete-signature-doc` | **Off** | Warning | Function missing `@param` or `@return` documentation |
-| `missing-global-doc` | **Off** | Warning | Global function/class with no documentation |
-
-### Type checking
-
-| Code | Default | Severity | Description |
-|---|---|---|---|
-| `type-not-found` | On | Warning | Referenced type not found in scope |
-| `param-type-mismatch` | On | Warning | Argument type doesn't match declared `@param` type |
-| `missing-parameter` | On | Warning | Required parameter not passed |
-| `redundant-parameter` | On | Information | Extra argument passed beyond declared parameters |
-| `assign-type-mismatch` | On | Hint | Assignment value type doesn't match declared type |
-| `return-type-mismatch` | **Off** | Warning | Returned type doesn't match declared `@return` type |
-| `missing-return` | **Off** | Warning | Function with `@return` annotation missing a return statement |
-| `missing-return-value` | On | Warning | `return` statement missing a required value |
-| `redundant-return-value` | **Off** | Warning | `return` statement has extra value(s) |
-| `cast-type-mismatch` | On | Warning | `@cast` target type is incompatible |
-| `generic-constraint-mismatch` | On | Information | Generic type argument violates constraint |
-| `enum-value-mismatch` | On | Warning | Value not part of the declared enum |
-| `need-check-nil` | On | Hint | Potential nil dereference (try `if x then ... end`) |
-| `unchecked-nil-access` | On | Warning | Chained access or call through an opaque table member that may be nil |
-| `infer-unknown` | On | Hint | An otherwise unknown value was stabilized from usage context and may be incorrect |
-| `infer-unguarded-child` | On | Warning | A child value was inferred from an unguarded parent relationship and may be incorrect |
-
-Nil diagnostics understand validity guards such as `IsValid` and annotated guard wrappers. See [Guard metadata](/annotations/guard-metadata) for custom wrappers.
-
-### Fields & access
-
-| Code | Default | Severity | Description |
-|---|---|---|---|
-| `undefined-field` | On | Warning | Field doesn't exist on the type |
-| `undefined-method` | On | Error | Method called with `:` doesn't exist on the type or an inferred child type |
-| `missing-fields` | On | Warning | Required fields not initialised in a table literal |
-| `inject-field` | **Off** | Warning | Field assigned to a type outside its definition |
-| `duplicate-doc-field` | On | Warning | Same field documented multiple times in a class |
-| `undefined-doc-param` | On | Warning | `@param` names a parameter that doesn't exist in the function signature |
-| `access-invisible` | On | Warning | Accessing a `private` or `protected` member from outside its class |
-| `read-only` | On | Warning | Writing to a read-only value |
-
-### Variables & scoping
-
-| Code | Default | Severity | Description |
-|---|---|---|---|
-| `undefined-global` | On | Error | Global variable not defined or whitelisted |
-| `undefined-global-assignment` | On | Warning | Undefined global used as a function argument or assigned to a variable / table field (alias: `undefined-global-argument`) |
-| `unused` | On | Hint | Variable or function is declared but never used |
-| `unused-self` | **Off** | Hint | `self` parameter is never used |
-| `redefined-local` | On | Hint | Local variable redefined in the same scope |
-| `redefined-label` | On | Warning | `::label::` defined multiple times |
-| `local-const-reassign` | On | Error | Reassigning a `<const>`-attributed local |
-
-### Control flow
-
-| Code | Default | Severity | Description |
-|---|---|---|---|
-| `unreachable-code` | On | Hint | Code after a `return`, `break`, or `error()` call |
-| `unnecessary-assert` | **Off** | Warning | `assert` that can never fail |
-| `unnecessary-if` | **Off** | Warning | `if` condition that is always true or false |
-| `invert-if` | **Off** | Warning | `if` block that could be simplified by inverting the condition |
-
-### Modules & requires
-
-| Code | Default | Severity | Description |
-|---|---|---|---|
-| `duplicate-require` | On | Hint | Module required more than once in the same file |
-| `require-module-not-visible` | On | Warning | `require()` path target is not visible in the workspace |
-
-### Documentation
-
-| Code | Default | Severity | Description |
-|---|---|---|---|
-| `deprecated` | On | Hint | Using a function, field, or class marked `@deprecated` |
-| `discard-returns` | On | Warning | Return value of a `@nodiscard` function is discarded |
-| `circle-doc-class` | On | Warning | Circular class inheritance detected |
-
-### Code style
-
-| Code | Default | Severity | Description |
-|---|---|---|---|
-| `code-style-check` | **Off** | Warning | Code style violations |
-| `duplicate-index` | On | Warning | Same table key used more than once |
-| `duplicate-set-field` | **Off** | Warning | Same field set multiple times |
-| `non-literal-expressions-in-assert` | **Off** | Warning | Non-literal values inside `assert()` |
-| `unbalanced-assignments` | On | Warning | Different number of values and variables in a multi-assignment |
-| `preferred-local-alias` | On | Hint | Suggest caching a global in a local variable |
-| `await-in-sync` | On | Warning | Using `---@async` function result in a synchronous context |
-
-### Type definitions
-
-| Code | Default | Severity | Description |
-|---|---|---|---|
-| `duplicate-type` | **Off** | Warning | Type defined more than once |
-| `global-in-non-module` | **Off** | Warning | Global defined in a non-module file scope |
-| `attribute-param-type-mismatch` | On | Warning | Attribute parameter type mismatch |
-| `attribute-missing-parameter` | On | Warning | Required attribute parameter missing |
-| `attribute-redundant-parameter` | On | Warning | Extra attribute parameter |
-| `call-non-callable` | **Off** | Warning | Calling a value that is not callable |
-
-### Garry's Mod Lua
-
-| Code | Default | Severity | Description |
-|---|---|---|---|
-| `gmod-invalid-hook-name` | On | Warning | Invalid or unknown GMod hook name |
-| `gmod-realm-mismatch` | On | Error | Client-only code used on the server, or server-only code used on the client |
-| `gmod-realm-mismatch-heuristic` | On | Error | Likely realm mismatch when the file realm is not certain |
-| `gmod-unknown-realm` | On | Hint | Realm could not be determined for a realm-sensitive call |
-| `gmod-net-missing-network-counterpart` | On | Warning | `net.Start` block with no `net.Receive` in the opposite realm (or vice versa) |
-| `gmod-net-read-write-order-mismatch` | On | Warning | `net.Read*` order doesn't match `net.Write*` order |
-| `gmod-net-read-write-type-mismatch` | On | Warning | `net.Read*` type doesn't match corresponding `net.Write*` type |
-| `gmod-net-read-write-bits-mismatch` | On | Warning | Literal bit-width differs between a matched write/read pair (e.g. `WriteUInt(8)` vs `ReadUInt(16)`) |
-| `gmod-unknown-net-message` | On | Warning | Unregistered net message identifier |
-| `gmod-duplicate-system-registration` | On | Hint | Duplicate registration for `net.Receive`, `concommand.Add`, `timer.Create`, etc. |
-| `gmod-null-check` | On | Warning | Entity validity checked with truthiness or `nil` instead of `IsValid` |
-
-
----
-
-## VS Code extension settings
-
-You can also configure these settings in VS Code settings with the `gluals.*` prefix:
-
-| VS Code setting | .gluarc.json key | Type | Default | Description |
-|---|---|---|---|---|
-| `gluals.strict.inferredTypeMismatch` | `strict.inferredTypeMismatch` | `boolean` | `false` | Stricter type checking for inferred values |
-| `gluals.codeAction.insertSpace` | `codeAction.insertSpace` | `boolean` | `false` | Space after --- in diagnostic comments |
-
----
-
-## Example configuration
+| Option | Default | Description |
+|---|---|---|
+| `diagnostics.enable` | `true` | Show diagnostics at all |
+| `diagnostics.disable` | `[]` | Codes to turn off |
+| `diagnostics.enables` | `[]` | Codes to turn on that are off by default |
+| `diagnostics.severity` | `{}` | Change how a code shows: `"error"`, `"warning"`, `"information"` or `"hint"` |
+| `diagnostics.globals` | `[]` | Global names that exist even though GLuaLS cannot find them |
+| `diagnostics.globalsRegex` | `[]` | Regex patterns for such global names |
 
 ```json .gluarc.json
 {
   "diagnostics": {
-    "enable": true,
-    "globals": ["GAMEMODE", "PLUGIN", "GM"],
-    "globalsRegex": ["^PLUGIN_"],
-    "enables": ["missing-return", "return-type-mismatch"],
-    "disable": ["call-non-callable"],
+    "disable": ["unused"],
+    "enables": ["return-type-mismatch"],
     "severity": {
-      "unused": "hint",
-      "param-type-mismatch": "information",
-      "need-check-nil": "hint",
-      "undefined-field": "information"
-    }
+      "need-check-nil": "warning"
+    },
+    "globals": ["DarkRP"],
+    "globalsRegex": ["^MYADDON_"]
   }
 }
 ```
+
+## Codes
+
+The code name appears at the end of each warning in the editor. Codes marked **Off** only run when you add them to `diagnostics.enables`.
+
+### Garry's Mod
+
+| Code | Default | Reports |
+|---|---|---|
+| `gmod-realm-mismatch` | Error | A client-only or server-only function used in the wrong realm |
+| `gmod-realm-mismatch-heuristic` | Error | A likely wrong-realm call where the file's realm is less certain |
+| `gmod-unknown-realm` | Hint | A realm-specific call in code whose realm is unknown |
+| `gmod-unknown-net-message` | Warning | A net message name that is never registered with `util.AddNetworkString` |
+| `gmod-net-missing-network-counterpart` | Warning | A net message that is sent but never received, or received but never sent |
+| `gmod-net-read-write-order-mismatch` | Warning | `net.Read*` calls in a different order from the `net.Write*` calls |
+| `gmod-net-read-write-type-mismatch` | Warning | A `net.Read*` call that does not match the type written |
+| `gmod-net-read-write-bits-mismatch` | Warning | A different bit count on a matching write and read, such as `WriteUInt(x, 8)` and `ReadUInt(16)` |
+| `gmod-invalid-hook-name` | Warning | An empty hook name, or one that is not a string literal |
+| `gmod-null-check` | Warning | An entity checked with `if ent then` or `~= nil` instead of `IsValid(ent)` |
+| `gmod-duplicate-system-registration` | Hint | The same `net.Receive`, `concommand.Add`, `timer.Create` and similar registered twice |
+
+### Globals and variables
+
+| Code | Default | Reports |
+|---|---|---|
+| `undefined-global` | Error | A global that is never defined |
+| `undefined-global-assignment` | Warning | An undefined global passed as an argument or stored in a variable |
+| `unused` | Hint | A variable or function that is never used |
+| `unused-self` | **Off** | A method that never uses `self` |
+| `redefined-local` | Hint | A local that hides another local with the same name |
+| `redefined-label` | Warning | A `::label::` defined more than once |
+| `local-const-reassign` | Error | A `<const>` local that is assigned again |
+| `global-in-non-module` | **Off** | A global defined outside module scope |
+
+### Fields and methods
+
+| Code | Default | Reports |
+|---|---|---|
+| `undefined-field` | Warning | A field that does not exist on the type |
+| `undefined-method` | Error | A method called with `:` that does not exist on the type |
+| `missing-fields` | Warning | A table missing fields its type requires |
+| `inject-field` | **Off** | A new field added to a type outside its definition |
+| `access-invisible` | Warning | A `private` or `protected` member used from outside its class |
+| `read-only` | Warning | A write to a read-only value |
+| `duplicate-index` | Warning | The same key twice in one table |
+| `duplicate-set-field` | **Off** | The same field set more than once |
+
+### Types and nil
+
+| Code | Default | Reports |
+|---|---|---|
+| `param-type-mismatch` | Warning | An argument of the wrong type |
+| `missing-parameter` | Warning | A required argument that is missing |
+| `redundant-parameter` | Information | More arguments than the function takes |
+| `assign-type-mismatch` | Hint | A value of the wrong type assigned to a typed variable or field |
+| `need-check-nil` | Hint | A value that may be `nil` used without a check |
+| `unchecked-nil-access` | Warning | A chain of field accesses or calls through a value that may be `nil` |
+| `infer-unknown` | Hint | A value whose type was guessed from how it is used |
+| `infer-unguarded-child` | Warning | A value whose type was guessed from a parent that may not be valid |
+| `type-not-found` | Warning | A type name that does not exist |
+| `cast-type-mismatch` | Warning | A `@cast` to an incompatible type |
+| `enum-value-mismatch` | Warning | A value that is not part of the expected enum |
+| `generic-constraint-mismatch` | Information | A generic type argument that breaks its constraint |
+| `call-non-callable` | **Off** | A call on a value that is not a function |
+
+`need-check-nil` and `unchecked-nil-access` understand `IsValid` and similar checks. See [Guard metadata](/annotations/guard-metadata) for your own check functions.
+
+### Returns
+
+| Code | Default | Reports |
+|---|---|---|
+| `missing-return-value` | Warning | A `return` with fewer values than the function declares |
+| `missing-return` | **Off** | A function with `@return` that can end without returning |
+| `return-type-mismatch` | **Off** | A returned value of the wrong type |
+| `redundant-return-value` | **Off** | A `return` with more values than the function declares |
+| `discard-returns` | Warning | An ignored result from a `@nodiscard` function |
+
+### Code quality
+
+| Code | Default | Reports |
+|---|---|---|
+| `syntax-error` | Error | Invalid Lua syntax |
+| `unreachable-code` | Hint | Code after `return`, `break` or `error()` |
+| `unbalanced-assignments` | Warning | A different number of variables and values in one assignment |
+| `duplicate-require` | Hint | The same module required twice in a file |
+| `require-module-not-visible` | Warning | A `require` path that is not in the workspace |
+| `preferred-local-alias` | Hint | A global that could be cached in a local |
+| `deprecated` | Hint | Use of something marked `@deprecated` |
+| `await-in-sync` | Warning | An `@async` function called from normal code |
+| `unnecessary-assert` | **Off** | An `assert` that can never fail |
+| `unnecessary-if` | **Off** | An `if` condition that is always true or always false |
+| `invert-if` | **Off** | An `if` that reads more simply when inverted |
+| `non-literal-expressions-in-assert` | **Off** | Non-literal values inside `assert()` |
+| `code-style-check` | **Off** | Code that does not match the formatter style |
+
+### Annotations
+
+| Code | Default | Reports |
+|---|---|---|
+| `doc-syntax-error` | Error | An annotation with invalid syntax |
+| `annotation-usage-error` | Error | An annotation in the wrong place |
+| `undefined-doc-param` | Warning | A `@param` for a parameter the function does not have |
+| `duplicate-doc-field` | Warning | The same field documented twice in a class |
+| `circle-doc-class` | Warning | Classes that inherit from each other in a loop |
+| `attribute-param-type-mismatch` | Warning | An attribute argument of the wrong type |
+| `attribute-missing-parameter` | Warning | A missing attribute argument |
+| `attribute-redundant-parameter` | Warning | Too many attribute arguments |
+| `duplicate-type` | **Off** | A type defined more than once |
+| `unknown-doc-tag` | **Off** | An unknown annotation tag |
+| `incomplete-signature-doc` | **Off** | A documented function missing some `@param` or `@return` |
+| `missing-global-doc` | **Off** | A global function or class with no documentation |
+
+## Related settings
+
+| Option | Default | Description |
+|---|---|---|
+| `codeAction.insertSpace` | `false` | Write `--- @diagnostic` instead of `---@diagnostic` when a quick fix adds a comment |
+
+Stricter type checks are in [Runtime and strict mode](/configuration/runtime#strict-mode).

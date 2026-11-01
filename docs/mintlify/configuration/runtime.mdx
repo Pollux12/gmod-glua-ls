@@ -1,179 +1,64 @@
 ---
-title: Runtime and strict settings
-description: Configure non-standard Lua symbols, strict type checking, special functions, and documentation format.
+title: Runtime and strict mode
+description: Syntax, require handling, stricter type checks and documentation options.
 ---
 
-## Overview
+Most projects never need these settings.
 
-The `runtime`, `strict`, `doc`, and `references` sections control how the language server interprets Lua syntax and checks types.
+## Runtime
 
----
+| Option | Default | Description |
+|---|---|---|
+| `runtime.nonstandardSymbol` | GLua symbols | Extra syntax the parser accepts. See below |
+| `runtime.requireLikeFunction` | `[]` | Your own functions that load modules like `require` |
+| `runtime.requirePattern` | `[]` | Path patterns for `require`, such as `"?.lua"` and `"?/init.lua"` |
+| `runtime.special` | `{}` | Treat your own functions like a built-in: `"require"`, `"error"`, `"assert"`, `"type"`, `"setmetatable"` or `"none"` |
+| `runtime.extensions` | `[]` | Extra file extensions to read as Lua, such as `".lua.txt"` |
 
-## Runtime (`runtime.*`)
+`runtime.version` has no effect. Garry's Mod always uses LuaJIT.
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `runtime.extensions` | `string[]` | `[]` | Additional file extensions to treat as Lua (e.g., `".lua.txt"`) |
-| `runtime.requireLikeFunction` | `string[]` | `[]` | Functions that behave like `require` for module resolution |
-| `runtime.requirePattern` | `string[]` | `[]` | Require path resolution patterns (e.g., `"?.lua"`, `"?/init.lua"`) |
-| `runtime.version` | `string` | `LuaJIT` | Lua version used for syntax and type behavior. Keep `LuaJIT` for Garry's Mod |
-| `runtime.nonstandardSymbol` | `string[]` | see below | Extra syntax accepted by the parser |
-| `runtime.frameworkVersions` | `string[]` | `[]` | Framework version identifiers |
-| `runtime.special` | `object` | `{}` | Map function names to special behaviours |
+### GLua syntax
 
-### Default non-standard symbols
-
-GLuaLS enables these non-standard symbols by default to match GLua syntax:
-
-```
-["//", "/**/", "continue", "!=", "||", "&&", "!"]
-```
-
-All available non-standard symbols:
-
-| Symbol | Description |
-|---|---|
-| `//` | Integer division operator |
-| `/**/` | Block comments (C-style) |
-| `` ` `` | Backtick strings |
-| `+=`, `-=`, `*=`, `/=`, `%=`, `^=`, `//=` | Compound assignment operators |
-| `\|=`, `&=`, `<<=`, `>>=` | Bitwise compound assignment |
-| `\|\|`, `&&`, `!`, `!=` | C-style logical operators |
-| `continue` | `continue` statement (not in standard Lua 5.1) |
-
-### Special functions
-
-Tell GLuaLS that a custom function behaves like a built-in Lua function:
+By default GLuaLS accepts the GLua additions `//`, `/* */`, `continue`, `!=`, `||`, `&&` and `!`. If you set `runtime.nonstandardSymbol`, your list replaces the default, so include these too. Other accepted values are `` ` ``, `+=`, `-=`, `*=`, `/=`, `%=`, `^=`, `//=`, `|=`, `&=`, `<<=` and `>>=`.
 
 ```json .gluarc.json
 {
   "runtime": {
+    "requireLikeFunction": ["MyAddon.Load"],
     "special": {
-      "include": "require",
-      "my_assert": "assert",
-      "my_type": "type"
+      "MyAddon.Assert": "assert"
     }
   }
 }
 ```
 
-Available behavior values: `"none"`, `"require"`, `"error"`, `"assert"`, `"type"`, `"setmetatable"`
+## Strict mode
 
----
+These settings make type checks stricter. They catch more mistakes, but also report more false warnings in loosely typed code.
 
-## Strict mode (`strict.*`)
+| Option | Default | Description |
+|---|---|---|
+| `strict.allowNullableAsNonNullable` | `true` | Allow a value that may be `nil` where a non-`nil` value is expected. Set `false` for stricter `nil` checks |
+| `strict.inferredTypeMismatch` | `false` | Report type mismatches for values without an explicit type |
+| `strict.strictTypeCoercion` | `false` | Report the automatic string and number conversions GLua allows |
+| `strict.arrayIndex` | `false` | Treat values read from arrays as possibly `nil` |
+| `strict.requirePath` | `false` | Match `require` paths exactly instead of finding the closest module |
+| `strict.requireExportGlobal` | `false` | Only use globals from libraries when they are marked `---@export global` |
+| `strict.docBaseConstMatchBaseType` | `true` | Let a plain `integer` or `string` match an alias of literal values, such as `---@alias id 1 \| 2 \| 3` |
+| `strict.metaOverrideFileDefine` | `true` | Let definitions from `---@meta` files override definitions in code |
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `strict.requirePath` | `boolean` | `false` | Enforce strict `require()` path validation |
-| `strict.arrayIndex` | `boolean` | `false` | Enforce strict array index usage |
-| `strict.metaOverrideFileDefine` | `boolean` | `true` | Allow meta (annotation) file definitions to override file-level definitions |
-| `strict.docBaseConstMatchBaseType` | `boolean` | `true` | Allow base constants (e.g., `0`, `""`) to match their base type |
-| `strict.requireExportGlobal` | `boolean` | `false` | Require explicit `---@export global` annotation for globals to be visible outside their file |
-| `strict.allowNullableAsNonNullable` | `boolean` | `true` | Allow optional types (`T?`) to be passed where non-optional (`T`) is expected (lenient nil-safety) |
-| `strict.inferredTypeMismatch` | `boolean` | `false` | Report type mismatch diagnostics for inferred values (stricter checker, may produce false positives) |
-| `strict.strictTypeCoercion` | `boolean` | `false` | Require exact primitive types instead of GLua's common string and number conversions |
+## Documentation comments
 
-### Enabling stricter nil checking
+| Option | Default | Description |
+|---|---|---|
+| `doc.syntax` | `"md"` | Format of documentation comments: `"md"`, `"myst"`, `"rst"` or `"none"` |
+| `doc.knownTags` | `[]` | Extra annotation tags to accept without an `unknown-doc-tag` warning |
+| `doc.privateName` | `[]` | Field name patterns to treat as private, such as `"m_*"` |
+| `doc.rstPrimaryDomain` | none | Primary domain for `"rst"` and `"myst"` |
+| `doc.rstDefaultRole` | none | Default role for `"rst"` and `"myst"` |
 
-```json .gluarc.json
-{
-  "strict": {
-    "allowNullableAsNonNullable": false,
-    "inferredTypeMismatch": true
-  }
-}
-```
+## Resource paths
 
----
-
-## Documentation format (`doc.*`)
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `doc.syntax` | `string` | `"md"` | Documentation syntax: `"md"`, `"myst"`, `"rst"`, `"none"` |
-| `doc.knownTags` | `string[]` | `[]` | Custom annotation tags to suppress `unknown-doc-tag` warnings for |
-| `doc.privateName` | `string[]` | `[]` | Field name patterns to treat as private (e.g., `["m_*", "_*"]`) |
-| `doc.rstPrimaryDomain` | `string \| null` | `null` | Main reStructuredText domain when `doc.syntax` is `"rst"` or `"myst"` |
-| `doc.rstDefaultRole` | `string \| null` | `null` | Default reStructuredText role when `doc.syntax` is `"rst"` or `"myst"` |
-
-### Custom tag suppression
-
-```json .gluarc.json
-{
-  "doc": {
-    "knownTags": ["realm", "hook", "accessorfunc"]
-  }
-}
-```
-
-### Private field naming patterns
-
-```json .gluarc.json
-{
-  "doc": {
-    "privateName": ["m_*", "_*", "__*"]
-  }
-}
-```
-
----
-
-## References (`references.*`)
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `references.enable` | `boolean` | `true` | Enable find references |
-| `references.fuzzySearch` | `boolean` | `true` | Fall back to fuzzy matching if exact search finds nothing |
-| `references.shortStringSearch` | `boolean` | `false` | Search for variable/function name references inside strings |
-
----
-
-## Document color (`documentColor.*`)
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `documentColor.enable` | `boolean` | `true` | Show color pickers for `Color(r, g, b)` and similar calls |
-
----
-
-## Resource paths (`resource.*`)
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `resource.paths` | `string[]` | `[]` | Extra folders used for file path completion and clickable file links |
-
----
-
-## VS Code extension settings
-
-You can also configure these settings in VS Code settings with the `gluals.*` prefix:
-
-| VS Code setting | .gluarc.json key | Type | Default | Description |
-|---|---|---|---|---|
-| `gluals.references.enable` | `references.enable` | `boolean` | `true` | Find all references |
-| `gluals.references.fuzzySearch` | `references.fuzzySearch` | `boolean` | `true` | Fuzzy search for references |
-| `gluals.references.shortStringSearch` | `references.shortStringSearch` | `boolean` | `false` | Search strings for references |
-
----
-
-## Full example
-
-```json .gluarc.json
-{
-  "runtime": {
-    "nonstandardSymbol": ["//", "/***/", "continue", "!=", "||", "&&", "!"],
-    "requireLikeFunction": ["include"],
-    "special": {
-      "include": "require"
-    }
-  },
-  "strict": {
-    "allowNullableAsNonNullable": true,
-    "inferredTypeMismatch": false
-  },
-  "doc": {
-    "privateName": ["m_*", "_*"]
-  }
-}
-```
+| Option | Default | Description |
+|---|---|---|
+| `resource.paths` | `[]` | Folders used to open file paths in strings with `Ctrl+Click`, such as `materials/` and `sound/` |
