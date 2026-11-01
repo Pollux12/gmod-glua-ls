@@ -11,7 +11,7 @@ use smol_str::SmolStr;
 
 use crate::{
     AccessorFuncCallMetadata, AccessorMember, AccessorOwner, AccessorPrefix, AccessorSignature,
-    DbIndex, FileId, GlobalId, GmodClassCallArg, GmodClassCallLiteral, GmodScriptedClassCallKind,
+    DbIndex, FileId, GmodClassCallArg, GmodClassCallLiteral, GmodScriptedClassCallKind,
     GmodScriptedClassCallMetadata, InFiled, InferFailReason, LuaMemberKey, LuaMemberOwner,
     LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId, LuaType, LuaTypeDeclId,
     compilation::analyzer::{
@@ -1009,21 +1009,20 @@ fn resolve_cached_index_expr_type(
             .map(Some);
     }
 
-    if let LuaMemberOwner::Type(type_decl_id) = member_owner {
-        let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(type_decl_id.get_name()));
-        if let Some(member_item) = analyzer
+    if let LuaMemberOwner::Type(type_decl_id) = member_owner
+        && let Some(global_owner) = type_decl_id.global_member_owner(analyzer.db)
+        && let Some(member_item) = analyzer
             .db
             .get_member_index()
             .get_member_item(&global_owner, &member_key)
-        {
-            return member_item
-                .resolve_type_with_realm_at_offset(
-                    &analyzer.db,
-                    &analyzer.file_id,
-                    index_expr.get_position(),
-                )
-                .map(Some);
-        }
+    {
+        return member_item
+            .resolve_type_with_realm_at_offset(
+                &analyzer.db,
+                &analyzer.file_id,
+                index_expr.get_position(),
+            )
+            .map(Some);
     }
 
     Ok(None)

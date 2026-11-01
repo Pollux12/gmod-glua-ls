@@ -4,10 +4,9 @@ use rowan::TextSize;
 use smol_str::SmolStr;
 
 use crate::{
-    CallerSite, DbIndex, FileId, GlobalId, GmodRealm, InFiled, InferFailReason, InferGuard,
-    InferGuardRef, LuaGenericType, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner,
-    LuaMergedTableType, LuaObjectType, LuaTupleType, LuaType, LuaTypeDeclId, TypeOps,
-    check_type_compact,
+    CallerSite, DbIndex, FileId, GmodRealm, InFiled, InferFailReason, InferGuard, InferGuardRef,
+    LuaGenericType, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaMergedTableType,
+    LuaObjectType, LuaTupleType, LuaType, LuaTypeDeclId, TypeOps, check_type_compact,
     semantic::{
         LuaInferCache,
         generic::{TypeSubstitutor, instantiate_type_generic},
@@ -529,10 +528,10 @@ fn infer_custom_type_raw_member_type(
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, member_key) {
         return member_item.resolve_type(db);
     }
-    let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(type_id.get_name()));
-    if let Some(member_item) = db
-        .get_member_index()
-        .get_member_item(&global_owner, member_key)
+    if let Some(global_owner) = type_id.global_member_owner(db)
+        && let Some(member_item) = db
+            .get_member_index()
+            .get_member_item(&global_owner, member_key)
     {
         return member_item.resolve_type(db);
     }

@@ -9,7 +9,7 @@ use smol_str::SmolStr;
 
 use crate::db_index::derivation::FilePosition;
 use crate::{
-    DbIndex, FileId, LuaMember, LuaMemberKey, LuaMemberOwner, TypeSubstitutor,
+    DbIndex, FileId, GlobalId, LuaMember, LuaMemberKey, LuaMemberOwner, TypeSubstitutor,
     instantiate_type_generic,
 };
 
@@ -603,6 +603,22 @@ impl LuaTypeDeclId {
                 LuaTypeIdentifier::Local(right_file, right),
             ) => left_file.cmp(right_file).then_with(|| left.cmp(right)),
         }
+    }
+
+    /// The global holding the members written through this type's table: its
+    /// namesake, which a file-private type shares only when its own file
+    /// declares that global.
+    pub fn global_member_owner(&self, db: &DbIndex) -> Option<LuaMemberOwner> {
+        let shares_global = match self.get_id() {
+            LuaTypeIdentifier::Global(_) => true,
+            LuaTypeIdentifier::Local(file_id, name) => {
+                let root = name.split('.').next().unwrap_or(name);
+                db.get_global_index()
+                    .get_global_decl_ids(root)
+                    .is_some_and(|decl_ids| decl_ids.iter().any(|id| id.file_id == *file_id))
+            }
+        };
+        shares_global.then(|| LuaMemberOwner::GlobalPath(GlobalId::new(self.get_name())))
     }
 
     pub fn get_simple_name(&self) -> &str {

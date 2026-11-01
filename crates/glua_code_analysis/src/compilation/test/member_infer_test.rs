@@ -1590,6 +1590,65 @@ parser:parse()",
         verify_eq!(owners("Name").len(), 1)
     }
 
+    fn member_names(ws: &VirtualWorkspace, type_id: LuaTypeDeclId) -> Vec<String> {
+        let db = ws.analysis.compilation.get_db();
+        let mut names = crate::get_member_map(db, &LuaType::Ref(type_id))
+            .unwrap_or_default()
+            .into_keys()
+            .filter_map(|key| key.get_name().map(str::to_string))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// A file-private class shares nothing with a global of its name declared
+    /// in another file: its members neither list nor read the global's.
+    #[gtest]
+    fn test_private_class_members_exclude_an_unrelated_global() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "hidden.lua",
+            r#"
+            ---@class (private) Hidden
+            ---@field Declared string
+            local Hidden = {}
+
+            ---@type Hidden
+            local hidden
+            read_other = hidden.OtherField
+            "#,
+        );
+        ws.def_file("other.lua", "Hidden = {}\nHidden.OtherField = 1\n");
+
+        verify_eq!(
+            member_names(&ws, LuaTypeDeclId::local(file_id, "Hidden")),
+            vec!["Declared".to_string()]
+        )?;
+        verify_eq!(ws.expr_ty("read_other"), LuaType::Nil)
+    }
+
+    /// A file-private class declared on a global of its own file holds the
+    /// members written through that global.
+    #[gtest]
+    fn test_private_class_members_include_writes_through_its_own_global() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "bound.lua",
+            r#"
+            ---@class (private) Bound
+            ---@field Declared string
+            Bound = {}
+
+            function Bound:Method() end
+            "#,
+        );
+
+        verify_eq!(
+            member_names(&ws, LuaTypeDeclId::local(file_id, "Bound")),
+            vec!["Declared".to_string(), "Method".to_string()]
+        )
+    }
+
     #[gtest]
     fn test_guarded_dynamic_key_assignment_preserves_shaped_table_value() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();

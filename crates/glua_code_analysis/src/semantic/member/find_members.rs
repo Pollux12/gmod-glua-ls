@@ -422,12 +422,9 @@ fn find_custom_type_members(
 
     // The class's global holds the members written through it outside the
     // class's own declaration; a key the class declares itself wins.
-    if let Some(global_members) = find_owner_members(
-        db,
-        ctx,
-        &LuaMemberOwner::GlobalPath(GlobalId::new(type_decl_id.get_name())),
-        filter,
-    ) {
+    if let Some(global_owner) = type_decl_id.global_member_owner(db)
+        && let Some(global_members) = find_owner_members(db, ctx, &global_owner, filter)
+    {
         let declared_keys = members
             .iter()
             .map(|member| member.key.clone())

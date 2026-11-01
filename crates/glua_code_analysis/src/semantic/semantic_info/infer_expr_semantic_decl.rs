@@ -555,10 +555,10 @@ fn infer_custom_type_member_semantic_decl(
             None => member_item.resolve_semantic_decl_with_realm(db, &cache.get_file_id()),
         });
     }
-    let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(prefix_type_id.get_name()));
-    if let Some(member_item) = db
-        .get_member_index()
-        .get_member_item(&global_owner, member_key)
+    if let Some(global_owner) = prefix_type_id.global_member_owner(db)
+        && let Some(member_item) = db
+            .get_member_index()
+            .get_member_item(&global_owner, member_key)
     {
         return Ok(match member_access_position {
             Some(position) => member_item.resolve_semantic_decl_with_realm_at_offset(

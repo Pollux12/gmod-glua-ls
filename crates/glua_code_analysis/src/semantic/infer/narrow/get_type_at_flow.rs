@@ -3451,8 +3451,9 @@ fn resolve_assigned_type_member(
         );
     }
 
-    let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(type_id.get_name()));
-    if let Some(member_item) = db.get_member_index().get_member_item(&global_owner, key) {
+    if let Some(global_owner) = type_id.global_member_owner(db)
+        && let Some(member_item) = db.get_member_index().get_member_item(&global_owner, key)
+    {
         return member_item.resolve_type_with_realm_at_offset(
             db,
             &cache.get_file_id(),

@@ -2459,47 +2459,48 @@ fn infer_custom_type_member(
         // A realm-incompatible override must not hide a compatible inherited
         // member. Continue through the normal owner hierarchy.
     }
-    let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(prefix_type_id.get_name()));
-    if matches!(key, LuaMemberKey::ExprType(_))
-        && let Some(member_type) = infer_owner_expr_key_member_type(
-            db,
-            &global_owner,
-            &key,
-            cache.get_file_id(),
-            access_position,
-        )?
-    {
-        return Ok(member_type);
-    }
-    if let Some(member_item) = db.get_member_index().get_member_item(&global_owner, &key) {
-        let resolved = member_item.resolve_type_with_realm_at_offset(
-            db,
-            &cache.get_file_id(),
-            access_position,
-        );
-        let decl_backed_type = resolve_decl_backed_global_path_member_type(
-            db,
-            member_item,
-            &cache.get_file_id(),
-            key.clone(),
-            Some(access_position),
-        );
-        if let Some(module_decl_type) = decl_backed_type.clone()
-            && resolved
-                .as_ref()
-                .is_ok_and(|resolved_type| resolved_type.is_table())
+    if let Some(global_owner) = prefix_type_id.global_member_owner(db) {
+        if matches!(key, LuaMemberKey::ExprType(_))
+            && let Some(member_type) = infer_owner_expr_key_member_type(
+                db,
+                &global_owner,
+                &key,
+                cache.get_file_id(),
+                access_position,
+            )?
         {
-            return Ok(module_decl_type);
+            return Ok(member_type);
         }
-        if resolved.is_ok() {
+        if let Some(member_item) = db.get_member_index().get_member_item(&global_owner, &key) {
+            let resolved = member_item.resolve_type_with_realm_at_offset(
+                db,
+                &cache.get_file_id(),
+                access_position,
+            );
+            let decl_backed_type = resolve_decl_backed_global_path_member_type(
+                db,
+                member_item,
+                &cache.get_file_id(),
+                key.clone(),
+                Some(access_position),
+            );
+            if let Some(module_decl_type) = decl_backed_type.clone()
+                && resolved
+                    .as_ref()
+                    .is_ok_and(|resolved_type| resolved_type.is_table())
+            {
+                return Ok(module_decl_type);
+            }
+            if resolved.is_ok() {
+                return resolved;
+            }
+
+            if let Some(module_decl_type) = decl_backed_type {
+                return Ok(module_decl_type);
+            }
+
             return resolved;
         }
-
-        if let Some(module_decl_type) = decl_backed_type {
-            return Ok(module_decl_type);
-        }
-
-        return resolved;
     }
     let local_class_member_ids =
         cached_local_class_table_member_ids(db, cache, &prefix_type_id, &key);
