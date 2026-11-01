@@ -333,7 +333,7 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
         let (insert_text, is_snippet) = match (has_bits_param, bits) {
             (true, Some(bits)) => (format!("{read_name}({bits})"), false),
             (true, None) => (format!("{read_name}(${{1:bits}})"), true),
-            (false, _) => (read_name.clone(), false),
+            (false, _) => (format!("{read_name}()"), false),
         };
 
         let _ = builder.add_completion_item(CompletionItem {

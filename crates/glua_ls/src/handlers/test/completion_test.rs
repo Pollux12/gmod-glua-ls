@@ -3346,6 +3346,66 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_net_read_completion_inserts_a_call() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.network.completion.smart_read_suggestions = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "addons/test/lua/autorun/server/send.lua",
+            r#"
+            net.Start("MyMsg")
+            net.WriteString(name)
+            net.WriteUInt(id, 8)
+            net.Broadcast()
+            "#,
+        );
+
+        let (receive_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            net.Receive("MyMsg", function()
+                local name = net.<??>
+            end)
+            "#,
+        )?;
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/client/receive.lua",
+            receive_content.as_str(),
+        );
+
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let inserted = |label: &str| {
+            items
+                .iter()
+                .find(|item| item.label == label)
+                .and_then(|item| match &item.text_edit {
+                    Some(lsp_types::CompletionTextEdit::Edit(edit)) => Some(edit.new_text.clone()),
+                    _ => None,
+                })
+        };
+
+        verify_that!(inserted("net.ReadString"), some(eq("net.ReadString()")))?;
+        verify_that!(inserted("net.ReadUInt"), some(eq("net.ReadUInt(8)")))?;
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_net_read_completion_uses_reader_bits_metadata() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -3418,7 +3478,7 @@ mod tests {
         };
 
         verify_eq!(item.kind, Some(CompletionItemKind::FUNCTION))?;
-        verify_that!(text_edit.new_text.as_str(), eq("MyNet.ReadAsymmetric"))?;
+        verify_that!(text_edit.new_text.as_str(), eq("MyNet.ReadAsymmetric()"))?;
         verify_that!(
             item.insert_text_format,
             eq(Some(InsertTextFormat::PLAIN_TEXT))
