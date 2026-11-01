@@ -1211,6 +1211,31 @@ mod tests {
     }
 
     #[gtest]
+    fn test_function_type_field_detail_spaces_its_return_arrow() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class C1
+                ---@field get_force fun(self: C1): number
+            "#,
+        );
+        check!(ws.check_completion_with_kind(
+            r#"
+                ---@type C1
+                local c1
+                c1:<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "get_force".to_string(),
+                kind: CompletionItemKind::METHOD,
+                label_detail: Some("() -> number".to_string()),
+            }],
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_class_function_3() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         ws.def(

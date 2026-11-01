@@ -294,7 +294,7 @@ pub fn get_detail(
             let rets_detail = match ret_type {
                 LuaType::Nil => "".to_string(),
                 _ => format!(
-                    "-> {}",
+                    " -> {}",
                     return_type_detail(builder.semantic_model.get_db(), ret_type)
                 ),
             };
