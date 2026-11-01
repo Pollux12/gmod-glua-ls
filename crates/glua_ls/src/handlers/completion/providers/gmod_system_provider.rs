@@ -281,6 +281,9 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
         return false;
     }
 
+    let inserts_call =
+        builder.semantic_model.get_emmyrc().completion.call_snippet && !is_called(&index_expr);
+
     let mismatch_marker = if builder
         .semantic_model
         .get_emmyrc()
@@ -330,10 +333,11 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
         // `bits` alone cannot separate the first two from the third, because it
         // is `None` both when there is no bit parameter and when the writer
         // passed a variable.
-        let (insert_text, is_snippet) = match (has_bits_param, bits) {
-            (true, Some(bits)) => (format!("{read_name}({bits})"), false),
-            (true, None) => (format!("{read_name}(${{1:bits}})"), true),
-            (false, _) => (format!("{read_name}()"), false),
+        let (insert_text, is_snippet) = match (inserts_call, has_bits_param, bits) {
+            (false, _, _) => (read_name.clone(), false),
+            (true, true, Some(bits)) => (format!("{read_name}({bits})"), false),
+            (true, true, None) => (format!("{read_name}(${{1:bits}})"), true),
+            (true, false, _) => (format!("{read_name}()"), false),
         };
 
         let _ = builder.add_completion_item(CompletionItem {
@@ -360,6 +364,15 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
     }
 
     true
+}
+
+/// Whether `index_expr` is already the callee of a call, whose arguments a
+/// completion replacing only `index_expr` keeps.
+fn is_called(index_expr: &LuaIndexExpr) -> bool {
+    index_expr
+        .get_parent::<LuaCallExpr>()
+        .and_then(|call_expr| call_expr.get_prefix_expr())
+        .is_some_and(|prefix_expr| prefix_expr.syntax() == index_expr.syntax())
 }
 
 fn choose_preferred_send_flow<'a>(

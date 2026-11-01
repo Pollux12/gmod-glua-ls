@@ -8,7 +8,7 @@ mod tests {
         CompletionItemKind, CompletionItemTag, CompletionResponse, CompletionTriggerKind,
         Documentation, InsertTextFormat, MarkupContent,
     };
-    use std::{fs, path::PathBuf};
+    use std::{collections::HashMap, fs, path::PathBuf};
     use tokio_util::sync::CancellationToken;
 
     use crate::handlers::completion::{completion, completion_with_deprecated_tag_support};
@@ -3408,12 +3408,14 @@ mod tests {
         Ok(())
     }
 
-    #[gtest]
-    fn test_gmod_net_read_completion_inserts_a_call() -> Result<()> {
+    /// The text each net read completion inserts at `read` inside a receiver
+    /// of a `WriteString` then `WriteUInt(id, 8)` send, keyed by label.
+    fn net_read_insertions(read: &str, call_snippet: bool) -> Result<HashMap<String, String>> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.network.completion.smart_read_suggestions = true;
+        emmyrc.completion.call_snippet = call_snippet;
         ws.analysis.update_config(emmyrc.into());
         ws.def_gmod_call_arg_builtins();
 
@@ -3427,13 +3429,13 @@ mod tests {
             "#,
         );
 
-        let (receive_content, position) = ProviderVirtualWorkspace::handle_file_content(
+        let (receive_content, position) = ProviderVirtualWorkspace::handle_file_content(&format!(
             r#"
             net.Receive("MyMsg", function()
-                local name = net.<??>
+                local name = {read}
             end)
-            "#,
-        )?;
+            "#
+        ))?;
         let file_id = ws.def_file(
             "addons/test/lua/autorun/client/receive.lua",
             receive_content.as_str(),
@@ -3452,20 +3454,39 @@ mod tests {
             CompletionResponse::Array(items) => items,
             CompletionResponse::List(list) => list.items,
         };
-        let inserted = |label: &str| {
-            items
-                .iter()
-                .find(|item| item.label == label)
-                .and_then(|item| match &item.text_edit {
-                    Some(lsp_types::CompletionTextEdit::Edit(edit)) => Some(edit.new_text.clone()),
-                    _ => None,
-                })
-        };
+        Ok(items
+            .into_iter()
+            .filter_map(|item| match item.text_edit {
+                Some(lsp_types::CompletionTextEdit::Edit(edit)) => {
+                    Some((item.label, edit.new_text))
+                }
+                _ => None,
+            })
+            .collect())
+    }
 
-        verify_that!(inserted("net.ReadString"), some(eq("net.ReadString()")))?;
-        verify_that!(inserted("net.ReadUInt"), some(eq("net.ReadUInt(8)")))?;
+    #[gtest]
+    fn test_gmod_net_read_completion_inserts_a_call() -> Result<()> {
+        let inserted = net_read_insertions("net.<??>", true)?;
+
+        verify_that!(inserted.get("net.ReadString"), some(eq("net.ReadString()")))?;
+        verify_that!(inserted.get("net.ReadUInt"), some(eq("net.ReadUInt(8)")))?;
 
         Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_net_read_completion_keeps_the_existing_call() -> Result<()> {
+        let inserted = net_read_insertions("net.R<??>()", true)?;
+
+        verify_that!(inserted.get("net.ReadString"), some(eq("net.ReadString")))
+    }
+
+    #[gtest]
+    fn test_gmod_net_read_completion_inserts_no_call_without_call_snippets() -> Result<()> {
+        let inserted = net_read_insertions("net.<??>", false)?;
+
+        verify_that!(inserted.get("net.ReadUInt"), some(eq("net.ReadUInt")))
     }
 
     #[gtest]
