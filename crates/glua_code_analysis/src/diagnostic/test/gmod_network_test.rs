@@ -35,6 +35,16 @@ mod tests {
             .count()
     }
 
+    /// The `(line, start column, end column)` of a diagnostic's range.
+    fn diagnostic_span(diagnostic: &Diagnostic) -> (u32, u32, u32) {
+        let range = diagnostic.range;
+        assert_eq!(
+            range.start.line, range.end.line,
+            "expected a one-line range"
+        );
+        (range.start.line, range.start.character, range.end.character)
+    }
+
     fn count_network_diagnostics(diagnostics: &[Diagnostic]) -> usize {
         count_diagnostic(diagnostics, DiagnosticCode::GmodNetReadWriteTypeMismatch)
             + count_diagnostic(diagnostics, DiagnosticCode::GmodNetReadWriteOrderMismatch)
@@ -87,6 +97,8 @@ mod tests {
                 .contains("expected `net.ReadEntity`, got `net.ReadString`"),
             eq(true)
         );
+        // Reported on the read itself, not the whole receive block.
+        expect_that!(diagnostic_span(mismatch), eq((2, 26, 42)));
     }
 
     #[gtest]
@@ -121,6 +133,54 @@ mod tests {
             count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteOrderMismatch),
             eq(1usize)
         );
+        // Reported on the first read out of order, not the whole receive block.
+        expect_that!(diagnostic_span(&diagnostics[0]), eq((2, 29, 45)));
+    }
+
+    /// A mismatched read composed from a helper in another file has no range
+    /// in the receiving file, so the warning stays on the receive block.
+    #[gtest]
+    fn test_mismatch_from_helper_in_other_file_reports_on_receive_block() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteTypeMismatch);
+
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("Msg")
+            net.Start("Msg")
+            net.WriteEntity(e)
+            net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/cl_helpers.lua",
+            r#"
+            function ReadPayloadName()
+                return net.ReadString()
+            end
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("Msg", function()
+                local name = ReadPayloadName()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        let mismatch = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == diagnostic_code(DiagnosticCode::GmodNetReadWriteTypeMismatch)
+            })
+            .expect("expected gmod-net-read-write-type-mismatch diagnostic");
+        expect_that!(mismatch.range.start.line, eq(1));
+        expect_that!(mismatch.range.end.line, eq(3));
     }
 
     #[gtest]

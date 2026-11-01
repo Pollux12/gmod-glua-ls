@@ -125,7 +125,7 @@ fn check_read_write_mismatch(
                 break;
             }
 
-            let (code, range, message) = first_mismatch_diagnostic(network_index, send_flow, receive_flow)
+            let (code, range, message) = first_mismatch_diagnostic(network_index, file_id, send_flow, receive_flow)
                 .unwrap_or_else(|| {
                     (
                         DiagnosticCode::GmodNetReadWriteOrderMismatch,
@@ -412,6 +412,7 @@ fn expected_read_label(network_index: &crate::GmodNetworkIndex, write: &NetOpEnt
 
 fn first_mismatch_diagnostic(
     network_index: &crate::GmodNetworkIndex,
+    file_id: crate::FileId,
     send_flow: &NetSendFlow,
     receive_flow: &NetReceiveFlow,
 ) -> Option<(DiagnosticCode, rowan::TextRange, String)> {
@@ -447,11 +448,18 @@ fn first_mismatch_diagnostic(
 
         let expected = expected_read_label(network_index, write);
         let actual = read.display_name.as_str();
+        // A read composed from a helper in another file is reported on the
+        // receive block, the part of the flow this file holds.
+        let range = if read.file_id == file_id {
+            read.range
+        } else {
+            receive_flow.receive_range
+        };
 
         if is_mispositioned_read(send_flow, index, read) {
             return Some((
                 DiagnosticCode::GmodNetReadWriteOrderMismatch,
-                receive_flow.receive_range,
+                range,
                 format!(
                     "Read/write order mismatch for `{name}` at position {position}: expected `{expected}`, got `{actual}`.",
                     name = receive_flow.message_name,
@@ -463,7 +471,7 @@ fn first_mismatch_diagnostic(
 
         return Some((
             DiagnosticCode::GmodNetReadWriteTypeMismatch,
-            receive_flow.receive_range,
+            range,
             format!(
                 "Read/write type mismatch for `{name}` at position {position}: expected `{expected}`, got `{actual}`.",
                 name = receive_flow.message_name,
