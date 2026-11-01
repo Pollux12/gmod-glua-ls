@@ -153,6 +153,26 @@ mod tests {
         assert_eq!(found[0].range.start.line, 1);
     }
 
+    /// Passing an unknown value to a generic parameter says nothing about it:
+    /// `ipairs`'s `V[]` is a placeholder until a call supplies `V`, so no type
+    /// is inferred from it.
+    #[test]
+    fn infer_unknown_does_not_infer_a_generic_parameter_container() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "annotations/infer-unknown.lua",
+            "---@meta\n---@return unknown\nfunction unknown_source() end\n",
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/infer-unknown.lua",
+            "local radios = unknown_source()\nfor _, radio in ipairs(radios) do\n    print(radio)\nend\n",
+        );
+
+        let found = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown);
+        assert_eq!(found, vec![]);
+        assert_eq!(local_type(&ws, file_id, "radios"), LuaType::Unknown);
+    }
+
     #[test]
     fn infer_unknown_can_be_disabled_independently() {
         let (mut ws, file_id) = workspace();

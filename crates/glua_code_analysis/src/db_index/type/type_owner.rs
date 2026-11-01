@@ -182,8 +182,9 @@ pub(crate) fn uninformative_rank(typ: &LuaType) -> Option<u8> {
 /// the checkers read — the arms beside the leak are real, so narrowing and
 /// nil-checking against them stay sound.
 ///
-/// Only value positions are checked: a function or table type that is generic
-/// *over* a parameter is a real type.
+/// Only value positions are checked, containers' elements among them: a
+/// function type that is generic *over* a parameter is a real type, but a
+/// table of an uninstantiated parameter (`V[]`) is still a placeholder.
 pub fn leaks_unsubstituted_tpl(typ: &LuaType) -> bool {
     match typ {
         LuaType::TplRef(_) | LuaType::StrTplRef(_) | LuaType::ConstTplRef(_) => true,
@@ -192,6 +193,16 @@ pub fn leaks_unsubstituted_tpl(typ: &LuaType) -> bool {
             .get_unions()
             .iter()
             .any(|(typ, _)| leaks_unsubstituted_tpl(typ)),
+        LuaType::Array(array) => leaks_unsubstituted_tpl(array.get_base()),
+        LuaType::Tuple(tuple) => tuple.get_types().iter().any(leaks_unsubstituted_tpl),
+        LuaType::TableGeneric(params) => params.iter().any(leaks_unsubstituted_tpl),
+        LuaType::Generic(generic) => generic.get_params().iter().any(leaks_unsubstituted_tpl),
+        LuaType::Object(object) => {
+            object.get_fields().values().any(leaks_unsubstituted_tpl)
+                || object.get_index_access().iter().any(|(key, value)| {
+                    leaks_unsubstituted_tpl(key) || leaks_unsubstituted_tpl(value)
+                })
+        }
         _ => false,
     }
 }
