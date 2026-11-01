@@ -4910,6 +4910,39 @@ mod tests {
         Ok(hooks)
     }
 
+    /// A function returning several values without `---@return` docs shows
+    /// the first of them, as documented multiple returns are shown.
+    #[gtest]
+    fn test_inferred_multiple_returns_show_the_first_value() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def_file(
+            "lua/lib/sh_chat.lua",
+            "lib = lib or {}\nfunction lib.Parse(message)\n    return \"ic\", message, false\nend\n",
+        );
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content("lib.<??>\n")?;
+        let file_id = ws.def_file("lua/autorun/sh_use.lua", &content);
+        let items = match completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?
+        {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let detail = items
+            .into_iter()
+            .find(|item| item.label == "Parse")
+            .and_then(|item| item.label_details)
+            .and_then(|details| details.detail);
+
+        verify_eq!(detail, Some("(message) -> \"ic\" ...".to_string()))
+    }
+
     #[gtest]
     fn test_gmod_plugin_completion_offers_derived_gamemode_hooks_in_schema_workspace() -> Result<()>
     {
