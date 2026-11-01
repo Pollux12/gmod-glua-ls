@@ -1958,6 +1958,52 @@ local EscapeStringMap: {
     }
 
     #[gtest]
+    fn test_hover_client_library_function_called_from_server_shows_its_signature() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let annotations_root = ws.virtual_url_generator.base.join("annotations");
+        ws.analysis.add_library_workspace(annotations_root);
+        ws.def_file(
+            "annotations/surface.lua",
+            r#"
+            ---@meta
+
+            surface = {}
+
+            ---Plays a sound file directly on the client.
+            ---@realm client
+            ---@param soundfile string The path to the sound file.
+            function surface.PlaySound(soundfile) end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                surface.Play<??>Sound("buttons/button14.wav")
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/server/sv_shop.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        verify_that!(
+            markup.value,
+            all!(
+                contains_substring("surface.PlaySound(soundfile: string)"),
+                contains_substring("Plays a sound file directly on the client."),
+                contains_substring("**CLIENT**")
+            )
+        )
+    }
+
+    #[gtest]
     fn test_hover_table_method_annotation_realm_overrides_shared_file_realm() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

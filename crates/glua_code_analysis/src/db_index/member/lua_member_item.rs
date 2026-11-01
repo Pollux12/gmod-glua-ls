@@ -169,8 +169,19 @@ impl LuaMemberIndexItem {
         db: &DbIndex,
         site: &CallerSite,
     ) -> Vec<LuaMemberId> {
+        self.visible_member_ids_at_site_in_realm(db, site, site.realm(db))
+    }
+
+    /// [`Self::visible_member_ids_at_site`] for a caller in `caller_realm`.
+    fn visible_member_ids_at_site_in_realm(
+        &self,
+        db: &DbIndex,
+        site: &CallerSite,
+        caller_realm: GmodRealm,
+    ) -> Vec<LuaMemberId> {
         if let LuaMemberIndexItem::One(member_id) = self {
-            if let Some(visible_member_id) = visible_single_member_id_at_site(db, *member_id, site)
+            if let Some(visible_member_id) =
+                visible_single_member_id_at_site(db, *member_id, site, caller_realm)
             {
                 return vec![visible_member_id];
             }
@@ -180,7 +191,6 @@ impl LuaMemberIndexItem {
         // selects indices into it, so the ids are materialised once, in the
         // output, instead of once per stage.
         let member_ids = self.member_ids_slice();
-        let caller_realm = site.realm(db);
         let caller_file_id = &site.file_id;
         let mut query = OffsetVisibilityQuery::new(db, site);
         let mut visible = query.visible_indices(member_ids);
@@ -253,6 +263,7 @@ fn visible_single_member_id_at_site(
     db: &DbIndex,
     member_id: LuaMemberId,
     site: &CallerSite,
+    caller_realm: GmodRealm,
 ) -> Option<LuaMemberId> {
     if !member_visible_at_offset(db, member_id, site)
         || should_expand_function_assignment_history(db, &[member_id], site)
@@ -272,7 +283,6 @@ fn visible_single_member_id_at_site(
         return Some(member_id);
     }
 
-    let caller_realm = site.realm(db);
     let member_realm = member_effective_realm(db.get_gmod_infer_index(), &member_id);
     if is_realm_compatible(caller_realm, member_realm) {
         Some(member_id)
@@ -1169,12 +1179,19 @@ fn resolve_member_semantic_id_with_realm(
     resolve_member_semantic_id(db, &member_item_from_ids(visible_member_ids))
 }
 
+/// The declaration an access at `site` names. One defined only for another
+/// realm is still what the access names: the realm misuse is a diagnostic's
+/// to report, so it is the fallback when the caller's realm sees none.
 fn resolve_member_semantic_id_at_site(
     db: &DbIndex,
     member_item: &LuaMemberIndexItem,
     site: &CallerSite,
 ) -> Option<LuaSemanticDeclId> {
-    let visible_member_ids = member_item.visible_member_ids_at_site(db, site);
+    let mut visible_member_ids = member_item.visible_member_ids_at_site(db, site);
+    if visible_member_ids.is_empty() {
+        visible_member_ids =
+            member_item.visible_member_ids_at_site_in_realm(db, site, GmodRealm::Unknown);
+    }
 
     resolve_member_semantic_id(db, &member_item_from_ids(visible_member_ids))
 }

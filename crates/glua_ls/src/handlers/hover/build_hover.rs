@@ -21,7 +21,7 @@ use crate::handlers::hover::function::{
     build_function_hover, format_doc_default_value, is_function,
 };
 use crate::handlers::hover::humanize_type_decl::build_type_decl_hover;
-use crate::handlers::hover::humanize_types::hover_humanize_type;
+use crate::handlers::hover::humanize_types::{hover_humanize_type, infer_property_owner_realm};
 
 use super::{
     color_swatch::color_swatch_markdown,
@@ -54,15 +54,16 @@ pub fn build_semantic_info_hover(
     };
     let typ = assignment_type.unwrap_or_else(|| semantic_info.display_typ().clone());
     let type_label = HoverTypeLabel::from_semantic_origin(semantic_info.origin);
-    if semantic_info.semantic_decl.is_none() {
+    let Some(semantic_decl) = semantic_info.semantic_decl else {
         return build_hover_without_property(db, semantic_model, document, token, typ, type_label);
-    }
+    };
+    let typ = other_realm_member_type(semantic_model, &token, &semantic_decl, typ);
     let hover_builder = build_hover_content(
         compilation,
         semantic_model,
         db,
-        Some(typ.clone()),
-        semantic_info.semantic_decl.unwrap(),
+        Some(typ),
+        semantic_decl,
         false,
         Some(token.clone()),
         render_level,
@@ -80,6 +81,34 @@ pub fn build_semantic_info_hover(
         hover_builder.build_hover_result(document.to_lsp_range(range))
     } else {
         None
+    }
+}
+
+/// The type to show for a member access that reads `typ`. An access whose
+/// realm cannot reach the member's only definition reads `nil`, yet it names
+/// that definition, so the hover shows the definition's type.
+fn other_realm_member_type(
+    semantic_model: &SemanticModel,
+    token: &LuaSyntaxToken,
+    semantic_decl: &LuaSemanticDeclId,
+    typ: LuaType,
+) -> LuaType {
+    let LuaSemanticDeclId::Member(member_id) = semantic_decl else {
+        return typ;
+    };
+    if !typ.is_nil() {
+        return typ;
+    }
+    let access_realm = semantic_model
+        .get_db()
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&semantic_model.get_file_id(), token.text_range().start());
+    let reachable = infer_property_owner_realm(semantic_model, semantic_decl)
+        .is_none_or(|member_realm| access_realm.is_compatible_with(member_realm));
+    if reachable {
+        typ
+    } else {
+        semantic_model.get_type((*member_id).into())
     }
 }
 
