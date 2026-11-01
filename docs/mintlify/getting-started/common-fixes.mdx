@@ -30,6 +30,10 @@ GLuaLS works out whether code runs on the client, the server or both (shared). I
 - How the file is loaded, such as `AddCSLuaFile` and `include`
 - A `---@realm client`, `---@realm server` or `---@realm shared` annotation, which takes priority over everything else
 
+<Frame>
+  <img src="/images/showcase/realm-check.gif" alt="A client-only function in a server net.Receive gets a realm warning, and its hover shows the CLIENT badge" />
+</Frame>
+
 If a warning says code runs in the wrong realm, check these first. Usually the fix is to wrap the code in `if CLIENT then` / `if SERVER then`, or to rename the file with the right prefix.
 
 When only one function is different, annotate that function:

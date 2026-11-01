@@ -45,6 +45,10 @@ See [Garry's Mod annotations](/configuration/annotations-management) for downloa
 | `gmod.network.completion.mismatchHints` | `true` | Mark suggestions that do not match the expected read |
 | `gmod.network.codeLensEnabled` | `true` | Show a code lens above net message receivers |
 
+<Frame>
+  <img src="/images/showcase/net-messages.gif" alt="A net message sent with no receiver is flagged. The receiver completes the message name and suggests each read in order. Moving a write flags the read that no longer matches" />
+</Frame>
+
 To turn off one net check, add its code to `diagnostics.disable`. The codes are listed in [Diagnostics settings](/configuration/diagnostics#garrys-mod).
 
 ## VGUI
@@ -67,6 +71,10 @@ Use these when your project calls hooks through its own functions.
 ## Scripted classes
 
 GLuaLS recognizes entities, weapons, effects, tools, player classes, gamemodes, and plugins and schemas for frameworks such as Helix, based on their folders. Each type is a *scope* in `gmod.scriptedClassScopes.include`. You only need this setting to add your own class type or change a built-in one.
+
+<Frame>
+  <img src="/images/showcase/scripted-classes.gif" alt="The Class Explorer listing effects, entities and Helix plugins, then completing a gamemode hook in a Helix plugin" />
+</Frame>
 
 Built-in scope ids: `entities`, `weapons`, `effects`, `stools`, `player_classes`, `plugins`, `schemas`, `gamemodes`.
 

@@ -15,6 +15,10 @@ The debugger works like any other VS Code debugger:
 - While paused, the **Variables** panel shows locals, upvalues and globals. Double-click a value to change it.
 - Type Lua in the **Debug Console** (`Ctrl+Shift+Y`) to run it where the code is paused, with access to its local variables.
 
+<Frame>
+  <img src="/images/showcase/debugger.gif" alt="Setting a breakpoint, running a file, then pausing with variable values shown inline and stepping over" />
+</Frame>
+
 ## Run Lua on the server or client
 
 While connected, you can run code without leaving VS Code:
@@ -33,8 +37,16 @@ Code runs in the realm shown as **Realm** in the status bar. Click it to switch 
 
 The **Errors** view in the Run and Debug sidebar collects Lua errors from the game while the debugger is connected. Repeated errors are grouped with a count. Click a stack frame to open that line in your code. Use **Clear** to empty the list.
 
+<Frame>
+  <img src="/images/showcase/runtime-errors.gif" alt="A Lua error appears in the Errors view, and clicking its stack frame opens the line that caused it" />
+</Frame>
+
 To pause the game when an error happens, set `"stopOnError": true` in `launch.json`. This also pauses on errors from other addons.
 
 ## Entity Explorer
 
 The **Entity Explorer** in the Run and Debug sidebar lists every entity in the game. Expand one to see its NetworkVars and table values. Use the toolbar to filter by type (players, Lua entities, others) or search names and values. While the debugger is paused, click a value or its pencil button to change it.
+
+<Frame>
+  <img src="/images/showcase/entity-explorer.gif" alt="The Entity Explorer expanding a balloon entity to show its Force NetworkVar" />
+</Frame>
