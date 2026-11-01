@@ -5,7 +5,6 @@ mod command;
 mod completion;
 mod configuration;
 mod definition;
-mod doc_search;
 mod document_color;
 mod document_formatting;
 mod document_highlight;
