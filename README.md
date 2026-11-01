@@ -35,26 +35,19 @@
 
 This repository contains the core language server and backend tooling that power the **[VSCode extension](https://github.com/Pollux12/vscode-gmod-glua-ls)**.
 
-You can find the VSCode extension and a full list of features here:
-https://marketplace.visualstudio.com/items?itemName=Pollux.gmod-glua-ls
+Install the extension from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Pollux.gmod-glua-ls).
 
 ---
 
-## ⚡ Performance & Architecture
+## Features
 
-* **Rust-Powered Backend:** Delivers fast indexing with a minimal memory footprint - over 10x quicker on large projects while delivering more features.
-* **Full Language Server**: Includes everything you'd expect from a language server, such as syntax highlighting, diagnostics, symbol renaming, type resolution, goto, formatting and more.
-* **Shared Foundation:** This repo is the backend that powers the VSCode extension and other editor integrations built around the language server.
+* Completion, hover docs, diagnostics, go to definition, find references, rename and formatting
+* Realm checks for client and server code
+* Checks and completion for `net` messages and hooks
+* Typed scripted classes such as `ENT`, `SWEP`, `TOOL` and Helix plugins, including NetworkVars and AccessorFuncs
+* Fast analysis of large workspaces, written in Rust
 
-## 🧠 Garry's Mod Specific Features
-
-* **Class Resolution:** Automatic mapping for classes such as `ENT`, `SWEP`, `TOOL`, `PLUGIN` and others. NetworkVars, AccessorFuncs and VGUI panels are all registered as well.
-* **Realm Awareness:** Analyses file prefixes (`sv_`, `cl_`, `sh_`) and `include()` chains. Generates real-time diagnostics for cross-realm function calls (e.g. calling a clientside method on the server). Delivers realm-aware suggestions by filtering autocomplete based on realm.
-* **Network Validation:** Parses and validates `net.Start`, `net.Receive` and other net library usages, catching mismatched payloads, read/write order errors, and delivering enhanced autocomplete.
-* **Smart Hook Integration:** Intelligent autocomplete and signatures for all hooks, `GM:` functions, and custom `---@hook` annotations. Automatically detects and registers new custom hooks in addition to those parsed from the wiki.
-* **Class Explorer & Templates:** Dedicated side-panel to easily reference key classes (Entities, Weapons, VGUI, Plugins) and workspace resources (Materials, Sounds) alongside a configurable template system for easy creation.
-
-For a full list of features, see the VSCode extension page here: https://github.com/Pollux12/vscode-gmod-glua-ls
+See the [VSCode extension](https://github.com/Pollux12/vscode-gmod-glua-ls) for the full feature list with media.
 
 ---
 
@@ -64,12 +57,15 @@ For a full list of features, see the VSCode extension page here: https://github.
 
 The recommended setup is the **[VSCode extension](https://marketplace.visualstudio.com/items?itemName=Pollux.gmod-glua-ls)**.
 
-That is the product most users want. It wraps this language server with:
+It wraps this language server with:
 
 * automatic annotation downloads and updates,
 * debugger setup and tooling,
-* custom settings UI,
-* workspace helpers and editor-specific features.
+* custom settings UI and easier setup,
+* workspace helpers and editor-specific features,
+* many more QoL features.
+
+Since this started as just a vscode extension, many features are tied to it, such as annotations which only automatically download if used via the extension. It is possible to manually pass an annotation path to the language server if you want to use it standalone, and future automatic setup via just the language server is planned.
 
 ### Other Editors
 
@@ -91,11 +87,11 @@ cargo build --release
 
 Binary location: `target/release/glua_ls` (or `glua_ls.exe` on Windows)
 
-You can also point the upstream EmmyLua extension at the `glua_ls` binary if you only want the language server portion.
+You can also point the EmmyLua vscode extension at the `glua_ls` binary if you only want the language server portion, although this is not recommended.
 
 ### Zed
 
-Support for Zed is being worked on, but it will remain more limited than VSCode because Zed currently exposes less editor integration surface.
+Support for Zed is being worked on, but it will remain more limited than VSCode because Zed currently exposes far less functionality for extensions.
 
 ## 🐞 Debugger & Tooling
 
@@ -105,23 +101,25 @@ The debugger is intended for local development environments, especially SRCDS-ba
 
 ## 📚 Configuration & Annotations
 
-Configuration is easiest through the VSCode extension UI, but the underlying options are documented here as well:
+The language server is designed with defaults that should "just work" in most addons and gamemodes, when used via the VSCode extension. On its own, you will need to pass things like annotations manually to the language server, as they are currently managed by the extension.
 
-* [Configuration Reference](./docs/config.md)
-* [Annotation Documentation](./docs/annotations/README.md)
+Configuration is easiest through the VSCode extension's settings panel. Every option and annotation is documented at https://gluals.arnux.net:
 
-Standard EmmyLua / LuaCATS annotations are supported, along with GMod-specific additions such as `---@hook`.
+* [Configuration](https://gluals.arnux.net/configuration/overview)
+* [Annotations](https://gluals.arnux.net/annotations)
 
-See updated documentation here: https://gluals.arnux.net
+Standard EmmyLua / LuaCATS annotations are supported, however there are some key differences and additions to make it work better with Garry's Mod, such as new realm and hook annotations.
+
+You can find the annotations repo here: https://github.com/Pollux12/annotations-gmod-glua-ls
+
 
 ## Troubleshooting
 
-If you are using VSCode, avoid running multiple competing Lua language extensions at the same time. For Garry's Mod work, this should generally be the only Lua language server / debugger stack enabled.
+If you are using VSCode, avoid running multiple competing Lua language extensions at the same time. This language server is not compatible with "GLua Enhanced".
 
 If you are working outside the standard `garrysmod/addons` or `garrysmod/gamemodes` layout, some features may need manual configuration. If that setup does not work cleanly, please open an issue and include your folder structure.
 
 ---
 
-This is a hard fork of [EmmyLua Analyzer Rust](https://github.com/CppCXY/emmylua-analyzer-rust), maintained specifically for Garry's Mod GLua.
-The original EmmyLua project does not support plugins, nor does it have any plan for them, making it difficult to fully adapt for Garry's Mod. This project contains significant changes from the original and only works for Garry's Mod GLua.
-While LuaLS has plugin support, it was annoyingly slow to use. Many features here are based on my [LuaLS plugin](https://github.com/Pollux12/gmod-luals-addon).
+This project started as hard fork of [EmmyLua Analyzer Rust](https://github.com/CppCXY/emmylua-analyzer-rust), but has had significant changes since to make it work well with Garry's Mod.
+Some features are based on my [LuaLS plugin](https://github.com/Pollux12/gmod-luals-addon).
