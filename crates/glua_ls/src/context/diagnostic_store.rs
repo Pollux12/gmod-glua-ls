@@ -369,7 +369,15 @@ impl DiagnosticStore {
     /// Forgets a file that left the workspace, clearing what the client
     /// shows for it.
     pub fn remove(&self, file_id: FileId, uri: &Uri) {
-        let _publishing = self.publishing();
+        if self.forget(file_id) {
+            self.clear_forgotten(file_id, uri);
+        }
+    }
+
+    /// Forgets a file that left the workspace without sending anything, so it
+    /// can run under the analysis lock; returns whether the client shows
+    /// diagnostics for it, which [`Self::clear_forgotten`] then clears.
+    pub fn forget(&self, file_id: FileId) -> bool {
         let had = {
             let mut state = self.state();
             if let Some((_, token)) = state.computing.remove(&file_id) {
@@ -381,10 +389,17 @@ impl DiagnosticStore {
             state.open.remove(&file_id);
             state.entries.remove(&file_id).is_some()
         };
-        if had {
+        self.computed.notify_waiters();
+        had
+    }
+
+    /// Clears what the client shows for a forgotten file, unless it was
+    /// diagnosed again since: that publish already replaced it.
+    pub fn clear_forgotten(&self, file_id: FileId, uri: &Uri) {
+        let _publishing = self.publishing();
+        if !self.state().entries.contains_key(&file_id) {
             self.cleared(uri.clone());
         }
-        self.computed.notify_waiters();
     }
 
     /// Forgets every file not in `live`, clearing what the client shows for
@@ -921,7 +936,10 @@ mod tests {
     use glua_code_analysis::FileId;
     use googletest::prelude::*;
     use lsp_server::{Connection, Message};
-    use lsp_types::{ClientCapabilities, PublishDiagnosticsParams};
+    use lsp_types::{
+        ClientCapabilities, DidCloseTextDocumentParams, PublishDiagnosticsParams,
+        TextDocumentIdentifier,
+    };
     use tokio_util::sync::CancellationToken;
 
     use super::{Priority, State};
@@ -1093,6 +1111,64 @@ mod tests {
             })
             .await
             .expect("the store records a computation for the file");
+
+            let write = tokio::time::timeout(Duration::from_secs(2), snapshot.analysis().write())
+                .await
+                .map(drop);
+            verify_that!(write.is_ok(), eq(true))
+        });
+        std::thread::spawn(move || while peer_receiver.recv().is_ok() {});
+        result
+    }
+
+    /// Closing a file deleted from disk clears what the client shows for it
+    /// once the analysis is released, so a client slow to read does not hold
+    /// every other edit and request.
+    #[gtest]
+    fn closing_a_deleted_file_does_not_hold_the_analysis_on_the_client() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (sender, peer_receiver) = crossbeam_channel::bounded(0);
+        let (_peer_sender, receiver) = crossbeam_channel::bounded(0);
+        let connection = Connection { sender, receiver };
+        let result = runtime.block_on(async {
+            let context = ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let workspace = crate::util::unique_temp_dir("gmod_glua_ls_diagnostic_store");
+            let uri = glua_code_analysis::file_path_to_uri(&workspace.join("lua/store_test.lua"))
+                .expect("file URI should parse");
+            let file_id = {
+                let mut analysis = snapshot.analysis().write().await;
+                analysis.add_main_workspace(workspace);
+                analysis
+                    .update_file_by_uri(&uri, Some("local unused = UndefinedGlobal".to_string()))
+                    .map(|(file_id, _)| file_id)
+                    .expect("file id")
+            };
+            let store = snapshot.file_diagnostic().store();
+            store.invalidate([file_id], &[file_id]);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !store.state().entries.contains_key(&file_id) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the store records a computation for the file");
+
+            let session = snapshot.mark_document_closed(&uri);
+            tokio::spawn(crate::handlers::on_did_close_document(
+                snapshot.clone(),
+                DidCloseTextDocumentParams {
+                    text_document: TextDocumentIdentifier { uri },
+                },
+                session,
+            ));
+            let forgotten = tokio::time::timeout(Duration::from_secs(10), async {
+                while store.state().entries.contains_key(&file_id) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            verify_that!(forgotten.is_ok(), eq(true))?;
 
             let write = tokio::time::timeout(Duration::from_secs(2), snapshot.analysis().write())
                 .await

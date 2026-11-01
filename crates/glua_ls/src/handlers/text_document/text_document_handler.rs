@@ -345,8 +345,11 @@ pub async fn on_did_close_document(
 
     // Only the text changes under the write lock; the debounced loop
     // re-analyses the file and whatever read what moved.
+    // A deleted file is forgotten under the lock, so a reopen cannot slip in
+    // first, and cleared after it: the send can wait on the client.
     let deleted = text.is_none();
-    let staged = {
+    let store = context.file_diagnostic().store();
+    let (staged, forgotten) = {
         let mut analysis = context.analysis().write().await;
         if !context.is_document_closed_for(uri, session) {
             return Some(());
@@ -356,11 +359,14 @@ pub async fn on_did_close_document(
             .stage_file_system_changes(vec![(uri.clone(), text)])
             .into_iter()
             .next();
-        if deleted && let Some(file_id) = analysis.get_file_id(uri) {
-            context.file_diagnostic().store().remove(file_id, uri);
-        }
-        staged
+        let forgotten = analysis
+            .get_file_id(uri)
+            .filter(|&file_id| deleted && store.forget(file_id));
+        (staged, forgotten)
     };
+    if let Some(file_id) = forgotten {
+        store.clear_forgotten(file_id, uri);
+    }
     if let Some(staged) = staged {
         context
             .debounced_analysis()
