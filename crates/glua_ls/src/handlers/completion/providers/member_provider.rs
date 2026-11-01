@@ -427,6 +427,7 @@ fn add_resolve_member_infos(
         filter_member_infos(&builder.semantic_model, member_infos)?;
 
     let resolve_state = get_resolve_state(builder.semantic_model.get_db(), &filtered_member_infos);
+    let first_item = builder.get_completion_items_mut().len();
 
     for member_info in filtered_member_infos {
         if !realm_filter.accepts(builder, member_info) {
@@ -477,8 +478,31 @@ fn add_resolve_member_infos(
             }
         }
     }
+    drop_identical_items(builder, first_item);
 
     Some(())
+}
+
+/// Drops each item from `first_item` on that renders exactly as an earlier one
+/// of them: definitions of one key in several files that show the same are a
+/// single entry to the user, while ones that differ, such as overloads, stay.
+fn drop_identical_items(builder: &mut CompletionBuilder, first_item: usize) {
+    let items = builder.get_completion_items_mut();
+    let added = items.split_off(first_item);
+    let mut seen = HashSet::default();
+    for item in added {
+        let details = item.label_details.as_ref();
+        let rendered = (
+            item.label.clone(),
+            format!("{:?}", item.kind),
+            details.and_then(|details| details.detail.clone()),
+            details.and_then(|details| details.description.clone()),
+            item.detail.clone(),
+        );
+        if seen.insert(rendered) {
+            items.push(item);
+        }
+    }
 }
 
 fn gmod_fallback_description_hint(

@@ -4943,6 +4943,39 @@ mod tests {
         verify_eq!(detail, Some("(message) -> \"ic\" ...".to_string()))
     }
 
+    /// A library table bootstrapped in several files is one entry, while
+    /// definitions of one key that render differently each stay listed.
+    #[gtest]
+    fn test_member_written_in_several_files_is_listed_once() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def_file(
+            "lua/lib/sh_lib.lua",
+            "lib = lib or {}\nlib.net = lib.net or {}\nfunction lib.Send(name) end\n",
+        );
+        ws.def_file(
+            "lua/lib/sh_networking.lua",
+            "lib.net = lib.net or {}\nfunction lib.Send(name, target) end\n",
+        );
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content("lib.<??>\n")?;
+        let file_id = ws.def_file("lua/autorun/sh_use.lua", &content);
+        let items = match completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?
+        {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let count = |label: &str| items.iter().filter(|item| item.label == label).count();
+
+        verify_eq!((count("net"), count("Send")), (1, 2))
+    }
+
     #[gtest]
     fn test_gmod_plugin_completion_offers_derived_gamemode_hooks_in_schema_workspace() -> Result<()>
     {
