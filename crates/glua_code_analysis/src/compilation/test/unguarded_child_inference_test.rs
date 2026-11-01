@@ -2886,7 +2886,7 @@ mod test {
         assert_eq!(diagnostics[0].range.start.line, 15);
         assert_eq!(
             diagnostics[0].message,
-            "expected `Player` but found `Entity`. Add a guard to narrow the parent to `Player`."
+            "`GetPlayerColor` is only defined on `Player`, but the value is `Entity`. Add a guard that narrows it to `Player`."
         );
     }
 
@@ -2914,7 +2914,7 @@ mod test {
             assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
             assert_eq!(
                 diagnostics[0].message,
-                "expected `Player` but found `Entity`. Add a guard to narrow the parent to `Player`."
+                "`SteamID` is only defined on `Player`, but the value is `Entity`. Add a guard that narrows it to `Player`."
             );
         }
     }
@@ -3086,7 +3086,7 @@ mod test {
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             diagnostics[0].message,
-            "expected `Player` but found `Entity`. Add a guard to narrow the parent to `Player`."
+            "`ConCommand` is only defined on `Player`, but the value is `Entity`. Add a guard that narrows it to `Player`."
         );
         assert_eq!(
             member_path_receiver_types(&ws, file_id, "h.Owner"),
@@ -3244,7 +3244,7 @@ mod test {
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             diagnostics[0].message,
-            "`Shared` is not defined on `Entity`. Add a guard that narrows the parent to one of \
+            "`Shared` is not defined on `Entity`. Add a guard that narrows the value to one of \
              `Alpha`, `Bravo`."
         );
         assert_eq!(
@@ -3280,7 +3280,7 @@ mod test {
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             diagnostics[0].message,
-            "`Shared` is not defined on `Panel`. Add a guard that narrows the parent to one of \
+            "`Shared` is not defined on `Panel`. Add a guard that narrows the value to one of \
              `DAlpha`, `DBravo`, `DCharlie` and 2 more."
         );
     }
@@ -3329,7 +3329,7 @@ mod test {
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             diagnostics[0].message,
-            "expected `Leaf` but found `Entity`. Add a guard to narrow the parent to `Leaf`."
+            "`Alpha` is only defined on `Leaf`, but the value is `Entity`. Add a guard that narrows it to `Leaf`."
         );
         assert_eq!(
             member_path_receiver_types(&ws, file_id, "h.proc"),
@@ -3975,7 +3975,7 @@ filter:SetUpdateOnType(true)
             .map(|diagnostic| diagnostic.message)
             .collect::<Vec<_>>();
 
-        let advice = "`GetAimVector` is not defined on `Entity`. Add a guard that narrows the parent to one of `NPC`, `Player`.";
+        let advice = "`GetAimVector` is not defined on `Entity`. Add a guard that narrows the value to one of `NPC`, `Player`.";
         assert_eq!(messages, vec![advice.to_string(), advice.to_string()]);
         assert_eq!(
             undefined,
@@ -4069,7 +4069,7 @@ filter:SetUpdateOnType(true)
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             diagnostics[0].message,
-            "expected `Car` but found `Entity`. Add a guard to narrow the parent to `Car`."
+            "`Driver` is only defined on `Car`, but the value is `Entity`. Add a guard that narrows it to `Car`."
         );
     }
 
@@ -4230,7 +4230,7 @@ filter:SetUpdateOnType(true)
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             diagnostics[0].message,
-            "expected `Car` but found `Entity`. Add a guard to narrow the parent to `Car`."
+            "`GetFuelCapacity` is only defined on `Car`, but the value is `Entity`. Add a guard that narrows it to `Car`."
         );
     }
 
@@ -4260,7 +4260,7 @@ filter:SetUpdateOnType(true)
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             diagnostics[0].message,
-            "expected `Car` but found `Entity`. Add a guard to narrow the parent to `Car`."
+            "`GetFuelCapacity` is only defined on `Car`, but the value is `Entity`. Add a guard that narrows it to `Car`."
         );
     }
 
@@ -4319,7 +4319,7 @@ filter:SetUpdateOnType(true)
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             diagnostics[0].message,
-            "expected `Car` but found `Entity`. Add a guard to narrow the parent to `Car`."
+            "`GetFuelCapacity` is only defined on `Car`, but the value is `Entity`. Add a guard that narrows it to `Car`."
         );
     }
 
@@ -4918,7 +4918,7 @@ mod base_runtime_type_classifier_test {
 
     const UTIL_PATH: &str = "lua/includes/util.lua";
     const PANEL_PATH: &str = "lua/vgui/prop_vectorcolor.lua";
-    const UNGUARDED: &str = "expected `Vector` but found `(Color|Vector)`. Add a guard to narrow the parent to `Vector`.";
+    const UNGUARDED: &str = "`ToColor` is only defined on `Vector`, but the value is `(Color|Vector)`. Add a guard that narrows it to `Vector`.";
 
     const UTIL: &str = r#"
 local C_type = type

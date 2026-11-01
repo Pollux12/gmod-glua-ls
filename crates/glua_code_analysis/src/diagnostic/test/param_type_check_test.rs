@@ -209,7 +209,7 @@ function OTHER:OtherOnly() end
             .map(|prefix| (
                 Some(lsp_types::NumberOrString::String("infer-unguarded-child".to_string())),
                 model.get_document().to_lsp_range(prefix.get_range()).unwrap(),
-                format!("expected `F1Other` but found `({union})`. Add a guard to narrow the parent to `F1Other`."),
+                format!("`OtherOnly` is only defined on `F1Other`, but the value is `({union})`. Add a guard that narrows it to `F1Other`."),
             )).collect()
     }
 

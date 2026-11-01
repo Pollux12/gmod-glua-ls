@@ -270,9 +270,8 @@ pub(super) fn inferred_from_usage_message(typ: &str) -> String {
     format!("Type `{typ}` was inferred from usage context and may be incorrect.")
 }
 
-/// A single winning child can be written into a guard, so it is named directly.
-/// A tie cannot: its union is not a type the user can narrow to, so the message
-/// names the member that drove the inference and the children that define it.
+/// The guard advice for the member that drove the inference, naming the
+/// winning child or, for a tie, the children that define the member.
 fn unguarded_child_message(
     semantic_model: &SemanticModel,
     file_id: FileId,
@@ -281,13 +280,13 @@ fn unguarded_child_message(
     inferred_text: &str,
     found: &str,
 ) -> String {
-    let LuaType::Union(union) = inferred_type else {
-        return unguarded_children_message(None, found, &[inferred_text.to_string()]);
+    let children = match inferred_type {
+        LuaType::Union(union) => union
+            .types()
+            .map(|child| humanize_type(semantic_model.get_db(), child, RenderLevel::Simple))
+            .collect::<Vec<_>>(),
+        _ => vec![inferred_text.to_string()],
     };
-    let children = union
-        .types()
-        .map(|child| humanize_type(semantic_model.get_db(), child, RenderLevel::Simple))
-        .collect::<Vec<_>>();
     let member = used_member_name(semantic_model, file_id, source);
     unguarded_children_message(member.as_deref(), found, &children)
 }
@@ -300,9 +299,14 @@ pub(super) fn unguarded_children_message(
     children: &[String],
 ) -> String {
     if let [child] = children {
-        return format!(
-            "expected `{child}` but found `{found}`. Add a guard to narrow the parent to `{child}`."
-        );
+        return match member {
+            Some(member) => format!(
+                "`{member}` is only defined on `{child}`, but the value is `{found}`. Add a guard that narrows it to `{child}`."
+            ),
+            None => format!(
+                "expected `{child}` but found `{found}`. Add a guard that narrows the value to `{child}`."
+            ),
+        };
     }
     // A union orders its arms by a content hash, so the names are sorted before
     // the cap decides which of them the message keeps.
@@ -322,10 +326,10 @@ pub(super) fn unguarded_children_message(
     };
     match member {
         Some(member) => format!(
-            "`{member}` is not defined on `{found}`. Add a guard that narrows the parent to one of {candidates}."
+            "`{member}` is not defined on `{found}`. Add a guard that narrows the value to one of {candidates}."
         ),
         None => format!(
-            "this member is not defined on `{found}`. Add a guard that narrows the parent to one of {candidates}."
+            "this member is not defined on `{found}`. Add a guard that narrows the value to one of {candidates}."
         ),
     }
 }

@@ -67,7 +67,10 @@ end
                 || (!guarded && index.syntax().text() == "ent.PrintName"))
             .map(|index| (
                 model.get_document().to_lsp_range(index.get_range()).unwrap(),
-                "expected `OptionalEntity` but found `Entity`. Add a guard to narrow the parent to `OptionalEntity`.".to_string(),
+                format!(
+                    "`{}` is only defined on `OptionalEntity`, but the value is `Entity`. Add a guard that narrows it to `OptionalEntity`.",
+                    index.get_index_name_token().unwrap().text()
+                ),
             )).collect()
     }
 
@@ -3779,7 +3782,7 @@ owner:GetShootPos()
         );
         assert_eq!(
             diagnostic.message,
-            "expected `Player` but found `Entity`. Add a guard to narrow the parent to `Player`."
+            "`GetShootPos` is only defined on `Player`, but the value is `Entity`. Add a guard that narrows it to `Player`."
         );
         assert_eq!(diagnostic.range.start.line, 2);
         assert_eq!(diagnostic.range.start.character, 0);
@@ -7878,9 +7881,17 @@ mod presence_argument_target_tests {
             .descendants::<LuaIndexExpr>()
             .find(|index| index.syntax().text() == field)
             .unwrap();
-        vec![(DiagnosticCode::InferUnguardedChild.get_name().to_string(),
-            model.get_document().to_lsp_range(index.get_range()).unwrap(),
-            "expected `PresenceChild` but found `PresenceBase`. Add a guard to narrow the parent to `PresenceChild`.".to_string())]
+        vec![(
+            DiagnosticCode::InferUnguardedChild.get_name().to_string(),
+            model
+                .get_document()
+                .to_lsp_range(index.get_range())
+                .unwrap(),
+            format!(
+                "`{member}` is only defined on `PresenceChild`, but the value is `PresenceBase`. Add a guard that narrows it to `PresenceChild`.",
+                member = field.rsplit('.').next().unwrap()
+            ),
+        )]
     }
 
     #[test]
