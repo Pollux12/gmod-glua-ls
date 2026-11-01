@@ -1915,6 +1915,49 @@ local EscapeStringMap: {
     }
 
     #[gtest]
+    fn test_hover_annotated_g_function_shows_its_realm_badge() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let annotations_root = ws.virtual_url_generator.base.join("annotations");
+        ws.analysis.add_library_workspace(annotations_root);
+        ws.def_file(
+            "annotations/global.lua",
+            r#"
+            ---@meta
+
+            ---Returns the player object of the current client.
+            ---@realm client
+            ---@return Player # The player object representing the client.
+            function _G.LocalPlayer() end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local ply = Local<??>Player()
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/client/cl_hud.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        verify_that!(
+            markup.value,
+            all!(
+                contains_substring("Returns the player object of the current client."),
+                contains_substring("**CLIENT**")
+            )
+        )
+    }
+
+    #[gtest]
     fn test_hover_table_method_annotation_realm_overrides_shared_file_realm() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

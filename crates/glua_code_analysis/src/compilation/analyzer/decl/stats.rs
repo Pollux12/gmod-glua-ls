@@ -488,12 +488,17 @@ pub fn analyze_func_stat(analyzer: &mut DeclAnalyzer, stat: LuaFuncStat) -> Opti
 
             // `function _G.name()` declares the global `name` as well as the
             // member: its type is the signature from the start, like the
-            // member's, so no read of the name sees it untyped.
+            // member's, so no read of the name sees it untyped, and it shares
+            // the signature's docs and realm, as the member does.
             if let LuaMemberKey::Name(name) = &key
                 && let Some(global_decl_id) =
                     analyze_maybe_global_index_expr(analyzer, &index_expr, name, None)
                 && let Some(closure) = stat.get_closure()
             {
+                analyzer.ops.push(DeclOp::OwnerMap {
+                    source: LuaSemanticDeclId::Member(member_id),
+                    same: LuaSemanticDeclId::LuaDecl(global_decl_id),
+                });
                 analyzer.delta.early_callable_signatures.push((
                     global_decl_id.into(),
                     LuaSignatureId::from_closure(analyzer.get_file_id(), &closure),
