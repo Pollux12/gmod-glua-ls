@@ -1236,6 +1236,44 @@ mod tests {
     }
 
     #[gtest]
+    fn test_colon_call_overload_detail_omits_explicit_self() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class C1
+                local C1 = {}
+
+                ---@overload fun(self: C1, key: string): number
+                ---@param key string
+                ---@param fallback number
+                ---@return number
+                function C1:get_value(key, fallback) end
+            "#,
+        );
+        check!(ws.check_completion_with_kind(
+            r#"
+                ---@type C1
+                local c1
+                c1:<??>
+            "#,
+            vec![
+                VirtualCompletionItem {
+                    label: "get_value".to_string(),
+                    kind: CompletionItemKind::METHOD,
+                    label_detail: Some("(key, fallback) -> number".to_string()),
+                },
+                VirtualCompletionItem {
+                    label: "get_value".to_string(),
+                    kind: CompletionItemKind::METHOD,
+                    label_detail: Some("(key) -> number".to_string()),
+                },
+            ],
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_class_function_3() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         ws.def(

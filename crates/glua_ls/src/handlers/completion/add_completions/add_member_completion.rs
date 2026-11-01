@@ -251,7 +251,7 @@ pub fn add_member_completion_with_description_hint(
         builder,
         property_owner,
         &remove_nil_type,
-        call_display,
+        status,
         deprecated,
         Some(kind),
         label,
@@ -313,7 +313,7 @@ fn add_signature_overloads(
     builder: &mut CompletionBuilder,
     property_owner: &Option<LuaSemanticDeclId>,
     typ: &LuaType,
-    call_display: CallDisplay,
+    status: CompletionTriggerStatus,
     deprecated: Option<bool>,
     kind: Option<lsp_types::CompletionItemKind>,
     label: String,
@@ -340,6 +340,8 @@ fn add_signature_overloads(
             let typ = LuaType::DocFunction(overload);
             let description =
                 apply_description_hint(get_description(builder, &typ), description_hint);
+            let call_display = get_call_show(builder.semantic_model.get_db(), &typ, status)
+                .unwrap_or(CallDisplay::None);
             let detail = get_detail(builder, &typ, call_display);
             let data = if let Some(id) = &property_owner {
                 CompletionData::from_overload(builder, id.clone(), index, overload_count)
