@@ -1,61 +1,40 @@
 ---
 title: Command-line checks
-description: Run GLuaLS diagnostics from a terminal or a continuous integration job.
+description: Run GLuaLS diagnostics from a terminal or in CI.
 ---
+
+`glua_check` runs the same checks as the editor, without opening an editor. Use it in CI to catch problems before they are merged.
 
 ## Install
 
-`glua_check` runs the same analyzer and diagnostics as the language server. Use it when you want to check a project without opening an editor.
+Download `glua_check` for Windows or Linux from the [GitHub releases](https://github.com/Pollux12/gmod-glua-ls/releases), or install it with Cargo:
 
 ```bash
 cargo install glua_check
 ```
 
+`glua_check` needs the Garry's Mod annotations. Download the [`gluals-annotations` branch](https://github.com/Pollux12/annotations-gmod-glua-ls/tree/gluals-annotations) and pass its folder with `--gmod-annotations`.
+
 ## Check a project
 
-Run the command with one or more addon or gamemode folders:
-
 ```bash
-glua_check .
+glua_check . --gmod-annotations ./annotations
 ```
 
-The command finds `.gluarc.json` in the workspace and prints diagnostics to the terminal. It exits with code `1` when it finds an error.
+It reads `.gluarc.json` from the project and prints every warning and error. It exits with code `1` when it finds an error. Add `--warnings-as-errors` to fail on warnings too.
 
-To make warnings fail the command too, add `--warnings-as-errors`:
+Pass several folders to check them together, like a multi-root workspace.
 
-```bash
-glua_check . --warnings-as-errors
-```
-
-## Load Garry's Mod API definitions
-
-Pass the generated annotations folder when you run `glua_check` outside the VS Code extension:
-
-```bash
-glua_check . --gmod-annotations /path/to/gmod/annotations
-```
-
-The API definitions load before your configured libraries, so those libraries can use Garry's Mod types and wrapper behavior.
-
-## Output formats
-
-The default `text` output is easy to read in a terminal. Use `json` for scripts or `sarif` for code scanning tools:
-
-```bash
-glua_check . --output-format json --output diagnostics.json
-glua_check . --output-format sarif --output diagnostics.sarif
-```
-
-## Useful options
+## Options
 
 | Option | Description |
 |---|---|
-| `-c, --config <PATHS>` | Use specific config files. Separate multiple paths with commas |
-| `-i, --ignore <PATTERNS>` | Ignore comma-separated glob patterns |
-| `-f, --output-format <FORMAT>` | Use `text`, `json`, or `sarif` output |
-| `--output <DESTINATION>` | Write JSON or SARIF output to a file; the default is standard output |
-| `--warnings-as-errors` | Exit with code `1` for warnings as well as errors |
-| `--gmod-annotations <PATH>` | Load Garry's Mod API definitions from a folder |
-| `--verbose` | Print additional loading information |
+| `--gmod-annotations <PATH>` | Folder with the Garry's Mod annotations |
+| `--warnings-as-errors` | Exit with code `1` on warnings as well |
+| `-f, --output-format <FORMAT>` | `text` (default), `json` or `sarif` |
+| `--output <FILE>` | Write `json` or `sarif` output to a file |
+| `-c, --config <PATHS>` | Use these config files instead of `.gluarc.json`, separated by commas |
+| `-i, --ignore <PATTERNS>` | Skip files matching these glob patterns, separated by commas |
+| `--verbose` | Print more detail while loading |
 
-Run `glua_check --help` for the complete command reference.
+SARIF output works with GitHub code scanning, which shows the results on pull requests.

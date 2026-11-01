@@ -703,4 +703,34 @@ mod test {
 
         assert_eq!(func.get_ret(), &ws.ty("boolean"));
     }
+
+    /// The type a call settles to on a local holding one of two callables,
+    /// assigned `first` in one branch and `second` in the other.
+    fn union_callee_call_type(first: &str, second: &str) -> String {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&format!(
+            r#"
+            ---@type fun(): string
+            local documented
+            local f
+            if Cond then
+                f = {first}
+            else
+                f = {second}
+            end
+            local r = f()
+            "#
+        ));
+        let typ = ws.local_ty(file_id, "r");
+        ws.humanize_type(typ)
+    }
+
+    #[test]
+    fn a_call_on_a_union_of_callables_infers_the_same_whichever_order_the_union_lists_them() {
+        let closure = "function() return 1 end";
+        assert_eq!(
+            union_callee_call_type("documented", closure),
+            union_callee_call_type(closure, "documented")
+        );
+    }
 }

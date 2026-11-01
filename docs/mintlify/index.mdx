@@ -1,50 +1,40 @@
 ---
 title: GLua Language Server
-description: Completion, diagnostics, formatting, and debugging for Garry's Mod Lua.
+description: Set up and configure GLuaLS for Garry's Mod Lua in VS Code.
 mode: wide
 ---
 
-GLua Language Server (GLuaLS) adds completion, diagnostics, formatting, and debugging to Garry's Mod Lua in VS Code.
+GLua Language Server (GLuaLS) adds completion, hover docs, diagnostics, formatting and a debugger for Garry's Mod Lua in VS Code. Most projects work without any setup. These docs cover installing it, opening your project the right way, and changing settings when you need to.
 
-<CardGroup cols={3}>
-  <Card title="Install" icon="download" href="/getting-started/installation">
-    Install the VS Code extension and check that it is running.
-  </Card>
-  <Card title="Workspace setup" icon="sliders" href="/getting-started/workspace-setup">
-    Open addons, gamemodes, and shared libraries correctly.
-  </Card>
-  <Card title="Set up debugging" icon="bug" href="/debugger/setup">
-    Connect VS Code to a local or remote SRCDS server.
-  </Card>
-</CardGroup>
-
----
-
-## Find what you need
+<video
+  autoPlay
+  muted
+  loop
+  playsInline
+  className="w-full rounded-xl"
+  src="/images/showcase/hero.mp4"
+  poster="/images/showcase/poster.png"
+></video>
 
 <CardGroup cols={2}>
-  <Card title="Realm awareness" icon="globe" href="/language/realm-awareness">
-    Find client, server, and shared realm mistakes.
+  <Card title="Install" icon="download" href="/getting-started/installation">
+    Install the extension and check that it is running.
   </Card>
-  <Card title="Network validation" icon="network-wired" href="/language/network-analysis">
-    Check network message names and read/write payloads.
+  <Card title="Open your project" icon="folder-open" href="/getting-started/workspace-setup">
+    Open addons and gamemodes so GLuaLS sees the right files.
   </Card>
-  <Card title="Scripted class support" icon="cube" href="/language/scripted-classes">
-    Work with ENT, SWEP, TOOL, NetworkVar, and AccessorFunc code.
+  <Card title="Fix common warnings" icon="wrench" href="/getting-started/common-fixes">
+    Unknown globals, wrong realm warnings and other quick fixes.
   </Card>
-  <Card title="Hook intelligence" icon="link" href="/language/hook-intelligence">
-    Complete hook names and type hook callback parameters.
+  <Card title="Change settings" icon="sliders" href="/configuration/overview">
+    Use the settings panel or a `.gluarc.json` file.
   </Card>
-  <Card title="Integrated debugger" icon="bug" href="/debugger/overview">
-    Set breakpoints, inspect state, and run Lua on SRCDS.
+  <Card title="Set up the debugger" icon="bug" href="/debugger/setup">
+    Connect VS Code to a local SRCDS server.
   </Card>
-  <Card title="AI integration" icon="wand-magic-sparkles" href="/vscode/ai-integration">
-    Give supported AI tools access to GLua docs and a debug session.
+  <Card title="Document your code" icon="code" href="/annotations">
+    Add types to your own functions and classes.
   </Card>
 </CardGroup>
 
----
-
-## More help
-
-Use [configuration](/configuration/overview) to change analyzer behavior, [annotations](/annotations) to document your own code, or [command-line checks](/tools/glua-check) to run the same diagnostics in CI.
+Found a bug or a false warning? [Open an issue](https://github.com/Pollux12/gmod-glua-ls/issues).

@@ -103,6 +103,11 @@ pub async fn run_check(cmd_args: CmdArgs) -> Result<(), Box<dyn Error + Sync + S
             sender.send((file_id, diagnostics)).await.unwrap();
         });
     }
+    // The channel must close when the workers are done: a worker that panics
+    // before sending drops its clone, and the drain below would otherwise
+    // wait on this original sender forever instead of reporting the short
+    // count, which output_result turns into an error.
+    drop(sender);
 
     let exit_code = output_result(
         need_check_files.len(),

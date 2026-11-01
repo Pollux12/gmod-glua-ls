@@ -2,10 +2,14 @@ use glua_code_analysis::file_path_to_uri;
 use log::{info, warn};
 use lsp_types::{
     ClientCapabilities, DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
-    FileEvent, FileSystemWatcher, GlobPattern, Registration, RegistrationParams, WatchKind,
+    FileChangeType, FileEvent, FileSystemWatcher, GlobPattern, Registration, RegistrationParams,
+    WatchKind,
 };
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
-use std::{sync::mpsc::channel, time::Duration};
+use notify::{
+    Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    event::{ModifyKind, RenameMode},
+};
+use std::{path::PathBuf, time::Duration};
 
 use crate::{
     context::{ClientProxy, ServerContextSnapshot},
@@ -84,8 +88,31 @@ const WATCH_FILE_EXTENSIONS: [&str; 6] = [
     ".gluarc.json",
 ];
 
+/// The watched-file change `event` makes to each of its paths. Reads and
+/// events of unknown kind change no file.
+fn path_changes(event: &Event) -> Vec<(&PathBuf, FileChangeType)> {
+    let typ = match event.kind {
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+            FileChangeType::CREATED
+        }
+        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+            FileChangeType::DELETED
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+            return event
+                .paths
+                .iter()
+                .zip([FileChangeType::DELETED, FileChangeType::CREATED])
+                .collect();
+        }
+        EventKind::Modify(_) => FileChangeType::CHANGED,
+        EventKind::Access(_) | EventKind::Any | EventKind::Other => return Vec::new(),
+    };
+    event.paths.iter().map(|path| (path, typ)).collect()
+}
+
 async fn register_files_watch_use_fsnotify(context: ServerContextSnapshot) -> Option<()> {
-    let (tx, rx) = channel();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let config = Config::default().with_poll_interval(Duration::from_secs(5));
     let mut watcher = match RecommendedWatcher::new(
         move |res| {
@@ -117,46 +144,99 @@ async fn register_files_watch_use_fsnotify(context: ServerContextSnapshot) -> Op
     drop(workspace_manager);
 
     tokio::spawn(async move {
-        loop {
-            match rx.recv() {
-                Ok(event) => {
-                    let typ = match event.kind {
-                        notify::event::EventKind::Create(_) => lsp_types::FileChangeType::CREATED,
-                        notify::event::EventKind::Modify(_) => lsp_types::FileChangeType::CHANGED,
-                        notify::event::EventKind::Remove(_) => lsp_types::FileChangeType::DELETED,
-                        _ => {
-                            break;
-                        }
-                    };
-                    let mut file_events = vec![];
-                    for path in event.paths.iter() {
-                        for ext in WATCH_FILE_EXTENSIONS.iter() {
-                            if path.as_os_str().to_string_lossy().ends_with(ext) {
-                                if let Some(uri) = file_path_to_uri(path) {
-                                    file_events.push(FileEvent { uri, typ });
-                                }
-                                break;
-                            }
-                        }
-                    }
-
-                    if file_events.is_empty() {
-                        continue;
-                    }
-                    let params = DidChangeWatchedFilesParams {
-                        changes: file_events,
-                    };
-                    on_did_change_watched_files(context.clone(), params).await;
-                }
-                Err(e) => {
-                    warn!("watch files notify error: {:?}", e);
-                    break;
-                }
+        while let Some(event) = rx.recv().await {
+            let file_events = path_changes(&event)
+                .into_iter()
+                .filter(|(path, _)| {
+                    let path = path.as_os_str().to_string_lossy();
+                    WATCH_FILE_EXTENSIONS.iter().any(|ext| path.ends_with(ext))
+                })
+                .filter_map(|(path, typ)| {
+                    Some(FileEvent {
+                        uri: file_path_to_uri(path)?,
+                        typ,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if file_events.is_empty() {
+                continue;
             }
+            let params = DidChangeWatchedFilesParams {
+                changes: file_events,
+            };
+            let in_flight = context.debounced_analysis_arc().begin_in_flight_change();
+            on_did_change_watched_files(context.clone(), params).await;
+            in_flight.finish().await;
         }
     });
 
     info!("watch files use notify success");
 
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use notify::event::{AccessKind, CreateKind, DataChange, RemoveKind};
+
+    use super::*;
+
+    fn changes(kind: EventKind, paths: &[&str]) -> Vec<(PathBuf, FileChangeType)> {
+        let event = paths.iter().fold(Event::new(kind), |event, path| {
+            event.add_path(PathBuf::from(path))
+        });
+        path_changes(&event)
+            .into_iter()
+            .map(|(path, typ)| (path.clone(), typ))
+            .collect()
+    }
+
+    /// A read or an event of unknown kind changes no file, and the watch goes
+    /// on to the events after it.
+    #[test]
+    fn events_that_change_no_file_report_nothing() {
+        assert!(changes(EventKind::Access(AccessKind::Any), &["a.lua"]).is_empty());
+        assert!(changes(EventKind::Any, &["a.lua"]).is_empty());
+        assert!(changes(EventKind::Other, &["a.lua"]).is_empty());
+    }
+
+    /// A renamed file is gone from its old path and created at its new one.
+    #[test]
+    fn a_rename_deletes_the_old_path_and_creates_the_new_one() {
+        let rename = |mode| EventKind::Modify(ModifyKind::Name(mode));
+        assert_eq!(
+            (
+                changes(rename(RenameMode::Both), &["old.lua", "new.lua"]),
+                changes(rename(RenameMode::From), &["old.lua"]),
+                changes(rename(RenameMode::To), &["new.lua"]),
+            ),
+            (
+                vec![
+                    (PathBuf::from("old.lua"), FileChangeType::DELETED),
+                    (PathBuf::from("new.lua"), FileChangeType::CREATED),
+                ],
+                vec![(PathBuf::from("old.lua"), FileChangeType::DELETED)],
+                vec![(PathBuf::from("new.lua"), FileChangeType::CREATED)],
+            )
+        );
+    }
+
+    #[test]
+    fn creates_edits_and_removals_keep_their_kind() {
+        assert_eq!(
+            (
+                changes(EventKind::Create(CreateKind::File), &["a.lua"]),
+                changes(
+                    EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                    &["a.lua"]
+                ),
+                changes(EventKind::Remove(RemoveKind::File), &["a.lua"]),
+            ),
+            (
+                vec![(PathBuf::from("a.lua"), FileChangeType::CREATED)],
+                vec![(PathBuf::from("a.lua"), FileChangeType::CHANGED)],
+                vec![(PathBuf::from("a.lua"), FileChangeType::DELETED)],
+            )
+        );
+    }
 }

@@ -1,11 +1,15 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
     LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaSemanticDeclId, LuaTupleType, LuaType,
     LuaTypeDecl, LuaTypeDeclId, RenderLevel, humanize_type,
     semantic::{
-        member::find_members,
+        member::{
+            MetatableIndexField, find_members, find_metatable_index_field, find_structural_members,
+            infer_raw_member_type,
+        },
         type_check::{
+            complex_type::structural_object_from_members,
             intersection_utils::intersection_to_object, type_check_context::TypeCheckContext,
         },
     },
@@ -13,8 +17,8 @@ use crate::{
 
 use super::{
     TypeCheckResult, check_general_type_compact, is_structural_method_member, is_sub_type_of,
-    member_has_documented_default, sub_type::get_base_type_id,
-    type_check_fail_reason::TypeCheckFailReason, type_check_guard::TypeCheckGuard,
+    member_is_required, sub_type::get_base_type_id, type_check_fail_reason::TypeCheckFailReason,
+    type_check_guard::TypeCheckGuard,
 };
 
 const GMOD_NULL_TYPE_NAME: &str = "NULL";
@@ -61,18 +65,30 @@ pub fn check_ref_type_compact(
     compact_type: &LuaType,
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
-    let type_decl = context
-        .db
-        .get_type_index()
-        .get_type_decl(source_id)
-        // unreachable!
-        .ok_or(if context.detail {
-            TypeCheckFailReason::TypeNotMatchWithReason(
-                format!("type `{name}` not found.", name = source_id.get_name()).to_string(),
-            )
-        } else {
-            TypeCheckFailReason::TypeNotMatch
-        })?;
+    // A `Def`/`Ref` carrying the same decl id is trivially the same type even
+    // when the declaration itself cannot be resolved — a scripted-class global
+    // alias (`Schema` -> `SCHEMA`) produces a `Def` for the class global while
+    // annotated params hold a `Ref`, and a workspace without a schema file
+    // never registers the decl, so the lookup below would fail before
+    // `check_ref_class` could see the identity.
+    let type_decl = if let LuaType::Def(id) | LuaType::Ref(id) = compact_type
+        && id == source_id
+    {
+        return Ok(());
+    } else {
+        context
+            .db
+            .get_type_index()
+            .get_type_decl(source_id)
+            // unreachable!
+            .ok_or(if context.detail {
+                TypeCheckFailReason::TypeNotMatchWithReason(
+                    format!("type `{name}` not found.", name = source_id.get_name()).to_string(),
+                )
+            } else {
+                TypeCheckFailReason::TypeNotMatch
+            })?
+    };
 
     if type_decl.is_alias() {
         if let Some(origin_type) = type_decl.get_alias_origin(context.db, None) {
@@ -116,8 +132,24 @@ fn check_ref_enum(
     check_guard: TypeCheckGuard,
     type_decl: &LuaTypeDecl,
 ) -> TypeCheckResult {
-    // 直接匹配相同类型
+    // Match identical types directly
     if matches!(compact_type, LuaType::Def(id) | LuaType::Ref(id) if id == source_id) {
+        return Ok(());
+    }
+
+    if let Some(enum_base @ (LuaType::Number | LuaType::Integer)) = type_decl.get_enum_base()
+        && matches!(
+            compact_type,
+            LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_) | LuaType::Integer
+        )
+        && context
+            .db
+            .get_member_index()
+            .get_member_len(&LuaMemberOwner::Type(source_id.clone()))
+            > 0
+        && check_general_type_compact(context, enum_base, compact_type, check_guard.next_level()?)
+            .is_ok()
+    {
         return Ok(());
     }
 
@@ -125,7 +157,7 @@ fn check_ref_enum(
         .get_enum_field_type(context.db)
         .ok_or(TypeCheckFailReason::TypeNotMatch)?;
 
-    // 移除掉枚举类型本身
+    // Remove the enum type itself
     let compact_type = match compact_type {
         LuaType::Union(union_types) => {
             let new_types: Vec<_> = union_types
@@ -154,7 +186,7 @@ fn check_ref_enum(
         _ => compact_type.clone(),
     };
 
-    // 当 enum 的值全为整数常量时, 可能会用于位运算, 此时右值推断为整数
+    // When all enum values are integer constants they may be used in bitwise operations, so the right value is inferred as an integer
     if let LuaType::Union(union_types) = &enum_fields
         && union_types
             .types()
@@ -225,7 +257,7 @@ fn check_ref_class(
                 return Ok(());
             }
 
-            // `compact`为枚举时的额外处理
+            // Extra handling when `compact` is an enum
             if let Some(compact_decl) = context.db.get_type_index().get_type_decl(id)
                 && compact_decl.is_enum()
                 && let Some(LuaType::Union(enum_fields)) =
@@ -264,7 +296,27 @@ fn check_ref_class(
                 Err(TypeCheckFailReason::TypeNotMatch)
             }
         }
+        LuaType::MergedTable(_) => {
+            // A merged table's runtime value carries every component's members,
+            // so structurally check the merged member view like a table literal.
+            let object_type = match structural_object_from_members(context, compact_type) {
+                Some(LuaType::Object(object_type)) => object_type,
+                _ => LuaObjectType::new_with_fields(Default::default(), Vec::new()).into(),
+            };
+            check_ref_type_compact_object(
+                context,
+                &object_type,
+                source_id,
+                check_guard.next_level()?,
+            )
+        }
         LuaType::Table => Ok(()),
+        LuaType::TableGeneric(_) => check_ref_type_compact_table_generic(
+            context,
+            source_id,
+            compact_type,
+            check_guard.next_level()?,
+        ),
         LuaType::TableOf(inner) => check_general_type_compact(
             context,
             &LuaType::Ref(source_id.clone()),
@@ -313,6 +365,48 @@ fn check_ref_class(
     }
 }
 
+/// A generic table answers each field of the class with what a read of the
+/// field's key gives: its value type when its key type admits the key, and
+/// nothing, which only an optional field accepts, otherwise.
+fn check_ref_type_compact_table_generic(
+    context: &mut TypeCheckContext,
+    source_id: &LuaTypeDeclId,
+    table_generic: &LuaType,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    let source_type = LuaType::Ref(source_id.clone());
+    let Some(source_members) = find_structural_members(context.db, &source_type) else {
+        return Ok(());
+    };
+    let mut checked_keys = HashSet::default();
+    for source_member in source_members {
+        if !checked_keys.insert(source_member.key.clone())
+            || is_structural_method_member(source_member.feature)
+        {
+            continue;
+        }
+        match infer_raw_member_type(context.db, table_generic, &source_member.key) {
+            Ok(read_type) => check_general_type_compact(
+                context,
+                &source_member.typ,
+                &read_type,
+                check_guard.next_level()?,
+            )?,
+            Err(_)
+                if member_is_required(
+                    context.db,
+                    source_member.property_owner_id.as_ref(),
+                    &source_member.typ,
+                ) =>
+            {
+                return Err(TypeCheckFailReason::TypeNotMatch);
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
 fn check_ref_type_compact_table(
     context: &mut TypeCheckContext,
     source_type_id: &LuaTypeDeclId,
@@ -331,13 +425,12 @@ fn check_ref_type_compact_table(
         .unwrap_or_default();
 
     let source_type = LuaType::Ref(source_type_id.clone());
-    let source_type_members = find_members(context.db, &source_type);
+    let source_type_members = find_structural_members(context.db, &source_type);
     let Some(source_type_members) = source_type_members else {
         return Ok(()); // empty member donot need check
     };
 
-    let mut checked_keys = HashSet::new();
-
+    let mut checked_keys = HashSet::default();
     for source_member in source_type_members {
         let key = source_member.key;
         if !checked_keys.insert(key.clone()) {
@@ -363,15 +456,28 @@ fn check_ref_type_compact_table(
             source_member_type = typ;
         }
 
-        match table_member_map.get(&key) {
+        // A field the table lacks is read through its metatable's `__index`.
+        let table_member_type = match table_member_map.get(&key) {
             Some(table_member_id) => {
                 let table_member = member_index
                     .get_member(table_member_id)
                     .ok_or(TypeCheckFailReason::TypeNotMatch)?;
-                let table_member_type = context
-                    .member_type(table_member.get_id())
-                    .unwrap_or(LuaType::Any);
+                MetatableIndexField::Present(
+                    context
+                        .member_type(table_member.get_id())
+                        .unwrap_or(LuaType::Any),
+                )
+            }
+            None => match &table_owner {
+                LuaMemberOwner::Element(table) => {
+                    find_metatable_index_field(context.db, table, &key)
+                }
+                _ => MetatableIndexField::Absent,
+            },
+        };
 
+        match table_member_type {
+            MetatableIndexField::Present(table_member_type) => {
                 if let Err(err) = check_general_type_compact(
                     context,
                     &source_member_type,
@@ -396,11 +502,11 @@ fn check_ref_type_compact_table(
                     ));
                 }
             }
-            None if !source_member_type.is_optional()
-                && !member_has_documented_default(
+            MetatableIndexField::Absent
+                if member_is_required(
                     context.db,
                     source_member.property_owner_id.as_ref(),
-                    Some(&source_member_type),
+                    &source_member_type,
                 ) =>
             {
                 if !context.detail {
@@ -411,7 +517,7 @@ fn check_ref_type_compact_table(
                     format!("missing member {name}, in table", name = key.to_path()).to_string(),
                 ));
             }
-            _ => {} // Optional member not found, continue
+            _ => {} // Optional or unknowable member, continue
         }
     }
 
@@ -424,13 +530,14 @@ fn check_ref_type_compact_object(
     source_type_id: &LuaTypeDeclId,
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
-    // ref 可能继承自其他类型, 所以需要使用 infer_members 来获取所有成员
-    let Some(source_type_members) = find_members(context.db, &LuaType::Ref(source_type_id.clone()))
+    // ref may inherit from other types, so infer_members is needed to get all members
+    let Some(source_type_members) =
+        find_structural_members(context.db, &LuaType::Ref(source_type_id.clone()))
     else {
         return Ok(());
     };
 
-    let mut checked_keys = HashSet::new();
+    let mut checked_keys = HashSet::default();
     for source_member in source_type_members {
         let key = source_member.key;
         if !checked_keys.insert(key.clone()) {
@@ -467,12 +574,11 @@ fn check_ref_type_compact_object(
                     ));
                 }
             }
-            None if !source_member_type.is_optional()
-                && !member_has_documented_default(
-                    context.db,
-                    property_owner_id.as_ref(),
-                    Some(&source_member_type),
-                ) =>
+            None if member_is_required(
+                context.db,
+                property_owner_id.as_ref(),
+                &source_member_type,
+            ) =>
             {
                 if !context.detail {
                     return Err(TypeCheckFailReason::TypeNotMatch);
@@ -516,7 +622,7 @@ fn check_ref_type_compact_tuple(
     };
 
     let tuple_types = tuple_type.get_types();
-    let mut checked_keys = HashSet::new();
+    let mut checked_keys = HashSet::default();
     for member in source_type_members {
         let key = member.key;
         if !checked_keys.insert(key.clone()) {
@@ -524,7 +630,7 @@ fn check_ref_type_compact_tuple(
         }
         match &key {
             LuaMemberKey::Integer(index) => {
-                // 在 lua 中数组索引从 1 开始, 当数组被解析为元组时也必然从 1 开始
+                // Array indices start at 1 in Lua, so an array parsed as a tuple also starts at 1
                 if *index <= 0 {
                     return Err(TypeCheckFailReason::TypeNotMatch);
                 }
@@ -541,7 +647,7 @@ fn check_ref_type_compact_tuple(
                 )?;
             }
             LuaMemberKey::ExprType(LuaType::Integer) => {
-                // 遍历元组确定所有内容是否匹配
+                // Walk the tuple to check that all elements match
                 for tuple_type in tuple_types {
                     check_general_type_compact(
                         context,

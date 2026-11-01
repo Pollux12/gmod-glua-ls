@@ -1,0 +1,78 @@
+#[cfg(test)]
+mod test {
+    use crate::{DiagnosticCode, VirtualWorkspace};
+
+    #[test]
+    fn missing_required_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AttributeMissingParameter,
+            r#"
+            ---@attribute tagged(name: string)
+
+            ---@[tagged]
+            local a = 1
+        "#
+        ));
+    }
+
+    #[test]
+    fn redundant_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AttributeRedundantParameter,
+            r#"
+            ---@attribute tagged2(name: string)
+
+            ---@[tagged2("a", "b")]
+            local a = 1
+        "#
+        ));
+    }
+
+    #[test]
+    fn param_type_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AttributeParamTypeMismatch,
+            r#"
+            ---@attribute tagged3(name: string)
+
+            ---@[tagged3(1)]
+            local a = 1
+        "#
+        ));
+    }
+
+    #[test]
+    fn omitted_alias_nullable_parameter_is_not_missing() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AttributeMissingParameter,
+            r#"
+            ---@alias OptName string|nil
+
+            ---@attribute tagged4(name: OptName)
+
+            ---@[tagged4]
+            local a = 1
+        "#
+        ));
+    }
+
+    #[test]
+    fn boolean_argument_matches_boolean_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            ---@attribute flagged(name: string, enabled: boolean)
+
+            ---@[flagged("a", true)]
+            local a = 1
+
+            ---@[flagged("b", false)]
+            local b = 1
+        "#;
+        assert!(ws.check_code_for(DiagnosticCode::DocSyntaxError, code));
+        assert!(ws.check_code_for(DiagnosticCode::AttributeParamTypeMismatch, code));
+    }
+}

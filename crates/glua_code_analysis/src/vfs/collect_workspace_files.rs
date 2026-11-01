@@ -36,6 +36,83 @@ impl WorkspaceFolder {
     }
 }
 
+/// The folders a workspace rooted at `workspace_root` loads under `emmyrc`,
+/// in registration order: the root, its extra roots, its libraries, then its
+/// package directories.
+pub fn workspace_collection_folders(
+    workspace_root: Option<PathBuf>,
+    emmyrc: &Emmyrc,
+) -> Vec<WorkspaceFolder> {
+    let mut workspaces = Vec::new();
+
+    if let Some(workspace_root) = workspace_root {
+        workspaces.push(WorkspaceFolder::new(workspace_root, false));
+    }
+
+    for extra_root in &emmyrc.workspace.workspace_roots {
+        workspaces.push(WorkspaceFolder::new(PathBuf::from(extra_root), false));
+    }
+
+    // Canonicalize the main workspace root for self-overlap detection.
+    let main_root_canon = workspaces
+        .first()
+        .and_then(|ws| ws.root.canonicalize().ok());
+
+    for lib in &emmyrc.workspace.library {
+        let configured = lib.get_path();
+        let path = PathBuf::from(configured);
+
+        // Filter invalid library paths: empty, nonexistent, not a directory,
+        // or resolves to the same path as the main workspace root (self-overlap
+        // would cause a redundant full re-scan of the workspace).
+        if configured.trim().is_empty() {
+            log::warn!(
+                "Skipping empty library path from config entry: {:?}",
+                configured
+            );
+            continue;
+        }
+        if !path.exists() {
+            log::warn!("Skipping library path that does not exist: {:?}", path);
+            continue;
+        }
+        if !path.is_dir() {
+            log::warn!("Skipping library path that is not a directory: {:?}", path);
+            continue;
+        }
+        if let (Ok(lib_canon), Some(ws_canon)) = (path.canonicalize(), &main_root_canon)
+            && lib_canon == *ws_canon
+        {
+            log::warn!(
+                "Skipping library path that resolves to the workspace root (self-overlap): {:?}",
+                path
+            );
+            continue;
+        }
+
+        workspaces.push(WorkspaceFolder::new(path, true));
+    }
+
+    for package_dir in &emmyrc.workspace.package_dirs {
+        let package_path = PathBuf::from(package_dir);
+        if let Some(parent) = package_path.parent() {
+            if let Some(name) = package_path.file_name() {
+                workspaces.push(WorkspaceFolder::with_sub_paths(
+                    parent.to_path_buf(),
+                    vec![PathBuf::from(name)],
+                    true,
+                ));
+            } else {
+                log::warn!("package dir {:?} has no file name", package_path);
+            }
+        } else {
+            log::warn!("package dir {:?} has no parent", package_path);
+        }
+    }
+
+    workspaces
+}
+
 #[derive(Debug)]
 pub(crate) struct WorkspaceFileCandidate {
     pub workspace_priority: usize,

@@ -184,6 +184,16 @@ pub async fn output_result(
         }
     }
 
+    // The channel closes early only when worker tasks died before sending
+    // (see the `drop(sender)` above the spawn loop): a partial file set is an
+    // error, never a complete result that passes CI on partial diagnostics.
+    if count != total_count {
+        eprintln!(
+            "glua_check: only {count} of {total_count} file results arrived; a worker task likely panicked"
+        );
+        return 1;
+    }
+
     collected_diagnostics.sort_by(compare_output_diagnostics);
     let mut current_file_id = None;
     let mut current_normalized_path = None;

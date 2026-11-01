@@ -228,17 +228,26 @@ impl PartialEq for VarRefId {
 
 impl Eq for VarRefId {}
 
+/// An interned name hashes its pointer, which a name freed and interned
+/// again does not keep, so a fingerprint hashes its text.
 impl Hash for VarRefId {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        let hash_name = |name: &ArcIntern<SmolStr>, state: &mut H| {
+            if crate::db_index::derivation::fingerprinting() {
+                name.as_str().hash(state);
+            } else {
+                name.hash(state);
+            }
+        };
         std::mem::discriminant(self).hash(state);
         match self {
             VarRefId::VarRef(decl_id) => decl_id.hash(state),
             VarRefId::SelfRef(self_ref_id) => self_ref_id.hash(state),
             VarRefId::IndexRef(root, path) => {
                 root.hash(state);
-                path.hash(state);
+                hash_name(path, state);
             }
-            VarRefId::GlobalName(name, _) => name.hash(state),
+            VarRefId::GlobalName(name, _) => hash_name(name, state),
         }
     }
 }
@@ -295,6 +304,16 @@ impl VarRefId {
     }
 }
 
+/// The root of a call's own reference, given its first argument's: a call
+/// names an entry of the variable it is passed first (`rawget(obj, key)`).
+pub(crate) fn call_var_ref_root(first_arg_ref: VarRefId) -> Option<VarRefRootId> {
+    match first_arg_ref {
+        VarRefId::SelfRef(self_ref_id) => Some(VarRefRootId::SelfRef(self_ref_id)),
+        VarRefId::VarRef(decl_id) => Some(VarRefRootId::Decl(decl_id)),
+        _ => None,
+    }
+}
+
 fn get_call_expr_var_ref_id(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -302,6 +321,36 @@ fn get_call_expr_var_ref_id(
 ) -> Option<VarRefId> {
     let prefix_expr = call_expr.get_prefix_expr()?;
     let maybe_func = infer_expr(db, cache, prefix_expr.clone()).ok()?;
+
+    if call_expr.is_colon_call() && call_expr.get_args_list()?.get_args().next().is_none() {
+        if crate::db_index::callee_signature_ids(&maybe_func)
+            .into_iter()
+            .any(|id| crate::signature_has_fresh_result(db, id))
+        {
+            return None;
+        }
+        let LuaExpr::IndexExpr(method) = prefix_expr else {
+            return None;
+        };
+        let receiver = method.get_prefix_expr()?;
+        let receiver_ref = get_var_expr_var_ref_id(db, cache, receiver.clone())?;
+        let (root, path) = match receiver_ref {
+            VarRefId::IndexRef(root, path) => (root, path.to_string()),
+            reference => (
+                call_var_ref_root(reference)?,
+                getter_access_path(&receiver)?,
+            ),
+        };
+        let name = method
+            .get_index_key()?
+            .get_name()?
+            .get_name_text()
+            .to_string();
+        return Some(VarRefId::IndexRef(
+            root,
+            crate::db_index::intern_smol_str(&format!("{path}.[:{name}()]")),
+        ));
+    }
 
     let ret = match maybe_func {
         LuaType::DocFunction(f) => f.get_ret().clone(),
@@ -317,46 +366,43 @@ fn get_call_expr_var_ref_id(
 
     match alias_call_type.get_call_kind() {
         LuaAliasCallKind::RawGet => {
-            let args_list = call_expr.get_args_list()?;
-            let mut args_iter = args_list.get_args();
-
-            let obj_expr = args_iter.next()?;
-            let root = match get_var_expr_var_ref_id(db, cache, obj_expr.clone()) {
-                Some(VarRefId::SelfRef(self_ref_id)) => VarRefRootId::SelfRef(self_ref_id),
-                Some(VarRefId::VarRef(decl_id)) => VarRefRootId::Decl(decl_id),
-                _ => return None,
-            };
-            // 开始构建 access_path
-            let mut access_path = String::new();
-            access_path.push_str(obj_expr.syntax().text().to_string().as_str()); // 这里不需要精确的文本
-            access_path.push('.');
-            let key_expr = args_iter.next()?;
-            match key_expr {
-                LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal()? {
-                    LuaLiteralToken::String(string_token) => {
-                        access_path.push_str(string_token.get_value().as_str());
-                    }
-                    LuaLiteralToken::Number(number_token) => {
-                        access_path.push_str(number_token.get_number_value().to_string().as_str());
-                    }
-                    _ => return None,
-                },
-                LuaExpr::NameExpr(name_expr) => {
-                    access_path.push_str(name_expr.get_access_path()?.as_str());
-                }
-                LuaExpr::IndexExpr(index_expr) => {
-                    access_path.push_str(index_expr.get_access_path()?.as_str());
-                }
-                _ => return None,
-            }
-
+            let obj_expr = call_expr.get_args_list()?.get_args().next()?;
+            let root = call_var_ref_root(get_var_expr_var_ref_id(db, cache, obj_expr)?)?;
+            let access_path = raw_get_access_path(call_expr)?;
             Some(VarRefId::IndexRef(
                 root,
-                ArcIntern::new(SmolStr::new(access_path)),
+                crate::db_index::intern_smol_str(&access_path),
             ))
         }
         _ => None,
     }
+}
+
+/// The access path a `rawget(obj, key)`-style call names, read off its
+/// syntax: the object's text, which need not be exact, and the key.
+pub(crate) fn raw_get_access_path(call_expr: &LuaCallExpr) -> Option<String> {
+    let mut args = call_expr.get_args_list()?.get_args();
+    let mut access_path = args.next()?.syntax().text().to_string();
+    access_path.push('.');
+    match args.next()? {
+        LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal()? {
+            LuaLiteralToken::String(string_token) => {
+                access_path.push_str(&glua_parser::path_segment(&string_token.get_value()));
+            }
+            LuaLiteralToken::Number(number_token) => {
+                access_path.push_str(number_token.get_number_value().to_string().as_str());
+            }
+            _ => return None,
+        },
+        LuaExpr::NameExpr(name_expr) => {
+            access_path.push_str(name_expr.get_access_path()?.as_str());
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            access_path.push_str(index_expr.get_access_path()?.as_str());
+        }
+        _ => return None,
+    }
+    Some(access_path)
 }
 
 pub fn get_var_expr_var_ref_id(
@@ -364,19 +410,56 @@ pub fn get_var_expr_var_ref_id(
     cache: &mut LuaInferCache,
     var_expr: LuaExpr,
 ) -> Option<VarRefId> {
-    if let Some(var_ref_id) = cache.expr_var_ref_id_cache.get(&var_expr.get_syntax_id()) {
-        return Some(var_ref_id.clone());
+    let syntax_id = var_expr.get_syntax_id();
+    if let Some(var_ref_id) =
+        cache.tracked_get(|cache| &mut cache.expr_var_ref_id_cache, &syntax_id)
+    {
+        return Some(var_ref_id);
     }
 
+    let frame = crate::db_index::derivation::open_frame();
     let ref_id = match &var_expr {
         LuaExpr::NameExpr(name_expr) => get_name_expr_var_ref_id(db, cache, name_expr),
         LuaExpr::IndexExpr(index_expr) => get_index_expr_var_ref_id(db, cache, index_expr),
         LuaExpr::CallExpr(call_expr) => get_call_expr_var_ref_id(db, cache, call_expr),
         _ => None,
-    }?;
-
-    cache
-        .expr_var_ref_id_cache
-        .insert(var_expr.get_syntax_id(), ref_id.clone());
+    };
+    let Some(ref_id) = ref_id else {
+        cache.close_frame(frame);
+        return None;
+    };
+    cache.tracked_insert(
+        |cache| &mut cache.expr_var_ref_id_cache,
+        syntax_id,
+        ref_id.clone(),
+        frame,
+    );
     Some(ref_id)
+}
+
+pub(crate) fn getter_access_path(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::NameExpr(name) => Some(name.get_name_text()?.to_string()),
+        LuaExpr::IndexExpr(index) => {
+            let prefix = getter_access_path(&index.get_prefix_expr()?)?;
+            let path = index.get_access_path()?;
+            let key = glua_parser::path_segments(&path).last()?;
+            Some(format!("{prefix}.{key}"))
+        }
+        LuaExpr::CallExpr(call)
+            if call.is_colon_call() && call.get_args_list()?.get_args().next().is_none() =>
+        {
+            let LuaExpr::IndexExpr(method) = call.get_prefix_expr()? else {
+                return None;
+            };
+            let prefix = getter_access_path(&method.get_prefix_expr()?)?;
+            let name = method
+                .get_index_key()?
+                .get_name()?
+                .get_name_text()
+                .to_string();
+            Some(format!("{prefix}.[:{name}()]"))
+        }
+        _ => None,
+    }
 }

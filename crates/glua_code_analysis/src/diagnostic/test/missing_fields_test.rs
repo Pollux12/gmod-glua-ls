@@ -751,6 +751,236 @@ foo({})
     }
 
     #[test]
+    fn unannotated_local_table_filled_before_its_use_has_no_missing_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Ray
+            ---@field start number
+            ---@field endpos number
+            ---@field mins number
+
+            ---@param ray Ray
+            local function trace(ray) return ray end
+
+            local ray = { mins = 1 }
+            function Fire(pos)
+                ray.start = pos
+                ray.endpos = pos + 1
+                return trace(ray)
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_field_written_only_where_it_may_not_run_before_the_use_is_still_missing() {
+        let mut ws = VirtualWorkspace::new();
+
+        for completion in [
+            "local function prepare() value.required = \"ready\" end",
+            "if flag then value.required = \"ready\" end",
+        ] {
+            assert!(
+                !ws.check_code_for(
+                    DiagnosticCode::MissingFields,
+                    &format!(
+                        r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value Full
+            local function consume(value) end
+
+            local value = {{}}
+            {completion}
+            consume(value)
+            "#
+                    ),
+                ),
+                "{completion}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_written_from_its_own_use_is_still_missing_there() {
+        for before in ["observe(value)", ""] {
+            let mut ws = VirtualWorkspace::new();
+
+            assert!(
+                !ws.check_code_for(
+                    DiagnosticCode::MissingFields,
+                    &format!(
+                        r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value any
+            local function observe(value) end
+
+            ---@param value Full
+            ---@return string
+            local function consume(value) return value.required end
+
+            local value = {{}}
+            {before}
+            value.required = consume(value)
+            "#
+                    ),
+                ),
+                "{before}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_written_from_a_call_its_value_makes_at_once_is_still_missing_there() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value Full
+            ---@return string
+            local function consume(value) return value.required end
+
+            ---@type Full
+            local value = {}
+            value.required = (function()
+                return consume(value)
+            end)()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_field_holding_the_table_itself_is_given() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Node
+            ---@field parent Node
+
+            ---@type Node
+            local root = {}
+            root.parent = root
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_field_written_from_another_field_of_the_table_is_given() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Size
+            ---@field w number
+            ---@field h number
+
+            ---@type Size
+            local size = {}
+            size.w = 10
+            size.h = size.w * 2
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_function_written_onto_the_table_it_uses_is_given() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Button
+            ---@field DoClick fun()
+
+            ---@type Button
+            local button = {}
+            button.DoClick = function() print(button) end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_table_of_functions_written_onto_the_table_they_use_is_given() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Callbacks
+            ---@field run fun()
+
+            ---@class Job
+            ---@field callbacks Callbacks
+
+            ---@type Job
+            local job = {}
+            job.callbacks = { run = function() print(job) end }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_field_written_in_a_do_block_before_the_use_is_given() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value any
+            local function observe(value) end
+
+            ---@param value Full
+            local function consume(value) end
+
+            local value = {}
+            observe(value)
+            do value.required = "ready" end
+            consume(value)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn an_untyped_use_before_the_completion_does_not_cut_it_off() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value any
+            local function observe(value) end
+
+            ---@param value Full
+            local function consume(value) end
+
+            local value = {}
+            observe(value)
+            value.required = "ready"
+            consume(value)
+            "#,
+        ));
+    }
+
+    #[test]
     fn unannotated_local_table_passed_to_reader_reports_missing_fields() {
         let mut ws = VirtualWorkspace::new();
 
@@ -766,6 +996,278 @@ foo({})
 
             local sized = { width = 100 }
             measure(sized)
+            "#,
+        ));
+    }
+
+    /// A field attached to a container element at runtime is not part of the
+    /// class contract, so it must never become a *required* member of it. The
+    /// same write at file scope already promotes nothing; sitting inside a block
+    /// must not change the answer.
+    #[test]
+    fn undeclared_field_written_to_a_container_element_is_not_required() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Fires
+            ---@field ID string
+
+            ---@type table<string, Fires>
+            local storeF = {}
+
+            ---@param t Fires
+            local function makeF(t) return t.ID end
+
+            makeF({ ID = "a" })
+            for _, v in pairs(storeF) do v.X = 5 end
+            "#,
+        ));
+    }
+
+    const MULTI_RETURNS: &str = r#"
+        ---@return number, string, boolean
+        local function m() return 1, "a", true end
+        ---@return number, string
+        local function m2() return 1, "a" end
+        ---@return string, number
+        local function g() return "a", 1 end
+        ---@return number
+        local function one() return 1 end
+        ---@return number...
+        local function va() return 1 end
+    "#;
+
+    #[test]
+    fn trailing_call_fills_every_positional_slot_it_returns() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            &format!(
+                r#"{MULTI_RETURNS}
+                ---@type {{ [1]: number, [2]: string, [3]: boolean }}
+                local t = {{ m() }}
+                ---@type {{ [1]: number, [2]: string, [3]: boolean }}
+                local u = {{ 1, m2() }}
+                "#
+            ),
+        ));
+    }
+
+    #[test]
+    fn trailing_call_after_named_field_fills_positional_slots() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            &format!(
+                r#"{MULTI_RETURNS}
+                ---@type {{ name: string, [1]: string, [2]: number }}
+                local t = {{ name = "x", g() }}
+                "#
+            ),
+        ));
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            &format!(
+                r#"{MULTI_RETURNS}
+                ---@type {{ name: string, [1]: string, [2]: number }}
+                local t = {{ name = "x", g() }}
+                "#
+            ),
+        ));
+    }
+
+    #[test]
+    fn trailing_variadic_call_may_fill_remaining_slots() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            &format!(
+                r#"{MULTI_RETURNS}
+                ---@type {{ [1]: number, [2]: number, [3]: number }}
+                local t = {{ va() }}
+                "#
+            ),
+        ));
+    }
+
+    #[test]
+    fn trailing_call_returning_too_few_values_is_still_missing() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            &format!(
+                r#"{MULTI_RETURNS}
+                ---@type {{ [1]: number, [2]: string, [3]: boolean }}
+                local t = {{ one() }}
+                "#
+            ),
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            &format!(
+                r#"{MULTI_RETURNS}
+                ---@type {{ [1]: number, [2]: string, [3]: boolean }}
+                local t = {{ m2() }}
+                "#
+            ),
+        ));
+    }
+
+    /// Whether the literal `index_table` backs through `setmetatable` is
+    /// reported missing a required field.
+    fn reports_missing_with_index_table(index_table: &str) -> bool {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        !ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            &format!(
+                r#"
+                ---@class MetaRequired
+                ---@field foo string
+
+                ---@param value MetaRequired
+                local function consume(value) end
+
+                local value = {{}}
+                setmetatable(value, {{ __index = {index_table} }})
+                consume(value)
+                "#
+            ),
+        )
+    }
+
+    /// A field the metatable's `__index` table supplies is there when read;
+    /// one it lacks stays missing. A supplied field of the wrong type is not
+    /// missing: the type check reports it.
+    #[test]
+    fn a_field_an_index_table_supplies_is_not_missing() {
+        assert_eq!(
+            [r#"{ foo = "yes" }"#, "{ foo = 123 }", r#"{ bar = "yes" }"#]
+                .map(reports_missing_with_index_table),
+            [false, false, true]
+        );
+    }
+    /// Handing `(value)` to a call consumes the table as handing `value` does.
+    #[test]
+    fn a_parenthesized_use_of_the_table_still_consumes_it() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value Full
+            ---@return string
+            local function consume(value) return value.required end
+
+            ---@type Full
+            local value = {}
+            value.required = consume((value))
+            "#,
+        ));
+    }
+
+    /// A function stored on the table runs once called, after the later writes.
+    #[test]
+    fn a_callback_written_before_another_field_does_not_consume_the_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Pair
+            ---@field fn fun()
+            ---@field required string
+
+            ---@param value Pair
+            local function consume(value) end
+
+            ---@type Pair
+            local value = {}
+            value.fn = function() consume(value) end
+            value.required = "ready"
+            value.fn()
+            "#,
+        ));
+    }
+
+    /// A function handed to a call may run there, consuming the table it uses.
+    #[test]
+    fn a_function_handed_to_a_call_consumes_the_table_it_uses() {
+        for callback in [
+            "function() consume(value) end",
+            "true and function() consume(value) end",
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+            assert!(
+                !ws.check_code_for(
+                    DiagnosticCode::MissingFields,
+                    &format!(
+                        r#"
+            ---@class Pair
+            ---@field ok boolean
+            ---@field required string
+
+            ---@param value Pair
+            local function consume(value) end
+
+            ---@type Pair
+            local value = {{}}
+            value.ok = pcall({callback})
+            value.required = "ready"
+            "#
+                    ),
+                ),
+                "{callback}"
+            );
+        }
+    }
+
+    /// A callee filling an `and`/`or` argument may fill the other operand, not the table.
+    #[test]
+    fn a_callee_filling_a_logical_argument_does_not_complete_the_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param target Full
+            local function Fill(target)
+                target.required = "ready"
+            end
+
+            ---@type Full
+            local value = {}
+            Fill(value and { required = "other" })
+            "#,
+        ));
+    }
+
+    /// A parameter named like the table is another value, not the table.
+    #[test]
+    fn a_shadowing_parameter_handed_to_a_call_is_not_the_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value Full
+            ---@return string
+            local function consume(value) return value.required end
+
+            ---@type Full
+            local value = {}
+            value.required = (function(value) return consume(value) end)({ required = "ready" })
             "#,
         ));
     }

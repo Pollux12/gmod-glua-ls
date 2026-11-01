@@ -1,4 +1,4 @@
-use crate::{DbIndex, LuaInstanceType, LuaType, get_real_type};
+use crate::{DbIndex, LuaType, get_real_type};
 
 pub fn remove_type(db: &DbIndex, source: LuaType, removed_type: LuaType) -> Option<LuaType> {
     if source == removed_type {
@@ -72,7 +72,7 @@ pub fn remove_type(db: &DbIndex, source: LuaType, removed_type: LuaType) -> Opti
             | LuaType::TableGeneric(_) => return None,
             LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
                 let type_decl = db.get_type_index().get_type_decl(type_decl_id)?;
-                // enum 在实际使用时实际上是 enum.field, 并不等于 table
+                // An enum is actually enum.field when used, and is not equal to table
                 if type_decl.is_enum() {
                     return Some(source.clone());
                 }
@@ -82,7 +82,12 @@ pub fn remove_type(db: &DbIndex, source: LuaType, removed_type: LuaType) -> Opti
                     return remove_type(db, alias_ref.clone(), removed_type);
                 }
 
-                // 需要对`userdata`进行特殊处理
+                // In Garry's Mod, engine/userdata classes have distinct type() names ("Vector", "Player", etc.) and are not table
+                if is_gmod_non_table_class(db, type_decl_id) {
+                    return Some(source.clone());
+                }
+
+                // `userdata` needs special handling
                 if let Some(super_types) = db.get_type_index().get_super_types_iter(type_decl_id) {
                     for super_type in super_types {
                         if super_type.is_userdata() {
@@ -155,13 +160,36 @@ pub fn remove_type(db: &DbIndex, source: LuaType, removed_type: LuaType) -> Opti
     // its base, preserving the Instance wrapper with the narrowed base type.
     if let LuaType::Instance(instance_type) = real_type {
         if let Some(new_base) = remove_type(db, instance_type.get_base().clone(), removed_type) {
-            return Some(LuaType::Instance(
-                LuaInstanceType::new(new_base, instance_type.get_range().clone()).into(),
-            ));
+            return Some(LuaType::Instance(instance_type.rebased(new_base).into()));
         }
         // If the entire base was removed, the Instance has no valid type.
         return Some(LuaType::Never);
     }
 
     Some(source.clone())
+}
+
+fn is_gmod_non_table_class(db: &crate::DbIndex, type_decl_id: &crate::LuaTypeDeclId) -> bool {
+    if !db.get_emmyrc().gmod.enabled {
+        return false;
+    }
+    let name = type_decl_id.get_name();
+    match name {
+        "Vector" | "Angle" | "VMatrix" | "Entity" | "Player" | "NPC" | "Weapon" | "Vehicle"
+        | "NextBot" | "Panel" | "PhysObj" | "File" | "IMaterial" | "ITexture" | "ISave"
+        | "IRestore" | "IGModAudioChannel" | "PathFollower" | "CLuaEmitter" | "CLuaParticle"
+        | "CNavArea" | "CNavLadder" | "CNewParticleEffect" | "CSoundPatch" | "CTakeDamageInfo"
+        | "CUserCmd" | "bf_read" => true,
+        _ => {
+            let mut supers = Vec::new();
+            type_decl_id.collect_super_types(db, &mut supers);
+            supers.iter().any(|st| {
+                if let LuaType::Ref(sid) | LuaType::Def(sid) = st {
+                    matches!(sid.get_name(), "Entity" | "Panel")
+                } else {
+                    false
+                }
+            })
+        }
+    }
 }

@@ -145,11 +145,7 @@ end
             .get_semantic_model(caller_file)
             .ok_or("missing caller semantic model")
             .or_fail()?;
-        let offset = semantic_model
-            .get_document()
-            .get_offset(position.line as usize, position.character as usize)
-            .ok_or("invalid caller position")
-            .or_fail()?;
+        let offset = semantic_model.get_document().to_offset(position);
         let token = match semantic_model.get_root().syntax().token_at_offset(offset) {
             rowan::TokenAtOffset::Single(token) => token,
             rowan::TokenAtOffset::Between(_, right) => right,

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use glua_code_analysis::{
     LuaCompilation, LuaDeclExtra, LuaDeclId, LuaMemberId, LuaMemberIndexItem, LuaMemberOwner,
-    LuaSemanticDeclId, LuaType, LuaTypeDeclId, LuaUnionType, SemanticDeclLevel, SemanticModel,
+    LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel, SemanticModel,
 };
 use glua_parser::{LuaAssignStat, LuaAstNode, LuaSyntaxKind, LuaTableExpr, LuaTableField};
 use rowan::TextSize;
@@ -129,14 +129,14 @@ pub fn find_member_origin_owners(
         );
     }
 
-    // 如果存在多个同名成员, 则返回多个成员
+    // If there are multiple members with the same name, return all of them
     if let Some(same_named_members) =
         find_all_same_named_members(semantic_model, &final_owner, usage_position)
         && same_named_members.len() > 1
     {
         return DeclOriginResult::Multiple(same_named_members);
     }
-    // 否则返回单个成员
+    // Otherwise return the single member
     DeclOriginResult::Single(final_owner.unwrap_or_else(|| LuaSemanticDeclId::Member(member_id)))
 }
 
@@ -342,7 +342,7 @@ fn resolve_member_owner(
     semantic_model: &SemanticModel,
     member_id: &LuaMemberId,
 ) -> Option<LuaSemanticDeclId> {
-    // 通常来说, 即使需要跨文件也一般只会跨一个文件, 所有不需要缓存
+    // Usually even a cross-file lookup spans only one file, so no cache is needed
     let semantic_model = if member_id.file_id == semantic_model.get_file_id() {
         semantic_model
     } else {
@@ -355,13 +355,13 @@ fn resolve_member_owner(
         LuaSyntaxKind::TableFieldAssign => {
             if LuaTableField::can_cast(current_node.kind().into()) {
                 let table_field = LuaTableField::cast(current_node.clone())?;
-                // 如果表是类, 那么通过类型推断获取 owner
+                // If the table is a class, get the owner through type inference
                 if let Some(owner_id) =
                     resolve_table_field_through_type_inference(semantic_model, &table_field)
                 {
                     return Some(owner_id);
                 }
-                // 非类, 那么通过右值推断
+                // Not a class, so infer through the right value
                 let value_expr = table_field.get_value_expr()?;
                 let value_node = value_expr.get_syntax_id().to_node_from_root(root)?;
                 semantic_model.find_decl(value_node.into(), SemanticDeclLevel::default())
@@ -388,7 +388,7 @@ fn resolve_member_owner(
         _ => None,
     };
 
-    // 禁止追溯到参数
+    // Do not trace back to parameters
     match result {
         Some(LuaSemanticDeclId::LuaDecl(decl_id)) => {
             let decl = semantic_model
@@ -404,16 +404,16 @@ fn resolve_member_owner(
     }
 }
 
-// 判断`table`是否为类
+// Determine whether `table` is a class
 fn table_is_class(table_type: &LuaType, depth: usize) -> bool {
     if depth > 10 {
         return false;
     }
     match table_type {
         LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_) => true,
-        LuaType::Union(union) => match union.as_ref() {
-            LuaUnionType::Nullable(t) => table_is_class(t, depth + 1),
-            LuaUnionType::Multi(ts) => ts.iter().any(|t| table_is_class(t, depth + 1)),
+        LuaType::Union(union) => match union.nullable_inner() {
+            Some(t) => table_is_class(t, depth + 1),
+            None => union.types().any(|t| table_is_class(t, depth + 1)),
         },
         _ => false,
     }
@@ -427,7 +427,7 @@ fn resolve_table_field_through_type_inference(
     let table_expr = LuaTableExpr::cast(parent)?;
     let table_type = semantic_model.infer_table_should_be(table_expr)?;
 
-    // 必须为类我们才搜索其成员
+    // Only search members if it is a class
     if !table_is_class(&table_type, 0) {
         return None;
     }

@@ -1,10 +1,12 @@
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::{collections::HashMap, sync::Arc};
 
 use glua_parser::{LuaAstNode, LuaClosureExpr, LuaDocFuncType};
-use rowan::TextSize;
+use rowan::{TextRange, TextSize};
+use smol_str::SmolStr;
 
 use crate::db_index::signature::async_state::AsyncState;
 use crate::{DbIndex, LuaAttributeUse, SemanticModel, VariadicType, first_param_may_not_self};
@@ -18,43 +20,86 @@ pub const CALL_ARG_FIELD_ATTRIBUTE: &str = "call_arg_field";
 pub const OVERLOAD_CALL_ARG_ATTRIBUTE: &str = "overload_call_arg";
 pub const OVERLOAD_CALL_ARG_FIELD_ATTRIBUTE: &str = "overload_call_arg_field";
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LuaSignature {
     pub generic_params: Vec<Arc<LuaGenericParamInfo>>,
     pub overloads: Vec<Arc<LuaFunctionType>>,
     pub param_docs: HashMap<usize, LuaDocParamInfo>,
     pub out_params: Vec<LuaOutParamInfo>,
-    pub params: Vec<String>,
+    pub params: Vec<SmolStr>,
     pub return_docs: Vec<LuaDocReturnInfo>,
     pub resolve_return: SignatureReturnStatus,
     pub is_colon_define: bool,
     pub async_state: AsyncState,
     pub nodiscard: Option<LuaNoDiscard>,
     pub is_vararg: bool,
+    /// Whether `param_docs` was filled in from the slot this closure was assigned
+    /// into rather than from its own `@param` tags.
+    ///
+    /// Those params are one receiver's answer, not a contract: the next closure
+    /// filling the same slot must not inherit them, or its receiver would be
+    /// whichever sibling the batch happened to resolve first.
+    pub params_filled_from_slot: bool,
+    pub receiver_filled_from_slot: bool,
+    /// Whether `return_docs` was filled in from the slot this closure was
+    /// assigned into rather than from its own `@return` tags. Slot-filled
+    /// returns may be refreshed when the inherited contract settles; explicit
+    /// doc-tag returns may not.
+    pub return_filled_from_slot: bool,
+    /// The facts few signatures carry; `None` exactly when all are empty.
+    facts: Option<Box<SignatureFacts>>,
+    pub return_cast: Option<super::LuaSignatureCast>,
+}
+
+/// Parameter/return relations inferred from a function body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SignatureFacts {
     require_guard_param: Option<usize>,
     nil_return_guard_params: Vec<usize>,
     return_correlations: Vec<LuaReturnCorrelation>,
     direct_param_return_alias: Option<usize>,
-    /// Param index of a classname string passed to a class-name factory
-    /// (`vgui.Create` / `ents.Create` / any `` `T` `` create) whose result is returned.
-    class_name_param_return_alias: Option<usize>,
+    class_name_param_return_alias: Option<LuaClassNameReturnAlias>,
+    /// Every return is the colon receiver `self`, never reassigned.
+    returns_receiver: bool,
     falsy_param_nil_free_return_slots: Vec<LuaFalsyParamNilFreeReturnSlot>,
     falsy_param_return_aliases: Vec<LuaFalsyParamReturnAlias>,
+    /// The table constructors and calls whose value the function returns and
+    /// which each call of it evaluates anew, relative to the function's start
+    /// so a shift of its file leaves the fact unchanged.
+    fresh_returned_values: Vec<TextRange>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A call whose result the function returns and which is handed some of the
+/// function's parameters unchanged. Whether one of them reaches a `` `T` ``
+/// parameter of the callee is decided at each call site, so a call passing a
+/// class name returns what the callee returns for it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LuaClassNameReturnAlias {
+    /// The call, relative to the function's start so a shift of its file
+    /// leaves the fact unchanged.
+    pub create_call: TextRange,
+    /// `(parameter, argument)` pairs: the call's argument `argument` is the
+    /// function's parameter `parameter`, never reassigned before the return.
+    pub forwarded: Vec<(usize, usize)>,
+    /// A method call on the created value that is returned in its place; it
+    /// keeps the created type only when the method returns its receiver.
+    /// Relative to the function's start like `create_call`.
+    pub receiver_call: Option<TextRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaReturnCorrelation {
     pub discriminant_slot: usize,
     pub implied_non_nil_slots: Vec<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaFalsyParamNilFreeReturnSlot {
     pub param_idx: usize,
     pub return_slot: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaFalsyParamReturnAlias {
     pub falsy_param_idx: usize,
     pub aliased_param_idx: usize,
@@ -76,10 +121,62 @@ impl LuaCallArgRole {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LuaNoDiscard {
     NoDiscard,
     NoDiscardWithMessage(Box<String>),
+}
+
+impl LuaSignature {
+    /// What a read of the signature as declared observes; see
+    /// [`crate::db_index::derivation::FactKey::SignatureDecl`].
+    pub(crate) fn declaration(&self) -> impl Hash + '_ {
+        let mut param_docs: Vec<_> = self.param_docs.iter().collect();
+        param_docs.sort_unstable_by_key(|(idx, _)| **idx);
+        (
+            &self.generic_params,
+            &self.overloads,
+            param_docs,
+            &self.out_params,
+            &self.params,
+            self.is_colon_define,
+            self.is_vararg,
+            self.params_filled_from_slot,
+            self.receiver_filled_from_slot,
+        )
+    }
+}
+
+/// Content hash; `param_docs` is hashed in param-index order.
+impl Hash for LuaSignature {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.generic_params.hash(state);
+        self.overloads.hash(state);
+        let mut param_docs: Vec<_> = self.param_docs.iter().collect();
+        param_docs.sort_unstable_by_key(|(idx, _)| **idx);
+        param_docs.hash(state);
+        self.out_params.hash(state);
+        self.params.hash(state);
+        self.return_docs.hash(state);
+        self.resolve_return.hash(state);
+        self.is_colon_define.hash(state);
+        self.async_state.hash(state);
+        self.nodiscard.hash(state);
+        self.is_vararg.hash(state);
+        self.params_filled_from_slot.hash(state);
+        self.receiver_filled_from_slot.hash(state);
+        self.return_filled_from_slot.hash(state);
+        self.require_guard_param().hash(state);
+        self.nil_return_guard_params().hash(state);
+        self.return_correlations().hash(state);
+        self.direct_param_return_alias().hash(state);
+        self.class_name_param_return_alias().hash(state);
+        self.returns_receiver().hash(state);
+        self.falsy_param_nil_free_return_slots().hash(state);
+        self.falsy_param_return_aliases().hash(state);
+        self.fresh_returned_values().hash(state);
+        self.return_cast.hash(state);
+    }
 }
 
 impl Default for LuaSignature {
@@ -102,18 +199,36 @@ impl LuaSignature {
             async_state: AsyncState::None,
             nodiscard: None,
             is_vararg: false,
-            require_guard_param: None,
-            nil_return_guard_params: Vec::new(),
-            return_correlations: Vec::new(),
-            direct_param_return_alias: None,
-            class_name_param_return_alias: None,
-            falsy_param_nil_free_return_slots: Vec::new(),
-            falsy_param_return_aliases: Vec::new(),
+            params_filled_from_slot: false,
+            receiver_filled_from_slot: false,
+            return_filled_from_slot: false,
+            facts: None,
+            return_cast: None,
+        }
+    }
+
+    fn facts_mut(&mut self) -> &mut SignatureFacts {
+        self.facts.get_or_insert_default()
+    }
+
+    pub fn return_correlations(&self) -> &[LuaReturnCorrelation] {
+        match &self.facts {
+            Some(facts) => &facts.return_correlations,
+            None => &[],
         }
     }
 
     pub fn set_return_correlations(&mut self, correlations: Vec<LuaReturnCorrelation>) {
-        self.return_correlations = correlations;
+        match &mut self.facts {
+            Some(facts) => {
+                facts.return_correlations = correlations;
+                if **facts == SignatureFacts::default() {
+                    self.facts = None;
+                }
+            }
+            None if correlations.is_empty() => {}
+            None => self.facts_mut().return_correlations = correlations,
+        }
     }
 
     pub fn return_correlation_implies(
@@ -121,44 +236,57 @@ impl LuaSignature {
         discriminant_slot: usize,
         implied_slot: usize,
     ) -> bool {
-        self.return_correlations.iter().any(|correlation| {
+        self.return_correlations().iter().any(|correlation| {
             correlation.discriminant_slot == discriminant_slot
                 && correlation.implied_non_nil_slots.contains(&implied_slot)
         })
     }
 
     pub fn set_direct_param_return_alias(&mut self, param_idx: usize) {
-        self.direct_param_return_alias = Some(param_idx);
+        self.facts_mut().direct_param_return_alias = Some(param_idx);
     }
 
     pub fn direct_param_return_alias(&self) -> Option<usize> {
-        self.direct_param_return_alias
+        self.facts.as_ref()?.direct_param_return_alias
     }
 
-    pub fn set_class_name_param_return_alias(&mut self, param_idx: usize) {
-        self.class_name_param_return_alias = Some(param_idx);
+    pub fn set_class_name_param_return_alias(&mut self, alias: LuaClassNameReturnAlias) {
+        self.facts_mut().class_name_param_return_alias = Some(alias);
     }
 
-    pub fn class_name_param_return_alias(&self) -> Option<usize> {
-        self.class_name_param_return_alias
+    pub fn class_name_param_return_alias(&self) -> Option<&LuaClassNameReturnAlias> {
+        self.facts.as_ref()?.class_name_param_return_alias.as_ref()
+    }
+
+    pub fn set_returns_receiver(&mut self) {
+        self.facts_mut().returns_receiver = true;
+    }
+
+    pub fn returns_receiver(&self) -> bool {
+        self.facts
+            .as_ref()
+            .is_some_and(|facts| facts.returns_receiver)
     }
 
     pub fn require_guard_param(&self) -> Option<usize> {
-        self.require_guard_param
+        self.facts.as_ref()?.require_guard_param
     }
 
     pub fn set_require_guard_param(&mut self, param_idx: usize) {
-        self.require_guard_param = Some(param_idx);
+        self.facts_mut().require_guard_param = Some(param_idx);
     }
 
     pub fn add_nil_return_guard_param(&mut self, param_idx: usize) {
-        if !self.nil_return_guard_params.contains(&param_idx) {
-            self.nil_return_guard_params.push(param_idx);
+        if !self.nil_return_guard_params().contains(&param_idx) {
+            self.facts_mut().nil_return_guard_params.push(param_idx);
         }
     }
 
     pub fn nil_return_guard_params(&self) -> &[usize] {
-        &self.nil_return_guard_params
+        match &self.facts {
+            Some(facts) => &facts.nil_return_guard_params,
+            None => &[],
+        }
     }
 
     pub fn add_falsy_param_nil_free_return_slot(&mut self, param_idx: usize, return_slot: usize) {
@@ -166,13 +294,18 @@ impl LuaSignature {
             param_idx,
             return_slot,
         };
-        if !self.falsy_param_nil_free_return_slots.contains(&fact) {
-            self.falsy_param_nil_free_return_slots.push(fact);
+        if !self.falsy_param_nil_free_return_slots().contains(&fact) {
+            self.facts_mut()
+                .falsy_param_nil_free_return_slots
+                .push(fact);
         }
     }
 
     pub fn falsy_param_nil_free_return_slots(&self) -> &[LuaFalsyParamNilFreeReturnSlot] {
-        &self.falsy_param_nil_free_return_slots
+        match &self.facts {
+            Some(facts) => &facts.falsy_param_nil_free_return_slots,
+            None => &[],
+        }
     }
 
     pub fn add_falsy_param_return_alias(
@@ -186,13 +319,27 @@ impl LuaSignature {
             aliased_param_idx,
             return_slot,
         };
-        if !self.falsy_param_return_aliases.contains(&fact) {
-            self.falsy_param_return_aliases.push(fact);
+        if !self.falsy_param_return_aliases().contains(&fact) {
+            self.facts_mut().falsy_param_return_aliases.push(fact);
         }
     }
 
     pub fn falsy_param_return_aliases(&self) -> &[LuaFalsyParamReturnAlias] {
-        &self.falsy_param_return_aliases
+        match &self.facts {
+            Some(facts) => &facts.falsy_param_return_aliases,
+            None => &[],
+        }
+    }
+
+    pub fn set_fresh_returned_values(&mut self, tables: Vec<TextRange>) {
+        self.facts_mut().fresh_returned_values = tables;
+    }
+
+    pub fn fresh_returned_values(&self) -> &[TextRange] {
+        match &self.facts {
+            Some(facts) => &facts.fresh_returned_values,
+            None => &[],
+        }
     }
 
     pub fn is_generic(&self) -> bool {
@@ -208,8 +355,7 @@ impl LuaSignature {
             type_contains_str_tpl_ref(&param_info.type_ref)
                 || param_info.get_attribute_by_name("constructor").is_some()
         }) || !self.out_params.is_empty()
-            || self.direct_param_return_alias.is_some()
-            || self.class_name_param_return_alias.is_some()
+            || self.direct_param_return_alias().is_some()
             || self
                 .overloads
                 .iter()
@@ -278,9 +424,9 @@ impl LuaSignature {
         let mut type_params = Vec::new();
         for (idx, param_name) in self.params.iter().enumerate() {
             if let Some(param_info) = self.param_docs.get(&idx) {
-                type_params.push((param_name.clone(), Some(param_info.type_ref.clone())));
+                type_params.push((param_name.to_string(), Some(param_info.type_ref.clone())));
             } else {
-                type_params.push((param_name.clone(), None));
+                type_params.push((param_name.to_string(), None));
             }
         }
 
@@ -309,11 +455,11 @@ impl LuaSignature {
 
     pub fn get_param_name_by_id(&self, idx: usize) -> Option<String> {
         if idx < self.params.len() {
-            return Some(self.params[idx].clone());
+            return Some(self.params[idx].to_string());
         } else if let Some(name) = self.params.last()
             && name == "..."
         {
-            return Some(name.clone());
+            return Some(name.to_string());
         }
 
         None
@@ -329,6 +475,27 @@ impl LuaSignature {
         }
 
         None
+    }
+
+    /// The declared type of the parameter call argument `arg_idx` binds, when
+    /// it is a string-template generic (`` `T` ``).
+    pub fn str_tpl_param_for_call_arg(
+        &self,
+        is_colon_call: bool,
+        arg_idx: usize,
+    ) -> Option<&LuaType> {
+        let param_idx = match (self.is_colon_define, is_colon_call) {
+            (true, false) => arg_idx.checked_sub(1)?,
+            (false, true) => arg_idx + 1,
+            _ => arg_idx,
+        };
+        let type_ref = &self.get_param_info_by_id(param_idx)?.type_ref;
+        type_contains_str_tpl_ref(type_ref).then_some(type_ref)
+    }
+
+    /// Whether [`Self::get_return_type`] is `never`.
+    pub fn returns_never(&self) -> bool {
+        matches!(self.return_docs.as_slice(), [only] if only.type_ref.is_never())
     }
 
     pub fn get_return_type(&self) -> LuaType {
@@ -359,7 +526,7 @@ impl LuaSignature {
             }
             match owner_type {
                 Some(owner_type) => {
-                    // 一些类型不应该被视为 method
+                    // Some types should not be treated as methods
                     if matches!(owner_type, LuaType::Ref(_) | LuaType::Def(_))
                         && first_param_may_not_self(param_type)
                     {
@@ -408,6 +575,211 @@ impl LuaSignature {
                 .with_optional_params(optional_params);
         Arc::new(func_type)
     }
+
+    /// Every top-level `LuaType` this signature stores.
+    ///
+    /// Covers generic constraints, overload params/returns, param doc
+    /// `type_ref`s, out-param `type_ref`s and return doc `type_ref`s. Fields
+    /// holding only indexes, names or correlations carry no `LuaType` and are
+    /// intentionally absent.
+    pub(crate) fn visit_payload_types(&self, visitor: &mut impl FnMut(&LuaType)) {
+        for generic in &self.generic_params {
+            if let Some(constraint) = &generic.constraint {
+                visitor(constraint);
+            }
+        }
+        for overload in &self.overloads {
+            for (_, param_ty) in overload.get_params() {
+                if let Some(ty) = param_ty {
+                    visitor(ty);
+                }
+            }
+            visitor(overload.get_ret());
+        }
+        for param in self.param_docs.values() {
+            visitor(&param.type_ref);
+        }
+        for out in &self.out_params {
+            visitor(&out.type_ref);
+        }
+        for ret in &self.return_docs {
+            visitor(&ret.type_ref);
+        }
+    }
+
+    /// Rewrites every nested position-bearing identity in the typed payloads.
+    ///
+    /// Atomic per signature: when any nested identity is lost nothing is
+    /// rewritten and `lost` is reported, so the caller dirties the holder
+    /// instead of leaving a guessed mix of old and new coordinates.
+    pub(crate) fn remap_payload_types(
+        &mut self,
+        remap: &crate::FileRemap,
+    ) -> SignaturePayloadRemap {
+        let mut lost = false;
+        let mut changed = false;
+
+        let mut new_constraints: Vec<Option<LuaType>> =
+            Vec::with_capacity(self.generic_params.len());
+        for generic in &self.generic_params {
+            match &generic.constraint {
+                Some(constraint) => {
+                    let result = crate::db_index::remap_identities_in_type(constraint, remap);
+                    if result.lost {
+                        lost = true;
+                    }
+                    if result.typ.is_some() {
+                        changed = true;
+                    }
+                    new_constraints.push(result.typ);
+                }
+                None => new_constraints.push(None),
+            }
+        }
+
+        let mut new_overloads: Vec<Option<Arc<LuaFunctionType>>> =
+            Vec::with_capacity(self.overloads.len());
+        for overload in &self.overloads {
+            let mut overload_changed = false;
+            let mut new_params = Vec::with_capacity(overload.get_params().len());
+            for (name, ty) in overload.get_params() {
+                match ty {
+                    Some(ty) => {
+                        let result = crate::db_index::remap_identities_in_type(ty, remap);
+                        if result.lost {
+                            lost = true;
+                        }
+                        match result.typ {
+                            Some(new_ty) => {
+                                overload_changed = true;
+                                new_params.push((name.clone(), Some(new_ty)));
+                            }
+                            None => new_params.push((name.clone(), Some(ty.clone()))),
+                        }
+                    }
+                    None => new_params.push((name.clone(), None)),
+                }
+            }
+            let ret_result = crate::db_index::remap_identities_in_type(overload.get_ret(), remap);
+            if ret_result.lost {
+                lost = true;
+            }
+            let new_ret = match ret_result.typ {
+                Some(new_ty) => {
+                    overload_changed = true;
+                    new_ty
+                }
+                None => overload.get_ret().clone(),
+            };
+            if overload_changed {
+                changed = true;
+                let rebuilt = LuaFunctionType::new(
+                    overload.get_async_state(),
+                    overload.is_colon_define(),
+                    overload.is_variadic(),
+                    new_params,
+                    new_ret,
+                )
+                .with_optional_params(overload.get_optional_params().to_vec())
+                .with_call_arg_roles(overload.get_call_arg_roles().to_vec());
+                new_overloads.push(Some(Arc::new(rebuilt)));
+            } else {
+                new_overloads.push(None);
+            }
+        }
+
+        let mut new_param_types: std::collections::HashMap<usize, LuaType> =
+            std::collections::HashMap::new();
+        for (idx, info) in &self.param_docs {
+            let result = crate::db_index::remap_identities_in_type(&info.type_ref, remap);
+            if result.lost {
+                lost = true;
+            }
+            if let Some(new_ty) = result.typ {
+                changed = true;
+                new_param_types.insert(*idx, new_ty);
+            }
+        }
+
+        let mut new_out_types: Vec<Option<LuaType>> = Vec::with_capacity(self.out_params.len());
+        for out in &self.out_params {
+            let result = crate::db_index::remap_identities_in_type(&out.type_ref, remap);
+            if result.lost {
+                lost = true;
+            }
+            if result.typ.is_some() {
+                changed = true;
+            }
+            new_out_types.push(result.typ);
+        }
+
+        let mut new_return_types: Vec<Option<LuaType>> = Vec::with_capacity(self.return_docs.len());
+        for ret in &self.return_docs {
+            let result = crate::db_index::remap_identities_in_type(&ret.type_ref, remap);
+            if result.lost {
+                lost = true;
+            }
+            if result.typ.is_some() {
+                changed = true;
+            }
+            new_return_types.push(result.typ);
+        }
+
+        if lost {
+            return SignaturePayloadRemap {
+                lost: true,
+                changed: false,
+            };
+        }
+        if !changed {
+            return SignaturePayloadRemap {
+                lost: false,
+                changed: false,
+            };
+        }
+
+        for (generic, new_constraint) in self.generic_params.iter_mut().zip(new_constraints) {
+            if let Some(new_ty) = new_constraint {
+                let rebuilt = LuaGenericParamInfo::new(
+                    generic.name.clone(),
+                    Some(new_ty),
+                    generic.attributes.clone(),
+                );
+                *generic = Arc::new(rebuilt);
+            }
+        }
+        for (overload, new_overload) in self.overloads.iter_mut().zip(new_overloads) {
+            if let Some(new_ty) = new_overload {
+                *overload = new_ty;
+            }
+        }
+        for (idx, new_ty) in new_param_types {
+            if let Some(info) = self.param_docs.get_mut(&idx) {
+                info.type_ref = new_ty;
+            }
+        }
+        for (out, new_ty) in self.out_params.iter_mut().zip(new_out_types) {
+            if let Some(new_ty) = new_ty {
+                out.type_ref = new_ty;
+            }
+        }
+        for (ret, new_ty) in self.return_docs.iter_mut().zip(new_return_types) {
+            if let Some(new_ty) = new_ty {
+                ret.type_ref = new_ty;
+            }
+        }
+        SignaturePayloadRemap {
+            lost: false,
+            changed: true,
+        }
+    }
+}
+
+/// Whether remapping one signature's typed payloads moved or lost anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignaturePayloadRemap {
+    pub lost: bool,
+    pub changed: bool,
 }
 
 fn visit_call_arg_roles_from_param_attribute<F>(
@@ -499,12 +871,12 @@ pub fn visit_call_arg_roles_from_type<F>(
         LuaType::Instance(instance) => {
             visit_call_arg_roles_from_type(db, instance.get_base(), arg_idx, visitor);
         }
-        LuaType::Union(union) => match union.as_ref() {
-            crate::db_index::LuaUnionType::Nullable(inner) => {
+        LuaType::Union(union) => match union.nullable_inner() {
+            Some(inner) => {
                 visit_call_arg_roles_from_type(db, inner, arg_idx, visitor);
             }
-            crate::db_index::LuaUnionType::Multi(types) => {
-                for typ in types {
+            None => {
+                for typ in union.types() {
                     visit_call_arg_roles_from_type(db, typ, arg_idx, visitor);
                 }
             }
@@ -546,6 +918,21 @@ pub fn find_call_arg_role_from_type(
     best
 }
 
+/// The signatures a callee type names: its own, or each of a union's.
+pub(crate) fn callee_signature_ids(callee: &LuaType) -> Vec<LuaSignatureId> {
+    match callee {
+        LuaType::Signature(id) => vec![*id],
+        LuaType::Union(union) => union
+            .types()
+            .filter_map(|typ| match typ {
+                LuaType::Signature(id) => Some(*id),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn type_contains_str_tpl_ref(typ: &LuaType) -> bool {
     match typ {
         LuaType::StrTplRef(_) => true,
@@ -572,7 +959,7 @@ fn overload_has_special_call_params(func: &LuaFunctionType) -> bool {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaDocParamInfo {
     pub name: String,
     pub type_ref: LuaType,
@@ -646,7 +1033,7 @@ mod tests {
     #[test]
     fn call_arg_roles_for_param_keeps_multiple_attributes() {
         let mut signature = LuaSignature::new();
-        signature.params.push("name".to_string());
+        signature.params.push("name".into());
         signature.param_docs.insert(
             0,
             LuaDocParamInfo {
@@ -678,7 +1065,7 @@ mod tests {
     #[test]
     fn call_arg_roles_for_param_keeps_field_path_attributes() {
         let mut signature = LuaSignature::new();
-        signature.params.push("panel".to_string());
+        signature.params.push("panel".into());
         signature.param_docs.insert(
             0,
             LuaDocParamInfo {
@@ -705,20 +1092,20 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LuaOutParamRoot {
     Param(usize),
     SelfReceiver,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaOutParamInfo {
     pub root: LuaOutParamRoot,
     pub field_path: Vec<String>,
     pub type_ref: LuaType,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ReturnTypeKind {
     #[default]
     Reference,
@@ -735,7 +1122,7 @@ pub enum LuaDocDefaultValue {
     Expression(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaDocReturnInfo {
     pub name: Option<String>,
     pub type_ref: LuaType,
@@ -745,7 +1132,7 @@ pub struct LuaDocReturnInfo {
     pub return_kind: ReturnTypeKind,
 }
 
-#[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub struct LuaSignatureId {
     file_id: FileId,
     position: TextSize,
@@ -804,7 +1191,6 @@ impl<'de> Deserialize<'de> for LuaSignatureId {
 }
 
 impl LuaSignatureId {
-    #[cfg(test)]
     pub(crate) fn new(file_id: FileId, position: TextSize) -> Self {
         Self { file_id, position }
     }
@@ -839,7 +1225,7 @@ pub enum SignatureReturnStatus {
     InferResolve,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash, PartialEq)]
 pub struct LuaGenericParamInfo {
     pub name: String,
     pub constraint: Option<LuaType>,

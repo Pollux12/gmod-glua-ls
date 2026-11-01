@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use glua_parser::LuaSyntaxNodeExt;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use glua_parser::{
     LuaAst, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaSyntaxKind, LuaVarExpr,
@@ -19,10 +20,12 @@ impl Checker for CheckExportChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::InjectField, DiagnosticCode::UndefinedField];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        let mut checked_index_expr = HashSet::new();
-        let mut exported_key_cache: ExportedKeyCache = HashMap::new();
-        for node in root.descendants::<LuaAst>() {
+        let mut checked_index_expr = HashSet::default();
+        let mut exported_key_cache: ExportedKeyCache = HashMap::default();
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for node in buckets.all_nodes.iter().cloned() {
             if context.is_cancelled() {
                 return;
             }
@@ -140,7 +143,7 @@ fn check_export_index_expr(
     if !decl.is_local() {
         return Some(());
     }
-    // 且该声明标记了 `export`
+    // and the declaration is marked `export`
     let property = semantic_model
         .get_db()
         .get_property_index()
@@ -154,7 +157,7 @@ fn check_export_index_expr(
         return Some(());
     };
 
-    // 不是导入表, 且定义位于当前文件中, 则尝试检查本地表.
+    // Not an imported table and defined in the current file, so try checking the local table.
     if code != DiagnosticCode::UndefinedField && table_const.file_id != semantic_model.get_file_id()
     {
         return Some(());
@@ -266,12 +269,12 @@ fn module_source_declares_exported_key(
         return false;
     };
 
-    let mut exported_local_names = HashSet::new();
-    let mut exported_keys = HashSet::new();
-    let mut local_table_init_keys: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut local_assigned_keys: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut exported_local_names = HashSet::default();
+    let mut exported_keys = HashSet::default();
+    let mut local_table_init_keys: HashMap<String, HashSet<String>> = HashMap::default();
+    let mut local_assigned_keys: HashMap<String, HashSet<String>> = HashMap::default();
 
-    for node in module_root.descendants().filter_map(LuaAst::cast) {
+    for node in module_root.descendants_of::<LuaAst>() {
         match node {
             LuaAst::LuaReturnStat(return_stat) => {
                 if return_stat
@@ -420,7 +423,7 @@ fn check_require_table_const_with_export<'a>(
         .get_local_reference(&semantic_model.get_file_id())
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))?;
 
-    // 获取声明
+    // Get the declaration
     let decl = semantic_model
         .get_db()
         .get_decl_index()

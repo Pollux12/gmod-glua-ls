@@ -91,7 +91,7 @@ pub fn narrow_down_type(
             LuaType::Table | LuaType::Userdata | LuaType::Any | LuaType::Unknown => {
                 return Some(LuaType::Table);
             }
-            // TODO: 应该根据模板约束进行精确匹配
+            // TODO: should match precisely according to the template constraint
             LuaType::TplRef(_) => return Some(source),
             LuaType::Global
             | LuaType::Array(_)
@@ -100,12 +100,12 @@ pub fn narrow_down_type(
             | LuaType::TableGeneric(_) => return Some(source),
             LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
                 let type_decl = db.get_type_index().get_type_decl(type_decl_id)?;
-                // enum 在实际使用时实际上是 enum.field, 并不等于 table
+                // An enum is actually enum.field when used, and is not equal to table
                 if type_decl.is_enum() {
                     return None;
                 }
 
-                // 需要对`userdata`进行特殊处理
+                // `userdata` needs special handling
                 if let Some(super_types) = db.get_type_index().get_super_types_iter(type_decl_id) {
                     for super_type in super_types {
                         if super_type.is_userdata() {
@@ -217,18 +217,23 @@ pub fn narrow_down_type(
         LuaType::Instance(base) => {
             return narrow_down_type(db, source, base.get_base().clone(), declared);
         }
-        LuaType::BooleanConst(_) => {
+        LuaType::BooleanConst(b) => {
             if real_source_ref.is_boolean() {
                 return Some(LuaType::Boolean);
             } else if real_source_ref.is_unknown() {
-                return Some(LuaType::BooleanConst(true));
+                return Some(LuaType::BooleanConst(*b));
             }
         }
         LuaType::Union(target_u) => {
+            // An unknown source declares nothing an arm could be dropped against.
+            let keeps_unmatched_arms = real_source_ref.is_unknown();
             let source_types = target_u
                 .into_vec()
                 .into_iter()
-                .filter_map(|t| narrow_down_type(db, real_source_ref.clone(), t, declared.clone()))
+                .filter_map(|t| {
+                    narrow_down_type(db, real_source_ref.clone(), t.clone(), declared.clone())
+                        .or_else(|| keeps_unmatched_arms.then_some(t))
+                })
                 .collect::<Vec<_>>();
 
             if source_types.is_empty() {

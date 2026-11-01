@@ -22,8 +22,8 @@ pub use find_origin::{
     find_member_origin_owners,
 };
 use glua_code_analysis::{
-    EmmyLuaAnalysis, FileId, GmodRealm, LuaMemberKey, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
-    RenderLevel, WorkspaceId, humanize_type, resolve_gmod_hook_callback_doc_function,
+    EmmyLuaAnalysis, FileId, GmodRealm, LuaMemberKey, LuaSemanticDeclId, LuaType, RenderLevel,
+    WorkspaceId, humanize_type, resolve_gmod_hook_callback_doc_function,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaDocDescription, LuaLiteralExpr,
@@ -73,7 +73,7 @@ pub fn hover(
     let root = semantic_model.get_root();
     let position_offset = {
         let document = semantic_model.get_document();
-        document.get_offset(position.line as usize, position.character as usize)?
+        document.to_offset(position)
     };
 
     if position_offset > root.syntax().text_range().end() {
@@ -392,7 +392,7 @@ pub(crate) fn resolve_hook_property_owner(
     }
 
     for owner_name in &owner_names {
-        let owner_type = LuaType::Ref(LuaTypeDeclId::global(owner_name));
+        let owner_type = LuaType::Ref(semantic_model.resolve_global_class(owner_name));
         let Some(member_infos) = semantic_model.get_member_info_with_key_at_offset(
             &owner_type,
             member_key.clone(),

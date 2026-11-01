@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "LuaParser/Lexer/LuaTokenKind.h"
 #include "LuaParser/Types/TextRange.h"

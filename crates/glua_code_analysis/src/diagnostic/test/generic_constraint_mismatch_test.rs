@@ -616,6 +616,37 @@ mod test {
         expect_that!(diagnostic.range.start, eq(expected_start));
     }
 
+    fn forwarded_pack_str_tpl_mismatch_count(pack_type: &str) -> usize {
+        let mut ws = VirtualWorkspace::new();
+        ws.enable_check(DiagnosticCode::GenericConstraintMismatch);
+        let file_id = ws.def(&format!(
+            r#"
+                    ---@class Panel
+
+                    ---@generic T: Panel
+                    ---@param name `T`
+                    ---@return T
+                    function create_panel(name) end
+
+                    ---@param ... {pack_type}
+                    function forward(...)
+                        return create_panel(...)
+                    end
+                "#
+        ));
+        generic_constraint_mismatch_diagnostics(&mut ws, file_id).len()
+    }
+
+    #[gtest]
+    fn test_str_tpl_accepts_forwarded_string_pack() {
+        expect_that!(forwarded_pack_str_tpl_mismatch_count("string"), eq(0));
+    }
+
+    #[gtest]
+    fn test_str_tpl_rejects_forwarded_integer_pack() {
+        expect_that!(forwarded_pack_str_tpl_mismatch_count("integer"), eq(1));
+    }
+
     #[gtest]
     fn test_str_tpl_union_all_non_string_emits_single_hard_mismatch() {
         let mut ws = VirtualWorkspace::new();
@@ -687,6 +718,43 @@ mod test {
         ));
     }
 
+    #[gtest]
+    fn test_union_of_template_arms_all_rejecting_reports_once() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+
+            ---@generic T: Panel, U: Panel
+            ---@param name `T`|T|U
+            function create_panel(name) end
+
+            create_panel("MissingPanel")
+        "#,
+        );
+
+        let diagnostics = generic_constraint_mismatch_diagnostics(&mut ws, file_id);
+        expect_that!(diagnostics.len(), eq(1));
+    }
+
+    #[gtest]
+    fn test_union_of_template_arms_one_accepting_reports_nothing() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+
+            ---@generic X            ---@param name `T`|T|U
+            function create_panel(name) end
+
+            create_panel("MissingPanel")
+        "#,
+        );
+
+        let diagnostics = generic_constraint_mismatch_diagnostics(&mut ws, file_id);
+        expect_that!(diagnostics.len(), eq(0));
+    }
+
     fn generic_constraint_mismatch_diagnostics(
         ws: &mut VirtualWorkspace,
         file_id: crate::FileId,
@@ -719,5 +787,47 @@ mod test {
         }
 
         Position::new(line, character)
+    }
+
+    #[test]
+    fn a_template_union_reports_the_auto_created_class_in_either_arm_order() {
+        for param in ["`T`|T", "T|`T`"] {
+            let mut ws = VirtualWorkspace::new();
+            ws.enable_check(DiagnosticCode::GenericConstraintMismatch);
+            let file_id = ws.def(&format!(
+                r#"
+                ---@class Foo
+                ---@generic T: Foo
+                ---@param name {param}
+                ---@return T
+                local function make(name) end
+                Made = make("Baz")
+                "#
+            ));
+            let messages = ws
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|diagnostic| {
+                    diagnostic.code
+                        == Some(NumberOrString::String(
+                            DiagnosticCode::GenericConstraintMismatch
+                                .get_name()
+                                .to_string(),
+                        ))
+                })
+                .map(|diagnostic| (diagnostic.severity, diagnostic.message))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                messages,
+                [(
+                    Some(DiagnosticSeverity::HINT),
+                    "Type `Baz` is not explicitly defined; auto-created inheriting `Foo`"
+                        .to_string()
+                )],
+                "{param}"
+            );
+        }
     }
 }

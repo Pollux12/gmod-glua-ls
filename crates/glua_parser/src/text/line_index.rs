@@ -29,6 +29,8 @@ impl LineIndex {
         line_only_ascii_vec.push(is_line_only_ascii);
 
         assert_eq!(line_offsets.len(), line_only_ascii_vec.len());
+        line_offsets.shrink_to_fit();
+        line_only_ascii_vec.shrink_to_fit();
         LineIndex {
             line_offsets,
             line_only_ascii_vec,
@@ -69,66 +71,57 @@ impl LineIndex {
         Some((line, start_offset))
     }
 
-    pub fn is_line_only_ascii(&self, line: TextSize) -> bool {
-        let line_index = usize::from(line);
-        if line_index < self.line_only_ascii_vec.len() {
-            self.line_only_ascii_vec[line_index]
-        } else {
-            false
-        }
+    fn is_line_only_ascii(&self, line: usize) -> bool {
+        self.line_only_ascii_vec.get(line).copied().unwrap_or(false)
     }
 
     pub fn line_count(&self) -> usize {
         self.line_offsets.len()
     }
 
-    // get col base 0
-    pub fn get_col(&self, offset: TextSize, source_text: &str) -> Option<usize> {
-        let (line, start_offset) = self.get_line_with_start_offset(offset)?;
-        if self.is_line_only_ascii(line.try_into().unwrap()) {
-            Some(usize::from(offset - start_offset))
-        } else {
-            let text = &source_text[usize::from(start_offset)..usize::from(offset)];
-            Some(text.chars().count())
-        }
+    /// Byte range of `line` without its line terminator.
+    fn line_content_range(&self, line: usize, source_text: &str) -> Option<(usize, usize)> {
+        let start = usize::from(*self.line_offsets.get(line)?);
+        let end = match self.line_offsets.get(line + 1) {
+            Some(next) => {
+                let content = &source_text[start..usize::from(*next) - 1];
+                start + content.strip_suffix('\r').unwrap_or(content).len()
+            }
+            None => source_text.len(),
+        };
+        Some((start, end))
     }
 
-    // get line and col base 0
+    /// UTF-16 column (the LSP default position encoding) of `offset`, base 0.
+    pub fn get_col(&self, offset: TextSize, source_text: &str) -> Option<usize> {
+        self.get_line_col(offset, source_text).map(|(_, col)| col)
+    }
+
+    /// Line and UTF-16 column of `offset`, both base 0.
     pub fn get_line_col(&self, offset: TextSize, source_text: &str) -> Option<(usize, usize)> {
         let (line, start_offset) = self.get_line_with_start_offset(offset)?;
-        if self.is_line_only_ascii(line.try_into().unwrap()) {
-            Some((line, usize::from(offset - start_offset)))
+        let col = if self.is_line_only_ascii(line) {
+            usize::from(offset - start_offset)
         } else {
-            let text = &source_text[usize::from(start_offset)..usize::from(offset)];
-            Some((line, text.chars().count()))
-        }
+            source_text[usize::from(start_offset)..usize::from(offset)]
+                .encode_utf16()
+                .count()
+        };
+        Some((line, col))
     }
 
-    // get offset by line and col
-    pub fn get_offset(&self, line: usize, col: usize, source_text: &str) -> Option<TextSize> {
-        let start_offset = self.get_line_offset(line)?;
-        if col == 0 {
-            return Some(start_offset);
-        }
-
-        if self.is_line_only_ascii(line.try_into().unwrap()) {
-            let col = col.min(source_text.len());
-            Some(start_offset + TextSize::from(col as u32))
-        } else {
-            let mut offset = 0;
-            let mut col = col;
-            for c in source_text[usize::from(start_offset)..].chars() {
-                if col == 0 {
-                    break;
-                }
-
-                offset += c.len_utf8();
-                col -= 1;
-            }
-            Some(start_offset + TextSize::from(offset as u32))
-        }
+    /// Offset of a line and UTF-16 column. A column past the line end clamps to the line end
+    /// (before its terminator); a line past the last line clamps to the end of the text.
+    pub fn get_offset(&self, line: usize, col: usize, source_text: &str) -> TextSize {
+        self.offset_at_column(line, col, source_text, char::len_utf16)
     }
 
+    /// Offset of a line and Unicode scalar column, clamped like [`Self::get_offset`].
+    pub fn get_offset_by_char_col(&self, line: usize, col: usize, source_text: &str) -> TextSize {
+        self.offset_at_column(line, col, source_text, |_| 1)
+    }
+
+    /// Offset of a UTF-16 column relative to the start of `line`, clamped to the line end.
     pub fn get_col_offset_at_line(
         &self,
         line: usize,
@@ -136,25 +129,31 @@ impl LineIndex {
         source_text: &str,
     ) -> Option<TextSize> {
         let start_offset = self.get_line_offset(line)?;
-        if col == 0 {
-            return Some(0.into());
-        }
+        Some(self.get_offset(line, col, source_text) - start_offset)
+    }
 
-        if self.is_line_only_ascii(line.try_into().unwrap()) {
-            let col = col.min(source_text.len());
-            Some(TextSize::from(col as u32))
+    fn offset_at_column(
+        &self,
+        line: usize,
+        col: usize,
+        source_text: &str,
+        width: fn(char) -> usize,
+    ) -> TextSize {
+        let Some((start, end)) = self.line_content_range(line, source_text) else {
+            return TextSize::of(source_text);
+        };
+        let offset = if self.is_line_only_ascii(line) {
+            start + col.min(end - start)
         } else {
-            let mut offset = 0;
-            let mut col = col;
-            for c in source_text[usize::from(start_offset)..].chars() {
-                if col == 0 {
-                    break;
-                }
-
-                offset += c.len_utf8();
-                col -= 1;
-            }
-            Some(TextSize::from(offset as u32))
-        }
+            let mut units = 0;
+            source_text[start..end]
+                .char_indices()
+                .find_map(|(i, c)| {
+                    units += width(c);
+                    (units > col).then_some(start + i)
+                })
+                .unwrap_or(end)
+        };
+        TextSize::from(offset as u32)
     }
 }

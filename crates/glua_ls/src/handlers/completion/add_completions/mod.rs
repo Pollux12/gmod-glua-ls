@@ -5,6 +5,7 @@ mod completion_item_info;
 
 pub use add_decl_completion::add_decl_completion;
 pub use add_member_completion::get_index_alias_name;
+pub(crate) use add_member_completion::is_callable_member_type;
 pub use add_member_completion::{
     CompletionTriggerStatus, add_member_completion_with_description_hint,
 };
@@ -15,7 +16,8 @@ pub(crate) use completion_item_info::{
     is_color_type,
 };
 use glua_code_analysis::{
-    GlobalId, LuaDeclId, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaUnionType, RenderLevel,
+    DbIndex, GlobalId, LuaDeclId, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaUnionType,
+    RenderLevel, VariadicType,
 };
 use lsp_types::{CompletionItemKind, CompletionItemTag};
 
@@ -135,10 +137,10 @@ pub fn is_table_namespace_type(typ: &LuaType) -> bool {
         | LuaType::TableOf(_)
         | LuaType::Object(_)
         | LuaType::Global => true,
-        LuaType::Union(union) => match union.as_ref() {
-            LuaUnionType::Nullable(typ) => is_table_namespace_type(typ),
-            LuaUnionType::Multi(types) => {
-                let mut non_nil_types = types.iter().filter(|typ| !matches!(typ, LuaType::Nil));
+        LuaType::Union(union) => match union.nullable_inner() {
+            Some(typ) => is_table_namespace_type(typ),
+            None => {
+                let mut non_nil_types = union.types().filter(|typ| !matches!(typ, LuaType::Nil));
                 non_nil_types.next().is_some_and(is_table_namespace_type)
                     && non_nil_types.all(is_table_namespace_type)
             }
@@ -178,10 +180,10 @@ pub fn get_completion_tags(
 }
 
 fn get_union_completion_kind(union: &LuaUnionType) -> CompletionItemKind {
-    let kinds = match union {
-        LuaUnionType::Nullable(typ) => return get_completion_kind(typ),
-        LuaUnionType::Multi(types) => types
-            .iter()
+    let kinds = match union.nullable_inner() {
+        Some(typ) => return get_completion_kind(typ),
+        None => union
+            .types()
             .filter(|typ| !matches!(typ, LuaType::Nil))
             .map(get_completion_kind)
             .collect::<Vec<_>>(),
@@ -258,23 +260,14 @@ pub fn get_detail(
                 }
                 _ => {}
             }
-            let rets = &signature.return_docs;
-            let rets_detail = if rets.len() == 1 {
-                let detail = humanize_type(
-                    builder.semantic_model.get_db(),
-                    &rets[0].type_ref,
-                    RenderLevel::Minimal,
-                );
-                format!(" -> {}", detail)
-            } else if rets.len() > 1 {
-                let detail = humanize_type(
-                    builder.semantic_model.get_db(),
-                    &rets[0].type_ref,
-                    RenderLevel::Minimal,
-                );
-                format!(" -> {} ...", detail)
-            } else {
-                "".to_string()
+            let db = builder.semantic_model.get_db();
+            let rets_detail = match signature.return_docs.as_slice() {
+                [] => "".to_string(),
+                [ret] => format!(" -> {}", return_type_detail(db, &ret.type_ref)),
+                [first, ..] => format!(
+                    " -> {} ...",
+                    humanize_type(db, &first.type_ref, RenderLevel::Minimal)
+                ),
             };
 
             Some(format!("({}){}", params_str.join(", "), rets_detail))
@@ -300,19 +293,27 @@ pub fn get_detail(
             let ret_type = f.get_ret();
             let rets_detail = match ret_type {
                 LuaType::Nil => "".to_string(),
-                _ => {
-                    let type_detail = humanize_type(
-                        builder.semantic_model.get_db(),
-                        ret_type,
-                        RenderLevel::Minimal,
-                    );
-                    format!("-> {}", type_detail)
-                }
+                _ => format!(
+                    " -> {}",
+                    return_type_detail(builder.semantic_model.get_db(), ret_type)
+                ),
             };
             Some(format!("({}){}", params_str.join(", "), rets_detail))
         }
         _ => None,
     }
+}
+
+/// A return type as a completion detail shows it: several values as the first
+/// of them followed by `...`, as documented returns are shown.
+fn return_type_detail(db: &DbIndex, typ: &LuaType) -> String {
+    if let LuaType::Variadic(variadic) = typ
+        && let VariadicType::Multi(types) = variadic.as_ref()
+        && let Some(first) = types.first()
+    {
+        return format!("{} ...", humanize_type(db, first, RenderLevel::Minimal));
+    }
+    humanize_type(db, typ, RenderLevel::Minimal)
 }
 
 pub fn get_function_snippet(

@@ -1,12 +1,15 @@
+use std::hash::{Hash, Hasher};
+
 use crate::FileId;
+use crate::db_index::derivation::FilePosition;
 use crate::{LuaMemberId, LuaSignatureId};
-use glua_parser::{LuaKind, LuaSyntaxId, LuaSyntaxKind};
+use glua_parser::{LuaAstNode, LuaKind, LuaSyntaxId, LuaSyntaxKind, LuaTableExpr};
 use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
 use super::decl_id::LuaDeclId;
 
-#[derive(Eq, PartialEq, Hash, Debug, Clone)]
+#[derive(Eq, PartialEq, Debug, Clone)]
 pub struct LuaDecl {
     name: SmolStr,
     file_id: FileId,
@@ -16,15 +19,36 @@ pub struct LuaDecl {
     pub extra: LuaDeclExtra,
 }
 
+impl Hash for LuaDecl {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.file_id.hash(state);
+        self.range.hash_in_file(self.file_id, state);
+        self.expr_id.is_some().hash(state);
+        if let Some(expr_id) = &self.expr_id {
+            expr_id.hash_in_file(self.file_id, state);
+        }
+        self.initializer.is_some().hash(state);
+        if let Some(initializer) = &self.initializer {
+            initializer.expr_id.hash_in_file(self.file_id, state);
+            (initializer.ret_idx as usize).hash(state);
+        }
+        self.extra.hash(state);
+    }
+}
+
 #[derive(Eq, PartialEq, Hash, Debug, Clone, Copy)]
 pub struct LuaDeclInitializer {
     expr_id: LuaSyntaxId,
-    ret_idx: usize,
+    ret_idx: u32,
 }
 
 impl LuaDeclInitializer {
     pub fn new(expr_id: LuaSyntaxId, ret_idx: usize) -> Self {
-        Self { expr_id, ret_idx }
+        Self {
+            expr_id,
+            ret_idx: ret_idx as u32,
+        }
     }
 
     pub fn get_expr_syntax_id(&self) -> LuaSyntaxId {
@@ -32,7 +56,7 @@ impl LuaDeclInitializer {
     }
 
     pub fn get_ret_idx(&self) -> usize {
-        self.ret_idx
+        self.ret_idx as usize
     }
 }
 
@@ -122,6 +146,13 @@ impl LuaDecl {
         self.initializer.is_some()
     }
 
+    /// The table literal the declaration takes as its first value, if any.
+    pub fn table_literal_initializer(&self) -> Option<LuaSyntaxId> {
+        let initializer = self.initializer?;
+        (initializer.ret_idx == 0 && LuaTableExpr::can_cast(initializer.expr_id.get_kind()))
+            .then_some(initializer.expr_id)
+    }
+
     pub fn set_initializer(&mut self, initializer: Option<LuaDeclInitializer>) {
         self.initializer = initializer;
     }
@@ -156,6 +187,11 @@ impl LuaDecl {
 
     pub fn is_implicit_self(&self) -> bool {
         matches!(&self.extra, LuaDeclExtra::ImplicitSelf { .. })
+    }
+
+    /// Whether a macro call such as `DEFINE_BASECLASS("X")` declares this local at its arguments.
+    pub fn is_macro_local(&self) -> bool {
+        matches!(&self.extra, LuaDeclExtra::Local { kind, .. } if *kind == LuaSyntaxKind::CallArgList.into())
     }
 }
 

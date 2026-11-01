@@ -6,7 +6,7 @@ use glua_parser::{
 };
 
 use crate::{
-    FlowId, FlowNodeKind,
+    FlowId, FlowNodeKind, analysis_stack_exhausted,
     compilation::analyzer::flow::{
         bind_analyze::{bind_each_child, exprs::bind_binary_expr::is_binary_logical},
         binder::FlowBinder,
@@ -21,35 +21,50 @@ pub fn bind_condition_expr(
     true_target: FlowId,
     false_target: FlowId,
 ) {
+    // Crash-safety guard (not a budget): skip the subtree when the stack
+    // reserve is exhausted. Must precede all binder state saves/mutations.
+    if analysis_stack_exhausted() {
+        return;
+    }
     let old_true_target = binder.true_target;
     let old_false_target = binder.false_target;
 
     // Condition expressions can narrow any variable they mention; record all
     // referenced names / index paths so the flow-walk skip stays sound.
-    binder.record_condition_refs_in_expr(&condition_expr);
+    let records_refs = !binder.condition_refs_recorded;
+    if records_refs {
+        binder.record_condition_refs_in_expr(&condition_expr);
+        binder.condition_refs_recorded = true;
+    }
 
     binder.true_target = true_target;
     binder.false_target = false_target;
     bind_expr(binder, condition_expr.clone(), current);
     binder.true_target = old_true_target;
     binder.false_target = old_false_target;
+    if records_refs {
+        binder.condition_refs_recorded = false;
+    }
 
     if !is_binary_logical(&condition_expr) {
         let true_condition =
             binder.create_node(FlowNodeKind::TrueCondition(condition_expr.to_ptr()));
-        binder.record_condition_flow_paths(true_condition, &condition_expr);
         binder.add_antecedent(true_condition, current);
         binder.add_antecedent(true_target, true_condition);
 
         let false_condition =
             binder.create_node(FlowNodeKind::FalseCondition(condition_expr.to_ptr()));
-        binder.record_condition_flow_paths(false_condition, &condition_expr);
         binder.add_antecedent(false_condition, current);
         binder.add_antecedent(false_target, false_condition);
     }
 }
 
 pub fn bind_expr(binder: &mut FlowBinder, expr: LuaExpr, current: FlowId) -> FlowId {
+    // Crash-safety guard (not a budget): skip the subtree when the stack
+    // reserve is exhausted. No flow nodes means conservative un-narrowed reads.
+    if analysis_stack_exhausted() {
+        return current;
+    }
     match expr {
         LuaExpr::NameExpr(name_expr) => bind_name_expr(binder, name_expr, current),
         LuaExpr::CallExpr(call_expr) => bind_call_expr(binder, call_expr, current),
@@ -93,19 +108,27 @@ pub fn bind_closure_expr(
 
     let old_loop = binder.loop_label;
     let old_break = binder.break_target_label;
+    let old_continue = binder.continue_target_label;
     let old_true = binder.true_target;
     let old_false = binder.false_target;
+    let old_condition_refs_recorded = binder.condition_refs_recorded;
     binder.loop_label = binder.unreachable;
     binder.break_target_label = binder.unreachable;
+    binder.continue_target_label = binder.unreachable;
     binder.true_target = binder.unreachable;
     binder.false_target = binder.unreachable;
+    // The body's statements take their own snapshots, so its conditions record
+    // their references again.
+    binder.condition_refs_recorded = false;
 
     bind_each_child(binder, LuaAst::LuaClosureExpr(closure_expr), entry);
 
     binder.loop_label = old_loop;
     binder.break_target_label = old_break;
+    binder.continue_target_label = old_continue;
     binder.true_target = old_true;
     binder.false_target = old_false;
+    binder.condition_refs_recorded = old_condition_refs_recorded;
     Some(())
 }
 
@@ -160,6 +183,7 @@ pub fn bind_call_expr(
     call_expr: LuaCallExpr,
     current: FlowId,
 ) -> Option<()> {
+    binder.bind_syntax_node(call_expr.get_syntax_id(), current);
     bind_each_child(binder, LuaAst::LuaCallExpr(call_expr.clone()), current);
     Some(())
 }
@@ -191,10 +215,12 @@ mod tests {
         let mut binder = FlowBinder::new(&db, FileId::new(1));
         let outer_loop = binder.create_loop_label();
         let outer_break = binder.create_branch_label();
+        let outer_continue = binder.create_branch_label();
         let outer_true = binder.create_branch_label();
         let outer_false = binder.create_branch_label();
         binder.loop_label = outer_loop;
         binder.break_target_label = outer_break;
+        binder.continue_target_label = outer_continue;
         binder.true_target = outer_true;
         binder.false_target = outer_false;
 
@@ -205,20 +231,27 @@ mod tests {
             [
                 binder.loop_label,
                 binder.break_target_label,
+                binder.continue_target_label,
                 binder.true_target,
                 binder.false_target,
             ],
-            [outer_loop, outer_break, outer_true, outer_false]
+            [
+                outer_loop,
+                outer_break,
+                outer_continue,
+                outer_true,
+                outer_false
+            ]
         );
 
         let (tree, errors) = binder.finish();
-        let outer_targets_have_antecedents =
-            [outer_break, outer_true, outer_false].map(|flow_id| {
+        let outer_targets_have_antecedents = [outer_break, outer_continue, outer_true, outer_false]
+            .map(|flow_id| {
                 tree.get_flow_node(flow_id)
                     .is_some_and(|node| node.antecedent.is_some())
             });
 
-        assert_eq!(outer_targets_have_antecedents, [false, false, false]);
+        assert_eq!(outer_targets_have_antecedents, [false, false, false, false]);
         assert_eq!(
             errors
                 .iter()

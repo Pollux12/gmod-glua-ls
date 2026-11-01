@@ -3,9 +3,12 @@ use glua_parser::{
     LuaNameExpr, LuaTableExpr, LuaTableField, LuaVarExpr,
 };
 
+use super::StatementWrite;
+use super::stats::register_positional_instance_members;
+use crate::semantic::decl_value_expr;
 use crate::{
-    InFiled, LuaDeclExtra, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId,
-    OperatorFunction, SetmetatableFactoryBinding,
+    BoundMetatable, InFiled, LuaDeclExtra, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner,
+    LuaSignatureId, OperatorFunction, SetmetatableFactoryBinding,
 };
 
 use super::LuaAnalyzer;
@@ -22,14 +25,50 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
     let metatable = args[1].clone();
 
     let file_id = analyzer.file_id;
-    let Some(metatable_range) = resolve_metatable_backing_table(analyzer, &metatable) else {
+    let metatable_range = resolve_metatable_backing_table(analyzer, &metatable).or_else(|| {
+        matches!(metatable, LuaExpr::CallExpr(_))
+            .then(|| inferred_table_range(analyzer, &metatable))
+            .flatten()
+    });
+    let included_table = included_table_call_range(analyzer, &table);
+    let Some(metatable_range) = metatable_range else {
+        let opaque = BoundMetatable::Opaque(InFiled::new(file_id, metatable.get_range()));
+        for table in resolve_metatable_backing_table(analyzer, &table)
+            .into_iter()
+            .chain(included_table)
+        {
+            let sort_key = writer_sort_key(analyzer);
+            analyzer.write(StatementWrite::AddMetatable {
+                table,
+                metatable: opaque.clone(),
+                file_id,
+                sort_key,
+            });
+        }
         return Some(());
     };
+    if let Some(included_table) = included_table {
+        let sort_key = writer_sort_key(analyzer);
+        analyzer.write(StatementWrite::AddMetatable {
+            table: included_table,
+            metatable: BoundMetatable::Table(metatable_range.clone()),
+            file_id,
+            sort_key,
+        });
+    }
+    if let Some(instance_range) = resolve_metatable_backing_table(analyzer, &table)
+        && let Some(instance_literal) = table_expr_from_range(analyzer, &instance_range)
+    {
+        register_positional_instance_members(analyzer, &instance_literal);
+    }
+    let writer_sort_key = writer_sort_key(analyzer);
 
-    analyzer.db.get_metatable_index_mut().add(
-        InFiled::new(file_id, table.get_range()),
-        metatable_range.clone(),
-    );
+    analyzer.write(StatementWrite::AddMetatable {
+        table: InFiled::new(file_id, table.get_range()),
+        metatable: BoundMetatable::Table(metatable_range.clone()),
+        file_id,
+        sort_key: writer_sort_key.clone(),
+    });
 
     if let Some(binding) = setmetatable_factory_binding(
         analyzer,
@@ -38,17 +77,16 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
         &metatable,
         metatable_range.clone(),
     ) {
-        analyzer
-            .db
-            .get_metatable_index_mut()
-            .add_factory_binding(binding);
+        analyzer.write(StatementWrite::AddFactoryBinding(binding));
     }
 
     if let Some(backing_table) = resolve_metatable_backing_table(analyzer, &table) {
-        analyzer
-            .db
-            .get_metatable_index_mut()
-            .add(backing_table, metatable_range.clone());
+        analyzer.write(StatementWrite::AddMetatable {
+            table: backing_table,
+            metatable: BoundMetatable::Table(metatable_range.clone()),
+            file_id,
+            sort_key: writer_sort_key,
+        });
     }
 
     let metatable_table = match metatable {
@@ -63,6 +101,12 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
     }
 
     Some(())
+}
+
+/// Ordering key for the writing file, so several writers of one table literal resolve the same
+/// way in a cold build and an incremental session.
+fn writer_sort_key(analyzer: &LuaAnalyzer) -> std::sync::Arc<str> {
+    analyzer.db.get_vfs().file_order_key(&analyzer.file_id)
 }
 
 fn setmetatable_factory_binding(
@@ -106,6 +150,43 @@ fn setmetatable_factory_binding(
         call_position: call_expr.get_position(),
         function_scope,
     })
+}
+
+/// The range of the `include(...)` call whose result `table` is, directly or through a local
+/// that is never reassigned. The included file's returned table is the one the metatable lands on.
+fn included_table_call_range(
+    analyzer: &LuaAnalyzer,
+    table: &LuaExpr,
+) -> Option<InFiled<rowan::TextRange>> {
+    match table {
+        LuaExpr::ParenExpr(paren_expr) => {
+            included_table_call_range(analyzer, &paren_expr.get_expr()?)
+        }
+        LuaExpr::CallExpr(call_expr) => {
+            let Some(LuaExpr::NameExpr(callee)) = call_expr.get_prefix_expr() else {
+                return None;
+            };
+            (callee.get_name_text()? == "include")
+                .then(|| InFiled::new(analyzer.file_id, call_expr.get_range()))
+        }
+        LuaExpr::NameExpr(name_expr) => {
+            let decl_id = analyzer
+                .db
+                .get_reference_index()
+                .get_var_reference_decl(&analyzer.file_id, name_expr.get_range())?;
+            let decl = analyzer.db.get_decl_index().get_decl(&decl_id)?;
+            let is_mutated = analyzer
+                .db
+                .get_reference_index()
+                .get_decl_references(&analyzer.file_id, &decl_id)
+                .is_some_and(|references| references.mutable);
+            if !decl.is_local() || is_mutated {
+                return None;
+            }
+            included_table_call_range(analyzer, &decl_value_expr(&analyzer.db, decl_id)?)
+        }
+        _ => None,
+    }
 }
 
 fn resolve_metatable_backing_table(
@@ -155,28 +236,24 @@ fn table_backing_range_from_expr(
                     .map(|closure| LuaSignatureId::from_closure(analyzer.file_id, &closure)),
                 _ => None,
             };
+            let is_mutated = analyzer
+                .db
+                .get_reference_index()
+                .get_decl_references(&analyzer.file_id, &decl_id)
+                .is_some_and(|references| references.mutable);
             if let Some(signature_id) = receiver_signature_id {
-                let is_mutated = analyzer
-                    .db
-                    .get_reference_index()
-                    .get_decl_references(&analyzer.file_id, &decl_id)
-                    .is_some_and(|references| references.mutable);
                 if is_mutated {
                     return None;
                 }
 
                 return receiver_owner_table_range(analyzer, name_expr, signature_id);
             }
+            // A reassigned local holds the table its last write left, not its initializer.
+            if is_mutated {
+                return inferred_table_range(analyzer, expr);
+            }
 
-            let root = analyzer
-                .db
-                .get_vfs()
-                .get_syntax_tree(&decl_id.file_id)?
-                .get_red_root();
-            let value_expr = decl
-                .get_value_syntax_id()?
-                .to_node_from_root(&root)
-                .and_then(LuaExpr::cast)?;
+            let value_expr = decl_value_expr(&analyzer.db, decl_id)?;
             table_backing_range_from_expr(analyzer, &value_expr)
         }
         LuaExpr::IndexExpr(_) => inferred_table_range(analyzer, expr),
@@ -208,9 +285,24 @@ fn inferred_table_range(
     analyzer: &mut LuaAnalyzer,
     expr: &LuaExpr,
 ) -> Option<InFiled<rowan::TextRange>> {
-    match analyzer.infer_expr(expr).ok()? {
-        crate::LuaType::TableConst(range) => Some(range),
-        crate::LuaType::Instance(instance) => Some(instance.get_range().clone()),
+    single_table_range(&analyzer.infer_expr(expr).ok()?)
+}
+
+/// The one table literal every arm of `typ` is, or is an instance of.
+fn single_table_range(typ: &crate::LuaType) -> Option<InFiled<rowan::TextRange>> {
+    match typ {
+        crate::LuaType::TableConst(range) => Some(range.clone()),
+        crate::LuaType::Instance(instance) => match instance.get_base() {
+            crate::LuaType::TableConst(range) => Some(range.clone()),
+            _ => Some(instance.get_range().clone()),
+        },
+        crate::LuaType::Union(union) => {
+            let mut ranges = union.types().map(single_table_range);
+            let first = ranges.next()??;
+            ranges
+                .all(|range| range.as_ref() == Some(&first))
+                .then_some(first)
+        }
         _ => None,
     }
 }
@@ -282,7 +374,7 @@ fn analyze_metable_field(
                 field.get_range(),
                 operator_func,
             );
-            analyzer.db.get_operator_index_mut().add_operator(operator);
+            analyzer.write(StatementWrite::AddOperator(operator));
             return Some(());
         }
     };
@@ -294,7 +386,7 @@ fn analyze_metable_field(
         field.get_range(),
         OperatorFunction::Signature(signature_id),
     );
-    analyzer.db.get_operator_index_mut().add_operator(operator);
+    analyzer.write(StatementWrite::AddOperator(operator));
 
     Some(())
 }

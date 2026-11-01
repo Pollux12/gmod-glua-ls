@@ -1,4 +1,4 @@
-use lsp_server::{Message, Response};
+use lsp_server::Message;
 use lsp_types::InitializeParams;
 use std::error::Error;
 use tokio::sync::oneshot;
@@ -42,8 +42,12 @@ impl LspServer {
     /// Run the main server loop
     pub(super) async fn run(mut self) -> Result<(), Box<dyn Error + Sync + Send>> {
         // First, wait for initialization to complete while handling allowed messages.
-        // Returns the init outcome if it failed; otherwise the server is ready.
-        if let Some(failure_reason) = self.wait_for_initialization().await? {
+        let failure_reason = match self.wait_for_initialization().await? {
+            Startup::Ready => None,
+            Startup::Failed(reason) => Some(reason),
+            Startup::Exited => return self.exit().await,
+        };
+        if let Some(failure_reason) = failure_reason {
             // Initialization failed (e.g. GMod annotations validation). The
             // `initialized_handler` already sent a `window/showMessage` with
             // the reason. Close the context and abort the server cleanly
@@ -78,48 +82,49 @@ impl LspServer {
         }
 
         // Process all pending messages after initialization
-        if self
+        let mut exited = self
             .processor
             .process_pending_messages(&mut self.connection, &mut self.server_context)
-            .await?
-        {
-            self.server_context.close().await;
-            return Ok(()); // Shutdown requested during pending message processing
-        }
+            .await?;
 
         // Now focus on normal message processing
-        while let Some(msg) = self.connection.recv().await {
-            if self
+        while !exited && let Some(msg) = self.connection.recv().await {
+            exited = self
                 .processor
                 .process_message(msg, &mut self.connection, &mut self.server_context)
-                .await?
-            {
-                break; // Shutdown requested
-            }
+                .await?;
         }
 
+        self.exit().await
+    }
+
+    /// Ends the server once the client sent `exit` or closed the connection:
+    /// cleanly only when `shutdown` came first.
+    async fn exit(&mut self) -> Result<(), Box<dyn Error + Sync + Send>> {
         self.server_context.close().await;
+        if !self.processor.shutdown_requested() {
+            return Err(
+                ExitError("exit notification without a shutdown request".to_owned()).into(),
+            );
+        }
         Ok(())
     }
 
     /// Wait for initialization to complete while handling initialization-allowed messages.
     ///
-    /// Returns `Ok(Some(reason))` when initialization failed and the server
-    /// should abort, `Ok(None)` when initialization succeeded and the server
-    /// may continue, and `Err` for connection-level errors.
-    async fn wait_for_initialization(
-        &mut self,
-    ) -> Result<Option<String>, Box<dyn Error + Sync + Send>> {
+    /// Returns how initialization ended, or that the client ended the session
+    /// before it did; `Err` for connection-level errors.
+    async fn wait_for_initialization(&mut self) -> Result<Startup, Box<dyn Error + Sync + Send>> {
         loop {
             // Check if initialization is complete
             if let Some(outcome) = self.processor.poll_initialization() {
                 match outcome {
-                    InitOutcome::Ready => return Ok(None),
-                    InitOutcome::Failed(reason) => return Ok(Some(reason)),
+                    InitOutcome::Ready => return Ok(Startup::Ready),
+                    InitOutcome::Failed(reason) => return Ok(Startup::Failed(reason)),
                     InitOutcome::Closed => {
                         // Init task ended without a result; treat as a fatal
                         // startup failure so we don't silently limp on.
-                        return Ok(Some(
+                        return Ok(Startup::Failed(
                             "language server initialization task terminated unexpectedly"
                                 .to_string(),
                         ));
@@ -137,9 +142,13 @@ impl LspServer {
                 Ok(Some(msg)) => {
                     // Process message if allowed during initialization, otherwise queue it
                     if self.processor.can_process_during_init(&msg) {
-                        self.processor
+                        if self
+                            .processor
                             .handle_message(msg, &mut self.connection, &mut self.server_context)
-                            .await?;
+                            .await?
+                        {
+                            return Ok(Startup::Exited);
+                        }
                     } else {
                         match msg {
                             Message::Request(request) => {
@@ -148,11 +157,9 @@ impl LspServer {
                                     // of queueing them behind full workspace initialization.
                                     // Clients will re-request after initialization and avoid
                                     // perceived 10-20s startup request stalls.
-                                    let response = Response::new_err(
-                                        request.id,
-                                        lsp_server::ErrorCode::ContentModified as i32,
-                                        "server initializing".to_owned(),
-                                    );
+                                    let response = self
+                                        .server_context
+                                        .refused_during_init(request.id, &request.method);
                                     self.connection.send(response.into())?;
                                 } else {
                                     // Preserve one-shot/critical request semantics by
@@ -168,10 +175,7 @@ impl LspServer {
                         }
                     }
                 }
-                Ok(None) => {
-                    // Connection closed during initialization
-                    return Ok(None);
-                }
+                Ok(None) => return Ok(Startup::Exited),
                 Err(_) => {
                     // Timeout - continue checking for initialization completion
                     continue;
@@ -179,6 +183,14 @@ impl LspServer {
             }
         }
     }
+}
+
+/// How the wait for initialization ended.
+enum Startup {
+    Ready,
+    Failed(String),
+    /// The client sent `exit` or closed the connection first.
+    Exited,
 }
 
 fn should_fail_fast_request_during_init(method: &str) -> bool {
@@ -193,13 +205,10 @@ fn should_fail_fast_request_during_init(method: &str) -> bool {
             | "textDocument/codeLens"
             | "textDocument/inlayHint"
             | "textDocument/semanticTokens/full"
-            | "textDocument/diagnostic"
-            | "workspace/diagnostic"
             | "workspace/symbol"
             | "gluals/annotator"
             | "gluals/gmodScriptedClasses"
             | "gluals/gmodScriptedClassesV2"
-            | "gluals/docSearch"
             | "gluals/hoverExpand"
             | "emmy/annotator"
     )

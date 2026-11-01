@@ -259,7 +259,7 @@ mod tests {
                 }
             "#,
             VirtualHoverResult {
-                value: "```lua\n(field) T.func(a: (number|string|unknown))\n```\n\n```lua\n(field) T.func(a: string)\n```\n\n```lua\n(field) T.func(a: number)\n```\n\n---\n\n注释1\n\n注释2"
+                value: "```lua\n(field) T.func(a: (number|string))\n```\n\n```lua\n(field) T.func(a: string)\n```\n\n```lua\n(field) T.func(a: number)\n```\n\n---\n\n注释1\n\n注释2"
                     .to_string(),
             },
         ));
@@ -659,7 +659,6 @@ mod tests {
     #[gtest]
     fn test_fix_global_index_function_2() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
-        // TODO: 构建完整的访问路径
         check!(ws.check_hover(
             r#"
             M = {
@@ -669,7 +668,7 @@ mod tests {
             end
             "#,
             VirtualHoverResult {
-                value: "```lua\nfunction Value()\n```".to_string(),
+                value: "```lua\nfunction M.K.Value()\n```".to_string(),
             },
         ));
         Ok(())
@@ -828,7 +827,7 @@ mod tests {
             markup.value
         );
         assert!(
-            top_section.contains("function Create(name, safety)"),
+            top_section.contains("function ents.Create(name, safety)"),
             "expected override signature in top section, got: {}",
             markup.value
         );
@@ -838,7 +837,7 @@ mod tests {
             markup.value
         );
         assert!(
-            top_section.contains("function Create(class: string)"),
+            top_section.contains("function ents.Create(class: string)"),
             "expected annotated signature in top section, got: {}",
             markup.value
         );
@@ -986,7 +985,7 @@ mod tests {
         assert!(
             server_markup
                 .value
-                .contains("function Create(name, safety)"),
+                .contains("function ents.Create(name, safety)"),
             "expected server hover to include server override signature, got: {}",
             server_markup.value
         );
@@ -1011,7 +1010,7 @@ mod tests {
         assert!(
             client_markup
                 .value
-                .contains("function Create(class: string)"),
+                .contains("function ents.Create(class: string)"),
             "expected client hover to show shared annotated signature, got: {}",
             client_markup.value
         );
@@ -1030,7 +1029,7 @@ mod tests {
         assert!(
             !client_markup
                 .value
-                .contains("function Create(name, safety)"),
+                .contains("function ents.Create(name, safety)"),
             "did not expect server-only override signature in client hover, got: {}",
             client_markup.value
         );

@@ -1,12 +1,10 @@
 use rustc_hash::FxHashMap;
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaCommentOwner, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey,
-    LuaLocalFuncStat, PathTrait,
-};
+use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaIndexKey, PathTrait};
 use rowan::{NodeOrToken, TextRange, TextSize};
 
 use crate::{
@@ -15,49 +13,72 @@ use crate::{
     SemanticDeclLevel, SemanticModel, WorkspaceId, semantic::is_sub_type_of,
 };
 
-use super::{Checker, DiagnosticContext};
-use crate::compilation::analyzer::gmod::realm_from_doc_comment;
+use super::{Checker, DiagnosticContext, FileNodeBuckets};
 
-/// Immutable, workspace-scoped callee realm map keyed by semantic declaration.
-pub type PrecomputedCalleeRealmMap = FxHashMap<LuaSemanticDeclId, Vec<ResolvedRealm>>;
+/// The realm each of one file's declarations, members and signatures
+/// resolves to as a callee.
+pub type FileCalleeRealms = FxHashMap<LuaSemanticDeclId, ResolvedRealm>;
+
+/// The global access paths one file's declarations and members can be called
+/// by, each with its realm, in source order.
+pub type FileRealmAccessPaths = Vec<(String, ResolvedRealm)>;
+
+/// Immutable, workspace-scoped callee realms, held per declaring file.
+#[derive(Debug, Default)]
+pub struct PrecomputedCalleeRealmMap {
+    by_file: FxHashMap<FileId, Arc<FileCalleeRealms>>,
+}
+
+impl PrecomputedCalleeRealmMap {
+    pub fn from_files(files: impl IntoIterator<Item = (FileId, Arc<FileCalleeRealms>)>) -> Self {
+        Self {
+            by_file: files.into_iter().collect(),
+        }
+    }
+
+    pub(crate) fn get(&self, semantic_decl: &LuaSemanticDeclId) -> Option<ResolvedRealm> {
+        let (file_id, _) = semantic_decl_position(semantic_decl)?;
+        self.by_file.get(&file_id)?.get(semantic_decl).copied()
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct PrecomputedRealmCallCandidates {
-    realms_by_name: FxHashMap<String, Vec<ResolvedRealm>>,
     realms_by_access_path: FxHashMap<String, Vec<ResolvedRealm>>,
 }
 
 impl PrecomputedRealmCallCandidates {
-    pub fn insert_realm(&mut self, name: &str, realm: ResolvedRealm) {
-        let realms = self.realms_by_name.entry(name.to_string()).or_default();
-        push_unique_realm(realms, realm);
+    /// The candidates of the files' access paths, in file order, and of the
+    /// annotated gamemode methods.
+    pub fn from_access_paths<'a>(
+        files: impl IntoIterator<Item = &'a FileRealmAccessPaths>,
+        gm_method_realms: &GmMethodRealmMap,
+    ) -> Self {
+        let mut candidates = Self::default();
+        for (access_path, realm) in files.into_iter().flatten() {
+            candidates.insert_access_path(access_path, *realm);
+        }
+        candidates.insert_gm_method_realms(gm_method_realms);
+        candidates
     }
 
     pub fn insert_access_path(&mut self, access_path: &str, realm: ResolvedRealm) {
-        let realms = self
-            .realms_by_access_path
-            .entry(access_path.to_string())
-            .or_default();
-        push_unique_realm(realms, realm);
+        match self.realms_by_access_path.get_mut(access_path) {
+            Some(realms) => push_unique_realm(realms, realm),
+            None => {
+                self.realms_by_access_path
+                    .insert(access_path.to_string(), vec![realm]);
+            }
+        }
     }
 
     pub fn insert_gm_method_realms(&mut self, gm_method_realms: &GmMethodRealmMap) {
         for (method_name, realms) in gm_method_realms {
             for realm in realms {
-                self.insert_realm(method_name, *realm);
                 self.insert_access_path(&format!("GM.{method_name}"), *realm);
                 self.insert_access_path(&format!("GAMEMODE.{method_name}"), *realm);
             }
         }
-    }
-
-    #[cfg(test)]
-    fn should_check_call(&self, call_realm: ResolvedRealm, name: &str) -> bool {
-        let Some(realms) = self.realms_by_name.get(name) else {
-            return true;
-        };
-
-        should_check_candidate_realms(call_realm, realms)
     }
 
     fn should_check_access_path(
@@ -86,11 +107,6 @@ fn should_check_candidate_realms(call_realm: ResolvedRealm, realms: &[ResolvedRe
     realms.iter().any(|callee| {
         is_known_evidence(callee.evidence) && is_cross_realm_misuse(call_realm, *callee)
     })
-}
-
-pub struct PrecomputedCalleeRealmData {
-    pub callee_realms: PrecomputedCalleeRealmMap,
-    pub realm_call_candidates: PrecomputedRealmCallCandidates,
 }
 
 pub struct GmodRealmMisuseChecker;
@@ -135,7 +151,6 @@ impl Checker for GmodRealmMisuseChecker {
             }
         };
 
-        let mut decl_annotation_cache: DeclAnnotationRealmCache = FxHashMap::default();
         let mut callee_realm_cache: CalleeRealmCache = FxHashMap::default();
         let mut member_candidate_cache: MemberCandidateCache = FxHashMap::default();
         let mut owner_key_member_candidate_cache: OwnerKeyMemberCandidateCache =
@@ -155,7 +170,11 @@ impl Checker for GmodRealmMisuseChecker {
         let profile_enabled = log::log_enabled!(log::Level::Info);
         let mut profile = profile_enabled.then(GmodRealmMisuseProfile::default);
 
-        for call_expr in semantic_model.get_root().descendants::<LuaCallExpr>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        let mut guarded_names = None;
+        for call_expr in buckets.call_exprs.iter() {
             if context.is_cancelled() {
                 return;
             }
@@ -180,7 +199,7 @@ impl Checker for GmodRealmMisuseChecker {
             }
             if let Some(candidates) = realm_call_candidates
                 && let Some(should_check) =
-                    should_check_static_realm_call(&call_expr, call_realm, candidates, decl_tree)
+                    should_check_static_realm_call(call_expr, call_realm, candidates, decl_tree)
                 && !should_check
             {
                 if let Some(profile) = profile.as_mut() {
@@ -192,10 +211,9 @@ impl Checker for GmodRealmMisuseChecker {
             let mut callee_realms = resolve_callee_realms(
                 context,
                 semantic_model,
-                &call_expr,
+                call_expr,
                 call_realm,
                 &gm_method_realms,
-                &mut decl_annotation_cache,
                 &mut decl_realm_cache,
                 &mut callee_realm_cache,
                 &mut member_candidate_cache,
@@ -226,6 +244,10 @@ impl Checker for GmodRealmMisuseChecker {
             }
 
             if let Some(callee_realm) = unknown_realm_candidate(call_realm, &callee_realms) {
+                if is_presence_guarded_call(semantic_model, &buckets, &mut guarded_names, call_expr)
+                {
+                    continue;
+                }
                 let call_name = call_expr
                     .get_access_path()
                     .unwrap_or_else(|| "function".into());
@@ -235,8 +257,8 @@ impl Checker for GmodRealmMisuseChecker {
                     mismatch_message(
                         DiagnosticCode::GmodUnknownRealm,
                         &call_name,
-                        call_realm.realm,
-                        callee_realm.realm,
+                        call_realm,
+                        callee_realm,
                     ),
                     None,
                 );
@@ -279,6 +301,9 @@ impl Checker for GmodRealmMisuseChecker {
             else {
                 continue;
             };
+            if is_presence_guarded_call(semantic_model, &buckets, &mut guarded_names, call_expr) {
+                continue;
+            }
 
             let call_name = call_expr
                 .get_access_path()
@@ -286,7 +311,7 @@ impl Checker for GmodRealmMisuseChecker {
             context.add_diagnostic(
                 code,
                 call_expr.get_range(),
-                mismatch_message(code, &call_name, call_realm.realm, callee_realm.realm),
+                mismatch_message(code, &call_name, call_realm, callee_realm),
                 None,
             );
             if let Some(profile) = profile.as_mut() {
@@ -294,10 +319,47 @@ impl Checker for GmodRealmMisuseChecker {
             }
         }
 
-        if let Some(mut profile) = profile {
-            profile.annotation_cache_files_loaded = decl_annotation_cache.len();
+        if let Some(profile) = profile {
             profile.log(file_id);
         }
+    }
+}
+
+/// Whether `call_expr` only runs where its callee is present; a name guard covers only a global callee.
+fn is_presence_guarded_call(
+    semantic_model: &SemanticModel,
+    buckets: &FileNodeBuckets,
+    guarded_names: &mut Option<FxHashSet<TextRange>>,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    match call_expr.get_prefix_expr() {
+        Some(LuaExpr::IndexExpr(index_expr)) => {
+            crate::compilation::analyzer::is_member_path_presence_guarded(
+                semantic_model.get_db(),
+                &mut semantic_model.get_cache().borrow_mut(),
+                &index_expr,
+            )
+        }
+        Some(LuaExpr::NameExpr(name_expr)) => {
+            let is_global = name_expr.get_name_text().is_some_and(|name| {
+                semantic_model
+                    .get_db()
+                    .get_decl_index()
+                    .get_decl_tree(&semantic_model.get_file_id())
+                    .and_then(|tree| tree.find_local_decl(&name, name_expr.get_position()))
+                    .is_none()
+            });
+            is_global
+                && guarded_names
+                    .get_or_insert_with(|| {
+                        super::undefined_global::calc_guarded_name_expr_ranges(
+                            semantic_model,
+                            buckets,
+                        )
+                    })
+                    .contains(&name_expr.get_range())
+        }
+        _ => false,
     }
 }
 
@@ -318,14 +380,13 @@ struct GmodRealmMisuseProfile {
     member_candidate_cache_misses: usize,
     member_candidate_time: Duration,
     call_realm_resolution_time: Duration,
-    annotation_cache_files_loaded: usize,
     callee_resolution_time: Duration,
 }
 
 impl GmodRealmMisuseProfile {
     fn log(&self, file_id: FileId) {
         log::info!(
-            "gmod realm misuse profile: file={:?} calls_scanned={} calls_checked={} shared_skips={} static_skips={} empty_callee={} diagnostics={} gm_fast_hits={} decl_cache_hits={} decl_cache_misses={} precomputed_hits={} member_realms_cache_hits={} member_cache_hits={} member_cache_misses={} member_time={:?} call_realm_time={:?} annotation_files_loaded={} callee_time={:?}",
+            "gmod realm misuse profile: file={:?} calls_scanned={} calls_checked={} shared_skips={} static_skips={} empty_callee={} diagnostics={} gm_fast_hits={} decl_cache_hits={} decl_cache_misses={} precomputed_hits={} member_realms_cache_hits={} member_cache_hits={} member_cache_misses={} member_time={:?} call_realm_time={:?} callee_time={:?}",
             file_id,
             self.calls_scanned,
             self.calls_checked,
@@ -342,7 +403,6 @@ impl GmodRealmMisuseProfile {
             self.member_candidate_cache_misses,
             self.member_candidate_time,
             self.call_realm_resolution_time,
-            self.annotation_cache_files_loaded,
             self.callee_resolution_time,
         );
     }
@@ -401,14 +461,7 @@ impl ResolvedRealm {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct AnnotatedRealmRange {
-    pub range: TextRange,
-    pub realm: GmodRealm,
-}
-
-pub type GmMethodRealmMap = FxHashMap<String, Vec<ResolvedRealm>>;
-type DeclAnnotationRealmCache = FxHashMap<FileId, Vec<AnnotatedRealmRange>>;
+pub type GmMethodRealmMap = HashMap<String, Vec<ResolvedRealm>>;
 type CalleeRealmCache = FxHashMap<LuaSemanticDeclId, Vec<ResolvedRealm>>;
 type MemberCandidateCache = FxHashMap<(LuaType, LuaMemberKey, bool), Vec<LuaMemberId>>;
 type OwnerKeyMemberCandidateCache = FxHashMap<(LuaMemberOwner, LuaMemberKey), Vec<LuaMemberId>>;
@@ -452,7 +505,6 @@ fn resolve_callee_realms(
     call_expr: &LuaCallExpr,
     call_realm: ResolvedRealm,
     gm_method_realms: &GmMethodRealmMap,
-    decl_annotation_cache: &mut DeclAnnotationRealmCache,
     decl_realm_cache: &mut DeclRealmCache,
     callee_realm_cache: &mut CalleeRealmCache,
     member_candidate_cache: &mut MemberCandidateCache,
@@ -469,7 +521,7 @@ fn resolve_callee_realms(
 
     let is_bare_name_call = matches!(prefix_expr, LuaExpr::NameExpr(_));
 
-    // Fast path: GM method annotations (O(1) HashMap lookup, no inference needed).
+    // Fast path: GM method annotations (O(1) hash lookup, no inference needed).
     // Only applies to member calls (index expressions like GM:Method or GAMEMODE.Method).
     if !is_bare_name_call {
         if let Some(index_expr) = LuaIndexExpr::cast(prefix_expr.syntax().clone()) {
@@ -499,6 +551,21 @@ fn resolve_callee_realms(
         return Vec::new();
     }
 
+    // A table whose metatable can provide any field has no definitive callee for a member it
+    // lacks in this realm: the call may be served by the metatable, whatever other realms declare.
+    if let Some(index_expr) = LuaIndexExpr::cast(prefix_expr.syntax().clone())
+        && let Some(owner_expr) = index_expr.get_prefix_expr()
+        && let Ok(owner_type) = semantic_model.infer_expr(owner_expr)
+        && super::check_field::has_unresolved_metatable_index(
+            semantic_model.get_db(),
+            semantic_model,
+            &owner_type,
+            Some(call_expr.get_position()),
+        )
+    {
+        return Vec::new();
+    }
+
     let semantic_decl = semantic_model.find_decl(
         NodeOrToken::Node(prefix_expr.syntax().clone()),
         SemanticDeclLevel::default(),
@@ -520,7 +587,7 @@ fn resolve_callee_realms(
         }
     }
 
-    // Resolve realms: try precomputed first (O(1) HashMap lookup), then
+    // Resolve realms: try precomputed first (O(1) hash lookup), then
     // fall back to expensive member/global resolution paths.
     let mut realms = Vec::new();
 
@@ -534,9 +601,7 @@ fn resolve_callee_realms(
             if let Some(profile) = profile.as_mut() {
                 profile.precomputed_callee_hits += 1;
             }
-            for realm in precomputed {
-                push_unique_realm(&mut realms, *realm);
-            }
+            push_unique_realm(&mut realms, precomputed);
         }
     }
 
@@ -549,7 +614,6 @@ fn resolve_callee_realms(
                 semantic_model,
                 &prefix_expr,
                 decl,
-                decl_annotation_cache,
                 decl_realm_cache,
                 precomputed_callee_realms,
             ) {
@@ -571,7 +635,6 @@ fn resolve_callee_realms(
             semantic_model,
             call_expr,
             semantic_decl.as_ref(),
-            decl_annotation_cache,
             decl_realm_cache,
             member_candidate_cache,
             owner_key_member_candidate_cache,
@@ -591,10 +654,8 @@ fn resolve_callee_realms(
     if realms.is_empty() && !is_bare_name_call {
         if let Some(ref decl) = semantic_decl {
             if let Some(realm) = resolve_decl_realm_cached(
-                context,
                 semantic_model,
                 decl,
-                decl_annotation_cache,
                 decl_realm_cache,
                 precomputed_callee_realms,
             ) {
@@ -605,10 +666,8 @@ fn resolve_callee_realms(
                 && let Some(origin_owner) = semantic_model.get_member_origin_owner(member_id)
             {
                 if let Some(realm) = resolve_decl_realm_cached(
-                    context,
                     semantic_model,
                     &origin_owner,
-                    decl_annotation_cache,
                     decl_realm_cache,
                     precomputed_callee_realms,
                 ) {
@@ -636,7 +695,6 @@ fn resolve_global_name_candidate_realms(
     semantic_model: &SemanticModel,
     prefix_expr: &LuaExpr,
     semantic_decl: &LuaSemanticDeclId,
-    decl_annotation_cache: &mut DeclAnnotationRealmCache,
     decl_realm_cache: &mut DeclRealmCache,
     precomputed_callee_realms: Option<&PrecomputedCalleeRealmMap>,
 ) -> Vec<ResolvedRealm> {
@@ -670,10 +728,8 @@ fn resolve_global_name_candidate_realms(
                 continue;
             };
             if let Some(realm) = resolve_decl_realm_cached(
-                context,
                 semantic_model,
                 &property_owner_id,
-                decl_annotation_cache,
                 decl_realm_cache,
                 precomputed_callee_realms,
             ) {
@@ -690,7 +746,6 @@ fn resolve_member_candidate_realms(
     semantic_model: &SemanticModel,
     call_expr: &LuaCallExpr,
     semantic_decl: Option<&LuaSemanticDeclId>,
-    decl_annotation_cache: &mut DeclAnnotationRealmCache,
     decl_realm_cache: &mut DeclRealmCache,
     member_candidate_cache: &mut MemberCandidateCache,
     owner_key_member_candidate_cache: &mut OwnerKeyMemberCandidateCache,
@@ -756,7 +811,7 @@ fn resolve_member_candidate_realms(
         && resolved_member.get_key() == &member_key
         && let Some(resolved_owner) = member_index.get_current_owner(resolved_member_id)
     {
-        let mut seen: HashSet<LuaMemberId> = all_member_ids.iter().copied().collect();
+        let mut seen: FxHashSet<LuaMemberId> = all_member_ids.iter().copied().collect();
         push_cached_member_ids_for_owner_key(
             member_index,
             resolved_owner,
@@ -774,10 +829,8 @@ fn resolve_member_candidate_realms(
         }
         let property_owner_id = LuaSemanticDeclId::Member(member_id);
         if let Some(realm) = resolve_decl_realm_cached(
-            context,
             semantic_model,
             &property_owner_id,
-            decl_annotation_cache,
             decl_realm_cache,
             precomputed_callee_realms,
         ) {
@@ -812,21 +865,15 @@ fn is_gmod_baseclass_receiver(semantic_model: &SemanticModel, owner_expr: &LuaEx
 }
 
 fn resolve_decl_realm(
-    context: &DiagnosticContext,
     semantic_model: &SemanticModel,
     semantic_decl: &LuaSemanticDeclId,
-    decl_annotation_cache: &mut DeclAnnotationRealmCache,
 ) -> Option<ResolvedRealm> {
     let (decl_file_id, decl_offset) = semantic_decl_position(semantic_decl)?;
     let infer_index = semantic_model.get_db().get_gmod_infer_index();
     let metadata = infer_index.get_realm_file_metadata(&decl_file_id)?;
-    if let Some(annotation_realm) = resolve_decl_annotation_realm_at_offset(
-        context,
-        semantic_model,
-        &decl_file_id,
-        decl_offset,
-        decl_annotation_cache,
-    ) {
+    if let Some(annotation_realm) =
+        resolve_decl_annotation_realm_at_offset(semantic_model, &decl_file_id, decl_offset)
+    {
         return Some(ResolvedRealm::new(
             annotation_realm,
             RealmEvidence::ExplicitAnnotation,
@@ -839,10 +886,8 @@ fn resolve_decl_realm(
 /// Cached wrapper around `resolve_decl_realm`. The result (including `None`) is memoized
 /// per `LuaSemanticDeclId` so that the same member/decl is never resolved twice in a file pass.
 fn resolve_decl_realm_cached(
-    context: &DiagnosticContext,
     semantic_model: &SemanticModel,
     semantic_decl: &LuaSemanticDeclId,
-    decl_annotation_cache: &mut DeclAnnotationRealmCache,
     decl_realm_cache: &mut DeclRealmCache,
     precomputed_callee_realms: Option<&PrecomputedCalleeRealmMap>,
 ) -> Option<ResolvedRealm> {
@@ -850,190 +895,33 @@ fn resolve_decl_realm_cached(
     if let Some(cached) = decl_realm_cache.get(semantic_decl) {
         return *cached;
     }
-    if let Some(resolved) = precomputed_callee_realms
-        .and_then(|map| map.get(semantic_decl))
-        .and_then(|realms| realms.first())
-        .copied()
-    {
+    if let Some(resolved) = precomputed_callee_realms.and_then(|map| map.get(semantic_decl)) {
         decl_realm_cache.insert(semantic_decl.clone(), Some(resolved));
         return Some(resolved);
     }
-    let result = resolve_decl_realm(
-        context,
-        semantic_model,
-        semantic_decl,
-        decl_annotation_cache,
-    );
+    let result = resolve_decl_realm(semantic_model, semantic_decl);
     decl_realm_cache.insert(semantic_decl.clone(), result);
     result
 }
 
 fn resolve_decl_annotation_realm_at_offset(
-    context: &DiagnosticContext,
     semantic_model: &SemanticModel,
     file_id: &FileId,
     offset: TextSize,
-    decl_annotation_cache: &mut DeclAnnotationRealmCache,
 ) -> Option<GmodRealm> {
-    if let Some(file_entries) = context
-        .get_shared_data()
-        .and_then(|shared_data| shared_data.decl_annotation_realms.get(file_id))
-    {
-        return file_entries
-            .iter()
-            .find(|entry| entry.range.contains(offset))
-            .map(|entry| entry.realm);
-    }
-
-    // Fast path: GmodInferIndex already holds the per-file member realm ranges computed
-    // during gmod_pre. Prefer its O(log n) binary-search over an AST re-walk.
-    let infer_index = semantic_model.get_db().get_gmod_infer_index();
-    if infer_index.has_member_realm_ranges(file_id) {
-        return infer_index.get_member_annotation_realm_at_offset(file_id, offset);
-    }
-
-    let file_entries = decl_annotation_cache
-        .entry(file_id.clone())
-        .or_insert_with(|| {
-            collect_decl_annotation_realms_for_file(context, semantic_model, file_id)
-        });
-
-    file_entries
-        .iter()
-        .find(|entry| entry.range.contains(offset))
-        .map(|entry| entry.realm)
+    semantic_model
+        .get_db()
+        .get_gmod_infer_index()
+        .get_member_annotation_realm_at_offset(file_id, offset)
 }
 
 fn resolve_decl_annotation_realm_at_offset_from_db(
     db: &crate::DbIndex,
     file_id: &FileId,
     offset: TextSize,
-    decl_annotation_cache: &mut DeclAnnotationRealmCache,
 ) -> Option<GmodRealm> {
-    // Fast path: GmodInferIndex already holds the per-file member realm ranges computed
-    // during gmod_pre. Prefer its O(log n) binary-search over an AST re-walk.
-    let infer_index = db.get_gmod_infer_index();
-    if infer_index.has_member_realm_ranges(file_id) {
-        return infer_index.get_member_annotation_realm_at_offset(file_id, offset);
-    }
-
-    let file_entries = decl_annotation_cache
-        .entry(*file_id)
-        .or_insert_with(|| collect_decl_annotation_realms_for_file_from_db(db, file_id));
-
-    file_entries
-        .iter()
-        .find(|entry| entry.range.contains(offset))
-        .map(|entry| entry.realm)
-}
-
-fn collect_decl_annotation_realms_for_file(
-    context: &DiagnosticContext,
-    semantic_model: &SemanticModel,
-    file_id: &FileId,
-) -> Vec<AnnotatedRealmRange> {
-    let Some(tree) = semantic_model.get_db().get_vfs().get_syntax_tree(file_id) else {
-        return Vec::new();
-    };
-
-    let mut realms = Vec::new();
-    for func_stat in tree.get_chunk_node().descendants::<LuaFuncStat>() {
-        if context.is_cancelled() {
-            return realms;
-        }
-        if let Some(comment) = func_stat.get_left_comment()
-            && let Some(realm) = realm_from_doc_comment(&comment)
-        {
-            realms.push(AnnotatedRealmRange {
-                range: func_stat.get_range(),
-                realm,
-            });
-        }
-    }
-
-    for local_func_stat in tree.get_chunk_node().descendants::<LuaLocalFuncStat>() {
-        if context.is_cancelled() {
-            return realms;
-        }
-        if let Some(comment) = local_func_stat.get_left_comment()
-            && let Some(realm) = realm_from_doc_comment(&comment)
-        {
-            realms.push(AnnotatedRealmRange {
-                range: local_func_stat.get_range(),
-                realm,
-            });
-        }
-    }
-
-    realms
-}
-
-fn collect_decl_annotation_realms_for_file_from_db(
-    db: &crate::DbIndex,
-    file_id: &FileId,
-) -> Vec<AnnotatedRealmRange> {
-    let Some(tree) = db.get_vfs().get_syntax_tree(file_id) else {
-        return Vec::new();
-    };
-
-    let mut realms = Vec::new();
-    for func_stat in tree.get_chunk_node().descendants::<LuaFuncStat>() {
-        if let Some(comment) = func_stat.get_left_comment()
-            && let Some(realm) = realm_from_doc_comment(&comment)
-        {
-            realms.push(AnnotatedRealmRange {
-                range: func_stat.get_range(),
-                realm,
-            });
-        }
-    }
-
-    for local_func_stat in tree.get_chunk_node().descendants::<LuaLocalFuncStat>() {
-        if let Some(comment) = local_func_stat.get_left_comment()
-            && let Some(realm) = realm_from_doc_comment(&comment)
-        {
-            realms.push(AnnotatedRealmRange {
-                range: local_func_stat.get_range(),
-                realm,
-            });
-        }
-    }
-
-    realms
-}
-
-pub fn collect_decl_annotation_realms_for_file_precompute(
-    db: &crate::DbIndex,
-    file_id: &FileId,
-) -> Vec<AnnotatedRealmRange> {
-    let Some(tree) = db.get_vfs().get_syntax_tree(file_id) else {
-        return Vec::new();
-    };
-
-    let mut realms = Vec::new();
-    for func_stat in tree.get_chunk_node().descendants::<LuaFuncStat>() {
-        if let Some(comment) = func_stat.get_left_comment()
-            && let Some(realm) = realm_from_doc_comment(&comment)
-        {
-            realms.push(AnnotatedRealmRange {
-                range: func_stat.get_range(),
-                realm,
-            });
-        }
-    }
-
-    for local_func_stat in tree.get_chunk_node().descendants::<LuaLocalFuncStat>() {
-        if let Some(comment) = local_func_stat.get_left_comment()
-            && let Some(realm) = realm_from_doc_comment(&comment)
-        {
-            realms.push(AnnotatedRealmRange {
-                range: local_func_stat.get_range(),
-                realm,
-            });
-        }
-    }
-
-    realms
+    db.get_gmod_infer_index()
+        .get_member_annotation_realm_at_offset(file_id, offset)
 }
 
 fn resolve_annotated_gm_method_realms(
@@ -1101,7 +989,7 @@ fn collect_all_member_ids_for_type_key(
         owners
     };
     let mut result = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = rustc_hash::FxHashSet::default();
 
     for owner in &owners {
         push_cached_member_ids_for_owner_key(
@@ -1156,7 +1044,7 @@ fn subtype_member_owners_for_key(
     // every missing member name.
     let member_index = db.get_member_index();
     let mut subtype_ids = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     for member in member_index.get_current_members_for_key(member_key) {
         let Some(owner) = member_index.get_current_owner(&member.get_id()) else {
             continue;
@@ -1186,7 +1074,7 @@ fn push_cached_member_ids_for_owner_key(
     member_key: &LuaMemberKey,
     owner_key_member_candidate_cache: &mut OwnerKeyMemberCandidateCache,
     result: &mut Vec<LuaMemberId>,
-    seen: &mut HashSet<LuaMemberId>,
+    seen: &mut FxHashSet<LuaMemberId>,
 ) -> bool {
     let cache_key = (owner.clone(), member_key.clone());
     if let Some(member_ids) = owner_key_member_candidate_cache.get(&cache_key) {
@@ -1208,7 +1096,7 @@ fn push_cached_member_ids_for_owner_key(
         owner,
         member_key,
         &mut owner_key_member_ids,
-        &mut HashSet::new(),
+        &mut FxHashSet::default(),
     );
     owner_key_member_candidate_cache.insert(cache_key, owner_key_member_ids.clone());
     if !found {
@@ -1228,7 +1116,7 @@ fn push_member_ids_for_owner_key(
     owner: &LuaMemberOwner,
     member_key: &LuaMemberKey,
     result: &mut Vec<LuaMemberId>,
-    seen: &mut HashSet<LuaMemberId>,
+    seen: &mut FxHashSet<LuaMemberId>,
 ) -> bool {
     let indexed_members = member_index.get_members_for_owner_key(owner, member_key);
     if indexed_members.is_empty() {
@@ -1271,14 +1159,14 @@ fn owner_type_to_member_owners(
     db: &crate::DbIndex,
     include_inherited_members: bool,
 ) -> Vec<LuaMemberOwner> {
-    let mut visited = HashSet::new();
+    let mut visited = FxHashSet::default();
     owner_type_to_member_owners_inner(typ, db, &mut visited, include_inherited_members)
 }
 
 fn owner_type_to_member_owners_inner(
     typ: &LuaType,
     db: &crate::DbIndex,
-    visited: &mut HashSet<LuaType>,
+    visited: &mut FxHashSet<LuaType>,
     include_inherited_members: bool,
 ) -> Vec<LuaMemberOwner> {
     if !visited.insert(typ.clone()) {
@@ -1360,7 +1248,7 @@ fn owner_type_to_member_owners_inner(
 fn expand_type_decl_member_owners(
     type_decl_id: &crate::LuaTypeDeclId,
     db: &crate::DbIndex,
-    visited: &mut HashSet<LuaType>,
+    visited: &mut FxHashSet<LuaType>,
     include_inherited_members: bool,
 ) -> Vec<LuaMemberOwner> {
     let mut owners = vec![LuaMemberOwner::Type(type_decl_id.clone())];
@@ -1383,7 +1271,7 @@ fn collect_annotated_gm_method_realms(
     context: &DiagnosticContext,
     semantic_model: &SemanticModel,
 ) -> GmMethodRealmMap {
-    let mut gm_method_realms = FxHashMap::default();
+    let mut gm_method_realms = GmMethodRealmMap::default();
 
     let db = semantic_model.get_db();
     let module_index = db.get_module_index();
@@ -1629,11 +1517,11 @@ fn is_cross_realm_misuse(call_realm: ResolvedRealm, callee_realm: ResolvedRealm)
 fn mismatch_message(
     code: DiagnosticCode,
     call_name: &str,
-    call_realm: GmodRealm,
-    callee_realm: GmodRealm,
+    call: ResolvedRealm,
+    callee: ResolvedRealm,
 ) -> String {
-    let call_realm = realm_label(call_realm);
-    let callee_realm = realm_label(callee_realm);
+    let call_realm = realm_label(call.realm);
+    let callee_realm = realm_label(callee.realm);
 
     match code {
         DiagnosticCode::GmodRealmMismatch => format!(
@@ -1644,10 +1532,12 @@ fn mismatch_message(
         )
         .to_string(),
         DiagnosticCode::GmodRealmMismatchHeuristic => format!(
-            "Potential realm mismatch (heuristic): `{name}` is called in inferred {call_realm} realm while declaration is inferred {decl_realm}.",
+            "Possible realm mismatch: `{name}` is called in {call_realm} realm ({call_source}) but declaration is {decl_realm} ({decl_source}).",
             name = call_name,
             call_realm = call_realm,
+            call_source = evidence_label(call.evidence),
             decl_realm = callee_realm,
+            decl_source = evidence_label(callee.evidence),
         )
         .to_string(),
         DiagnosticCode::GmodUnknownRealm => format!(
@@ -1657,6 +1547,17 @@ fn mismatch_message(
         )
         .to_string(),
         _ => format!("Realm mismatch for `{name}`.", name = call_name).to_string(),
+    }
+}
+
+fn evidence_label(evidence: RealmEvidence) -> &'static str {
+    match evidence {
+        RealmEvidence::ExplicitBranch => "from a CLIENT/SERVER branch",
+        RealmEvidence::ExplicitAnnotation => "from a @realm annotation",
+        RealmEvidence::InferredFilename => "inferred from the file path",
+        RealmEvidence::InferredDependency => "inferred from how the file is loaded",
+        RealmEvidence::InferredDefault => "the default realm",
+        RealmEvidence::Unknown => "unknown",
     }
 }
 
@@ -1673,18 +1574,14 @@ fn realm_label(realm: GmodRealm) -> &'static str {
 fn resolve_precomputed_decl_realm(
     db: &crate::DbIndex,
     semantic_decl: &LuaSemanticDeclId,
-    decl_annotation_cache: &mut DeclAnnotationRealmCache,
 ) -> Option<ResolvedRealm> {
     let (decl_file_id, decl_offset) = semantic_decl_position(semantic_decl)?;
     let metadata = db
         .get_gmod_infer_index()
         .get_realm_file_metadata(&decl_file_id)?;
-    if let Some(annotation_realm) = resolve_decl_annotation_realm_at_offset_from_db(
-        db,
-        &decl_file_id,
-        decl_offset,
-        decl_annotation_cache,
-    ) {
+    if let Some(annotation_realm) =
+        resolve_decl_annotation_realm_at_offset_from_db(db, &decl_file_id, decl_offset)
+    {
         return Some(ResolvedRealm::new(
             annotation_realm,
             RealmEvidence::ExplicitAnnotation,
@@ -1694,155 +1591,72 @@ fn resolve_precomputed_decl_realm(
     Some(resolve_realm_at_position(metadata, decl_offset))
 }
 
-/// Precompute declaration/member/signature realm facts for workspace diagnostics.
-pub fn precompute_callee_realm_data_for_workspace(
+/// What one file's declarations, members and signatures resolve to as
+/// callees, and the global access paths its declarations and members can be
+/// called by. Reads only the file's own facts.
+pub fn resolve_file_callee_realms(
     db: &crate::DbIndex,
-    workspace_id: WorkspaceId,
-    workspace_file_ids: &[FileId],
-) -> PrecomputedCalleeRealmData {
-    let module_index = db.get_module_index();
-    let mut callee_realms = FxHashMap::default();
-    let mut realm_call_candidates = PrecomputedRealmCallCandidates::default();
-    let mut decl_annotation_cache = FxHashMap::default();
-
-    // Resolving one file's declaration and member realms reads only
-    // immutable `&DbIndex` state, so the resolution is derived
-    // concurrently. The annotation cache is a pure memo, so giving each
-    // worker its own only costs repeated lookups.
-    let resolve_files: Vec<FileId> = workspace_file_ids
-        .iter()
-        .copied()
-        .filter(|&file_id| {
-            let candidate_workspace_id = module_index
-                .get_workspace_id(file_id)
-                .unwrap_or(WorkspaceId::MAIN);
-            module_index
-                .workspace_resolution_priority(workspace_id, candidate_workspace_id)
-                .is_some()
-        })
-        .collect();
-    let resolved_by_file = crate::compilation::analyzer::parallel::map_files_collect(
-        db,
-        &resolve_files,
-        |db, file_id| {
-            let mut cache = FxHashMap::default();
-            let mut resolved = Vec::new();
-            if let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) {
-                let mut decl_ids: Vec<_> = decl_tree.get_decls().keys().copied().collect();
-                decl_ids.sort_unstable_by_key(|decl_id| decl_id.position);
-                for decl_id in decl_ids {
-                    let semantic_decl = LuaSemanticDeclId::LuaDecl(decl_id);
-                    if let Some(realm) =
-                        resolve_precomputed_decl_realm(db, &semantic_decl, &mut cache)
-                    {
-                        resolved.push((semantic_decl, realm));
-                    }
+    file_id: FileId,
+) -> (FileCalleeRealms, FileRealmAccessPaths) {
+    let mut callee_realms = FileCalleeRealms::default();
+    let mut access_paths = FileRealmAccessPaths::new();
+    if let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) {
+        let mut decls: Vec<_> = decl_tree.get_decls().values().collect();
+        decls.sort_unstable_by_key(|decl| decl.get_id().position);
+        for decl in decls {
+            let semantic_decl = LuaSemanticDeclId::LuaDecl(decl.get_id());
+            if let Some(realm) = resolve_precomputed_decl_realm(db, &semantic_decl) {
+                if decl.is_global() {
+                    access_paths.push((decl.get_name().to_string(), realm));
                 }
+                callee_realms.insert(semantic_decl, realm);
             }
-
-            let mut member_ids: Vec<_> = db
-                .get_member_index()
-                .get_file_members(file_id)
-                .into_iter()
-                .map(|member| member.get_id())
-                .collect();
-            member_ids.sort_unstable_by_key(|member_id| member_id.get_position());
-            for member_id in member_ids {
-                let semantic_decl = LuaSemanticDeclId::Member(member_id);
-                if let Some(realm) = resolve_precomputed_decl_realm(db, &semantic_decl, &mut cache)
-                {
-                    resolved.push((semantic_decl, realm));
-                }
-            }
-            (resolved, cache)
-        },
-    );
-
-    // The annotation memo the workers filled is keyed by file and holds the same
-    // value for the same key whoever computed it, so folding the fragments back
-    // in leaves the signature pass below reading a warm cache, exactly as it did
-    // when the whole function ran on one thread.
-    for (semantic_decl, resolved) in resolved_by_file.into_iter().flat_map(|(resolved, cache)| {
-        decl_annotation_cache.extend(cache);
-        resolved
-    }) {
-        match semantic_decl {
-            LuaSemanticDeclId::LuaDecl(decl_id) => {
-                if let Some(decl) = db.get_decl_index().get_decl(&decl_id) {
-                    realm_call_candidates.insert_realm(decl.get_name(), resolved);
-                    if decl.is_global() {
-                        realm_call_candidates.insert_access_path(decl.get_name(), resolved);
-                    }
-                }
-            }
-            LuaSemanticDeclId::Member(member_id) => {
-                if let Some(member) = db.get_member_index().get_member(&member_id)
-                    && let Some(name) = member.get_key().get_name()
-                {
-                    realm_call_candidates.insert_realm(name, resolved);
-                    if let Some(global_id) = member.get_global_id() {
-                        realm_call_candidates.insert_access_path(global_id.get_name(), resolved);
-                    }
-                }
-            }
-            _ => {}
-        }
-        callee_realms.insert(semantic_decl, vec![resolved]);
-    }
-
-    let mut signature_ids: Vec<_> = db
-        .get_signature_index()
-        .iter()
-        .map(|(signature_id, _)| *signature_id)
-        .filter(|signature_id| {
-            let candidate_workspace_id = module_index
-                .get_workspace_id(signature_id.get_file_id())
-                .unwrap_or(WorkspaceId::MAIN);
-            module_index
-                .workspace_resolution_priority(workspace_id, candidate_workspace_id)
-                .is_some()
-        })
-        .collect();
-    signature_ids.sort_unstable_by_key(|signature_id| {
-        (signature_id.get_file_id(), signature_id.get_position())
-    });
-    for signature_id in signature_ids {
-        let semantic_decl = LuaSemanticDeclId::Signature(signature_id);
-        if let Some(resolved) =
-            resolve_precomputed_decl_realm(db, &semantic_decl, &mut decl_annotation_cache)
-        {
-            callee_realms.insert(semantic_decl, vec![resolved]);
         }
     }
 
-    PrecomputedCalleeRealmData {
-        callee_realms,
-        realm_call_candidates,
+    let mut members = db.get_member_index().get_file_members(file_id);
+    members.sort_unstable_by_key(|member| member.get_id().get_position());
+    for member in members {
+        let semantic_decl = LuaSemanticDeclId::Member(member.get_id());
+        if let Some(realm) = resolve_precomputed_decl_realm(db, &semantic_decl) {
+            if let Some(global_id) = member.get_key().get_name().and(member.get_global_id()) {
+                access_paths.push((global_id.get_name().to_string(), realm));
+            }
+            callee_realms.insert(semantic_decl, realm);
+        }
     }
+
+    if let Some(signature_ids) = db.get_signature_index().get_file_signature_ids(file_id) {
+        for signature_id in signature_ids {
+            let semantic_decl = LuaSemanticDeclId::Signature(*signature_id);
+            if let Some(realm) = resolve_precomputed_decl_realm(db, &semantic_decl) {
+                callee_realms.insert(semantic_decl, realm);
+            }
+        }
+    }
+
+    (callee_realms, access_paths)
 }
 
-/// Precompute GM method realm annotations for a specific workspace.
-/// This is the same data that `collect_annotated_gm_method_realms` computes per-file,
-/// but extracted to be called once per workspace during batch diagnostics.
-pub fn precompute_gm_method_realms(
-    db: &crate::db_index::DbIndex,
-    workspace_id: WorkspaceId,
-) -> GmMethodRealmMap {
-    let mut gm_method_realms = FxHashMap::default();
-    let module_index = db.get_module_index();
+/// Every file's GM method realm annotations, in the index's order.
+pub fn gm_method_realm_annotations(db: &crate::DbIndex) -> Vec<(FileId, Vec<(String, GmodRealm)>)> {
+    db.get_gmod_infer_index()
+        .iter_gm_method_realm_annotations()
+        .map(|(file_id, method_realms)| (*file_id, method_realms.clone()))
+        .collect()
+}
 
-    for (file_id, method_realms) in db.get_gmod_infer_index().iter_gm_method_realm_annotations() {
-        let file_id = *file_id;
-        let candidate_workspace_id = module_index
-            .get_workspace_id(file_id)
-            .unwrap_or(WorkspaceId::MAIN);
-        if module_index
-            .workspace_resolution_priority(workspace_id, candidate_workspace_id)
-            .is_none()
-        {
+/// The GM method realm annotations of the files `includes` admits, folded in
+/// the annotations' order.
+pub fn fold_gm_method_realms(
+    annotations: &[(FileId, Vec<(String, GmodRealm)>)],
+    includes: impl Fn(FileId) -> bool,
+) -> GmMethodRealmMap {
+    let mut gm_method_realms = GmMethodRealmMap::default();
+    for (file_id, method_realms) in annotations {
+        if !includes(*file_id) {
             continue;
         }
-
         for (method_name, realm) in method_realms {
             let entry = gm_method_realms
                 .entry(method_name.clone())
@@ -1853,7 +1667,6 @@ pub fn precompute_gm_method_realms(
             );
         }
     }
-
     gm_method_realms
 }
 
@@ -1917,29 +1730,29 @@ mod tests {
     }
 
     #[gtest]
-    fn precomputed_realm_call_candidates_skip_only_known_compatible_static_names() {
+    fn precomputed_realm_call_candidates_skip_only_known_compatible_access_paths() {
         let mut candidates = PrecomputedRealmCallCandidates::default();
-        candidates.insert_realm(
+        candidates.insert_access_path(
             "SharedOnly",
             ResolvedRealm::new(GmodRealm::Shared, RealmEvidence::InferredDependency),
         );
-        candidates.insert_realm(
+        candidates.insert_access_path(
             "ClientOnly",
             ResolvedRealm::new(GmodRealm::Client, RealmEvidence::InferredFilename),
         );
         let server_call = ResolvedRealm::new(GmodRealm::Server, RealmEvidence::InferredFilename);
 
         assert_that!(
-            candidates.should_check_call(server_call, "SharedOnly"),
-            eq(false)
+            candidates.should_check_access_path(server_call, "SharedOnly"),
+            some(eq(false))
         );
         assert_that!(
-            candidates.should_check_call(server_call, "ClientOnly"),
-            eq(true)
+            candidates.should_check_access_path(server_call, "ClientOnly"),
+            some(eq(true))
         );
         assert_that!(
-            candidates.should_check_call(server_call, "Missing"),
-            eq(true)
+            candidates.should_check_access_path(server_call, "Missing"),
+            none()
         );
     }
 }

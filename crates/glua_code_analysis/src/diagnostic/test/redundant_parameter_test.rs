@@ -73,16 +73,18 @@ mod test {
             &other_workspace.join("lua/foreign_arity_edge.lua"),
         )
         .expect("other workspace uri");
-        ws.analysis.update_file_by_uri(
-            &other_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &other_uri,
+                Some(
+                    r#"
                 ---@class ArityChild : ArityBase
                 local ArityChild = {}
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         let file_id = ws.def_file(
             "lua/current_arity.lua",
             r#"
@@ -712,5 +714,268 @@ mod test {
             A:Think(1, 2)
             "#,
         ));
+    }
+
+    /// A call with more arguments than any overload takes is resolved by how
+    /// the leading arguments fit, so only the surplus argument is reported.
+    #[test]
+    fn test_overloaded_call_with_surplus_argument_reports_only_the_surplus() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class SurplusColor
+            ---@field r number
+
+            ---@overload fun(color: SurplusColor)
+            ---@param r number
+            ---@param g number
+            ---@param b number
+            ---@param a number
+            function SetSurplusColor(r, g, b, a) end
+
+            SetSurplusColor(255, 255, 255, 255, 0)
+            "#,
+        );
+        let diagnostics_for = |ws: &mut VirtualWorkspace, code: DiagnosticCode| {
+            ws.analysis.diagnostic.enable_only(code);
+            let expected = Some(NumberOrString::String(code.get_name().to_string()));
+            ws.analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|diagnostic| diagnostic.code == expected)
+                .collect::<Vec<_>>()
+        };
+
+        let redundant = diagnostics_for(&mut ws, DiagnosticCode::RedundantParameter);
+        assert_eq!(redundant.len(), 1);
+        assert_eq!(redundant[0].range.start.line, 11);
+        assert!(redundant[0].range.start.character >= 40);
+        assert!(diagnostics_for(&mut ws, DiagnosticCode::ParamTypeMismatch).is_empty());
+    }
+
+    fn diagnostic_count(source: &str, code: DiagnosticCode) -> usize {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(source);
+        ws.analysis.diagnostic.enable_only(code);
+        let expected = Some(NumberOrString::String(code.get_name().to_string()));
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == expected)
+            .count()
+    }
+
+    /// The shorter overload that fits the leading arguments is chosen whatever
+    /// the declaration order, and the surplus arguments are the redundant ones.
+    #[test]
+    fn test_surplus_call_selects_shorter_fitting_overload_in_any_order() {
+        for (first, second) in [("boolean", "number"), ("number", "boolean")] {
+            let source = format!(
+                r#"
+                ---@overload fun(value: {first})
+                ---@overload fun(value: {second})
+                ---@param left string
+                ---@param right string
+                local function choose(left, right) end
+
+                choose(10, 20, 30)
+                "#
+            );
+            assert_eq!(
+                diagnostic_count(&source, DiagnosticCode::RedundantParameter),
+                2
+            );
+            assert_eq!(
+                diagnostic_count(&source, DiagnosticCode::ParamTypeMismatch),
+                0
+            );
+        }
+    }
+
+    /// A candidate accepting the whole leading argument type wins over one
+    /// accepting only a union component of it, whatever the declaration order.
+    #[test]
+    fn test_surplus_call_prefers_full_match_over_union_component_match() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@overload fun(value: number): string
+            ---@param value number|string
+            ---@return boolean
+            local function choose(value)
+                return true
+            end
+
+            ---@param value number|string
+            local function caller(value)
+                local result = choose(value, false)
+                return result
+            end
+            "#,
+        );
+        let result = ws.local_ty(file_id, "result");
+        assert_eq!(ws.humanize_type(result), "boolean");
+        assert_eq!(
+            diagnostic_count_in(&mut ws, file_id, DiagnosticCode::RedundantParameter),
+            1
+        );
+        assert_eq!(
+            diagnostic_count_in(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            0
+        );
+    }
+
+    /// A variadic alternative matching only a union component does not beat the
+    /// finite form that matches in full, although it consumes more arguments.
+    #[test]
+    fn test_surplus_call_prefers_full_match_over_partial_variadic() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@overload fun(...: number|boolean): string
+            ---@param value number|string
+            ---@return boolean
+            local function choose(value)
+                return true
+            end
+
+            ---@param value number|string
+            local function caller(value)
+                local result = choose(value, false)
+                return result
+            end
+            "#,
+        );
+        let result = ws.local_ty(file_id, "result");
+        assert_eq!(ws.humanize_type(result), "boolean");
+    }
+
+    /// A variadic alternative whose required fixed parameter is not supplied
+    /// ranks below the finite form whose required parameters are all supplied.
+    #[test]
+    fn test_surplus_call_prefers_finite_form_over_variadic_missing_required_prefix() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@overload fun(a: number, b: number, required: string, ...: number): string
+            ---@param value number
+            ---@return boolean
+            local function choose(value)
+                return true
+            end
+
+            local result = choose(1, 2)
+            "#,
+        );
+        let result = ws.local_ty(file_id, "result");
+        assert_eq!(ws.humanize_type(result), "boolean");
+        assert_eq!(
+            diagnostic_count_in(&mut ws, file_id, DiagnosticCode::RedundantParameter),
+            1
+        );
+        assert_eq!(
+            diagnostic_count_in(&mut ws, file_id, DiagnosticCode::MissingParameter),
+            0
+        );
+    }
+
+    /// An optional fixed parameter left unsupplied does not demote the variadic alternative.
+    #[test]
+    fn test_surplus_call_keeps_variadic_with_optional_prefix() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@overload fun(a: number, b: number, required: string?, ...: number): string
+            ---@param value number
+            ---@return boolean
+            local function choose(value)
+                return true
+            end
+
+            local result = choose(1, 2)
+            "#,
+        );
+        let result = ws.local_ty(file_id, "result");
+        assert_eq!(ws.humanize_type(result), "string");
+        assert_eq!(
+            diagnostic_count_in(&mut ws, file_id, DiagnosticCode::RedundantParameter),
+            0
+        );
+    }
+
+    /// A fixed parameter whose type accepts an omitted argument through an alias or `unknown` does not demote the variadic alternative.
+    #[test]
+    fn test_surplus_call_keeps_variadic_with_nullable_alias_or_unknown_prefix() {
+        for (prelude, param_type) in [
+            ("---@alias MaybeString string|nil\n", "MaybeString"),
+            ("", "unknown"),
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            let file_id = ws.def(&format!(
+                r#"
+                {prelude}
+                ---@overload fun(a: number, b: number, extra: {param_type}, ...: number): string
+                ---@param value number
+                ---@return boolean
+                local function choose(value)
+                    return true
+                end
+
+                local result = choose(1, 2)
+                "#
+            ));
+            let result = ws.local_ty(file_id, "result");
+            assert_eq!(ws.humanize_type(result), "string", "{param_type}");
+            for code in [
+                DiagnosticCode::RedundantParameter,
+                DiagnosticCode::MissingParameter,
+            ] {
+                assert_eq!(
+                    diagnostic_count_in(&mut ws, file_id, code),
+                    0,
+                    "{param_type}"
+                );
+            }
+        }
+    }
+
+    fn diagnostic_count_in(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        code: DiagnosticCode,
+    ) -> usize {
+        ws.analysis.diagnostic.enable_only(code);
+        let expected = Some(NumberOrString::String(code.get_name().to_string()));
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == expected)
+            .count()
+    }
+
+    /// A typed variadic overload whose leading type fails does not hide the
+    /// finite overload that fits.
+    #[test]
+    fn test_surplus_call_ignores_failing_typed_variadic_overload() {
+        let source = r#"
+            ---@overload fun(value: boolean)
+            ---@overload fun(tag: string, ...: string)
+            ---@param left number
+            ---@param right number
+            local function choose(left, right) end
+
+            choose(1, 2, 3)
+            "#;
+        assert_eq!(
+            diagnostic_count(source, DiagnosticCode::RedundantParameter),
+            1
+        );
+        assert_eq!(
+            diagnostic_count(source, DiagnosticCode::ParamTypeMismatch),
+            0
+        );
     }
 }

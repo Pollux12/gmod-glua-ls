@@ -9,6 +9,7 @@ use fern::Dispatch;
 use glua_code_analysis::file_path_to_uri;
 use log::{LevelFilter, info};
 use non_blocking_stderr::NonBlockingStderr;
+pub use non_blocking_stderr::drain_queued as drain_stderr_log;
 
 use crate::cmd_args::{CmdArgs, LogLevel};
 

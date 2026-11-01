@@ -43,7 +43,7 @@ pub fn build_function_hover(
         }
     };
 
-    // 如果是函数调用, 那么我们需要根据上下文实例化出实际类型
+    // For a function call, instantiate the actual type from the context
     if let Some(call_expr) = builder.get_call_expr() {
         build_function_call_hover(
             builder,
@@ -78,7 +78,7 @@ fn build_function_call_hover(
     )
     .ok()?;
 
-    // 根据推断出来的类型确定哪个 semantic_decl 是匹配的
+    // Determine which semantic_decl matches according to the inferred type
     let mut match_semantic_decl = &semantic_decls.last()?.0;
     for (semantic_decl, typ) in semantic_decls.iter() {
         if let LuaType::DocFunction(f) = typ {
@@ -215,10 +215,10 @@ fn build_function_define_hover(
                     .get_realm_at_offset(&builder.semantic_model.get_file_id(), trigger_position)
             },
         );
-    // 去重, 这是必须的.
+    // Deduplicate; this is required.
     // Keep the last occurrence for each signature so the active symbol remains the primary entry.
     dedup_function_infos(&mut function_infos, caller_realm);
-    // 需要显示重载的情况
+    // Cases where overloads need to be shown
     match function_infos.len() {
         0 => {
             return None;
@@ -510,10 +510,10 @@ fn hover_doc_function_type(
     owner_member: Option<&LuaMember>,
     func_name: &str,
     is_local: bool,
-    is_field: bool, /* 是否为类字段 */
+    is_field: bool, /* whether it is a class field */
     concrete_owner_type: Option<&LuaType>,
     param_docs: Option<&HashMap<usize, LuaDocParamInfo>>,
-    return_docs: Vec<LuaDocReturnInfo>, /* 返回值以此为准 */
+    return_docs: Vec<LuaDocReturnInfo>, /* the return values are authoritative here */
 ) -> String {
     let async_label = match func.get_async_state() {
         AsyncState::Async => "async ",
@@ -527,7 +527,7 @@ fn hover_doc_function_type(
         "function "
     };
 
-    // 有可能来源于类. 例如: `local add = class.add`, `add()`应被视为类方法
+    // May originate from a class. For example: `local add = class.add`, where `add()` should be treated as a class method
     let full_name = if let Some(owner_member) = owner_member {
         if is_field {
             type_label = "(field) ";
@@ -565,6 +565,13 @@ fn hover_doc_function_type(
                             .unwrap_or_else(|| type_decl_id.get_simple_name());
                         push_typed_owner_prefix(&prefix, LuaType::Ref(type_decl_id.clone()));
                     }
+                }
+                LuaMemberOwner::GlobalPath(path) => {
+                    name.push_str(path.get_name());
+                    if is_method {
+                        type_label = "(method) ";
+                    }
+                    name.push(if is_method { ':' } else { '.' });
                 }
                 LuaMemberOwner::Element(element_id) => {
                     if let Some(LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id)) =
@@ -805,7 +812,7 @@ fn get_function_description(
     match semantic_decl_id {
         LuaSemanticDeclId::Member(id) => {
             let member = db.get_member_index().get_member(id)?;
-            // 以 @field 定义的 function 描述信息绑定的 id 并不是 member, 需要特殊处理
+            // The id bound to the description of a function defined by @field is not a member and needs special handling
             if description.is_none()
                 && let Some(signature_id) = try_extract_signature_id_from_field(db, member)
             {
@@ -826,7 +833,7 @@ fn build_function_returns(
     return_docs: Vec<LuaDocReturnInfo>,
 ) -> String {
     let mut result = String::new();
-    // 如果不是补全且存在名称, 我们需要多行显示
+    // If not completion and a name exists, display on multiple lines
     let has_multiline = !builder.is_completion
         && return_docs
             .iter()
@@ -839,7 +846,7 @@ fn build_function_returns(
         let type_text = build_function_return_type(builder, return_info, i);
 
         if has_multiline {
-            // 存在返回值名称时使用多行模式
+            // Use multi-line mode when return value names exist
             let prefix = if i == 0 {
                 result.push('\n');
                 "-> ".to_string()
@@ -859,7 +866,7 @@ fn build_function_returns(
                 type_text,
             ));
         } else {
-            // 不存在返回值名称时使用单行模式
+            // Use single-line mode when no return value names exist
             if i == 0 {
                 result.push_str(&format!(" -> {}", type_text));
             } else {
@@ -877,10 +884,10 @@ fn build_function_return_type(
     i: usize,
 ) -> String {
     let type_expansion_count = builder.get_type_expansion_count();
-    // 在这个过程中可能会设置`type_expansion`
+    // `type_expansion` may be set in this process
     let type_text = hover_humanize_type(builder, &ret_info.type_ref, Some(RenderLevel::Simple));
     if builder.get_type_expansion_count() > type_expansion_count {
-        // 重新设置`type_expansion`
+        // Reset `type_expansion`
         if let Some(pop_type_expansion) =
             builder.pop_type_expansion(type_expansion_count, builder.get_type_expansion_count())
         {
@@ -904,7 +911,7 @@ fn build_function_return_type(
     }
 }
 
-// 函数是否为类字段, 任意一个为类字段我们都认为全部为类字段
+// Whether the function is a class field; if any is a class field, all are treated as class fields
 fn function_member_is_field(db: &DbIndex, semantic_decls: &[(LuaSemanticDeclId, LuaType)]) -> bool {
     semantic_decls.iter().any(|(semantic_decl, _)| {
         if let LuaSemanticDeclId::Member(id) = semantic_decl {

@@ -10,6 +10,7 @@ fn default_false() -> bool {
     false
 }
 
+/// Strictness settings for type matching and module resolution.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcStrict {

@@ -2,6 +2,7 @@ mod build_call_hierarchy;
 
 use build_call_hierarchy::{
     CallHierarchyItemData, build_call_hierarchy_item, build_incoming_hierarchy,
+    build_outgoing_hierarchy,
 };
 use glua_code_analysis::SemanticDeclLevel;
 use glua_parser::{LuaAstNode, LuaTokenKind};
@@ -30,7 +31,7 @@ pub async fn on_prepare_call_hierarchy_handler(
     let root = semantic_model.get_root();
     let position_offset = {
         let document = semantic_model.get_document();
-        document.get_offset(position.line as usize, position.character as usize)?
+        document.to_offset(position)
     };
 
     if position_offset > root.syntax().text_range().end() {
@@ -87,11 +88,20 @@ pub async fn on_incoming_calls_handler(
 }
 
 pub async fn on_outgoing_calls_handler(
-    _: ServerContextSnapshot,
-    _: CallHierarchyOutgoingCallsParams,
-    _: CancellationToken,
+    context: ServerContextSnapshot,
+    params: CallHierarchyOutgoingCallsParams,
+    cancel_token: CancellationToken,
 ) -> Option<Vec<CallHierarchyOutgoingCall>> {
-    None
+    if cancel_token.is_cancelled() {
+        return None;
+    }
+    let data = params.item.data.as_ref()?;
+    let data = serde_json::from_value::<CallHierarchyItemData>(data.clone()).ok()?;
+    let analysis = context.read_analysis(&cancel_token).await?;
+    if cancel_token.is_cancelled() {
+        return None;
+    }
+    build_outgoing_hierarchy(&analysis.compilation, data.semantic_decl, &cancel_token)
 }
 
 pub struct CallHierarchyCapabilities;

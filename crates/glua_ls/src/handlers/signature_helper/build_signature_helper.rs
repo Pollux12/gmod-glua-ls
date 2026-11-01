@@ -57,7 +57,7 @@ pub fn build_signature_helper(
     };
 
     if let Some(mut help) = help {
-        // 将所有参数均相同的签名放在最前面
+        // Put signatures whose parameters are all identical first
         process_best_call_params_info(&builder, &mut help.signatures);
         Some(help)
     } else {
@@ -136,7 +136,7 @@ fn build_doc_function_signature_help(
     let db = semantic_model.get_db();
     let mut current_idx = current_idx;
     let params = func_type.get_params().to_vec();
-    // 参数信息
+    // Parameter info
     let mut param_infos = vec![];
     for param in params.iter() {
         let param_label = generate_param_label(db, param.clone());
@@ -225,7 +225,7 @@ fn build_sig_id_signature_help(
     if is_call_operator && !params.is_empty() && !colon_define {
         params.remove(0);
     }
-    // 参数信息
+    // Parameter info
     let mut param_infos = vec![];
     for param in params.iter() {
         let param_label = generate_param_label(db, param.clone());
@@ -555,7 +555,7 @@ pub fn generate_param_label(db: &DbIndex, param: (String, Option<LuaType>)) -> S
     )
 }
 
-/// 处理最佳参数信息
+/// Handles the best parameter info
 fn process_best_call_params_info(
     builder: &SignatureHelperBuilder,
     signatures: &mut Vec<SignatureInformation>,
@@ -564,9 +564,9 @@ fn process_best_call_params_info(
         return;
     }
     let best_call_params_info: &[ParameterInformation] = builder.get_best_call_params_info();
-    // 由于一些泛型调用会与原始签名不同, 因此如果只有一个签名, 则替换参数为最佳匹配,
+    // Some generic calls differ from the original signature, so with a single signature the parameters are replaced by the best match,
     if signatures.len() == 1 {
-        // 由于 best_call_params_info 不包含参数说明, 我们不能简单地直接替换
+        // but best_call_params_info has no parameter descriptions, so it cannot simply be replaced directly
         if let Some(mut parameters) = signatures[0].parameters.take() {
             for (best_param, param) in best_call_params_info.iter().zip(parameters.iter_mut()) {
                 param.label = best_param.label.clone();
@@ -578,7 +578,7 @@ fn process_best_call_params_info(
         return;
     }
 
-    // 将最佳参数信息放在前面
+    // Put the best parameter info first
     let mut matched = Vec::new();
     let mut unmatched = Vec::new();
 
@@ -594,7 +594,7 @@ fn process_best_call_params_info(
         }
     }
 
-    // 将匹配的签名放在前面，不匹配的放在后面
+    // Put matching signatures first and non-matching ones last
     signatures.extend(matched);
     signatures.extend(unmatched);
 }

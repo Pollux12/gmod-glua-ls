@@ -10,21 +10,26 @@ use smol_str::SmolStr;
 
 use crate::{
     FileId, InferFailReason, LuaFunctionType, LuaMemberInfo, LuaMemberKey, LuaMemberOwner,
-    LuaObjectType, LuaSemanticDeclId, LuaStringTplType, LuaTupleType, LuaTypeDeclId, LuaUnionType,
-    SemanticDeclLevel, VariadicType, check_type_compact,
+    LuaObjectType, LuaOperatorMetaMethod, LuaSemanticDeclId, LuaStringTplType, LuaTupleType,
+    LuaTypeDeclId, LuaUnionType, SemanticDeclLevel, VariadicType, check_type_compact,
     db_index::{DbIndex, LuaGenericType, LuaType},
     infer_node_semantic_decl,
     semantic::{
         generic::{
-            tpl_context::TplContext, tpl_pattern::generic_tpl_pattern::generic_tpl_pattern_match,
+            instantiate_type::{
+                build_self_type, instantiate_doc_function, instantiate_type_generic,
+            },
+            tpl_context::TplContext,
+            tpl_pattern::generic_tpl_pattern::generic_tpl_pattern_match,
             type_substitutor::SubstitutorValue,
         },
+        infer::{infer_instance_type_doc_function, infer_table_type_doc_function},
         member::{find_index_operations, get_member_map},
     },
 };
 
 use super::type_substitutor::TypeSubstitutor;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 type TplPatternMatchResult = Result<(), InferFailReason>;
 
@@ -139,17 +144,12 @@ fn get_str_tpl_infer_type(
                 ref_type
             } else if let Some(extend_type) = extend_type {
                 if let LuaType::Ref(extend_type_decl_id) = extend_type
-                    && let Some(extend_type_decl) = context
+                    && context
                         .db
                         .get_type_index()
                         .get_type_decl(extend_type_decl_id)
-                    && extend_type_decl.is_class()
+                        .is_some_and(|decl| decl.is_class())
                 {
-                    context.cache.add_pending_str_tpl_type_decl(
-                        context.source_range,
-                        type_decl_id,
-                        extend_type.clone(),
-                    );
                     ref_type
                 } else {
                     extend_type.clone()
@@ -188,6 +188,8 @@ fn infer_str_tpl_target_type(
                 _ => Some(LuaType::Union(LuaUnionType::from_vec(inferred).into())),
             }
         }
+        // A name not known until runtime names some type the constraint admits.
+        LuaType::String | LuaType::Unknown => str_tpl.get_constraint().cloned(),
         _ => None,
     }
 }
@@ -197,6 +199,9 @@ fn infer_str_tpl_member_type(
     str_tpl: &LuaStringTplType,
     value: &str,
 ) -> LuaType {
+    if !super::str_tpl_value_names_type(value) {
+        return str_tpl.get_constraint().cloned().unwrap_or(LuaType::Any);
+    }
     let type_name = SmolStr::new(format!(
         "{}{}{}",
         str_tpl.get_prefix(),
@@ -215,6 +220,71 @@ pub fn tpl_pattern_match(
     let target = escape_alias(context.db, target);
     if !pattern.contain_tpl() {
         return Ok(());
+    }
+
+    // A merged table is one table seen through the several literals that wrote
+    // it, so a parameter binds off it exactly as it binds off any one of them.
+    // Every arm below matches a single table shape, so without this the merge
+    // falls through unmatched and the parameter is left as a raw template ref —
+    // and whether a slot holds the merge or one literal is decided by how far
+    // the batch had run when the read was taken.
+    if let LuaType::MergedTable(merged) = &target {
+        for constituent in merged.get_types() {
+            tpl_pattern_match(context, pattern, constituent)?;
+        }
+        return Ok(());
+    }
+
+    // A union target contributes whatever each arm can bind: `V[]` against
+    // `A[] | nil` still binds `V = A` from the array arm while the nil arm
+    // supplies nothing, and the same holds for map/object/class arms. Bare
+    // template refs are excluded — `T` against `A | B` binds the union whole.
+    let union_arms: Option<Vec<LuaType>> = match &target {
+        LuaType::Union(union) => Some(union.types().cloned().collect()),
+        LuaType::MultiLineUnion(union) => Some(
+            union
+                .get_unions()
+                .iter()
+                .map(|(typ, _)| typ.clone())
+                .collect(),
+        ),
+        _ => None,
+    };
+    if let Some(arms) = union_arms
+        && !matches!(
+            pattern,
+            LuaType::TplRef(_) | LuaType::ConstTplRef(_) | LuaType::StrTplRef(_)
+        )
+    {
+        let arm_count = arms.len();
+        let mut error_count = 0;
+        let mut last_error = InferFailReason::None;
+        let mut arm_substitutors = Vec::with_capacity(arm_count);
+        for arm in &arms {
+            let mut arm_substitutor = context.substitutor.clone();
+            let mut arm_context = TplContext {
+                db: context.db,
+                cache: &mut *context.cache,
+                substitutor: &mut arm_substitutor,
+                call_expr: context.call_expr.clone(),
+                source_range: context.source_range,
+            };
+            match tpl_pattern_match(&mut arm_context, pattern, arm) {
+                Ok(()) => arm_substitutors.push(arm_substitutor),
+                Err(reason) => {
+                    error_count += 1;
+                    last_error = reason;
+                }
+            }
+        }
+        context
+            .substitutor
+            .merge_union_arm_bindings(arm_substitutors);
+        return if error_count == arm_count && arm_count > 0 {
+            Err(last_error)
+        } else {
+            Ok(())
+        };
     }
 
     match pattern {
@@ -283,17 +353,17 @@ fn object_tpl_pattern_match(
 ) -> TplPatternMatchResult {
     match target {
         LuaType::Object(target_object) => {
-            // 先匹配 fields
+            // Match fields first
             for (k, v) in origin_obj.get_fields().iter().sorted_by_key(|(k, _)| *k) {
                 let target_value = target_object.get_fields().get(k);
                 if let Some(target_value) = target_value {
                     tpl_pattern_match(context, v, target_value)?;
                 }
             }
-            // 再匹配索引访问
+            // Then match index access
             let target_index_access = target_object.get_index_access();
             for (origin_key, v) in origin_obj.get_index_access() {
-                // 先匹配 key 类型进行转换
+                // Match the key type first for conversion
                 let target_access = target_index_access.iter().find(|(target_key, _)| {
                     check_type_compact(context.db, origin_key, target_key).is_ok()
                 });
@@ -504,7 +574,7 @@ fn table_generic_tpl_pattern_match(
     Ok(())
 }
 
-// KV 表匹配 ref/def/tableconst
+// KV table matches ref/def/tableconst
 fn table_generic_tpl_pattern_member_owner_match(
     context: &mut TplContext,
     table_generic_params: &[LuaType],
@@ -530,7 +600,7 @@ fn table_generic_tpl_pattern_member_owner_match(
     };
 
     let members = get_member_map(context.db, &owner_type).ok_or(InferFailReason::None)?;
-    // 如果是 pairs 调用, 我们需要尝试寻找元方法, 但目前`__pairs` 被放进成员表中
+    // For a pairs call we need to look for a metamethod, but `__pairs` is currently put into the member table
     if is_pairs_call(context).unwrap_or(false)
         && try_handle_pairs_metamethod(context, table_generic_params, &members).is_ok()
     {
@@ -658,7 +728,7 @@ fn union_tpl_pattern_match(
     let mut last_error = InferFailReason::None;
     for u in union.types() {
         match tpl_pattern_match(context, u, target) {
-            // 返回 ok 时并不一定匹配成功, 仅表示没有发生错误
+            // Returning ok does not necessarily mean the match succeeded, only that no error occurred
             Ok(_) => {}
             Err(e) => {
                 error_count += 1;
@@ -689,6 +759,21 @@ fn func_tpl_pattern_match(
                 .get_signature_index()
                 .get(signature_id)
                 .ok_or(InferFailReason::None)?;
+            let fake_doc_func = signature.to_doc_func_type();
+            let mut tpl_func_params = tpl_func.get_params().to_vec();
+            if tpl_func.is_colon_define() {
+                tpl_func_params.insert(0, ("self".to_string(), Some(LuaType::Any)));
+            }
+            let mut target_func_params = fake_doc_func.get_params().to_vec();
+            if fake_doc_func.is_colon_define() {
+                target_func_params.insert(0, ("self".to_string(), Some(LuaType::Any)));
+            }
+            param_type_list_pattern_match_type_list(
+                context,
+                &tpl_func_params,
+                &target_func_params,
+            )?;
+
             if !signature.is_resolve_return() {
                 return lambda_tpl_pattern::check_lambda_tpl_pattern(
                     context,
@@ -696,10 +781,163 @@ fn func_tpl_pattern_match(
                     *signature_id,
                 );
             }
-            let fake_doc_func = signature.to_doc_func_type();
-            func_tpl_pattern_match_doc_func(context, tpl_func, &fake_doc_func)?;
+            let tpl_return = tpl_func.get_ret();
+            let target_return = fake_doc_func.get_ret();
+            return_type_pattern_match_target_type(context, tpl_return, target_return)?;
+        }
+        LuaType::TableConst(table) => {
+            match infer_table_type_doc_function(context.db, table.clone()) {
+                Ok(target_doc_func) => {
+                    func_tpl_pattern_match_doc_func(context, tpl_func, &target_doc_func)?;
+                }
+                Err(InferFailReason::None) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        LuaType::Instance(inst) => match infer_instance_type_doc_function(context.db, inst) {
+            Ok(target_doc_func) => {
+                func_tpl_pattern_match_doc_func(context, tpl_func, &target_doc_func)?;
+            }
+            Err(InferFailReason::None) => {
+                if !matches!(
+                    inst.get_base(),
+                    LuaType::TableConst(_) | LuaType::Instance(_)
+                ) {
+                    func_tpl_pattern_match(context, tpl_func, inst.get_base())?;
+                }
+            }
+            Err(err) => return Err(err),
+        },
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => {
+            func_tpl_pattern_match_custom_type(context, tpl_func, type_id, target)?;
+        }
+        LuaType::Generic(generic) => {
+            func_tpl_pattern_match_generic_type(context, tpl_func, generic)?;
         }
         _ => {}
+    }
+
+    Ok(())
+}
+
+fn func_tpl_pattern_match_custom_type(
+    context: &mut TplContext,
+    tpl_func: &LuaFunctionType,
+    type_id: &LuaTypeDeclId,
+    target: &LuaType,
+) -> TplPatternMatchResult {
+    let Some(operator_ids) = context
+        .db
+        .get_operator_index()
+        .get_operators(&type_id.clone().into(), LuaOperatorMetaMethod::Call)
+        .cloned()
+    else {
+        return Ok(());
+    };
+
+    for operator_id in &operator_ids {
+        let Some(operator) = context.db.get_operator_index().get_operator(operator_id) else {
+            continue;
+        };
+        let func = operator.get_operator_func(context.db);
+        match func {
+            LuaType::DocFunction(mut doc_func) => {
+                if doc_func.contain_self() {
+                    let mut substitutor = TypeSubstitutor::new();
+                    let self_type = build_self_type(context.db, target);
+                    substitutor.add_self_type(self_type);
+                    if let LuaType::DocFunction(instantiated) =
+                        instantiate_doc_function(context.db, &doc_func, &substitutor)
+                    {
+                        doc_func = instantiated;
+                    }
+                }
+                return func_tpl_pattern_match_doc_func(context, tpl_func, &doc_func);
+            }
+            LuaType::Signature(signature_id) => {
+                let signature = context
+                    .db
+                    .get_signature_index()
+                    .get(&signature_id)
+                    .ok_or(InferFailReason::None)?;
+                if !signature.is_resolve_return() {
+                    return Err(InferFailReason::UnResolveSignatureReturn(signature_id));
+                }
+                let mut doc_func = signature.to_call_operator_func_type();
+                if doc_func.contain_self() {
+                    let mut substitutor = TypeSubstitutor::new();
+                    let self_type = build_self_type(context.db, target);
+                    substitutor.add_self_type(self_type);
+                    if let LuaType::DocFunction(instantiated) =
+                        instantiate_doc_function(context.db, &doc_func, &substitutor)
+                    {
+                        doc_func = instantiated;
+                    }
+                }
+                return func_tpl_pattern_match_doc_func(context, tpl_func, &doc_func);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn func_tpl_pattern_match_generic_type(
+    context: &mut TplContext,
+    tpl_func: &LuaFunctionType,
+    generic: &LuaGenericType,
+) -> TplPatternMatchResult {
+    let type_id = generic.get_base_type_id();
+    let substitutor = TypeSubstitutor::from_type_array(generic.get_params().clone());
+
+    if let Some(type_decl) = context.db.get_type_index().get_type_decl(&type_id)
+        && type_decl.is_alias()
+        && let Some(origin_type) = type_decl.get_alias_origin(context.db, Some(&substitutor))
+    {
+        return func_tpl_pattern_match(context, tpl_func, &origin_type);
+    }
+
+    let Some(operator_ids) = context
+        .db
+        .get_operator_index()
+        .get_operators(&type_id.into(), LuaOperatorMetaMethod::Call)
+        .cloned()
+    else {
+        return Ok(());
+    };
+
+    for operator_id in &operator_ids {
+        let Some(operator) = context.db.get_operator_index().get_operator(operator_id) else {
+            continue;
+        };
+        let func = operator.get_operator_func(context.db);
+        match func {
+            LuaType::DocFunction(_) => {
+                if let LuaType::DocFunction(doc_func) =
+                    instantiate_type_generic(context.db, &func, &substitutor)
+                {
+                    return func_tpl_pattern_match_doc_func(context, tpl_func, &doc_func);
+                }
+            }
+            LuaType::Signature(signature_id) => {
+                let signature = context
+                    .db
+                    .get_signature_index()
+                    .get(&signature_id)
+                    .ok_or(InferFailReason::None)?;
+                if !signature.is_resolve_return() {
+                    return Err(InferFailReason::UnResolveSignatureReturn(signature_id));
+                }
+                let typ = LuaType::DocFunction(signature.to_call_operator_func_type());
+                if let LuaType::DocFunction(doc_func) =
+                    instantiate_type_generic(context.db, &typ, &substitutor)
+                {
+                    return func_tpl_pattern_match_doc_func(context, tpl_func, &doc_func);
+                }
+            }
+            _ => {}
+        }
     }
 
     Ok(())
@@ -1106,14 +1344,14 @@ fn is_pairs_call(context: &mut TplContext) -> Option<bool> {
 fn try_handle_pairs_metamethod(
     context: &mut TplContext,
     table_generic_params: &[LuaType],
-    members: &HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
+    members: &FxHashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
 ) -> TplPatternMatchResult {
     let pairs_member = members
         .get(&LuaMemberKey::Name("__pairs".into()))
         .ok_or(InferFailReason::None)?
         .first()
         .ok_or(InferFailReason::None)?;
-    // 获取迭代函数返回类型
+    // Get the iterator function return type
     let meta_return = match &pairs_member.typ {
         LuaType::Signature(signature_id) => context
             .db
@@ -1125,7 +1363,7 @@ fn try_handle_pairs_metamethod(
     }
     .ok_or(InferFailReason::None)?;
 
-    // 解析出迭代函数返回类型
+    // Resolve the iterator function return type
     let final_return_type = match meta_return {
         LuaType::DocFunction(doc_func) => Some(doc_func.get_ret().clone()),
         LuaType::Signature(signature_id) => context

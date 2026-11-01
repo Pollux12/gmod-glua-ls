@@ -5,7 +5,7 @@ mod tests {
     #[test]
     fn test() {
         let mut ws = VirtualWorkspace::new();
-        // 作用域不同
+        // Different scopes
         assert!(ws.check_code_for(
             DiagnosticCode::DuplicateRequire,
             r#"
@@ -17,7 +17,7 @@ mod tests {
             "#,
         ));
 
-        // 父作用域已存在
+        // Already present in the parent scope
         assert!(!ws.check_code_for(
             DiagnosticCode::DuplicateRequire,
             r#"

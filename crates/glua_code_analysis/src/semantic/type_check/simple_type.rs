@@ -315,6 +315,14 @@ pub fn check_simple_type_compact(
 
             return Ok(());
         }
+        // A multi-value argument (`f(g())`, `f(...)`) occupies a slot with its
+        // first value; the pack marker itself is not a value to compare.
+        LuaType::Variadic(compact_variadic) => {
+            let Some(first) = compact_variadic.get_type(0) else {
+                return Ok(());
+            };
+            return check_general_type_compact(context, source, first, check_guard.next_level()?);
+        }
         LuaType::Generic(generic) => {
             if !generic.contain_tpl() {
                 let base_id = generic.get_base_type_id();
@@ -367,7 +375,7 @@ fn get_alias_real_type<'a>(
     Ok(compact_type)
 }
 
-/// 检查基础类型是否匹配自定义类型
+/// Checks whether a basic type matches a custom type
 fn check_base_type_for_ref_compact(
     context: &mut TypeCheckContext,
     source: &LuaType,
@@ -415,7 +423,7 @@ fn check_base_type_for_ref_compact(
     Err(TypeCheckFailReason::TypeNotMatch)
 }
 
-/// 检查`enum`的所有字段是否匹配`source`
+/// Checks whether all fields of the `enum` match `source`
 fn check_enum_fields_match_source(
     context: &mut TypeCheckContext,
     source: &LuaType,

@@ -3,9 +3,10 @@ use glua_parser::{
     LuaTableExpr, LuaTableField, LuaVarExpr,
 };
 
+use crate::semantic::semantic_decl_value;
 use crate::{
     DbIndex, InFiled, InferFailReason, LuaDeclExtra, LuaInferCache, LuaInstanceType, LuaMemberKey,
-    LuaMemberOwner, LuaType, LuaUnionType, SemanticDeclLevel, infer_expr,
+    LuaMemberOwner, LuaType, SemanticDeclLevel, infer_expr,
     semantic::{
         SemanticDeclGuard, get_member_value_expr, infer::InferResult, infer_expr_semantic_decl,
         member::find_members_with_key,
@@ -39,7 +40,7 @@ pub fn infer_setmetatable_call(
         MetatableIndex::Unresolved => {
             return Err(InferFailReason::UnResolveExpr(InFiled::new(
                 cache.get_file_id(),
-                metatable,
+                metatable.get_syntax_id(),
             )));
         }
         MetatableIndex::Index(index_type) => (index_type, true),
@@ -98,31 +99,13 @@ fn resolve_table_backing_range(
         SemanticDeclGuard::default(),
         SemanticDeclLevel::default(),
     )?;
-    let (value_file_id, value_expr) = match semantic_decl {
-        crate::LuaSemanticDeclId::LuaDecl(decl_id) => {
-            let root = db
-                .get_vfs()
-                .get_syntax_tree(&decl_id.file_id)?
-                .get_red_root();
-            (
-                decl_id.file_id,
-                db.get_decl_index()
-                    .get_decl(&decl_id)?
-                    .get_value_syntax_id()?
-                    .to_node_from_root(&root)
-                    .and_then(LuaExpr::cast)?,
-            )
-        }
-        crate::LuaSemanticDeclId::Member(member_id) => {
-            (member_id.file_id, get_member_value_expr(db, member_id)?)
-        }
-        _ => return None,
-    };
+    let (value_file_id, value_expr) = semantic_decl_value(db, semantic_decl)?;
 
     table_backing_range_from_expr(value_file_id, &value_expr)
 }
 
-fn table_backing_range_from_expr(
+/// The table literal `expr` evaluates to, read through parentheses and the right of `or`.
+pub(crate) fn table_backing_range_from_expr(
     file_id: crate::FileId,
     expr: &LuaExpr,
 ) -> Option<InFiled<rowan::TextRange>> {
@@ -154,7 +137,7 @@ fn table_backing_range_from_expr(
 //         let index_members = find_members(db, &member.typ)?;
 //         let table_type = infer_expr(db, cache, LuaExpr::TableExpr(table_expr.clone())).ok()?;
 //         let table_members = find_members(db, &table_type)?;
-//         // 如果 index_members 包含了 table_members 中的所有成员，则返回 meta_type
+//         // If index_members contains all members of table_members, return meta_type
 //         if table_members.iter().all(|table_member| {
 //             index_members
 //                 .iter()
@@ -191,7 +174,11 @@ fn infer_metatable_index_type(
                     | LuaExpr::IndexExpr(_)
                     | LuaExpr::NameExpr(_)
             ) {
-                return Ok(MetatableIndex::Index(infer_expr(db, cache, index_value)?));
+                let index_type = infer_expr(db, cache, index_value)?;
+                if index_type.is_function() {
+                    return Ok(MetatableIndex::NoIndex(LuaType::Unknown));
+                }
+                return Ok(MetatableIndex::Index(index_type));
             }
 
             let inferred_type = infer_expr(db, cache, index_value.clone()).ok();
@@ -221,7 +208,7 @@ fn infer_metatable_index_type(
         ReceiverOwnerType::Rejected => return Ok(MetatableIndex::NoIndex(LuaType::Unknown)),
         ReceiverOwnerType::NotReceiver => infer_expr(db, cache, metatable)?,
     };
-    match exact_table_index_type(db, cache, &meta_type) {
+    match exact_table_index_type(db, cache, &meta_type, metatable_expr.get_position()) {
         ExactMetatableIndexType::Exact(index_type) => {
             return Ok(MetatableIndex::Index(index_type));
         }
@@ -229,8 +216,9 @@ fn infer_metatable_index_type(
         ExactMetatableIndexType::None => {}
     }
 
+    // Every `__index` writer, so writers that disagree are seen to disagree.
     if let Some(meta_members) =
-        find_members_with_key(db, &meta_type, LuaMemberKey::Name("__index".into()), false)
+        find_members_with_key(db, &meta_type, LuaMemberKey::Name("__index".into()), true)
     {
         let mut index_types = Vec::with_capacity(meta_members.len());
         for meta_member in meta_members {
@@ -411,7 +399,7 @@ enum ExactMetatableIndexType {
     Exact(LuaType),
 }
 
-enum MetatableIndexCandidate {
+pub(crate) enum MetatableIndexCandidate {
     Unsupported,
     Supported(LuaType),
 }
@@ -420,6 +408,7 @@ fn exact_table_index_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     meta_type: &LuaType,
+    caller_position: rowan::TextSize,
 ) -> ExactMetatableIndexType {
     let table_range = match meta_type {
         LuaType::TableConst(range) => range,
@@ -428,12 +417,16 @@ fn exact_table_index_type(
     };
     let owner = LuaMemberOwner::Element(table_range.clone());
     let key = LuaMemberKey::Name("__index".into());
-    let mut member_ids = db
-        .get_member_index()
-        .get_members_for_owner_key(&owner, &key)
-        .into_iter()
-        .map(|member| member.get_id())
-        .collect::<Vec<_>>();
+    // The writers a reader at the call sees: a later plain write in the same
+    // file has replaced the earlier ones by then.
+    let mut member_ids = crate::LuaMemberIndexItem::Many(
+        db.get_member_index()
+            .get_members_for_owner_key(&owner, &key)
+            .into_iter()
+            .map(|member| member.get_id())
+            .collect(),
+    )
+    .visible_member_ids_with_realm_at_offset(db, &cache.get_file_id(), caller_position);
     member_ids.sort_by_key(|id| (id.file_id.id, u32::from(id.get_position())));
     if member_ids.is_empty() {
         let Some(index_type) = last_table_literal_index_type(db, cache, table_range) else {
@@ -507,7 +500,7 @@ fn last_table_literal_index_type(
 ) -> Option<LuaType> {
     let root = db
         .get_vfs()
-        .get_syntax_tree(&table_range.file_id)?
+        .syntax_tree_around(&table_range.file_id, table_range.value)?
         .get_red_root();
     let table = root
         .token_at_offset(table_range.value.start())
@@ -549,13 +542,13 @@ fn last_table_literal_index_value(table: &LuaTableExpr) -> Option<LuaExpr> {
     })
 }
 
-fn classify_metatable_index_candidate(typ: &LuaType) -> MetatableIndexCandidate {
+pub(crate) fn classify_metatable_index_candidate(typ: &LuaType) -> MetatableIndexCandidate {
     match typ {
-        LuaType::Union(union) => match union.as_ref() {
-            LuaUnionType::Nullable(inner) => classify_metatable_index_candidate(inner),
-            LuaUnionType::Multi(types) => {
+        LuaType::Union(union) => match union.nullable_inner() {
+            Some(inner) => classify_metatable_index_candidate(inner),
+            None => {
                 let mut supported_types = Vec::new();
-                for typ in types.iter().filter(|typ| !typ.is_nil()) {
+                for typ in union.types().filter(|typ| !typ.is_nil()) {
                     match classify_metatable_index_candidate(typ) {
                         MetatableIndexCandidate::Supported(typ) => supported_types.push(typ),
                         MetatableIndexCandidate::Unsupported => {

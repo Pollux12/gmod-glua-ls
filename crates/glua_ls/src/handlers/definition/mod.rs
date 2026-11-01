@@ -77,7 +77,7 @@ fn definition_with_cancel(
     let root = semantic_model.get_root();
     let position_offset = {
         let document = semantic_model.get_document();
-        document.get_offset(position.line as usize, position.character as usize)?
+        document.to_offset(position)
     };
 
     if position_offset > root.syntax().text_range().end() {
@@ -301,7 +301,7 @@ fn collect_dynamic_field_locations(
             let definitions = semantic_model
                 .get_db()
                 .get_dynamic_field_index()
-                .get_field_definitions(&owner, field_name);
+                .field_definitions(&owner, field_name);
             for definition in definitions {
                 if respect_file_scope
                     && !dynamic_fields_global
@@ -317,11 +317,14 @@ fn collect_dynamic_field_locations(
             }
         }
         LuaType::TableConst(table_range) => {
-            let owner = glua_code_analysis::DynamicFieldOwner::Table(table_range.clone());
+            let owner = glua_code_analysis::canonical_dynamic_field_owner(
+                semantic_model.get_db(),
+                glua_code_analysis::DynamicFieldOwner::Table(table_range.clone()),
+            );
             let definitions = semantic_model
                 .get_db()
                 .get_dynamic_field_index()
-                .get_field_definitions(&owner, field_name);
+                .field_definitions(&owner, field_name);
             for definition in definitions {
                 if respect_file_scope
                     && !dynamic_fields_global
@@ -502,7 +505,7 @@ fn goto_vgui_panel_definition(
     let definitions = semantic_model
         .get_db()
         .get_gmod_class_metadata_index()
-        .find_vgui_panel_definitions(&panel_name);
+        .find_vgui_panel_definitions(semantic_model.get_db().get_vfs(), &panel_name);
 
     let mut locations = Vec::new();
     for (file_id, call) in definitions {
@@ -558,7 +561,7 @@ fn goto_derma_skin_definition(
     let definitions = semantic_model
         .get_db()
         .get_gmod_class_metadata_index()
-        .find_derma_skin_definitions(&context.name);
+        .find_derma_skin_definitions(semantic_model.get_db().get_vfs(), &context.name);
 
     let mut locations = Vec::new();
     for (file_id, call) in definitions {

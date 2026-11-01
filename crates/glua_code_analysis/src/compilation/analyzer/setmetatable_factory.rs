@@ -4,13 +4,13 @@ use glua_parser::{
 use rowan::{TextRange, TextSize};
 
 use crate::{
-    FileId, InFiled, LuaMemberId, LuaMemberKey, LuaType,
+    FileId, LuaMemberId, LuaMemberKey, LuaType,
     compilation::analyzer::common::add_member,
     db_index::{DbIndex, LuaMemberOwner, SetmetatableFactoryBinding},
 };
 
 pub fn synthesize_setmetatable_factory_members(db: &mut DbIndex, file_ids: &[FileId]) {
-    let _p = crate::profile::Profile::new("setmetatable_factory");
+    let _p = crate::profile::PhaseGuard::new("setmetatable_factory");
     let mut bindings = file_ids
         .iter()
         .filter_map(|file_id| db.get_metatable_index().factory_bindings_for_file(*file_id))
@@ -24,7 +24,7 @@ pub fn synthesize_setmetatable_factory_members(db: &mut DbIndex, file_ids: &[Fil
         let Some(member_ids) = transferable_factory_member_ids(db, &binding) else {
             continue;
         };
-        let class_owner = LuaMemberOwner::Element(binding.metatable_range.clone());
+        let class_owner = crate::semantic::metatable_member_owner(db, &binding.metatable_range);
         for member_id in member_ids {
             add_member(db, class_owner.clone(), member_id);
         }
@@ -54,14 +54,16 @@ fn transferable_factory_member_ids(
         }
 
         let member_scope = db.get_member_index().member_function_scope_range(member_id);
-        let direct_member = member_defined_via_variable_strict(
-            db,
-            binding.file_id,
-            member_position,
-            binding.local_name.as_str(),
-        );
+        let in_constructor = binding.table_range.value.contains(member_position);
+        let direct_member = in_constructor
+            || member_defined_via_variable_strict(
+                db,
+                binding.file_id,
+                member_position,
+                binding.local_name.as_str(),
+            );
 
-        if member_scope != Some(binding.function_scope) || !direct_member {
+        if !direct_member || (!in_constructor && member_scope != Some(binding.function_scope)) {
             // Any field collected for the factory table through an alias or a
             // nested closure makes the constructor ambiguous. Transfer nothing.
             return None;
@@ -76,7 +78,7 @@ fn transferable_factory_member_ids(
 }
 
 fn metatable_has_self_index(db: &DbIndex, binding: &SetmetatableFactoryBinding) -> bool {
-    let owner = LuaMemberOwner::Element(binding.metatable_range.clone());
+    let owner = crate::semantic::metatable_member_owner(db, &binding.metatable_range);
     let key = LuaMemberKey::Name("__index".into());
     db.get_member_index()
         .get_current_owner_members_for_key(&owner, &key)
@@ -84,17 +86,20 @@ fn metatable_has_self_index(db: &DbIndex, binding: &SetmetatableFactoryBinding) 
         .any(|member| {
             db.get_type_index()
                 .get_type_cache(&member.get_id().into())
-                .is_some_and(|cache| {
-                    type_points_to_table(cache.as_type(), &binding.metatable_range)
-                })
+                .is_some_and(|cache| type_points_to_metatable(cache.as_type(), binding, &owner))
         })
 }
 
-fn type_points_to_table(typ: &LuaType, table_range: &InFiled<TextRange>) -> bool {
+fn type_points_to_metatable(
+    typ: &LuaType,
+    binding: &SetmetatableFactoryBinding,
+    owner: &LuaMemberOwner,
+) -> bool {
     match typ {
-        LuaType::TableConst(range) => range == table_range,
-        LuaType::Instance(instance) => instance.get_range() == table_range,
-        LuaType::TypeGuard(inner) => type_points_to_table(inner, table_range),
+        LuaType::TableConst(range) => *range == binding.metatable_range,
+        LuaType::Instance(instance) => *instance.get_range() == binding.metatable_range,
+        LuaType::Def(id) | LuaType::Ref(id) => owner.get_type_id() == Some(id),
+        LuaType::TypeGuard(inner) => type_points_to_metatable(inner, binding, owner),
         _ => false,
     }
 }

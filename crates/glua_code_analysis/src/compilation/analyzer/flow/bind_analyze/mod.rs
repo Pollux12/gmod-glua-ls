@@ -6,7 +6,7 @@ mod stats;
 use glua_parser::{LuaAst, LuaAstNode, LuaBlock, LuaChunk, LuaExpr};
 
 use crate::{
-    FlowAntecedent, FlowId, FlowNodeKind,
+    FlowAntecedent, FlowId, FlowNodeKind, analysis_stack_exhausted,
     compilation::analyzer::flow::{
         bind_analyze::{
             comment::bind_comment,
@@ -34,6 +34,9 @@ fn bind_block(binder: &mut FlowBinder, block: LuaBlock, current: FlowId) -> Flow
     let mut return_flow_id = current;
     let mut can_change_flow = true;
     for node in block.children::<LuaAst>() {
+        if matches!(&node, LuaAst::LuaLabelStat(_)) {
+            can_change_flow = true;
+        }
         let node_flow_id = bind_node(binder, node, return_flow_id);
         if can_change_flow {
             return_flow_id = node_flow_id;
@@ -62,6 +65,11 @@ fn bind_each_child(binder: &mut FlowBinder, ast_node: LuaAst, mut current: FlowI
 }
 
 fn bind_node(binder: &mut FlowBinder, node: LuaAst, current: FlowId) -> FlowId {
+    // Crash-safety guard (not a budget): skip the subtree when the stack
+    // reserve is exhausted. No flow nodes means conservative un-narrowed reads.
+    if analysis_stack_exhausted() {
+        return current;
+    }
     match node {
         LuaAst::LuaBlock(block) => bind_block(binder, block, current),
         // stat

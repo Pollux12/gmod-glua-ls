@@ -1,4 +1,4 @@
-﻿#include "Util/Utf8.h"
+#include "Util/Utf8.h"
 
 std::size_t utf8::Utf8nLen(const char *source, std::size_t byteNum) {
     const char *t = source;

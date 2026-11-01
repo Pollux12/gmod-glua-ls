@@ -510,6 +510,7 @@ mod test {
 
         ws.analysis
             .remove_file_by_uri(&producer_uri)
+            .0
             .expect("producer must be removable");
         let removed_font_width = latest_member_type(&ws, consumer_file, "FontWidth");
         let removed_font_width_desc = ws.humanize_type(removed_font_width);
@@ -520,6 +521,7 @@ mod test {
 
         ws.analysis
             .update_file_by_uri(&producer_uri, Some(producer_source.to_string()))
+            .map(|(id, _)| id)
             .expect("producer must reopen");
         let reopened_font_width = latest_member_type(&ws, consumer_file, "FontWidth");
         let reopened_font_width_desc = ws.humanize_type(reopened_font_width);
@@ -1068,6 +1070,329 @@ mod test {
             local t = {}
             local value = t.foo
             "#
+        ));
+    }
+
+    fn residual_col_param_type(ws: &VirtualWorkspace, file_id: crate::FileId) -> LuaType {
+        use glua_parser::{LuaAstNode, LuaAstToken, LuaParamName};
+        let model = ws.analysis.compilation.get_semantic_model(file_id).unwrap();
+        let param = model
+            .get_root()
+            .descendants::<LuaParamName>()
+            .find(|param| {
+                param
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == "col")
+            })
+            .unwrap();
+        model
+            .get_semantic_info(param.get_name_token().unwrap().syntax().clone().into())
+            .unwrap()
+            .display_typ()
+            .clone()
+    }
+
+    #[test]
+    fn residual_col_param_ttt_reassigned_palette() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def(
+            "---@class Color
+---@return Color
+function Color(...) end",
+        );
+        let file = ws.def_file("gamemodes/terrortown/gamemode/cl_wepswitch.lua", r#"
+            local col_active = { tip = { [1] = Color(255,255,255) }, bg = Color(20,20,20,250), text = Color(255,255,255), shadow = 255 }
+            local col_dark = { tip = { [1] = Color(0,0,0) }, bg = Color(0,0,0,250), text = Color(0,0,0), shadow = 0 }
+            WSWITCH = { Selected = 0 }
+            function WSWITCH:DrawBarBg(x, y, w, h, col)
+                local role = 1
+                local c = col.tip[role]
+                c = col.bg
+            end
+            function WSWITCH:DrawWeapon(x, y, c, wep) return c.text end
+            function WSWITCH:Draw(client)
+                local col = col_dark
+                for k, wep in pairs({}) do
+                    if self.Selected == k then col = col_active else col = col_dark end
+                    self:DrawBarBg(0, 0, 10, 10, col)
+                    self:DrawWeapon(0, 0, col, wep)
+                end
+            end
+        "#);
+        let typ = residual_col_param_type(&ws, file);
+        let diagnostics =
+            diagnostic_messages_for_file(&mut ws, file, DiagnosticCode::UndefinedField);
+        assert!(
+            diagnostics.is_empty(),
+            "col type: {typ:?}; diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            matches!(&typ, LuaType::Union(union) if union.types().count() == 2),
+            "{typ:?}"
+        );
+        let db = ws.analysis.compilation.get_db();
+        let fact = db
+            .get_call_site_param_index()
+            .iter_inferred_params()
+            .find(|(signature, idx, _)| signature.get_file_id() == file && *idx == 4)
+            .map(|(_, _, fact)| fact)
+            .unwrap();
+        assert_eq!(fact.confidence(), crate::LuaInferenceConfidence::Anchored);
+        assert!(
+            fact.provenance()
+                .iter()
+                .all(|step| step.event.kind == crate::LuaInferenceProvenanceKind::ConcreteValue)
+        );
+        assert!(
+            diagnostic_messages_for_file(&mut ws, file, DiagnosticCode::InferUnknown).is_empty()
+        );
+    }
+
+    #[test]
+    fn residual_col_param_different_shapes_form_union() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def("---@class Color");
+        let file = ws.def_file(
+            "gamemodes/terrortown/gamemode/cl_palette.lua",
+            r#"
+            function AcceptPalette(col) local value = col end
+            local dark = { bg = 1 }
+            local active = { tip = "active" }
+            local palette = dark
+            if enabled then palette = active else palette = dark end
+            AcceptPalette(palette)
+        "#,
+        );
+        let typ = residual_col_param_type(&ws, file);
+        let LuaType::Union(union) = &typ else {
+            panic!("{typ:?}")
+        };
+        assert_eq!(union.types().count(), 2, "{typ:?}");
+        assert!(
+            union
+                .types()
+                .all(|typ| matches!(typ, LuaType::TableConst(_))),
+            "{typ:?}"
+        );
+        ws.def_file(
+            "gamemodes/terrortown/gamemode/cl_palette.lua",
+            r#"
+            function AcceptPalette(col) local value = col end
+            local dark = { bg = 1 }
+            local active = { tip = "active" }
+            local function DarkPair() return 0, dark end
+            local function ActivePair() return 0, active end
+            local unused, palette = DarkPair()
+            if enabled then unused, palette = ActivePair() end
+            AcceptPalette(palette)
+        "#,
+        );
+        let typ = residual_col_param_type(&ws, file);
+        assert!(
+            matches!(&typ, LuaType::Union(union)
+            if union.types().count() == 2 && union.types().all(|typ| matches!(typ, LuaType::TableConst(_)))),
+            "{typ:?}"
+        );
+        ws.def(
+            "---@class DeclaredPalette
+---@field bg number
+---@return table
+function LoadPalette() end",
+        );
+        ws.def_file(
+            "gamemodes/terrortown/gamemode/cl_palette.lua",
+            r#"
+            function AcceptPalette(col) local value = col.bg end
+            ---@type DeclaredPalette
+            local palette = LoadPalette()
+            if enabled then palette = LoadPalette() end
+            AcceptPalette(palette)
+        "#,
+        );
+        assert_eq!(residual_col_param_type(&ws, file), ws.ty("DeclaredPalette"));
+    }
+
+    #[test]
+    fn residual_col_param_shared_alias_chain_is_folded_once_per_local() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut ws = VirtualWorkspace::new();
+            ws.def_gmod_call_arg_builtins();
+            ws.def("---@class Color");
+            let mut source = String::from(
+                "function AcceptPalette(col) local value = col end\nlocal p0 = { bg = 1 }\n",
+            );
+            for idx in 1..=26 {
+                let prev = idx - 1;
+                source.push_str(&format!("local p{idx} = p{prev}\np{idx} = p{prev}\n"));
+            }
+            source.push_str("AcceptPalette(p26)");
+            let file = ws.def_file("gamemodes/terrortown/gamemode/cl_palette.lua", &source);
+            sender.send(residual_col_param_type(&ws, file)).unwrap();
+        });
+        let typ = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("each aliased local must be folded once, not once per path to it");
+        assert!(matches!(typ, LuaType::TableConst(_)), "{typ:?}");
+    }
+
+    #[test]
+    fn residual_col_param_cross_file_edit_delete_reopen() {
+        use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr};
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def("---@class Color");
+        let callee = ws.def_file(
+            "gamemodes/terrortown/gamemode/cl_palette_api.lua",
+            "function AcceptPalette(col) local value = col.bg end",
+        );
+        let path = "gamemodes/terrortown/gamemode/cl_palette_caller.lua";
+        let source = |value: &str| {
+            format!(
+                "local col_dark = {{ bg = {value} }}
+local col = col_dark
+if enabled then col = col_dark end
+AcceptPalette(col)"
+            )
+        };
+        let infer_bg = |ws: &VirtualWorkspace| {
+            let model = ws.analysis.compilation.get_semantic_model(callee).unwrap();
+            let expr = model
+                .get_root()
+                .descendants::<LuaIndexExpr>()
+                .find(|expr| expr.syntax().text() == "col.bg")
+                .unwrap();
+            model.infer_expr(LuaExpr::IndexExpr(expr)).unwrap()
+        };
+        ws.def_file(path, &source("1"));
+        assert!(
+            matches!(infer_bg(&ws), LuaType::IntegerConst(1)),
+            "{:?}",
+            infer_bg(&ws)
+        );
+        ws.def_file(path, &source("'changed'"));
+        assert!(
+            matches!(infer_bg(&ws), LuaType::StringConst(_)),
+            "{:?}",
+            infer_bg(&ws)
+        );
+        ws.def_file(path, &source("'changed'").replace("bg =", "tip ="));
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, callee, DiagnosticCode::UndefinedField).len(),
+            1
+        );
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert_eq!(residual_col_param_type(&ws, callee), ws.ty("Color"));
+        ws.def_file(path, &source("2"));
+        assert!(
+            matches!(infer_bg(&ws), LuaType::IntegerConst(2)),
+            "{:?}",
+            infer_bg(&ws)
+        );
+    }
+
+    #[test]
+    fn residual_col_param_incomplete_caller_does_not_narrow() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def("---@class Vector\n---@class Entity\n---@param offset Vector\n---@return Vector\nfunction Entity:LocalToWorld(offset) end");
+        let file = ws.def_file(
+            "gamemodes/terrortown/entities/weapons/weapon_scan.lua",
+            r#"
+            SWEP = {}
+            function SWEP:SendScan(pos) local value = pos end
+            SWEP:SendScan(nil)
+            ---@type Entity
+            local target
+            ---@type Vector
+            local offset
+            local pos = target:LocalToWorld(offset)
+            SWEP:SendScan(pos)
+        "#,
+        );
+        let db = ws.analysis.compilation.get_db();
+        let signature = db
+            .get_signature_index()
+            .get_file_signature_ids(file)
+            .unwrap();
+        assert!(signature.iter().all(|id| {
+            db.get_call_site_param_index()
+                .get_inferred_param(id, 0)
+                .is_none()
+        }));
+        for return_type in ["any", "any|Vector"] {
+            ws.def(&format!(
+                "---@return {return_type}
+function UnknownPosition() end"
+            ));
+            ws.def_file(
+                "gamemodes/terrortown/entities/weapons/weapon_scan.lua",
+                r#"
+                SWEP = {}
+                function SWEP:SendScan(pos) local value = pos end
+                SWEP:SendScan(nil)
+                local pos = UnknownPosition()
+                SWEP:SendScan(pos)
+            "#,
+            );
+            let db = ws.analysis.compilation.get_db();
+            let signatures = db
+                .get_signature_index()
+                .get_file_signature_ids(file)
+                .unwrap();
+            assert!(
+                signatures.iter().all(|id| db
+                    .get_call_site_param_index()
+                    .get_inferred_param(id, 0)
+                    .is_none()),
+                "{return_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn residual_col_param_unsupported_cross_file_edit_delete_reopen() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def("---@class Color\n---@return any\nfunction DynamicPalette(value) end");
+        let callee = ws.def_file(
+            "gamemodes/terrortown/gamemode/cl_palette_api.lua",
+            "function AcceptPalette(col) local value = col end",
+        );
+        ws.def_file(
+            "gamemodes/terrortown/gamemode/cl_supported.lua",
+            "AcceptPalette({ bg = 1 })",
+        );
+        let path = "gamemodes/terrortown/gamemode/cl_unsupported.lua";
+        let unsupported = "local col = DynamicPalette(1)\nAcceptPalette(col)";
+        assert!(matches!(
+            residual_col_param_type(&ws, callee),
+            LuaType::TableConst(_)
+        ));
+        ws.def_file(path, unsupported);
+        assert_eq!(residual_col_param_type(&ws, callee), ws.ty("Color"));
+        ws.def_file(path, "AcceptPalette({ bg = 2 })");
+        assert!(matches!(
+            residual_col_param_type(&ws, callee),
+            LuaType::Union(_)
+        ));
+        ws.def_file(path, unsupported);
+        assert_eq!(residual_col_param_type(&ws, callee), ws.ty("Color"));
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert!(matches!(
+            residual_col_param_type(&ws, callee),
+            LuaType::TableConst(_)
+        ));
+        ws.def_file(path, unsupported);
+        assert_eq!(residual_col_param_type(&ws, callee), ws.ty("Color"));
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert!(matches!(
+            residual_col_param_type(&ws, callee),
+            LuaType::TableConst(_)
         ));
     }
 
@@ -1683,5 +2008,185 @@ mod test {
             diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedField),
             vec!["Undefined field `bogus`. "]
         );
+    }
+
+    fn panel_annotations(ws: &mut VirtualWorkspace) {
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/gmod.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@class Panel : Entity
+            ---@class DPanel : Panel
+            ---@class Vector
+            ---@field x number
+            ---@return Vector
+            function Vector(x, y, z) end
+            ---@generic T: Panel
+            ---@param classname `T`
+            ---@param parent? Panel
+            ---@return (instance) T?
+            function vgui.Create(classname, parent) end
+            "#,
+        );
+    }
+
+    /// A write in the enclosing function runs before the closure defined inside
+    /// it can be called, so the field is not nil-able at the closure's read.
+    #[gtest]
+    fn test_enclosing_function_write_is_visible_in_nested_closure() {
+        let mut ws = VirtualWorkspace::new();
+        panel_annotations(&mut ws);
+        let file_id = ws.def_file(
+            "lua/nested_closure_write.lua",
+            r#"
+            local ENT = {}
+            function ENT:Initialize()
+                self.frame = vgui.Create("DPanel")
+                self.frame.col = Vector(1, 2, 3)
+                self.frame.Paint = function(pnl, w, h)
+                    print(pnl.col.x)
+                end
+            end
+            "#,
+        );
+
+        assert_eq!(
+            nil_diagnostic_messages_for_file(&mut ws, file_id),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A write in a sibling function proves nothing about ordering, so the read
+    /// inside the closure stays nil-able.
+    #[gtest]
+    fn test_sibling_function_write_stays_nilable() {
+        let mut ws = VirtualWorkspace::new();
+        panel_annotations(&mut ws);
+        let file_id = ws.def_file(
+            "lua/sibling_function_write.lua",
+            r#"
+            local ENT = {}
+            function ENT:Initialize()
+                self.frame = vgui.Create("DPanel")
+                self.frame.Paint = function(pnl, w, h)
+                    print(pnl.col.x)
+                end
+            end
+            function ENT:Draw()
+                self.frame.col = Vector(1, 2, 3)
+            end
+            "#,
+        );
+
+        assert_eq!(
+            nil_diagnostic_messages_for_file(&mut ws, file_id),
+            vec!["pnl.col may be nil"]
+        );
+    }
+
+    const SCORE_ROW_PRELUDE: &str = r#"
+            ---@class InfoTags
+            ---@class InfoSearch
+            ---@return InfoTags
+            local function make_tags() end
+            ---@return InfoSearch
+            local function make_search() end
+    "#;
+
+    fn score_row_assign_mismatches(class_docs: &str) -> Vec<String> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "gamemodes/terrortown/gamemode/vgui/sb_row.lua",
+            &format!(
+                "{SCORE_ROW_PRELUDE}
+            {class_docs}
+            local PANEL = {{}}
+            function PANEL:Init()
+               self.info = nil
+            end
+            function PANEL:SetPlayer(group)
+               if not self.info then
+                  if group == 1 then
+                     self.info = make_tags()
+                  elseif group == 2 then
+                     self.info = make_search()
+                  end
+               end
+            end
+            "
+            ),
+        );
+        diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::AssignTypeMismatch)
+    }
+
+    #[gtest]
+    fn a_field_only_assignments_define_holds_each_class_written_to_it() {
+        expect_that!(
+            score_row_assign_mismatches("---@class ScoreRow"),
+            is_empty()
+        );
+    }
+
+    #[gtest]
+    fn a_declared_field_still_rejects_another_class() {
+        expect_that!(
+            score_row_assign_mismatches("---@class ScoreRow\n---@field info InfoTags?"),
+            elements_are![contains_substring("InfoSearch")]
+        );
+    }
+
+    #[gtest]
+    fn a_field_a_base_class_declares_still_rejects_another_class() {
+        expect_that!(
+            score_row_assign_mismatches(
+                "---@class RowBase\n---@field info InfoTags?\n\n---@class ScoreRow : RowBase"
+            ),
+            elements_are![contains_substring("InfoSearch")]
+        );
+    }
+
+    #[gtest]
+    fn a_field_written_on_an_instance_is_one_its_prototype_methods_read_through_self() {
+        let mut ws = VirtualWorkspace::new();
+        let prototype = ws.def_file(
+            "lua/includes/modules/markup_object.lua",
+            r#"
+            MarkupObject = {}
+            function MarkupObject:create()
+                local o = {}
+                setmetatable(o, self)
+                self.__index = self
+                return o
+            end
+            function MarkupObject:GetWidth()
+                return self.totalWidth
+            end
+            "#,
+        );
+        let parser_path = "lua/includes/modules/markup_parse.lua";
+        let parser = r#"
+            function MarkupParse()
+                local object = MarkupObject:create()
+                object.totalWidth = 5
+                return object
+            end
+            "#;
+        ws.def_file(parser_path, parser);
+        let undefined = |ws: &mut VirtualWorkspace| {
+            diagnostic_messages_for_file(ws, prototype, DiagnosticCode::UndefinedField)
+        };
+        expect_that!(undefined(&mut ws), is_empty());
+
+        let uri = ws.virtual_url_generator.new_uri(parser_path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        expect_that!(
+            undefined(&mut ws),
+            elements_are![contains_substring("totalWidth")]
+        );
+
+        ws.def_file(parser_path, parser);
+        expect_that!(undefined(&mut ws), is_empty());
     }
 }

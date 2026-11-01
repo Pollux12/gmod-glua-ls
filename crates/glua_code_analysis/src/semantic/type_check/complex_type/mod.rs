@@ -31,8 +31,8 @@ pub fn check_complex_type_compact(
     compact_type: &LuaType,
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
-    // TODO: 缓存以提高性能
-    // 如果是泛型+不包含模板参数+alias, 那么尝试实例化再检查
+    // TODO: cache to improve performance
+    // If it is generic + no template parameters + alias, try instantiating before checking
     if let LuaType::Generic(generic) = compact_type {
         if !generic.contain_tpl() {
             let base_id = generic.get_base_type_id();
@@ -176,9 +176,13 @@ fn check_merged_table_type_compact(
         return Ok(());
     }
 
-    let Some(object) = structural_object_from_members(context, source) else {
-        return Err(TypeCheckFailReason::DonotCheck);
-    };
+    if let LuaType::MergedTable(merged) = source {
+        if merged.get_types().iter().any(|comp| comp == compact_type) {
+            return Ok(());
+        }
+    }
+
+    let object = open_table_object(context, source);
 
     if matches!(compact_type, LuaType::MergedTable(_))
         && let Some(compact_object) = structural_object_from_members(context, compact_type)
@@ -194,7 +198,10 @@ fn check_merged_table_type_compact(
     check_general_type_compact(context, &object, compact_type, check_guard.next_level()?)
 }
 
-fn structural_object_from_members(context: &TypeCheckContext, typ: &LuaType) -> Option<LuaType> {
+pub(super) fn structural_object_from_members(
+    context: &TypeCheckContext,
+    typ: &LuaType,
+) -> Option<LuaType> {
     let members = find_members(context.db, typ).unwrap_or_default();
     // A key several members write to is worth all of them. Collecting straight
     // into the map would keep whichever one `find_members` happened to yield
@@ -222,6 +229,30 @@ fn structural_object_from_members(context: &TypeCheckContext, typ: &LuaType) -> 
     Some(LuaType::Object(
         LuaObjectType::new_with_fields(fields, index_access).into(),
     ))
+}
+
+/// The structural object of a table its writers' literals merge into: every
+/// field one writer spells is a field the table can have, so none is required,
+/// and a table no writer gave a field is an empty object any literal fits.
+fn open_table_object(context: &TypeCheckContext, typ: &LuaType) -> LuaType {
+    let (fields, index_access): (BTreeMap<_, _>, Vec<_>) =
+        match structural_object_from_members(context, typ) {
+            Some(LuaType::Object(object)) => (
+                object
+                    .get_fields()
+                    .iter()
+                    .map(|(key, typ)| {
+                        (
+                            key.clone(),
+                            TypeOps::Union.apply(context.db, typ, &LuaType::Nil),
+                        )
+                    })
+                    .collect(),
+                object.get_index_access().to_vec(),
+            ),
+            _ => (BTreeMap::new(), Vec::new()),
+        };
+    LuaType::Object(LuaObjectType::new_with_fields(fields, index_access).into())
 }
 
 fn collect_index_access_from_type(typ: &LuaType, index_access: &mut Vec<(LuaType, LuaType)>) {

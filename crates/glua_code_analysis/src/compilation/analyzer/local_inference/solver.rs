@@ -23,7 +23,7 @@ pub(crate) fn solve_local_inference_graph(
     nodes: &FxHashMap<LuaInferenceNodeId, Vec<ContextualTypeEvidence>>,
 ) -> LocalInferenceSolveResult {
     let components = strongly_connected_components(nodes);
-    let mut resolved = HashMap::<LuaInferenceNodeId, LuaTypeFact>::new();
+    let mut resolved = HashMap::<LuaInferenceNodeId, LuaTypeFact>::default();
 
     loop {
         let mut progress = false;
@@ -38,7 +38,7 @@ pub(crate) fn solve_local_inference_graph(
                     continue;
                 };
                 for item in evidence {
-                    if type_is_uninformative(&item.candidate) {
+                    if is_any_unknown_or_never(&item.candidate) {
                         continue;
                     }
                     let external_ready = item
@@ -110,7 +110,7 @@ pub(crate) fn solve_local_inference_graph(
     }
 }
 
-fn type_is_uninformative(typ: &LuaType) -> bool {
+fn is_any_unknown_or_never(typ: &LuaType) -> bool {
     matches!(typ, LuaType::Any | LuaType::Unknown | LuaType::Never)
 }
 

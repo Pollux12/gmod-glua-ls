@@ -2,7 +2,7 @@ use rowan::TextRange;
 
 use crate::DiagnosticCode;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct AnalyzeError {
     pub kind: DiagnosticCode,
     pub message: String,

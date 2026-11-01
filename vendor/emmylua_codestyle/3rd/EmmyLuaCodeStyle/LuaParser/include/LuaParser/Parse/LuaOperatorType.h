@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 // 取名都来自lua 源代码
 enum class UnOpr {

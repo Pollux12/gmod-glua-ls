@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::hash::Hash;
 use std::path::Path;
 use std::sync::Arc;
@@ -39,11 +41,14 @@ const FILE_PARAM_DEFAULTS: &[(&str, &str)] = &[
     ("mat", "IMaterial"),
 ];
 
+/// Garry's Mod analysis settings.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmod {
+    /// Enable Garry's Mod analysis. Disabling it is unsupported and only meant for isolating issues.
     #[serde(default = "enabled_default")]
     pub enabled: bool,
+    /// Realm assumed for files with no realm signal.
     #[serde(default)]
     pub default_realm: EmmyrcGmodRealm,
     #[serde(default)]
@@ -67,12 +72,16 @@ pub struct EmmyrcGmod {
         "x-gluals-value-label" = "Type"
     ))]
     pub file_param_defaults: HashMap<String, String>,
+    /// Detect realm from `cl_`, `sv_` and `sh_` filename prefixes and `client`/`server` parent folders. Defaults to `true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detect_realm_from_filename: Option<bool>,
+    /// Infer realm from calls such as `include`, `AddCSLuaFile`, `IncludeCS` and annotated wrappers. Defaults to `true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detect_realm_from_calls: Option<bool>,
+    /// Track fields dynamically assigned to Garry's Mod objects.
     #[serde(default = "infer_dynamic_fields_default")]
     pub infer_dynamic_fields: bool,
+    /// Share inferred dynamic fields across all files. Set `false` to scope them per file.
     #[serde(default = "dynamic_fields_global_default")]
     pub dynamic_fields_global: bool,
     /// Path to GMod annotations to load as core library.
@@ -91,14 +100,17 @@ pub struct EmmyrcGmod {
     pub template_path: Option<String>,
     /// Automatically detect and add the base gamemode as a library when a gamemode
     /// derives from another (via the `"base"` field in the gamemode `.txt` file).
+    /// `base` and `sandbox` come from the GMod annotations and are never added.
     /// Set to `false` to disable this detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_detect_gamemode_base: Option<bool>,
 }
 
+/// Scripted class groups used for class analysis, the Class Explorer and scaffolding.
 #[derive(Serialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmodScriptedClassScopes {
+    /// Scripted class definitions, or glob strings, that decide which files are analyzed as scripted classes.
     #[serde(default = "scripted_scope_include_default")]
     #[schemars(extend("x-gluals-editor" = "scriptedClassTable"))]
     include: Vec<EmmyrcGmodScriptedClassScopeEntry>,
@@ -137,37 +149,52 @@ pub enum EmmyrcGmodScriptedClassScopeEntry {
     Definition(Box<EmmyrcGmodScriptedClassDefinition>),
 }
 
+/// A scripted class group, such as entities or weapons.
 #[derive(Serialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmodScriptedClassDefinition {
+    /// Name used to change or remove this entry, including built-in groups.
     pub id: String,
+    /// Display name in the Class Explorer and settings UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Path segments that mark a class folder, such as `entities`; the folder or file after them names the class.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<Vec<String>>,
+    /// Glob patterns for files in this group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include: Option<Vec<String>>,
+    /// Glob patterns excluded from this group only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude: Option<Vec<String>>,
+    /// Global variable the class is authored through, such as `ENT` or `SWEP`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class_global: Option<String>,
+    /// Class name shared by every matching file instead of one derived from the path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_class_name: Option<String>,
+    /// Merge every matching file into one workspace-wide global class.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_global_singleton: Option<bool>,
+    /// Additional global names that refer to the same class.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aliases: Option<Vec<String>>,
+    /// Types the class inherits members and hooks from, such as `GM`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub super_types: Option<Vec<String>>,
     /// Whether this class global and its aliases define gamemode hooks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_owner: Option<bool>,
+    /// Parent definition ID for nested grouping in the Class Explorer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    /// VS Code icon ID shown in the Class Explorer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// Default folder, relative to the workspace, that new classes are scaffolded into.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_dir: Option<String>,
+    /// Files created by the scaffold action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scaffold: Option<EmmyrcGmodScriptedClassScaffold>,
     /// Optional prefix prepended to class names derived from the folder segment.
@@ -175,21 +202,27 @@ pub struct EmmyrcGmodScriptedClassDefinition {
     /// class name `gamemode_sandbox`, matching the runtime convention.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class_name_prefix: Option<String>,
+    /// Turn this definition off, such as a built-in group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled: Option<bool>,
 }
 
+/// Files the scaffold action creates for a new class.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmodScriptedClassScaffold {
+    /// Files to create for each new class.
     #[serde(default)]
     pub files: Vec<EmmyrcGmodScriptedClassScaffoldFile>,
 }
 
+/// One scaffolded file.
 #[derive(Serialize, Debug, JsonSchema, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmodScriptedClassScaffoldFile {
+    /// Output path relative to the target folder; `{{name}}` is replaced with the class name.
     pub path: String,
+    /// Template file name, looked up in `gmod.templatePath` before the built-in templates.
     pub template: String,
 }
 
@@ -622,11 +655,14 @@ impl Default for EmmyrcGmod {
     }
 }
 
+/// VGUI panel support.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmodVgui {
+    /// Show code lens actions on `vgui.Register` calls.
     #[serde(default = "vgui_code_lens_default")]
     pub code_lens_enabled: bool,
+    /// Show inlay hints for panel types inferred from `panel:Add` calls.
     #[serde(default = "vgui_inlay_hint_default")]
     pub inlay_hint_enabled: bool,
 }
@@ -992,7 +1028,7 @@ fn merge_scripted_class_definitions(
         .iter()
         .enumerate()
         .map(|(idx, definition)| (definition.id.clone(), idx))
-        .collect::<HashMap<_, _>>();
+        .collect::<FxHashMap<_, _>>();
     let mut synthetic_legacy_id = 0usize;
 
     for entry in entries {
@@ -1067,7 +1103,7 @@ fn merge_scripted_class_definitions(
         }
     }
 
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     resolved.retain(|definition| seen.insert(definition.id.clone()));
 
     if !legacy_include.is_empty() && !has_definition_entries {
@@ -1440,7 +1476,7 @@ impl EmmyrcGmodScriptedClassScopes {
     }
 
     pub fn hook_owner_globals(&self) -> Vec<String> {
-        let mut seen = HashSet::new();
+        let mut seen = FxHashSet::default();
         let mut globals = Vec::new();
 
         for definition in self
@@ -1627,12 +1663,12 @@ impl EmmyrcGmodScriptedClassScopes {
     {
         let definitions = self.resolved_definitions_slice();
         if definitions.is_empty() {
-            return (HashSet::new(), HashMap::new());
+            return (HashSet::default(), HashMap::default());
         }
 
         let compiled_definitions = compile_scope_definitions(definitions);
-        let mut scope_files = HashSet::new();
-        let mut matches = HashMap::new();
+        let mut scope_files = HashSet::default();
+        let mut matches = HashMap::default();
         for (file_id, file_path) in files {
             let candidate_paths = build_scope_candidate_paths(file_path);
             if !compiled_definitions.iter().any(|definition| {
@@ -1849,6 +1885,7 @@ pub enum EmmyrcGmodOutlineVerbosity {
     Verbose,
 }
 
+/// Document outline settings.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmodOutline {
@@ -1869,22 +1906,29 @@ impl Default for EmmyrcGmodOutline {
     }
 }
 
+/// Custom hook detection rules.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmodHookMappings {
+    /// Map method names to hook names, such as `{ "Think": "Think" }`.
     #[serde(default)]
     pub method_to_hook: HashMap<String, String>,
+    /// Map custom emitter functions to the hook names they call.
     #[serde(default)]
     pub emitter_to_hook: HashMap<String, String>,
+    /// Extra class prefixes whose methods are treated as gamemode hooks, such as `COMPONENT`.
     #[serde(default)]
     pub method_prefixes: Vec<String>,
 }
 
+/// Network message analysis settings.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmodNetwork {
+    /// Enable network message flow analysis.
     #[serde(default = "network_enabled_default")]
     pub enabled: bool,
+    /// Show code lens actions on net message receivers.
     #[serde(default = "network_code_lens_default")]
     pub code_lens_enabled: bool,
     #[serde(default)]
@@ -1909,11 +1953,14 @@ impl Default for EmmyrcGmodNetwork {
     }
 }
 
+/// Network completion settings.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmodNetworkCompletion {
+    /// Suggest `net.Read*` calls in the order the sender writes them inside receive callbacks.
     #[serde(default = "network_smart_read_suggestions_default")]
     pub smart_read_suggestions: bool,
+    /// Mark suggestions whose read does not match the expected write.
     #[serde(default = "network_mismatch_hints_default")]
     pub mismatch_hints: bool,
 }

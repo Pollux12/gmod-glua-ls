@@ -63,7 +63,7 @@ fn handle_decl_definition(
     property_owner: &LuaSemanticDeclId,
     decl_id: &LuaDeclId,
 ) -> Option<GotoDefinitionResponse> {
-    // 尝试查找函数调用的原始定义
+    // Try to find the original definition of the function call
     if let Some(match_semantic_decl) =
         find_function_call_origin(semantic_model, compilation, trigger_token, property_owner)
         && let LuaSemanticDeclId::LuaDecl(matched_decl_id) = match_semantic_decl
@@ -87,12 +87,12 @@ fn handle_decl_definition(
         return Some(GotoDefinitionResponse::Scalar(location));
     }
 
-    // 返回声明的位置
+    // Return the declaration position
     if let Some(location) = get_decl_location(semantic_model, decl_id) {
         return Some(GotoDefinitionResponse::Scalar(location));
     }
 
-    // 如果不等于当前文件, 那么我们可能是引用了其他文件的导出
+    // If it is not the current file, we may be referencing an export from another file
     if decl_id.file_id != semantic_model.get_file_id()
         && let Some(semantic_decl) =
             semantic_model.find_decl(trigger_token.clone().into(), SemanticDeclLevel::NoTrace)
@@ -169,7 +169,7 @@ fn handle_member_definition(
 
     let mut locations: Vec<Location> = Vec::new();
 
-    // 尝试寻找函数调用时最匹配的定义
+    // Try to find the best-matching definition for a function call
     if let Some(match_members) = find_matching_function_definitions(
         semantic_model,
         compilation,
@@ -188,7 +188,7 @@ fn handle_member_definition(
         && trigger_token
             .parent()
             .is_some_and(|node| LuaIndexExpr::can_cast(node.kind().into()));
-    // 添加原始成员的位置
+    // Add the position of the original member
     for member in same_named_members {
         if let LuaSemanticDeclId::Member(candidate_member_id) = member
             && let Some(location) = get_member_location(semantic_model, &candidate_member_id)
@@ -197,7 +197,7 @@ fn handle_member_definition(
                 continue;
             }
 
-            // 尝试添加访问器的位置
+            // Try to add the accessor position
             try_set_accessor_locations(
                 semantic_model,
                 &member,
@@ -208,7 +208,7 @@ fn handle_member_definition(
         }
     }
 
-    // 处理实例表成员
+    // Handle instance table members
     locations.extend(instance_table_locations);
 
     // Add origin owner locations so that usage-site members on typed/ref
@@ -255,7 +255,7 @@ fn process_matched_members(
         match member {
             LuaSemanticDeclId::Member(member_id) => {
                 if should_trace_member(semantic_model, member_id).unwrap_or(false) {
-                    // 尝试搜索这个成员最原始的定义
+                    // Try to find the original definition of this member
                     match find_member_origin_owners(
                         compilation,
                         semantic_model,
@@ -303,7 +303,7 @@ fn collect_instance_table_member_locations(
     trigger_token: &LuaSyntaxToken,
     member_id: &LuaMemberId,
 ) -> Vec<Location> {
-    /* 对于实例的处理, 对于实例 obj
+    /* Handling of instances, for an instance obj
     ```lua
         ---@class T
         ---@field func fun(a: int)
@@ -311,9 +311,9 @@ fn collect_instance_table_member_locations(
 
         ---@type T
         local obj = {
-            func = function() end  -- 点击`func`时需要寻找`T`的定义
+            func = function() end  -- clicking `func` needs to find the definition of `T`
         }
-        obj:func(1) -- 点击`func`时, 不止需要寻找`T`的定义也需要寻找`obj`实例化时赋值的`func`
+        obj:func(1) -- clicking `func` needs to find the definition of `T` and also the `func` assigned when `obj` was instantiated
     ```
      */
     let mut locations = Vec::new();
@@ -446,14 +446,14 @@ pub fn goto_str_tpl_ref_definition(
         }
         _ => params.get(string_token_idx),
     }?;
-    // 首先尝试直接匹配StrTplRef类型
+    // Try matching the StrTplRef type directly first
     if let Some(locations) =
         try_extract_str_tpl_ref_locations(semantic_model, &target_param.1, &name)
     {
         return Some(GotoDefinitionResponse::Array(locations));
     }
 
-    // 如果参数类型是union，尝试从中提取StrTplRef类型
+    // If the parameter type is a union, try extracting the StrTplRef type from it
     if let Some(LuaType::Union(union_type)) = target_param.1.clone() {
         for union_member in union_type.types() {
             if let Some(locations) = try_extract_str_tpl_ref_locations(
@@ -549,7 +549,7 @@ fn find_member_in_table_const(
     )
 }
 
-/// 是否对 member 启动追踪
+/// Whether to start tracing for a member
 fn should_trace_member(semantic_model: &SemanticModel, member_id: &LuaMemberId) -> Option<bool> {
     let root = semantic_model
         .get_db()
@@ -558,7 +558,7 @@ fn should_trace_member(semantic_model: &SemanticModel, member_id: &LuaMemberId) 
         .get_red_root();
     let node = member_id.get_syntax_id().to_node_from_root(&root)?;
     let parent = node.parent()?.parent()?;
-    // 如果成员在返回语句中, 则需要追踪
+    // If the member is in a return statement, it must be traced
     if LuaReturnStat::can_cast(parent.kind().into()) {
         return Some(true);
     } else {
@@ -705,11 +705,11 @@ fn try_set_accessor_locations(
             false
         };
 
-    // 显式指定了获取器与设置器, 则不需要根据规则处理
+    // If the getter and setter are given explicitly, no rule-based handling is needed
     if has_getter && has_setter {
         return Some(());
     }
-    // 根据规则处理
+    // Handle by rule
     // "camelCase"|"PascalCase"|"snake_case"
     let convention = {
         if let Some(LuaType::DocStringConst(convention)) =
@@ -763,7 +763,7 @@ fn try_set_accessor_locations(
     Some(())
 }
 
-/// 尝试添加访问器位置到位置列表中
+/// Tries to add the accessor position to the location list
 fn try_add_accessor_location(
     semantic_model: &SemanticModel,
     prefix_type: &LuaType,

@@ -10,7 +10,7 @@ use crate::{
 
 use super::lua_operator_meta_method::LuaOperatorMetaMethod;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Hash, PartialEq)]
 pub struct LuaOperator {
     owner: LuaOperatorOwner,
     op: LuaOperatorMetaMethod,
@@ -19,7 +19,7 @@ pub struct LuaOperator {
     func: OperatorFunction,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash, PartialEq)]
 pub enum OperatorFunction {
     Func(Arc<LuaFunctionType>),
     Signature(LuaSignatureId),
@@ -46,7 +46,6 @@ impl LuaOperator {
             func,
         }
     }
-
     pub fn get_owner(&self) -> &LuaOperatorOwner {
         &self.owner
     }
@@ -76,8 +75,22 @@ impl LuaOperator {
 
                 LuaType::Any
             }
-            // 只有 .field 才有`operand`, call 不会有这个
+            // Only .field has an `operand`; call does not
             OperatorFunction::DefaultClassCtor { .. } => LuaType::Unknown,
+        }
+    }
+
+    /// Whether the result type is declared rather than inferred from the
+    /// function's body.
+    pub fn declares_result(&self, db: &DbIndex) -> bool {
+        match &self.func {
+            OperatorFunction::Signature(signature_id) => db
+                .get_signature_index()
+                .get(signature_id)
+                .is_some_and(|signature| {
+                    signature.resolve_return == SignatureReturnStatus::DocResolve
+                }),
+            OperatorFunction::Func(_) | OperatorFunction::DefaultClassCtor { .. } => true,
         }
     }
 

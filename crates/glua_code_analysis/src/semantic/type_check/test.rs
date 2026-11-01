@@ -209,6 +209,74 @@ mod test {
         assert!(check_type_compact(&db, &source, &compact).is_ok());
     }
 
+    fn colors_written_by_two_files() -> (VirtualWorkspace, LuaType) {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/autorun/a.lua",
+            "CONFIG = {}
+CONFIG.colors = { red = 1 }
+",
+        );
+        ws.def_file(
+            "lua/autorun/b.lua",
+            "CONFIG.colors = { blue = 2 }
+",
+        );
+        let colors = ws.expr_ty("CONFIG.colors");
+        assert!(matches!(colors, LuaType::MergedTable(_)));
+        (ws, colors)
+    }
+
+    #[test]
+    fn a_merged_table_accepts_a_literal_spelling_only_some_of_its_fields() {
+        let (mut ws, colors) = colors_written_by_two_files();
+        let literal = ws.expr_ty("{ red = 1 }");
+
+        assert!(ws.check_type(&colors, &literal));
+    }
+
+    #[test]
+    fn a_merged_table_rejects_a_literal_whose_field_has_another_type() {
+        let (mut ws, colors) = colors_written_by_two_files();
+        let literal = ws.expr_ty("{ red = \"crimson\" }");
+
+        assert!(!ws.check_type(&colors, &literal));
+    }
+
+    fn empty_colors_written_by_two_files() -> (VirtualWorkspace, LuaType) {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/autorun/a.lua",
+            "CONFIG = {}
+CONFIG.colors = {}
+",
+        );
+        ws.def_file(
+            "lua/autorun/b.lua",
+            "CONFIG.colors = {}
+",
+        );
+        let colors = ws.expr_ty("CONFIG.colors");
+        assert!(matches!(colors, LuaType::MergedTable(_)));
+        (ws, colors)
+    }
+
+    #[test]
+    fn a_merged_table_of_empty_literals_accepts_another_empty_literal() {
+        let (mut ws, colors) = empty_colors_written_by_two_files();
+        let literal = ws.expr_ty("{}");
+
+        assert!(ws.check_type(&colors, &literal));
+    }
+
+    #[test]
+    fn a_merged_table_of_empty_literals_rejects_a_string() {
+        let (mut ws, colors) = empty_colors_written_by_two_files();
+        let string = ws.expr_ty("\"red\"");
+
+        assert!(!ws.check_type(&colors, &string));
+    }
+
     fn merged_table_with_field(name: &str, typ: LuaType) -> LuaType {
         merged_table_from_object(object_with_field(name, typ))
     }
@@ -647,5 +715,138 @@ mod test {
         let table_ty = ws.expr_ty("{ value = 1, check = 1 }");
 
         assert!(ws.check_type(&target_ty, &table_ty));
+    }
+
+    /// An enum check answers as the check against its built field union does.
+    #[test]
+    fn enum_checks_match_the_built_field_union() {
+        use crate::LuaTypeDeclId;
+
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            FLAT_A = 1
+            FLAT_B = 2
+            FLAT_STR = "x"
+            ---@enum FlatNumber : number
+            ---| FLAT_A
+            ---| FLAT_B
+
+            ---@enum FlatInteger : integer
+            ---| FLAT_A
+            ---| FLAT_B
+
+            ---@enum FlatNoBase
+            ---| FLAT_A
+            ---| FLAT_B
+
+            ---@enum FlatMixed : number
+            ---| FLAT_A
+            ---| FLAT_STR
+
+            ---@enum FlatStringBase : string
+            ---| FLAT_STR
+
+            ---@enum (key) KeyEnum
+            local KeyEnum = { first = 1, second = 2 }
+
+            ---@enum TableEnum
+            local TableEnum = { Low = 1, High = 5 }
+
+            ---@enum TableNumberEnum : number
+            local TableNumberEnum = { Low = 1, High = 5 }
+
+            ---@enum EmptyNumber : number
+            local EmptyNumber = {}
+            "#,
+        );
+        let db = ws.analysis.compilation.get_db();
+        let compacts = [
+            LuaType::IntegerConst(1),
+            LuaType::IntegerConst(3),
+            LuaType::IntegerConst(-7),
+            LuaType::DocIntegerConst(2),
+            LuaType::Integer,
+            LuaType::Number,
+            LuaType::FloatConst(1.5),
+            LuaType::String,
+            LuaType::StringConst(smol_str::SmolStr::new("x").into()),
+            LuaType::Nil,
+            LuaType::Boolean,
+        ];
+        for name in [
+            "FlatNumber",
+            "FlatInteger",
+            "FlatNoBase",
+            "FlatMixed",
+            "FlatStringBase",
+            "KeyEnum",
+            "TableEnum",
+            "TableNumberEnum",
+            "EmptyNumber",
+            "MissingEnum",
+        ] {
+            let id = LuaTypeDeclId::global(name);
+            let fields = db
+                .get_type_index()
+                .get_type_decl(&id)
+                .and_then(|decl| decl.get_enum_field_type(db));
+            for compact in &compacts {
+                let built = match &fields {
+                    Some(LuaType::Union(union))
+                        if union.types().all(|t| {
+                            matches!(t, LuaType::DocIntegerConst(_) | LuaType::IntegerConst(_))
+                        }) && matches!(
+                            compact,
+                            LuaType::Integer
+                                | LuaType::DocIntegerConst(_)
+                                | LuaType::IntegerConst(_)
+                        ) =>
+                    {
+                        true
+                    }
+                    Some(fields) => check_type_compact(db, fields, compact).is_ok(),
+                    None => false,
+                };
+                assert_eq!(
+                    check_type_compact(db, &LuaType::Ref(id.clone()), compact).is_ok(),
+                    built,
+                    "{name} against {compact:?}"
+                );
+            }
+        }
+    }
+
+    /// A named field the generic table's key type excludes is never in the
+    /// table: an optional one is met, a required one is not. A field the key
+    /// type admits must accept the value type.
+    #[test]
+    fn a_generic_table_meets_only_the_fields_its_key_type_admits() {
+        let mut ws = VirtualWorkspace::new();
+        let cases = [
+            ("{ foo?: string }", "table<integer, number>", true),
+            ("{ foo: number }", "table<integer, number>", false),
+            ("{ foo?: string }", "table<string, number>", false),
+            ("{ foo: number }", "table<string, number>", true),
+            ("{ foo?: string }", "table<'bar', number>", true),
+            ("{ foo: number }", "table<'bar', number>", false),
+            ("{ foo: number }", "table<'foo', number>", true),
+            ("{ foo?: string }", "table<'foo' | integer, number>", false),
+            ("{ bar?: string }", "table<'foo' | integer, number>", true),
+            ("{ [3]: number }", "table<1 | 2, number>", false),
+            ("{ [3]: string? }", "table<1 | 2, number>", true),
+            ("{ [2]: number }", "table<1 | 2, number>", true),
+            ("{ [2]: string }", "table<1 | 2, number>", false),
+        ];
+
+        let results = cases
+            .iter()
+            .map(|(object, table, _)| {
+                let object_ty = ws.ty(object);
+                let table_ty = ws.ty(table);
+                (*object, *table, ws.check_type(&object_ty, &table_ty))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results, cases);
     }
 }

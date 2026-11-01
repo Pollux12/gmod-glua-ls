@@ -63,4 +63,25 @@ mod test {
         let ty_desc = ws.humanize_type(ty);
         assert_eq!(ty_desc, "integer");
     }
+
+    #[test]
+    fn a_delayed_definition_leaves_the_next_name_of_its_statement_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+        ---@[lsp_optimization("delayed_definition")]
+        local config, other
+
+        function func()
+            A = other
+        end
+
+        config = 1
+        "#,
+        );
+
+        let ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(ty), "nil");
+    }
 }

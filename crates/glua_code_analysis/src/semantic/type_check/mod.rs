@@ -10,7 +10,7 @@ mod type_check_context;
 mod type_check_fail_reason;
 mod type_check_guard;
 
-use std::{collections::HashMap, ops::Deref};
+use rustc_hash::FxHashMap as HashMap;
 
 use complex_type::check_complex_type_compact;
 use func_type::{check_doc_func_type_compact, check_sig_type_compact};
@@ -33,6 +33,32 @@ pub use type_check_context::TypeCheckCheckLevel;
 // types can include body-specific literal returns and, for colon methods, `self`.
 fn is_structural_method_member(feature: Option<LuaMemberFeature>) -> bool {
     feature.is_some_and(|feature| feature.is_method_decl())
+}
+
+/// A member that exists only because something assigned to it is an addition to
+/// a value, not part of what the type requires a literal to supply.
+fn is_assignment_added_member(db: &DbIndex, property_owner_id: Option<&LuaSemanticDeclId>) -> bool {
+    let Some(LuaSemanticDeclId::Member(member_id)) = property_owner_id else {
+        return false;
+    };
+    db.get_member_index()
+        .get_member(member_id)
+        .is_some_and(crate::LuaMember::is_assignment_define)
+}
+
+/// Whether a literal that omits this member fails to satisfy the type.
+///
+/// Three things excuse an omission, and they are all exemptions from the same
+/// rule, so they are asked together: the member is declared optional, it was
+/// added by a runtime write rather than declared, or it documents a default.
+pub(super) fn member_is_required(
+    db: &DbIndex,
+    property_owner_id: Option<&LuaSemanticDeclId>,
+    member_type: &LuaType,
+) -> bool {
+    !member_type.is_optional()
+        && !is_assignment_added_member(db, property_owner_id)
+        && !member_has_documented_default(db, property_owner_id, Some(member_type))
 }
 
 // A documented default makes a member optional for presence only.
@@ -109,6 +135,25 @@ fn check_general_type_compact(
         return Ok(());
     }
 
+    // `never` is the bottom of the lattice: it holds no values, so there is no
+    // value it could fail to be. It is what narrowing produces where the
+    // analyzer's own picture is contradictory — `if a.x ~= nil` on a field it
+    // could only see as `nil` — and reporting a type error against code we
+    // believe unreachable says nothing about the source. Nor can a runtime
+    // guard recover it, since `never & T` is `never`.
+    //
+    // Only the value the caller asked about. A `never` *member* is a declared
+    // shape that contradicts itself (`integer & string`), which is worth
+    // reporting on its own merits.
+    //
+    // And only where the answer becomes a message. Inference asks the same
+    // question to *decide* things — which way a guard narrows, which member a
+    // `t[k]` read resolves to, how a generic binds — and there "no value can
+    // fail this" would read as "`never` matches anything".
+    if context.detail && compact_type.is_never() && check_guard.is_top_level() {
+        return Ok(());
+    }
+
     if fast_eq_check(source, compact_type) {
         return Ok(());
     }
@@ -135,8 +180,8 @@ fn check_general_type_compact(
         .allow_nullable_as_non_nullable
         && let LuaType::Union(union_type) = compact_type
     {
-        match union_type.deref() {
-            LuaUnionType::Nullable(non_nullable_type) => {
+        match union_type.nullable_inner() {
+            Some(non_nullable_type) => {
                 return check_general_type_compact(
                     context,
                     source,
@@ -144,9 +189,9 @@ fn check_general_type_compact(
                     check_guard.next_level()?,
                 );
             }
-            LuaUnionType::Multi(types) if types.contains(&LuaType::Nil) => {
-                let non_nil: Vec<LuaType> = types
-                    .iter()
+            None if union_type.types().any(|t| matches!(t, LuaType::Nil)) => {
+                let non_nil: Vec<LuaType> = union_type
+                    .types()
                     .filter(|t| !matches!(t, LuaType::Nil))
                     .cloned()
                     .collect();
@@ -156,7 +201,7 @@ fn check_general_type_compact(
                         .next()
                         .expect("non_nil has exactly 1 element")
                 } else {
-                    LuaType::Union(LuaUnionType::Multi(non_nil).into())
+                    LuaType::Union(LuaUnionType::from_multi_unchecked(non_nil).into())
                 };
                 return check_general_type_compact(
                     context,
@@ -170,6 +215,10 @@ fn check_general_type_compact(
     }
 
     if let LuaType::Union(union_type) = compact_type {
+        // A value that may be `any` is no more provably wrong than `any` itself.
+        if context.detail && union_type.types().any(LuaType::is_any) {
+            return Ok(());
+        }
         for compact_sub_type in union_type.types() {
             check_general_type_compact(
                 context,
@@ -264,7 +313,7 @@ fn check_general_type_compact(
             Err(TypeCheckFailReason::TypeNotMatch)
         }
         LuaType::Never => {
-            // never 只能赋值给 never
+            // never can only be assigned to never
             if compact_type.is_never() {
                 return Ok(());
             }
@@ -312,7 +361,7 @@ fn fast_eq_check(a: &LuaType, b: &LuaType) -> bool {
         | (LuaType::Any, LuaType::Any) => true,
         (LuaType::Ref(type_id_left), LuaType::Ref(type_id_right)) => type_id_left == type_id_right,
         (LuaType::Union(u), LuaType::Ref(type_id_right)) => {
-            if let LuaUnionType::Nullable(LuaType::Ref(type_id_left)) = u.deref() {
+            if let Some(LuaType::Ref(type_id_left)) = u.nullable_inner() {
                 return type_id_left == type_id_right;
             }
             false

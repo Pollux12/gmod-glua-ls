@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use glua_parser::{LuaAstPtr, LuaExpr, LuaNameToken, LuaSyntaxId};
 use internment::ArcIntern;
@@ -7,8 +7,7 @@ use smol_str::SmolStr;
 
 use crate::{
     AnalyzeError, AssignVarHint, AssignmentFlowInfo, BranchLabelInfo, DbIndex, FileId,
-    FileNarrowingCapability, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree,
-    LuaClosureId, LuaDeclId,
+    FileNarrowingCapability, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree, LuaDeclId,
 };
 
 /// Snapshot of the modification counters, used to detect what was created
@@ -23,11 +22,19 @@ pub struct ModificationSnapshot {
 }
 
 #[derive(Debug, Clone)]
-enum NarrowingEvent {
+enum NarrowingTarget {
     Name(ArcIntern<SmolStr>),
     IndexPath(ArcIntern<SmolStr>),
     OpaqueName,
     OpaqueIndex,
+}
+
+#[derive(Debug, Clone)]
+struct NarrowingEvent {
+    target: NarrowingTarget,
+    /// Recorded from a condition, which narrows its references without
+    /// writing them.
+    from_condition: bool,
 }
 
 #[derive(Debug)]
@@ -39,19 +46,29 @@ pub struct FlowBinder<'a> {
     /// immutable `&DbIndex`, enabling parallel per-file binding. The pipeline
     /// drains these into the diagnostic index sequentially afterward.
     pub errors: Vec<AnalyzeError>,
-    pub decl_bind_expr_ref: HashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
+    pub decl_bind_expr_ref: FxHashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
+    /// The call each never reassigned local was declared with: a condition reading
+    /// the local narrows what the call does.
+    pub call_initializers: FxHashMap<LuaDeclId, LuaExpr>,
     pub start: FlowId,
     pub unreachable: FlowId,
     pub loop_label: FlowId,
     pub break_target_label: FlowId,
+    /// Where a `continue` goes: the until condition entry of a repeat loop, unreachable in other loops.
+    pub continue_target_label: FlowId,
     pub true_target: FlowId,
     pub false_target: FlowId,
+    /// Whether the condition being bound already recorded its references,
+    /// which cover every operand an `and`/`or` binds as a condition of its own.
+    pub condition_refs_recorded: bool,
     flow_nodes: Vec<FlowNode>,
     multiple_antecedents: Vec<Vec<FlowId>>,
-    labels: HashMap<LuaClosureId, HashMap<SmolStr, FlowId>>,
+    /// Each block's labels by name, with where each is written.
+    labels: FxHashMap<LuaSyntaxId, FxHashMap<SmolStr, (FlowId, TextSize)>>,
     goto_stats: Vec<GotoCache>,
-    bindings: HashMap<LuaSyntaxId, FlowId>,
-    branch_label_info: HashMap<FlowId, BranchLabelInfo>,
+    bindings: FxHashMap<LuaSyntaxId, FlowId>,
+    branch_label_info: FxHashMap<FlowId, BranchLabelInfo>,
+    condition_label_entries: FxHashMap<FlowId, FlowId>,
     assignment_flow_info: Vec<AssignmentFlowInfo>,
     // Counters for tracking modifications inside branch blocks.
     name_assign_count: u32,
@@ -71,17 +88,21 @@ impl<'a> FlowBinder<'a> {
             errors: Vec::new(),
             flow_nodes: Vec::new(),
             multiple_antecedents: Vec::new(),
-            decl_bind_expr_ref: HashMap::new(),
-            labels: HashMap::new(),
+            decl_bind_expr_ref: FxHashMap::default(),
+            call_initializers: FxHashMap::default(),
+            labels: FxHashMap::default(),
             start: FlowId::default(),
             unreachable: FlowId::default(),
             break_target_label: FlowId::default(),
-            bindings: HashMap::new(),
+            continue_target_label: FlowId::default(),
+            bindings: FxHashMap::default(),
             goto_stats: Vec::new(),
             loop_label: FlowId::default(),
             true_target: FlowId::default(),
             false_target: FlowId::default(),
-            branch_label_info: HashMap::new(),
+            condition_refs_recorded: false,
+            branch_label_info: FxHashMap::default(),
+            condition_label_entries: FxHashMap::default(),
             assignment_flow_info: Vec::new(),
             name_assign_count: 0,
             index_assign_count: 0,
@@ -94,6 +115,7 @@ impl<'a> FlowBinder<'a> {
         binder.start = binder.create_start();
         binder.unreachable = binder.create_unreachable();
         binder.break_target_label = binder.unreachable;
+        binder.continue_target_label = binder.unreachable;
         binder.loop_label = binder.unreachable;
         binder.true_target = binder.unreachable;
         binder.false_target = binder.unreachable;
@@ -137,25 +159,39 @@ impl<'a> FlowBinder<'a> {
         self.create_node(FlowNodeKind::BranchLabel)
     }
 
+    /// A branch label reached only by the outcomes of a condition evaluated
+    /// from `entry`, so every arm it merges is a refinement of the values at
+    /// `entry`.
+    pub fn create_condition_label(&mut self, entry: FlowId) -> FlowId {
+        let label = self.create_branch_label();
+        self.condition_label_entries.insert(label, entry);
+        label
+    }
+
     pub fn create_loop_label(&mut self) -> FlowId {
         self.create_node(FlowNodeKind::LoopLabel)
     }
 
-    pub fn create_name_label(&mut self, name: &str, closure_id: LuaClosureId) -> FlowId {
-        let label_id = self.create_node(FlowNodeKind::NamedLabel(ArcIntern::from(SmolStr::new(
-            name,
-        ))));
+    /// A label named `name` written at `position` in `block`.
+    pub fn create_name_label(
+        &mut self,
+        name: &str,
+        block: LuaSyntaxId,
+        position: TextSize,
+    ) -> FlowId {
+        let label_id = self.create_node(FlowNodeKind::NamedLabel);
         self.labels
-            .entry(closure_id)
+            .entry(block)
             .or_default()
-            .insert(SmolStr::new(name), label_id);
+            .insert(SmolStr::new(name), (label_id, position));
 
         label_id
     }
 
-    pub fn get_label(&self, closure_id: LuaClosureId, name: &str) -> Option<FlowId> {
+    /// The label named `name` that `block` declares, with where it is written.
+    pub fn get_label(&self, block: LuaSyntaxId, name: &str) -> Option<(FlowId, TextSize)> {
         self.labels
-            .get(&closure_id)
+            .get(&block)
             .and_then(|labels| labels.get(name).copied())
     }
 
@@ -222,15 +258,8 @@ impl<'a> FlowBinder<'a> {
         self.bindings.get(&syntax_id).copied()
     }
 
-    pub fn cache_goto_flow(
-        &mut self,
-        closure_id: LuaClosureId,
-        label_token: LuaNameToken,
-        label: &str,
-        flow_id: FlowId,
-    ) {
+    pub fn cache_goto_flow(&mut self, label_token: LuaNameToken, label: &str, flow_id: FlowId) {
         self.goto_stats.push(GotoCache {
-            closure_id,
             label_token,
             label: SmolStr::new(label),
             flow_id,
@@ -272,23 +301,38 @@ impl<'a> FlowBinder<'a> {
         &self,
         snap: ModificationSnapshot,
     ) -> FileNarrowingCapability {
+        self.capability_since(snap, true)
+    }
+
+    /// Names and index paths written (assigned, cast, or defined as a
+    /// function) since `snap`, leaving out the ones conditions only narrow.
+    pub fn written_capability_since(&self, snap: ModificationSnapshot) -> FileNarrowingCapability {
+        self.capability_since(snap, false)
+    }
+
+    fn capability_since(
+        &self,
+        snap: ModificationSnapshot,
+        include_conditions: bool,
+    ) -> FileNarrowingCapability {
         let mut capability = FileNarrowingCapability::default();
         for event in self
             .narrowing_events
             .iter()
             .skip(snap.narrowing_event_count)
+            .filter(|event| include_conditions || !event.from_condition)
         {
-            match event {
-                NarrowingEvent::Name(name) => {
+            match &event.target {
+                NarrowingTarget::Name(name) => {
                     capability.referenced_names.insert(name.clone());
                 }
-                NarrowingEvent::IndexPath(path) => {
+                NarrowingTarget::IndexPath(path) => {
                     capability.referenced_index_paths.insert(path.clone());
                 }
-                NarrowingEvent::OpaqueName => {
+                NarrowingTarget::OpaqueName => {
                     capability.has_opaque_name_target = true;
                 }
-                NarrowingEvent::OpaqueIndex => {
+                NarrowingTarget::OpaqueIndex => {
                     capability.has_opaque_index_target = true;
                 }
             }
@@ -316,87 +360,136 @@ impl<'a> FlowBinder<'a> {
     /// Record a bare name that can be narrowed at some site (assignment target,
     /// cast, or condition expression).
     pub fn record_narrowable_name(&mut self, name: &str) {
-        let name = ArcIntern::from(SmolStr::new(name));
-        self.narrowing_capability
-            .referenced_names
-            .insert(name.clone());
-        self.narrowing_events.push(NarrowingEvent::Name(name));
+        self.record_name(name, false);
     }
 
     /// Record an index access path that can be narrowed.
     pub fn record_narrowable_index_path(&mut self, path: &str) {
-        let path = ArcIntern::from(SmolStr::new(path));
-        self.narrowing_capability
-            .referenced_index_paths
-            .insert(path.clone());
-        self.narrowing_events.push(NarrowingEvent::IndexPath(path));
+        self.record_index_path(path, false);
     }
 
     pub fn mark_opaque_name_target(&mut self) {
-        self.narrowing_capability.has_opaque_name_target = true;
-        self.narrowing_events.push(NarrowingEvent::OpaqueName);
+        self.record_opaque_name(false);
     }
 
     pub fn mark_opaque_index_target(&mut self) {
-        self.narrowing_capability.has_opaque_index_target = true;
-        self.narrowing_events.push(NarrowingEvent::OpaqueIndex);
+        self.record_opaque_index(false);
     }
 
     /// Walk an expression subtree and record every name / index access path it
     /// references as narrowable. Used for cast expressions.
     pub fn record_narrowable_refs_in_expr(&mut self, expr: &LuaExpr) {
-        self.record_narrowable_refs(expr);
+        self.record_narrowable_refs(expr, false);
     }
 
-    /// Record condition references separately from assignment and cast targets.
+    /// Record condition references separately from assignment and cast targets,
+    /// with what the call each local the condition reads was declared with can
+    /// narrow: its arguments and the receiver of a method call.
     pub fn record_condition_refs_in_expr(&mut self, expr: &LuaExpr) {
-        self.record_narrowable_refs(expr);
-    }
-
-    pub fn record_condition_flow_paths(&mut self, flow_id: FlowId, expr: &LuaExpr) {
-        use glua_parser::{LuaAstNode, LuaIndexExpr, PathTrait};
-
-        for index_expr in expr.syntax().descendants().filter_map(LuaIndexExpr::cast) {
-            let dynamic = matches!(
-                index_expr.get_index_key(),
-                Some(glua_parser::LuaIndexKey::Expr(_))
-            );
-            if let Some(path) = index_expr.get_access_path().filter(|_| !dynamic) {
-                self.narrowing_capability
-                    .condition_flows_by_path
-                    .entry(ArcIntern::from(SmolStr::new(path)))
-                    .or_default()
-                    .insert(flow_id);
+        let mut pending = vec![expr.clone()];
+        let mut expanded = FxHashSet::default();
+        while let Some(expr) = pending.pop() {
+            for decl_id in self.record_narrowable_refs(&expr, true) {
+                if !expanded.insert(decl_id) {
+                    continue;
+                }
+                let Some(LuaExpr::CallExpr(call)) = self.call_initializers.get(&decl_id) else {
+                    continue;
+                };
+                pending.extend(
+                    call.get_args_list()
+                        .into_iter()
+                        .flat_map(|args| args.get_args()),
+                );
+                if call.is_colon_call()
+                    && let Some(LuaExpr::IndexExpr(method)) = call.get_prefix_expr()
+                    && let Some(receiver) = method.get_prefix_expr()
+                {
+                    pending.push(receiver);
+                }
             }
         }
     }
 
-    fn record_narrowable_refs(&mut self, expr: &LuaExpr) {
-        use glua_parser::{LuaAstNode, LuaIndexExpr, LuaNameExpr, PathTrait};
+    fn record_name(&mut self, name: &str, from_condition: bool) {
+        let name = crate::db_index::intern_smol_str(name);
+        self.narrowing_capability
+            .referenced_names
+            .insert(name.clone());
+        self.push_narrowing_event(NarrowingTarget::Name(name), from_condition);
+    }
+
+    fn record_index_path(&mut self, path: &str, from_condition: bool) {
+        let path = crate::db_index::intern_smol_str(path);
+        self.narrowing_capability
+            .referenced_index_paths
+            .insert(path.clone());
+        self.push_narrowing_event(NarrowingTarget::IndexPath(path), from_condition);
+    }
+
+    fn record_opaque_name(&mut self, from_condition: bool) {
+        self.narrowing_capability.has_opaque_name_target = true;
+        self.push_narrowing_event(NarrowingTarget::OpaqueName, from_condition);
+    }
+
+    fn record_opaque_index(&mut self, from_condition: bool) {
+        self.narrowing_capability.has_opaque_index_target = true;
+        self.push_narrowing_event(NarrowingTarget::OpaqueIndex, from_condition);
+    }
+
+    fn push_narrowing_event(&mut self, target: NarrowingTarget, from_condition: bool) {
+        self.narrowing_events.push(NarrowingEvent {
+            target,
+            from_condition,
+        });
+    }
+
+    /// Records the names and paths `expr` references, returning the locals it reads
+    /// that were declared with a call.
+    fn record_narrowable_refs(&mut self, expr: &LuaExpr, from_condition: bool) -> Vec<LuaDeclId> {
+        use glua_parser::{LuaAstNode, LuaCallExpr, LuaIndexExpr, LuaNameExpr, PathTrait};
         // Record the expr itself if it is a name or index, then recurse into
         // descendants to cover nested references (e.g. `a.b and c(d.e)`).
+        let mut call_locals = Vec::new();
         for node in expr.syntax().descendants() {
             if let Some(name_expr) = LuaNameExpr::cast(node.clone()) {
                 if let Some(name) = name_expr.get_name_text() {
-                    self.record_narrowable_name(&name);
+                    self.record_name(&name, from_condition);
                 } else {
-                    self.mark_opaque_name_target();
+                    self.record_opaque_name(from_condition);
+                }
+                if from_condition
+                    && let Some(decl_id) = self
+                        .db
+                        .get_reference_index()
+                        .get_var_reference_decl(&self.file_id, name_expr.get_range())
+                        .filter(|decl_id| self.call_initializers.contains_key(decl_id))
+                {
+                    call_locals.push(decl_id);
+                }
+            } else if let Some(call) = LuaCallExpr::cast(node.clone()) {
+                if let Some(path) = crate::semantic::getter_access_path(&LuaExpr::CallExpr(call)) {
+                    self.record_index_path(&path, from_condition);
                 }
             } else if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
                 let dynamic = matches!(
                     index_expr.get_index_key(),
                     Some(glua_parser::LuaIndexKey::Expr(_))
                 );
-                match index_expr.get_access_path() {
+                match crate::semantic::getter_access_path(&LuaExpr::IndexExpr(index_expr.clone()))
+                    .map(smol_str::SmolStr::new)
+                    .or_else(|| index_expr.get_access_path())
+                {
                     Some(path) if !dynamic => {
-                        self.record_narrowable_index_path(&path);
+                        self.record_index_path(&path, from_condition);
                     }
                     _ => {
-                        self.mark_opaque_index_target();
+                        self.record_opaque_index(from_condition);
                     }
                 }
             }
         }
+        call_locals
     }
 
     pub fn finish(self) -> (FlowTree, Vec<AnalyzeError>) {
@@ -407,6 +500,7 @@ impl<'a> FlowBinder<'a> {
             // self.labels,
             self.bindings,
             self.branch_label_info,
+            self.condition_label_entries,
             self.assignment_flow_info,
             self.narrowing_capability,
         );
@@ -416,7 +510,6 @@ impl<'a> FlowBinder<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GotoCache {
-    pub closure_id: LuaClosureId,
     pub label_token: LuaNameToken,
     pub label: SmolStr,
     pub flow_id: FlowId,

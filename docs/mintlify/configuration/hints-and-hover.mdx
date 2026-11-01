@@ -1,152 +1,36 @@
 ---
-title: "Hints & Hover Settings"
-description: Configure inlay hints, inline values, hover documentation, semantic tokens, and signature help.
+title: Hints and hover settings
+description: Inlay hints, hover, code lens, highlighting and color pickers.
 ---
 
-import ConfigTip from "/snippets/config-tip.mdx"
+These are display settings, so many people set them in VS Code settings (`gluals.*`) instead of `.gluarc.json`. Set `gluals.hint.enable` to `false` to turn all inlay hints off at once.
 
-## Overview
+## Inlay hints
 
-These settings control editor hints, hover documentation, and semantic syntax highlighting.
+Inlay hints are the small grey labels shown inside your code.
 
----
+| Option | Default | Shows |
+|---|---|---|
+| `hint.paramHint` | `true` | Parameter names next to call arguments |
+| `hint.localHint` | `true` | The type of each local variable |
+| `hint.enumParamHint` | `true` | The enum name for a number passed where an enum is expected, such as `MASK_SOLID` |
+| `hint.indexHint` | `true` | Names for numbered table entries |
+| `hint.overrideHint` | `true` | A marker on methods that override a base class method |
+| `hint.metaCallHint` | `true` | A marker on calls to tables that have a `__call` function in their metatable |
+| `hint.closingEndHint` | `true` | The function name after the `end` of a long function |
+| `hint.closingEndHintControlFlow` | `false` | The same for `if`, `for`, `while` and `do` blocks |
+| `hint.closingEndHintMinLines` | `15` | How many lines a block needs before it gets an `end` hint |
 
-## Inlay hints (`hint.*`)
+## Editor features
 
-Inlay hints show inline type and name annotations beside your code.
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `hint.paramHint` | `boolean` | `true` | Show parameter names next to call arguments |
-| `hint.localHint` | `boolean` | `true` | Show inferred types next to local variable declarations |
-| `hint.indexHint` | `boolean` | `true` | Show named indexes for array table entries |
-| `hint.overrideHint` | `boolean` | `true` | Show which base-class method a function overrides |
-| `hint.metaCallHint` | `boolean` | `true` | Show `__call` metamethod hints |
-| `hint.enumParamHint` | `boolean` | `true` | Show enum member names next to literal integer arguments |
-| `hint.closingEndHint` | `boolean` | `true` | Show `-- end FunctionName` hints after closing `end` keywords |
-| `hint.closingEndHintControlFlow` | `boolean` | `false` | Also show closing end hints for `if`, `while`, `do`, `for` blocks |
-| `hint.closingEndHintMinLines` | `integer` | `15` | Minimum number of lines a block must span before a closing hint appears |
-
-### Inlay hint examples
-
-**Parameter hints:**
-```lua
-Entity:SetPos(vec3(0, 0, 0))
---           ^ pos: Vector
-```
-
-**Local hints:**
-```lua
-local ply = game.GetWorld()
---    ^ : Entity
-```
-
-**Closing end hints:**
-```lua
-function GAMEMODE:PlayerSpawn(ply)
-    -- ... 15 lines of code ...
-end -- PlayerSpawn
-```
-
----
-
-## Inline values (`inlineValues.*`)
-
-Inline values show variable contents during a debug session, overlaid on the source code.
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `inlineValues.enable` | `boolean` | `true` | Show variable values inline during debugging |
-
----
-
-## Hover (`hover.*`)
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `hover.enable` | `boolean` | `true` | Enable hover documentation |
-
-Hover documentation shows:
-- Type signatures and docs for functions, fields, and classes
-- Realm badge (client/shared/server) for GMod API symbols
-- `@deprecated` messages for deprecated symbols
-- `@see` cross-references
-- Inline **+**/**−** verbosity buttons for classes with many members — click **+** to show more members, **−** to show fewer
-
----
-
-## Semantic tokens (`semanticTokens.*`)
-
-Semantic tokens provide syntax highlighting based on type analysis. GLuaLS colors variables by role, such as local, global, field, or method, instead of lexical category.
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `semanticTokens.enable` | `boolean` | `true` | Enable semantic syntax highlighting |
-| `semanticTokens.renderDocumentationMarkup` | `boolean` | `true` | Render Markdown in annotation documentation (e.g., in hover popups) |
-
----
-
-
-
-## Code lens (`codeLens.*`)
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `codeLens.enable` | `boolean` | `true` | Enable code lens actions (references, override links, VGUI parent links) |
-
----
-
-## Code action (`codeAction.*`)
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `codeAction.insertSpace` | `boolean` | `false` | Add a space after `---` when inserting `@diagnostic disable-next-line` via a code action |
-
----
-
-## VS Code extension settings
-
-You can also configure these settings in VS Code settings with the `gluals.*` prefix:
-
-| VS Code setting | .gluarc.json key | Type | Default | Description |
-|---|---|---|---|---|
-| `gluals.hint.enable` | All `hint.*` settings | `boolean \| null` | `null` | Enable or disable all inlay hints |
-| `gluals.hint.paramHint` | `hint.paramHint` | `boolean` | `true` | Parameter name hints |
-| `gluals.hint.localHint` | `hint.localHint` | `boolean` | `true` | Local variable type hints |
-| `gluals.hint.indexHint` | `hint.indexHint` | `boolean` | `true` | Named array index hints |
-| `gluals.hint.overrideHint` | `hint.overrideHint` | `boolean` | `true` | Override hints for base class methods |
-| `gluals.hint.metaCallHint` | `hint.metaCallHint` | `boolean` | `true` | `__call` meta method hints |
-| `gluals.hint.enumParamHint` | `hint.enumParamHint` | `boolean` | `true` | Enum parameter name hints |
-| `gluals.hint.closingEndHint` | `hint.closingEndHint` | `boolean` | `true` | Block end labels |
-| `gluals.hint.closingEndHintControlFlow` | `hint.closingEndHintControlFlow` | `boolean` | `false` | Control flow end labels |
-| `gluals.hint.closingEndHintMinLines` | `hint.closingEndHintMinLines` | `integer` | `15` | Minimum lines for end hints |
-| `gluals.inlineValues.enable` | `inlineValues.enable` | `boolean` | `true` | Inline debug values |
-| `gluals.hover.enable` | `hover.enable` | `boolean` | `true` | Enable hover documentation |
-| `gluals.semanticTokens.enable` | `semanticTokens.enable` | `boolean` | `true` | Enable semantic tokens |
-| `gluals.codeLens.enable` | `codeLens.enable` | `boolean` | `true` | Enable code lens |
-| `gluals.documentColor.enable` | `documentColor.enable` | `boolean` | `true` | Color picker for color strings |
-
----
-
-## Full example
-
-<ConfigTip />
-```json .gluarc.json
-{
-  "hint": {
-    "paramHint": true,
-    "localHint": false,
-    "closingEndHint": true,
-    "closingEndHintMinLines": 15
-  },
-  "hover": {
-    "enable": true
-  },
-  "semanticTokens": {
-    "enable": true
-  },
-  "codeLens": {
-    "enable": true
-  }
-}
-```
+| Option | Default | Description |
+|---|---|---|
+| `hover.enable` | `true` | Documentation when you hover code |
+| `codeLens.enable` | `true` | Reference counts and links shown above functions |
+| `semanticTokens.enable` | `true` | Coloring based on what each name is, such as global, local or field |
+| `semanticTokens.renderDocumentationMarkup` | `true` | Render Markdown in documentation |
+| `inlineValues.enable` | `true` | Variable values shown in the editor while the debugger is paused |
+| `documentColor.enable` | `true` | Color previews and a color picker for `Color(...)` calls |
+| `references.enable` | `true` | **Find All References** |
+| `references.fuzzySearch` | `true` | Fall back to a looser search when nothing is found |
+| `references.shortStringSearch` | `false` | Also search inside strings |

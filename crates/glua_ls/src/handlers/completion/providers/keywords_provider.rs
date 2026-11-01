@@ -35,7 +35,7 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
     Some(())
 }
 
-/// 处理中文输入法下输入完整单词的情况
+/// Handles typing a complete word with a Chinese input method
 fn is_full_match_keyword(builder: &mut CompletionBuilder) -> Option<()> {
     match builder.trigger_token.kind() {
         LuaKind::Token(LuaTokenKind::TkIf) => Some(()),
@@ -135,7 +135,7 @@ fn add_expr_keyword_completions(builder: &mut CompletionBuilder) -> Option<()> {
 }
 
 fn add_function_keyword_completions(builder: &mut CompletionBuilder) -> Option<()> {
-    // 非主动补全不添加
+    // Not added for non-explicit completion
     if !builder.is_invoked() {
         return None;
     }
@@ -145,7 +145,7 @@ fn add_function_keyword_completions(builder: &mut CompletionBuilder) -> Option<(
         insert_text: Some("function ${1:name}(${2:})\n\t${0}\nend".to_string()),
         insert_text_format: Some(InsertTextFormat::SNIPPET),
         insert_text_mode: Some(InsertTextMode::ADJUST_INDENTATION),
-        sort_text: Some("0000".to_string()), // 优先级较高
+        sort_text: Some("0000".to_string()), // Higher priority
         ..CompletionItem::default()
     };
 

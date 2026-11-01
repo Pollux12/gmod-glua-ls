@@ -11,13 +11,14 @@ impl Checker for AnalyzeErrorChecker {
     ];
 
     fn check(context: &mut DiagnosticContext, _: &SemanticModel) {
-        let db = context.get_db();
         let file_id = context.get_file_id();
-        let diagnostic_index = db.get_diagnostic_index();
-        let Some(diagnostics) = diagnostic_index.get_diagnostics(&file_id) else {
-            return;
+        let errors = {
+            let db = context.get_db();
+            let Some(diagnostics) = db.get_diagnostic_index().get_diagnostics(&file_id) else {
+                return;
+            };
+            diagnostics.to_vec()
         };
-        let errors = diagnostics.to_vec();
         for error in errors {
             context.add_diagnostic(error.kind, error.range, error.message, None);
         }

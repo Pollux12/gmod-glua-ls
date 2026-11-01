@@ -46,16 +46,18 @@ mod unnecessary_if;
 mod unused;
 
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaChunk, LuaClosureExpr, LuaComment,
-    LuaExpr, LuaIndexExpr, LuaReturnStat, LuaStat, LuaSyntaxKind, LuaSyntaxNode,
+    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaBlock, LuaCallExpr,
+    LuaCallExprStat, LuaChunk, LuaClosureExpr, LuaComment, LuaDocTag, LuaDocTagAttributeUse,
+    LuaDocTagClass, LuaDocTagOther, LuaExpr, LuaIfStat, LuaIndexExpr, LuaLocalStat, LuaNameExpr,
+    LuaReturnStat, LuaStat, LuaSyntaxKind, LuaSyntaxNode, LuaTableExpr, LuaTableField,
+    UnaryOperator,
 };
 use lsp_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
 use rowan::{TextRange, TextSize};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-
-use rustc_hash::FxHashMap;
 
 use crate::{
     FileId, LuaSemanticDeclId, LuaType, LuaTypeDeclId, RenderLevel, SemanticDeclLevel, WorkspaceId,
@@ -68,19 +70,16 @@ use super::{
     lua_diagnostic_config::LuaDiagnosticConfig,
 };
 
-pub use await_in_sync::{PrecomputedAwaitCandidates, precompute_await_candidates};
-pub use discard_returns::{PrecomputedNoDiscardCandidates, precompute_nodiscard_candidates};
 pub use gmod_network::SortedSendFlowCache;
 pub use gmod_network::precompute_sorted_send_flows;
-pub use gmod_realm_misuse::AnnotatedRealmRange;
-pub use gmod_realm_misuse::GmMethodRealmMap;
-pub use gmod_realm_misuse::PrecomputedCalleeRealmMap;
-pub use gmod_realm_misuse::PrecomputedRealmCallCandidates;
-pub(crate) use gmod_realm_misuse::collect_decl_annotation_realms_for_file_precompute;
-pub use gmod_realm_misuse::precompute_callee_realm_data_for_workspace;
-pub use gmod_realm_misuse::precompute_gm_method_realms;
-pub use missing_fields::precompute_missing_required_fields;
-pub use param_type_check::{PrecomputedParamTypeCandidates, precompute_param_type_candidates};
+pub use gmod_realm_misuse::{
+    FileCalleeRealms, FileRealmAccessPaths, GmMethodRealmMap, PrecomputedCalleeRealmMap,
+    PrecomputedRealmCallCandidates, fold_gm_method_realms, gm_method_realm_annotations,
+    resolve_file_callee_realms,
+};
+pub use missing_fields::{
+    OwnFieldRequirements, fold_required_fields, own_field_requirements, own_fields_owner,
+};
 pub use property_name_candidates::{
     PrecomputedPropertyNameCandidates, precompute_property_name_candidates,
 };
@@ -93,6 +92,229 @@ pub type AssignmentPrefixEvents = HashMap<AssignmentPrefixKey, Vec<AssignmentPre
 pub struct AssignmentPrefixEvent {
     pub offset: TextSize,
     pub is_table_literal: bool,
+}
+
+/// Per-file syntax nodes bucketed by kind in a single preorder walk.
+///
+/// Every `descendants::<T>()` filter over the file root visits the whole
+/// tree; with ~45 such walks per file that dominates diagnostics CPU.
+/// `build_file_node_buckets` performs exactly one `descendants::<LuaAst>()`
+/// walk and fans each node out to its typed buckets, all in source order, so
+/// checkers iterate slices instead of re-walking.
+///
+/// Fidelity: each bucket holds exactly what the corresponding
+/// `descendants::<T>()` walk would yield, because both go through the same
+/// `T::cast` on the same nodes in the same preorder. Two node classes are
+/// invisible to `LuaAst::cast` and therefore absent here: `EmptyStat` nodes
+/// (no `LuaAst` variant) and `DocTagVisibility` nodes (no `LuaAst` variant).
+/// Both fall into `_ => {}` arms in the only checkers walking those kinds
+/// (`UnbalancedAssignments`, `DuplicateType`), so no diagnostic changes.
+#[derive(Debug, Default)]
+pub struct FileNodeBuckets {
+    pub all_nodes: Vec<LuaAst>,
+    pub call_exprs: Vec<LuaCallExpr>,
+    pub assign_stats: Vec<LuaAssignStat>,
+    pub local_stats: Vec<LuaLocalStat>,
+    pub closure_exprs: Vec<LuaClosureExpr>,
+    pub name_exprs: Vec<LuaNameExpr>,
+    pub if_stats: Vec<LuaIfStat>,
+    pub table_exprs: Vec<LuaTableExpr>,
+    pub table_fields: Vec<LuaTableField>,
+    pub binary_exprs: Vec<LuaBinaryExpr>,
+    pub blocks: Vec<LuaBlock>,
+    pub call_expr_stats: Vec<LuaCallExprStat>,
+    pub doc_tag_classes: Vec<LuaDocTagClass>,
+    pub statements: Vec<LuaStat>,
+    pub exprs: Vec<LuaExpr>,
+    pub doc_tags: Vec<LuaDocTag>,
+    pub doc_tag_others: Vec<LuaDocTagOther>,
+    pub doc_tag_attribute_uses: Vec<LuaDocTagAttributeUse>,
+}
+
+pub fn build_file_node_buckets(root: &LuaChunk) -> FileNodeBuckets {
+    let mut buckets = FileNodeBuckets::default();
+    for node in root.descendants::<LuaAst>() {
+        push_file_node(&mut buckets, &node);
+        buckets.all_nodes.push(node);
+    }
+    buckets
+}
+
+fn push_file_node(buckets: &mut FileNodeBuckets, node: &LuaAst) {
+    match node {
+        LuaAst::LuaCallExpr(call_expr) => {
+            buckets.call_exprs.push(call_expr.clone());
+            buckets.exprs.push(LuaExpr::CallExpr(call_expr.clone()));
+        }
+        LuaAst::LuaTableExpr(table_expr) => {
+            buckets.table_exprs.push(table_expr.clone());
+            buckets.exprs.push(LuaExpr::TableExpr(table_expr.clone()));
+        }
+        LuaAst::LuaLiteralExpr(literal_expr) => {
+            buckets
+                .exprs
+                .push(LuaExpr::LiteralExpr(literal_expr.clone()));
+        }
+        LuaAst::LuaBinaryExpr(binary_expr) => {
+            buckets.binary_exprs.push(binary_expr.clone());
+            buckets.exprs.push(LuaExpr::BinaryExpr(binary_expr.clone()));
+        }
+        LuaAst::LuaUnaryExpr(unary_expr) => {
+            buckets.exprs.push(LuaExpr::UnaryExpr(unary_expr.clone()));
+        }
+        LuaAst::LuaClosureExpr(closure_expr) => {
+            buckets.closure_exprs.push(closure_expr.clone());
+            buckets
+                .exprs
+                .push(LuaExpr::ClosureExpr(closure_expr.clone()));
+        }
+        LuaAst::LuaParenExpr(paren_expr) => {
+            buckets.exprs.push(LuaExpr::ParenExpr(paren_expr.clone()));
+        }
+        LuaAst::LuaNameExpr(name_expr) => {
+            buckets.name_exprs.push(name_expr.clone());
+            buckets.exprs.push(LuaExpr::NameExpr(name_expr.clone()));
+        }
+        LuaAst::LuaIndexExpr(index_expr) => {
+            buckets.exprs.push(LuaExpr::IndexExpr(index_expr.clone()));
+        }
+        LuaAst::LuaLocalStat(local_stat) => {
+            buckets.local_stats.push(local_stat.clone());
+            buckets
+                .statements
+                .push(LuaStat::LocalStat(local_stat.clone()));
+        }
+        LuaAst::LuaAssignStat(assign_stat) => {
+            buckets.assign_stats.push(assign_stat.clone());
+            buckets
+                .statements
+                .push(LuaStat::AssignStat(assign_stat.clone()));
+        }
+        LuaAst::LuaCallExprStat(call_stat) => {
+            buckets.call_expr_stats.push(call_stat.clone());
+            buckets
+                .statements
+                .push(LuaStat::CallExprStat(call_stat.clone()));
+        }
+        LuaAst::LuaFuncStat(func_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::FuncStat(func_stat.clone()));
+        }
+        LuaAst::LuaLocalFuncStat(local_func_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::LocalFuncStat(local_func_stat.clone()));
+        }
+        LuaAst::LuaIfStat(if_stat) => {
+            buckets.if_stats.push(if_stat.clone());
+            buckets.statements.push(LuaStat::IfStat(if_stat.clone()));
+        }
+        LuaAst::LuaWhileStat(while_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::WhileStat(while_stat.clone()));
+        }
+        LuaAst::LuaDoStat(do_stat) => {
+            buckets.statements.push(LuaStat::DoStat(do_stat.clone()));
+        }
+        LuaAst::LuaForStat(for_stat) => {
+            buckets.statements.push(LuaStat::ForStat(for_stat.clone()));
+        }
+        LuaAst::LuaForRangeStat(for_range_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::ForRangeStat(for_range_stat.clone()));
+        }
+        LuaAst::LuaRepeatStat(repeat_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::RepeatStat(repeat_stat.clone()));
+        }
+        LuaAst::LuaBreakStat(break_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::BreakStat(break_stat.clone()));
+        }
+        LuaAst::LuaReturnStat(return_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::ReturnStat(return_stat.clone()));
+        }
+        LuaAst::LuaGotoStat(goto_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::GotoStat(goto_stat.clone()));
+        }
+        LuaAst::LuaLabelStat(label_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::LabelStat(label_stat.clone()));
+        }
+        LuaAst::LuaGlobalStat(global_stat) => {
+            buckets
+                .statements
+                .push(LuaStat::GlobalStat(global_stat.clone()));
+        }
+        LuaAst::LuaBlock(block) => {
+            buckets.blocks.push(block.clone());
+        }
+        LuaAst::LuaTableField(field) => {
+            buckets.table_fields.push(field.clone());
+        }
+        LuaAst::LuaDocTagClass(class_tag) => {
+            buckets.doc_tag_classes.push(class_tag.clone());
+            buckets.doc_tags.push(LuaDocTag::Class(class_tag.clone()));
+        }
+        LuaAst::LuaDocTagOther(other_tag) => {
+            buckets.doc_tag_others.push(other_tag.clone());
+            buckets.doc_tags.push(LuaDocTag::Other(other_tag.clone()));
+        }
+        LuaAst::LuaDocTagAttributeUse(attribute_use) => {
+            buckets.doc_tag_attribute_uses.push(attribute_use.clone());
+            buckets
+                .doc_tags
+                .push(LuaDocTag::AttributeUse(attribute_use.clone()));
+        }
+        LuaAst::LuaDocTagEnum(_)
+        | LuaAst::LuaDocTagAlias(_)
+        | LuaAst::LuaDocTagAttribute(_)
+        | LuaAst::LuaDocTagType(_)
+        | LuaAst::LuaDocTagParam(_)
+        | LuaAst::LuaDocTagReturn(_)
+        | LuaAst::LuaDocTagOverload(_)
+        | LuaAst::LuaDocTagField(_)
+        | LuaAst::LuaDocTagModule(_)
+        | LuaAst::LuaDocTagSee(_)
+        | LuaAst::LuaDocTagDiagnostic(_)
+        | LuaAst::LuaDocTagDeprecated(_)
+        | LuaAst::LuaDocTagVersion(_)
+        | LuaAst::LuaDocTagCast(_)
+        | LuaAst::LuaDocTagSource(_)
+        | LuaAst::LuaDocTagSchema(_)
+        | LuaAst::LuaDocTagNamespace(_)
+        | LuaAst::LuaDocTagUsing(_)
+        | LuaAst::LuaDocTagMeta(_)
+        | LuaAst::LuaDocTagRealm(_)
+        | LuaAst::LuaDocTagNodiscard(_)
+        | LuaAst::LuaDocTagReadonly(_)
+        | LuaAst::LuaDocTagOperator(_)
+        | LuaAst::LuaDocTagGeneric(_)
+        | LuaAst::LuaDocTagAsync(_)
+        | LuaAst::LuaDocTagAs(_)
+        | LuaAst::LuaDocTagReturnCast(_)
+        | LuaAst::LuaDocTagExport(_)
+        | LuaAst::LuaDocTagLanguage(_)
+        | LuaAst::LuaDocTagFileparam(_)
+        | LuaAst::LuaDocTagOutparam(_) => {
+            // Delegate to `LuaDocTag::cast` so this bucket mirrors
+            // `descendants::<LuaDocTag>()` exactly.
+            if let Some(tag) = LuaDocTag::cast(node.syntax().clone()) {
+                buckets.doc_tags.push(tag);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub trait Checker {
@@ -111,6 +333,40 @@ fn checker_file_label(context: &DiagnosticContext, semantic_model: &SemanticMode
         .get_file_path(&file_id)
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| format!("{file_id:?}"))
+}
+
+thread_local! {
+    /// Under `GLUALS_PROFILE_PHASE`: each checker's time on the file being diagnosed.
+    static FILE_CHECKER_TIMES: std::cell::RefCell<Vec<(&'static str, std::time::Duration)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Under `GLUALS_PROFILE_PHASE`: prints one file's diagnose wall and CPU time
+/// and its three slowest checkers, then clears this thread's checker times.
+pub fn report_file_profile(
+    path: &str,
+    elapsed: std::time::Duration,
+    cpu: Option<std::time::Duration>,
+) {
+    let mut times = FILE_CHECKER_TIMES.with_borrow_mut(std::mem::take);
+    times.sort_unstable_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(right.0)));
+    let top = times
+        .iter()
+        .take(3)
+        .map(|(name, time)| {
+            let name = name.rsplit("::").next().unwrap_or(name);
+            format!("{name}={:.1}", time.as_secs_f64() * 1000.0)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cpu = cpu.map_or_else(
+        || "-".to_string(),
+        |cpu| format!("{:.3}", cpu.as_secs_f64() * 1000.0),
+    );
+    eprintln!(
+        "[diagfile] {:>9.3}ms cpu={cpu}ms {path} | {top}",
+        elapsed.as_secs_f64() * 1000.0
+    );
 }
 
 fn run_check<T: Checker>(
@@ -135,7 +391,8 @@ fn run_check<T: Checker>(
             );
         }
 
-        if !log::log_enabled!(log::Level::Info) {
+        let profiling = crate::profile::phase_enabled();
+        if !profiling && !log::log_enabled!(log::Level::Info) {
             T::check(context, semantic_model);
             return;
         }
@@ -143,7 +400,12 @@ fn run_check<T: Checker>(
         let start = std::time::Instant::now();
         T::check(context, semantic_model);
         let elapsed = start.elapsed();
-        if elapsed.as_millis() > 5 {
+        if profiling {
+            FILE_CHECKER_TIMES.with_borrow_mut(|times| {
+                times.push((std::any::type_name::<T>(), elapsed));
+            });
+        }
+        if log::log_enabled!(log::Level::Info) && elapsed.as_millis() > 5 {
             let name = T::CODES
                 .iter()
                 .map(|c| c.get_name())
@@ -276,8 +538,6 @@ pub fn check_file(
 /// Precomputed data shared across all diagnostic files in a batch run.
 /// Computing this once instead of per-file saves ~60s on large workspaces.
 pub struct SharedDiagnosticData {
-    /// Main-workspace file IDs sorted by stable FileId order.
-    pub workspace_file_ids: Arc<Vec<FileId>>,
     /// Maps workspace_id -> precomputed GM method realm annotations.
     /// GmodRealmMisuseChecker uses this to avoid re-scanning all annotations per file.
     pub gm_method_realms: HashMap<WorkspaceId, Arc<GmMethodRealmMap>>,
@@ -288,17 +548,8 @@ pub struct SharedDiagnosticData {
         HashMap<WorkspaceId, Arc<PrecomputedRealmCallCandidates>>,
     /// Required non-method fields for each type declaration, including inherited fields.
     pub missing_required_fields: Arc<PrecomputedMissingRequiredFields>,
-    /// Whether any indexed signature/type cache can produce an async callable.
-    pub await_candidates: Arc<PrecomputedAwaitCandidates>,
-    /// Static callee names whose callable metadata has parameter types worth checking.
-    pub param_type_candidates: Arc<PrecomputedParamTypeCandidates>,
-    /// Static callee names whose signatures are marked @nodiscard.
-    pub nodiscard_candidates: Arc<PrecomputedNoDiscardCandidates>,
     /// Names the deprecated, readonly and visibility checkers could report on.
     pub property_name_candidates: Arc<PrecomputedPropertyNameCandidates>,
-    /// Precomputed declaration annotation realms for all workspace files.
-    /// Avoids re-scanning syntax trees for @realm annotations per file.
-    pub decl_annotation_realms: Arc<FxHashMap<FileId, Vec<AnnotatedRealmRange>>>,
     /// Precomputed sorted send flows by message name. Built once per batch
     /// run instead of per-file, avoiding repeated VFS path lookups and sorts.
     pub sorted_send_flows: Arc<SortedSendFlowCache>,
@@ -312,6 +563,8 @@ pub struct DiagnosticContext<'a> {
     cancel_token: CancellationToken,
     shared_data: Option<Arc<SharedDiagnosticData>>,
     assignment_prefix_events: Option<Arc<AssignmentPrefixEvents>>,
+    file_buckets: Option<Arc<FileNodeBuckets>>,
+    enable_cache: RefCell<HashMap<DiagnosticCode, bool>>,
 }
 
 impl<'a> DiagnosticContext<'a> {
@@ -329,6 +582,8 @@ impl<'a> DiagnosticContext<'a> {
             cancel_token,
             shared_data: None,
             assignment_prefix_events: None,
+            file_buckets: None,
+            enable_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -347,15 +602,13 @@ impl<'a> DiagnosticContext<'a> {
             cancel_token,
             shared_data: Some(shared_data),
             assignment_prefix_events: None,
+            file_buckets: None,
+            enable_cache: RefCell::new(HashMap::new()),
         }
     }
 
     pub fn get_shared_data_arc(&self) -> Option<Arc<SharedDiagnosticData>> {
         self.shared_data.clone()
-    }
-
-    pub fn get_shared_data(&self) -> Option<&SharedDiagnosticData> {
-        self.shared_data.as_deref()
     }
 
     pub fn get_db(&self) -> &DbIndex {
@@ -371,9 +624,32 @@ impl<'a> DiagnosticContext<'a> {
             return events.clone();
         }
 
-        let events = Arc::new(collect_assignment_prefix_events(root));
+        let events = if let Some(buckets) = self.file_buckets() {
+            collect_assignment_prefix_events_from_assigns(&buckets.assign_stats)
+        } else {
+            collect_assignment_prefix_events(root)
+        };
+        let events = Arc::new(events);
         self.assignment_prefix_events = Some(events.clone());
         events
+    }
+
+    /// Per-file syntax nodes bucketed by kind, built with a single preorder
+    /// walk on first use and shared by all checkers. Returns `None` only when
+    /// the file has no syntax tree, in which case diagnostics cannot run.
+    // Rowan syntax nodes are `!Send`/`!Sync`, but this `Arc` never crosses
+    // threads: buckets are built and iterated synchronously within one file's
+    // check pass, bridging only the `&mut` borrow between checkers.
+    #[expect(clippy::arc_with_non_send_sync)]
+    pub fn file_buckets(&mut self) -> Option<Arc<FileNodeBuckets>> {
+        if let Some(buckets) = &self.file_buckets {
+            return Some(buckets.clone());
+        }
+
+        let tree = self.db.get_vfs().get_syntax_tree(&self.file_id)?;
+        let buckets = Arc::new(build_file_node_buckets(&tree.get_chunk_node()));
+        self.file_buckets = Some(buckets.clone());
+        Some(buckets)
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -479,6 +755,20 @@ impl<'a> DiagnosticContext<'a> {
     }
 
     pub fn is_checker_enable_by_code(&self, code: &DiagnosticCode) -> bool {
+        // Evaluated once per emitted diagnostic plus once per checker dispatch,
+        // so hundreds of repeated workspace-set/index lookups per file. The
+        // inputs (config, per-file diagnostic index, module index) are fixed
+        // for the lifetime of this context, so memoize per code.
+        if let Some(cached) = self.enable_cache.borrow().get(code) {
+            return *cached;
+        }
+
+        let enabled = self.is_checker_enable_by_code_uncached(code);
+        self.enable_cache.borrow_mut().insert(*code, enabled);
+        enabled
+    }
+
+    fn is_checker_enable_by_code_uncached(&self, code: &DiagnosticCode) -> bool {
         let file_id = self.get_file_id();
         let db = self.get_db();
         let diagnostic_index = db.get_diagnostic_index();
@@ -514,12 +804,15 @@ impl<'a> DiagnosticContext<'a> {
 }
 
 fn collect_assignment_prefix_events(root: &LuaChunk) -> AssignmentPrefixEvents {
-    let mut events: AssignmentPrefixEvents = HashMap::new();
-    for node in root.descendants::<LuaAst>() {
-        let LuaAst::LuaAssignStat(assign_stat) = node else {
-            continue;
-        };
+    let assigns: Vec<LuaAssignStat> = root.descendants().collect();
+    collect_assignment_prefix_events_from_assigns(&assigns)
+}
 
+fn collect_assignment_prefix_events_from_assigns(
+    assigns: &[LuaAssignStat],
+) -> AssignmentPrefixEvents {
+    let mut events: AssignmentPrefixEvents = HashMap::default();
+    for assign_stat in assigns {
         let Some((block_start, block_end)) = assignment_block_range(assign_stat.syntax()) else {
             continue;
         };
@@ -535,6 +828,39 @@ fn collect_assignment_prefix_events(root: &LuaChunk) -> AssignmentPrefixEvents {
             let is_table_literal = exprs
                 .get(idx)
                 .is_some_and(|expr| assignment_guarantees_table(var.syntax(), expr));
+            if is_table_literal
+                && let Some((outer_start, outer_end, after)) =
+                    absence_guard_seed_scope(assign_stat.syntax(), &prefix_text)
+            {
+                // `if not t.k then t.k = {} end` runs exactly when `t.k` is
+                // absent, so `t.k` is a table on every path out of the `if`.
+                // The event otherwise stays keyed to the branch's own block and
+                // the statements after the `if` never see it, so writes through
+                // `t.k` there are checked as if it had never been seeded.
+                events
+                    .entry((outer_start, outer_end, prefix_text.clone()))
+                    .or_default()
+                    .push(AssignmentPrefixEvent {
+                        offset: after,
+                        is_table_literal,
+                    });
+            }
+            // A write that may leave something other than a table reaches out
+            // of its block too: after `if c then t.k = nil end`, `t.k` may be
+            // nil whatever an earlier `t.k = {}` in an enclosing block set.
+            if !is_table_literal {
+                for (start, end) in enclosing_assignment_block_ranges(assign_stat.syntax()) {
+                    if (start, end) != (block_start, block_end) {
+                        events
+                            .entry((start, end, prefix_text.clone()))
+                            .or_default()
+                            .push(AssignmentPrefixEvent {
+                                offset,
+                                is_table_literal,
+                            });
+                    }
+                }
+            }
             events
                 .entry((block_start, block_end, prefix_text))
                 .or_default()
@@ -545,7 +871,77 @@ fn collect_assignment_prefix_events(root: &LuaChunk) -> AssignmentPrefixEvents {
         }
     }
 
+    for entries in events.values_mut() {
+        entries.sort_by_key(|event| event.offset);
+    }
+
     events
+}
+
+/// The block an `if not <prefix> then <prefix> = {} end` seed reaches, and the
+/// offset it is in force from.
+///
+/// Only an absence guard qualifies: its branch runs exactly when the target is
+/// missing, so the target is present afterwards whichever way the test went,
+/// as long as nothing else in the `if` writes it. A plain
+/// `if cond then t.k = {} end` guarantees nothing after the `if`.
+fn absence_guard_seed_scope(
+    assign_syntax: &LuaSyntaxNode,
+    prefix_text: &str,
+) -> Option<(TextSize, TextSize, TextSize)> {
+    let branch_block = assign_syntax.parent()?;
+    let if_stat = LuaIfStat::cast(branch_block.parent()?)?;
+    // Only the `then` block: an `else` runs when the target is present.
+    if if_stat.get_block()?.syntax() != &branch_block {
+        return None;
+    }
+    if !condition_tests_absence(&if_stat.get_condition_expr()?, prefix_text) {
+        return None;
+    }
+    let writes_prefix_again = if_stat
+        .syntax()
+        .descendants()
+        .filter_map(LuaAssignStat::cast)
+        .filter(|assign| assign.syntax() != assign_syntax)
+        .any(|assign| {
+            assign
+                .get_var_and_expr_list()
+                .0
+                .iter()
+                .any(|var| syntax_text_eq_normalized(var.syntax(), prefix_text))
+        });
+    if writes_prefix_again {
+        return None;
+    }
+
+    let (outer_start, outer_end) = assignment_block_range(if_stat.syntax())?;
+    Some((outer_start, outer_end, if_stat.syntax().text_range().end()))
+}
+
+fn condition_tests_absence(condition: &LuaExpr, prefix_text: &str) -> bool {
+    match condition {
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| condition_tests_absence(&inner, prefix_text)),
+        LuaExpr::UnaryExpr(unary) => {
+            unary.get_op_token().map(|op| op.get_op()) == Some(UnaryOperator::OpNot)
+                && unary
+                    .get_expr()
+                    .is_some_and(|inner| syntax_text_eq_normalized(inner.syntax(), prefix_text))
+        }
+        LuaExpr::BinaryExpr(binary) => {
+            binary.get_op_token().map(|op| op.get_op()) == Some(BinaryOperator::OpEq)
+                && binary.get_exprs().is_some_and(|(left, right)| {
+                    (matches!(right, LuaExpr::LiteralExpr(_))
+                        && syntax_text_eq_normalized(right.syntax(), "nil")
+                        && syntax_text_eq_normalized(left.syntax(), prefix_text))
+                        || (matches!(left, LuaExpr::LiteralExpr(_))
+                            && syntax_text_eq_normalized(left.syntax(), "nil")
+                            && syntax_text_eq_normalized(right.syntax(), prefix_text))
+                })
+        }
+        _ => false,
+    }
 }
 
 fn assignment_guarantees_table(var: &LuaSyntaxNode, expr: &LuaExpr) -> bool {
@@ -564,7 +960,7 @@ fn assignment_guarantees_table(var: &LuaSyntaxNode, expr: &LuaExpr) -> bool {
     };
 
     matches!(right, LuaExpr::TableExpr(_))
-        && normalized_syntax_text(left.syntax()) == normalized_syntax_text(var)
+        && syntax_text_eq_normalized(left.syntax(), &normalized_syntax_text(var))
 }
 
 pub fn is_initialized_assignment_prefix(
@@ -576,23 +972,50 @@ pub fn is_initialized_assignment_prefix(
         return false;
     };
 
-    let Some((block_start, block_end)) = assignment_block_range(assign_stat.syntax()) else {
-        return false;
-    };
-
     let prefix_text = normalized_syntax_text(prefix.syntax());
     if prefix_text.is_empty() {
         return false;
     }
 
-    let key = (block_start, block_end, prefix_text);
-    let Some(events) = assignment_prefixes.get(&key) else {
-        return false;
-    };
-
     let current_offset = assign_stat.syntax().text_range().start();
-    let last_event_idx = events.partition_point(|event| event.offset < current_offset);
-    last_event_idx > 0 && events[last_event_idx - 1].is_table_literal
+    // A seed in an enclosing block still reaches here: `t.k = {}` before an
+    // `if` initialises `t.k` for the writes inside it just as much as for the
+    // ones after it. Only a closure breaks the chain, since its body runs
+    // somewhere else entirely.
+    //
+    // The key reuses one `String` across blocks instead of cloning the prefix
+    // per enclosing block.
+    let mut key: AssignmentPrefixKey = (TextSize::from(0), TextSize::from(0), prefix_text);
+    for (block_start, block_end) in enclosing_assignment_block_ranges(assign_stat.syntax()) {
+        key.0 = block_start;
+        key.1 = block_end;
+        let Some(events) = assignment_prefixes.get(&key) else {
+            continue;
+        };
+        let last_event_idx = events.partition_point(|event| event.offset < current_offset);
+        if last_event_idx > 0 {
+            return events[last_event_idx - 1].is_table_literal;
+        }
+    }
+
+    false
+}
+
+/// Every block that encloses `node` within its own function, innermost first.
+fn enclosing_assignment_block_ranges(node: &LuaSyntaxNode) -> Vec<(TextSize, TextSize)> {
+    let mut ranges = Vec::new();
+    let mut current = node.parent();
+    while let Some(block) = current {
+        if LuaClosureExpr::can_cast(block.kind().into()) {
+            break;
+        }
+        if LuaSyntaxKind::Block == block.kind().into() {
+            let range = block.text_range();
+            ranges.push((range.start(), range.end()));
+        }
+        current = block.parent();
+    }
+    ranges
 }
 
 pub fn assignment_prefix_key_for_syntax(
@@ -644,6 +1067,28 @@ fn normalized_syntax_text(syntax: &LuaSyntaxNode) -> String {
         .collect()
 }
 
+/// Whitespace-insensitive comparison without materialising the syntax text.
+/// Hot query paths (`condition_tests_absence`, `assignment_guarantees_table`)
+/// compare single nodes against short literals or an already-normalized
+/// prefix; building an intermediate `String` per query showed up per file.
+fn syntax_text_eq_normalized(syntax: &LuaSyntaxNode, expected: &str) -> bool {
+    let mut expected_chars = expected.chars().filter(|c| !c.is_whitespace());
+    for element in syntax.descendants_with_tokens() {
+        let Some(token) = element.into_token() else {
+            continue;
+        };
+        for c in token.text().chars() {
+            if c.is_whitespace() {
+                continue;
+            }
+            if expected_chars.next() != Some(c) {
+                return false;
+            }
+        }
+    }
+    expected_chars.next().is_none()
+}
+
 fn get_closure_expr_comment(closure_expr: &LuaClosureExpr) -> Option<LuaComment> {
     let comment = closure_expr
         .ancestors::<LuaStat>()
@@ -653,13 +1098,13 @@ fn get_closure_expr_comment(closure_expr: &LuaClosureExpr) -> Option<LuaComment>
     match comment.kind().into() {
         LuaSyntaxKind::Comment => {
             let comment = LuaComment::cast(comment)?;
-            Some(comment)
+            (comment.get_owner_closure().as_ref() == Some(closure_expr)).then_some(comment)
         }
         _ => None,
     }
 }
 
-/// 获取属于自身的返回语句
+/// Gets the return statements that belong to the node itself
 pub fn get_return_stats(closure_expr: &LuaClosureExpr) -> impl Iterator<Item = LuaReturnStat> + '_ {
     closure_expr
         .descendants::<LuaReturnStat>()
@@ -672,7 +1117,7 @@ pub fn get_return_stats(closure_expr: &LuaClosureExpr) -> impl Iterator<Item = L
 
 pub fn humanize_lint_type(db: &DbIndex, typ: &LuaType) -> String {
     match typ {
-        // TODO: 应该仅去掉命名空间
+        // TODO: should only strip the namespace
         // LuaType::Ref(type_decl_id) => type_decl_id.get_simple_name().to_string(),
         // LuaType::Generic(generic_type) => generic_type
         //     .get_base_type_id()

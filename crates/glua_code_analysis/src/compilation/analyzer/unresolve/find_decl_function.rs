@@ -8,6 +8,7 @@ use crate::{
     db_index::{
         DbIndex, LuaGenericType, LuaIntersectionType, LuaMemberKey, LuaObjectType,
         LuaOperatorMetaMethod, LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType,
+        member_id_sort_key,
     },
     infer_expr, instantiate_type_generic,
     semantic::{InferGuard, visible_super_types_in_workspace_for_file_at_offset},
@@ -37,6 +38,13 @@ impl DeepLevel {
     }
     pub fn get(&self) -> usize {
         self.deep
+    }
+
+    /// The owner answering also holds the definition itself, as a shared base
+    /// that every scoped subclass's definition is registered on does: its
+    /// other members are the definition's siblings, not a parent's contract.
+    pub fn answered_by_own_owner(&mut self) {
+        self.deep = 0;
     }
 }
 
@@ -73,7 +81,7 @@ fn visible_super_types_for_index(
     }
 }
 
-/// 寻找声明的函数类型(排除自身), 假设目标具有多个声明, 那么将返回一个联合类型
+/// Finds the declared function type (excluding itself); if the target has multiple declarations, a union type is returned
 pub fn find_decl_function_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -225,14 +233,21 @@ fn find_custom_type_function_member(
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
         let index_member_id = get_member_id(cache, &index_expr);
         let mut result_type = LuaType::Never;
-        for member_id in member_item.get_member_ids() {
-            if index_member_id != member_id
-                && let Some(type_cache) = db.get_type_index().get_type_cache(&member_id.into())
+        for member_id in member_item.visible_member_ids_with_realm_at_offset(
+            db,
+            &cache.get_file_id(),
+            index_expr.get_position(),
+        ) {
+            if let Some(type_cache) = db.get_type_index().get_type_cache(&member_id.into())
+                && (index_member_id != member_id || type_cache.is_doc())
             {
                 result_type = TypeOps::Union.apply(db, &result_type, type_cache.as_type());
             }
         }
         if !result_type.is_never() {
+            if member_item.member_ids_slice().contains(&index_member_id) {
+                deep_guard.answered_by_own_owner();
+            }
             return Ok(result_type);
         }
     }
@@ -561,9 +576,17 @@ fn find_member_by_index_table(
             let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
             if let LuaIndexKey::Expr(expr) = index_key {
                 let key_type = infer_expr(db, cache, expr.clone())?;
-                let members = db
-                    .get_member_index()
-                    .get_members(&LuaMemberOwner::Element(table_range.clone()));
+                let owner = LuaMemberOwner::Element(table_range.clone());
+                let member_index = db.get_member_index();
+                let members = match LuaMemberKey::from_expr_type(key_type.clone()) {
+                    // A constant key names one entry, whatever its siblings hold.
+                    key @ (LuaMemberKey::Integer(_) | LuaMemberKey::Name(_)) => {
+                        let mut members = member_index.get_members_for_owner_key(&owner, &key);
+                        members.sort_by_key(|member| member_id_sort_key(member.get_id()));
+                        Some(members)
+                    }
+                    _ => member_index.get_members(&owner),
+                };
                 if let Some(members) = members {
                     let mut result_type = LuaType::Never;
                     for member in members {
@@ -895,19 +918,18 @@ fn infer_namespace_member_decl_type(
 ) -> FunctionTypeResult {
     let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
     let member_key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
-    let member_key = match member_key {
-        LuaMemberKey::Name(name) => name.to_string(),
-        LuaMemberKey::Integer(i) => i.to_string(),
+    let (name, segment) = match member_key {
+        LuaMemberKey::Name(name) => (name.to_string(), glua_parser::path_segment(&name)),
+        LuaMemberKey::Integer(i) => (i.to_string(), SmolStr::new(i.to_string())),
         _ => return Err(InferFailReason::None),
     };
 
-    let namespace_or_type_id = format!("{}.{}", ns, member_key);
-    let type_id = LuaTypeDeclId::global(&namespace_or_type_id);
+    let type_id = LuaTypeDeclId::global(&format!("{ns}.{name}"));
     if db.get_type_index().get_type_decl(&type_id).is_some() {
         return Ok(LuaType::Def(type_id));
     }
 
     Ok(LuaType::Namespace(
-        SmolStr::new(namespace_or_type_id).into(),
+        SmolStr::new(format!("{ns}.{segment}")).into(),
     ))
 }

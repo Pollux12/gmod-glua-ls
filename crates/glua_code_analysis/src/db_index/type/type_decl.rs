@@ -1,4 +1,5 @@
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use flagset::{FlagSet, flags};
 use internment::ArcIntern;
@@ -6,8 +7,9 @@ use rowan::TextRange;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smol_str::SmolStr;
 
+use crate::db_index::derivation::FilePosition;
 use crate::{
-    DbIndex, FileId, LuaMember, LuaMemberKey, LuaMemberOwner, TypeSubstitutor,
+    DbIndex, FileId, GlobalId, LuaMember, LuaMemberKey, LuaMemberOwner, TypeSubstitutor,
     instantiate_type_generic,
 };
 
@@ -22,6 +24,7 @@ pub enum LuaDeclTypeKind {
 }
 
 flags! {
+    #[derive(Hash)]
     pub enum LuaTypeFlag: u8 {
         None,
         Key,
@@ -34,7 +37,7 @@ flags! {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Clone)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub struct LuaTypeDecl {
     simple_name: String,
     locations: Vec<LuaDeclLocation>,
@@ -59,20 +62,67 @@ impl LuaTypeDecl {
                 flag,
             }],
             id,
-            extra: match kind {
-                LuaDeclTypeKind::Enum => LuaTypeExtra::Enum {
-                    base: None,
-                    flat: false,
-                },
-                LuaDeclTypeKind::Class => LuaTypeExtra::Class,
-                LuaDeclTypeKind::Alias => LuaTypeExtra::Alias { origin: None },
-                LuaDeclTypeKind::Attribute => LuaTypeExtra::Attribute { typ: None },
-            },
+            extra: LuaTypeExtra::of_kind(kind),
         }
     }
 
+    /// Makes the declaration one of `kind`, its payload left for the winning
+    /// site's sources to install.
+    pub(super) fn set_kind(&mut self, kind: LuaDeclTypeKind) {
+        self.extra = LuaTypeExtra::of_kind(kind);
+    }
+
+    /// Where the type is declared, each location with its flags.
     pub fn get_locations(&self) -> &[LuaDeclLocation] {
+        crate::db_index::derivation::note_type_decl_locations_read(&self.id);
         &self.locations
+    }
+
+    /// The file and flags of each place the type is declared, without where
+    /// in the file.
+    pub fn get_location_flags(&self) -> impl Iterator<Item = (FileId, FlagSet<LuaTypeFlag>)> + '_ {
+        crate::db_index::derivation::note_type_decl_files_read(&self.id);
+        self.locations
+            .iter()
+            .map(|location| (location.file_id, location.flag))
+    }
+
+    /// What [`Self::get_location_flags`] observes, in a stable order: records
+    /// no read.
+    pub(super) fn sorted_location_flags(&self) -> Vec<(FileId, u8)> {
+        let mut flags: Vec<(FileId, u8)> = self
+            .locations
+            .iter()
+            .map(|location| (location.file_id, location.flag.bits()))
+            .collect();
+        flags.sort_unstable();
+        flags
+    }
+
+    /// [`Self::get_locations`] for the type index's own bookkeeping: records
+    /// no read.
+    pub(super) fn locations(&self) -> &[LuaDeclLocation] {
+        &self.locations
+    }
+
+    /// What a read of the declaration observes apart from where it is
+    /// declared: its name, kind and extra, and the flags any location carries.
+    pub(super) fn declaration(&self) -> impl Hash + '_ {
+        let flags = self
+            .locations
+            .iter()
+            .fold(0u8, |flags, location| flags | location.flag.bits());
+        (&self.simple_name, &self.id, &self.extra, flags)
+    }
+
+    /// The declaration's kind.
+    pub fn kind(&self) -> LuaDeclTypeKind {
+        match &self.extra {
+            LuaTypeExtra::Enum { .. } => LuaDeclTypeKind::Enum,
+            LuaTypeExtra::Class => LuaDeclTypeKind::Class,
+            LuaTypeExtra::Alias { .. } => LuaDeclTypeKind::Alias,
+            LuaTypeExtra::Attribute { .. } => LuaDeclTypeKind::Attribute,
+        }
     }
 
     pub fn get_mut_locations(&mut self) -> &mut Vec<LuaDeclLocation> {
@@ -97,6 +147,27 @@ impl LuaTypeDecl {
 
     pub fn is_attribute(&self) -> bool {
         matches!(self.extra, LuaTypeExtra::Attribute { .. })
+    }
+
+    /// The declaration's kind plus the flags each of its locations carries.
+    ///
+    /// Both live only on the declaration - they touch no member, signature or
+    /// type cache - yet `(exact)` decides whether another file's write creates
+    /// a member on this type, and `(partial)`/`(private)` gate diagnostics that
+    /// other files report.
+    pub fn kind_and_flags(&self) -> (LuaDeclTypeKind, Vec<(FileId, u8)>) {
+        crate::db_index::derivation::note_type_decl_files_read(&self.id);
+        (self.kind(), self.sorted_location_flags())
+    }
+
+    /// The enum's base type and flatness, or the attribute's type. `None` for
+    /// a class; an alias's origin has its own accessor.
+    pub fn extra_type(&self) -> (Option<&LuaType>, bool) {
+        match &self.extra {
+            LuaTypeExtra::Enum { base, flat } => (base.as_ref(), *flat),
+            LuaTypeExtra::Attribute { typ } => (typ.as_ref(), false),
+            LuaTypeExtra::Class | LuaTypeExtra::Alias { .. } => (None, false),
+        }
     }
 
     pub fn is_exact(&self) -> bool {
@@ -180,10 +251,37 @@ impl LuaTypeDecl {
         }
     }
 
-    pub fn add_enum_base(&mut self, base_type: LuaType) {
-        if let LuaTypeExtra::Enum { base, .. } = &mut self.extra {
-            *base = Some(base_type);
+    /// Installs the effective alias origin selected from the per-site
+    /// contributions, or clears it when no contribution survives.
+    /// `add_alias_origin` stays for low-level tests that bypass the
+    /// contribution store.
+    pub fn set_alias_origin(&mut self, origin: Option<LuaType>) {
+        if let LuaTypeExtra::Alias { origin: slot, .. } = &mut self.extra {
+            *slot = origin;
         }
+    }
+
+    /// Installs a declaration site's `---@enum` or `---@attribute` payload,
+    /// or with `None` clears it, when it matches the decl's kind. Returns
+    /// whether the decl changed.
+    pub(crate) fn install_site_extra(&mut self, extra: Option<&LuaTypeExtra>) -> bool {
+        let next = match (extra, &self.extra) {
+            (Some(extra @ LuaTypeExtra::Enum { .. }), LuaTypeExtra::Enum { .. })
+            | (Some(extra @ LuaTypeExtra::Attribute { .. }), LuaTypeExtra::Attribute { .. }) => {
+                extra.clone()
+            }
+            (None, LuaTypeExtra::Enum { .. }) => LuaTypeExtra::Enum {
+                base: None,
+                flat: false,
+            },
+            (None, LuaTypeExtra::Attribute { .. }) => LuaTypeExtra::Attribute { typ: None },
+            _ => return false,
+        };
+        if next == self.extra {
+            return false;
+        }
+        self.extra = next;
+        true
     }
 
     /// The declared base type of `---@enum X : T`. Values of the enum are `T`,
@@ -202,24 +300,74 @@ impl LuaTypeDecl {
         matches!(self.extra, LuaTypeExtra::Enum { flat: true, .. })
     }
 
-    pub fn mark_flat_enum(&mut self) {
-        if let LuaTypeExtra::Enum { flat, .. } = &mut self.extra {
-            *flat = true;
-        }
-    }
-
-    pub fn add_attribute_type(&mut self, attribute_type: LuaType) {
-        if let LuaTypeExtra::Attribute { typ } = &mut self.extra {
-            *typ = Some(attribute_type);
-        }
-    }
-
     pub fn get_attribute_type(&self) -> Option<&LuaType> {
         if let LuaTypeExtra::Attribute { typ: Some(typ) } = &self.extra {
             Some(typ)
         } else {
             None
         }
+    }
+
+    /// Merges two tasks' changes to one declaration: each task's own
+    /// declaration sites, keyed by `(file, range)`. Two tasks changing one
+    /// site, the name or the payload apart, or removing the declaration,
+    /// conflict.
+    pub(crate) fn merge(
+        merged: &mut Option<Self>,
+        frozen: Option<&Self>,
+        fork: Option<&Self>,
+    ) -> crate::db_index::cow_shards::Merged {
+        use crate::db_index::cow_shards::{Conflict, merge_map, refuse};
+        let (Some(current), Some(fork)) = (merged.as_ref(), fork) else {
+            return Err(Conflict);
+        };
+        fn pick<'a, T: PartialEq>(
+            current: &'a T,
+            frozen: Option<&T>,
+            fork: &'a T,
+        ) -> Result<&'a T, Conflict> {
+            if Some(fork) == frozen || current == fork {
+                Ok(current)
+            } else if Some(current) == frozen {
+                Ok(fork)
+            } else {
+                Err(Conflict)
+            }
+        }
+        let sites = |decl: &Self| {
+            decl.locations
+                .iter()
+                .map(|location| {
+                    let key = (
+                        location.file_id,
+                        location.range.start(),
+                        location.range.end(),
+                    );
+                    (key, location.clone())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let mut locations = Some(sites(current));
+        merge_map(
+            &mut locations,
+            frozen.map(sites).as_ref(),
+            Some(&sites(fork)),
+            refuse,
+        )?;
+        let locations = locations.ok_or(Conflict)?.into_values().collect();
+        let decl = Self {
+            simple_name: pick(
+                &current.simple_name,
+                frozen.map(|decl| &decl.simple_name),
+                &fork.simple_name,
+            )?
+            .clone(),
+            locations,
+            id: pick(&current.id, frozen.map(|decl| &decl.id), &fork.id)?.clone(),
+            extra: pick(&current.extra, frozen.map(|decl| &decl.extra), &fork.extra)?.clone(),
+        };
+        *merged = Some(decl);
+        Ok(())
     }
 
     pub fn merge_decl(&mut self, other: LuaTypeDecl) {
@@ -240,8 +388,18 @@ impl LuaTypeDecl {
             existing.flag |= location.flag;
             return;
         }
-
-        self.locations.push(location);
+        let at = self.locations.partition_point(|existing| {
+            (
+                existing.file_id,
+                existing.range.start(),
+                existing.range.end(),
+            ) < (
+                location.file_id,
+                location.range.start(),
+                location.range.end(),
+            )
+        });
+        self.locations.insert(at, location);
     }
 
     /// The value an enum member stands for. A table enum stores it on the member
@@ -275,7 +433,7 @@ impl LuaTypeDecl {
         })
     }
 
-    /// 获取枚举字段的类型
+    /// Gets the type of an enum field
     pub fn get_enum_field_type(&self, db: &DbIndex) -> Option<LuaType> {
         if !self.is_enum() {
             return None;
@@ -325,22 +483,95 @@ pub enum LuaTypeIdentifier {
     Local(FileId, SmolStr),
 }
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub struct LuaTypeDeclId {
     id: ArcIntern<LuaTypeIdentifier>,
 }
 
 impl LuaTypeDeclId {
-    pub fn global(str: &str) -> Self {
+    /// The interned value's address: equal for equal ids while either lives.
+    pub(crate) fn interned_address(&self) -> u64 {
+        std::ptr::from_ref::<LuaTypeIdentifier>(&self.id) as usize as u64
+    }
+}
+
+/// Hashes the name, not the interned pointer: an id interned again after its
+/// last holder dropped it must hash as before.
+impl Hash for LuaTypeDeclId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (*self.id).hash(state);
+    }
+}
+
+/// Per-thread memo in front of `ArcIntern`'s shared pool. Every type-name
+/// lookup constructs an id, and `ArcIntern::new` pays a SipHash string hash
+/// plus a shard write-lock on each call; the same handful of names dominate
+/// any corpus, so a bounded per-thread map takes the hit once per name per
+/// worker instead. Capped: past the cap the pool is consulted directly, which
+/// is correct but uncached — the cap bounds per-thread memory, not behavior.
+mod decl_id_intern {
+    use super::{FileId, LuaTypeDeclId};
+    use rustc_hash::FxHashMap;
+    use smol_str::SmolStr;
+    use std::cell::RefCell;
+
+    const CAP: usize = 8192;
+
+    thread_local! {
+        static GLOBAL: RefCell<FxHashMap<SmolStr, LuaTypeDeclId>> =
+            RefCell::new(FxHashMap::default());
+        static LOCAL: RefCell<FxHashMap<(FileId, SmolStr), LuaTypeDeclId>> =
+            RefCell::new(FxHashMap::default());
+    }
+
+    pub fn global(name: &str) -> LuaTypeDeclId {
+        GLOBAL.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(id) = cache.get(name) {
+                return id.clone();
+            }
+            let id = LuaTypeDeclId::interned_global(name);
+            if cache.len() < CAP {
+                cache.insert(SmolStr::new(name), id.clone());
+            }
+            id
+        })
+    }
+
+    pub fn local(file_id: FileId, name: &str) -> LuaTypeDeclId {
+        LOCAL.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(id) = cache.get(&(file_id, SmolStr::new(name))) {
+                return id.clone();
+            }
+            let id = LuaTypeDeclId::interned_local(file_id, name);
+            if cache.len() < CAP {
+                cache.insert((file_id, SmolStr::new(name)), id.clone());
+            }
+            id
+        })
+    }
+}
+
+impl LuaTypeDeclId {
+    fn interned_global(str: &str) -> Self {
         Self {
             id: ArcIntern::new(LuaTypeIdentifier::Global(SmolStr::new(str))),
         }
     }
 
-    pub fn local(file_id: FileId, str: &str) -> Self {
+    fn interned_local(file_id: FileId, str: &str) -> Self {
         Self {
             id: ArcIntern::new(LuaTypeIdentifier::Local(file_id, SmolStr::new(str))),
         }
+    }
+
+    pub fn global(str: &str) -> Self {
+        decl_id_intern::global(str)
+    }
+
+    pub fn local(file_id: FileId, str: &str) -> Self {
+        decl_id_intern::local(file_id, str)
     }
 
     pub fn get_id(&self) -> &LuaTypeIdentifier {
@@ -374,6 +605,22 @@ impl LuaTypeDeclId {
         }
     }
 
+    /// The global holding the members written through this type's table: its
+    /// namesake, which a file-private type shares only when its own file
+    /// declares that global.
+    pub fn global_member_owner(&self, db: &DbIndex) -> Option<LuaMemberOwner> {
+        let shares_global = match self.get_id() {
+            LuaTypeIdentifier::Global(_) => true,
+            LuaTypeIdentifier::Local(file_id, name) => {
+                let root = name.split('.').next().unwrap_or(name);
+                db.get_global_index()
+                    .get_global_decl_ids(root)
+                    .is_some_and(|decl_ids| decl_ids.iter().any(|id| id.file_id == *file_id))
+            }
+        };
+        shares_global.then(|| LuaMemberOwner::GlobalPath(GlobalId::new(self.get_name())))
+    }
+
     pub fn get_simple_name(&self) -> &str {
         let basic_name = self.get_name();
 
@@ -385,9 +632,9 @@ impl LuaTypeDeclId {
     }
 
     pub fn collect_super_types(&self, db: &DbIndex, collected_types: &mut Vec<LuaType>) {
-        // BFS with HashSet for O(1) visited check instead of Vec::contains O(n).
+        // BFS with FxHashSet for O(1) visited check instead of Vec::contains O(n).
         let mut queue = Vec::new();
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = rustc_hash::FxHashSet::default();
         visited.insert(self.clone());
         queue.push(self.clone());
 
@@ -474,10 +721,38 @@ pub struct LuaDeclLocation {
     pub flag: FlagSet<LuaTypeFlag>,
 }
 
+impl Hash for LuaDeclLocation {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            file_id,
+            range,
+            flag,
+        } = self;
+        file_id.hash(state);
+        range.hash_in_file(*file_id, state);
+        flag.hash(state);
+    }
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum LuaTypeExtra {
     Enum { base: Option<LuaType>, flat: bool },
     Class,
     Alias { origin: Option<LuaType> },
     Attribute { typ: Option<LuaType> },
+}
+
+impl LuaTypeExtra {
+    /// The payload of a declaration of `kind` no site has filled in.
+    fn of_kind(kind: LuaDeclTypeKind) -> Self {
+        match kind {
+            LuaDeclTypeKind::Enum => Self::Enum {
+                base: None,
+                flat: false,
+            },
+            LuaDeclTypeKind::Class => Self::Class,
+            LuaDeclTypeKind::Alias => Self::Alias { origin: None },
+            LuaDeclTypeKind::Attribute => Self::Attribute { typ: None },
+        }
+    }
 }

@@ -1,18 +1,19 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaBlock, LuaCallExpr,
-    LuaClosureExpr, LuaExpr, LuaIfStat, LuaLiteralToken, LuaLocalStat, LuaNameExpr, LuaStat,
-    LuaTableField, UnaryOperator,
+    BinaryOperator, LuaAstNode, LuaBinaryExpr, LuaBlock, LuaCallExpr, LuaClosureExpr, LuaExpr,
+    LuaIfStat, LuaLiteralToken, LuaLocalStat, LuaNameExpr, LuaParenExpr, LuaStat, UnaryOperator,
 };
 use rowan::{TextRange, TextSize};
 
 use crate::{
     DiagnosticCode, GlobalId, LuaDeclId, LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType,
-    SemanticModel, semantic::unwrap_paren_to_name_expr,
+    SemanticModel,
+    compilation::analyzer::{is_nil_literal_expr, is_presence_tested},
+    semantic::unwrap_paren_to_name_expr,
 };
 
-use super::{Checker, DiagnosticContext};
+use super::{Checker, DiagnosticContext, FileNodeBuckets};
 
 pub struct UndefinedGlobalChecker;
 
@@ -23,9 +24,11 @@ impl Checker for UndefinedGlobalChecker {
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        let mut use_range_set = HashSet::new();
-        let guarded_range_set = calc_guarded_name_expr_ranges(semantic_model);
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        let mut use_range_set = HashSet::default();
+        let guarded_range_set = calc_guarded_name_expr_ranges(semantic_model, &buckets);
         // Positions where an undefined-global read is "silent" (the read itself
         // can't crash; the resulting nil just propagates). We demote these from
         // `UndefinedGlobal` (Error) to `UndefinedGlobalAssignment` (Warning):
@@ -33,14 +36,17 @@ impl Checker for UndefinedGlobalChecker {
         //   * RHS of an assignment:        `x = UNDEF`, `local x = UNDEF`,
         //                                   `t.x = UNDEF`, `{ k = UNDEF }`
         //   * names reached through `or`/`and`/parens in those positions
-        let silent_use_ranges = calc_silent_use_name_expr_ranges(&root);
+        let silent_use_ranges = calc_silent_use_name_expr_ranges(&buckets);
         calc_name_expr_ref(semantic_model, &mut use_range_set);
-        for name_expr in root.descendants::<LuaNameExpr>() {
+        let tested_names =
+            calc_presence_tested_global_names(semantic_model, &buckets, &use_range_set);
+        for name_expr in buckets.name_exprs.iter().cloned() {
             check_name_expr(
                 context,
                 semantic_model,
                 &mut use_range_set,
                 &guarded_range_set,
+                &tested_names,
                 &silent_use_ranges,
                 name_expr,
             );
@@ -48,11 +54,13 @@ impl Checker for UndefinedGlobalChecker {
     }
 }
 
-fn calc_guarded_name_expr_ranges(semantic_model: &SemanticModel) -> HashSet<TextRange> {
-    let mut guarded_ranges = HashSet::new();
-    let root = semantic_model.get_root();
+pub(super) fn calc_guarded_name_expr_ranges(
+    semantic_model: &SemanticModel,
+    buckets: &FileNodeBuckets,
+) -> HashSet<TextRange> {
+    let mut guarded_ranges = HashSet::default();
 
-    for if_stat in root.descendants::<LuaIfStat>() {
+    for if_stat in &buckets.if_stats {
         if let (Some(condition), Some(block)) = (if_stat.get_condition_expr(), if_stat.get_block())
         {
             collect_clause_guarded_name_ranges(
@@ -80,10 +88,10 @@ fn calc_guarded_name_expr_ranges(semantic_model: &SemanticModel) -> HashSet<Text
 
     guarded_ranges.extend(calc_continuation_guarded_name_expr_ranges(
         semantic_model,
-        root,
+        buckets,
     ));
 
-    for binary_expr in root.descendants::<LuaBinaryExpr>() {
+    for binary_expr in &buckets.binary_exprs {
         collect_short_circuit_guarded_name_expr_ranges(
             semantic_model,
             &binary_expr,
@@ -102,12 +110,12 @@ struct ContinuationGuardRule {
 
 fn calc_continuation_guarded_name_expr_ranges(
     semantic_model: &SemanticModel,
-    root: &glua_parser::LuaChunk,
+    buckets: &FileNodeBuckets,
 ) -> HashSet<TextRange> {
-    let mut guarded_ranges = HashSet::new();
-    let mut guard_rules_by_name = HashMap::<String, Vec<ContinuationGuardRule>>::new();
+    let mut guarded_ranges = HashSet::default();
+    let mut guard_rules_by_name = HashMap::<String, Vec<ContinuationGuardRule>>::default();
 
-    for block in root.descendants::<LuaBlock>() {
+    for block in &buckets.blocks {
         let block_range = block.get_range();
         for stat in block.get_stats() {
             let LuaStat::IfStat(if_stat) = stat else {
@@ -134,7 +142,7 @@ fn calc_continuation_guarded_name_expr_ranges(
         return guarded_ranges;
     }
 
-    for name_expr in root.descendants::<LuaNameExpr>() {
+    for name_expr in &buckets.name_exprs {
         let expr_range = name_expr.get_range();
         let Some(name_text) = name_expr.get_name_text() else {
             continue;
@@ -161,7 +169,7 @@ fn continuation_guard_names(
     if_stat: &LuaIfStat,
 ) -> Option<HashSet<String>> {
     let block = if_stat.get_block()?;
-    if !is_return_only_block(&block) {
+    if !ends_with_return(&block) {
         return None;
     }
 
@@ -179,7 +187,7 @@ fn collect_short_circuit_guarded_name_expr_ranges(
         .map(|op| op.get_op())
         .unwrap_or(BinaryOperator::OpNop);
 
-    if op != BinaryOperator::OpAnd {
+    if op != BinaryOperator::OpAnd && op != BinaryOperator::OpOr {
         return;
     }
 
@@ -187,7 +195,17 @@ fn collect_short_circuit_guarded_name_expr_ranges(
         return;
     };
 
-    let mut lhs_guard_ranges = HashSet::new();
+    if op == BinaryOperator::OpOr {
+        // `local X = X or fallback` probes an optional global for a local of its name.
+        if let Some(name_expr) = unwrap_paren_to_name_expr(&left_expr)
+            && initializes_local_of_same_name(binary_expr, &name_expr)
+        {
+            guarded_ranges.insert(name_expr.get_range());
+        }
+        return;
+    }
+
+    let mut lhs_guard_ranges = HashSet::default();
     let lhs_guarded_names =
         collect_truthy_guarded_names(semantic_model, &left_expr, &mut lhs_guard_ranges);
     guarded_ranges.extend(lhs_guard_ranges);
@@ -205,6 +223,42 @@ fn collect_short_circuit_guarded_name_expr_ranges(
             guarded_ranges.insert(rhs_name_expr.get_range());
         }
     }
+}
+
+/// Whether `or_expr`, through parentheses and the left of further `or`s, initializes a local
+/// declared with the name the probed `name_expr` reads, as in `local X = (X or a) or b`.
+fn initializes_local_of_same_name(or_expr: &LuaBinaryExpr, name_expr: &LuaNameExpr) -> bool {
+    let Some(name) = name_expr.get_name_text() else {
+        return false;
+    };
+    let mut initializer = or_expr.syntax().clone();
+    while let Some(parent) = initializer.parent() {
+        let continues = LuaParenExpr::cast(parent.clone()).is_some()
+            || LuaBinaryExpr::cast(parent.clone()).is_some_and(|outer| {
+                outer
+                    .get_op_token()
+                    .is_some_and(|token| token.get_op() == BinaryOperator::OpOr)
+                    && outer
+                        .get_exprs()
+                        .is_some_and(|(left, _)| left.syntax() == &initializer)
+            });
+        if !continues {
+            break;
+        }
+        initializer = parent;
+    }
+    let Some(local_stat) = initializer.parent().and_then(LuaLocalStat::cast) else {
+        return false;
+    };
+    local_stat
+        .get_local_name_list()
+        .zip(local_stat.get_value_exprs())
+        .any(|(local_name, value)| {
+            value.syntax() == &initializer
+                && local_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == name)
+        })
 }
 
 #[derive(Debug)]
@@ -229,29 +283,20 @@ impl GuardedTarget {
     }
 }
 
-fn is_return_only_block(block: &LuaBlock) -> bool {
-    let mut has_return_stat = false;
-    for stat in block.get_stats() {
-        match stat {
-            LuaStat::EmptyStat(_) => {}
-            LuaStat::ReturnStat(_) => {
-                if has_return_stat {
-                    return false;
-                }
-                has_return_stat = true;
-            }
-            _ => return false,
-        }
-    }
-
-    has_return_stat
+/// Whether `block` always leaves the function: whatever it does first, it ends in a `return`.
+fn ends_with_return(block: &LuaBlock) -> bool {
+    block
+        .get_stats()
+        .filter(|stat| !matches!(stat, LuaStat::EmptyStat(_)))
+        .last()
+        .is_some_and(|stat| matches!(stat, LuaStat::ReturnStat(_)))
 }
 
 fn extract_continuation_guarded_names(
     semantic_model: &SemanticModel,
     expr: &LuaExpr,
 ) -> HashSet<String> {
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
 
     match expr {
         LuaExpr::ParenExpr(paren_expr) => {
@@ -267,11 +312,11 @@ fn extract_continuation_guarded_names(
                 .get_op_token()
                 .is_some_and(|op| op.get_op() == UnaryOperator::OpNot);
             if !is_not {
-                return HashSet::new();
+                return HashSet::default();
             }
 
             if let Some(inner_expr) = unary_expr.get_expr() {
-                let mut condition_guard_ranges = HashSet::new();
+                let mut condition_guard_ranges = HashSet::default();
                 names.extend(collect_truthy_guarded_names(
                     semantic_model,
                     &inner_expr,
@@ -284,7 +329,7 @@ fn extract_continuation_guarded_names(
                 .get_op_token()
                 .is_some_and(|op| op.get_op() == BinaryOperator::OpEq);
             if !is_eq {
-                return HashSet::new();
+                return HashSet::default();
             }
 
             let Some((left_expr, right_expr)) = binary_expr.get_exprs() else {
@@ -308,7 +353,7 @@ fn collect_clause_guarded_name_ranges(
     block: &glua_parser::LuaBlock,
     guarded_ranges: &mut HashSet<TextRange>,
 ) {
-    let mut condition_guard_ranges = HashSet::new();
+    let mut condition_guard_ranges = HashSet::default();
     let truthy_names =
         collect_truthy_guarded_names(semantic_model, condition, &mut condition_guard_ranges);
     guarded_ranges.extend(condition_guard_ranges);
@@ -335,7 +380,7 @@ fn collect_truthy_guarded_names(
 ) -> HashSet<String> {
     match expr {
         LuaExpr::NameExpr(name_expr) => {
-            let mut names = HashSet::new();
+            let mut names = HashSet::default();
             if let Some(name_text) = name_expr.get_name_text() {
                 condition_guard_ranges.insert(name_expr.get_range());
                 names.insert(name_text.to_string());
@@ -350,7 +395,7 @@ fn collect_truthy_guarded_names(
             .unwrap_or_default(),
         LuaExpr::UnaryExpr(unary_expr) => {
             let Some(inner_expr) = unary_expr.get_expr() else {
-                return HashSet::new();
+                return HashSet::default();
             };
 
             let is_not = unary_expr
@@ -368,7 +413,7 @@ fn collect_truthy_guarded_names(
         }
         LuaExpr::BinaryExpr(binary_expr) => {
             let Some((left_expr, right_expr)) = binary_expr.get_exprs() else {
-                return HashSet::new();
+                return HashSet::default();
             };
 
             let op = binary_expr
@@ -401,10 +446,10 @@ fn collect_truthy_guarded_names(
                         &right_expr,
                         condition_guard_ranges,
                     );
-                    HashSet::new()
+                    HashSet::default()
                 }
                 BinaryOperator::OpNe => {
-                    let mut names = HashSet::new();
+                    let mut names = HashSet::default();
                     if let Some(name_expr) = name_compared_with_nil(&left_expr, &right_expr)
                         && let Some(name_text) = name_expr.get_name_text()
                     {
@@ -417,7 +462,7 @@ fn collect_truthy_guarded_names(
                     if let Some(name_expr) = name_compared_with_nil(&left_expr, &right_expr) {
                         condition_guard_ranges.insert(name_expr.get_range());
                     }
-                    HashSet::new()
+                    HashSet::default()
                 }
                 // Comparison / arithmetic / bitwise operators do not produce
                 // truthy names (e.g. `x.y < 4` doesn't make `x.y` a truthy
@@ -436,12 +481,12 @@ fn collect_truthy_guarded_names(
                         &right_expr,
                         condition_guard_ranges,
                     );
-                    HashSet::new()
+                    HashSet::default()
                 }
             }
         }
         LuaExpr::CallExpr(call_expr) => {
-            let mut names = HashSet::new();
+            let mut names = HashSet::default();
             if let Some(guarded_target) = guarded_call_target_name(semantic_model, call_expr)
                 && let Some(name_text) = guarded_target.name()
             {
@@ -457,7 +502,7 @@ fn collect_truthy_guarded_names(
             // If we're checking `if ctp.Disable then`, it implies `ctp` exists.
             // For nested chains like `foo.bar.baz`, recurse into the prefix so
             // the deepest base name (`foo`) is still registered as guarded.
-            let mut names = HashSet::new();
+            let mut names = HashSet::default();
             if let Some(prefix_expr) = index_expr.get_prefix_expr() {
                 if let Some(name_expr) = unwrap_paren_to_name_expr(&prefix_expr)
                     && let Some(name_text) = name_expr.get_name_text()
@@ -474,28 +519,20 @@ fn collect_truthy_guarded_names(
             }
             names
         }
-        _ => HashSet::new(),
+        _ => HashSet::default(),
     }
 }
 
 fn name_compared_with_nil(left_expr: &LuaExpr, right_expr: &LuaExpr) -> Option<LuaNameExpr> {
-    if is_nil_literal(left_expr) {
+    if is_nil_literal_expr(left_expr) {
         return unwrap_paren_to_name_expr(right_expr);
     }
 
-    if is_nil_literal(right_expr) {
+    if is_nil_literal_expr(right_expr) {
         return unwrap_paren_to_name_expr(left_expr);
     }
 
     None
-}
-
-fn is_nil_literal(expr: &LuaExpr) -> bool {
-    let LuaExpr::LiteralExpr(literal_expr) = expr else {
-        return false;
-    };
-
-    matches!(literal_expr.get_literal(), Some(LuaLiteralToken::Nil(_)))
 }
 
 fn guarded_call_target_name(
@@ -512,7 +549,10 @@ fn guarded_call_target_name(
         LuaExpr::NameExpr(name_expr) => {
             // Metadata-driven: recognize any callee whose resolved return type
             // is `TypeGuard<...>`, regardless of the function's name.
-            if !call_prefix_returns_type_guard(semantic_model, &name_expr) {
+            if !call_prefix_returns_type_guard(
+                semantic_model,
+                &LuaExpr::NameExpr(name_expr.clone()),
+            ) {
                 return None;
             }
 
@@ -604,7 +644,7 @@ fn collect_truthy_guarded_names_with_not_chain(
         match &current_expr {
             LuaExpr::ParenExpr(paren_expr) => {
                 let Some(inner_expr) = paren_expr.get_expr() else {
-                    return HashSet::new();
+                    return HashSet::default();
                 };
                 current_expr = inner_expr;
             }
@@ -618,7 +658,7 @@ fn collect_truthy_guarded_names_with_not_chain(
 
                 not_count += 1;
                 let Some(inner_expr) = unary_expr.get_expr() else {
-                    return HashSet::new();
+                    return HashSet::default();
                 };
                 current_expr = inner_expr;
             }
@@ -630,7 +670,7 @@ fn collect_truthy_guarded_names_with_not_chain(
     if not_count.is_multiple_of(2) {
         names
     } else {
-        HashSet::new()
+        HashSet::default()
     }
 }
 
@@ -722,8 +762,8 @@ fn collect_condition_guard_side_effects(
     }
 }
 
-fn call_prefix_returns_type_guard(semantic_model: &SemanticModel, name_expr: &LuaNameExpr) -> bool {
-    match semantic_model.infer_expr(LuaExpr::NameExpr(name_expr.clone())) {
+fn call_prefix_returns_type_guard(semantic_model: &SemanticModel, prefix: &LuaExpr) -> bool {
+    match semantic_model.infer_expr(prefix.clone()) {
         Ok(LuaType::DocFunction(func)) => matches!(func.get_ret(), LuaType::TypeGuard(_)),
         Ok(LuaType::Signature(signature_id)) => semantic_model
             .get_db()
@@ -804,10 +844,12 @@ fn type_has_self_guard_metadata(semantic_model: &SemanticModel, typ: &LuaType) -
                     return true;
                 }
                 // Check for return_cast targeting self.
-                if let Some(cast) = db.get_flow_index().get_signature_cast(signature_id) {
-                    if cast.name == "self" {
-                        return true;
-                    }
+                if signature
+                    .return_cast
+                    .as_ref()
+                    .is_some_and(|cast| cast.name == "self")
+                {
+                    return true;
                 }
             }
             false
@@ -850,11 +892,11 @@ fn collect_silent_assignment_rhs_names(expr: &LuaExpr, ranges: &mut HashSet<Text
     }
 }
 
-fn calc_silent_use_name_expr_ranges(root: &glua_parser::LuaChunk) -> HashSet<TextRange> {
-    let mut ranges = HashSet::new();
+fn calc_silent_use_name_expr_ranges(buckets: &FileNodeBuckets) -> HashSet<TextRange> {
+    let mut ranges = HashSet::default();
 
     // Direct call arguments: `f(UNDEF)` and `f((UNDEF))`.
-    for call_expr in root.descendants::<LuaCallExpr>() {
+    for call_expr in &buckets.call_exprs {
         let Some(args_list) = call_expr.get_args_list() else {
             continue;
         };
@@ -867,7 +909,7 @@ fn calc_silent_use_name_expr_ranges(root: &glua_parser::LuaChunk) -> HashSet<Tex
 
     // RHS of assignments: `x = UNDEF`, `t.x, y = UNDEF, OTHER`, plus names
     // reached through `or`/`and`/parens (e.g. `local m = ModA or ModB`).
-    for assign_stat in root.descendants::<LuaAssignStat>() {
+    for assign_stat in &buckets.assign_stats {
         let (_vars, exprs) = assign_stat.get_var_and_expr_list();
         for expr in &exprs {
             collect_silent_assignment_rhs_names(expr, &mut ranges);
@@ -875,7 +917,7 @@ fn calc_silent_use_name_expr_ranges(root: &glua_parser::LuaChunk) -> HashSet<Tex
     }
 
     // RHS of `local` declarations: `local x = UNDEF`, `local x = A or B`.
-    for local_stat in root.descendants::<LuaLocalStat>() {
+    for local_stat in &buckets.local_stats {
         for expr in local_stat.get_value_exprs() {
             collect_silent_assignment_rhs_names(&expr, &mut ranges);
         }
@@ -884,7 +926,7 @@ fn calc_silent_use_name_expr_ranges(root: &glua_parser::LuaChunk) -> HashSet<Tex
     // Table constructor field values: `{ k = UNDEF }`, `{ k = A or B }`. Same
     // silent-nil-bind semantics as a regular assignment, so route through the
     // OR/AND-aware collector rather than only matching bare names.
-    for field in root.descendants::<LuaTableField>() {
+    for field in &buckets.table_fields {
         if let Some(value_expr) = field.get_value_expr() {
             collect_silent_assignment_rhs_names(&value_expr, &mut ranges);
         }
@@ -899,6 +941,30 @@ fn extract_direct_name_expr(expr: &LuaExpr) -> Option<LuaNameExpr> {
         LuaExpr::ParenExpr(paren_expr) => extract_direct_name_expr(&paren_expr.get_expr()?),
         _ => None,
     }
+}
+
+/// The globals this file tests for a value, which it treats as optional externals.
+fn calc_presence_tested_global_names(
+    semantic_model: &SemanticModel,
+    buckets: &FileNodeBuckets,
+    local_ranges: &HashSet<TextRange>,
+) -> HashSet<String> {
+    buckets
+        .name_exprs
+        .iter()
+        .filter(|name_expr| !local_ranges.contains(&name_expr.get_range()))
+        .filter(|name_expr| {
+            is_presence_tested(name_expr.syntax(), &mut |call: &LuaCallExpr| {
+                call.get_args_list()
+                    .and_then(|args| args.get_args().next())
+                    .is_some_and(|arg| arg.get_range().contains_range(name_expr.get_range()))
+                    && call.get_prefix_expr().is_some_and(|prefix| {
+                        call_prefix_returns_type_guard(semantic_model, &prefix)
+                    })
+            })
+        })
+        .filter_map(|name_expr| name_expr.get_name_text().map(|name| name.to_string()))
+        .collect()
 }
 
 fn calc_name_expr_ref(
@@ -922,6 +988,7 @@ fn check_name_expr(
     semantic_model: &SemanticModel,
     use_range_set: &mut HashSet<TextRange>,
     guarded_range_set: &HashSet<TextRange>,
+    tested_names: &HashSet<String>,
     silent_use_ranges: &HashSet<TextRange>,
     name_expr: LuaNameExpr,
 ) -> Option<()> {
@@ -989,8 +1056,7 @@ fn check_name_expr(
         db.get_global_index().is_exist_global_decl(&name_text)
     };
 
-    if is_valid_global {
-        // Name exists as global - skip diagnostic
+    if is_valid_global || tested_names.contains(name_text.as_str()) {
         return Some(());
     }
 
@@ -1003,16 +1069,6 @@ fn check_name_expr(
             .get_gmod_infer_index()
             .get_scoped_class_info(&semantic_model.get_file_id())
             .is_some_and(|info| info.global_name == name_text.as_str())
-    {
-        return Some(());
-    }
-
-    if name_text == "BaseClass"
-        && semantic_model
-            .get_db()
-            .get_gmod_class_metadata_index()
-            .get_define_baseclass_name(&semantic_model.get_file_id())
-            .is_some()
     {
         return Some(());
     }

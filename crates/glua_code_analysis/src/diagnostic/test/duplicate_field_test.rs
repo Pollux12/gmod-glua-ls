@@ -41,6 +41,26 @@ mod test {
     }
 
     #[test]
+    fn a_panel_registered_by_two_files_declares_no_duplicate_doc_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let register = "local PANEL = {}\nvgui.Register(\"PlayerFrame\", PANEL, \"Panel\")\n";
+        ws.def_file(
+            "gamemodes/cityrp/plugins/characters/ui/cl_player_frame.lua",
+            register,
+        );
+
+        assert!(ws.check_file_for(
+            DiagnosticCode::DuplicateDocField,
+            "gamemodes/cityrp/plugins/scoreboard/ui/cl_player_frame.lua",
+            register,
+        ));
+    }
+
+    #[test]
     fn test_duplicate_field() {
         let mut ws = VirtualWorkspace::new();
 
@@ -183,7 +203,7 @@ mod test {
     #[test]
     fn test_duplicate_function_4() {
         let mut ws = VirtualWorkspace::new();
-        // 如果是 .member = 参数, 则不报错
+        // No error for `.member = param`
         assert!(ws.check_code_for(
             DiagnosticCode::DuplicateSetField,
             r#"

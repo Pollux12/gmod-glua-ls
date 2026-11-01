@@ -10,9 +10,8 @@ use crate::{
 };
 
 use super::{
-    TypeCheckResult, check_general_type_compact, is_structural_method_member,
-    member_has_documented_default, type_check_fail_reason::TypeCheckFailReason,
-    type_check_guard::TypeCheckGuard,
+    TypeCheckResult, check_general_type_compact, is_structural_method_member, member_is_required,
+    type_check_fail_reason::TypeCheckFailReason, type_check_guard::TypeCheckGuard,
 };
 
 pub fn check_generic_type_compact(
@@ -40,7 +39,7 @@ pub fn check_generic_type_compact(
         }
     }
 
-    // 不检查尚未实例化的泛型类
+    // Do not check generic classes that are not yet instantiated
     let is_tpl = source_generic.contain_tpl();
 
     match compact_type {
@@ -140,7 +139,7 @@ fn check_generic_type_compact_table(
 ) -> TypeCheckResult {
     let member_index = context.db.get_member_index();
 
-    // 构建表成员映射
+    // Build the table member map
     let table_member_map: HashMap<_, _> = member_index
         .get_members(&table_owner)
         .map(|members| {
@@ -151,13 +150,13 @@ fn check_generic_type_compact_table(
         })
         .unwrap_or_default();
 
-    // 获取泛型类型的成员, 使用 find_members 来获取包括继承的所有成员
+    // Get the members of the generic type; find_members also returns inherited members
     let source_type = LuaType::Generic(Arc::new(source_generic.clone()));
     let Some(source_type_members) = find_members(context.db, &source_type) else {
-        return Ok(()); // 空成员无需检查
+        return Ok(()); // No members, nothing to check
     };
 
-    // 提前计算下一级检查守卫
+    // Compute the next-level check guard in advance
     let next_guard = check_guard.next_level()?;
     let mut checked_keys = HashSet::new();
 
@@ -204,12 +203,11 @@ fn check_generic_type_compact_table(
                     ));
                 }
             }
-            None if !source_member_type.is_optional()
-                && !member_has_documented_default(
-                    context.db,
-                    property_owner_id.as_ref(),
-                    Some(&source_member_type),
-                ) =>
+            None if member_is_required(
+                context.db,
+                property_owner_id.as_ref(),
+                &source_member_type,
+            ) =>
             {
                 if !context.detail {
                     return Err(TypeCheckFailReason::TypeNotMatch);
@@ -219,7 +217,7 @@ fn check_generic_type_compact_table(
                     format!("missing member {name}, in table", name = key.to_path()).to_string(),
                 ));
             }
-            _ => {} // 可选成员未找到，继续检查
+            _ => {} // Optional member not found, continue checking
         }
     }
 
@@ -267,7 +265,7 @@ fn check_generic_type_compact_ref_type(
         }
     }
 
-    // 如果泛型参数是`any`, 那么我们只需要匹配基础类型
+    // If the generic parameter is `any`, only the base type needs to match
     if source_generic.get_params().iter().any(|p| p.is_any()) {
         return check_general_type_compact(
             context,

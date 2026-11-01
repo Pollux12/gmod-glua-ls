@@ -1,17 +1,22 @@
 use glua_code_analysis::{
-    DbIndex, FileId, GmodRealm, GmodStateMask, LuaMemberInfo, LuaMemberKey, LuaSemanticDeclId,
-    LuaType, LuaTypeDeclId, SemanticModel, enum_variable_is_param, get_tpl_ref_extend_type,
+    BUILTIN_HOOK_OWNERS, DbIndex, FileId, GmodRealm, GmodStateMask, LuaMemberInfo, LuaMemberKey,
+    LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticModel,
+    enum_variable_is_param, get_tpl_ref_extend_type, gmod_hook_owner_group,
+    gmod_hook_owner_group_of,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaComment, LuaCommentOwner, LuaDocTag, LuaDocTagRealm, LuaExpr,
     LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat, LuaNameExpr, LuaStringToken, PathTrait,
 };
 use rowan::TextSize;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smol_str::SmolStr;
-use std::collections::{HashMap, HashSet};
 
 use crate::handlers::completion::{
-    add_completions::{CompletionTriggerStatus, add_member_completion_with_description_hint},
+    add_completions::{
+        CompletionTriggerStatus, add_member_completion_with_description_hint,
+        is_callable_member_type,
+    },
     completion_builder::CompletionBuilder,
 };
 
@@ -47,7 +52,7 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         )?,
         prefix_type => prefix_type,
     };
-    // 如果是枚举类型且为函数参数, 则不进行补全
+    // No completion for an enum type used as a function parameter
     if enum_variable_is_param(
         builder.semantic_model.get_db(),
         &mut builder.semantic_model.get_cache().borrow_mut(),
@@ -66,13 +71,14 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
     extend_global_path_members(builder, &prefix_expr, &mut member_info_map);
     let gmod_owner_name = gmod_hook_owner_name(&prefix_expr, &prefix_type);
     let gmod_fallback_owner = if builder.semantic_model.get_emmyrc().gmod.enabled {
-        gmod_owner_name
-            .as_deref()
-            .and_then(gmod_hook_fallback_owner)
+        gmod_owner_name.as_deref().and_then(|owner_name| {
+            gmod_hook_fallback_owner(builder.semantic_model.get_db(), owner_name, &prefix_type)
+        })
     } else {
         None
     };
     extend_gmod_hook_fallback_members(builder, gmod_fallback_owner, &mut member_info_map);
+    dedupe_member_infos(builder, &mut member_info_map);
 
     add_completions_for_members_with_gmod_owner(
         builder,
@@ -99,6 +105,11 @@ fn extend_global_path_members(
         return;
     };
 
+    // The namespace route is a fallback for keys the prefix type cannot
+    // answer — e.g. a guarded bootstrap slot that resolves to an empty
+    // literal while the accumulated members live under the global path
+    // owner. Its members join the prefix type's own, and superseded
+    // same-file writers are collapsed afterwards.
     let mut existing = collect_member_identities(members);
 
     for (key, infos) in global_path_members {
@@ -154,7 +165,7 @@ fn expr_root_name(expr: &LuaExpr) -> Option<LuaNameExpr> {
 
 fn extend_gmod_hook_fallback_members(
     builder: &CompletionBuilder,
-    fallback_owner: Option<GmodFallbackOwner<'_>>,
+    fallback_owner: Option<HookOwnerGroup>,
     members: &mut HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
 ) {
     let Some(fallback_owner) = fallback_owner else {
@@ -164,7 +175,7 @@ fn extend_gmod_hook_fallback_members(
     let mut existing = collect_member_identities(members);
 
     for owner_candidate in fallback_owner.candidates {
-        let owner_type = LuaType::Ref(LuaTypeDeclId::global(owner_candidate));
+        let owner_type = LuaType::Ref(builder.semantic_model.resolve_global_class(owner_candidate));
         let Some(fallback_map) = builder
             .semantic_model
             .get_member_info_map_at_offset(&owner_type, builder.position_offset)
@@ -177,6 +188,92 @@ fn extend_gmod_hook_fallback_members(
                 push_unique_member_info(members, &mut existing, key.clone(), info);
             }
         }
+    }
+}
+
+/// Collapses each key's candidates to one entry per distinct definition the
+/// caller can be looking at: branch-only writes drop out where an unconditional
+/// one exists, and what remains is deduplicated by identity.
+fn dedupe_member_infos(
+    builder: &CompletionBuilder,
+    members: &mut HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
+) {
+    let db = builder.semantic_model.get_db();
+    for infos in members.values_mut() {
+        resolve_slot_writes(db, infos);
+        let mut seen = HashSet::default();
+        infos.retain(|info| seen.insert(MemberInfoIdentity::from(info)));
+    }
+}
+
+/// What a candidate for one key is, as far as the rule below is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotWrite {
+    /// Not a write: a class declaration field (`---@field`) is a contract, and
+    /// a dynamic field carries no member at all. Never collapsed.
+    NotAWrite,
+    /// Runs whenever the statement around it is reached. A write in a function
+    /// body counts: reaching the body is the caller's business, not a condition
+    /// on the write.
+    Unconditional,
+    /// Runs only when its branch is taken, so the slot may never hold it.
+    Branch,
+}
+
+/// Drops the writes of a key that only happen in a branch, where one outside
+/// any branch of the same kind, callable or not, exists.
+///
+/// This is the only separation available here. Load order across files is
+/// decided by member resolution, which also picks the write the caller's realm
+/// selects, both before these infos are built; what is left is whether a write
+/// is conditional at all. A plain value says nothing about a method a branch
+/// defines, which can still be what a `:` call reaches, so only a write of the
+/// same kind stands in for a branch write. Writes that are all unconditional —
+/// guarded bootstrap siblings (`x = x or {}`) among them — say nothing about
+/// each other and all survive.
+fn resolve_slot_writes(db: &DbIndex, infos: &mut Vec<LuaMemberInfo>) {
+    if infos.len() <= 1 {
+        return;
+    }
+
+    let writes = infos
+        .iter()
+        .map(|info| {
+            (
+                classify_slot_write(db, info),
+                is_callable_member_type(db, &info.typ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let superseded = writes
+        .iter()
+        .map(|(write, callable)| {
+            *write == SlotWrite::Branch
+                && writes.iter().any(|(other, other_callable)| {
+                    *other == SlotWrite::Unconditional && other_callable == callable
+                })
+        })
+        .collect::<Vec<_>>();
+
+    let mut superseded = superseded.into_iter();
+    infos.retain(|_| superseded.next() != Some(true));
+}
+
+fn classify_slot_write(db: &DbIndex, info: &LuaMemberInfo) -> SlotWrite {
+    let Some(LuaSemanticDeclId::Member(member_id)) = &info.property_owner_id else {
+        return SlotWrite::NotAWrite;
+    };
+    let member_index = db.get_member_index();
+    if matches!(
+        member_index.get_member_owner(member_id),
+        Some(LuaMemberOwner::Type(_))
+    ) {
+        return SlotWrite::NotAWrite;
+    }
+    if glua_code_analysis::is_member_assignment_in_conditional_branch(db, *member_id) {
+        SlotWrite::Branch
+    } else {
+        SlotWrite::Unconditional
     }
 }
 
@@ -200,7 +297,7 @@ impl From<&LuaMemberInfo> for MemberInfoIdentity {
 fn collect_member_identities(
     members: &HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
 ) -> MemberIdentityMap {
-    let mut existing: MemberIdentityMap = HashMap::new();
+    let mut existing: MemberIdentityMap = HashMap::default();
     for (key, infos) in members {
         let entry = existing.entry(key.clone()).or_default();
         entry.extend(infos.iter().map(MemberInfoIdentity::from));
@@ -230,34 +327,27 @@ fn gmod_hook_owner_name(prefix_expr: &LuaExpr, prefix_type: &LuaType) -> Option<
     }
 }
 
+/// A hook owner's completion: the hook owner it is written through, and the
+/// owners whose hooks it also offers.
 #[derive(Clone, Copy)]
-struct GmodFallbackOwner<'a> {
-    owner_name: &'a str,
+struct HookOwnerGroup {
+    owner: &'static str,
     candidates: &'static [&'static str],
 }
 
-fn gmod_hook_fallback_owner(owner_name: &str) -> Option<GmodFallbackOwner<'_>> {
-    let candidates = gmod_hook_owner_candidates(owner_name);
-    if candidates.is_empty() {
-        None
-    } else {
-        Some(GmodFallbackOwner {
-            owner_name,
-            candidates,
-        })
-    }
-}
-
-fn gmod_hook_owner_candidates(owner_name: &str) -> &'static [&'static str] {
-    if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
-        &["GM", "GAMEMODE", "SANDBOX"]
-    } else if owner_name.eq_ignore_ascii_case("PLUGIN") {
-        &["PLUGIN", "GM", "GAMEMODE", "SANDBOX"]
-    } else if owner_name.eq_ignore_ascii_case("SANDBOX") {
-        &["SANDBOX", "GM", "GAMEMODE"]
-    } else {
-        &[]
-    }
+fn gmod_hook_fallback_owner(
+    db: &DbIndex,
+    owner_name: &str,
+    owner_type: &LuaType,
+) -> Option<HookOwnerGroup> {
+    let candidates = match owner_type {
+        LuaType::Ref(owner) | LuaType::Def(owner) => gmod_hook_owner_group_of(db, owner),
+        _ => gmod_hook_owner_group(owner_name),
+    };
+    let owner = gmod_hook_owner_group(owner_name)
+        .first()
+        .or(candidates.first())?;
+    Some(HookOwnerGroup { owner, candidates })
 }
 
 pub fn add_completions_for_members(
@@ -272,9 +362,9 @@ fn add_completions_for_members_with_gmod_owner(
     builder: &mut CompletionBuilder,
     members: &HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
     completion_status: CompletionTriggerStatus,
-    gmod_fallback_owner: Option<GmodFallbackOwner<'_>>,
+    gmod_fallback_owner: Option<HookOwnerGroup>,
 ) -> Option<()> {
-    // 排序
+    // Sort
     let mut sorted_entries: Vec<_> = members.iter().collect();
     sorted_entries.sort_unstable_by_key(|(name, _)| *name);
 
@@ -296,7 +386,7 @@ fn add_resolve_member_infos(
     builder: &mut CompletionBuilder,
     member_infos: &Vec<LuaMemberInfo>,
     completion_status: CompletionTriggerStatus,
-    gmod_fallback_owner: Option<GmodFallbackOwner<'_>>,
+    gmod_fallback_owner: Option<HookOwnerGroup>,
     realm_filter: &mut RealmFilter,
 ) -> Option<()> {
     if member_infos.len() == 1 {
@@ -337,6 +427,7 @@ fn add_resolve_member_infos(
         filter_member_infos(&builder.semantic_model, member_infos)?;
 
     let resolve_state = get_resolve_state(builder.semantic_model.get_db(), &filtered_member_infos);
+    let first_item = builder.get_completion_items_mut().len();
 
     for member_info in filtered_member_infos {
         if !realm_filter.accepts(builder, member_info) {
@@ -387,31 +478,58 @@ fn add_resolve_member_infos(
             }
         }
     }
+    drop_identical_items(builder, first_item);
 
     Some(())
 }
 
-fn gmod_fallback_description_hint(
-    builder: &CompletionBuilder,
-    fallback_owner: Option<GmodFallbackOwner<'_>>,
-    member_info: &LuaMemberInfo,
-) -> Option<String> {
-    let fallback_owner = fallback_owner?;
-    let source_owner = get_owner_type_id(builder.semantic_model.get_db(), member_info)?;
-    let source_owner_name = source_owner.get_simple_name();
-    if source_owner_name.eq_ignore_ascii_case(fallback_owner.owner_name)
-        || !fallback_owner
-            .candidates
-            .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(source_owner_name))
-    {
-        return None;
+/// Drops each item from `first_item` on that renders exactly as an earlier one
+/// of them: definitions of one key in several files that show the same are a
+/// single entry to the user, while ones that differ, such as overloads, stay.
+fn drop_identical_items(builder: &mut CompletionBuilder, first_item: usize) {
+    let items = builder.get_completion_items_mut();
+    let added = items.split_off(first_item);
+    let mut seen = HashSet::default();
+    for item in added {
+        let details = item.label_details.as_ref();
+        let rendered = (
+            item.label.clone(),
+            format!("{:?}", item.kind),
+            details.and_then(|details| details.detail.clone()),
+            details.and_then(|details| details.description.clone()),
+            item.detail.clone(),
+        );
+        if seen.insert(rendered) {
+            items.push(item);
+        }
     }
-
-    Some(format!("from {source_owner_name}"))
 }
 
-/// 过滤成员信息，返回需要的成员列表和重载数量
+fn gmod_fallback_description_hint(
+    builder: &CompletionBuilder,
+    fallback_owner: Option<HookOwnerGroup>,
+    member_info: &LuaMemberInfo,
+) -> Option<String> {
+    let prefix_owner = fallback_owner?.owner;
+    let source_owner = member_hook_owner(builder.semantic_model.get_db(), member_info)?;
+    (source_owner != prefix_owner).then(|| format!("from {source_owner}"))
+}
+
+/// The hook owner whose hooks `info` is among: that of the class or global
+/// the member is written on.
+fn member_hook_owner(db: &DbIndex, info: &LuaMemberInfo) -> Option<&'static str> {
+    let Some(LuaSemanticDeclId::Member(member_id)) = &info.property_owner_id else {
+        return None;
+    };
+    let group = match db.get_member_index().get_current_owner(member_id)? {
+        LuaMemberOwner::Type(owner) => gmod_hook_owner_group_of(db, owner),
+        LuaMemberOwner::GlobalPath(path) => gmod_hook_owner_group(path.get_name()),
+        _ => return None,
+    };
+    group.first().copied()
+}
+
+/// Filters member info, returning the needed member list and the overload count
 fn filter_member_infos<'a>(
     semantic_model: &SemanticModel,
     member_infos: &'a Vec<LuaMemberInfo>,
@@ -427,12 +545,12 @@ fn filter_member_infos<'a>(
     let mut all_doc_function = true;
     let mut overload_count = 0;
 
-    // 一次遍历收集所有信息
+    // Collect all info in a single pass
     for member_info in member_infos {
         let owner_id = get_owner_type_id(semantic_model.get_db(), member_info);
         member_with_owners.push((member_info, owner_id.clone()));
 
-        // 寻找第一个 file_decl 作为参考，如果没有则使用第一个
+        // Use the first file_decl as the reference, or the first member if there is none
         if file_decl_member.is_none()
             && let Some(feature) = member_info.feature
             && feature.is_file_decl()
@@ -448,7 +566,7 @@ fn filter_member_infos<'a>(
             gmod_meta_member = Some(member_info);
         }
 
-        // 检查是否全为 DocFunction，同时计算重载数量
+        // Check whether all are DocFunction while counting overloads
         match &member_info.typ {
             LuaType::DocFunction(_) => {
                 overload_count += 1;
@@ -466,11 +584,11 @@ fn filter_member_infos<'a>(
         }
     }
 
-    // 确定最终使用的参考 owner
+    // Determine the reference owner to use
     let final_reference_owner = if let Some(meta_member_info) = gmod_meta_member {
         get_owner_type_id(semantic_model.get_db(), meta_member_info)
     } else if let Some(file_decl_member_info) = file_decl_member {
-        // 与第一个成员进行类型检查, 确保子类成员的类型与父类成员的类型一致
+        // Type-check against the first member so subclass member types are consistent with parent class member types
         if let Some((first_member, first_owner)) = member_with_owners.first() {
             let type_check_result =
                 semantic_model.type_check(&file_decl_member_info.typ, &first_member.typ);
@@ -483,13 +601,13 @@ fn filter_member_infos<'a>(
             get_owner_type_id(semantic_model.get_db(), file_decl_member_info)
         }
     } else {
-        // 没有找到 file_decl，使用第一个成员作为参考
+        // No file_decl found, use the first member as the reference
         member_with_owners
             .first()
             .and_then(|(_, owner)| owner.clone())
     };
 
-    // 过滤出相同 owner_type_id 的成员
+    // Filter members with the same owner_type_id
     let mut filtered_member_infos: Vec<&LuaMemberInfo> = member_with_owners
         .into_iter()
         .filter_map(|(member_info, owner_id)| {
@@ -501,7 +619,7 @@ fn filter_member_infos<'a>(
         })
         .collect();
 
-    // 处理重载计数
+    // Handle overload counting
     let final_overload_count = if overload_count >= 1 {
         let count = overload_count - 1;
         if count == 0 { None } else { Some(count) }
@@ -509,7 +627,7 @@ fn filter_member_infos<'a>(
         None
     };
 
-    // 如果全为 DocFunction, 只保留第一个
+    // If all are DocFunction, keep only the first
     if all_doc_function && !filtered_member_infos.is_empty() {
         filtered_member_infos.truncate(1);
     }
@@ -558,10 +676,9 @@ fn is_gmod_hook_member_info(db: &DbIndex, info: &LuaMemberInfo) -> bool {
     };
 
     let owner_name = owner_type_id.get_simple_name();
-    owner_name.eq_ignore_ascii_case("GM")
-        || owner_name.eq_ignore_ascii_case("GAMEMODE")
-        || owner_name.eq_ignore_ascii_case("SANDBOX")
-        || owner_name.eq_ignore_ascii_case("PLUGIN")
+    BUILTIN_HOOK_OWNERS
+        .iter()
+        .any(|hook_owner| hook_owner.eq_ignore_ascii_case(owner_name))
 }
 
 /// Realm filtering state shared by every candidate member of one request.
@@ -570,9 +687,9 @@ fn is_gmod_hook_member_info(db: &DbIndex, info: &LuaMemberInfo) -> bool {
 /// `---@realm` annotations are the same for every member declared in it. Both
 /// used to be re-derived per member, which meant walking the declaring file's
 /// entire syntax tree once per candidate — 98ms of a 200ms completion on a
-/// gamemode workspace. The analyzer already indexes those ranges, so prefer its
-/// binary search and fall back to one cached walk per file, exactly as the
-/// realm-misuse checker does.
+/// gamemode workspace. The analyzer indexes those ranges for every file it
+/// analyses, so this reads its binary search; the cached walk below only covers
+/// a file that never reached the analyzer at all.
 struct RealmFilter {
     enabled: bool,
     call_mask: GmodStateMask,
@@ -597,7 +714,7 @@ impl RealmFilter {
         Self {
             enabled,
             call_mask,
-            walked: HashMap::new(),
+            walked: HashMap::default(),
         }
     }
 
@@ -748,7 +865,7 @@ mod tests {
     #[gtest]
     fn push_unique_member_info_keeps_distinct_overload_indices() -> Result<()> {
         let key = LuaMemberKey::Name("lookup".into());
-        let mut members = HashMap::new();
+        let mut members = HashMap::default();
         let mut existing = collect_member_identities(&members);
 
         push_unique_member_info(

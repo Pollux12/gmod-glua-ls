@@ -21,13 +21,15 @@ impl Checker for ReadOnlyChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::ReadOnly];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
         let candidates = ReadOnlyCandidates::new(context, semantic_model.get_db());
         if candidates.is_empty() {
             return;
         }
 
-        for ast_node in root.descendants::<LuaAst>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for ast_node in buckets.all_nodes.iter().cloned() {
             match ast_node {
                 LuaAst::LuaAssignStat(assign_stat) => {
                     check_assign_stat(context, semantic_model, &assign_stat, &candidates);

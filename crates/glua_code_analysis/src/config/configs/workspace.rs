@@ -1,6 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Workspace roots, libraries, ignores and file handling.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcWorkspace {
@@ -51,11 +52,13 @@ pub struct EmmyrcWorkspace {
     /// }
     #[serde(default)]
     pub module_map: Vec<EmmyrcWorkspaceModuleMap>,
-    /// Delay between changing a file and full project reindex, in milliseconds.
+    /// How long edits must pause before the recheck `enableReindex` runs, in
+    /// milliseconds (at least 1000).
     #[serde(default = "reindex_duration_default")]
     #[schemars(extend("x-vscode-setting" = true))]
     pub reindex_duration: u64,
-    /// Enable full project reindex after changing a file.
+    /// After a save, once edits pause, drop the files deleted from disk
+    /// outside the editor and compute every file's diagnostics again.
     #[serde(default = "enable_reindex_default")]
     #[schemars(extend("x-vscode-setting" = true))]
     pub enable_reindex: bool,
@@ -158,9 +161,12 @@ impl EmmyrcWorkspace {
     }
 }
 
+/// A require path rewrite rule.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 pub struct EmmyrcWorkspaceModuleMap {
+    /// Regex matched against the require path.
     pub pattern: String,
+    /// Replacement path; may use capture groups such as `$1`.
     pub replace: String,
 }
 

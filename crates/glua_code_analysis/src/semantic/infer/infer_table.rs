@@ -18,6 +18,7 @@ use crate::{
 
 use super::{
     InferFailReason, InferResult,
+    infer_call::infer_call_return_contract,
     infer_index::{infer_member_by_member_key, infer_member_by_operator},
 };
 
@@ -73,7 +74,7 @@ fn infer_table_array_summary(
             fields[0].get_value_expr().ok_or(InferFailReason::None)?,
         )?;
         return Ok(LuaType::Array(
-            LuaArrayType::from_base_type(first_type).into(),
+            LuaArrayType::from_base_type(summary_row_type(first_type)).into(),
         ));
     }
 
@@ -108,10 +109,29 @@ fn infer_table_array_summary(
         }
     }
 
+    let mut unknown_tail = false;
     if let Some(last_field) = fields.last() {
         let last_value_expr = last_field.get_value_expr().ok_or(InferFailReason::None)?;
+        unknown_tail = if let LuaExpr::CallExpr(call_expr) = &last_value_expr {
+            let contract = call_expr
+                .get_prefix_expr()
+                .and_then(|prefix| infer_expr(db, cache, prefix).ok())
+                .and_then(|ty| {
+                    infer_call_return_contract(db, cache, call_expr.clone(), ty, &InferGuard::new())
+                        .ok()
+                });
+            contract.is_none()
+        } else {
+            false
+        };
         let last_expr_type = infer_expr(db, cache, last_value_expr)?;
-        if let LuaType::Variadic(multi) = last_expr_type
+        if unknown_tail && fields.len() == 1 {
+            return Ok(LuaType::Array(
+                LuaArrayType::from_base_type(LuaType::Unknown).into(),
+            ));
+        }
+        if !unknown_tail
+            && let LuaType::Variadic(multi) = last_expr_type
             && let VariadicType::Base(base) = &multi.deref()
         {
             let non_nil_base = TypeOps::Remove.apply(db, base, &LuaType::Nil);
@@ -144,13 +164,20 @@ fn infer_table_array_summary(
     // infer-resolve tuple (a positional-evidence carrier; see the function doc).
     // Mutation leniency is handled in the diagnostic layer.
     let mut types = Vec::new();
-    for field in fields {
+    let last_index = fields.len().saturating_sub(1);
+    for (index, field) in fields.into_iter().enumerate() {
         let value_expr = field.get_value_expr().ok_or(InferFailReason::None)?;
         let typ = infer_expr(db, cache, value_expr)?;
+        if unknown_tail && index == last_index {
+            types.push(LuaType::Variadic(
+                VariadicType::Base(LuaType::Unknown).into(),
+            ));
+            continue;
+        }
         match typ {
             LuaType::Variadic(multi) => flatten_multi_into_tuple(&mut types, &multi),
             _ => {
-                types.push(typ);
+                types.push(summary_row_type(typ));
             }
         }
     }
@@ -158,6 +185,63 @@ fn infer_table_array_summary(
     Ok(LuaType::Tuple(
         LuaTupleType::new(types, LuaTupleStatus::InferResolve).into(),
     ))
+}
+
+/// A row's type as a summary holds it: an inferred tuple keeps its own
+/// positions, and any inferred tuple inside them becomes `table`.
+///
+/// A summary's positions are evidence about the literal itself. Copying a
+/// row's own summary into them whole nests without bound when the row's value
+/// is the literal (`local c = G; G = { c }`); keeping one level of rows bounds
+/// how deep a summary nests, so such a literal settles.
+fn summary_row_type(typ: LuaType) -> LuaType {
+    match typ {
+        LuaType::Tuple(tuple)
+            if matches!(tuple.status, LuaTupleStatus::InferResolve)
+                && tuple.get_types().iter().any(holds_inferred_tuple) =>
+        {
+            LuaType::Tuple(
+                LuaTupleType::new(
+                    tuple
+                        .get_types()
+                        .iter()
+                        .cloned()
+                        .map(nested_row_type)
+                        .collect(),
+                    LuaTupleStatus::InferResolve,
+                )
+                .into(),
+            )
+        }
+        LuaType::Union(union) if union.into_vec().iter().any(holds_inferred_tuple) => {
+            LuaType::from_vec(union.into_vec().into_iter().map(summary_row_type).collect())
+        }
+        typ => typ,
+    }
+}
+
+/// A position inside a row: an inferred tuple there becomes `table`.
+fn nested_row_type(typ: LuaType) -> LuaType {
+    match typ {
+        LuaType::Tuple(tuple) if matches!(tuple.status, LuaTupleStatus::InferResolve) => {
+            LuaType::Table
+        }
+        LuaType::Union(union) if union.into_vec().iter().any(is_inferred_tuple) => {
+            LuaType::from_vec(union.into_vec().into_iter().map(nested_row_type).collect())
+        }
+        typ => typ,
+    }
+}
+
+fn holds_inferred_tuple(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Union(union) => union.into_vec().iter().any(is_inferred_tuple),
+        typ => is_inferred_tuple(typ),
+    }
+}
+
+fn is_inferred_tuple(typ: &LuaType) -> bool {
+    matches!(typ, LuaType::Tuple(tuple) if matches!(tuple.status, LuaTupleStatus::InferResolve))
 }
 
 fn flatten_multi_into_tuple(tuple_list: &mut Vec<LuaType>, multi: &VariadicType) {
@@ -229,13 +313,8 @@ pub fn infer_table_field_value_should_be(
         .ok_or(InferFailReason::None)?;
     let parent_table_expr_type = infer_table_should_be(db, cache, parnet_table_expr)?;
     let index = LuaIndexMemberExpr::TableField(table_field.clone());
-    let reason = match infer_member_by_member_key(
-        db,
-        cache,
-        &parent_table_expr_type,
-        index.clone(),
-        &InferGuard::new(),
-    ) {
+    let reason = match infer_member_by_member_key(db, cache, &parent_table_expr_type, index.clone())
+    {
         Ok(member_type) => return Ok(member_type),
         Err(InferFailReason::FieldNotFound) => InferFailReason::FieldNotFound,
         Err(err) => return Err(err),
@@ -280,7 +359,7 @@ fn infer_table_type_by_callee(
     match &typ {
         LuaType::TableConst(_) => {}
         LuaType::Union(union) => {
-            // TODO: 假设存在多个匹配项, 我们需要根据字段的匹配情况来确定最终的类型
+            // TODO: if there are multiple matches, determine the final type from how the fields match
             return Ok(union_remove_non_table_type(db, union));
         }
         _ => {}
@@ -324,7 +403,7 @@ fn infer_call_arg_should_be(
     Ok(typ)
 }
 
-/// 移除掉一些非`table`类型
+/// Removes some non-`table` types
 fn union_remove_non_table_type(db: &DbIndex, union: &Arc<LuaUnionType>) -> LuaType {
     union
         .into_set()
@@ -353,7 +432,7 @@ fn infer_table_field_type_by_parent(
                 LuaType::TableConst(_) => {}
                 LuaType::Tuple(tuple) => {
                     let types = tuple.get_types();
-                    // 这种情况下缓存的类型可能是不精确的
+                    // The cached type may be imprecise in this case
                     if tuple.is_infer_resolve() && types.len() == 1 && types[0].is_unknown() {
                     } else {
                         return Ok(typ.clone());
@@ -374,13 +453,8 @@ fn infer_table_field_type_by_parent(
     let parent_table_expr_type = infer_table_should_be(db, cache, parnet_table_expr)?;
 
     let index = LuaIndexMemberExpr::TableField(field);
-    let reason = match infer_member_by_member_key(
-        db,
-        cache,
-        &parent_table_expr_type,
-        index.clone(),
-        &InferGuard::new(),
-    ) {
+    let reason = match infer_member_by_member_key(db, cache, &parent_table_expr_type, index.clone())
+    {
         Ok(member_type) => return Ok(member_type),
         Err(InferFailReason::FieldNotFound) => InferFailReason::FieldNotFound,
         Err(err) => return Err(err),
@@ -435,6 +509,25 @@ fn infer_table_type_from_local_call_references(
     cache: &mut LuaInferCache,
     decl_id: LuaDeclId,
 ) -> InferResult {
+    let typ = local_call_reference_expectations(db, cache, decl_id)?
+        .into_iter()
+        .fold(LuaType::Never, |typ, (_, expected)| {
+            TypeOps::Union.apply(db, &typ, &expected)
+        });
+    if typ.is_never() {
+        Err(InferFailReason::None)
+    } else {
+        Ok(typ)
+    }
+}
+
+/// Where an unreassigned local is passed as a call argument whose parameter
+/// expects a known type, with that type: what a table literal it holds must be.
+pub(crate) fn local_call_reference_expectations(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl_id: LuaDeclId,
+) -> Result<Vec<(TextRange, LuaType)>, InferFailReason> {
     let file_id = cache.get_file_id();
     let references = db
         .get_reference_index()
@@ -454,7 +547,7 @@ fn infer_table_type_from_local_call_references(
         .ok_or(InferFailReason::None)?
         .get_chunk_node();
 
-    let mut typ = LuaType::Never;
+    let mut expectations = Vec::new();
     for cell in &references.cells {
         if cell.is_write {
             continue;
@@ -484,14 +577,9 @@ fn infer_table_type_from_local_call_references(
             continue;
         }
 
-        typ = TypeOps::Union.apply(db, &typ, &call_arg_type);
+        expectations.push((cell.range, call_arg_type));
     }
-
-    if typ.is_never() {
-        Err(InferFailReason::None)
-    } else {
-        Ok(typ)
-    }
+    Ok(expectations)
 }
 
 fn find_reference_expr_on_range_spine(root: &LuaChunk, range: TextRange) -> Option<LuaExpr> {
@@ -609,7 +697,6 @@ fn infer_declared_index_assignment_type(
         cache,
         &prefix_type,
         LuaIndexMemberExpr::IndexExpr(index_expr),
-        &InferGuard::new(),
     )
     .ok()?;
     match declared_type {

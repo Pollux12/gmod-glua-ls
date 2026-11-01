@@ -43,7 +43,7 @@ mod test {
         let consumer_uri = ws
             .virtual_url_generator
             .new_uri("lua/autorun/server/incremental_alias_consumer.lua");
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 ws.virtual_url_generator
                     .new_uri("lua/includes/incremental_alias_types.lua"),
@@ -93,7 +93,7 @@ mod test {
         let consumer_uri = ws
             .virtual_url_generator
             .new_uri("lua/autorun/server/z_consumer_incremental.lua");
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 types_uri,
                 Some(
@@ -164,7 +164,7 @@ mod test {
         let consumer_uri = ws
             .virtual_url_generator
             .new_uri("lua/autorun/server/assignment_guard_consumer.lua");
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 ws.virtual_url_generator
                     .new_uri("lua/includes/assignment_guard_types.lua"),
@@ -1341,6 +1341,165 @@ end
             ws.expr_ty("named_parameter_return_cast_capture"),
             ws.ty("Player")
         );
+    }
+
+    /// A return cast names its parameter, whichever argument that is.
+    #[test]
+    fn a_return_cast_narrows_a_later_argument() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+
+            ---@param kind string
+            ---@param value Entity
+            ---@return boolean
+            ---@return_cast value Player
+            local function isKind(kind, value) end
+
+            ---@param ent Entity
+            local function make(ent)
+                if isKind("player", ent) then
+                    later_argument_return_cast = ent
+                end
+            end
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("later_argument_return_cast"), ws.ty("Player"));
+    }
+
+    #[test]
+    fn assigning_to_an_untyped_param_takes_the_assigned_value() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Player
+
+            ---@type Player
+            local any_player
+
+            local function find(name)
+                if name then
+                    return false
+                end
+                return any_player
+            end
+
+            local function reset(found, flag)
+                found = find(1)
+                assigned_union = found
+                flag = false
+                assigned_false = flag
+            end
+            "#,
+        );
+
+        let assigned_union = ws.expr_ty("assigned_union");
+        let player_or_false = ws.ty("Player|false");
+        assert_eq!(
+            ws.humanize_type(assigned_union),
+            ws.humanize_type(player_or_false)
+        );
+        assert_eq!(ws.expr_ty("assigned_false"), LuaType::BooleanConst(false));
+    }
+
+    #[test]
+    fn a_failed_predicate_that_removes_a_type_adds_it_only_where_the_value_could_hold_it() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL: Entity
+            ---@class Panel
+
+            ---@return boolean
+            ---@return_cast object -NULL
+            function IsLive(object) end
+
+            ---@param ent Entity
+            ---@param pnl Panel
+            local function make(ent, pnl)
+                if not IsLive(ent) then
+                    failed_entity = ent
+                end
+                if not IsLive(pnl) then
+                    failed_panel = pnl
+                end
+            end
+            "#,
+        );
+
+        let failed_entity = ws.expr_ty("failed_entity");
+        let entity_or_null = ws.ty("Entity|NULL");
+        assert_eq!(
+            ws.humanize_type(failed_entity),
+            ws.humanize_type(entity_or_null)
+        );
+        assert_eq!(ws.expr_ty("failed_panel"), ws.ty("Panel"));
+    }
+
+    #[test]
+    fn a_failed_predicate_that_removes_several_types_adds_each_one_the_value_could_hold() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL: Entity
+            ---@class Panel
+            ---@class Vector
+
+            ---@return boolean
+            ---@return_cast object -NULL|Vector
+            function IsLive(object) end
+
+            ---@param thing Entity|Panel
+            local function make(thing)
+                if not IsLive(thing) then
+                    failed_thing = thing
+                end
+            end
+            "#,
+        );
+
+        let failed_thing = ws.expr_ty("failed_thing");
+        let with_null = ws.ty("Entity|Panel|NULL");
+        assert_eq!(ws.humanize_type(failed_thing), ws.humanize_type(with_null));
+    }
+
+    #[test]
+    fn a_failed_predicate_that_removes_an_aliased_union_adds_each_part_the_value_could_hold() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL: Entity
+            ---@class Panel
+            ---@class Vector
+            ---@alias Dead NULL|Vector
+
+            ---@return boolean
+            ---@return_cast object -Dead
+            function IsLive(object) end
+
+            ---@param thing Entity|Panel
+            local function make(thing)
+                if not IsLive(thing) then
+                    failed_aliased = thing
+                end
+            end
+            "#,
+        );
+
+        let failed = ws.expr_ty("failed_aliased");
+        let with_null = ws.ty("Entity|Panel|NULL");
+        assert_eq!(ws.humanize_type(failed), ws.humanize_type(with_null));
     }
 
     #[test]
@@ -2771,6 +2930,40 @@ _2 = a[1]
     }
 
     #[test]
+    fn test_gmod_param_name_hint_yields_to_local_arg_holding_a_call_result() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Panel
+            ---@class DCategoryList: Panel
+
+            ---@param parent Panel
+            ---@return DCategoryList
+            local function make_list(parent) end
+
+            local function populate(pnl)
+                B = pnl
+            end
+
+            ---@type Panel
+            local root
+            local master_list = make_list(root)
+            populate(master_list)
+        "#;
+
+        ws.def(code);
+        let param_type = ws.expr_ty("B");
+        let param = ws.humanize_type(param_type);
+        assert_eq!(
+            param, "DCategoryList",
+            "a name guess must not beat a local the call site fills from a call"
+        );
+    }
+
+    #[test]
     fn test_gmod_func_param_name_hint_infers_function_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
@@ -2934,6 +3127,83 @@ _2 = a[1]
     }
 
     #[test]
+    fn field_guard_keeps_a_base_that_inherits_the_field_over_a_subclass_that_overrides_it() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Panel
+            local Panel = {}
+            function Panel:Init() end
+
+            ---@class Label: Panel
+
+            ---@class ScriptedLabel: Label
+            local ScriptedLabel = {}
+            function ScriptedLabel:Init() end
+
+            ---@type Label
+            local label
+            if label.Init then
+                A = label
+            end
+        "#,
+        );
+
+        let a = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(a), "Label");
+    }
+
+    #[test]
+    fn field_guard_narrows_a_weapon_to_the_scripted_weapon_declaring_the_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_files(vec![
+            (
+                "annotations/entity.lua",
+                r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@class Weapon: Entity
+                local Weapon = {}
+
+                ---@class Player: Entity
+                local Player = {}
+
+                ---@return Weapon
+                function Player:GetActiveWeapon() end
+
+                ---@param value any
+                ---@return boolean
+                function IsValid(value) end
+                "#,
+            ),
+            (
+                "lua/weapons/cw_base/shared.lua",
+                r#"
+                SWEP.CW20Weapon = true
+                function SWEP:MakeRecoil() end
+                "#,
+            ),
+            (
+                "lua/autorun/client/cw_hooks.lua",
+                r#"
+                ---@param ply Player
+                local function Recoil(ply)
+                    local wep = ply:GetActiveWeapon()
+                    if IsValid(wep) and wep.CW20Weapon then
+                        A = wep
+                    end
+                end
+                "#,
+            ),
+        ]);
+
+        let a = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(a), "cw_base");
+    }
+
+    #[test]
     fn test_isfunction_member_guard_narrows_base_entity_to_callable_member_subtypes() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 
@@ -3052,6 +3322,63 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_isvalid_guard_drops_boolean_from_union() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        // `getEntOrBool` widens to `Entity|boolean` the way a `local rp = false`
+        // that later takes an entity does; `IsValid` answers true only for a live
+        // handle, so the true branch must be `Entity`, never `Entity|true`.
+        let file_id = ws.def(
+            r#"
+            ---@return Entity|boolean
+            local function getEntOrBool() end
+
+            local function use()
+                local x = getEntOrBool()
+                if IsValid(x) then
+                    local narrowed = x
+                    print(narrowed)
+                end
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+    }
+
+    #[gtest]
+    fn test_plain_truthiness_keeps_boolean_true_unlike_isvalid() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        // The `IsValid` narrowing above is stronger than truthiness on purpose:
+        // a bare `if x` cannot rule out `x` being the boolean `true`, so the
+        // truthy component stays. This pins that the fix did not collapse the
+        // two into one behaviour.
+        let file_id = ws.def(
+            r#"
+            ---@return Entity|boolean
+            local function getEntOrBool() end
+
+            local function use()
+                local x = getEntOrBool()
+                if x then
+                    local narrowed = x
+                    print(narrowed)
+                end
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "(Entity|true)");
+    }
+
+    #[gtest]
     fn test_unannotated_predicate_wrapper_narrows_member_expression_on_true_branch() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
@@ -3119,7 +3446,7 @@ _2 = a[1]
     }
 
     #[gtest]
-    fn test_cold_batch_ttt_predicate_guard_publishes_consumer_dependency() {
+    fn test_cold_batch_ttt_predicate_guard_narrows_consumer() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
 
@@ -3195,14 +3522,6 @@ _2 = a[1]
             file_has_diagnostic(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
             eq(false)
         );
-        assert!(
-            ws.analysis
-                .compilation
-                .get_db()
-                .get_signature_index()
-                .inferred_guard_consumers_for_files(&HashSet::from([file_ids[2]]))
-                .contains(&file_id)
-        );
     }
 
     #[gtest]
@@ -3223,6 +3542,7 @@ _2 = a[1]
                         .to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("predicate file id after update");
 
         let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -3254,7 +3574,7 @@ _2 = a[1]
             let consumer_uri = ws
                 .virtual_url_generator
                 .new_uri(&format!("lua/autorun/server/{case}_alias_consumer.lua"));
-            ws.analysis.update_files_by_uri_sorted(vec![
+            ws.analysis.update_files_by_uri(vec![
                 (
                     ws.virtual_url_generator
                         .new_uri(&format!("lua/includes/{case}_alias_types.lua")),
@@ -3300,20 +3620,11 @@ _2 = a[1]
                     &guard_uri,
                     Some(definition.replace("{body}", "return IsValid(ent) and ent:IsPlayer()")),
                 )
+                .map(|(id, _)| id)
                 .unwrap_or_else(|| panic!("{case} guard addition"));
 
             let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
             assert_eq!(ws.humanize_type(narrowed), "Player", "{case} after edit");
-            assert_eq!(
-                ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-                1
-            );
-            assert_eq!(
-                ws.analysis
-                    .inferred_guard_propagation_stats
-                    .broad_stabilizations,
-                0
-            );
         }
     }
 
@@ -3334,20 +3645,11 @@ _2 = a[1]
                     "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("new guard source file id");
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Player");
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            1
-        );
-        assert_eq!(
-            ws.analysis
-                .inferred_guard_propagation_stats
-                .broad_stabilizations,
-            0
-        );
     }
 
     #[gtest]
@@ -3365,16 +3667,6 @@ _2 = a[1]
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Player");
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            1
-        );
-        assert_eq!(
-            ws.analysis
-                .inferred_guard_propagation_stats
-                .broad_stabilizations,
-            0
-        );
     }
 
     #[gtest]
@@ -3407,17 +3699,11 @@ _2 = a[1]
                             .to_string(),
                     ),
                 )
+                .map(|(id, _)| id)
                 .unwrap_or_else(|| panic!("{case} guard source file id"));
 
             let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
             assert_eq!(ws.humanize_type(narrowed), "Player", "{case}");
-            assert_eq!(
-                ws.analysis
-                    .inferred_guard_propagation_stats
-                    .broad_stabilizations,
-                0,
-                "{case}"
-            );
         }
     }
 
@@ -3441,18 +3727,15 @@ _2 = a[1]
                     "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("deep alias guard source file id");
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Player");
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            1
-        );
     }
 
     #[gtest]
-    fn test_new_inferred_guard_alias_cycle_terminates_without_narrowing() {
+    fn test_new_inferred_guard_alias_cycle_narrows_like_a_cold_build() {
         let mut ws = VirtualWorkspace::new();
         let (guard_uri, consumer_file_id) = define_incremental_alias_guard_workspace(
             &mut ws,
@@ -3466,14 +3749,11 @@ _2 = a[1]
                     "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("cyclic alias guard source file id");
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
-        assert_eq!(ws.humanize_type(narrowed), "Entity");
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            0
-        );
+        assert_eq!(ws.humanize_type(narrowed), "Player");
     }
 
     #[gtest]
@@ -3491,14 +3771,11 @@ _2 = a[1]
                     "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("mutable alias guard source file id");
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Entity");
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            0
-        );
     }
 
     #[gtest]
@@ -3567,7 +3844,7 @@ _2 = a[1]
                 ));
                 consumer_uris.push(uri);
             }
-            ws.analysis.update_files_by_uri_sorted(files);
+            ws.analysis.update_files_by_uri(files);
 
             for consumer_uri in &consumer_uris {
                 let consumer_file_id = ws
@@ -3591,6 +3868,7 @@ _2 = a[1]
                     &guard_uri,
                     Some(definition.replace("{body}", "return IsValid(ent) and ent:IsPlayer()")),
                 )
+                .map(|(id, _)| id)
                 .unwrap_or_else(|| panic!("{case} guard file id after update"));
 
             for consumer_uri in consumer_uris {
@@ -3622,7 +3900,7 @@ _2 = a[1]
                     .new_uri(&format!("lua/autorun/server/{idx}_guard_chain.lua"))
             })
             .collect::<Vec<_>>();
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 uris[0].clone(),
                 Some(
@@ -3690,6 +3968,7 @@ _2 = a[1]
                 &uris[1],
                 Some("function GuardA(ent) return IsValid(ent) and ent:IsPlayer() end".to_string()),
             )
+            .map(|(id, _)| id)
             .expect("GuardA file id after update");
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -3709,7 +3988,7 @@ _2 = a[1]
         let guard_a = |prefix: &str, predicate: &str| {
             format!("{prefix}function GuardA(ent) return IsValid(ent) and ent:{predicate}() end")
         };
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 uris[0].clone(),
                 Some(
@@ -3776,48 +4055,25 @@ _2 = a[1]
 
         ws.analysis
             .update_file_by_uri(&uris[1], Some(guard_a("-- unrelated edit\n\n", "IsPlayer")))
+            .map(|(id, _)| id)
             .expect("fact-preserving guard source reindex");
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.changed_facts,
-            0
-        );
 
         ws.analysis
             .update_file_by_uri(&uris[1], Some(guard_a("-- unrelated edit\n\n", "IsNPC")))
+            .map(|(id, _)| id)
             .expect("guard type change");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "NPC");
-        assert_eq!(ws.analysis.inferred_guard_propagation_stats.frontiers, 5);
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            5
-        );
-        assert_eq!(
-            ws.analysis
-                .inferred_guard_propagation_stats
-                .broad_stabilizations,
-            0
-        );
 
         ws.analysis
             .update_file_by_uri(
                 &uris[1],
                 Some("-- unrelated edit\n\nfunction GuardA(ent) return true end".to_string()),
             )
+            .map(|(id, _)| id)
             .expect("guard removal");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Entity");
-        assert_eq!(ws.analysis.inferred_guard_propagation_stats.frontiers, 5);
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            5
-        );
-        assert_eq!(
-            ws.analysis
-                .inferred_guard_propagation_stats
-                .broad_stabilizations,
-            0
-        );
     }
 
     #[gtest]
@@ -3836,7 +4092,7 @@ _2 = a[1]
                     "{prefix}function GuardA(ent) return IsValid(ent) and ent:{predicate}() end"
                 )
             };
-            ws.analysis.update_files_by_uri_sorted(vec![
+            ws.analysis.update_files_by_uri(vec![
                 (
                     uris[0].clone(),
                     Some(
@@ -3899,7 +4155,7 @@ _2 = a[1]
                 })
                 .collect::<Vec<_>>();
 
-            ws.analysis.update_files_by_uri_sorted(vec![
+            ws.analysis.update_files_by_uri(vec![
                 (
                     uris[1].clone(),
                     Some(guard_a(equivalent_prefix, "IsPlayer")),
@@ -3910,22 +4166,9 @@ _2 = a[1]
                 ),
             ]);
 
-            let signature_index = ws.analysis.compilation.get_db().get_signature_index();
-            assert_eq!(
-                signature_index.inferred_guard_consumers_for_files(&HashSet::from([file_ids[1]])),
-                HashSet::from([file_ids[2]])
-            );
-            assert_eq!(
-                signature_index.inferred_guard_consumers_for_files(&HashSet::from([file_ids[2]])),
-                HashSet::from([file_ids[3]])
-            );
-            assert_eq!(
-                signature_index.inferred_guard_consumers_for_files(&HashSet::from([file_ids[3]])),
-                HashSet::from([file_ids[4]])
-            );
-
             ws.analysis
                 .update_file_by_uri(&uris[1], Some(guard_a(equivalent_prefix, "IsNPC")))
+                .map(|(id, _)| id)
                 .expect("guard type change");
 
             let wrapper_types = {
@@ -3934,7 +4177,7 @@ _2 = a[1]
                     .iter()
                     .map(|file_id| {
                         signature_index
-                            .inferred_guard_facts_for_files(&HashSet::from([*file_id]))
+                            .inferred_guard_facts_for_files(&HashSet::from_iter([*file_id]))
                             .into_values()
                             .next()
                             .expect("wrapper inferred guard")
@@ -3951,11 +4194,6 @@ _2 = a[1]
             );
             let narrowed = nth_name_expr_type_from_end(&mut ws, file_ids[5], "narrowed", 0);
             assert_eq!(ws.humanize_type(narrowed), "NPC");
-            assert_eq!(ws.analysis.inferred_guard_propagation_stats.frontiers, 4);
-            assert_eq!(
-                ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-                4
-            );
         }
     }
 
@@ -4027,6 +4265,7 @@ _2 = a[1]
                 &guard_uri,
                 Some(source("IsPlayer", "return IsValid(ent) and ent:IsPlayer()")),
             )
+            .map(|(id, _)| id)
             .expect("dot assignment guard addition");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Player");
@@ -4036,12 +4275,14 @@ _2 = a[1]
                 &guard_uri,
                 Some(source("IsPlayer", "return IsValid(ent) and ent:IsNPC()")),
             )
+            .map(|(id, _)| id)
             .expect("dot assignment guard type change");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "NPC");
 
         ws.analysis
             .update_file_by_uri(&guard_uri, Some(source("IsPlayer", "return true")))
+            .map(|(id, _)| id)
             .expect("dot assignment guard removal");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Entity");
@@ -4051,6 +4292,7 @@ _2 = a[1]
                 &guard_uri,
                 Some(source("IsPerson", "return IsValid(ent) and ent:IsPlayer()")),
             )
+            .map(|(id, _)| id)
             .expect("dot assignment guard rename");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Entity");
@@ -4071,7 +4313,7 @@ _2 = a[1]
             .virtual_url_generator
             .new_uri("lua/autorun/server/moved_assignment_guard.lua");
 
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (old_uri, None),
             (new_uri.clone(), Some(guard_source.to_string())),
         ]);
@@ -4085,7 +4327,7 @@ _2 = a[1]
                     "Predicates = Predicates or {}\nPredicates[\"IsPlayer\"] = function(ent) return true end"
                         .to_string(),
                 ),
-            )
+            ).map(|(id, _)| id)
             .expect("moved static-string assignment guard removal");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Entity");
@@ -4119,7 +4361,7 @@ _2 = a[1]
                     .new_uri(&format!("lua/autorun/server/reverse_guard_{idx}.lua"))
             })
             .collect::<Vec<_>>();
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 uris[0].clone(),
                 Some(
@@ -4179,6 +4421,7 @@ _2 = a[1]
                     .to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("guard chain file id");
 
         let consumer_file_id = ws
@@ -4190,19 +4433,6 @@ _2 = a[1]
             .expect("consumer file id");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Player");
-        assert_eq!(ws.analysis.inferred_guard_propagation_stats.frontiers, 1);
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            1
-        );
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reference_edges,
-            1
-        );
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.changed_facts,
-            4
-        );
     }
 
     #[gtest]
@@ -4275,7 +4505,7 @@ _2 = a[1]
         let source = |name: &str, body: &str| {
             format!("Predicates = Predicates or {{}}\nfunction Predicates.{name}(ent) {body} end")
         };
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 ws.virtual_url_generator
                     .new_uri("lua/includes/namespaced_incremental_types.lua"),
@@ -4324,12 +4554,14 @@ _2 = a[1]
                 &guard_uri,
                 Some(source("IsPlayer", "return IsValid(ent) and ent:IsPlayer()")),
             )
+            .map(|(id, _)| id)
             .expect("guard addition");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Player");
 
         ws.analysis
             .update_file_by_uri(&guard_uri, Some(source("IsPlayer", "return true")))
+            .map(|(id, _)| id)
             .expect("guard removal");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Entity");
@@ -4339,13 +4571,14 @@ _2 = a[1]
                 &guard_uri,
                 Some(source("IsPerson", "return IsValid(ent) and ent:IsPlayer()")),
             )
+            .map(|(id, _)| id)
             .expect("guard rename");
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Entity");
     }
 
     #[gtest]
-    fn test_namespaced_inferred_guard_file_move_rebinds_consumer_dependency() {
+    fn test_namespaced_inferred_guard_file_move_keeps_consumer_following_the_guard() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
         let old_uri = ws
@@ -4363,7 +4596,7 @@ _2 = a[1]
                 return IsValid(ent) and ent:IsPlayer()
             end
         "#;
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 ws.virtual_url_generator
                     .new_uri("lua/includes/moved_guard_types.lua"),
@@ -4407,28 +4640,20 @@ _2 = a[1]
             .get_file_id(&consumer_uri)
             .expect("consumer file id");
 
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (old_uri, None),
             (new_uri.clone(), Some(guard_source.to_string())),
         ]);
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed), "Player");
-        let new_file_id = ws
-            .analysis
-            .compilation
-            .get_db()
-            .get_vfs()
-            .get_file_id(&new_uri)
-            .expect("moved guard file id");
-        assert!(
-            ws.analysis
-                .compilation
-                .get_db()
-                .get_signature_index()
-                .inferred_guard_consumers_for_files(&HashSet::from([new_file_id]))
-                .contains(&consumer_file_id)
+
+        ws.analysis.update_file_by_uri(
+            &new_uri,
+            Some(guard_source.replace(" and ent:IsPlayer()", "")),
         );
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
     }
 
     #[gtest]
@@ -4517,7 +4742,7 @@ _2 = a[1]
                 "#,
             )
         };
-        ws.analysis.update_files_by_uri_sorted(vec![
+        ws.analysis.update_files_by_uri(vec![
             (
                 types_uri,
                 Some(
@@ -4592,21 +4817,13 @@ _2 = a[1]
                 &guards_uri,
                 Some(guard_source("return IsValid(ent) and ent:IsPlayer()")),
             )
+            .map(|(id, _)| id)
             .expect("realm guard file id after update");
 
         let server_type = nth_name_expr_type_from_end(&mut ws, server_file_id, "narrowed", 0);
         let client_type = nth_name_expr_type_from_end(&mut ws, client_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(server_type), "Player");
         assert_eq!(ws.humanize_type(client_type), "NPC");
-        assert_eq!(ws.analysis.inferred_guard_propagation_stats.frontiers, 1);
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
-            1
-        );
-        assert_eq!(
-            ws.analysis.inferred_guard_propagation_stats.reference_edges,
-            1
-        );
     }
 
     #[gtest]
@@ -4624,6 +4841,7 @@ _2 = a[1]
                 &predicate_uri,
                 Some("\n\nfunction IsPlayer(ent)\n    return true\nend".to_string()),
             )
+            .map(|(id, _)| id)
             .expect("predicate file id after offset shift");
 
         let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -4648,6 +4866,7 @@ _2 = a[1]
                         .to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("predicate file id after rename");
 
         let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -4666,6 +4885,7 @@ _2 = a[1]
 
         ws.analysis
             .remove_file_by_uri(&predicate_uri)
+            .0
             .expect("removed predicate file id");
 
         let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
@@ -4764,6 +4984,7 @@ _2 = a[1]
         let file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(source("return IsValid(ent) and ent:IsPlayer()")))
+            .map(|(id, _)| id)
             .expect("file id");
 
         let inferred_guard_count = |ws: &VirtualWorkspace| {
@@ -4787,6 +5008,7 @@ _2 = a[1]
         let updated_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(source("return true")))
+            .map(|(id, _)| id)
             .expect("file id after update");
         assert_eq!(updated_file_id, file_id);
         assert_eq!(inferred_guard_count(&ws), 0);
@@ -6069,10 +6291,11 @@ _2 = a[1]
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@class Entity
             ---@field GetClass fun(self: Entity): string
 
@@ -6080,9 +6303,10 @@ _2 = a[1]
             ---@return TypeGuard<any>
             function _G.IsValid(x) end
             "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -6419,6 +6643,29 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn an_equality_with_a_subclass_value_narrows_a_base_class_variable() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Animal
+            ---@class Dog: Animal
+
+            ---@return Dog
+            local function get_dog() end
+
+            ---@param animal Animal
+            local function test(animal)
+                if animal == get_dog() then
+                    narrowed = animal
+                end
+            end
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("narrowed"), ws.ty("Dog"));
+    }
+
+    #[gtest]
     fn test_type_guard_class_name_not_equals_early_return_narrows_afterward() {
         let mut ws = VirtualWorkspace::new();
         let code = r#"
@@ -6532,6 +6779,108 @@ _2 = a[1]
             end
             "#,
         ));
+    }
+
+    /// A stored `type()` result describes the value it was taken of, not one assigned
+    /// after it, nor one seen from a closure that may run later.
+    #[gtest]
+    fn test_type_guard_class_name_alias_does_not_outlive_its_value() {
+        let warns = |body: &str| {
+            let mut ws = VirtualWorkspace::new();
+            !ws.check_code_for(
+                DiagnosticCode::UndefinedMethod,
+                &format!(
+                    r#"
+            ---@class Dog
+            local Dog = {{}}
+            function Dog:Bark() end
+
+            ---@return Dog
+            local function makeDog() end
+
+            local function test()
+                local value = makeDog()
+                {body}
+            end
+            "#
+                ),
+            )
+        };
+        assert_eq!(
+            [
+                "local kind = type(value)\nvalue = 42\nif kind == \"Dog\" then value:Bark() end",
+                "value = 42\nlocal kind = type(value)\nlocal function later() if kind == \"Dog\" then value:Bark() end end\nlater()",
+            ]
+            .map(warns),
+            [true, true]
+        );
+    }
+
+    #[gtest]
+    fn test_type_guard_class_name_does_not_narrow_a_global_of_another_type() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            ---@class Dog
+            local Dog = {}
+            function Dog:Bark() end
+
+            pet = "text"
+            if type(pet) == "Dog" then
+                pet:Bark()
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_captured_counter_written_by_two_closures_reads_the_same_in_either_order() {
+        let code = r#"
+            local count = 0
+            local function inc() count = count + 1 end
+            local function dec() count = count - 1 end
+        "#;
+        // `count` inside `inc` is the second read from the end, inside `dec` the first.
+        let reads_in = |first: usize| {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let file_id = ws.def(code);
+            let first_read = nth_name_expr_type_from_end(&mut ws, file_id, "count", first);
+            let second_read = nth_name_expr_type_from_end(&mut ws, file_id, "count", 2 - first);
+            [ws.humanize_type(first_read), ws.humanize_type(second_read)]
+        };
+        expect_that!(
+            reads_in(0),
+            eq(&["integer".to_string(), "integer".to_string()])
+        );
+        expect_that!(
+            reads_in(2),
+            eq(&["integer".to_string(), "integer".to_string()])
+        );
+    }
+
+    #[gtest]
+    fn test_guard_alias_keeps_narrowing_applied_after_its_declaration() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@param s string
+            local function takes_string(s) end
+
+            ---@param x string|number|nil
+            local function f(x)
+                local ok = x ~= nil
+                if type(x) == "string" then
+                    if ok then
+                        takes_string(x)
+                    end
+                end
+            end
+            "#,
+        );
+
+        let x = nth_name_expr_type_from_end(&mut ws, file_id, "x", 0);
+        expect_that!(x, eq(&LuaType::String));
     }
 
     #[gtest]
@@ -6662,10 +7011,11 @@ _2 = a[1]
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@class Entity
             ---@field GetClass fun(self: Entity): string
 
@@ -6673,9 +7023,10 @@ _2 = a[1]
             ---@return TypeGuard<any>
             function _G.IsValid(x) end
             "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -6700,10 +7051,11 @@ _2 = a[1]
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@class Entity
             ---@field GetClass fun(self: Entity): string
 
@@ -6711,9 +7063,10 @@ _2 = a[1]
             ---@return TypeGuard<any>
             function _G.IsValid(x) end
             "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -6789,17 +7142,19 @@ _2 = a[1]
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@param x any
             ---@return boolean
             function _G.IsValid(x) end
             "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         assert!(!ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -8605,5 +8960,992 @@ _2 = a[1]
             "while true/break must not narrow, got: {}",
             desc
         );
+    }
+
+    /// A truthy guard proves its subject non-nil for a field read, not only for
+    /// a method call. `x:m()` already read the guard off the source when the
+    /// value was too unresolved for flow narrowing; `x.f` reported instead.
+    #[test]
+    fn truthy_guard_proves_an_unresolved_local_for_a_field_read() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class EntityObject
+            ---@field origin any
+
+            ---@class BspHolder
+            local meta = {}
+
+            ---@return EntityObject[]
+            function meta:GetEntities() end
+
+            local function cachedBrushes(self)
+                if self.__funcBrush then return self.__funcBrush end
+                local entities = self:GetEntities()
+                self.__funcBrush = { [0] = entities[0] }
+                for _, v in pairs(entities) do
+                    self.__funcBrush[1] = v
+                end
+                return self.__funcBrush
+            end
+
+            function meta:Probe(bNum)
+                local brush = cachedBrushes(self)[bNum]
+                if brush then
+                    return brush.origin
+                end
+            end
+            "#
+        ));
+    }
+
+    /// A branch that assigns `nil` keeps its arm when the other branch's type is
+    /// unknown, so the merge stays nullable instead of collapsing to `unknown`.
+    #[test]
+    fn merge_with_an_unknown_branch_keeps_the_nil_arm() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            local function ModifyColor(color, mode)
+                if mode == "bad" then color = nil end
+                local merged = color
+                return merged
+            end
+            "#,
+        );
+
+        let merged = nth_name_expr_type_from_end(&mut ws, file_id, "merged", 0);
+        assert!(
+            merged.is_nullable(),
+            "merge must keep the nil arm, got: {}",
+            ws.humanize_type(merged)
+        );
+    }
+
+    /// `input:upper()` runs when `bNoUpperFirst` is falsy or `input` is: the
+    /// two paths are pieces of the same unknown `input`, which merge back to
+    /// `unknown`.
+    #[test]
+    fn and_or_split_of_an_unknown_value_merges_back_to_unknown() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            local function ExpandCamelCase(input, bNoUpperFirst)
+                input = bNoUpperFirst and input or input:upper()
+                return input
+            end
+            "#,
+        );
+
+        let receiver = nth_name_expr_type_from_end(&mut ws, file_id, "input", 1);
+        assert_eq!(
+            receiver,
+            LuaType::Unknown,
+            "got: {}",
+            ws.humanize_type(receiver.clone())
+        );
+    }
+
+    #[test]
+    fn if_condition_split_of_an_unknown_value_merges_back_to_unknown() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            local function DrawBar(icon, anywayicon, enabled)
+                if (icon and enabled == 1 or anywayicon == true) then
+                    local material = icon
+                end
+            end
+            "#,
+        );
+
+        let icon = nth_name_expr_type_from_end(&mut ws, file_id, "icon", 0);
+        assert_eq!(
+            icon,
+            LuaType::Unknown,
+            "got: {}",
+            ws.humanize_type(icon.clone())
+        );
+    }
+
+    #[test]
+    fn fall_through_of_a_compound_guard_on_an_unknown_value_is_unknown() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            local function Stub(given, bOptional)
+                local argument = given[1]
+                if not argument and not bOptional then
+                    return
+                end
+                local value = argument
+            end
+            "#,
+        );
+
+        let argument = nth_name_expr_type_from_end(&mut ws, file_id, "argument", 0);
+        assert_eq!(
+            argument,
+            LuaType::Unknown,
+            "got: {}",
+            ws.humanize_type(argument.clone())
+        );
+    }
+
+    /// Only a merge restores the rest of an unknown value: the branch that
+    /// took the falsy operand still knows it is `nil` or `false`.
+    #[test]
+    fn falsy_operand_of_an_and_condition_stays_nil_or_false() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            local function Check(x, y)
+                if not x and y then
+                    local narrowed = x
+                end
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "x", 0);
+        assert_eq!(
+            ws.humanize_type(narrowed),
+            ws.humanize_type(LuaType::from_vec(vec![
+                LuaType::Nil,
+                LuaType::BooleanConst(false)
+            ]))
+        );
+    }
+
+    /// The value entering the condition is `unknown|nil`, not `unknown`: its
+    /// pieces merge back to a nullable type.
+    #[test]
+    fn condition_split_of_a_nullable_value_keeps_the_nil_arm() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            local function ModifyColor(color, mode, other)
+                if mode == "bad" then color = nil end
+                if color or other then
+                    local merged = color
+                    return merged
+                end
+            end
+            "#,
+        );
+
+        let merged = nth_name_expr_type_from_end(&mut ws, file_id, "merged", 0);
+        assert!(
+            merged.is_nullable(),
+            "merge must keep the nil arm, got: {}",
+            ws.humanize_type(merged)
+        );
+    }
+
+    #[test]
+    fn assigning_an_any_value_replaces_the_falsy_narrowed_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            ---@param x any
+            local function Resolve(x, amount)
+                if not amount then
+                    amount = x
+                    local assigned = amount
+                end
+            end
+            "#,
+        );
+
+        let assigned = nth_name_expr_type_from_end(&mut ws, file_id, "amount", 0);
+        assert_eq!(
+            assigned,
+            LuaType::Any,
+            "got: {}",
+            ws.humanize_type(assigned.clone())
+        );
+    }
+
+    #[test]
+    fn assigning_an_any_value_keeps_a_doc_declared_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            ---@param x any
+            local function Resolve(x)
+                ---@type string
+                local label = "default"
+                label = x
+                local assigned = label
+            end
+            "#,
+        );
+
+        let assigned = nth_name_expr_type_from_end(&mut ws, file_id, "label", 0);
+        assert_eq!(
+            assigned,
+            LuaType::String,
+            "got: {}",
+            ws.humanize_type(assigned.clone())
+        );
+    }
+
+    #[test]
+    fn assigning_an_any_value_to_an_unannotated_local_makes_it_any() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            ---@param lookup any
+            local function Resolve(level, lookup)
+                local class = "w"
+                if level == 2 then
+                    class = "ic"
+                end
+                class = lookup
+                local assigned = class
+            end
+            "#,
+        );
+
+        let assigned = nth_name_expr_type_from_end(&mut ws, file_id, "class", 0);
+        assert_eq!(
+            assigned,
+            LuaType::Any,
+            "got: {}",
+            ws.humanize_type(assigned.clone())
+        );
+    }
+
+    #[test]
+    fn assigning_an_unresolved_entry_to_an_annotated_local_takes_its_annotation_not_its_last_value()
+    {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_id = ws.def(
+            r#"
+            local registry = {}
+            local function Register(name, data)
+                name = string.lower(name)
+                registry[name] = data
+            end
+
+            local function Resolve(level)
+                ---@type string|number
+                local class = "w"
+                class = "changed"
+                class = registry[level]
+                local assigned = class
+            end
+            "#,
+        );
+
+        let assigned = nth_name_expr_type_from_end(&mut ws, file_id, "class", 0);
+        let declared = ws.ty("string|number");
+        assert_eq!(ws.humanize_type(assigned), ws.humanize_type(declared));
+    }
+
+    #[test]
+    fn assigning_an_unresolved_entry_to_an_unannotated_local_drops_its_old_kind() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_id = ws.def(
+            r#"
+            local registry = {}
+            local function Register(name, data)
+                name = string.lower(name)
+                registry[name] = data
+            end
+
+            local function Resolve(level)
+                local class = "w"
+                if level == 2 then
+                    class = "ic"
+                end
+                class = registry[class]
+                local assigned = class
+            end
+            "#,
+        );
+
+        let assigned = nth_name_expr_type_from_end(&mut ws, file_id, "class", 0);
+        assert!(
+            crate::db_index::is_unresolved_type(&assigned),
+            "got: {}",
+            ws.humanize_type(assigned.clone())
+        );
+    }
+
+    #[test]
+    fn assigning_an_unresolved_entry_to_an_annotated_local_keeps_its_declared_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_id = ws.def(
+            r#"
+            local registry = {}
+            local function Register(name, data)
+                name = string.lower(name)
+                registry[name] = data
+            end
+
+            local function Resolve(level)
+                ---@type string
+                local class = "w"
+                class = registry[level]
+                local assigned = class
+            end
+            "#,
+        );
+
+        let assigned = nth_name_expr_type_from_end(&mut ws, file_id, "class", 0);
+        assert_eq!(assigned, LuaType::String);
+    }
+
+    #[test]
+    fn a_type_guard_that_shares_no_arm_with_the_value_narrows_to_the_guarded_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_type_predicates();
+
+        let file_id = ws.def(
+            r#"
+            ---@param tree table<integer, integer|table>
+            ---@param act integer
+            local function Translate(tree, act)
+                if isstring(tree[act]) then
+                    local sequence = tree[act]
+                end
+            end
+            "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let index = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaIndexExpr>()
+            .last()
+            .expect("guarded read");
+        let guarded = semantic_model
+            .infer_expr(glua_parser::LuaExpr::IndexExpr(index))
+            .expect("guarded read type");
+        assert_eq!(
+            guarded,
+            LuaType::String,
+            "got: {}",
+            ws.humanize_type(guarded.clone())
+        );
+    }
+
+    #[test]
+    fn assigning_an_any_value_keeps_a_doc_declared_param_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            ---@param count number
+            ---@param x any
+            local function Resolve(count, x)
+                count = x
+                local assigned = count
+            end
+            "#,
+        );
+
+        let assigned = nth_name_expr_type_from_end(&mut ws, file_id, "count", 0);
+        assert_eq!(
+            assigned,
+            LuaType::Number,
+            "got: {}",
+            ws.humanize_type(assigned.clone())
+        );
+    }
+
+    /// The declared type is the local's, found at its declaration rather
+    /// than at the assignment.
+    #[test]
+    fn assigning_an_any_value_keeps_a_nullable_doc_declared_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            ---@param x any
+            local function Resolve(x)
+                ---@type string?
+                local label = "default"
+                label = x
+                local assigned = label
+            end
+            "#,
+        );
+
+        let assigned = nth_name_expr_type_from_end(&mut ws, file_id, "label", 0);
+        assert_eq!(ws.humanize_type(assigned), "string?");
+    }
+
+    #[test]
+    fn assigning_an_any_value_keeps_a_nullable_doc_declared_param_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            ---@param count number?
+            ---@param x any
+            local function Resolve(count, x)
+                count = x
+                local assigned = count
+            end
+            "#,
+        );
+
+        let assigned = nth_name_expr_type_from_end(&mut ws, file_id, "count", 0);
+        assert_eq!(ws.humanize_type(assigned), "number?");
+    }
+
+    /// Narrowing the union that owns a field by that field's comparison with
+    /// a literal must not stop the field's own walk at the comparison.
+    #[test]
+    fn a_field_guarded_by_a_nil_comparison_is_not_nil_inside_the_guard() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/steering.lua",
+            r#"
+            ---@class SteeringA
+            ---@field steer fun(self: SteeringA): number
+            ---@class SteeringB
+            ---@field steer? fun(self: SteeringB): number
+            ---@type SteeringA|SteeringB
+            local veh = make()
+            if veh.steer ~= nil then
+                local steer = veh.steer
+            end
+            "#,
+        );
+
+        let steer = ws.local_ty(file_id, "steer");
+        assert!(!steer.is_nullable(), "{steer:?}");
+    }
+
+    /// A field read after its owner was narrowed by a comparison with a
+    /// literal walks past that comparison to the value assigned before it.
+    #[test]
+    fn a_field_read_past_a_literal_comparison_of_its_owner_keeps_its_assigned_value() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/literal_narrowing.lua",
+            r#"
+            ---@class LiteralA
+            ---@field kind "a"
+            ---@field value string?
+            ---@class LiteralB
+            ---@field kind "b"
+            ---@field value string?
+            ---@type LiteralA|LiteralB
+            local x = make()
+            x.value = "set"
+            if x.kind == "a" then
+                local value = x.value
+            end
+            "#,
+        );
+
+        assert_eq!(
+            ws.local_ty(file_id, "value"),
+            LuaType::StringConst(smol_str::SmolStr::new("set").into())
+        );
+    }
+
+    /// A file without special-call effects passes a branch that cannot
+    /// narrow a variable without walking the branch for one.
+    #[gtest]
+    fn a_branch_in_a_file_without_special_calls_is_passed_without_a_walk() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local x = 1
+            local y = 0
+            if y > 0 then
+                y = 2
+            else
+                y = 3
+            end
+            print(x)
+            "#,
+        );
+        let db = ws.analysis.compilation.get_db();
+        let chunk = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("the file is parsed")
+            .get_chunk_node();
+        let x = chunk
+            .descendants::<LuaNameExpr>()
+            .filter(|name| name.get_name_text().as_deref() == Some("x"))
+            .last()
+            .expect("the read of x");
+        let mut cache = crate::LuaInferCache::new(file_id, Default::default());
+        let typ = crate::semantic::infer_expr(db, &mut cache, glua_parser::LuaExpr::NameExpr(x))
+            .expect("x infers");
+
+        expect_that!(ws.humanize_type(typ), eq("1"));
+        verify_that!(cache.branch_special_call_effect_cache.is_empty(), eq(true))
+    }
+
+    const LATER_WRITE_PRELUDE: &str = r#"
+            ---@class DImage
+            ---@field SetMaterial fun(self: DImage, mat: string)
+
+            ---@class DButton
+            ---@field DoClick fun(self: DButton)
+
+            ---@return DImage
+            local function create_image() end
+
+            ---@return DButton
+            local function create_button() end
+
+            ---@param s string
+            local function write_string(s) end
+    "#;
+
+    #[gtest]
+    fn a_read_of_a_loop_variable_before_its_reassignment_holds_the_iterated_value() -> Result<()> {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(&format!(
+            "{LATER_WRITE_PRELUDE}
+            local function render(rows)
+               for key, value in pairs(rows) do
+                  _G.before = value
+                  write_string(value)
+                  if key then
+                     _G.sibling = value
+                  else
+                     value = create_image()
+                     _G.after = value
+                  end
+               end
+            end
+            "
+        ));
+
+        let before = nth_name_expr_type_from_end(&mut ws, file_id, "value", 4);
+        expect_that!(ws.humanize_type(before), eq("any"));
+        let sibling = nth_name_expr_type_from_end(&mut ws, file_id, "value", 2);
+        expect_that!(ws.humanize_type(sibling), eq("any"));
+        let after = nth_name_expr_type_from_end(&mut ws, file_id, "value", 0);
+        expect_that!(ws.humanize_type(after), contains_substring("DImage"));
+        verify_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            eq(false)
+        )
+    }
+
+    #[gtest]
+    fn a_read_before_a_later_assignment_holds_the_initializers_value() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&format!(
+            "{LATER_WRITE_PRELUDE}
+            local function order(args)
+               local id = args[1]
+               _G.before = id
+               write_string(id)
+               id = create_image()
+               _G.after = id
+            end
+            "
+        ));
+
+        let before = nth_name_expr_type_from_end(&mut ws, file_id, "id", 3);
+        expect_that!(ws.humanize_type(before), eq("unknown"));
+        let after = nth_name_expr_type_from_end(&mut ws, file_id, "id", 0);
+        expect_that!(ws.humanize_type(after), eq("DImage"));
+        verify_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            eq(false)
+        )
+    }
+
+    #[gtest]
+    fn a_closure_reading_a_local_assigned_after_it_sees_the_assignment() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&format!(
+            "{LATER_WRITE_PRELUDE}
+            local function setup(source)
+               local image = source.image
+               local button = create_button()
+               button.DoClick = function()
+                  _G.inside = image
+               end
+               image = create_image()
+            end
+            "
+        ));
+
+        let inside = nth_name_expr_type_from_end(&mut ws, file_id, "image", 1);
+        verify_that!(ws.humanize_type(inside), contains_substring("DImage"))
+    }
+
+    /// `local mat = eicon; eicon = create_image(); eicon:SetMaterial(mat)`:
+    /// the copy holds what `eicon` was declared with, not the image.
+    fn assert_copy_before_reassignment_keeps_the_old_value(
+        helpers: &str,
+        initializer: &str,
+    ) -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&format!(
+            "{LATER_WRITE_PRELUDE}
+            {helpers}
+            local function fill(source, key)
+               local eicon = {initializer}
+               if eicon then
+                  local mat = eicon
+                  eicon = create_image()
+                  eicon:SetMaterial(mat)
+               end
+            end
+            "
+        ));
+
+        let mat = nth_name_expr_type_from_end(&mut ws, file_id, "mat", 0);
+        expect_that!(ws.humanize_type(mat), not(eq("DImage")));
+        verify_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            eq(false)
+        )
+    }
+
+    #[gtest]
+    fn a_copy_of_a_local_read_off_an_unknown_value_keeps_the_old_value() -> Result<()> {
+        assert_copy_before_reassignment_keeps_the_old_value("", "source.icon")
+    }
+
+    #[gtest]
+    fn a_copy_of_a_local_whose_initializer_may_be_nil_keeps_the_old_value() -> Result<()> {
+        assert_copy_before_reassignment_keeps_the_old_value(
+            "local function lookup(registry, key)
+               if not key then return end
+               return registry[key]
+            end",
+            "lookup(source, key)",
+        )
+    }
+
+    #[gtest]
+    fn a_copy_of_a_local_initialized_to_any_keeps_the_old_value() -> Result<()> {
+        assert_copy_before_reassignment_keeps_the_old_value(
+            "---@return any
+            local function lookup(registry, key) end",
+            "lookup(source, key)",
+        )
+    }
+
+    const STORED_ENTITY_PRELUDE: &str = r#"
+            ---@class ScriptedEntityStored
+            ---@field t table
+
+            ---@return ScriptedEntityStored?
+            local function get_stored() end
+
+            ---@return table
+            local function fallback() end
+
+            local w = get_stored()
+    "#;
+
+    fn local_after(body: &str) -> String {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&format!(
+            "{STORED_ENTITY_PRELUDE}\n{body}\nlocal after = w\n"
+        ));
+        let after = ws.local_ty(file_id, "after");
+        ws.humanize_type(after)
+    }
+
+    #[gtest]
+    fn a_local_assigned_its_own_member_holds_the_member() {
+        expect_that!(local_after("if w then w = w.t end"), eq("table?"));
+    }
+
+    #[gtest]
+    fn a_local_assigned_its_own_member_or_a_fallback_holds_either() {
+        expect_that!(
+            local_after("if w then w = w.t or fallback() end"),
+            eq("table?")
+        );
+    }
+
+    #[gtest]
+    fn a_local_assigned_its_own_member_behind_a_nil_guard_holds_the_member() {
+        expect_that!(local_after("w = w and w.t"), eq("table?"));
+    }
+
+    #[gtest]
+    fn a_local_defaulted_to_a_table_keeps_its_own_class() {
+        expect_that!(
+            local_after("w = w or fallback()"),
+            contains_substring("ScriptedEntityStored")
+        );
+    }
+
+    #[gtest]
+    fn a_value_written_only_on_break_paths_may_be_unwritten_after_a_repeat_loop() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@param first boolean
+            ---@param second boolean
+            ---@param number_value number
+            ---@param string_value string
+            local function use(first, second, number_value, string_value)
+                local v
+                repeat
+                    if first then
+                        v = number_value
+                        break
+                    elseif second then
+                        v = string_value
+                        break
+                    end
+                until true
+                local after = v
+                return after
+            end
+        "#,
+        );
+        let after_ty = ws.local_ty(file_id, "after");
+        expect_that!(after_ty.is_nullable(), eq(true));
+        let after = ws.humanize_type(after_ty);
+        expect_that!(after, contains_substring("number"));
+        expect_that!(after, contains_substring("string"));
+    }
+
+    fn local_after_in_function(params: &str, body: &str) -> String {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&format!(
+            r#"
+            ---@return string?
+            local function fetch() end
+
+            {params}
+            local function use(value, flag, number_value, string_value)
+                {body}
+                local after = value
+                return after
+            end
+            "#
+        ));
+        let after = ws.local_ty(file_id, "after");
+        ws.humanize_type(after)
+    }
+
+    #[gtest]
+    fn an_optional_parameter_keeps_nil_when_a_repeat_breaks_on_nil() {
+        expect_that!(
+            local_after_in_function(
+                "---@param value string?",
+                r#"repeat
+                    if value == nil then
+                        break
+                    end
+                until true"#
+            ),
+            eq("string?")
+        );
+    }
+
+    #[gtest]
+    fn a_while_loop_break_carries_its_assignment_to_the_loop_exit() {
+        let after = local_after_in_function(
+            "---@param value number\n---@param flag boolean\n---@param string_value string",
+            r#"while flag do
+                    value = string_value
+                    break
+                end"#,
+        );
+        expect_that!(after, contains_substring("number"));
+        expect_that!(after, contains_substring("string"));
+    }
+
+    #[gtest]
+    fn a_repeat_exit_holds_the_value_its_until_condition_confirms() {
+        expect_that!(
+            local_after_in_function(
+                "---@param value string?",
+                r#"repeat
+                    value = fetch()
+                until value ~= nil"#
+            ),
+            eq("string")
+        );
+    }
+
+    #[gtest]
+    fn a_repeat_whose_only_exit_is_a_break_leaves_the_following_code_reachable() {
+        expect_that!(
+            local_after_in_function(
+                "---@param value string?\n---@param string_value string",
+                r#"repeat
+                    value = string_value
+                    break
+                until false"#
+            ),
+            eq("string")
+        );
+    }
+
+    #[gtest]
+    fn a_guard_that_returns_keeps_narrowing_the_elseif_branches_after_the_if() {
+        expect_that!(
+            local_after_in_function(
+                "---@param value string?
+---@param flag boolean",
+                r#"if value == nil then
+                    return
+                elseif flag then
+                    print(value)
+                end"#
+            ),
+            eq("string")
+        );
+    }
+
+    #[gtest]
+    fn a_condition_inside_a_closure_in_a_condition_narrows_its_own_branches() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@param callback fun(): boolean
+            local function run(callback) end
+
+            ---@param value string?
+            ---@param flag boolean
+            local function use(value, flag)
+                if run(function()
+                    if value == nil then
+                        return false
+                    elseif flag then
+                        print(value)
+                    end
+                    local after = value
+                    return true
+                end) and flag then
+                end
+            end
+            "#,
+        );
+        let after = ws.local_ty(file_id, "after");
+        expect_that!(ws.humanize_type(after), eq("string"));
+    }
+
+    #[gtest]
+    fn a_repeat_without_an_exit_leaves_the_following_code_unreachable() {
+        expect_that!(
+            local_after_in_function(
+                "---@param value string?
+---@param string_value string",
+                r#"repeat
+                    value = string_value
+                until false"#
+            ),
+            eq("string?")
+        );
+    }
+
+    #[gtest]
+    fn a_repeat_continue_carries_its_state_through_the_until_condition_to_the_exit() {
+        let params = "---@param value string?";
+        let guard = "if value == nil then continue end";
+        let cases = [
+            format!("repeat {guard} until true"),
+            format!("repeat repeat break until true {guard} until true"),
+            format!("repeat repeat {guard} until true until true"),
+        ];
+        for body in cases {
+            expect_that!(local_after_in_function(params, &body), eq("string?"));
+        }
+    }
+
+    #[gtest]
+    fn a_continue_in_an_inner_loop_does_not_feed_the_outer_repeat_condition() {
+        for inner in [
+            "while flag do value = string_value continue end",
+            "for _ = 1, 2 do value = string_value continue end",
+        ] {
+            let after = local_after_in_function(
+                "---@param value number\n---@param flag boolean\n---@param string_value string",
+                &format!("repeat {inner} until true"),
+            );
+            expect_that!(after.contains("string"), eq(false));
+        }
+    }
+
+    #[gtest]
+    fn a_continue_with_a_semicolon_flows_like_one_without() {
+        let params = "---@param value string?";
+        let with = |stat: &str| {
+            local_after_in_function(params, &format!("while value ~= nil do {stat} end"))
+        };
+        assert_eq!(with("continue;"), with("continue"));
+        expect_that!(with("continue"), eq("nil"));
+        expect_that!(with("break"), eq("string?"));
+    }
+
+    fn local_in_function(body: &str, name: &str) -> String {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&format!(
+            r#"
+            ---@param value string?
+            local function use(value)
+                {body}
+            end
+            "#
+        ));
+        let local = ws.local_ty(file_id, name);
+        ws.humanize_type(local)
+    }
+
+    #[gtest]
+    fn a_goto_reaches_the_label_of_its_own_block_when_a_sibling_block_reuses_the_name() {
+        let first_block = r#"
+            do
+                if value == nil then goto skip end
+                ::skip::
+                local first = value
+            end"#;
+        expect_that!(local_in_function(first_block, "first"), eq("string?"));
+        let with_sibling = format!("{first_block}\ndo ::skip:: end");
+        expect_that!(local_in_function(&with_sibling, "first"), eq("string?"));
+    }
+
+    #[gtest]
+    fn a_backward_goto_reads_at_its_label_as_a_loop_reads_at_its_head() {
+        let goto_loop = r#"
+            ::retry::
+            local seen = value
+            if value == nil then
+                value = 1
+                goto retry
+            end"#;
+        let while_loop = r#"
+            while true do
+                local seen = value
+                if value ~= nil then break end
+                value = 1
+            end"#;
+        let at_label = local_in_function(goto_loop, "seen");
+        expect_that!(at_label, not(eq("unknown")));
+        expect_that!(at_label, eq(&local_in_function(while_loop, "seen")));
     }
 }

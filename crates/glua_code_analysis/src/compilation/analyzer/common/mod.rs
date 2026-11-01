@@ -1,16 +1,139 @@
-mod migrate_global_member;
-use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
-pub(super) use migrate_global_member::{
-    migrate_global_members_when_type_resolve, migrate_global_path_members_when_owner_resolved,
-    reconcile_directly_attached_candidate_members, reconcile_parked_global_path_members,
+use glua_parser::{
+    BinaryOperator, LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaElseIfClauseStat,
+    LuaExpr, LuaForRangeStat, LuaIfStat, LuaLiteralToken, LuaRepeatStat, LuaSyntaxNode,
+    LuaWhileStat, UnaryOperator,
 };
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 
 use crate::{
-    FileId, InFiled, LuaDeclId, LuaMemberId, LuaTypeCache, LuaTypeOwner,
+    FileId, InFiled, LuaDeclId, LuaMemberId, LuaTypeCache, LuaTypeOwner, LuaUnionType,
     compilation::analyzer::lua::iterates_table_member_map,
-    db_index::{DbIndex, LuaMemberOwner, LuaType, LuaTypeDeclId, is_informative_type},
+    db_index::{
+        DbIndex, LuaMemberOwner, LuaType, LuaTypeDeclId, derivation, is_informative_type,
+        is_undetermined_type,
+    },
 };
+
+/// Cheap upper-bound estimate of one file's member/reference index writes from
+/// its syntax text length, without walking the tree.
+///
+/// Dense field writes can exceed one entry per 16 bytes and
+/// sparse files use far fewer, so callers treat the result as a reservation
+/// hint only: under-estimating merely leaves some rehashing in place, and
+/// over-estimating leaves bounded slack. Never changes indexed facts.
+pub fn estimate_file_index_entries(text_len: usize) -> usize {
+    const BYTES_PER_ENTRY: usize = 16;
+    const MIN_ENTRIES: usize = 8;
+    const MAX_ENTRIES: usize = 4096;
+    (text_len / BYTES_PER_ENTRY + MIN_ENTRIES).min(MAX_ENTRIES)
+}
+
+/// Whether `expr` is a `nil` literal, possibly parenthesized. A `nil` write is
+/// a delete: it removes an entry, it never adds a member typed `nil`.
+pub fn is_nil_literal_expr(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::LiteralExpr(literal_expr) => {
+            matches!(literal_expr.get_literal(), Some(LuaLiteralToken::Nil(_)))
+        }
+        LuaExpr::ParenExpr(paren_expr) => paren_expr
+            .get_expr()
+            .is_some_and(|expr| is_nil_literal_expr(&expr)),
+        _ => false,
+    }
+}
+
+/// Whether `node`'s value is only tested for presence; the left of an untested `or` is a
+/// fallback. `guard_call_arg` decides whether the call tests this argument.
+pub fn is_presence_tested(
+    node: &LuaSyntaxNode,
+    guard_call_arg: &mut dyn FnMut(&LuaCallExpr) -> bool,
+) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if let Some(LuaExpr::ParenExpr(paren)) = LuaExpr::cast(parent.clone()) {
+        return is_presence_tested(paren.syntax(), guard_call_arg);
+    }
+    if let Some(LuaExpr::UnaryExpr(unary)) = LuaExpr::cast(parent.clone()) {
+        return unary
+            .get_op_token()
+            .is_some_and(|op| op.get_op() == UnaryOperator::OpNot)
+            && (is_short_circuit_left(unary.syntax())
+                || is_presence_tested(unary.syntax(), guard_call_arg));
+    }
+    if let Some(LuaExpr::BinaryExpr(binary)) = LuaExpr::cast(parent.clone()) {
+        let (Some(op), Some((left, right))) = (
+            binary.get_op_token().map(|op| op.get_op()),
+            binary.get_exprs(),
+        ) else {
+            return false;
+        };
+        let is_left = left.syntax() == node;
+        return match op {
+            BinaryOperator::OpAnd => is_left || is_presence_tested(binary.syntax(), guard_call_arg),
+            BinaryOperator::OpOr => is_presence_tested(binary.syntax(), guard_call_arg),
+            BinaryOperator::OpEq | BinaryOperator::OpNe => {
+                is_nil_literal_expr(if is_left { &right } else { &left })
+            }
+            _ => false,
+        };
+    }
+    if let Some(args) = LuaCallArgList::cast(parent.clone()) {
+        return args
+            .get_parent::<LuaCallExpr>()
+            .is_some_and(|call| guard_call_arg(&call));
+    }
+    let is_condition_of =
+        |condition: Option<LuaExpr>| condition.is_some_and(|condition| condition.syntax() == node);
+    LuaIfStat::cast(parent.clone()).is_some_and(|stat| is_condition_of(stat.get_condition_expr()))
+        || LuaElseIfClauseStat::cast(parent.clone())
+            .is_some_and(|clause| is_condition_of(clause.get_condition_expr()))
+        || LuaWhileStat::cast(parent.clone())
+            .is_some_and(|stat| is_condition_of(stat.get_condition_expr()))
+        || LuaRepeatStat::cast(parent)
+            .is_some_and(|stat| is_condition_of(stat.get_condition_expr()))
+}
+
+/// Whether `node` is the left operand of an `and` or `or`, whose truthiness picks the result.
+fn is_short_circuit_left(node: &LuaSyntaxNode) -> bool {
+    let Some(LuaExpr::BinaryExpr(binary)) = node.parent().and_then(LuaExpr::cast) else {
+        return false;
+    };
+    binary
+        .get_op_token()
+        .is_some_and(|op| matches!(op.get_op(), BinaryOperator::OpAnd | BinaryOperator::OpOr))
+        && binary
+            .get_exprs()
+            .is_some_and(|(left, _)| left.syntax() == node)
+}
+
+/// Whether `expr` is a `nil` or `false` literal, possibly parenthesized: a value
+/// `x or default` replaces with its default.
+pub fn is_falsy_literal_expr(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal() {
+            Some(LuaLiteralToken::Nil(_)) => true,
+            Some(LuaLiteralToken::Bool(value)) => !value.is_true(),
+            _ => false,
+        },
+        LuaExpr::ParenExpr(paren_expr) => paren_expr
+            .get_expr()
+            .is_some_and(|expr| is_falsy_literal_expr(&expr)),
+        _ => false,
+    }
+}
+
+/// Whether `expr` in tail position can expand to fill extra assignment slots:
+/// a call returns all its values, and `...` spreads.
+pub fn expr_expands_to_fill_slots(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::CallExpr(_) => true,
+        LuaExpr::LiteralExpr(literal_expr) => {
+            matches!(literal_expr.get_literal(), Some(LuaLiteralToken::Dots(_)))
+        }
+        _ => false,
+    }
+}
 
 /// Whether `typ` is a raw template placeholder inherited from a generic-for
 /// variable that nothing has bound yet.
@@ -83,9 +206,7 @@ pub enum TypeCacheWriteMode {
 /// Writes a type cache using the requested low-level write mode.
 ///
 /// Call sites fall into doc-annotation, assignment-inferred, and
-/// resolved-synthesized families. Authority-based precedence was evaluated and
-/// rejected in Phase C2 for lack of evidence; see
-/// `.slim/deepwork/indexing-type-source-refactor.md`.
+/// resolved-synthesized families.
 pub fn write_type_cache(
     db: &mut DbIndex,
     owner: LuaTypeOwner,
@@ -93,9 +214,12 @@ pub fn write_type_cache(
     mode: TypeCacheWriteMode,
 ) {
     match mode {
-        TypeCacheWriteMode::InsertOnly => db.get_type_index_mut().bind_type(owner, cache),
-        TypeCacheWriteMode::ForceOverwrite => db.get_type_index_mut().force_bind_type(owner, cache),
+        TypeCacheWriteMode::InsertOnly => db.get_type_index_mut().bind_type(owner.clone(), cache),
+        TypeCacheWriteMode::ForceOverwrite => db
+            .get_type_index_mut()
+            .force_bind_type(owner.clone(), cache),
     }
+    bind_global_path_class(db, &owner);
 }
 
 /// Binds an inferred/declared type and preserves the legacy declaration merge
@@ -108,44 +232,409 @@ pub fn write_type_cache(
 pub fn bind_type(
     db: &mut DbIndex,
     type_owner: LuaTypeOwner,
-    mut type_cache: LuaTypeCache,
+    type_cache: LuaTypeCache,
 ) -> Option<()> {
     let decl_type_cache = db.get_type_index().get_type_cache(&type_owner);
 
     if decl_type_cache.is_none() {
-        // type backward
-        if type_cache.is_infer()
-            && let LuaTypeOwner::Decl(decl_id) = &type_owner
-            && let Some(decl_ref) = db
-                .get_reference_index()
-                .get_decl_references(&decl_id.file_id, decl_id)
-            && decl_ref.mutable
-        {
-            match &type_cache.as_type() {
-                LuaType::IntegerConst(_) => type_cache = LuaTypeCache::InferType(LuaType::Integer),
-                LuaType::StringConst(_) => type_cache = LuaTypeCache::InferType(LuaType::String),
-                LuaType::BooleanConst(_) => type_cache = LuaTypeCache::InferType(LuaType::Boolean),
-                LuaType::FloatConst(_) => type_cache = LuaTypeCache::InferType(LuaType::Number),
-                _ => {}
-            }
-        }
-
-        db.get_type_index_mut()
-            .bind_type(type_owner.clone(), type_cache);
-        migrate_global_members_when_type_resolve(db, type_owner);
+        seed_type_slot(db, type_owner, type_cache);
     } else {
+        // A write that leaves the slot as it is still produces it, so a reset
+        // of the statement's outputs reaches what it seeded on an earlier run.
+        derivation::note_write(|| derivation::FactKey::TypeCache(type_owner.clone()));
         let decl_type_cache = decl_type_cache?;
         let decl_type = decl_type_cache.as_type();
         if should_replace_uninformative_inferred_cache(&type_owner, decl_type_cache, &type_cache) {
             db.get_type_index_mut()
                 .force_bind_type(type_owner.clone(), type_cache);
-            migrate_global_members_when_type_resolve(db, type_owner);
+            bind_global_path_class(db, &type_owner);
         } else {
-            merge_def_type(db, decl_type.clone(), type_cache.as_type().clone(), 0);
+            // A guarded `X.k = X.k or {}` bootstrap of a path whose
+            // declaration carries a `---@class` assigns that class's own
+            // table: the literal canonicalises to the class owner. Merging it
+            // into the class type states nothing new, and widens `C` to
+            // `C|table`.
+            if !incoming_is_the_declared_class_table(db, decl_type, type_cache.as_type()) {
+                merge_def_type(db, decl_type.clone(), type_cache.as_type().clone(), 0);
+            }
         }
     }
 
     Some(())
+}
+
+/// Seeds a type owner that holds nothing yet, widening a mutable declaration's
+/// literal to its base type on the way in.
+fn seed_type_slot(db: &mut DbIndex, type_owner: LuaTypeOwner, type_cache: LuaTypeCache) {
+    let type_cache = widen_mutable_decl_literal(db, &type_owner, type_cache);
+    let type_cache = match class_table_seed_type(db, type_cache.as_type()) {
+        Some(class_type) => LuaTypeCache::InferType(class_type),
+        None => type_cache,
+    };
+    db.get_type_index_mut()
+        .force_bind_type(type_owner.clone(), type_cache);
+    bind_global_path_class(db, &type_owner);
+}
+
+/// The class a table literal belongs to, when it is the table a
+/// class-annotated global path was declared with.
+///
+/// `X.k = X.k or {}` in a second file assigns the very table the first file
+/// annotated, and a reader of `X.k` holds that same table. Seeding the literal
+/// instead of the class hands both an empty table where the class stands.
+fn class_table_seed_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
+    let LuaType::TableConst(range) = typ else {
+        return None;
+    };
+    let class = db
+        .get_member_index()
+        .canonical_owner(LuaMemberOwner::Element(range.clone()))
+        .get_type_id()?
+        .clone();
+    Some(LuaType::Ref(class))
+}
+
+fn incoming_is_the_declared_class_table(
+    db: &DbIndex,
+    declared: &LuaType,
+    incoming: &LuaType,
+) -> bool {
+    let (LuaType::Def(class) | LuaType::Ref(class)) = declared else {
+        return false;
+    };
+    let LuaType::TableConst(range) = incoming else {
+        return false;
+    };
+    db.get_member_index()
+        .canonical_owner(LuaMemberOwner::Element(range.clone()))
+        .get_type_id()
+        == Some(class)
+}
+
+/// Files a global path's members under the class its declaration is annotated
+/// with.
+///
+/// `---@class oslib` on `os = {}` gives one table two names, and every reader
+/// of the annotated type looks its members up on the class. Without this the
+/// path's members and the class's are two disjoint sets, and the workspace
+/// precedence between two files writing the same key (annotations over the std
+/// stub) never gets to apply.
+fn bind_global_path_class(db: &mut DbIndex, type_owner: &LuaTypeOwner) -> Option<()> {
+    // Only a `Def` names the class's own table: `Glide.Fuel = Fuel` assigns
+    // the `---@class Fuel` table itself, so the path and the class are two
+    // names for one table and the members must follow the class. A `Ref`
+    // (`wep = ply:GetActiveWeapon()` holding `Weapon`) names an *instance*
+    // the variable happens to hold — treating it as a class path would pin
+    // every `wep.k` write to whichever class the inference order picked.
+    let class = match db.get_type_index().get_type_cache(type_owner)?.as_type() {
+        LuaType::Def(id) => id.clone(),
+        _ => return None,
+    };
+    let (path, file_id) = match type_owner {
+        LuaTypeOwner::Decl(decl_id) => {
+            let decl = db.get_decl_index().get_decl(decl_id)?;
+            if !decl.is_global() {
+                return None;
+            }
+            (crate::GlobalId::new(decl.get_name()), decl_id.file_id)
+        }
+        LuaTypeOwner::Member(member_id) => {
+            let member = db.get_member_index().get_member(member_id)?;
+            (member.get_global_id()?.clone(), member_id.file_id)
+        }
+        _ => return None,
+    };
+    db.get_member_index_mut()
+        .set_global_path_class(path, class, file_id);
+    Some(())
+}
+
+/// A declaration written more than once holds a primitive over its lifetime,
+/// not whichever literal one write happened to carry.
+pub(crate) fn widen_mutable_decl_literal(
+    db: &DbIndex,
+    type_owner: &LuaTypeOwner,
+    type_cache: LuaTypeCache,
+) -> LuaTypeCache {
+    if !type_cache.is_infer() {
+        return type_cache;
+    }
+    let LuaTypeOwner::Decl(decl_id) = type_owner else {
+        return type_cache;
+    };
+    if !db
+        .get_reference_index()
+        .get_decl_references(&decl_id.file_id, decl_id)
+        .is_some_and(|decl_ref| decl_ref.mutable)
+    {
+        return type_cache;
+    }
+    match type_cache.as_type() {
+        LuaType::IntegerConst(_) => LuaTypeCache::InferType(LuaType::Integer),
+        LuaType::StringConst(_) => LuaTypeCache::InferType(LuaType::String),
+        LuaType::BooleanConst(_) => LuaTypeCache::InferType(LuaType::Boolean),
+        LuaType::FloatConst(_) => LuaTypeCache::InferType(LuaType::Number),
+        _ => type_cache,
+    }
+}
+
+pub(crate) fn mutable_local_name_read_decl(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: &LuaExpr,
+) -> Option<LuaDeclId> {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return None;
+    };
+    let name = name_expr.get_name_text()?;
+    let decl_id = db
+        .get_decl_index()
+        .get_decl_tree(&file_id)?
+        .find_local_decl(&name, name_expr.get_position())?
+        .get_id();
+    db.get_reference_index()
+        .get_decl_references(&file_id, &decl_id)
+        .is_some_and(|references| references.mutable)
+        .then_some(decl_id)
+}
+
+pub(crate) fn widen_mutable_local_name_copy(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: &LuaExpr,
+    typ: LuaType,
+) -> LuaType {
+    let Some(decl_id) = mutable_local_name_read_decl(db, file_id, expr) else {
+        return typ;
+    };
+    widen_mutable_decl_literal(
+        db,
+        &LuaTypeOwner::Decl(decl_id),
+        LuaTypeCache::InferType(typ),
+    )
+    .as_type()
+    .clone()
+}
+
+/// Where a write to a declaration came from, for [`bind_decl_write`].
+#[derive(Debug, Clone, Copy)]
+pub struct DeclWrite {
+    /// Source position of the writing statement.
+    pub position: TextSize,
+    /// Whether the right-hand side is one whose answer can still improve — a
+    /// call or index read, or an operator over one. Only those may fill in a
+    /// declaration that nothing has determined yet.
+    pub may_improve_after_resolve: bool,
+    /// Whether the right-hand side reads out of the declaration it writes to
+    /// (`width = bit.bor(width:byte(1), ...)`). Such a write derives its type
+    /// from the slot it is about to fill, so it must not fill it.
+    pub reads_out_of_decl: bool,
+    /// Whether the right-hand side is `<this decl> or <default>`, the one body
+    /// write that refines a parameter instead of replacing it.
+    pub fills_own_default: bool,
+    /// Whether this write is one the file walk would let replace an
+    /// uninformative cache: an initializer whose answer can still improve, or
+    /// an assignment that reads through a call or index — the boundary
+    /// `should_retry_narrowing_decl_assignment` enforces. Used to replay the
+    /// acceptance rule a competing write would have faced, not to route this
+    /// one.
+    pub may_narrow_uninformative: bool,
+    /// Whether this write is the declaration's own initializer arriving from
+    /// the unresolve pass, which is the only route allowed to displace an
+    /// uninformative cache through [`bind_resolved_type`].
+    pub resolved_initializer: bool,
+}
+
+/// Binds a decl type written by the statement at `write.position`.
+///
+/// An empty decl slot otherwise goes to whichever write reaches it first, and a
+/// write whose right-hand side could not be inferred during the file walk
+/// reaches it late — so the decl's type depended on which callees the batch had
+/// already resolved rather than on the source. Ordering the claim by source
+/// position makes both arrival orders agree on the same answer: the earliest
+/// writer owns the decl, except that a write which determined nothing never
+/// takes the slot back from a later one that did.
+pub fn bind_decl_write(
+    db: &mut DbIndex,
+    decl_id: LuaDeclId,
+    type_cache: LuaTypeCache,
+    write: DeclWrite,
+) -> Option<()> {
+    let DeclWrite {
+        position,
+        may_improve_after_resolve,
+        reads_out_of_decl,
+        may_narrow_uninformative,
+        resolved_initializer,
+        fills_own_default,
+    } = write;
+    let type_owner = LuaTypeOwner::Decl(decl_id);
+    let fallback = |db: &mut DbIndex, type_cache| {
+        if resolved_initializer {
+            bind_resolved_type(db, type_owner.clone(), type_cache)
+        } else {
+            bind_type(db, type_owner.clone(), type_cache)
+        }
+    };
+    // A parameter's type is its declared or call-site-inferred type; the writes
+    // in the body narrow it for flow analysis, they do not own it. Only a local
+    // has a "first writer" to order.
+    if db
+        .get_decl_index()
+        .get_decl(&decl_id)
+        .is_none_or(|decl| decl.is_param())
+    {
+        // A default fill goes through the resolved path, so
+        // `gender = gender or GENDER_MALE` gives the same answer whether it was
+        // inferred during the walk — seeding the slot outright — or deferred
+        // until after the unresolve pass parked `unknown` there. Which of those
+        // happens depends on whether the file defining `GENDER_MALE` had been
+        // walked yet, which is a property of the batch, not of the source.
+        //
+        // Only a default fill: a reassignment to something else — splitting a
+        // string parameter into a list, say — states what the parameter becomes
+        // further down one branch, not what it was passed.
+        //
+        // Anything else is not the parameter's type: binding it would make a
+        // read before the write (`local copy = arg; arg = { copy }`) see the
+        // write's value, and through it its own.
+        if fills_own_default {
+            let widened = widen_mutable_decl_literal(db, &type_owner, type_cache);
+            return bind_resolved_type(db, type_owner, widened);
+        }
+        return Some(());
+    }
+    // Every write of a local produces its slot, whether its value lands or
+    // not, so the local's writers run as one group on every run rather than
+    // only those whose value the slot took last time.
+    derivation::note_write(|| derivation::FactKey::TypeCache(type_owner.clone()));
+    // Only a local's own initializer claims its empty slot: a later write that
+    // reached it first would hold it just until the initializer answered.
+    if db.get_type_index().get_type_cache(&type_owner).is_none()
+        && db
+            .get_decl_index()
+            .get_decl(&decl_id)
+            .and_then(|decl| decl.get_value_syntax_id())
+            .is_some_and(|initializer| initializer.get_range().start() < position)
+    {
+        return Some(());
+    }
+    // A local assigned after its declaration holds whatever it is assigned, so
+    // no single write's literal is its type, whichever route the write takes.
+    let type_cache = widen_mutable_decl_literal(db, &type_owner, type_cache);
+    let seeded = type_cache.clone();
+    // A contextual fallback holds the slot only until something is assigned:
+    // the pass that published it derives it again from what the slot holds.
+    let contextual = db.get_type_index().holds_contextual_fallback(&type_owner);
+    let seeds = match db.get_type_index().get_type_cache(&type_owner) {
+        None => true,
+        Some(_) if contextual => true,
+        Some(existing) => {
+            let both_inferred = existing.is_infer() && type_cache.is_infer();
+            let comparable = both_inferred && !reads_out_of_decl;
+            // `any` is the one answer neither `bind_type` nor
+            // `bind_resolved_type` will trade in either direction, so between
+            // two ordered writes it is ranked rather than positioned: whichever
+            // determined something takes the slot, and the winner is then a
+            // function of the write set instead of which one resolved first. A
+            // union with an `any` arm ranks as `any`: it determines no more, and
+            // a loop over a table holding an `any` element binds one. The
+            // other bottoms are left alone — `unknown` on a declaration is what
+            // lets a use narrow it, not a give-up to be overwritten.
+            let outranks_any = comparable
+                && is_informative_type(seeded.as_type())
+                && has_any_arm(existing.as_type());
+            let outranked_by_any = comparable
+                && has_any_arm(seeded.as_type())
+                && is_informative_type(existing.as_type());
+            if outranks_any {
+                true
+            } else if outranked_by_any {
+                false
+            } else if comparable
+                && may_improve_after_resolve
+                && is_informative_type(seeded.as_type())
+                && is_undetermined_type(existing.as_type())
+            {
+                // The slot holds an inferred give-up answer and this write
+                // determined something from a right-hand side the walk already
+                // treats as improvable (`should_retry_uninformative_initializer`).
+                // Applying that here too keeps the answer the same whether the
+                // write was committed during the walk or deferred to this pass.
+                true
+            } else {
+                match db.get_type_index().decl_write_claim(&decl_id) {
+                    // Nothing else has taken the slot by source position, so
+                    // whatever is in it was not put there by an ordered write.
+                    None => false,
+                    Some((claimed, claim_may_narrow)) => {
+                        position < claimed
+                            && !claiming_write_would_have_won(
+                                &type_owner,
+                                &seeded,
+                                existing,
+                                claim_may_narrow,
+                            )
+                    }
+                }
+            }
+        }
+    };
+    if !seeds {
+        // A later write that holds everything the slot holds and more widens
+        // the local to every value it is assigned.
+        if let Some(existing) = db.get_type_index().get_type_cache(&type_owner)
+            && existing.is_infer()
+            && type_cache.is_infer()
+            && is_informative_type(type_cache.as_type())
+            && (union_widens_cached_type(type_cache.as_type(), existing.as_type())
+                || settled_covers_cached_type(type_cache.as_type(), existing.as_type())
+                || settled_extends_cached_classes(db, type_cache.as_type(), existing.as_type()))
+            && type_cache.as_type() != existing.as_type()
+        {
+            db.get_type_index_mut()
+                .force_bind_type(type_owner, type_cache);
+            return Some(());
+        }
+        return fallback(db, type_cache);
+    }
+    db.get_type_index_mut()
+        .record_decl_write_claim(decl_id, position, may_narrow_uninformative);
+    seed_type_slot(db, type_owner, type_cache);
+    Some(())
+}
+
+/// Whether `typ` is `any` or a union with an `any` arm.
+fn has_any_arm(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Any => true,
+        LuaType::Union(union) => union.types().any(has_any_arm),
+        LuaType::MultiLineUnion(union) => {
+            union.get_unions().iter().any(|(typ, _)| has_any_arm(typ))
+        }
+        _ => false,
+    }
+}
+
+/// Replays the acceptance rule the slot's current holder would have faced had
+/// this write reached the slot first, and reports whether it would still have
+/// taken it.
+///
+/// The rule depends on how that write was committed: a call or index read whose
+/// target is uninformative goes through the unresolve pass and
+/// [`bind_resolved_type`], which displaces it; anything else goes through
+/// [`bind_type`], which keeps a decl's whole-lifetime type unless the incoming
+/// one supersedes it.
+fn claiming_write_would_have_won(
+    type_owner: &LuaTypeOwner,
+    seeded: &LuaTypeCache,
+    existing: &LuaTypeCache,
+    claim_may_narrow: bool,
+) -> bool {
+    if claim_may_narrow && should_replace_uninformative_resolved_cache(seeded, existing) {
+        return true;
+    }
+    should_replace_uninformative_inferred_cache(type_owner, seeded, existing)
 }
 
 /// Binds a type produced by the unresolve/resolution pass.
@@ -164,7 +653,7 @@ pub fn bind_resolved_type(
     {
         db.get_type_index_mut()
             .force_bind_type(type_owner.clone(), type_cache);
-        migrate_global_members_when_type_resolve(db, type_owner);
+        bind_global_path_class(db, &type_owner);
         return Some(());
     }
 
@@ -272,16 +761,24 @@ fn merge_def_type_with_table(
     def_id: LuaTypeDeclId,
     table_range: InFiled<TextRange>,
 ) -> Option<()> {
-    let expr_member_owner = LuaMemberOwner::Element(table_range);
-    let member_index = db.get_member_index_mut();
+    let expr_member_owner = LuaMemberOwner::Element(table_range.clone());
+    let member_index = db.get_member_index();
     let expr_member_ids = member_index
         .get_members(&expr_member_owner)?
         .iter()
         .map(|member| member.get_id())
         .collect::<Vec<_>>();
     let def_owner = LuaMemberOwner::Type(def_id);
-    for table_member_id in expr_member_ids {
+    for table_member_id in expr_member_ids.clone() {
         add_member(db, def_owner.clone(), table_member_id);
+    }
+    // A literal that initialises a global path keeps its members following the
+    // path's `---@class` flips even though they now also live on the def. The
+    // homing note may have dropped that evidence when the def is not the
+    // path's current canonical owner, so re-stamp here.
+    if let Some(path) = db.get_member_index().definition_site_path(&table_range) {
+        db.get_member_index_mut()
+            .stamp_path_provenance_if_absent(expr_member_ids, &path);
     }
 
     Some(())
@@ -296,50 +793,111 @@ pub fn add_member(db: &mut DbIndex, owner: LuaMemberOwner, member_id: LuaMemberI
     Some(())
 }
 
-fn get_owner_id(db: &DbIndex, type_owner: &LuaTypeOwner) -> Option<LuaMemberOwner> {
-    let type_cache = db.get_type_index().get_type_cache(type_owner)?;
-    member_owner_from_type(type_cache.as_type())
-}
-
-fn member_owner_from_type(typ: &LuaType) -> Option<LuaMemberOwner> {
-    match typ {
-        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
-            Some(LuaMemberOwner::Type(type_id.clone()))
+/// Whether the re-derived type is a union that already contains everything the
+/// cached one holds, plus more.
+///
+/// The cache then holds a subset snapshot taken before the other arms were
+/// visible, so replacing it widens to the settled answer instead of guessing a
+/// different one. A cached union is as much a subset snapshot as a cached single
+/// arm is: both are decided by which contributors happened to be indexed first.
+pub(crate) fn union_widens_cached_type(inferred: &LuaType, current: &LuaType) -> bool {
+    let LuaType::Union(inferred_union) = inferred else {
+        return false;
+    };
+    let inferred_arms = known_arms(inferred_union);
+    // A cached arm is covered when the settled union holds it verbatim or holds
+    // the primitive it widens to — `number` covers a cached `integer` the same
+    // way it covers a cached `5`.
+    let covered = |cached: &LuaType| {
+        inferred_arms
+            .iter()
+            .any(|arm| arm == cached || crate::db_index::widens_primitive(arm, cached))
+    };
+    match current {
+        LuaType::Union(current_union) => {
+            let current_arms = known_arms(current_union);
+            (current_arms.len() < inferred_arms.len()
+                || (current_arms.len() == inferred_arms.len()
+                    && current_union.types().count() < inferred_union.types().count()))
+                && current_arms.iter().all(covered)
         }
-        LuaType::TableConst(id) => Some(LuaMemberOwner::Element(id.clone())),
-        LuaType::Instance(inst) => member_owner_from_type(inst.get_base())
-            .or_else(|| Some(LuaMemberOwner::Element(inst.get_range().clone()))),
-        LuaType::TypeGuard(inner) => member_owner_from_type(inner),
-        LuaType::Union(union) => preferred_owner_from_types(union.types()),
-        LuaType::Intersection(intersection) => {
-            preferred_owner_from_types(intersection.get_types().iter())
-        }
-        LuaType::MultiLineUnion(union) => {
-            preferred_owner_from_types(union.get_unions().iter().map(|(typ, _)| typ))
-        }
-        _ => None,
+        current => covered(current),
     }
 }
 
-fn preferred_owner_from_types<'a>(
-    types: impl Iterator<Item = &'a LuaType>,
-) -> Option<LuaMemberOwner> {
-    let mut fallback_owner = None;
-    for typ in types {
-        let Some(owner) = member_owner_from_type(typ) else {
-            continue;
-        };
-
-        if matches!(owner, LuaMemberOwner::Type(_)) {
-            return Some(owner);
-        }
-
-        if fallback_owner.is_none() {
-            fallback_owner = Some(owner);
+/// Whether the settled answer is the cached one with more of the writer set
+/// folded in: every arm the cache holds is either an arm of the settled answer
+/// or a literal that one of its arms widens to.
+///
+/// [`union_widens_cached_type`] and [`settled_widens_cached_literals`] each
+/// cover one shape of this; a sibling merge produces both at once, `"a"|"b"`
+/// against `string|number` when a computed-key writer joins widened literal
+/// entries. A `nil` arm is covered only by a `nil` arm, so the collapse never
+/// drops one.
+pub(crate) fn settled_covers_cached_type(inferred: &LuaType, current: &LuaType) -> bool {
+    fn arms(typ: &LuaType) -> Vec<LuaType> {
+        match typ {
+            LuaType::Union(union) => known_arms(union),
+            other => vec![other.clone()],
         }
     }
+    let inferred_arms = arms(inferred);
+    let current_arms = arms(current);
+    !current_arms.is_empty()
+        && current_arms.iter().all(|cached| {
+            inferred_arms.iter().any(|settled| {
+                settled == cached || crate::db_index::widens_primitive(settled, cached)
+            })
+        })
+}
 
-    fallback_owner
+/// Whether the settled answer holds everything the cache holds once a class
+/// instance arm counts as held by a class it extends: `NULL` against
+/// `Entity|Foo`. A
+/// cache of subclasses is as much a subset snapshot as a cache of fewer arms,
+/// and a rule that took the answer for one and not the other would accept
+/// whichever the writers produced first.
+pub(crate) fn settled_extends_cached_classes(
+    db: &DbIndex,
+    inferred: &LuaType,
+    current: &LuaType,
+) -> bool {
+    fn arms(typ: &LuaType) -> Vec<LuaType> {
+        match typ {
+            LuaType::Union(union) => known_arms(union),
+            other => vec![other.clone()],
+        }
+    }
+    fn instance_class(typ: &LuaType) -> Option<&LuaTypeDeclId> {
+        match typ {
+            LuaType::Ref(id) => Some(id),
+            _ => None,
+        }
+    }
+    let inferred_arms = arms(inferred);
+    let current_arms = arms(current);
+    !current_arms.is_empty()
+        && current_arms.iter().all(|cached| {
+            inferred_arms.iter().any(|settled| {
+                settled == cached
+                    || crate::db_index::widens_primitive(settled, cached)
+                    || instance_class(settled)
+                        .zip(instance_class(cached))
+                        .is_some_and(|(settled, cached)| {
+                            crate::semantic::is_sub_type_of(db, cached, settled)
+                        })
+            })
+        })
+}
+
+/// The union arms that carry information. An `unknown` arm stands for a type
+/// that has not settled yet, so it can neither widen a cache nor block one.
+pub(crate) fn known_arms(union: &LuaUnionType) -> Vec<LuaType> {
+    union
+        .types()
+        .filter(|arm| !matches!(arm, LuaType::Unknown))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -418,6 +976,77 @@ mod tests {
             db.get_type_index().get_type_cache(&owner),
             Some(LuaTypeCache::InferType(LuaType::Integer))
         ));
+    }
+
+    /// A loop variable over a table with an `any` element, reassigned a string
+    /// in the body, holds the string whichever of the two writes reaches the
+    /// slot first.
+    #[test]
+    fn union_with_an_any_arm_ranks_as_any_against_a_later_assignment() {
+        let loop_element = LuaType::Union(
+            crate::LuaUnionType::from_vec(vec![
+                LuaType::StringConst(smol_str::SmolStr::new("a.mp3").into()),
+                LuaType::Any,
+            ])
+            .into(),
+        );
+        for loop_write_first in [true, false] {
+            let mut ws = VirtualWorkspace::new();
+            let file_id = ws.def(
+                "local snd
+snd = string.sub('x', 1)
+",
+            );
+            let db = ws.get_db_mut();
+            let decl_id = db
+                .get_decl_index()
+                .get_decl_tree(&file_id)
+                .expect("decl tree")
+                .get_decls()
+                .values()
+                .find(|decl| decl.get_name() == "snd")
+                .map(|decl| decl.get_id())
+                .expect("snd decl");
+            let owner = LuaTypeOwner::Decl(decl_id);
+            db.get_type_index_mut().reset_type_cache(&owner);
+            let loop_write = |db: &mut DbIndex| {
+                write_type_cache(
+                    db,
+                    owner.clone(),
+                    LuaTypeCache::InferType(loop_element.clone()),
+                    TypeCacheWriteMode::InsertOnly,
+                );
+            };
+            let assignment = |db: &mut DbIndex| {
+                bind_decl_write(
+                    db,
+                    decl_id,
+                    LuaTypeCache::InferType(LuaType::String),
+                    DeclWrite {
+                        position: 20.into(),
+                        may_improve_after_resolve: true,
+                        reads_out_of_decl: false,
+                        fills_own_default: false,
+                        may_narrow_uninformative: true,
+                        resolved_initializer: false,
+                    },
+                );
+            };
+            if loop_write_first {
+                loop_write(db);
+                assignment(db);
+            } else {
+                assignment(db);
+                loop_write(db);
+            }
+            assert_eq!(
+                db.get_type_index()
+                    .get_type_cache(&owner)
+                    .map(|cache| cache.as_type().clone()),
+                Some(LuaType::String),
+                "loop write first: {loop_write_first}"
+            );
+        }
     }
 
     #[test]

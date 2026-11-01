@@ -14,7 +14,7 @@ use glua_parser::{
 };
 use glua_parser::{LuaAstToken, LuaTokenKind};
 use lsp_types::{InlayHint, InlayHintKind, InlayHintLabel, InlayHintLabelPart, Location};
-use rowan::NodeOrToken;
+use rowan::{NodeOrToken, TextRange, WalkEvent};
 
 use rowan::TokenAtOffset;
 use tokio_util::sync::CancellationToken;
@@ -24,17 +24,30 @@ use crate::handlers::completion::get_index_alias_name;
 use crate::handlers::definition::compare_function_types;
 use crate::handlers::inlay_hint::build_function_hint::{build_closure_hint, build_label_parts};
 
+/// The hints of the nodes `range` reaches, or of the whole file.
 pub fn build_inlay_hints(
     semantic_model: &SemanticModel,
+    range: Option<TextRange>,
     client_id: ClientId,
     cancel_token: &CancellationToken,
 ) -> Option<Vec<InlayHint>> {
     let mut result = Vec::new();
     let root = semantic_model.get_root();
-    for node in root.clone().descendants::<LuaAst>() {
+    let mut walk = root.syntax().preorder();
+    while let Some(event) = walk.next() {
+        let WalkEvent::Enter(node) = event else {
+            continue;
+        };
         if cancel_token.is_cancelled() {
             return None;
         }
+        if range.is_some_and(|range| node.text_range().intersect(range).is_none()) {
+            walk.skip_subtree();
+            continue;
+        }
+        let Some(node) = LuaAst::cast(node) else {
+            continue;
+        };
         match node {
             LuaAst::LuaClosureExpr(closure) => {
                 build_closure_hint(semantic_model, &mut result, closure);
@@ -401,7 +414,7 @@ fn build_local_name_hint(
     if !enable_local_hint && !enable_vgui_inlay_hint {
         return Some(());
     }
-    // local function 不显示
+    // Not shown for local function
     if let Some(parent) = local_name.syntax().parent() {
         if LuaLocalFuncStat::can_cast(parent.kind().into()) {
             return Some(());
@@ -555,7 +568,7 @@ fn get_vgui_panel_name(
             let base_name = semantic_model
                 .get_db()
                 .get_gmod_class_metadata_index()
-                .get_vgui_panel_base(type_name)?;
+                .get_vgui_panel_base(semantic_model.get_db().get_vfs(), type_name)?;
 
             Some((type_name.to_string(), base_name))
         }
@@ -565,7 +578,7 @@ fn get_vgui_panel_name(
             let base_name = semantic_model
                 .get_db()
                 .get_gmod_class_metadata_index()
-                .get_vgui_panel_base(type_name)?;
+                .get_vgui_panel_base(semantic_model.get_db().get_vfs(), type_name)?;
 
             Some((type_name.to_string(), base_name))
         }
@@ -762,7 +775,7 @@ fn set_meta_call_part(
     let document = semantic_model.get_document();
     let parent = call_expr.syntax().parent()?;
 
-    // 如果是 `Class(...)` 且调用返回值是 Class 类型, 则显示 `new` 提示
+    // For `Class(...)` whose call returns a Class type, show the `new` hint
     let hint_new = {
         LuaStat::can_cast(parent.kind().into())
             && !matches!(call_expr.get_prefix_expr()?, LuaExpr::CallExpr(_))
@@ -924,13 +937,13 @@ fn build_index_expr_hint(
         return Some(());
     }
 
-    // 只处理整数索引
+    // Only handle integer indices
     let index_key = index_expr.get_index_key()?;
     if !matches!(index_key, LuaIndexKey::Integer(_)) {
         return Some(());
     }
 
-    // 获取前缀表达式的类型信息
+    // Get the type info of the prefix expression
     let prefix_expr = index_expr.get_prefix_expr()?;
     let prefix_type = semantic_model.infer_expr(prefix_expr).ok()?;
     let member_key = semantic_model.get_member_key(&index_key)?;
@@ -942,9 +955,9 @@ fn build_index_expr_hint(
         index_expr.syntax().text_range().start(),
     )?;
     let member_info = member_infos.first()?;
-    // 尝试提取别名
+    // Try to extract an alias
     let alias = get_index_alias_name(semantic_model, member_info)?;
-    // 创建 hint
+    // Create the hint
     let document = semantic_model.get_document();
     let position = {
         let index_token = index_expr.get_index_name_token()?;
@@ -1034,10 +1047,10 @@ fn process_enum_hint_for_arg(
         return None;
     }
 
-    // 推断参数类型
+    // Infer the parameter type
     let arg_type = semantic_model.infer_expr(arg.clone()).ok()?;
 
-    // 查找对应的枚举成员
+    // Find the corresponding enum member
     let member_decl = find_matching_enum_member(semantic_model, type_decl, &arg_type)?;
     let member_name = member_decl.get_key().to_path();
 
@@ -1067,7 +1080,7 @@ fn process_enum_hint_for_arg(
                 if member_name == arg_name {
                     return None;
                 }
-                // 名称里包含了枚举名和成员名(忽略大小写)也不显示提示
+                // No hint either when the name contains both the enum name and member name (case-insensitive)
                 let lower_arg_name = arg_name.to_lowercase();
                 let lower_enum_name = type_decl.get_name().to_lowercase();
                 let lower_member_name = member_name.to_lowercase();
@@ -1079,7 +1092,7 @@ fn process_enum_hint_for_arg(
             }
         }
         LuaExpr::IndexExpr(index_expr) => {
-            // 对索引访问需要完全匹配尾名称
+            // Index access needs an exact match of the trailing name
             if let Some(index_name_token) = index_expr.get_index_name_token()
                 && let Some(name_token) = glua_parser::LuaNameToken::cast(index_name_token.clone())
             {
@@ -1188,7 +1201,7 @@ fn get_scripted_entity_suffix(
     if let Some(base_name) = semantic_model
         .get_db()
         .get_gmod_class_metadata_index()
-        .get_vgui_panel_base(type_name)
+        .get_vgui_panel_base(semantic_model.get_db().get_vfs(), type_name)
     {
         return Some(match base_name {
             Some(base) => format!(" ({type_name} : {base})"),

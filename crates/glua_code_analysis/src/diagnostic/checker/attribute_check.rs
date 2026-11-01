@@ -1,15 +1,11 @@
-use std::collections::HashSet;
-
 use crate::{
     DiagnosticCode, DocTypeInferContext, LuaType, SemanticModel, TypeCheckFailReason,
     TypeCheckResult, diagnostic::checker::humanize_lint_type, infer_doc_type,
 };
-use glua_parser::{
-    LuaAstNode, LuaDocAttributeUse, LuaDocTagAttributeUse, LuaDocType, LuaExpr, LuaLiteralExpr,
-};
+use glua_parser::{LuaAstNode, LuaDocAttributeUse, LuaDocType, LuaExpr, LuaLiteralExpr};
 use rowan::TextRange;
 
-use super::{Checker, DiagnosticContext};
+use super::{Checker, DiagnosticContext, check_param_count::is_nullable};
 
 pub struct AttributeCheckChecker;
 
@@ -21,8 +17,10 @@ impl Checker for AttributeCheckChecker {
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        for tag_use in root.descendants::<LuaDocTagAttributeUse>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for tag_use in buckets.doc_tag_attribute_uses.iter() {
             for attribute_use in tag_use.get_attribute_uses() {
                 check_attribute_use(context, semantic_model, &attribute_use);
             }
@@ -58,27 +56,32 @@ fn check_attribute_use(
         Some(arg_list) => arg_list.get_args().collect::<Vec<_>>(),
         None => vec![],
     };
-    check_param_count(context, &def_params, &attribute_use, &args);
+    check_param_count(context, semantic_model, &def_params, &attribute_use, &args);
     check_param(context, semantic_model, &def_params, args);
 
     Some(())
 }
 
-/// 检查参数数量是否匹配
+/// Checks whether the number of parameters matches
 fn check_param_count(
     context: &mut DiagnosticContext,
+    semantic_model: &SemanticModel,
     def_params: &[(String, Option<LuaType>)],
     attribute_use: &LuaDocAttributeUse,
     args: &[LuaLiteralExpr],
 ) -> Option<()> {
     let call_args_count = args.len();
-    // 调用参数少于定义参数, 需要考虑可空参数
+    // Fewer call arguments than defined parameters; nullable parameters must be considered
     if call_args_count < def_params.len() {
         for def_param in def_params[call_args_count..].iter() {
             if def_param.0 == "..." {
                 break;
             }
-            if def_param.1.as_ref().is_some_and(is_nullable) {
+            if def_param
+                .1
+                .as_ref()
+                .is_some_and(|typ| is_nullable(semantic_model.get_db(), typ))
+            {
                 continue;
             }
             context.add_diagnostic(
@@ -97,9 +100,9 @@ fn check_param_count(
             );
         }
     }
-    // 调用参数多于定义参数, 需要考虑可变参数
+    // More call arguments than defined parameters; variadic parameters must be considered
     else if call_args_count > def_params.len() {
-        // 参数定义中最后一个参数是 `...`
+        // The last parameter in the definition is `...`
         if def_params.last().is_some_and(|(name, typ)| {
             name == "..." || typ.as_ref().is_some_and(|typ| typ.is_variadic())
         }) {
@@ -123,7 +126,7 @@ fn check_param_count(
     Some(())
 }
 
-/// 检查参数是否匹配
+/// Checks whether the parameters match
 fn check_param(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
@@ -211,26 +214,4 @@ fn add_type_check_diagnostic(
             );
         }
     }
-}
-
-fn is_nullable(typ: &LuaType) -> bool {
-    let mut stack: Vec<LuaType> = Vec::new();
-    stack.push(typ.clone());
-    let mut visited = HashSet::new();
-    while let Some(typ) = stack.pop() {
-        if visited.contains(&typ) {
-            continue;
-        }
-        visited.insert(typ.clone());
-        match typ {
-            LuaType::Any | LuaType::Unknown | LuaType::Nil => return true,
-            LuaType::Union(u) => {
-                for t in u.into_vec() {
-                    stack.push(t);
-                }
-            }
-            _ => {}
-        }
-    }
-    false
 }

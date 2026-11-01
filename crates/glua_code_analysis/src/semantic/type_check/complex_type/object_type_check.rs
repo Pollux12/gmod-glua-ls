@@ -1,10 +1,11 @@
-use std::collections::{HashMap, hash_map::Entry};
+use rustc_hash::FxHashMap as HashMap;
+use std::collections::hash_map::Entry;
 
 use crate::{
     LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaTupleType, LuaType, RenderLevel,
-    TypeCheckFailReason, TypeCheckResult, humanize_type,
+    TypeCheckFailReason, TypeCheckResult, check_type_compact, humanize_type,
     semantic::{
-        member::{find_members, member_key_matches_type},
+        member::{find_members, member_key_as_type, member_key_matches_type},
         type_check::{
             check_general_type_compact, type_check_context::TypeCheckContext,
             type_check_guard::TypeCheckGuard,
@@ -59,11 +60,47 @@ pub fn check_object_type_compact(
                 check_guard.next_level()?,
             );
         }
+        LuaType::TableGeneric(params) => {
+            return check_object_type_compact_table_generic(
+                context,
+                source_object,
+                params,
+                check_guard.next_level()?,
+            );
+        }
         LuaType::Table => return Ok(()),
         _ => {}
     }
 
     Err(TypeCheckFailReason::DonotCheck)
+}
+
+/// A `table<K, V>` holds `V` under every key it has, so each field whose key
+/// `K` admits and each indexed value of the object must accept `V`, and each
+/// index key must accept `K`. A field whose key `K` excludes is never there:
+/// fine when optional, unmet when required.
+fn check_object_type_compact_table_generic(
+    context: &mut TypeCheckContext,
+    source_object: &LuaObjectType,
+    params: &[LuaType],
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    let key_type = params.first().unwrap_or(&LuaType::Any);
+    let value_type = params.get(1).unwrap_or(&LuaType::Any);
+    for (field_key, field_type) in source_object.get_fields() {
+        let admitted = member_key_as_type(field_key)
+            .is_some_and(|field_key| check_type_compact(context.db, key_type, &field_key).is_ok());
+        if admitted {
+            check_general_type_compact(context, field_type, value_type, check_guard.next_level()?)?;
+        } else if !(field_type.is_nullable() || field_type.is_any()) {
+            return Err(TypeCheckFailReason::TypeNotMatch);
+        }
+    }
+    for (index_key, index_value) in source_object.get_index_access() {
+        check_general_type_compact(context, index_key, key_type, check_guard.next_level()?)?;
+        check_general_type_compact(context, index_value, value_type, check_guard.next_level()?)?;
+    }
+    Ok(())
 }
 
 fn check_object_type_compact_object_type(
@@ -213,7 +250,7 @@ fn collect_type_members(
 
     // Build a merged view of class members (including supertypes). When the same key appears
     // multiple times (override), keep the first one (subclass wins).
-    let mut map: HashMap<LuaMemberKey, LuaType> = HashMap::new();
+    let mut map: HashMap<LuaMemberKey, LuaType> = HashMap::default();
     let mut index_keys: Vec<LuaMemberKey> = Vec::new();
     if collect_index_keys {
         index_keys.reserve(type_members.len());
@@ -276,6 +313,33 @@ fn member_key_type_for_index(member_key: &LuaMemberKey) -> Option<LuaType> {
     }
 }
 
+/// The value an integer slot receives from the literal's trailing call or
+/// `...`, which fills every slot from its own position onward. The analyzer
+/// binds the spread to the trailing field's member.
+fn trailing_spread_slot_type(
+    context: &TypeCheckContext,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+) -> Option<LuaType> {
+    let LuaMemberKey::Integer(slot) = key else {
+        return None;
+    };
+    let db = context.db;
+    db.get_member_index()
+        .get_members(owner)?
+        .into_iter()
+        .find_map(|member| {
+            let LuaMemberKey::Integer(start) = member.get_key() else {
+                return None;
+            };
+            let offset = usize::try_from(slot.checked_sub(*start)?).ok()?;
+            let Some(LuaType::Variadic(spread)) = context.member_type(member.get_id()) else {
+                return None;
+            };
+            spread.get_type(offset).cloned()
+        })
+}
+
 fn check_object_type_compact_table_const(
     context: &mut TypeCheckContext,
     source_object: &LuaObjectType,
@@ -287,11 +351,15 @@ fn check_object_type_compact_table_const(
     let member_index = db.get_member_index();
     let source_fields = source_object.get_fields();
 
-    // 检查名称字段
+    // Check name fields
     for (key, source_type) in source_fields {
         let member_item = match member_index.get_member_item(&member_owner, key) {
             Some(member_item) => member_item,
             None => {
+                if let Some(slot_type) = trailing_spread_slot_type(context, &member_owner, key) {
+                    check_member_value(context, key, None, source_type, &slot_type, check_guard)?;
+                    continue;
+                }
                 if source_type.is_nullable() || source_type.is_any() {
                     continue;
                 } else {
@@ -302,6 +370,10 @@ fn check_object_type_compact_table_const(
             }
         };
         let member_type = match context.resolve_member_item_type(member_item) {
+            Ok(LuaType::Variadic(spread)) => match spread.get_type(0) {
+                Some(first) => first.clone(),
+                None => continue,
+            },
             Ok(t) => t,
             _ => {
                 continue;
@@ -315,7 +387,7 @@ fn check_object_type_compact_table_const(
         return Ok(());
     }
 
-    // 检查索引访问字段
+    // Check index access fields
     let members = member_index.get_members(&member_owner).unwrap_or_default();
     for (key_type, source_type) in source_object.get_index_access() {
         for member in &members {

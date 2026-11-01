@@ -43,7 +43,7 @@ impl LuaDiagnosticConfig {
             })
             .collect();
 
-        let mut severity = HashMap::new();
+        let mut severity = HashMap::default();
         for (code, sev) in &emmyrc.diagnostics.severity {
             severity.insert(*code, (*sev).into());
         }
@@ -55,5 +55,17 @@ impl LuaDiagnosticConfig {
             severity,
             level: emmyrc.get_language_level(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_collections_are_std() {
+        let cfg = LuaDiagnosticConfig::default();
+        let _: &std::collections::HashSet<DiagnosticCode> = &cfg.workspace_disabled;
+        let _: &std::collections::HashMap<DiagnosticCode, DiagnosticSeverity> = &cfg.severity;
     }
 }

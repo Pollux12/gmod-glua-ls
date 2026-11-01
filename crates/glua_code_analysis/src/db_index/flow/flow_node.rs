@@ -2,16 +2,17 @@ use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstPtr, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaDocTagCast,
     LuaExpr, LuaForStat, LuaFuncStat, LuaSyntaxKind, LuaSyntaxNode,
 };
-use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
-use smol_str::SmolStr;
+use std::hash::{Hash, Hasher};
+
+use crate::db_index::derivation::hash_local;
 
 /// Unique identifier for flow nodes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct FlowId(pub u32);
 
 /// Represents how flow nodes are connected
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FlowAntecedent {
     /// Single predecessor node
     Single(FlowId),
@@ -20,7 +21,7 @@ pub enum FlowAntecedent {
 }
 
 /// Main flow node structure containing all flow analysis information
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FlowNode {
     pub id: FlowId,
     pub kind: FlowNodeKind,
@@ -29,7 +30,7 @@ pub struct FlowNode {
 
 /// Lightweight hint about which kinds of LHS variables appear in an assignment.
 /// Used to skip non-matching assignments in flow analysis without AST reconstruction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AssignVarHint {
     /// Only simple name expressions (local variables / globals)
     NameOnly,
@@ -51,7 +52,7 @@ pub enum FlowNodeKind {
     /// Label for loops (while, for, repeat)
     LoopLabel,
     /// Named label (goto target)
-    NamedLabel(ArcIntern<SmolStr>),
+    NamedLabel,
     /// Declaration position
     DeclPosition(TextSize),
     /// Entry to a deferred closure body. Its antecedent preserves persistent
@@ -77,6 +78,37 @@ pub enum FlowNodeKind {
     Return,
 }
 
+/// Positions hash as positions of the tree's file, so a tree fingerprinted
+/// with an edit mapped back compares equal when it only moved.
+impl Hash for FlowNodeKind {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            FlowNodeKind::Start
+            | FlowNodeKind::Unreachable
+            | FlowNodeKind::BranchLabel
+            | FlowNodeKind::LoopLabel
+            | FlowNodeKind::NamedLabel
+            | FlowNodeKind::Break
+            | FlowNodeKind::Return => {}
+            FlowNodeKind::DeclPosition(position) | FlowNodeKind::ClosureEntry(position) => {
+                hash_local(position, state)
+            }
+            FlowNodeKind::Assignment(ptr, hint) => {
+                hash_local(&ptr.syntax_id, state);
+                hint.hash(state);
+            }
+            FlowNodeKind::Call(ptr) => hash_local(&ptr.syntax_id, state),
+            FlowNodeKind::TrueCondition(ptr) | FlowNodeKind::FalseCondition(ptr) => {
+                hash_local(&ptr.syntax_id, state)
+            }
+            FlowNodeKind::ImplFunc(ptr) => hash_local(&ptr.syntax_id, state),
+            FlowNodeKind::ForIStat(ptr) => hash_local(&ptr.syntax_id, state),
+            FlowNodeKind::TagCast(ptr) => hash_local(&ptr.syntax_id, state),
+        }
+    }
+}
+
 #[allow(unused)]
 impl FlowNodeKind {
     pub fn is_branch_label(&self) -> bool {
@@ -88,7 +120,7 @@ impl FlowNodeKind {
     }
 
     pub fn is_named_label(&self) -> bool {
-        matches!(self, FlowNodeKind::NamedLabel(_))
+        matches!(self, FlowNodeKind::NamedLabel)
     }
 
     pub fn is_change_flow(&self) -> bool {

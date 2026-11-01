@@ -259,6 +259,24 @@ impl LuaTableField {
         self.syntax().kind() == LuaSyntaxKind::TableFieldValue.into()
     }
 
+    /// The last positional field of an object literal when it is a call or
+    /// `...`, which fills every positional slot from its own onward.
+    pub fn is_trailing_spread(&self) -> bool {
+        self.is_value_field()
+            && self.get_value_expr().is_some_and(|expr| match expr {
+                LuaExpr::CallExpr(_) => true,
+                LuaExpr::LiteralExpr(literal) => {
+                    matches!(literal.get_literal(), Some(LuaLiteralToken::Dots(_)))
+                }
+                _ => false,
+            })
+            && self
+                .get_parent::<LuaTableExpr>()
+                .is_some_and(|table| table.is_object())
+            && std::iter::successors(self.syntax().next_sibling(), |node| node.next_sibling())
+                .all(|node| !LuaTableField::can_cast(node.kind().into()))
+    }
+
     pub fn get_field_key(&self) -> Option<LuaIndexKey> {
         if !self.is_assign_field() {
             let parent_table = self.get_parent::<LuaTableExpr>()?;

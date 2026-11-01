@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use itertools::Itertools;
 
@@ -84,7 +84,7 @@ pub fn humanize_type(db: &DbIndex, ty: &LuaType, level: RenderLevel) -> String {
         LuaType::IntegerConst(i) => i.to_string(),
         LuaType::FloatConst(f) => {
             let s = f.to_string();
-            // 如果字符串不包含小数点，添加 ".0"
+            // If the string has no decimal point, append ".0"
             if !s.contains('.') {
                 format!("{}.0", s)
             } else {
@@ -226,8 +226,13 @@ fn humanize_simple_type(
     };
 
     let member_owner = LuaMemberOwner::Type(id.clone());
-    let member_index = db.get_member_index();
-    let members = member_index.get_sorted_members(&member_owner)?;
+    let mut members = db.sorted_members(&member_owner)?;
+    // One key names one field. Several files writing it -- a `---@field` and a
+    // `function X.k() end`, say -- describe the same field, and listing it once
+    // per writer says nothing extra. Keeps the first in the index's own order,
+    // so the choice does not depend on the batch.
+    let mut seen_keys = rustc_hash::FxHashSet::default();
+    members.retain(|member| seen_keys.insert(member.get_key().clone()));
     let all_count = members.len();
     let mut member_strings = String::new();
     let mut function_vec = Vec::new();
@@ -312,7 +317,7 @@ where
         RenderLevel::Minimal => 2,
     };
     // Sort before truncation so rendered subsets stay canonical across runs.
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     let mut type_strings = Vec::new();
     let mut has_nil = false;
     let mut has_function = false;
@@ -640,8 +645,7 @@ fn humanize_table_const_type_detail_and_simple(
     level: RenderLevel,
 ) -> Option<String> {
     let layout = TableLayout::from_level(level)?;
-    let member_index = db.get_member_index();
-    let members = member_index.get_sorted_members(&member_owned)?;
+    let members = db.sorted_members(&member_owned)?;
 
     // Use the custom count from DetailedCount, or the compact default for Detailed.
     let detailed_max = match level {
@@ -738,6 +742,7 @@ fn humanize_table_const_type_detail_and_simple(
 fn owner_has_dynamic_wildcard(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
     let dynamic_owner = match owner {
         LuaMemberOwner::Type(type_id) => DynamicFieldOwner::Type(type_id.clone()),
+        LuaMemberOwner::GlobalPath(path) => DynamicFieldOwner::GlobalPath(path.clone()),
         LuaMemberOwner::Element(table_range) => DynamicFieldOwner::Table(table_range.clone()),
         _ => return false,
     };
@@ -1116,6 +1121,39 @@ mod tests {
             LuaType::Nil => "nil".to_string(),
             _ => "other".to_string(),
         }
+    }
+
+    /// A table's fields render in the order of the files that write them,
+    /// which a file keeps when it is deleted and created again, not in the
+    /// order the files were handed their ids.
+    #[gtest]
+    fn table_fields_render_as_a_cold_build_after_a_file_is_created_again() {
+        let files = vec![
+            (
+                "lua/autorun/a_fields.lua",
+                "Fields = {}
+Fields.first = 1
+",
+            ),
+            (
+                "lua/autorun/b_fields.lua",
+                "Fields.second = \"x\"
+",
+            ),
+        ];
+        let mut warm = crate::VirtualWorkspace::new();
+        warm.def_files(files.clone());
+        let uri = warm.virtual_url_generator.new_uri(files[0].0);
+        warm.analysis.remove_file_by_uri(&uri);
+        warm.def_file(files[0].0, files[0].1);
+        let mut cold = crate::VirtualWorkspace::new();
+        cold.def_files(files);
+
+        let (warm_fields, cold_fields) = (warm.expr_ty("Fields"), cold.expr_ty("Fields"));
+        expect_eq!(
+            warm.humanize_type_detailed(warm_fields),
+            cold.humanize_type_detailed(cold_fields)
+        );
     }
 
     #[gtest]

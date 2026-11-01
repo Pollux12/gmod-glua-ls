@@ -64,7 +64,7 @@ pub fn check_call_type_compact(
         }
     }
 
-    // TODO: 实现其他 call 类型的检查
+    // TODO: implement checks for other call types
     Ok(())
 }
 

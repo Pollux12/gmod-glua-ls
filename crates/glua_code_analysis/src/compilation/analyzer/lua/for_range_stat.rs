@@ -1,15 +1,22 @@
-use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
-use std::collections::{HashMap, HashSet};
+use super::StatementWrite;
+use glua_parser::{
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaIndexExpr, LuaIndexKey,
+    LuaNameExpr, PathTrait,
+};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
-    DbIndex, FileId, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaDeclId, LuaInferCache,
-    LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaOperatorMetaMethod, LuaType, LuaTypeCache,
-    TplContext, TypeOps, TypeSubstitutor, VariadicType,
+    DbIndex, FileId, FuncGenericBinding, FuncGenericBindingState, GenericTplId, InferFailReason,
+    LuaAliasCallKind, LuaAliasCallType, LuaDeclId, LuaInferCache, LuaMemberId, LuaMemberInfo,
+    LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaOperatorMetaMethod, LuaSemanticDeclId, LuaType,
+    LuaTypeCache, TplContext, TypeOps, TypeSubstitutor, VariadicType,
     compilation::analyzer::{
-        common::{TypeCacheWriteMode, write_type_cache},
-        unresolve::UnResolveIterVar,
+        common::TypeCacheWriteMode, dynamic_field::for_range_pairs_source_for_var,
+        is_provably_builtin_iterator_call, writes_own_pairs_key,
     },
-    get_member_map, infer_expr, instantiate_doc_function, tpl_pattern_match_args,
+    get_member_map, infer_expr, instantiate_doc_function,
+    semantic::get_buildin_type_map_type_id,
+    tpl_pattern_match_args,
 };
 
 use super::LuaAnalyzer;
@@ -24,9 +31,9 @@ pub fn analyze_for_range_stat(
         .context
         .infer_manager
         .get_infer_cache(analyzer.file_id);
-    let iter_var_types = infer_for_range_iter_expr_func(analyzer.db, cache, &iter_exprs);
+    let iter_var_types = infer_for_range_iter_expr_func(&analyzer.db, cache, &iter_exprs);
     let enumerates_member_map =
-        iterates_table_member_map(analyzer.db, analyzer.file_id, &for_range_stat);
+        iterates_table_member_map(&analyzer.db, analyzer.file_id, &for_range_stat);
 
     match iter_var_types {
         Ok(iter_var_types) => {
@@ -37,54 +44,45 @@ pub fn analyze_for_range_stat(
                     .get_type(idx)
                     .cloned()
                     .unwrap_or(LuaType::Unknown);
-                let ret_type = TypeOps::Remove.apply(analyzer.db, &ret_type, &LuaType::Nil);
-                write_type_cache(
-                    analyzer.db,
-                    decl_id.into(),
-                    LuaTypeCache::InferType(ret_type),
-                    TypeCacheWriteMode::InsertOnly,
-                );
+                let ret_type = TypeOps::Remove.apply(&analyzer.db, &ret_type, &LuaType::Nil);
+                analyzer.write(StatementWrite::WriteTypeCache {
+                    owner: decl_id.into(),
+                    cache: LuaTypeCache::InferType(ret_type),
+                    mode: TypeCacheWriteMode::InsertOnly,
+                });
             }
 
-            if iter_var_types.contain_tpl() || enumerates_member_map {
-                // Either nothing bound the generic, so the vars hold raw
-                // template refs, or the types came from enumerating a
-                // table's member map. Either way the answer only covers the
-                // members indexed when this ran, and which those are
-                // depends on the order files were analysed in.
-                let unresolved = UnResolveIterVar {
+            if iter_var_types.degraded_unbound_tpl || enumerates_member_map {
+                // Either a generic iterator left templates nothing bound, so
+                // the vars hold degraded placeholders, or the types came from
+                // enumerating a table's member map. The bound arms, or the
+                // enumerated union, replace what the insert kept when they
+                // widen it.
+                let var_positions = var_name_list
+                    .iter()
+                    .map(LuaAstToken::get_position)
+                    .collect::<Vec<_>>();
+                analyzer.write(StatementWrite::IterVarUpdates {
                     file_id: analyzer.file_id,
-                    iter_exprs: iter_exprs.clone(),
-                    iter_vars: var_name_list,
-                };
-                analyzer
-                    .context
-                    .add_unresolve(unresolved.into(), InferFailReason::UnResolveIterTemplate);
+                    iter_var_types: iter_var_types.clone(),
+                    var_positions,
+                });
             }
         }
         Err(InferFailReason::None) => {
             for var_name in var_name_list {
                 let position = var_name.get_position();
                 let decl_id = LuaDeclId::new(analyzer.file_id, position);
-                write_type_cache(
-                    analyzer.db,
-                    decl_id.into(),
-                    LuaTypeCache::InferType(LuaType::Unknown),
-                    TypeCacheWriteMode::InsertOnly,
-                );
+                analyzer.write(StatementWrite::WriteTypeCache {
+                    owner: decl_id.into(),
+                    cache: LuaTypeCache::InferType(LuaType::Unknown),
+                    mode: TypeCacheWriteMode::InsertOnly,
+                });
             }
         }
-        Err(reason) => {
-            let unresolved = UnResolveIterVar {
-                file_id: analyzer.file_id,
-                iter_exprs: iter_exprs.clone(),
-                iter_vars: var_name_list,
-            };
-
-            analyzer
-                .context
-                .add_unresolve(unresolved.into(), reason.clone());
-        }
+        // Nothing to write: the statement runs again once a fact the iterator
+        // read changes.
+        Err(_) => {}
     }
 
     Some(())
@@ -104,11 +102,28 @@ pub fn iterates_table_member_map(
     is_global_pairs_call(db, file_id, &call_expr)
 }
 
+#[derive(Debug, Clone)]
+pub struct IterVarInference {
+    pub types: VariadicType,
+    pub settled_overrides: Vec<Option<LuaType>>,
+    /// Whether some slot carried an unbound template, degraded to its
+    /// constraint or [`LuaType::Unknown`]. Such an answer was taken against
+    /// the index as it stood when the iterator was inferred, so the loop vars
+    /// stay queued for settled re-derivation.
+    pub degraded_unbound_tpl: bool,
+}
+
+impl IterVarInference {
+    pub fn get_type(&self, idx: usize) -> Option<&LuaType> {
+        self.types.get_type(idx)
+    }
+}
+
 pub fn infer_for_range_iter_expr_func(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     iter_exprs: &[LuaExpr],
-) -> Result<VariadicType, InferFailReason> {
+) -> Result<IterVarInference, InferFailReason> {
     if iter_exprs.is_empty() {
         return Err(InferFailReason::None);
     }
@@ -124,8 +139,22 @@ pub fn infer_for_range_iter_expr_func(
     if let Some(iter_types) =
         try_infer_pairs_iter_types_from_table_members(db, cache, &iter_exprs[0], &first_expr_type)?
     {
-        return Ok(iter_types);
+        return Ok(IterVarInference {
+            types: iter_types,
+            settled_overrides: Vec::new(),
+            degraded_unbound_tpl: false,
+        });
     }
+
+    let builtin_iter_bindings = if let Some(LuaExpr::CallExpr(call_expr)) = iter_exprs.first()
+        && is_provably_builtin_iterator_call(db, cache.get_file_id(), call_expr)
+    {
+        cache
+            .get_generic_call_bindings(&call_expr.get_syntax_id())
+            .map(|bindings| bindings.to_vec())
+    } else {
+        None
+    };
 
     let doc_function = match first_expr_type {
         LuaType::DocFunction(func) => func,
@@ -189,7 +218,16 @@ pub fn infer_for_range_iter_expr_func(
     };
 
     let Some(status_param) = status_param else {
-        return Ok(doc_function.get_variadic_ret());
+        let types = doc_function.get_variadic_ret();
+        let settled_overrides =
+            compute_proven_settled_overrides(builtin_iter_bindings.as_deref(), &types);
+        let (types, degraded_unbound_tpl) =
+            substitute_unbound_iter_var_templates(types, &settled_overrides);
+        return Ok(IterVarInference {
+            types,
+            settled_overrides,
+            degraded_unbound_tpl,
+        });
     };
     let mut substitutor = TypeSubstitutor::new();
     let mut context = TplContext {
@@ -215,7 +253,164 @@ pub fn infer_for_range_iter_expr_func(
         doc_function
     };
 
-    Ok(instantiate_func.get_variadic_ret())
+    let types = instantiate_func.get_variadic_ret();
+    let settled_overrides =
+        compute_proven_settled_overrides(builtin_iter_bindings.as_deref(), &types);
+    let (types, degraded_unbound_tpl) =
+        substitute_unbound_iter_var_templates(types, &settled_overrides);
+    Ok(IterVarInference {
+        types,
+        settled_overrides,
+        degraded_unbound_tpl,
+    })
+}
+
+/// Substitutes the settled overrides into the iterator's return slots and
+/// degrades every remaining unbound template. A raw `TplRef` is a placeholder
+/// an unbound generic left behind, never a type the variable holds, so it must
+/// never reach the decl cache: it degrades to its declared constraint, or to
+/// `Unknown` when none exists. Returns whether any slot carried an unbound
+/// template — such an answer was taken against the index as it stood when the
+/// iterator was inferred, so it must be re-derived once the rest has landed.
+fn substitute_unbound_iter_var_templates(
+    types: VariadicType,
+    settled_overrides: &[Option<LuaType>],
+) -> (VariadicType, bool) {
+    match types {
+        VariadicType::Multi(list) => {
+            let mut degraded_unbound_tpl = false;
+            let substituted = list
+                .into_iter()
+                .enumerate()
+                .map(|(idx, typ)| {
+                    if !typ.contain_tpl() {
+                        return typ;
+                    }
+                    degraded_unbound_tpl = true;
+                    let result = match settled_overrides.get(idx) {
+                        Some(Some(fallback)) if !fallback.contain_tpl() => fallback.clone(),
+                        _ => degrade_unbound_iter_var_type(typ),
+                    };
+                    if result.contain_tpl() {
+                        LuaType::Unknown
+                    } else {
+                        result
+                    }
+                })
+                .collect();
+            (VariadicType::Multi(substituted), degraded_unbound_tpl)
+        }
+        VariadicType::Base(typ) => {
+            if !typ.contain_tpl() {
+                return (VariadicType::Base(typ), false);
+            }
+            if let Some(Some(fallback)) = settled_overrides.first() {
+                if !fallback.contain_tpl() {
+                    return (VariadicType::Base(fallback.clone()), true);
+                }
+            }
+            let degraded = degrade_unbound_iter_var_type(typ);
+            let final_type = if degraded.contain_tpl() {
+                LuaType::Unknown
+            } else {
+                degraded
+            };
+            (VariadicType::Base(final_type), true)
+        }
+    }
+}
+
+/// Degrade an unbound template placeholder to a real type: its declared
+/// constraint when one exists and is concrete, else `Unknown`. Union arms that
+/// did bind survive; only the placeholder arms are dropped.
+fn degrade_unbound_iter_var_type(typ: LuaType) -> LuaType {
+    let degraded = match typ {
+        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => match tpl.get_constraint() {
+            Some(constraint) if !constraint.contain_tpl() => constraint.clone(),
+            _ => LuaType::Unknown,
+        },
+        LuaType::StrTplRef(tpl) => match tpl.get_constraint() {
+            Some(constraint) if !constraint.contain_tpl() => constraint.clone(),
+            _ => LuaType::Unknown,
+        },
+        LuaType::Union(union) => {
+            let bound = union
+                .types()
+                .filter(|arm| !arm.contain_tpl())
+                .cloned()
+                .collect::<Vec<_>>();
+            match bound.as_slice() {
+                [] => LuaType::Unknown,
+                [only] => only.clone(),
+                _ => LuaType::from_vec(bound),
+            }
+        }
+        typ => {
+            if typ.contain_tpl() {
+                LuaType::Unknown
+            } else {
+                typ
+            }
+        }
+    };
+    if degraded.contain_tpl() {
+        LuaType::Unknown
+    } else {
+        degraded
+    }
+}
+
+fn compute_proven_settled_overrides(
+    bindings: Option<&[FuncGenericBinding]>,
+    types: &VariadicType,
+) -> Vec<Option<LuaType>> {
+    let Some(bindings) = bindings else {
+        return Vec::new();
+    };
+    if !bindings
+        .iter()
+        .any(|b| matches!(b.state, FuncGenericBindingState::Unbound { .. }))
+    {
+        return Vec::new();
+    }
+    let slot_count = match types {
+        VariadicType::Multi(types) => types.len(),
+        VariadicType::Base(_) => 1,
+    };
+    (0..slot_count)
+        .map(|idx| {
+            let slot_type = match types {
+                VariadicType::Multi(list) => list.get(idx),
+                VariadicType::Base(base) => Some(base),
+            };
+            let want = slot_type.and_then(find_tpl_id_in_type);
+            let want = want.unwrap_or(GenericTplId::Func(idx as u32));
+            bindings.iter().find_map(|b| {
+                if b.id != want {
+                    return None;
+                }
+                match &b.state {
+                    FuncGenericBindingState::Unbound { fallback } => Some(fallback.clone()),
+                    FuncGenericBindingState::Bound => None,
+                }
+            })
+        })
+        .collect()
+}
+
+fn find_tpl_id_in_type(typ: &LuaType) -> Option<GenericTplId> {
+    match typ {
+        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => Some(tpl.get_tpl_id()),
+        LuaType::StrTplRef(tpl) => Some(tpl.get_tpl_id()),
+        LuaType::Union(union) => union.types().find_map(find_tpl_id_in_type),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .find_map(|(typ, _)| find_tpl_id_in_type(typ)),
+        LuaType::Array(base) => find_tpl_id_in_type(base.get_base()),
+        LuaType::TableOf(inner) => find_tpl_id_in_type(inner),
+        _ => None,
+    }
 }
 
 fn try_infer_pairs_iter_types_from_table_members(
@@ -270,6 +465,9 @@ fn try_infer_pairs_iter_types_from_table_members(
         );
         return Ok(Some(VariadicType::Multi(vec![key_type, value_type])));
     }
+    let Some(table_type) = pairs_enumerable_type(db, table_type) else {
+        return Ok(None);
+    };
     let Some(members) = get_member_map(db, &table_type) else {
         return Ok(None);
     };
@@ -278,42 +476,84 @@ fn try_infer_pairs_iter_types_from_table_members(
     }
     let mut keys = Vec::new();
     let mut values = Vec::new();
+    // Sort borrowed entries: the walk below only needs each member's `typ`
+    // clone, so cloning the whole map's keys and info vectors up front would
+    // pay a second deep clone of every member type for nothing.
     let mut member_entries = members
         .iter()
-        .map(|(key, member_infos)| (key.clone(), member_infos.clone()))
+        .map(|(key, infos)| (key, infos, false))
         .collect::<Vec<_>>();
-    member_entries.sort_by_key(|(key, _)| member_key_stable_key(key));
+    member_entries.sort_by_key(|(key, _, _)| member_key_stable_key(key));
 
     // A dynamic key aliases every access whose key infers to the same type
     // rather than naming a member, so once one is present the literal keys
     // beside it are a sample of the indices some file happened to write, not
     // the table's key domain. Which samples are in the map depends on how far
     // inference had progressed, so the keys are reported by kind.
+    //
+    // A member filed by writing an iterated table back through a loop's own
+    // key variable (`T[k] = v` inside `for k in pairs(T)`, in this loop or any
+    // other over `T`; see `is_pairs_write_back` for how `T` is matched) is feedback,
+    // not evidence: its key was minted from that loop variable's settling
+    // answer, which is this very domain, so counting it would widen the domain
+    // being derived. Such a member is excluded from the key domain — and from
+    // the sampling decision — only when every writer under the key is one of
+    // these write-backs and its key variable was not reassigned before the
+    // write; a reassigned key or an independent writer under the same key is
+    // real computed-key evidence.
+    let mut self_write_only = |member_infos: &[LuaMemberInfo]| {
+        !member_infos.is_empty()
+            && member_infos.iter().all(|member| {
+                matches!(
+                    &member.property_owner_id,
+                    Some(LuaSemanticDeclId::Member(member_id)) if is_pairs_write_back(db, cache, member_id)
+                )
+            })
+    };
+    for (_, member_infos, self_feedback) in &mut member_entries {
+        *self_feedback = self_write_only(member_infos);
+    }
     let keys_are_sampled = member_entries
         .iter()
-        .any(|(key, _)| matches!(key, LuaMemberKey::ExprType(_)));
+        .any(|(key, _, self_feedback)| is_sampled_pairs_key(key) && !self_feedback);
 
-    for (key, member_infos) in member_entries {
-        let key_type = if keys_are_sampled {
-            match table_projection_member_key_type(&key) {
-                Some(typ) => typ,
-                None => continue,
-            }
-        } else {
-            match key {
-                LuaMemberKey::Integer(i) => LuaType::IntegerConst(i),
-                LuaMemberKey::Name(name) => LuaType::StringConst(name.into()),
-                LuaMemberKey::ExprType(typ) => typ,
-                LuaMemberKey::None => continue,
-            }
-        };
-        keys.push(key_type);
+    for (key, member_infos, self_feedback) in member_entries {
+        if !self_feedback {
+            let key_type = if keys_are_sampled {
+                match table_projection_member_key_type(key) {
+                    Some(typ) => typ,
+                    None => continue,
+                }
+            } else {
+                match key {
+                    LuaMemberKey::Integer(i) => LuaType::IntegerConst(*i),
+                    LuaMemberKey::Name(name) => LuaType::StringConst(name.clone().into()),
+                    LuaMemberKey::ExprType(typ) => typ.clone(),
+                    LuaMemberKey::None => continue,
+                }
+            };
+            keys.push(key_type);
+        }
 
-        let value_type = match member_infos.as_slice() {
-            [] => LuaType::Any,
+        // Writing a loop's own value back (`T[k] = v` inside `for k, v in
+        // pairs(T)`) puts back an element the table already holds, so that
+        // value is feedback too: it carries whatever the element type was when
+        // the write-back last ran. Any other value written is evidence.
+        let evidence = member_infos
+            .iter()
+            .filter(|member| {
+                !matches!(
+                    &member.property_owner_id,
+                    Some(LuaSemanticDeclId::Member(member_id)) if writes_back_loop_value(db, member_id)
+                )
+            })
+            .collect::<Vec<_>>();
+        let value_type = match evidence.as_slice() {
+            [] if member_infos.is_empty() => LuaType::Any,
+            [] => continue,
             [member] => member.typ.clone(),
             _ => LuaType::from_inferred_vec(
-                member_infos.into_iter().map(|member| member.typ).collect(),
+                evidence.iter().map(|member| member.typ.clone()).collect(),
             ),
         };
         values.push(value_type);
@@ -331,9 +571,124 @@ fn try_infer_pairs_iter_types_from_table_members(
     Ok(Some(iter_types))
 }
 
+/// The arms of `typ` that `pairs` enumerates: a string's members are the library its
+/// metatable indexes, not entries of the value, so a string arm contributes none.
+fn pairs_enumerable_type(db: &DbIndex, typ: LuaType) -> Option<LuaType> {
+    let mut arms = Vec::new();
+    collect_resolved_arms(db, typ, &mut arms, &mut HashSet::default());
+    let enumerable = arms
+        .into_iter()
+        .filter(|arm| get_buildin_type_map_type_id(arm).is_none())
+        .collect::<Vec<_>>();
+    (!enumerable.is_empty()).then(|| LuaType::from_vec(enumerable))
+}
+
+/// The arms of `typ` with every alias among them resolved.
+fn collect_resolved_arms(
+    db: &DbIndex,
+    typ: LuaType,
+    arms: &mut Vec<LuaType>,
+    visited: &mut HashSet<LuaType>,
+) {
+    if !visited.insert(typ.clone()) {
+        return;
+    }
+    match crate::get_real_type(db, &typ).cloned().unwrap_or(typ) {
+        LuaType::Union(union) => {
+            for arm in union.types() {
+                collect_resolved_arms(db, arm.clone(), arms, visited);
+            }
+        }
+        LuaType::MultiLineUnion(union) => {
+            for (arm, _) in union.get_unions() {
+                collect_resolved_arms(db, arm.clone(), arms, visited);
+            }
+        }
+        resolved => arms.push(resolved),
+    }
+}
+
+/// Whether `member_id` writes a table back through the key variable of a
+/// `pairs` loop over that same table, unreassigned before the write: a loop
+/// over the table as the write spells it, or, in the file being analysed, one
+/// every table of which is the table written. A write in another file is
+/// judged by its spelling alone: inferring what its loop iterates would read
+/// that file's text, so every edit of it would reach this file.
+fn is_pairs_write_back(db: &DbIndex, cache: &mut LuaInferCache, member_id: &LuaMemberId) -> bool {
+    let Some(index_expr) = written_index_expr(db, member_id) else {
+        return false;
+    };
+    let Some(LuaIndexKey::Expr(LuaExpr::NameExpr(key_name))) = index_expr.get_index_key() else {
+        return false;
+    };
+    if is_unreassigned_loop_var_over(db, member_id.file_id, &key_name, 0, &index_expr) {
+        return true;
+    }
+    member_id.file_id == cache.get_file_id()
+        && writes_own_pairs_key(db, cache, &index_expr).is_some()
+}
+
+/// Whether `member_id` writes the value variable of a `pairs` loop over the
+/// same table back into it, unreassigned before the write.
+fn writes_back_loop_value(db: &DbIndex, member_id: &LuaMemberId) -> bool {
+    let Some(index_expr) = written_index_expr(db, member_id) else {
+        return false;
+    };
+    let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() else {
+        return false;
+    };
+    let (vars, exprs) = assign_stat.get_var_and_expr_list();
+    let written_value = vars
+        .iter()
+        .position(|var| var.syntax() == index_expr.syntax())
+        .and_then(|at| exprs.get(at));
+    let Some(LuaExpr::NameExpr(value_name)) = written_value else {
+        return false;
+    };
+    is_unreassigned_loop_var_over(db, member_id.file_id, value_name, 1, &index_expr)
+}
+
+fn written_index_expr(db: &DbIndex, member_id: &LuaMemberId) -> Option<LuaIndexExpr> {
+    let syntax_id = member_id.get_syntax_id();
+    db.get_vfs()
+        .syntax_tree_around(&member_id.file_id, syntax_id.get_range())
+        .and_then(|tree| syntax_id.to_node_from_root(&tree.get_red_root()))
+        .and_then(LuaIndexExpr::cast)
+}
+
+/// Whether `name` is variable `var_index` of a `pairs` loop over the table
+/// `index_expr` writes into, and not reassigned before the write.
+fn is_unreassigned_loop_var_over(
+    db: &DbIndex,
+    file_id: FileId,
+    name: &LuaNameExpr,
+    var_index: usize,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let Some(source) = for_range_pairs_source_for_var(db, file_id, name, var_index) else {
+        return false;
+    };
+    let written_table = index_expr
+        .get_prefix_expr()
+        .and_then(|prefix| access_path(&prefix));
+    written_table.is_some_and(|path| access_path(&source.source_expr) == Some(path))
+        && db
+            .get_reference_index()
+            .first_local_reassignment(file_id, &source.iter_decl_id)
+            .is_none_or(|position| position >= index_expr.get_position())
+}
+
+fn access_path(expr: &LuaExpr) -> Option<smol_str::SmolStr> {
+    match expr {
+        LuaExpr::NameExpr(name) => name.get_access_path(),
+        LuaExpr::IndexExpr(index) => index.get_access_path(),
+        _ => None,
+    }
+}
+
 fn infer_table_projection_key_type(db: &DbIndex, inner: &LuaType) -> LuaType {
     let mut pending = vec![inner.clone()];
-    let mut visited_types = HashSet::new();
+    let mut visited_types = HashSet::default();
     let mut key_type = None;
 
     while let Some(typ) = pending.pop() {
@@ -379,6 +734,27 @@ fn infer_table_projection_key_type(db: &DbIndex, inner: &LuaType) -> LuaType {
     })
 }
 
+fn is_sampled_pairs_key(key: &LuaMemberKey) -> bool {
+    match key {
+        LuaMemberKey::ExprType(LuaType::Union(union))
+            if !union.is_empty()
+                && union.types().all(|typ| {
+                    matches!(
+                        typ,
+                        LuaType::StringConst(_)
+                            | LuaType::DocStringConst(_)
+                            | LuaType::IntegerConst(_)
+                            | LuaType::DocIntegerConst(_)
+                    )
+                }) =>
+        {
+            false
+        }
+        LuaMemberKey::ExprType(_) => true,
+        _ => false,
+    }
+}
+
 fn table_projection_member_key_type(key: &LuaMemberKey) -> Option<LuaType> {
     match key {
         LuaMemberKey::Name(_) => Some(LuaType::String),
@@ -415,20 +791,42 @@ fn compact_pairs_key_type(keys: &[LuaType]) -> LuaType {
 }
 
 fn compact_pairs_value_type(db: &DbIndex, values: Vec<LuaType>) -> LuaType {
-    let values = values
-        .into_iter()
-        .map(|value| remove_pairs_yield_nil(db, &value))
-        .filter(|value| !value.is_unknown() && !value.is_never())
-        .collect::<Vec<_>>();
+    let mut saw_concrete = false;
+    let mut values = values;
+    values.retain_mut(|value| {
+        *value = remove_pairs_yield_nil(db, value);
+        if value.is_unknown() || value.is_never() {
+            return false;
+        }
+        saw_concrete |= !value.is_any();
+        true
+    });
+    if saw_concrete {
+        values.retain(|value| !value.is_any());
+    }
     if values.is_empty() {
         // All observed values were nil-only or otherwise uninformative; avoid collapsing to Nil.
         return LuaType::Unknown;
+    }
+
+    if values.len() == 1 && !matches!(values[0], LuaType::Union(_)) {
+        return values.pop().unwrap_or(LuaType::Unknown);
     }
 
     try_compact_record_values(db, &values).unwrap_or_else(|| LuaType::from_inferred_vec(values))
 }
 
 fn remove_pairs_yield_nil(db: &DbIndex, value_type: &LuaType) -> LuaType {
+    if matches!(value_type, LuaType::Unknown | LuaType::Never | LuaType::Nil) {
+        return LuaType::Unknown;
+    }
+    if !matches!(
+        value_type,
+        LuaType::Union(_) | LuaType::Ref(_) | LuaType::Instance(_)
+    ) {
+        return value_type.clone();
+    }
+
     let non_nil = TypeOps::Remove.apply(db, value_type, &LuaType::Nil);
     if non_nil.is_never() {
         LuaType::Unknown
@@ -442,12 +840,12 @@ fn try_compact_record_values(db: &DbIndex, values: &[LuaType]) -> Option<LuaType
         return None;
     }
 
-    let mut fields: HashMap<LuaMemberKey, (LuaType, usize)> = HashMap::new();
+    let mut fields: HashMap<LuaMemberKey, (LuaType, usize)> = HashMap::default();
     for value in values {
         let Some(member_map) = get_member_map(db, value) else {
             continue;
         };
-        let mut present_keys = HashSet::new();
+        let mut present_keys = HashSet::default();
         for (key, member_infos) in member_map.iter() {
             if matches!(key, LuaMemberKey::None) || member_infos.is_empty() {
                 continue;
@@ -529,4 +927,37 @@ fn is_global_pairs_call(
         .get_local_reference(&file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
         .is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compact_pairs_value_type;
+    use crate::{DbIndex, LuaType};
+
+    #[test]
+    fn compact_pairs_value_type_keeps_nil_and_any_cleanup_semantics() {
+        let db = DbIndex::new();
+
+        assert_eq!(
+            compact_pairs_value_type(&db, vec![LuaType::Nil, LuaType::Unknown]),
+            LuaType::Unknown
+        );
+        assert_eq!(
+            compact_pairs_value_type(&db, vec![LuaType::Any, LuaType::String]),
+            LuaType::String
+        );
+        assert_eq!(
+            compact_pairs_value_type(&db, vec![LuaType::Integer, LuaType::Nil]),
+            LuaType::Integer
+        );
+    }
+
+    #[test]
+    fn compact_pairs_value_type_matches_inferred_union_for_multiple_values() {
+        let db = DbIndex::new();
+        let values = vec![LuaType::Integer, LuaType::String];
+        let expected = LuaType::from_inferred_vec(values.clone());
+
+        assert_eq!(compact_pairs_value_type(&db, values), expected);
+    }
 }

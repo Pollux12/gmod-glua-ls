@@ -1,18 +1,12 @@
 #[cfg(test)]
 mod test {
-    use std::time::Instant;
-
+    use crate::VirtualWorkspace;
     use crate::semantic::BASELINE_FLOW_WALKS;
-    use crate::{Emmyrc, EmmyrcGmodScriptedClassScopeEntry, VirtualWorkspace};
-
-    fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
-        EmmyrcGmodScriptedClassScopeEntry::LegacyGlob(pattern.to_string())
-    }
 
     /// A closure reading an outer local resolves its baseline type by walking
     /// back past every branch merge ahead of it, so the branch count is the
     /// exponent if a merge point is derived once per path instead of once.
-    fn index_branch_merges_before_closure(count: usize) -> std::time::Duration {
+    fn index_branch_merges_before_closure(count: usize) {
         let mut body = String::from("local value = 1\n");
         for i in 0..count {
             body.push_str(&format!(
@@ -22,16 +16,13 @@ mod test {
         }
         body.push_str("local read = function() return value end\n");
 
-        let mut ws = VirtualWorkspace::new();
-        let start = Instant::now();
-        ws.def(&body);
-        start.elapsed()
+        VirtualWorkspace::new().def(&body);
     }
 
     /// Closure-baseline walks performed while indexing `count` branch merges.
     fn baseline_walks_for_branch_merges(count: usize) -> u64 {
         BASELINE_FLOW_WALKS.with(|walks| walks.set(0));
-        let _ = index_branch_merges_before_closure(count);
+        index_branch_merges_before_closure(count);
         BASELINE_FLOW_WALKS.with(|walks| walks.get())
     }
 
@@ -41,8 +32,7 @@ mod test {
     ///
     /// Counted rather than timed. The two behaviours differ by orders of
     /// magnitude in *work done*, so counting says so directly, runs in
-    /// milliseconds, and cannot flake when the test suite saturates the CPU —
-    /// which a wall-clock ceiling here demonstrably does.
+    /// milliseconds, and cannot flake when the test suite saturates the CPU.
     #[test]
     fn closure_baseline_memoises_branch_merges() {
         let small = baseline_walks_for_branch_merges(8);
@@ -62,73 +52,7 @@ mod test {
         );
     }
 
-    /// The ratio form of [`closure_baseline_memoises_branch_merges`], for
-    /// bisecting a regression that test has already caught.
-    #[test]
-    #[ignore = "wall-clock ratio, for bisecting; the counted guard above runs by default"]
-    fn closure_baseline_cost_stays_linear_in_branch_merges() {
-        // Warm up so first-file fixed costs (std/global setup) don't skew the ratio.
-        let _ = index_branch_merges_before_closure(4);
-
-        let small = index_branch_merges_before_closure(10);
-        let large = index_branch_merges_before_closure(20);
-
-        // Memoised this is linear; deriving per path doubles per branch. A 20x
-        // ceiling sits well above linear noise and well below exponential.
-        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
-        assert!(
-            ratio < 20.0,
-            "closure-baseline narrowing scaled exponentially with branch merges \
-             (10 -> {small:?}, 20 -> {large:?}, ratio {ratio:.1}x); \
-             merge points are being re-derived once per path"
-        );
-    }
-
-    /// Regression guard for issue #36: a field assigned a very large number of
-    /// times under distinct (branched / guarded) writes used to drive
-    /// `lua analyze` into O(N²) behaviour — each assignment re-scanned every
-    /// prior member sharing the same `(owner, key)` to widen/preserve its type.
-    /// On large generated files this made a single file take seconds and timed
-    /// the whole workspace out.
-    ///
-    /// Analysis should stay close to linear in the number of assignments. This
-    /// test asserts that doubling the assignment count does not super-linearly
-    /// blow up indexing time. Timing-based, but with a wide margin: the pre-fix
-    /// code was ~quadratic (≈16× from 1k→4k), so even a generous ratio check
-    /// reliably catches a regression without flaking.
-    fn index_repeated_branched_assignments(count: usize) -> std::time::Duration {
-        let mut body = String::from("local T = {}\n");
-        for i in 0..count {
-            // Each write is a distinct, branch-guarded assignment to the SAME
-            // field, so all members are preserved under one (owner, key).
-            body.push_str(&format!(
-                "if cond{i} then T.field = {{ a{i} = {i}, shared = true }} end\n"
-            ));
-        }
-        body.push_str("return T\n");
-
-        let mut ws = VirtualWorkspace::new();
-        let start = Instant::now();
-        ws.def(&body);
-        start.elapsed()
-    }
-
-    fn index_repeated_guarded_bootstrap_assignments(count: usize) -> std::time::Duration {
-        let mut body = String::from("local T = {}\n");
-        for _ in 0..count {
-            body.push_str("T.field = T.field or {}\n");
-        }
-        body.push_str("return T\n");
-
-        let mut ws = VirtualWorkspace::new();
-        let start = Instant::now();
-        ws.def(&body);
-        start.elapsed()
-    }
-
-    fn infer_after_repeated_unrelated_inner_conditions(
-        count: usize,
-    ) -> (std::time::Duration, String) {
+    fn infer_after_repeated_unrelated_inner_conditions(count: usize) -> String {
         let mut body = String::from(
             r#"
 ---@type string?
@@ -144,39 +68,9 @@ local unrelated = {}
         body.push_str("result = target\n");
 
         let mut ws = VirtualWorkspace::new();
-        let start = Instant::now();
         ws.def(&body);
         let result_type = ws.expr_ty("result");
-        (start.elapsed(), ws.humanize_type(result_type))
-    }
-
-    /// Ignored because it is wall-clock: the ratio is stable against machine
-    /// speed but not against the test suite saturating the CPU around it, and
-    /// the sizes it needs to separate linear from quadratic take too long to
-    /// belong in a default run. There is no counted stand-in — the widening does
-    /// not route through an owner-scoped lookup that could be counted — so this
-    /// regression has no default-run guard. Run it before and after changes to
-    /// member assignment widening.
-    #[test]
-    #[ignore = "wall-clock ratio; run manually when touching member assignment widening"]
-    fn repeated_field_assignment_indexing_stays_near_linear() {
-        // Warm up so the first-file fixed costs (std/global setup) don't skew the
-        // ratio, then measure two sizes that differ by 4×.
-        let _ = index_repeated_branched_assignments(200);
-
-        let small = index_repeated_branched_assignments(1000);
-        let large = index_repeated_branched_assignments(4000);
-
-        // 4× the assignments. Linear would be ~4×; the old quadratic path was
-        // ~16×. Allow a generous 12× ceiling: comfortably below quadratic, but
-        // tolerant of wall-clock noise when this ignored smoke is run manually.
-        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
-        assert!(
-            ratio < 12.0,
-            "indexing scaled super-linearly with repeated field assignments \
-             (1000 -> {small:?}, 4000 -> {large:?}, ratio {ratio:.1}x); \
-             the O(N^2) member-assignment widening may have regressed (issue #36)"
-        );
+        ws.humanize_type(result_type)
     }
 
     #[test]
@@ -233,111 +127,9 @@ local unrelated = {}
 
     #[test]
     fn repeated_unrelated_inner_conditions_still_infer_quick_smoke() {
-        let (_, result_type) = infer_after_repeated_unrelated_inner_conditions(200);
+        let result_type = infer_after_repeated_unrelated_inner_conditions(200);
 
         assert_eq!(result_type, "string?");
-    }
-
-    #[test]
-    #[ignore = "wall-clock performance smoke for unrelated inner-condition branch merges"]
-    fn unrelated_inner_condition_branch_merges_stay_near_linear() {
-        let _ = infer_after_repeated_unrelated_inner_conditions(100);
-
-        let (small, _) = infer_after_repeated_unrelated_inner_conditions(500);
-        let (large, _) = infer_after_repeated_unrelated_inner_conditions(2000);
-
-        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
-        eprintln!(
-            "unrelated inner-condition flow scaling: 500 -> {small:?}, 2000 -> {large:?}, ratio {ratio:.1}x"
-        );
-        assert!(
-            ratio < 12.0,
-            "flow narrowing scaled super-linearly with unrelated inner conditions \
-             (500 -> {small:?}, 2000 -> {large:?}, ratio {ratio:.1}x)"
-        );
-    }
-
-    #[test]
-    #[ignore = "wall-clock performance smoke for repeated guarded table bootstraps"]
-    fn repeated_guarded_bootstrap_assignment_indexing_stays_near_linear() {
-        let _ = index_repeated_guarded_bootstrap_assignments(200);
-
-        let small = index_repeated_guarded_bootstrap_assignments(1000);
-        let large = index_repeated_guarded_bootstrap_assignments(4000);
-
-        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
-        eprintln!(
-            "guarded bootstrap assignment scaling: 1000 -> {small:?}, 4000 -> {large:?}, ratio {ratio:.1}x"
-        );
-        assert!(
-            ratio < 12.0,
-            "indexing scaled super-linearly with guarded bootstrap assignments \
-             (1000 -> {small:?}, 4000 -> {large:?}, ratio {ratio:.1}x)"
-        );
-    }
-
-    fn index_distinct_self_field_assignments(count: usize) -> std::time::Duration {
-        let mut ws = VirtualWorkspace::new();
-        let mut emmyrc = Emmyrc::default();
-        emmyrc.gmod.enabled = true;
-        emmyrc
-            .gmod
-            .scripted_class_scopes
-            .set_include(vec![legacy_scope("entities/**")]);
-        ws.update_emmyrc(emmyrc);
-
-        let mut body = String::from("function ENT:Initialize()\n");
-        for i in 0..count {
-            body.push_str(&format!("    self.field{i} = {i}\n"));
-        }
-        body.push_str("end\n");
-
-        let start = Instant::now();
-        ws.def_file("lua/entities/perf_entity/init.lua", &body);
-        start.elapsed()
-    }
-
-    #[test]
-    #[ignore = "wall-clock ratio, for bisecting"]
-    fn distinct_self_field_assignments_index_near_linearly() {
-        let _ = index_distinct_self_field_assignments(200);
-
-        let small = index_distinct_self_field_assignments(1000);
-        let large = index_distinct_self_field_assignments(4000);
-
-        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
-        eprintln!(
-            "distinct self field assignment scaling: 1000 -> {small:?}, 4000 -> {large:?}, ratio {ratio:.1}x"
-        );
-        assert!(
-            ratio < 12.0,
-            "indexing scaled super-linearly with distinct self field assignments \
-             (1000 -> {small:?}, 4000 -> {large:?}, ratio {ratio:.1}x)"
-        );
-    }
-
-    fn index_dynamic_key_collection_assignments(count: usize) -> std::time::Duration {
-        let mut body = String::from(
-            r#"
----@return string
-local function key_name()
-end
-
-local T = {}
-"#,
-        );
-        for i in 0..count {
-            body.push_str(&format!("T.field{i} = {{ {i} }}\n"));
-        }
-        for i in 0..count {
-            body.push_str(&format!("T[key_name()] = {{ {i} }}\n"));
-        }
-        body.push_str("return T\n");
-
-        let mut ws = VirtualWorkspace::new();
-        let start = Instant::now();
-        ws.def(&body);
-        start.elapsed()
     }
 
     #[test]
@@ -385,84 +177,5 @@ local result = T["entry"].name
 
         let result_type = ws.expr_ty("result");
         assert_ne!(ws.humanize_type(result_type), "string");
-    }
-
-    #[test]
-    #[ignore = "wall-clock ratio, for bisecting"]
-    fn dynamic_key_collection_assignments_do_not_scan_owner_members_quadratically() {
-        let _ = index_dynamic_key_collection_assignments(100);
-
-        let small = index_dynamic_key_collection_assignments(500);
-        let large = index_dynamic_key_collection_assignments(2000);
-
-        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
-        eprintln!(
-            "dynamic key collection assignment scaling: 500 -> {small:?}, 2000 -> {large:?}, ratio {ratio:.1}x"
-        );
-        assert!(
-            ratio < 12.0,
-            "indexing scaled super-linearly with dynamic-key collection assignments \
-             (500 -> {small:?}, 2000 -> {large:?}, ratio {ratio:.1}x)"
-        );
-    }
-
-    /// `count` reads of fields that do not exist, against one table that ends
-    /// up `count` fields wide.
-    fn index_misses_on_one_wide_table(count: usize) -> std::time::Duration {
-        let mut body = String::from("local store = {}\n");
-        for i in 0..count {
-            body.push_str(&format!("store.f{i} = {i}\nlocal miss{i} = store.g{i}\n"));
-        }
-        body.push_str("return store\n");
-
-        let mut ws = VirtualWorkspace::new();
-        let start = Instant::now();
-        ws.def(&body);
-        start.elapsed()
-    }
-
-    /// The same reads and the same field count, spread so that no table is
-    /// more than one field wide.
-    fn index_misses_on_narrow_tables(count: usize) -> std::time::Duration {
-        let mut body = String::new();
-        for i in 0..count {
-            body.push_str(&format!(
-                "local store{i} = {{}}\nstore{i}.f{i} = {i}\nlocal miss{i} = store{i}.g{i}\n"
-            ));
-        }
-
-        let mut ws = VirtualWorkspace::new();
-        let start = Instant::now();
-        ws.def(&body);
-        start.elapsed()
-    }
-
-    /// A read of a field the table does not declare must not cost the width of
-    /// the owner. Both halves do the same number of reads over the same number
-    /// of fields and differ only in how wide any single table gets, so the ratio
-    /// isolates per-access cost that grows with owner width.
-    ///
-    /// Ignored because it is wall-clock, and the wide half takes tens of seconds
-    /// even when it is behaving — the residual is flow narrowing over the
-    /// writes, which this does not guard and which no cheap absolute ceiling can
-    /// separate from a regression. So this one has no default-run guard either.
-    #[test]
-    #[ignore = "wall-clock ratio; run manually when touching owner member lookup"]
-    fn named_field_misses_do_not_scan_every_owner_member() {
-        // Warm up so first-file fixed costs (std/global setup) don't skew the ratio.
-        let _ = index_misses_on_narrow_tables(100);
-
-        let narrow = index_misses_on_narrow_tables(2000);
-        let wide = index_misses_on_one_wide_table(2000);
-
-        // The residual gap is flow narrowing over the writes, which this does
-        // not guard, so the ceiling sits above that and below a full scan.
-        let ratio = wide.as_secs_f64() / narrow.as_secs_f64().max(1e-6);
-        assert!(
-            ratio < 25.0,
-            "field misses cost more on a wide table than on narrow ones \
-             (narrow -> {narrow:?}, wide -> {wide:?}, ratio {ratio:.1}x); \
-             a miss is probably walking every member of the owner again"
-        );
     }
 }

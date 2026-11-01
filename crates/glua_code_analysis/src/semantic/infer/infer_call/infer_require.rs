@@ -1,3 +1,4 @@
+use glua_parser::LuaAstNode;
 use glua_parser::LuaCallExpr;
 
 use crate::{
@@ -33,7 +34,7 @@ pub fn infer_require_call(
         },
         None => Err(InferFailReason::UnResolveExpr(InFiled::new(
             cache.get_file_id(),
-            call_expr.into(),
+            call_expr.get_syntax_id(),
         ))),
     }
 }

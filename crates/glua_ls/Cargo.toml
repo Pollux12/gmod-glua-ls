@@ -39,6 +39,7 @@ dirs.workspace = true
 wax.workspace = true
 internment.workspace = true
 smol_str.workspace = true
+rustc-hash.workspace = true
 
 [dependencies.clap]
 workspace = true
@@ -49,6 +50,7 @@ workspace = true
 optional = true
 
 [dev-dependencies]
+crossbeam-channel.workspace = true
 googletest.workspace = true
 
 

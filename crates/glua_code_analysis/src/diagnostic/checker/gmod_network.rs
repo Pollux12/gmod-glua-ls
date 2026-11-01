@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
-
 use crate::{
-    DiagnosticCode, FileId, GmodRealm, NetOpEntry, NetReceiveFlow, NetSendFlow, SemanticModel,
-    flows_can_match, is_opposite_strict_realm_pair, is_strict_realm,
+    DiagnosticCode, FileId, GmodRealm, GmodStateMask, NetOpEntry, NetReceiveFlow, NetSendFlow,
+    SemanticModel, flows_can_match, is_opposite_strict_realm_pair, is_strict_realm,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -94,14 +92,15 @@ fn check_read_write_mismatch(
             continue;
         }
 
-        let Some(matching_send_flows) = sorted_send_flows.get(&receive_flow.message_name) else {
+        let Some(matching_send_flows) = sent_under(sorted_send_flows, &receive_flow.message_name)
+        else {
             continue;
         };
         let mut has_matching_candidate = false;
         let mut best_mismatch: Option<CandidateMismatch> = None;
 
         for (send_file_id, send_flow, sender_sort_key) in matching_send_flows {
-            if send_flow.is_wrapped {
+            if !send_flow.payload_known() {
                 continue;
             }
 
@@ -126,7 +125,7 @@ fn check_read_write_mismatch(
                 break;
             }
 
-            let (code, range, message) = first_mismatch_diagnostic(network_index, send_flow, receive_flow)
+            let (code, range, message) = first_mismatch_diagnostic(network_index, file_id, send_flow, receive_flow)
                 .unwrap_or_else(|| {
                     (
                         DiagnosticCode::GmodNetReadWriteOrderMismatch,
@@ -195,7 +194,8 @@ pub struct SenderSortKey {
 
 /// Precomputed send flows sorted by SenderSortKey for each message name.
 /// Built once per diagnostic batch run instead of per file.
-pub type SortedSendFlowCache = FxHashMap<String, Vec<(FileId, NetSendFlow, SenderSortKey)>>;
+pub type SortedSendFlowCache =
+    std::collections::HashMap<String, Vec<(FileId, NetSendFlow, SenderSortKey)>>;
 
 /// Precompute and sort all send flows by message name, using VFS path
 /// ordering so that all files in a workspace sort consistently. Called
@@ -204,7 +204,7 @@ pub fn precompute_sorted_send_flows(
     network_index: &crate::GmodNetworkIndex,
     vfs: &crate::vfs::Vfs,
 ) -> SortedSendFlowCache {
-    let mut cache: SortedSendFlowCache = FxHashMap::default();
+    let mut cache: SortedSendFlowCache = SortedSendFlowCache::default();
     for (file_id, flow_idx, send_flow) in network_index.iter_send_flows() {
         let sort_key = sender_sort_key(vfs, file_id, flow_idx, send_flow);
         cache
@@ -216,6 +216,15 @@ pub fn precompute_sorted_send_flows(
         flows.sort_by(|a, b| a.2.cmp(&b.2));
     }
     cache
+}
+
+/// The send flows sorted under `name`, read as that message's sends.
+fn sent_under<'a>(
+    sorted_send_flows: &'a SortedSendFlowCache,
+    name: &str,
+) -> Option<&'a Vec<(FileId, NetSendFlow, SenderSortKey)>> {
+    crate::GmodNetworkIndex::note_sends_read(name);
+    sorted_send_flows.get(name)
 }
 
 fn sender_sort_key(
@@ -230,7 +239,7 @@ fn sender_sort_key(
         .unwrap_or_default();
 
     SenderSortKey {
-        normalized_path: crate::vfs::normalize_path_for_ordering(&raw_path),
+        normalized_path: raw_path.replace('\\', "/"),
         raw_path,
         file_id: file_id.id,
         start_offset: u32::from(send_flow.start_range.start()),
@@ -257,6 +266,37 @@ fn matching_prefix_len(send_flow: &NetSendFlow, receive_flow: &NetReceiveFlow) -
     matched
 }
 
+/// The state mask of the receiver at `offset`, `None` when its branch and file
+/// realms leave no state that runs it.
+fn receiver_state_mask(
+    infer_index: &crate::GmodInferIndex,
+    file_id: &FileId,
+    offset: rowan::TextSize,
+) -> Option<GmodStateMask> {
+    let mask = infer_index.get_state_mask_at_offset(file_id, offset);
+    let unreachable =
+        mask.is_empty() && infer_index.get_realm_at_offset(file_id, offset) != GmodRealm::Unknown;
+    (!unreachable).then_some(mask)
+}
+
+/// Whether a receiver running in `receiver_mask` can take `send_flow`: the
+/// send's destination realm is compatible with it, or the send is a wrapped
+/// stub whose destination is unknown and the receiver can run in-game.
+fn receiver_accepts(send_flow: &NetSendFlow, receiver_mask: Option<GmodStateMask>) -> bool {
+    let Some(mask) = receiver_mask else {
+        return false;
+    };
+    let unknown_destination = send_flow.is_wrapped && send_flow.send_range == send_flow.start_range;
+    if unknown_destination && (mask.is_empty() || mask.intersects(GmodStateMask::SHARED)) {
+        return true;
+    }
+    send_flow
+        .send_kind
+        .receiver_realm
+        .state_mask()
+        .is_compatible_with(mask)
+}
+
 fn check_missing_send_counterpart(
     context: &mut DiagnosticContext,
     file_id: crate::FileId,
@@ -264,7 +304,14 @@ fn check_missing_send_counterpart(
     network_index: &crate::GmodNetworkIndex,
     infer_index: &crate::GmodInferIndex,
 ) {
-    for send_flow in send_flows {
+    let mut reported = std::collections::HashSet::new();
+    // Wrapped flows come last so a send reported directly is not reported again
+    // by the wrapper definition at the same range.
+    let ordered_flows = send_flows
+        .iter()
+        .filter(|flow| !flow.is_wrapped)
+        .chain(send_flows.iter().filter(|flow| flow.is_wrapped));
+    for send_flow in ordered_flows {
         if network_index.is_replaced_definition(file_id, send_flow) {
             continue;
         }
@@ -273,13 +320,23 @@ fn check_missing_send_counterpart(
             continue;
         }
 
-        let expected_realm = send_flow.send_kind.receiver_realm;
-
         let has_counterpart = network_index
             .get_receive_flows_for_message(&send_flow.message_name)
             .into_iter()
-            .any(|_| true);
-        if has_counterpart {
+            .any(|(receive_file_id, receive_flow)| {
+                let receiver_mask = receiver_state_mask(
+                    infer_index,
+                    &receive_file_id,
+                    receive_flow.receive_range.start(),
+                );
+                receiver_accepts(send_flow, receiver_mask)
+            });
+        if has_counterpart
+            || !reported.insert((
+                crate::GmodNetworkIndex::message_key(&send_flow.message_name),
+                send_flow.start_range,
+            ))
+        {
             continue;
         }
 
@@ -289,7 +346,7 @@ fn check_missing_send_counterpart(
             format!(
                 "No `net.Receive` counterpart found for `{name}` in {realm} realm.",
                 name = send_flow.message_name,
-                realm = realm_label(expected_realm),
+                realm = realm_label(send_flow.send_kind.receiver_realm),
             )
             .to_string(),
             None,
@@ -315,10 +372,15 @@ fn check_missing_receive_counterpart(
             continue;
         };
 
+        let receiver_mask =
+            receiver_state_mask(infer_index, &file_id, receive_flow.receive_range.start());
+        if receiver_mask.is_none() {
+            continue;
+        }
         let has_counterpart = network_index
             .get_send_flows_for_message(&receive_flow.message_name)
             .into_iter()
-            .any(|_| true);
+            .any(|(_, send_flow)| receiver_accepts(send_flow, receiver_mask));
 
         if has_counterpart {
             continue;
@@ -350,6 +412,7 @@ fn expected_read_label(network_index: &crate::GmodNetworkIndex, write: &NetOpEnt
 
 fn first_mismatch_diagnostic(
     network_index: &crate::GmodNetworkIndex,
+    file_id: crate::FileId,
     send_flow: &NetSendFlow,
     receive_flow: &NetReceiveFlow,
 ) -> Option<(DiagnosticCode, rowan::TextRange, String)> {
@@ -385,11 +448,18 @@ fn first_mismatch_diagnostic(
 
         let expected = expected_read_label(network_index, write);
         let actual = read.display_name.as_str();
+        // A read composed from a helper in another file is reported on the
+        // receive block, the part of the flow this file holds.
+        let range = if read.file_id == file_id {
+            read.range
+        } else {
+            receive_flow.receive_range
+        };
 
         if is_mispositioned_read(send_flow, index, read) {
             return Some((
                 DiagnosticCode::GmodNetReadWriteOrderMismatch,
-                receive_flow.receive_range,
+                range,
                 format!(
                     "Read/write order mismatch for `{name}` at position {position}: expected `{expected}`, got `{actual}`.",
                     name = receive_flow.message_name,
@@ -401,7 +471,7 @@ fn first_mismatch_diagnostic(
 
         return Some((
             DiagnosticCode::GmodNetReadWriteTypeMismatch,
-            receive_flow.receive_range,
+            range,
             format!(
                 "Read/write type mismatch for `{name}` at position {position}: expected `{expected}`, got `{actual}`.",
                 name = receive_flow.message_name,
@@ -466,7 +536,7 @@ fn check_bits_mismatch(
     sorted_send_flows: &SortedSendFlowCache,
     infer_index: &crate::GmodInferIndex,
 ) {
-    use std::collections::HashSet;
+    use rustc_hash::FxHashSet;
 
     for receive_flow in receive_flows {
         if receive_flow.reads_opaque {
@@ -479,14 +549,15 @@ fn check_bits_mismatch(
             continue;
         }
 
-        let Some(matching_send_flows) = sorted_send_flows.get(&receive_flow.message_name) else {
+        let Some(matching_send_flows) = sent_under(sorted_send_flows, &receive_flow.message_name)
+        else {
             continue;
         };
 
-        let mut reported: HashSet<(usize, u32, u32)> = HashSet::new();
+        let mut reported: FxHashSet<(usize, u32, u32)> = FxHashSet::default();
 
         for (send_file_id, send_flow, _) in matching_send_flows {
-            if send_flow.is_wrapped {
+            if !send_flow.payload_known() {
                 continue;
             }
 

@@ -1,12 +1,17 @@
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
 use glua_code_analysis::{
-    DbIndex, FileId, LuaCompilation, LuaDeclId, LuaMemberId, LuaSemanticDeclId, LuaTypeOwner,
-    SemanticModel,
+    DbIndex, FileId, LuaCompilation, LuaDeclId, LuaMemberId, LuaSemanticDeclId, LuaType,
+    LuaTypeOwner, SemanticDeclLevel, SemanticModel,
 };
 use glua_parser::{
-    LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaGeneralToken, LuaStat, LuaTokenKind, LuaVarExpr,
-    PathTrait,
+    LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaClosureExpr, LuaGeneralToken,
+    LuaStat, LuaTokenKind, LuaVarExpr, PathTrait,
 };
-use lsp_types::{CallHierarchyIncomingCall, CallHierarchyItem, Location, SymbolKind};
+use lsp_types::{
+    CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall, Location, SymbolKind,
+};
 use rowan::TokenAtOffset;
 use serde::{Deserialize, Serialize};
 
@@ -134,6 +139,68 @@ pub fn build_incoming_hierarchy(
     Some(result)
 }
 
+/// The calls the body of the function `semantic_decl` names makes, outside the
+/// closures nested in it, by the callee each resolves to, in the order each is
+/// first called.
+pub fn build_outgoing_hierarchy(
+    compilation: &LuaCompilation,
+    semantic_decl: LuaSemanticDeclId,
+    cancel_token: &CancellationToken,
+) -> Option<Vec<CallHierarchyOutgoingCall>> {
+    let owner: LuaTypeOwner = match semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.into(),
+        LuaSemanticDeclId::Member(member_id) => member_id.into(),
+        _ => return None,
+    };
+    let LuaType::Signature(signature_id) = compilation
+        .get_db()
+        .get_type_index()
+        .get_type_cache(&owner)?
+        .as_type()
+    else {
+        return None;
+    };
+    let semantic_model = compilation.get_semantic_model(signature_id.get_file_id())?;
+    let closure = semantic_model.get_signature_closure(*signature_id)?;
+    let document = semantic_model.get_document();
+    let mut calls: Vec<CallHierarchyOutgoingCall> = Vec::new();
+    let mut by_callee = HashMap::<LuaSemanticDeclId, usize>::new();
+    for call in closure.descendants::<LuaCallExpr>() {
+        if cancel_token.is_cancelled() {
+            return None;
+        }
+        if call.ancestors::<LuaClosureExpr>().next().as_ref() != Some(&closure) {
+            continue;
+        }
+        let Some(prefix) = call.get_prefix_expr() else {
+            continue;
+        };
+        let Some(callee) =
+            semantic_model.find_decl(prefix.syntax().clone().into(), SemanticDeclLevel::default())
+        else {
+            continue;
+        };
+        let Some(range) = document.to_lsp_range(prefix.get_range()) else {
+            continue;
+        };
+        match by_callee.entry(callee) {
+            Entry::Occupied(at) => calls[*at.get()].from_ranges.push(range),
+            Entry::Vacant(entry) => {
+                let Some(to) = build_call_hierarchy_item(&semantic_model, entry.key().clone())
+                else {
+                    continue;
+                };
+                entry.insert(calls.len());
+                calls.push(CallHierarchyOutgoingCall {
+                    to,
+                    from_ranges: vec![range],
+                });
+            }
+        }
+    }
+    Some(calls)
+}
+
 fn build_incoming_hierarchy_item(
     compilation: &LuaCompilation,
     location: &Location,
@@ -146,7 +213,7 @@ fn build_incoming_hierarchy_item(
     let tree = db.get_vfs().get_syntax_tree(&file_id)?;
     let root_chunk = tree.get_chunk_node();
     let document = db.get_vfs().get_document(&file_id)?;
-    let pos = document.get_offset(range.start.line as usize, range.start.character as usize)?;
+    let pos = document.to_offset(range.start);
     let token = match root_chunk.syntax().token_at_offset(pos) {
         TokenAtOffset::Single(token) => token,
         TokenAtOffset::Between(left, right) => {
@@ -268,4 +335,63 @@ fn build_incoming_hierarchy_item(
     }
 
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use glua_code_analysis::{LuaDeclId, LuaSemanticDeclId};
+    use glua_parser::{LuaAstNode, LuaAstToken, LuaLocalFuncStat};
+    use googletest::prelude::*;
+    use tokio_util::sync::CancellationToken;
+
+    use super::build_outgoing_hierarchy;
+    use crate::handlers::test_lib::ProviderVirtualWorkspace;
+
+    /// A function's outgoing calls are what its own body calls, each callee
+    /// once with every place it is called, and not what a closure inside it
+    /// calls.
+    #[gtest]
+    fn outgoing_calls_are_what_a_function_body_calls() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local function first() end
+            local function second() end
+            local function outer()
+                first()
+                second()
+                first()
+                local inner = function() second() end
+            end
+            "#,
+        );
+        let compilation = &ws.analysis.compilation;
+        let outer = compilation
+            .get_semantic_model(file_id)
+            .or_fail()?
+            .get_root()
+            .descendants::<LuaLocalFuncStat>()
+            .filter_map(|stat| stat.get_local_name())
+            .find(|name| {
+                name.get_name_token()
+                    .is_some_and(|token| token.get_text() == "outer")
+            })
+            .or_fail()?;
+        let calls = build_outgoing_hierarchy(
+            compilation,
+            LuaSemanticDeclId::LuaDecl(LuaDeclId::new(file_id, outer.get_position())),
+            &CancellationToken::new(),
+        )
+        .or_fail()?;
+
+        let summary = calls
+            .iter()
+            .map(|call| (call.to.name.clone(), call.from_ranges.len()))
+            .collect::<Vec<_>>();
+        assert_that!(
+            summary,
+            eq(&vec![("first".to_string(), 2), ("second".to_string(), 1)])
+        );
+        Ok(())
+    }
 }

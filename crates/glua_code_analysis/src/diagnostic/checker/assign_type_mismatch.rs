@@ -11,7 +11,7 @@ use rowan::{NodeOrToken, TextRange};
 use crate::{
     DbIndex, DiagnosticCode, LuaDeclExtra, LuaDeclId, LuaMemberKey, LuaSemanticDeclId, LuaType,
     SemanticDeclLevel, SemanticModel, TypeCheckFailReason, TypeCheckResult, VariadicType,
-    infer_index_expr,
+    infer_index_expr, semantic::member_key_matches_type,
 };
 
 use super::{
@@ -28,7 +28,10 @@ impl Checker for AssignTypeMismatchChecker {
         let root = semantic_model.get_root().clone();
         let assignment_prefixes = context.get_assignment_prefix_events(&root);
 
-        for node in root.descendants::<LuaAst>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for node in buckets.all_nodes.iter().cloned() {
             match node {
                 LuaAst::LuaAssignStat(assign) => {
                     check_assign_stat(context, semantic_model, &assign, &assignment_prefixes);
@@ -187,23 +190,23 @@ fn check_index_expr(
         return Some(());
     }
 
-    let source_is_inferred = inferred_member_flags(semantic_model, index_expr)
-        .map(|(is_inferred, _)| is_inferred)
-        .unwrap_or(false);
-
-    // Prefer the pre-write member type to avoid the current assignment
-    // widening the target field type before comparison.
-    let source_type = pre_write_index_expr_type(semantic_model, index_expr).or_else(|| {
-        infer_index_expr(
-            semantic_model.get_db(),
-            &mut semantic_model.get_cache().borrow_mut(),
-            index_expr.clone(),
-            false,
-        )
-        .ok()
-    });
+    let (source_type, source_is_inferred) =
+        match class_computed_key_target(semantic_model, index_expr) {
+            Some(ComputedKeyTarget::Undeclared) => return Some(()),
+            Some(ComputedKeyTarget::Declared(declared_type)) => (Some(declared_type), false),
+            None if is_undeclared_class_field(semantic_model, index_expr) => return Some(()),
+            None => (
+                index_target_type(semantic_model, index_expr),
+                index_target_is_inferred(semantic_model, index_expr),
+            ),
+        };
 
     let value_type = semantic_model.infer_expr_list_value_type_at(exprs, value_idx)?;
+    let value_type = function_without_returns_as_method_definition(
+        semantic_model,
+        source_type.as_ref(),
+        value_type,
+    );
     check_assign_type_mismatch(
         context,
         semantic_model,
@@ -229,6 +232,177 @@ fn check_index_expr(
         }
     }
     Some(())
+}
+
+/// A function that returns nothing is accepted for a member's declared return,
+/// as `function obj:Method() end` is, so `obj.Method = function() end` and
+/// `obj.Method = handler` are too, when the return is all that keeps it from
+/// the member's type.
+fn function_without_returns_as_method_definition(
+    semantic_model: &SemanticModel,
+    source_type: Option<&LuaType>,
+    value_type: LuaType,
+) -> LuaType {
+    let (Some(source_type), LuaType::Signature(signature_id)) = (source_type, &value_type) else {
+        return value_type;
+    };
+    let Some(signature) = semantic_model
+        .get_db()
+        .get_signature_index()
+        .get(signature_id)
+    else {
+        return value_type;
+    };
+    let func = signature.to_doc_func_type();
+    if !func.get_ret().is_nil() {
+        return value_type;
+    }
+    let relaxed = LuaType::DocFunction((*func).clone().with_ret(LuaType::Any).into());
+    if semantic_model
+        .type_check_detail(source_type, &relaxed)
+        .is_ok()
+    {
+        relaxed
+    } else {
+        value_type
+    }
+}
+
+fn index_target_is_inferred(semantic_model: &SemanticModel, index_expr: &LuaIndexExpr) -> bool {
+    inferred_member_flags(semantic_model, index_expr)
+        .map(|(is_inferred, _)| is_inferred)
+        .unwrap_or_else(|| {
+            index_expr
+                .get_prefix_expr()
+                .and_then(|prefix| semantic_model.infer_expr(prefix).ok())
+                .is_some_and(|t| {
+                    matches!(
+                        t,
+                        LuaType::TableConst(_)
+                            | LuaType::Table
+                            | LuaType::Object(_)
+                            | LuaType::MergedTable(_)
+                    )
+                })
+        })
+}
+
+fn index_target_type(semantic_model: &SemanticModel, index_expr: &LuaIndexExpr) -> Option<LuaType> {
+    // Prefer the pre-write member type to avoid the current assignment
+    // widening the target field type before comparison.
+    pre_write_index_expr_type(semantic_model, index_expr)
+        .or_else(|| prior_writers_type(semantic_model, index_expr))
+        .or_else(|| {
+            infer_index_expr(
+                semantic_model.get_db(),
+                &mut semantic_model.get_cache().borrow_mut(),
+                index_expr.clone(),
+                false,
+            )
+            .ok()
+        })
+}
+
+/// Whether `index_expr` writes a class field that only assignments define. The
+/// field holds every value written to it, so a write of a new type widens it;
+/// only a declaration on the class or a super states a type to mismatch.
+fn is_undeclared_class_field(semantic_model: &SemanticModel, index_expr: &LuaIndexExpr) -> bool {
+    let db = semantic_model.get_db();
+    let member_index = db.get_member_index();
+    let type_index = db.get_type_index();
+    let member_id =
+        crate::LuaMemberId::new(index_expr.get_syntax_id(), semantic_model.get_file_id());
+    let (Some(member), Some(crate::LuaMemberOwner::Type(type_id))) = (
+        member_index.get_member(&member_id),
+        member_index.get_member_owner(&member_id),
+    ) else {
+        return false;
+    };
+    let mut class_types = vec![LuaType::Ref(type_id.clone())];
+    type_id.collect_super_types(db, &mut class_types);
+    class_types.iter().all(|class_type| {
+        let (LuaType::Ref(id) | LuaType::Def(id)) = class_type else {
+            return true;
+        };
+        member_index
+            .get_members_for_owner_key(&crate::LuaMemberOwner::Type(id.clone()), member.get_key())
+            .into_iter()
+            .all(|writer| {
+                writer.is_assignment_define()
+                    && type_index
+                        .get_type_cache(&writer.get_id().into())
+                        .is_some_and(|cache| cache.is_infer())
+            })
+    })
+}
+
+enum ComputedKeyTarget {
+    Declared(LuaType),
+    Undeclared,
+}
+
+/// What a computed-key write on a class instance is held to. An `ExprType`
+/// key names no slot, so other computed-key writes on the class share only a
+/// key type with it and state nothing; only a declared `[K]: V` index field
+/// on the class or a super does. `None` for literal keys and non-class prefixes.
+fn class_computed_key_target(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+) -> Option<ComputedKeyTarget> {
+    let db = semantic_model.get_db();
+    let index_key = index_expr.get_index_key()?;
+    let LuaMemberKey::ExprType(access_key_type) =
+        LuaMemberKey::from_index_key(db, &mut semantic_model.get_cache().borrow_mut(), &index_key)
+            .ok()?
+    else {
+        return None;
+    };
+    let prefix_type = semantic_model
+        .infer_expr(index_expr.get_prefix_expr()?)
+        .ok()?;
+    let (LuaType::Def(type_id) | LuaType::Ref(type_id)) = &prefix_type else {
+        return None;
+    };
+
+    let mut class_types = vec![LuaType::Ref(type_id.clone())];
+    type_id.collect_super_types(db, &mut class_types);
+    let member_index = db.get_member_index();
+    let type_index = db.get_type_index();
+    let declared_ids = class_types
+        .iter()
+        .filter_map(|class_type| match class_type {
+            LuaType::Ref(id) | LuaType::Def(id) => {
+                member_index.get_expr_key_members(&crate::LuaMemberOwner::Type(id.clone()))
+            }
+            _ => None,
+        })
+        .flatten()
+        .filter(|member| {
+            type_index
+                .get_type_cache(&member.get_id().into())
+                .is_some_and(|cache| cache.is_doc())
+                && member_key_matches_type(db, &access_key_type, member.get_key())
+        })
+        .map(|member| member.get_id())
+        .collect::<Vec<_>>();
+    if declared_ids.is_empty() {
+        return Some(ComputedKeyTarget::Undeclared);
+    }
+
+    let visible_ids = crate::LuaMemberIndexItem::Many(declared_ids)
+        .visible_member_ids_with_realm_at_offset(
+            db,
+            &semantic_model.get_file_id(),
+            index_expr.get_range().start(),
+        );
+    if visible_ids.is_empty() {
+        return Some(ComputedKeyTarget::Undeclared);
+    }
+    Some(
+        crate::LuaMemberIndexItem::Many(visible_ids)
+            .resolve_type(db)
+            .map_or(ComputedKeyTarget::Undeclared, ComputedKeyTarget::Declared),
+    )
 }
 
 fn expr_blocks_initialized_assignment_fast_path(expr: &LuaExpr, index_expr: &LuaIndexExpr) -> bool {
@@ -265,43 +439,61 @@ fn is_only_current_inferred_member_assignment(
     let Some(owner) = member_index.get_member_owner(&member_id) else {
         return false;
     };
-    !has_visible_prior_member_for_owner_key(
-        semantic_model,
-        owner,
-        member.get_key(),
-        member_id,
-        index_expr.get_range().start(),
-    )
+    // Every writer of the slot is visible and a reader unions them, so a write
+    // of a new type widens an inferred slot rather than violating it. Only a
+    // doc-typed sibling states a type this write can mismatch.
+    !member_index
+        .get_current_owner_members_for_key(owner, member.get_key())
+        .into_iter()
+        .filter(|sibling| sibling.get_id() != member_id)
+        .any(|sibling| {
+            semantic_model
+                .get_db()
+                .get_type_index()
+                .get_type_cache(&sibling.get_id().into())
+                .is_some_and(|cache| cache.is_doc())
+        })
 }
 
-fn has_visible_prior_member_for_owner_key(
+/// A class field's type as the writers visible before this write left it. The
+/// slot itself unions every writer, this one included, so reading it back
+/// would compare the write against itself. An anonymous table's fields are
+/// shaped by all their writes, so only class-owned fields are held to this.
+fn prior_writers_type(
     semantic_model: &SemanticModel,
-    owner: &crate::LuaMemberOwner,
-    member_key: &LuaMemberKey,
-    current_member_id: crate::LuaMemberId,
-    position: rowan::TextSize,
-) -> bool {
-    let member_ids = semantic_model
-        .get_db()
-        .get_member_index()
-        .get_current_owner_members_for_key(owner, member_key)
+    index_expr: &LuaIndexExpr,
+) -> Option<LuaType> {
+    let db = semantic_model.get_db();
+    let member_id =
+        crate::LuaMemberId::new(index_expr.get_syntax_id(), semantic_model.get_file_id());
+    let member_index = db.get_member_index();
+    let member = member_index.get_member(&member_id)?;
+    let owner = member_index.get_member_owner(&member_id)?;
+    if !matches!(owner, crate::LuaMemberOwner::Type(_)) {
+        return None;
+    }
+    let position = index_expr.get_range().start();
+    let prior_ids = member_index
+        .get_current_owner_members_for_key(owner, member.get_key())
         .into_iter()
-        .filter(|member| {
-            let member_id = member.get_id();
-            member_id != current_member_id
-                && (member_id.file_id != semantic_model.get_file_id()
-                    || member_id.get_position() < position)
+        .map(|sibling| sibling.get_id())
+        .filter(|sibling_id| {
+            *sibling_id != member_id
+                && (sibling_id.file_id != member_id.file_id || sibling_id.get_position() < position)
         })
-        .map(|member| member.get_id())
-        .collect();
-
-    !crate::LuaMemberIndexItem::Many(member_ids)
+        .collect::<Vec<_>>();
+    let visible_ids = crate::LuaMemberIndexItem::Many(prior_ids)
         .visible_member_ids_with_realm_at_offset_from_history(
-            semantic_model.get_db(),
+            db,
             &semantic_model.get_file_id(),
             position,
-        )
-        .is_empty()
+        );
+    if visible_ids.is_empty() {
+        return None;
+    }
+    crate::LuaMemberIndexItem::Many(visible_ids)
+        .resolve_type(db)
+        .ok()
 }
 
 /// Resolve the **pre-write** source type for an indexed assignment target by
@@ -332,7 +524,7 @@ fn pre_write_index_expr_type(
     let root = semantic_model
         .get_db()
         .get_vfs()
-        .get_syntax_tree(&in_file_range.file_id)?;
+        .syntax_tree_at_statement(&in_file_range.file_id, in_file_range.value)?;
     let red_root = root.get_red_root();
     let table_node = red_root.covering_element(in_file_range.value).into_node()?;
     let table_expr = LuaTableExpr::cast(table_node)?;
@@ -702,7 +894,14 @@ fn is_inferred_collection_member_type(db: &DbIndex, typ: &LuaType) -> bool {
 
 fn is_lenient_inferred_member_type(db: &DbIndex, typ: &LuaType) -> bool {
     match typ {
-        LuaType::Nil | LuaType::Unknown | LuaType::Never | LuaType::Array(_) => true,
+        // An inferred `false` is the Lua idiom for "not set yet", the same role
+        // `nil` plays here, so it is evidence rather than a contract. `true` is
+        // a positive assertion and stays strict, as does a declared boolean.
+        LuaType::Nil
+        | LuaType::Unknown
+        | LuaType::Never
+        | LuaType::Array(_)
+        | LuaType::BooleanConst(false) => true,
         LuaType::Tuple(tuple) => tuple.is_infer_resolve(),
         // Shaped sequential literals infer as TableConst and are mutable dynamic
         // tables, so later modification must not be flagged. Object/keyed
@@ -797,15 +996,15 @@ fn check_local_stat(
     Some(())
 }
 
-/// 检查整个表, 返回`true`表示诊断出异常.
+/// Checks the whole table; returns `true` if an anomaly is diagnosed.
 pub fn check_table_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     decl_node: NodeOrToken<LuaSyntaxNode, LuaSyntaxToken>,
     table_expr: &LuaExpr,
-    table_type: Option<&LuaType>, // 记录的类型
+    table_type: Option<&LuaType>, // Recorded type
 ) -> Option<bool> {
-    // 检查是否附加了元数据以跳过诊断
+    // Check whether metadata is attached to skip the diagnostic
     if let Some(semantic_decl) = semantic_model.find_decl(decl_node, SemanticDeclLevel::default()) {
         if let Some(property) = semantic_model
             .get_db()
@@ -831,7 +1030,7 @@ pub fn check_table_expr(
     Some(false)
 }
 
-// 处理 value_expr 是 TableExpr 的情况, 但不会处理 `local a = { x = 1 }, local v = a`
+// Handles value_expr being a TableExpr, but not `local a = { x = 1 }, local v = a`
 fn check_table_expr_content(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
@@ -850,16 +1049,20 @@ fn check_table_expr_content(
         let expr_fact = semantic_model.infer_expr_fact(value_expr.clone());
         let expr_type = expr_fact.typ().clone();
 
-        // 位于的最后的 TableFieldValue 允许接受函数调用返回的多值, 而且返回的值必然会从下标 1 开始覆盖掉所有索引字段.
+        // The last TableFieldValue may accept multiple values from a function call, and the returned values necessarily overwrite all index fields starting from index 1.
         if field.is_value_field()
             && idx == fields.len() - 1
             && let LuaType::Variadic(variadic) = &expr_type
         {
+            let positional_before = fields[..idx]
+                .iter()
+                .filter(|field| field.is_value_field())
+                .count();
             if let Some(result) = check_table_last_variadic_type(
                 context,
                 semantic_model,
                 table_type,
-                idx,
+                positional_before,
                 variadic,
                 field.get_range(),
             ) {
@@ -896,7 +1099,7 @@ fn check_table_expr_content(
             && should_check_nested_table_fields(&source_type)
             && let Some(table_expr) = LuaTableExpr::cast(value_expr.syntax().clone())
         {
-            // 检查子表
+            // Check the sub-table
             if let Some(result) =
                 check_table_expr_content(context, semantic_model, &source_type, &table_expr)
             {
@@ -947,22 +1150,23 @@ fn check_table_last_variadic_type(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     table_type: &LuaType,
-    idx: usize,
+    positional_before: usize,
     value_variadic: &VariadicType,
     range: TextRange,
 ) -> Option<bool> {
-    // test max 10
-    for offset in idx..(idx + 10) {
-        let member_key = LuaMemberKey::Integer((idx + offset) as i64 + 1);
-        let source_type = semantic_model
-            .infer_member_type(table_type, &member_key)
-            .ok()?;
+    for offset in 0..value_variadic.element_types().len() {
+        let member_key = LuaMemberKey::Integer((positional_before + offset) as i64 + 1);
+        let Ok(source_type) = semantic_model.infer_member_type(table_type, &member_key) else {
+            continue;
+        };
         match source_type {
             LuaType::Variadic(source_variadic) => {
                 return Some(source_variadic.deref() != value_variadic);
             }
             _ => {
-                let expr_type = value_variadic.get_type(offset)?;
+                let Some(expr_type) = value_variadic.get_type(offset) else {
+                    continue;
+                };
 
                 if let Some(result) = check_assign_type_mismatch(
                     context,
@@ -995,7 +1199,7 @@ fn check_assign_type_mismatch(
     source_is_direct_target: bool,
 ) -> Option<bool> {
     let source_type = source_type.unwrap_or(&LuaType::Any);
-    // 如果一致, 则不进行类型检查
+    // If identical, skip the type check
     if source_type == value_type {
         return Some(false);
     }
@@ -1014,16 +1218,16 @@ fn check_assign_type_mismatch(
         return Some(false);
     }
 
-    // 某些情况下我们应允许可空, 例如: boolean[]
+    // In some cases nullable should be allowed, e.g. boolean[]
     if allow_nil && value_type.is_nullable() {
         return Some(false);
     }
 
     match (&source_type, &value_type) {
-        // 如果源类型是定义类型, 则仅在目标类型是定义类型或引用类型时进行类型检查
+        // If the source type is a definition type, only check when the target type is a definition or reference type
         (LuaType::Def(_), LuaType::Def(_) | LuaType::Ref(_)) => {}
         (LuaType::Def(_), _) => return Some(false),
-        // 此时检查交给 table_field
+        // The check is left to table_field here
         (LuaType::Ref(_) | LuaType::Tuple(_), LuaType::TableConst(_)) => return Some(false),
         // Inferred/derived nil is a sentinel. Explicit nil/void direct targets remain authoritative.
         (LuaType::Nil, _) if !source_is_explicit => return Some(false),

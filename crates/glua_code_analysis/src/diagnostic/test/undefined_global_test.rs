@@ -109,6 +109,33 @@ mod test {
     }
 
     #[test]
+    fn undefined_global_range_after_an_emoji_is_in_utf16_units() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedGlobal);
+        let file_id = ws.def_file(
+            "test.lua",
+            "local s = \"h\u{e9}llo \u{1F642}\" missing_global()\n",
+        );
+        let ranges = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|diagnostic| diagnostic.range)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ranges,
+            vec![lsp_types::Range::new(
+                lsp_types::Position::new(0, 21),
+                lsp_types::Position::new(0, 35),
+            )]
+        );
+    }
+
+    #[test]
     fn test_issue_250() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(ws.check_code_for(
@@ -138,6 +165,155 @@ mod test {
             end
             "#
         ));
+    }
+
+    #[test]
+    fn a_negated_global_used_as_a_value_is_reported() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "lua/autorun/negated_argument.lua",
+            r#"
+            local T = {}
+            function T:Apply() print(not shadowdisable) end
+            function T:Read() local shadowdisable = 1 return shadowdisable end
+            "#,
+            "shadowdisable",
+        ));
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "lua/autorun/negated_local.lua",
+            "local hidden = not missingFlag\nreturn hidden",
+            "missingFlag",
+        ));
+    }
+
+    #[test]
+    fn a_negated_global_tested_by_a_condition_probes_its_presence() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            if not optionalAddon or not (optionalOther) then return end
+            print(optionalAddon, optionalOther)
+            "#
+        ));
+    }
+
+    /// Codes of the undefined-global diagnostics `content` produces, with every default check on.
+    fn undefined_global_codes(ws: &mut VirtualWorkspace, content: &str) -> Vec<String> {
+        let file_id = ws.def(content);
+        let codes = [
+            DiagnosticCode::UndefinedGlobal.get_name().to_string(),
+            DiagnosticCode::UndefinedGlobalAssignment
+                .get_name()
+                .to_string(),
+        ];
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|diagnostic| match diagnostic.code {
+                Some(NumberOrString::String(code)) if codes.contains(&code) => Some(code),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_left_of_or_probes_global_presence() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert_eq!(
+            undefined_global_codes(
+                &mut ws,
+                r#"
+                local schemaName = schemaName or { name = "default" }
+                local wrapped = (wrapped) or false
+                local folder = ((folder or (Schema and Schema.folder)))
+                local chained = chained or nil or "fallback"
+                "#
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_a_self_named_probe_leaves_a_later_global_read_strict() {
+        let strict = DiagnosticCode::UndefinedGlobal.get_name().to_string();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert_eq!(
+            undefined_global_codes(
+                &mut ws,
+                r#"
+                do local optional = optional or {} end
+                optional.run()
+                "#
+            ),
+            [strict]
+        );
+    }
+
+    #[test]
+    fn test_or_probe_into_a_differently_named_local_keeps_the_assignment_warning() {
+        let assignment = DiagnosticCode::UndefinedGlobalAssignment
+            .get_name()
+            .to_string();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert_eq!(
+            undefined_global_codes(
+                &mut ws,
+                r#"
+                local schema = missingSchema or { name = "default" }
+                "#
+            ),
+            [assignment]
+        );
+    }
+
+    #[test]
+    fn test_or_probe_exempts_only_the_tested_name() {
+        let strict = DiagnosticCode::UndefinedGlobal.get_name().to_string();
+        let assignment = DiagnosticCode::UndefinedGlobalAssignment
+            .get_name()
+            .to_string();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(
+            undefined_global_codes(
+                &mut ws,
+                r#"
+                local folder = missingMember.folder or "fallback"
+                "#
+            )
+            .contains(&strict)
+        );
+        assert!(
+            undefined_global_codes(
+                &mut ws,
+                r#"
+                local value = missingCall() or 1
+                "#
+            )
+            .contains(&strict)
+        );
+        assert_eq!(
+            undefined_global_codes(
+                &mut ws,
+                r#"
+                local imported = missingImport
+                "#
+            ),
+            [assignment]
+        );
+        assert!(
+            undefined_global_codes(
+                &mut ws,
+                r#"
+                local probed = missingLater or 1
+                missingLater.run()
+                "#
+            )
+            .contains(&strict)
+        );
     }
 
     #[test]
@@ -292,10 +468,11 @@ mod test {
         ));
     }
 
+    /// A guard that returns when the global is present still tests it.
     #[test]
-    fn test_guard_clause_that_implies_falsy_still_reports_undefined_global() {
+    fn test_guard_clause_that_implies_falsy_still_tests_the_global() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        assert!(!ws.check_code_for(
+        assert!(ws.check_code_for(
             DiagnosticCode::UndefinedGlobalAssignment,
             r#"
             if invalidVar then
@@ -341,9 +518,30 @@ mod test {
     }
 
     #[test]
-    fn test_top_level_not_guard_without_early_return_does_not_suppress_later_use() {
+    fn test_continuation_guard_that_cleans_up_before_returning_suppresses_later_use() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        assert!(!ws.check_code_for(
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "lua/autorun/client/cl_pac_update.lua",
+            r#"
+            local function update(stop)
+                if not pac then
+                    stop()
+                    return
+                end
+
+                print(pac.LocalPlayer)
+            end
+            "#,
+            "pac",
+        ));
+    }
+
+    /// A test without an exit still tests the global.
+    #[test]
+    fn test_top_level_not_guard_without_early_return_still_tests_the_global() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
             DiagnosticCode::UndefinedGlobalAssignment,
             r#"
             if not MR then
@@ -381,10 +579,11 @@ mod test {
         ));
     }
 
+    /// A `~= nil` comparison tests the global whichever branch runs.
     #[test]
-    fn test_top_level_guard_clause_not_equal_nil_does_not_suppress_later_use() {
+    fn test_top_level_guard_clause_not_equal_nil_still_tests_the_global() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        assert!(!ws.check_code_for(
+        assert!(ws.check_code_for(
             DiagnosticCode::UndefinedGlobalAssignment,
             r#"
             if MR ~= nil then
@@ -1764,5 +1963,91 @@ mod test {
             "#,
             "SCHEMA",
         ));
+    }
+    /// A global the file tests for a value is defined throughout that file.
+    #[test]
+    fn a_global_the_file_tests_for_a_value_is_defined_throughout_it() {
+        for (name, content) in [
+            (
+                "pac",
+                r#"
+                local function attach(client) pac.SetupENT(client) end
+                local function think() if not pac then return end end
+                "#,
+            ),
+            (
+                "evolve",
+                r#"
+                local function detect() if evolve and evolve.Ban then return "evolve" end end
+                local ban = function(ply) evolve:Ban(ply) end
+                "#,
+            ),
+            (
+                "mysqloo",
+                r#"
+                local function connect() if not istable(mysqloo) then require("mysqloo") end end
+                local function query() return mysqloo.OPTION_NAMED_FIELDS end
+                "#,
+            ),
+            (
+                "ULib",
+                r#"
+                local kick = ULib.kick
+                local found = ULib ~= nil
+                "#,
+            ),
+            (
+                "pace",
+                r#"
+                local found = (nil) == pace
+                pace.Open()
+                "#,
+            ),
+            (
+                "wire",
+                r#"
+                local function attach() wire.Link() end
+                if not predicates.isTable(wire) then return end
+                "#,
+            ),
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            ws.def_file(
+                "lua/includes/extensions/util.lua",
+                "---@param value any\n---@return TypeGuard<table>\nfunction istable(value) end\npredicates = {}\n---@param value any\n---@return TypeGuard<table>\nfunction predicates.isTable(value) end\n",
+            );
+            assert!(
+                !has_undefined_global_name(&mut ws, "lua/autorun/sh_optional.lua", content, name),
+                "{name}"
+            );
+        }
+    }
+
+    /// Only a same-file test of the global itself makes it defined.
+    #[test]
+    fn a_global_its_file_does_not_test_for_a_value_is_still_undefined() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/autorun/sh_detect.lua",
+            "local function detect() return pac ~= nil end\n",
+        );
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "lua/autorun/sh_use.lua",
+            "pac.SetupENT()\n",
+            "pac",
+        ));
+
+        for content in [
+            "local enabled = true\nlocal alias = enabled and pac\npac.SetupENT()\n",
+            "if pac.Enabled then print(1) end\npac.SetupENT()\n",
+            "local function f() local pac = {} if pac then print(1) end end\npac.SetupENT()\n",
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            assert!(
+                has_undefined_global_name(&mut ws, "lua/autorun/sh_use.lua", content, "pac"),
+                "{content}"
+            );
+        }
     }
 }

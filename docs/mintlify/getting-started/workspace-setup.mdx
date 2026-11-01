@@ -1,141 +1,72 @@
 ---
-title: Workspace setup
-description: Configure your workspace for addon and gamemode development with multi-root workspace support.
+title: Open your project
+description: Open addons and gamemodes so GLuaLS analyzes the right files.
 ---
 
-import ConfigTip from "/snippets/config-tip.mdx"
+## One addon or gamemode
 
-## Single addon or gamemode <a id="single-addon-or-gamemode" />
-
-Open the addon or gamemode folder directly in VS Code. The extension detects the structure from its path (`garrysmod/addons/` or `garrysmod/gamemodes/`).
-
+Open the addon or gamemode folder directly in VS Code:
 
 <Tree>
   <Tree.Folder name="garrysmod" openable="false" defaultOpen>
     <Tree.Folder name="addons" openable="false" defaultOpen>
-      <Tree.Folder name="my-addon <- Workspace Root" defaultOpen>
+      <Tree.Folder name="my-addon  ← open this" defaultOpen>
         <Tree.File name="lua" />
         <Tree.File name="addon.json" />
-        <Tree.File name=".gluarc.json" />
-        <Tree.File name="..." />
       </Tree.Folder>
     </Tree.Folder>
     <Tree.Folder name="gamemodes" openable="false" defaultOpen>
-      <Tree.Folder name="my-gamemode <- Workspace Root" defaultOpen>
+      <Tree.Folder name="my-gamemode  ← or this" defaultOpen>
         <Tree.File name="gamemode" />
-        <Tree.File name=".gluarc.json" />
-        <Tree.File name="gamemode.txt" />
-        <Tree.File name="..." />
+        <Tree.File name="my-gamemode.txt" />
       </Tree.Folder>
     </Tree.Folder>
   </Tree.Folder>
 </Tree>
 
----
+The folder does not have to be inside a Garry's Mod install. A standalone Git repository of an addon works the same way.
 
-## Multi-root workspaces <a id="multi-root-workspaces" />
+<Warning>
+Do not open the whole `garrysmod/` folder. It contains game files and unrelated addons, which makes analysis slower and adds warnings from code that is not yours.
+</Warning>
 
-If you work on a gamemode and multiple addons, use a [multi-root workspace](https://code.visualstudio.com/docs/editing/workspaces/multi-root-workspaces) and add each as its own folder.
+## Several addons or a gamemode with addons
 
-By default, GLuaLS analyzes all workspace folders together so your addons and gamemode can refer to one another. Enable `workspace.enableIsolation` only when you want each folder analyzed separately. See [workspace configuration](/configuration/workspace) for details.
+Use a [multi-root workspace](https://code.visualstudio.com/docs/editing/workspaces/multi-root-workspaces) and add each addon or gamemode as its own folder (**File → Add Folder to Workspace**).
 
-<Note>
-Do not open the entire `garrysmod/` folder as your workspace root. GLuaLS expects each root to be an individual addon or gamemode, not the entire game directory.
-</Note>
+GLuaLS analyzes all folders together, so code in one folder can use functions and classes from another.
 
----
+## Gamemodes based on another gamemode
 
-## Library paths <a id="library-paths" />
+If your gamemode's `.txt` file sets a `base`, GLuaLS loads that base gamemode automatically when it can find it next to yours. For example, a Helix schema finds the `helix` gamemode in the same `gamemodes/` folder. `base` and `sandbox` are always available.
 
-If your project uses shared utility files outside the workspace root, add them as library paths:
+If the base gamemode lives somewhere else, add it as a library (see below).
 
-<ConfigTip />
-```json .gluarc.json
-{
-  "workspace": {
-    "library": [
-      "/path/to/shared-utils",
-      {
-        "path": "./external/mylibrary",
-        "ignoreDir": ["tests"],
-        "ignoreGlobs": ["**/*.spec.lua"]
-      }
-    ]
-  }
-}
-```
+## Code from outside your project
 
-GLuaLS analyzes library files and makes their types available in your workspace. It does not report diagnostics for library files.
-
----
-
-## Ignoring files and folders <a id="ignoring-files-and-folders" />
-
-Ignore generated, vendored, or test files that should not affect editor results:
-
-<ConfigTip />
+If your code uses an addon or library that is not open in VS Code, add its folder to `workspace.library` in `.gluarc.json`. GLuaLS reads its functions and types, but does not show warnings for it.
 
 ```json .gluarc.json
 {
   "workspace": {
-    "ignoreDir": ["build", "dist", ".git"],
-    "ignoreGlobs": ["**/*.min.lua", "tests/**"]
+    "library": ["../my-shared-library", "C:/srcds/garrysmod/addons/some-framework"]
   }
 }
 ```
 
+Relative paths start from your project folder.
 
----
+## Skip files
 
-## Custom require patterns <a id="custom-require-patterns" />
-
-If your project uses a custom module loader, map it to `require` behavior:
-
-<ConfigTip />
+GLuaLS already skips folders such as `.git`, `node_modules` and `tests`. To skip more, right-click a folder in the Explorer and choose **Add Directory to Ignore List**, or edit `.gluarc.json`:
 
 ```json .gluarc.json
 {
-  "runtime": {
-    "requireLikeFunction": ["include", "MYADDON.Require"],
-    "requirePattern": ["?.lua", "?/init.lua"]
+  "workspace": {
+    "ignoreDir": ["old-code"],
+    "ignoreGlobs": ["**/*.min.lua"]
   }
 }
 ```
 
----
-
-## Annotations path <a id="annotations-path" />
-
-By default, the VS Code extension downloads and updates Garry's Mod wiki annotations. If you need a custom annotations build or want to turn off downloads:
-
-<ConfigTip />
-
-```json .gluarc.json
-{
-  "gmod": {
-    "annotationsPath": "./my-custom-annotations",
-    "autoLoadAnnotations": false
-  }
-}
-```
-
-See [Annotations management](/configuration/annotations-management) for details on annotation downloads.
-
----
-
-## Next steps
-
-<CardGroup cols={2}>
-  <Card title="Set up the debugger" icon="bug" href="/debugger/setup">
-    Move from workspace setup to runtime debugging on SRCDS.
-  </Card>
-  <Card title="Debugger overview" icon="list-tree" href="/debugger/overview">
-    See what breakpoints, stepping, inspection, and Lua execution can do.
-  </Card>
-  <Card title="Configuration overview" icon="sliders" href="/configuration/overview">
-    Tune GLuaLS behavior for your workspace.
-  </Card>
-  <Card title="Features overview" icon="sparkles" href="/features/overview">
-    Browse the main language, debugger, realm, networking, and VGUI features.
-  </Card>
-</CardGroup>
+See [Workspace settings](/configuration/workspace) for every option.

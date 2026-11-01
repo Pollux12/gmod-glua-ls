@@ -1,6 +1,6 @@
 use crate::{
     UNARY_TYPE_PRIORITY,
-    grammar::DocParseResult,
+    grammar::{DocParseResult, parser_stack_exhausted},
     kind::{LuaOpKind, LuaSyntaxKind, LuaTokenKind, LuaTypeBinaryOperator, LuaTypeUnaryOperator},
     lexer::LuaDocLexerState,
     parser::{CompleteMarker, LuaDocParser, LuaDocParserState, Marker, MarkerEventContainer},
@@ -57,6 +57,12 @@ pub fn parse_type(p: &mut LuaDocParser) -> DocParseResult {
 // keyof <type>, -1
 // <type> | <type> , <type> & <type>, <type> extends <type>, <type> in keyof <type>
 fn parse_sub_type(p: &mut LuaDocParser, limit: i32) -> DocParseResult {
+    if parser_stack_exhausted() {
+        return Err(LuaParseError::doc_error_from(
+            "type is too deeply nested",
+            p.current_token_range(),
+        ));
+    }
     let uop = LuaOpKind::to_type_unary_operator(p.current_token());
     let mut cm = if uop != LuaTypeUnaryOperator::None {
         let range = p.current_token_range();

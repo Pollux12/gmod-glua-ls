@@ -2,9 +2,11 @@ mod checker;
 mod lua_diagnostic;
 mod lua_diagnostic_code;
 mod lua_diagnostic_config;
+mod shared_data_cache;
 mod test;
 
 pub use checker::SharedDiagnosticData;
 pub use lua_diagnostic::LuaDiagnostic;
 pub use lua_diagnostic_code::DiagnosticCode;
 pub use lua_diagnostic_config::LuaDiagnosticConfig;
+pub use shared_data_cache::SharedDiagnosticComponentCache;

@@ -259,7 +259,7 @@ fn add_tag_type_flag_completion(
         }
         _ => {}
     }
-    // 已存在的属性
+    // Existing attributes
     let mut existing_flags = HashSet::new();
     for token in node.get_attrib_tokens() {
         let name_text = token.get_name_text().to_string();

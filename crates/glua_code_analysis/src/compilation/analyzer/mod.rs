@@ -1,9 +1,13 @@
 mod call_site_params;
+pub(crate) mod call_target;
 mod common;
 mod decl;
+mod derive;
 mod doc;
 mod dynamic_field;
+mod engine;
 mod flow;
+mod function_summary;
 pub(crate) mod gmod;
 mod infer_cache_manager;
 mod local_inference;
@@ -12,30 +16,45 @@ pub(crate) mod parallel;
 mod setmetatable_factory;
 pub(crate) mod unresolve;
 
-pub(crate) use lua::{dominating_guarded_table_bootstrap_range, infer_for_range_iter_expr_func};
-
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
+pub(crate) use call_site_params::{CallbackArg, CallbackParamsQuery, ReceiverAuthorityQuery};
+pub(crate) use common::{
+    is_falsy_literal_expr, is_nil_literal_expr, is_presence_tested, union_widens_cached_type,
+    widen_mutable_decl_literal,
+};
+pub(crate) use dynamic_field::is_provably_builtin_iterator_call;
+pub(crate) use dynamic_field::{
+    copies_table_into_itself, for_range_pairs_source_for_var, writes_own_pairs_key,
+};
+pub(crate) use engine::EngineStats;
+#[cfg(test)]
+pub(crate) use engine::serial_engine;
+pub(crate) use engine::stale_among;
+pub use engine::{Schedule, Slice};
+pub(crate) use local_inference::{
+    SubtypesWithMember, class_union_arms, class_union_arms_with_member, class_union_partial_arms,
+    is_guarded_by_enclosing_condition, is_member_path_presence_guarded, unguarded_child_candidates,
+};
+pub use lua::is_member_assignment_in_conditional_branch;
+pub(crate) use lua::{
+    dominating_guarded_table_bootstrap_range, infer_for_range_iter_expr_func,
+    is_guarded_table_definition_site,
 };
 
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::db_index::derivation;
 use crate::{
-    AsyncState, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaDeclId, LuaDefinitionId,
-    LuaFunctionType, LuaInferenceNodeId, LuaInferredGuardOwner, LuaMember, LuaMemberFeature,
-    LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDeclId, LuaTypeFact,
-    LuaTypeOwner, LuaUnionType, WorkspaceId,
+    AnalyzeError, AsyncState, FileId, FlowTree, GmodScopedClassInfo, InFiled, LuaDeclId,
+    LuaFunctionType, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignatureId,
+    LuaType, LuaTypeCache, WorkspaceId,
     compilation::analyzer::common::{TypeCacheWriteMode, write_type_cache},
     db_index::{DbIndex, LuaMemberOwner},
-    profile::Profile,
-    semantic::infer_expr_fact_with_cache,
 };
-use glua_parser::{
-    BinaryOperator, LuaAstNode, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr, LuaNameExpr,
-    LuaSyntaxId, LuaSyntaxNode,
-};
+use glua_parser::{LuaAstNode, LuaChunk, LuaClosureExpr, LuaExpr, LuaSyntaxId, LuaSyntaxNode};
 use infer_cache_manager::InferCacheManager;
-use lua::LuaReturnPoint;
-use unresolve::{UnResolve, UnResolveReturn};
+use unresolve::UnResolve;
 
 pub(crate) fn infer_closure_body_function_type(
     db: &DbIndex,
@@ -50,7 +69,10 @@ pub(crate) fn infer_closure_body_function_type(
         return None;
     }
 
-    let return_points = lua::func_body::analyze_func_body_returns(closure.get_block()?);
+    let return_points = lua::func_body::analyze_func_body_returns(
+        Some((db, cache.get_file_id())),
+        closure.get_block()?,
+    );
     let return_type = lua::analyze_return_point(db, cache, &return_points)
         .ok()?
         .into_iter()
@@ -68,444 +90,1274 @@ pub(crate) fn infer_closure_body_function_type(
     Some(LuaType::DocFunction(function_type.into()))
 }
 
-pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
-    if need_analyzed_files.is_empty() {
-        return;
+/// Which files are scripted-class scopes, and their class info: a function of
+/// the live files' paths, the main workspaces and the config.
+#[derive(Clone)]
+pub(crate) struct ScriptedScopes {
+    files: Arc<HashSet<FileId>>,
+    infos: Arc<HashMap<FileId, GmodScopedClassInfo>>,
+}
+
+impl ScriptedScopes {
+    #[cfg(test)]
+    fn new(db: &DbIndex) -> Self {
+        Self::of(db, &live_paths(db), &root_gamemodes(db))
     }
 
-    let mut contexts = {
-        let _p = Profile::new("module_analyze");
-        module_analyze(db, need_analyzed_files)
-    };
-
-    // Declaration and documentation indexing runs for *every* workspace
-    // group before any group enters resolution. Both passes are per-file
-    // syntactic walks that only populate the decl/type/signature indexes,
-    // so hoisting them costs nothing — each file is still visited exactly
-    // once — but it guarantees that later stages observe the complete
-    // signature and type declaration set rather than only the groups
-    // analysed so far.
-    for (workspace_id, context) in contexts.iter_mut() {
-        context.workspace_id = Some(*workspace_id);
-        let profile_log = format!("declare workspace {}", workspace_id);
-        let _p = Profile::cond_new(&profile_log, context.tree_list.len() > 1);
-        run_analysis::<decl::DeclAnalysisPipeline>(db, context);
-        run_analysis::<doc::DocAnalysisPipeline>(db, context);
-    }
-
-    // Scripted-class and load call sites are collected for *every* group
-    // here, for the same reason declaration and documentation indexing is
-    // hoisted: they are per-file syntactic walks, and the passes that read
-    // them are not per-group.
-    {
-        let _p = Profile::new("collect_gmod_call_sites");
-        for (_, context) in contexts.iter_mut() {
-            gmod::collect_gmod_call_sites(db, context);
-        }
-    }
-
-    for (workspace_id, mut context) in contexts {
-        let profile_log = format!("analyze workspace {}", workspace_id);
-        let _p = Profile::cond_new(&profile_log, context.tree_list.len() > 1);
-        let workspace_file_ids = context
-            .tree_list
+    /// The scopes of the live files at `paths`, given the gamemode folders
+    /// the main workspaces hold.
+    fn of(
+        db: &DbIndex,
+        paths: &HashMap<FileId, Option<PathBuf>>,
+        gamemodes: &[(PathBuf, GmodScopedClassInfo)],
+    ) -> Self {
+        let files = paths
             .iter()
-            .map(|in_filed_tree| in_filed_tree.file_id)
+            .map(|(file_id, path)| (*file_id, path.as_deref()))
             .collect::<Vec<_>>();
-
-        // Mirrors the per-group lifecycle of the infer-cache visibility flag:
-        // this group's dynamic-field facts are not complete until its own
-        // dynamic-field pass has run.
-        db.get_dynamic_field_index_mut().set_sealed(false);
-
-        run_analysis::<gmod::GmodPreAnalysisPipeline>(db, &mut context);
-        let early_signature_owners = {
-            let _p = Profile::new("publish_callable_signatures");
-            publish_callable_signatures(db, &context)
-        };
-        run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
-
-        let early_member_owners = {
-            let _p = Profile::new("resolve_early_member_owners");
-            resolve_early_member_owners(db, &mut context)
-        };
-        let _p_guards = Profile::new("early inferred guards");
-        local_inference::prepare_inferred_positive_guards(db, &context);
-        let guard_candidates = context.inferred_guard_candidates.len();
-        let early_guard_stats = stabilize_inferred_positive_guards(db, &mut context);
-        drop(_p_guards);
-
-        run_analysis::<lua::LuaAnalysisPipeline>(db, &mut context);
-
-        // Gmod post-analysis: synthesize members that depend on metadata collected
-        // during lua_analyze (AccessorFunc, NetworkVar, VGUI register calls).
-        run_analysis::<gmod::GmodPostAnalysisPipeline>(db, &mut context);
-
-        {
-            let _p = Profile::new("synthesize_accessorfunc_members");
-            synthesize_accessorfunc_members(db, &workspace_file_ids);
+        let (files, infos) = scan_scopes(db, &files, gamemodes);
+        Self {
+            files: Arc::new(files),
+            infos: Arc::new(infos),
         }
-        let infer_dynamic_fields =
-            db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields;
-        if infer_dynamic_fields {
-            // Special-call resolution needs dynamic fields that point at outparam
-            // tables, while some dynamic fields need unresolve-refined aliases.
-            // Seed only declared-member table fields before unresolve; the full
-            // dynamic pass still runs afterward.
-            run_analysis::<dynamic_field::EarlyDynamicFieldAnalysisPipeline>(db, &mut context);
-        }
-        // Every pass above ran against an empty dynamic-field index on a cold
-        // build; a warm re-index must not let retained facts leak into them.
-        context.infer_manager.set_dynamic_fields_visible();
+    }
 
-        // Seed direct parent-to-child evidence before function returns are
-        // resolved. The later pass still captures evidence unlocked by unresolve.
-        // Both passes read the same declaration references and syntax trees, so
-        // the first one's site walk is shared with the second.
-        let mut unguarded_child_sites = local_inference::UnguardedChildSiteCache::new();
-        let early_child_sources = local_inference::stabilize_unguarded_children(
-            db,
-            &mut context,
-            true,
-            &mut unguarded_child_sites,
-        );
-        context.invalidate_inferred_returns_for_sources(db, &early_child_sources);
-
-        if infer_dynamic_fields {
-            run_analysis::<unresolve::PreDynamicUnResolveAnalysisPipeline>(db, &mut context);
-        } else {
-            run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
-        }
-        setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
-
-        run_analysis::<call_site_params::CallSiteParamAnalysisPipeline>(db, &mut context);
-
-        let call_site_return_invalidation_changed = context.call_site_return_invalidation_changed;
-        let local_inference_changed = local_inference::stabilize_unknown_locals(db, &mut context);
-        let late_guard_retries = context.inferred_guard_candidates.len();
-        let late_guard_stats = stabilize_inferred_positive_guards(db, &mut context);
-        let inferred_guard_changed = late_guard_stats.changed;
-        let late_inference_changed = call_site_return_invalidation_changed
-            || local_inference_changed
-            || inferred_guard_changed;
-
-        if infer_dynamic_fields {
-            run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);
-            db.get_dynamic_field_index_mut().set_sealed(true);
-            context.infer_manager.clear();
-            run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
-            setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
-            refresh_initializer_caches(db, &mut context);
-        } else if late_inference_changed {
-            // Late inference facts can unlock deferred locals even when the
-            // optional dynamic-field pass is disabled. Retry that retained work
-            // in-place instead of reindexing the entire file batch.
-            context.infer_manager.clear();
-            run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
-            setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
-            refresh_initializer_caches(db, &mut context);
-        }
-
-        context.resolve_call_site_return_consumers(db);
-
-        // Unguarded-child inference is a fallback. Run it only after dynamic
-        // fields and retained unresolves have stabilized declaration types.
-        let late_child_sources = local_inference::stabilize_unguarded_children(
-            db,
-            &mut context,
-            false,
-            &mut unguarded_child_sites,
-        );
-        let late_child_local_changed = if late_child_sources.is_empty() {
-            false
-        } else {
-            local_inference::stabilize_unknown_locals(db, &mut context)
-        };
-        let late_child_returns =
-            context.requeue_inferred_returns_for_sources(db, &late_child_sources);
-        if !late_child_sources.is_empty() {
-            context.infer_manager.clear();
-            if late_child_local_changed || late_child_returns != 0 {
-                run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
-                setmetatable_factory::synthesize_setmetatable_factory_members(
-                    db,
-                    &workspace_file_ids,
-                );
-            }
-            refresh_initializer_caches(db, &mut context);
-        }
-
-        {
-            let _p = Profile::new("attach_settled_index_expr_members");
-            attach_settled_index_expr_members(db, &mut context);
-        }
-
-        {
-            let _p = Profile::new("rederive_settled_inferred_returns");
-            rederive_settled_inferred_returns(db, &mut context);
-        }
-
-        {
-            let _p = Profile::new("rewiden_settled_member_assignments");
-            rewiden_settled_member_assignments(db, &mut context);
-        }
-
-        // Members that landed on a global path before the global's owner was
-        // known are attached now that it is. See
-        // `reconcile_parked_global_path_members`.
-        {
-            let _p = Profile::new("reconcile_parked_global_path_members");
-            common::reconcile_parked_global_path_members(db);
-        }
-
-        // Writes that inferred their prefix to one concrete declaration of a
-        // multi-declaration global attach directly to that table and never
-        // park, so which table won depends on batch composition. Re-apply the
-        // ownership rule to them now that every declaration stands. See
-        // `reconcile_directly_attached_candidate_members`.
-        {
-            let _p = Profile::new("reconcile_directly_attached_candidate_members");
-            common::reconcile_directly_attached_candidate_members(db);
-        }
-
-        // Runs last of the settled passes: it needs every member to have reached
-        // its final owner, because the writer set it merges is grouped by owner.
-        {
-            let _p = Profile::new("rederive_contributed_member_assignments");
-            let analyzed_files = context.analyzed_file_ids();
-            lua::rederive_contributed_member_assignments(db, &analyzed_files);
-        }
-
-        // Every settled pass above refines the types the member attach retry
-        // reads, so candidates it could not place on the first attempt can be
-        // placed now. Without this a member's existence depends on how far
-        // inference had progressed when its file happened to be walked.
-        {
-            let _p = Profile::new("attach_settled_index_expr_members (late)");
-            attach_settled_index_expr_members(db, &mut context);
-        }
-
-        // The late attach can still place members straight onto whichever
-        // candidate table its prefix resolved to, so the direct-attached
-        // repair has to see its results too.
-        {
-            let _p = Profile::new("reconcile_directly_attached_candidate_members (late)");
-            common::reconcile_directly_attached_candidate_members(db);
-        }
-
-        // Net flows are collected last: the collector resolves wrappers through
-        // signatures, receiver types and members, none of which exist yet when
-        // the gmod pre-pass runs. See `GmodNetworkAnalysisPipeline`.
-        run_analysis::<gmod::GmodNetworkAnalysisPipeline>(db, &mut context);
-
-        for (consumer_file_id, owners) in context.infer_manager.drain_inferred_guard_dependencies()
-        {
-            context.add_inferred_guard_dependencies(consumer_file_id, owners);
-        }
-        for (consumer_file_id, owners) in std::mem::take(&mut context.inferred_guard_dependencies) {
-            db.get_signature_index_mut()
-                .set_inferred_guard_dependencies(consumer_file_id, owners);
-        }
-
-        if std::env::var_os("GLUALS_PROFILE").is_some() {
-            eprintln!(
-                "[profile] member_assignment_contributions entries={}",
-                db.get_member_index()
-                    .member_assignment_contributions()
-                    .entry_count(),
-            );
-            eprintln!(
-                "[profile] inferred_guard candidates={} candidate_attempts={} candidate_iterations={} early_published={} late_retries={} late_published={} pending={} early_signature_owners={} early_member_owners={}",
-                guard_candidates,
-                early_guard_stats.attempts + late_guard_stats.attempts,
-                early_guard_stats.iterations + late_guard_stats.iterations,
-                early_guard_stats.published,
-                late_guard_retries,
-                late_guard_stats.published,
-                context.inferred_guard_candidates.len(),
-                early_signature_owners,
-                early_member_owners,
-            );
-        }
+    /// The files `self` and `other` scope differently, sorted.
+    fn rescoped(&self, other: &Self) -> Vec<FileId> {
+        let mut files = self
+            .files
+            .symmetric_difference(&other.files)
+            .chain(
+                self.infos
+                    .keys()
+                    .chain(other.infos.keys())
+                    .filter(|file_id| self.infos.get(*file_id) != other.infos.get(*file_id)),
+            )
+            .copied()
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        files.dedup();
+        files
     }
 }
 
-/// Retries the index-expression member attaches `set_index_expr_owner`
-/// dropped.
-fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    let mut candidates = std::mem::take(&mut context.settled_member_attach_candidates);
-    if candidates.is_empty() {
-        return;
+/// Which of `files` are scripted-class scopes, and the class info of those
+/// that author one, given the gamemode folders the main workspaces hold.
+fn scan_scopes(
+    db: &DbIndex,
+    files: &[(FileId, Option<&Path>)],
+    gamemodes: &[(PathBuf, GmodScopedClassInfo)],
+) -> (HashSet<FileId>, HashMap<FileId, GmodScopedClassInfo>) {
+    let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
+    if scopes.resolved_definitions_slice().is_empty() {
+        let files = files.iter().map(|(file_id, _)| *file_id).collect();
+        return (files, HashMap::default());
     }
-    candidates.sort_by_key(|candidate| (candidate.file_id, candidate.value.get_range().start()));
-    candidates.dedup();
-    let mut retry = Vec::new();
-
-    // Only the candidate files are re-inferred, so only their caches are stale.
-    // Clearing the whole manager would also discard caches the passes that ran
-    // before this one built for files this pass never touches.
-    let candidate_files = candidates
+    let paths = files
         .iter()
-        .map(|candidate| candidate.file_id)
-        .collect::<HashSet<_>>();
-    context.infer_manager.clear_files(&candidate_files);
-
-    for candidate in candidates {
-        let file_id = candidate.file_id;
-        let member_id = LuaMemberId::new(candidate.value, file_id);
-        // A member that already found a real owner is not the gap this pass
-        // exists for: some other authority decided where it lives, and re-homing
-        // it here would overrule that decision with a later, weaker read.
-        if db
-            .get_member_index()
-            .get_current_owner(&member_id)
-            .is_some_and(|owner| !matches!(owner, LuaMemberOwner::LocalUnresolve))
-        {
-            continue;
-        }
-        let Some(prefix_expr) = db
-            .get_vfs()
-            .get_syntax_tree(&file_id)
-            .map(|tree| tree.get_red_root())
-            .and_then(|root| candidate.value.to_node_from_root(&root))
-            .and_then(glua_parser::LuaIndexExpr::cast)
-            .and_then(|index_expr| index_expr.get_prefix_expr())
-        else {
-            continue;
-        };
-        let mut unresolve_member = unresolve::UnResolveMember {
-            file_id,
-            member_id,
-            expr: None,
-            prefix: Some(prefix_expr),
-            ret_idx: 0,
-        };
-        let cache = context.infer_manager.get_infer_cache(file_id);
-        if unresolve::try_resolve_member(db, cache, &mut unresolve_member).is_err() {
-            // The prefix still has not settled. Dropping it here is what made a
-            // member's existence depend on analysis order: the passes that run
-            // after this one go on refining the very types this retry needs, so
-            // a candidate that fails now can succeed once they have. Keep it
-            // queued for the next attempt instead.
-            retry.push(candidate);
-        }
-    }
-
-    context.settled_member_attach_candidates = retry;
-}
-
-/// Re-resolves inferred returns that settled on `any`/`unknown`.
-fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    let mut candidates = context
-        .inferred_return_candidates
-        .iter()
-        .filter(|return_| {
-            db.get_signature_index()
-                .get(&return_.signature_id)
-                .is_some_and(|signature| {
-                    signature.resolve_return == crate::SignatureReturnStatus::InferResolve && {
-                        let current = signature.get_return_type();
-                        current.is_any() || current.is_unknown()
-                    }
-                })
-        })
-        .cloned()
+        .filter_map(|(file_id, path)| Some((*file_id, (*path)?)))
         .collect::<Vec<_>>();
-    if candidates.is_empty() {
-        return;
-    }
-    candidates.sort_by_key(|return_| (return_.file_id, return_.signature_id.get_position()));
-
-    // Only the candidate files are re-inferred, so only their caches are stale.
-    let candidate_files = candidates
-        .iter()
-        .map(|return_| return_.file_id)
-        .collect::<HashSet<_>>();
-    context.infer_manager.clear_files(&candidate_files);
-
-    for mut return_ in candidates {
-        let cache = context.infer_manager.get_infer_cache(return_.file_id);
-        let _ = unresolve::try_resolve_return_point(db, cache, &mut return_);
-    }
-}
-
-/// Re-derives member assignment widenings that ran against an incomplete
-/// set of sibling writers.
-fn rewiden_settled_member_assignments(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    let candidates = std::mem::take(&mut context.settled_member_widening_candidates);
-    if candidates.is_empty() {
-        return;
-    }
-    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
-    candidates.sort_by_key(|(member_id, _)| (member_id.file_id, member_id.get_position()));
-
-    for (member_id, (assigned_type, preserve_table_literals)) in candidates {
-        // Only an inferred assignment cache is this pass' to rewrite: a doc type
-        // outranks inference, and anything else reaching the slot was written by
-        // an authority this pass has no evidence to overrule.
-        if !db
-            .get_type_index()
-            .get_type_cache(&member_id.into())
-            .is_some_and(|cache| cache.is_infer())
-        {
-            continue;
+    let (scope_files, scope_matches) =
+        scopes.scan_scripted_class_scope_files(paths.iter().copied());
+    let mut scope_files: HashSet<_> = scope_files.into_iter().collect();
+    let mut infos = scope_matches
+        .into_iter()
+        .map(|(file_id, scope_match)| {
+            (
+                file_id,
+                GmodScopedClassInfo {
+                    class_name: scope_match.class_name,
+                    global_name: scope_match.definition.class_global,
+                    is_global_singleton: scope_match.definition.is_global_singleton,
+                    aliases: scope_match.definition.aliases,
+                    super_types: scope_match.definition.super_types,
+                    class_name_prefix: scope_match.definition.class_name_prefix,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    // A workspace rooted at a gamemode checkout has `gamemode/` directly
+    // under the root — no `gamemodes/<name>` segment for the scope path
+    // rules to anchor on — but its `gamemode/**` files author `GM` just
+    // like `gamemodes/*/gamemode/**`. Scope them the same way.
+    for (gamemode_dir, info) in gamemodes {
+        for (file_id, path) in &paths {
+            if infos.contains_key(file_id) || !path.starts_with(gamemode_dir) {
+                continue;
+            }
+            scope_files.insert(*file_id);
+            infos.insert(*file_id, info.clone());
         }
+    }
+    (scope_files, infos)
+}
 
-        let type_owner = LuaTypeOwner::Member(member_id);
-        let Some(widened_type) = lua::get_widened_member_assignment_type(
-            db,
-            &type_owner,
-            &assigned_type,
-            preserve_table_literals,
-            &mut false,
-        ) else {
-            continue;
-        };
+/// The gamemode folders the main workspaces hold, each with the class its
+/// files author, in workspace order.
+fn root_gamemodes(db: &DbIndex) -> Vec<(PathBuf, GmodScopedClassInfo)> {
+    db.get_module_index()
+        .get_main_workspace_ids()
+        .into_iter()
+        .filter_map(|workspace_id| gmod::root_gamemode_scope(db, workspace_id))
+        .map(|(gamemode_dir, scope_match)| {
+            (
+                gamemode_dir,
+                GmodScopedClassInfo {
+                    class_name: scope_match.class_name,
+                    global_name: scope_match.global_name,
+                    is_global_singleton: scope_match.is_global_singleton,
+                    aliases: scope_match.aliases,
+                    super_types: scope_match.super_types,
+                    class_name_prefix: scope_match.class_name_prefix,
+                },
+            )
+        })
+        .collect()
+}
 
-        db.get_type_index_mut()
-            .force_bind_type(type_owner, LuaTypeCache::InferType(widened_type));
+/// Each live file's path.
+fn live_paths(db: &DbIndex) -> HashMap<FileId, Option<PathBuf>> {
+    let vfs = db.get_vfs();
+    vfs.get_all_local_file_ids()
+        .into_iter()
+        .filter(|file_id| vfs.get_syntax_tree(file_id).is_some())
+        .map(|file_id| (file_id, vfs.get_file_path(&file_id).cloned()))
+        .collect()
+}
+
+/// The main workspaces with their roots, by id.
+fn main_workspace_roots(db: &DbIndex) -> Vec<(WorkspaceId, Option<PathBuf>)> {
+    let module_index = db.get_module_index();
+    let mut workspaces = module_index
+        .get_main_workspace_ids()
+        .into_iter()
+        .map(|id| (id, module_index.get_workspace_root(id).map(Into::into)))
+        .collect::<Vec<_>>();
+    workspaces.sort_by_key(|(id, _)| id.id);
+    workspaces
+}
+
+/// [`ScriptedScopes`] with what they were computed from besides the config:
+/// each live file's path, the main workspaces and their gamemode folders.
+#[derive(Clone)]
+struct HeldScopes {
+    paths: HashMap<FileId, Option<PathBuf>>,
+    workspaces: Vec<(WorkspaceId, Option<PathBuf>)>,
+    gamemodes: Vec<(PathBuf, GmodScopedClassInfo)>,
+    scopes: ScriptedScopes,
+}
+
+impl HeldScopes {
+    /// Takes in the live files' paths as they stand, scanning again the files
+    /// that moved, came or went: a file's scope follows from its own path.
+    /// Returns those it scopes otherwise, sorted.
+    fn follow_paths(&mut self, db: &DbIndex) -> Vec<FileId> {
+        let vfs = db.get_vfs();
+        let mut live = HashSet::default();
+        let mut changed = Vec::new();
+        for file_id in vfs.get_all_local_file_ids() {
+            if vfs.get_syntax_tree(&file_id).is_none() {
+                continue;
+            }
+            live.insert(file_id);
+            let path = vfs.get_file_path(&file_id);
+            if self
+                .paths
+                .get(&file_id)
+                .is_none_or(|held| held.as_ref() != path)
+            {
+                self.paths.insert(file_id, path.cloned());
+                changed.push(file_id);
+            }
+        }
+        self.paths.retain(|file_id, _| {
+            let kept = live.contains(file_id);
+            if !kept {
+                changed.push(*file_id);
+            }
+            kept
+        });
+        if changed.is_empty() {
+            return Vec::new();
+        }
+        changed.sort_unstable();
+        let before = changed
+            .iter()
+            .map(|file_id| {
+                (
+                    self.scopes.files.contains(file_id),
+                    self.scopes.infos.get(file_id).cloned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let scanned = changed
+            .iter()
+            .filter_map(|file_id| Some((*file_id, self.paths.get(file_id)?.as_deref())))
+            .collect::<Vec<_>>();
+        let (files, infos) = scan_scopes(db, &scanned, &self.gamemodes);
+        let scope_files = Arc::make_mut(&mut self.scopes.files);
+        let scope_infos = Arc::make_mut(&mut self.scopes.infos);
+        for file_id in &changed {
+            scope_files.remove(file_id);
+            scope_infos.remove(file_id);
+        }
+        scope_files.extend(files);
+        scope_infos.extend(infos);
+        changed
+            .into_iter()
+            .zip(before)
+            .filter(|(file_id, (scoped, info))| {
+                *scoped != scope_files.contains(file_id)
+                    || info.as_ref() != scope_infos.get(file_id)
+            })
+            .map(|(file_id, _)| file_id)
+            .collect()
     }
 }
 
-#[derive(Default)]
-struct InferredGuardFixedPointStats {
-    attempts: usize,
-    iterations: usize,
-    published: usize,
-    changed: bool,
+/// The last [`ScriptedScopes`], followed file by file while the main
+/// workspaces and their gamemode folders stand. A new config clears it.
+#[derive(Clone, Default)]
+pub(crate) struct ScopesCache(Option<HeldScopes>);
+
+impl std::fmt::Debug for ScopesCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopesCache")
+            .field("filled", &self.0.is_some())
+            .finish()
+    }
 }
 
-fn stabilize_inferred_positive_guards(
-    db: &mut DbIndex,
-    context: &mut AnalyzeContext,
-) -> InferredGuardFixedPointStats {
-    let mut stats = InferredGuardFixedPointStats::default();
-    let max_iterations = context.inferred_guard_candidates.len().saturating_add(1);
+impl ScopesCache {
+    /// The scopes of the files as they stand, and the files they scope
+    /// otherwise than the scopes held last did, sorted.
+    fn get(&mut self, db: &DbIndex) -> (ScriptedScopes, Vec<FileId>) {
+        let workspaces = main_workspace_roots(db);
+        let gamemodes = root_gamemodes(db);
+        if let Some(held) = &mut self.0
+            && held.workspaces == workspaces
+            && held.gamemodes == gamemodes
+        {
+            let rescoped = held.follow_paths(db);
+            return (held.scopes.clone(), rescoped);
+        }
+        let paths = live_paths(db);
+        let scopes = ScriptedScopes::of(db, &paths, &gamemodes);
+        let rescoped = self
+            .0
+            .as_ref()
+            .map(|held| held.scopes.rescoped(&scopes))
+            .unwrap_or_default();
+        self.0 = Some(HeldScopes {
+            paths,
+            workspaces,
+            gamemodes,
+            scopes: scopes.clone(),
+        });
+        (scopes, rescoped)
+    }
+}
 
-    while !context.inferred_guard_candidates.is_empty() && stats.iterations < max_iterations {
-        let attempted = context.inferred_guard_candidates.len();
-        let published = local_inference::publish_inferred_positive_guards(db, context);
-        let changed = db
-            .get_signature_index_mut()
-            .take_inferred_positive_guards_changed();
-        stats.attempts += attempted;
-        stats.iterations += 1;
-        stats.published += published;
-        stats.changed |= changed;
-        if !changed {
+/// What a finished [`Reanalysis`] did.
+pub(crate) struct Reanalysed {
+    /// The files whose diagnostics read a fact that moved, sorted.
+    pub stale_diagnostics: Vec<FileId>,
+    /// The files whose source layer was rebuilt or whose derivations were
+    /// evaluated, sorted.
+    pub evaluated_files: Vec<FileId>,
+    pub(crate) stats: engine::EngineStats,
+    /// The scripted scopes, to lend the next re-analysis.
+    pub(crate) scopes: ScopesCache,
+    /// Each evaluated file's inference memo, for its diagnostics.
+    pub(crate) memos: HashMap<FileId, crate::LuaInferCache>,
+}
+
+/// A re-analysis in progress. It re-analyses files from their current text:
+/// forgets what their previous analysis produced, rebuilds each live file's
+/// source layer, and evaluates every derivation that is new or read a fact
+/// that changed until nothing is stale. A file without a syntax tree is
+/// treated as deleted; a file that only moved keeps its analysis, which takes
+/// in where it now is.
+///
+/// It advances in slices ([`Self::run`]). Between two, no evaluation is open
+/// and the index reads as it does outside any run, so readers can use it.
+pub(crate) struct Reanalysis {
+    engine: engine::Engine,
+    /// The current pass; `None` once no pass is left.
+    pass: Option<Pass>,
+    /// The access paths the current pass built: text is fixed for a pass.
+    access_paths: crate::semantic::AccessPaths,
+    /// The stage the run is at while it waits for its next slice.
+    stage: derivation::AnalysisStage,
+    scopes: ScopesCache,
+    /// The inference memos of the passes that settled; a later pass's
+    /// replaces an earlier one's.
+    memos: HashMap<FileId, crate::LuaInferCache>,
+    /// Whether the run settled and was wrapped up, leaving the check of
+    /// which diagnostics went stale; see [`Self::wrap_up`].
+    wrapped: bool,
+    /// The files whose diagnostics went stale, once checked.
+    stale: Option<Vec<FileId>>,
+}
+
+impl Reanalysis {
+    /// Starts re-analysing `file_ids`: rebuilds their source layers and
+    /// queues their derivations and whatever read a fact that moved.
+    pub(crate) fn begin(
+        db: &mut DbIndex,
+        file_ids: Vec<FileId>,
+        edits: derivation::EditMaps,
+        schedule: engine::Schedule,
+        mut scopes: ScopesCache,
+        interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let mut engine = engine::Engine::new(edits, schedule);
+        engine.interrupt_with(interrupt);
+        let pass = start_pass(db, &mut engine, file_ids, &mut scopes, HashSet::default());
+        let mut reanalysis = Self {
+            engine,
+            pass,
+            access_paths: crate::semantic::AccessPaths::default(),
+            stage: derivation::AnalysisStage::Closed,
+            scopes,
+            memos: HashMap::default(),
+            wrapped: false,
+            stale: None,
+        };
+        reanalysis.pause(db);
+        crate::profile::phase_report("take");
+        reanalysis
+    }
+
+    /// Takes `file_ids`' new text in, `edits` saying where it moved their
+    /// positions since this re-analysis took them last: they settle before
+    /// the work still queued.
+    pub(crate) fn take(
+        &mut self,
+        db: &mut DbIndex,
+        file_ids: Vec<FileId>,
+        edits: derivation::EditMaps,
+    ) {
+        // What a pending pass's rebuild moved follows these edits with what
+        // this rebuild moves.
+        let pending = match &mut self.pass {
+            Some(Pass::Replaced { touched, .. }) => std::mem::take(touched),
+            _ => HashSet::default(),
+        };
+        self.wrapped = false;
+        self.stale = None;
+        refresh_payload_refs(db, self.engine.payload_holders());
+        self.engine.take_edits(edits);
+        if let Some(pass) = start_pass(db, &mut self.engine, file_ids, &mut self.scopes, pending) {
+            self.pass = Some(pass);
+            self.access_paths = crate::semantic::AccessPaths::default();
+        }
+        self.pause(db);
+        crate::profile::phase_report("take");
+    }
+
+    /// Evaluates until the re-analysis settles or `slice` is over. Returns
+    /// whether it settled.
+    pub(crate) fn run(&mut self, db: &mut DbIndex, slice: engine::Slice) -> bool {
+        crate::progress::enter_phase("Inferring types", 0, "");
+        db.set_analysis_stage(self.stage);
+        crate::semantic::keep_access_paths(std::mem::take(&mut self.access_paths));
+        let unwinding = Unwinding;
+        let evaluated = self.engine.stats().total_evaluations();
+        let settled = loop {
+            self.open_pass(db);
+            let Some(Pass::Open(recipes)) = &self.pass else {
+                break true;
+            };
+            let slice = slice.remaining(self.engine.stats().total_evaluations() - evaluated);
+            let settled = crate::profile::phase("reanalyze: engine run", || {
+                self.engine.run(db, &**recipes, slice)
+            });
+            if !settled {
+                break false;
+            }
+            crate::profile::memory::checkpoint("after the engine run");
+            if let Some(Pass::Open(recipes)) = self.pass.take() {
+                let recipes = std::sync::Arc::into_inner(recipes)
+                    .expect("no superstep's tasks outlive their pass");
+                self.memos.extend(recipes.into_memos());
+            }
+            let stale = self.engine.take_stale_sources();
+            crate::semantic::stop_keeping_access_paths();
+            self.pass = start_pass(
+                db,
+                &mut self.engine,
+                stale.into_iter().collect(),
+                &mut self.scopes,
+                HashSet::default(),
+            );
+            crate::semantic::keep_access_paths(crate::semantic::AccessPaths::default());
+        };
+        std::mem::forget(unwinding);
+        self.access_paths = crate::semantic::stop_keeping_access_paths();
+        self.pause(db);
+        settled
+    }
+
+    /// Queues the readers of what the pass's rebuild moved and opens the run.
+    fn open_pass(&mut self, db: &mut DbIndex) {
+        let (touched, scopes) = match self.pass.take() {
+            Some(Pass::Replaced { touched, scopes }) => (touched, scopes),
+            pass => {
+                self.pass = pass;
+                return;
+            }
+        };
+        crate::profile::phase("reanalyze: readers of touched", || {
+            self.engine.readers_of(db, touched.iter())
+        });
+        let recipes =
+            crate::profile::phase("reanalyze: recipes", || derive::Recipes::new(db, scopes));
+        self.engine.open(db);
+        self.pass = Some(Pass::Open(std::sync::Arc::new(recipes)));
+    }
+
+    /// Leaves the index as it reads outside any run until the next slice.
+    fn pause(&mut self, db: &mut DbIndex) {
+        self.engine.flush_slot_notifications(db);
+        self.stage = db.analysis_stage();
+        db.set_analysis_stage(derivation::AnalysisStage::Closed);
+        crate::profile::phase("reanalyze: flush", || db.flush_inference_derived_state());
+    }
+
+    /// Has a slice that ends with a worker superstep due leave its tasks to
+    /// run outside it; see [`Self::take_detached`].
+    pub(crate) fn detach_supersteps(&mut self) {
+        self.engine.detach_supersteps();
+    }
+
+    /// The superstep whose tasks the last slice left to run outside it, with
+    /// the recipes they evaluate by: run them while readers share the index
+    /// and hand the superstep back with [`Self::restore_detached`].
+    pub(crate) fn take_detached(
+        &mut self,
+    ) -> Option<(engine::Superstep, std::sync::Arc<derive::Recipes>)> {
+        let Some(Pass::Open(recipes)) = &self.pass else {
+            return None;
+        };
+        let recipes = std::sync::Arc::clone(recipes);
+        Some((self.engine.take_detached()?, recipes))
+    }
+
+    pub(crate) fn restore_detached(&mut self, superstep: engine::Superstep) {
+        self.engine.restore_detached(superstep);
+    }
+
+    pub(crate) fn has_detached(&self) -> bool {
+        self.engine.has_detached()
+    }
+
+    /// Installs the tasks of a superstep left to run outside the slices, so
+    /// the index can be written.
+    pub(crate) fn install_detached(&mut self, db: &mut DbIndex) {
+        if self.has_detached() {
+            self.run(db, engine::Slice::Evaluations(0));
+        }
+    }
+
+    /// Settles `file_ids` before the other work still queued.
+    pub(crate) fn prioritise(&mut self, file_ids: &[FileId]) {
+        self.engine.prioritise(file_ids);
+    }
+
+    /// Whether `file_id` has work still to settle. Until a pass opens, what
+    /// its rebuild moved has not queued its readers, so every file may.
+    pub(crate) fn is_settling(&self, file_id: FileId) -> bool {
+        matches!(self.pass, Some(Pass::Replaced { .. })) || self.engine.is_settling(file_id)
+    }
+
+    /// Whether `file_id` still settles ahead of the rest.
+    pub(crate) fn in_focus(&self, file_id: FileId) -> bool {
+        self.engine.in_focus(file_id)
+    }
+
+    /// Whether the run settled and was wrapped up; see [`Self::wrap_up`].
+    pub(crate) fn wrapped(&self) -> bool {
+        self.wrapped
+    }
+
+    /// Writes what a settled run leaves the index: what the payloads its
+    /// files hold refer to, and the call targets it settled. What is left is
+    /// the check of which diagnostics went stale, which only reads the index
+    /// ([`Self::check_stale`]), and [`Self::finish`].
+    pub(crate) fn wrap_up(&mut self, db: &mut DbIndex) {
+        debug_assert!(self.pass.is_none(), "wrapping up an unsettled re-analysis");
+        if std::mem::replace(&mut self.wrapped, true) {
+            return;
+        }
+        crate::profile::phase("reanalyze: payload refs", || {
+            refresh_payload_refs(db, self.engine.payload_holders())
+        });
+        call_target::check_settled_call_targets(db);
+        crate::profile::phase_report("reanalyze");
+        self.engine
+            .stats()
+            .report(self.engine.evaluated_files().len());
+        if crate::profile::profiling() {
+            for (kind, query_stats) in db.queries().stats() {
+                eprintln!("[query] {kind:?} {query_stats:?}");
+            }
+        }
+        crate::profile::memory::checkpoint("end of re-analysis");
+    }
+
+    /// Whether the run is wrapped up and its stale diagnostics not checked.
+    pub(crate) fn needs_stale_check(&self) -> bool {
+        self.wrapped && self.stale.is_none()
+    }
+
+    /// The files to check for stale diagnostics off the session's lock, when
+    /// the check is due; [`Self::keep_stale`] takes the result.
+    pub(crate) fn stale_check_files(&self) -> Option<Vec<FileId>> {
+        self.needs_stale_check()
+            .then(|| self.engine.diagnosed_files())
+    }
+
+    /// Keeps `stale`, checked on the wrapped-up index, unless a check landed
+    /// meanwhile.
+    pub(crate) fn keep_stale(&mut self, db: &DbIndex, stale: Vec<FileId>) {
+        if self.needs_stale_check() {
+            self.engine.note_stale_diagnostics(db, &stale);
+            self.stale = Some(stale);
+        }
+    }
+
+    /// Checks which files' diagnostics went stale, on the wrapped-up index.
+    pub(crate) fn check_stale(&mut self, db: &DbIndex) {
+        if self.stale.is_none() {
+            self.stale = Some(crate::profile::phase(
+                "reanalyze: stale diagnostics",
+                || self.engine.stale_diagnostics(db),
+            ));
+        }
+    }
+
+    /// Wraps up a settled re-analysis.
+    pub(crate) fn finish(mut self, db: &mut DbIndex) -> Reanalysed {
+        self.wrap_up(db);
+        self.check_stale(db);
+        Reanalysed {
+            stale_diagnostics: self.stale.take().unwrap_or_default(),
+            evaluated_files: self.engine.evaluated_files(),
+            stats: self.engine.stats().clone(),
+            scopes: self.scopes,
+            memos: self.memos,
+        }
+    }
+}
+
+impl std::fmt::Debug for Reanalysis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reanalysis")
+            .field("stage", &self.stage)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A pass of a re-analysis: some files' source layers rebuilt, then their
+/// derivations and whatever read what the rebuild moved evaluated.
+enum Pass {
+    /// The source layers are rebuilt; the readers of `touched` are queued
+    /// when the pass opens, at its first slice.
+    Replaced {
+        touched: HashSet<derivation::HashedKey>,
+        scopes: ScriptedScopes,
+    },
+    Open(std::sync::Arc<derive::Recipes>),
+}
+
+/// Stops keeping access paths if a slice unwinds.
+struct Unwinding;
+
+impl Drop for Unwinding {
+    fn drop(&mut self) {
+        crate::semantic::stop_keeping_access_paths();
+    }
+}
+
+/// Rebuilds `file_ids`' source layers, or takes in where a file that only
+/// moved now is, and queues their derivations ahead of the work already
+/// queued, alongside any files still settling first; `None` when there is
+/// nothing to re-analyse. `pending` holds keys an earlier rebuild moved whose
+/// readers are not queued yet, positioned as before these edits.
+fn start_pass(
+    db: &mut DbIndex,
+    engine: &mut engine::Engine,
+    mut file_ids: Vec<FileId>,
+    scopes: &mut ScopesCache,
+    pending: HashSet<derivation::HashedKey>,
+) -> Option<Pass> {
+    file_ids.sort();
+    file_ids.dedup();
+    if file_ids.is_empty() {
+        return None;
+    }
+    // Source layers are rebuilt at the stage outside a run.
+    db.set_analysis_stage(derivation::AnalysisStage::Closed);
+    let (scopes, rescoped) = crate::profile::phase("reanalyze: scopes", || scopes.get(db));
+    let repathed = repathed_files(db, engine, &file_ids, &rescoped);
+    // A file whose scope changed with its own or other files' paths is
+    // re-indexed.
+    file_ids.extend(rescoped);
+    file_ids.sort();
+    file_ids.dedup();
+    let replaced = file_ids
+        .iter()
+        .copied()
+        .filter(|file_id| repathed.binary_search(file_id).is_err())
+        .collect::<Vec<_>>();
+    // Queries computed since the last run read the index as it stood before
+    // the rebuild moves it.
+    let mut moved = pending;
+    moved.extend(engine::file_queries(db));
+    engine.replacing(&replaced);
+    engine.note_rebuilt(&file_ids);
+    engine.prioritise(&file_ids);
+    crate::profile::memory::checkpoint("before the source layer");
+    let touched = crate::profile::phase("reanalyze: replace files", || {
+        replace_files(db, engine, &replaced, &repathed, &scopes, moved)
+    });
+    crate::profile::memory::checkpoint("after the source layer");
+    db.reader_graph_mut().forget_fingerprints();
+    Some(Pass::Replaced { touched, scopes })
+}
+
+/// The files among `file_ids` that only moved, sorted: their source layer was
+/// built from the text they hold, and where they now are leaves their scope,
+/// their workspace and the files they load by path as they were. What their
+/// source layer derived from their path [`repath_files`] takes in; the rest of
+/// it, and every derivation of theirs that did not read where they are,
+/// stands.
+fn repathed_files(
+    db: &DbIndex,
+    engine: &engine::Engine,
+    file_ids: &[FileId],
+    rescoped: &[FileId],
+) -> Vec<FileId> {
+    let vfs = db.get_vfs();
+    file_ids
+        .iter()
+        .copied()
+        .filter(|file_id| {
+            if !vfs.has_left_paths(file_id)
+                || engine.edits_text_of(*file_id)
+                || rescoped.binary_search(file_id).is_ok()
+            {
+                return false;
+            }
+            let (Some(tree), Some(path)) = (
+                vfs.get_syntax_tree(file_id),
+                vfs.get_file_path(file_id).and_then(|path| path.to_str()),
+            ) else {
+                return false;
+            };
+            let source = derivation::DerivationId::new(
+                derivation::DerivationKind::Source,
+                *file_id,
+                LuaSyntaxId::from_node(&tree.get_red_root()),
+            );
+            db.reader_graph().contains(source)
+                && db.get_module_index().belongs_alike_at(*file_id, path)
+                && !db.get_file_dependencies_index().loads_by_path(*file_id)
+        })
+        .collect()
+}
+
+/// Touches `file_id`'s path and the paths it is and was at, taking the ones it
+/// left.
+fn touch_paths(db: &mut DbIndex, file_id: FileId, touched: &mut HashSet<derivation::HashedKey>) {
+    touched.insert(derivation::HashedKey::new(derivation::FactKey::FilePath(
+        file_id,
+    )));
+    let vfs = db.get_vfs_mut();
+    let paths = vfs.take_left_paths(&file_id);
+    for path in paths
+        .into_iter()
+        .chain(vfs.get_file_path(&file_id).cloned())
+    {
+        touched.insert(derivation::HashedKey::new(derivation::FactKey::PathFile(
+            Arc::from(path),
+        )));
+    }
+}
+
+/// Takes in where each of `file_ids`, files that only moved, now is: re-files
+/// its module under its path and ranks what its source layer ordered by its
+/// path by where it is, as building it there would. Returns every key whose
+/// value may have changed.
+fn repath_files(db: &mut DbIndex, file_ids: &[FileId]) -> Vec<derivation::HashedKey> {
+    if file_ids.is_empty() {
+        return Vec::new();
+    }
+    let _recording = derivation::begin(derivation::DerivationId::workspace(
+        derivation::DerivationKind::Source,
+    ));
+    let mut order_keys = Vec::with_capacity(file_ids.len());
+    for file_id in file_ids {
+        db.get_file_dependencies_index_mut()
+            .forget_unresolved_target(*file_id);
+        if let Some(path) = db
+            .get_vfs()
+            .get_file_path(file_id)
+            .and_then(|path| path.to_str())
+            .map(str::to_string)
+        {
+            db.get_module_index_mut().repath_module(*file_id, &path);
+        }
+        order_keys.push((*file_id, db.get_vfs().file_order_key(file_id)));
+    }
+    db.get_global_index_mut().rekey_files(&order_keys);
+    db.get_property_index_mut().rekey_files(&order_keys);
+    db.get_type_index_mut().rekey_files(&order_keys);
+    db.get_operator_index_mut().rekey_files(&order_keys);
+    db.get_accessor_func_index_mut().rekey_files(&order_keys);
+    let refresh = derivation::end();
+    let mut touched = refresh.moved().cloned().collect::<Vec<_>>();
+    let (_, _, written) = refresh.into_parts(|_| derivation::ABSENT);
+    touched.extend(written);
+    touched
+}
+
+/// For each derivation among the `foreign` producers of the replaced files'
+/// facts, the live files among `live_files` it stored a fact in that the
+/// indexes do not keep when the file is re-indexed. Each producer's outputs
+/// are read once, on the pool, however many files it stored in.
+fn unkept_foreign_outputs(
+    db: &DbIndex,
+    foreign: &[Vec<derivation::DerivationId>],
+    replaced: &HashSet<FileId>,
+    live_files: &HashSet<FileId>,
+) -> HashMap<derivation::DerivationId, HashSet<FileId>> {
+    use rayon::prelude::*;
+    let mut producers = foreign
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|producer| !replaced.contains(&producer.file_id))
+        .collect::<Vec<_>>();
+    producers.sort_unstable();
+    producers.dedup();
+    producers
+        .into_par_iter()
+        .map(|producer| {
+            let unkept = db
+                .reader_graph()
+                .outputs_of(producer)
+                .filter(|key| !key.keeps_foreign_contributions())
+                .filter_map(|key| key.owning_file())
+                .filter(|file_id| live_files.contains(file_id))
+                .collect::<HashSet<_>>();
+            (producer, unkept)
+        })
+        .collect()
+}
+
+/// Forgets `file_ids`' derivations and facts, rebuilds the live ones' source
+/// layer and queues their derivations, and takes in where each of
+/// `repathed`, files that only moved, now is. Returns every key whose value
+/// may have changed, `moved` among them, each also at its new position.
+fn replace_files(
+    db: &mut DbIndex,
+    engine: &mut engine::Engine,
+    file_ids: &[FileId],
+    repathed: &[FileId],
+    scopes: &ScriptedScopes,
+    moved: HashSet<derivation::HashedKey>,
+) -> HashSet<derivation::HashedKey> {
+    let mut touched = moved;
+    touched.insert(derivation::HashedKey::new(derivation::FactKey::FileSet));
+    let forgetting = crate::profile::PhaseGuard::new("replace: forget derivations");
+    let mut outputs = HashSet::default();
+    let replaced = file_ids.iter().copied().collect::<HashSet<_>>();
+    let live_files = file_ids
+        .iter()
+        .copied()
+        .filter(|file_id| db.get_vfs().get_syntax_tree(file_id).is_some())
+        .collect::<HashSet<_>>();
+    let foreign = file_ids
+        .iter()
+        .map(|file_id| db.reader_graph().foreign_producers(*file_id))
+        .collect::<Vec<_>>();
+    let unkept = unkept_foreign_outputs(db, &foreign, &replaced, &live_files);
+    for (file_id, producers) in file_ids.iter().zip(foreign) {
+        touched.insert(derivation::HashedKey::new(derivation::FactKey::FileText(
+            *file_id,
+        )));
+        touch_paths(db, *file_id, &mut touched);
+        let live = live_files.contains(file_id);
+        for producer in producers {
+            if replaced.contains(&producer.file_id) {
+                continue;
+            }
+            // What it stored in a file that is re-indexed, not deleted, the
+            // indexes keep, and the edit remap carries to its new place.
+            if live
+                && unkept
+                    .get(&producer)
+                    .is_none_or(|lost| !lost.contains(file_id))
+            {
+                continue;
+            }
+            if crate::profile::tracing_evaluations() {
+                let kept = db
+                    .reader_graph()
+                    .outputs_of(producer)
+                    .filter(|key| {
+                        key.owning_file() == Some(*file_id) && !key.keeps_foreign_contributions()
+                    })
+                    .map(|key| format!("{:?}", key.key()))
+                    .collect::<Vec<_>>();
+                eprintln!("[trace] foreign producer {producer:?} of {file_id:?} for {kept:?}");
+            }
+            match producer.kind {
+                derivation::DerivationKind::Source => engine.source_stale(producer.file_id),
+                _ => engine.changed(producer),
+            }
+        }
+        if live
+            && db
+                .reader_graph()
+                .derivations_of_file(*file_id)
+                .next()
+                .is_some()
+        {
+            engine.rebuilding(*file_id);
+        }
+        outputs.extend(
+            db.reader_graph()
+                .derivations_of_file(*file_id)
+                .flat_map(|id| db.reader_graph().outputs_of(id).cloned()),
+        );
+    }
+    // A key read out of a removed output held, before the removal, what its
+    // base did: its readers count against that, as the base's do.
+    let derived = outputs
+        .iter()
+        .filter(|key| key.is_base())
+        .flat_map(|key| db.reader_graph().derived_keys(key))
+        .collect::<Vec<_>>();
+    outputs.extend(derived);
+    let outputs = outputs.into_iter().collect::<Vec<_>>();
+    let fingerprints = {
+        use rayon::prelude::*;
+        outputs
+            .par_iter()
+            .map(|key| db.fact_fingerprint(key))
+            .collect::<Vec<_>>()
+    };
+    for (key, fingerprint) in outputs.into_iter().zip(fingerprints) {
+        engine.note_removed_output(key, fingerprint);
+    }
+    let removed = db.reader_graph_mut().remove_files(file_ids);
+    for (id, outputs) in removed {
+        for key in outputs.iter() {
+            if key.is_primary() && key.owning_file() != Some(id.file_id) {
+                touched.extend(derivation::capture_writes(|| db.reset_fact(key)));
+                for producer in db.reader_graph().producers(key).collect::<Vec<_>>() {
+                    if producer.kind != derivation::DerivationKind::Source {
+                        engine.changed(producer);
+                    }
+                }
+            }
+        }
+        touched.extend(outputs.into_vec());
+    }
+    drop(forgetting);
+    // What removal takes out, read off the indexes as they drop it: a
+    // recorded output can name a slot the index has since re-homed.
+    // A file taken in at another path than its module was registered from
+    // moved: the sites that named it by its old path stay unresolved.
+    let moved = file_ids
+        .iter()
+        .copied()
+        .filter(|file_id| {
+            let registered = db.get_module_index().registered_path(*file_id);
+            let current = db
+                .get_vfs()
+                .get_file_path(file_id)
+                .map(|path| path.to_string_lossy().replace('\\', "/"));
+            registered.is_some() && registered != current.as_deref()
+        })
+        .collect::<HashSet<_>>();
+    let _recording = derivation::begin(derivation::DerivationId::workspace(
+        derivation::DerivationKind::Source,
+    ));
+    db.remove_index(file_ids.to_vec());
+    let removal = derivation::end();
+    touched.extend(removal.moved().cloned());
+    let (_, _, removed) = removal.into_parts(|_| derivation::ABSENT);
+    touched.extend(removed);
+    // Files that only moved re-file their modules before any file registers,
+    // so a load by path resolves against the workspace as it stands.
+    for file_id in repathed {
+        touch_paths(db, *file_id, &mut touched);
+    }
+    touched.extend(crate::profile::phase("replace: repath files", || {
+        repath_files(db, repathed)
+    }));
+
+    let live = file_ids
+        .iter()
+        .copied()
+        .filter(|file_id| db.get_vfs().get_syntax_tree(file_id).is_some())
+        .collect::<Vec<_>>();
+    for file_id in &live {
+        let dependencies = db.get_file_dependencies_index_mut();
+        if moved.contains(file_id) {
+            dependencies.forget_unresolved_target(*file_id);
+        } else {
+            dependencies.relink_unresolved_target(*file_id);
+        }
+    }
+    // Every file registers its module before any file declares, so a
+    // dependency call resolves against the whole workspace's modules, and
+    // declares before any file documents, so doc annotations resolve against
+    // the whole workspace's declarations, whatever the order.
+    let registered = live
+        .iter()
+        .map(|file_id| (*file_id, register_source(db, *file_id)))
+        .collect::<Vec<_>>();
+    // Each batch's declarations are walked together on the pool, outside
+    // every recording evaluation, then written file by file in canonical
+    // order, each inside its file's source evaluation.
+    let batch = parallel::analysis_threads().saturating_mul(SOURCE_TAILS_PER_THREAD);
+    let total = registered.len();
+    crate::progress::enter_phase("Collecting declarations", total, "files");
+    let mut declared = Vec::with_capacity(total);
+    let mut registered = registered.into_iter();
+    loop {
+        let declaring = registered.by_ref().take(batch).collect::<Vec<_>>();
+        if declaring.is_empty() {
             break;
         }
-
-        let pending_files = context
-            .inferred_guard_candidates
+        let file_ids = declaring
             .iter()
-            .map(|candidate| candidate.file_id)
-            .collect::<HashSet<_>>();
-        context.infer_manager.clear_files(&pending_files);
+            .map(|(file_id, _)| *file_id)
+            .collect::<Vec<_>>();
+        debug_assert!(!derivation::recording(), "declarations walk unrecorded");
+        let walks = crate::profile::phase("declaration walks", || {
+            parallel::map_files_collect(db, &file_ids, |db, file_id| {
+                decl::walk_file(db, file_id, scopes)
+            })
+        });
+        for ((file_id, evaluation), walk) in declaring.into_iter().zip(walks) {
+            declared.push((
+                file_id,
+                declare_source(db, file_id, evaluation, scopes, walk),
+            ));
+        }
+        crate::progress::advance_current_phase(declared.len(), total, "files");
     }
-
-    stats
+    crate::progress::enter_phase("Reading annotations", total, "files");
+    let mut documented_count = 0;
+    let mut changed = Vec::new();
+    // Each batch's tails are computed together on the pool, outside every
+    // recording evaluation, then published file by file in canonical order.
+    let mut declared = declared.into_iter();
+    loop {
+        let documented = declared.by_ref().take(batch).collect::<Vec<_>>();
+        if documented.is_empty() {
+            break;
+        }
+        let file_ids = documented
+            .iter()
+            .map(|(file_id, _)| *file_id)
+            .collect::<Vec<_>>();
+        debug_assert!(!derivation::recording(), "source tails compute unrecorded");
+        let tails = crate::profile::phase("source tails", || {
+            parallel::map_files_collect(db, &file_ids, source_tail)
+        });
+        documented_count += documented.len();
+        for ((file_id, (evaluation, context)), tail) in documented.into_iter().zip(tails) {
+            let (outputs, derivations) = document_source(db, file_id, evaluation, context, tail);
+            touched.extend(outputs);
+            changed.extend(derivations);
+        }
+        crate::progress::advance_current_phase(documented_count, total, "files");
+    }
+    engine.changed_all(changed);
+    if let Some(edits) = engine.edits_to_apply() {
+        engine.follow_removed_outputs(&edits);
+        touched = crate::profile::phase("reanalyze: follow edits", || {
+            follow_edits(db, engine, &edits, touched)
+        });
+    }
+    for kind in derive::WORKSPACE_DERIVATIONS {
+        let id = derivation::DerivationId::workspace(kind);
+        if !db.reader_graph().contains(id) {
+            engine.changed(id);
+        }
+    }
+    touched
 }
+
+/// Carries every other file's reference to a position the edits moved to
+/// its new place: stored facts through the index remaps, recorded reads
+/// through the reader graph. Whatever names a position an edit destroyed is
+/// evaluated again. Returns `touched` with each key also at its new position.
+fn follow_edits(
+    db: &mut DbIndex,
+    engine: &mut engine::Engine,
+    edits: &derivation::EditMaps,
+    touched: HashSet<derivation::HashedKey>,
+) -> HashSet<derivation::HashedKey> {
+    let mut files = edits.files().collect::<Vec<_>>();
+    files.sort();
+    let mut remapped = Vec::new();
+    for file_id in files {
+        let Some(map) = edits.map(file_id) else {
+            continue;
+        };
+        let remap = crate::profile::phase("follow edits: file facts", || {
+            crate::FileRemap::validated(db, file_id, map)
+        });
+        // A key naming a position the edit destroyed is taken again by the
+        // derivation that wrote the member.
+        for member_id in db.get_member_index_mut().remap_expr_keys(&remap) {
+            let key = derivation::HashedKey::new(derivation::FactKey::Member(member_id));
+            for producer in db.reader_graph().producers(&key).collect::<Vec<_>>() {
+                rerun(engine, producer);
+            }
+        }
+        // A fact another file holds that names a moved position is filed
+        // again; its readers check it as the edit moved it.
+        let _recording = derivation::begin(derivation::DerivationId::workspace(
+            derivation::DerivationKind::Source,
+        ));
+        let lost = crate::profile::phase("follow edits: remap indexes", || {
+            crate::remap_into_file(db, &remap)
+        });
+        let remap_writes = derivation::end();
+        remapped.extend(remap_writes.moved().cloned());
+        let (_, _, written) = remap_writes.into_parts(|_| derivation::ABSENT);
+        remapped.extend(written);
+        if crate::profile::tracing_evaluations() && !lost.is_empty() {
+            let keys = lost.iter().map(|fact| &fact.key).collect::<Vec<_>>();
+            eprintln!("[trace] remap of {file_id:?} lost positions in {keys:?}");
+        }
+        for id in producers_of_lost(db, file_id, &lost) {
+            rerun(engine, id);
+        }
+    }
+    let applied = crate::profile::phase("follow edits: rename reads", || {
+        db.reader_graph_mut().apply_edits(edits)
+    });
+    for reader in applied.lost {
+        if crate::profile::tracing_evaluations() {
+            eprintln!("[trace] a read of {reader:?} names a destroyed position");
+        }
+        rerun(engine, reader);
+    }
+    // A moved read holds what it saw only with the edits mapped back; as a
+    // touched key the run checks it and re-records it as the value now. No
+    // derivation writes some of them, such as a statement's syntax.
+    touched
+        .into_iter()
+        .flat_map(|key| {
+            let moved = edits
+                .map_key(&key)
+                .filter(|moved| moved != key.key())
+                .map(derivation::HashedKey::new);
+            std::iter::once(key).chain(moved)
+        })
+        .chain(applied.moved)
+        .chain(remapped)
+        .collect()
+}
+
+/// The derivations that compute `lost` again, sorted: each fact's producers
+/// outside the edited file, whose own derivations its source layer already
+/// re-runs. A fact no derivation produced is rebuilt by re-analysing the file
+/// storing it whole. Read before the reader graph takes the edits, while it
+/// still files each key at the positions the remap found it under.
+fn producers_of_lost(
+    db: &DbIndex,
+    edited: FileId,
+    lost: &[crate::LostFact],
+) -> Vec<derivation::DerivationId> {
+    let graph = db.reader_graph();
+    let mut ids = Vec::new();
+    let mut unproduced = Vec::new();
+    for fact in lost {
+        let producers = graph
+            .producers(&derivation::HashedKey::new(fact.key.clone()))
+            .collect::<Vec<_>>();
+        if producers.is_empty() {
+            unproduced.push(fact.file_id);
+        }
+        ids.extend(producers.into_iter().filter(|id| id.file_id != edited));
+    }
+    unproduced.sort_unstable();
+    unproduced.dedup();
+    if crate::profile::tracing_evaluations() && !unproduced.is_empty() {
+        eprintln!("[trace] lost facts no derivation produced in {unproduced:?}");
+    }
+    for file_id in unproduced {
+        ids.extend(graph.derivations_of_file(file_id));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Re-takes which files the signatures of every file whose signatures moved
+/// name, so the next edit's remap finds them.
+fn refresh_payload_refs(db: &mut DbIndex, holders: impl Iterator<Item = FileId>) {
+    for holder in holders {
+        db.get_signature_index_mut().snapshot_payload_refs(holder);
+    }
+}
+
+fn rerun(engine: &mut engine::Engine, id: derivation::DerivationId) {
+    match id.kind {
+        derivation::DerivationKind::Source => engine.source_stale(id.file_id),
+        derivation::DerivationKind::Diagnostics => engine.check_diagnostics(id.file_id),
+        _ => engine.changed(id),
+    }
+}
+
+/// The first stage of `file_id`'s source layer: module registration.
+fn register_source(db: &mut DbIndex, file_id: FileId) -> derivation::Evaluation {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .expect("a live file has a syntax tree")
+        .get_red_root();
+    let _recording = derivation::begin(derivation::DerivationId::new(
+        derivation::DerivationKind::Source,
+        file_id,
+        LuaSyntaxId::from_node(&root),
+    ));
+    if let Some(path) = db.get_vfs().get_file_path(&file_id).cloned()
+        && let Some(path) = path.to_str()
+    {
+        db.get_module_index_mut().add_module_by_path(file_id, path);
+    }
+    let mut evaluation = derivation::end();
+    evaluation.fingerprint_stage(|key| db.fact_fingerprint(key));
+    evaluation
+}
+
+/// The second stage of a file's source layer: declarations.
+fn declare_source(
+    db: &mut DbIndex,
+    file_id: FileId,
+    evaluation: derivation::Evaluation,
+    scopes: &ScriptedScopes,
+    walk: decl::DeclWalk,
+) -> (derivation::Evaluation, AnalyzeContext) {
+    let _recording = derivation::resume(evaluation);
+    let mut context = AnalyzeContext::for_files(db, vec![file_id], scopes);
+    crate::profile::phase("declaration writes", || walk.apply(db, &mut context));
+    let mut evaluation = derivation::end();
+    evaluation.fingerprint_stage(|key| db.fact_fingerprint(key));
+    (evaluation, context)
+}
+
+/// How many files' declaration walks and source tails [`replace_files`]
+/// computes per analysis thread at once: enough to keep the pool busy, few
+/// enough that the batch's results are published before the next batch's are
+/// built.
+const SOURCE_TAILS_PER_THREAD: usize = 16;
+
+/// The part of a file's source layer that its syntax and its own references
+/// and declarations decide, which docs leave as they are: computed for many
+/// files at once off the canonical thread, published by [`document_source`].
+struct SourceTail {
+    flow_tree: FlowTree,
+    errors: Vec<AnalyzeError>,
+    summaries: Option<(
+        Arc<function_summary::FileFunctionSummaries>,
+        derivation::Fingerprint,
+    )>,
+    role_mentions: Option<Arc<[smol_str::SmolStr]>>,
+    syntax_derivations: Vec<derivation::DerivationId>,
+}
+
+/// `file_id`'s source tail, once every file has declared. Reads only facts of
+/// `file_id`'s own source layer, which its source evaluation does not record.
+fn source_tail(db: &DbIndex, file_id: FileId) -> SourceTail {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .expect("a live file has a syntax tree")
+        .get_chunk_node();
+    let (flow_tree, errors) = flow::bind_flow_tree_for_file(db, file_id, root.clone());
+    SourceTail {
+        flow_tree,
+        errors,
+        summaries: function_summary::collect_function_summaries(db, file_id, &root),
+        role_mentions: gmod::collect_role_mentions(db, file_id, &root),
+        syntax_derivations: derive::syntax_derivations(file_id, &root),
+    }
+}
+
+/// The last stage of a file's source layer: docs, callable signatures,
+/// early member owners, guard candidates, then its source tail. Returns what
+/// the whole source layer wrote and the file's other derivations.
+fn document_source(
+    db: &mut DbIndex,
+    file_id: FileId,
+    evaluation: derivation::Evaluation,
+    mut context: AnalyzeContext,
+    tail: SourceTail,
+) -> (Vec<derivation::HashedKey>, Vec<derivation::DerivationId>) {
+    let _recording = derivation::resume(evaluation);
+    run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
+    let source_root = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .expect("a live file has a syntax tree")
+        .get_chunk_node();
+    doc::register_inferred_accessor_generators(db, file_id, &source_root);
+    publish_callable_signatures(db, &context);
+    resolve_early_member_owners(db, &mut context);
+    local_inference::prepare_inferred_positive_guards(db, &context);
+    db.get_flow_index_mut()
+        .add_flow_tree(file_id, tail.flow_tree);
+    if !tail.errors.is_empty() {
+        let diagnostic_index = db.get_diagnostic_index_mut();
+        for error in tail.errors {
+            diagnostic_index.add_diagnostic(file_id, error);
+        }
+    }
+    if let Some((summaries, fingerprint)) = tail.summaries {
+        db.set_function_summaries(file_id, summaries, fingerprint);
+    }
+    if let Some(mentions) = tail.role_mentions {
+        db.set_role_mentions(file_id, mentions);
+    }
+    let evaluation = derivation::end();
+    let moved = evaluation.moved().cloned().collect::<Vec<_>>();
+    let (id, reads, outputs) = evaluation.into_parts(|key| db.fact_fingerprint(key));
+    let reads = reads
+        .into_iter()
+        .map(|(key, seen)| (key, Some(seen)))
+        .collect();
+    db.reader_graph_mut()
+        .replace(id, reads, outputs.clone(), |_| derivation::ABSENT);
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .expect("a live file has a syntax tree")
+        .get_chunk_node();
+    let derivations = derive::file_derivations(
+        file_id,
+        &root,
+        tail.syntax_derivations,
+        &context.inferred_guard_candidates,
+    );
+    (outputs.into_iter().chain(moved).collect(), derivations)
+}
+
+fn assert_send<T: Send>() {}
+
+const _: fn() = assert_send::<crate::LuaInferCache>;
 
 fn publish_callable_signatures(db: &mut DbIndex, context: &AnalyzeContext) -> usize {
     let mut published = 0;
@@ -540,466 +1392,6 @@ fn resolve_early_member_owners(db: &mut DbIndex, context: &mut AnalyzeContext) -
     resolved
 }
 
-fn refresh_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    refresh_local_decl_initializer_caches(db, context);
-    refresh_member_initializer_caches(db, context);
-}
-
-fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    if context.uninformative_local_decl_candidates.is_empty() {
-        return;
-    }
-
-    let mut candidates_by_file = HashMap::<FileId, Vec<LuaDeclId>>::new();
-    for decl_id in &context.uninformative_local_decl_candidates {
-        candidates_by_file
-            .entry(decl_id.file_id)
-            .or_default()
-            .push(*decl_id);
-    }
-    for candidates in candidates_by_file.values_mut() {
-        candidates.sort_by_key(|decl_id| decl_id.position);
-    }
-    let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
-    file_ids.sort();
-    let analysis_phase = context.infer_manager.current_phase();
-    let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
-
-    // Initializer inference reads the stabilized indexes and records candidate
-    // cache writes without mutating the database. Process that read-only work
-    // per file, then merge inference side effects and type writes in stable file
-    // and source order on the caller thread.
-    let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
-        let mut infer_cache = crate::LuaInferCache::new(
-            file_id,
-            crate::CacheOptions {
-                analysis_phase,
-                dynamic_fields_visible,
-                building_dynamic_field_index: false,
-            },
-        );
-        let Some(root) = db
-            .get_vfs()
-            .get_syntax_tree(&file_id)
-            .map(|tree| tree.get_red_root())
-        else {
-            return InitializerRefreshResult::new(file_id);
-        };
-        let mut result = InitializerRefreshResult::new(file_id);
-        for decl_id in &candidates_by_file[&file_id] {
-            let type_owner = (*decl_id).into();
-            let current_cache = db.get_type_index().get_type_cache(&type_owner).cloned();
-            if current_cache.as_ref().is_some_and(LuaTypeCache::is_doc) {
-                continue;
-            }
-            let current_is_uninformative = type_cache_is_uninformative(current_cache.as_ref());
-            let current_fact = db.get_type_index().get_type_fact(&type_owner);
-            let target_node = LuaInferenceNodeId::TypeOwner(type_owner.clone());
-            let can_upgrade_authority = current_fact.as_ref().is_some_and(|fact| {
-                fact.base_provenance_kind()
-                    != Some(crate::LuaInferenceProvenanceKind::ExplicitAnnotation)
-            });
-            let can_refine_nominal_type = !current_is_uninformative
-                && db.get_emmyrc().gmod.enabled
-                && current_cache
-                    .as_ref()
-                    .is_some_and(|current| single_nominal_type_id(current.as_type()).is_some())
-                && db
-                    .get_reference_index()
-                    .get_decl_references(&decl_id.file_id, decl_id)
-                    .is_none_or(|references| !references.mutable);
-            let Some((ret_idx, expr)) = local_initializer_expr(db, &root, *decl_id) else {
-                continue;
-            };
-            if !initializer_reads_through_call_or_index(&expr) {
-                continue;
-            }
-
-            // Every pass before the dynamic-field one ran without those facts,
-            // so an initializer that reads a dynamic field was answered blind
-            // and the answer was cached as if it were final. Re-inferring with
-            // the index hidden reproduces exactly that blind answer, so where
-            // it differs from the settled one *and* matches what is cached, the
-            // cache is provably the guess and the settled read replaces it.
-            // Whether the field's writer had been walked yet is a property of
-            // the batch, not of the source: cold cached `false` for
-            // `local on = LocalPlayer()._flag or false` where re-analysing the
-            // same unchanged file cached `true`.
-            let inferred_fact = select_result_fact(
-                infer_expr_fact_with_cache(db, &mut infer_cache, expr.clone()),
-                ret_idx,
-            );
-            let inferred_type = inferred_fact.typ().clone();
-
-            // Only asked when nothing else would let the settled read through
-            // and it actually disagrees with the cache, so the second inference
-            // is paid for the handful of decls whose answer it can change.
-            let cached_a_blind_dynamic_field_read = !current_is_uninformative
-                && dynamic_fields_visible
-                && current_cache
-                    .as_ref()
-                    .is_some_and(|current| current.as_type() != &inferred_type)
-                && {
-                    let mut blind_cache = crate::LuaInferCache::new(
-                        file_id,
-                        crate::CacheOptions {
-                            analysis_phase,
-                            dynamic_fields_visible: false,
-                            building_dynamic_field_index: false,
-                        },
-                    );
-                    let blind_type = select_result_fact(
-                        infer_expr_fact_with_cache(db, &mut blind_cache, expr),
-                        ret_idx,
-                    )
-                    .typ()
-                    .clone();
-                    current_cache
-                        .as_ref()
-                        .is_some_and(|current| current.as_type() == &blind_type)
-                        && blind_type != inferred_type
-                };
-            if !current_is_uninformative
-                && !can_refine_nominal_type
-                && !can_upgrade_authority
-                && !cached_a_blind_dynamic_field_read
-            {
-                continue;
-            }
-            if type_is_uninformative(&inferred_type) {
-                // When the cache and the settled re-derivation disagree
-                // over *which* bottom an unresolvable initializer has, both
-                // are false certainties — `nil` and `never` are only ever
-                // reached here by giving up, so which one is cached is
-                // decided by arrival order. Canonicalize to `unknown`,
-                // which is the honest answer and is opaque to the checkers,
-                // so it neither silences a real report nor invents one.
-                if is_bottom(&inferred_type)
-                    && current_cache
-                        .as_ref()
-                        .is_some_and(|current| is_bottom(current.as_type()))
-                    && current_cache.as_ref().map(LuaTypeCache::as_type) != Some(&inferred_type)
-                {
-                    result.updates.push(InitializerCacheUpdate::Overwrite {
-                        owner: type_owner,
-                        fact: inferred_fact.with_runtime_type(LuaType::Unknown),
-                    });
-                }
-                continue;
-            }
-            if current_cache
-                .as_ref()
-                .is_some_and(|current| current.as_type() == &inferred_type)
-            {
-                if current_fact.as_ref().is_some_and(|current| {
-                    inferred_fact.has_independently_stronger_authority_than(current, &target_node)
-                }) {
-                    result.updates.push(InitializerCacheUpdate::ReplaceFact {
-                        owner: type_owner,
-                        fact: inferred_fact,
-                    });
-                }
-                continue;
-            }
-
-            let has_stronger_declared_authority = can_upgrade_authority
-                && current_fact.as_ref().is_some_and(|current| {
-                    inferred_fact.base_provenance_kind()
-                        == Some(crate::LuaInferenceProvenanceKind::ExplicitAnnotation)
-                        && inferred_fact
-                            .has_independently_stronger_authority_than(current, &target_node)
-                });
-            let is_nominal_refinement = can_refine_nominal_type
-                && current_cache.as_ref().is_some_and(|current| {
-                    is_strict_nominal_refinement(db, &inferred_type, current.as_type())
-                });
-            let is_settled_widening = current_cache
-                .as_ref()
-                .is_some_and(|current| union_widens_arm(&inferred_type, current.as_type()));
-            if current_is_uninformative {
-                result.updates.push(InitializerCacheUpdate::Bind {
-                    owner: type_owner,
-                    fact: inferred_fact,
-                });
-            } else if has_stronger_declared_authority
-                || is_nominal_refinement
-                || is_settled_widening
-                || cached_a_blind_dynamic_field_read
-            {
-                result.updates.push(InitializerCacheUpdate::Overwrite {
-                    owner: type_owner,
-                    fact: inferred_fact,
-                });
-            }
-        }
-        result.pending_type_decls = infer_cache.take_pending_str_tpl_type_decls();
-        result.guard_dependencies = infer_cache.take_inferred_guard_dependencies();
-        result
-    });
-
-    let mut updates = Vec::new();
-    for result in results {
-        context.infer_manager.merge_inference_side_effects(
-            result.file_id,
-            result.pending_type_decls,
-            result.guard_dependencies,
-        );
-        updates.extend(result.updates);
-    }
-    apply_initializer_cache_updates(db, updates);
-}
-
-/// Whether the re-derived type is a union that already contains the cached one.
-///
-/// The cache then holds a subset snapshot taken before the other arms were
-/// visible, so replacing it widens to the settled answer instead of guessing a
-/// different one.
-fn union_widens_arm(inferred: &LuaType, current: &LuaType) -> bool {
-    match inferred {
-        LuaType::Union(union) => union.types().any(|arm| arm == current),
-        _ => false,
-    }
-}
-
-/// Whether the re-derived union contains everything the cached type holds, plus
-/// more — the union-to-union counterpart of [`union_widens_arm`].
-///
-/// A cached union is as much a subset snapshot as a cached single arm is: both
-/// are decided by which contributors happened to be indexed first.
-pub(crate) fn union_widens_cached_type(inferred: &LuaType, current: &LuaType) -> bool {
-    let LuaType::Union(inferred_union) = inferred else {
-        return false;
-    };
-    let inferred_arms = known_arms(inferred_union);
-    match current {
-        LuaType::Union(current_union) => {
-            let current_arms = known_arms(current_union);
-            current_arms.len() < inferred_arms.len()
-                && current_arms.iter().all(|arm| inferred_arms.contains(arm))
-        }
-        current => inferred_arms.contains(current),
-    }
-}
-
-/// The union arms that carry information. An `unknown` arm stands for a type
-/// that has not settled yet, so it can neither widen a cache nor block one.
-fn known_arms(union: &LuaUnionType) -> Vec<LuaType> {
-    union
-        .types()
-        .filter(|arm| !matches!(arm, LuaType::Unknown))
-        .cloned()
-        .collect()
-}
-
-fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    if context.member_initializer_reinfer_candidates.is_empty() {
-        return;
-    }
-
-    let mut candidates_by_file = HashMap::<FileId, Vec<LuaMemberId>>::new();
-    for member_id in &context.member_initializer_reinfer_candidates {
-        candidates_by_file
-            .entry(member_id.file_id)
-            .or_default()
-            .push(*member_id);
-    }
-    for candidates in candidates_by_file.values_mut() {
-        candidates.sort_by_key(LuaMemberId::get_position);
-    }
-    let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
-    file_ids.sort();
-    let analysis_phase = context.infer_manager.current_phase();
-    let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
-
-    let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
-        let mut infer_cache = crate::LuaInferCache::new(
-            file_id,
-            crate::CacheOptions {
-                analysis_phase,
-                dynamic_fields_visible,
-                building_dynamic_field_index: false,
-            },
-        );
-        let Some(root) = db
-            .get_vfs()
-            .get_syntax_tree(&file_id)
-            .map(|tree| tree.get_red_root())
-        else {
-            return InitializerRefreshResult::new(file_id);
-        };
-        let mut result = InitializerRefreshResult::new(file_id);
-        for member_id in &candidates_by_file[&file_id] {
-            let type_owner = LuaTypeOwner::Member(*member_id);
-            let Some(current_cache) = db.get_type_index().get_type_cache(&type_owner).cloned()
-            else {
-                continue;
-            };
-            let current_is_uninformative = type_is_uninformative(current_cache.as_type());
-            if current_cache.is_doc()
-                || (!current_is_uninformative
-                    && single_nominal_type_id(current_cache.as_type()).is_none())
-            {
-                continue;
-            }
-            let Some(expr) = member_initializer_expr(&root, *member_id) else {
-                continue;
-            };
-            let Ok(inferred_type) = crate::infer_expr(db, &mut infer_cache, expr) else {
-                continue;
-            };
-            if inferred_type == *current_cache.as_type() {
-                continue;
-            }
-            let takes_inferred_type = if current_is_uninformative {
-                // A placeholder is not an answer: it only records that the
-                // member's initializer had not been inferred yet when the write
-                // landed. Re-inferring it against the settled index is the same
-                // question, asked once the facts exist.
-                !type_is_uninformative(&inferred_type)
-            } else {
-                is_strict_nominal_refinement(db, &inferred_type, current_cache.as_type())
-            };
-            if !takes_inferred_type {
-                continue;
-            }
-
-            result.updates.push(InitializerCacheUpdate::Overwrite {
-                owner: type_owner,
-                fact: LuaTypeFact::certain(inferred_type),
-            });
-        }
-        result.pending_type_decls = infer_cache.take_pending_str_tpl_type_decls();
-        result.guard_dependencies = infer_cache.take_inferred_guard_dependencies();
-        result
-    });
-
-    let mut updates = Vec::new();
-    for result in results {
-        context.infer_manager.merge_inference_side_effects(
-            result.file_id,
-            result.pending_type_decls,
-            result.guard_dependencies,
-        );
-        updates.extend(result.updates);
-    }
-    apply_initializer_cache_updates(db, updates);
-}
-
-struct InitializerRefreshResult {
-    file_id: FileId,
-    pending_type_decls: Vec<crate::PendingStrTplTypeDecl>,
-    guard_dependencies: HashSet<LuaInferredGuardOwner>,
-    updates: Vec<InitializerCacheUpdate>,
-}
-
-impl InitializerRefreshResult {
-    fn new(file_id: FileId) -> Self {
-        Self {
-            file_id,
-            pending_type_decls: Vec::new(),
-            guard_dependencies: HashSet::new(),
-            updates: Vec::new(),
-        }
-    }
-}
-
-enum InitializerCacheUpdate {
-    Bind {
-        owner: LuaTypeOwner,
-        fact: LuaTypeFact,
-    },
-    Overwrite {
-        owner: LuaTypeOwner,
-        fact: LuaTypeFact,
-    },
-    ReplaceFact {
-        owner: LuaTypeOwner,
-        fact: LuaTypeFact,
-    },
-}
-
-fn apply_initializer_cache_updates(db: &mut DbIndex, updates: Vec<InitializerCacheUpdate>) {
-    let mut fact_updates = Vec::with_capacity(updates.len());
-    for update in updates {
-        match update {
-            InitializerCacheUpdate::Bind { owner, fact } => {
-                common::bind_resolved_type(
-                    db,
-                    owner.clone(),
-                    LuaTypeCache::InferType(fact.typ().clone()),
-                );
-                if db
-                    .get_type_index()
-                    .get_type_cache(&owner)
-                    .is_some_and(|cache| cache.as_type() == fact.typ())
-                {
-                    fact_updates.push((LuaInferenceNodeId::TypeOwner(owner), fact));
-                }
-            }
-            InitializerCacheUpdate::Overwrite { owner, fact }
-            | InitializerCacheUpdate::ReplaceFact { owner, fact } => {
-                fact_updates.push((LuaInferenceNodeId::TypeOwner(owner), fact));
-            }
-        }
-    }
-    db.publish_inference_facts(fact_updates);
-}
-
-fn select_result_fact(fact: LuaTypeFact, result_idx: usize) -> LuaTypeFact {
-    let typ = match fact.typ() {
-        LuaType::Variadic(variadic) => variadic
-            .get_type(result_idx)
-            .cloned()
-            .unwrap_or(LuaType::Nil),
-        typ if result_idx == 0 => typ.clone(),
-        _ => LuaType::Nil,
-    };
-    fact.with_runtime_type(typ)
-}
-
-fn member_initializer_expr(root: &LuaSyntaxNode, member_id: LuaMemberId) -> Option<LuaExpr> {
-    let node = member_id.get_syntax_id().to_node_from_root(root)?;
-    let index_expr = glua_parser::LuaIndexExpr::cast(node)?;
-    let assign_stat = index_expr.get_parent::<glua_parser::LuaAssignStat>()?;
-    let (vars, exprs) = assign_stat.get_var_and_expr_list();
-    let value_idx = vars
-        .iter()
-        .position(|var| var.syntax().text_range() == index_expr.get_range())?;
-    exprs.get(value_idx).cloned()
-}
-
-fn is_strict_nominal_refinement(db: &DbIndex, candidate: &LuaType, current: &LuaType) -> bool {
-    let Some(candidate_id) = single_nominal_type_id(candidate) else {
-        return false;
-    };
-    let Some(current_id) = single_nominal_type_id(current) else {
-        return false;
-    };
-    candidate_id != current_id && crate::semantic::is_sub_type_of(db, &candidate_id, &current_id)
-}
-
-fn single_nominal_type_id(typ: &LuaType) -> Option<LuaTypeDeclId> {
-    match typ {
-        LuaType::Def(type_id) | LuaType::Ref(type_id) => Some(type_id.clone()),
-        LuaType::Instance(instance) => single_nominal_type_id(instance.get_base()),
-        LuaType::Union(union) => {
-            let mut nominal = None;
-            for component in union.types().filter(|component| !component.is_nil()) {
-                let type_id = single_nominal_type_id(component)?;
-                if nominal
-                    .as_ref()
-                    .is_some_and(|existing| existing != &type_id)
-                {
-                    return None;
-                }
-                nominal = Some(type_id);
-            }
-            nominal
-        }
-        _ => None,
-    }
-}
-
 /// Whether an initializer's type is decided by a call or index read.
 ///
 /// `or`, `and` and parentheses take their type from an operand, so they inherit
@@ -1011,20 +1403,45 @@ pub(crate) fn initializer_reads_through_call_or_index(expr: &LuaExpr) -> bool {
         LuaExpr::ParenExpr(paren) => paren
             .get_expr()
             .is_some_and(|inner| initializer_reads_through_call_or_index(&inner)),
-        LuaExpr::BinaryExpr(binary) => {
-            matches!(
-                binary.get_op_token().map(|op| op.get_op()),
-                Some(BinaryOperator::OpOr | BinaryOperator::OpAnd)
-            ) && binary.get_exprs().is_some_and(|(left, right)| {
-                initializer_reads_through_call_or_index(&left)
-                    || initializer_reads_through_call_or_index(&right)
-            })
-        }
+        // `CT + self.a / self.b` reads through the index reads it combines
+        // exactly as `self.a or self.b` does: the operator adds no fact of its
+        // own, so the answer is a placeholder until those reads settle.
+        LuaExpr::BinaryExpr(binary) => binary.get_exprs().is_some_and(|(left, right)| {
+            initializer_reads_through_call_or_index(&left)
+                || initializer_reads_through_call_or_index(&right)
+        }),
+        LuaExpr::UnaryExpr(unary) => unary
+            .get_expr()
+            .is_some_and(|inner| initializer_reads_through_call_or_index(&inner)),
         _ => false,
     }
 }
 
-fn local_initializer_expr(
+/// Whether an initializer's uninformative result may still improve once the
+/// unresolve pass settles what it reads.
+///
+/// An operator expression contributes no type of its own: `w - 1` is `unknown`
+/// only while `w` is, so the answer the file walk cached is a placeholder in
+/// exactly the way a call or index read is, and it has to be retried on the same
+/// terms. Without this it stays `unknown` forever and usage-context inference
+/// guesses at it instead.
+pub(crate) fn initializer_may_improve_after_resolve(expr: &LuaExpr) -> bool {
+    initializer_reads_through_call_or_index(expr)
+        || initializer_is_operator_expr(expr)
+        || matches!(expr, LuaExpr::NameExpr(_))
+}
+
+pub(crate) fn initializer_is_operator_expr(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::BinaryExpr(_) | LuaExpr::UnaryExpr(_) => true,
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| initializer_is_operator_expr(&inner)),
+        _ => false,
+    }
+}
+
+pub(crate) fn local_initializer_expr(
     db: &DbIndex,
     root: &LuaSyntaxNode,
     decl_id: LuaDeclId,
@@ -1035,91 +1452,47 @@ fn local_initializer_expr(
     Some((initializer.get_ret_idx(), LuaExpr::cast(node)?))
 }
 
-fn type_cache_is_uninformative(type_cache: Option<&LuaTypeCache>) -> bool {
-    match type_cache {
-        Some(LuaTypeCache::InferType(typ)) => type_is_uninformative(typ),
-        Some(LuaTypeCache::DocType(_)) => false,
-        None => true,
-    }
-}
-
-/// The two lattice bottoms. Both are reached by giving up on an expression, so
-/// neither carries evidence about the value — unlike `any`/`unknown`, which the
-/// checkers already treat as opaque.
-fn is_bottom(typ: &LuaType) -> bool {
-    matches!(typ, LuaType::Nil | LuaType::Never)
-}
-
-fn type_is_uninformative(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
-        LuaType::Union(union) => union.types().all(type_is_uninformative),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .all(|(typ, _)| type_is_uninformative(typ)),
-        _ => false,
-    }
+fn is_uninformative_or_template_leak(typ: &LuaType) -> bool {
+    !crate::db_index::is_informative_type(typ) || crate::db_index::leaks_unsubstituted_tpl(typ)
 }
 
 fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
-    let workspace_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
-    let all_calls = db
-        .get_accessor_func_call_index()
-        .iter()
-        .filter(|(file_id, _)| workspace_file_ids.contains(file_id))
-        .map(|(file_id, calls)| (*file_id, calls.clone()))
-        .collect::<Vec<_>>();
-
-    for (file_id, file_calls) in all_calls {
-        for call in file_calls {
-            if call.accessor_name.is_empty() {
-                continue;
-            }
-
-            let setter_member_id = LuaMemberId::new(call.syntax_id, file_id);
-
-            let owner = LuaMemberOwner::Type(call.owner_type_id.clone());
-
-            let getter_name = format!("Get{}", call.accessor_name);
-            let getter_func =
-                LuaFunctionType::new(AsyncState::None, true, false, vec![], LuaType::Any);
-            let getter_syntax_id = call.name_arg_syntax_id.unwrap_or(call.syntax_id);
-            let getter_member_id = LuaMemberId::new(getter_syntax_id, file_id);
-            let getter_member = LuaMember::new(
-                getter_member_id,
-                LuaMemberKey::Name(getter_name.as_str().into()),
-                LuaMemberFeature::FileMethodDecl,
-                None,
+    for &file_id in file_ids {
+        let file_calls = db.get_accessor_func_call_index().calls_in(file_id).to_vec();
+        for member in file_calls.into_iter().flat_map(|call| call.members) {
+            let member_id = LuaMemberId::new_in_slot(member.syntax_id, file_id, member.slot);
+            let func = match member.signature {
+                crate::AccessorSignature::Setter => LuaFunctionType::new(
+                    AsyncState::None,
+                    true,
+                    false,
+                    vec![("value".to_string(), Some(LuaType::Any))],
+                    LuaType::Nil,
+                ),
+                crate::AccessorSignature::Getter => {
+                    LuaFunctionType::new(AsyncState::None, true, false, vec![], LuaType::Any)
+                }
+                crate::AccessorSignature::Any => LuaFunctionType::new(
+                    AsyncState::None,
+                    true,
+                    false,
+                    vec![("...".to_string(), Some(LuaType::Any))],
+                    LuaType::Any,
+                ),
+            };
+            db.get_member_index_mut().add_member(
+                member.owner,
+                LuaMember::new(
+                    member_id,
+                    LuaMemberKey::Name(member.name),
+                    LuaMemberFeature::FileMethodDecl,
+                    None,
+                ),
             );
-            db.get_member_index_mut()
-                .add_member(owner.clone(), getter_member);
             write_type_cache(
                 db,
-                getter_member_id.into(),
-                LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(getter_func))),
-                TypeCacheWriteMode::InsertOnly,
-            );
-
-            let setter_name = format!("Set{}", call.accessor_name);
-            let setter_func = LuaFunctionType::new(
-                AsyncState::None,
-                true,
-                false,
-                vec![("value".to_string(), Some(LuaType::Any))],
-                LuaType::Nil,
-            );
-            let setter_member = LuaMember::new(
-                setter_member_id,
-                LuaMemberKey::Name(setter_name.as_str().into()),
-                LuaMemberFeature::FileMethodDecl,
-                None,
-            );
-            db.get_member_index_mut().add_member(owner, setter_member);
-            write_type_cache(
-                db,
-                setter_member_id.into(),
-                LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(setter_func))),
+                member_id.into(),
+                LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(func))),
                 TypeCacheWriteMode::InsertOnly,
             );
         }
@@ -1135,105 +1508,9 @@ fn run_analysis<T: AnalysisPipeline>(db: &mut DbIndex, context: &mut AnalyzeCont
         .rsplit("::")
         .next()
         .unwrap_or_default();
-    if context.tree_list.len() > 1 {
-        crate::progress::enter_phase(
-            crate::progress::phase_label(name),
-            context.tree_list.len(),
-            "files",
-        );
-    }
-    // Timed through the phase accumulator rather than a `Profile`: several
-    // pipelines already carry their own `Profile`, and an unconditional one
-    // here would add a log line per pipeline per batch on a live server.
+    // Timed through the phase accumulator, which the re-analysis reports
+    // whole: a report per file would split it.
     crate::profile::phase(name, || T::analyze(db, context));
-    crate::profile::phase_report(name);
-}
-
-fn module_analyze(
-    db: &mut DbIndex,
-    need_analyzed_files: Vec<InFiled<LuaChunk>>,
-) -> Vec<(WorkspaceId, AnalyzeContext)> {
-    if need_analyzed_files.len() == 1 {
-        let in_filed_tree = need_analyzed_files[0].clone();
-        let file_id = in_filed_tree.file_id;
-        if let Some(path) = db.get_vfs().get_file_path(&file_id).cloned() {
-            let path_str = match path.to_str() {
-                Some(path) => path,
-                None => {
-                    log::warn!("file_id {:?} path not found", file_id);
-                    return vec![];
-                }
-            };
-
-            let workspace_id = db
-                .get_module_index_mut()
-                .add_module_by_path(file_id, path_str);
-            let workspace_id = workspace_id.unwrap_or(WorkspaceId::MAIN);
-            let mut context = AnalyzeContext::new();
-            context.add_tree_chunk(in_filed_tree);
-            return vec![(workspace_id, context)];
-        } else if db.get_vfs().is_remote_file(&file_id) {
-            let mut context = AnalyzeContext::new();
-            context.add_tree_chunk(in_filed_tree);
-            return vec![(WorkspaceId::REMOTE, context)];
-        };
-
-        return vec![];
-    }
-
-    let mut file_tree_map: HashMap<WorkspaceId, Vec<InFiled<LuaChunk>>> = HashMap::new();
-    for in_filed_tree in need_analyzed_files {
-        let file_id = in_filed_tree.file_id;
-        if let Some(path) = db.get_vfs().get_file_path(&file_id).cloned() {
-            let path_str = match path.to_str() {
-                Some(path) => path,
-                None => {
-                    log::warn!("file_id {:?} path not found", file_id);
-                    continue;
-                }
-            };
-
-            let workspace_id = db
-                .get_module_index_mut()
-                .add_module_by_path(file_id, path_str);
-            let workspace_id = workspace_id.unwrap_or(WorkspaceId::MAIN);
-            file_tree_map
-                .entry(workspace_id)
-                .or_default()
-                .push(in_filed_tree);
-        } else if db.get_vfs().is_remote_file(&file_id) {
-            file_tree_map
-                .entry(WorkspaceId::REMOTE)
-                .or_default()
-                .push(in_filed_tree);
-        }
-    }
-
-    let mut contexts = Vec::new();
-    if let Some(std_lib) = file_tree_map.remove(&WorkspaceId::STD) {
-        let mut context = AnalyzeContext::new();
-        context.tree_list = std_lib;
-        contexts.push((WorkspaceId::STD, context));
-    }
-
-    let mut main_vec = Vec::new();
-    for (workspace_id, tree_list) in file_tree_map {
-        let mut context = AnalyzeContext::new();
-        context.tree_list = tree_list;
-        if db.get_module_index().is_library_workspace_id(workspace_id)
-            || db.get_module_index().is_remote_workspace_id(workspace_id)
-        {
-            contexts.push((workspace_id, context));
-        } else {
-            main_vec.push((workspace_id, context));
-        }
-    }
-
-    contexts.sort_by_key(|a| a.0);
-    main_vec.sort_by_key(|a| a.0);
-
-    contexts.extend(main_vec);
-    contexts
 }
 
 #[derive(Debug)]
@@ -1241,34 +1518,11 @@ pub struct AnalyzeContext {
     tree_list: Vec<InFiled<LuaChunk>>,
     metas: HashSet<FileId>,
     scripted_scope_files: Option<Arc<HashSet<FileId>>>,
-    scripted_scope_infos: Option<Arc<HashMap<FileId, GmodScopedClassInfo>>>,
-    /// Annotated global call-role map built by the gmod pre-pass, keyed by the
-    /// helper-registry revision it was derived from. Building it is a full
-    /// signature-index scan, so the late network pass reuses it whenever the
-    /// index has not grown since.
-    #[allow(clippy::type_complexity)]
-    gmod_global_call_roles: Option<(u64, Arc<gmod::AnnotatedGmodGlobalCallRoleMap>)>,
-    unresolves: Vec<(UnResolve, InferFailReason)>,
-    inferred_return_candidates: Vec<UnResolveReturn>,
-    pending_call_site_return_consumers: Vec<UnResolve>,
-    pending_call_site_definition_refreshes: Vec<(LuaDefinitionId, LuaTypeOwner)>,
-    pending_unresolve_decl_ids: HashSet<LuaDeclId>,
-    uninformative_local_decl_candidates: HashSet<LuaDeclId>,
-    member_initializer_reinfer_candidates: HashSet<LuaMemberId>,
+    unresolves: Vec<UnResolve>,
     infer_manager: InferCacheManager,
-    inferred_guard_dependencies: HashMap<FileId, HashSet<LuaInferredGuardOwner>>,
     inferred_guard_candidates: Vec<InFiled<LuaSyntaxId>>,
     early_callable_signatures: Vec<(crate::LuaTypeOwner, LuaSignatureId)>,
     early_member_owner_candidates: Vec<(LuaMemberId, LuaDeclId)>,
-    /// Index-expression member attaches that `set_index_expr_owner` dropped
-    /// because the prefix carried no owner information yet. See
-    /// [`attach_settled_index_expr_members`].
-    settled_member_attach_candidates: Vec<InFiled<LuaSyntaxId>>,
-    /// Member assignments whose widening ran against an incomplete sibling set,
-    /// with the type each one actually assigned. See
-    /// [`rewiden_settled_member_assignments`].
-    settled_member_widening_candidates: HashMap<LuaMemberId, (LuaType, bool)>,
-    call_site_return_invalidation_changed: bool,
     pub workspace_id: Option<WorkspaceId>,
 }
 
@@ -1276,27 +1530,38 @@ impl AnalyzeContext {
     pub fn new() -> Self {
         Self {
             tree_list: Vec::new(),
-            metas: HashSet::new(),
+            metas: HashSet::default(),
             scripted_scope_files: None,
-            scripted_scope_infos: None,
-            gmod_global_call_roles: None,
             unresolves: Vec::new(),
-            inferred_return_candidates: Vec::new(),
-            pending_call_site_return_consumers: Vec::new(),
-            pending_call_site_definition_refreshes: Vec::new(),
-            pending_unresolve_decl_ids: HashSet::new(),
-            uninformative_local_decl_candidates: HashSet::new(),
-            member_initializer_reinfer_candidates: HashSet::new(),
             infer_manager: InferCacheManager::new(),
-            inferred_guard_dependencies: HashMap::new(),
             inferred_guard_candidates: Vec::new(),
             early_callable_signatures: Vec::new(),
             early_member_owner_candidates: Vec::new(),
-            settled_member_attach_candidates: Vec::new(),
-            settled_member_widening_candidates: HashMap::new(),
-            call_site_return_invalidation_changed: false,
             workspace_id: None,
         }
+    }
+
+    /// A context for evaluating derivations of `file_ids` against the settled
+    /// index: every fact source visible, unresolved reads floored.
+    pub(crate) fn for_files(db: &DbIndex, file_ids: Vec<FileId>, scopes: &ScriptedScopes) -> Self {
+        let mut context = Self::new();
+        context.scripted_scope_files = Some(scopes.files.clone());
+        for file_id in file_ids {
+            let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+                continue;
+            };
+            if db.get_module_index().is_meta_file(&file_id) {
+                context.add_meta(file_id);
+            }
+            if context.workspace_id.is_none() {
+                context.workspace_id = db.get_module_index().get_workspace_id(file_id);
+            }
+            context.add_tree_chunk(InFiled::new(file_id, tree.get_chunk_node()));
+        }
+        context.infer_manager.set_force();
+        context.infer_manager.set_dynamic_fields_visible();
+        context.infer_manager.set_call_site_params_visible();
+        context
     }
 
     pub fn add_meta(&mut self, file_id: FileId) {
@@ -1307,32 +1572,8 @@ impl AnalyzeContext {
         self.tree_list.push(tree);
     }
 
-    pub fn add_unresolve(&mut self, un_resolve: UnResolve, reason: InferFailReason) {
-        if let UnResolve::Decl(decl) = &un_resolve {
-            self.pending_unresolve_decl_ids.insert(decl.decl_id);
-        }
-        self.unresolves.push((un_resolve, reason));
-    }
-
-    pub fn add_inferred_return_candidate(&mut self, return_: UnResolveReturn) {
-        self.inferred_return_candidates.push(return_);
-    }
-
-    pub(crate) fn analyzed_file_ids(&self) -> HashSet<FileId> {
-        self.tree_list.iter().map(|tree| tree.file_id).collect()
-    }
-
-    /// Remembers an assignment whose widening skipped a sibling that had no type
-    /// yet. The assigned type is kept as written, not as widened, so the settled
-    /// pass can re-derive the merge instead of growing the partial answer.
-    pub(crate) fn record_settled_member_widening_candidate(
-        &mut self,
-        member_id: LuaMemberId,
-        assigned_type: LuaType,
-        preserve_table_literals: bool,
-    ) {
-        self.settled_member_widening_candidates
-            .insert(member_id, (assigned_type, preserve_table_literals));
+    pub fn add_unresolve(&mut self, un_resolve: UnResolve) {
+        self.unresolves.push(un_resolve);
     }
 
     pub fn add_inferred_guard_candidate(&mut self, candidate: InFiled<LuaSyntaxId>) {
@@ -1353,231 +1594,6 @@ impl AnalyzeContext {
             .push((member_id, decl_id));
     }
 
-    pub(crate) fn add_settled_member_attach_candidate(&mut self, candidate: InFiled<LuaSyntaxId>) {
-        self.settled_member_attach_candidates.push(candidate);
-    }
-
-    pub(crate) fn requeue_call_site_inferred_returns(
-        &mut self,
-        db: &mut DbIndex,
-        signature_ids: &HashSet<LuaSignatureId>,
-        consumers: Vec<(
-            LuaSignatureId,
-            UnResolve,
-            Option<(LuaDefinitionId, LuaTypeOwner)>,
-        )>,
-    ) -> (usize, usize) {
-        let mut returns = self
-            .inferred_return_candidates
-            .iter()
-            .filter(|return_| signature_ids.contains(&return_.signature_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        let current_signatures = returns
-            .iter()
-            .map(|return_| return_.signature_id)
-            .collect::<HashSet<_>>();
-        returns.extend(
-            signature_ids
-                .iter()
-                .filter(|signature_id| !current_signatures.contains(signature_id))
-                .filter_map(|signature_id| inferred_return_candidate(db, *signature_id)),
-        );
-        returns.retain(|return_| inferred_return_uses_receiver_metatable(db, return_));
-
-        let mut requeued = Vec::new();
-        for return_ in returns {
-            if let Some(signature) = db.get_signature_index_mut().get_mut(&return_.signature_id)
-                && signature.resolve_return == crate::SignatureReturnStatus::InferResolve
-            {
-                signature.resolve_return = crate::SignatureReturnStatus::UnResolve;
-                requeued.push(return_);
-            }
-        }
-
-        let count = requeued.len();
-        let requeued_signatures = requeued
-            .iter()
-            .map(|return_| return_.signature_id)
-            .collect::<HashSet<_>>();
-        self.unresolves.extend(
-            requeued
-                .into_iter()
-                .map(|return_| (return_.into(), InferFailReason::None)),
-        );
-
-        let mut requeued_consumers = 0;
-        for (signature_id, consumer, definition_refresh) in consumers {
-            if requeued_signatures.contains(&signature_id) {
-                self.pending_call_site_return_consumers.push(consumer);
-                if let Some(definition_refresh) = definition_refresh {
-                    self.pending_call_site_definition_refreshes
-                        .push(definition_refresh);
-                }
-                requeued_consumers += 1;
-            }
-        }
-
-        self.call_site_return_invalidation_changed |= count != 0 || requeued_consumers != 0;
-        (count, requeued_consumers)
-    }
-
-    pub(crate) fn queue_call_site_return_consumers(
-        &mut self,
-        consumers: Vec<(UnResolve, Option<(LuaDefinitionId, LuaTypeOwner)>)>,
-    ) -> usize {
-        let count = consumers.len();
-        for (consumer, definition_refresh) in consumers {
-            self.pending_call_site_return_consumers.push(consumer);
-            if let Some(definition_refresh) = definition_refresh {
-                self.pending_call_site_definition_refreshes
-                    .push(definition_refresh);
-            }
-        }
-        count
-    }
-
-    fn resolve_call_site_return_consumers(&mut self, db: &mut DbIndex) -> usize {
-        let consumers = std::mem::take(&mut self.pending_call_site_return_consumers);
-        let count = consumers.len();
-        if count == 0 {
-            self.pending_call_site_definition_refreshes.clear();
-            return 0;
-        }
-
-        let mut definition_refreshes = HashMap::<LuaTypeOwner, Vec<LuaDefinitionId>>::new();
-        for (definition, owner) in std::mem::take(&mut self.pending_call_site_definition_refreshes)
-        {
-            definition_refreshes
-                .entry(owner)
-                .or_default()
-                .push(definition);
-        }
-        self.infer_manager.clear();
-        let mut fact_updates = Vec::with_capacity(
-            consumers.len() + definition_refreshes.values().map(Vec::len).sum::<usize>(),
-        );
-
-        for consumer in consumers {
-            let (file_id, owner, expr, ret_idx) = match consumer {
-                UnResolve::Decl(decl) => (
-                    decl.file_id,
-                    LuaTypeOwner::Decl(decl.decl_id),
-                    decl.expr,
-                    decl.ret_idx,
-                ),
-                UnResolve::Member(member) => {
-                    let Some(expr) = member.expr else {
-                        continue;
-                    };
-                    (
-                        member.file_id,
-                        LuaTypeOwner::Member(member.member_id),
-                        expr,
-                        member.ret_idx,
-                    )
-                }
-                _ => continue,
-            };
-            let cache = self.infer_manager.get_infer_cache(file_id);
-            let fact = select_result_fact(infer_expr_fact_with_cache(db, cache, expr), ret_idx);
-            fact_updates.push((LuaInferenceNodeId::TypeOwner(owner.clone()), fact.clone()));
-            if let Some(definitions) = definition_refreshes.get(&owner) {
-                for definition in definitions {
-                    fact_updates.push((LuaInferenceNodeId::Definition(*definition), fact.clone()));
-                }
-            }
-        }
-        db.publish_inference_facts(fact_updates);
-        count
-    }
-
-    fn invalidate_inferred_returns_for_sources(
-        &self,
-        db: &mut DbIndex,
-        sources: &[InFiled<glua_parser::LuaSyntaxId>],
-    ) {
-        for return_ in self.inferred_return_candidates.iter().filter(|return_| {
-            sources.iter().any(|source| {
-                source.file_id == return_.file_id
-                    && (return_.body.as_ref().is_some_and(|body| {
-                        body.get_range().contains_range(source.value.get_range())
-                    }) || return_
-                        .return_points
-                        .iter()
-                        .any(|point| return_point_contains_range(point, source.value.get_range())))
-            })
-        }) {
-            if let Some(signature) = db.get_signature_index_mut().get_mut(&return_.signature_id)
-                && signature.resolve_return == crate::SignatureReturnStatus::InferResolve
-            {
-                signature.resolve_return = crate::SignatureReturnStatus::UnResolve;
-            }
-        }
-    }
-
-    fn requeue_inferred_returns_for_sources(
-        &mut self,
-        db: &mut DbIndex,
-        sources: &[InFiled<glua_parser::LuaSyntaxId>],
-    ) -> usize {
-        if sources.is_empty() {
-            return 0;
-        }
-
-        let returns = self
-            .inferred_return_candidates
-            .iter()
-            .filter(|return_| {
-                sources.iter().any(|source| {
-                    source.file_id == return_.file_id
-                        && (return_.body.as_ref().is_some_and(|body| {
-                            body.get_range().contains_range(source.value.get_range())
-                        }) || return_.return_points.iter().any(|point| {
-                            return_point_contains_range(point, source.value.get_range())
-                        }))
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let mut requeued = 0;
-        for return_ in returns {
-            if let Some(signature) = db.get_signature_index_mut().get_mut(&return_.signature_id)
-                && signature.resolve_return == crate::SignatureReturnStatus::InferResolve
-            {
-                signature.resolve_return = crate::SignatureReturnStatus::UnResolve;
-                self.unresolves
-                    .push((return_.into(), InferFailReason::None));
-                requeued += 1;
-            }
-        }
-        requeued
-    }
-
-    pub fn has_pending_decl_unresolve(&self, decl_id: LuaDeclId) -> bool {
-        self.pending_unresolve_decl_ids.contains(&decl_id)
-    }
-
-    pub fn request_uninformative_local_decl_reinfer(&mut self, decl_id: LuaDeclId) {
-        self.uninformative_local_decl_candidates.insert(decl_id);
-    }
-
-    pub fn request_member_initializer_reinfer(&mut self, member_id: LuaMemberId) {
-        self.member_initializer_reinfer_candidates.insert(member_id);
-    }
-
-    fn add_inferred_guard_dependencies(
-        &mut self,
-        file_id: FileId,
-        owners: HashSet<LuaInferredGuardOwner>,
-    ) {
-        self.inferred_guard_dependencies
-            .entry(file_id)
-            .or_default()
-            .extend(owners);
-    }
-
     pub fn get_or_compute_scripted_scope_files(&mut self, db: &DbIndex) -> Arc<HashSet<FileId>> {
         self.ensure_scripted_scope_cache(db);
 
@@ -1587,137 +1603,23 @@ impl AnalyzeContext {
             .clone()
     }
 
-    pub fn get_or_compute_scripted_scope_infos(
-        &mut self,
-        db: &DbIndex,
-    ) -> Arc<HashMap<FileId, GmodScopedClassInfo>> {
-        self.ensure_scripted_scope_cache(db);
-
-        self.scripted_scope_infos
-            .as_ref()
-            .expect("set above")
-            .clone()
-    }
-
     fn ensure_scripted_scope_cache(&mut self, db: &DbIndex) {
-        if self.scripted_scope_files.is_some() && self.scripted_scope_infos.is_some() {
+        if self.scripted_scope_files.is_some() {
             return;
         }
-
-        let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
-        if scopes.resolved_definitions_slice().is_empty() {
-            let file_ids = self
-                .tree_list
-                .iter()
-                .map(|in_filed_tree| in_filed_tree.file_id)
-                .collect::<HashSet<_>>();
-            self.scripted_scope_files = Some(Arc::new(file_ids));
-            self.scripted_scope_infos = Some(Arc::new(HashMap::new()));
-            return;
-        }
-
-        let file_paths = self
+        let files = self
             .tree_list
             .iter()
-            .filter_map(|in_filed_tree| {
-                db.get_vfs()
-                    .get_file_path(&in_filed_tree.file_id)
-                    .map(|path| (in_filed_tree.file_id, path.as_path()))
-            })
-            .collect::<Vec<_>>();
-        let (scripted_scope_files, scoped_matches) =
-            scopes.scan_scripted_class_scope_files(file_paths);
-        let scripted_scope_infos = scoped_matches
-            .into_iter()
-            .map(|(file_id, scope_match)| {
+            .map(|in_filed_tree| {
+                let file_id = in_filed_tree.file_id;
                 (
                     file_id,
-                    GmodScopedClassInfo {
-                        class_name: scope_match.class_name,
-                        global_name: scope_match.definition.class_global,
-                        is_global_singleton: scope_match.definition.is_global_singleton,
-                        aliases: scope_match.definition.aliases,
-                        super_types: scope_match.definition.super_types,
-                        class_name_prefix: scope_match.definition.class_name_prefix,
-                    },
+                    db.get_vfs().get_file_path(&file_id).map(PathBuf::as_path),
                 )
             })
-            .collect::<HashMap<_, _>>();
-
-        self.scripted_scope_files = Some(Arc::new(scripted_scope_files));
-        self.scripted_scope_infos = Some(Arc::new(scripted_scope_infos));
-    }
-}
-
-fn inferred_return_candidate(
-    db: &DbIndex,
-    signature_id: LuaSignatureId,
-) -> Option<UnResolveReturn> {
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&signature_id.get_file_id())?
-        .get_red_root();
-    let closure = root
-        .token_at_offset(signature_id.get_position())
-        .right_biased()?
-        .parent_ancestors()
-        .find_map(LuaClosureExpr::cast)
-        .filter(|closure| {
-            LuaSignatureId::from_closure(signature_id.get_file_id(), closure) == signature_id
-        })?;
-    let body = closure.get_block()?;
-    let return_points = lua::func_body::analyze_func_body_returns(body.clone());
-    Some(UnResolveReturn {
-        file_id: signature_id.get_file_id(),
-        signature_id,
-        body: Some(body),
-        return_points,
-    })
-}
-
-fn inferred_return_uses_receiver_metatable(db: &DbIndex, return_: &UnResolveReturn) -> bool {
-    return_.return_points.iter().any(|point| {
-        let exprs = match point {
-            LuaReturnPoint::Expr(expr) => std::slice::from_ref(expr),
-            LuaReturnPoint::MuliExpr(exprs) => exprs.as_slice(),
-            LuaReturnPoint::Nil | LuaReturnPoint::Error => return false,
-        };
-        exprs.iter().any(|expr| {
-            expr.descendants::<LuaCallExpr>().any(|call| {
-                if !call.is_setmetatable() {
-                    return false;
-                }
-                let Some(metatable) = call.get_args_list().and_then(|args| args.get_args().nth(1))
-                else {
-                    return false;
-                };
-                metatable.descendants::<LuaNameExpr>().any(|name| {
-                    db.get_reference_index()
-                        .get_var_reference_decl(&return_.file_id, name.get_range())
-                        .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
-                        .is_some_and(|decl| {
-                            matches!(
-                                decl.extra,
-                                crate::LuaDeclExtra::Param {
-                                    idx: 0,
-                                    signature_id,
-                                    ..
-                                } if signature_id == return_.signature_id
-                            )
-                        })
-                })
-            })
-        })
-    })
-}
-
-fn return_point_contains_range(point: &LuaReturnPoint, range: rowan::TextRange) -> bool {
-    match point {
-        LuaReturnPoint::Expr(expr) => expr.get_range().contains_range(range),
-        LuaReturnPoint::MuliExpr(exprs) => exprs
-            .iter()
-            .any(|expr| expr.get_range().contains_range(range)),
-        LuaReturnPoint::Nil | LuaReturnPoint::Error => false,
+            .collect::<Vec<_>>();
+        let (files, _) = scan_scopes(db, &files, &root_gamemodes(db));
+        self.scripted_scope_files = Some(Arc::new(files));
     }
 }
 

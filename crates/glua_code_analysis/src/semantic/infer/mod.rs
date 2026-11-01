@@ -13,39 +13,60 @@ use std::{ops::Deref, sync::Arc};
 
 use glua_parser::{
     LuaAst, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaLiteralExpr, LuaLiteralToken,
-    LuaTableExpr, LuaVarExpr, NumberResult,
+    LuaNameExpr, LuaSyntaxKind, LuaTableExpr, LuaVarExpr, NumberResult,
 };
+#[cfg(test)]
+pub(crate) use infer_binary::CONSTANT_EXPR_CLASSIFICATIONS;
 use infer_binary::infer_binary_expr;
 pub(crate) use infer_call::get_prefix_expr_signature_id;
 use infer_call::infer_call_expr;
 pub use infer_call::infer_call_expr_func;
 pub(crate) use infer_call::signature_call_selects_declared_overload;
+pub(crate) use infer_call::table_backing_range_from_expr;
+pub(crate) use infer_call::{
+    infer_instance_type_doc_function, infer_table_type_doc_function,
+    normalize_call_operator_doc_function,
+};
 pub use infer_doc_type::{DocTypeInferContext, infer_doc_type};
 pub use infer_fail_reason::InferFailReason;
 pub(crate) use infer_index::check_iter_var_range;
+pub(crate) use infer_index::global_expr_access_path;
 pub use infer_index::infer_index_expr;
 pub(crate) use infer_index::infer_member_by_member_key;
+pub(crate) use infer_index::pairs_iter_value_registry_path;
 pub(crate) use infer_index::resolve_decl_backed_global_path_member_type;
+pub(crate) use infer_index::{
+    AccessPaths, keep_access_paths, restore_access_path_snapshot, stop_keeping_access_paths,
+    take_access_path_snapshot, with_access_paths,
+};
 pub(crate) use infer_name::find_self_ref_id;
 pub(crate) use infer_name::infer_authoritative_method_self_type;
 pub(crate) use infer_name::infer_enclosing_self_type;
 use infer_name::infer_name_expr;
 pub(crate) use infer_name::is_authoritative_self_receiver_type;
+pub(crate) use infer_name::is_concrete_self_receiver_type;
+pub(crate) use infer_name::resolve_global_singleton_scripted_type_decl_id;
 pub(crate) use infer_name::try_local_decl_initializer_fallback_type;
 pub(crate) use infer_name::type_decl_is_vgui_panel;
-pub(crate) use infer_name::{ParamInferenceSource, infer_param_is_weak};
+pub(crate) use infer_name::{ParamInferenceSource, infer_param_is_weak, infer_param_source};
+pub(crate) use infer_name::{declaring_for_range, try_infer_enclosing_for_range_iter_type};
 pub use infer_name::{infer_param, infer_param_with_cache};
 use infer_table::infer_table_expr;
+pub(crate) use infer_table::local_call_reference_expectations;
 pub use infer_table::{infer_table_field_value_should_be, infer_table_should_be};
 use infer_unary::infer_unary_expr;
 pub use narrow::{SelfRefId, VarRefId, VarRefRootId};
-pub(crate) use narrow::{contains_gmod_null_type, get_var_expr_var_ref_id, remove_false_or_nil};
+pub(crate) use narrow::{
+    condition_has_concrete_type_evidence, condition_nominal_type, contains_gmod_null_type,
+    get_var_expr_var_ref_id, getter_access_path, is_gmod_null_entity_candidate,
+    presence_guard_target, raw_get_access_path, remove_false_or_nil,
+};
 
 use rowan::TextRange;
 use smol_str::SmolStr;
 
 use crate::{
-    InFiled, InferGuard, LuaMemberKey, VariadicType,
+    InFiled, InferGuard, LuaMemberKey, VariadicType, analysis_stack_exhausted,
     db_index::{DbIndex, LuaOperator, LuaOperatorMetaMethod, LuaSignatureId, LuaType},
 };
 
@@ -54,51 +75,110 @@ use super::{CacheEntry, LuaInferCache, member::infer_raw_member_type_with_cache}
 pub type InferResult = Result<LuaType, InferFailReason>;
 pub use infer_call::InferCallFuncResult;
 
+/// Whether inference answers a read it cannot settle with a floor: under the
+/// force phase once the engine run has closed. Before that the read stays
+/// unanswered and is recorded, so its reader runs again when the fact lands
+/// or the run closes, and a floor never stands in for a fact still to come.
+pub(crate) fn floors_unsettled(db: &DbIndex, cache: &LuaInferCache) -> bool {
+    cache.phase_is_force()
+        && db.stage_rule_holds(crate::db_index::derivation::StageRule::FloorUnsettled)
+}
+
 pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> InferResult {
-    let syntax_id = expr.get_syntax_id();
-    let key = syntax_id;
-    if let Some(cache_entry) = cache.expr_cache.get(&key) {
+    let key = expr.get_syntax_id();
+    if let Some(mark) = cache.expr_in_progress.get(&key) {
+        crate::db_index::derivation::consult_cycle(*mark);
+        return Err(InferFailReason::RecursiveInfer);
+    }
+    let lookup = cache.lookup();
+    cache.watch_reuse();
+    if let Some(cache_entry) = cache.expr_cache.get(&key, lookup, &cache.keyed) {
         match cache_entry {
-            CacheEntry::Cache(ty) => return Ok(ty.clone()),
+            CacheEntry::Cache(ty) => {
+                let ty = ty.clone();
+                cache.check_reuse(key, &ty, |fresh| infer_expr(db, fresh, expr.clone()).ok());
+                return Ok(ty);
+            }
             CacheEntry::Error(reason) => {
                 // If a cached UnResolveDeclType error is stale (the decl now
                 // has a type), invalidate the entry and re-infer. This handles
                 // cases where generic type resolution makes progress within
                 // the same Lua pass.
-                if let InferFailReason::UnResolveDeclType(decl_id) = reason {
+                if let InferFailReason::UnResolveDeclType(decl_id) = &**reason {
+                    let decl_id = *decl_id;
                     if db
                         .get_type_index()
-                        .get_type_cache(&(*decl_id).into())
+                        .get_type_cache(&decl_id.into())
                         .is_some()
                     {
                         cache.expr_cache.remove(&key);
                     // Fall through to re-infer below
                     } else {
-                        return Err(reason.clone());
+                        return Err(InferFailReason::UnResolveDeclType(decl_id));
                     }
                 } else {
-                    return Err(reason.clone());
+                    return Err(InferFailReason::clone(reason));
                 }
             }
             CacheEntry::Ready => return Err(InferFailReason::RecursiveInfer),
         }
     }
 
+    crate::profile::work::computed(crate::profile::work::Work::Infer, || {
+        (cache.get_file_id(), key)
+    });
+    let frame = crate::db_index::derivation::open_frame();
+    let (result, stored) = infer_expr_miss(db, cache, expr, key);
+    let provenance = cache.close_frame(frame);
+    match stored {
+        Some(Some(entry)) => {
+            cache.expr_in_progress.remove(&key);
+            cache.expr_cache.insert(key, entry, provenance);
+        }
+        Some(None) => {
+            cache.expr_in_progress.remove(&key);
+            cache.expr_cache.remove(&key);
+        }
+        None => {}
+    }
+    result
+}
+
+/// Infers `expr` on a memo miss. Returns the result and what to store for
+/// it: an entry, `Some(None)` to drop the key, or `None` to leave it as is.
+#[allow(clippy::option_option)]
+fn infer_expr_miss(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+    key: glua_parser::LuaSyntaxId,
+) -> (InferResult, Option<Option<CacheEntry<LuaType>>>) {
     // for @as
     let file_id = cache.get_file_id();
-    let in_filed_syntax_id = InFiled::new(file_id, syntax_id);
+    let in_filed_syntax_id = InFiled::new(file_id, key);
     if let Some(bind_type_cache) = db
         .get_type_index()
         .get_type_cache(&in_filed_syntax_id.into())
     {
-        cache
-            .expr_cache
-            .insert(key, CacheEntry::Cache(bind_type_cache.as_type().clone()));
-        return Ok(bind_type_cache.as_type().clone());
+        let ty = bind_type_cache.as_type().clone();
+        return (Ok(ty.clone()), Some(Some(CacheEntry::Cache(ty))));
     }
 
-    cache.expr_cache.insert(key, CacheEntry::Ready);
+    // The reserve check sits below the cache fast paths: cache hits return
+    // without recursing, so they need no stack.
+    if analysis_stack_exhausted() {
+        crate::db_index::derivation::taint();
+        return (Err(InferFailReason::RecursiveInfer), None);
+    }
 
+    cache
+        .expr_in_progress
+        .insert(key, crate::db_index::derivation::scope_mark());
+
+    let index_syntax = match &expr {
+        LuaExpr::IndexExpr(index_expr) => Some(index_expr.syntax().clone()),
+        _ => None,
+    };
     let result_type = match expr {
         LuaExpr::CallExpr(call_expr) => infer_call_expr(db, cache, call_expr),
         LuaExpr::TableExpr(table_expr) => infer_table_expr(db, cache, table_expr),
@@ -106,11 +186,14 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
         LuaExpr::BinaryExpr(binary_expr) => infer_binary_expr(db, cache, binary_expr),
         LuaExpr::UnaryExpr(unary_expr) => infer_unary_expr(db, cache, unary_expr),
         LuaExpr::ClosureExpr(closure_expr) => infer_closure_expr(db, cache, closure_expr),
-        LuaExpr::ParenExpr(paren_expr) => infer_expr(
-            db,
-            cache,
-            paren_expr.get_expr().ok_or(InferFailReason::None)?,
-        ),
+        LuaExpr::ParenExpr(paren_expr) => match paren_expr.get_expr() {
+            Some(inner) => infer_expr(db, cache, inner),
+            // The key keeps its `Ready` marker.
+            None => {
+                crate::db_index::derivation::taint();
+                return (Err(InferFailReason::None), None);
+            }
+        },
         LuaExpr::NameExpr(name_expr) => infer_name_expr(db, cache, name_expr),
         LuaExpr::IndexExpr(index_expr) => infer_index_expr(db, cache, index_expr, true),
     };
@@ -119,38 +202,50 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
     // recomputation across diagnostic checkers. During analysis, unresolved errors are
     // removed so the unresolve phase can retry them.
     let is_diagnostics = cache.get_config().analysis_phase.is_diagnostics();
+    let floors = matches!(&result_type, Err(reason) if reason.is_need_resolve())
+        && floors_unsettled(db, cache);
 
-    match &result_type {
+    match result_type {
         Ok(result_type) => {
-            cache
-                .expr_cache
-                .insert(key, CacheEntry::Cache(result_type.clone()));
+            let stored = CacheEntry::Cache(result_type.clone());
+            (Ok(result_type), Some(Some(stored)))
         }
-        Err(InferFailReason::None) | Err(InferFailReason::RecursiveInfer) => {
-            cache
-                .expr_cache
-                .insert(key, CacheEntry::Cache(LuaType::Unknown));
-            return Ok(LuaType::Unknown);
-        }
+        Err(InferFailReason::None) | Err(InferFailReason::RecursiveInfer) => (
+            Ok(LuaType::Unknown),
+            Some(Some(CacheEntry::Cache(LuaType::Unknown))),
+        ),
         Err(InferFailReason::FieldNotFound) => {
-            if cache.get_config().analysis_phase.is_force() {
-                cache
-                    .expr_cache
-                    .insert(key, CacheEntry::Cache(LuaType::Nil));
-                return Ok(LuaType::Nil);
+            if floors {
+                // A missing member a test reads for presence may be installed at run time.
+                let floor = if index_syntax.is_some_and(|syntax| {
+                    crate::compilation::analyzer::is_presence_tested(&syntax, &mut |_| false)
+                }) {
+                    LuaType::Unknown
+                } else {
+                    LuaType::Nil
+                };
+                (Ok(floor.clone()), Some(Some(CacheEntry::Cache(floor))))
             } else if is_diagnostics {
-                cache
-                    .expr_cache
-                    .insert(key, CacheEntry::Error(InferFailReason::FieldNotFound));
+                (
+                    Err(InferFailReason::FieldNotFound),
+                    Some(Some(CacheEntry::error(InferFailReason::FieldNotFound))),
+                )
             } else {
-                cache.expr_cache.remove(&key);
+                (Err(InferFailReason::FieldNotFound), Some(None))
             }
+        }
+        Err(_) if floors => {
+            // A fact that has not landed reads as unknown: the read is
+            // recorded, so its reader is evaluated again once it lands.
+            (
+                Ok(LuaType::Unknown),
+                Some(Some(CacheEntry::Cache(LuaType::Unknown))),
+            )
         }
         Err(reason) => {
             if is_diagnostics {
-                cache
-                    .expr_cache
-                    .insert(key, CacheEntry::Error(reason.clone()));
+                let stored = CacheEntry::error(reason.clone());
+                (Err(reason), Some(Some(stored)))
             } else if matches!(reason, InferFailReason::UnResolveDeclType(_)) {
                 // Cache UnResolveDeclType as an error during analysis to prevent
                 // O(N×M) re-inference cascade. The decl's type depends on its
@@ -158,16 +253,13 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
                 // same Lua pass won't help. The unresolve phase calls clear()
                 // and re-infers from scratch. Other errors are still removed
                 // so same-pass re-inference can pick up newly-added members.
-                cache
-                    .expr_cache
-                    .insert(key, CacheEntry::Error(reason.clone()));
+                let stored = CacheEntry::error(reason.clone());
+                (Err(reason), Some(Some(stored)))
             } else {
-                cache.expr_cache.remove(&key);
+                (Err(reason), Some(None))
             }
         }
     }
-
-    result_type
 }
 
 fn infer_literal_expr(
@@ -270,20 +362,21 @@ pub fn infer_call_arg_expr_list_types(
     cache: &mut LuaInferCache,
     call_expr: LuaCallExpr,
     var_count: Option<usize>,
-) -> Vec<(LuaType, TextRange)> {
+) -> Arc<[(LuaType, TextRange)]> {
     let key = (call_expr.get_syntax_id(), var_count);
-    if let Some(types) = cache.call_arg_types_cache.get(&key) {
-        return types.as_ref().clone();
+    if let Some(types) = cache.tracked_get(|cache| &mut cache.call_arg_types_cache, &key) {
+        return types;
     }
     if let Some(var_count) = var_count {
         let full_key = (call_expr.get_syntax_id(), None);
-        if let Some(types) = cache.call_arg_types_cache.get(&full_key)
+        if let Some(types) = cache.tracked_get(|cache| &mut cache.call_arg_types_cache, &full_key)
             && types.len() >= var_count
         {
-            return types[..var_count].to_vec();
+            return Arc::from(&types[..var_count]);
         }
     }
 
+    let frame = crate::db_index::derivation::open_frame();
     let types = call_expr
         .get_args_list()
         .and_then(|args| {
@@ -294,10 +387,14 @@ pub fn infer_call_arg_expr_list_types(
             .ok()
         })
         .unwrap_or_default();
-    cache
-        .call_arg_types_cache
-        .insert(key, Arc::new(types.clone()));
-    types
+    let shared: Arc<[(LuaType, TextRange)]> = Arc::from(types);
+    cache.tracked_insert(
+        |cache| &mut cache.call_arg_types_cache,
+        key,
+        shared.clone(),
+        frame,
+    );
+    shared
 }
 
 pub fn infer_expr_list_types<F>(
@@ -319,6 +416,11 @@ where
         }
 
         let expr_type = infer(db, cache, expr.clone())?;
+        // Lua truncates every expression but the last to its first value.
+        if idx + 1 != exprs.len() {
+            value_types.push((first_value(db, expr_type), expr.get_range()));
+            continue;
+        }
         match expr_type {
             LuaType::Variadic(variadic) => {
                 if let Some(var_count) = var_count {
@@ -333,8 +435,12 @@ where
                     }
                 } else {
                     match variadic.deref() {
-                        VariadicType::Base(base) => {
-                            value_types.push((base.clone(), expr.get_range()));
+                        // The last expression in the list forwards every value
+                        // it produces: `f(g())`, `f(...)` and `return f()` all
+                        // pass the whole pack on.
+                        VariadicType::Base(_) => {
+                            value_types
+                                .push((LuaType::Variadic(variadic.clone()), expr.get_range()));
                         }
                         VariadicType::Multi(vecs) => {
                             for typ in vecs {
@@ -342,6 +448,51 @@ where
                             }
                         }
                     }
+                }
+
+                break;
+            }
+            // A union that carries a multi-return still spreads, slot by
+            // slot. An `unknown` arm - what an unannotated recursive function
+            // leaves behind, since its own return cannot inform itself - says
+            // nothing about arity or about any slot, so the informative arms
+            // decide both.
+            LuaType::Union(ref union)
+                if union.types().any(|typ| matches!(typ, LuaType::Variadic(_))) =>
+            {
+                let arms = union
+                    .types()
+                    .filter_map(|typ| match typ {
+                        LuaType::Variadic(variadic) => Some(variadic.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                // A `Base` arm answers every slot, so its arity bounds nothing.
+                // That is only safe while the caller has asked for a fixed
+                // number of values; with no arity to fill it contributes one
+                // value, exactly as a bare `Variadic` does.
+                let slots = arms
+                    .iter()
+                    .map(|variadic| match variadic.deref() {
+                        VariadicType::Multi(types) => types.len(),
+                        VariadicType::Base(_) if var_count.is_some() => usize::MAX,
+                        VariadicType::Base(_) => 1,
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let wanted = match var_count {
+                    Some(var_count) => var_count.saturating_sub(value_types.len()),
+                    None => slots,
+                };
+                for slot in 0..wanted.min(slots) {
+                    let slot_type = arms
+                        .iter()
+                        .filter_map(|variadic| variadic.get_type(slot).cloned())
+                        .reduce(|left, right| crate::TypeOps::Union.apply(db, &left, &right));
+                    let Some(slot_type) = slot_type else {
+                        break;
+                    };
+                    value_types.push((slot_type, expr.get_range()));
                 }
 
                 break;
@@ -363,7 +514,75 @@ where
     Ok(value_types)
 }
 
-/// 推断值已经绑定的类型(不是推断值的类型). 例如从右值推断左值类型, 从调用参数推断函数参数类型参数类型
+/// The value an expression of type `typ` gives where Lua keeps only its first:
+/// the first slot of a multi-return, `nil` when it returns nothing. As where
+/// a union spreads, only its multi-return arms decide the slot.
+fn first_value(db: &DbIndex, typ: LuaType) -> LuaType {
+    let first_slot =
+        |variadic: &VariadicType| variadic.get_type(0).cloned().unwrap_or(LuaType::Nil);
+    match typ {
+        LuaType::Variadic(variadic) => first_slot(&variadic),
+        LuaType::Union(union) if union.types().any(|typ| matches!(typ, LuaType::Variadic(_))) => {
+            union
+                .types()
+                .filter_map(|typ| match typ {
+                    LuaType::Variadic(variadic) => Some(first_slot(variadic)),
+                    _ => None,
+                })
+                .reduce(|left, right| crate::TypeOps::Union.apply(db, &left, &right))
+                .unwrap_or(LuaType::Nil)
+        }
+        typ => typ,
+    }
+}
+
+/// Infers the type a value is already bound to (not the type of the value itself). For example, inferring the left value type from the right value, or the function parameter type from call arguments
+/// Whether the local `target` names was declared as a copy of the variable
+/// `expr` reads (`local value = argument` ... `value = argument`): what it holds
+/// then came from that variable, so storing the variable back into it is the
+/// variable deriving itself, not evidence of its type.
+fn declared_as_copy_of(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    target: &LuaNameExpr,
+    expr: &LuaExpr,
+) -> bool {
+    let LuaExpr::NameExpr(source) = expr else {
+        return false;
+    };
+    let references = db.get_reference_index();
+    let Some(source_decl) = references.get_var_reference_decl(&file_id, source.get_range()) else {
+        return false;
+    };
+    references
+        .get_var_reference_decl(&file_id, target.get_range())
+        .and_then(|target_decl| db.get_decl_index().get_decl(&target_decl))
+        .and_then(|decl| decl.get_value_syntax_id())
+        .filter(|value| value.get_kind() == LuaSyntaxKind::NameExpr)
+        .and_then(|value| references.get_var_reference_decl(&file_id, value.get_range()))
+        == Some(source_decl)
+}
+
+/// Whether `target` names a local declared with neither a value nor a type:
+/// what it holds is the merge of the values stored into it, the one `expr`
+/// stores included, so reading it back is the stored value deriving itself,
+/// not evidence of its type.
+fn typed_only_by_stores(db: &DbIndex, file_id: crate::FileId, target: &LuaNameExpr) -> bool {
+    let Some(decl_id) = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, target.get_range())
+    else {
+        return false;
+    };
+    db.get_decl_index().get_decl(&decl_id).is_some_and(|decl| {
+        matches!(decl.extra, crate::LuaDeclExtra::Local { .. })
+            && decl.get_value_syntax_id().is_none()
+    }) && !db
+        .get_type_index()
+        .get_type_cache(&decl_id.into())
+        .is_some_and(|cache| cache.is_doc())
+}
+
 pub fn infer_bind_value_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -392,14 +611,29 @@ pub fn infer_bind_value_type(
                 if expr == *assign_expr {
                     let var = vars.get(idx);
                     if let Some(var) = var {
+                        if let LuaVarExpr::NameExpr(target) = var
+                            && (declared_as_copy_of(db, cache.get_file_id(), target, &expr)
+                                || typed_only_by_stores(db, cache.get_file_id(), target))
+                        {
+                            return None;
+                        }
                         if let LuaVarExpr::IndexExpr(index_expr) = var {
                             let prefix_expr = index_expr.get_prefix_expr()?;
                             let prefix_type = infer_expr(db, cache, prefix_expr).ok()?;
-                            // 如果前缀类型是定义类型, 则不认为存在左值绑定
+                            // If the prefix type is a definition type, there is no left-value binding
                             if let LuaType::Def(_) = prefix_type {
                                 return None;
                             }
-                        };
+                            // An inferred container's element type is the merge
+                            // of every store into the slot -- this one included
+                            // -- plus the slot's own bootstrap placeholder, so
+                            // it reads back as `Union({}, local, ...)`. That is
+                            // the local deriving itself, not evidence of its
+                            // type, so it cannot pin the stored local.
+                            if matches!(prefix_type, LuaType::TableConst(_)) {
+                                return None;
+                            }
+                        }
                         typ = Some(infer_expr(db, cache, var.clone().into()).ok()?);
                         break;
                     }
@@ -434,7 +668,7 @@ pub fn infer_bind_value_type(
         }
         LuaAst::LuaCallArgList(call_arg_list) => {
             let call_expr = call_arg_list.get_parent::<LuaCallExpr>()?;
-            // 获取调用位置
+            // Get the call position
             let mut param_pos = 0;
             for (idx, arg) in call_arg_list.get_args().enumerate() {
                 if arg == expr {

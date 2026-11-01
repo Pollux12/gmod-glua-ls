@@ -10,7 +10,9 @@ use glua_parser::{
 use glua_parser_desc::DescItemKind;
 use rowan::TextRange;
 
-pub fn build_annotators(semantic: &SemanticModel) -> Vec<EmmyAnnotator> {
+/// The annotators of `semantic`'s file: documentation emphasis, and the
+/// references of locals, parameters and globals when `references` is set.
+pub fn build_annotators(semantic: &SemanticModel, references: bool) -> Vec<EmmyAnnotator> {
     let mut result = vec![];
     let document = semantic.get_document();
     let root = semantic.get_root();
@@ -22,6 +24,17 @@ pub fn build_annotators(semantic: &SemanticModel) -> Vec<EmmyAnnotator> {
         .render_documentation_markup;
     for node in root.descendants::<LuaAst>() {
         match node {
+            LuaAst::LuaDocDescription(description) => {
+                if is_rendering_description {
+                    build_description_annotator(
+                        semantic,
+                        &mut use_range_set,
+                        &mut result,
+                        description,
+                    );
+                }
+            }
+            _ if !references => {}
             LuaAst::LuaLocalStat(local_stat) => {
                 build_local_stat_annotator(
                     db,
@@ -57,16 +70,6 @@ pub fn build_annotators(semantic: &SemanticModel) -> Vec<EmmyAnnotator> {
             }
             LuaAst::LuaNameExpr(name_expr) => {
                 build_name_expr_annotator(&document, &mut use_range_set, &mut result, name_expr);
-            }
-            LuaAst::LuaDocDescription(description) => {
-                if is_rendering_description {
-                    build_description_annotator(
-                        semantic,
-                        &mut use_range_set,
-                        &mut result,
-                        description,
-                    );
-                }
             }
             _ => {}
         }
@@ -347,4 +350,52 @@ fn build_description_annotator(
     result.push(strong);
 
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use googletest::prelude::*;
+
+    use super::build_annotators;
+    use crate::handlers::emmy_annotator::EmmyAnnotatorType;
+    use crate::handlers::test_lib::ProviderVirtualWorkspace;
+
+    /// A client that draws no reference gets none, so its references are
+    /// never walked.
+    #[gtest]
+    fn annotators_without_references_leave_the_references_out() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local function first(a)
+                local b = a
+                return b
+            end
+            "#,
+        );
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .or_fail()?;
+        let kinds = |references| {
+            build_annotators(&semantic_model, references)
+                .into_iter()
+                .map(|annotator| annotator.typ as u8)
+                .collect::<Vec<_>>()
+        };
+        let documentation = [
+            EmmyAnnotatorType::DocEm as u8,
+            EmmyAnnotatorType::DocStrong as u8,
+        ];
+
+        assert_that!(
+            (
+                kinds(false).iter().all(|kind| documentation.contains(kind)),
+                kinds(true).contains(&(EmmyAnnotatorType::ReadOnlyLocal as u8)),
+            ),
+            eq((true, true))
+        );
+        Ok(())
+    }
 }

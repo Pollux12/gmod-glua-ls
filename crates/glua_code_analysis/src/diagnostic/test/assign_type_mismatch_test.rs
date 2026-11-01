@@ -146,8 +146,8 @@ mod tests {
             "#
         ));
 
-        // TODO: 解决枚举值运算结果的推断问题
-        // 暂时没有好的方式去处理这个警告, 在 ts 中, 枚举值运算的结果不是实际值, 但我们目前的结果是实际值, 所以难以处理
+        // TODO: fix the inference of enum value operation results
+        // No good way to handle this warning yet: in ts the result of an enum value operation is not the actual value, but ours is, which makes it hard to handle
         assert!(ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
@@ -369,12 +369,12 @@ mod tests {
         ));
     }
 
-    /// 暂时无法解决的测试
+    /// Tests that cannot be solved yet
     #[test]
     fn test_error() {
         // let mut ws = VirtualWorkspace::new();
 
-        // 推断类型异常
+        // Inference anomaly
         // assert!(ws.check_code_for_namespace(
         //     DiagnosticCode::AssignTypeMismatch,
         //     r#"
@@ -450,7 +450,7 @@ t.x = y
             "#
         ));
 
-        assert!(!ws.check_code_for_namespace(
+        assert!(ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
 ---@class A
@@ -782,7 +782,7 @@ return t
         ));
     }
 
-    // 可能需要处理的
+    // May need handling
     #[test]
     fn test_pending() {
         let mut ws = VirtualWorkspace::new();
@@ -818,7 +818,7 @@ return t
                         "#
         ));
 
-        // 数组类型匹配允许可空, 但在初始化赋值时, 不允许直接赋值`nil`(其实是偷懒了, table_expr 推断没有处理边缘情况, 可能后续会做处理允许)
+        // Array types allow nullable matching, but initialization must not assign `nil` directly (really a shortcut: table_expr inference does not handle the edge case, and may allow it later)
         assert!(ws.check_code_for_namespace(
             DiagnosticCode::AssignTypeMismatch,
             r#"
@@ -861,8 +861,8 @@ return t
     #[test]
     fn test_issue_295() {
         let mut ws = VirtualWorkspace::new();
-        // TODO: 解决枚举值运算结果的推断问题
-        // 暂时没有好的方式去处理这个警告, 在 ts 中, 枚举值运算的结果不是实际值, 但我们目前的结果是实际值, 所以难以处理
+        // TODO: fix the inference of enum value operation results
+        // No good way to handle this warning yet: in ts the result of an enum value operation is not the actual value, but ours is, which makes it hard to handle
         assert!(ws.check_code_for(
             DiagnosticCode::AssignTypeMismatch,
             r#"
@@ -2103,6 +2103,123 @@ return t
     }
 
     #[test]
+    fn a_row_written_once_through_a_dynamic_key_keeps_its_positions() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                local quads = {}
+
+                local function add(i)
+                    quads[i] = { "a", 55 }
+                end
+
+                local function draw(i)
+                    local q = quads[i]
+                    ---@type string
+                    local tag = q[1]
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn rows_of_two_shapes_written_through_a_dynamic_key_keep_their_positions() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                local reports = {}
+
+                local function open(id)
+                    reports[id] = { "reporter", 1 }
+                end
+
+                local function claim(id)
+                    reports[id] = { "reporter", 1, true }
+                end
+
+                local function read(id)
+                    local report = reports[id]
+                    ---@type string
+                    local reporter = report[1]
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn a_table_of_any_is_assignable_to_a_keyed_table_shape() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@param data table<any, any>
+            local function sync(data)
+                ---@type { [string]: { value: any, type: integer } }
+                local stored = {}
+                stored = data
+            end
+            "#
+        ));
+    }
+
+    #[test]
+    fn a_table_whose_values_do_not_fit_a_field_is_not_assignable_to_the_shape() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@param data table<string, number>
+            local function sync(data)
+                ---@type { name: string }
+                local stored = { name = "x" }
+                stored = data
+            end
+            "#
+        ));
+    }
+
+    #[test]
+    fn a_write_widens_an_inferred_member_read_through_a_nullable_class() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@class SnipInv
+            local META = {}
+            META.data = META.data or {}
+
+            ---@param key string
+            ---@param dataType? integer
+            function META:SetData(key, value, dataType)
+                dataType = dataType or 1
+                self.data = self.data or {}
+                self.data[key] = { value = value, type = dataType }
+            end
+
+            ---@return SnipInv?
+            local function GetInv(id) return nil end
+            ---@return SnipInv
+            local function CreateInv(id) return META end
+
+            ---@param data table<any, any>
+            local function sync(data)
+                local inv = GetInv(1)
+                if not inv then
+                    inv = CreateInv(1)
+                else
+                    inv.items = {}
+                end
+                if data then
+                    inv.data = data
+                end
+            end
+            "#
+        ));
+    }
+
+    #[test]
     fn test_annotated_tuple_member_collection_remains_strict() {
         let mut ws = VirtualWorkspace::new();
         assert!(!ws.check_code_for(
@@ -2168,6 +2285,7 @@ return t
         let file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id)
             .expect("file id should exist");
 
         ws.analysis.compilation.clear_index();
@@ -2215,18 +2333,20 @@ return t
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                 ---@class Entity
                 ---@param class string
                 ---@return Entity
                 function ents.Create(class) end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         // Main workspace: unannotated override + test call
         assert!(ws.check_code_for(
@@ -2263,18 +2383,20 @@ return t
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                 ---@class Entity
                 ---@param class string
                 ---@return Entity
                 function ents.Create(class) end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         // Main workspace: override with extra parameters + test call
         assert!(ws.check_code_for(
@@ -2308,18 +2430,20 @@ return t
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                 ---@class Entity
                 ---@param class string
                 ---@return Entity
                 function ents.Create(class) end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         // Main workspace: declaration-style non-variadic override with extra parameter.
         assert!(ws.check_code_for(
@@ -2353,18 +2477,20 @@ return t
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                 ---@class Entity
                 ---@param class string
                 ---@return Entity
                 function ents.Create(class) end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         assert!(ws.check_code_for(
             DiagnosticCode::AssignTypeMismatch,
@@ -2401,18 +2527,20 @@ return t
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                 ---@class Entity
                 ---@param class string
                 ---@return Entity
                 function ents.Create(class) end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         assert!(ws.check_code_for(
             DiagnosticCode::RedundantParameter,
@@ -2449,18 +2577,20 @@ return t
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                 ---@class Entity
                 ---@param class string
                 ---@return Entity
                 function ents.Create(class) end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         // Main workspace: 2-param call with typed local should NOT produce
         // assign-type-mismatch because the meta return type (Entity) wins.
@@ -2496,18 +2626,20 @@ return t
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                 ---@class Entity
                 ---@param class string
                 ---@return Entity
                 function ents.Create(class) end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         assert!(!ws.check_code_for(
             DiagnosticCode::AssignTypeMismatch,
@@ -2564,19 +2696,21 @@ return t
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("ents.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                 ---@class Entity
                 ---@realm shared
                 ---@param class string
                 ---@return Entity
                 function ents.Create(class) end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         ws.def_file(
             "gamemode/modules/workarounds/sv_workarounds.lua",
@@ -3074,5 +3208,1075 @@ fn declared_empty_container_controls_remain_clean() {
             singleWrite[key] = group
         end
         "#
+    ));
+}
+
+/// An empty `{}` is a valid value for any container type. A `[k] = nil` write in
+/// a *second* closure bound to the same `fun(self: T)` slot made the element
+/// type nilable, and that re-inference reached back and rejected the seed.
+#[test]
+fn empty_table_seed_survives_a_sibling_closure_clearing_an_element() {
+    let mut ws = crate::VirtualWorkspace::new();
+
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class element
+        ---@class holder
+        ---@field map table<any, element>
+
+        ---@param f fun(self: holder)
+        local function hook(f) end
+
+        hook(function(self) self.map = {} end)
+        hook(function(self) self.map["k"] = nil end)
+        "#
+    ));
+}
+
+/// `if not t.k then t.k = {} end` runs exactly when `t.k` is missing, so `t.k`
+/// is a table on every path out of the `if` — the same seed a plain
+/// `t.k = {}` gives. Keeping that fact inside the branch left the writes after
+/// it checked as if the table had never been seeded, so each was reported
+/// against whichever sibling write the walk happened to record last.
+#[test]
+fn absence_guarded_seed_initialises_the_table_for_later_writes() {
+    for seed in [
+        "if not ext.slots then ext.slots = {} end",
+        "if ext.slots == nil then ext.slots = {} end",
+        "ext.slots = ext.slots or {}",
+    ] {
+        let mut ws = crate::VirtualWorkspace::new();
+        assert!(
+            ws.check_code_for(
+                crate::DiagnosticCode::AssignTypeMismatch,
+                &format!(
+                    r#"
+                    ---@class SeedPart
+                    ---@class SeedExt
+                    ---@param ext SeedExt
+                    ---@param part SeedPart
+                    local function use(ext, part)
+                        {seed}
+                        if part then ext.slots[1] = part end
+                        ext.slots[1] = false
+                    end
+                    "#
+                )
+            ),
+            "seed: {seed}"
+        );
+    }
+}
+
+/// Order must not decide it either: the same two writes the other way round
+/// have to stay clean, or the slot's type is whichever writer the walk saw last
+/// rather than the union of both.
+#[test]
+fn absence_guarded_seed_is_order_independent() {
+    let mut ws = crate::VirtualWorkspace::new();
+
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class OrdPart
+        ---@class OrdExt
+        ---@param ext OrdExt
+        ---@param part OrdPart
+        local function use(ext, part)
+            if not ext.slots then ext.slots = {} end
+            ext.slots[1] = false
+            ext.slots[1] = part
+        end
+        "#
+    ));
+}
+
+/// A plain `if cond then t.k = {} end` guarantees nothing afterwards, so it
+/// must not count as a seed.
+#[test]
+fn conditional_seed_that_is_not_an_absence_guard_is_not_an_initialiser() {
+    let mut ws = crate::VirtualWorkspace::new();
+
+    assert!(!ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class CondOwner
+        ---@field slots integer[]
+        local O = {}
+
+        ---@param cond boolean
+        function O:seed(cond)
+            if cond then self.slots = {} end
+            self.slots[1] = "not an integer"
+        end
+        "#
+    ));
+}
+
+/// A `false` seed in a table literal is an inferred "not set yet" placeholder,
+/// not a declared contract, so a later write of another type is not a mismatch.
+#[test]
+fn inferred_false_seed_is_lenient() {
+    let mut ws = crate::VirtualWorkspace::new();
+
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class FalseSeed.Player
+        local game = { betting = { curPlayer = false } }
+
+        ---@param ply FalseSeed.Player
+        local function setTurn(ply)
+            game.betting.curPlayer = ply
+        end
+        "#
+    ));
+}
+
+/// A declared `boolean` field is a contract and still reports.
+#[test]
+fn declared_boolean_field_still_reports() {
+    let mut ws = crate::VirtualWorkspace::new();
+
+    assert!(!ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class DeclaredBool.Player
+        ---@class DeclaredBool.Betting
+        ---@field curPlayer boolean
+        ---@type DeclaredBool.Betting
+        local betting
+
+        ---@param ply DeclaredBool.Player
+        local function setTurn(ply)
+            betting.curPlayer = ply
+        end
+        "#
+    ));
+}
+
+#[test]
+fn library_doc_field_not_tightened_by_cross_file_inferred_writers() {
+    let mut ws = crate::VirtualWorkspace::new();
+
+    // The doc class lives in a library workspace (like Doors' sh_api.lua
+    // being a workspace.library for TARDIS), while the field's writers live
+    // in the main workspace.
+    let library_root = ws.virtual_url_generator.new_path("__test_sound_opts_lib");
+    ws.analysis.add_library_workspace(library_root.clone());
+    let library_uri = lsp_types::Uri::parse_from_file_path(&library_root.join("opts.lua")).unwrap();
+    ws.analysis
+        .update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@class LibSoundOpts
+                ---@field owner LibBase?
+                "#
+                .to_string(),
+            ),
+        )
+        .expect("library file");
+
+    ws.def_file(
+        "lua/types.lua",
+        r#"
+        ---@class LibBase
+        ---@class LibSubA: LibBase
+        ---@class LibSubB: LibBase
+    "#,
+    );
+
+    let a_id = ws.def_file(
+        "lua/a.lua",
+        r#"
+        ---@param opts LibSoundOpts
+        ---@param a LibSubA
+        local function fa(opts, a)
+            opts.owner = opts.owner or a
+        end
+    "#,
+    );
+
+    let b_id = ws.def_file(
+        "lua/b.lua",
+        r#"
+        ---@param opts LibSoundOpts
+        ---@param b LibSubB
+        local function fb(opts, b)
+            opts.owner = opts.owner or b
+        end
+    "#,
+    );
+
+    // `owner` is documented `LibBase?`; an inferred writer union must not
+    // tighten it, so neither write may be flagged.
+    for file_id in [a_id, b_id] {
+        ws.analysis
+            .diagnostic
+            .enable_only(crate::DiagnosticCode::AssignTypeMismatch);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        let mismatches: Vec<_> = diagnostics
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(lsp_types::NumberOrString::String(
+                        crate::DiagnosticCode::AssignTypeMismatch
+                            .get_name()
+                            .to_string(),
+                    ))
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+}
+
+/// `self.Primary` is unresolvable on the receiver class, so the write's
+/// right-hand side cannot produce a value. The member it feeds must record
+/// `unknown`, not `never`: a `never` member is reserved for declared shapes
+/// that contradict themselves and fails any structural check.
+#[test]
+fn member_write_of_unresolvable_read_is_not_never() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    ws.analysis
+        .diagnostic
+        .enable_only(crate::DiagnosticCode::ParamTypeMismatch);
+    let file_id = ws.def(
+        r#"
+            ---@class (partial) BulletT
+            ---@field Num? number
+            ---@field Damage? number
+
+            ---@class BulletWeapCls
+
+            ---@param b BulletT
+            local function fire(b) end
+
+            ---@param self BulletWeapCls
+            local function shoot(self)
+                local bullet = {}
+                bullet.Num = 1
+                bullet.Damage = self.Primary.Damage
+                fire(bullet)
+            end
+        "#,
+    );
+    let diagnostics = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default();
+    let mismatches: Vec<_> = diagnostics
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::ParamTypeMismatch
+                        .get_name()
+                        .to_string(),
+                ))
+        })
+        .collect();
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// Same shape but `self.Primary` resolves to a table type that lacks `Damage`:
+/// the missing-field read floors to `nil`, which must not produce a member
+/// mismatch against an optional field either.
+#[test]
+fn member_write_of_missing_doc_field_is_nil_not_mismatch() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    ws.analysis
+        .diagnostic
+        .enable_only(crate::DiagnosticCode::ParamTypeMismatch);
+    let file_id = ws.def(
+        r#"
+            ---@class (partial) BulletT2
+            ---@field Num? number
+            ---@field Damage? number
+
+            ---@class AmmoT2
+            ---@field ClipSize number
+
+            ---@class WeapCls2
+            ---@field Primary AmmoT2
+
+            ---@param b BulletT2
+            local function fire(b) end
+
+            ---@param self WeapCls2
+            local function shoot(self)
+                local bullet = {}
+                bullet.Num = 1
+                bullet.Damage = self.Primary.Damage
+                fire(bullet)
+            end
+        "#,
+    );
+    let diagnostics = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default();
+    let mismatches: Vec<_> = diagnostics
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::ParamTypeMismatch
+                        .get_name()
+                        .to_string(),
+                ))
+        })
+        .collect();
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// Same shape with `Damage` *required* on the target class: the floored `nil`
+/// must report with a real member reason rather than silently mismatching.
+#[test]
+fn member_write_of_missing_doc_field_reports_member_reason() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    ws.analysis
+        .diagnostic
+        .enable_only(crate::DiagnosticCode::ParamTypeMismatch);
+    let file_id = ws.def(
+        r#"
+            ---@class BulletT3
+            ---@field Num number
+            ---@field Damage number
+
+            ---@class AmmoT3
+            ---@field ClipSize number
+
+            ---@class WeapCls3
+            ---@field Primary AmmoT3
+
+            ---@param b BulletT3
+            local function fire(b) end
+
+            ---@param self WeapCls3
+            local function shoot(self)
+                local bullet = {}
+                bullet.Num = 1
+                bullet.Damage = self.Primary.Damage
+                fire(bullet)
+            end
+        "#,
+    );
+    let diagnostics = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default();
+    let mismatches: Vec<_> = diagnostics
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::ParamTypeMismatch
+                        .get_name()
+                        .to_string(),
+                ))
+        })
+        .collect();
+    assert_eq!(mismatches.len(), 1, "{mismatches:#?}");
+    assert!(mismatches[0].message.contains("Damage"), "{mismatches:#?}");
+}
+/// A global table built by member writes across files infers as `MergedTable`;
+/// passing it to a class parameter must member-check the merged structure
+/// rather than failing with a bare `TypeNotMatch`.
+#[test]
+fn merged_table_across_files_satisfies_partial_class() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    let mismatches = merged_table_param_diagnostics(
+        &mut ws,
+        r#"
+            ---@class (partial) BulletT4
+            ---@field Num? number
+            ---@field Damage? number
+        "#,
+        r#"
+            bullet.Damage = 20
+        "#,
+    );
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// The merged-table check must still report a genuinely incompatible member.
+#[test]
+fn merged_table_across_files_reports_required_member_mismatch() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    let mismatches = merged_table_param_diagnostics(
+        &mut ws,
+        r#"
+            ---@class (partial) BulletT4
+            ---@field Num? number
+            ---@field Damage number
+        "#,
+        r#"
+            bullet.Damage = "not a number"
+        "#,
+    );
+    assert_eq!(mismatches.len(), 1, "{mismatches:#?}");
+}
+
+#[cfg(test)]
+fn merged_table_param_diagnostics(
+    ws: &mut crate::VirtualWorkspace,
+    class_def: &str,
+    other_file: &str,
+) -> Vec<lsp_types::Diagnostic> {
+    ws.analysis
+        .diagnostic
+        .enable_only(crate::DiagnosticCode::ParamTypeMismatch);
+    let file_ids = ws.def_files(vec![
+        (
+            "a.lua",
+            &format!(
+                r#"
+                {class_def}
+
+                ---@param b BulletT4
+                function fire(b) end
+
+                bullet = {{}}
+                bullet.Num = 1
+                bullet.Damage = 10
+                fire(bullet)
+            "#
+            ),
+        ),
+        (
+            "b.lua",
+            &format!(
+                r#"
+                bullet = {{}}
+                bullet.Num = 2
+                {other_file}
+            "#
+            ),
+        ),
+    ]);
+    ws.analysis
+        .diagnose_file(file_ids[0], tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::ParamTypeMismatch
+                        .get_name()
+                        .to_string(),
+                ))
+        })
+        .collect()
+}
+
+/// Regression (CityRP `cl_tooltip.lua`): an AccessorFunc backing field with no
+/// force type is synthesized as an uninformative inferred member — a
+/// placeholder — while a real assignment writes a concrete type. The
+/// placeholder must not absorb the writer's evidence: `entity` resolves `E4`,
+/// so `min`/`max` narrow back to number through the `ToScreen().x`
+/// reassignment and `math.max` stays clean.
+#[test]
+fn accessor_func_any_field_does_not_mask_inferred_writes() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    ws.analysis
+        .diagnostic
+        .enable_only(crate::DiagnosticCode::ParamTypeMismatch);
+    ws.def_gmod_call_arg_builtins();
+    let file_id = ws.def(
+        r#"
+            ---@class TSD4
+            ---@field x number
+            ---@field y number
+
+            ---@class V4
+            local V4 = {}
+            ---@return TSD4
+            function V4:ToScreen() end
+
+            ---@class E4
+            local E4 = {}
+            ---@return V4
+            function E4:OBBMins() end
+            ---@return V4
+            function E4:OBBMaxs() end
+            ---@return V4, V4
+            function E4:GetRotatedAABB(mins, maxs) end
+            ---@param lpos V4
+            ---@return V4
+            function E4:LocalToWorld(lpos) end
+
+            ---@class P4
+
+            DEFINE_BASECLASS("P4")
+            PANEL = {} ---@class TT4 : P4
+
+            AccessorFunc(PANEL, "entity", "Entity")
+
+            ---@param entity E4
+            function PANEL:SetEntity(entity)
+                self.entity = entity
+            end
+
+            function PANEL:Think()
+                if IsValid(self.entity) then
+                    local entity = self.entity
+                    local min, max = entity:GetRotatedAABB(entity:OBBMins() * 0.5, entity:OBBMaxs() * 0.5)
+                    min = entity:LocalToWorld(min):ToScreen().x
+                    max = entity:LocalToWorld(max):ToScreen().x
+                    local m = math.max(min, max)
+                end
+            end
+
+            vgui.Register("TT4", PANEL, "P4")
+        "#,
+    );
+    let diagnostics = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default();
+    let mismatches: Vec<_> = diagnostics
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::ParamTypeMismatch
+                        .get_name()
+                        .to_string(),
+                ))
+        })
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "uninformative AccessorFunc field must not mask the inferred writer: {mismatches:#?}"
+    );
+
+    // Root cause: the synthesized backing field declares existence, not a
+    // type, so the `self.entity` read must resolve the concrete `SetEntity`
+    // write rather than the placeholder.
+    assert_eq!(infer_first_index_ty(&ws, file_id, "self.entity"), "E4");
+}
+
+/// An unforced `AccessorFunc` backing field with no writes still resolves
+/// `any` — existence without a type.
+#[test]
+fn accessor_func_any_field_without_writes_resolves_any() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    ws.def_gmod_call_arg_builtins();
+    let file_id = ws.def(
+        r#"
+            ---@class P5
+
+            DEFINE_BASECLASS("P5")
+            PANEL = {} ---@class TT5 : P5
+
+            AccessorFunc(PANEL, "entity", "Entity")
+
+            function PANEL:Think()
+                local entity = self.entity
+            end
+
+            vgui.Register("TT5", PANEL, "P5")
+        "#,
+    );
+    assert_eq!(infer_first_index_ty(&ws, file_id, "self.entity"), "any");
+}
+
+#[cfg(test)]
+fn infer_first_index_ty(
+    ws: &crate::VirtualWorkspace,
+    file_id: crate::FileId,
+    field_access: &str,
+) -> String {
+    use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr};
+
+    let semantic_model = ws
+        .analysis
+        .compilation
+        .get_semantic_model(file_id)
+        .expect("semantic model");
+    let target = semantic_model
+        .get_root()
+        .descendants::<LuaIndexExpr>()
+        .find(|expr| expr.syntax().text() == field_access)
+        .expect("field access should exist");
+    let ty = semantic_model
+        .infer_expr(LuaExpr::IndexExpr(target))
+        .unwrap_or(crate::LuaType::Unknown);
+    crate::humanize_type(
+        ws.analysis.compilation.get_db(),
+        &ty,
+        crate::RenderLevel::Simple,
+    )
+}
+
+/// Regression (CityRP `cl_vgui3d2d.lua`): `{ ... }` stores the pack as a
+/// `Tuple([Variadic(T)])`; indexing `key[1]` read the stored element verbatim
+/// and surfaced `Variadic(T)` — a multi-value container — where a single value
+/// sits. The element at that position is the spread's first value, `T`.
+#[test]
+fn vararg_pack_table_index_unwraps_variadic_element() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    ws.def(
+        r#"
+            ---@class Panel
+            Panel = {}
+            ---@param keyCode number
+            function Panel:OnMouseReleased(keyCode) end
+        "#,
+    );
+    let file_id = ws.def(
+        r#"
+            local usedpanel = {}
+
+            ---@param pnl Panel
+            local function postPanelEvent(pnl, event, ...)
+                if pnl[event] then
+                    pnl[event](pnl, ...)
+                    usedpanel[pnl] = { ... }
+                    return true
+                end
+                return false
+            end
+
+            local function release()
+                for pnl, key in pairs(usedpanel) do
+                    if pnl["OnMouseReleased"] then
+                        pnl["OnMouseReleased"](pnl, key[1])
+                    end
+                end
+            end
+        "#,
+    );
+
+    let mismatches: Vec<_> = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::ParamTypeMismatch
+                        .get_name()
+                        .to_string(),
+                ))
+        })
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "uninformative vararg element must not flag a number param: {mismatches:#?}"
+    );
+
+    use glua_parser::{LuaAstNode, LuaExpr};
+    let (key_ty, elem_ty) = {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let mut key_ty = crate::LuaType::Unknown;
+        let mut elem_ty = crate::LuaType::Unknown;
+        for expr in semantic_model.get_root().descendants::<LuaExpr>() {
+            let text = expr.syntax().text().to_string();
+            if text == "key[1]" {
+                elem_ty = semantic_model
+                    .infer_expr(expr)
+                    .unwrap_or(crate::LuaType::Unknown);
+            } else if text == "key" && key_ty.is_unknown() {
+                // the `for pnl, key` loop variable
+                key_ty = semantic_model
+                    .infer_expr(expr)
+                    .unwrap_or(crate::LuaType::Unknown);
+            }
+        }
+        (key_ty, elem_ty)
+    };
+    assert_eq!(
+        ws.humanize_type(elem_ty),
+        "unknown",
+        "indexing a vararg-packed table yields the element type, not the pack; key={}",
+        ws.humanize_type(key_ty)
+    );
+}
+
+/// Forwarding `...` through a chain of locals must keep the pack open for the
+/// callee's vararg: `pack`'s `T...` binds the forwarded pack as `T ...`, not a
+/// closed one-element tuple, so `arg[2]` stays a valid read.
+#[test]
+fn forwarded_dots_binds_open_variadic_param() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    let file_id = ws.def(
+        r#"
+            local pack = table.pack or function(...) return { n = 1, ... } end
+            local function date_from(...)
+                local arg = pack(...)
+                local y, m, d = arg[1], arg[2], arg[3]
+                return y, m, d
+            end
+            local function date(...)
+                return date_from(...)
+            end
+            date("x")
+        "#,
+    );
+    let diags: Vec<_> = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::UndefinedField.get_name().to_string(),
+                ))
+        })
+        .collect();
+    assert!(
+        diags.is_empty(),
+        "a forwarded vararg pack must keep its open arity: {diags:#?}"
+    );
+}
+
+#[cfg(test)]
+fn def_player_meta_library(ws: &mut crate::VirtualWorkspace) {
+    ws.def(
+        r#"
+        ---@meta
+        ---@class Entity
+
+        ---@class Player : Entity
+        ---@field Money number
+
+        ---@generic T : table
+        ---@param metaName `T`
+        ---@return (definition) T
+        function _G.FindMetaTable(metaName) end
+
+        ---@return Player
+        function LocalPlayer() end
+        "#,
+    );
+    ws.def_file(
+        "gamemode/core/metatables/sh_player.lua",
+        r#"
+        ---@param name string
+        ---@param prefix string?
+        function PlayerNSReader(name, prefix)
+            local pMeta = FindMetaTable("Player")
+            local fn = (prefix or "Get") .. name
+            pMeta[fn] = function(self, def)
+                return def
+            end
+        end
+        "#,
+    );
+}
+
+/// Regression (CityRP `cl_hooks.lua`): a computed-key write on an entity lands
+/// in its Lua table under whatever key it names. The `pMeta[fn]` accessors
+/// share only a `string` key type with it, not a slot, so they state no type
+/// the write can mismatch.
+#[test]
+fn computed_key_write_on_class_is_not_held_to_other_computed_key_writes() {
+    let mut ws = crate::VirtualWorkspace::new();
+    def_player_meta_library(&mut ws);
+    assert!(ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "gamemode/core/hooks/cl_hooks.lua",
+        r#"
+        ---@param key string
+        ---@param value number
+        local function storeLocalVariable(key, value)
+            LocalPlayer()[key] = value
+        end
+        "#,
+    ));
+}
+
+/// A literal key names a declared field, so a wrong value is still reported.
+#[test]
+fn literal_key_write_on_class_still_reports_declared_field_mismatch() {
+    let mut ws = crate::VirtualWorkspace::new();
+    def_player_meta_library(&mut ws);
+    assert!(!ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "gamemode/core/hooks/cl_money_name.lua",
+        r#"
+        LocalPlayer().Money = "broke"
+        "#,
+    ));
+    assert!(!ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "gamemode/core/hooks/cl_money_string.lua",
+        r#"
+        LocalPlayer()["Money"] = "broke"
+        "#,
+    ));
+}
+
+/// A declared `[string]: V` index field is the contract for computed-key writes.
+#[test]
+fn computed_key_write_on_class_is_held_to_declared_index_field() {
+    let mut ws = crate::VirtualWorkspace::new();
+    ws.def(
+        r#"
+        ---@class NetVarStore
+        ---@field [string] number
+        "#,
+    );
+    assert!(!ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "gamemode/core/libraries/sh_netvar_bad.lua",
+        r#"
+        ---@param store NetVarStore
+        ---@param key string
+        local function set(store, key)
+            store[key] = "x"
+        end
+        "#,
+    ));
+    assert!(ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "gamemode/core/libraries/sh_netvar_ok.lua",
+        r#"
+        ---@param store NetVarStore
+        ---@param key string
+        local function set(store, key)
+            store[key] = 1
+        end
+        "#,
+    ));
+}
+
+#[test]
+fn trailing_call_return_values_are_all_checked_against_table_elements() {
+    let mut ws = crate::VirtualWorkspace::new();
+    assert!(!ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@return number, string
+        local function f() end
+
+        ---@type table<integer, string>
+        local t = { "a", f() }
+        "#,
+    ));
+}
+
+#[cfg(test)]
+const HOOK_CLASS: &str = r#"
+---@class HookPanel
+local HookPanel = {}
+
+---@return boolean
+function HookPanel:Paint(width, height) end
+
+---@param keyCode number
+---@return boolean
+function HookPanel:OnMousePressed(keyCode) end
+
+---@param cb fun(): boolean
+local function takes_callback(cb) end
+
+---@type HookPanel
+local p
+"#;
+
+#[test]
+fn closure_without_returns_may_be_assigned_to_a_method_field() {
+    let mut ws = crate::VirtualWorkspace::new();
+    let code = format!(
+        "{HOOK_CLASS}\np.Paint = function(s, w, h) end\np.OnMousePressed = function(s, code) end"
+    );
+    assert!(ws.check_code_for(crate::DiagnosticCode::AssignTypeMismatch, &code));
+}
+
+#[test]
+fn a_named_function_without_returns_may_be_assigned_to_a_method_field() {
+    let mut ws = crate::VirtualWorkspace::new();
+    let code = format!(
+        "{HOOK_CLASS}
+local function draw_selected(s) end
+p.Paint = draw_selected
+function HookPanel:PaintHovered() end
+p.Paint = p.PaintHovered"
+    );
+    assert!(ws.check_code_for(crate::DiagnosticCode::AssignTypeMismatch, &code));
+}
+
+#[test]
+fn a_named_function_returning_the_wrong_type_is_still_reported_for_a_method_field() {
+    let mut ws = crate::VirtualWorkspace::new();
+    let code = format!(
+        "{HOOK_CLASS}
+local function draw_label(s) return \"x\" end
+p.Paint = draw_label"
+    );
+    assert!(!ws.check_code_for(crate::DiagnosticCode::AssignTypeMismatch, &code));
+}
+
+#[test]
+fn a_function_without_returns_that_still_mismatches_is_reported_as_written() {
+    let mut ws = crate::VirtualWorkspace::new();
+    ws.analysis
+        .diagnostic
+        .enable_only(crate::DiagnosticCode::AssignTypeMismatch);
+    let file_id = ws.def(&format!(
+        "{HOOK_CLASS}
+---@param code string
+local function on_press(s, code) end
+p.OnMousePressed = on_press"
+    ));
+    let messages = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|diagnostic| diagnostic.message)
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(!messages[0].contains("-> any"), "{messages:?}");
+}
+
+#[test]
+fn closure_returning_the_wrong_type_is_still_reported_for_a_method_field() {
+    let mut ws = crate::VirtualWorkspace::new();
+    let code = format!("{HOOK_CLASS}\np.Paint = function(s, w, h) return \"x\" end");
+    assert!(!ws.check_code_for(crate::DiagnosticCode::AssignTypeMismatch, &code));
+}
+
+#[test]
+fn closure_without_returns_stays_rejected_as_a_callback_argument() {
+    let mut ws = crate::VirtualWorkspace::new();
+    let code = format!("{HOOK_CLASS}\ntakes_callback(function() end)");
+    assert!(!ws.check_code_for(crate::DiagnosticCode::ParamTypeMismatch, &code));
+}
+
+#[cfg(test)]
+fn def_bsp_object_class(ws: &mut crate::VirtualWorkspace) {
+    ws.def_file(
+        "gamemode/core/libraries/thirdparty/niknaks/modules/sh_bsp_brushes.lua",
+        r#"
+        ---@class BSPObject
+        BSPObject = {}
+        "#,
+    );
+}
+
+/// Regression (CityRP niknaks `sh_bsp_staticprops.lua`): the earlier `{}`
+/// writes of a class field merge into a table no writer gave a field, and a
+/// later annotated `{}` write to it still fits.
+#[test]
+fn annotated_empty_literal_fits_a_class_field_earlier_empty_literals_wrote() {
+    let mut ws = crate::VirtualWorkspace::new();
+    def_bsp_object_class(&mut ws);
+    assert!(ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "gamemode/core/libraries/thirdparty/niknaks/modules/sh_bsp_models.lua",
+        r#"
+        local meta = BSPObject
+
+        ---@param empty boolean
+        ---@param unknown boolean
+        function meta:LoadModels(empty, unknown)
+            if empty then
+                self._staticprops_mdl = {}
+                return
+            end
+
+            if unknown then
+                self._staticprops_mdl = {}
+                return
+            end
+
+            ---@type string[]
+            self._staticprops_mdl = {}
+        end
+        "#,
+    ));
+}
+
+/// Regression (CityRP niknaks `sh_bsp_staticprops.lua`): an array-typed class
+/// field re-assigned `{}` later in the function, plainly and annotated.
+#[test]
+fn array_typed_class_field_accepts_empty_literal_reassigned_later() {
+    let mut ws = crate::VirtualWorkspace::new();
+    def_bsp_object_class(&mut ws);
+    assert!(ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "gamemode/core/libraries/thirdparty/niknaks/modules/sh_bsp_staticprops.lua",
+        r#"
+        ---@class StaticProp
+        ---@field Index number
+
+        local meta = BSPObject
+
+        ---@param empty boolean
+        ---@param unknown boolean
+        ---@param count integer
+        ---@return StaticProp[]
+        function meta:GetStaticProps(empty, unknown, count)
+            if self._staticprops then return self._staticprops end
+
+            if empty then
+                self._staticprops = {}
+                return self._staticprops
+            end
+
+            if unknown then
+                self._staticprops = {}
+                return self._staticprops
+            end
+
+            if count > 16384 then
+                self._staticprops = {}
+                return self._staticprops
+            end
+
+            ---@type StaticProp[]
+            self._staticprops = {}
+            return self._staticprops
+        end
+        "#,
+    ));
+}
+
+/// Regression (CityRP `rp_evocity_v2d.lua`): an integer slot of a plain table
+/// that map files each set to `{}` accepts `{}` again, including a file that
+/// writes the slot twice.
+#[test]
+fn empty_literal_fits_an_integer_slot_other_files_set_to_empty_literals() {
+    let mut ws = crate::VirtualWorkspace::new();
+    ws.def_file(
+        "plugins/propertysystem/sh_plugin.lua",
+        r#"
+        property = property or {}
+        property.access = property.access or {}
+        property.teams = property.teams or {}
+        "#,
+    );
+    ws.def_file(
+        "plugins/propertysystem/mapsettings/rp_evocity2_v5p.lua",
+        r#"
+        property.access[38] = {}
+        property.teams[38] = {}
+        "#,
+    );
+    assert!(ws.check_file_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        "plugins/propertysystem/mapsettings/rp_evocity_v2d.lua",
+        r#"
+        property.access[38] = {}
+        property.teams[38] = {}
+        property.access[39] = {}
+        property.teams[39] = {}
+        property.access[38] = {}
+        property.teams[38] = {}
+        "#,
     ));
 }

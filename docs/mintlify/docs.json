@@ -11,77 +11,42 @@
   "navigation": {
     "tabs": [
       {
-        "tab": "Get Started",
+        "tab": "Guide",
         "groups": [
           {
-            "group": "Start here",
+            "group": "Get started",
             "pages": [
               "index",
               "getting-started/installation",
               "getting-started/workspace-setup",
-              "features/overview"
+              "getting-started/common-fixes"
             ]
           },
           {
-            "group": "Common tasks",
+            "group": "Configuration",
             "pages": [
-              "debugger/setup",
               "configuration/overview",
-              "annotations/index",
-              "tools/glua-check"
-            ]
-          }
-        ]
-      },
-      {
-        "tab": "Features",
-        "groups": [
-          {
-            "group": "Overview",
-            "pages": [
-              "features/overview"
-            ]
-          },
-          {
-            "group": "Code intelligence",
-            "pages": [
-              "language/code-intelligence",
-              "language/diagnostics",
-              "language/formatting",
-              "language/inlay-hints"
-            ]
-          },
-          {
-            "group": "Garry's Mod",
-            "pages": [
-              "language/realm-awareness",
-              "language/network-analysis",
-              "language/hook-intelligence",
-              "language/vgui-support"
-            ]
-          },
-          {
-            "group": "Classes",
-            "pages": [
-              "language/scripted-classes"
+              "configuration/gmod",
+              "configuration/diagnostics",
+              "configuration/formatting",
+              "configuration/workspace",
+              "configuration/completion",
+              "configuration/hints-and-hover",
+              "configuration/runtime",
+              "configuration/annotations-management"
             ]
           },
           {
             "group": "Debugger",
             "pages": [
-              "debugger/overview",
               "debugger/setup",
-              "debugger/breakpoints-and-stepping",
-              "debugger/inspecting-variables",
-              "debugger/entity-explorer",
-              "debugger/lua-execution",
-              "debugger/error-tracking"
+              "debugger/usage"
             ]
           },
           {
-            "group": "AI integration",
+            "group": "Tools",
             "pages": [
-              "vscode/ai-integration"
+              "tools/glua-check"
             ]
           }
         ]
@@ -143,25 +108,6 @@
             ]
           }
         ]
-      },
-      {
-        "tab": "Configuration",
-        "groups": [
-          {
-            "group": "Reference",
-            "pages": [
-              "configuration/overview",
-              "configuration/gmod",
-              "configuration/diagnostics",
-              "configuration/completion",
-              "configuration/formatting",
-              "configuration/hints-and-hover",
-              "configuration/workspace",
-              "configuration/runtime",
-              "configuration/annotations-management"
-            ]
-          }
-        ]
       }
     ],
     "global": {
@@ -204,12 +150,7 @@
   "contextual": {
     "options": [
       "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "cursor",
-      "vscode"
+      "view"
     ]
   },
   "footer": {

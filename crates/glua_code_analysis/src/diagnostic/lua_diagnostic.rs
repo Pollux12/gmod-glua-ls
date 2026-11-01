@@ -1,31 +1,24 @@
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use log::info;
-use rustc_hash::FxHashMap;
 
 pub use super::checker::DiagnosticContext;
 use super::checker::SharedDiagnosticData;
-use super::checker::precompute_await_candidates;
-use super::checker::precompute_callee_realm_data_for_workspace;
-use super::checker::precompute_gm_method_realms;
-use super::checker::precompute_missing_required_fields;
-use super::checker::precompute_nodiscard_candidates;
-use super::checker::precompute_param_type_candidates;
-use super::checker::precompute_property_name_candidates;
-use super::checker::precompute_sorted_send_flows;
+use super::shared_data_cache::SharedDiagnosticComponentCache;
 use super::{checker::check_file, lua_diagnostic_config::LuaDiagnosticConfig};
 use crate::semantic::LuaAnalysisPhase;
 use crate::{DiagnosticCode, Emmyrc, FileId, LuaCompilation, WorkspaceId};
 use lsp_types::Diagnostic;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaDiagnostic {
     enable: bool,
     config: Arc<LuaDiagnosticConfig>,
-    workspace_configs: HashMap<WorkspaceId, Arc<LuaDiagnosticConfig>>,
+    workspace_configs: FxHashMap<WorkspaceId, Arc<LuaDiagnosticConfig>>,
 }
 
 impl Default for LuaDiagnostic {
@@ -39,7 +32,7 @@ impl LuaDiagnostic {
         Self {
             enable: true,
             config: Arc::new(LuaDiagnosticConfig::default()),
-            workspace_configs: HashMap::new(),
+            workspace_configs: FxHashMap::default(),
         }
     }
 
@@ -53,10 +46,10 @@ impl LuaDiagnostic {
         &mut self,
         configs: HashMap<WorkspaceId, Arc<LuaDiagnosticConfig>>,
     ) {
-        self.workspace_configs = configs;
+        self.workspace_configs = configs.into_iter().collect();
     }
 
-    // 只开启指定的诊断
+    // Only enable the given diagnostic
     pub fn enable_only(&mut self, code: DiagnosticCode) {
         let mut emmyrc = Emmyrc::default();
         emmyrc.diagnostics.enables.push(code);
@@ -109,117 +102,18 @@ impl LuaDiagnostic {
         &self,
         compilation: &LuaCompilation,
     ) -> Arc<SharedDiagnosticData> {
-        let db = compilation.get_db();
-        let module_index = db.get_module_index();
-        let mut workspace_file_ids = module_index.get_main_workspace_file_ids();
-        workspace_file_ids.sort_unstable();
-        // Callee resolution for a main workspace can select declarations from
-        // compatible library and std workspaces. Include those files in the
-        // realm lookup precompute while keeping `workspace_file_ids` limited to
-        // main files for diagnostics that intentionally scan only user code.
-        let mut realm_candidate_file_ids = db.get_vfs().get_all_local_file_ids();
-        realm_candidate_file_ids.sort_unstable();
+        self.precompute_shared_data_with_cache(compilation, &SharedDiagnosticComponentCache::new())
+    }
 
-        // Every precomputation here scans the workspace-wide db independently and
-        // reads only immutable `&DbIndex` state, so run them all concurrently. On
-        // large workspaces this block was a ~0.3-0.4s serial prelude to the
-        // parallel per-file diagnostic pass; fanning it out keeps the one-time
-        // precompute off the critical path. The per-workspace realm loop keeps its
-        // own sequential ordering inside a single task (insertion order is
-        // significant for the "first definition wins" realm-candidate rule).
-        let workspace_file_ids_ref = &workspace_file_ids;
-        let realm_candidate_file_ids_ref = &realm_candidate_file_ids;
-        let (
-            workspace_realm_data,
-            missing_required_fields,
-            await_candidates,
-            param_type_candidates,
-            nodiscard_candidates,
-            decl_annotation_realms,
-            sorted_send_flows,
-            property_name_candidates,
-        ) = std::thread::scope(|s| {
-            let workspace_realms = s.spawn(|| {
-                let mut gm_method_realms = HashMap::new();
-                let mut callee_realms_by_workspace = HashMap::new();
-                let mut realm_call_candidates_by_workspace = HashMap::new();
-                for workspace_id in module_index.get_main_workspace_ids() {
-                    let realms = Arc::new(precompute_gm_method_realms(db, workspace_id));
-                    let mut callee_realm_data = precompute_callee_realm_data_for_workspace(
-                        db,
-                        workspace_id,
-                        realm_candidate_file_ids_ref,
-                    );
-                    callee_realm_data
-                        .realm_call_candidates
-                        .insert_gm_method_realms(realms.as_ref());
-                    gm_method_realms.insert(workspace_id, realms);
-                    callee_realms_by_workspace
-                        .insert(workspace_id, Arc::new(callee_realm_data.callee_realms));
-                    realm_call_candidates_by_workspace.insert(
-                        workspace_id,
-                        Arc::new(callee_realm_data.realm_call_candidates),
-                    );
-                }
-                (
-                    gm_method_realms,
-                    callee_realms_by_workspace,
-                    realm_call_candidates_by_workspace,
-                )
-            });
-            let missing = s.spawn(|| precompute_missing_required_fields(db));
-            let await_c = s.spawn(|| precompute_await_candidates(db));
-            let param_type = s.spawn(|| precompute_param_type_candidates(db));
-            let nodiscard = s.spawn(|| precompute_nodiscard_candidates(db));
-            let property_names = s.spawn(|| precompute_property_name_candidates(db));
-            let decl_realms =
-                s.spawn(|| precompute_decl_annotation_realms(db, workspace_file_ids_ref));
-            let send_flows =
-                s.spawn(|| precompute_sorted_send_flows(db.get_gmod_network_index(), db.get_vfs()));
-            (
-                workspace_realms
-                    .join()
-                    .expect("workspace realm precompute panicked"),
-                missing
-                    .join()
-                    .expect("precompute_missing_required_fields panicked"),
-                await_c
-                    .join()
-                    .expect("precompute_await_candidates panicked"),
-                param_type
-                    .join()
-                    .expect("precompute_param_type_candidates panicked"),
-                nodiscard
-                    .join()
-                    .expect("precompute_nodiscard_candidates panicked"),
-                decl_realms
-                    .join()
-                    .expect("precompute_decl_annotation_realms panicked"),
-                Arc::new(
-                    send_flows
-                        .join()
-                        .expect("precompute_sorted_send_flows panicked"),
-                ),
-                property_names
-                    .join()
-                    .expect("precompute_property_name_candidates panicked"),
-            )
-        });
-        let (gm_method_realms, callee_realms_by_workspace, realm_call_candidates_by_workspace) =
-            workspace_realm_data;
-        Arc::new(SharedDiagnosticData {
-            workspace_file_ids: Arc::new(workspace_file_ids),
-            gm_method_realms,
-            callee_realms_by_workspace,
-            realm_call_candidates_by_workspace,
-            missing_required_fields: Arc::new(missing_required_fields),
-            await_candidates: Arc::new(await_candidates),
-            param_type_candidates: Arc::new(param_type_candidates),
-            nodiscard_candidates: Arc::new(nodiscard_candidates),
-            property_name_candidates: Arc::new(property_name_candidates),
-            decl_annotation_realms: Arc::new(decl_annotation_realms),
-            sorted_send_flows,
-        })
+    /// [`precompute_shared_data`](Self::precompute_shared_data) reusing what
+    /// `cache` holds from earlier runs wherever the facts it read still hold;
+    /// see [`SharedDiagnosticComponentCache`]. The data equals a cold build's.
+    pub fn precompute_shared_data_with_cache(
+        &self,
+        compilation: &LuaCompilation,
+        cache: &SharedDiagnosticComponentCache,
+    ) -> Arc<SharedDiagnosticData> {
+        cache.shared_data(compilation)
     }
 
     fn diagnose_file_inner(
@@ -243,12 +137,14 @@ impl LuaDiagnostic {
         {
             return None;
         }
+        let profile_start = crate::profile::phase_enabled()
+            .then(|| (Instant::now(), crate::profile::cpu::thread_cpu_time()));
 
         let config = self.get_config_for_file(compilation, file_id);
 
         let slow_log_enabled = log::log_enabled!(log::Level::Info);
         let sem_start = slow_log_enabled.then(Instant::now);
-        let semantic_model = compilation.get_semantic_model(file_id)?;
+        let semantic_model = compilation.get_diagnostic_semantic_model(file_id)?;
         // Set diagnostics phase so error results are cached (types are final,
         // no subsequent unresolve pass will change them). This prevents expensive
         // recomputation across diagnostic checkers.
@@ -275,21 +171,35 @@ impl LuaDiagnostic {
             return None;
         }
 
-        Some(context.get_diagnostics())
+        let mut diagnostics = context.get_diagnostics();
+        diagnostics.sort_by(|a, b| {
+            (a.range.start, a.range.end, code_order(&a.code), &a.message).cmp(&(
+                b.range.start,
+                b.range.end,
+                code_order(&b.code),
+                &b.message,
+            ))
+        });
+        if let Some((wall_start, cpu_start)) = profile_start {
+            drop(semantic_model);
+            let path = db
+                .get_vfs()
+                .get_file_path(&file_id)
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("{file_id:?}"));
+            let cpu = cpu_start
+                .zip(crate::profile::cpu::thread_cpu_time())
+                .map(|(start, end)| end.saturating_sub(start));
+            super::checker::report_file_profile(&path, wall_start.elapsed(), cpu);
+        }
+        Some(diagnostics)
     }
 }
 
-fn precompute_decl_annotation_realms(
-    db: &crate::DbIndex,
-    workspace_file_ids: &[FileId],
-) -> FxHashMap<FileId, Vec<super::checker::AnnotatedRealmRange>> {
-    use super::checker::collect_decl_annotation_realms_for_file_precompute;
-    let mut cache = FxHashMap::default();
-    for &file_id in workspace_file_ids {
-        let realms = collect_decl_annotation_realms_for_file_precompute(db, &file_id);
-        if !realms.is_empty() {
-            cache.insert(file_id, realms);
-        }
+fn code_order(code: &Option<lsp_types::NumberOrString>) -> (u8, i32, &str) {
+    match code {
+        None => (0, 0, ""),
+        Some(lsp_types::NumberOrString::Number(number)) => (1, *number, ""),
+        Some(lsp_types::NumberOrString::String(name)) => (2, 0, name),
     }
-    cache
 }

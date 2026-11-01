@@ -213,4 +213,24 @@ mod test {
             "#,
         ));
     }
+
+    #[test]
+    fn test_global_declaration_value_is_inferred_in_its_own_file() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "addons/t/lua/autorun/b.lua",
+            r#"
+                local function make() return function() end end
+                ---@type any
+                Foo = make()
+            "#,
+        );
+        ws.def_file("addons/t/lua/autorun/c.lua", "function make() return 5 end");
+
+        assert!(ws.check_file_for(
+            DiagnosticCode::CallNonCallable,
+            "addons/t/lua/autorun/a.lua",
+            "Foo()",
+        ));
+    }
 }

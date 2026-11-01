@@ -1,19 +1,19 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use glua_parser::LuaSyntaxNodeExt;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIndexKey,
-    LuaStat, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    LuaAssignStat, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaExpr, LuaIndexKey, LuaStat,
+    LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 
 use crate::{
-    DbIndex, DiagnosticCode, LuaMemberFeature, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId,
-    LuaType, LuaTypeCache, LuaTypeDeclId, SemanticModel,
+    DbIndex, DiagnosticCode, FileId, InFiled, LuaMemberFeature, LuaMemberKey, LuaMemberOwner,
+    LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDeclId, SemanticModel, VariadicType,
+    semantic::{MetatableIndexField, find_metatable_index_field},
 };
 
-use super::{Checker, DiagnosticContext, PrecomputedMissingRequiredFields, humanize_lint_type};
+use super::{Checker, DiagnosticContext, humanize_lint_type};
 use itertools::Itertools;
 
 pub struct MissingFieldsChecker;
@@ -22,14 +22,15 @@ impl Checker for MissingFieldsChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::MissingFields];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-
-        let mut type_cache: HashMap<LuaType, Arc<HashSet<String>>> = HashMap::new();
-        for expr in root.descendants::<LuaTableExpr>() {
+        let mut type_cache: HashMap<LuaType, Arc<HashSet<String>>> = HashMap::default();
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for expr in buckets.table_exprs.iter() {
             if context.is_cancelled() {
                 return;
             }
-            check_table_expr(context, semantic_model, &expr, &mut type_cache);
+            check_table_expr(context, semantic_model, expr, &mut type_cache);
         }
     }
 }
@@ -106,10 +107,11 @@ fn check_table_expr(
         return Some(());
     }
 
-    let current_fields = fields
+    let mut current_fields: HashSet<String> = fields
         .iter()
         .filter_map(|field| field.get_field_key().map(|key| key.get_path_part()))
         .collect();
+    let spread = trailing_spread_slots(semantic_model, &fields);
 
     let required_fields = match &table_type {
         LuaType::Ref(type_decl_id) => get_precomputed_required_fields(context, type_decl_id)
@@ -148,7 +150,7 @@ fn check_table_expr(
         LuaType::Intersection(intersections) => type_cache
             .entry(table_type.clone())
             .or_insert_with(|| {
-                let mut computed_fields = HashSet::new();
+                let mut computed_fields = HashSet::default();
                 for intersection_component in intersections.get_types() {
                     if context.is_cancelled() {
                         return Arc::new(computed_fields);
@@ -164,6 +166,14 @@ fn check_table_expr(
         _ => return Some(()),
     };
 
+    if let Some(spread) = &spread {
+        current_fields.extend(
+            required_fields
+                .iter()
+                .filter(|name| spread.fills(name))
+                .cloned(),
+        );
+    }
     let mut missing: HashSet<&str> = required_fields
         .difference(&current_fields)
         .map(String::as_str)
@@ -173,6 +183,8 @@ fn check_table_expr(
     }
 
     remove_fields_completed_after(semantic_model, &table_type, expr, &mut missing);
+    remove_fields_supplied_by_metatable(db, semantic_model.get_file_id(), expr, &mut missing);
+    remove_fields_gained_before_use(semantic_model, expr, &mut missing);
     if missing.is_empty() {
         return Some(());
     }
@@ -220,8 +232,12 @@ fn remove_fields_completed_after(
         }
 
         let mut written_prefixes = Vec::new();
+        let mut values = Vec::new();
         if let Some(assign) = LuaAssignStat::cast(node.clone()) {
-            for var in assign.get_var_and_expr_list().0 {
+            let vars;
+            (vars, values) = assign.get_var_and_expr_list();
+            let mut written_keys = Vec::new();
+            for var in vars {
                 let LuaVarExpr::IndexExpr(index) = var else {
                     continue;
                 };
@@ -237,19 +253,51 @@ fn remove_fields_completed_after(
                 }
                 written_prefixes.push(prefix.syntax().clone());
                 if let Some(key) = index.get_index_key() {
-                    missing.remove(key.get_path_part().as_str());
+                    written_keys.push(key.get_path_part());
                 }
+            }
+
+            // Values run before their writes; a function value runs later unless called there.
+            let consumed_by_values = values
+                .iter()
+                .flat_map(|value| {
+                    value
+                        .syntax()
+                        .descendants_of::<LuaVarExpr>()
+                        .filter(move |var| !runs_after_value(var, value))
+                })
+                .filter(|var| {
+                    var.get_access_path().as_deref() == Some(target.as_str())
+                        && !declared_within(semantic_model, var, &node)
+                        && hands_to_call(var)
+                })
+                .collect::<Vec<_>>();
+            if !consumed_by_values.is_empty() {
+                for var in consumed_by_values {
+                    remove_fields_filled_by_callee(semantic_model, table_type, &var, missing);
+                }
+                break;
+            }
+            for key in &written_keys {
+                missing.remove(key.as_str());
             }
         }
 
         // Anything else touching the target consumes it while it is still
         // incomplete, so later writes no longer make the literal complete.
         let escaping_vars = node
-            .descendants()
-            .filter_map(LuaVarExpr::cast)
+            .descendants_of::<LuaVarExpr>()
             .filter(|var| {
                 var.get_access_path().as_deref() == Some(target.as_str())
                     && !written_prefixes.contains(var.syntax())
+                    && !declared_within(semantic_model, var, &node)
+                    && !values.iter().any(|value| {
+                        value
+                            .syntax()
+                            .text_range()
+                            .contains_range(var.syntax().text_range())
+                            && runs_after_value(var, value)
+                    })
             })
             .collect::<Vec<_>>();
         if !escaping_vars.is_empty() {
@@ -265,6 +313,96 @@ fn remove_fields_completed_after(
     Some(())
 }
 
+/// Whether `var` is handed to a call, as an argument or as a method call's `self`.
+fn hands_to_call(var: &LuaVarExpr) -> bool {
+    let operand = outermost_value(var.syntax());
+    let Some(parent) = operand.parent() else {
+        return false;
+    };
+    LuaCallArgList::can_cast(parent.kind().into())
+        || glua_parser::LuaIndexExpr::cast(parent).is_some_and(|index| {
+            index
+                .get_prefix_expr()
+                .is_some_and(|prefix| prefix.syntax() == &operand)
+                && index
+                    .get_index_token()
+                    .is_some_and(|token| token.is_colon())
+        })
+}
+
+/// `node` together with the parentheses wrapped around it, which pass on exactly its value.
+fn outermost_parens(node: &LuaSyntaxNode) -> LuaSyntaxNode {
+    let mut operand = node.clone();
+    while let Some(paren) = operand.parent().and_then(glua_parser::LuaParenExpr::cast) {
+        operand = paren.syntax().clone();
+    }
+    operand
+}
+
+/// `node` together with the parentheses and `and`/`or` operators that may pass its value on.
+fn outermost_value(node: &LuaSyntaxNode) -> LuaSyntaxNode {
+    let mut operand = node.clone();
+    while let Some(parent) = operand.parent() {
+        let carries_value = glua_parser::LuaParenExpr::can_cast(parent.kind().into())
+            || glua_parser::LuaBinaryExpr::cast(parent.clone()).is_some_and(|binary| {
+                binary.get_op_token().is_some_and(|op| {
+                    matches!(
+                        op.get_op(),
+                        glua_parser::BinaryOperator::OpAnd | glua_parser::BinaryOperator::OpOr
+                    )
+                })
+            });
+        if !carries_value {
+            break;
+        }
+        operand = parent;
+    }
+    operand
+}
+
+/// Whether `var`'s root variable is declared inside `scope`, shadowing any outer one.
+fn declared_within(
+    semantic_model: &SemanticModel,
+    var: &LuaVarExpr,
+    scope: &LuaSyntaxNode,
+) -> bool {
+    let mut root = LuaExpr::cast(var.syntax().clone());
+    while let Some(LuaExpr::IndexExpr(index)) = root {
+        root = index.get_prefix_expr();
+    }
+    let Some(LuaExpr::NameExpr(name)) = root else {
+        return false;
+    };
+    semantic_model
+        .get_db()
+        .get_reference_index()
+        .get_local_reference(&semantic_model.get_file_id())
+        .and_then(|references| references.get_decl_id(&name.get_range()))
+        .is_some_and(|decl_id| scope.text_range().contains(decl_id.position))
+}
+
+/// Whether `var` sits in a function `value` stores for later instead of running it.
+fn runs_after_value(var: &LuaVarExpr, value: &LuaExpr) -> bool {
+    var.syntax()
+        .ancestors()
+        .take_while(|node| node != value.syntax())
+        .chain(std::iter::once(value.syntax().clone()))
+        .filter_map(glua_parser::LuaClosureExpr::cast)
+        .any(|closure| !may_run_where_written(&closure))
+}
+
+/// Whether `closure` is called where it is written, or handed to a call that may run it.
+fn may_run_where_written(closure: &glua_parser::LuaClosureExpr) -> bool {
+    let operand = outermost_value(closure.syntax());
+    let Some(parent) = operand.parent() else {
+        return false;
+    };
+    LuaCallArgList::can_cast(parent.kind().into())
+        || LuaCallExpr::cast(parent)
+            .and_then(|call| call.get_prefix_expr())
+            .is_some_and(|prefix| prefix.syntax() == &operand)
+}
+
 /// A literal passed as an out-parameter is completed by the callee, not by the
 /// caller: `local layout = {}` followed by `Fill(layout)` is complete when
 /// `Fill` writes those fields onto its parameter. Only a parameter declared as
@@ -276,11 +414,12 @@ fn remove_fields_filled_by_callee(
     var: &LuaVarExpr,
     missing: &mut HashSet<&str>,
 ) -> Option<()> {
-    let arg_list = var.get_parent::<LuaCallArgList>()?;
+    let operand = outermost_parens(var.syntax());
+    let arg_list = LuaCallArgList::cast(operand.parent()?)?;
     let call_expr = arg_list.get_parent::<LuaCallExpr>()?;
     let arg_index = arg_list
         .get_args()
-        .position(|arg| arg.get_position() == var.get_position())?;
+        .position(|arg| arg.syntax() == &operand)?;
 
     let prefix_expr = call_expr.get_prefix_expr()?;
     let LuaType::Signature(signature_id) = semantic_model.infer_expr(prefix_expr).ok()? else {
@@ -302,7 +441,7 @@ fn remove_fields_filled_by_callee(
     }
     let param_name = signature.params.get(param_index)?;
 
-    let closure = find_closure(semantic_model, &signature_id)?;
+    let closure = semantic_model.get_signature_closure(signature_id)?;
     let block = closure.get_block()?;
     // Only the body's own statements count, the same rule
     // `remove_fields_completed_after` applies to the caller side: a write nested
@@ -331,18 +470,128 @@ fn remove_fields_filled_by_callee(
     Some(())
 }
 
-fn find_closure(
+/// A field the literal's metatable `__index` answers is there when read, so it
+/// is not missing; whether its type fits is the type check's to report.
+fn remove_fields_supplied_by_metatable(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: &LuaTableExpr,
+    missing: &mut HashSet<&str>,
+) {
+    let table = InFiled::new(file_id, expr.get_range());
+    missing.retain(|name| {
+        let key = name
+            .strip_prefix('[')
+            .and_then(|index| index.strip_suffix(']'))
+            .and_then(|index| index.parse::<i64>().ok())
+            .map_or_else(|| LuaMemberKey::Name((*name).into()), LuaMemberKey::Integer);
+        matches!(
+            find_metatable_index_field(db, &table, &key),
+            MetatableIndexField::Absent
+        )
+    });
+}
+
+/// A literal an untyped local holds is expected to be what the local's typed call
+/// uses take, so like those uses it counts a field its table is given before each
+/// of them on the way there: `local trace = { mins = m }` filled with
+/// `trace.start = p` ahead of `util.TraceHull(trace)` in the same function.
+fn remove_fields_gained_before_use(
     semantic_model: &SemanticModel,
-    signature_id: &LuaSignatureId,
-) -> Option<LuaClosureExpr> {
-    let file_id = signature_id.get_file_id();
-    let root = semantic_model.get_root_by_file_id(file_id)?;
-    root.syntax()
-        .token_at_offset(signature_id.get_position())
-        .right_biased()?
-        .parent_ancestors()
-        .find_map(LuaClosureExpr::cast)
-        .filter(|closure| LuaSignatureId::from_closure(file_id, closure) == *signature_id)
+    expr: &LuaTableExpr,
+    missing: &mut HashSet<&str>,
+) {
+    let db = semantic_model.get_db();
+    let file_id = semantic_model.get_file_id();
+    let table = InFiled::new(file_id, expr.get_range());
+    let Some(decl_id) = expr
+        .get_parent::<glua_parser::LuaLocalStat>()
+        .and_then(|local| {
+            let index = local
+                .get_value_exprs()
+                .position(|value| value.syntax() == expr.syntax())?;
+            let name = local.get_local_name_list().nth(index)?;
+            Some(crate::LuaDeclId::new(file_id, name.get_position()))
+        })
+    else {
+        return;
+    };
+    if !db
+        .get_type_index()
+        .get_type_cache(&decl_id.into())
+        .is_some_and(|cache| cache.as_type() == &LuaType::TableConst(table.clone()))
+    {
+        return;
+    }
+    let Ok(uses) = crate::semantic::local_call_reference_expectations(
+        db,
+        &mut semantic_model.get_cache().borrow_mut(),
+        decl_id,
+    ) else {
+        return;
+    };
+    if uses.is_empty() {
+        return;
+    }
+    let Some(members) = db
+        .get_member_index()
+        .get_members(&LuaMemberOwner::Element(table))
+    else {
+        return;
+    };
+    let root = semantic_model.get_root().syntax().clone();
+    let mut writes: HashMap<String, Vec<glua_parser::LuaSyntaxNode>> = HashMap::new();
+    for member in members {
+        let name = member.get_key().to_path();
+        if !missing.contains(name.as_str()) {
+            continue;
+        }
+        if let Some(node) = member.get_id().get_syntax_id().to_node_from_root(&root) {
+            writes.entry(name).or_default().push(node);
+        }
+    }
+    missing.retain(|name| {
+        let Some(writes) = writes.get(*name) else {
+            return true;
+        };
+        !uses.iter().all(|(use_range, _)| {
+            let use_node = root.covering_element(*use_range);
+            writes
+                .iter()
+                .any(|write| write_runs_before_use(write, &use_node, use_range.start()))
+        })
+    });
+}
+
+/// Whether the write `write` always runs before the read at `use_start`: its
+/// statement ends earlier in the same function, in a block that also holds the read
+/// or one only `do ... end` blocks separate from it.
+fn write_runs_before_use(
+    write: &glua_parser::LuaSyntaxNode,
+    use_node: &rowan::NodeOrToken<glua_parser::LuaSyntaxNode, glua_parser::LuaSyntaxToken>,
+    use_start: rowan::TextSize,
+) -> bool {
+    let function_of = |node: Option<glua_parser::LuaSyntaxNode>| {
+        node.and_then(|node| node.ancestors().find_map(glua_parser::LuaClosureExpr::cast))
+    };
+    let Some(stat) = write.ancestors().find_map(LuaStat::cast) else {
+        return false;
+    };
+    if stat.syntax().text_range().end() > use_start
+        || function_of(Some(write.clone())) != function_of(use_node.parent())
+    {
+        return false;
+    }
+    let mut block = stat.get_parent::<glua_parser::LuaBlock>();
+    while let Some(current) = block {
+        if current.syntax().text_range().contains(use_start) {
+            return true;
+        }
+        block = current
+            .get_parent::<glua_parser::LuaDoStat>()
+            .and_then(|do_stat| do_stat.get_parent::<glua_parser::LuaBlock>());
+    }
+    false
 }
 
 /// The path the literal is assigned to, e.g. `self.portals` or `cfg`.
@@ -366,20 +615,6 @@ fn assigned_target_path(expr: &LuaTableExpr, stat: &LuaStat) -> Option<String> {
     }
 }
 
-pub fn precompute_missing_required_fields(db: &DbIndex) -> PrecomputedMissingRequiredFields {
-    db.get_type_index()
-        .get_all_types()
-        .into_iter()
-        .filter_map(|type_decl| {
-            let type_decl_id = type_decl.get_id();
-            let typ = LuaType::Ref(type_decl_id.clone());
-            let types = type_decl_id.collect_super_types_with_self(db, typ);
-            let required_fields = get_required_fields_for_types(db, &types, || false)?;
-            Some((type_decl_id, Arc::new(required_fields)))
-        })
-        .collect()
-}
-
 fn get_precomputed_required_fields(
     context: &DiagnosticContext,
     type_decl_id: &LuaTypeDeclId,
@@ -387,6 +622,47 @@ fn get_precomputed_required_fields(
     context
         .get_shared_data_arc()
         .and_then(|shared| shared.missing_required_fields.get(type_decl_id).cloned())
+}
+
+/// The values a trailing call or `...` fills the positional slots with, from
+/// slot `first` onward.
+struct SpreadSlots {
+    first: usize,
+    values: VariadicType,
+}
+
+impl SpreadSlots {
+    fn fills(&self, field_name: &str) -> bool {
+        field_name
+            .strip_prefix('[')
+            .and_then(|name| name.strip_suffix(']'))
+            .and_then(|slot| slot.parse::<usize>().ok())
+            .and_then(|slot| slot.checked_sub(self.first))
+            .is_some_and(|offset| self.values.get_type(offset).is_some())
+    }
+}
+
+fn trailing_spread_slots(
+    semantic_model: &SemanticModel,
+    fields: &[LuaTableField],
+) -> Option<SpreadSlots> {
+    let (last, preceding) = fields.split_last()?;
+    if !last.is_value_field() {
+        return None;
+    }
+    let fact = semantic_model.infer_expr_fact(last.get_value_expr()?);
+    let LuaType::Variadic(values) = fact.typ() else {
+        return None;
+    };
+    let first = preceding
+        .iter()
+        .filter(|field| field.is_value_field())
+        .count()
+        + 1;
+    Some(SpreadSlots {
+        first,
+        values: values.as_ref().clone(),
+    })
 }
 
 fn table_literal_looks_array_like(fields: &[LuaTableField]) -> bool {
@@ -408,7 +684,7 @@ fn table_literal_looks_array_like(fields: &[LuaTableField]) -> bool {
 
 fn get_required_fields(
     context: &mut DiagnosticContext,
-    // types 应为广度优先, 子类型会先于父类型被遍历, 而子类型的优先级高于父类型
+    // types should be breadth-first: subtypes are visited before supertypes, and subtypes have higher priority than supertypes
     types: &[LuaType],
 ) -> Option<HashSet<String>> {
     let db = context.db;
@@ -417,125 +693,140 @@ fn get_required_fields(
 
 fn get_required_fields_for_types(
     db: &DbIndex,
-    // types 应为广度优先, 子类型会先于父类型被遍历, 而子类型的优先级高于父类型
+    // types should be breadth-first: subtypes are visited before supertypes, and subtypes have higher priority than supertypes
     types: &[LuaType],
     mut is_cancelled: impl FnMut() -> bool,
 ) -> Option<HashSet<String>> {
-    let member_index = db.get_member_index();
-    let mut required_fields: HashSet<String> = HashSet::new();
+    Some(fold_required_fields(
+        types,
+        &mut is_cancelled,
+        |type_decl_id, is_cancelled| {
+            own_field_requirements(db, type_decl_id, is_cancelled).map(Arc::new)
+        },
+    ))
+}
 
-    let mut optional_type = HashSet::new();
+/// What one type's own members require of a table literal, and the names
+/// they leave optional to write.
+#[derive(Debug, Default, PartialEq)]
+pub struct OwnFieldRequirements {
+    required: HashSet<String>,
+    optional: HashSet<String>,
+}
+
+/// `type_decl_id`'s own field requirements: `None` when it has no member map
+/// or the walk was cancelled.
+pub fn own_field_requirements(
+    db: &DbIndex,
+    type_decl_id: &LuaTypeDeclId,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<OwnFieldRequirements> {
+    let members = db
+        .get_member_index()
+        .get_members(&LuaMemberOwner::Type(type_decl_id.clone()))?;
+    let mut own = OwnFieldRequirements::default();
+    for member in members {
+        if is_cancelled() {
+            return None;
+        }
+        if matches!(
+            member.get_feature(),
+            LuaMemberFeature::FileMethodDecl | LuaMemberFeature::MetaMethodDecl
+        ) {
+            continue;
+        }
+        let name = member.get_key().to_path();
+
+        // A field the class never declared, attached by a plain `v.X = ...`
+        // write somewhere, is an addition to a value — not part of the
+        // contract a constructor has to satisfy. Only what the class
+        // declares can be required of a literal; runtime writes make the
+        // field available to read, at most optional to write.
+        if member.is_assignment_define() {
+            own.optional.insert(name);
+            continue;
+        }
+        let decl_type = db
+            .get_type_index()
+            .get_type_cache(&member.get_id().into())
+            .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown))
+            .as_type()
+            .clone();
+
+        // Treat fields with documented defaults as optional-for-writing,
+        // matching the semantic table-compatibility rule in type_check.
+        let has_default = {
+            let owner_id = LuaSemanticDeclId::Member(member.get_id());
+            db.get_property_index()
+                .get_property(&owner_id)
+                .is_some_and(|p| p.default_value().is_some())
+                || match &decl_type {
+                    LuaType::Signature(sig_id) => db
+                        .get_property_index()
+                        .get_property(&LuaSemanticDeclId::Signature(sig_id.clone()))
+                        .is_some_and(|p| p.default_value().is_some()),
+                    _ => false,
+                }
+        };
+        if has_default {
+            own.optional.insert(name);
+            continue;
+        }
+
+        record_required_fields(&mut own.required, &mut own.optional, name, decl_type);
+    }
+    Some(own)
+}
+
+/// The type whose own requirements a super chain entry contributes.
+pub fn own_fields_owner(typ: &LuaType) -> Option<&LuaTypeDeclId> {
+    match typ {
+        LuaType::Ref(type_decl_id) => Some(type_decl_id),
+        LuaType::Generic(generic_type) => Some(generic_type.get_base_type_id_ref()),
+        _ => None,
+    }
+}
+
+/// The fields a table literal of `types` must set, folding each type's own
+/// requirements (`own`) in order: earlier types take priority.
+pub fn fold_required_fields<C: FnMut() -> bool>(
+    types: &[LuaType],
+    is_cancelled: &mut C,
+    mut own: impl FnMut(&LuaTypeDeclId, &mut C) -> Option<Arc<OwnFieldRequirements>>,
+) -> HashSet<String> {
+    let mut required_fields: HashSet<String> = HashSet::default();
+    let mut optional_type = HashSet::default();
     for super_type in types {
         if is_cancelled() {
-            return Some(required_fields);
+            return required_fields;
         }
-        match super_type {
-            LuaType::Ref(type_decl_id) => process_type_decl_id(
-                db,
-                member_index,
-                &mut required_fields,
-                &mut optional_type,
-                type_decl_id.clone(),
-                &mut is_cancelled,
-            ),
-            LuaType::Generic(generic_type) => process_type_decl_id(
-                db,
-                member_index,
-                &mut required_fields,
-                &mut optional_type,
-                generic_type.get_base_type_id().clone(),
-                &mut is_cancelled,
-            ),
-            // 处理 ---@class test: { a: number }
-            LuaType::Object(object_type) => {
-                let fields = object_type.get_fields();
-                for (key, decl_type) in fields {
-                    if is_cancelled() {
-                        return Some(required_fields);
-                    }
-                    let name = key.to_path();
-                    record_required_fields(
-                        &mut required_fields,
-                        &mut optional_type,
-                        name,
-                        decl_type.clone(),
-                    );
+        // Handle ---@class test: { a: number }
+        if let LuaType::Object(object_type) = super_type {
+            for (key, decl_type) in object_type.get_fields() {
+                if is_cancelled() {
+                    return required_fields;
                 }
-                continue;
+                record_required_fields(
+                    &mut required_fields,
+                    &mut optional_type,
+                    key.to_path(),
+                    decl_type.clone(),
+                );
             }
-            _ => continue,
+            continue;
+        }
+        let Some(owned) = own_fields_owner(super_type).and_then(|owner| own(owner, is_cancelled))
+        else {
+            continue;
         };
-    }
-
-    fn process_type_decl_id(
-        db: &DbIndex,
-        member_index: &crate::LuaMemberIndex,
-        required_fields: &mut HashSet<String>,
-        optional_type: &mut HashSet<String>,
-        type_decl_id: LuaTypeDeclId,
-        is_cancelled: &mut impl FnMut() -> bool,
-    ) -> Option<()> {
-        let members = member_index.get_members(&LuaMemberOwner::Type(type_decl_id))?;
-        let mut type_required_fields = HashSet::new();
-        let mut type_optional_fields = HashSet::new();
-
-        for member in members {
-            if is_cancelled() {
-                return Some(());
-            }
-            if matches!(
-                member.get_feature(),
-                LuaMemberFeature::FileMethodDecl | LuaMemberFeature::MetaMethodDecl
-            ) {
-                continue;
-            }
-            let name = member.get_key().to_path();
-            let decl_type = db
-                .get_type_index()
-                .get_type_cache(&member.get_id().into())
-                .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown))
-                .as_type()
-                .clone();
-
-            // Treat fields with documented defaults as optional-for-writing,
-            // matching the semantic table-compatibility rule in type_check.
-            let has_default = {
-                let owner_id = LuaSemanticDeclId::Member(member.get_id());
-                db.get_property_index()
-                    .get_property(&owner_id)
-                    .is_some_and(|p| p.default_value().is_some())
-                    || match &decl_type {
-                        LuaType::Signature(sig_id) => db
-                            .get_property_index()
-                            .get_property(&LuaSemanticDeclId::Signature(sig_id.clone()))
-                            .is_some_and(|p| p.default_value().is_some()),
-                        _ => false,
-                    }
-            };
-            if has_default {
-                type_optional_fields.insert(name);
-                continue;
-            }
-
-            record_required_fields(
-                &mut type_required_fields,
-                &mut type_optional_fields,
-                name,
-                decl_type,
-            );
-        }
-
-        optional_type.extend(type_optional_fields.iter().cloned());
-        for name in type_required_fields {
-            if !optional_type.contains(&name) {
-                required_fields.insert(name);
+        optional_type.extend(owned.optional.iter().cloned());
+        for name in &owned.required {
+            if !optional_type.contains(name) {
+                required_fields.insert(name.clone());
             }
         }
-
-        Some(())
     }
-
-    Some(required_fields)
+    required_fields
 }
 
 fn record_required_fields(
@@ -566,11 +857,28 @@ mod tests {
     use googletest::prelude::*;
     use tokio_util::sync::CancellationToken;
 
-    use super::get_required_fields;
+    use super::{SpreadSlots, get_required_fields};
     use crate::{
-        DiagnosticCode, Emmyrc, LuaType, diagnostic::lua_diagnostic_config::LuaDiagnosticConfig,
-        test_lib::VirtualWorkspace,
+        DiagnosticCode, Emmyrc, LuaType, VariadicType,
+        diagnostic::lua_diagnostic_config::LuaDiagnosticConfig, test_lib::VirtualWorkspace,
     };
+
+    /// A spread short of the end of the values gives one of them, as the type
+    /// check reads the values; only the last spread reaches every later slot.
+    #[test]
+    fn a_spread_short_of_the_end_fills_one_slot() {
+        let slots = SpreadSlots {
+            first: 2,
+            values: VariadicType::Multi(vec![
+                LuaType::Variadic(Arc::new(VariadicType::Base(LuaType::Number))),
+                LuaType::String,
+            ]),
+        };
+        assert!(!slots.fills("[1]"));
+        assert!(slots.fills("[2]"));
+        assert!(slots.fills("[3]"));
+        assert!(!slots.fills("[4]"));
+    }
 
     #[gtest]
     fn get_required_fields_stops_when_cancelled() {

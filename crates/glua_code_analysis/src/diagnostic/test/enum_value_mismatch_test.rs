@@ -142,4 +142,97 @@ mod tests {
             "#,
         ));
     }
+
+    fn enum_mismatch_messages(ws: &mut VirtualWorkspace, block: &str) -> Vec<String> {
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::EnumValueMismatch);
+        let file_id = ws.def(block);
+        ws.analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect()
+    }
+
+    #[test]
+    fn test_enum_value_doc_literal_operand_matches_member_value() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(
+            enum_mismatch_messages(
+                &mut ws,
+                r#"
+                ---@enum Status
+                local Status = {
+                    PENDING = "pending",
+                    COMPLETED = "completed",
+                }
+
+                ---@param expected "pending"
+                ---@param status Status
+                local function check(expected, status)
+                    if status == expected then
+                    end
+                end
+                "#,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_enum_value_doc_integer_operand_matches_member_value() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(
+            enum_mismatch_messages(
+                &mut ws,
+                r#"
+                ---@enum ErrorCode
+                local ErrorCode = {
+                    SUCCESS = 0,
+                    NOT_FOUND = 404,
+                }
+
+                ---@param expected 404
+                ---@param code ErrorCode
+                local function check(expected, code)
+                    if code == expected then
+                    end
+                end
+                "#,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_enum_value_mismatch_message_shows_literal_values() {
+        let mut ws = VirtualWorkspace::new();
+
+        let messages = enum_mismatch_messages(
+            &mut ws,
+            r#"
+                ---@enum Status
+                local Status = {
+                    PENDING = "pending",
+                    COMPLETED = "completed",
+                }
+
+                ---@param expected "other"
+                ---@param status Status
+                local function check(expected, status)
+                    if status == expected then
+                    end
+                end
+                "#,
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("Value '\"other\"'"));
+        assert!(messages[0].contains("\"pending\""));
+        assert!(messages[0].contains("\"completed\""));
+    }
 }

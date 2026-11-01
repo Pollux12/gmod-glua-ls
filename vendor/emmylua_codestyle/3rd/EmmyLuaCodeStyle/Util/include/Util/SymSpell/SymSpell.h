@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 // Copyright (C) 2019 Wolf Garbe
 // Version: 6.5

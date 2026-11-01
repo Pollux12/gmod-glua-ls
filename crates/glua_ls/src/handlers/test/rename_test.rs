@@ -1,9 +1,38 @@
 #[cfg(test)]
 mod tests {
-    use crate::handlers::rename::{prepare_rename, rename};
+    use crate::handlers::rename::{prepare_rename, rename, versioned_edit};
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, check};
     use googletest::prelude::*;
     use lsp_types::{Position, Range, TextEdit};
+
+    /// Each file's edits name the version of the text they were computed on.
+    #[gtest]
+    fn test_rename_edits_name_the_version_they_were_computed_on() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local <??>value = 1
+                print(value)
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        ws.analysis
+            .compilation
+            .get_db_mut()
+            .get_vfs_mut()
+            .update_file_version(&file_id, Some(7));
+        let edit = rename(&ws.analysis, file_id, position, "renamed".to_string())
+            .expect("a local renames");
+
+        let Some(lsp_types::DocumentChanges::Edits(document_edits)) =
+            versioned_edit(&ws.analysis, edit).document_changes
+        else {
+            panic!("versioned edits");
+        };
+        verify_that!(document_edits.len(), eq(1))?;
+        verify_that!(document_edits[0].text_document.version, eq(Some(7)))?;
+        verify_that!(document_edits[0].edits.len(), eq(2))
+    }
 
     /// A written `self` has a declaration to carry the new name; only a colon
     /// method's implicit receiver does not.
@@ -52,6 +81,69 @@ mod tests {
             eq(true)
         )?;
         Ok(())
+    }
+
+    /// `DEFINE_BASECLASS` writes no `BaseClass` name to carry a new one, so
+    /// renaming it would only overwrite the macro's argument.
+    #[gtest]
+    fn test_rename_refused_for_define_baseclass_local() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = glua_code_analysis::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                DEFINE_BASECLASS("Panel")
+                local _ = <??>BaseClass
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/vgui/cl_panel.lua", &content);
+        verify_that!(
+            rename(&ws.analysis, file_id, position, "renamed".to_string()).is_none(),
+            eq(true)
+        )?;
+        verify_that!(
+            prepare_rename(&ws.analysis, file_id, position).is_none(),
+            eq(true)
+        )?;
+        Ok(())
+    }
+
+    /// The request position and the returned edit ranges count UTF-16 code
+    /// units, so a name after an emoji sits one column further right than its
+    /// character count.
+    #[gtest]
+    fn rename_after_an_emoji_uses_utf16_columns() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let file_id = ws.def("local s = \"\u{1F642}\" local val = 1\nprint(val)\n");
+        let result = rename(
+            &ws.analysis,
+            file_id,
+            Position::new(0, 22),
+            "renamed".to_string(),
+        )
+        .or_fail()?;
+        let mut edits = result
+            .changes
+            .or_fail()?
+            .into_values()
+            .flatten()
+            .collect::<Vec<_>>();
+        edits.sort_by_key(|edit| edit.range.start);
+        verify_eq!(
+            edits,
+            vec![
+                TextEdit {
+                    range: Range::new(Position::new(0, 21), Position::new(0, 24)),
+                    new_text: "renamed".to_string(),
+                },
+                TextEdit {
+                    range: Range::new(Position::new(1, 6), Position::new(1, 9)),
+                    new_text: "renamed".to_string(),
+                },
+            ]
+        )
     }
 
     #[gtest]

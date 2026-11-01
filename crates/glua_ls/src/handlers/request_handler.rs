@@ -7,20 +7,18 @@ use lsp_types::Uri;
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
     CodeActionRequest, CodeLensRequest, CodeLensResolve, ColorPresentationRequest, Completion,
-    DocumentColor, DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentLinkRequest,
-    DocumentLinkResolve, DocumentSymbolRequest, ExecuteCommand, FoldingRangeRequest, Formatting,
-    GotoDefinition, GotoImplementation, HoverRequest, InlayHintRequest, InlayHintResolveRequest,
+    DocumentColor, DocumentHighlightRequest, DocumentLinkRequest, DocumentLinkResolve,
+    DocumentSymbolRequest, ExecuteCommand, FoldingRangeRequest, Formatting, GotoDefinition,
+    GotoImplementation, HoverRequest, InlayHintRequest, InlayHintResolveRequest,
     InlineValueRequest, OnTypeFormatting, PrepareRenameRequest, RangeFormatting, References,
     Rename, Request as LspRequest, ResolveCompletionItem, SelectionRangeRequest,
-    SemanticTokensFullRequest, SignatureHelpRequest, WorkspaceDiagnosticRequest,
-    WorkspaceSymbolRequest,
+    SemanticTokensFullRequest, SignatureHelpRequest, WillRenameFiles, WorkspaceSymbolRequest,
 };
 use serde::Serialize;
 
 use crate::{
-    context::{RequestTaskMetadata, ServerContext},
+    context::{Freshness, RequestTaskMetadata, ServerContext},
     handlers::{
-        diagnostic::{on_pull_document_diagnostic, on_pull_workspace_diagnostic},
         document_type_format::on_type_formatting_handler,
         emmy_gutter::{
             EmmyGutterDetailRequest, EmmyGutterRequest, on_emmy_gutter_detail_handler,
@@ -39,7 +37,6 @@ use super::{
     command::on_execute_command_handler,
     completion::{on_completion_handler, on_completion_resolve_handler},
     definition::on_goto_definition_handler,
-    doc_search::{GluaDocSearchRequest, on_doc_search_handler},
     document_color::{on_document_color, on_document_color_presentation},
     document_formatting::on_formatting_handler,
     document_highlight::on_document_highlight_handler,
@@ -63,6 +60,7 @@ use super::{
     rename::{on_prepare_rename_handler, on_rename_handler},
     semantic_token::on_semantic_token_handler,
     signature_helper::on_signature_helper_handler,
+    workspace::on_will_rename_files_handler,
     workspace_symbol::on_workspace_symbol_handler,
 };
 
@@ -90,10 +88,24 @@ fn extract_uri_from_value(value: &serde_json::Value) -> Option<Uri> {
             .and_then(|text_document| text_document.get("uri")),
         value.get("item").and_then(|item| item.get("uri")),
         value.get("data").and_then(|data| data.get("uri")),
+        value.get("uri"),
     ]
     .into_iter()
     .flatten()
     .find_map(|uri| Uri::from_str(uri.as_str()?).ok())
+}
+
+/// Whether a request's result points into documents other than its own: any
+/// document mid-edit, not only its own, would leave those places wrong.
+fn result_spans_documents(method: &str) -> bool {
+    matches!(
+        method,
+        <References as LspRequest>::METHOD
+            | <Rename as LspRequest>::METHOD
+            | <GotoImplementation as LspRequest>::METHOD
+            | <CallHierarchyIncomingCalls as LspRequest>::METHOD
+            | <CallHierarchyOutgoingCalls as LspRequest>::METHOD
+    )
 }
 
 fn content_modified(id: lsp_server::RequestId) -> Option<Response> {
@@ -107,6 +119,8 @@ fn content_modified(id: lsp_server::RequestId) -> Option<Response> {
 macro_rules! dispatch_request {
     ($request:expr, $context:expr, {
         $($req_type:ty => $handler:expr),* $(,)?
+    }, wait_for_taken_text: {
+        $($text_req_type:ty => $text_handler:expr),* $(,)?
     }, wait_for_fresh_index: {
         $($fresh_req_type:ty => $fresh_handler:expr),* $(,)?
     }, content_modified_if_client_retries: {
@@ -127,51 +141,173 @@ macro_rules! dispatch_request {
                 }
             )*
             $(
+                <$text_req_type>::METHOD => {
+                    if let Ok((id, params)) = $request.extract::<<$text_req_type as LspRequest>::Params>(<$text_req_type>::METHOD) {
+                        let snapshot = $context.snapshot();
+                        let task_metadata = request_task_metadata(<$text_req_type>::METHOD, &params);
+                        let target_uri = task_metadata.uri.clone();
+                        $context.task(id.clone(), task_metadata, |cancel_token| async move {
+                            // The analysis reads a document's text once a take
+                            // installs it; positions sent for newer text would
+                            // not line up with the older one.
+                            if let Some(uri) = target_uri.as_ref() {
+                                match snapshot
+                                    .debounced_analysis()
+                                    .wait_until_text_taken_for(
+                                        &cancel_token,
+                                        <$text_req_type>::METHOD,
+                                        uri,
+                                    )
+                                    .await
+                                {
+                                    Freshness::Fresh => {}
+                                    Freshness::Cancelled => return None,
+                                    Freshness::LoopDead => {
+                                        cancel_token.cancel();
+                                        return None;
+                                    }
+                                }
+                            }
+                            let result = $text_handler(snapshot, params, cancel_token).await;
+                            Some(Response::new_ok(id, result))
+                        }).await;
+                        return Ok(());
+                    }
+                }
+            )*
+            $(
                 <$fresh_req_type>::METHOD => {
                     if let Ok((id, params)) = $request.extract::<<$fresh_req_type as LspRequest>::Params>(<$fresh_req_type>::METHOD) {
                         let snapshot = $context.snapshot();
                         let task_metadata = request_task_metadata(<$fresh_req_type>::METHOD, &params);
-                        let target_uri = task_metadata.uri.clone();
+                        let target_uri = task_metadata
+                            .uri
+                            .clone()
+                            .filter(|_| !result_spans_documents(<$fresh_req_type>::METHOD));
                         $context.task(id.clone(), task_metadata, |cancel_token| async move {
-                            // Symbol resolution against a stale index silently
-                            // returns empty; wait for the reindex. A request
-                            // aimed at one file only needs that file's own
-                            // entries to match its text, so it waits for those
-                            // rather than for the edit's whole dependency
-                            // ripple — seconds apart on a large gamemode.
-                            // The handoff is held across the handler so the
-                            // ripple waits for this request to take its read
-                            // lock rather than putting it behind the ripple it
-                            // was just released from.
-                            let (fresh, _handoff) = match target_uri.as_ref() {
-                                Some(uri) => {
-                                    let debounced = snapshot.debounced_analysis_arc();
-                                    let handoff = debounced.begin_reader_handoff();
-                                    let fresh = debounced
-                                        .wait_until_file_fresh_for(
-                                            &cancel_token,
-                                            <$fresh_req_type>::METHOD,
-                                            uri,
-                                        )
-                                        .await;
-                                    (fresh, Some(handoff))
+                            if !crate::util::ls_profile::ls_profile_enabled() {
+                                // Symbol resolution against a stale index silently
+                                // returns empty; wait for the reindex. A request
+                                // whose result stays in its own file waits only
+                                // for that file.
+                                let freshness = match target_uri.as_ref() {
+                                    Some(uri) => {
+                                        snapshot
+                                            .debounced_analysis()
+                                            .wait_until_file_fresh_for(
+                                                &cancel_token,
+                                                <$fresh_req_type>::METHOD,
+                                                uri,
+                                            )
+                                            .await
+                                    }
+                                    None => {
+                                        snapshot
+                                            .debounced_analysis()
+                                            .wait_until_fresh_for(
+                                                &cancel_token,
+                                                <$fresh_req_type>::METHOD,
+                                            )
+                                            .await
+                                    }
+                                };
+                                match freshness {
+                                    Freshness::Fresh => {}
+                                    Freshness::Cancelled => return None,
+                                    // Freshness can never arrive: fail as
+                                    // cancelled so the client re-sends instead
+                                    // of recording an internal error.
+                                    Freshness::LoopDead => {
+                                        cancel_token.cancel();
+                                        return None;
+                                    }
                                 }
-                                None => {
-                                    let fresh = snapshot
-                                        .debounced_analysis()
-                                        .wait_until_fresh_for(
-                                            &cancel_token,
-                                            <$fresh_req_type>::METHOD,
-                                        )
-                                        .await;
-                                    (fresh, None)
-                                }
-                            };
-                            if !fresh {
-                                return None;
+                                let result = $fresh_handler(snapshot, params, cancel_token).await;
+                                Some(Response::new_ok(id, result))
+                            } else {
+                                // Profiled path: identical wake-up behavior, plus
+                                // one `[profile] ls_request` line
+                                // accumulating fresh-wait by observed state.
+                                // `analysis_read_wait` is contributed by
+                                // `read_analysis` via the scoped accumulator;
+                                // `handler_ms` comes from the completion
+                                // handler's guard when present, else from the
+                                // dispatch-side measurement.
+                                let seq = crate::util::ls_profile::next_ls_seq();
+                                let total_start = std::time::Instant::now();
+                                let id_string = format!("{:?}", id);
+                                let method = <$fresh_req_type>::METHOD;
+                                let accum =
+                                    std::sync::Arc::new(crate::util::ls_profile::LsRequestAccum::new());
+                                let accum_scope = accum.clone();
+                                crate::util::ls_profile::LS_REQUEST_ACCUM
+                                    .scope(accum_scope, async move {
+                                        let (freshness, breakdown) = match target_uri.as_ref() {
+                                            Some(uri) => {
+                                                snapshot
+                                                    .debounced_analysis()
+                                                    .wait_until_file_fresh_for_profiled(
+                                                        &cancel_token,
+                                                        <$fresh_req_type>::METHOD,
+                                                        uri,
+                                                    )
+                                                    .await
+                                            }
+                                            None => {
+                                                snapshot
+                                                    .debounced_analysis()
+                                                    .wait_until_fresh_for_profiled(
+                                                        &cancel_token,
+                                                        <$fresh_req_type>::METHOD,
+                                                    )
+                                                    .await
+                                            }
+                                        };
+                                        if freshness != Freshness::Fresh {
+                                            let total = total_start.elapsed();
+                                            let read_wait = accum.take_read_wait();
+                                            let handler_ms =
+                                                accum.take_handler_time().unwrap_or_default();
+                                            crate::util::ls_profile::emit_ls_request(
+                                                seq,
+                                                &id_string,
+                                                method,
+                                                total,
+                                                breakdown.total,
+                                                breakdown.in_flight,
+                                                breakdown.blocked,
+                                                read_wait,
+                                                handler_ms,
+                                            );
+                                            if freshness == Freshness::LoopDead {
+                                                cancel_token.cancel();
+                                            }
+                                            return None;
+                                        }
+                                        let handler_start = std::time::Instant::now();
+                                        let result =
+                                            $fresh_handler(snapshot, params, cancel_token).await;
+                                        let handler_measured = handler_start.elapsed();
+                                        let handler_ms = accum
+                                            .take_handler_time()
+                                            .unwrap_or(handler_measured);
+                                        let read_wait = accum.take_read_wait();
+                                        let total = total_start.elapsed();
+                                        crate::util::ls_profile::emit_ls_request(
+                                            seq,
+                                            &id_string,
+                                            method,
+                                            total,
+                                            breakdown.total,
+                                            breakdown.in_flight,
+                                            breakdown.blocked,
+                                            read_wait,
+                                            handler_ms,
+                                        );
+                                        Some(Response::new_ok(id, result))
+                                    })
+                                    .await
                             }
-                            let result = $fresh_handler(snapshot, params, cancel_token).await;
-                            Some(Response::new_ok(id, result))
                         }).await;
                         return Ok(());
                     }
@@ -186,12 +322,7 @@ macro_rules! dispatch_request {
                         $context.task(id.clone(), task_metadata, |cancel_token| async move {
                             let debounced = snapshot.debounced_analysis_arc();
                             // Aimed at one document, so its own entries are what
-                            // it needs. Waiting on the workspace instead parks it
-                            // behind the whole dependency ripple, and refuses it
-                            // outright while any other file is mid-edit.
-                            let _handoff = target_uri
-                                .as_ref()
-                                .map(|_| debounced.begin_reader_handoff());
+                            // it needs: another file mid-edit must not refuse it.
                             let stale = || async {
                                 match target_uri.as_ref() {
                                     Some(uri) => !debounced.file_is_answerable(uri).await,
@@ -205,7 +336,7 @@ macro_rules! dispatch_request {
                                 .lsp_features()
                                 .retries_on_content_modified(<$retry_req_type>::METHOD)
                             {
-                                let fresh = match target_uri.as_ref() {
+                                let freshness = match target_uri.as_ref() {
                                     Some(uri) => {
                                         debounced
                                             .wait_until_file_fresh_for(
@@ -224,14 +355,23 @@ macro_rules! dispatch_request {
                                             .await
                                     }
                                 };
-                                if !fresh {
-                                    return None;
+                                match freshness {
+                                    Freshness::Fresh => {}
+                                    Freshness::Cancelled => return None,
+                                    // Freshness can never arrive: fail as
+                                    // cancelled so the client re-sends instead
+                                    // of recording an internal error.
+                                    Freshness::LoopDead => {
+                                        cancel_token.cancel();
+                                        return None;
+                                    }
                                 }
                                 let result = $retry_handler(snapshot, params, cancel_token).await;
                                 return Some(Response::new_ok(id, result));
                             }
 
                             if stale().await {
+                                debounced.request_refused().await;
                                 return content_modified(id);
                             }
 
@@ -267,6 +407,12 @@ pub async fn on_request_handler(
     server_context: &mut ServerContext,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     dispatch_request!(req, server_context, {
+        // Reads the index but performs its own wait to control the cancel
+        // response.
+        EmmyAnnotatorRequest => on_emmy_annotator_handler,
+        CodeLensRequest => on_code_lens_handler,
+        InlayHintRequest => on_inlay_hint_handler,
+    }, wait_for_taken_text: {
         // Must not resolve declarations/members/globals through the index —
         // those need the `wait_for_fresh_index` arm.
         FoldingRangeRequest => on_folding_range_handler,
@@ -275,14 +421,6 @@ pub async fn on_request_handler(
         Formatting => on_formatting_handler,
         RangeFormatting => on_range_formatting_handler,
         OnTypeFormatting => on_type_formatting_handler,
-
-        // Reads the index but performs its own wait to control the cancel
-        // response.
-        EmmyAnnotatorRequest => on_emmy_annotator_handler,
-        CodeLensRequest => on_code_lens_handler,
-        InlayHintRequest => on_inlay_hint_handler,
-        DocumentDiagnosticRequest => on_pull_document_diagnostic,
-        WorkspaceDiagnosticRequest => on_pull_workspace_diagnostic,
     }, wait_for_fresh_index: {
         Completion => on_completion_handler,
         ResolveCompletionItem => on_completion_resolve_handler,
@@ -310,10 +448,10 @@ pub async fn on_request_handler(
         CallHierarchyPrepare => on_prepare_call_hierarchy_handler,
         CallHierarchyIncomingCalls => on_incoming_calls_handler,
         CallHierarchyOutgoingCalls => on_outgoing_calls_handler,
-        GluaDocSearchRequest => on_doc_search_handler,
         GmodScriptedClassesRequest => on_gmod_scripted_classes_handler,
         GmodScriptedClassesV2Request => on_gmod_scripted_classes_v2_handler,
         ExecuteCommand => on_execute_command_handler,
+        WillRenameFiles => on_will_rename_files_handler,
     }, content_modified_if_client_retries: {
         SemanticTokensFullRequest => on_semantic_token_handler,
     });
@@ -393,6 +531,49 @@ mod tests {
         })
     }
 
+    /// Only what the user waits on while typing ends an edit's debounce, and
+    /// the policy names each by its real method.
+    #[test]
+    fn only_interactive_requests_expedite_the_debounce() {
+        use super::{
+            CodeLensRequest, Completion, DocumentSymbolRequest, EmmyAnnotatorRequest,
+            EmmySyntaxTreeRequest, FoldingRangeRequest, Formatting, GluaHoverExpandRequest,
+            GotoDefinition, HoverRequest, InlayHintRequest, LspRequest, OnTypeFormatting,
+            RangeFormatting, ResolveCompletionItem, SelectionRangeRequest,
+            SemanticTokensFullRequest, SignatureHelpRequest,
+        };
+        use crate::context::expedites_debounce;
+
+        for method in [
+            Completion::METHOD,
+            ResolveCompletionItem::METHOD,
+            HoverRequest::METHOD,
+            GluaHoverExpandRequest::METHOD,
+            SignatureHelpRequest::METHOD,
+            GotoDefinition::METHOD,
+            SemanticTokensFullRequest::METHOD,
+            SelectionRangeRequest::METHOD,
+            Formatting::METHOD,
+            RangeFormatting::METHOD,
+            OnTypeFormatting::METHOD,
+        ] {
+            assert!(expedites_debounce(method), "{method} should expedite");
+        }
+        for method in [
+            FoldingRangeRequest::METHOD,
+            EmmySyntaxTreeRequest::METHOD,
+            DocumentSymbolRequest::METHOD,
+            CodeLensRequest::METHOD,
+            InlayHintRequest::METHOD,
+            EmmyAnnotatorRequest::METHOD,
+        ] {
+            assert!(
+                !expedites_debounce(method),
+                "{method} should wait passively"
+            );
+        }
+    }
+
     #[test]
     fn extracts_text_document_uri() {
         let uri = Uri::from_str("file:///document.lua").expect("uri should parse");
@@ -415,6 +596,16 @@ mod tests {
                 }
             }
         });
+
+        assert_eq!(extract_uri_from_value(&value), Some(uri));
+    }
+
+    /// The custom document requests (annotator, gutter, syntax tree) carry
+    /// their document as a top-level `uri`, which an edit to it must cancel.
+    #[test]
+    fn extracts_top_level_uri() {
+        let uri = Uri::from_str("file:///annotated.lua").expect("uri should parse");
+        let value = json!({ "uri": uri.clone() });
 
         assert_eq!(extract_uri_from_value(&value), Some(uri));
     }

@@ -33,6 +33,19 @@ mod alloc_stats {
     pub static BYTES: AtomicU64 = AtomicU64::new(0);
     pub static LIVE: AtomicUsize = AtomicUsize::new(0);
     pub static PEAK: AtomicUsize = AtomicUsize::new(0);
+    /// The highest live bytes since the profile last took it.
+    pub static PEAK_SINCE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Lends the profile these counters for its memory checkpoints.
+    pub fn lend_to_profile() {
+        glua_code_analysis::profile::memory::set_alloc_counters(
+            glua_code_analysis::profile::memory::AllocCounters {
+                live: || LIVE.load(Relaxed),
+                take_peak: || PEAK_SINCE.swap(LIVE.load(Relaxed), Relaxed),
+                allocated: || (ALLOCS.load(Relaxed), BYTES.load(Relaxed)),
+            },
+        );
+    }
 
     pub struct Counting(pub super::MiMalloc);
 
@@ -42,6 +55,7 @@ mod alloc_stats {
             BYTES.fetch_add(layout.size() as u64, Relaxed);
             let live = LIVE.fetch_add(layout.size(), Relaxed) + layout.size();
             PEAK.fetch_max(live, Relaxed);
+            PEAK_SINCE.fetch_max(live, Relaxed);
             unsafe { self.0.alloc(layout) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -54,6 +68,7 @@ mod alloc_stats {
             LIVE.fetch_sub(layout.size(), Relaxed);
             let live = LIVE.fetch_add(new_size, Relaxed) + new_size;
             PEAK.fetch_max(live, Relaxed);
+            PEAK_SINCE.fetch_max(live, Relaxed);
             unsafe { self.0.realloc(ptr, layout, new_size) }
         }
     }
@@ -130,12 +145,14 @@ struct BenchmarkResult {
 static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 /// Edit each sampled file (append a comment, so the token-identity no-op gate
-/// does not skip the work), timing the full production keystroke cost: reindex
-/// of the file plus its dependency expansion, then the post-edit diagnostics
-/// pass. Restores the original text after each edit. Returns the worst edit.
+/// does not skip the work), timing the full production keystroke cost: the
+/// re-analysis of the file and of everything that read a fact it moved, then
+/// re-diagnosis of every file whose diagnostics went stale. Restores the
+/// original text after each edit. Returns the worst edit.
 fn run_incremental_edits(
     analysis: &mut EmmyLuaAnalysis,
     sample: Vec<(FileId, usize)>,
+    parallelism: usize,
 ) -> Option<std::time::Duration> {
     let mut total = std::time::Duration::ZERO;
     let mut worst = std::time::Duration::ZERO;
@@ -148,6 +165,14 @@ fn run_incremental_edits(
         .and_then(|value| value.parse().ok())
         .unwrap_or(1)
         .max(1);
+    // `BENCH_EDIT_SLICE_MS=N` settles each edit in slices of N ms, the way
+    // the language server does, instead of in one call.
+    let slice_ms: Option<u64> = std::env::var("BENCH_EDIT_SLICE_MS")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    if slice_ms.is_some() {
+        analysis.compilation.set_detached_tasks(true);
+    }
     let sample: Vec<(FileId, usize)> = sample
         .into_iter()
         .flat_map(|entry| std::iter::repeat_n(entry, repeats))
@@ -179,79 +204,43 @@ fn run_incremental_edits(
             .get_file_path(&file_id)
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| format!("{file_id:?}"));
-        let edited_text = format!("{text}\n-- bench incremental edit\n");
-        if std::env::var_os("BENCH_EDIT_LANDMARKS").is_some() {
-            eprintln!(
-                "  [incremental] BEGIN {name} at t+{:.3}s",
-                PROCESS_START
-                    .get()
-                    .map_or(0.0, |s| s.elapsed().as_secs_f64())
-            );
-        }
-        // `BENCH_EDIT_STAGED=1` splits the keystroke into the two halves a
-        // position-based request actually depends on: re-indexing the edited
-        // file alone, then the dependency ripple. It reports what a handler
-        // gated on the edited file's own freshness would wait for.
-        let reindex = if std::env::var_os("BENCH_EDIT_STAGED").is_some() {
-            // The expansion has to be captured before the edit lands, exactly as
-            // the production edit path does; recomputing it after the edited
-            // file has been re-indexed under-expands.
-            let expansion = analysis.expand_reindex_file_ids(vec![file_id]);
+        for (label, edited_text) in incremental_edit_variants(&text) {
+            let name = format!("{name} [{label}]");
+            let text = text.clone();
+            if std::env::var_os("BENCH_EDIT_LANDMARKS").is_some() {
+                eprintln!(
+                    "  [incremental] BEGIN {name} at t+{:.3}s",
+                    PROCESS_START
+                        .get()
+                        .map_or(0.0, |s| s.elapsed().as_secs_f64())
+                );
+            }
             analysis.update_file_text_only(&uri, edited_text);
-            // Just the edited file's own entries — no cross-file stabilization
-            // and no expansion. This is the floor a position-based request has
-            // to wait for if it is gated on its own file rather than on the
-            // whole ripple.
             let t = Instant::now();
-            analysis.compilation.remove_index(vec![file_id]);
-            analysis.compilation.update_index(vec![file_id]);
-            let self_only = t.elapsed();
-            // `BENCH_EDIT_SELF_ONLY=1` stops after the edited file's own
-            // entries, so a profile of the run contains nothing but the cost a
-            // per-file freshness gate would pay.
-            let ripple = if std::env::var_os("BENCH_EDIT_SELF_ONLY").is_some() {
-                std::time::Duration::ZERO
-            } else {
-                let t = Instant::now();
-                analysis.reindex_expanded_files(vec![file_id], expansion);
-                t.elapsed()
+            let affected = match slice_ms {
+                Some(ms) => reindex_in_slices(analysis, file_id, ms),
+                None => analysis.reindex_files(vec![file_id]),
             };
+            let reindex = t.elapsed();
+            glua_code_analysis::profile::work::report(&format!("edit {name}"));
             eprintln!(
-                "  [incremental] {name} staged: {:.3}s self-only + {:.3}s ripple",
-                self_only.as_secs_f64(),
-                ripple.as_secs_f64()
+                "  [incremental] {name} affects the diagnostics of {} file(s)",
+                affected.len()
             );
-            self_only + ripple
-        } else {
-            let t = Instant::now();
-            analysis.update_file_by_uri(&uri, Some(edited_text));
-            t.elapsed()
-        };
 
-        let t = Instant::now();
-        let shared = analysis.precompute_diagnostic_shared_data();
-        analysis.diagnose_file_with_shared(file_id, CancellationToken::new(), shared);
-        let diagnostics = t.elapsed();
-        let elapsed = reindex + diagnostics;
-        total += elapsed;
-        worst = worst.max(elapsed);
-        edited += 1;
-        eprintln!(
-            "  [incremental] {name} (reindexes {expansion} files): {:.3}s ({:.3}s reindex + {:.3}s diagnostics)",
-            elapsed.as_secs_f64(),
-            reindex.as_secs_f64(),
-            diagnostics.as_secs_f64()
-        );
-        // Reverting through the full path costs a whole ripple per iteration —
-        // several times the self-index being measured, and untimed, so it
-        // would dominate any profile of this loop. `BENCH_EDIT_SELF_ONLY`
-        // exists to leave nothing but the self-index in the profile, so the
-        // revert has to match it.
-        if std::env::var_os("BENCH_EDIT_SELF_ONLY").is_some() {
-            analysis.update_file_text_only(&uri, text);
-            analysis.compilation.remove_index(vec![file_id]);
-            analysis.compilation.update_index(vec![file_id]);
-        } else {
+            let t = Instant::now();
+            diagnose_files(analysis, &affected, parallelism);
+            let diagnostics = t.elapsed();
+            let elapsed = reindex + diagnostics;
+            total += elapsed;
+            worst = worst.max(elapsed);
+            edited += 1;
+            eprintln!(
+                "  [incremental] {name} (read by {expansion} files): {:.3}s ({:.3}s reindex + {:.3}s diagnostics)",
+                elapsed.as_secs_f64(),
+                reindex.as_secs_f64(),
+                diagnostics.as_secs_f64()
+            );
             analysis.update_file_by_uri(&uri, Some(text));
         }
     }
@@ -265,6 +254,161 @@ fn run_incremental_edits(
         worst.as_secs_f64()
     );
     Some(worst)
+}
+
+/// Diagnoses `file_ids` on `parallelism` threads, as the language server
+/// re-diagnoses the files an edit left stale.
+fn diagnose_files(analysis: &EmmyLuaAnalysis, file_ids: &[FileId], parallelism: usize) {
+    let shared = analysis.precompute_diagnostic_shared_data();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..parallelism {
+            let shared = shared.clone();
+            let next = &next;
+            s.spawn(move || {
+                loop {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(file_id) = file_ids.get(idx) else {
+                        break;
+                    };
+                    analysis.diagnose_file_with_shared(
+                        *file_id,
+                        CancellationToken::new(),
+                        shared.clone(),
+                    );
+                }
+            });
+        }
+    });
+}
+
+/// Re-analyses `file_id` in slices of `ms`, running what each slice leaves to
+/// run outside it as the language server does between slices. Returns every
+/// live file whose diagnostics may have changed.
+fn reindex_in_slices(analysis: &mut EmmyLuaAnalysis, file_id: FileId, ms: u64) -> Vec<FileId> {
+    analysis.begin_reindex(vec![file_id]);
+    let mut slices = 0usize;
+    loop {
+        slices += 1;
+        let deadline = Instant::now() + std::time::Duration::from_millis(ms);
+        match analysis.advance_reindex(glua_code_analysis::Slice::Until(deadline)) {
+            glua_code_analysis::UpdateProgress::Settled(mut affected) => {
+                eprintln!("  [incremental] settled in {slices} slice(s)");
+                affected.push(file_id);
+                affected.sort_unstable();
+                affected.dedup();
+                return affected;
+            }
+            _ => {
+                if analysis.compilation.has_detached_tasks() {
+                    analysis.compilation.run_detached_tasks();
+                }
+            }
+        }
+    }
+}
+
+/// The edits this harness applies to one sampled file, each labelled with the
+/// class of change it makes.
+///
+/// `no-op` is a comment appended at EOF: nothing above it moves and nothing it
+/// exports changes, so a correct edit path does no cross-file work at all.
+/// The other two do change what the file exports, which is what makes the
+/// ripple numbers a workload measurement rather than a floor. `prepend` types a
+/// function at the top, as an editor does, so every position in the file moves.
+///
+/// `BENCH_EDIT_FIND` and `BENCH_EDIT_REPLACE` add a `find-replace` edit that
+/// replaces the first occurrence, for files that contain the text.
+fn incremental_edit_variants(text: &str) -> Vec<(&'static str, String)> {
+    let mut variants = vec![
+        ("no-op", format!("{text}\n-- bench incremental edit\n")),
+        (
+            "new-export",
+            format!("{text}\nfunction BenchIncrementalExport() end\n"),
+        ),
+        (
+            "prepend",
+            format!("function BenchPrepended(a, b)\nlocal r = a + b\nreturn r\nend\n{text}"),
+        ),
+    ];
+    if let Some(edited) = add_param_to_first_function(text) {
+        variants.push(("param-add", edited));
+    }
+    variants.push(("rewrite", agent_rewrite(text)));
+    if let (Ok(find), Ok(replace)) = (
+        std::env::var("BENCH_EDIT_FIND"),
+        std::env::var("BENCH_EDIT_REPLACE"),
+    ) && text.contains(&find)
+    {
+        variants.push(("find-replace", text.replacen(&find, &replace, 1)));
+    }
+    variants
+}
+
+/// What an agent's light rewrite of a file does in the language-server
+/// scenarios: three globals defined at the top, and a parameter added to each
+/// of the first three `function name(...)` lines that take a fixed list.
+fn agent_rewrite(text: &str) -> String {
+    let mut added = 0;
+    let mut body = String::with_capacity(text.len() + 64);
+    for line in text.split_inclusive('\n') {
+        let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+        let rest = &line[indent..];
+        let signature = rest
+            .strip_prefix("function")
+            .filter(|after| after.starts_with([' ', '\t']))
+            .and_then(|after| {
+                let name = after.trim_start_matches([' ', '\t']);
+                let open = name.find('(')?;
+                let valid = name[..open].trim_end().split(['.', ':']).all(|part| {
+                    part.chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                        && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                });
+                let close = name[open..].find(')')? + open;
+                let at = line.len() - name.len();
+                valid.then_some((at + open, at + close))
+            });
+        match signature {
+            Some((open, close))
+                if added < 3 && !line[open + 1..close].trim_end().ends_with("...") =>
+            {
+                added += 1;
+                let params = line[open + 1..close].trim();
+                let params = if params.is_empty() {
+                    "_scn".to_string()
+                } else {
+                    format!("{}, _scn", &line[open + 1..close])
+                };
+                body.push_str(&line[..open + 1]);
+                body.push_str(&params);
+                body.push_str(&line[close..]);
+            }
+            _ => body.push_str(line),
+        }
+    }
+    format!(
+        "function ScnA_bench(a, b) return a + b end\nfunction ScnB_bench(self, n) local r = {{}} for i = 1, n do r[i] = i end return r end\nScnV_bench = {{ name = \"scn\", count = 3 }}\n{body}"
+    )
+}
+
+/// Adds a parameter to the file's first top-level `function name(...)`, which
+/// changes a signature its existing callers are already evidence for.
+///
+/// Returns `None` when the file declares no top-level function, in which case
+/// the harness simply skips this class for that file.
+fn add_param_to_first_function(text: &str) -> Option<String> {
+    let at = text.find("\nfunction ")? + 1;
+    let open = text[at..].find('(')? + at;
+    let close = text[open..].find(')')? + open;
+    let existing = text[open + 1..close].trim();
+    let params = if existing.is_empty() {
+        "benchAddedParam".to_string()
+    } else {
+        format!("{existing}, benchAddedParam")
+    };
+    Some(format!("{}{params}{}", &text[..open + 1], &text[close..]))
 }
 
 /// Everything a *consumer* of a file could observe from it: the members it
@@ -297,7 +441,14 @@ fn contribution_entries(analysis: &EmmyLuaAnalysis, file_id: FileId) -> Vec<Stri
 /// changed?" optimisation downstream is dead on arrival, because every file
 /// reports itself as changed.
 fn report_reindex_idempotency(analysis: &mut EmmyLuaAnalysis, file_id: FileId) {
-    let expansion = analysis.expand_reindex_file_ids(vec![file_id]);
+    let expansion = std::iter::once(file_id)
+        .chain(
+            analysis
+                .dependent_files()
+                .remove(&file_id)
+                .unwrap_or_default(),
+        )
+        .collect::<Vec<_>>();
     let before = expansion
         .iter()
         .map(|id| (*id, contribution_entries(analysis, *id)))
@@ -374,15 +525,36 @@ fn discover_config_files(root: &Path) -> Vec<PathBuf> {
     .collect()
 }
 
-/// Analysis recurses over deeply nested syntax. The server does that work on
-/// spawned threads, which get a far larger stack than a process main thread does
-/// on Windows, so the tools have to ask for one explicitly.
+/// Sets each `KEY=VALUE` line of a `bench.env` file next to the executable
+/// that the environment does not already set, so a launcher that cannot pass
+/// environment variables (the elevated samply bridge) can still configure a run.
+fn load_env_file_beside_exe() {
+    let Some(text) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| std::fs::read_to_string(exe.with_file_name("bench.env")).ok())
+    else {
+        return;
+    };
+    for (key, value) in text.lines().filter_map(|line| line.trim().split_once('=')) {
+        let key = key.trim();
+        if !key.is_empty() && std::env::var_os(key).is_none() {
+            // SAFETY: runs first thing in `main`, before any other thread exists.
+            unsafe { std::env::set_var(key, value.trim()) };
+        }
+    }
+}
+
+/// Analysis recurses over deeply nested syntax and runs on every runtime
+/// thread, so each one, like the thread driving the runtime, gets
+/// [`glua_code_analysis::ANALYSIS_STACK_SIZE`], as in the server.
 fn main() {
+    load_env_file_beside_exe();
     std::thread::Builder::new()
-        .stack_size(256 * 1024 * 1024)
+        .stack_size(glua_code_analysis::ANALYSIS_STACK_SIZE)
         .spawn(|| {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
+                .thread_stack_size(glua_code_analysis::ANALYSIS_STACK_SIZE)
                 .build()
                 .expect("tokio runtime should build")
                 .block_on(run());
@@ -396,6 +568,8 @@ async fn run() {
     let _ = PROCESS_START.set(Instant::now());
     #[allow(unused_mut, unused_assignments, unused_variables)]
     let mut alloc_mark = (0u64, 0u64);
+    #[cfg(all(feature = "alloc-stats", not(feature = "dhat-heap")))]
+    alloc_stats::lend_to_profile();
     setup_logger();
 
     let large_codebase = std::env::var("BENCH_CODEBASE").unwrap_or_else(|_| {
@@ -429,6 +603,31 @@ async fn run() {
 
     let mut results = Vec::new();
 
+    // `BENCH_THREADS` sizes both the analyzer's pool and the diagnostics
+    // threads, so `BENCH_THREADS=1` measures the whole run on one core.
+    let parallelism = match std::env::var("BENCH_THREADS") {
+        Ok(val) => match val.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            Ok(_) => {
+                eprintln!(
+                    "ERROR: BENCH_THREADS must be a positive integer, got: {}",
+                    val
+                );
+                std::process::exit(1);
+            }
+            Err(_) => {
+                eprintln!("ERROR: BENCH_THREADS is not a valid integer: {}", val);
+                std::process::exit(1);
+            }
+        },
+        Err(_) => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(16),
+    };
+    glua_code_analysis::set_analysis_threads(parallelism);
+    eprintln!("Threads: {parallelism}");
+
     // Phase 1: Config loading
     let t = Instant::now();
     let config_files = discover_config_files(&large_path);
@@ -449,6 +648,28 @@ async fn run() {
     // Phase 2: Create analysis + add workspaces
     let t = Instant::now();
     let mut analysis = EmmyLuaAnalysis::new();
+    // `BENCH_SCHEDULE=reversed`, `=deferred` or `=<seed>` changes the order
+    // files run in.
+    match std::env::var("BENCH_SCHEDULE").as_deref() {
+        Ok("reversed") => analysis
+            .compilation
+            .set_schedule(glua_code_analysis::Schedule::Reversed),
+        Ok("deferred") => analysis
+            .compilation
+            .set_schedule(glua_code_analysis::Schedule::Deferred),
+        Ok(seed) => match seed.parse::<u64>() {
+            Ok(seed) => analysis
+                .compilation
+                .set_schedule(glua_code_analysis::Schedule::Shuffled(seed)),
+            Err(_) => {
+                eprintln!(
+                    "ERROR: BENCH_SCHEDULE must be `reversed`, `deferred` or a seed, got: {seed}"
+                );
+                std::process::exit(1);
+            }
+        },
+        Err(_) => {}
+    }
     analysis.update_config(Arc::new(emmyrc.clone()));
     analysis.init_std_lib();
 
@@ -547,130 +768,33 @@ async fn run() {
     #[cfg(feature = "dhat-heap")]
     drop(dhat_profiler);
     let indexing_duration = t.elapsed();
+    glua_code_analysis::profile::work::report("index");
+    glua_code_analysis::profile::memory::checkpoint("after indexing");
     alloc_report!("indexing", alloc_mark);
+    // `BENCH_MEM_PARTS=1` (with `--features alloc-stats`) drops the indexed analysis
+    // part by part and prints the live bytes each part held, then exits.
+    #[cfg(all(feature = "alloc-stats", not(feature = "dhat-heap")))]
+    if std::env::var_os("BENCH_MEM_PARTS").is_some() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mib = |bytes: isize| bytes as f64 / (1 << 20) as f64;
+        let mut live = alloc_stats::LIVE.load(Relaxed) as isize;
+        eprintln!("[mem part] live before {:.1} MiB", mib(live));
+        analysis.compilation.drop_by_part(|part| {
+            let now = alloc_stats::LIVE.load(Relaxed) as isize;
+            eprintln!("[mem part] {part:<32} {:>9.1} MiB", mib(live - now));
+            live = now;
+        });
+        drop(analysis);
+        eprintln!(
+            "[mem part] live after everything {:.1} MiB",
+            mib(alloc_stats::LIVE.load(Relaxed) as isize)
+        );
+        std::process::exit(0);
+    }
     results.push(BenchmarkResult {
         phase: "indexing (total)".into(),
         duration: indexing_duration,
     });
-
-    // Phase 4b: Incremental edit latency — the full cost a keystroke pays
-    // once it lands: reindex of the edited file plus its whole dependency
-    // expansion, then the post-edit diagnostics pass (shared-data recompute
-    // + the edited file), matching the production LS flow. Worst-case
-    // biased: files are ranked by reindex-expansion size and the top hubs
-    // are edited.
-    let mut incremental_worst: Option<std::time::Duration> = None;
-    if std::env::var("BENCH_INCREMENTAL").is_ok() {
-        let main_ids = analysis
-            .compilation
-            .get_db()
-            .get_module_index()
-            .get_main_workspace_file_ids();
-        // `BENCH_EDIT_TARGETS=a.lua,b.lua` edits exactly those files and skips
-        // the ranking pass, which costs ~27s and swamps a CPU profile.
-        let explicit_targets = std::env::var("BENCH_EDIT_TARGETS").ok();
-        if let Some(targets) = &explicit_targets {
-            // A target is either a bare file name or a path suffix, so that a
-            // common name like `shared.lua` can be pinned to one entity.
-            let wanted: Vec<String> = targets
-                .split(',')
-                .map(|target| target.trim().replace('\\', "/").to_lowercase())
-                .collect();
-            let sample: Vec<(FileId, usize)> = main_ids
-                .iter()
-                .filter(|id| {
-                    analysis
-                        .compilation
-                        .get_db()
-                        .get_vfs()
-                        .get_file_path(id)
-                        .map(|path| path.to_string_lossy().replace('\\', "/").to_lowercase())
-                        .is_some_and(|path| {
-                            wanted.iter().any(|wanted| path.ends_with(wanted.as_str()))
-                        })
-                })
-                .map(|id| (*id, analysis.expand_reindex_file_ids(vec![*id]).len()))
-                .collect();
-            #[cfg(feature = "dhat-heap")]
-            let dhat_edit = dhat::Profiler::builder()
-                .file_name("dhat-edit.json")
-                .trim_backtraces(Some(24))
-                .build();
-            incremental_worst = run_incremental_edits(&mut analysis, sample);
-            alloc_report!("incremental edits", alloc_mark);
-            #[cfg(feature = "dhat-heap")]
-            drop(dhat_edit);
-        } else {
-            let t_rank = Instant::now();
-            let mut ranked: Vec<(FileId, usize)> = main_ids
-                .iter()
-                .map(|id| (*id, analysis.expand_reindex_file_ids(vec![*id]).len()))
-                .collect();
-            ranked.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-            {
-                // What an edit costs depends almost entirely on how many files
-                // it drags in, so the shape of that distribution matters more
-                // than the worst case the sample below reports.
-                let sizes: Vec<usize> = ranked.iter().map(|(_, n)| *n).collect();
-                let total = sizes.len();
-                let pct = |p: usize| sizes[(total.saturating_sub(1)) * (100 - p) / 100];
-                let buckets = [1usize, 5, 20, 100, 500, usize::MAX];
-                let mut counts = vec![0usize; buckets.len()];
-                for n in &sizes {
-                    for (idx, limit) in buckets.iter().enumerate() {
-                        if n <= limit {
-                            counts[idx] += 1;
-                            break;
-                        }
-                    }
-                }
-                eprintln!(
-                    "  [incremental] expansion distribution over {total} files: median {} p75 {} p90 {} p99 {} max {}",
-                    pct(50),
-                    pct(75),
-                    pct(90),
-                    pct(99),
-                    sizes.first().copied().unwrap_or(0)
-                );
-                eprintln!(
-                    "  [incremental] <=1: {} | <=5: {} | <=20: {} | <=100: {} | <=500: {} | >500: {}",
-                    counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]
-                );
-            }
-            eprintln!(
-                "  [incremental] ranked {} files by reindex expansion in {:.3}s",
-                ranked.len(),
-                t_rank.elapsed().as_secs_f64()
-            );
-
-            // Top-3 hubs (worst ripple), the median file, and the largest file
-            // by bytes (worst parse).
-            let mut sample: Vec<(FileId, usize)> = ranked.iter().take(3).copied().collect();
-            for extra in [
-                ranked.get(ranked.len() / 2).copied(),
-                main_ids
-                    .iter()
-                    .max_by_key(|id| {
-                        analysis
-                            .compilation
-                            .get_db()
-                            .get_vfs()
-                            .get_file_content(id)
-                            .map_or(0, |text| text.len())
-                    })
-                    .and_then(|id| ranked.iter().find(|(f, _)| f == id).copied()),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if !sample.iter().any(|(id, _)| *id == extra.0) {
-                    sample.push(extra);
-                }
-            }
-
-            incremental_worst = run_incremental_edits(&mut analysis, sample);
-        }
-    }
 
     // Phase 5: Diagnostics (parallel, matching real LS behavior)
     let t = Instant::now();
@@ -685,26 +809,6 @@ async fn run() {
         precompute_t.elapsed().as_secs_f64()
     );
 
-    let parallelism = match std::env::var("BENCH_THREADS") {
-        Ok(val) => match val.parse::<usize>() {
-            Ok(n) if n > 0 => n,
-            Ok(_) => {
-                eprintln!(
-                    "ERROR: BENCH_THREADS must be a positive integer, got: {}",
-                    val
-                );
-                std::process::exit(1);
-            }
-            Err(_) => {
-                eprintln!("ERROR: BENCH_THREADS is not a valid integer: {}", val);
-                std::process::exit(1);
-            }
-        },
-        Err(_) => std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(16),
-    };
     eprintln!(
         "Diagnostics: {} files, {} threads",
         diag_file_count, parallelism
@@ -768,6 +872,11 @@ async fn run() {
     let infos = info_count.load(std::sync::atomic::Ordering::Relaxed);
     let hints = hint_count.load(std::sync::atomic::Ordering::Relaxed);
     let diagnostics_duration = t.elapsed();
+    glua_code_analysis::profile::work::report("diagnostics");
+    glua_code_analysis::profile::memory::checkpoint("after diagnostics");
+    if glua_code_analysis::profile::profiling() {
+        eprintln!("[mem] {}", analysis.compilation.memory_census());
+    }
     alloc_report!("diagnostics", alloc_mark);
     results.push(BenchmarkResult {
         phase: format!(
@@ -782,6 +891,126 @@ async fn run() {
         "Diagnostic breakdown: {} errors, {} warnings, {} info, {} hints",
         errors, warnings, infos, hints
     );
+
+    // Phase 6: Incremental edit latency on the diagnosed workspace, as the
+    // language server holds it — the full cost a keystroke pays once it
+    // lands: re-analysis of the edited file and everything that read a fact
+    // it moved, then re-diagnosis of every file whose diagnostics went stale.
+    // Worst-case biased: files are ranked by how many other files read their
+    // facts and the top hubs are edited.
+    let mut incremental_worst: Option<std::time::Duration> = None;
+    if std::env::var("BENCH_INCREMENTAL").is_ok() {
+        let main_ids = analysis
+            .compilation
+            .get_db()
+            .get_module_index()
+            .get_main_workspace_file_ids();
+        // `BENCH_EDIT_TARGETS=a.lua,b.lua` edits exactly those files and skips
+        // the ranking pass, which costs ~27s and swamps a CPU profile.
+        let explicit_targets = std::env::var("BENCH_EDIT_TARGETS").ok();
+        let dependents = analysis.dependent_files();
+        if let Some(targets) = &explicit_targets {
+            // A target is either a bare file name or a path suffix, so that a
+            // common name like `shared.lua` can be pinned to one entity.
+            let wanted: Vec<String> = targets
+                .split(',')
+                .map(|target| target.trim().replace('\\', "/").to_lowercase())
+                .collect();
+            let sample: Vec<(FileId, usize)> = main_ids
+                .iter()
+                .filter(|id| {
+                    analysis
+                        .compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_file_path(id)
+                        .map(|path| path.to_string_lossy().replace('\\', "/").to_lowercase())
+                        .is_some_and(|path| {
+                            wanted.iter().any(|wanted| path.ends_with(wanted.as_str()))
+                        })
+                })
+                .map(|id| (*id, dependents.get(id).map_or(0, Vec::len)))
+                .collect();
+            #[cfg(feature = "dhat-heap")]
+            let dhat_edit = dhat::Profiler::builder()
+                .file_name("dhat-edit.json")
+                .trim_backtraces(Some(24))
+                .build();
+            incremental_worst = run_incremental_edits(&mut analysis, sample, parallelism);
+            alloc_report!("incremental edits", alloc_mark);
+            #[cfg(feature = "dhat-heap")]
+            drop(dhat_edit);
+        } else {
+            let t_rank = Instant::now();
+            let mut ranked: Vec<(FileId, usize)> = main_ids
+                .iter()
+                .map(|id| (*id, dependents.get(id).map_or(0, Vec::len)))
+                .collect();
+            ranked.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            {
+                // What an edit costs depends almost entirely on how many files
+                // it drags in, so the shape of that distribution matters more
+                // than the worst case the sample below reports.
+                let sizes: Vec<usize> = ranked.iter().map(|(_, n)| *n).collect();
+                let total = sizes.len();
+                let pct = |p: usize| sizes[(total.saturating_sub(1)) * (100 - p) / 100];
+                let buckets = [1usize, 5, 20, 100, 500, usize::MAX];
+                let mut counts = vec![0usize; buckets.len()];
+                for n in &sizes {
+                    for (idx, limit) in buckets.iter().enumerate() {
+                        if n <= limit {
+                            counts[idx] += 1;
+                            break;
+                        }
+                    }
+                }
+                eprintln!(
+                    "  [incremental] dependent-file distribution over {total} files: median {} p75 {} p90 {} p99 {} max {}",
+                    pct(50),
+                    pct(75),
+                    pct(90),
+                    pct(99),
+                    sizes.first().copied().unwrap_or(0)
+                );
+                eprintln!(
+                    "  [incremental] <=1: {} | <=5: {} | <=20: {} | <=100: {} | <=500: {} | >500: {}",
+                    counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]
+                );
+            }
+            eprintln!(
+                "  [incremental] ranked {} files by reindex expansion in {:.3}s",
+                ranked.len(),
+                t_rank.elapsed().as_secs_f64()
+            );
+
+            // Top-3 hubs (worst ripple), the median file, and the largest file
+            // by bytes (worst parse).
+            let mut sample: Vec<(FileId, usize)> = ranked.iter().take(3).copied().collect();
+            for extra in [
+                ranked.get(ranked.len() / 2).copied(),
+                main_ids
+                    .iter()
+                    .max_by_key(|id| {
+                        analysis
+                            .compilation
+                            .get_db()
+                            .get_vfs()
+                            .get_file_content(id)
+                            .map_or(0, |text| text.len())
+                    })
+                    .and_then(|id| ranked.iter().find(|(f, _)| f == id).copied()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !sample.iter().any(|(id, _)| *id == extra.0) {
+                    sample.push(extra);
+                }
+            }
+
+            incremental_worst = run_incremental_edits(&mut analysis, sample, parallelism);
+        }
+    }
 
     // Output results
     eprintln!();
@@ -850,5 +1079,6 @@ async fn run() {
         );
         eprintln!("Target: ≤1s per edit (reindex ripple + edited-file diagnostics)");
     }
+    glua_code_analysis::profile::memory::report_peak();
     eprintln!("========================================");
 }

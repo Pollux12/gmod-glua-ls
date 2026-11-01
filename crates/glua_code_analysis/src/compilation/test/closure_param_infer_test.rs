@@ -22,6 +22,278 @@ mod test {
             .expect("index expression type")
     }
 
+    /// The class a type names, through the instances `vgui.Create` sites wrap it in.
+    fn created_class(typ: LuaType) -> LuaType {
+        match typ {
+            LuaType::Instance(instance) => created_class(instance.get_base().clone()),
+            typ => typ,
+        }
+    }
+
+    fn installed_panel_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut config = Emmyrc::default();
+        config.gmod.enabled = true;
+        ws.update_emmyrc(config);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/installed_panel_api.lua",
+            r#"
+            ---@class Panel
+            ---@field Receive fun(value: number)
+            Panel = {}
+            ---@param width number
+            ---@param height number
+            function Panel:Paint(width, height) end
+            ---@class DLabel: Panel
+            DLabel = {}
+            ---@class DPanel: Panel
+            DPanel = {}
+            ---@class DDragBase: Panel
+            DDragBase = {}
+            ---@param drop number
+            ---@param pnl Panel
+            function DDragBase:UpdateDropTarget(drop, pnl) end
+            ---@class Color
+            local Color = {}
+            ---@param value number
+            function need_number(value) end
+            ---@param value string
+            function need_string(value) end
+            ---@param value Color
+            function need_color(value) end
+        "#,
+        );
+        ws
+    }
+
+    fn installed_param_source(
+        ws: &VirtualWorkspace,
+        file: crate::FileId,
+        name: &str,
+    ) -> crate::semantic::ParamInferenceSource {
+        let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
+        let read = model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|read| read.syntax().text() == name)
+            .unwrap();
+        let decl = model
+            .get_db()
+            .get_decl_index()
+            .get_decl_tree(&file)
+            .unwrap()
+            .find_local_decl(name, read.get_position())
+            .unwrap();
+        let source = crate::semantic::infer_param_source(
+            model.get_db(),
+            &mut model.get_cache().borrow_mut(),
+            decl,
+        )
+        .unwrap();
+        source
+    }
+
+    #[test]
+    fn installed_panel_receivers_are_contextual_and_scalar_contracts_stay_concrete() {
+        use crate::semantic::ParamInferenceSource;
+        for (path, source, receiver) in [
+            (
+                "lua/vgui/dhorizontalscroller.lua",
+                r#"
+                local PANEL = {}
+                function PANEL:Init()
+                    self.pnlCanvas = vgui.Create("DDragBase", self)
+                    self.pnlCanvas.UpdateDropTarget = function(Canvas, drop, pnl)
+                        DDragBase.UpdateDropTarget(Canvas, drop, pnl)
+                    end
+                end
+                vgui.Register("DHorizontalScroller", PANEL, "Panel")
+            "#,
+                "Canvas",
+            ),
+            (
+                "lua/menu/openurl.lua",
+                r#"
+                local PANEL = {}
+                function PANEL:Init()
+                    self.CustomPanel = vgui.Create("DLabel", self)
+                    ---@type Color
+                    local color
+                    self.CustomPanel.Color = color
+                    self.CustomPanel.Paint = function(s, w, h)
+                        need_number(w)
+                        need_number(h)
+                        need_color(s.Color)
+                    end
+                end
+                vgui.Register("OpenURLProbe", PANEL, "Panel")
+            "#,
+                "s",
+            ),
+            (
+                "lua/glide/client/vgui/vehicle_layout_editor_compact.lua",
+                r#"
+                local PANEL = {}
+                function PANEL:Init()
+                    self.resizeHandle = vgui.Create("DPanel", self)
+                    self.resizeHandle.animHover = 0
+                    self.resizeHandle.Paint = function(s, w, h)
+                        s.animHover = s.animHover + 1
+                        need_number(w)
+                        need_number(h)
+                        need_number(s.animHover)
+                    end
+                end
+                vgui.Register("LayoutEditorProbe", PANEL, "Panel")
+            "#,
+                "s",
+            ),
+        ] {
+            let mut ws = installed_panel_workspace();
+            let file = ws.def_file(path, source);
+            assert_eq!(
+                installed_param_source(&ws, file, receiver),
+                ParamInferenceSource::Contextual,
+                "{path}"
+            );
+            let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
+            let read = model
+                .get_root()
+                .descendants::<LuaNameExpr>()
+                .find(|read| read.syntax().text() == receiver)
+                .unwrap();
+            let receiver_type = model.infer_expr(LuaExpr::NameExpr(read)).unwrap();
+            let owner = match receiver {
+                "Canvas" => "self.pnlCanvas",
+                _ if path == "lua/menu/openurl.lua" => "self.CustomPanel",
+                _ => "self.resizeHandle",
+            };
+            assert_eq!(
+                created_class(receiver_type),
+                created_class(index_expr_type(&ws, file, owner)),
+                "{path}"
+            );
+            if receiver == "s" {
+                assert_eq!(
+                    installed_param_source(&ws, file, "w"),
+                    ParamInferenceSource::Explicit,
+                    "{path}"
+                );
+            }
+            let reports = ws
+                .analysis
+                .diagnose_file(file, tokio_util::sync::CancellationToken::new())
+                .unwrap();
+            for code in [
+                crate::DiagnosticCode::InferUnguardedChild,
+                crate::DiagnosticCode::UndefinedField,
+                crate::DiagnosticCode::ParamTypeMismatch,
+            ] {
+                assert!(
+                    reports.iter().all(|report| report.code
+                        != Some(lsp_types::NumberOrString::String(
+                            code.get_name().to_string(),
+                        ))),
+                    "{path}: {reports:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn installed_callbacks_keep_explicit_receivers_and_non_receiver_parameter_contracts() {
+        use crate::semantic::ParamInferenceSource;
+        let mut ws = installed_panel_workspace();
+        let mut config = ws.get_emmyrc();
+        config.strict.strict_type_coercion = true;
+        ws.update_emmyrc(config);
+        let file = ws.def_file(
+            "lua/autorun/client/installed_contract_controls.lua",
+            r#"
+            local label = vgui.Create("DLabel")
+            ---@param explicit Panel
+            label.Paint = function(explicit, w, h)
+                need_number(explicit)
+            end
+            label.Receive = function(value)
+                need_string(value)
+            end
+        "#,
+        );
+        assert_eq!(
+            installed_param_source(&ws, file, "explicit"),
+            ParamInferenceSource::Explicit
+        );
+        assert_eq!(
+            installed_param_source(&ws, file, "value"),
+            ParamInferenceSource::Explicit
+        );
+        assert_eq!(param_mismatches(&mut ws, file), 2);
+    }
+
+    #[test]
+    fn installed_receiver_provenance_follows_annotation_edits_delete_and_reopen() {
+        use crate::semantic::ParamInferenceSource;
+        let mut ws = installed_panel_workspace();
+        let path = "lua/autorun/client/installed_receiver_edit.lua";
+        let borrowed = r#"
+            local label = vgui.Create("DLabel")
+            label.Paint = function(s, w, h)
+                local receiver = s
+            end
+        "#;
+        let annotated = borrowed.replace("label.Paint =", "---@param s Panel\nlabel.Paint =");
+        for (source, expected) in [
+            (borrowed, ParamInferenceSource::Contextual),
+            (annotated.as_str(), ParamInferenceSource::Explicit),
+            (borrowed, ParamInferenceSource::Contextual),
+        ] {
+            let file = ws.def_file(path, source);
+            assert_eq!(installed_param_source(&ws, file, "s"), expected);
+        }
+        let uri = ws.virtual_url_generator.new_uri(path);
+        let _ = ws.analysis.update_file_by_uri(&uri, None);
+        let file = ws.def_file(path, &annotated);
+        assert_eq!(
+            installed_param_source(&ws, file, "s"),
+            ParamInferenceSource::Explicit
+        );
+    }
+
+    /// A local function passed by name as a callback takes the callback's
+    /// parameter types, as a closure written in its place does; a parameter it
+    /// documents itself keeps its own type, and a direct call of it is not
+    /// held to the callback's contract.
+    #[test]
+    fn a_local_function_passed_as_a_callback_takes_its_param_types() {
+        let source = r#"
+            ---@param name string
+            ---@param callback fun(ply: number, cmd: string, args: string[], argStr: string)
+            local function add_command(name, callback) end
+
+            ---@param cmd string?
+            local function handler(ply, cmd, args)
+                first_arg = args[1]
+                own_cmd = cmd
+            end
+            add_command("x", handler)
+            handler(1, nil, { 0 })
+            "#;
+        let mut ws = VirtualWorkspace::new();
+        ws.def(source);
+
+        assert_eq!(ws.expr_ty("first_arg"), ws.ty("string"));
+        assert_eq!(ws.expr_ty("own_cmd"), ws.ty("string?"));
+        for code in [
+            crate::DiagnosticCode::ParamTypeMismatch,
+            crate::DiagnosticCode::MissingParameter,
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(ws.check_code_for(code, source), "{code:?}");
+        }
+    }
+
     #[test]
     fn test_closure_param_infer() {
         let mut ws = VirtualWorkspace::new();
@@ -144,6 +416,7 @@ mod test {
         };
         ws.analysis
             .update_file_by_uri(&api_uri, Some(api_source("CallbackEntityA")))
+            .map(|(id, _)| id)
             .expect("initial callback API");
         let consumer_file_id = ws.def_file(
             "lua/autorun/shared/callback_consumer.lua",
@@ -161,6 +434,7 @@ mod test {
 
         ws.analysis
             .update_file_by_uri(&api_uri, Some(api_source("CallbackEntityB")))
+            .map(|(id, _)| id)
             .expect("edited callback API");
         assert_eq!(
             index_expr_type(&ws, consumer_file_id, "data.proc"),
@@ -169,9 +443,11 @@ mod test {
 
         ws.analysis
             .remove_file_by_uri(&api_uri)
+            .0
             .expect("removed callback API");
         ws.analysis
             .update_file_by_uri(&api_uri, Some(api_source("CallbackEntityA")))
+            .map(|(id, _)| id)
             .expect("reopened callback API");
         assert_eq!(
             index_expr_type(&ws, consumer_file_id, "data.proc"),
@@ -513,9 +789,9 @@ mod test {
             A = Test.e
             "#,
         );
-        // 必须要这样写, 无法直接`A = a`拿到`a`的实际类型, `A`的推断目前是独立的且在`Test.e`推断之前缓存
+        // This has to be written this way: `A = a` cannot yield the actual type of `a`, `A` is inferred independently and cached before `Test.e` is inferred
         let ty = ws.expr_ty("A");
-        let expected_a = ws.ty("string|number|unknown");
+        let expected_a = ws.ty("string|number");
         // let expected_a_str = ws.humanize_type(expected_a);
 
         match ty {
@@ -992,6 +1268,35 @@ mod test {
     }
 
     #[test]
+    fn inherited_param_from_generic_base_method_takes_the_template_constraint() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class GenericBase
+            local GenericBase = {}
+
+            ---@generic T : GenericBase
+            ---@param name `T`
+            ---@param fallback T
+            function GenericBase:Make(name, fallback) end
+
+            ---@class GenericChild : GenericBase
+            local GenericChild = {}
+
+            function GenericChild:Make(name, fallback)
+                inherited_template_name = name
+                inherited_template_fallback = fallback
+            end
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("inherited_template_name"), LuaType::String);
+        let fallback = ws.expr_ty("inherited_template_fallback");
+        assert_eq!(ws.humanize_type(fallback), "GenericBase");
+    }
+
+    #[test]
     fn test_stool_buildcpanel_param_inherits_global_tool_contract() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
@@ -1074,6 +1379,7 @@ mod test {
                     .to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("other workspace file");
         let main_file_id = ws.def_file(
             "base.lua",
@@ -1149,16 +1455,18 @@ mod test {
             &other_workspace.join("lua/weapons/gmod_tool/stools/context_test.lua"),
         )
         .expect("other workspace uri");
-        ws.analysis.update_file_by_uri(
-            &other_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &other_uri,
+                Some(
+                    r#"
                 ---@class TOOL.context_test : WrongBase
                 TOOL = {}
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let (base_contract, class_contract) = current_super.map_or_else(
             || (
@@ -1253,6 +1561,7 @@ mod test {
         let edge_uri = ws.virtual_url_generator.new_uri("sh_contract.lua");
         ws.analysis
             .update_file_by_uri(&edge_uri, Some(edge_source("CLIENT")))
+            .map(|(id, _)| id)
             .expect("client edge file");
         ws.def_file(
             "sh_override.lua",
@@ -1350,16 +1659,18 @@ mod test {
         let other_uri =
             lsp_types::Uri::parse_from_file_path(&other_workspace.join("lua/foreign_contract.lua"))
                 .expect("other workspace uri");
-        ws.analysis.update_file_by_uri(
-            &other_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &other_uri,
+                Some(
+                    r#"
                 ---@class WorkspaceMid : WorkspaceContract
                 local WorkspaceMid = {}
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         ws.def_file(
             "lua/current_override.lua",
             r#"
@@ -1402,10 +1713,11 @@ mod test {
             &other_workspace.join("lua/foreign_callback_edges.lua"),
         )
         .expect("other workspace uri");
-        ws.analysis.update_file_by_uri(
-            &other_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &other_uri,
+                Some(
+                    r#"
                 ---@class CallbackChild : CallbackBase
                 local CallbackChild = {}
 
@@ -1415,9 +1727,10 @@ mod test {
                 ---@class IndexCallbackChild : IndexCallbackBase
                 local IndexCallbackChild = {}
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         ws.def_file(
             "lua/current_callback_calls.lua",
             r#"
@@ -1712,5 +2025,170 @@ mod test {
         let client_type = ws.expr_ty("schema_hook_client");
         let player_type = ws.ty("Player");
         assert_eq!(ws.humanize_type(client_type), ws.humanize_type(player_type));
+    }
+    #[test]
+    fn test_gmod_hook_callback_prefers_annotated_contract_over_peer_closure() {
+        // A peer `hook.Add` closure filling the same slot carries params only
+        // because this pass copied them off its own receiver. Ranking must
+        // prefer the annotated `GM` contract regardless of batch order, so a
+        // warm re-analysis cannot degrade the callback to `any`.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+            ---@class Player
+            local Player = {}
+
+            ---@class Entity
+            local Entity = {}
+
+            ---@class GM
+            GM = {}
+
+            ---@param player Player
+            ---@param entity Entity
+            ---@return boolean
+            function GM:PhysgunPickup(player, entity) end
+
+            hook.Add("PhysgunPickup", "peer", function(player, entity)
+                peer_hook_player = player
+            end)
+
+            hook.Add("PhysgunPickup", "target", function(ply, ent)
+                target_hook_ply = ply
+                target_hook_ent = ent
+            end)
+            "#,
+        );
+
+        let ply = ws.expr_ty("target_hook_ply");
+        let ent = ws.expr_ty("target_hook_ent");
+        let player_type = ws.ty("Player");
+        let entity_type = ws.ty("Entity");
+        assert_eq!(ws.humanize_type(ply), ws.humanize_type(player_type));
+        assert_eq!(ws.humanize_type(ent), ws.humanize_type(entity_type));
+    }
+
+    #[test]
+    fn a_handler_under_a_constant_key_takes_no_param_type_from_a_sibling_handler() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            Lib = {}
+            Lib.CMD_TEXT = 2
+            Lib.CMD_VALUE = 1
+
+            ---@param text string
+            local function on_text(text) end
+
+            local handlers = {}
+            handlers[Lib.CMD_TEXT] = on_text
+            handlers[Lib.CMD_VALUE] = function(value)
+                first_handler_value = value
+            end
+            "#,
+        );
+
+        let ty = ws.expr_ty("first_handler_value");
+        assert_ne!(ws.humanize_type(ty), "string");
+    }
+
+    /// A `...` forwards whatever the caller passed; a one-position base does
+    /// not type it.
+    #[test]
+    fn test_dots_override_of_positional_base_does_not_type_forwarded_args() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            crate::DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param count number
+            local function take_count(count) end
+
+            ---@class DotsPositionalBase
+            ---@field Run fun(entities: table)
+
+            ---@class DotsPositionalChild : DotsPositionalBase
+            local DotsPositionalChild = {}
+
+            function DotsPositionalChild.Run(...)
+                take_count(...)
+            end
+            "#
+        ));
+    }
+
+    /// A `...` the base declares still types the forwarded args.
+    #[test]
+    fn test_dots_override_of_variadic_base_types_forwarded_args() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            crate::DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param name table
+            local function take_name(name) end
+
+            ---@class DotsVariadicBase
+            ---@field Run fun(...: number)
+
+            ---@class DotsVariadicChild : DotsVariadicBase
+            local DotsVariadicChild = {}
+
+            function DotsVariadicChild.Run(...)
+                take_name(...)
+            end
+            "#
+        ));
+    }
+
+    /// A declared `...` type survives a positional overload of the same function.
+    #[test]
+    fn test_declared_dots_type_survives_positional_overload() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            crate::DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value table
+            local function need_table(value) end
+
+            ---@overload fun(value: number)
+            ---@param ... number
+            local function forward(...)
+                need_table(...)
+            end
+
+            forward(1)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_declared_dots_type_is_inferred_beside_positional_overload() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@overload fun(value: number)
+            ---@param ... number
+            local function forward(...)
+                local first = ...
+                return first
+            end
+            "#,
+        );
+        let first = ws.local_ty(file_id, "first");
+        assert_eq!(ws.humanize_type(first), "number");
+    }
+
+    fn param_mismatches(ws: &mut VirtualWorkspace, file_id: crate::FileId) -> usize {
+        ws.analysis
+            .diagnostic
+            .enable_only(crate::DiagnosticCode::ParamTypeMismatch);
+        ws.analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .expect("diagnostics")
+            .len()
     }
 }

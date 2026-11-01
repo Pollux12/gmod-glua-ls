@@ -153,6 +153,26 @@ mod tests {
         assert_eq!(found[0].range.start.line, 1);
     }
 
+    /// Passing an unknown value to a generic parameter says nothing about it:
+    /// `ipairs`'s `V[]` is a placeholder until a call supplies `V`, so no type
+    /// is inferred from it.
+    #[test]
+    fn infer_unknown_does_not_infer_a_generic_parameter_container() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "annotations/infer-unknown.lua",
+            "---@meta\n---@return unknown\nfunction unknown_source() end\n",
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/infer-unknown.lua",
+            "local radios = unknown_source()\nfor _, radio in ipairs(radios) do\n    print(radio)\nend\n",
+        );
+
+        let found = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown);
+        assert_eq!(found, vec![]);
+        assert_eq!(local_type(&ws, file_id, "radios"), LuaType::Unknown);
+    }
+
     #[test]
     fn infer_unknown_can_be_disabled_independently() {
         let (mut ws, file_id) = workspace();
@@ -292,6 +312,7 @@ mod tests {
         let file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(source("")))
+            .map(|(id, _)| id)
             .expect("raw receiver file");
         assert_eq!(
             diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown).len(),
@@ -302,6 +323,7 @@ mod tests {
         let annotated_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(annotated.clone()))
+            .map(|(id, _)| id)
             .expect("annotated receiver file");
         assert!(
             diagnostics_for(&mut ws, annotated_file_id, DiagnosticCode::InferUnknown).is_empty()
@@ -310,6 +332,7 @@ mod tests {
         let raw_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(source("")))
+            .map(|(id, _)| id)
             .expect("raw receiver file after edit");
         assert_eq!(
             diagnostics_for(&mut ws, raw_file_id, DiagnosticCode::InferUnknown).len(),
@@ -318,10 +341,12 @@ mod tests {
 
         ws.analysis
             .update_file_by_uri(&uri, None)
+            .map(|(id, _)| id)
             .expect("receiver file removal");
         let reopened_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(annotated))
+            .map(|(id, _)| id)
             .expect("reopened annotated receiver file");
         assert!(
             diagnostics_for(&mut ws, reopened_file_id, DiagnosticCode::InferUnknown).is_empty()
@@ -428,6 +453,32 @@ mod tests {
     }
 
     #[test]
+    fn a_local_assigned_back_into_its_own_copy_gains_no_usage_context() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "copy_context.lua",
+            r#"
+            ---@class Target
+            ---@return Target
+            local function find() end
+            ---@return unknown
+            local function unknown_source() end
+
+            local argument = unknown_source()
+            local value = argument
+            if value then
+                value = find()
+            end
+            value = argument
+            "#,
+        );
+
+        let found = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown);
+
+        assert_eq!(found, Vec::new());
+    }
+
+    #[test]
     fn declared_overload_return_does_not_infer_from_usage_context() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def_file(
@@ -511,6 +562,7 @@ mod tests {
                 .into(),
             ),
         )]);
+        ws.get_db_mut().flush_inference_derived_state();
         let call = root
             .descendants::<LuaCallExpr>()
             .find(|call| {
@@ -846,7 +898,8 @@ mod tests {
         );
 
         ws.analysis
-            .update_file_by_uri(&provider_uri, Some(WITH_FLOAT_NETWORK_VAR.to_string()));
+            .update_file_by_uri(&provider_uri, Some(WITH_FLOAT_NETWORK_VAR.to_string()))
+            .map(|(id, _)| id);
         assert_eq!(
             (
                 local_type(&ws, consumer_file_id, "value"),
@@ -856,17 +909,21 @@ mod tests {
         );
 
         ws.analysis
-            .update_file_by_uri(&provider_uri, Some(WITH_BOOL_NETWORK_VAR.to_string()));
+            .update_file_by_uri(&provider_uri, Some(WITH_BOOL_NETWORK_VAR.to_string()))
+            .map(|(id, _)| id);
         assert_eq!(local_type(&ws, consumer_file_id, "value"), LuaType::Boolean);
 
-        ws.analysis.update_file_by_uri(&provider_uri, None);
+        ws.analysis
+            .update_file_by_uri(&provider_uri, None)
+            .map(|(id, _)| id);
         assert_eq!(
             diagnostics_for(&mut ws, consumer_file_id, DiagnosticCode::InferUnknown).len(),
             1
         );
 
         ws.analysis
-            .update_file_by_uri(&provider_uri, Some(WITH_FLOAT_NETWORK_VAR.to_string()));
+            .update_file_by_uri(&provider_uri, Some(WITH_FLOAT_NETWORK_VAR.to_string()))
+            .map(|(id, _)| id);
         assert_eq!(
             (
                 local_type(&ws, consumer_file_id, "value"),
@@ -874,6 +931,146 @@ mod tests {
             ),
             (LuaType::Number, Vec::new())
         );
+    }
+
+    #[test]
+    fn contextual_parameter_evidence_keeps_child_inference_advisory() {
+        for (confidence, annotation, replacement, expected) in [
+            (
+                LuaInferenceConfidence::Anchored,
+                "",
+                "",
+                DiagnosticCode::InferUnknown,
+            ),
+            (
+                LuaInferenceConfidence::Certain,
+                "",
+                "",
+                DiagnosticCode::InferUnguardedChild,
+            ),
+            (
+                LuaInferenceConfidence::Anchored,
+                "---@param attacker L2Parent|L2Child",
+                "",
+                DiagnosticCode::InferUnguardedChild,
+            ),
+            (
+                LuaInferenceConfidence::Anchored,
+                "",
+                "attacker = l2_parent()",
+                DiagnosticCode::InferUnguardedChild,
+            ),
+            (
+                LuaInferenceConfidence::Anchored,
+                "",
+                "---@cast attacker L2Parent|L2Child",
+                DiagnosticCode::InferUnguardedChild,
+            ),
+        ] {
+            let mut ws = gmod_workspace();
+            ws.def_file(
+                "lua/annotations/l2_provenance.lua",
+                r#"
+                ---@class L2Parent
+                local L2Parent = {}
+                ---@class L2Child: L2Parent
+                ---@field ChildOnly fun(self: L2Child)
+                local L2Child = {}
+                ---@return L2Parent
+                function l2_parent() end
+            "#,
+            );
+            let source = format!(
+                "{annotation}
+function L2LockOn(attacker)
+{replacement}
+attacker:ChildOnly()
+end"
+            );
+            let file_id = ws.def_file("lua/autorun/server/l2_provenance.lua", &source);
+            let func = ws.get_node::<LuaFuncStat>(file_id);
+            let closure = func.get_closure().unwrap();
+            let signature_id = crate::LuaSignatureId::from_closure(file_id, &closure);
+            let param = closure
+                .get_params_list()
+                .unwrap()
+                .get_params()
+                .next()
+                .unwrap();
+            let decl_id = crate::LuaDeclId::new(file_id, param.get_position());
+            let read = closure
+                .descendants::<glua_parser::LuaIndexExpr>()
+                .find(|index| index.syntax().text() == "attacker:ChildOnly")
+                .unwrap();
+            let parent = ws.ty("L2Parent|L2Child");
+            let child = ws.ty("L2Child");
+            ws.get_db_mut()
+                .get_call_site_param_index_mut()
+                .set_callback_contributions(
+                    file_id,
+                    vec![(
+                        signature_id,
+                        0,
+                        Some(LuaTypeFact::new(
+                            parent.clone(),
+                            confidence,
+                            Vec::new().into(),
+                        )),
+                    )],
+                );
+            let node = LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(decl_id));
+            ws.get_db_mut().publish_inference_facts(vec![(
+                node.clone(),
+                LuaTypeFact::new(
+                    child.clone(),
+                    LuaInferenceConfidence::Heuristic,
+                    vec![LuaInferenceStep {
+                        event: LuaInferenceEventId {
+                            node: LuaInferenceNodeId::TypeOwner(LuaTypeOwner::SyntaxId(
+                                InFiled::new(file_id, read.get_syntax_id()),
+                            )),
+                            kind: LuaInferenceProvenanceKind::UnguardedChild,
+                            source: InFiled::new(file_id, read.get_syntax_id()),
+                        },
+                        support: Vec::new().into(),
+                        inferred_type: Some(Arc::new(child)),
+                        found_type: Some(Arc::new(parent)),
+                    }]
+                    .into(),
+                ),
+            )]);
+            ws.get_db_mut().flush_inference_derived_state();
+            let found = diagnostics_for(&mut ws, file_id, expected);
+            let read_line = source
+                .lines()
+                .position(|line| line == "attacker:ChildOnly()")
+                .unwrap() as u32;
+            let at_read = found
+                .iter()
+                .filter(|diagnostic| diagnostic.range.start.line == read_line)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                at_read.len(),
+                1,
+                "{confidence:?}: {annotation}: {replacement}: {found:?}"
+            );
+            let severity = if expected == DiagnosticCode::InferUnknown {
+                lsp_types::DiagnosticSeverity::HINT
+            } else {
+                lsp_types::DiagnosticSeverity::WARNING
+            };
+            assert_eq!(at_read[0].severity, Some(severity));
+            let unexpected = if expected == DiagnosticCode::InferUnknown {
+                DiagnosticCode::InferUnguardedChild
+            } else {
+                DiagnosticCode::InferUnknown
+            };
+            assert!(
+                !diagnostics_for(&mut ws, file_id, unexpected)
+                    .iter()
+                    .any(|diagnostic| diagnostic.range.start.line == read_line)
+            );
+        }
     }
 
     #[test]
@@ -911,6 +1108,7 @@ mod tests {
                 .into(),
             ),
         )]);
+        ws.get_db_mut().flush_inference_derived_state();
 
         let found = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
         assert_eq!(found.len(), 1, "{found:?}");
@@ -1081,5 +1279,172 @@ mod tests {
             ),
             (ws.ty("Entity"), LuaType::Number, Vec::new())
         );
+    }
+
+    /// A callback-slot receiver types its method call through the unresolve
+    /// pass, so arithmetic over that call was cached `unknown` while the
+    /// operand was still settling. Nothing retried the operator expression, so
+    /// usage-context inference guessed at a value the analyzer already knew.
+    #[test]
+    fn arithmetic_over_callback_slot_receiver_does_not_infer_from_usage_context() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "callback_arithmetic.lua",
+            r#"
+            ---@class Frame
+            ---@field GetWide fun(self: Frame): number
+
+            ---@param n number
+            local function sink(n) end
+
+            ---@param func fun(frame: Frame)
+            local function AddScreen(func) end
+
+            AddScreen(function(frame)
+                local w = frame:GetWide()
+                local x = w - 1
+                sink(x)
+            end)
+            "#,
+        );
+
+        let found = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown);
+
+        // The operand must still resolve, so silence above cannot come from a
+        // workspace where the receiver never attached.
+        assert_eq!(
+            (
+                local_type(&ws, file_id, "w"),
+                local_type(&ws, file_id, "x"),
+                found,
+            ),
+            (LuaType::Number, LuaType::Number, Vec::new())
+        );
+    }
+
+    /// Screen layout chains arithmetic several locals deep, so each retry has to
+    /// wait for the one it reads. Retiring a retry that still answered
+    /// `unknown` froze every value past the first link.
+    #[test]
+    fn chained_arithmetic_over_a_callback_slot_receiver_resolves_every_link() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        // The registrar lives in another file, so the slot that types `frame`
+        // only resolves in a later unresolve wave than the arithmetic that
+        // reads it — which is what the real screen files do.
+        ws.def_file(
+            "lua/registrar.lua",
+            r#"
+            ---@class Frame
+            ---@field GetWide fun(self: Frame): number
+            ---@field GetTall fun(self: Frame): number
+
+            ---@class Registry
+            Registry = {}
+
+            ---@param name string
+            ---@param func fun(self: Registry, frame: Frame)
+            function Registry:AddScreen(name, func) end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/screen.lua",
+            r#"
+            ---@param w number
+            ---@param h number
+            local function setSize(w, h) end
+
+            Registry:AddScreen("Destination", function(self, frame)
+                local w = frame:GetWide()
+                local h = frame:GetTall()
+                local d = 0.05 * math.min(w, h)
+                local panel_w = (w - 3 * d) / 2
+                local panel_h = (h - 4 * d) / 3
+                local elem_w = (panel_w - 5 * d) / 4
+                local elem_h = (panel_h - 4 * d) / 3
+                setSize(elem_w, elem_h)
+            end)
+            "#,
+        );
+
+        let found = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown);
+
+        // Each link must resolve on its own, so silence cannot come from a
+        // workspace where the receiver never attached.
+        assert_eq!(
+            (
+                local_type(&ws, file_id, "d"),
+                local_type(&ws, file_id, "panel_w"),
+                local_type(&ws, file_id, "elem_w"),
+                found,
+            ),
+            (
+                LuaType::Number,
+                LuaType::Number,
+                LuaType::Number,
+                Vec::new()
+            )
+        );
+    }
+
+    #[test]
+    fn two_unknown_arguments_pick_the_overload_that_fits_their_count() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/insert-unknown.lua",
+            r#"
+            local settings = {}
+            function AddTeam(a, b, name)
+                local n = name
+                table.insert(settings[a][b]["Teams"], n)
+            end
+            "#,
+        );
+
+        assert!(diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown).is_empty());
+    }
+
+    #[test]
+    fn unresolved_writers_are_no_evidence_for_a_stored_local() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/aaa_annotations/panel.lua",
+            r#"
+            ---@class Panel
+            Panel = Panel or {}
+            ---@generic T : Panel
+            ---@param className `T`
+            ---@return (instance) T
+            function Panel:Add(className) end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/other_writers.lua",
+            r#"
+            ---@param panel Panel
+            ---@param anything any
+            function OtherWriters(panel, anything)
+                panel.id = anything
+                panel.id = 5
+            end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/stored_local.lua",
+            r#"
+            ---@param row Panel
+            function StoreKey(row)
+                local key = UndefinedPlugins.loaded
+                row.id = key
+            end
+
+            ---@param row Panel
+            function StoreUnloadedKey(row)
+                local unloaded = UndefinedPlugins.unloaded
+                row.id = unloaded
+            end
+            "#,
+        );
+
+        assert_eq!(local_type(&ws, file_id, "key"), LuaType::IntegerConst(5));
     }
 }

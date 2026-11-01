@@ -32,7 +32,7 @@ fn bind_and_expr(
 ) -> Option<()> {
     let (left, right) = binary_expr.get_exprs()?;
 
-    let pre_right = binder.create_branch_label();
+    let pre_right = binder.create_condition_label(current);
     bind_condition_expr(binder, left, current, pre_right, binder.false_target);
     let current = finish_flow_label(binder, pre_right, current);
     bind_condition_expr(
@@ -52,7 +52,7 @@ fn bind_or_expr(
     current: FlowId,
 ) -> Option<()> {
     let (left, right) = binary_expr.get_exprs()?;
-    let pre_right = binder.create_branch_label();
+    let pre_right = binder.create_condition_label(current);
     bind_condition_expr(binder, left, current, binder.true_target, pre_right);
     let current = finish_flow_label(binder, pre_right, current);
     bind_condition_expr(

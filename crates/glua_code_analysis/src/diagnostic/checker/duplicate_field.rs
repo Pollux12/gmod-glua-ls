@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use glua_parser::{
-    LuaAstNode, LuaDocTagClass, LuaDocTagField, LuaIndexExpr, LuaStat, LuaSyntaxKind, LuaSyntaxNode,
+    LuaAstNode, LuaDocTagField, LuaIndexExpr, LuaStat, LuaSyntaxKind, LuaSyntaxNode,
 };
 
 use crate::{
@@ -39,7 +39,7 @@ struct DeclInfo {
 }
 
 fn get_decl_set(
-    context: &DiagnosticContext,
+    context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
 ) -> Option<HashSet<DeclInfo>> {
     let file_id = semantic_model.get_file_id();
@@ -47,7 +47,7 @@ fn get_decl_set(
         .get_db()
         .get_decl_index()
         .get_decl_tree(&file_id)?;
-    let mut type_decl_id_set = HashSet::new();
+    let mut type_decl_id_set = HashSet::default();
     for (decl_id, decl) in decl_tree.get_decls() {
         if context.is_cancelled() {
             return Some(type_decl_id_set);
@@ -77,8 +77,10 @@ fn get_decl_set(
         }
     }
 
-    let root = semantic_model.get_root();
-    for tag_class in root.descendants::<LuaDocTagClass>() {
+    let Some(buckets) = context.file_buckets() else {
+        return Some(type_decl_id_set);
+    };
+    for tag_class in buckets.doc_tag_classes.iter() {
         if context.is_cancelled() {
             return Some(type_decl_id_set);
         }
@@ -126,13 +128,13 @@ fn check_decl_duplicate_field(
         .get_member_index()
         .get_members(&type_decl.get_id().into())?;
 
-    let mut member_map: HashMap<&LuaMemberKey, Vec<&LuaMember>> = HashMap::new();
+    let mut member_map: HashMap<&LuaMemberKey, Vec<&LuaMember>> = HashMap::default();
 
     for member in members.iter() {
         if context.is_cancelled() {
             return Some(());
         }
-        // 过滤掉 meta 定义的 signature
+        // Filter out signatures defined by meta
         if member.get_feature() == LuaMemberFeature::MetaMethodDecl {
             continue;
         }
@@ -155,7 +157,7 @@ fn check_decl_duplicate_field(
             return Some(());
         }
         if members.len() < 2 {
-            // 需要特殊处理: require("a").fun = function() end
+            // Needs special handling: require("a").fun = function() end
             if let Some(member) = members.first() {
                 check_one_member(context, semantic_model, member, decl_info.is_require);
             }
@@ -176,10 +178,9 @@ fn check_decl_duplicate_field(
             });
         }
 
-        // 1. 检查 signature
+        // 1. Check signature
         let signatures = member_infos.iter().filter(|info| {
-            matches!(info.typ, LuaType::Signature(_))
-                && !is_assignment_file_define_member(info.member)
+            matches!(info.typ, LuaType::Signature(_)) && !info.member.is_assignment_define()
         });
         if signatures.clone().count() > 1 {
             for signature in signatures {
@@ -198,19 +199,19 @@ fn check_decl_duplicate_field(
             }
         }
 
-        // 2. 检查 ---@field 成员
+        // 2. Check ---@field members
         let field_decls = member_infos
             .iter()
-            .filter(|info| info.feature.is_field_decl())
+            .filter(|info| info.feature.is_field_decl() && is_doc_field_tag(info.member))
             .collect::<Vec<_>>();
-        // 如果 field_decls 数量大于1，则进一步检查
+        // If there is more than one field_decl, check further
         if field_decls.len() > 1 {
-            // 检查是否所有 field_decls 都是 DocFunction
+            // Check whether all field_decls are DocFunction
             let all_doc_functions = field_decls
                 .iter()
                 .all(|info| matches!(info.typ, LuaType::DocFunction(_)));
 
-            // 如果不全是 DocFunction，则报错
+            // If not all are DocFunction, report an error
             if !all_doc_functions {
                 for field_decl in &field_decls {
                     if context.is_cancelled() {
@@ -219,7 +220,7 @@ fn check_decl_duplicate_field(
                     if field_decl.member.get_file_id() == file_id {
                         context.add_diagnostic(
                             DiagnosticCode::DuplicateDocField,
-                            // TODO: 范围缩小到名称而不是整个 ---@field
+                            // TODO: narrow the range to the name instead of the whole ---@field
                             field_decl.member.get_range(),
                             format!("Duplicate field `{name}`.", name = key.to_path()).to_string(),
                             None,
@@ -233,12 +234,17 @@ fn check_decl_duplicate_field(
     Some(())
 }
 
-fn is_assignment_file_define_member(member: &LuaMember) -> bool {
-    member.get_feature() == LuaMemberFeature::FileDefine
-        && member.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr
+/// Whether `member` is a field a doc tag declares. Members the analysis
+/// synthesizes (a registered panel's `BaseClass`, module and global-path
+/// members) share the field-declaration feature but no author wrote them.
+fn is_doc_field_tag(member: &LuaMember) -> bool {
+    matches!(
+        member.get_syntax_id().get_kind(),
+        LuaSyntaxKind::DocTagField | LuaSyntaxKind::DocEnumField
+    )
 }
 
-/// 特殊处理: require("a").fun = function() end
+/// Special handling: require("a").fun = function() end
 fn check_one_member(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
@@ -255,7 +261,7 @@ fn check_one_member(
     let key = member.get_key();
     let member_id = member.get_id();
     let typ = semantic_model.get_type(member.get_id().into());
-    // 如果不是 signature 则不需要检查
+    // No check needed if it is not a signature
     if !matches!(typ, LuaType::Signature(_)) {
         return None;
     }
@@ -270,11 +276,11 @@ fn check_one_member(
         if context.is_cancelled() {
             return Some(());
         }
-        // 不同文件不检查
+        // Do not check across different files
         if in_filed.file_id != context.file_id {
             continue;
         }
-        // 不需要检查自身
+        // No need to check itself
         if in_filed.value == *member_id.get_syntax_id() {
             continue;
         }
@@ -288,7 +294,7 @@ fn check_one_member(
             continue;
         }
 
-        // 如果不是赋值则不需要检查
+        // No check needed if it is not an assignment
         if check_function_member_is_set(semantic_model, &node, is_require).is_none() {
             continue;
         }
@@ -304,7 +310,7 @@ fn check_one_member(
     Some(())
 }
 
-/// 检查是否是 require("a").member = newValue
+/// Checks whether it is require("a").member = newValue
 fn check_function_member_is_set(
     semantic_model: &SemanticModel,
     node: &LuaSyntaxNode,
@@ -317,14 +323,14 @@ fn check_function_member_is_set(
             if let LuaType::Def(_) = prefix_type {
                 return None;
             }
-            // 往上寻找 stat 节点
+            // Look upwards for the stat node
             let stat = expr.ancestors::<LuaStat>().next()?;
             match stat {
                 LuaStat::FuncStat(_) => {
                     return Some(());
                 }
                 LuaStat::AssignStat(assign_stat) => {
-                    // 判断是否在左侧
+                    // Determine whether it is on the left side
                     let (vars, exprs) = assign_stat.get_var_and_expr_list();
                     for (i, var) in vars.iter().enumerate() {
                         if var
@@ -332,11 +338,11 @@ fn check_function_member_is_set(
                             .text_range()
                             .contains(node.text_range().start())
                         {
-                            // 如果是 require 导入的, 则直接认为是重复字段
+                            // If imported via require, treat it as a duplicate field directly
                             if is_require {
                                 return Some(());
                             }
-                            // 确定右侧表达式是否是 signature
+                            // Determine whether the right-hand expression is a signature
                             if let Some(expr) = exprs.get(i) {
                                 let expr_type = semantic_model.infer_expr(expr.clone()).ok()?;
                                 if matches!(expr_type, LuaType::Signature(_)) {

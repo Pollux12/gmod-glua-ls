@@ -90,7 +90,7 @@ impl<'a> SignatureHelperBuilder<'a> {
             NodeOrToken::Node(prefix_expr.syntax().clone()),
             SemanticDeclLevel::Trace(50),
         );
-        // 推断为来源
+        // Infer as the source
         semantic_decl = match semantic_decl {
             Some(LuaSemanticDeclId::Member(member_id)) => find_member_origin_owners(
                 self.compilation,
@@ -108,7 +108,7 @@ impl<'a> SignatureHelperBuilder<'a> {
         };
         let semantic_decl = semantic_decl?;
 
-        // 先设置原始描述
+        // Set the original description first
         let property = self
             .semantic_model
             .get_db()
@@ -154,11 +154,11 @@ impl<'a> SignatureHelperBuilder<'a> {
             LuaSemanticDeclId::Member(member_id) => {
                 let member = db.get_member_index().get_member(member_id)?;
                 let global_name = infer_prefix_global_name(self.semantic_model, member);
-                // 处理前缀
+                // Handle the prefix
                 let parent_owner = db.get_member_index().get_current_owner(&member.get_id());
                 if let Some(LuaMemberOwner::Type(ty)) = parent_owner {
                     let mut name = String::new();
-                    // 如果是全局定义, 则使用定义时的名称
+                    // If it is a global definition, use the name given at definition
                     if let Some(global_name) = global_name {
                         name.push_str(global_name);
                     } else {

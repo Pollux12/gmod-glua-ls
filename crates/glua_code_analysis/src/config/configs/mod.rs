@@ -39,7 +39,7 @@ pub use reformat::{
     EmmyrcFormatStyleOverrides, EmmyrcReformat,
 };
 pub use resource::EmmyrcResource;
-pub use runtime::{EmmyrcLuaVersion, EmmyrcRuntime};
+pub use runtime::{EmmyrcLuaVersion, EmmyrcNonStdSymbol, EmmyrcRuntime};
 pub use semantictoken::EmmyrcSemanticToken;
 pub use strict::EmmyrcStrict;
 pub use workspace::{

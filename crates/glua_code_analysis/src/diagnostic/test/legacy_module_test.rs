@@ -326,8 +326,8 @@ mod test {
         emmyrc.workspace.enable_isolation = true;
         analysis.update_config(Arc::new(emmyrc));
 
-        let workspace_a = std::env::temp_dir().join("legacy-module-workspace-a");
-        let workspace_b = std::env::temp_dir().join("legacy-module-workspace-b");
+        let workspace_a = crate::test_lib::unique_temp_dir("legacy-module-workspace-a");
+        let workspace_b = crate::test_lib::unique_temp_dir("legacy-module-workspace-b");
         analysis.add_main_workspace(workspace_a.clone());
         analysis.add_main_workspace(workspace_b.clone());
 
@@ -335,16 +335,18 @@ mod test {
         let file_b =
             lsp_types::Uri::parse_from_file_path(&workspace_b.join("consumer.lua")).unwrap();
 
-        analysis.update_file_by_uri(
-            &file_a,
-            Some(
-                r#"
+        analysis
+            .update_file_by_uri(
+                &file_a,
+                Some(
+                    r#"
                 module("class", package.seeall)
                 function Create() end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         let file_id_b = analysis
             .update_file_by_uri(
                 &file_b,
@@ -355,6 +357,7 @@ mod test {
                     .to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("consumer file id");
 
         analysis

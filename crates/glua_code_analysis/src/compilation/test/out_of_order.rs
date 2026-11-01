@@ -2,6 +2,39 @@
 mod test {
     use crate::VirtualWorkspace;
 
+    /// A callee that reassigns its callback parameter supplies no call-site
+    /// evidence for the callback's parameters, whichever of the caller and the
+    /// callee is analysed first.
+    #[test]
+    fn test_mutated_callback_param_suppresses_evidence_in_any_file_order() {
+        const CALLER: &str = r#"
+            M.run(function(data)
+                local value = data
+            end)
+            "#;
+        const CALLEE: &str = r#"
+            M = {}
+            function M.run(callback)
+                callback({ x = 1 })
+                callback = nil
+            end
+            "#;
+        let ws = VirtualWorkspace::assert_warm_matches_cold(
+            |_| {},
+            &[("lua/caller.lua", "")],
+            &[("lua/callee.lua", CALLEE), ("lua/caller.lua", CALLER)],
+        );
+        assert_eq!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_call_site_param_index()
+                .iter_inferred_params()
+                .count(),
+            0
+        );
+    }
+
     /// `local orig = tonumber` runs before the `function tonumber` statement
     /// below it, so it must capture the std global, not the same-file wrapper.
     /// Binding it to the wrapper makes the wrapper self-recursive and its
@@ -209,5 +242,61 @@ mod test {
                 "SF.Instance.{field} did not attach: {ty:?}"
             );
         }
+    }
+
+    /// A member with one definition per realm settles to `any`, so a caller
+    /// that reaches it after that resolves the call against an `any` callee.
+    /// Answering "cannot infer" there makes the call's type depend on when the
+    /// caller was walked: the file walk can still see a signature and write a
+    /// real type, while a later unresolve retry sees the settled `any` and
+    /// comes back undetermined, and which of the two claims the slot is a
+    /// property of how the workspace was batched rather than of the source.
+    /// Calling `any` yields `any`, so both paths agree.
+    #[test]
+    fn test_call_on_an_any_callee_yields_any() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@type any
+            AnyCallee = nil
+
+            ---@class AnyHolder
+            ---@field opaque any
+
+            ---@type AnyHolder
+            AnyHolderValue = nil
+
+            AnyPlainCall = AnyCallee()
+            AnyCallWithArgs = AnyCallee(1, "two")
+            AnyMemberCall = AnyHolderValue.opaque()
+            "#,
+        );
+
+        assert!(ws.expr_ty("AnyCallee").is_any());
+        assert!(ws.expr_ty("AnyHolderValue.opaque").is_any());
+
+        for expr in ["AnyPlainCall", "AnyCallWithArgs", "AnyMemberCall"] {
+            let ty = ws.expr_ty(expr);
+            assert!(
+                ty.is_any(),
+                "calling an `any` callee should yield `any`, got {ty:?} for {expr}"
+            );
+        }
+    }
+
+    /// The synthesized callable has to accept any arity, or every argument to
+    /// an `any` callee is reported redundant.
+    #[test]
+    fn test_call_on_an_any_callee_reports_no_redundant_parameter() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            crate::DiagnosticCode::RedundantParameter,
+            r#"
+            ---@type any
+            local opaque
+
+            local _ = opaque(1, 2, 3)
+            "#,
+        ));
     }
 }

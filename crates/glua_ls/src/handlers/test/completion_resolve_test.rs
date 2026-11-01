@@ -103,7 +103,7 @@ mod tests {
         let detail = item.detail.ok_or("item detail is empty").or_fail()?;
         verify_eq!(
             detail,
-            "function lookup(kind: \"steamid\") -> string (+1 overloads)"
+            "function ix.character.lookup(kind: \"steamid\") -> string (+1 overloads)"
         )?;
         verify_that!(item.documentation, none())?;
         Ok(())
@@ -215,7 +215,7 @@ mod tests {
             VirtualCompletionResolveItem {
                 detail: "(method) SANDBOX:PlayerSpawnSENT(ply, class) (+1 overloads)".to_string(),
                 documentation: Some(
-                    "\n![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png)\n\nCalled when a player attempts to spawn a SENT."
+                    "\n![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png) **SHARED**\n\nCalled when a player attempts to spawn a SENT."
                         .to_string(),
                 ),
             },
@@ -251,7 +251,7 @@ mod tests {
             VirtualCompletionResolveItem {
                 detail: "(method) SANDBOX:PlayerSpawnSENT(ply, class)".to_string(),
                 documentation: Some(
-                    "\n![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png)"
+                    "\n![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png) **SHARED**"
                         .to_string(),
                 ),
             },

@@ -1,53 +1,44 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use crate::{
-    CacheEntry, DbIndex, InFiled, InferFailReason, LuaMemberKey, LuaSemanticDeclId, LuaSignatureId,
-    LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
+    CacheEntry, DbIndex, FileId, GlobalId, InFiled, InferFailReason, LuaInferCache, LuaMemberKey,
+    LuaSemanticDeclId, LuaSignatureId, LuaTypeCache, LuaTypeOwner, TypeOps,
     compilation::analyzer::{
         common::{
-            TypeCacheWriteMode, add_member, bind_type, holds_unbound_iter_template,
-            reads_settling_iter_var, write_type_cache,
+            DeclWrite, TypeCacheWriteMode, holds_unbound_iter_template, is_nil_literal_expr,
+            reads_settling_iter_var, widen_mutable_local_name_copy,
         },
         gmod::name_expr_resolves_to_scoped_authoring_table,
         unresolve::{UnResolveDecl, UnResolveMember},
     },
     db_index::{
         LuaDeclId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberOwner, LuaType,
-        MemberAssignmentContribution, member_id_sort_key,
+        member_id_sort_key,
     },
-    semantic::{merge_open_table_types, remove_false_or_nil},
+    semantic::{merge_open_table_types, pairs_iter_value_registry_path, remove_false_or_nil},
 };
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAstNode, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
-    LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaSyntaxKind,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,
+    LuaIndexExpr, LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr,
     LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use rustc_hash::FxHashMap;
 
 #[cfg(test)]
-use crate::{GmodStateMask, LuaArrayType};
+use crate::LuaArrayType;
 
 use super::{
-    LuaAnalyzer,
+    AssignmentHoming, AssignmentStage, LuaAnalyzer, MemberHoming, StatementWrite,
     member_write_policy::{
-        MemberAssignmentWideningCacheKey, MemberAssignmentWideningDecision,
-        MemberAssignmentWideningState, WideningCacheLookup, decide_member_assignment_widening,
-        direct_local_prefix_has_declared_type, direct_local_table_prefix_member_owner,
-        flush_pending_dynamic_key_collection_widening_for_members,
-        get_widened_member_assignment_collection_type, is_collection_append_write,
-        is_member_realm_compatible, lookup_widening_cache, member_assignment_state_mask,
-        member_assignment_state_masks_compatible, merge_member_assignment_widening_state,
-        record_member_collection_assignment_widening_cache, record_widening_cache,
-        resolve_index_expr_member_owner_for_file, union_member_assignment_widening,
-        widen_existing_member_collection_type, widen_related_assignment_type,
+        alias_target_global_path, direct_local_prefix_has_declared_type,
+        direct_local_table_prefix_member_owner,
+        flush_pending_dynamic_key_collection_widening_for_members, is_collection_append_write,
+        resolve_index_expr_member_owner_for_file, widen_existing_member_collection_type,
     },
 };
 
 #[cfg(test)]
-use super::member_write_policy::{
-    get_cached_widened_member_collection_assignment_type,
-    record_pending_dynamic_key_collection_widening,
-};
+use super::member_write_policy::record_pending_dynamic_key_collection_widening;
 
 pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) -> Option<()> {
     let name_list: Vec<_> = local_stat.get_local_name_list().collect();
@@ -58,9 +49,9 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
         for local_name in name_list {
             let position = local_name.get_position();
             let decl_id = LuaDeclId::new(analyzer.file_id, position);
-            // 标记了延迟定义属性, 此时将跳过绑定类型, 等待第一次赋值时再绑定类型
+            // A deferred-definition attribute is set: skip binding the type and bind it on the first assignment
             if has_delayed_definition_attribute(analyzer, decl_id) {
-                return Some(());
+                continue;
             }
             // Skip Nil binding for mutable locals (those with subsequent write-assignments).
             // This prevents false "cannot assign X to never" diagnostics when a local is used
@@ -68,12 +59,11 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
             if is_local_mutable(analyzer, decl_id) {
                 continue;
             }
-            write_type_cache(
-                analyzer.db,
-                decl_id.into(),
-                LuaTypeCache::InferType(LuaType::Nil),
-                TypeCacheWriteMode::InsertOnly,
-            );
+            analyzer.write(StatementWrite::WriteTypeCache {
+                owner: decl_id.into(),
+                cache: LuaTypeCache::InferType(LuaType::Nil),
+                mode: TypeCacheWriteMode::InsertOnly,
+            });
         }
 
         return Some(());
@@ -88,20 +78,15 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
             break;
         };
         let decl_id = LuaDeclId::new(analyzer.file_id, position);
-        if is_call_or_index_expr(&expr) {
-            analyzer
-                .context
-                .request_uninformative_local_decl_reinfer(decl_id);
-        }
 
-        if let Some(reason) = should_defer_guarded_index_alias(analyzer, &expr) {
+        if should_defer_guarded_index_alias(analyzer, &expr) {
             let unresolve = UnResolveDecl {
                 file_id: analyzer.file_id,
                 decl_id,
                 expr: expr.clone(),
                 ret_idx: 0,
             };
-            analyzer.context.add_unresolve(unresolve.into(), reason);
+            analyzer.context.add_unresolve(unresolve.into());
             continue;
         }
 
@@ -117,13 +102,11 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         expr: expr.clone(),
                         ret_idx: 0,
                     };
-                    analyzer
-                        .context
-                        .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
+                    analyzer.context.add_unresolve(unresolve.into());
                     continue;
                 }
-                if holds_unbound_iter_template(analyzer.db, analyzer.file_id, &expr, &expr_type)
-                    || reads_settling_iter_var(analyzer.db, analyzer.file_id, &expr)
+                if holds_unbound_iter_template(&analyzer.db, analyzer.file_id, &expr, &expr_type)
+                    || reads_settling_iter_var(&analyzer.db, analyzer.file_id, &expr)
                 {
                     let unresolve = UnResolveDecl {
                         file_id: analyzer.file_id,
@@ -131,21 +114,7 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         expr: expr.clone(),
                         ret_idx: 0,
                     };
-                    analyzer
-                        .context
-                        .add_unresolve(unresolve.into(), InferFailReason::UnResolveIterTemplate);
-                    continue;
-                }
-                if should_defer_pending_local_alias(analyzer, &expr, &expr_type) {
-                    let unresolve = UnResolveDecl {
-                        file_id: analyzer.file_id,
-                        decl_id,
-                        expr: expr.clone(),
-                        ret_idx: 0,
-                    };
-                    analyzer
-                        .context
-                        .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
+                    analyzer.context.add_unresolve(unresolve.into());
                     continue;
                 }
                 if should_defer_weak_gmod_call_expr(analyzer, &expr, &expr_type) {
@@ -155,9 +124,7 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         expr: expr.clone(),
                         ret_idx: 0,
                     };
-                    analyzer
-                        .context
-                        .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
+                    analyzer.context.add_unresolve(unresolve.into());
                     continue;
                 }
                 if should_defer_nil_gmod_index_alias(analyzer, &expr, &expr_type)
@@ -170,13 +137,11 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         expr: expr.clone(),
                         ret_idx: 0,
                     };
-                    analyzer
-                        .context
-                        .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
+                    analyzer.context.add_unresolve(unresolve.into());
                     continue;
                 }
 
-                // 当`call`参数包含表时, 表可能未被分析, 需要延迟
+                // When the `call` arguments contain a table, the table may not have been analyzed yet and must be deferred
                 if let LuaType::Instance(instance) = &expr_type
                     && instance.get_base().is_unknown()
                     && call_expr_has_effect_table_arg(&expr).is_some()
@@ -187,22 +152,18 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         expr: expr.clone(),
                         ret_idx: 0,
                     };
-                    analyzer.context.add_unresolve(
-                        unresolve.into(),
-                        InferFailReason::UnResolveExpr(InFiled::new(
-                            analyzer.file_id,
-                            expr.clone(),
-                        )),
-                    );
+                    analyzer.context.add_unresolve(unresolve.into());
                     continue;
                 }
 
                 let retry_uninformative = should_retry_uninformative_initializer(&expr, &expr_type);
-                bind_type(
-                    analyzer.db,
-                    decl_id.into(),
-                    LuaTypeCache::InferType(expr_type),
-                );
+                let write = initializer_decl_write(analyzer, decl_id, &expr);
+                analyzer.write(StatementWrite::BindDeclWrite {
+                    decl_id,
+                    cache: LuaTypeCache::InferType(expr_type),
+                    write,
+                });
+                publish_initializer_fact(analyzer, decl_id, &expr);
                 if retry_uninformative {
                     let unresolve = UnResolveDecl {
                         file_id: analyzer.file_id,
@@ -210,9 +171,7 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         expr: expr.clone(),
                         ret_idx: 0,
                     };
-                    analyzer
-                        .context
-                        .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
+                    analyzer.context.add_unresolve(unresolve.into());
                 }
             }
             Err(InferFailReason::None) => {
@@ -223,19 +182,16 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         expr: expr.clone(),
                         ret_idx: 0,
                     };
-                    analyzer
-                        .context
-                        .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
+                    analyzer.context.add_unresolve(unresolve.into());
                 } else {
-                    write_type_cache(
-                        analyzer.db,
-                        decl_id.into(),
-                        LuaTypeCache::InferType(LuaType::Nil),
-                        TypeCacheWriteMode::InsertOnly,
-                    );
+                    analyzer.write(StatementWrite::WriteTypeCache {
+                        owner: decl_id.into(),
+                        cache: LuaTypeCache::InferType(LuaType::Nil),
+                        mode: TypeCacheWriteMode::InsertOnly,
+                    });
                 }
             }
-            Err(reason) => {
+            Err(_) => {
                 let unresolve = UnResolveDecl {
                     file_id: analyzer.file_id,
                     decl_id,
@@ -243,7 +199,7 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                     ret_idx: 0,
                 };
 
-                analyzer.context.add_unresolve(unresolve.into(), reason);
+                analyzer.context.add_unresolve(unresolve.into());
             }
         }
     }
@@ -261,20 +217,13 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                             let position = name.get_position();
                             let decl_id = LuaDeclId::new(analyzer.file_id, position);
                             let ret_type = variadic.get_type(i - expr_count + 1);
-                            if let Some(ret_type) = ret_type {
-                                bind_type(
-                                    analyzer.db,
-                                    decl_id.into(),
-                                    LuaTypeCache::InferType(ret_type.clone()),
-                                );
-                            } else {
-                                write_type_cache(
-                                    analyzer.db,
-                                    decl_id.into(),
-                                    LuaTypeCache::InferType(LuaType::Nil),
-                                    TypeCacheWriteMode::InsertOnly,
-                                );
-                            }
+                            let ret_type = ret_type.cloned().unwrap_or(LuaType::Nil);
+                            let write = initializer_decl_write(analyzer, decl_id, last_expr);
+                            analyzer.write(StatementWrite::BindDeclWrite {
+                                decl_id,
+                                cache: LuaTypeCache::InferType(ret_type),
+                                write,
+                            });
                         }
                         return Some(());
                     } else {
@@ -289,22 +238,28 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                             } else {
                                 LuaType::Any
                             };
-                            bind_type(analyzer.db, decl_id.into(), LuaTypeCache::InferType(typ));
+                            let write = initializer_decl_write(analyzer, decl_id, last_expr);
+                            analyzer.write(StatementWrite::BindDeclWrite {
+                                decl_id,
+                                cache: LuaTypeCache::InferType(typ),
+                                write,
+                            });
                         }
                         return Some(());
                     }
                 }
-                Err(reason) => {
+                Err(_) => {
                     for i in expr_count..name_count {
                         let name = name_list.get(i)?;
                         let position = name.get_position();
                         let decl_id = LuaDeclId::new(analyzer.file_id, position);
                         if last_expr_is_call {
-                            bind_type(
-                                analyzer.db,
-                                decl_id.into(),
-                                LuaTypeCache::InferType(LuaType::Unknown),
-                            );
+                            let write = initializer_decl_write(analyzer, decl_id, last_expr);
+                            analyzer.write(StatementWrite::BindDeclWrite {
+                                decl_id,
+                                cache: LuaTypeCache::InferType(LuaType::Unknown),
+                                write,
+                            });
                         }
                         let unresolve = UnResolveDecl {
                             file_id: analyzer.file_id,
@@ -313,9 +268,7 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                             ret_idx: i - expr_count + 1,
                         };
 
-                        analyzer
-                            .context
-                            .add_unresolve(unresolve.into(), reason.clone());
+                        analyzer.context.add_unresolve(unresolve.into());
                     }
                 }
             }
@@ -324,12 +277,11 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 let name = name_list.get(i)?;
                 let position = name.get_position();
                 let decl_id = LuaDeclId::new(analyzer.file_id, position);
-                write_type_cache(
-                    analyzer.db,
-                    decl_id.into(),
-                    LuaTypeCache::InferType(LuaType::Nil),
-                    TypeCacheWriteMode::InsertOnly,
-                );
+                analyzer.write(StatementWrite::WriteTypeCache {
+                    owner: decl_id.into(),
+                    cache: LuaTypeCache::InferType(LuaType::Nil),
+                    mode: TypeCacheWriteMode::InsertOnly,
+                });
             }
         }
     }
@@ -337,15 +289,13 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
     Some(())
 }
 
-fn should_defer_guarded_index_alias(
-    analyzer: &mut LuaAnalyzer,
-    expr: &LuaExpr,
-) -> Option<InferFailReason> {
-    let left = guarded_index_or_empty_table_left(expr)?;
+fn should_defer_guarded_index_alias(analyzer: &mut LuaAnalyzer, expr: &LuaExpr) -> bool {
+    let Some(left) = guarded_index_or_empty_table_left(expr) else {
+        return false;
+    };
     match analyzer.infer_expr(&left) {
-        Ok(ty) if ty.is_unknown() || ty.is_nil() => Some(InferFailReason::FieldNotFound),
-        Err(reason) if reason.is_need_resolve() => Some(reason),
-        _ => None,
+        Ok(ty) => ty.is_unknown() || ty.is_nil(),
+        Err(reason) => reason.is_need_resolve(),
     }
 }
 
@@ -419,10 +369,9 @@ fn should_defer_weak_gmod_dynamic_index_alias(
 fn is_weak_dynamic_index_alias_type(expr_type: &LuaType) -> bool {
     match expr_type {
         LuaType::Any | LuaType::Unknown => true,
-        LuaType::Union(union) => match union.as_ref() {
-            LuaUnionType::Nullable(inner) => inner.is_any() || inner.is_unknown(),
-            LuaUnionType::Multi(_) => false,
-        },
+        LuaType::Union(union) => union
+            .nullable_inner()
+            .is_some_and(|inner| inner.is_any() || inner.is_unknown()),
         _ => false,
     }
 }
@@ -446,7 +395,7 @@ fn clear_index_expr_type_cache(analyzer: &mut LuaAnalyzer, expr: &LuaExpr) {
     let mut current_expr = expr.clone();
     while let LuaExpr::IndexExpr(index_expr) = current_expr {
         let syntax_id = index_expr.get_syntax_id();
-        if matches!(cache.expr_cache.get(&syntax_id), Some(CacheEntry::Cache(typ)) if typ.is_nil() || is_weak_dynamic_index_alias_type(typ))
+        if matches!(cache.expr_cache.peek(&syntax_id), Some(CacheEntry::Cache(typ)) if typ.is_nil() || is_weak_dynamic_index_alias_type(typ))
         {
             cache.expr_cache.remove(&syntax_id);
             cache.expr_var_ref_id_cache.remove(&syntax_id);
@@ -497,10 +446,50 @@ fn get_var_owner(analyzer: &mut LuaAnalyzer, var: LuaVarExpr) -> LuaTypeOwner {
     }
 }
 
+/// Whether the write goes through a computed index (`t[k].field = v`).
+///
+/// Which entry `t[k]` names is not knowable statically, so the declaration walk
+/// files such a write under the path's placeholder segment (`t.[]`). Re-homing
+/// it onto whichever concrete entry the prefix *type* happened to resolve to
+/// makes ownership a function of how far inference had run when the write was
+/// analysed, which differs between a cold build and a warm re-index.
+fn prefix_path_has_computed_segment(prefix_expr: &LuaExpr) -> bool {
+    let mut current = prefix_expr.clone();
+    loop {
+        let LuaExpr::IndexExpr(index_expr) = current else {
+            return false;
+        };
+        if matches!(
+            index_expr.get_index_key(),
+            Some(LuaIndexKey::Expr(_) | LuaIndexKey::Idx(_))
+        ) {
+            return true;
+        }
+        match index_expr.get_prefix_expr() {
+            Some(next) => current = next,
+            None => return false,
+        }
+    }
+}
+
 fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Option<()> {
     let index_expr = LuaIndexExpr::cast(var_expr.syntax().clone())?;
+    if !analyzer.homed_members.insert(LuaMemberId::new(
+        index_expr.get_syntax_id(),
+        analyzer.file_id,
+    )) {
+        return Some(());
+    }
     let prefix_expr = index_expr.get_prefix_expr()?;
-
+    if prefix_path_has_computed_segment(&prefix_expr) {
+        let member_id = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
+        if matches!(
+            analyzer.db.get_member_index().get_member_owner(&member_id),
+            Some(LuaMemberOwner::GlobalPath(_))
+        ) {
+            return Some(());
+        }
+    }
     if let Some((member_owner, set_owner_only)) =
         try_resolve_scoped_class_prefix_member_owner(analyzer, &prefix_expr)
     {
@@ -513,7 +502,12 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
         return Some(());
     }
 
-    if let Some(member_owner) = cached_literal_index_prefix_member_owner(analyzer, &prefix_expr) {
+    // A write through the value variable of `for _, v in pairs(REG)` states a
+    // field on *every* value of `REG`, so it belongs on the registry's wildcard
+    // segment rather than on whichever entry the prefix type had settled to.
+    if let Some(path) = pairs_iter_value_registry_path(&analyzer.db, analyzer.file_id, &prefix_expr)
+    {
+        let member_owner = LuaMemberOwner::GlobalPath(GlobalId::new(&path));
         apply_index_expr_member_owner(analyzer, index_expr, member_owner, false);
         return Some(());
     }
@@ -523,34 +517,15 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
             if should_skip_ambiguous_unknown_key_table_owner(analyzer, &prefix_type, &index_expr) {
                 return Some(());
             }
-            let Some((member_owner, set_owner_only)) =
-                resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))
-            else {
-                // The prefix inferred, but to nothing that names an owner. That
-                // is not a property of the source: the prefix may simply not
-                // have settled yet, and nothing revisits this attach. Record it
-                // so the settled pass can retry it once the batch is done.
-                if prefix_carries_no_owner_information(&prefix_type) {
-                    analyzer
-                        .context
-                        .add_settled_member_attach_candidate(InFiled::new(
-                            analyzer.file_id,
-                            var_expr.get_syntax_id(),
-                        ));
-                }
-                return None;
-            };
+            let (member_owner, set_owner_only) = resolve_index_expr_member_owner_for_file(
+                &analyzer.db,
+                &prefix_type,
+                Some(analyzer.file_id),
+            )?;
             apply_index_expr_member_owner(analyzer, index_expr, member_owner, set_owner_only);
         }
-        Err(InferFailReason::None) => {
-            analyzer
-                .context
-                .add_settled_member_attach_candidate(InFiled::new(
-                    analyzer.file_id,
-                    var_expr.get_syntax_id(),
-                ));
-        }
-        Err(reason) => {
+        Err(InferFailReason::None) => {}
+        Err(_) => {
             // Every other branch above reaches
             // `apply_index_expr_member_owner`, which *creates* the
             // `LuaMember` and then attaches it. This branch cannot: the
@@ -563,28 +538,11 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
                 prefix: Some(prefix_expr),
                 ret_idx: 0,
             };
-            analyzer
-                .context
-                .add_unresolve(unresolve_member.into(), reason);
+            analyzer.context.add_unresolve(unresolve_member.into());
         }
     }
 
     Some(())
-}
-
-/// Whether a prefix type says nothing about which table a member write lands on.
-///
-/// Distinguishes "this prefix has no owner" (a number, a string — a real answer)
-/// from "this prefix has not settled yet", which is the only case worth retrying
-/// after the batch is done.
-fn prefix_carries_no_owner_information(prefix_type: &LuaType) -> bool {
-    match prefix_type {
-        LuaType::Unknown | LuaType::Any => true,
-        LuaType::Union(union) => union
-            .types()
-            .all(|arm| matches!(arm, LuaType::Nil | LuaType::Unknown | LuaType::Any)),
-        _ => false,
-    }
 }
 
 fn should_skip_ambiguous_unknown_key_table_owner(
@@ -599,7 +557,7 @@ fn should_skip_ambiguous_unknown_key_table_owner(
         .context
         .infer_manager
         .get_infer_cache(analyzer.file_id);
-    let Ok(member_key) = LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key)
+    let Ok(member_key) = LuaMemberKey::from_index_key_or_unknown(&analyzer.db, cache, &index_key)
     else {
         return false;
     };
@@ -613,14 +571,14 @@ fn should_skip_ambiguous_unknown_key_table_owner(
 pub(in crate::compilation::analyzer) fn has_multiple_distinct_index_expr_member_owners(
     typ: &LuaType,
 ) -> bool {
-    let mut owners = HashSet::new();
+    let mut owners = FxHashSet::default();
     collect_distinct_index_expr_member_owners(typ, &mut owners);
     owners.len() > 1
 }
 
 fn collect_distinct_index_expr_member_owners(
     typ: &LuaType,
-    owners: &mut HashSet<LuaMemberOwner>,
+    owners: &mut FxHashSet<LuaMemberOwner>,
 ) -> bool {
     match typ {
         LuaType::TableConst(in_file_range) => {
@@ -654,14 +612,16 @@ fn collect_distinct_index_expr_member_owners(
             }
             false
         }
-        LuaType::MergedTable(merged_table) => {
-            for typ in merged_table.get_types() {
-                if collect_distinct_index_expr_member_owners(typ, owners) {
-                    return true;
-                }
-            }
-            false
-        }
+        // The settled form of one slot's several bootstrap literals is one
+        // table, not a choice between alternatives: a write through it lands on
+        // the arm the writing file prefers. Counting every arm made the answer
+        // depend on whether the slot had settled yet -- the walk reads the one
+        // literal it has reached on a cold build and the merge on a re-index.
+        LuaType::MergedTable(merged_table) => merged_table
+            .get_types()
+            .iter()
+            .find_map(representative_index_expr_member_owner)
+            .is_some_and(|owner| insert_index_expr_member_owner(owners, owner)),
         LuaType::MultiLineUnion(union) => {
             for (typ, _) in union.get_unions() {
                 if collect_distinct_index_expr_member_owners(typ, owners) {
@@ -674,8 +634,37 @@ fn collect_distinct_index_expr_member_owners(
     }
 }
 
+/// The first owner a type names, in the type's canonical arm order.
+fn representative_index_expr_member_owner(typ: &LuaType) -> Option<LuaMemberOwner> {
+    match typ {
+        LuaType::TableConst(in_file_range) => Some(LuaMemberOwner::Element(in_file_range.clone())),
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => {
+            Some(LuaMemberOwner::Type(type_id.clone()))
+        }
+        LuaType::Instance(instance) => Some(LuaMemberOwner::Element(instance.get_range().clone())),
+        LuaType::TableOf(inner) => representative_index_expr_member_owner(inner),
+        LuaType::TypeGuard(inner) => representative_index_expr_member_owner(inner),
+        LuaType::Union(union) => union
+            .types()
+            .find_map(representative_index_expr_member_owner),
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .find_map(representative_index_expr_member_owner),
+        LuaType::MergedTable(merged_table) => merged_table
+            .get_types()
+            .iter()
+            .find_map(representative_index_expr_member_owner),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .find_map(|(typ, _)| representative_index_expr_member_owner(typ)),
+        _ => None,
+    }
+}
+
 fn insert_index_expr_member_owner(
-    owners: &mut HashSet<LuaMemberOwner>,
+    owners: &mut FxHashSet<LuaMemberOwner>,
     owner: LuaMemberOwner,
 ) -> bool {
     owners.insert(owner);
@@ -686,18 +675,29 @@ fn try_resolve_scoped_class_prefix_member_owner(
     analyzer: &LuaAnalyzer,
     prefix_expr: &LuaExpr,
 ) -> Option<(LuaMemberOwner, bool)> {
+    scoped_class_prefix_member_owner(&analyzer.db, analyzer.file_id, prefix_expr)
+}
+
+/// The walk's scoped-class fast path, shared with the owner-settle pass: a
+/// `SWEP`/`ENT`/`GM`-style prefix (or `self` inside one of its colon methods)
+/// names the file's authoring class without any inference, so the answer does
+/// not move between a cold build and a warm re-index.
+pub(crate) fn scoped_class_prefix_member_owner(
+    db: &DbIndex,
+    file_id: FileId,
+    prefix_expr: &LuaExpr,
+) -> Option<(LuaMemberOwner, bool)> {
     let LuaExpr::NameExpr(name_expr) = prefix_expr else {
         return None;
     };
 
     let name = name_expr.get_name_text()?;
     if name != "self" {
-        let class_decl_id =
-            name_expr_resolves_to_scoped_authoring_table(analyzer.db, analyzer.file_id, name_expr)?;
+        let class_decl_id = name_expr_resolves_to_scoped_authoring_table(db, file_id, name_expr)?;
         return Some((LuaMemberOwner::Type(class_decl_id), false));
     }
 
-    if !name_expr_resolves_to_implicit_self(analyzer, name_expr) {
+    if !name_expr_resolves_to_implicit_self(db, file_id, name_expr) {
         return None;
     }
 
@@ -712,21 +712,20 @@ fn try_resolve_scoped_class_prefix_member_owner(
     let LuaExpr::NameExpr(class_name_expr) = func_name.get_prefix_expr()? else {
         return None;
     };
-    let class_decl_id = name_expr_resolves_to_scoped_authoring_table(
-        analyzer.db,
-        analyzer.file_id,
-        &class_name_expr,
-    )?;
+    let class_decl_id =
+        name_expr_resolves_to_scoped_authoring_table(db, file_id, &class_name_expr)?;
     Some((LuaMemberOwner::Type(class_decl_id), false))
 }
 
-fn name_expr_resolves_to_implicit_self(analyzer: &LuaAnalyzer, name_expr: &LuaNameExpr) -> bool {
-    analyzer
-        .db
-        .get_reference_index()
-        .get_local_reference(&analyzer.file_id)
+fn name_expr_resolves_to_implicit_self(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+) -> bool {
+    db.get_reference_index()
+        .get_local_reference(&file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
-        .and_then(|decl_id| analyzer.db.get_decl_index().get_decl(&decl_id))
+        .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
         .is_some_and(|decl| decl.is_implicit_self())
 }
 
@@ -755,106 +754,83 @@ fn apply_index_expr_member_owner_with_guarded(
 ) -> Option<()> {
     let index_key = index_expr.get_index_key()?;
     let member_id = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
+    // for provenance purposes, so the member follows the path's `---@class`
+    // flips. Only computed when the owner resolved to a class: path and
+    // Element owners already carry their provenance through the homing note.
+    let alias_path = match &member_owner {
+        LuaMemberOwner::Type(_) => index_expr
+            .get_prefix_expr()
+            .and_then(|prefix| alias_target_global_path(&analyzer.db, analyzer.file_id, &prefix)),
+        _ => None,
+    };
 
-    if analyzer
+    let cache = analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(analyzer.file_id);
+    let Ok(member_key) = LuaMemberKey::from_index_key_or_unknown(&analyzer.db, cache, &index_key)
+    else {
+        return Some(());
+    };
+    let new_member = if analyzer
         .db
         .get_member_index()
         .get_member(&member_id)
         .is_none()
     {
-        let cache = analyzer
-            .context
-            .infer_manager
-            .get_infer_cache(analyzer.file_id);
-        let Ok(member_key) =
-            LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key)
-        else {
-            return Some(());
-        };
         let decl_feature = if analyzer.context.metas.contains(&analyzer.file_id) {
             LuaMemberFeature::MetaDefine
         } else {
             LuaMemberFeature::FileDefine
         };
-        let member = LuaMember::new(member_id, member_key, decl_feature, None);
-        let guarded_file_define =
-            guarded_table_assignment && matches!(decl_feature, LuaMemberFeature::FileDefine);
-        if guarded_table_assignment {
-            analyzer
-                .db
-                .get_member_index_mut()
-                .mark_non_overwriting_assignment_member(member_id);
-        }
-        let member_index = analyzer.db.get_member_index_mut();
-        member_index.add_member(member_owner, member);
-        // `add_member` already records the enclosing function scope for
-        // `FileDefine` index-expr members (via
-        // `assignment_file_define_scope_for_member`). For other features
-        // (e.g. `MetaDefine`) it stores `None`, so set the real scope here.
-        if !matches!(decl_feature, LuaMemberFeature::FileDefine) {
-            let function_scope = member_index
-                .enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
-            member_index.set_member_function_scope_range(member_id, function_scope);
-        }
-        if guarded_table_assignment && !guarded_file_define {
-            preserve_guarded_table_assignment_members(analyzer.db, member_id);
-        }
-        return Some(());
-    }
-
-    if set_owner_only {
-        if guarded_table_assignment {
-            analyzer
-                .db
-                .get_member_index_mut()
-                .mark_non_overwriting_assignment_member(member_id);
-        }
-        let function_scope = analyzer
-            .db
-            .get_member_index()
-            .enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
-        {
-            let member_index = analyzer.db.get_member_index_mut();
-            member_index.set_member_owner(member_owner, member_id.file_id, member_id);
-            member_index.set_member_function_scope_range(member_id, function_scope);
-        }
-        if guarded_table_assignment {
-            preserve_guarded_table_assignment_members(analyzer.db, member_id);
-        }
-        return Some(());
-    }
-
-    let guarded_existing_file_define = guarded_table_assignment
-        && analyzer
-            .db
-            .get_member_index()
-            .get_member(&member_id)
-            .is_some_and(|member| member.get_feature() == LuaMemberFeature::FileDefine);
-
-    if guarded_table_assignment {
-        analyzer
-            .db
-            .get_member_index_mut()
-            .mark_non_overwriting_assignment_member(member_id);
-    }
-    let function_scope = analyzer
-        .db
-        .get_member_index()
-        .enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
-    add_member(analyzer.db, member_owner, member_id);
-    analyzer
-        .db
-        .get_member_index_mut()
-        .set_member_function_scope_range(member_id, function_scope);
-    if guarded_table_assignment && !guarded_existing_file_define {
-        preserve_guarded_table_assignment_members(analyzer.db, member_id);
-    }
+        Some(LuaMember::new(
+            member_id,
+            member_key.clone(),
+            decl_feature,
+            None,
+        ))
+    } else {
+        None
+    };
+    analyzer.write(StatementWrite::HomeMember(MemberHoming {
+        member_id,
+        key: member_key,
+        owner: member_owner,
+        new_member,
+        set_owner_only,
+        guarded_table_assignment,
+        alias_path,
+    }));
 
     Some(())
 }
 
 // assign stat is toooooooooo complex
+/// Records where a call or index initializer's value came from, when the
+/// declaration holds exactly that value.
+fn publish_initializer_fact(analyzer: &mut LuaAnalyzer, decl_id: LuaDeclId, expr: &LuaExpr) {
+    if !is_call_or_index_expr(expr) {
+        return;
+    }
+    let cache = analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(analyzer.file_id);
+    let fact = crate::semantic::infer_expr_fact_with_cache(&analyzer.db, cache, expr.clone());
+    let fact = match fact.typ() {
+        LuaType::Variadic(multi) => match multi.get_type(0) {
+            Some(first) => fact.with_runtime_type(first.clone()),
+            None => return,
+        },
+        _ => fact,
+    };
+    analyzer.write(StatementWrite::PublishInitializerFact { decl_id, fact });
+}
+
 pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignStat) -> Option<()> {
+    if let AssignmentStage::Homing(_) = analyzer.assignment_stage {
+        return home_assignment_targets(analyzer, assign_stat);
+    }
     let (var_list, expr_list) = assign_stat.get_var_and_expr_list();
     let expr_count = expr_list.len();
     let var_count = var_list.len();
@@ -867,10 +843,11 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         }
         let expr = expr?;
 
-        if should_skip_nil_table_shape_assignment(analyzer, &var, expr) {
-            continue;
-        }
-        if should_skip_nullable_collection_append_shape_assignment(analyzer, &var, expr) {
+        let skipped = match &analyzer.assignment_stage {
+            AssignmentStage::Values(homing) => homing.skipped.get(i).copied().unwrap_or(false),
+            _ => skips_assignment(analyzer, &var, expr),
+        };
+        if skipped {
             continue;
         }
 
@@ -889,8 +866,36 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             continue;
         }
 
-        let declared_empty_table_type = declared_empty_table_assignment_type(analyzer, &var, expr);
+        let read_before_homing = match &analyzer.assignment_stage {
+            AssignmentStage::Values(homing) => {
+                homing.declared_empty_table_types.get(i).cloned().flatten()
+            }
+            _ => None,
+        };
+        let declared_empty_table_type = match read_before_homing {
+            Some(declared) => declared,
+            None => declared_empty_table_assignment_type(analyzer, &var, expr),
+        };
         set_index_expr_owner(analyzer, var.clone());
+
+        if copies_table_into_itself(analyzer, &var, expr) {
+            assign_merge_type_owner_and_expr_type(
+                analyzer,
+                type_owner.clone(),
+                &LuaType::Never,
+                0,
+                false,
+                DeclWrite {
+                    position: expr.get_position(),
+                    may_improve_after_resolve: false,
+                    reads_out_of_decl: false,
+                    may_narrow_uninformative: false,
+                    resolved_initializer: false,
+                    fills_own_default: false,
+                },
+            );
+            continue;
+        }
 
         let expr_type = match declared_empty_table_type
             .map(Ok)
@@ -902,45 +907,17 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                 }
 
                 if expr_type.is_nil() && should_defer_nil_gmod_expr(analyzer, expr) {
-                    add_unresolve_for_assignment(
-                        analyzer,
-                        type_owner,
-                        &var,
-                        expr.clone(),
-                        InferFailReason::FieldNotFound,
-                    );
+                    add_unresolve_for_assignment(analyzer, type_owner, &var, expr.clone());
                     continue;
                 }
-                if holds_unbound_iter_template(analyzer.db, analyzer.file_id, expr, &expr_type)
-                    || reads_settling_iter_var(analyzer.db, analyzer.file_id, expr)
+                if holds_unbound_iter_template(&analyzer.db, analyzer.file_id, expr, &expr_type)
+                    || reads_settling_iter_var(&analyzer.db, analyzer.file_id, expr)
                 {
-                    add_unresolve_for_assignment(
-                        analyzer,
-                        type_owner,
-                        &var,
-                        expr.clone(),
-                        InferFailReason::UnResolveIterTemplate,
-                    );
-                    continue;
-                }
-                if should_defer_pending_local_alias(analyzer, expr, &expr_type) {
-                    add_unresolve_for_assignment(
-                        analyzer,
-                        type_owner,
-                        &var,
-                        expr.clone(),
-                        InferFailReason::FieldNotFound,
-                    );
+                    add_unresolve_for_assignment(analyzer, type_owner, &var, expr.clone());
                     continue;
                 }
                 if should_defer_weak_gmod_call_expr(analyzer, expr, &expr_type) {
-                    add_unresolve_for_assignment(
-                        analyzer,
-                        type_owner,
-                        &var,
-                        expr.clone(),
-                        InferFailReason::FieldNotFound,
-                    );
+                    add_unresolve_for_assignment(analyzer, type_owner, &var, expr.clone());
                     continue;
                 }
                 if should_defer_weak_gmod_member_index_assignment(
@@ -949,13 +926,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                     expr,
                     &expr_type,
                 ) {
-                    add_unresolve_for_assignment(
-                        analyzer,
-                        type_owner,
-                        &var,
-                        expr.clone(),
-                        InferFailReason::FieldNotFound,
-                    );
+                    add_unresolve_for_assignment(analyzer, type_owner, &var, expr.clone());
                     continue;
                 }
                 if expr_type.is_unknown() && is_undefined_global_name_expr(analyzer, expr) {
@@ -976,7 +947,6 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                             type_owner.clone(),
                             &var,
                             expr.clone(),
-                            InferFailReason::FieldNotFound,
                         );
                     }
                     expr_type
@@ -987,19 +957,13 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             // the local-stat path above so hover/inference stays consistent.
             Err(InferFailReason::None) => {
                 if should_defer_none_infer_expr(expr) {
-                    add_unresolve_for_assignment(
-                        analyzer,
-                        type_owner,
-                        &var,
-                        expr.clone(),
-                        InferFailReason::FieldNotFound,
-                    );
+                    add_unresolve_for_assignment(analyzer, type_owner, &var, expr.clone());
                     continue;
                 }
                 LuaType::Nil
             }
-            Err(reason) => {
-                add_unresolve_for_assignment(analyzer, type_owner, &var, expr.clone(), reason);
+            Err(_) => {
+                add_unresolve_for_assignment(analyzer, type_owner, &var, expr.clone());
                 continue;
             }
         };
@@ -1008,35 +972,43 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             continue;
         }
 
-        // 如果具有延迟定义属性, 则先绑定最初的定义
+        // With a deferred-definition attribute, bind the initial definition first
         if let LuaVarExpr::NameExpr(name_expr) = var {
             if let Some(decl_id) = get_delayed_definition_decl_id(analyzer, name_expr) {
-                bind_type(
-                    analyzer.db,
-                    decl_id.into(),
-                    LuaTypeCache::InferType(expr_type.clone()),
-                );
+                analyzer.write(StatementWrite::BindType {
+                    owner: decl_id.into(),
+                    cache: LuaTypeCache::InferType(expr_type.clone()),
+                });
             }
         }
 
-        if analyzer.gmod_enabled
-            && matches!(
-                expr,
-                LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_) | LuaExpr::NameExpr(_)
-            )
-            && type_contains_nominal_reference(&expr_type)
-            && let LuaTypeOwner::Member(member_id) = &type_owner
-        {
-            analyzer
-                .context
-                .request_member_initializer_reinfer(*member_id);
+        let mut expr_type =
+            member_assignment_or_source_type(analyzer, &type_owner, expr, expr_type);
+        if matches!(type_owner, LuaTypeOwner::Member(_)) && expr_reads_own_path(&var, expr) {
+            // `t.k = t.k + 1` holds a new value every time it runs: a literal
+            // would be one run's value, and writers reading each other's
+            // literal would count up without end.
+            expr_type = crate::db_index::widen_literal_type_for_assignment(&expr_type);
         }
 
-        let expr_type = member_assignment_or_source_type(analyzer, &type_owner, expr, expr_type);
-
         widen_existing_member_collection_type(analyzer, &var, &expr_type);
-        assign_merge_type_owner_and_expr_type(analyzer, type_owner, &expr_type, 0, false);
-        update_literal_index_member_owner_cache(analyzer, &var, &expr_type);
+        assign_merge_type_owner_and_expr_type(
+            analyzer,
+            type_owner.clone(),
+            &expr_type,
+            0,
+            false,
+            DeclWrite {
+                position: expr.get_position(),
+                may_improve_after_resolve: may_improve_after_resolve(expr),
+                reads_out_of_decl: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                    if expr_reads_out_of_decl(&analyzer.db, analyzer.file_id, *decl_id, expr)),
+                may_narrow_uninformative: is_call_or_index_expr(expr),
+                resolved_initializer: false,
+                fills_own_default: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                    if expr_fills_own_default(&analyzer.db, analyzer.file_id, *decl_id, expr)),
+            },
+        );
     }
 
     // The complexity brought by multiple return values is too high
@@ -1052,10 +1024,30 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                         set_index_expr_owner(analyzer, var.clone());
                         assign_merge_type_owner_and_expr_type(
                             analyzer,
-                            type_owner,
+                            type_owner.clone(),
                             &last_expr_type,
                             i - expr_count + 1,
                             false,
+                            DeclWrite {
+                                position: last_expr.get_position(),
+                                may_improve_after_resolve: may_improve_after_resolve(last_expr),
+                                reads_out_of_decl: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                                if expr_reads_out_of_decl(
+                                    &analyzer.db,
+                                    analyzer.file_id,
+                                    *decl_id,
+                                    last_expr,
+                                )),
+                                may_narrow_uninformative: is_call_or_index_expr(last_expr),
+                                resolved_initializer: false,
+                                fills_own_default: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                                if expr_fills_own_default(
+                                    &analyzer.db,
+                                    analyzer.file_id,
+                                    *decl_id,
+                                    last_expr,
+                                )),
+                            },
                         );
                     }
                 } else {
@@ -1065,10 +1057,30 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                         set_index_expr_owner(analyzer, var.clone());
                         assign_merge_type_owner_and_expr_type(
                             analyzer,
-                            type_owner,
+                            type_owner.clone(),
                             &LuaType::Any,
                             0, // Any doesn't need indexing
                             false,
+                            DeclWrite {
+                                position: last_expr.get_position(),
+                                may_improve_after_resolve: may_improve_after_resolve(last_expr),
+                                reads_out_of_decl: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                                if expr_reads_out_of_decl(
+                                    &analyzer.db,
+                                    analyzer.file_id,
+                                    *decl_id,
+                                    last_expr,
+                                )),
+                                may_narrow_uninformative: is_call_or_index_expr(last_expr),
+                                resolved_initializer: false,
+                                fills_own_default: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                                if expr_fills_own_default(
+                                    &analyzer.db,
+                                    analyzer.file_id,
+                                    *decl_id,
+                                    last_expr,
+                                )),
+                            },
                         );
                     }
                 }
@@ -1090,6 +1102,74 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
     }
 
     Some(())
+}
+
+/// Whether `var = expr` is a `pairs` copy of a table into itself, which gives
+/// no field a value: see [`crate::compilation::analyzer::copies_table_into_itself`].
+fn copies_table_into_itself(analyzer: &mut LuaAnalyzer, var: &LuaVarExpr, expr: &LuaExpr) -> bool {
+    let LuaVarExpr::IndexExpr(index_expr) = var else {
+        return false;
+    };
+    let cache = analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(analyzer.file_id);
+    crate::compilation::analyzer::copies_table_into_itself(&analyzer.db, cache, index_expr, expr)
+}
+
+/// Whether an assignment leaves a value's target alone: a `nil` that only
+/// clears a table's shape, or a nullable append to a collection.
+fn skips_assignment(analyzer: &mut LuaAnalyzer, var: &LuaVarExpr, expr: &LuaExpr) -> bool {
+    should_skip_nil_table_shape_assignment(analyzer, var, expr)
+        || should_skip_nullable_collection_append_shape_assignment(analyzer, var, expr)
+}
+
+/// The homing stage of an assignment: homes the members whose values are
+/// inferred after their homing, recording what the values stage reads from
+/// before it. A guarded `x = x or {}` homes only once its value is inferred,
+/// in the values stage.
+fn home_assignment_targets(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignStat) -> Option<()> {
+    let (var_list, expr_list) = assign_stat.get_var_and_expr_list();
+    let mut homing = AssignmentHoming::default();
+    for (i, expr) in expr_list.iter().enumerate() {
+        let Some(var) = var_list.get(i) else {
+            break;
+        };
+        let skipped = skips_assignment(analyzer, var, expr);
+        homing.skipped.push(skipped);
+        let declared_empty_table_type = match self_default_arms(var, expr) {
+            _ if skipped => None,
+            Some((_, LuaExpr::TableExpr(_))) => None,
+            Some(_) => {
+                set_index_expr_owner(analyzer, var.clone());
+                None
+            }
+            None => {
+                let declared = declared_empty_table_assignment_type(analyzer, var, expr);
+                set_index_expr_owner(analyzer, var.clone());
+                Some(declared)
+            }
+        };
+        homing
+            .declared_empty_table_types
+            .push(declared_empty_table_type);
+    }
+    homing.homed = analyzer.homed_members.clone();
+    analyzer.assignment_stage = AssignmentStage::Homing(homing);
+    Some(())
+}
+
+/// The two arms of `x = x or <default>`, when `expr` is one for `var`.
+fn self_default_arms(var: &LuaVarExpr, expr: &LuaExpr) -> Option<(LuaExpr, LuaExpr)> {
+    let LuaExpr::BinaryExpr(binary_expr) = expr else {
+        return None;
+    };
+    if binary_expr.get_op_token()?.get_op() != BinaryOperator::OpOr {
+        return None;
+    }
+    let (left, right) = binary_expr.get_exprs()?;
+    let left_var = LuaVarExpr::cast(left.syntax().clone())?;
+    (var.get_access_path()? == left_var.get_access_path()?).then_some((left, right))
 }
 
 fn declared_empty_table_assignment_type(
@@ -1117,21 +1197,22 @@ fn declared_empty_table_assignment_type(
         .infer_manager
         .get_infer_cache(analyzer.file_id);
     let declared_type =
-        crate::infer_index_expr(analyzer.db, cache, index_expr.clone(), false).ok()?;
-    let table_value_type = declared_table_assignment_type(analyzer.db, &declared_type)?;
+        crate::infer_index_expr(&analyzer.db, cache, index_expr.clone(), false).ok()?;
+    let table_value_type = declared_table_assignment_type(&analyzer.db, &declared_type)?;
 
-    write_type_cache(
-        analyzer.db,
-        LuaTypeOwner::SyntaxId(InFiled::new(analyzer.file_id, table_expr.get_syntax_id())),
-        LuaTypeCache::InferType(table_value_type.clone()),
-        TypeCacheWriteMode::InsertOnly,
-    );
+    analyzer.write(StatementWrite::WriteTypeCache {
+        owner: LuaTypeOwner::SyntaxId(InFiled::new(analyzer.file_id, table_expr.get_syntax_id())),
+        cache: LuaTypeCache::InferType(table_value_type.clone()),
+        mode: TypeCacheWriteMode::InsertOnly,
+    });
 
     Some(table_value_type)
 }
 
 fn declared_table_assignment_type(db: &crate::DbIndex, declared_type: &LuaType) -> Option<LuaType> {
     match declared_type {
+        // Another assignment's table literal, a value that declares nothing.
+        LuaType::TableConst(_) => None,
         typ if typ.is_table() => Some(typ.clone()),
         LuaType::Ref(type_id) | LuaType::Def(type_id)
             if db
@@ -1178,75 +1259,6 @@ fn declared_table_assignment_type(db: &crate::DbIndex, declared_type: &LuaType) 
     }
 }
 
-fn type_contains_nominal_reference(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Def(_) | LuaType::Ref(_) => true,
-        LuaType::Instance(instance) => type_contains_nominal_reference(instance.get_base()),
-        LuaType::Union(union) => union.types().any(type_contains_nominal_reference),
-        _ => false,
-    }
-}
-
-fn cached_literal_index_prefix_member_owner(
-    analyzer: &LuaAnalyzer,
-    prefix_expr: &LuaExpr,
-) -> Option<LuaMemberOwner> {
-    let LuaExpr::IndexExpr(index_expr) = prefix_expr else {
-        return None;
-    };
-    if !is_literal_index_cache_candidate(index_expr) {
-        return None;
-    }
-
-    let access_path = index_expr.get_access_path()?;
-    analyzer
-        .literal_index_member_owner_cache
-        .get(&access_path)
-        .cloned()
-}
-
-fn update_literal_index_member_owner_cache(
-    analyzer: &mut LuaAnalyzer,
-    var: &LuaVarExpr,
-    expr_type: &LuaType,
-) -> Option<()> {
-    let LuaVarExpr::IndexExpr(index_expr) = var else {
-        return None;
-    };
-    if !is_literal_index_cache_candidate(index_expr) {
-        return None;
-    }
-
-    let access_path = index_expr.get_access_path()?;
-    if let Some(owner) = current_file_table_member_owner(analyzer, expr_type) {
-        analyzer
-            .literal_index_member_owner_cache
-            .insert(access_path, owner);
-    } else {
-        analyzer
-            .literal_index_member_owner_cache
-            .remove(&access_path);
-    }
-    Some(())
-}
-
-fn is_literal_index_cache_candidate(index_expr: &LuaIndexExpr) -> bool {
-    matches!(
-        index_expr.get_index_key(),
-        Some(LuaIndexKey::String(_) | LuaIndexKey::Integer(_))
-    )
-}
-
-fn current_file_table_member_owner(
-    analyzer: &LuaAnalyzer,
-    typ: &LuaType,
-) -> Option<LuaMemberOwner> {
-    let LuaType::TableConst(range) = typ else {
-        return None;
-    };
-    (range.file_id == analyzer.file_id).then(|| LuaMemberOwner::Element(range.clone()))
-}
-
 fn should_skip_nil_table_shape_assignment(
     analyzer: &mut LuaAnalyzer,
     var: &LuaVarExpr,
@@ -1260,6 +1272,22 @@ fn should_skip_nil_table_shape_assignment(
         return false;
     };
 
+    let Some(index_key) = index_expr.get_index_key() else {
+        return false;
+    };
+    let cache = analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(analyzer.file_id);
+    let member_key = match LuaMemberKey::from_index_key_or_unknown(&analyzer.db, cache, &index_key)
+    {
+        Ok(member_key) => member_key,
+        Err(_) => return index_key.is_expr(),
+    };
+    if member_key.is_expr() {
+        return true;
+    }
+
     let Some(prefix_expr) = index_expr.get_prefix_expr() else {
         return false;
     };
@@ -1267,6 +1295,15 @@ fn should_skip_nil_table_shape_assignment(
     let Ok(prefix_type) = analyzer.infer_expr(&prefix_expr) else {
         return false;
     };
+
+    // A prefix that has not settled yet cannot answer this, and the write is a
+    // delete either way: `t[k] = nil` removes an entry, it never adds a member
+    // typed `nil`. A receiver typed by a `fun(self: T)` callback slot is still
+    // `unknown` while its file is walked, so a member attached here would land
+    // on the slot every closure filling it shares.
+    if matches!(prefix_type, LuaType::Unknown | LuaType::Never) {
+        return true;
+    }
 
     if !is_table_shape_cleanup_type(&prefix_type) {
         return false;
@@ -1276,27 +1313,13 @@ fn should_skip_nil_table_shape_assignment(
         return true;
     }
 
-    let Some((owner, _)) =
-        resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))
-    else {
+    let Some((owner, _)) = resolve_index_expr_member_owner_for_file(
+        &analyzer.db,
+        &prefix_type,
+        Some(analyzer.file_id),
+    ) else {
         return false;
     };
-
-    let Some(index_key) = index_expr.get_index_key() else {
-        return false;
-    };
-
-    let cache = analyzer
-        .context
-        .infer_manager
-        .get_infer_cache(analyzer.file_id);
-    let Ok(member_key) = LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key)
-    else {
-        return false;
-    };
-    if member_key.is_expr() {
-        return true;
-    }
 
     let member_id = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
     !analyzer
@@ -1330,18 +1353,6 @@ fn should_skip_nullable_collection_append_shape_assignment(
     analyzer
         .infer_expr(expr)
         .is_ok_and(|expr_type| expr_type.is_nullable())
-}
-
-fn is_nil_literal_expr(expr: &LuaExpr) -> bool {
-    match expr {
-        LuaExpr::LiteralExpr(literal_expr) => {
-            matches!(literal_expr.get_literal(), Some(LuaLiteralToken::Nil(_)))
-        }
-        LuaExpr::ParenExpr(paren_expr) => paren_expr
-            .get_expr()
-            .is_some_and(|expr| is_nil_literal_expr(&expr)),
-        _ => false,
-    }
 }
 
 fn is_table_shape_cleanup_type(typ: &LuaType) -> bool {
@@ -1417,10 +1428,27 @@ fn is_call_or_index_expr(expr: &LuaExpr) -> bool {
     crate::compilation::analyzer::initializer_reads_through_call_or_index(expr)
 }
 
+fn may_improve_after_resolve(expr: &LuaExpr) -> bool {
+    crate::compilation::analyzer::initializer_may_improve_after_resolve(expr)
+}
+
+fn initializer_decl_write(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &LuaExpr) -> DeclWrite {
+    let may_improve = may_improve_after_resolve(expr);
+    DeclWrite {
+        position: expr.get_position(),
+        may_improve_after_resolve: may_improve,
+        reads_out_of_decl: expr_reads_out_of_decl(&analyzer.db, analyzer.file_id, decl_id, expr),
+        may_narrow_uninformative: may_improve,
+        resolved_initializer: false,
+        fills_own_default: expr_fills_own_default(&analyzer.db, analyzer.file_id, decl_id, expr),
+    }
+}
+
 /// Whether an initializer that inferred to a type carrying no information
 /// has to be queued for the unresolve pass as well as committed here.
 fn should_retry_uninformative_initializer(expr: &LuaExpr, expr_type: &LuaType) -> bool {
-    is_call_or_index_expr(expr) && !crate::db_index::is_informative_type(expr_type)
+    crate::compilation::analyzer::initializer_may_improve_after_resolve(expr)
+        && !crate::db_index::is_informative_type(expr_type)
 }
 
 /// Whether an assignment that *would* narrow an uninformative decl cache
@@ -1498,28 +1526,34 @@ fn weak_call_is_scoped_method_call(call_expr: &glua_parser::LuaCallExpr) -> bool
     )
 }
 
-fn should_defer_pending_local_alias(
-    analyzer: &LuaAnalyzer,
+/// Whether `expr` is the default-value idiom for `decl_id` — `p = p or DEFAULT`.
+///
+/// The result always includes the declaration's own type, so unlike a plain
+/// reassignment it refines the declaration rather than replacing it, and is the
+/// one body write a parameter may take its type from.
+pub(crate) fn expr_fills_own_default(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    decl_id: LuaDeclId,
     expr: &LuaExpr,
-    expr_type: &LuaType,
 ) -> bool {
-    if !(expr_type.is_any() || expr_type.is_unknown() || expr_type.is_nil()) {
+    let LuaExpr::BinaryExpr(binary_expr) = expr else {
+        return false;
+    };
+    if binary_expr.get_op_token().map(|op| op.get_op()) != Some(BinaryOperator::OpOr) {
         return false;
     }
-
-    let LuaExpr::NameExpr(name_expr) = expr else {
+    let Some((LuaExpr::NameExpr(left), _)) = binary_expr.get_exprs() else {
         return false;
     };
-    let Some(decl_id) = analyzer
-        .db
-        .get_reference_index()
-        .get_local_reference(&analyzer.file_id)
-        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
-    else {
+    let Some(name) = left.get_name_text() else {
         return false;
     };
 
-    analyzer.context.has_pending_decl_unresolve(decl_id)
+    db.get_decl_index()
+        .get_decl_tree(&file_id)
+        .and_then(|decl_tree| decl_tree.find_local_decl(&name, left.get_position()))
+        .is_some_and(|decl| decl.get_id() == decl_id)
 }
 
 /// Whether `expr` reads out of `decl_id` itself: the `x = x.field` shape,
@@ -1527,8 +1561,34 @@ fn should_defer_pending_local_alias(
 /// bit.bor(bit.lshift(width:byte(1), 24), ...)`). Depth does not change the
 /// self-contradiction — the value still cannot be the decl's lifetime type,
 /// because it was computed from a read that type would reject.
-fn expr_reads_out_of_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &LuaExpr) -> bool {
-    if index_chain_roots_at_decl(analyzer, decl_id, expr) {
+/// Whether `expr`, outside the closures it holds, reads the path `var`
+/// writes.
+fn expr_reads_own_path(var: &LuaVarExpr, expr: &LuaExpr) -> bool {
+    let Some(path) = var.get_access_path() else {
+        return false;
+    };
+    let expr_range = expr.get_range();
+    std::iter::once(expr.syntax().clone())
+        .chain(expr.syntax().descendants())
+        .filter_map(LuaVarExpr::cast)
+        .filter(|read| {
+            !read
+                .ancestors::<LuaClosureExpr>()
+                .any(|closure| expr_range.contains_range(closure.get_range()))
+        })
+        .any(|read| {
+            read.get_access_path()
+                .is_some_and(|read_path| read_path == path)
+        })
+}
+
+pub(crate) fn expr_reads_out_of_decl(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    decl_id: LuaDeclId,
+    expr: &LuaExpr,
+) -> bool {
+    if index_chain_roots_at_decl(db, file_id, decl_id, expr) {
         return true;
     }
 
@@ -1540,11 +1600,15 @@ fn expr_reads_out_of_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &Lua
                 .any(|closure| expr_range.contains_range(closure.get_range()))
         })
         .any(|index_expr| {
-            index_chain_roots_at_decl(analyzer, decl_id, &LuaExpr::IndexExpr(index_expr))
+            index_chain_roots_at_decl(db, file_id, decl_id, &LuaExpr::IndexExpr(index_expr))
         })
 }
-
-fn index_chain_roots_at_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &LuaExpr) -> bool {
+fn index_chain_roots_at_decl(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    decl_id: LuaDeclId,
+    expr: &LuaExpr,
+) -> bool {
     let mut current = expr.clone();
     loop {
         match current {
@@ -1553,16 +1617,36 @@ fn index_chain_roots_at_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &
                 None => return false,
             },
             LuaExpr::NameExpr(name_expr) => {
-                return analyzer
-                    .db
+                return db
                     .get_reference_index()
-                    .get_local_reference(&analyzer.file_id)
+                    .get_local_reference(&file_id)
                     .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
-                    == Some(decl_id);
+                    .is_some_and(|read| {
+                        read == decl_id || local_alias_roots_at_decl(db, file_id, decl_id, read)
+                    });
             }
             _ => return false,
         }
     }
+}
+
+/// Whether `alias` is a local never written after its declaration whose
+/// initializer reads out of `decl_id`: reading the alias reads the decl's
+/// slot (`local id = data; data = id`).
+fn local_alias_roots_at_decl(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    decl_id: LuaDeclId,
+    alias: LuaDeclId,
+) -> bool {
+    db.get_reference_index()
+        .get_decl_references(&file_id, &alias)
+        .is_some_and(|references| !references.mutable)
+        && crate::semantic::local_initializer_expr(db, alias).is_some_and(
+            |(ret_idx, initializer)| {
+                ret_idx == 0 && index_chain_roots_at_decl(db, file_id, decl_id, &initializer)
+            },
+        )
 }
 
 /// Whether this assignment would seed an empty decl slot from a read out of
@@ -1581,7 +1665,7 @@ fn seeds_empty_decl_from_own_read(
         .get_type_index()
         .get_type_cache(type_owner)
         .is_none()
-        && expr_reads_out_of_decl(analyzer, *decl_id, expr)
+        && expr_reads_out_of_decl(&analyzer.db, analyzer.file_id, *decl_id, expr)
 }
 
 fn add_unresolve_for_assignment(
@@ -1589,7 +1673,6 @@ fn add_unresolve_for_assignment(
     type_owner: LuaTypeOwner,
     var: &LuaVarExpr,
     expr: LuaExpr,
-    reason: InferFailReason,
 ) {
     match type_owner {
         LuaTypeOwner::Decl(decl_id) => {
@@ -1598,7 +1681,7 @@ fn add_unresolve_for_assignment(
             // slot is empty until one of the file's deferred writes
             // resolves, and `bind_type` has no acceptance rule for an empty
             // slot, so whichever lands first owns the decl's lifetime type.
-            if expr_reads_out_of_decl(analyzer, decl_id, &expr) {
+            if expr_reads_out_of_decl(&analyzer.db, analyzer.file_id, decl_id, &expr) {
                 return;
             }
 
@@ -1609,9 +1692,7 @@ fn add_unresolve_for_assignment(
                 ret_idx: 0,
             };
 
-            analyzer
-                .context
-                .add_unresolve(unresolve_decl.into(), reason);
+            analyzer.context.add_unresolve(unresolve_decl.into());
         }
         LuaTypeOwner::Member(member_id) => {
             let prefix = if !analyzer.is_scripted_class_scope {
@@ -1631,19 +1712,7 @@ fn add_unresolve_for_assignment(
                 prefix,
                 ret_idx: 0,
             };
-            // The deferred write resolves against whatever the index held
-            // when its retry ran, and an attempt that reaches `unknown`
-            // succeeds: the item retires and the placeholder becomes the
-            // member's final type. Whether the retry was early or late is a
-            // property of batch order, not of the source, so record the
-            // member for the settled re-infer in
-            // `refresh_member_initializer_caches`.
-            analyzer
-                .context
-                .request_member_initializer_reinfer(member_id);
-            analyzer
-                .context
-                .add_unresolve(unresolve_member.into(), reason);
+            analyzer.context.add_unresolve(unresolve_member.into());
         }
         _ => {}
     }
@@ -1655,148 +1724,54 @@ fn assign_merge_type_owner_and_expr_type(
     expr_type: &LuaType,
     idx: usize,
     preserve_table_literals: bool,
-) -> Option<()> {
+    write: DeclWrite,
+) {
     let mut expr_type = expr_type.clone();
     if let LuaType::Variadic(multi) = expr_type {
         expr_type = multi.get_type(idx).unwrap_or(&LuaType::Nil).clone();
     }
 
-    // A self-referential guarded bootstrap (`x.y = x.y or {}`) assigns its
-    // own `{}` whatever the self-read resolves to, which is what
-    // `special_or_rule` folds it to. The inferred expression type can still
-    // carry that self-read when it was memoised before the fold ran, and
-    // what the read resolved to is whichever sibling file the batch
-    // analysed first.
-    if let LuaTypeOwner::Member(member_id) = &type_owner
-        && let Some(bootstrap_type) =
-            guarded_table_bootstrap_member_type(analyzer.db, *member_id, true)
-    {
-        expr_type = bootstrap_type;
-    }
-
-    let dynamic_expr_key_member = is_dynamic_expr_key_member_assignment(analyzer, &type_owner);
-    // What this write carries on its own, before any sibling merge widens it.
-    let mut source_type = None;
-    if !dynamic_expr_key_member {
-        if let Some(widened_type) =
-            get_widened_member_assignment_collection_type(analyzer, &type_owner, &expr_type)
-        {
-            expr_type = widened_type;
-        }
-        if matches!(type_owner, LuaTypeOwner::Member(_)) {
-            source_type = Some(expr_type.clone());
-        }
-
-        match get_cached_widened_member_assignment_type(
-            analyzer,
-            &type_owner,
-            &expr_type,
+    if let LuaTypeOwner::Member(member_id) = type_owner {
+        // A self-referential guarded bootstrap (`x.y = x.y or {}`) assigns its
+        // own `{}` whatever the self-read resolves to, which is what
+        // `special_or_rule` folds it to. The inferred expression type can still
+        // carry that self-read when it was memoised before the fold ran, and
+        // what the read resolved to is whichever sibling file the batch
+        // analysed first.
+        let value =
+            guarded_table_bootstrap_member_type(&analyzer.db, member_id, true).unwrap_or(expr_type);
+        // A repeated `x.y = x.y or {}` guard names one table, however many
+        // files open with it: each writer means "reuse it if it is there".
+        let preserve_table_literals =
+            preserve_table_literals || is_guarded_table_assignment_member(&analyzer.db, member_id);
+        analyzer.write(StatementWrite::AssignMember {
+            member_id,
+            value,
+            dynamic_key: is_dynamic_expr_key_member_assignment(analyzer, &type_owner),
             preserve_table_literals,
-        ) {
-            Some(Some(widened_type)) => {
-                expr_type = widened_type;
-            }
-            Some(None) => {}
-            None => {
-                // Whether every sibling writer already carried a type is a
-                // property of how far the batch has run, not of the source.
-                // Where one did not, the merge below is provisional and the
-                // settled pass re-derives it against the complete writer set.
-                let mut skipped_uncached_sibling = false;
-                let widened = get_widened_member_assignment_type(
-                    analyzer.db,
-                    &type_owner,
-                    &expr_type,
-                    preserve_table_literals,
-                    &mut skipped_uncached_sibling,
-                );
-                // Recorded on the skip, not on the answer: a walk that read no
-                // sibling type declines to widen at all, and that write needs
-                // the settled re-derivation just as much as one that widened
-                // from a partial set.
-                if skipped_uncached_sibling && let LuaTypeOwner::Member(member_id) = &type_owner {
-                    analyzer.context.record_settled_member_widening_candidate(
-                        *member_id,
-                        expr_type.clone(),
-                        preserve_table_literals,
-                    );
-                }
-                if let Some(widened_type) = widened {
-                    expr_type = widened_type;
-                }
-            }
-        }
+        });
+        return;
     }
 
     if is_global_decl_owner(analyzer, &type_owner) {
-        expr_type = merge_open_table_types(analyzer.db, vec![expr_type]);
+        expr_type = merge_open_table_types(&analyzer.db, vec![expr_type]);
     }
 
-    bind_type(
-        analyzer.db,
-        type_owner.clone(),
-        LuaTypeCache::InferType(expr_type.clone()),
-    );
-
-    if let LuaTypeOwner::Member(member_id) = &type_owner
-        && is_assignment_file_define_member(analyzer.db, *member_id)
-    {
-        let guarded_table_assignment =
-            preserve_table_literals || is_guarded_table_assignment_member(analyzer.db, *member_id);
-        let conditional_branch_assignment =
-            is_member_assignment_in_conditional_branch(analyzer.db, *member_id);
-        if !dynamic_expr_key_member {
-            record_member_assignment_contribution(
-                analyzer,
-                *member_id,
-                &expr_type,
-                source_type,
-                guarded_table_assignment,
-                preserve_table_literals,
-            );
+    match &type_owner {
+        LuaTypeOwner::Decl(decl_id) => {
+            analyzer.write(StatementWrite::BindDeclWrite {
+                decl_id: *decl_id,
+                cache: LuaTypeCache::InferType(expr_type),
+                write,
+            });
         }
-        if guarded_table_assignment {
-            let already_preserved = analyzer
-                .db
-                .get_member_index()
-                .is_non_overwriting_assignment_member(*member_id);
-            if !already_preserved {
-                analyzer
-                    .db
-                    .get_member_index_mut()
-                    .mark_non_overwriting_assignment_member(*member_id);
-                preserve_guarded_table_assignment_members(analyzer.db, *member_id);
-            }
-        } else if conditional_branch_assignment {
-            analyzer
-                .db
-                .get_member_index_mut()
-                .mark_conditional_branch_assignment_member(*member_id);
-        } else if !dynamic_expr_key_member
-            && analyzer
-                .db
-                .get_member_index()
-                .member_function_scope_range(*member_id)
-                .is_none()
-        {
-            analyzer
-                .db
-                .get_member_index_mut()
-                .retain_only_member_for_owner_key(*member_id);
+        _ => {
+            analyzer.write(StatementWrite::BindType {
+                owner: type_owner,
+                cache: LuaTypeCache::InferType(expr_type),
+            });
         }
     }
-
-    if !dynamic_expr_key_member {
-        record_member_assignment_widening_cache(
-            analyzer,
-            &type_owner,
-            &expr_type,
-            preserve_table_literals,
-        );
-        record_member_collection_assignment_widening_cache(analyzer, &type_owner, &expr_type);
-    }
-
-    Some(())
 }
 
 fn member_assignment_or_source_type(
@@ -1805,9 +1780,32 @@ fn member_assignment_or_source_type(
     expr: &LuaExpr,
     fallback_type: LuaType,
 ) -> LuaType {
+    let cache = analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(analyzer.file_id);
+    member_assignment_or_source_type_with_cache(
+        &analyzer.db,
+        cache,
+        analyzer.file_id,
+        type_owner,
+        expr,
+        fallback_type,
+    )
+}
+
+pub(in crate::compilation::analyzer) fn member_assignment_or_source_type_with_cache(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    type_owner: &LuaTypeOwner,
+    expr: &LuaExpr,
+    fallback_type: LuaType,
+) -> LuaType {
     if !matches!(type_owner, LuaTypeOwner::Member(_)) {
         return fallback_type;
     }
+    let fallback_type = widen_mutable_local_name_copy(db, file_id, expr, fallback_type);
 
     let Some(arms) = top_level_or_expr_arms(expr) else {
         return fallback_type;
@@ -1819,7 +1817,7 @@ fn member_assignment_or_source_type(
 
     let mut source_type = None;
     for arm in non_final_arms {
-        let Ok(arm_type) = analyzer.infer_expr(arm) else {
+        let Ok(arm_type) = crate::infer_expr(db, cache, arm.clone()) else {
             return fallback_type;
         };
         if arm_type.is_unknown() || arm_type.is_any() {
@@ -1827,12 +1825,12 @@ fn member_assignment_or_source_type(
         }
         let arm_type = remove_false_or_nil(arm_type);
         source_type = Some(match source_type {
-            Some(current) => TypeOps::Union.apply(analyzer.db, &current, &arm_type),
+            Some(current) => TypeOps::Union.apply(db, &current, &arm_type),
             None => arm_type,
         });
     }
 
-    let Ok(last_type) = analyzer.infer_expr(last_arm) else {
+    let Ok(last_type) = crate::infer_expr(db, cache, last_arm.clone()) else {
         return fallback_type;
     };
     if last_type.is_unknown() || last_type.is_any() {
@@ -1840,7 +1838,7 @@ fn member_assignment_or_source_type(
     }
 
     match source_type {
-        Some(current) => TypeOps::Union.apply(analyzer.db, &current, &last_type),
+        Some(current) => TypeOps::Union.apply(db, &current, &last_type),
         None => fallback_type,
     }
 }
@@ -1872,6 +1870,12 @@ fn collect_or_expr_arms(expr: &LuaExpr, arms: &mut Vec<LuaExpr>) -> Option<()> {
     Some(())
 }
 
+/// Whether the write's key is computed.
+///
+/// Read off the syntax, not off the member's key: a computed key whose
+/// expression the walk could resolve is minted under the name it resolved
+/// to, and whether it could resolve is a property of how far the batch had
+/// got when the write was walked.
 fn is_dynamic_expr_key_member_assignment(
     analyzer: &LuaAnalyzer,
     type_owner: &LuaTypeOwner,
@@ -1879,11 +1883,10 @@ fn is_dynamic_expr_key_member_assignment(
     let LuaTypeOwner::Member(member_id) = type_owner else {
         return false;
     };
-    analyzer
-        .db
-        .get_member_index()
-        .get_member(member_id)
-        .is_some_and(|member| member.get_key().is_expr())
+    member_write_node(&analyzer.db, *member_id)
+        .and_then(LuaIndexExpr::cast)
+        .and_then(|index_expr| index_expr.get_index_key())
+        .is_some_and(|key| matches!(key, LuaIndexKey::Expr(_)))
 }
 
 fn is_global_decl_owner(analyzer: &LuaAnalyzer, type_owner: &LuaTypeOwner) -> bool {
@@ -1896,140 +1899,6 @@ fn is_global_decl_owner(analyzer: &LuaAnalyzer, type_owner: &LuaTypeOwner) -> bo
         .get_decl_index()
         .get_decl(decl_id)
         .is_some_and(|decl| decl.is_global())
-}
-
-fn get_cached_widened_member_assignment_type(
-    analyzer: &mut LuaAnalyzer,
-    type_owner: &LuaTypeOwner,
-    incoming_type: &LuaType,
-    _preserve_table_literals: bool,
-) -> Option<Option<LuaType>> {
-    let LuaTypeOwner::Member(member_id) = type_owner else {
-        return None;
-    };
-    if !is_assignment_file_define_member(analyzer.db, *member_id) {
-        return None;
-    }
-
-    let member_index = analyzer.db.get_member_index();
-    let owner = member_index.get_member_owner(member_id)?.clone();
-    let key = member_index.get_member(member_id)?.get_key().clone();
-    let visible_count = member_index.visible_member_count_for_owner_key(&owner, &key);
-    let cache_key = MemberAssignmentWideningCacheKey { owner, key };
-
-    let cache = match lookup_widening_cache(
-        &analyzer.member_assignment_widening_cache,
-        &cache_key,
-        visible_count,
-    ) {
-        WideningCacheLookup::FirstSighting => return Some(None),
-        WideningCacheLookup::Fallback => return None,
-        WideningCacheLookup::Hit(cache) => cache,
-    };
-
-    let current_state_mask = member_assignment_state_mask(analyzer, *member_id);
-    let compatible_states = cache
-        .by_state_mask
-        .iter()
-        .filter(|(state_mask, _)| {
-            member_assignment_state_masks_compatible(analyzer, current_state_mask, **state_mask)
-        })
-        .map(|(_, state)| state.clone())
-        .collect::<Vec<_>>();
-    if compatible_states.is_empty() {
-        return Some(None);
-    }
-
-    match decide_member_assignment_widening(
-        analyzer.db,
-        incoming_type,
-        true,
-        compatible_states.iter(),
-    ) {
-        MemberAssignmentWideningDecision::Widened(widened_type) => Some(Some(widened_type)),
-        MemberAssignmentWideningDecision::ClassBootstrapRejected => None,
-        MemberAssignmentWideningDecision::NoPreviousAssignments => Some(None),
-    }
-}
-
-/// Stores this write's own evidence so the settled re-derivation can merge the
-/// complete writer set. See [`MemberAssignmentContribution`].
-fn record_member_assignment_contribution(
-    analyzer: &mut LuaAnalyzer,
-    member_id: LuaMemberId,
-    bound_type: &LuaType,
-    source_type: Option<LuaType>,
-    guarded_bootstrap: bool,
-    preserve_table_literals: bool,
-) {
-    record_member_assignment_contribution_in(
-        analyzer.db,
-        member_id,
-        bound_type,
-        source_type,
-        guarded_bootstrap,
-        preserve_table_literals,
-    );
-}
-
-fn record_member_assignment_contribution_in(
-    db: &mut DbIndex,
-    member_id: LuaMemberId,
-    bound_type: &LuaType,
-    source_type: Option<LuaType>,
-    guarded_bootstrap: bool,
-    preserve_table_literals: bool,
-) {
-    let doc_type = db
-        .get_type_index()
-        .get_type_cache(&member_id.into())
-        .filter(|cache| cache.is_doc())
-        .map(|cache| cache.as_type().clone());
-    let contribution = MemberAssignmentContribution {
-        bound_type: bound_type.clone(),
-        source_type: source_type.unwrap_or_else(|| bound_type.clone()),
-        doc_type,
-        guarded_bootstrap,
-        preserve_table_literals,
-    };
-    db.get_member_index_mut()
-        .record_member_assignment_contribution(member_id, contribution);
-}
-
-/// Records the evidence of an assignment whose value only resolved after the
-/// walk had moved on.
-///
-/// The walk records a contribution as it binds each write, so a write whose
-/// right-hand side deferred contributes nothing and the settled merge never
-/// sees it. Whether a write deferred is a fact about how far the batch had
-/// run - a re-index keeps out-of-batch types standing and resolves inline what
-/// a cold build had to defer - so the writer set the merge reads would
-/// otherwise differ between the two.
-pub(in crate::compilation::analyzer) fn record_resolved_member_assignment_contribution(
-    db: &mut DbIndex,
-    member_id: LuaMemberId,
-    bound_type: &LuaType,
-) {
-    if !is_assignment_file_define_member(db, member_id) {
-        return;
-    }
-    if db
-        .get_member_index()
-        .member_assignment_contributions()
-        .contribution_of(&member_id)
-        .is_some()
-    {
-        return;
-    }
-    let guarded_bootstrap = is_guarded_table_assignment_member(db, member_id);
-    record_member_assignment_contribution_in(
-        db,
-        member_id,
-        bound_type,
-        None,
-        guarded_bootstrap,
-        false,
-    );
 }
 
 /// Applies the visibility marks a write earns from its own syntax, for a write
@@ -2049,253 +1918,32 @@ pub(in crate::compilation::analyzer) fn mark_resolved_member_assignment(
     if !is_assignment_file_define_member(db, member_id) {
         return;
     }
-    if is_guarded_table_assignment_member(db, member_id) {
-        if !db
-            .get_member_index()
-            .is_non_overwriting_assignment_member(member_id)
-        {
-            db.get_member_index_mut()
-                .mark_non_overwriting_assignment_member(member_id);
-            preserve_guarded_table_assignment_members(db, member_id);
-        }
-    } else if is_member_assignment_in_conditional_branch(db, member_id) {
+    if is_guarded_table_assignment_member(db, member_id)
+        || is_member_assignment_in_conditional_branch(db, member_id)
+    {
         db.get_member_index_mut()
-            .mark_conditional_branch_assignment_member(member_id);
+            .mark_non_overwriting_assignment_member(member_id);
     }
 }
 
-fn record_member_assignment_widening_cache(
-    analyzer: &mut LuaAnalyzer,
-    type_owner: &LuaTypeOwner,
-    assigned_type: &LuaType,
-    _preserve_table_literals: bool,
-) {
-    let LuaTypeOwner::Member(member_id) = type_owner else {
-        return;
-    };
-    if !is_assignment_file_define_member(analyzer.db, *member_id) {
-        return;
-    }
-
-    let member_index = analyzer.db.get_member_index();
-    let Some(owner) = member_index.get_member_owner(member_id).cloned() else {
-        return;
-    };
-    let Some(key) = member_index
-        .get_member(member_id)
-        .map(|member| member.get_key().clone())
-    else {
-        return;
-    };
-    let visible_count = member_index.visible_member_count_for_owner_key(&owner, &key);
-    let state_mask = member_assignment_state_mask(analyzer, *member_id);
-    let cache_key = MemberAssignmentWideningCacheKey { owner, key };
-    let doc_type = analyzer
-        .db
-        .get_type_index()
-        .get_type_cache(&(*member_id).into())
-        .filter(|cache| cache.is_doc())
-        .map(|cache| cache.as_type().clone());
-    let new_state = MemberAssignmentWideningState::from_assigned_type(assigned_type, doc_type);
-    let db = &*analyzer.db;
-    record_widening_cache(
-        &mut analyzer.member_assignment_widening_cache,
-        cache_key,
-        visible_count,
-        state_mask,
-        new_state,
-        |state, new_state| {
-            merge_member_assignment_widening_state(db, state, new_state, assigned_type);
-        },
-    );
-}
-
-pub(in crate::compilation::analyzer) fn preserve_guarded_table_assignment_members(
-    db: &mut DbIndex,
-    member_id: LuaMemberId,
-) {
-    let Some(member_ids) = guarded_table_assignment_member_ids_for_owner_key(db, member_id) else {
-        return;
-    };
-
-    db.get_member_index_mut()
-        .preserve_members_for_owner_key(member_id, member_ids);
-}
-
-/// Returns true when the assignment that introduced this member sits inside a
-/// branching construct (if / while / repeat / for). In those cases we must not
-/// collapse to a single "latest write" member, because the assignments in
-/// sibling branches (or earlier loop iterations) are not dominated by this one
-/// and their types must remain available so reads can union them.
-///
-/// Without this guard, a pattern like
-///
-/// ```lua
-/// if cond then
-///     obj.field = Vector(...)
-/// else
-///     obj.field = nil
-/// end
-/// ```
-///
-/// would silently drop the `Vector` branch and hover `obj.field` as just `nil`.
-fn is_member_assignment_in_conditional_branch(db: &DbIndex, member_id: LuaMemberId) -> bool {
-    let Some(tree) = db.get_vfs().get_syntax_tree(&member_id.file_id) else {
-        return false;
-    };
-    let root = tree.get_red_root();
-    let Some(node) = member_id.get_syntax_id().to_node_from_root(&root) else {
+/// Whether this write sits inside a branch or loop body, so it may not run
+/// and does not overwrite the writers before it in the same scope.
+pub fn is_member_assignment_in_conditional_branch(db: &DbIndex, member_id: LuaMemberId) -> bool {
+    let Some(node) = member_write_node(db, member_id) else {
         return false;
     };
 
     node.ancestors().any(|ancestor| {
         matches!(
             ancestor.kind().into(),
-            LuaSyntaxKind::IfStat
-                | LuaSyntaxKind::ElseIfClauseStat
-                | LuaSyntaxKind::ElseClauseStat
-                | LuaSyntaxKind::WhileStat
-                | LuaSyntaxKind::RepeatStat
-                | LuaSyntaxKind::ForStat
-                | LuaSyntaxKind::ForRangeStat
+            glua_parser::LuaSyntaxKind::IfStat
+                | glua_parser::LuaSyntaxKind::ElseIfClauseStat
+                | glua_parser::LuaSyntaxKind::ElseClauseStat
+                | glua_parser::LuaSyntaxKind::WhileStat
+                | glua_parser::LuaSyntaxKind::RepeatStat
+                | glua_parser::LuaSyntaxKind::ForStat
+                | glua_parser::LuaSyntaxKind::ForRangeStat
         )
-    })
-}
-
-fn guarded_table_assignment_member_ids_for_owner_key(
-    db: &DbIndex,
-    member_id: LuaMemberId,
-) -> Option<Vec<LuaMemberId>> {
-    let member_index = db.get_member_index();
-    let owner = member_index.get_member_owner(&member_id)?.clone();
-    let key = member_index.get_member(&member_id)?.get_key().clone();
-    let mut member_ids = Vec::new();
-
-    for related_member in member_index.get_current_owner_members_for_key(&owner, &key) {
-        let related_member_id = related_member.get_id();
-        if !is_guarded_table_assignment_member(db, related_member_id) {
-            return None;
-        }
-
-        member_ids.push(related_member_id);
-    }
-
-    (member_ids.len() >= 2).then_some(member_ids)
-}
-
-/// Widens a member assignment against its same-owner/key siblings.
-pub(in crate::compilation::analyzer) fn get_widened_member_assignment_type(
-    db: &DbIndex,
-    type_owner: &LuaTypeOwner,
-    incoming_type: &LuaType,
-    preserve_table_literals: bool,
-    skipped_uncached_sibling: &mut bool,
-) -> Option<LuaType> {
-    let LuaTypeOwner::Member(member_id) = type_owner else {
-        return None;
-    };
-    if !is_assignment_file_define_member(db, *member_id) {
-        return None;
-    }
-
-    let member_index = db.get_member_index();
-    let owner = member_index.get_member_owner(member_id)?.clone();
-    let key = member_index.get_member(member_id)?.get_key().clone();
-    let related_members = if preserve_table_literals {
-        let related_member_ids = guarded_table_assignment_member_ids_for_owner_key(db, *member_id)?;
-        related_member_ids
-            .into_iter()
-            .filter_map(|related_member_id| member_index.get_member(&related_member_id))
-            .collect()
-    } else {
-        member_index.get_members_for_owner_key(&owner, &key)
-    };
-    if related_members.len() < 2 {
-        return None;
-    }
-
-    let mut previous_states = Vec::new();
-    let mut saw_previous_assignment = false;
-
-    for related_member in related_members {
-        let related_member_id = related_member.get_id();
-        if related_member_id == *member_id {
-            continue;
-        }
-        // Only writers that come before this one are evidence for it. The walk
-        // otherwise settles that with "the sibling already has a type cache",
-        // which reports how far the batch has run rather than anything about
-        // the source: a re-index clears the batch's caches and leaves the rest
-        // standing, so the same sibling counts on one run and not on another.
-        // Reading the order off the source makes the set identical on both,
-        // and it is the rule the settled re-derivation already applies - a
-        // later write must not widen the type it is itself checked against.
-        if !preserve_table_literals
-            && member_id_sort_key(related_member_id) >= member_id_sort_key(*member_id)
-        {
-            continue;
-        }
-        if !is_member_realm_compatible(db, *member_id, related_member_id) {
-            continue;
-        }
-        saw_previous_assignment = true;
-
-        if !is_assignment_file_define_member(db, related_member_id) {
-            return None;
-        }
-
-        let existing_state = match db
-            .get_type_index()
-            .get_type_cache(&related_member_id.into())
-            .cloned()
-        {
-            Some(existing_cache) => MemberAssignmentWideningState::from_type_cache(&existing_cache),
-            None => match guarded_table_bootstrap_member_type(db, related_member_id, false) {
-                Some(bootstrap_type) => {
-                    MemberAssignmentWideningState::from_assigned_type(&bootstrap_type, None)
-                }
-                None => {
-                    *skipped_uncached_sibling = true;
-                    continue;
-                }
-            },
-        };
-
-        previous_states.push(existing_state);
-    }
-
-    if !saw_previous_assignment {
-        return None;
-    }
-
-    let widened_type = match decide_member_assignment_widening(
-        db,
-        incoming_type,
-        !preserve_table_literals,
-        previous_states.iter(),
-    ) {
-        MemberAssignmentWideningDecision::Widened(widened_type) => widened_type,
-        MemberAssignmentWideningDecision::ClassBootstrapRejected => {
-            union_member_assignment_widening(
-                db,
-                incoming_type,
-                !preserve_table_literals,
-                previous_states.iter(),
-            )
-        }
-        // Only reachable once a preceding writer has been seen but every one of
-        // them was skipped for having no type yet: siblings exist, and not one
-        // of them is evidence. Widening the literal here guesses at writers this
-        // pass has not read, and how many it has read is how far the batch has
-        // run, not anything about the source. Leave the write as it stands and
-        // let the settled re-derivation decide against the complete set.
-        MemberAssignmentWideningDecision::NoPreviousAssignments => return None,
-    };
-
-    Some(if preserve_table_literals {
-        crate::prune_redundant_guarded_table_bootstrap_type(db, widened_type)
-    } else {
-        widened_type
     })
 }
 
@@ -2325,34 +1973,134 @@ pub(super) fn is_assignment_file_define_member(
 ) -> bool {
     db.get_member_index()
         .get_member(&member_id)
-        .is_some_and(|member| {
-            member.get_feature() == LuaMemberFeature::FileDefine
-                && member.get_syntax_id().get_kind() == glua_parser::LuaSyntaxKind::IndexExpr
-        })
+        .is_some_and(crate::LuaMember::is_assignment_define)
 }
 
 pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_member(
     db: &crate::DbIndex,
     member_id: LuaMemberId,
 ) -> bool {
-    let Some(tree) = db.get_vfs().get_syntax_tree(&member_id.file_id) else {
-        return false;
-    };
-    let root = tree.get_red_root();
-    let Some(node) = member_id.get_syntax_id().to_node_from_root(&root) else {
-        return false;
-    };
-    let Some(index_expr) = LuaIndexExpr::cast(node) else {
-        return false;
-    };
+    member_write_node(db, member_id)
+        .and_then(|node| guarded_bootstrap_range_for_node(node, false))
+        .is_some()
+}
 
-    is_guarded_table_assignment_index_expr(&index_expr)
+/// The node that wrote `member_id`. The checks that ask look only at it, the
+/// statement holding it and the kinds of its ancestors, so only that is read.
+fn member_write_node(db: &DbIndex, member_id: LuaMemberId) -> Option<glua_parser::LuaSyntaxNode> {
+    let syntax_id = member_id.get_syntax_id();
+    let tree = db
+        .get_vfs()
+        .syntax_tree_at_statement(&member_id.file_id, syntax_id.get_range())?;
+    syntax_id.to_node_from_root(&tree.get_red_root())
 }
 
 pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_index_expr(
     index_expr: &LuaIndexExpr,
 ) -> bool {
     guarded_table_assignment_bootstrap_range(index_expr, false).is_some()
+}
+
+pub(crate) fn is_guarded_table_definition_site(
+    db: &DbIndex,
+    site: &InFiled<rowan::TextRange>,
+) -> bool {
+    let Some(tree) = db.get_vfs().syntax_tree_around(&site.file_id, site.value) else {
+        return false;
+    };
+    let root = tree.get_red_root();
+    let mut node = match root.covering_element(site.value) {
+        rowan::NodeOrToken::Node(node) => Some(node),
+        rowan::NodeOrToken::Token(token) => token.parent(),
+    };
+
+    while let Some(current) = node {
+        if current.text_range() == site.value && LuaTableExpr::cast(current.clone()).is_some() {
+            node = Some(current);
+            break;
+        }
+        if !current.text_range().contains_range(site.value) {
+            return false;
+        }
+        node = current.parent();
+    }
+
+    let Some(mut node) = node else {
+        return false;
+    };
+    while let Some(parent) = node.parent() {
+        if LuaClosureExpr::cast(parent.clone()).is_some() {
+            return false;
+        }
+        if let Some(binary_expr) = LuaBinaryExpr::cast(parent.clone())
+            && let Some(assign_stat) = binary_expr.get_parent::<LuaAssignStat>()
+        {
+            let (var_list, expr_list) = assign_stat.get_var_and_expr_list();
+            let access_path = var_list
+                .iter()
+                .zip(expr_list.iter())
+                .find(|(_, expr)| expr.get_syntax_id() == binary_expr.get_syntax_id())
+                .and_then(|(var, _)| var.get_access_path());
+            if access_path.is_some_and(|access_path| {
+                guarded_assignment_table_arm_range(
+                    &LuaExpr::BinaryExpr(binary_expr),
+                    &access_path,
+                    false,
+                )
+                .is_some_and(|guarded_range| guarded_range.contains_range(site.value))
+            }) {
+                return true;
+            }
+        }
+        node = parent;
+    }
+
+    false
+}
+
+/// Range of the table a guarded bootstrap of this member names, whichever of
+/// the two shapes wrote it.
+fn guarded_bootstrap_range_for_node(
+    node: glua_parser::LuaSyntaxNode,
+    empty_only: bool,
+) -> Option<rowan::TextRange> {
+    if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
+        return guarded_table_assignment_bootstrap_range(&index_expr, empty_only);
+    }
+
+    guarded_table_literal_field_range(&LuaTableField::cast(node)?, empty_only)
+}
+
+/// Range of the table a field of a guarded table literal names.
+///
+/// `x = x or { y = {} }` creates `x.y` on exactly the condition `x.y = x.y or
+/// {}` does — the namespace not existing yet — so the two shapes bootstrap the
+/// same slot and have to resolve to one literal between them. Treating only the
+/// second as a guarded writer leaves the first looking like a plain write, which
+/// makes the whole slot ineligible for canonicalisation.
+fn guarded_table_literal_field_range(
+    table_field: &LuaTableField,
+    empty_only: bool,
+) -> Option<rowan::TextRange> {
+    let LuaExpr::TableExpr(value) = table_field.get_value_expr()? else {
+        return None;
+    };
+    if empty_only && !value.is_empty() {
+        return None;
+    }
+
+    let table_expr = LuaTableExpr::cast(table_field.syntax().parent()?)?;
+    let binary_expr = LuaBinaryExpr::cast(table_expr.syntax().parent()?)?;
+    let assign_stat = binary_expr.get_parent::<LuaAssignStat>()?;
+    let (var_list, expr_list) = assign_stat.get_var_and_expr_list();
+    let access_path = var_list
+        .iter()
+        .zip(expr_list.iter())
+        .find(|(_, expr)| expr.get_syntax_id() == binary_expr.get_syntax_id())
+        .and_then(|(var, _)| var.get_access_path())?;
+    guarded_assignment_table_arm_range(&LuaExpr::BinaryExpr(binary_expr), &access_path, false)?;
+
+    Some(value.get_range())
 }
 
 /// Range of the table arm of a self-referential guarded bootstrap (`x.y =
@@ -2448,12 +2196,64 @@ fn guarded_table_bootstrap_member_type(
     member_id: LuaMemberId,
     empty_only: bool,
 ) -> Option<LuaType> {
-    let tree = db.get_vfs().get_syntax_tree(&member_id.file_id)?;
-    let root = tree.get_red_root();
-    let index_expr = LuaIndexExpr::cast(member_id.get_syntax_id().to_node_from_root(&root)?)?;
-    let range = guarded_table_assignment_bootstrap_range(&index_expr, empty_only)?;
+    let range = guarded_table_bootstrap_range(db, member_id, empty_only)?;
 
     Some(LuaType::TableConst(InFiled::new(member_id.file_id, range)))
+}
+
+fn guarded_table_bootstrap_range(
+    db: &crate::DbIndex,
+    member_id: LuaMemberId,
+    empty_only: bool,
+) -> Option<rowan::TextRange> {
+    guarded_bootstrap_range_for_node(member_write_node(db, member_id)?, empty_only)
+}
+
+/// Every writer of this member's slot when all of them are `x.y = x.y or {}`
+/// guards.
+///
+/// Walks the history slot unsorted: the caller only takes its minimum. Bails
+/// on the first non-guard, so the outcome never depends on the walk order.
+fn guarded_table_assignment_member_ids_for_owner_key(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+) -> Option<Vec<LuaMemberId>> {
+    let member_index = db.get_member_index();
+    let owner = member_index.get_member_owner(&member_id)?.clone();
+    let key = member_index.get_member(&member_id)?.get_key().clone();
+    let mut member_ids = Vec::new();
+
+    for related_member_id in
+        member_index.get_current_owner_member_ids_for_key_unsorted(&owner, &key)
+    {
+        if !is_guarded_table_assignment_member(db, related_member_id) {
+            return None;
+        }
+
+        member_ids.push(related_member_id);
+    }
+
+    (member_ids.len() >= 2).then_some(member_ids)
+}
+
+/// The one table a repeated `x.y = x.y or {}` guard names.
+///
+/// Every such writer means "reuse it if it is there", so at runtime they are all
+/// the same table and only the first to run creates it. Giving each writer its
+/// own literal instead makes a file that re-guards the namespace read its own
+/// empty table and lose whatever another file attached, so they resolve to the
+/// earliest writer's literal — the one that would have won at runtime.
+pub(in crate::compilation::analyzer) fn canonical_guarded_table_bootstrap_type(
+    db: &crate::DbIndex,
+    member_id: LuaMemberId,
+) -> Option<LuaType> {
+    // No second guard filter: the walk above only returns when every writer
+    // passed, so filtering again would re-walk each member's syntax.
+    let canonical = guarded_table_assignment_member_ids_for_owner_key(db, member_id)?
+        .into_iter()
+        .min_by_key(|candidate| member_id_sort_key(*candidate))?;
+
+    guarded_table_bootstrap_member_type(db, canonical, false)
 }
 
 fn merge_type_owner_and_unresolve_expr(
@@ -2471,10 +2271,7 @@ fn merge_type_owner_and_unresolve_expr(
                 ret_idx: idx,
             };
 
-            analyzer.context.add_unresolve(
-                unresolve_decl.into(),
-                InferFailReason::UnResolveExpr(InFiled::new(analyzer.file_id, expr.clone())),
-            );
+            analyzer.context.add_unresolve(unresolve_decl.into());
         }
         LuaTypeOwner::Member(member_id) => {
             let unresolve_member = UnResolveMember {
@@ -2484,10 +2281,7 @@ fn merge_type_owner_and_unresolve_expr(
                 prefix: None,
                 ret_idx: idx,
             };
-            analyzer.context.add_unresolve(
-                unresolve_member.into(),
-                InferFailReason::UnResolveExpr(InFiled::new(analyzer.file_id, expr.clone())),
-            );
+            analyzer.context.add_unresolve(unresolve_member.into());
         }
         _ => {}
     }
@@ -2502,12 +2296,11 @@ pub fn analyze_func_stat(analyzer: &mut LuaAnalyzer, func_stat: LuaFuncStat) -> 
         LuaType::Signature(LuaSignatureId::from_closure(analyzer.file_id, &closure));
     let type_owner = get_var_owner(analyzer, func_name.clone());
     set_index_expr_owner(analyzer, func_name.clone());
-    write_type_cache(
-        analyzer.db,
-        type_owner,
-        LuaTypeCache::InferType(signature_type.clone()),
-        TypeCacheWriteMode::InsertOnly,
-    );
+    analyzer.write(StatementWrite::WriteTypeCache {
+        owner: type_owner,
+        cache: LuaTypeCache::InferType(signature_type.clone()),
+        mode: TypeCacheWriteMode::InsertOnly,
+    });
 
     Some(())
 }
@@ -2522,12 +2315,11 @@ pub fn analyze_local_func_stat(
         LuaType::Signature(LuaSignatureId::from_closure(analyzer.file_id, &closure));
     let position = func_name.get_position();
     let decl_id = LuaDeclId::new(analyzer.file_id, position);
-    write_type_cache(
-        analyzer.db,
-        decl_id.into(),
-        LuaTypeCache::InferType(signature_type.clone()),
-        TypeCacheWriteMode::InsertOnly,
-    );
+    analyzer.write(StatementWrite::WriteTypeCache {
+        owner: decl_id.into(),
+        cache: LuaTypeCache::InferType(signature_type.clone()),
+        mode: TypeCacheWriteMode::InsertOnly,
+    });
 
     Some(())
 }
@@ -2554,7 +2346,7 @@ fn register_expr_key_member(analyzer: &mut LuaAnalyzer, field: &LuaTableField) {
         .context
         .infer_manager
         .get_infer_cache(analyzer.file_id);
-    let Ok(member_key) = LuaMemberKey::from_index_key(analyzer.db, cache, &field_key) else {
+    let Ok(member_key) = LuaMemberKey::from_index_key(&analyzer.db, cache, &field_key) else {
         return;
     };
     if matches!(member_key, LuaMemberKey::ExprType(ref typ) if typ.is_unknown()) {
@@ -2570,10 +2362,10 @@ fn register_expr_key_member(analyzer: &mut LuaAnalyzer, field: &LuaTableField) {
         LuaMemberFeature::FileDefine
     };
     let member = LuaMember::new(member_id, member_key, decl_feature, None);
-    analyzer
-        .db
-        .get_member_index_mut()
-        .add_member(owner_id, member);
+    analyzer.write(StatementWrite::AddMember {
+        owner: owner_id,
+        member,
+    });
 }
 
 /// Whether this value-field (positional `{ expr }`) belongs to a shaped
@@ -2588,45 +2380,111 @@ fn is_shaped_array_value_field(field: &LuaTableField) -> bool {
             .is_some_and(|table_expr| table_expr.is_shaped_array_literal())
 }
 
+/// Registers the positional elements of a plain array literal that
+/// `setmetatable` makes an instance, which the declaration pass leaves as an
+/// element-typed array: the instance carries them as `[n]` members its class
+/// table is read through.
+pub(super) fn register_positional_instance_members(
+    analyzer: &mut LuaAnalyzer,
+    table_expr: &LuaTableExpr,
+) {
+    if !table_expr.is_array() || table_expr.is_shaped_array_literal() {
+        return;
+    }
+    let owner = LuaMemberOwner::Element(InFiled::new(analyzer.file_id, table_expr.get_range()));
+    let feature = if analyzer.context.metas.contains(&analyzer.file_id) {
+        LuaMemberFeature::MetaDefine
+    } else {
+        LuaMemberFeature::FileDefine
+    };
+    for field in table_expr.get_fields() {
+        if !field.is_value_field() || field.is_trailing_spread() {
+            continue;
+        }
+        let Some(LuaIndexKey::Idx(idx)) = field.get_field_key() else {
+            continue;
+        };
+        let member_id = LuaMemberId::new(field.get_syntax_id(), analyzer.file_id);
+        if analyzer
+            .db
+            .get_member_index()
+            .get_member(&member_id)
+            .is_some()
+        {
+            continue;
+        }
+        analyzer.write(StatementWrite::AddMember {
+            owner: owner.clone(),
+            member: LuaMember::new(member_id, LuaMemberKey::Integer(idx as i64), feature, None),
+        });
+        bind_table_field_value_type(analyzer, &field, false);
+    }
+}
+
 pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> Option<()> {
     register_expr_key_member(analyzer, &field);
 
-    if field.is_assign_field() || is_shaped_array_value_field(&field) {
-        let value_expr = field.get_value_expr()?;
-        let member_id = LuaMemberId::new(field.get_syntax_id(), analyzer.file_id);
-        let value_type = match analyzer.infer_expr(&value_expr.clone()) {
-            Ok(value_type) => match value_type {
-                LuaType::Def(ref_id) => LuaType::Ref(ref_id),
-                other => {
-                    if other.is_unknown() && is_undefined_global_name_expr(analyzer, &value_expr) {
-                        LuaType::Nil
-                    } else {
-                        other
-                    }
-                }
-            },
-            // Same rationale as `analyze_assign_stat`: a missing/undefined
-            // RHS evaluates to `nil` at runtime.
-            Err(InferFailReason::None) => LuaType::Nil,
-            Err(reason) => {
-                let unresolve = UnResolveMember {
-                    file_id: analyzer.file_id,
-                    member_id,
-                    expr: Some(value_expr.clone()),
-                    prefix: None,
-                    ret_idx: 0,
-                };
-
-                analyzer.context.add_unresolve(unresolve.into(), reason);
-                return None;
-            }
-        };
-        bind_type(
-            analyzer.db,
-            member_id.into(),
-            LuaTypeCache::InferType(value_type),
-        );
+    let trailing_spread = field.is_trailing_spread();
+    if field.is_assign_field() || is_shaped_array_value_field(&field) || trailing_spread {
+        bind_table_field_value_type(analyzer, &field, trailing_spread)?;
     }
+    Some(())
+}
+
+fn bind_table_field_value_type(
+    analyzer: &mut LuaAnalyzer,
+    field: &LuaTableField,
+    trailing_spread: bool,
+) -> Option<()> {
+    let value_expr = field.get_value_expr()?;
+    let member_id = LuaMemberId::new(field.get_syntax_id(), analyzer.file_id);
+    let inferred = analyzer.infer_expr(&value_expr.clone());
+    let value_type = match inferred {
+        Ok(value_type) => match value_type {
+            LuaType::Def(ref_id) => LuaType::Ref(ref_id),
+            other => {
+                if other.is_unknown() && is_undefined_global_name_expr(analyzer, &value_expr) {
+                    LuaType::Nil
+                } else {
+                    other
+                }
+            }
+        },
+        // Same rationale as `analyze_assign_stat`: a missing/undefined
+        // RHS evaluates to `nil` at runtime.
+        Err(InferFailReason::None) => LuaType::Nil,
+        Err(_) => {
+            let unresolve = UnResolveMember {
+                file_id: analyzer.file_id,
+                member_id,
+                expr: Some(value_expr.clone()),
+                prefix: None,
+                ret_idx: 0,
+            };
+
+            analyzer.context.add_unresolve(unresolve.into());
+            return None;
+        }
+    };
+    if trailing_spread && !matches!(value_type, LuaType::Variadic(_)) {
+        return None;
+    }
+    // A table-valued field of a guarded `x = x or { ... }` literal
+    // bootstraps the same member `x.y = x.y or {}` does: when every writer
+    // of the slot is a guard they all name one table — the earliest
+    // writer's literal — so the field binds that literal, not its own.
+    // Binding the field literal instead leaves whichever file re-walked
+    // last in the cache, and reads taken between the writes disagree with
+    // the settled answer.
+    let value_type = if is_guarded_table_assignment_member(&analyzer.db, member_id) {
+        canonical_guarded_table_bootstrap_type(&analyzer.db, member_id).unwrap_or(value_type)
+    } else {
+        value_type
+    };
+    analyzer.write(StatementWrite::BindType {
+        owner: member_id.into(),
+        cache: LuaTypeCache::InferType(value_type),
+    });
     Some(())
 }
 
@@ -2648,35 +2506,22 @@ fn special_assign_pattern(
     expr: LuaExpr,
     assign_stat_range: rowan::TextRange,
 ) -> Option<()> {
-    let access_path = var.get_access_path()?;
-    let binary_expr = if let LuaExpr::BinaryExpr(binary_expr) = expr {
-        binary_expr
-    } else {
+    let (left, right) = self_default_arms(&var, &expr)?;
+    let LuaExpr::BinaryExpr(binary_expr) = expr else {
         return None;
     };
 
-    if binary_expr.get_op_token()?.get_op() != BinaryOperator::OpOr {
-        return None;
-    }
-
-    let (left, right) = binary_expr.get_exprs()?;
-    let left_var = LuaVarExpr::cast(left.syntax().clone())?;
-    let left_access_path = left_var.get_access_path()?;
-    if access_path != left_access_path {
-        return None;
-    }
-
     let guarded_table_expr = matches!(&right, LuaExpr::TableExpr(_));
-    let expr_type = if guarded_table_expr {
-        infer_guarded_table_assignment_type(
-            analyzer,
-            &LuaExpr::BinaryExpr(binary_expr),
-            &left,
-            &right,
-        )
-    } else {
+    let expr_type = if !guarded_table_expr {
         set_index_expr_owner(analyzer, var.clone());
         analyzer.infer_expr(&right)
+    } else if defines_own_slot(analyzer, &left) {
+        // The left read is the slot this statement defines, which cannot
+        // inform its own definition: whatever it holds is written back
+        // unchanged, so the statement contributes only its right arm.
+        analyzer.infer_expr(&right)
+    } else {
+        analyzer.infer_expr(&LuaExpr::BinaryExpr(binary_expr.clone()))
     };
 
     match expr_type {
@@ -2693,15 +2538,12 @@ fn special_assign_pattern(
             if !guarded_table_expr {
                 if let LuaTypeOwner::Decl(decl_id) = &type_owner {
                     if let Some(string_value) = extract_string_literal_from_expr(&right) {
-                        analyzer
-                            .db
-                            .get_property_index_mut()
-                            .add_inferred_string_default(
-                                analyzer.file_id,
-                                *decl_id,
-                                smol_str::SmolStr::new(string_value),
-                                assign_stat_range,
-                            );
+                        analyzer.write(StatementWrite::AddInferredStringDefault {
+                            file_id: analyzer.file_id,
+                            decl_id: *decl_id,
+                            value: smol_str::SmolStr::new(string_value),
+                            range: assign_stat_range,
+                        });
                     }
                 }
             }
@@ -2712,12 +2554,39 @@ fn special_assign_pattern(
                 &expr_type,
                 0,
                 guarded_table_expr,
+                DeclWrite {
+                    position: assign_stat_range.start(),
+                    may_improve_after_resolve: false,
+                    reads_out_of_decl: false,
+                    may_narrow_uninformative: false,
+                    resolved_initializer: false,
+                    // `x = x or <default>`, matched above.
+                    fills_own_default: true,
+                },
             );
         }
         Err(_) => return None,
     }
 
     Some(())
+}
+
+/// Whether `left`, the read of `x = x or {…}`, is the shared slot the
+/// statement defines: a field or a global. A local or parameter makes the
+/// statement a default over the value it already holds.
+fn defines_own_slot(analyzer: &LuaAnalyzer, left: &LuaExpr) -> bool {
+    match left {
+        LuaExpr::IndexExpr(_) => true,
+        LuaExpr::NameExpr(name) => name.get_name_text().is_some_and(|text| {
+            analyzer
+                .db
+                .get_decl_index()
+                .get_decl_tree(&analyzer.file_id)
+                .and_then(|tree| tree.find_local_decl(&text, name.get_position()))
+                .is_none_or(|decl| !(decl.is_local() || decl.is_param()))
+        }),
+        _ => false,
+    }
 }
 
 fn set_guarded_table_assignment_index_owner(
@@ -2727,12 +2596,12 @@ fn set_guarded_table_assignment_index_owner(
 ) -> Option<()> {
     match var {
         LuaVarExpr::IndexExpr(index_expr) => {
-            if let Some(cache_key) = guarded_table_assignment_cache_key(analyzer, left) {
+            if let Some((owner, set_owner_only)) = guarded_table_assignment_info(analyzer, left) {
                 apply_index_expr_member_owner_with_guarded(
                     analyzer,
                     index_expr,
-                    cache_key.owner,
-                    false,
+                    owner,
+                    set_owner_only,
                     true,
                 )
             } else {
@@ -2743,107 +2612,32 @@ fn set_guarded_table_assignment_index_owner(
     }
 }
 
-fn infer_guarded_table_assignment_type(
-    analyzer: &mut LuaAnalyzer,
-    binary_expr: &LuaExpr,
-    left: &LuaExpr,
-    right: &LuaExpr,
-) -> Result<LuaType, InferFailReason> {
-    let right_type = analyzer.infer_expr(right)?;
-    let cache_key = guarded_table_assignment_cache_key(analyzer, left);
-    if let Some(cached_left_type) = cache_key
-        .as_ref()
-        .and_then(|key| analyzer.guarded_table_assignment_type_cache.get(key))
-        .cloned()
-    {
-        if matches!(cached_left_type, LuaType::Table) && is_empty_table_expr(right) {
-            return Ok(LuaType::Table);
-        }
-        return merge_guarded_table_assignment_type(
-            analyzer,
-            binary_expr,
-            left,
-            cached_left_type,
-            right_type,
-        );
-    }
-
-    let left_type = match analyzer.infer_expr(left) {
-        Ok(left_type) => left_type,
-        Err(reason) if reason.is_need_resolve() => LuaType::Nil,
-        Err(reason) => return Err(reason),
-    };
-
-    let result =
-        merge_guarded_table_assignment_type(analyzer, binary_expr, left, left_type, right_type)?;
-    if let Some(cache_key) = cache_key
-        && (result.is_any() || result.is_table())
-    {
-        analyzer
-            .guarded_table_assignment_type_cache
-            .insert(cache_key, widen_related_assignment_type(&result, true));
-    }
-
-    Ok(result)
-}
-
-fn is_empty_table_expr(expr: &LuaExpr) -> bool {
-    matches!(expr, LuaExpr::TableExpr(table_expr) if table_expr.get_fields().next().is_none())
-}
-
-fn merge_guarded_table_assignment_type(
-    analyzer: &mut LuaAnalyzer,
-    binary_expr: &LuaExpr,
-    left: &LuaExpr,
-    left_type: LuaType,
-    right_type: LuaType,
-) -> Result<LuaType, InferFailReason> {
-    let left_type = remove_false_or_nil(left_type);
-    if left_type.is_nil() || left_type.is_unknown() || left_type.is_never() {
-        return Ok(right_type);
-    }
-    if should_prefer_guarded_dynamic_index_rhs(analyzer, left, &left_type) {
-        return Ok(right_type);
-    }
-    if !(left_type.is_any() || left_type.is_table()) {
-        return analyzer.infer_expr(binary_expr);
-    }
-
-    Ok(TypeOps::Union.apply(analyzer.db, &left_type, &right_type))
-}
-
-fn guarded_table_assignment_cache_key(
+fn guarded_table_assignment_info(
     analyzer: &mut LuaAnalyzer,
     left: &LuaExpr,
-) -> Option<MemberAssignmentWideningCacheKey> {
+) -> Option<(LuaMemberOwner, bool)> {
     let left_var = LuaVarExpr::cast(left.syntax().clone())?;
     let LuaVarExpr::IndexExpr(index_expr) = left_var else {
         return None;
     };
     let prefix_expr = index_expr.get_prefix_expr()?;
-    let owner = direct_local_table_prefix_member_owner(analyzer, &prefix_expr).or_else(|| {
-        let prefix_type = analyzer.infer_expr(&prefix_expr).ok()?;
-        resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))
-            .map(|(owner, _)| owner)
-    })?;
+    let (owner, set_owner_only) = direct_local_table_prefix_member_owner(analyzer, &prefix_expr)
+        .map(|owner| (owner, false))
+        .or_else(|| {
+            let prefix_type = analyzer.infer_expr(&prefix_expr).ok()?;
+            resolve_index_expr_member_owner_for_file(
+                &analyzer.db,
+                &prefix_type,
+                Some(analyzer.file_id),
+            )
+        })?;
     let index_key = index_expr.get_index_key()?;
     let cache = analyzer
         .context
         .infer_manager
         .get_infer_cache(analyzer.file_id);
-    let key = LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key).ok()?;
-    (!key.is_expr()).then_some(MemberAssignmentWideningCacheKey { owner, key })
-}
-
-fn should_prefer_guarded_dynamic_index_rhs(
-    analyzer: &LuaAnalyzer,
-    left: &LuaExpr,
-    left_type: &LuaType,
-) -> bool {
-    analyzer.gmod_enabled
-        && analyzer.db.get_emmyrc().gmod.infer_dynamic_fields
-        && left_type.is_any()
-        && matches!(left, LuaExpr::IndexExpr(index_expr) if matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_))))
+    let key = LuaMemberKey::from_index_key_or_unknown(&analyzer.db, cache, &index_key).ok()?;
+    (!key.is_expr()).then_some((owner, set_owner_only))
 }
 
 fn has_delayed_definition_attribute(analyzer: &LuaAnalyzer, decl_id: LuaDeclId) -> bool {
@@ -2873,7 +2667,7 @@ pub(super) fn is_local_mutable(analyzer: &LuaAnalyzer, decl_id: LuaDeclId) -> bo
         .unwrap_or(false)
 }
 
-// 获取延迟定义的声明id
+// Get the declaration id of the deferred definition
 fn get_delayed_definition_decl_id(
     analyzer: &LuaAnalyzer,
     name_expr: &LuaNameExpr,
@@ -2935,9 +2729,60 @@ mod tests {
     use glua_parser::LuaSyntaxId;
     use rowan::{TextRange, TextSize};
 
-    use crate::{DbIndex, FileId, InFiled, LuaMergedTableType, LuaTypeDeclId, LuaUnionType};
+    use crate::{DbIndex, FileId, InFiled, LuaMergedTableType, LuaUnionType};
 
     use super::*;
+
+    /// Every assignment of a local produces the local's slot, the ones whose
+    /// value the slot did not take included, so the local's writers run as
+    /// one group on every run.
+    #[test]
+    fn every_assignment_of_a_local_produces_its_slot() {
+        use crate::db_index::derivation::{DerivationId, DerivationKind, FactKey};
+
+        let mut ws = crate::VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/local_writes.lua",
+            r#"
+            local torque = 1
+            if brake then
+                torque = torque + 2
+            else
+                torque = unknown_source
+            end
+            "#,
+        );
+        let db = ws.analysis.compilation.get_db();
+        let root = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("syntax tree")
+            .get_chunk_node();
+        let decl_id = root
+            .descendants::<glua_parser::LuaLocalName>()
+            .find_map(|name| {
+                db.get_decl_index()
+                    .get_decl(&crate::LuaDeclId::new(file_id, name.get_position()))
+                    .map(|decl| decl.get_id())
+            })
+            .expect("the local");
+        let slot = FactKey::TypeCache(crate::LuaTypeOwner::Decl(decl_id));
+        let producing = root
+            .descendants::<glua_parser::LuaAssignStat>()
+            .map(|assign| {
+                let id = DerivationId::new(
+                    DerivationKind::AssignStat,
+                    file_id,
+                    LuaSyntaxId::from_node(assign.syntax()),
+                );
+                db.reader_graph()
+                    .outputs_of(id)
+                    .any(|key| key.key() == &slot)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(producing, vec![true, true]);
+    }
 
     fn table_const(start: u32, end: u32) -> LuaType {
         LuaType::TableConst(InFiled::new(
@@ -2971,7 +2816,7 @@ mod tests {
     fn member_id_at_file(file_id: FileId, start: u32) -> LuaMemberId {
         let range = TextRange::new(TextSize::new(start), TextSize::new(start + 1));
         LuaMemberId::new(
-            LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), range),
+            LuaSyntaxId::new(glua_parser::LuaSyntaxKind::IndexExpr.into(), range),
             file_id,
         )
     }
@@ -2993,12 +2838,12 @@ mod tests {
         );
     }
 
-    fn with_analyzer<T>(db: &mut DbIndex, run: impl FnOnce(&mut LuaAnalyzer<'_>) -> T) -> T {
+    fn with_analyzer<T>(db: &DbIndex, run: impl FnOnce(&mut LuaAnalyzer<'_>) -> T) -> T {
         with_analyzer_config(db, false, run)
     }
 
     fn with_analyzer_config<T>(
-        db: &mut DbIndex,
+        db: &DbIndex,
         gmod_enabled: bool,
         run: impl FnOnce(&mut LuaAnalyzer<'_>) -> T,
     ) -> T {
@@ -3024,730 +2869,19 @@ mod tests {
     }
 
     #[test]
+    fn merged_bootstrap_literals_are_one_owner() {
+        let typ = LuaMergedTableType::new(vec![table_const(1, 2), table_const(3, 4)]).into();
+
+        assert!(!has_multiple_distinct_index_expr_member_owners(&typ));
+    }
+
+    #[test]
     fn distinct_table_owners_are_ambiguous() {
         let typ = LuaType::Union(
             LuaUnionType::from_vec(vec![table_const(1, 2), table_const(3, 4)]).into(),
         );
 
         assert!(has_multiple_distinct_index_expr_member_owners(&typ));
-    }
-
-    #[test]
-    fn member_assignment_widening_uses_cache_for_sequential_same_key_members() {
-        let mut db = DbIndex::new();
-        let owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        let key = LuaMemberKey::from("field");
-        let first_member = member_id_at(1);
-        let second_member = member_id_at(3);
-        add_typed_file_define_member(
-            &mut db,
-            owner.clone(),
-            first_member,
-            key.clone(),
-            LuaType::Integer,
-        );
-
-        with_analyzer(&mut db, |analyzer| {
-            record_member_assignment_widening_cache(
-                analyzer,
-                &LuaTypeOwner::Member(first_member),
-                &LuaType::Integer,
-                false,
-            );
-            add_typed_file_define_member(analyzer.db, owner, second_member, key, LuaType::String);
-
-            let widened = get_cached_widened_member_assignment_type(
-                analyzer,
-                &LuaTypeOwner::Member(second_member),
-                &LuaType::String,
-                false,
-            )
-            .expect("sequential owner/key cache should be usable")
-            .expect("second same-key assignment should widen with cached prior type");
-
-            assert_eq!(
-                widened,
-                TypeOps::Union.apply(analyzer.db, &LuaType::Integer, &LuaType::String)
-            );
-        });
-    }
-
-    #[test]
-    fn member_assignment_widening_cache_tracks_many_same_key_members() {
-        let mut db = DbIndex::new();
-        let owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        let key = LuaMemberKey::from("field");
-
-        with_analyzer(&mut db, |analyzer| {
-            let mut cache_hits = 0;
-            for i in 0..512 {
-                let member_id = member_id_at(i * 2 + 1);
-                add_typed_file_define_member(
-                    analyzer.db,
-                    owner.clone(),
-                    member_id,
-                    key.clone(),
-                    LuaType::String,
-                );
-
-                if i > 0 {
-                    assert!(
-                        get_cached_widened_member_assignment_type(
-                            analyzer,
-                            &LuaTypeOwner::Member(member_id),
-                            &LuaType::String,
-                            false,
-                        )
-                        .is_some(),
-                        "cache should stay enabled at member {i}"
-                    );
-                    cache_hits += 1;
-                }
-
-                record_member_assignment_widening_cache(
-                    analyzer,
-                    &LuaTypeOwner::Member(member_id),
-                    &LuaType::String,
-                    false,
-                );
-            }
-
-            assert_eq!(cache_hits, 511);
-        });
-    }
-
-    #[test]
-    fn member_assignment_widening_cache_tracks_many_preserved_table_literal_members() {
-        let mut db = DbIndex::new();
-        let owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        let key = LuaMemberKey::from("field");
-
-        with_analyzer(&mut db, |analyzer| {
-            let mut cache_hits = 0;
-            for i in 0..512 {
-                let member_id = member_id_at(i * 2 + 1);
-                let table_type = table_const(i * 2 + 1000, i * 2 + 1001);
-                add_typed_file_define_member(
-                    analyzer.db,
-                    owner.clone(),
-                    member_id,
-                    key.clone(),
-                    table_type.clone(),
-                );
-
-                if i > 0 {
-                    let cached_type = get_cached_widened_member_assignment_type(
-                        analyzer,
-                        &LuaTypeOwner::Member(member_id),
-                        &table_type,
-                        true,
-                    )
-                    .expect("preserved table-literal cache should stay enabled")
-                    .expect("preserved table-literal cache should return a widened type");
-                    assert_eq!(cached_type, LuaType::Table, "unexpected type at member {i}");
-                    cache_hits += 1;
-                }
-
-                record_member_assignment_widening_cache(
-                    analyzer,
-                    &LuaTypeOwner::Member(member_id),
-                    &table_type,
-                    true,
-                );
-            }
-
-            assert_eq!(cache_hits, 511);
-        });
-    }
-
-    #[test]
-    fn member_assignment_widening_cache_tracks_many_same_class_bootstrap_members() {
-        let mut db = DbIndex::new();
-        let owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        let key = LuaMemberKey::from("field");
-        let class_type = LuaType::Def(LuaTypeDeclId::global("ClassType"));
-
-        with_analyzer(&mut db, |analyzer| {
-            let mut cache_hits = 0;
-            for i in 0..512 {
-                let member_id = member_id_at(i * 2 + 1);
-                add_typed_file_define_member(
-                    analyzer.db,
-                    owner.clone(),
-                    member_id,
-                    key.clone(),
-                    class_type.clone(),
-                );
-
-                if i > 0 {
-                    let cached_type = get_cached_widened_member_assignment_type(
-                        analyzer,
-                        &LuaTypeOwner::Member(member_id),
-                        &class_type,
-                        false,
-                    )
-                    .expect("class bootstrap cache should stay enabled")
-                    .expect("same class bootstrap should return cached class type");
-                    assert_eq!(cached_type, class_type, "unexpected type at member {i}");
-                    cache_hits += 1;
-                }
-
-                record_member_assignment_widening_cache(
-                    analyzer,
-                    &LuaTypeOwner::Member(member_id),
-                    &class_type,
-                    false,
-                );
-            }
-
-            assert_eq!(cache_hits, 511);
-        });
-    }
-
-    #[test]
-    fn member_assignment_widening_cache_rejects_different_class_bootstrap_members() {
-        let mut db = DbIndex::new();
-        let owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        let key = LuaMemberKey::from("field");
-        let first_class = LuaType::Def(LuaTypeDeclId::global("FirstClass"));
-        let second_class = LuaType::Def(LuaTypeDeclId::global("SecondClass"));
-        let first_member = member_id_at(1);
-        let second_member = member_id_at(3);
-
-        add_typed_file_define_member(
-            &mut db,
-            owner.clone(),
-            first_member,
-            key.clone(),
-            first_class.clone(),
-        );
-
-        with_analyzer(&mut db, |analyzer| {
-            record_member_assignment_widening_cache(
-                analyzer,
-                &LuaTypeOwner::Member(first_member),
-                &first_class,
-                false,
-            );
-            add_typed_file_define_member(
-                analyzer.db,
-                owner,
-                second_member,
-                key,
-                second_class.clone(),
-            );
-
-            assert!(
-                get_cached_widened_member_assignment_type(
-                    analyzer,
-                    &LuaTypeOwner::Member(second_member),
-                    &second_class,
-                    false,
-                )
-                .is_none(),
-                "different class bootstraps must fall back to the full compatibility scan"
-            );
-        });
-    }
-
-    #[test]
-    fn member_assignment_widening_fallback_preserves_doc_authority() {
-        let mut db = DbIndex::new();
-        let owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        let key = LuaMemberKey::from("field");
-        let doc_type = LuaType::Def(LuaTypeDeclId::global("DocType"));
-        let first_member = member_id_at(1);
-        let second_member = member_id_at(3);
-        let third_member = member_id_at(5);
-
-        add_typed_file_define_member(
-            &mut db,
-            owner.clone(),
-            first_member,
-            key.clone(),
-            LuaType::Integer,
-        );
-        db.get_type_index_mut().force_bind_type(
-            LuaTypeOwner::Member(first_member),
-            LuaTypeCache::DocType(doc_type.clone()),
-        );
-
-        with_analyzer(&mut db, |analyzer| {
-            record_member_assignment_widening_cache(
-                analyzer,
-                &LuaTypeOwner::Member(first_member),
-                &LuaType::Integer,
-                false,
-            );
-            add_typed_file_define_member(
-                analyzer.db,
-                owner.clone(),
-                second_member,
-                key.clone(),
-                LuaType::String,
-            );
-            add_typed_file_define_member(analyzer.db, owner, third_member, key, LuaType::Boolean);
-
-            assert_eq!(
-                get_cached_widened_member_assignment_type(
-                    analyzer,
-                    &LuaTypeOwner::Member(third_member),
-                    &LuaType::Boolean,
-                    false,
-                ),
-                None,
-                "visible-count mismatch should force the fallback scan"
-            );
-
-            let widened = get_widened_member_assignment_type(
-                analyzer.db,
-                &LuaTypeOwner::Member(third_member),
-                &LuaType::Boolean,
-                false,
-                &mut false,
-            )
-            .expect("fallback scan should find prior same-key assignments");
-
-            assert_eq!(widened, doc_type);
-        });
-    }
-
-    #[test]
-    fn member_assignment_widening_fallback_rejects_different_class_bootstrap() {
-        let mut db = DbIndex::new();
-        let owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        let key = LuaMemberKey::from("field");
-        let first_class = LuaType::Def(LuaTypeDeclId::global("FirstClass"));
-        let second_class = LuaType::Def(LuaTypeDeclId::global("SecondClass"));
-        let first_member = member_id_at(1);
-        let second_member = member_id_at(3);
-        let third_member = member_id_at(5);
-
-        add_typed_file_define_member(
-            &mut db,
-            owner.clone(),
-            first_member,
-            key.clone(),
-            first_class.clone(),
-        );
-
-        with_analyzer(&mut db, |analyzer| {
-            record_member_assignment_widening_cache(
-                analyzer,
-                &LuaTypeOwner::Member(first_member),
-                &first_class,
-                false,
-            );
-            add_typed_file_define_member(
-                analyzer.db,
-                owner.clone(),
-                second_member,
-                key.clone(),
-                second_class.clone(),
-            );
-            add_typed_file_define_member(
-                analyzer.db,
-                owner,
-                third_member,
-                key,
-                second_class.clone(),
-            );
-
-            assert_eq!(
-                get_cached_widened_member_assignment_type(
-                    analyzer,
-                    &LuaTypeOwner::Member(third_member),
-                    &second_class,
-                    false,
-                ),
-                None,
-                "visible-count mismatch should force the fallback scan"
-            );
-
-            let widened = get_widened_member_assignment_type(
-                analyzer.db,
-                &LuaTypeOwner::Member(third_member),
-                &second_class,
-                false,
-                &mut false,
-            )
-            .expect("fallback scan should widen incompatible class assignments");
-            let expected = TypeOps::Union.apply(analyzer.db, &first_class, &second_class);
-
-            assert_eq!(widened, expected);
-            assert_ne!(widened, second_class);
-        });
-    }
-
-    #[test]
-    fn member_assignment_widening_cache_and_fallback_match_plain_scalars() {
-        let key = LuaMemberKey::from("field");
-        let first_member = member_id_at(1);
-        let second_member = member_id_at(3);
-        let third_member = member_id_at(5);
-
-        let mut cached_db = DbIndex::new();
-        let cached_owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        add_typed_file_define_member(
-            &mut cached_db,
-            cached_owner.clone(),
-            first_member,
-            key.clone(),
-            LuaType::Integer,
-        );
-        let cached_widened = with_analyzer(&mut cached_db, |analyzer| {
-            record_member_assignment_widening_cache(
-                analyzer,
-                &LuaTypeOwner::Member(first_member),
-                &LuaType::Integer,
-                false,
-            );
-            add_typed_file_define_member(
-                analyzer.db,
-                cached_owner,
-                second_member,
-                key.clone(),
-                LuaType::String,
-            );
-
-            get_cached_widened_member_assignment_type(
-                analyzer,
-                &LuaTypeOwner::Member(second_member),
-                &LuaType::String,
-                false,
-            )
-            .expect("sequential same-key assignment should use cache")
-            .expect("cached scalar assignment should widen")
-        });
-
-        let mut fallback_db = DbIndex::new();
-        let fallback_owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        add_typed_file_define_member(
-            &mut fallback_db,
-            fallback_owner.clone(),
-            first_member,
-            key.clone(),
-            LuaType::Integer,
-        );
-        let fallback_widened = with_analyzer(&mut fallback_db, |analyzer| {
-            record_member_assignment_widening_cache(
-                analyzer,
-                &LuaTypeOwner::Member(first_member),
-                &LuaType::Integer,
-                false,
-            );
-            add_typed_file_define_member(
-                analyzer.db,
-                fallback_owner.clone(),
-                second_member,
-                key.clone(),
-                LuaType::String,
-            );
-            add_typed_file_define_member(
-                analyzer.db,
-                fallback_owner,
-                third_member,
-                key,
-                LuaType::String,
-            );
-
-            assert_eq!(
-                get_cached_widened_member_assignment_type(
-                    analyzer,
-                    &LuaTypeOwner::Member(third_member),
-                    &LuaType::String,
-                    false,
-                ),
-                None,
-                "visible-count mismatch should force the fallback scan"
-            );
-
-            get_widened_member_assignment_type(
-                analyzer.db,
-                &LuaTypeOwner::Member(third_member),
-                &LuaType::String,
-                false,
-                &mut false,
-            )
-            .expect("fallback scalar assignment should widen")
-        });
-
-        assert_eq!(cached_widened, fallback_widened);
-    }
-
-    #[test]
-    fn member_collection_assignment_widening_uses_cache_for_sequential_same_key_members() {
-        let mut db = DbIndex::new();
-        let owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        let key = LuaMemberKey::from("items");
-        let first_member = member_id_at(1);
-        let second_member = member_id_at(3);
-        let first_array = LuaType::Array(LuaArrayType::from_base_type(LuaType::Integer).into());
-        let second_array = LuaType::Array(LuaArrayType::from_base_type(LuaType::String).into());
-        add_typed_file_define_member(
-            &mut db,
-            owner.clone(),
-            first_member,
-            key.clone(),
-            first_array.clone(),
-        );
-
-        with_analyzer(&mut db, |analyzer| {
-            record_member_collection_assignment_widening_cache(
-                analyzer,
-                &LuaTypeOwner::Member(first_member),
-                &first_array,
-            );
-            add_typed_file_define_member(
-                analyzer.db,
-                owner,
-                second_member,
-                key,
-                second_array.clone(),
-            );
-            let (owner, key) = {
-                let member_index = analyzer.db.get_member_index();
-                (
-                    member_index
-                        .get_member_owner(&second_member)
-                        .expect("member owner")
-                        .clone(),
-                    member_index
-                        .get_member(&second_member)
-                        .expect("member")
-                        .get_key()
-                        .clone(),
-                )
-            };
-
-            let widened = get_cached_widened_member_collection_assignment_type(
-                analyzer,
-                &owner,
-                &key,
-                second_member,
-                &LuaType::String,
-            )
-            .expect("sequential collection cache should be usable")
-            .expect("second same-key collection assignment should widen with cached prior type");
-
-            assert_eq!(
-                widened,
-                LuaType::Array(
-                    LuaArrayType::from_base_type(TypeOps::Union.apply(
-                        analyzer.db,
-                        &LuaType::String,
-                        &LuaType::Integer,
-                    ))
-                    .into()
-                )
-            );
-        });
-    }
-
-    #[test]
-    fn member_collection_assignment_widening_cache_and_fallback_match_array_base_unions() {
-        let key = LuaMemberKey::from("items");
-        let first_member = member_id_at(1);
-        let second_member = member_id_at(3);
-        let third_member = member_id_at(5);
-        let first_array = LuaType::Array(LuaArrayType::from_base_type(LuaType::Integer).into());
-        let second_array = LuaType::Array(LuaArrayType::from_base_type(LuaType::String).into());
-
-        let mut cached_db = DbIndex::new();
-        let cached_owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        add_typed_file_define_member(
-            &mut cached_db,
-            cached_owner.clone(),
-            first_member,
-            key.clone(),
-            first_array.clone(),
-        );
-        let cached_widened = with_analyzer(&mut cached_db, |analyzer| {
-            record_member_collection_assignment_widening_cache(
-                analyzer,
-                &LuaTypeOwner::Member(first_member),
-                &first_array,
-            );
-            add_typed_file_define_member(
-                analyzer.db,
-                cached_owner.clone(),
-                second_member,
-                key.clone(),
-                second_array.clone(),
-            );
-
-            get_cached_widened_member_collection_assignment_type(
-                analyzer,
-                &cached_owner,
-                &key,
-                second_member,
-                &LuaType::String,
-            )
-            .expect("sequential collection assignment should use cache")
-            .expect("cached collection assignment should widen array base")
-        });
-
-        let mut fallback_db = DbIndex::new();
-        let fallback_owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        add_typed_file_define_member(
-            &mut fallback_db,
-            fallback_owner.clone(),
-            first_member,
-            key.clone(),
-            first_array.clone(),
-        );
-        let fallback_widened = with_analyzer(&mut fallback_db, |analyzer| {
-            record_member_collection_assignment_widening_cache(
-                analyzer,
-                &LuaTypeOwner::Member(first_member),
-                &first_array,
-            );
-            add_typed_file_define_member(
-                analyzer.db,
-                fallback_owner.clone(),
-                second_member,
-                key.clone(),
-                second_array.clone(),
-            );
-            add_typed_file_define_member(
-                analyzer.db,
-                fallback_owner,
-                third_member,
-                key,
-                second_array,
-            );
-
-            assert_eq!(
-                get_cached_widened_member_collection_assignment_type(
-                    analyzer,
-                    &LuaMemberOwner::Element(InFiled::new(
-                        FileId::new(0),
-                        TextRange::new(TextSize::new(10), TextSize::new(11)),
-                    )),
-                    &LuaMemberKey::from("items"),
-                    third_member,
-                    &LuaType::String,
-                ),
-                None,
-                "visible-count mismatch should force the fallback scan"
-            );
-
-            get_widened_member_assignment_collection_type(
-                analyzer,
-                &LuaTypeOwner::Member(third_member),
-                &LuaType::Array(LuaArrayType::from_base_type(LuaType::String).into()),
-            )
-            .expect("fallback collection assignment should widen array base")
-        });
-
-        let expected = LuaType::Array(
-            LuaArrayType::from_base_type(TypeOps::Union.apply(
-                &fallback_db,
-                &LuaType::Integer,
-                &LuaType::String,
-            ))
-            .into(),
-        );
-
-        assert_eq!(cached_widened, fallback_widened);
-        assert_eq!(fallback_widened, expected);
-    }
-
-    #[test]
-    fn member_collection_assignment_widening_cache_preserves_first_collection_assignment() {
-        let mut db = DbIndex::new();
-        let owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        let key = LuaMemberKey::from("items");
-        let member_id = member_id_at(1);
-        let array = LuaType::Array(LuaArrayType::from_base_type(LuaType::Integer).into());
-        add_typed_file_define_member(
-            &mut db,
-            owner.clone(),
-            member_id,
-            key.clone(),
-            array.clone(),
-        );
-
-        with_analyzer(&mut db, |analyzer| {
-            let cached = get_cached_widened_member_collection_assignment_type(
-                analyzer,
-                &owner,
-                &key,
-                member_id,
-                &LuaType::Integer,
-            );
-
-            assert_eq!(
-                cached,
-                Some(None),
-                "first visible collection assignment should use the cache path without widening"
-            );
-        });
-    }
-
-    #[test]
-    fn member_collection_assignment_widening_fallback_preserves_first_collection_assignment() {
-        let mut db = DbIndex::new();
-        let owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        let key = LuaMemberKey::from("items");
-        let member_id = member_id_at(1);
-        let array = LuaType::Array(LuaArrayType::from_base_type(LuaType::Integer).into());
-        add_typed_file_define_member(&mut db, owner, member_id, key, array.clone());
-
-        with_analyzer(&mut db, |analyzer| {
-            let widened = get_widened_member_assignment_collection_type(
-                analyzer,
-                &LuaTypeOwner::Member(member_id),
-                &array,
-            );
-
-            assert_eq!(
-                widened, None,
-                "fallback scan without prior compatible collection state should not widen"
-            );
-        });
     }
 
     #[test]
@@ -3769,7 +2903,7 @@ mod tests {
                 initial_array,
             );
 
-            with_analyzer(&mut db, |analyzer| {
+            let writes = with_analyzer(&db, |analyzer| {
                 for additional_base in order {
                     record_pending_dynamic_key_collection_widening(
                         analyzer,
@@ -3779,15 +2913,17 @@ mod tests {
                     );
                 }
                 flush_pending_dynamic_key_collection_widenings(analyzer);
+                std::mem::take(&mut analyzer.log)
+            });
+            for write in &writes {
+                write.apply(&mut db);
+            }
 
-                analyzer
-                    .db
-                    .get_type_index()
-                    .get_type_cache(&LuaTypeOwner::Member(member_id))
-                    .expect("flushed member type")
-                    .as_type()
-                    .clone()
-            })
+            db.get_type_index()
+                .get_type_cache(&LuaTypeOwner::Member(member_id))
+                .expect("flushed member type")
+                .as_type()
+                .clone()
         }
 
         let string_then_boolean = flushed_type_for(&[LuaType::String, LuaType::Boolean]);
@@ -3796,143 +2932,100 @@ mod tests {
         assert_eq!(string_then_boolean, boolean_then_string);
     }
 
-    #[test]
-    fn member_collection_assignment_widening_cache_respects_load_state_masks() {
-        let mut db = DbIndex::new();
-        db.get_gmod_infer_index_mut().set_all_realm_file_metadata(
-            rustc_hash::FxHashMap::from_iter([
-                (
-                    FileId::new(0),
-                    crate::GmodRealmFileMetadata {
-                        load_state_mask: GmodStateMask::CLIENT,
-                        ..Default::default()
-                    },
-                ),
-                (
-                    FileId::new(1),
-                    crate::GmodRealmFileMetadata {
-                        load_state_mask: GmodStateMask::SERVER,
-                        ..Default::default()
-                    },
-                ),
-            ]),
-        );
-
-        let owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        let key = LuaMemberKey::from("items");
-        let first_member = member_id_at_file(FileId::new(0), 1);
-        let second_member = member_id_at_file(FileId::new(1), 3);
-        let first_array = LuaType::Array(LuaArrayType::from_base_type(LuaType::Integer).into());
-        let second_array = LuaType::Array(LuaArrayType::from_base_type(LuaType::String).into());
-        add_typed_file_define_member(
-            &mut db,
-            owner.clone(),
-            first_member,
-            key.clone(),
-            first_array.clone(),
-        );
-
-        with_analyzer_config(&mut db, true, |analyzer| {
-            record_member_collection_assignment_widening_cache(
-                analyzer,
-                &LuaTypeOwner::Member(first_member),
-                &first_array,
-            );
-            add_typed_file_define_member(
-                analyzer.db,
-                owner.clone(),
-                second_member,
-                key.clone(),
-                second_array,
-            );
-
-            let cached = get_cached_widened_member_collection_assignment_type(
-                analyzer,
-                &owner,
-                &key,
-                second_member,
-                &LuaType::String,
-            );
-
-            assert_eq!(
-                cached,
-                Some(None),
-                "client-only and server-only collection assignments must not be widened together"
-            );
-        });
-    }
-
-    #[test]
-    fn member_collection_assignment_widening_cache_tracks_many_same_key_members() {
-        let mut db = DbIndex::new();
-        let owner = LuaMemberOwner::Element(InFiled::new(
-            FileId::new(0),
-            TextRange::new(TextSize::new(10), TextSize::new(11)),
-        ));
-        let key = LuaMemberKey::from("items");
-        let array = LuaType::Array(LuaArrayType::from_base_type(LuaType::String).into());
-
-        with_analyzer(&mut db, |analyzer| {
-            let mut cache_hits = 0;
-            for i in 0..512 {
-                let member_id = member_id_at(i * 2 + 1);
-                add_typed_file_define_member(
-                    analyzer.db,
-                    owner.clone(),
-                    member_id,
-                    key.clone(),
-                    array.clone(),
-                );
-
-                if i > 0 {
-                    assert!(
-                        get_cached_widened_member_collection_assignment_type(
-                            analyzer,
-                            &owner,
-                            &key,
-                            member_id,
-                            &LuaType::String,
-                        )
-                        .is_some(),
-                        "collection cache should stay enabled at member {i}"
-                    );
-                    cache_hits += 1;
-                }
-
-                record_member_collection_assignment_widening_cache(
-                    analyzer,
-                    &LuaTypeOwner::Member(member_id),
-                    &array,
-                );
-            }
-
-            assert_eq!(cache_hits, 511);
-        });
-    }
-
+    /// The classification reads the write's syntax: a computed key the walk
+    /// resolved to a name is still a computed key.
     #[test]
     fn expr_key_members_are_detected_as_dynamic_assignments() {
-        let mut db = DbIndex::new();
-        let member_id = member_id_at(1);
-        add_typed_file_define_member(
-            &mut db,
-            LuaMemberOwner::Element(InFiled::new(
-                FileId::new(0),
-                TextRange::new(TextSize::new(10), TextSize::new(11)),
-            )),
-            member_id,
-            LuaMemberKey::ExprType(LuaType::String),
-            LuaType::Table,
+        let mut ws = crate::VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/keys.lua",
+            "local t = {}\nlocal k = \"named\"\nt[k] = 1\nt.plain = 2\n",
         );
+        let db = ws.analysis.compilation.get_db_mut();
+        let chunk = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("the file's tree")
+            .get_chunk_node();
+        let writes = chunk
+            .descendants::<LuaIndexExpr>()
+            .map(|index_expr| {
+                (
+                    index_expr.syntax().text().to_string(),
+                    LuaMemberId::new(index_expr.get_syntax_id(), file_id),
+                )
+            })
+            .collect::<Vec<_>>();
+        let computed = writes
+            .iter()
+            .find(|(text, _)| text == "t[k]")
+            .expect("t[k]")
+            .1;
+        let plain = writes
+            .iter()
+            .find(|(text, _)| text == "t.plain")
+            .expect("t.plain")
+            .1;
 
-        with_analyzer(&mut db, |analyzer| {
+        with_analyzer(db, |analyzer| {
             assert!(is_dynamic_expr_key_member_assignment(
                 analyzer,
-                &LuaTypeOwner::Member(member_id)
+                &LuaTypeOwner::Member(computed)
+            ));
+            assert!(!is_dynamic_expr_key_member_assignment(
+                analyzer,
+                &LuaTypeOwner::Member(plain)
             ));
         });
+    }
+
+    /// A write of a local through an alias of itself (`local id = data;
+    /// data = id`) derives its type from the slot it fills, like a direct read
+    /// of it: it reads out of the decl.
+    #[test]
+    fn decl_assignment_through_a_local_alias_of_itself_reads_out_of_it() {
+        let mut ws = crate::VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/alias-self-read.lua",
+            r#"
+            local function handle(read, key)
+                local data = read()
+                if key then
+                    local id = data
+                    local first = data[1]
+                    data = id
+                    data = first
+                end
+                return data
+            end
+            "#,
+        );
+
+        let db = ws.analysis.compilation.get_db();
+        let root = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("syntax tree")
+            .get_chunk_node();
+        let references = db
+            .get_reference_index()
+            .get_local_reference(&file_id)
+            .expect("local references");
+        let data_decl = root
+            .descendants::<glua_parser::LuaNameExpr>()
+            .find(|name| name.get_name_text().as_deref() == Some("data"))
+            .and_then(|name| references.get_decl_id(&name.get_range()))
+            .expect("data decl");
+        let assigned = root
+            .descendants::<glua_parser::LuaAssignStat>()
+            .filter_map(|assign| assign.get_var_and_expr_list().1.into_iter().next())
+            .collect::<Vec<_>>();
+
+        assert_eq!(assigned.len(), 2);
+        assert!(
+            assigned
+                .iter()
+                .all(|expr| { super::expr_reads_out_of_decl(db, file_id, data_decl, expr) })
+        );
     }
 }

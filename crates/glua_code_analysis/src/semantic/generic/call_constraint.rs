@@ -8,7 +8,7 @@ use crate::{
     infer_doc_type,
 };
 
-// 泛型约束上下文
+// Generic constraint context
 pub struct CallConstraintContext {
     pub params: Vec<(String, Option<LuaType>)>,
     pub arg_infos: Vec<LuaType>,
@@ -25,7 +25,7 @@ pub fn build_call_constraint_context(
 
     let mut substitutor = TypeSubstitutor::new();
 
-    // 读取显式传入的泛型实参
+    // Read the explicitly passed generic arguments
     if let Some(type_list) = call_expr.get_call_generic_type_list() {
         let doc_ctx =
             DocTypeInferContext::new(semantic_model.get_db(), semantic_model.get_file_id());
@@ -35,7 +35,7 @@ pub fn build_call_constraint_context(
         }
     }
 
-    // 处理冒号调用与函数定义在 self 参数上的差异
+    // Handle the difference between colon calls and function definitions on the self parameter
     match (call_expr.is_colon_call(), doc_func.is_colon_define()) {
         (true, true) | (false, false) => {}
         (false, true) => {
@@ -58,7 +58,7 @@ pub fn build_call_constraint_context(
     ))
 }
 
-// 将推导结果转换为更易比较的形式
+// Convert the inference result into a form that is easier to compare
 pub fn normalize_constraint_type(db: &DbIndex, ty: LuaType) -> LuaType {
     match ty {
         LuaType::Tuple(tuple) if tuple.is_infer_resolve() => tuple.cast_down_array_base(db),
@@ -70,7 +70,7 @@ pub fn normalize_constraint_type(db: &DbIndex, ty: LuaType) -> LuaType {
     }
 }
 
-// 收集各个参数对应的泛型推导
+// Collect the generic inference for each parameter
 fn collect_generic_assignments(
     substitutor: &mut TypeSubstitutor,
     params: &[(String, Option<LuaType>)],
@@ -87,7 +87,7 @@ fn collect_generic_assignments(
     }
 }
 
-// 实际写入泛型替换表
+// Actually write into the generic substitution table
 fn record_generic_assignment(
     param_type: &LuaType,
     arg_type: &LuaType,
@@ -112,7 +112,7 @@ fn record_generic_assignment(
     }
 }
 
-// 解析冒号调用时调用者的具体类型
+// Resolve the concrete type of the caller for colon calls
 fn infer_call_source_type(
     semantic_model: &SemanticModel,
     call_expr: &LuaCallExpr,
@@ -128,12 +128,10 @@ fn infer_call_source_type(
                 && let Some(LuaSemanticDeclId::Member(member_id)) =
                     semantic_model.get_member_origin_owner(member_id)
             {
-                let root = semantic_model
+                let cur_node = semantic_model
                     .get_db()
                     .get_vfs()
-                    .get_syntax_tree(&member_id.file_id)?
-                    .get_red_root();
-                let cur_node = member_id.get_syntax_id().to_node_from_root(&root)?;
+                    .syntax_node_around(&member_id.file_id, *member_id.get_syntax_id())?;
                 let index_expr = LuaIndexExpr::cast(cur_node)?;
 
                 return index_expr.get_prefix_expr().map(|prefix_expr| {
@@ -158,12 +156,10 @@ fn infer_call_source_type(
                 SemanticDeclLevel::default(),
             )?;
             if let LuaSemanticDeclId::Member(member_id) = decl {
-                let root = semantic_model
+                let cur_node = semantic_model
                     .get_db()
                     .get_vfs()
-                    .get_syntax_tree(&member_id.file_id)?
-                    .get_red_root();
-                let cur_node = member_id.get_syntax_id().to_node_from_root(&root)?;
+                    .syntax_node_around(&member_id.file_id, *member_id.get_syntax_id())?;
                 let index_expr = LuaIndexExpr::cast(cur_node)?;
 
                 return index_expr.get_prefix_expr().map(|prefix_expr| {
@@ -181,7 +177,7 @@ fn infer_call_source_type(
     None
 }
 
-// 推导每个实参类型
+// Infer the type of each argument
 fn get_arg_infos(semantic_model: &SemanticModel, call_expr: &LuaCallExpr) -> Option<Vec<LuaType>> {
     let arg_exprs = call_expr.get_args_list()?.get_args().collect::<Vec<_>>();
     let mut arg_infos = infer_expr_list_types(semantic_model, &arg_exprs);
@@ -292,7 +288,7 @@ fn overload_matches_call(
     true
 }
 
-// 获取约束类型
+// Get the constraint type
 fn get_constraint_type(
     semantic_model: &SemanticModel,
     arg_type: &LuaType,
@@ -318,18 +314,18 @@ fn get_union_constraint_type(
     union_type: &LuaUnionType,
     depth: usize,
 ) -> Option<LuaType> {
-    match union_type {
-        LuaUnionType::Nullable(typ) => {
+    match union_type.nullable_inner() {
+        Some(typ) => {
             let constraint_type = get_constraint_type(semantic_model, typ, depth + 1)?;
             Some(TypeOps::Union.apply(semantic_model.get_db(), &constraint_type, &LuaType::Nil))
         }
-        LuaUnionType::Multi(types) => {
+        None => {
             let mut constraint_types = None;
-            for (idx, typ) in types.iter().enumerate() {
+            for (idx, typ) in union_type.types().enumerate() {
                 if let Some(constraint_type) = get_constraint_type(semantic_model, typ, depth + 1) {
                     let constraint_types = constraint_types.get_or_insert_with(|| {
-                        let mut mapped = Vec::with_capacity(types.len());
-                        mapped.extend(types[..idx].iter().cloned());
+                        let mut mapped = Vec::with_capacity(union_type.len());
+                        mapped.extend(union_type.types().take(idx).cloned());
                         mapped
                     });
                     constraint_types.push(constraint_type);
@@ -356,20 +352,26 @@ fn rebuild_constraint_union(
     )
 }
 
-// 将多个表达式推导为具体类型列表
+// Infer multiple expressions into a list of concrete types
 fn infer_expr_list_types(
     semantic_model: &SemanticModel,
     exprs: &[LuaExpr],
 ) -> Vec<(LuaType, LuaExpr)> {
     let mut value_types = Vec::new();
-    for expr in exprs.iter() {
+    for (idx, expr) in exprs.iter().enumerate() {
         let expr_type = semantic_model
             .infer_expr(expr.clone())
             .unwrap_or(LuaType::Unknown);
         match expr_type {
+            // Earlier positions keep only the first value.
+            LuaType::Variadic(variadic) if idx + 1 != exprs.len() => {
+                let first = variadic.get_type(0).cloned().unwrap_or(LuaType::Nil);
+                value_types.push((first, expr.clone()));
+            }
+            // The last expression forwards its whole pack.
             LuaType::Variadic(variadic) => match variadic.deref() {
-                VariadicType::Base(base) => {
-                    value_types.push((base.clone(), expr.clone()));
+                VariadicType::Base(_) => {
+                    value_types.push((LuaType::Variadic(variadic.clone()), expr.clone()));
                 }
                 VariadicType::Multi(vecs) => {
                     for typ in vecs {

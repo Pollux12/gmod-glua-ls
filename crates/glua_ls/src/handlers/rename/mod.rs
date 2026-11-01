@@ -10,8 +10,9 @@ use glua_parser::{
     LuaSyntaxToken, LuaTokenKind,
 };
 use lsp_types::{
-    ClientCapabilities, OneOf, PrepareRenameResponse, RenameOptions, RenameParams,
-    ServerCapabilities, TextDocumentPositionParams, WorkspaceEdit,
+    ClientCapabilities, DocumentChanges, OneOf, OneOf3, OptionalVersionedTextDocumentIdentifier,
+    PrepareRenameResponse, RenameOptions, RenameParams, ServerCapabilities, TextDocumentEdit,
+    TextDocumentPositionParams, WorkspaceEdit,
 };
 use rename_decl::rename_decl_references;
 use rename_member::rename_member_references;
@@ -32,7 +33,43 @@ pub async fn on_rename_handler(
     let analysis = context.read_analysis(&cancel_token).await?;
     let file_id = analysis.get_file_id(&uri)?;
     let position = params.text_document_position.position;
-    rename(&analysis, file_id, position, params.new_name)
+    let edit = rename(&analysis, file_id, position, params.new_name)?;
+    if !context.lsp_features().supports_document_changes() {
+        return Some(edit);
+    }
+    Some(versioned_edit(&analysis, edit))
+}
+
+/// `edit` with each file's edits naming the version of the text they were
+/// computed on, so a client holding newer text refuses them instead of
+/// applying them at shifted places.
+pub(crate) fn versioned_edit(
+    analysis: &glua_code_analysis::EmmyLuaAnalysis,
+    edit: WorkspaceEdit,
+) -> WorkspaceEdit {
+    let vfs = analysis.compilation.get_db().get_vfs();
+    let mut changes = edit
+        .changes
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<Vec<_>>();
+    changes.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+    let document_edits = changes
+        .into_iter()
+        .map(|(uri, edits)| TextDocumentEdit {
+            text_document: OptionalVersionedTextDocumentIdentifier {
+                version: vfs
+                    .get_file_id(&uri)
+                    .and_then(|file_id| vfs.get_file_version(&file_id)),
+                uri,
+            },
+            edits: edits.into_iter().map(OneOf3::Left).collect(),
+        })
+        .collect();
+    WorkspaceEdit {
+        document_changes: Some(DocumentChanges::Edits(document_edits)),
+        ..Default::default()
+    }
 }
 
 pub async fn on_prepare_rename_handler(
@@ -54,8 +91,7 @@ pub fn prepare_rename(
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
     let root = semantic_model.get_root();
     let document = semantic_model.get_document();
-    let position_offset =
-        document.get_offset(position.line as usize, position.character as usize)?;
+    let position_offset = document.to_offset(position);
 
     if position_offset > root.syntax().text_range().end() {
         return None;
@@ -103,7 +139,7 @@ pub fn rename(
     let root = semantic_model.get_root();
     let position_offset = {
         let document = semantic_model.get_document();
-        document.get_offset(position.line as usize, position.character as usize)?
+        document.to_offset(position)
     };
 
     if position_offset > root.syntax().text_range().end() {
@@ -137,17 +173,17 @@ fn find_rename_target(
     }
 }
 
-/// A colon method's `self` is implicit: there is no declaration to carry the
-/// new name, so the edit would only break the code. A written `self` — an
-/// explicit parameter, or a `local self = self` capture — has one and renames
-/// normally.
+/// A colon method's `self` and the `BaseClass` a `DEFINE_BASECLASS` call
+/// declares are implicit: there is no declaration to carry the new name, so
+/// the edit would only break the code. A written `self` — an explicit
+/// parameter, or a `local self = self` capture — has one and renames normally.
 fn is_unrenameable(semantic_model: &SemanticModel, semantic_decl: &LuaSemanticDeclId) -> bool {
     let LuaSemanticDeclId::LuaDecl(decl_id) = semantic_decl else {
         return false;
     };
 
     match semantic_model.get_db().get_decl_index().get_decl(decl_id) {
-        Some(decl) => decl.is_implicit_self(),
+        Some(decl) => decl.is_implicit_self() || decl.is_macro_local(),
         None => true,
     }
 }

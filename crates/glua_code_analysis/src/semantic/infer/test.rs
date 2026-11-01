@@ -86,6 +86,269 @@ mod test {
     }
 
     #[test]
+    fn ternary_idiom_yields_both_branches_whatever_the_condition() {
+        let mut ws = VirtualWorkspace::new();
+        let file = ws.def_file(
+            "addons/ternary/lua/autorun/sh_ternary.lua",
+            r#"
+            local function pick(condition)
+                local chosen = condition and "first" or "second"
+                return chosen
+            end
+            "#,
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "chosen"),
+            LuaType::Union(
+                LuaUnionType::from_vec(vec![
+                    LuaType::StringConst(smol_str::SmolStr::new("first").into()),
+                    LuaType::StringConst(smol_str::SmolStr::new("second").into()),
+                ])
+                .into()
+            )
+        );
+    }
+
+    #[test]
+    fn pairs_over_a_value_that_may_be_a_string_enumerates_only_its_table_arm() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "addons/pairs_string/lua/autorun/sh_pairs_string.lua",
+            r#"
+            ---@param list string|table
+            local function each(list)
+                for key, value in pairs(list) do
+                    print(key, value)
+                end
+            end
+            "#,
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "key"),
+            LuaType::Any
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "value"),
+            LuaType::Any
+        );
+    }
+
+    #[test]
+    fn arithmetic_on_a_value_that_may_be_nil_yields_what_its_other_arms_yield() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "addons/arith_nil/lua/autorun/sh_arith_nil.lua",
+            r#"
+            ---@param time number?
+            local function scale(time)
+                local scaled = time * 0.75
+                local reduced = time - 1
+                return scaled, reduced
+            end
+            "#,
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "scaled"),
+            LuaType::Number
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "reduced"),
+            LuaType::Number
+        );
+    }
+
+    #[test]
+    fn arithmetic_on_a_value_that_may_be_nil_keeps_what_an_operator_taking_nil_yields() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "addons/arith_nil_op/lua/autorun/sh_arith_nil_op.lua",
+            r#"
+            ---@class Factor
+            ---@operator mul(number): number
+            ---@operator mul(nil): string
+
+            ---@param value number?
+            ---@param factor Factor
+            local function multiply(value, factor)
+                local product = value * factor
+                return product
+            end
+            "#,
+        );
+        let product = infer_last_name_expr_type_in_file(&ws, file, "product");
+        let expected = ws.ty("number|string");
+        assert_eq!(ws.humanize_type(product), ws.humanize_type(expected));
+    }
+
+    #[test]
+    fn arithmetic_between_an_unresolved_operand_and_a_class_picks_no_operator_overload() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "addons/arith_unresolved/lua/autorun/sh_arith_unresolved.lua",
+            r#"
+            ---@class Offset
+            ---@class Frame
+            ---@operator mul(Offset): Offset
+            ---@operator mul(Frame): Frame
+
+            ---@param frame Frame
+            local function combine(unresolved, frame)
+                local scaled = unresolved * frame
+                local scaled_back = frame * unresolved
+                return scaled, scaled_back
+            end
+            "#,
+        );
+        for name in ["scaled", "scaled_back"] {
+            let typ = infer_last_name_expr_type_in_file(&ws, file, name);
+            assert!(
+                typ.is_unknown(),
+                "{name} should stay unresolved, got {typ:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arithmetic_between_two_resolved_class_operands_still_picks_the_matching_overload() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "addons/arith_resolved/lua/autorun/sh_arith_resolved.lua",
+            r#"
+            ---@class Offset2
+            ---@class Frame2
+            ---@operator mul(Offset2): Offset2
+            ---@operator mul(Frame2): Frame2
+
+            ---@param frame Frame2
+            ---@param other Frame2
+            local function combine(frame, other)
+                local combined = frame * other
+                return combined
+            end
+            "#,
+        );
+        let typ = infer_last_name_expr_type_in_file(&ws, file, "combined");
+        assert_eq!(ws.humanize_type(typ), "Frame2");
+    }
+
+    #[test]
+    fn pairs_over_an_alias_that_may_be_a_string_enumerates_only_its_table_arm() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "addons/pairs_string_alias/lua/autorun/sh_pairs_string_alias.lua",
+            r#"
+            ---@alias List string|table
+            ---@param list List
+            local function each(list)
+                for key, value in pairs(list) do
+                    print(key, value)
+                end
+            end
+            "#,
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "key"),
+            LuaType::Any
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "value"),
+            LuaType::Any
+        );
+    }
+
+    #[test]
+    fn arithmetic_with_a_nullable_operand_keeps_what_its_operator_taking_nil_yields() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "addons/arith_nil_op2/lua/autorun/sh_arith_nil_op2.lua",
+            r#"
+            ---@class Factor2
+            ---@operator mul(number): number
+            ---@operator mul(nil): string
+
+            ---@param value number?
+            ---@param factor Factor2?
+            local function multiply(value, factor)
+                local product = value * factor
+                return product
+            end
+            "#,
+        );
+        let product = infer_last_name_expr_type_in_file(&ws, file, "product");
+        let rendered = ws.humanize_type(product);
+        assert!(rendered.contains("string"), "{rendered}");
+    }
+
+    #[test]
+    fn pairs_over_an_alias_of_an_aliased_string_enumerates_only_its_table_arm() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "addons/pairs_string_alias2/lua/autorun/sh_pairs_string_alias2.lua",
+            r#"
+            ---@alias Text string
+            ---@alias Items Text|table
+            ---@param list Items
+            local function each(list)
+                for key, value in pairs(list) do
+                    print(key, value)
+                end
+            end
+            "#,
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "value"),
+            LuaType::Any
+        );
+    }
+
+    #[test]
+    fn addition_with_a_nullable_operand_keeps_what_its_operator_taking_nil_yields() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "addons/add_nil_op/lua/autorun/sh_add_nil_op.lua",
+            r#"
+            ---@class Offset
+            ---@operator add(number): number
+            ---@operator add(nil): string
+
+            ---@param value number?
+            ---@param offset Offset?
+            local function shift(value, offset)
+                local sum = value + offset
+                return sum
+            end
+            "#,
+        );
+        let sum = infer_last_name_expr_type_in_file(&ws, file, "sum");
+        let expected = ws.ty("number|string");
+        assert_eq!(ws.humanize_type(sum), ws.humanize_type(expected));
+    }
+
+    #[test]
+    fn direct_param_return_alias_returns_one_actual_argument_value() {
+        let mut ws = VirtualWorkspace::new();
+        let file = ws.def_file(
+            "addons/return_arity/lua/autorun/sh_identity.lua",
+            r#"
+            local function pair() return 1, "extra" end
+            local function identity(value) return value end
+            local function one() return 1 end
+            local a, b = identity(pair())
+            local c, d = one()
+            print(a, b, c, d)
+            "#,
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "a"),
+            LuaType::IntegerConst(1)
+        );
+        assert_eq!(
+            infer_last_name_expr_type_in_file(&ws, file, "b"),
+            infer_last_name_expr_type_in_file(&ws, file, "d")
+        );
+    }
+
+    #[test]
     fn test_custom_binary() {
         let mut ws = VirtualWorkspace::new();
 
@@ -159,10 +422,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@class Entity
             ---@field health integer
 
@@ -170,9 +434,10 @@ mod test {
             ---@return TypeGuard<any>
             function _G.IsValid(obj) end
             "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         // Cached aliases of the global helper should still narrow.
         assert!(ws.check_code_for(
@@ -489,7 +754,7 @@ mod test {
     }
 
     #[test]
-    fn test_istable_guard_does_not_broaden_incompatible_known_type() {
+    fn test_istable_guard_narrows_an_incompatible_known_type_to_table() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         ws.def_gmod_type_predicates();
 
@@ -506,11 +771,11 @@ mod test {
             "value",
         );
 
-        assert_eq!(ty, ws.ty("string"));
+        assert_eq!(ty, LuaType::Table);
     }
 
     #[test]
-    fn test_istable_guard_preserves_unannotated_string_const_initializer() {
+    fn test_istable_guard_narrows_an_unannotated_string_const_initializer_to_table() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         ws.def_gmod_type_predicates();
 
@@ -526,7 +791,7 @@ mod test {
             "value",
         );
 
-        assert_eq!(ty, LuaType::StringConst(smol_str::SmolStr::new("x").into()));
+        assert_eq!(ty, LuaType::Table);
     }
 
     #[test]
@@ -836,7 +1101,7 @@ mod test {
             "value",
         );
 
-        assert_eq!(ty, ws.ty("boolean|unknown"));
+        assert_eq!(ty, ws.ty("boolean|any"));
     }
 
     #[test]
@@ -968,7 +1233,7 @@ mod test {
             "lua/glide/client/network.lua",
             r#"
             ---@class Vector
-            local Vector = {}
+            local VectorMeta = {}
             ---@return Vector
             function _G.Vector() end
 
@@ -1311,6 +1576,7 @@ mod test {
             &missing_key,
             file_id,
             None,
+            None,
         );
         assert!(
             matches!(missing_lookup, Err(InferFailReason::FieldNotFound)),
@@ -1323,6 +1589,7 @@ mod test {
             LuaMemberOwner::Element(table_id),
             &existing_key,
             file_id,
+            None,
             None,
         );
         assert!(
@@ -1590,5 +1857,124 @@ mod test {
         );
 
         assert_eq!(ws.expr_ty("cycleValue.missingField"), LuaType::Nil);
+    }
+
+    #[test]
+    fn test_dynamic_read_unions_exact_dynamic_writer_with_literal_keyed_siblings() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "shared/sh_property.lua",
+            r#"
+            property = property or {}
+            property.owner = property.owner or {}
+            "#,
+        );
+        ws.def_file(
+            "shared/map_a.lua",
+            r#"
+            property.owner[1] = "Public Area"
+            property.owner[2] = "Owned by the Government"
+            "#,
+        );
+        ws.def_file(
+            "server/sv_buy.lua",
+            r#"
+            local function buy(propertynumber)
+                local uniqueID = 1234
+                property.owner[propertynumber] = uniqueID
+            end
+            "#,
+        );
+        let reader = ws.def_file(
+            "shared/sh_reader.lua",
+            r#"
+            local function sync(propertynumber)
+                local owner = property.owner[propertynumber]
+            end
+            "#,
+        );
+
+        let ty =
+            infer_index_expr_type_by_text_in_file(&ws, reader, "property.owner[propertynumber]");
+        let LuaType::Union(union) = &ty else {
+            panic!("expected a union of every writer, got {ty:?}");
+        };
+        let arms = union.types().cloned().collect::<Vec<_>>();
+        assert!(
+            arms.iter()
+                .any(|arm| matches!(arm, LuaType::String | LuaType::StringConst(_))),
+            "missing the literal-keyed string writers: {ty:?}"
+        );
+        assert!(
+            arms.iter()
+                .any(|arm| matches!(arm, LuaType::Integer | LuaType::IntegerConst(_))),
+            "missing the dynamic-keyed integer writer: {ty:?}"
+        );
+    }
+
+    #[test]
+    fn test_member_bound_from_sibling_merge_takes_the_settled_writer_set() {
+        let mut ws = VirtualWorkspace::new();
+        let file_ids = ws.def_files(vec![
+            (
+                "shared/sh_property.lua",
+                r#"
+                property = property or {}
+                property.owner = property.owner or {}
+                "#,
+            ),
+            (
+                "shared/map_a.lua",
+                r#"
+                property.owner[1] = "Public Area"
+                "#,
+            ),
+            (
+                "server/sv_buy.lua",
+                r#"
+                local function buy(propertynumber)
+                    local uniqueID = 1234
+                    property.owner[propertynumber] = uniqueID
+                end
+                "#,
+            ),
+            (
+                "shared/sh_reader.lua",
+                r#"
+                local function sync(propertynumber)
+                    local access = { owner = property.owner[propertynumber] }
+                end
+                "#,
+            ),
+        ]);
+        let reader = *file_ids.last().expect("reader file");
+
+        let db = ws.analysis.compilation.get_db();
+        let member = db
+            .get_member_index()
+            .get_file_members(reader)
+            .into_iter()
+            .find(|member| member.get_key() == &LuaMemberKey::Name("owner".into()))
+            .expect("the table field member");
+        let cached = db
+            .get_type_index()
+            .get_type_cache(&member.get_id().into())
+            .expect("the table field cache")
+            .as_type()
+            .clone();
+        let LuaType::Union(union) = &cached else {
+            panic!("expected every writer in the settled cache, got {cached:?}");
+        };
+        let arms = union.types().cloned().collect::<Vec<_>>();
+        assert!(
+            arms.iter()
+                .any(|arm| matches!(arm, LuaType::String | LuaType::StringConst(_))),
+            "missing the literal-keyed string writer: {cached:?}"
+        );
+        assert!(
+            arms.iter()
+                .any(|arm| matches!(arm, LuaType::Integer | LuaType::IntegerConst(_))),
+            "missing the computed-key integer writer attached after the walk: {cached:?}"
+        );
     }
 }

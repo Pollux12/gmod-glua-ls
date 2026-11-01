@@ -21,7 +21,7 @@ use crate::handlers::hover::function::{
     build_function_hover, format_doc_default_value, is_function,
 };
 use crate::handlers::hover::humanize_type_decl::build_type_decl_hover;
-use crate::handlers::hover::humanize_types::hover_humanize_type;
+use crate::handlers::hover::humanize_types::{hover_humanize_type, infer_property_owner_realm};
 
 use super::{
     color_swatch::color_swatch_markdown,
@@ -54,15 +54,27 @@ pub fn build_semantic_info_hover(
     };
     let typ = assignment_type.unwrap_or_else(|| semantic_info.display_typ().clone());
     let type_label = HoverTypeLabel::from_semantic_origin(semantic_info.origin);
-    if semantic_info.semantic_decl.is_none() {
+    let Some(semantic_decl) = semantic_info.semantic_decl else {
+        if let Some(hover) = build_subtype_member_hover(
+            compilation,
+            semantic_model,
+            db,
+            document,
+            &token,
+            range,
+            render_level,
+        ) {
+            return Some(hover);
+        }
         return build_hover_without_property(db, semantic_model, document, token, typ, type_label);
-    }
+    };
+    let typ = other_realm_member_type(semantic_model, &token, &semantic_decl, typ);
     let hover_builder = build_hover_content(
         compilation,
         semantic_model,
         db,
-        Some(typ.clone()),
-        semantic_info.semantic_decl.unwrap(),
+        Some(typ),
+        semantic_decl,
         false,
         Some(token.clone()),
         render_level,
@@ -80,6 +92,82 @@ pub fn build_semantic_info_hover(
         hover_builder.build_hover_result(document.to_lsp_range(range))
     } else {
         None
+    }
+}
+
+/// The hover for a member its receiver's class lacks but subtypes define:
+/// the first subtype's member, with the classes that define it.
+fn build_subtype_member_hover(
+    compilation: &LuaCompilation,
+    semantic_model: &SemanticModel,
+    db: &DbIndex,
+    document: &LuaDocument,
+    token: &LuaSyntaxToken,
+    range: TextRange,
+    render_level: Option<RenderLevel>,
+) -> Option<Hover> {
+    let index_expr = token.parent().and_then(LuaIndexExpr::cast)?;
+    if index_expr.get_index_name_token()?.text_range() != token.text_range() {
+        return None;
+    }
+    let (LuaType::Ref(type_id) | LuaType::Def(type_id)) = semantic_model
+        .infer_expr(index_expr.get_prefix_expr()?)
+        .ok()?
+    else {
+        return None;
+    };
+    let key = LuaMemberKey::Name(token.text().into());
+    let members = semantic_model.get_subtype_members_for_key(&type_id, &key);
+    let (_, member_id) = members.first()?;
+    let mut hover_builder = build_hover_content(
+        compilation,
+        semantic_model,
+        db,
+        Some(semantic_model.get_type((*member_id).into())),
+        LuaSemanticDeclId::Member(*member_id),
+        false,
+        Some(token.clone()),
+        render_level,
+        HoverTypeLabel::Plain,
+    )?;
+    let owners = members
+        .iter()
+        .map(|(owner, _)| format!("`{}`", owner.get_name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    hover_builder.add_annotation_description(format!(
+        "`{}` is not defined on `{}`. Defined on {owners}.",
+        token.text(),
+        type_id.get_name()
+    ));
+    hover_builder.build_hover_result(document.to_lsp_range(range))
+}
+
+/// The type to show for a member access that reads `typ`. An access whose
+/// realm cannot reach the member's only definition reads `nil`, yet it names
+/// that definition, so the hover shows the definition's type.
+fn other_realm_member_type(
+    semantic_model: &SemanticModel,
+    token: &LuaSyntaxToken,
+    semantic_decl: &LuaSemanticDeclId,
+    typ: LuaType,
+) -> LuaType {
+    let LuaSemanticDeclId::Member(member_id) = semantic_decl else {
+        return typ;
+    };
+    if !typ.is_nil() {
+        return typ;
+    }
+    let access_realm = semantic_model
+        .get_db()
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&semantic_model.get_file_id(), token.text_range().start());
+    let reachable = infer_property_owner_realm(semantic_model, semantic_decl)
+        .is_none_or(|member_realm| access_realm.is_compatible_with(member_realm));
+    if reachable {
+        typ
+    } else {
+        semantic_model.get_type((*member_id).into())
     }
 }
 
@@ -141,7 +229,14 @@ fn build_hover_without_property(
     let render_level = RenderLevel::Detailed;
 
     let type_text = humanize_type(db, &typ, render_level);
-    let hover = format_type_label_hover(type_label, type_text);
+    let hover = if token.kind() == LuaTokenKind::TkName.into() {
+        format!(
+            "```lua\n{}: {type_text}\n```",
+            type_label.format(token.text().to_string())
+        )
+    } else {
+        format_type_label_hover(type_label, type_text)
+    };
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: lsp_types::MarkupKind::Markdown,
@@ -314,7 +409,7 @@ fn build_decl_hover(
         find_decl_origin_owners(builder.compilation, builder.semantic_model, decl_id)
             .get_types(builder.semantic_model);
 
-    // 处理类型签名
+    // Handle the type signature
     if is_function(&typ) && !builder.type_label().is_inferred() {
         adjust_semantic_decls(
             builder,
@@ -323,7 +418,7 @@ fn build_decl_hover(
             &typ,
         );
 
-        // 处理函数类型
+        // Handle function types
         build_function_hover(builder, db, &semantic_decls);
         // hover_function_type(builder, db, &semantic_decls);
 
@@ -335,7 +430,7 @@ fn build_decl_hover(
             builder.set_location_path(member);
         }
 
-        // `typ`此时可能是泛型实例化后的类型, 所以我们需要从member获取原始类型
+        // `typ` may be a generic-instantiated type here, so the original type must be fetched from member
         builder
             .add_signature_params_rets_description(builder.semantic_model.get_type(decl_id.into()));
     } else {
@@ -372,7 +467,7 @@ fn build_decl_hover(
             builder.set_type_description(builder.format_type_description(description));
         }
 
-        // 添加注释文本
+        // Add the comment text
         let mut semantic_decl_set = HashSet::new();
         let decl_decl = LuaSemanticDeclId::LuaDecl(decl_id);
         semantic_decl_set.insert(&decl_decl);
@@ -465,7 +560,7 @@ fn resolve_decl_default_display(builder: &HoverBuilder, decl_id: LuaDeclId) -> S
     let use_site_realm = db
         .get_gmod_infer_index()
         .get_realm_at_offset(&file_id, trigger_token.text_range().start());
-    cache.flow_query_realm = Some(use_site_realm);
+    cache.set_query_realm(Some(use_site_realm));
 
     // 1. Explicit param default from signature metadata.
     if let Some(decl) = db.get_decl_index().get_decl(&decl_id) {
@@ -597,7 +692,7 @@ fn build_member_hover(
 
         builder.set_location_path(Some(member));
 
-        // `typ`此时可能是泛型实例化后的类型, 所以我们需要从member获取原始类型
+        // `typ` may be a generic-instantiated type here, so the original type must be fetched from member
         let mut has_signature_docs = false;
         let current_signature_type = builder.semantic_model.get_type(member.get_id().into());
         let before_len = builder.annotation_description.len();
@@ -664,7 +759,7 @@ fn build_member_hover(
             builder.set_location_path(Some(member));
         }
 
-        // 添加注释文本
+        // Add the comment text
         let mut semantic_decl_set = HashSet::new();
         let member_decl = LuaSemanticDeclId::Member(member.get_id());
         semantic_decl_set.insert(&member_decl);
@@ -813,7 +908,7 @@ fn get_vgui_panel_name(db: &DbIndex, typ: &LuaType) -> Option<(String, Option<St
             let type_name = type_decl_id.get_simple_name();
             let base_name = db
                 .get_gmod_class_metadata_index()
-                .get_vgui_panel_base(type_name)?;
+                .get_vgui_panel_base(db.get_vfs(), type_name)?;
             Some((type_name.to_string(), base_name))
         }
         LuaType::Generic(generic) => {
@@ -821,7 +916,7 @@ fn get_vgui_panel_name(db: &DbIndex, typ: &LuaType) -> Option<(String, Option<St
             let type_name = type_decl_id.get_simple_name();
             let base_name = db
                 .get_gmod_class_metadata_index()
-                .get_vgui_panel_base(type_name)?;
+                .get_vgui_panel_base(db.get_vfs(), type_name)?;
             Some((type_name.to_string(), base_name))
         }
         LuaType::Instance(instance) => get_vgui_panel_name(db, instance.get_base()),
@@ -854,8 +949,9 @@ fn extend_gmod_hook_semantic_decls(
         return;
     };
 
-    let fallback_owner_names = gmod_hook_owner_fallbacks(owner_type_decl_id.get_simple_name());
-    if fallback_owner_names.is_empty() {
+    let owner_name = owner_type_decl_id.get_simple_name();
+    let hook_owners = glua_code_analysis::gmod_hook_owner_group_of(db, owner_type_decl_id);
+    if hook_owners.is_empty() {
         return;
     }
 
@@ -872,8 +968,16 @@ fn extend_gmod_hook_semantic_decls(
         semantic_decls,
     );
 
-    for fallback_owner_name in fallback_owner_names {
-        let fallback_type = LuaType::Ref(LuaTypeDeclId::global(fallback_owner_name));
+    // The owner's own definitions are the same-owner ones above.
+    for fallback_owner_name in hook_owners
+        .iter()
+        .filter(|name| !name.eq_ignore_ascii_case(owner_name))
+    {
+        let fallback_type = LuaType::Ref(
+            builder
+                .semantic_model
+                .resolve_global_class(fallback_owner_name),
+        );
         let member_infos = match trigger_position {
             Some(trigger_position) => builder.semantic_model.get_member_info_with_key_at_offset(
                 &fallback_type,
@@ -1034,18 +1138,6 @@ fn extend_gmod_hook_same_owner_semantic_decls(
         .filter(|(priority, _, _)| *priority == best_priority)
     {
         semantic_decls.push((same_owner_decl, owner_type));
-    }
-}
-
-fn gmod_hook_owner_fallbacks(owner_name: &str) -> &'static [&'static str] {
-    if owner_name.eq_ignore_ascii_case("GM") || owner_name.eq_ignore_ascii_case("GAMEMODE") {
-        &["SANDBOX"]
-    } else if owner_name.eq_ignore_ascii_case("PLUGIN") {
-        &["GM", "GAMEMODE", "SANDBOX"]
-    } else if owner_name.eq_ignore_ascii_case("SANDBOX") {
-        &["GM", "GAMEMODE"]
-    } else {
-        &[]
     }
 }
 
@@ -1214,22 +1306,22 @@ fn adjust_semantic_decls(
         return Some(());
     }
 
-    // semantic_decls 是追溯最初定义的结果, 不包含当前内容
+    // semantic_decls is the result of tracing the original definition and does not include the current content
     let current_len = semantic_decls.len();
     if current_len == 0 {
-        // 没有最初定义, 直接添加原始内容
+        // No original definition, add the original content directly
         semantic_decls.push((current_semantic_decl_id.clone(), current_type.clone()));
         return Some(());
     }
-    // 此时有最初定义, 证明当前内容的是派生的或者全部项实例化后联合的结果, 非常难以区分
-    // 如果当前定义是 LuaDecl 且追溯到了最初定义, 那么我们不需要添加
+    // With an original definition, the current content is derived or a union of all instantiated items, which is hard to tell apart
+    // If the current definition is a LuaDecl and the original definition was traced, it need not be added
     if let LuaSemanticDeclId::LuaDecl(_) = current_semantic_decl_id {
         return Some(());
     }
 
-    // 如果当前定义在最初定义组中存在, 那么我们也不需要添加.
-    // 具有一个难以解决的问题, 返回的`current_semantic_decl_id`为 member 时, 不一定是当前 token 指向的内容, 因此我们还需要再做一层判断,
-    // 如果是具有实际定义的, 我们仍然需要添加, 例如 signature.
+    // If the current definition exists in the original definition group, it also need not be added.
+    // There is a hard problem: when the returned `current_semantic_decl_id` is a member, it is not necessarily what the current token points to, so another check is needed;
+    // if it has an actual definition, it still needs to be added, e.g. signature.
     // Also exclude Unknown types: a legacy-module `NameExpr` member has its type bound to the
     // LuaDecl owner (not the Member owner), so the member's cached type is Unknown. In that case
     // we must still add the current Signature type so hover can render the function properly.
@@ -1266,7 +1358,7 @@ fn has_add_to_semantic_decls(
                 let table_expr = LuaTableExpr::cast(parent)?;
                 let table_type = semantic_model.infer_table_should_be(table_expr.clone())?;
                 if matches!(table_type, LuaType::Ref(_) | LuaType::Generic(_)) {
-                    // 如果位于函数调用中, 则不添加
+                    // Not added when inside a function call
                     let is_in_call = table_expr.ancestors::<LuaCallArgList>().next().is_some();
                     return Some(!is_in_call);
                 }

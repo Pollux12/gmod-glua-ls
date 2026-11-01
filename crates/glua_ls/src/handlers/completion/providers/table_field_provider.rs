@@ -26,7 +26,7 @@ fn add_table_field_key_completion(builder: &mut CompletionBuilder) -> Option<()>
     if !can_add_key_completion(builder) {
         return None;
     }
-    // 出现以下情况则代表是补全 value
+    // In the following cases completion is for a value
     let prev_token = builder.trigger_token.prev_token()?;
     if builder.trigger_token.kind() == LuaKind::Token(LuaTokenKind::TkWhitespace)
         && prev_token.kind() == LuaKind::Token(LuaTokenKind::TkAssign)
@@ -116,7 +116,7 @@ fn add_field_key_completion(
                 Some(InsertTextFormat::SNIPPET),
             )
         } else {
-            // 函数类型不补空格, 留空格让用户触发字符补全
+            // No space after function types; leave the space for the user to trigger character completion
             let space = if typ.is_function() { "" } else { " " };
             (
                 format!(
@@ -160,7 +160,7 @@ fn add_field_key_completion(
     Some(())
 }
 
-/// 是否在当前文件的 env 中, 将会排除掉`std`
+/// Whether it is in the env of the current file; `std` is excluded
 fn in_env(builder: &mut CompletionBuilder, target_name: &str, target_type: &LuaType) -> Option<()> {
     let file_id = builder.semantic_model.get_file_id();
     let decl_tree = builder
@@ -206,7 +206,7 @@ fn in_env(builder: &mut CompletionBuilder, target_name: &str, target_type: &LuaT
                     .unwrap_or(LuaType::Unknown),
             )
         };
-        // 必须要名称相同 + 类型兼容
+        // The name must be the same and the type compatible
         if name == target_name && builder.semantic_model.type_check(target_type, &typ).is_ok() {
             return Some(());
         }
@@ -218,7 +218,7 @@ fn add_table_field_value_completion(builder: &mut CompletionBuilder) -> Option<(
     if builder.is_cancelled() {
         return None;
     }
-    // 仅在 value 为空的时候触发
+    // Only trigger when value is empty
     let mut parent = if builder.trigger_token.kind() == LuaTokenKind::TkWhitespace.into() {
         builder.trigger_token.prev_token()?.parent()?
     } else {
@@ -241,7 +241,7 @@ fn add_table_field_value_completion(builder: &mut CompletionBuilder) -> Option<(
                     let member_info = member_infos.iter().find(|m| m.key == key)?;
 
                     if add_field_value_completion(builder, member_info.clone()).is_some() {
-                        // 如果添加了补全项, 则停止
+                        // Stop if a completion item was added
                         builder.stop_here();
                     }
                 } else {

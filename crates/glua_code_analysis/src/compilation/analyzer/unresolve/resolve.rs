@@ -5,142 +5,51 @@ use std::{
 };
 
 use glua_parser::{
-    BinaryOperator, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaLocalStat,
-    LuaTableExpr, LuaTableField, PathTrait,
+    BinaryOperator, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaTableExpr,
+    LuaTableField, PathTrait,
 };
-use internment::ArcIntern;
 use rowan::TextSize;
 
+use crate::semantic::{semantic_decl_closure_signature_id, semantic_decl_value_expr};
 use crate::{
-    DbIndex, FileId, InFiled, InferFailReason, LuaDeclId, LuaDeclOrMemberId, LuaDeclTypeKind,
-    LuaDocReturnInfo, LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
-    LuaInferenceProvenanceKind, LuaInferenceStep, LuaMember, LuaMemberId, LuaMemberInfo,
-    LuaMemberKey, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType,
-    LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFact, LuaTypeFlag, LuaTypeOwner,
-    OperatorFunction, RenderLevel, ReturnTypeKind, SemanticDeclLevel, SignatureReturnStatus,
-    TypeOps, VariadicType,
+    DbIndex, FileId, GlobalId, InferFailReason, LuaDeclId, LuaDeclOrMemberId, LuaDeclTypeKind,
+    LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaOperator,
+    LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl,
+    LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel, ReturnTypeKind,
+    SemanticDeclLevel, SignatureReturnStatus, TypeOps, VariadicType,
     compilation::analyzer::{
-        call_site_params::{
-            exact_receiver_type_is_usable, infer_supported_call_site_arg_type,
-            snapshot_callback_table_type,
-        },
         common::{
-            TypeCacheWriteMode, add_member, bind_resolved_type, bind_type,
-            holds_unbound_iter_template, write_type_cache,
+            DeclWrite, TypeCacheWriteMode, add_member, bind_decl_write, bind_resolved_type,
+            holds_unbound_iter_template,
         },
         lua::{
-            analyze_return_correlations, analyze_return_point, compute_module_semantic_id,
-            has_multiple_distinct_index_expr_member_owners, infer_for_range_iter_expr_func,
-            is_guarded_table_assignment_index_expr, preserve_guarded_table_assignment_members,
+            IterVarInference, alias_target_global_path, compute_module_semantic_id,
+            derive_inferred_return_with_reads, has_multiple_distinct_index_expr_member_owners,
+            is_guarded_table_assignment_index_expr, mark_resolved_member_assignment,
             resolve_index_expr_member_owner_for_file,
         },
         unresolve::UnResolveSpecialCall,
     },
     db_index::{
         LuaFunctionType, LuaMemberFeature, LuaMemberOwner, LuaOutParamRoot, LuaSignature,
-        LuaSignatureId,
+        LuaSignatureId, SpecialCallFact, derivation::StageRule,
     },
-    find_members_with_key, get_member_value_expr, humanize_type,
+    find_members_with_key, humanize_type,
     semantic::{
         InferGuard, LuaInferCache, SelfRefId, SemanticDeclGuard, VarRefId, VarRefRootId,
         get_var_expr_var_ref_id, infer_call_expr_func, infer_expr, resolve_dynamic_field_member,
         try_infer_expr_semantic_decl,
     },
 };
-use smol_str::SmolStr;
 
 use super::{
-    CallSiteContributionKind, ResolveResult, UnResolveCallSiteContribution, UnResolveDecl,
-    UnResolveIterVar, UnResolveMember, UnResolveModule, UnResolveModuleRef, UnResolveReturn,
-    UnResolveTableField, resolve_closure::inferred_return_tail_matching_documented_first,
+    ResolveResult, UnResolveDecl, UnResolveMember, UnResolveModule, UnResolveReturn,
+    resolve_closure::inferred_return_tail_matching_documented_first, writes::ResolveWrites,
 };
 
-/// Re-derive one call-site parameter contribution whose type was not
-/// buildable when its file was walked, and merge it into that file's
-/// contribution set.
-pub fn try_resolve_call_site_contribution(
-    db: &mut DbIndex,
-    cache: &mut LuaInferCache,
-    contribution: &mut UnResolveCallSiteContribution,
-) -> ResolveResult {
-    let Some(expr) = db
-        .get_vfs()
-        .get_syntax_tree(&contribution.expr_file_id)
-        .map(|tree| tree.get_red_root())
-        .and_then(|root| contribution.expr_syntax_id.to_node_from_root(&root))
-        .and_then(LuaExpr::cast)
-    else {
-        return Err(InferFailReason::None);
-    };
-    let Ok(param_idx) = u16::try_from(contribution.param_idx) else {
-        return Err(InferFailReason::None);
-    };
-
-    let (typ, confidence, provenance_kind, carries_inferred_type) = match contribution.kind {
-        CallSiteContributionKind::ExactReceiver => {
-            let typ = infer_expr(db, cache, expr)?;
-            if !exact_receiver_type_is_usable(&typ) {
-                return Err(InferFailReason::None);
-            }
-            (
-                typ,
-                LuaInferenceConfidence::Anchored,
-                LuaInferenceProvenanceKind::ContextualUnknown,
-                true,
-            )
-        }
-        CallSiteContributionKind::Argument => {
-            let typ =
-                infer_supported_call_site_arg_type(db, cache, contribution.expr_file_id, expr)?;
-            if typ.is_unknown() || typ.is_never() {
-                return Err(InferFailReason::None);
-            }
-            (
-                typ,
-                LuaInferenceConfidence::Anchored,
-                LuaInferenceProvenanceKind::ContextualUnknown,
-                true,
-            )
-        }
-        CallSiteContributionKind::CallbackTable => {
-            let inferred = infer_expr(db, cache, expr)?;
-            let Some(typ) = snapshot_callback_table_type(db, &inferred) else {
-                return Err(InferFailReason::None);
-            };
-            (
-                typ,
-                LuaInferenceConfidence::Certain,
-                LuaInferenceProvenanceKind::ConcreteValue,
-                false,
-            )
-        }
-    };
-
-    let step = LuaInferenceStep {
-        event: LuaInferenceEventId {
-            node: LuaInferenceNodeId::SignatureParam {
-                signature_id: contribution.signature_id,
-                param_idx,
-            },
-            kind: provenance_kind,
-            source: InFiled::new(contribution.expr_file_id, contribution.expr_syntax_id),
-        },
-        support: Arc::from([]),
-        inferred_type: carries_inferred_type.then(|| Arc::new(typ.clone())),
-        found_type: None,
-    };
-    db.get_call_site_param_index_mut()
-        .queue_deferred_contribution(
-            contribution.file_id,
-            contribution.signature_id,
-            contribution.param_idx,
-            LuaTypeFact::new(typ, confidence, Arc::from([step])),
-        );
-    Ok(())
-}
-
 pub fn try_resolve_decl(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     cache: &mut LuaInferCache,
     decl: &mut UnResolveDecl,
 ) -> ResolveResult {
@@ -163,20 +72,45 @@ pub fn try_resolve_decl(
         return Err(InferFailReason::UnResolveIterTemplate);
     }
 
-    // Narrowing an uninformative decl cache is reserved for a right-hand side
-    // that reads through a call or index: that is the boundary both routes into
-    // this pass enforce before they queue an item
-    // (`should_retry_uninformative_initializer`,
-    // `should_retry_narrowing_decl_assignment`). A write that landed here only
-    // because its right-hand side could not be inferred while its file was
-    // walked arrives without that check, so applying the narrowing policy to it
-    // let any shape overwrite an authoritative `any` — but only in the builds
-    // where the inference happened to fail.
-    if crate::compilation::analyzer::initializer_reads_through_call_or_index(&expr) {
-        bind_resolved_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
-    } else {
-        bind_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
-    }
+    // Displacing an uninformative cache is the initializer's privilege: it is
+    // the decl's own value, so it may narrow from any right-hand side whose
+    // answer can still improve. An assignment may only narrow from a call or
+    // index read — the boundary the file walk enforces in
+    // `should_retry_narrowing_decl_assignment` before it queues one. An
+    // assignment that landed here only because its right-hand side could not be
+    // inferred yet arrives without that check, and whether the walk's inference
+    // failed is a property of the batch: once the callee's return resolves, the
+    // same assignment infers cleanly and the walk refuses the narrowing.
+    //
+    // Either way the write goes through the positional claim, so a write that
+    // resolved late can still take the slot back from one that ran ahead of it.
+    let may_improve = crate::compilation::analyzer::initializer_may_improve_after_resolve(&expr);
+    let is_initializer = decl_expr_is_initializer(db, decl_id, &expr);
+    let write = DeclWrite {
+        position: expr.get_position(),
+        may_improve_after_resolve: may_improve,
+        reads_out_of_decl: crate::compilation::analyzer::lua::expr_reads_out_of_decl(
+            db,
+            decl.file_id,
+            decl_id,
+            &expr,
+        ),
+        may_narrow_uninformative: if is_initializer {
+            may_improve
+        } else {
+            crate::compilation::analyzer::initializer_reads_through_call_or_index(&expr)
+        },
+        resolved_initializer: is_initializer && may_improve,
+        fills_own_default: crate::compilation::analyzer::lua::expr_fills_own_default(
+            db,
+            decl.file_id,
+            decl_id,
+            &expr,
+        ),
+    };
+    writes.push(move |db, _| {
+        bind_decl_write(db, decl_id, LuaTypeCache::InferType(expr_type), write);
+    });
     Ok(())
 }
 
@@ -192,12 +126,13 @@ fn create_deferred_index_expr_member(
     prefix_type: &LuaType,
     owner: LuaMemberOwner,
     member_id: LuaMemberId,
+    alias_path: Option<GlobalId>,
+    set_owner_only: bool,
 ) -> Option<()> {
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
-        .get_red_root();
-    let index_expr = LuaIndexExpr::cast(member_id.get_syntax_id().to_node_from_root(&root)?)?;
+    let index_expr = LuaIndexExpr::cast(
+        db.get_vfs()
+            .syntax_node_around(&member_id.file_id, *member_id.get_syntax_id())?,
+    )?;
     let index_key = index_expr.get_index_key()?;
     let member_key = LuaMemberKey::from_index_key_or_unknown(db, cache, &index_key).ok()?;
     // An unknown key cannot pick between candidate tables, so pinning the member
@@ -214,29 +149,59 @@ fn create_deferred_index_expr_member(
         LuaMemberFeature::FileDefine
     };
     let guarded = is_guarded_table_assignment_index_expr(&index_expr);
+    let member = LuaMember::new(member_id, member_key, feature, None);
+    {
+        let member_index = db.get_member_index_mut();
+        member_index.add_member_with_owner_only(owner.clone(), member, set_owner_only);
+        // The same alias provenance the immediate path records: a write
+        // through an alias of a global path must follow the path's
+        // `---@class` flips even though its first home came from a prefix
+        // type read mid-fixpoint.
+        if let Some(alias_path) = alias_path {
+            member_index.home_alias_member_with_provenance(
+                owner,
+                member_id.file_id,
+                member_id,
+                alias_path,
+                set_owner_only,
+            );
+        }
+        // The owner above came from a prefix type read mid-fixpoint, so this
+        // placement is provisional: the post-settle re-home is the authority on
+        // where the member ends up, and it needs to know it may detach this one.
+        member_index.mark_deferred_index_expr_member(member_id);
+        // `add_member` records the enclosing function scope for `FileDefine`
+        // index-expr members only; for the rest it stores `None`. Same follow-up
+        // the Lua pass does in `apply_index_expr_member_owner_with_guarded`.
+        if !matches!(feature, LuaMemberFeature::FileDefine) {
+            let function_scope = member_index
+                .enclosing_function_scope_range(member_id.file_id, member_id.get_position());
+            member_index.set_member_function_scope_range(member_id, function_scope);
+        }
+    }
+    // Marks must run after the member exists: `mark_non_overwriting_assignment_member`
+    // readmits co-writers through the member's current owner, which is a no-op
+    // before insertion, and `mark_resolved_member_assignment` requires the member
+    // to exist. The explicit guarded mark preserves `MetaDefine` bootstrap
+    // semantics where `mark_resolved_member_assignment` early-returns; the shared
+    // call covers the conditional/loop-body policy.
     if guarded {
         db.get_member_index_mut()
             .mark_non_overwriting_assignment_member(member_id);
     }
-    let member = LuaMember::new(member_id, member_key, feature, None);
-    let member_index = db.get_member_index_mut();
-    member_index.add_member(owner, member);
-    // The owner above came from a prefix type read mid-fixpoint, so this
-    // placement is provisional: the post-settle re-home is the authority on
-    // where the member ends up, and it needs to know it may detach this one.
-    member_index.mark_deferred_index_expr_member(member_id);
-    // `add_member` records the enclosing function scope for `FileDefine`
-    // index-expr members only; for the rest it stores `None`. Same follow-up
-    // the Lua pass does in `apply_index_expr_member_owner_with_guarded`.
-    if !matches!(feature, LuaMemberFeature::FileDefine) {
-        let function_scope = member_index
-            .enclosing_function_scope_range(member_id.file_id, member_id.get_position());
-        member_index.set_member_function_scope_range(member_id, function_scope);
-        if guarded {
-            preserve_guarded_table_assignment_members(db, member_id);
-        }
-    }
+    mark_resolved_member_assignment(db, member_id);
     Some(())
+}
+
+/// Whether `expr` is the declaration's own initializer rather than a later
+/// assignment to it.
+fn decl_expr_is_initializer(db: &DbIndex, decl_id: LuaDeclId, expr: &LuaExpr) -> bool {
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .and_then(|decl| decl.get_initializer())
+        .is_some_and(|initializer| {
+            initializer.get_expr_syntax_id() == glua_parser::LuaSyntaxId::from_node(expr.syntax())
+        })
 }
 
 fn should_defer_guarded_index_alias_resolution(
@@ -249,7 +214,15 @@ fn should_defer_guarded_index_alias_resolution(
     };
 
     match infer_expr(db, cache, left) {
-        Ok(ty) => ty.is_nil() || ty.is_unknown(),
+        // A `nil`/`unknown` left defers only while the index may still produce
+        // the member. Under the force phase a failed read floors to `nil`,
+        // which is the settled answer rather than a placeholder — `nil or {}`
+        // yields the fresh table, so the `or` must run instead of waiting on a
+        // member that cannot become visible at this position (the common case
+        // is `local x = T.f or {}` where `T.f` is only written later in the
+        // same file). Deferring here retires the declaration with no type and
+        // lets usage-context inference fabricate one.
+        Ok(ty) => (ty.is_nil() || ty.is_unknown()) && !crate::semantic::floors_unsettled(db, cache),
         Err(reason) => reason.is_need_resolve(),
     }
 }
@@ -273,10 +246,14 @@ fn guarded_index_or_empty_table_left(expr: &LuaExpr) -> Option<LuaExpr> {
 }
 
 pub fn try_resolve_member(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     cache: &mut LuaInferCache,
     unresolve_member: &mut UnResolveMember,
 ) -> ResolveResult {
+    // Registers the member's derivation read before any deferred write.
+    db.get_member_index()
+        .get_member_owner(&unresolve_member.member_id);
     if let Some(prefix_expr) = &unresolve_member.prefix {
         let prefix_type = infer_expr(db, cache, prefix_expr.clone())?;
         let member_id = unresolve_member.member_id;
@@ -288,8 +265,11 @@ pub fn try_resolve_member(
         // = SF or {}` written once per realm — the GLua norm), a `Union` or
         // a `Ref` fell through to the annotation-class fallback and the
         // member was left parked on its global path.
-        let resolved_owner =
-            resolve_index_expr_member_owner_for_file(&prefix_type, Some(unresolve_member.file_id));
+        let resolved_owner = resolve_index_expr_member_owner_for_file(
+            db,
+            &prefix_type,
+            Some(unresolve_member.file_id),
+        );
         let member_owner = match resolved_owner {
             Some((LuaMemberOwner::Type(def_id), set_owner_only)) => {
                 let type_decl = db
@@ -307,6 +287,7 @@ pub fn try_resolve_member(
                 if matches!(prefix_expr, LuaExpr::IndexExpr(_)) {
                     let dynamic_type = infer_dynamic_index_expr_shape(db, cache, prefix_expr)?;
                     let Some(owner) = resolve_index_expr_member_owner_for_file(
+                        db,
                         &dynamic_type,
                         Some(unresolve_member.file_id),
                     ) else {
@@ -317,22 +298,34 @@ pub fn try_resolve_member(
                     // Some annotation bundles define methods as `function TypeName:Method()`
                     // without binding a typed declaration for `TypeName` in scope. Expose those
                     // runtime members through a matching class without replacing their real owner.
+                    //
+                    // This is the last branch that can end without an owner, and a
+                    // prefix that names no class reads exactly like one that has
+                    // not settled: the lookup misses for the lowercase locals the
+                    // real scripts use (`player._Sleeping`), and on a cold build
+                    // the walk reaches the write before the prefix carries a type
+                    // at all. Answering `Ok` there would settle the member with
+                    // nothing attached. Report it unresolved instead: the engine
+                    // re-evaluates the site once a fact its prefix read moves.
                     let LuaExpr::NameExpr(name_expr) = prefix_expr else {
                         return Err(InferFailReason::FieldNotFound);
                     };
                     let Some(name_token) = name_expr.get_name_token() else {
-                        return Ok(());
+                        return Err(InferFailReason::FieldNotFound);
                     };
                     let type_decl_id = LuaTypeDeclId::global(name_token.get_name_text());
                     let Some(type_decl) = db.get_type_index().get_type_decl(&type_decl_id) else {
-                        return Ok(());
+                        return Err(InferFailReason::FieldNotFound);
                     };
-                    if type_decl.is_class() {
-                        let _ = db.get_member_index_mut().add_member_alias_to_owner(
-                            LuaMemberOwner::Type(type_decl_id),
-                            member_id,
-                        );
+                    if !type_decl.is_class() {
+                        return Err(InferFailReason::FieldNotFound);
                     }
+                    let alias_owner = LuaMemberOwner::Type(type_decl_id);
+                    writes.push(move |db, _| {
+                        let _ = db
+                            .get_member_index_mut()
+                            .add_member_alias_to_owner(alias_owner, member_id);
+                    });
                     None
                 }
             }
@@ -341,29 +334,81 @@ pub fn try_resolve_member(
         // `Ref` prefix names a declared class, so the member is re-homed onto it
         // but does not become one of its declared members.
         if let Some((member_owner, set_owner_only)) = member_owner {
-            // The Lua pass creates a missing member before it looks at
-            // `set_owner_only`, so this must too: `set_member_owner` cannot
-            // re-home a member that does not exist, and a `Ref` prefix would
-            // otherwise leave the cold build with no member at all.
-            if db.get_member_index().get_member(&member_id).is_none() {
-                create_deferred_index_expr_member(
-                    db,
-                    cache,
-                    &prefix_type,
-                    member_owner.clone(),
-                    member_id,
-                );
-            }
+            // A prefix that is a local alias of a known global path is a path
+            // write for provenance purposes, so the member follows the path's
+            // `---@class` flips. Only computed when the owner resolved to a
+            // class: path and Element owners already carry their provenance
+            // through the homing note.
+            let alias_path = match &member_owner {
+                LuaMemberOwner::Type(_) => {
+                    alias_target_global_path(db, unresolve_member.file_id, prefix_expr)
+                }
+                _ => None,
+            };
+            // The whole gate + create + home block replays verbatim when the
+            // write lands: `get_member` is re-asked against the live index,
+            // so a member another write created in between is skipped exactly
+            // as the serial attempt would skip it, and the member-key
+            // inference inside `create_deferred_index_expr_member` reads the
+            // state it would have read inline.
+            writes.push({
+                let prefix_type = prefix_type.clone();
+                move |db, infer_manager| {
+                    // The Lua pass creates a missing member before it looks at
+                    // `set_owner_only`, so this must too: `set_member_owner`
+                    // cannot re-home a member that does not exist, and a `Ref`
+                    // prefix would otherwise leave the cold build with no
+                    // member at all.
+                    if db.get_member_index().get_member(&member_id).is_none() {
+                        let cache = infer_manager.get_infer_cache(member_id.file_id);
+                        create_deferred_index_expr_member(
+                            db,
+                            cache,
+                            &prefix_type,
+                            member_owner.clone(),
+                            member_id,
+                            alias_path.clone(),
+                            set_owner_only,
+                        );
+                    }
 
-            if set_owner_only {
-                db.get_member_index_mut().set_member_owner(
-                    member_owner,
-                    member_id.file_id,
-                    member_id,
-                );
-            } else {
-                add_member(db, member_owner, member_id);
-            }
+                    if set_owner_only {
+                        match alias_path {
+                            Some(alias_path) => {
+                                db.get_member_index_mut().home_alias_member_with_provenance(
+                                    member_owner,
+                                    member_id.file_id,
+                                    member_id,
+                                    alias_path,
+                                    true,
+                                );
+                            }
+                            None => {
+                                db.get_member_index_mut().set_member_owner_only(
+                                    member_owner,
+                                    member_id.file_id,
+                                    member_id,
+                                );
+                            }
+                        }
+                    } else {
+                        match alias_path {
+                            Some(alias_path) => {
+                                db.get_member_index_mut().home_alias_member_with_provenance(
+                                    member_owner,
+                                    member_id.file_id,
+                                    member_id,
+                                    alias_path,
+                                    false,
+                                );
+                            }
+                            None => {
+                                add_member(db, member_owner, member_id);
+                            }
+                        }
+                    }
+                }
+            });
         }
         unresolve_member.prefix = None;
     }
@@ -395,15 +440,17 @@ pub fn try_resolve_member(
         }
 
         let member_id = unresolve_member.member_id;
-        bind_resolved_type(
-            db,
-            member_id.into(),
-            LuaTypeCache::InferType(expr_type.clone()),
-        );
-        crate::compilation::analyzer::lua::record_resolved_member_assignment_contribution(
-            db, member_id, &expr_type,
-        );
-        crate::compilation::analyzer::lua::mark_resolved_member_assignment(db, member_id);
+        let type_owner: crate::LuaTypeOwner = member_id.into();
+        writes.push(move |db, _| {
+            bind_resolved_type(
+                db,
+                type_owner.clone(),
+                LuaTypeCache::InferType(expr_type.clone()),
+            );
+        });
+        writes.push(move |db, _| {
+            crate::compilation::analyzer::lua::mark_resolved_member_assignment(db, member_id);
+        });
     }
 
     Ok(())
@@ -456,85 +503,6 @@ fn local_cached_type_is_informative(typ: &LuaType) -> bool {
     }
 }
 
-pub fn try_resolve_table_field(
-    db: &mut DbIndex,
-    cache: &mut LuaInferCache,
-    unresolve_table_field: &mut UnResolveTableField,
-) -> ResolveResult {
-    let field = unresolve_table_field.field.clone();
-    let field_key = field.get_field_key().ok_or(InferFailReason::None)?;
-    let field_expr = field_key.get_expr().ok_or(InferFailReason::None)?;
-    let field_type = infer_expr(db, cache, field_expr.clone())?;
-    // The same mapping the immediate path uses. Re-deriving it here used to
-    // drop the member for every key type that is neither a literal nor a table,
-    // so a table field whose key type was known straight away got a member while
-    // an identical one that had to wait for inference got none — the analysis
-    // disagreed with itself depending on the order files happened to be
-    // analysed in.
-    let member_key = LuaMemberKey::from_expr_type(field_type);
-    if matches!(member_key, LuaMemberKey::ExprType(ref typ) if typ.is_unknown()) {
-        return Err(InferFailReason::None);
-    }
-    let file_id = unresolve_table_field.file_id;
-    let table_expr = unresolve_table_field.table_expr.clone();
-    let owner_id = LuaMemberOwner::Element(InFiled {
-        file_id,
-        value: table_expr.get_range(),
-    });
-
-    db.get_reference_index_mut().add_index_reference(
-        member_key.clone(),
-        file_id,
-        field.get_syntax_id(),
-    );
-
-    let decl_type = match field.get_value_expr() {
-        Some(expr) => infer_expr(db, cache, expr)?,
-        None => return Err(InferFailReason::None),
-    };
-
-    let member_id = LuaMemberId::new(field.get_syntax_id(), file_id);
-    let member = LuaMember::new(
-        member_id,
-        member_key,
-        unresolve_table_field.decl_feature,
-        None,
-    );
-    db.get_member_index_mut().add_member(owner_id, member);
-    write_type_cache(
-        db,
-        member_id.into(),
-        LuaTypeCache::InferType(decl_type.clone()),
-        TypeCacheWriteMode::InsertOnly,
-    );
-
-    merge_table_field_to_def(db, cache, table_expr, member_id);
-    Ok(())
-}
-
-fn merge_table_field_to_def(
-    db: &mut DbIndex,
-    cache: &mut LuaInferCache,
-    table_expr: LuaTableExpr,
-    member_id: LuaMemberId,
-) -> Option<()> {
-    let file_id = cache.get_file_id();
-    let local_name = table_expr
-        .get_parent::<LuaLocalStat>()?
-        .get_local_name_by_value(LuaExpr::TableExpr(table_expr.clone()))?;
-    let decl_id = LuaDeclId::new(file_id, local_name.get_position());
-    let type_cache = db.get_type_index().get_type_cache(&decl_id.into())?;
-    if let LuaType::Def(id) = type_cache.deref() {
-        let owner = LuaMemberOwner::Type(id.clone());
-        db.get_member_index_mut()
-            .set_member_owner(owner.clone(), member_id.file_id, member_id);
-        db.get_member_index_mut()
-            .add_member_to_owner(owner.clone(), member_id);
-    }
-
-    Some(())
-}
-
 pub fn try_resolve_module(
     db: &mut DbIndex,
     cache: &mut LuaInferCache,
@@ -550,17 +518,21 @@ pub fn try_resolve_module(
     // Compute semantic_id for the exported expression using the shared helper
     let semantic_id = compute_module_semantic_id(db, module.file_id, &module.expr);
 
-    let module_info = db
+    let changed = db
         .get_module_index_mut()
-        .get_module_mut(module.file_id)
+        .set_export(module.file_id, expr_type, semantic_id)
         .ok_or(InferFailReason::None)?;
-    module_info.export_type = Some(expr_type);
-    module_info.semantic_id = semantic_id;
+    // Re-settling an identical export moves nothing observable: only a novel
+    // fact may bump the module epoch.
+    if changed {
+        db.get_module_index_mut().note_module_write(module.file_id);
+    }
     Ok(())
 }
 
 pub fn try_resolve_return_point(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     cache: &mut LuaInferCache,
     return_: &mut UnResolveReturn,
 ) -> ResolveResult {
@@ -568,19 +540,19 @@ pub fn try_resolve_return_point(
     // function, and `should_apply_resolved_return_docs` then discards the
     // result whenever the signature already holds a concrete inferred return —
     // it can only ever upgrade `unknown`/`any`. Asking that question first
-    // costs two field reads instead of a full inference, and this pass
-    // re-attempts the same signatures across waves.
+    // costs two field reads instead of a full inference.
     if let Some(signature) = db.get_signature_index().get(&return_.signature_id)
         && signature.resolve_return == SignatureReturnStatus::InferResolve
     {
         let current_return = signature.get_return_type();
-        if !current_return.is_unknown() && !current_return.is_any() {
+        if !is_unsettled_inferred_return(&current_return) {
             return Ok(());
         }
     }
 
-    let return_correlations = analyze_return_correlations(db, cache, &return_.return_points);
-    let return_docs = analyze_return_point(db, cache, &return_.return_points)?;
+    let (return_correlations, return_docs) =
+        derive_inferred_return_with_reads(db, cache, &return_.return_points);
+    let return_docs = return_docs?;
 
     let inferred_return = return_docs_to_type(&return_docs);
     let inherited_tail = db
@@ -603,31 +575,51 @@ pub fn try_resolve_return_point(
             )
         });
 
-    let signature = db
-        .get_signature_index_mut()
-        .get_mut(&return_.signature_id)
-        .ok_or(InferFailReason::None)?;
-
-    if let Some(inherited_tail) = inherited_tail {
-        signature
-            .return_docs
-            .extend(inherited_tail.into_iter().map(|type_ref| LuaDocReturnInfo {
-                name: None,
-                type_ref,
-                default_value: None,
-                description: None,
-                attributes: None,
-                return_kind: ReturnTypeKind::default(),
-            }));
-        signature.set_return_correlations(return_correlations);
-        return Ok(());
+    let signature_id = return_.signature_id;
+    if db.get_signature_index().get(&signature_id).is_none() {
+        return Err(InferFailReason::None);
     }
 
-    if should_apply_resolved_return_docs(signature, &return_docs) {
-        signature.resolve_return = SignatureReturnStatus::InferResolve;
-        signature.return_docs = return_docs;
-        signature.set_return_correlations(return_correlations);
-    }
+    // The mutation reads the slot's live `resolve_return`/`return_docs` when
+    // it lands, so the deferred closure replays the whole decision verbatim —
+    // the same state the serial attempt would have mutated in place.
+    writes.push(move |db, _| {
+        let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id) else {
+            return;
+        };
+
+        if let Some(inherited_tail) = inherited_tail {
+            signature
+                .return_docs
+                .extend(inherited_tail.into_iter().map(|type_ref| LuaDocReturnInfo {
+                    name: None,
+                    type_ref,
+                    default_value: None,
+                    description: None,
+                    attributes: None,
+                    return_kind: ReturnTypeKind::default(),
+                }));
+            signature.set_return_correlations(return_correlations);
+            db.get_signature_index_mut().note_return_write(signature_id);
+            return;
+        }
+
+        if should_apply_resolved_return_docs(signature, &return_docs) {
+            let moved = signature
+                .return_docs
+                .iter()
+                .map(|doc| &doc.type_ref)
+                .ne(return_docs.iter().map(|doc| &doc.type_ref));
+            let correlations_moved =
+                signature.return_correlations() != return_correlations.as_slice();
+            signature.resolve_return = SignatureReturnStatus::InferResolve;
+            signature.return_docs = return_docs;
+            signature.set_return_correlations(return_correlations);
+            if moved || correlations_moved {
+                db.get_signature_index_mut().note_return_write(signature_id);
+            }
+        }
+    });
 
     Ok(())
 }
@@ -647,12 +639,68 @@ fn should_apply_resolved_return_docs(
         return false;
     }
 
-    if current_return.is_unknown() && new_return.is_any() {
-        return true; // Allow upgrading Unknown to Any
-    }
+    inferred_return_improves(&current_return, &new_return)
+}
 
-    (current_return.is_unknown() || current_return.is_any())
-        && !(new_return.is_unknown() || new_return.is_any())
+/// An inferred return that says nothing yet. `never` belongs here: a function
+/// whose body returns an expression cannot return no value, so a `never`
+/// return is an operand that had not resolved when the body was read.
+fn is_unsettled_inferred_return(return_type: &LuaType) -> bool {
+    match return_type {
+        LuaType::Unknown | LuaType::Any | LuaType::Never => true,
+        LuaType::Variadic(variadic) => match variadic.as_ref() {
+            VariadicType::Multi(types) => types.iter().any(is_unsettled_inferred_return),
+            VariadicType::Base(typ) => is_unsettled_inferred_return(typ),
+        },
+        // `T|nil` says as much as `T` does: a nullable wrapper around an
+        // unsettled slot is still an unsettled answer.
+        LuaType::Union(union) => union
+            .nullable_inner()
+            .is_some_and(is_unsettled_inferred_return),
+        _ => false,
+    }
+}
+
+fn inferred_return_improves(current: &LuaType, new: &LuaType) -> bool {
+    if current == new {
+        return false;
+    }
+    if current.is_unknown() && new.is_any() {
+        return true;
+    }
+    match (current, new) {
+        (LuaType::Unknown | LuaType::Any | LuaType::Never, LuaType::Union(union))
+            if union.nullable_inner() == Some(current) =>
+        {
+            true
+        }
+        (LuaType::Unknown | LuaType::Any | LuaType::Never, _) => !is_unsettled_inferred_return(new),
+        (LuaType::Union(union), _)
+            if union
+                .nullable_inner()
+                .is_some_and(is_unsettled_inferred_return) =>
+        {
+            !is_unsettled_inferred_return(new)
+        }
+        (LuaType::Variadic(current_variadic), LuaType::Variadic(new_variadic)) => {
+            match (current_variadic.as_ref(), new_variadic.as_ref()) {
+                (VariadicType::Multi(current_types), VariadicType::Multi(new_types)) => {
+                    current_types.len() == new_types.len()
+                        && current_types.iter().zip(new_types.iter()).all(
+                            |(current_slot, new_slot)| {
+                                current_slot == new_slot
+                                    || inferred_return_improves(current_slot, new_slot)
+                            },
+                        )
+                }
+                (VariadicType::Base(current_type), VariadicType::Base(new_type)) => {
+                    inferred_return_improves(current_type, new_type)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 fn return_docs_to_type(return_docs: &[LuaDocReturnInfo]) -> LuaType {
@@ -671,41 +719,64 @@ fn return_docs_to_type(return_docs: &[LuaDocReturnInfo]) -> LuaType {
     }
 }
 
-pub fn try_resolve_iter_var(
-    db: &mut DbIndex,
-    cache: &mut LuaInferCache,
-    unresolve_iter_var: &mut UnResolveIterVar,
-) -> ResolveResult {
-    let iter_var_types =
-        match infer_for_range_iter_expr_func(db, cache, &unresolve_iter_var.iter_exprs) {
-            Ok(types) => types,
-            // Placeholder items have nothing to add on a failed retry: the template
-            // ref is already cached. Keep the failure in this reason's own group
-            // rather than injecting the item into another group's fixpoint.
-            Err(reason) => {
-                return Err(
-                    if iter_var_holds_tpl_placeholder(db, unresolve_iter_var, 0) {
-                        InferFailReason::UnResolveIterTemplate
-                    } else {
-                        reason
-                    },
-                );
-            }
-        };
-    for (idx, var_name) in unresolve_iter_var.iter_vars.iter().enumerate() {
-        let position = var_name.get_position();
-        let decl_id = LuaDeclId::new(unresolve_iter_var.file_id, position);
+/// A resolved iterator-variable type plus the write mode it earned.
+pub struct IterVarTypeUpdate {
+    pub(crate) owner: LuaTypeOwner,
+    pub(crate) cache: LuaTypeCache,
+    pub(crate) mode: TypeCacheWriteMode,
+}
+
+/// The loop variables' types from `iter_var_types`: template arms an unbound
+/// generic left are dropped, and proven overrides win.
+pub(crate) fn iter_var_updates(
+    db: &DbIndex,
+    file_id: FileId,
+    iter_var_types: &IterVarInference,
+    var_positions: &[TextSize],
+) -> Vec<IterVarTypeUpdate> {
+    let mut updates = Vec::with_capacity(var_positions.len());
+    for (idx, &position) in var_positions.iter().enumerate() {
+        let decl_id = LuaDeclId::new(file_id, position);
         let ret_type = iter_var_types
             .get_type(idx)
             .cloned()
             .unwrap_or(LuaType::Unknown);
         let ret_type = TypeOps::Remove.apply(db, &ret_type, &LuaType::Nil);
+        // A raw template ref is the placeholder an unbound generic leaves for
+        // an arm it could not see into, not a type the variable holds, so the
+        // arms that did bind are the answer. A placeholder alone stays as it
+        // is: it is what marks the variable as still waiting.
+        let ret_type = match &ret_type {
+            LuaType::Union(union)
+                if ret_type.contain_tpl() && union.types().any(|arm| !arm.contain_tpl()) =>
+            {
+                LuaType::from_vec(
+                    union
+                        .types()
+                        .filter(|arm| !arm.contain_tpl())
+                        .cloned()
+                        .collect(),
+                )
+            }
+            _ => ret_type,
+        };
+
+        let ret_type = if let Some(Some(proven)) = iter_var_types.settled_overrides.get(idx) {
+            proven.clone()
+        } else {
+            ret_type
+        };
 
         let owner: LuaTypeOwner = decl_id.into();
-        let mode = iter_var_write_mode(db.get_type_index().get_type_cache(&owner), &ret_type);
-        write_type_cache(db, owner, LuaTypeCache::InferType(ret_type), mode);
+        let cached = db.get_type_index().get_type_cache(&owner);
+        let mode = iter_var_write_mode(cached, &ret_type);
+        updates.push(IterVarTypeUpdate {
+            owner,
+            cache: LuaTypeCache::InferType(ret_type),
+            mode,
+        });
     }
-    Ok(())
+    updates
 }
 
 /// The write mode for a settled iterator-variable type.
@@ -727,55 +798,6 @@ fn iter_var_write_mode(cached: Option<&LuaTypeCache>, settled: &LuaType) -> Type
     } else {
         TypeCacheWriteMode::InsertOnly
     }
-}
-
-/// Whether the iterator var at `idx` still caches a raw template ref, the
-/// placeholder an unbound generic leaves behind.
-fn iter_var_holds_tpl_placeholder(
-    db: &DbIndex,
-    unresolve_iter_var: &UnResolveIterVar,
-    idx: usize,
-) -> bool {
-    let Some(var_name) = unresolve_iter_var.iter_vars.get(idx) else {
-        return false;
-    };
-    let decl_id = LuaDeclId::new(unresolve_iter_var.file_id, var_name.get_position());
-    db.get_type_index()
-        .get_type_cache(&decl_id.into())
-        .is_some_and(|cache| cache.as_type().contain_tpl())
-}
-
-pub fn try_resolve_module_ref(
-    db: &mut DbIndex,
-    _: &mut LuaInferCache,
-    module_ref: &UnResolveModuleRef,
-) -> ResolveResult {
-    let module_index = db.get_module_index();
-    let module = module_index
-        .get_module(module_ref.module_file_id)
-        .ok_or(InferFailReason::None)?;
-    let export_type = module.export_type.clone().ok_or(InferFailReason::None)?;
-    match &module_ref.owner_id {
-        LuaSemanticDeclId::LuaDecl(decl_id) => {
-            write_type_cache(
-                db,
-                (*decl_id).into(),
-                LuaTypeCache::InferType(export_type),
-                TypeCacheWriteMode::InsertOnly,
-            );
-        }
-        LuaSemanticDeclId::Member(member_id) => {
-            write_type_cache(
-                db,
-                (*member_id).into(),
-                LuaTypeCache::InferType(export_type),
-                TypeCacheWriteMode::InsertOnly,
-            );
-        }
-        _ => {}
-    };
-
-    Ok(())
 }
 
 pub fn try_resolve_special_call(
@@ -1040,23 +1062,10 @@ pub(crate) fn get_wrapped_callable_target_expr(
     db: &DbIndex,
     semantic_decl: LuaSemanticDeclId,
 ) -> Option<LuaExpr> {
-    let LuaExpr::CallExpr(call_expr) = get_semantic_decl_value_expr(db, semantic_decl)? else {
+    let LuaExpr::CallExpr(call_expr) = semantic_decl_value_expr(db, semantic_decl)? else {
         return None;
     };
     get_setmetatable_call_target_expr(&call_expr)
-}
-
-fn get_semantic_decl_value_expr(db: &DbIndex, semantic_decl: LuaSemanticDeclId) -> Option<LuaExpr> {
-    match semantic_decl {
-        LuaSemanticDeclId::LuaDecl(decl_id) => {
-            let decl = db.get_decl_index().get_decl(&decl_id)?;
-            let value_syntax_id = decl.get_value_syntax_id()?;
-            let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
-            LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)
-        }
-        LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
-        LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => None,
-    }
 }
 
 pub(crate) fn get_setmetatable_call_target_expr(call_expr: &LuaCallExpr) -> Option<LuaExpr> {
@@ -1238,10 +1247,10 @@ fn collect_special_call_param_infos_from_operator_owner(
                         )
                     })
                     .unwrap_or_default(),
-                LuaType::DocFunction(func) => adjust_operator_special_call_param_infos(
-                    collect_doc_function_special_call_params(func.as_ref()),
-                    should_strip_first_operator_param(func.is_colon_define(), owner),
-                ),
+                // A doc call operator's operands are the call's arguments.
+                LuaType::DocFunction(func) => {
+                    collect_doc_function_special_call_params(func.as_ref())
+                }
                 _ => Vec::new(),
             }
         })
@@ -1571,10 +1580,9 @@ fn collect_special_call_out_param_infos_from_semantic_decl(
                     return Ok(out_params);
                 }
             }
-            if let Some(signature_id) = get_signature_id_from_semantic_decl_value_expr(
-                db,
-                LuaSemanticDeclId::LuaDecl(decl_id),
-            ) {
+            if let Some(signature_id) =
+                semantic_decl_closure_signature_id(db, LuaSemanticDeclId::LuaDecl(decl_id))
+            {
                 let out_params = db
                     .get_signature_index()
                     .get(&signature_id)
@@ -1607,10 +1615,9 @@ fn collect_special_call_out_param_infos_from_semantic_decl(
                     return Ok(out_params);
                 }
             }
-            if let Some(signature_id) = get_signature_id_from_semantic_decl_value_expr(
-                db,
-                LuaSemanticDeclId::Member(member_id),
-            ) {
+            if let Some(signature_id) =
+                semantic_decl_closure_signature_id(db, LuaSemanticDeclId::Member(member_id))
+            {
                 let out_params = db
                     .get_signature_index()
                     .get(&signature_id)
@@ -1666,22 +1673,6 @@ fn collect_same_member_key_special_call_out_params(
         .filter_map(|member| db.get_type_index().get_type_cache(&member.get_id().into()))
         .flat_map(|type_cache| collect_special_call_out_param_infos(db, type_cache.as_type()))
         .collect()
-}
-
-fn get_signature_id_from_semantic_decl_value_expr(
-    db: &DbIndex,
-    semantic_decl: LuaSemanticDeclId,
-) -> Option<LuaSignatureId> {
-    let file_id = match semantic_decl {
-        LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.file_id,
-        LuaSemanticDeclId::Member(member_id) => member_id.file_id,
-        LuaSemanticDeclId::Signature(signature_id) => return Some(signature_id),
-        LuaSemanticDeclId::TypeDecl(_) => return None,
-    };
-    let LuaExpr::ClosureExpr(closure) = get_semantic_decl_value_expr(db, semantic_decl)? else {
-        return None;
-    };
-    Some(LuaSignatureId::from_closure(file_id, &closure))
 }
 
 fn collect_special_call_param_infos(
@@ -1941,7 +1932,7 @@ fn resolve_out_param_target(
         SemanticDeclGuard::default(),
         SemanticDeclLevel::default(),
     )? && visited.insert(semantic_decl.clone())
-        && let Some(value_expr) = get_semantic_decl_value_expr(db, semantic_decl)
+        && let Some(value_expr) = semantic_decl_value_expr(db, semantic_decl)
         && let Some(target) =
             resolve_out_param_target(db, cache, file_id, value_expr, field_path, visited)?
     {
@@ -1980,7 +1971,7 @@ fn resolve_out_param_target_from_member_lookup(
         let semantic_decl = member_info.property_owner_id?;
         Some(ResolvedOutParamTarget {
             owner: semantic_decl_to_type_owner(semantic_decl.clone()),
-            value_expr: get_semantic_decl_value_expr(db, semantic_decl),
+            value_expr: semantic_decl_value_expr(db, semantic_decl),
         })
     }))
 }
@@ -2082,7 +2073,7 @@ fn collect_out_param_effect_path_targets(
         if let Some(semantic_decl) = semantic_decl_from_var_ref_id(&base_var_ref_id)
             && visited_aliases.insert(semantic_decl.clone())
             && !semantic_decl_has_write_before_position(db, &semantic_decl, call_position)
-            && let Some(value_expr) = get_semantic_decl_value_expr(db, semantic_decl)
+            && let Some(value_expr) = semantic_decl_value_expr(db, semantic_decl)
         {
             collect_out_param_effect_path_targets(
                 db,
@@ -2105,7 +2096,7 @@ fn collect_out_param_effect_path_targets(
         SemanticDeclLevel::default(),
     )? && visited_aliases.insert(semantic_decl.clone())
         && !semantic_decl_has_write_before_position(db, &semantic_decl, call_position)
-        && let Some(value_expr) = get_semantic_decl_value_expr(db, semantic_decl)
+        && let Some(value_expr) = semantic_decl_value_expr(db, semantic_decl)
     {
         collect_out_param_effect_path_targets(
             db,
@@ -2198,7 +2189,7 @@ fn extend_var_ref_id_with_path(
         Some(access_path) => format!("{}.{}", access_path, field_path.join(".")),
         None => field_path.join("."),
     };
-    let arc_path = ArcIntern::from(SmolStr::new(&full_path));
+    let arc_path = crate::db_index::intern_smol_str(&full_path);
     match var_ref_id {
         VarRefId::VarRef(decl_id) => {
             Some(VarRefId::IndexRef(VarRefRootId::Decl(decl_id), arc_path))
@@ -2243,10 +2234,63 @@ fn materialize_str_tpl_class_from_call(
     else {
         return Ok(());
     };
-    let Some(arg_name) = infer_string_const_arg(db, cache, &arg_expr) else {
+    // The name a call binds the template to, as the call's generic
+    // instantiation binds it.
+    let Ok(arg_type) = infer_expr(db, cache, arg_expr.clone()) else {
         return Ok(());
     };
+    let arg_type = crate::semantic::str_tpl_arg_type(
+        db, cache, param_type, &arg_expr, call_expr, param_idx, arg_type,
+    );
+    let mut arg_names = match &arg_type {
+        LuaType::StringConst(arg_name) | LuaType::DocStringConst(arg_name) => {
+            vec![arg_name.to_string()]
+        }
+        LuaType::Union(union) => union
+            .types()
+            .filter_map(|member| match member {
+                LuaType::StringConst(arg_name) | LuaType::DocStringConst(arg_name) => {
+                    Some(arg_name.to_string())
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => return Ok(()),
+    };
+    arg_names.retain(|arg_name| crate::semantic::str_tpl_value_names_type(arg_name));
+    arg_names.sort_unstable();
+    arg_names.dedup();
 
+    for arg_name in &arg_names {
+        materialize_str_tpl_class(
+            db,
+            file_id,
+            call_expr,
+            &arg_expr,
+            &str_tpl,
+            &constraint,
+            arg_name,
+            param_idx,
+            is_colon_define,
+            is_colon_call,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_str_tpl_class(
+    db: &mut DbIndex,
+    file_id: crate::FileId,
+    call_expr: &LuaCallExpr,
+    arg_expr: &LuaExpr,
+    str_tpl: &crate::LuaStringTplType,
+    constraint: &LuaTypeDeclId,
+    arg_name: &str,
+    param_idx: usize,
+    is_colon_define: bool,
+    is_colon_call: bool,
+) -> ResolveResult {
     let class_name = format!(
         "{}{}{}",
         str_tpl.get_prefix(),
@@ -2254,35 +2298,67 @@ fn materialize_str_tpl_class_from_call(
         str_tpl.get_suffix()
     );
     let class_decl_id = LuaTypeDeclId::global(&class_name);
-    let should_attach_super = match db.get_type_index().get_type_decl(&class_decl_id) {
-        Some(existing_decl) => existing_decl.is_auto_generated(),
-        None => true,
-    };
-    if db.get_type_index().get_type_decl(&class_decl_id).is_none() {
-        db.get_type_index_mut().add_type_decl(
-            file_id,
-            LuaTypeDecl::new(
-                file_id,
-                arg_expr.get_range(),
-                class_decl_id.get_simple_name().to_string(),
-                LuaDeclTypeKind::Class,
-                LuaTypeFlag::AutoGenerated.into(),
-                class_decl_id.clone(),
-            ),
-        );
-    }
-
-    if !should_attach_super {
+    // Whether a declaration owns the name is only final once every
+    // registration has run: deciding earlier would leave a placeholder behind
+    // for a class a later registration declares.
+    if !db.stage_rule_holds(StageRule::FloorUnsettled) {
         return Ok(());
     }
-
-    let super_type = LuaType::Ref(constraint);
-    db.get_type_index_mut().add_super_type_if_missing(
-        class_decl_id,
+    // A real declaration already owns this name (a `---@class` the author
+    // wrote, or a Register-synthesized one): the materialization must not add
+    // edges behind its back.
+    if db.get_type_index().has_non_auto_declaration(&class_decl_id) {
+        return Ok(());
+    }
+    // A re-settled call replays the same materialization: only a novel decl
+    // or super edge may bump the special-call epoch. The facts carry their
+    // full identity (call-site, class, constraint, source), so replaying them
+    // in any order hits the same dedup keys.
+    let call_position = call_expr.get_position();
+    // Every site materializing the class declares it: which one ran first
+    // must not decide where the class is declared.
+    db.get_type_index_mut().add_type_decl(
         file_id,
-        arg_expr.get_range(),
-        super_type,
+        LuaTypeDecl::new(
+            file_id,
+            arg_expr.get_range(),
+            class_decl_id.get_simple_name().to_string(),
+            LuaDeclTypeKind::Class,
+            LuaTypeFlag::AutoGenerated.into(),
+            class_decl_id.clone(),
+        ),
     );
+    let mut novel_facts = vec![SpecialCallFact::str_tpl_decl(
+        file_id,
+        call_position,
+        class_decl_id.clone(),
+        LuaType::Ref(constraint.clone()),
+        param_idx,
+        is_colon_define,
+        is_colon_call,
+    )];
+
+    let super_type = LuaType::Ref(constraint.clone());
+    let source_range = arg_expr.get_range();
+    if db.get_type_index_mut().add_super_type(
+        class_decl_id.clone(),
+        file_id,
+        source_range,
+        super_type.clone(),
+    ) {
+        novel_facts.push(SpecialCallFact::super_edge(
+            file_id,
+            call_position,
+            class_decl_id,
+            super_type,
+            file_id,
+            source_range,
+        ));
+    }
+    if !novel_facts.is_empty() {
+        db.get_flow_index_mut()
+            .install_special_call_facts(file_id, call_position, novel_facts);
+    }
 
     Ok(())
 }
@@ -2361,13 +2437,34 @@ fn try_resolve_constructor_param(
         if let Some(type_decl) = db.get_type_index().get_type_decl(&root_type_id)
             && type_decl.is_class()
         {
+            let source_range = get_call_arg_expr(
+                call_expr,
+                param_info.param_idx,
+                param_info.is_colon_define,
+                call_expr.is_colon_call(),
+            )
+            .map(|arg| arg.get_range())
+            .unwrap_or_else(|| call_expr.get_range());
             let root_type = LuaType::Ref(root_type_id.clone());
-            db.get_type_index_mut().add_super_type_if_missing(
+            if db.get_type_index_mut().add_super_type(
                 target_id.clone(),
                 file_id,
-                call_expr.get_range(),
-                root_type,
-            );
+                source_range,
+                root_type.clone(),
+            ) {
+                db.get_flow_index_mut().install_special_call_facts(
+                    file_id,
+                    call_expr.get_position(),
+                    [SpecialCallFact::super_edge(
+                        file_id,
+                        call_expr.get_position(),
+                        target_id.clone(),
+                        root_type,
+                        file_id,
+                        source_range,
+                    )],
+                );
+            }
         }
     }
 
@@ -2396,8 +2493,16 @@ fn try_resolve_constructor_param(
         .ok_or(InferFailReason::FieldNotFound)?;
     let ctor_signature_member = members.first().ok_or(InferFailReason::FieldNotFound)?;
 
-    set_signature_to_default_call(db, cache, ctor_signature_member, strip_self, return_self)
-        .ok_or(InferFailReason::FieldNotFound)?;
+    set_signature_to_default_call(
+        db,
+        cache,
+        ctor_signature_member,
+        strip_self,
+        return_self,
+        file_id,
+        call_expr.get_position(),
+    )
+    .ok_or(InferFailReason::FieldNotFound)?;
 
     Ok(())
 }
@@ -2408,25 +2513,26 @@ fn set_signature_to_default_call(
     member_info: &LuaMemberInfo,
     strip_self: bool,
     return_self: bool,
-) -> Option<()> {
+    site_file: FileId,
+    site_position: TextSize,
+) -> Option<bool> {
     let LuaType::Signature(signature_id) = member_info.typ else {
         return None;
     };
     let Some(LuaSemanticDeclId::Member(member_id)) = member_info.property_owner_id else {
         return None;
     };
-    // 我们仍然需要再做一次判断确定是否来源于`Def`类型
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
-        .get_red_root();
-    let index_expr = LuaIndexExpr::cast(member_id.get_syntax_id().to_node_from_root(&root)?)?;
+    // We still need another check to confirm the origin is a `Def` type
+    let index_expr = LuaIndexExpr::cast(
+        db.get_vfs()
+            .syntax_node_around(&member_id.file_id, *member_id.get_syntax_id())?,
+    )?;
     let prefix_expr = index_expr.get_prefix_expr()?;
     let prefix_type = infer_expr(db, cache, prefix_expr.clone()).ok()?;
     let LuaType::Def(decl_id) = prefix_type else {
         return None;
     };
-    // 如果已经存在显式的`__call`定义, 则不添加
+    // Do not add if an explicit `__call` definition already exists
     let call = db.get_operator_index().get_operators(
         &LuaOperatorOwner::Type(decl_id.clone()),
         LuaOperatorMetaMethod::Call,
@@ -2436,10 +2542,10 @@ fn set_signature_to_default_call(
     }
 
     let operator = LuaOperator::new(
-        decl_id.into(),
+        decl_id.clone().into(),
         LuaOperatorMetaMethod::Call,
         member_id.file_id,
-        // 必须指向名称, 使用 index_expr 的完整范围不会跳转到函数上
+        // Must point at the name; the full range of index_expr would not jump to the function
         index_expr.get_name_token()?.syntax().text_range(),
         OperatorFunction::DefaultClassCtor {
             id: signature_id,
@@ -2447,8 +2553,24 @@ fn set_signature_to_default_call(
             return_self,
         },
     );
-    db.get_operator_index_mut().add_operator(operator);
-    Some(())
+    let operator_id = operator.get_id();
+    let installed = db.add_operator(operator);
+    if installed {
+        db.get_flow_index_mut().install_special_call_facts(
+            site_file,
+            site_position,
+            [SpecialCallFact::call_operator(
+                site_file,
+                site_position,
+                operator_id,
+                LuaOperatorOwner::Type(decl_id),
+                signature_id,
+                strip_self,
+                return_self,
+            )],
+        );
+    }
+    Some(installed)
 }
 
 fn get_constructor_target_type(
@@ -2583,7 +2705,7 @@ mod tests {
             ))),
         );
         let id = operator.get_id();
-        db.get_operator_index_mut().add_operator(operator);
+        db.add_operator(operator);
         id
     }
 
@@ -2843,5 +2965,353 @@ mod tests {
             beta_first_selected.get_prefix(),
             "string template selection should be independent of union member order"
         );
+    }
+
+    const SPECIAL_DEFS: &str = r#"
+        ---@class Entity
+
+        ents = {}
+
+        ---@generic T: Entity
+        ---@param class `T`
+        ---@return T[]
+        function ents.FindByClass(class) end
+
+        ---@class TraceResult
+        ---@field Hit boolean
+        local TraceResult = {}
+
+        util = {}
+
+        ---@outparam traceConfig.output TraceResult
+        ---@param traceConfig table
+        function util.TraceLine(traceConfig) end
+    "#;
+
+    const SPECIAL_CALLER_A: &str = r#"local found_a = ents.FindByClass("prop_vehicle_jeep")"#;
+    const SPECIAL_CALLER_B: &str = r#"local found_b = ents.FindByClass("prop_vehicle_jeep")"#;
+    const SPECIAL_CALLER_C: &str = r#"
+        local ray = {}
+        local traceData = {
+            output = ray,
+        }
+
+        util.TraceLine(traceData)
+    "#;
+
+    /// Everything special calls have settled, as sorted text.
+    fn special_call_snapshot(db: &DbIndex) -> Vec<String> {
+        let flow = db.get_flow_index();
+        let mut snapshot = flow
+            .settled_special_call_facts()
+            .map(|fact| format!("{fact:?}"))
+            .chain(
+                flow.special_call_effects()
+                    .map(|entry| format!("{entry:?}")),
+            )
+            .collect::<Vec<_>>();
+        snapshot.sort();
+        snapshot
+    }
+
+    fn special_call_workspace() -> (
+        crate::VirtualWorkspace,
+        Vec<(FileId, Vec<glua_parser::LuaCallExpr>)>,
+    ) {
+        use glua_parser::LuaAstNode;
+
+        let mut ws = crate::VirtualWorkspace::new();
+        ws.def_file("defs.lua", SPECIAL_DEFS);
+        let caller_ids = [
+            ws.def_file("caller_a.lua", SPECIAL_CALLER_A),
+            ws.def_file("caller_b.lua", SPECIAL_CALLER_B),
+            ws.def_file("caller_c.lua", SPECIAL_CALLER_C),
+        ];
+        let db = ws.get_db_mut();
+        assert!(
+            !special_call_snapshot(db).is_empty(),
+            "the fixture must settle special-call facts"
+        );
+        let generated = LuaTypeDeclId::global("prop_vehicle_jeep");
+        assert!(
+            db.get_type_index().get_type_decl(&generated).is_some(),
+            "the fixture must synthesize the str-tpl class"
+        );
+
+        let mut sites = Vec::new();
+        for file_id in caller_ids {
+            let calls = db
+                .get_vfs()
+                .get_syntax_tree(&file_id)
+                .expect("expected syntax tree")
+                .get_chunk_node()
+                .descendants::<glua_parser::LuaCallExpr>()
+                .collect::<Vec<_>>();
+            assert!(
+                !calls.is_empty(),
+                "expected call expressions in {file_id:?}"
+            );
+            sites.push((file_id, calls));
+        }
+        (ws, sites)
+    }
+
+    /// Re-drives every special-call site in `order`, returning whether the
+    /// replay changed what special calls have settled.
+    fn resettle_special_calls(
+        db: &mut DbIndex,
+        sites: &[(FileId, Vec<glua_parser::LuaCallExpr>)],
+        order: &[usize],
+    ) -> bool {
+        use super::{UnResolveSpecialCall, try_resolve_special_call};
+
+        let before = special_call_snapshot(db);
+        for &idx in order {
+            let (file_id, calls) = &sites[idx];
+            for call_expr in calls {
+                let mut item = UnResolveSpecialCall {
+                    file_id: *file_id,
+                    call_expr: call_expr.clone(),
+                };
+                let mut cache = crate::LuaInferCache::new(*file_id, Default::default());
+                try_resolve_special_call(db, &mut cache, &mut item)
+                    .expect("expected the settled call to re-derive");
+            }
+        }
+        special_call_snapshot(db) != before
+    }
+
+    /// Replaying the same special-call fact set in two orders changes nothing
+    /// on the second pass: identical facts build identical dedup keys however
+    /// the pass interleaves the sites.
+    #[test]
+    fn resettling_special_calls_in_any_order_changes_nothing() {
+        use glua_parser::LuaAstNode;
+
+        let (mut ws, mut sites) = special_call_workspace();
+
+        let db = ws.get_db_mut();
+        assert!(
+            !resettle_special_calls(db, &sites, &[0, 1, 2]),
+            "replaying settled special calls changes nothing"
+        );
+        assert!(
+            !resettle_special_calls(db, &sites, &[2, 1, 0]),
+            "replaying settled special calls in reverse order changes nothing"
+        );
+
+        // A genuinely new class still settles.
+        let live_before = special_call_snapshot(db);
+        let caller_d = ws.def_file(
+            "caller_d.lua",
+            r#"local found_d = ents.FindByClass("prop_vehicle_apc")"#,
+        );
+        assert_ne!(
+            special_call_snapshot(ws.get_db_mut()),
+            live_before,
+            "a novel class install still settles"
+        );
+        let db = ws.get_db_mut();
+        let new_calls = db
+            .get_vfs()
+            .get_syntax_tree(&caller_d)
+            .expect("expected syntax tree")
+            .get_chunk_node()
+            .descendants::<glua_parser::LuaCallExpr>()
+            .collect::<Vec<_>>();
+        sites.push((caller_d, new_calls));
+        assert!(
+            !resettle_special_calls(db, &sites, &[3, 2, 1, 0]),
+            "replaying after a novel install changes nothing"
+        );
+    }
+
+    /// Which caller runs first does not decide where a class both call sites
+    /// materialize is declared, nor which facts settle.
+    #[test]
+    fn a_str_tpl_class_two_sites_materialize_settles_the_same_in_either_order() {
+        let settle = |schedule| {
+            let mut ws = crate::VirtualWorkspace::new();
+            ws.analysis.compilation.set_schedule(schedule);
+            ws.def_files(vec![
+                ("defs.lua", SPECIAL_DEFS),
+                ("caller_a.lua", SPECIAL_CALLER_A),
+                ("caller_b.lua", SPECIAL_CALLER_B),
+            ]);
+            let db = ws.get_db_mut();
+            let locations = db
+                .get_type_index()
+                .get_type_decl(&LuaTypeDeclId::global("prop_vehicle_jeep"))
+                .expect("the str-tpl class is materialized")
+                .get_locations()
+                .iter()
+                .map(|location| (location.file_id, location.range))
+                .collect::<Vec<_>>();
+            (locations, special_call_snapshot(db))
+        };
+
+        let canonical = settle(crate::Schedule::Canonical);
+
+        assert_eq!(settle(crate::Schedule::Reversed), canonical);
+        assert_eq!(canonical.0.len(), 2);
+    }
+
+    /// Defining the same callers in the opposite order settles as many facts:
+    /// which site materializes a shared fact first must not change the count.
+    #[test]
+    fn mirrored_workspaces_settle_the_same_number_of_special_call_facts() {
+        let mut forward = crate::VirtualWorkspace::new();
+        forward.def_file("defs.lua", SPECIAL_DEFS);
+        forward.def_file("caller_a.lua", SPECIAL_CALLER_A);
+        forward.def_file("caller_b.lua", SPECIAL_CALLER_B);
+        forward.def_file("caller_c.lua", SPECIAL_CALLER_C);
+
+        let mut reverse = crate::VirtualWorkspace::new();
+        reverse.def_file("defs.lua", SPECIAL_DEFS);
+        reverse.def_file("caller_c.lua", SPECIAL_CALLER_C);
+        reverse.def_file("caller_b.lua", SPECIAL_CALLER_B);
+        reverse.def_file("caller_a.lua", SPECIAL_CALLER_A);
+
+        assert_eq!(
+            special_call_snapshot(forward.get_db_mut()).len(),
+            special_call_snapshot(reverse.get_db_mut()).len(),
+            "definition order must not change how many facts settle"
+        );
+    }
+
+    /// A constructor call's `__call` install reports itself the same way on
+    /// replay without changing anything: an existing install is not novel.
+    #[test]
+    fn resettling_constructor_special_call_changes_nothing() {
+        use glua_parser::LuaAstNode;
+
+        use super::{UnResolveSpecialCall, try_resolve_special_call};
+
+        let mut ws = crate::VirtualWorkspace::new();
+        ws.def_file(
+            "defs.lua",
+            r#"
+                ---@attribute constructor(name: string, root_class: string?, strip_self: boolean?, return_self: boolean?)
+
+                ---@class Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@[constructor("__init", "Entity")]
+                ---@param class `T`
+                ---@return T[]
+                function ents.FindByClass(class)
+                end
+            "#,
+        );
+        let caller_id = ws.def_file(
+            "caller.lua",
+            r#"local found = ents.FindByClass("prop_vehicle_jeep")"#,
+        );
+
+        let db = ws.get_db_mut();
+        let baseline = special_call_snapshot(db);
+        assert!(
+            !baseline.is_empty(),
+            "the fixture must settle special-call facts"
+        );
+        let calls = db
+            .get_vfs()
+            .get_syntax_tree(&caller_id)
+            .expect("expected syntax tree")
+            .get_chunk_node()
+            .descendants::<glua_parser::LuaCallExpr>()
+            .collect::<Vec<_>>();
+        assert!(!calls.is_empty(), "expected the constructor call");
+
+        for call_expr in &calls {
+            let mut item = UnResolveSpecialCall {
+                file_id: caller_id,
+                call_expr: call_expr.clone(),
+            };
+            let mut cache = crate::LuaInferCache::new(caller_id, Default::default());
+            // An already-installed `__call` reports itself instead of
+            // reinstalling; either way nothing changes.
+            let _ = try_resolve_special_call(db, &mut cache, &mut item);
+        }
+        assert_eq!(
+            special_call_snapshot(db),
+            baseline,
+            "replaying a settled constructor call changes nothing"
+        );
+    }
+
+    fn variadic_multi(types: Vec<LuaType>) -> LuaType {
+        LuaType::Variadic(crate::VariadicType::Multi(types).into())
+    }
+
+    #[test]
+    fn unsettled_inferred_return_reaches_into_multi_slots() {
+        assert!(super::is_unsettled_inferred_return(&variadic_multi(vec![
+            LuaType::Unknown,
+            LuaType::Integer
+        ])));
+        assert!(!super::is_unsettled_inferred_return(&variadic_multi(vec![
+            LuaType::String,
+            LuaType::Integer
+        ])));
+    }
+
+    #[test]
+    fn inferred_return_improves_partial_multi_slots() {
+        assert!(super::inferred_return_improves(
+            &variadic_multi(vec![LuaType::Unknown, LuaType::Unknown]),
+            &variadic_multi(vec![LuaType::Unknown, LuaType::Integer])
+        ));
+    }
+
+    #[test]
+    fn inferred_return_rejects_regressing_slot() {
+        assert!(!super::inferred_return_improves(
+            &variadic_multi(vec![LuaType::String, LuaType::Unknown]),
+            &variadic_multi(vec![LuaType::Unknown, LuaType::Integer])
+        ));
+    }
+
+    #[test]
+    fn inferred_return_rejects_equal_multi() {
+        assert!(!super::inferred_return_improves(
+            &variadic_multi(vec![LuaType::Unknown, LuaType::Integer]),
+            &variadic_multi(vec![LuaType::Unknown, LuaType::Integer])
+        ));
+    }
+
+    #[test]
+    fn inferred_return_refines_a_nullable_unsettled_return() {
+        let nullable =
+            |typ| LuaType::Union(Arc::new(LuaUnionType::from_vec(vec![typ, LuaType::Nil])));
+        assert!(super::inferred_return_improves(
+            &nullable(LuaType::Unknown),
+            &nullable(LuaType::String)
+        ));
+        assert!(!super::inferred_return_improves(
+            &nullable(LuaType::Unknown),
+            &nullable(LuaType::Any)
+        ));
+    }
+
+    #[test]
+    fn inferred_return_preserves_unknown_any_direction() {
+        assert!(super::inferred_return_improves(
+            &LuaType::Unknown,
+            &LuaType::Any
+        ));
+        assert!(!super::inferred_return_improves(
+            &LuaType::Any,
+            &LuaType::Unknown
+        ));
+        assert!(super::inferred_return_improves(
+            &LuaType::Unknown,
+            &LuaType::Union(Arc::new(LuaUnionType::from_vec(vec![
+                LuaType::Unknown,
+                LuaType::Nil,
+            ])))
+        ));
     }
 }

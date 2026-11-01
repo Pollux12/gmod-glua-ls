@@ -253,10 +253,9 @@ fn export_generics(db: &DbIndex, type_decl_id: &LuaTypeDeclId) -> Vec<TypeVar> {
 }
 
 fn export_members(db: &DbIndex, member_owner: LuaMemberOwner) -> Vec<Member> {
-    let member_index = db.get_member_index();
     let type_index = db.get_type_index();
     let vfs = db.get_vfs();
-    let members = member_index.get_sorted_members(&member_owner);
+    let members = db.sorted_members(&member_owner);
     if let Some(members) = members {
         members
             .into_iter()
@@ -325,12 +324,12 @@ fn export_signature(
             .enumerate()
             .map(|(i, name)| match signature.param_docs.get(&i) {
                 Some(param_info) => FnParam {
-                    name: Some(name.clone()),
+                    name: Some(name.to_string()),
                     typ: Some(render_typ(db, &param_info.type_ref, RenderLevel::Simple)),
                     desc: param_info.description.clone(),
                 },
                 None => FnParam {
-                    name: Some(name.clone()),
+                    name: Some(name.to_string()),
                     ..Default::default()
                 },
             })

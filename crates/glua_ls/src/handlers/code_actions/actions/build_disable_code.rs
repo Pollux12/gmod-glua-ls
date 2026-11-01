@@ -73,7 +73,7 @@ pub fn build_disable_next_line_changes(
 ) -> Option<HashMap<Uri, Vec<TextEdit>>> {
     let emmyrc = semantic_model.get_emmyrc();
     let document = semantic_model.get_document();
-    let offset = document.get_offset(start.line as usize, start.character as usize)?;
+    let offset = document.to_offset(start);
     let root = semantic_model.get_root();
     if offset >= root.get_range().end() {
         return None;
@@ -88,7 +88,7 @@ pub fn build_disable_next_line_changes(
     let stat = token.parent_ancestors().find_map(LuaStat::cast)?;
     let mut ast = DisableLineAst::Stat(stat.clone());
     let expr = token.parent_ancestors().find_map(LuaExpr::cast);
-    // 如果 expr 是 stat 的子节点, 则认为是 expr
+    // If expr is a child node of stat, treat it as expr
     if let Some(expr) = expr
         && stat.get_range().contains(expr.get_range().start())
     {

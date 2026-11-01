@@ -117,7 +117,7 @@ impl FoldingRangeBuilder<'_> {
         }
 
         match self.client_id {
-            // Intellij 支持范围折叠
+            // Intellij supports range folding
             ClientId::Intellij => {
                 let start_col = start_col + 1;
                 let range = lsp_types::Range {

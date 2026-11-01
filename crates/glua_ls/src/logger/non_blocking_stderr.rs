@@ -12,16 +12,48 @@
 //! several lines still queues one entry per line, and can lose some of them.
 
 use std::io::{self, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Records allowed to queue before new ones are dropped.
 const QUEUE_CAPACITY: usize = 4096;
 
+enum Entry {
+    Record(Vec<u8>),
+    /// Answered once every entry queued before it is written.
+    Drained(SyncSender<()>),
+}
+
+/// The queue of the process's sink, for [`drain_queued`].
+static QUEUE: OnceLock<SyncSender<Entry>> = OnceLock::new();
+
+/// Waits up to `timeout` for the records queued so far to reach stderr, as
+/// the process is about to exit: a stderr nobody reads cannot hold the exit.
+pub fn drain_queued(timeout: Duration) {
+    let Some(queue) = QUEUE.get() else {
+        return;
+    };
+    let deadline = Instant::now() + timeout;
+    let (ack, drained) = sync_channel(1);
+    let mut entry = Entry::Drained(ack);
+    loop {
+        match queue.try_send(entry) {
+            Ok(()) => break,
+            Err(TrySendError::Full(full)) if Instant::now() < deadline => {
+                entry = full;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => return,
+        }
+    }
+    let _ = drained.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+}
+
 pub struct NonBlockingStderr {
     /// `None` once the background thread is known to be gone.
-    sender: Option<SyncSender<Vec<u8>>>,
+    sender: Option<SyncSender<Entry>>,
     /// The fragments of the record being written, up to its newline.
     record: Vec<u8>,
     dropped: Arc<AtomicUsize>,
@@ -29,7 +61,7 @@ pub struct NonBlockingStderr {
 
 impl NonBlockingStderr {
     pub fn new() -> Self {
-        let (sender, receiver) = sync_channel::<Vec<u8>>(QUEUE_CAPACITY);
+        let (sender, receiver) = sync_channel::<Entry>(QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicUsize::new(0));
 
         let drain_dropped = dropped.clone();
@@ -37,7 +69,10 @@ impl NonBlockingStderr {
             .name("gluals-stderr".to_string())
             .spawn(move || drain(receiver, drain_dropped))
         {
-            Ok(_handle) => Some(sender),
+            Ok(_handle) => {
+                let _ = QUEUE.set(sender.clone());
+                Some(sender)
+            }
             Err(error) => {
                 // The logger is not up yet, so this is the only way to say it.
                 eprintln!(
@@ -55,8 +90,8 @@ impl NonBlockingStderr {
     }
 
     #[cfg(test)]
-    fn with_capacity(capacity: usize) -> (Self, Receiver<Vec<u8>>) {
-        let (sender, receiver) = sync_channel::<Vec<u8>>(capacity);
+    fn with_capacity(capacity: usize) -> (Self, Receiver<Entry>) {
+        let (sender, receiver) = sync_channel::<Entry>(capacity);
         (
             Self {
                 sender: Some(sender),
@@ -72,7 +107,7 @@ impl NonBlockingStderr {
             return;
         };
 
-        match sender.try_send(record) {
+        match sender.try_send(Entry::Record(record)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -84,9 +119,16 @@ impl NonBlockingStderr {
 
 /// Writes queued records, prefixing however many were dropped while the queue
 /// was full so the loss is visible in the output it interrupted.
-fn drain(receiver: Receiver<Vec<u8>>, dropped: Arc<AtomicUsize>) {
+fn drain(receiver: Receiver<Entry>, dropped: Arc<AtomicUsize>) {
     let stderr = io::stderr();
-    for record in receiver {
+    for entry in receiver {
+        let record = match entry {
+            Entry::Record(record) => record,
+            Entry::Drained(ack) => {
+                let _ = ack.send(());
+                continue;
+            }
+        };
         let missing = dropped.swap(0, Ordering::Relaxed);
         let mut handle = stderr.lock();
         if missing != 0 {
@@ -132,6 +174,13 @@ impl Write for NonBlockingStderr {
 mod tests {
     use super::*;
 
+    fn record(entry: Entry) -> Vec<u8> {
+        match entry {
+            Entry::Record(record) => record,
+            Entry::Drained(_) => panic!("expected a record"),
+        }
+    }
+
     #[test]
     fn writes_report_success_and_never_block() {
         let (mut sink, _receiver) = NonBlockingStderr::with_capacity(4);
@@ -160,8 +209,28 @@ mod tests {
         .expect("write should not fail");
         sink.flush().expect("flush should not fail");
 
-        assert_eq!(receiver.try_recv().expect("one record"), b"[INFO] hello\n");
+        assert_eq!(
+            record(receiver.try_recv().expect("one record")),
+            b"[INFO] hello\n"
+        );
         assert!(receiver.try_recv().is_err());
+    }
+
+    /// The exit waits on this answer, so it must come once what was queued
+    /// before it is written, and come at all.
+    #[test]
+    fn a_drain_marker_is_answered_after_the_records_queued_before_it() {
+        let (sender, receiver) = sync_channel(4);
+        let (ack, drained) = sync_channel(1);
+        sender
+            .send(Entry::Record(b"before\n".to_vec()))
+            .expect("queued");
+        sender.send(Entry::Drained(ack)).expect("queued");
+        drop(sender);
+
+        drain(receiver, Arc::new(AtomicUsize::new(0)));
+
+        assert!(drained.try_recv().is_ok());
     }
 
     #[test]
@@ -172,7 +241,7 @@ mod tests {
         sink.write_all(b"second\n").expect("write should not fail");
         sink.write_all(b"third\n").expect("write should not fail");
 
-        assert_eq!(receiver.try_recv().expect("one record"), b"first\n");
+        assert_eq!(record(receiver.try_recv().expect("one record")), b"first\n");
         assert!(receiver.try_recv().is_err());
         assert_eq!(sink.dropped.load(Ordering::Relaxed), 2);
     }

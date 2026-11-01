@@ -21,12 +21,78 @@ enum StrTplArgClass {
     Incompatible,
 }
 
+struct Finding {
+    range: TextRange,
+    message: String,
+    severity: Option<DiagnosticSeverity>,
+}
+
+#[derive(Default)]
+struct Findings(Vec<Finding>);
+
+impl Findings {
+    fn add(&mut self, range: TextRange, message: String) {
+        self.add_with_severity(range, message, None);
+    }
+
+    fn add_with_severity(
+        &mut self,
+        range: TextRange,
+        message: String,
+        severity: Option<DiagnosticSeverity>,
+    ) {
+        self.0.push(Finding {
+            range,
+            message,
+            severity,
+        });
+    }
+
+    /// Whether every finding only informs (such as an auto-created class), so
+    /// the argument is as good as accepted.
+    fn is_hint_only(&self) -> bool {
+        self.0
+            .iter()
+            .all(|finding| finding.severity == Some(DiagnosticSeverity::HINT))
+    }
+
+    fn report(self, context: &mut DiagnosticContext) {
+        for finding in self.0 {
+            context.add_diagnostic_with_severity(
+                DiagnosticCode::GenericConstraintMismatch,
+                finding.range,
+                finding.message,
+                finding.severity,
+                None,
+            );
+        }
+    }
+}
+
+enum ParamVerdict {
+    NotApplicable,
+    Accepted,
+    Rejected(Findings),
+}
+
+impl From<Findings> for ParamVerdict {
+    fn from(findings: Findings) -> Self {
+        if findings.0.is_empty() {
+            ParamVerdict::Accepted
+        } else {
+            ParamVerdict::Rejected(findings)
+        }
+    }
+}
+
 impl Checker for GenericConstraintMismatchChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::GenericConstraintMismatch];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        for node in root.descendants::<LuaAst>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for node in buckets.all_nodes.iter().cloned() {
             match node {
                 LuaAst::LuaCallExpr(call_expr) => {
                     check_call_expr(context, semantic_model, call_expr);
@@ -57,6 +123,17 @@ fn check_call_expr(
         return Some(());
     };
 
+    // A forwarded `...` fills its slot with one of the pack's values.
+    let arg_infos: Vec<LuaType> = arg_infos
+        .into_iter()
+        .map(|arg_type| match &arg_type {
+            LuaType::Variadic(variadic) => match variadic.as_ref() {
+                VariadicType::Base(base) => base.clone(),
+                VariadicType::Multi(_) => arg_type,
+            },
+            _ => arg_type,
+        })
+        .collect();
     let mut arg_ranges = collect_arg_ranges(semantic_model, &call_expr);
     if call_expr.is_colon_call() && !doc_func.is_colon_define() {
         let colon_range = call_expr.get_colon_token()?.get_range();
@@ -70,8 +147,7 @@ fn check_call_expr(
             continue;
         };
 
-        check_param(
-            context,
+        if let ParamVerdict::Rejected(findings) = check_param(
             semantic_model,
             i,
             param_type,
@@ -79,7 +155,9 @@ fn check_call_expr(
             &arg_ranges,
             false,
             &substitutor,
-        );
+        ) {
+            findings.report(context);
+        }
     }
 
     Some(())
@@ -132,23 +210,23 @@ fn check_doc_tag_type(
             let extend_type = generic_params.get(i)?.type_constraint.clone()?;
             let result = semantic_model.type_check_detail(&extend_type, param_type);
             if result.is_err() {
+                let mut findings = Findings::default();
                 add_type_check_diagnostic(
-                    context,
+                    &mut findings,
                     semantic_model,
                     doc_type.get_range(),
                     &extend_type,
                     param_type,
                     result,
                 );
+                findings.report(context);
             }
         }
     }
     Some(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn check_param(
-    context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     param_index: usize,
     param_type: &LuaType,
@@ -156,8 +234,9 @@ fn check_param(
     arg_ranges: &[TextRange],
     from_union: bool,
     substitutor: &TypeSubstitutor,
-) -> Option<()> {
-    // 应该先通过泛型体操约束到唯一类型再进行检查
+) -> ParamVerdict {
+    let mut findings = Findings::default();
+    // Should first be constrained to a single type through generic gymnastics before checking
     match param_type {
         LuaType::StrTplRef(str_tpl_ref) => {
             let extend_type = str_tpl_ref.get_constraint().cloned().map(|ty| {
@@ -166,19 +245,22 @@ fn check_param(
                     instantiate_type_generic(semantic_model.get_db(), &ty, substitutor),
                 )
             });
-            let arg_type = arg_infos.get(param_index)?;
-            let arg_range = arg_ranges.get(param_index).copied()?;
+            let (Some(arg_type), Some(arg_range)) =
+                (arg_infos.get(param_index), arg_ranges.get(param_index))
+            else {
+                return ParamVerdict::NotApplicable;
+            };
 
             if from_union && !arg_type.is_string() {
-                return None;
+                return ParamVerdict::NotApplicable;
             }
 
             validate_str_tpl_ref(
-                context,
+                &mut findings,
                 semantic_model,
                 str_tpl_ref,
                 arg_type,
-                arg_range,
+                *arg_range,
                 extend_type,
             );
         }
@@ -192,7 +274,7 @@ fn check_param(
                         .find_type_decl(semantic_model.get_file_id(), &type_name)
                         .is_some_and(|decl| !decl.is_auto_generated())
                 {
-                    return None;
+                    return ParamVerdict::NotApplicable;
                 }
             }
             let extend_type = tpl_ref.get_constraint().cloned().map(|ty| {
@@ -201,34 +283,55 @@ fn check_param(
                     instantiate_type_generic(semantic_model.get_db(), &ty, substitutor),
                 )
             });
-            let arg_type = arg_infos.get(param_index);
-            let arg_range = arg_ranges.get(param_index).copied();
-            validate_tpl_ref(context, semantic_model, &extend_type, arg_type, arg_range);
+            let (Some(extend_type), Some(arg_type), Some(arg_range)) = (
+                extend_type,
+                arg_infos.get(param_index),
+                arg_ranges.get(param_index),
+            ) else {
+                return ParamVerdict::NotApplicable;
+            };
+            validate_tpl_ref(
+                &mut findings,
+                semantic_model,
+                &extend_type,
+                arg_type,
+                *arg_range,
+            );
         }
-        LuaType::Union(union_type) => {
-            // 如果不是来自 union, 才展开 union 中的每个类型进行检查
-            if !from_union {
-                for union_member_type in union_type.types() {
-                    check_param(
-                        context,
-                        semantic_model,
-                        param_index,
-                        union_member_type,
-                        arg_infos,
-                        arg_ranges,
-                        true,
-                        substitutor,
-                    );
+        LuaType::Union(union_type) if !from_union => {
+            // An argument is valid when any arm accepts it; otherwise the mildest
+            // rejection speaks, the first of equals.
+            let mut mildest_rejection: Option<Findings> = None;
+            for union_member_type in union_type.types() {
+                match check_param(
+                    semantic_model,
+                    param_index,
+                    union_member_type,
+                    arg_infos,
+                    arg_ranges,
+                    true,
+                    substitutor,
+                ) {
+                    ParamVerdict::Accepted => return ParamVerdict::Accepted,
+                    ParamVerdict::Rejected(rejection) => {
+                        if mildest_rejection.as_ref().is_none_or(|mildest| {
+                            rejection.is_hint_only() && !mildest.is_hint_only()
+                        }) {
+                            mildest_rejection = Some(rejection);
+                        }
+                    }
+                    ParamVerdict::NotApplicable => {}
                 }
             }
+            return mildest_rejection.map_or(ParamVerdict::NotApplicable, ParamVerdict::Rejected);
         }
-        _ => {}
+        _ => return ParamVerdict::NotApplicable,
     }
-    Some(())
+    findings.into()
 }
 
 fn validate_str_tpl_ref(
-    context: &mut DiagnosticContext,
+    findings: &mut Findings,
     semantic_model: &SemanticModel,
     str_tpl_ref: &LuaStringTplType,
     arg_type: &LuaType,
@@ -238,7 +341,7 @@ fn validate_str_tpl_ref(
     match arg_type {
         LuaType::StringConst(str) | LuaType::DocStringConst(str) => {
             emit_str_tpl_const_diagnostic(
-                context,
+                findings,
                 semantic_model,
                 str_tpl_ref,
                 str,
@@ -259,7 +362,7 @@ fn validate_str_tpl_ref(
                         &extend_type,
                     ) {
                         emit_str_tpl_const_diagnostic(
-                            context,
+                            findings,
                             semantic_model,
                             str_tpl_ref,
                             &str,
@@ -269,21 +372,17 @@ fn validate_str_tpl_ref(
                     }
                 }
                 StrTplArgClass::Incompatible => {
-                    context.add_diagnostic(
-                        DiagnosticCode::GenericConstraintMismatch,
+                    findings.add(
                         range,
                         "the string template type must be a string constant".to_string(),
-                        None,
                     );
                 }
             }
         }
         _ => {
-            context.add_diagnostic(
-                DiagnosticCode::GenericConstraintMismatch,
+            findings.add(
                 range,
                 "the string template type must be a string constant".to_string(),
-                None,
             );
         }
     }
@@ -382,13 +481,16 @@ fn first_unprovable_str_tpl_const(
 }
 
 fn emit_str_tpl_const_diagnostic(
-    context: &mut DiagnosticContext,
+    findings: &mut Findings,
     semantic_model: &SemanticModel,
     str_tpl_ref: &LuaStringTplType,
     str: &str,
     range: TextRange,
     extend_type: Option<&LuaType>,
 ) {
+    if !crate::semantic::str_tpl_value_names_type(str) {
+        return;
+    }
     let full_type_name = str_tpl_full_type_name(str_tpl_ref, str);
     let founded_type_decl = semantic_model
         .get_db()
@@ -398,8 +500,7 @@ fn emit_str_tpl_const_diagnostic(
         .as_ref()
         .is_some_and(|type_decl| type_decl.is_auto_generated());
     if is_auto_generated_decl && let Some(extend_type) = extend_type {
-        context.add_diagnostic_with_severity(
-            DiagnosticCode::GenericConstraintMismatch,
+        findings.add_with_severity(
             range,
             format!(
                 "Type `{}` is not explicitly defined; auto-created inheriting `{}`",
@@ -407,14 +508,12 @@ fn emit_str_tpl_const_diagnostic(
                 humanize_type(semantic_model.get_db(), extend_type, RenderLevel::Simple)
             ),
             Some(DiagnosticSeverity::HINT),
-            None,
         );
     }
 
     if founded_type_decl.is_none() {
         if let Some(extend_type) = extend_type {
-            context.add_diagnostic_with_severity(
-                DiagnosticCode::GenericConstraintMismatch,
+            findings.add_with_severity(
                 range,
                 format!(
                     "type `{}` is not defined in the codebase, using constraint type `{}`",
@@ -422,14 +521,11 @@ fn emit_str_tpl_const_diagnostic(
                     humanize_type(semantic_model.get_db(), extend_type, RenderLevel::Simple)
                 ),
                 Some(DiagnosticSeverity::HINT),
-                None,
             );
         } else {
-            context.add_diagnostic(
-                DiagnosticCode::GenericConstraintMismatch,
+            findings.add(
                 range,
                 "the string template type does not match any type declaration".to_string(),
-                None,
             );
         }
 
@@ -444,7 +540,7 @@ fn emit_str_tpl_const_diagnostic(
         let result = semantic_model.type_check_detail(extend_type, &ref_type);
         if result.is_err() {
             add_type_check_diagnostic(
-                context,
+                findings,
                 semantic_model,
                 range,
                 extend_type,
@@ -465,31 +561,27 @@ fn str_tpl_full_type_name(str_tpl_ref: &LuaStringTplType, str: &str) -> String {
 }
 
 fn validate_tpl_ref(
-    context: &mut DiagnosticContext,
+    findings: &mut Findings,
     semantic_model: &SemanticModel,
-    extend_type: &Option<LuaType>,
-    arg_type: Option<&LuaType>,
-    range: Option<TextRange>,
-) -> Option<()> {
-    let extend_type = extend_type.clone()?;
-    let arg_type = arg_type?;
-    let range = range?;
-    let result = semantic_model.type_check_detail(&extend_type, arg_type);
+    extend_type: &LuaType,
+    arg_type: &LuaType,
+    range: TextRange,
+) {
+    let result = semantic_model.type_check_detail(extend_type, arg_type);
     if result.is_err() {
         add_type_check_diagnostic(
-            context,
+            findings,
             semantic_model,
             range,
-            &extend_type,
+            extend_type,
             arg_type,
             result,
         );
     }
-    Some(())
 }
 
 fn add_type_check_diagnostic(
-    context: &mut DiagnosticContext,
+    findings: &mut Findings,
     semantic_model: &SemanticModel,
     range: TextRange,
     extend_type: &LuaType,
@@ -507,8 +599,7 @@ fn add_type_check_diagnostic(
                 }
                 TypeCheckFailReason::TypeRecursion => "type recursion".to_string(),
             };
-            context.add_diagnostic(
-                DiagnosticCode::GenericConstraintMismatch,
+            findings.add(
                 range,
                 format!(
                     "type `{found}` does not satisfy the constraint `{source}`. {reason}",
@@ -517,7 +608,6 @@ fn add_type_check_diagnostic(
                     reason = reason_message
                 )
                 .to_string(),
-                None,
             );
         }
     }

@@ -1,74 +1,351 @@
-mod assignment_contribution;
+mod function_scopes;
 mod lua_member;
 mod lua_member_feature;
 mod lua_member_item;
 mod lua_member_owner;
 mod lua_owner_members;
+mod slot_ids;
+mod test;
 
-use glua_parser::LuaSyntaxKind;
+use crate::db_index::cow_shards::{CowCell, CowShardSet, CowShards, ShardKey};
 use rowan::{TextRange, TextSize};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 use super::traits::LuaIndex;
-use crate::{FileId, GlobalId, db_index::member::lua_owner_members::LuaOwnerMembers};
-
-pub use assignment_contribution::{
-    MemberAssignmentContribution, MemberAssignmentContributionKey,
-    MemberAssignmentContributionStore,
+use crate::db_index::derivation::{
+    self, ABSENT, DerivationId, FactKey, Fingerprint, fingerprint_of,
 };
+use crate::{FileId, GlobalId, db_index::member::lua_owner_members::LuaOwnerMembers};
+use function_scopes::FunctionScopes;
+use slot_ids::SlotIds;
+
 pub use lua_member::{LuaMember, LuaMemberId, LuaMemberKey};
 pub use lua_member_feature::LuaMemberFeature;
+pub(crate) use lua_member_item::CallerSite;
 pub use lua_member_item::LuaMemberIndexItem;
 pub use lua_member_owner::LuaMemberOwner;
 
-#[derive(Debug)]
+/// Members filed by owner and then by key, each slot sorted by
+/// [`member_id_sort_key`].
+///
+/// Two of these are kept. The visible one answers lookups; the history one also
+/// keeps members a later write displaced, so a removal can still find where they
+/// were filed.
+type OwnerKeyMap = CowShards<LuaMemberOwner, HashMap<LuaMemberKey, SlotIds>>;
+
+/// Files `id` in its slot unless the slot already holds it.
+fn push_owner_key_id_unique(
+    target: &mut OwnerKeyMap,
+    owner: LuaMemberOwner,
+    key: LuaMemberKey,
+    id: LuaMemberId,
+) -> bool {
+    target
+        .entry(owner)
+        .or_default()
+        .entry(key)
+        .or_default()
+        .insert_sorted(id)
+}
+
+/// Merges two tasks' changes to one owner-key slot, which stays sorted by
+/// [`member_id_sort_key`].
+fn merge_member_ids(
+    current: &mut Option<SlotIds>,
+    frozen: Option<&SlotIds>,
+    fork: Option<&SlotIds>,
+) -> crate::db_index::cow_shards::Merged {
+    let to_vec = |ids: Option<&SlotIds>| ids.map(|ids| ids.to_vec());
+    let mut merged = to_vec(current.as_ref());
+    crate::db_index::cow_shards::merge_sorted_by(
+        &mut merged,
+        to_vec(frozen).as_ref(),
+        to_vec(fork).as_ref(),
+        |id| member_id_sort_key(*id),
+    )?;
+    *current = merged.map(SlotIds::from_vec);
+    Ok(())
+}
+
+/// The member fingerprints a task install rebuilds.
+#[derive(Default)]
+pub(crate) struct FingerprintsToRebuild {
+    owners: Vec<LuaMemberOwner>,
+    keys: Vec<LuaMemberKey>,
+    files: Vec<FileId>,
+}
+
+/// Drops `id` from its slot, and the slot and owner once they are empty.
+fn remove_owner_key_id(
+    target: &mut OwnerKeyMap,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    id: LuaMemberId,
+) -> bool {
+    let Some(owner_items) = target.get_mut(owner) else {
+        return false;
+    };
+    let mut removed = false;
+    if let Some(member_ids) = owner_items.get_mut(key) {
+        removed = member_ids.remove_sorted(id);
+        if member_ids.is_empty() {
+            owner_items.remove(key);
+        }
+    }
+    if owner_items.is_empty() {
+        target.remove(owner);
+    }
+    removed
+}
+
+/// Adds (`add`) or subtracts one element's fingerprint from `key`'s wrapping
+/// multiset sum, dropping the entry once the sum is empty.
+fn fold_fingerprint<K: ShardKey + Clone>(
+    sums: &mut CowShards<K, Fingerprint>,
+    key: K,
+    element: Fingerprint,
+    add: bool,
+) {
+    let sum = sums.get(&key).copied().unwrap_or(ABSENT);
+    let sum = if add {
+        sum.wrapping_add(element)
+    } else {
+        sum.wrapping_sub(element)
+    };
+    if sum == ABSENT {
+        sums.remove(&key);
+    } else {
+        sums.insert(key, sum);
+    }
+}
+
+fn history_element(key: &LuaMemberKey, id: LuaMemberId) -> Fingerprint {
+    fingerprint_of(&(1u8, key, id))
+}
+
+fn current_history_element(id: LuaMemberId) -> Fingerprint {
+    fingerprint_of(&(2u8, id))
+}
+
+fn file_member_element(id: LuaMemberId) -> Fingerprint {
+    fingerprint_of(&(0u8, id))
+}
+
+fn file_scope_element(file_id: FileId, range: TextRange) -> Fingerprint {
+    fingerprint_of(&(1u8, crate::InFiled::new(file_id, range)))
+}
+
+fn file_element_owner_element(site: &crate::InFiled<TextRange>) -> Fingerprint {
+    fingerprint_of(&(2u8, site))
+}
+
+/// What a read of a member object alone observes: its key, feature and global
+/// id.
+fn member_object(member: &LuaMember) -> impl std::hash::Hash + '_ {
+    (
+        member.get_key(),
+        member.get_feature(),
+        member.get_global_id(),
+    )
+}
+
+fn note_slot_write(owner: &LuaMemberOwner, key: &LuaMemberKey) {
+    derivation::note_write(|| FactKey::MemberSlot(owner.clone(), key.clone()));
+}
+
+/// Notes a change to `owner`'s members. Whether it has a member map at all
+/// moves only where the map appears or goes ([`note_owner_presence_write`]).
+fn note_owner_map_write(owner: &LuaMemberOwner) {
+    derivation::note_write(|| FactKey::MemberOwnerMap(owner.clone()));
+    derivation::note_write(|| FactKey::MemberOwnerExprKeys(owner.clone()));
+    derivation::note_write(|| FactKey::MemberOwnerFields(owner.clone()));
+}
+
+/// Notes that `owner`'s member map appeared or went, or that the owner a
+/// name canonicalises to moved: its members and its presence.
+fn note_owner_presence_write(owner: &LuaMemberOwner) {
+    note_owner_map_write(owner);
+    derivation::note_write(|| FactKey::MemberOwnerPresence(owner.clone()));
+}
+
+fn note_owner_presence_read(owner: &LuaMemberOwner) {
+    derivation::note_read(|| FactKey::MemberOwnerPresence(owner.clone()));
+}
+
+fn note_slot_read(owner: &LuaMemberOwner, key: &LuaMemberKey) {
+    derivation::note_member_slot_read(owner, key);
+}
+
+fn note_owner_map_read(owner: &LuaMemberOwner) {
+    derivation::note_read(|| FactKey::MemberOwnerMap(owner.clone()));
+}
+
+/// A member as the source layer left it, kept while a derivation has changed
+/// it so a reset can restore it.
+#[derive(Debug, Clone, PartialEq)]
+struct SourceMember {
+    /// `None` when the source layer has no such member.
+    state: Option<SourceMemberState>,
+    /// Every owner a derivation listed the member under.
+    derived_owners: Vec<LuaMemberOwner>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SourceMemberState {
+    member: LuaMember,
+    owner: Option<LuaMemberOwner>,
+    owner_only: bool,
+    provenance: Option<GlobalId>,
+    non_overwriting: bool,
+    deferred_index_expr: bool,
+    function_scope: Option<TextRange>,
+}
+
+/// The class a scripted-class synthesis moved a member to; see
+/// [`FactKey::MemberTransfer`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MemberTransfer {
+    owner: LuaMemberOwner,
+    /// Whether a global path's class change leaves the member there.
+    pinned: bool,
+}
+
+/// Where a transferred member's own writers left it homed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FiledHome {
+    owner: Option<LuaMemberOwner>,
+    owner_only: bool,
+    provenance: Option<GlobalId>,
+}
+
+/// Who moves a member: its own writers, whose home is part of its
+/// [`FactKey::Member`], or a transfer, which moves only its
+/// [`FactKey::MemberHome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Homing {
+    Filed,
+    Transferred,
+}
+
+#[derive(Debug, Clone)]
 pub struct LuaMemberIndex {
-    members: HashMap<LuaMemberId, LuaMember>,
-    in_filed: HashMap<FileId, HashSet<MemberOrOwner>>,
-    owner_members: HashMap<LuaMemberOwner, LuaOwnerMembers>,
-    member_current_owner: HashMap<LuaMemberId, LuaMemberOwner>,
-    member_owner_key_index: HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
-    member_owner_key_history_index:
-        HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
-    current_owner_member_history:
-        HashMap<LuaMemberOwner, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
-    current_members_by_key: HashMap<LuaMemberKey, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
-    non_overwriting_assignment_members: HashSet<LuaMemberId>,
-    /// Assignment members written inside a conditional construct (`if c
-    /// then t.k = v end`).
-    conditional_branch_assignment_members: HashSet<LuaMemberId>,
-    /// Members whose owner was decided by scripted-class synthesis rather
-    /// than by name resolution.
-    synthesized_owner_members: HashSet<LuaMemberId>,
+    members: CowShards<LuaMemberId, LuaMember>,
+    source_members: CowShards<LuaMemberId, SourceMember>,
+    /// The owners each file's members are filed under. The members themselves
+    /// are the file's shard of `members`.
+    in_filed: CowShards<FileId, HashSet<LuaMemberOwner>>,
+    owner_members: CowShards<LuaMemberOwner, LuaOwnerMembers>,
+    member_current_owner: CowShards<LuaMemberId, LuaMemberOwner>,
+    member_owner_key_index: OwnerKeyMap,
+    member_owner_key_history_index: OwnerKeyMap,
+    /// The owners under which a file's members were filed in the two
+    /// owner-key indexes. A file sweep only has to visit these owners, rather
+    /// than every owner in the workspace. Entries may outlive the members that
+    /// caused them; a sweep of an owner that holds none is a no-op.
+    owner_key_index_owners_by_file: CowShards<FileId, HashSet<LuaMemberOwner>>,
+    current_owner_member_history: CowShards<LuaMemberOwner, SlotIds>,
+    current_members_by_key: CowShards<LuaMemberKey, SlotIds>,
+    /// The members filed under an expression key that names another file's
+    /// positions, by that file.
+    expr_key_members_by_file: CowShards<FileId, HashSet<LuaMemberId>>,
+    non_overwriting_assignment_members: CowShardSet<LuaMemberId>,
+    /// `(owner, key)` slots whose last co-writer readmission merged nothing.
+    ///
+    /// See [`Self::readmit_preserved_assignment_co_writers`]: every later
+    /// scan of such a slot is a proven no-op, so marks skip the walk. Only
+    /// `clear` drops entries, with the index they describe — every other
+    /// mutation preserves the coverage they record, and any future history
+    /// write without a paired item merge must clear its slot here.
+    preserved_co_writer_reconciled: CowShardSet<(LuaMemberOwner, LuaMemberKey)>,
+    /// Members whose owner was recorded without adding them to the owner's
+    /// member list: a write through an instance of a class, not the class.
+    /// See [`Self::set_member_owner_only`].
+    owner_only_members: CowShardSet<LuaMemberId>,
+    /// The class each member a scripted-class synthesis moved went to.
+    member_transfers: CowShards<LuaMemberId, MemberTransfer>,
+    /// Where each member with a transfer applied was before it: the home its
+    /// own writers own.
+    filed_homes: CowShards<LuaMemberId, FiledHome>,
     /// Members `try_resolve_member` had to create itself, from a prefix
     /// type read mid-fixpoint.
-    deferred_index_expr_members: HashSet<LuaMemberId>,
-    function_scope_ranges: HashMap<FileId, Vec<TextRange>>,
-    /// Per file, each `if` branch's range paired with the range of the `if` it
-    /// belongs to, sorted by branch start. Recorded on the decl walk.
-    conditional_branch_ranges: HashMap<FileId, Vec<(TextRange, TextRange)>>,
-    member_function_scope_ranges: HashMap<LuaMemberId, TextRange>,
-    /// Per-writer evidence for the member assignment widening merge. See
-    /// [`MemberAssignmentContribution`].
-    assignment_contributions: MemberAssignmentContributionStore,
+    deferred_index_expr_members: CowCell<HashSet<LuaMemberId>>,
+    function_scope_ranges: CowCell<HashMap<FileId, FunctionScopes>>,
+    member_function_scope_ranges: CowShards<LuaMemberId, TextRange>,
+    /// The owner a table literal that initialises a global path resolves to:
+    /// the `{}` of `X = {}` or of the GLua-idiomatic `X = X or {}`, at any
+    /// depth. Held as the owner rather than the path so the normaliser can
+    /// hand back a reference. See [`LuaMemberIndex::canonical_owner`].
+    definition_site_owner: CowCell<HashMap<crate::InFiled<TextRange>, LuaMemberOwner>>,
+    /// The reverse of [`Self::definition_site_owner`], each path's sites sorted
+    /// by `(file id, range)`.
+    path_definition_sites: CowCell<HashMap<GlobalId, Vec<crate::InFiled<TextRange>>>>,
+    definition_sites_by_file: CowCell<HashMap<FileId, Vec<crate::InFiled<TextRange>>>>,
+    /// The class a global path's declaration carries (`---@class oslib` on
+    /// `os = {}`). Such a path's members belong to the class, which is where
+    /// every reader of the annotated type looks for them.
+    global_path_class_owner: CowShards<GlobalId, LuaMemberOwner>,
+    /// Every `---@class` proposal made for a global path's declaration, by
+    /// path. The winner is the set minimum, so two files annotating one
+    /// global settle on the same class regardless of analysis order, and a
+    /// removed file's proposal can be dropped without losing the others.
+    global_path_class_candidates: CowShards<GlobalId, BTreeSet<GlobalPathClassCandidate>>,
+    /// Who proposed each candidate: `None` for the source layer, else the
+    /// derivation. A candidate leaves with its last holder.
+    path_class_holders: CowShards<(GlobalId, GlobalPathClassCandidate), Vec<Option<DerivationId>>>,
+    /// The candidates each derivation proposed, retracted before it re-runs.
+    derived_path_classes: CowShards<DerivationId, Vec<(GlobalId, GlobalPathClassCandidate)>>,
+    /// The global path a member's homing went through: its write named the
+    /// path directly, or a table literal that initialises one. Such members
+    /// follow the path when its winning `---@class` changes; members homed
+    /// onto a class by any other route stay where they are.
+    member_path_provenance: CowShards<LuaMemberId, GlobalId>,
+    /// Per-owner multiset fingerprint of its history-index entries and
+    /// current-owner history, for [`FactKey::MemberOwnerMap`].
+    owner_history_fingerprints: CowShards<LuaMemberOwner, Fingerprint>,
+    /// Per-key multiset fingerprint of `current_members_by_key`, for
+    /// [`FactKey::MemberKey`].
+    key_fingerprints: CowShards<LuaMemberKey, Fingerprint>,
+    /// Per-file multiset fingerprint of the file's members, function scopes
+    /// and element owners, for [`FactKey::MemberFile`].
+    file_fingerprints: CowShards<FileId, Fingerprint>,
 }
 
+/// One file's `---@class` proposal for a global path's declaration.
+///
+/// Ordered by class name first — the winner must be name-lexicographic-min so
+/// two files annotating one global do not depend on analysis order — then by
+/// file id and class identity, which breaks ties between same-named classes
+/// deterministically. Deriving [`Eq`] over all three fields makes re-proposing
+/// the same class from the same file a no-op.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum MemberOrOwner {
-    Member(LuaMemberId),
-    Owner(LuaMemberOwner),
+pub(crate) struct GlobalPathClassCandidate {
+    class_name: Box<str>,
+    file_id: FileId,
+    class: crate::LuaTypeDeclId,
 }
 
-#[derive(Debug)]
-enum MemberInsertAction {
-    Noop,
-    Store(LuaMemberIndexItem),
-    StoreRemovingVisibleOldIds {
-        item: LuaMemberIndexItem,
-        old_ids: Vec<LuaMemberId>,
-    },
-    PushPreservedAssignment,
+impl GlobalPathClassCandidate {
+    /// The file whose annotation proposed the class.
+    pub(crate) fn file_id(&self) -> FileId {
+        self.file_id
+    }
+}
+
+impl Ord for GlobalPathClassCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.class_name
+            .cmp(&other.class_name)
+            .then_with(|| self.file_id.cmp(&other.file_id))
+            .then_with(|| self.class.stable_cmp(&other.class))
+    }
+}
+
+impl PartialOrd for GlobalPathClassCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl Default for LuaMemberIndex {
@@ -80,481 +357,1100 @@ impl Default for LuaMemberIndex {
 impl LuaMemberIndex {
     pub fn new() -> Self {
         Self {
-            members: HashMap::default(),
-            in_filed: HashMap::default(),
-            owner_members: HashMap::default(),
-            member_current_owner: HashMap::default(),
-            member_owner_key_index: HashMap::default(),
-            member_owner_key_history_index: HashMap::default(),
-            current_owner_member_history: HashMap::default(),
-            current_members_by_key: HashMap::default(),
-            non_overwriting_assignment_members: HashSet::default(),
-            conditional_branch_assignment_members: HashSet::default(),
-            synthesized_owner_members: HashSet::default(),
-            deferred_index_expr_members: HashSet::default(),
-            function_scope_ranges: HashMap::default(),
-            conditional_branch_ranges: HashMap::default(),
-            member_function_scope_ranges: HashMap::default(),
-            assignment_contributions: MemberAssignmentContributionStore::default(),
+            members: CowShards::default(),
+            source_members: CowShards::default(),
+            in_filed: Default::default(),
+            owner_members: CowShards::default(),
+            member_current_owner: Default::default(),
+            member_owner_key_index: Default::default(),
+            member_owner_key_history_index: Default::default(),
+            owner_key_index_owners_by_file: Default::default(),
+            current_owner_member_history: CowShards::default(),
+            current_members_by_key: CowShards::default(),
+            expr_key_members_by_file: Default::default(),
+            non_overwriting_assignment_members: Default::default(),
+            preserved_co_writer_reconciled: Default::default(),
+            owner_only_members: Default::default(),
+            member_transfers: CowShards::default(),
+            filed_homes: CowShards::default(),
+            deferred_index_expr_members: Default::default(),
+            function_scope_ranges: Default::default(),
+            member_function_scope_ranges: Default::default(),
+            definition_site_owner: Default::default(),
+            path_definition_sites: Default::default(),
+            definition_sites_by_file: Default::default(),
+            global_path_class_owner: Default::default(),
+            global_path_class_candidates: Default::default(),
+            path_class_holders: Default::default(),
+            derived_path_classes: Default::default(),
+            member_path_provenance: Default::default(),
+            owner_history_fingerprints: Default::default(),
+            key_fingerprints: Default::default(),
+            file_fingerprints: Default::default(),
         }
     }
 
-    /// Records this write's own evidence for the settled widening re-derivation.
-    pub fn record_member_assignment_contribution(
-        &mut self,
-        member_id: LuaMemberId,
-        contribution: MemberAssignmentContribution,
-    ) -> Option<()> {
-        let owner = self.member_current_owner.get(&member_id)?.clone();
-        let key = self.get_member(&member_id)?.get_key().clone();
-        self.assignment_contributions
-            .record(owner, key, member_id, contribution);
-        Some(())
+    /// The fingerprint of what a read of `key` observes now.
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        match key {
+            FactKey::Member(id) => self.member_fingerprint(*id),
+            FactKey::MemberObject(id) => self
+                .members
+                .get(id)
+                .map_or(ABSENT, |member| fingerprint_of(&member_object(member))),
+            FactKey::MemberHome(id) => {
+                let owner = self.member_current_owner.get(id);
+                let provenance = self.member_path_provenance.get(id);
+                let owner_only = self.owner_only_members.contains(id);
+                if owner.is_none() && provenance.is_none() && !owner_only {
+                    return ABSENT;
+                }
+                fingerprint_of(&(owner, owner_only, provenance))
+            }
+            FactKey::MemberTransfer(id) => {
+                derivation::fingerprint_opt(self.member_transfers.get(id))
+            }
+            FactKey::MemberMarks(id) => {
+                let (provenance, flags) = self.member_marks(*id);
+                let scope = self.member_scope(*id);
+                if provenance.is_none() && scope.is_none() && !flags.contains(&true) {
+                    return ABSENT;
+                }
+                fingerprint_of(&(provenance, flags, scope))
+            }
+            FactKey::MemberSlot(owner, key) => self.slot_fingerprint(owner, key),
+            FactKey::FunctionScope(site) => fingerprint_of(&crate::InFiled::new(
+                site.file_id,
+                self.innermost_function_scope(site.file_id, site.value),
+            )),
+            FactKey::MemberOwnerPresence(owner) => {
+                if self.owner_members.contains_key(owner) {
+                    fingerprint_of(&true)
+                } else {
+                    ABSENT
+                }
+            }
+            FactKey::MemberOwnerFields(owner) => {
+                self.owner_members.get(owner).map_or(ABSENT, |members| {
+                    fingerprint_of(&self.field_member_ids(members).collect::<Vec<_>>())
+                })
+            }
+            FactKey::MemberOwnerExprKeys(owner) => {
+                self.owner_members.get(owner).map_or(ABSENT, |members| {
+                    fingerprint_of(&members.sorted_expr_key_member_ids())
+                })
+            }
+            FactKey::MemberOwnerMap(owner) => {
+                let items = self.owner_members.get(owner).map_or(ABSENT, |members| {
+                    members
+                        .fingerprint()
+                        .wrapping_add(fingerprint_of("owner-present"))
+                });
+                items.wrapping_add(self.owner_history_fingerprint(owner))
+            }
+            FactKey::MemberKey(key) if derivation::mapping_back() => self
+                .current_members_by_key
+                .get(key)
+                .map_or(ABSENT, |members| {
+                    members
+                        .iter()
+                        .map(fingerprint_of)
+                        .fold(ABSENT, Fingerprint::wrapping_add)
+                }),
+            FactKey::MemberKey(key) => self.key_fingerprints.get(key).copied().unwrap_or(ABSENT),
+            FactKey::MemberFile(file_id) if derivation::mapping_back() => {
+                self.recomputed_file_fingerprint(*file_id)
+            }
+            FactKey::MemberFile(file_id) => self
+                .file_fingerprints
+                .get(file_id)
+                .copied()
+                .unwrap_or(ABSENT),
+            FactKey::GlobalPath(path) => {
+                let sites = self.path_definition_sites.get(path);
+                let class = self.global_path_class_owner.get(path);
+                let candidates = self.global_path_class_candidates.get(path);
+                if sites.is_none() && class.is_none() && candidates.is_none() {
+                    return ABSENT;
+                }
+                fingerprint_of(&(sites, class, candidates))
+            }
+            FactKey::PathClassContrib(id) => {
+                derivation::fingerprint_opt(self.derived_path_classes.get(id))
+            }
+            FactKey::DefinitionSite(site) => {
+                derivation::fingerprint_opt(self.definition_site_owner.get(site))
+            }
+            _ => {
+                debug_assert!(false, "{key:?} is not a member-index fact");
+                ABSENT
+            }
+        }
     }
 
-    pub fn member_assignment_contributions(&self) -> &MemberAssignmentContributionStore {
-        &self.assignment_contributions
+    /// The member object, the owner its own writers homed it under, flags,
+    /// provenance and scope: a transfer moves none of it.
+    fn member_fingerprint(&self, id: LuaMemberId) -> Fingerprint {
+        let member = self.members.get(&id).map(member_object);
+        let owner = self.filed_home(id).0;
+        let (provenance, flags) = self.member_marks(id);
+        let scope = self.member_scope(id);
+        if member.is_none()
+            && owner.is_none()
+            && provenance.is_none()
+            && scope.is_none()
+            && !flags.contains(&true)
+        {
+            return ABSENT;
+        }
+        fingerprint_of(&(member, owner, provenance, scope, flags))
     }
 
-    pub fn member_assignment_contributions_mut(
+    /// A member's function scope, in its file.
+    fn member_scope(&self, id: LuaMemberId) -> Option<crate::InFiled<TextRange>> {
+        self.member_function_scope_ranges
+            .get(&id)
+            .map(|range| crate::InFiled::new(id.file_id, *range))
+    }
+
+    /// A member's path provenance and its owner-only, deferred and
+    /// non-overwriting flags, as its own writers left them.
+    fn member_marks(&self, id: LuaMemberId) -> (Option<&GlobalId>, [bool; 3]) {
+        let (_, owner_only, provenance) = self.filed_home(id);
+        (
+            provenance,
+            [
+                owner_only,
+                self.deferred_index_expr_members.contains(&id),
+                self.non_overwriting_assignment_members.contains(&id),
+            ],
+        )
+    }
+
+    /// `id`'s owner, owner-only mark and provenance as its own writers left
+    /// them: before the transfer applied to it, if one is.
+    fn filed_home(&self, id: LuaMemberId) -> (Option<&LuaMemberOwner>, bool, Option<&GlobalId>) {
+        match self.filed_homes.get(&id) {
+            Some(home) => (
+                home.owner.as_ref(),
+                home.owner_only,
+                home.provenance.as_ref(),
+            ),
+            None => (
+                self.member_current_owner.get(&id),
+                self.owner_only_members.contains(&id),
+                self.member_path_provenance.get(&id),
+            ),
+        }
+    }
+
+    /// The item listed under `(owner, key)` and both owner-key index slots in
+    /// order, each id with whether it is still homed there under `key`.
+    fn slot_fingerprint(&self, owner: &LuaMemberOwner, key: &LuaMemberKey) -> Fingerprint {
+        let item = self
+            .owner_members
+            .get(owner)
+            .and_then(|members| members.get_member(key));
+        let visible = self
+            .member_owner_key_index
+            .get(owner)
+            .and_then(|slots| slots.get(key));
+        let history = self
+            .member_owner_key_history_index
+            .get(owner)
+            .and_then(|slots| slots.get(key));
+        if item.is_none() && visible.is_none() && history.is_none() {
+            return ABSENT;
+        }
+        let entries = [visible, history].map(|ids| {
+            ids.map_or(&[][..], SlotIds::as_slice)
+                .iter()
+                .map(|id| {
+                    let homed = self.member_current_owner.get(id) == Some(owner);
+                    let key_matches =
+                        homed.then(|| self.members.get(id).map(|member| member.get_key() == key));
+                    (id, homed, key_matches)
+                })
+                .collect::<Vec<_>>()
+        });
+        fingerprint_of(&(item, entries))
+    }
+
+    /// Notes every fact naming `id`'s current home: the member object, its
+    /// home, its owner's slot and map, and its key.
+    fn note_member_home_write(&self, id: LuaMemberId) {
+        self.note_home_write(id, Homing::Filed);
+    }
+
+    /// [`Self::note_member_home_write`] for a move by `homing`: a transfer
+    /// leaves the member object alone.
+    fn note_home_write(&self, id: LuaMemberId, homing: Homing) {
+        if !derivation::recording() {
+            return;
+        }
+        if homing == Homing::Filed {
+            derivation::note_write(|| FactKey::Member(id));
+        }
+        derivation::note_write(|| FactKey::MemberHome(id));
+        let key = self.members.get(&id).map(LuaMember::get_key);
+        if let Some(key) = key {
+            derivation::note_write(|| FactKey::MemberKey(key.clone()));
+        }
+        if let Some(owner) = self.member_current_owner.get(&id) {
+            note_owner_map_write(owner);
+            if let Some(key) = key {
+                note_slot_write(owner, key);
+            }
+        }
+    }
+
+    /// Notes a change to what `path` (and `site`, when given) canonicalises
+    /// to: the mapping keys themselves and the owner maps of every owner the
+    /// old and new mappings name.
+    fn note_canonical_write(
+        path: &GlobalId,
+        site: Option<&crate::InFiled<TextRange>>,
+        classes: &[Option<&crate::LuaTypeDeclId>],
+    ) {
+        derivation::note_write(|| FactKey::GlobalPath(path.clone()));
+        note_owner_presence_write(&LuaMemberOwner::GlobalPath(path.clone()));
+        if let Some(site) = site {
+            derivation::note_write(|| FactKey::DefinitionSite(site.clone()));
+            note_owner_presence_write(&LuaMemberOwner::Element(site.clone()));
+        }
+        for class in classes.iter().flatten() {
+            note_owner_presence_write(&LuaMemberOwner::Type((*class).clone()));
+        }
+    }
+
+    fn owner_history_fingerprint(&self, owner: &LuaMemberOwner) -> Fingerprint {
+        if !derivation::mapping_back() {
+            return self
+                .owner_history_fingerprints
+                .get(owner)
+                .copied()
+                .unwrap_or(ABSENT);
+        }
+        self.recomputed_owner_history_fingerprint(owner)
+    }
+
+    /// `owner`'s history fingerprint summed afresh, which is what the
+    /// incremental `owner_history_fingerprints` sum holds.
+    fn recomputed_owner_history_fingerprint(&self, owner: &LuaMemberOwner) -> Fingerprint {
+        let keyed = self
+            .member_owner_key_history_index
+            .get(owner)
+            .into_iter()
+            .flatten()
+            .flat_map(|(key, ids)| ids.iter().map(move |id| history_element(key, *id)));
+        let current = self
+            .current_owner_member_history
+            .get(owner)
+            .into_iter()
+            .flat_map(|history| history.iter())
+            .map(|id| current_history_element(*id));
+        keyed
+            .chain(current)
+            .fold(ABSENT, |sum: Fingerprint, element| {
+                sum.wrapping_add(element)
+            })
+    }
+
+    fn fold_history_fingerprint(
         &mut self,
-    ) -> &mut MemberAssignmentContributionStore {
-        &mut self.assignment_contributions
+        owner: &LuaMemberOwner,
+        element: Fingerprint,
+        add: bool,
+    ) {
+        note_owner_map_write(owner);
+        fold_fingerprint(
+            &mut self.owner_history_fingerprints,
+            owner.clone(),
+            element,
+            add,
+        );
+    }
+
+    /// `file_id`'s member-file fingerprint summed afresh, which is what the
+    /// incremental `file_fingerprints` sum holds.
+    fn recomputed_file_fingerprint(&self, file_id: FileId) -> Fingerprint {
+        let members = self
+            .members
+            .file_entries(file_id)
+            .map(|(id, _)| file_member_element(*id));
+        let scopes = self
+            .function_scope_ranges
+            .get(&file_id)
+            .into_iter()
+            .flat_map(FunctionScopes::ranges)
+            .map(|range| file_scope_element(file_id, *range));
+        let element_owners = self
+            .owner_members
+            .file_entries(file_id)
+            .filter_map(|(owner, _)| match owner {
+                LuaMemberOwner::Element(site) => Some(file_element_owner_element(site)),
+                _ => None,
+            });
+        members
+            .chain(scopes)
+            .chain(element_owners)
+            .fold(ABSENT, Fingerprint::wrapping_add)
+    }
+
+    /// `key`'s fingerprint summed afresh, which is what the incremental
+    /// `key_fingerprints` sum holds.
+    fn recomputed_key_fingerprint(&self, key: &LuaMemberKey) -> Fingerprint {
+        self.current_members_by_key
+            .get(key)
+            .into_iter()
+            .flat_map(|members| members.iter())
+            .map(fingerprint_of)
+            .fold(ABSENT, Fingerprint::wrapping_add)
+    }
+
+    /// The fingerprints both `self` and `fork`, a task fork of `frozen`,
+    /// changed: sums over what both changed, rebuilt from the merged state.
+    fn fingerprints_to_rebuild(&self, frozen: &Self, fork: &Self) -> FingerprintsToRebuild {
+        FingerprintsToRebuild {
+            owners: self.owner_history_fingerprints.both_changed_keys(
+                &frozen.owner_history_fingerprints,
+                &fork.owner_history_fingerprints,
+            ),
+            keys: self
+                .key_fingerprints
+                .both_changed_keys(&frozen.key_fingerprints, &fork.key_fingerprints),
+            files: self
+                .file_fingerprints
+                .both_changed_keys(&frozen.file_fingerprints, &fork.file_fingerprints),
+        }
+    }
+
+    /// Installs the fingerprints of a superstep's `forks` in fork order,
+    /// leaving each fork the frozen ones, and returns every fingerprint both
+    /// the index and a fork changed. Summed afresh once every fork is in,
+    /// each holds what summing it afresh after each such fork leaves: once
+    /// summed afresh it differs from `frozen`, so the last fork that changes
+    /// it sums it afresh too, and later forks change no slot it sums.
+    fn install_fingerprints(
+        &mut self,
+        frozen: &Self,
+        forks: &mut [(usize, Self)],
+    ) -> FingerprintsToRebuild {
+        fn take_in<K: ShardKey + Clone + Send + Sync + 'static>(
+            installed: &mut CowShards<K, Fingerprint>,
+            frozen: &CowShards<K, Fingerprint>,
+            forked: &mut CowShards<K, Fingerprint>,
+        ) {
+            let forked = std::mem::replace(forked, frozen.clone());
+            let conflicted = crate::db_index::cow_shards::MergeFork::install_merging(
+                installed,
+                frozen,
+                forked,
+                crate::db_index::cow_shards::rebuilt,
+            );
+            debug_assert!(!conflicted, "a rebuilt fingerprint never conflicts");
+        }
+        let mut rebuild = FingerprintsToRebuild::default();
+        for (_, fork) in forks {
+            let planned = self.fingerprints_to_rebuild(frozen, fork);
+            rebuild.owners.extend(planned.owners);
+            rebuild.keys.extend(planned.keys);
+            rebuild.files.extend(planned.files);
+            take_in(
+                &mut self.owner_history_fingerprints,
+                &frozen.owner_history_fingerprints,
+                &mut fork.owner_history_fingerprints,
+            );
+            take_in(
+                &mut self.key_fingerprints,
+                &frozen.key_fingerprints,
+                &mut fork.key_fingerprints,
+            );
+            take_in(
+                &mut self.file_fingerprints,
+                &frozen.file_fingerprints,
+                &mut fork.file_fingerprints,
+            );
+        }
+        rebuild
+    }
+
+    fn rebuild_fingerprints(&mut self, rebuild: FingerprintsToRebuild) {
+        fn store<K: ShardKey + Clone>(
+            sums: &mut CowShards<K, Fingerprint>,
+            key: K,
+            sum: Fingerprint,
+        ) {
+            if sum == ABSENT {
+                sums.remove(&key);
+            } else {
+                sums.insert(key, sum);
+            }
+        }
+        for owner in rebuild.owners.into_iter().collect::<HashSet<_>>() {
+            let sum = self.recomputed_owner_history_fingerprint(&owner);
+            store(&mut self.owner_history_fingerprints, owner, sum);
+        }
+        for key in rebuild.keys.into_iter().collect::<HashSet<_>>() {
+            let sum = self.recomputed_key_fingerprint(&key);
+            store(&mut self.key_fingerprints, key, sum);
+        }
+        for file_id in rebuild.files.into_iter().collect::<HashSet<_>>() {
+            let sum = self.recomputed_file_fingerprint(file_id);
+            store(&mut self.file_fingerprints, file_id, sum);
+        }
+    }
+
+    fn fold_file_fingerprint(&mut self, file_id: FileId, element: Fingerprint, add: bool) {
+        derivation::note_write(|| FactKey::MemberFile(file_id));
+        fold_fingerprint(&mut self.file_fingerprints, file_id, element, add);
+    }
+
+    /// Removes `owner`'s member map, keeping the fingerprints that name it.
+    fn remove_owner_entry(&mut self, owner: &LuaMemberOwner) -> Option<LuaOwnerMembers> {
+        let removed = self.owner_members.remove(owner)?;
+        note_owner_presence_write(owner);
+        if derivation::recording() {
+            for key in removed.get_member_keys() {
+                note_slot_write(owner, key);
+            }
+        }
+        if let LuaMemberOwner::Element(range) = owner {
+            self.fold_file_fingerprint(range.file_id, file_element_owner_element(range), false);
+        }
+        Some(removed)
+    }
+
+    /// Notes every fact the index currently holds, for a wholesale reset.
+    fn note_every_fact_written(&self) {
+        let ids = self
+            .members
+            .keys()
+            .chain(self.member_current_owner.keys())
+            .chain(self.member_path_provenance.keys())
+            .chain(self.member_function_scope_ranges.keys())
+            .chain(self.owner_only_members.iter())
+            .chain(self.filed_homes.keys())
+            .chain(self.deferred_index_expr_members.iter())
+            .chain(self.non_overwriting_assignment_members.iter());
+        for id in ids {
+            derivation::note_write(|| FactKey::Member(*id));
+            derivation::note_write(|| FactKey::MemberHome(*id));
+        }
+        for id in self.member_transfers.keys() {
+            derivation::note_write(|| FactKey::MemberTransfer(*id));
+        }
+        for (owner, members) in &self.owner_members {
+            note_owner_presence_write(owner);
+            for key in members.get_member_keys() {
+                note_slot_write(owner, key);
+            }
+        }
+        for index in [
+            &self.member_owner_key_index,
+            &self.member_owner_key_history_index,
+        ] {
+            for (owner, slots) in index {
+                note_owner_map_write(owner);
+                for key in slots.keys() {
+                    note_slot_write(owner, key);
+                }
+            }
+        }
+        for owner in self.current_owner_member_history.keys() {
+            note_owner_map_write(owner);
+        }
+        for key in self.current_members_by_key.keys() {
+            derivation::note_write(|| FactKey::MemberKey(key.clone()));
+        }
+        for file_id in self.file_fingerprints.keys() {
+            derivation::note_write(|| FactKey::MemberFile(*file_id));
+        }
+        let paths = self
+            .path_definition_sites
+            .keys()
+            .chain(self.global_path_class_owner.keys())
+            .chain(self.global_path_class_candidates.keys());
+        for path in paths {
+            derivation::note_write(|| FactKey::GlobalPath(path.clone()));
+        }
+        for site in self.definition_site_owner.keys() {
+            derivation::note_write(|| FactKey::DefinitionSite(site.clone()));
+        }
+    }
+
+    /// Creates `file_id`'s per-file entries when absent. An empty file keeps
+    /// empty per-file entries, which all readers treat exactly like absent ones.
+    pub fn add_file_entries(&mut self, file_id: FileId) {
+        self.in_filed.entry(file_id).or_default();
+        self.owner_key_index_owners_by_file
+            .entry(file_id)
+            .or_default();
+        self.function_scope_ranges.entry(file_id).or_default();
+    }
+
+    /// A rewrite, flag change, or drop behind the member's back alters the
+    /// membership view both its owner and key slots answer for.
+    fn note_member_move(&mut self, member_id: LuaMemberId) {
+        self.note_member_home_write(member_id);
+    }
+
+    /// [`Self::note_member_move`] for writes that leave the owner/key slots
+    /// alone — provenance, bookkeeping flags, first filings, owner-slot
+    /// bookkeeping — but still change what an id-keyed member read sees.
+    fn note_member_object_write(&mut self, member_id: LuaMemberId) {
+        self.note_object_write(member_id, Homing::Filed);
+    }
+
+    /// [`Self::note_member_object_write`] for a write by `homing`.
+    fn note_object_write(&self, member_id: LuaMemberId, homing: Homing) {
+        if homing == Homing::Filed {
+            derivation::note_write(|| FactKey::Member(member_id));
+        }
+        derivation::note_write(|| FactKey::MemberHome(member_id));
+    }
+
+    /// Keeps the source layer's version of `id` before a derivation first
+    /// changes it.
+    fn snapshot_member(&mut self, id: LuaMemberId) {
+        if derivation::writes_source() {
+            return;
+        }
+        derivation::note_write(|| FactKey::Member(id));
+        if self.source_members.contains_key(&id) {
+            return;
+        }
+        let (owner, owner_only, provenance) = self.filed_home(id);
+        let state = self.members.get(&id).map(|member| SourceMemberState {
+            member: member.clone(),
+            owner: owner.cloned(),
+            owner_only,
+            provenance: provenance.cloned(),
+            non_overwriting: self.non_overwriting_assignment_members.contains(&id),
+            deferred_index_expr: self.deferred_index_expr_members.contains(&id),
+            function_scope: self.member_function_scope_ranges.get(&id).copied(),
+        });
+        self.source_members.insert(
+            id,
+            SourceMember {
+                state,
+                derived_owners: Vec::new(),
+            },
+        );
+    }
+
+    /// Records that a derivation listed `id` under `owner`, and under the
+    /// owner that name resolves to now, which is where the listing lands: a
+    /// reset must find it there even after the name resolves elsewhere.
+    fn note_derived_owner(&mut self, id: LuaMemberId, owner: &LuaMemberOwner) {
+        if derivation::writes_source() {
+            return;
+        }
+        self.snapshot_member(id);
+        let listed = derivation::untracked(|| {
+            let listed = self
+                .effective_path_member_owner(id, owner)
+                .unwrap_or_else(|| owner.clone());
+            self.canonical(&listed).clone()
+        });
+        if let Some(source) = self.source_members.get_mut(&id) {
+            for owner in [owner, &listed] {
+                if !source.derived_owners.contains(owner) {
+                    source.derived_owners.push(owner.clone());
+                }
+            }
+        }
+    }
+
+    /// Restores `id` to what the source layer left: every derived listing is
+    /// dropped and the source member, if any, is filed again, under the
+    /// transfer that still holds for it.
+    pub(crate) fn reset_member(&mut self, id: LuaMemberId) {
+        if !self.source_members.contains_key(&id) {
+            return;
+        }
+        self.write_filed(id, |index| index.reset_filed_member(id));
+    }
+
+    fn reset_filed_member(&mut self, id: LuaMemberId) {
+        let Some(source) = self.source_members.remove(&id) else {
+            return;
+        };
+        let mut owners = source.derived_owners;
+        if let Some(owner) = self.member_current_owner.get(&id) {
+            owners.push(owner.clone());
+        }
+        for owner in &owners {
+            self.remove_member_from_all_owner_key_indexes(owner, id);
+            self.remove_member_from_owner_item(owner, id);
+        }
+        self.forget_member(id);
+        let Some(state) = source.state else {
+            return;
+        };
+        // A member homed through a global path is filed under the path, so
+        // it follows whichever class the path resolves to now.
+        let owner = match state.provenance {
+            Some(path) => LuaMemberOwner::GlobalPath(path),
+            None => state.owner.unwrap_or(LuaMemberOwner::LocalUnresolve),
+        };
+        self.file_member(owner, state.member, state.owner_only);
+        if state.non_overwriting {
+            self.non_overwriting_assignment_members.insert(id);
+        }
+        if state.deferred_index_expr {
+            self.deferred_index_expr_members.insert(id);
+        }
+        if let Some(range) = state.function_scope {
+            self.member_function_scope_ranges.insert(id, range);
+        }
     }
 
     pub fn add_member(&mut self, owner: LuaMemberOwner, member: LuaMember) -> LuaMemberId {
+        self.add_member_with_owner_only(owner, member, false)
+    }
+
+    pub fn add_member_with_owner_only(
+        &mut self,
+        owner: LuaMemberOwner,
+        member: LuaMember,
+        is_owner_only: bool,
+    ) -> LuaMemberId {
+        derivation::noting_writes_once(|| {
+            if !owner.is_unknown() {
+                self.note_derived_owner(member.get_id(), &owner);
+            } else {
+                self.snapshot_member(member.get_id());
+            }
+            // Where the member is filed is the index's own placement: a later
+            // class binding or site registration re-homes it, so what the
+            // writer produced does not depend on the placement state it saw.
+            if !owner.is_unknown() {
+                note_slot_write(&owner, member.get_key());
+                note_owner_map_write(&owner);
+            }
+            let id = member.get_id();
+            derivation::untracked(|| {
+                self.write_filed(id, |index| index.file_member(owner, member, is_owner_only))
+            })
+        })
+    }
+
+    fn file_member(
+        &mut self,
+        owner: LuaMemberOwner,
+        member: LuaMember,
+        is_owner_only: bool,
+    ) -> LuaMemberId {
         let id = member.get_id();
+        self.note_member_home_write(id);
+        let owner = self
+            .effective_path_member_owner(id, &owner)
+            .unwrap_or(owner);
+        self.note_member_path_provenance(id, &owner, Homing::Filed);
+        let owner = self.canonical(&owner).clone();
         let file_id = member.get_file_id();
         let function_scope = self.assignment_file_define_scope_for_member(&member);
-        self.members.insert(id, member);
+        // Re-filing an existing id re-homes whatever the old filing named:
+        // the member keeps its identity while its owner and key maps move, so
+        // any memo holding the old slot must rebuild. Pure first filings are
+        // append-only and leave the revision alone. An identical re-file —
+        // same owner, key and member record — changes nothing a membership
+        // view or memo can observe, so stamping it would only churn readers
+        // (settled passes re-file members every round while converging).
+        let mut already_filed_here = false;
+        let mut member_object_changed = true;
+        if self.members.contains_key(&id) {
+            // The insert below overwrites the member record, but nothing else
+            // removes the id from the key slot its previous filing named. When
+            // the owner is unchanged and only the key moved, that leaves the id
+            // listed under two keys of one owner, so `get_members` yields it
+            // twice. Drop the stale key slot; a changed owner is a genuine
+            // second home (membership accumulates across owners) and is kept.
+            let old_owner = self.member_current_owner.get(&id).cloned();
+            let same_owner = old_owner.as_ref() == Some(&owner);
+            let key_changed = self.get_member(&id).map(|m| m.get_key()) != Some(member.get_key());
+            let identical = same_owner
+                && !key_changed
+                && self.owner_only_members.contains(&id) == is_owner_only
+                && self.members.get(&id).is_some_and(|existing| {
+                    existing.get_feature() == member.get_feature()
+                        && existing.get_global_id() == member.get_global_id()
+                });
+            member_object_changed = !identical;
+            if !identical {
+                self.note_member_move(id);
+            }
+            match old_owner {
+                Some(old_owner) if same_owner && key_changed => {
+                    self.remove_member_from_owner_slot(&old_owner, id);
+                }
+                // The old owner keeps listing the id, but it is no longer the
+                // member's current home, so its current-only views let it go.
+                Some(old_owner) if !same_owner => {
+                    self.remove_member_from_visible_owner_key_index(&old_owner, id);
+                    self.remove_current_owner_member(&old_owner, id);
+                    if key_changed {
+                        self.remove_current_member_key(id);
+                    }
+                }
+                _ => {}
+            }
+            // A re-file under the same owner and key is a rewrite, not a new
+            // membership: the owner-key indexes already hold the id, and
+            // pushing it again would list the member twice in the slot.
+            already_filed_here = same_owner && !key_changed;
+        }
+        let first_filing = self.members.insert(id, member).is_none();
+        if member_object_changed {
+            self.note_member_object_write(id);
+        }
         self.set_member_function_scope_range(id, function_scope);
-        self.add_in_file_object(file_id, MemberOrOwner::Member(id));
+        if first_filing {
+            self.fold_file_fingerprint(file_id, file_member_element(id), true);
+        }
         if !owner.is_unknown() {
             self.member_current_owner.insert(id, owner.clone());
             self.add_current_member_key(id);
-            self.current_owner_member_history
-                .entry(owner.clone())
-                .or_default()
-                .insert(member_id_sort_key(id), id);
-            self.add_in_file_object(file_id, MemberOrOwner::Owner(owner.clone()));
-            self.add_new_member_to_owner_key_index(owner.clone(), id);
-            self.add_new_member_to_owner_key_history_index(owner.clone(), id);
-            self.add_member_to_owner(owner.clone(), id);
+            self.insert_current_owner_member(&owner, id);
+            self.add_file_owner(file_id, owner.clone());
+            if is_owner_only {
+                self.owner_only_members.insert(id);
+            } else {
+                if !already_filed_here {
+                    self.add_new_member_to_owner_key_indexes(owner.clone(), id);
+                }
+                self.list_member(owner.clone(), id, Homing::Filed);
+            }
         }
+        self.note_member_home_write(id);
         id
     }
 
-    fn add_in_file_object(&mut self, file_id: FileId, member_or_owner: MemberOrOwner) {
-        self.in_filed
-            .entry(file_id)
-            .or_default()
-            .insert(member_or_owner);
-    }
-
-    pub fn add_member_to_owner(&mut self, owner: LuaMemberOwner, id: LuaMemberId) -> Option<()> {
-        let member = self.get_member(&id)?;
-        let key = member.get_key().clone();
-        let is_decl = member.get_feature().is_decl();
-        if self.member_current_owner.get(&id) != Some(&owner) {
-            self.add_member_to_owner_key_index(owner.clone(), id);
-            self.add_member_to_owner_key_history_index(owner.clone(), id);
-        }
-
-        self.owner_members
+    /// Files `id` in `owner`'s current-owner history.
+    fn insert_current_owner_member(&mut self, owner: &LuaMemberOwner, id: LuaMemberId) {
+        let inserted = self
+            .current_owner_member_history
             .entry(owner.clone())
-            .or_insert_with(LuaOwnerMembers::new);
-
-        let current_item = self
-            .owner_members
-            .get(&owner)
-            .and_then(|owner_members| owner_members.get_member(&key));
-        let action = self.classify_member_insert(&owner, &key, id, is_decl, current_item);
-        self.apply_member_insert_action(owner, key, id, action);
-
-        Some(())
+            .or_default()
+            .insert_sorted(id);
+        if inserted {
+            self.fold_history_fingerprint(owner, current_history_element(id), true);
+        }
     }
 
-    fn classify_member_insert(
-        &self,
-        owner: &LuaMemberOwner,
-        key: &LuaMemberKey,
-        id: LuaMemberId,
-        is_decl: bool,
-        current_item: Option<&LuaMemberIndexItem>,
-    ) -> MemberInsertAction {
-        let Some(item) = current_item else {
-            return MemberInsertAction::Store(LuaMemberIndexItem::One(id));
+    /// Removes `id` from `owner`'s item slot and the owner-key indexes, reading
+    /// the key off the member's current record. Shared by `rekey_member` and
+    /// the re-file path in `add_member_with_owner_only`: both move a member
+    /// whose stored key still names the slot being vacated.
+    fn remove_member_from_owner_slot(&mut self, owner: &LuaMemberOwner, id: LuaMemberId) {
+        let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
+            return;
         };
-
-        if is_decl {
-            return match item {
-                LuaMemberIndexItem::One(old_id) if *old_id == id => MemberInsertAction::Noop,
-                LuaMemberIndexItem::One(old_id) => {
-                    MemberInsertAction::Store(LuaMemberIndexItem::Many(vec![*old_id, id]))
-                }
-                LuaMemberIndexItem::Many(ids) if ids.contains(&id) => MemberInsertAction::Noop,
-                LuaMemberIndexItem::Many(ids) => {
-                    let mut ids = ids.clone();
-                    ids.push(id);
-                    MemberInsertAction::Store(LuaMemberIndexItem::Many(ids))
-                }
-            };
-        }
-
-        if let Some(action) = self.classify_conditional_branch_insert(id, item) {
-            return action;
-        }
-
-        if self.should_preserve_assignment_file_define_member(owner, key, id) {
-            return MemberInsertAction::PushPreservedAssignment;
-        }
-
-        if self.is_item_only_meta(item) {
-            return match item {
-                LuaMemberIndexItem::One(old_id) if *old_id == id => MemberInsertAction::Noop,
-                LuaMemberIndexItem::One(old_id) => {
-                    MemberInsertAction::Store(LuaMemberIndexItem::Many(vec![id, *old_id]))
-                }
-                LuaMemberIndexItem::Many(ids) if ids.contains(&id) => MemberInsertAction::Noop,
-                LuaMemberIndexItem::Many(ids) => {
-                    let mut ids = ids.clone();
-                    ids.push(id);
-                    MemberInsertAction::Store(LuaMemberIndexItem::Many(ids))
-                }
-            };
-        }
-
-        if !self.is_item_only_file_define(item) {
-            return MemberInsertAction::Noop;
-        }
-
-        let old_member_ids = member_ids_from_item(item);
-        let all_assignment_file_defines = self.is_assignment_file_define_member(id)
-            && old_member_ids
-                .iter()
-                .all(|old_id| self.is_assignment_file_define_member(*old_id));
-
-        if all_assignment_file_defines {
-            let should_preserve_members = self.non_overwriting_assignment_members.contains(&id)
-                && old_member_ids
-                    .iter()
-                    .all(|old_id| self.non_overwriting_assignment_members.contains(old_id));
-            if should_preserve_members {
-                let mut ids = old_member_ids;
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
-                let item = match ids.as_slice() {
-                    [id] => LuaMemberIndexItem::One(*id),
-                    _ => LuaMemberIndexItem::Many(ids),
-                };
-                return MemberInsertAction::Store(item);
-            }
-
-            // A guarded self-assignment (`t.k = t.k or {}`) is a
-            // placeholder: its `{}` carries no member information of its
-            // own, so it must not take the visible slot from a real writer
-            // in another file -- which one survived would then depend on
-            // load order. Only across files: statements in one file run in
-            // source order, so a later write there genuinely supersedes.
-            if self.non_overwriting_assignment_members.contains(&id)
-                && old_member_ids.iter().any(|old_id| {
-                    old_id.file_id != id.file_id
-                        && !self.non_overwriting_assignment_members.contains(old_id)
-                })
-            {
-                return MemberInsertAction::Noop;
-            }
-
-            // The surviving write is the *latest defined* one, not the one
-            // that arrived last -- the rule the mixed-feature fall-through
-            // below already applies. Within a file the two agree, because
-            // the sort key leads with source position.
-            let candidates = || old_member_ids.iter().copied().chain(std::iter::once(id));
-            let winner = candidates()
-                .filter(|candidate| {
-                    !self.non_overwriting_assignment_members.contains(candidate)
-                        || !candidates().any(|other| {
-                            other.file_id != candidate.file_id
-                                && !self.non_overwriting_assignment_members.contains(&other)
-                        })
-                })
-                .max_by_key(|candidate| member_id_sort_key(*candidate))
-                .unwrap_or_else(|| latest_defined_member(&old_member_ids, id));
-
-            return match item {
-                LuaMemberIndexItem::One(old_id) if *old_id == id => MemberInsertAction::Noop,
-                LuaMemberIndexItem::Many(ids) if ids.contains(&id) => MemberInsertAction::Noop,
-                _ => MemberInsertAction::Store(LuaMemberIndexItem::One(winner)),
-            };
-        }
-
-        match item {
-            LuaMemberIndexItem::One(old_id) if *old_id == id => MemberInsertAction::Noop,
-            _ => {
-                // Ids this owner only *aliases* belong to another owner, and
-                // `add_member_alias_to_owner` never displaces what it finds. Letting
-                // one win this slot -- or evicting one -- would make the outcome
-                // depend on whether the owner's own write or the alias arrived
-                // first, which is a property of the batch, not of the source.
-                let (aliased, owned): (Vec<_>, Vec<_>) = old_member_ids
-                    .iter()
-                    .copied()
-                    .partition(|old_id| self.member_current_owner.get(old_id) != Some(owner));
-                let winner = latest_defined_member(&owned, id);
-                let mut visible = aliased;
-                visible.push(winner);
-                visible.sort_by_key(|visible_id| member_id_sort_key(*visible_id));
-                let new_item = match visible.as_slice() {
-                    [only] => LuaMemberIndexItem::One(*only),
-                    _ => LuaMemberIndexItem::Many(visible),
-                };
-                if item == &new_item {
-                    return MemberInsertAction::Noop;
-                }
-                MemberInsertAction::StoreRemovingVisibleOldIds {
-                    item: new_item,
-                    old_ids: owned
-                        .into_iter()
-                        .chain(std::iter::once(id))
-                        .filter(|candidate| {
-                            *candidate != winner
-                                && !self.is_assignment_file_define_member(*candidate)
-                        })
-                        .collect(),
-                }
-            }
+        self.remove_member_from_all_owner_key_indexes(owner, id);
+        self.remove_current_member_key(id);
+        if let Some(owner_members) = self.owner_members.get_mut(owner)
+            && owner_members.remove_id(&key, id)
+        {
+            note_slot_write(owner, &key);
+            note_owner_map_write(owner);
         }
     }
 
-    /// Resolves an owner/key slot that any conditional-branch write
-    /// contributes to, as a function of the members involved rather than of
-    /// their arrival order.
-    fn classify_conditional_branch_insert(
-        &self,
-        id: LuaMemberId,
-        item: &LuaMemberIndexItem,
-    ) -> Option<MemberInsertAction> {
-        if !self.is_item_only_file_define(item)
-            || !self.is_item_only_file_define(&LuaMemberIndexItem::One(id))
-        {
-            return None;
-        }
-
-        let mut candidates = member_ids_from_item(item);
-        if !candidates.contains(&id) {
-            candidates.push(id);
-        }
-        let new_item = self.conditional_branch_item(&candidates)?;
-        Some(if &new_item == item {
-            MemberInsertAction::Noop
-        } else {
-            MemberInsertAction::Store(new_item)
+    /// Files an existing member under a different key.
+    ///
+    /// A dynamically keyed write is filed under the type its key expression
+    /// inferred to, and that type is a function of how far the walk had got.
+    /// Once the settled passes have taken the key again against the complete
+    /// map, the member has to move to the slot the settled key names — the
+    /// member's own id is its identity, so moving it keeps the writers of a
+    /// slot together instead of orphaning the old key.
+    ///
+    /// Every removal path reads the key back off the member, so the member and
+    /// all key-indexed maps move together; a half-moved member would leave the
+    /// old slot behind on the next `remove_files`.
+    pub fn rekey_member(&mut self, member_id: LuaMemberId, new_key: LuaMemberKey) -> Option<()> {
+        self.write_filed(member_id, |index| {
+            index.rekey_filed_member(member_id, new_key)
         })
     }
 
-    /// The visible item for a slot at least one conditional write reaches.
-    ///
-    /// Only writes that run in the same flow can overwrite each other, so the
-    /// candidates are bucketed by function scope: two writes in different scopes
-    /// are parallel -- each runs on its own object, which is how a class collects
-    /// a callback field from every instance that sets one -- and both stay
-    /// visible. Within one scope the writes are successive, so only the last one
-    /// survives, unless they sit in different branches of the same `if`, where
-    /// exactly one of them runs and all of them survive.
-    ///
-    /// Ordered by [`member_id_sort_key`], so it is a pure function of the
-    /// candidate set.
-    fn conditional_branch_item(&self, candidates: &[LuaMemberId]) -> Option<LuaMemberIndexItem> {
-        if !candidates.iter().any(|candidate| {
-            self.conditional_branch_assignment_members
-                .contains(candidate)
-        }) {
-            return None;
+    fn rekey_filed_member(&mut self, member_id: LuaMemberId, new_key: LuaMemberKey) -> Option<()> {
+        self.snapshot_member(member_id);
+        let old_key = self.get_member(&member_id)?.get_key().clone();
+        if old_key == new_key {
+            return Some(());
         }
 
-        let mut scopes: Vec<(Option<TextRange>, Vec<LuaMemberId>)> = Vec::new();
-        for candidate in candidates.iter().copied() {
-            let scope = self.member_function_scope_range(candidate);
-            match scopes.iter_mut().find(|(seen, _)| *seen == scope) {
-                Some((_, members)) => members.push(candidate),
-                None => scopes.push((scope, vec![candidate])),
-            }
+        self.note_member_move(member_id);
+        let owner = self.member_current_owner.get(&member_id).cloned();
+        if let Some(owner) = &owner {
+            self.remove_member_from_owner_slot(owner, member_id);
         }
 
-        let mut kept = Vec::new();
-        for (_, members) in &scopes {
-            kept.extend(self.live_writes_in_one_scope(members));
-        }
-        if kept.is_empty() {
-            return None;
-        }
-        kept.sort_by_key(|id| member_id_sort_key(*id));
+        self.members.get_mut(&member_id)?.set_key(new_key.clone());
 
-        Some(match kept.as_slice() {
-            [only] => LuaMemberIndexItem::One(*only),
-            _ => LuaMemberIndexItem::Many(kept),
-        })
-    }
-
-    /// The writes among `members` that can still be live at the end of the one
-    /// function scope they share: the branches of an `if` they write to from more
-    /// than one side, because exactly one of those runs, and otherwise just the
-    /// latest write, because successive writes in one flow overwrite each other.
-    fn live_writes_in_one_scope(&self, members: &[LuaMemberId]) -> Vec<LuaMemberId> {
-        let chains = members
-            .iter()
-            .map(|member_id| self.enclosing_conditional_branches(*member_id))
-            .collect::<Vec<_>>();
-
-        // A write survives its scope only if some other write sits in a different
-        // branch of an `if` that encloses them both. Two survivors in the same
-        // branch still overwrite each other, so a branch contributes its latest.
-        let mut latest_per_branch: Vec<(Option<(TextRange, TextRange)>, LuaMemberId)> = Vec::new();
-        for (index, member_id) in members.iter().copied().enumerate() {
-            let has_alternative = chains.iter().enumerate().any(|(other, other_chain)| {
-                other != index
-                    && chains[index].iter().any(|(branch, if_range)| {
-                        other_chain
-                            .iter()
-                            .any(|(seen, seen_if)| seen_if == if_range && seen != branch)
-                    })
-            });
-            if !has_alternative {
-                continue;
-            }
-            let branch = chains[index].first().copied();
-            match latest_per_branch
-                .iter_mut()
-                .find(|(seen, _)| *seen == branch)
-            {
-                Some(entry) => {
-                    if member_id_sort_key(member_id) > member_id_sort_key(entry.1) {
-                        entry.1 = member_id;
-                    }
-                }
-                None => latest_per_branch.push((branch, member_id)),
-            }
+        if let Some(owner) = owner {
+            self.add_current_member_key(member_id);
+            self.add_member_to_owner_key_indexes(owner.clone(), member_id);
+            self.list_member(owner, member_id, Homing::Filed);
         }
-        if !latest_per_branch.is_empty() {
-            return latest_per_branch
-                .into_iter()
-                .map(|(_, member_id)| member_id)
-                .collect();
-        }
-
-        members
-            .iter()
-            .copied()
-            .max_by_key(|member_id| member_id_sort_key(*member_id))
-            .into_iter()
-            .collect()
-    }
-
-    /// Re-resolves the slot `member_id` writes to, now that it is known to
-    /// be a conditional-branch write.
-    fn resolve_conditional_branch_owner_key_item(&mut self, member_id: LuaMemberId) -> Option<()> {
-        let owner = self.member_current_owner.get(&member_id)?.clone();
-        if matches!(owner, LuaMemberOwner::GlobalPath(_)) {
-            return None;
-        }
-        let key = self.get_member(&member_id)?.get_key().clone();
-        let candidates = self
-            .get_current_owner_members_for_key(&owner, &key)
-            .into_iter()
-            .map(|member| member.get_id())
-            .collect::<Vec<_>>();
-        if !candidates
-            .iter()
-            .all(|candidate| self.is_assignment_file_define_member(*candidate))
-        {
-            return None;
-        }
-
-        let item = self.conditional_branch_item(&candidates)?;
-        let owner_members = self.owner_members.get_mut(&owner)?;
-        if owner_members.get_member(&key) != Some(&item) {
-            owner_members.add_member(key, item);
-        }
+        self.note_member_home_write(member_id);
         Some(())
     }
 
-    fn apply_member_insert_action(
+    fn add_file_owner(&mut self, file_id: FileId, owner: LuaMemberOwner) {
+        self.in_filed.entry(file_id).or_default().insert(owner);
+    }
+
+    /// Files `id` under `owner`. A slot holds every member written or declared
+    /// for its key, ordered by [`member_id_sort_key`]; readers merge them.
+    pub fn add_member_to_owner(&mut self, owner: LuaMemberOwner, id: LuaMemberId) -> Option<()> {
+        self.write_filed(id, |index| index.list_member(owner, id, Homing::Filed))
+    }
+
+    /// [`Self::add_member_to_owner`] for a listing by `homing`.
+    fn list_member(
         &mut self,
         owner: LuaMemberOwner,
-        key: LuaMemberKey,
         id: LuaMemberId,
-        action: MemberInsertAction,
-    ) {
-        match action {
-            MemberInsertAction::Noop => {}
-            MemberInsertAction::Store(item) => {
-                self.owner_members
-                    .entry(owner)
-                    .or_insert_with(LuaOwnerMembers::new)
-                    .add_member(key, item);
+        homing: Homing,
+    ) -> Option<()> {
+        if homing == Homing::Filed {
+            self.note_derived_owner(id, &owner);
+        }
+        let owner = self
+            .effective_path_member_owner(id, &owner)
+            .unwrap_or(owner);
+        let owner = self.canonical(&owner).clone();
+        let key = self.get_member(&id)?.get_key().clone();
+        if self.member_current_owner.get(&id) != Some(&owner) {
+            self.add_member_to_owner_key_indexes(owner.clone(), id);
+        }
+        if self.owner_only_members.remove(&id) {
+            self.note_object_write(id, homing);
+        }
+        self.add_file_owner(id.file_id, owner.clone());
+        self.merge_member_into_owner_item(owner, key, id);
+        Some(())
+    }
+
+    /// Records `owner` as `id`'s owner without listing `id` among the owner's
+    /// members: the write went through an instance of a class and does not
+    /// define a member on it. The mark keeps later co-writer readmission from
+    /// listing it either, which otherwise depended on which writer the batch
+    /// walked first.
+    pub fn set_member_owner_only(
+        &mut self,
+        owner: LuaMemberOwner,
+        file_id: FileId,
+        id: LuaMemberId,
+    ) -> Option<()> {
+        self.write_filed(id, |index| {
+            index.note_derived_owner(id, &owner);
+            index.home_member(owner, file_id, id, Homing::Filed)?;
+            let owner = index.member_current_owner.get(&id)?.clone();
+            index.remove_member_from_owner_item(&owner, id);
+            if index.owner_only_members.insert(id) {
+                index.note_member_move(id);
             }
-            MemberInsertAction::StoreRemovingVisibleOldIds { item, old_ids } => {
-                for old_id in old_ids {
-                    self.remove_member_from_visible_owner_key_index(&owner, old_id);
-                }
-                self.owner_members
-                    .entry(owner)
-                    .or_insert_with(LuaOwnerMembers::new)
-                    .add_member(key, item);
+            Some(())
+        })
+    }
+
+    /// Homes a member whose write went through an alias of the global path
+    /// `alias_path`, stamping that provenance first.
+    ///
+    /// `local Repair = Glide.Repair` names the path's table, so the member
+    /// must follow the path when its winning `---@class` changes — exactly
+    /// what a write through the path itself would do. The provenance is
+    /// recorded before the effective-owner redirect so a write that names a
+    /// losing candidate class re-homes onto the winner, and the note's drop
+    /// branch is skipped so a homing that lands elsewhere keeps the alias's
+    /// evidence. `owner_only` files the member without listing it among the
+    /// owner's members, matching [`Self::set_member_owner_only`].
+    pub fn home_alias_member_with_provenance(
+        &mut self,
+        owner: LuaMemberOwner,
+        file_id: FileId,
+        id: LuaMemberId,
+        alias_path: GlobalId,
+        owner_only: bool,
+    ) -> Option<()> {
+        self.write_filed(id, |index| {
+            index.home_alias_filed_member(owner, file_id, id, alias_path, owner_only)
+        })
+    }
+
+    fn home_alias_filed_member(
+        &mut self,
+        owner: LuaMemberOwner,
+        file_id: FileId,
+        id: LuaMemberId,
+        alias_path: GlobalId,
+        owner_only: bool,
+    ) -> Option<()> {
+        self.note_derived_owner(id, &owner);
+        self.stamp_member_path_provenance(id, &alias_path, Homing::Filed);
+        self.record_member_owner(owner, file_id, id, Homing::Filed)?;
+        if owner_only {
+            if self.owner_only_members.insert(id) {
+                self.note_member_move(id);
             }
-            MemberInsertAction::PushPreservedAssignment => {
-                self.merge_member_into_owner_item(owner, key, id);
-            }
+            return Some(());
+        }
+        let key = self.get_member(&id)?.get_key().clone();
+        if self.owner_only_members.remove(&id) {
+            self.note_member_object_write(id);
+        }
+        let owner = self.member_current_owner.get(&id)?.clone();
+        self.merge_member_into_owner_item(owner, key, id);
+        Some(())
+    }
+
+    /// Moves `id` to `owner`, the class a scripted-class synthesis decided,
+    /// over the home its own writers keep: the move is this transfer's fact,
+    /// not the member's. A `pinned` member stays there when
+    /// [`Self::set_global_path_class`] moves the path's members onto the
+    /// annotated class.
+    pub fn transfer_member(&mut self, owner: LuaMemberOwner, id: LuaMemberId, pinned: bool) {
+        derivation::note_write(|| FactKey::MemberTransfer(id));
+        self.unapply_transfer(id);
+        self.member_transfers
+            .insert(id, MemberTransfer { owner, pinned });
+        self.apply_transfer(id);
+    }
+
+    /// Drops the transfer of `id`, which goes back to the home its own
+    /// writers left it in.
+    pub(crate) fn reset_transfer(&mut self, id: LuaMemberId) {
+        self.unapply_transfer(id);
+        if self.member_transfers.remove(&id).is_some() {
+            derivation::note_write(|| FactKey::MemberTransfer(id));
         }
     }
 
-    /// Records that `id`'s owner was decided by scripted-class synthesis, so the
-    /// global-member migration must leave it alone.
-    pub fn pin_synthesized_owner(&mut self, id: LuaMemberId) {
-        self.synthesized_owner_members.insert(id);
+    /// Runs `write`, a write by `id`'s own writers, against the home they left
+    /// it in: the transfer applied to `id` comes off first and goes back on
+    /// after, so where `id` ends up never depends on whether its writers or
+    /// its transfer ran last.
+    fn write_filed<R>(&mut self, id: LuaMemberId, write: impl FnOnce(&mut Self) -> R) -> R {
+        self.unapply_transfer(id);
+        let written = write(self);
+        self.apply_transfer(id);
+        written
     }
 
-    pub fn has_synthesized_owner(&self, id: &LuaMemberId) -> bool {
-        self.synthesized_owner_members.contains(id)
+    /// Moves `id` onto its transfer's owner, keeping its filed home.
+    fn apply_transfer(&mut self, id: LuaMemberId) {
+        let Some(transfer) = self.member_transfers.get(&id).cloned() else {
+            return;
+        };
+        if !self.members.contains_key(&id) || self.filed_homes.contains_key(&id) {
+            return;
+        }
+        let (owner, owner_only, provenance) = self.filed_home(id);
+        let filed = FiledHome {
+            owner: owner.cloned(),
+            owner_only,
+            provenance: provenance.cloned(),
+        };
+        self.filed_homes.insert(id, filed);
+        self.home_member(transfer.owner.clone(), id.file_id, id, Homing::Transferred);
+        self.list_member(transfer.owner, id, Homing::Transferred);
+    }
+
+    /// Moves `id` from its transfer's owner back to its filed home, undoing
+    /// [`Self::apply_transfer`].
+    fn unapply_transfer(&mut self, id: LuaMemberId) {
+        let Some(filed) = self.filed_homes.remove(&id) else {
+            return;
+        };
+        let current = self.member_current_owner.get(&id).cloned();
+        if current != filed.owner {
+            self.note_home_write(id, Homing::Transferred);
+            if let Some(current) = &current {
+                self.remove_member_from_all_owner_key_indexes(current, id);
+                self.remove_member_from_owner_item(current, id);
+                self.remove_current_owner_member(current, id);
+            }
+            match &filed.owner {
+                Some(owner) => {
+                    self.member_current_owner.insert(id, owner.clone());
+                    self.insert_current_owner_member(owner, id);
+                    self.add_member_to_owner_key_indexes(owner.clone(), id);
+                }
+                None => {
+                    self.member_current_owner.remove(&id);
+                }
+            }
+        }
+        if filed.owner_only {
+            self.owner_only_members.insert(id);
+        } else {
+            self.owner_only_members.remove(&id);
+        }
+        match filed.provenance {
+            Some(path) => {
+                self.member_path_provenance.insert(id, path);
+            }
+            None => {
+                self.member_path_provenance.remove(&id);
+            }
+        }
+        self.note_home_write(id, Homing::Transferred);
+    }
+
+    /// The global path this member reached its owner through, if it named one:
+    /// a write through the path itself, an alias of it, or a table literal
+    /// initialising it. Members carrying provenance are owned by the
+    /// class-flip machinery (`set_global_path_class`), not by the prefix-type
+    /// read a settled pass re-derives.
+    pub fn member_path_provenance(&self, id: &LuaMemberId) -> Option<&GlobalId> {
+        derivation::note_member_marks_read(*id);
+        self.member_path_provenance.get(id)
     }
 
     /// Records that `id` was created by deferred resolution, so its first home
     /// was decided from a mid-fixpoint prefix type. See
     /// [`Self::deferred_index_expr_members`].
     pub fn mark_deferred_index_expr_member(&mut self, id: LuaMemberId) {
-        self.deferred_index_expr_members.insert(id);
+        self.snapshot_member(id);
+        if self.deferred_index_expr_members.insert(id) {
+            self.note_member_move(id);
+        }
     }
 
     pub fn is_deferred_index_expr_member(&self, id: &LuaMemberId) -> bool {
+        derivation::note_member_marks_read(*id);
         self.deferred_index_expr_members.contains(id)
     }
 
     /// Removes `id` from `owner` entirely, including the item
     /// `set_member_owner` leaves behind.
     pub fn detach_member_from_owner(&mut self, owner: &LuaMemberOwner, id: LuaMemberId) {
+        self.write_filed(id, |index| index.detach_filed_member(owner, id));
+    }
+
+    fn detach_filed_member(&mut self, owner: &LuaMemberOwner, id: LuaMemberId) {
+        self.snapshot_member(id);
+        let owner = &self.canonical(owner).clone();
         let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
             return;
         };
+        self.drop_member_path_provenance_on_detach(owner, id);
         self.remove_member_from_all_owner_key_indexes(owner, id);
         self.remove_current_owner_member(owner, id);
 
         let Some(owner_members) = self.owner_members.get_mut(owner) else {
             return;
         };
-        let drop_key = match owner_members.get_member_mut(&key) {
-            Some(LuaMemberIndexItem::One(existing)) => *existing == id,
-            Some(LuaMemberIndexItem::Many(ids)) => {
-                ids.retain(|member_id| *member_id != id);
-                ids.is_empty()
-            }
-            None => false,
-        };
-        if drop_key {
-            owner_members.remove_member(&key);
+        if owner_members.remove_id(&key, id) {
+            note_slot_write(owner, &key);
+            note_owner_map_write(owner);
         }
         if owner_members.is_empty() {
-            self.owner_members.remove(owner);
+            self.remove_owner_entry(owner);
         }
     }
 
@@ -565,102 +1461,23 @@ impl LuaMemberIndex {
         owner: LuaMemberOwner,
         id: LuaMemberId,
     ) -> Option<()> {
+        self.write_filed(id, |index| index.add_filed_member_alias(owner, id))
+    }
+
+    fn add_filed_member_alias(&mut self, owner: LuaMemberOwner, id: LuaMemberId) -> Option<()> {
+        self.note_derived_owner(id, &owner);
+        let owner = self.canonical(&owner).clone();
         let member = self.get_member(&id)?;
         let file_id = member.get_file_id();
         let key = member.get_key().clone();
 
         if self.member_current_owner.get(&id) != Some(&owner) {
-            self.add_member_to_owner_key_index(owner.clone(), id);
-            self.add_member_to_owner_key_history_index(owner.clone(), id);
+            self.add_member_to_owner_key_indexes(owner.clone(), id);
         }
 
-        let owner_members = self
-            .owner_members
-            .entry(owner.clone())
-            .or_insert_with(LuaOwnerMembers::new);
-        if owner_members.contains_member(&key) {
-            self.merge_member_into_owner_item(owner.clone(), key, id);
-        } else {
-            owner_members.add_member(key, LuaMemberIndexItem::One(id));
-        }
-
-        self.add_in_file_object(file_id, MemberOrOwner::Owner(owner));
+        self.merge_member_into_owner_item(owner.clone(), key, id);
+        self.add_file_owner(file_id, owner);
         Some(())
-    }
-
-    /// Whether every write
-    /// [`add_member_alias_to_owner`](Self::add_member_alias_to_owner) would
-    /// perform for `(owner, id)` is already in the index, so calling it would
-    /// leave the index unchanged.
-    pub(crate) fn alias_to_owner_is_recorded(
-        &self,
-        owner: &LuaMemberOwner,
-        id: LuaMemberId,
-    ) -> bool {
-        let Some(member) = self.get_member(&id) else {
-            return false;
-        };
-        let key = member.get_key();
-
-        let is_indexed = |index: &HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>| {
-            index
-                .get(owner)
-                .and_then(|members_by_key| members_by_key.get(key))
-                .is_some_and(|member_ids| member_ids.contains(&id))
-        };
-        if self.member_current_owner.get(&id) != Some(owner)
-            && !(is_indexed(&self.member_owner_key_index)
-                && is_indexed(&self.member_owner_key_history_index))
-        {
-            return false;
-        }
-
-        let item_holds_member = self
-            .owner_members
-            .get(owner)
-            .and_then(|owner_members| owner_members.get_member(key))
-            .is_some_and(|item| match item {
-                LuaMemberIndexItem::One(existing_id) => *existing_id == id,
-                LuaMemberIndexItem::Many(ids) => ids.contains(&id),
-            });
-        if !item_holds_member {
-            return false;
-        }
-
-        self.in_filed
-            .get(&member.get_file_id())
-            .is_some_and(|objects| objects.contains(&MemberOrOwner::Owner(owner.clone())))
-    }
-
-    fn should_preserve_assignment_file_define_member(
-        &self,
-        owner: &LuaMemberOwner,
-        key: &LuaMemberKey,
-        id: LuaMemberId,
-    ) -> bool {
-        if !self.non_overwriting_assignment_members.contains(&id)
-            || !self.is_assignment_file_define_member(id)
-        {
-            return false;
-        }
-
-        self.owner_members
-            .get(owner)
-            .and_then(|owner_members| owner_members.get_member(key))
-            .is_some_and(|item| self.item_can_append_preserved_assignment_member(item))
-    }
-
-    fn item_can_append_preserved_assignment_member(&self, item: &LuaMemberIndexItem) -> bool {
-        match item {
-            LuaMemberIndexItem::One(id) => {
-                self.is_assignment_file_define_member(*id)
-                    && self.non_overwriting_assignment_members.contains(id)
-            }
-            LuaMemberIndexItem::Many(ids) => ids.last().is_some_and(|id| {
-                self.is_assignment_file_define_member(*id)
-                    && self.non_overwriting_assignment_members.contains(id)
-            }),
-        }
     }
 
     /// Adds `id` to the item already stored at `owner`/`key`, keeping the item a
@@ -672,12 +1489,42 @@ impl LuaMemberIndex {
         key: LuaMemberKey,
         id: LuaMemberId,
     ) {
-        let Some(item) = self
+        note_slot_write(&owner, &key);
+        let creates_map = !self.owner_members.contains_key(&owner);
+        if creates_map {
+            note_owner_presence_write(&owner);
+        } else {
+            note_owner_map_write(&owner);
+        }
+        if creates_map && let LuaMemberOwner::Element(range) = &owner {
+            self.fold_file_fingerprint(range.file_id, file_element_owner_element(range), true);
+        }
+        let owner_members = self
             .owner_members
             .entry(owner)
-            .or_insert_with(LuaOwnerMembers::new)
-            .get_member_mut(&key)
-        else {
+            .or_insert_with(LuaOwnerMembers::new);
+        // A slot that already holds `id` must not touch the item:
+        // `get_member_mut` invalidates the owner's revision on entry, so a
+        // no-op merge would still mark every read recorded against this
+        // owner stale.
+        let already_present = match owner_members.get_member(&key) {
+            Some(LuaMemberIndexItem::One(existing)) => *existing == id,
+            Some(LuaMemberIndexItem::Many(ids)) => ids
+                .binary_search_by_key(&member_id_sort_key(id), |existing_id| {
+                    member_id_sort_key(*existing_id)
+                })
+                .is_ok(),
+            None => false,
+        };
+        if already_present {
+            return;
+        }
+        if !owner_members.contains_member(&key) {
+            owner_members.add_member(key, LuaMemberIndexItem::One(id));
+            return;
+        }
+        owner_members.note_id_added(&key, id);
+        let Some(item) = owner_members.get_member_mut(&key) else {
             return;
         };
 
@@ -688,13 +1535,11 @@ impl LuaMemberIndex {
                 }
             }
             LuaMemberIndexItem::Many(ids) => {
-                // `Many` is not guaranteed sorted — `classify_member_insert`
-                // appends in arrival order — so the ordered fast paths below
-                // cannot themselves rule out a duplicate. Enumerating a member
-                // twice is worse than the linear scan; these lists are short.
-                if ids.contains(&id) {
-                    return;
-                }
+                // `Many` is always sorted by `member_id_sort_key`: `One`
+                // promotes through `sorted_member_pair`, every later insert
+                // lands through the paths below, and removals only filter —
+                // so the binary search doubles as the duplicate check and no
+                // linear scan is needed.
                 if ids
                     .last()
                     .is_none_or(|last_id| member_id_sort_key(*last_id) < member_id_sort_key(id))
@@ -713,82 +1558,86 @@ impl LuaMemberIndex {
         }
     }
 
-    fn add_member_to_owner_key_index(&mut self, owner: LuaMemberOwner, id: LuaMemberId) {
-        self.add_member_id_to_owner_key_map(owner, id, false);
-    }
-
-    fn add_member_to_owner_key_history_index(&mut self, owner: LuaMemberOwner, id: LuaMemberId) {
-        self.add_member_id_to_owner_key_map(owner, id, true);
-    }
-
-    fn add_new_member_to_owner_key_index(&mut self, owner: LuaMemberOwner, id: LuaMemberId) {
-        self.add_new_member_id_to_owner_key_map(owner, id, false);
-    }
-
-    fn add_new_member_to_owner_key_history_index(
-        &mut self,
-        owner: LuaMemberOwner,
-        id: LuaMemberId,
-    ) {
-        self.add_new_member_id_to_owner_key_map(owner, id, true);
-    }
-
-    fn add_member_id_to_owner_key_map(
-        &mut self,
-        owner: LuaMemberOwner,
-        id: LuaMemberId,
-        history: bool,
-    ) {
+    /// Files `id` under its owner and key in both owner-key indexes, ignoring a
+    /// slot that already holds it.
+    fn add_member_to_owner_key_indexes(&mut self, owner: LuaMemberOwner, id: LuaMemberId) {
         let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
             return;
         };
 
-        {
-            let target_index = if history {
-                &mut self.member_owner_key_history_index
-            } else {
-                &mut self.member_owner_key_index
-            };
-            let member_ids = target_index
-                .entry(owner)
-                .or_default()
-                .entry(key.clone())
-                .or_default();
-            if !member_ids.contains(&id) {
-                member_ids.push(id);
-            }
+        self.record_owner_key_index_owner(id.file_id, &owner);
+        let visible_changed = push_owner_key_id_unique(
+            &mut self.member_owner_key_index,
+            owner.clone(),
+            key.clone(),
+            id,
+        );
+        let history_changed = push_owner_key_id_unique(
+            &mut self.member_owner_key_history_index,
+            owner.clone(),
+            key.clone(),
+            id,
+        );
+        if history_changed {
+            self.fold_history_fingerprint(&owner, history_element(&key, id), true);
+        }
+        if visible_changed || history_changed {
+            note_slot_write(&owner, &key);
         }
     }
 
-    fn add_new_member_id_to_owner_key_map(
-        &mut self,
-        owner: LuaMemberOwner,
-        id: LuaMemberId,
-        history: bool,
-    ) {
+    /// [`add_member_to_owner_key_indexes`](Self::add_member_to_owner_key_indexes)
+    /// for a member whose *current* filing is new. The history index keeps
+    /// entries a later owner move left behind, and an alias filing
+    /// ([`Self::add_member_alias_to_owner`]) lists the id under an owner its
+    /// current owner never names, so either slot can already hold the id when
+    /// the member returns to a former `(owner, key)`: both pushes dedupe.
+    fn add_new_member_to_owner_key_indexes(&mut self, owner: LuaMemberOwner, id: LuaMemberId) {
         let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
             return;
         };
 
-        let target_index = if history {
-            &mut self.member_owner_key_history_index
-        } else {
-            &mut self.member_owner_key_index
-        };
-        target_index
-            .entry(owner)
-            .or_default()
-            .entry(key)
-            .or_default()
-            .push(id);
+        self.record_owner_key_index_owner(id.file_id, &owner);
+        note_slot_write(&owner, &key);
+        push_owner_key_id_unique(
+            &mut self.member_owner_key_index,
+            owner.clone(),
+            key.clone(),
+            id,
+        );
+        if push_owner_key_id_unique(
+            &mut self.member_owner_key_history_index,
+            owner.clone(),
+            key.clone(),
+            id,
+        ) {
+            self.fold_history_fingerprint(&owner, history_element(&key, id), true);
+        }
     }
 
+    fn record_owner_key_index_owner(&mut self, file_id: FileId, owner: &LuaMemberOwner) {
+        let owners = self
+            .owner_key_index_owners_by_file
+            .entry(file_id)
+            .or_default();
+        if !owners.contains(owner) {
+            owners.insert(owner.clone());
+        }
+    }
+
+    /// Drops `id` from the visible index only, leaving the history index to
+    /// remember that this owner once held it.
     fn remove_member_from_visible_owner_key_index(
         &mut self,
         owner: &LuaMemberOwner,
         id: LuaMemberId,
     ) {
-        self.remove_member_from_owner_key_map(owner, id, false);
+        let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
+            return;
+        };
+        if remove_owner_key_id(&mut self.member_owner_key_index, owner, &key, id) {
+            note_slot_write(owner, &key);
+        }
     }
 
     fn remove_member_from_all_owner_key_indexes(
@@ -796,120 +1645,165 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         id: LuaMemberId,
     ) {
-        self.remove_member_from_visible_owner_key_index(owner, id);
-        self.remove_member_from_owner_key_map(owner, id, true);
-    }
-
-    fn remove_member_from_owner_key_map(
-        &mut self,
-        owner: &LuaMemberOwner,
-        id: LuaMemberId,
-        history: bool,
-    ) {
         let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
             return;
         };
-
-        let mut remove_owner_entry = false;
-        let target_index = if history {
-            &mut self.member_owner_key_history_index
-        } else {
-            &mut self.member_owner_key_index
-        };
-        if let Some(owner_items) = target_index.get_mut(owner) {
-            if let Some(member_ids) = owner_items.get_mut(&key) {
-                member_ids.retain(|member_id| *member_id != id);
-                if member_ids.is_empty() {
-                    owner_items.remove(&key);
-                }
-            }
-            remove_owner_entry = owner_items.is_empty();
+        let visible_changed =
+            remove_owner_key_id(&mut self.member_owner_key_index, owner, &key, id);
+        let history_changed =
+            remove_owner_key_id(&mut self.member_owner_key_history_index, owner, &key, id);
+        if history_changed {
+            self.fold_history_fingerprint(owner, history_element(&key, id), false);
         }
-
-        if remove_owner_entry {
-            target_index.remove(owner);
+        if visible_changed || history_changed {
+            note_slot_write(owner, &key);
         }
     }
 
     fn remove_files_members_from_owner_key_indexes(&mut self, removed: &HashSet<FileId>) {
-        Self::remove_files_members_from_owner_key_map(&mut self.member_owner_key_index, removed);
-        Self::remove_files_members_from_owner_key_map(
+        let owners = removed
+            .iter()
+            .filter_map(|file_id| self.owner_key_index_owners_by_file.remove(file_id))
+            .flatten()
+            .collect::<HashSet<_>>();
+        let visible = Self::remove_files_members_from_owner_key_map(
+            &mut self.member_owner_key_index,
+            removed,
+            &owners,
+        );
+        if derivation::recording() {
+            for (owner, key, _) in &visible {
+                note_slot_write(owner, key);
+            }
+        }
+        let history = Self::remove_files_members_from_owner_key_map(
             &mut self.member_owner_key_history_index,
             removed,
+            &owners,
         );
+        for (owner, key, id) in &history {
+            note_slot_write(owner, key);
+            self.fold_history_fingerprint(owner, history_element(key, *id), false);
+        }
     }
 
+    /// Drops the removed files' members from `owners`' slots, returning each
+    /// `(owner, key, id)` dropped.
     fn remove_files_members_from_owner_key_map(
-        owner_key_index: &mut HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
+        owner_key_index: &mut OwnerKeyMap,
         removed: &HashSet<FileId>,
-    ) {
-        owner_key_index.retain(|_, key_members| {
-            key_members.retain(|_, member_ids| {
-                member_ids.retain(|member_id| !removed.contains(&member_id.file_id));
+        owners: &HashSet<LuaMemberOwner>,
+    ) -> Vec<(LuaMemberOwner, LuaMemberKey, LuaMemberId)> {
+        let mut removed_entries = Vec::new();
+        for owner in owners {
+            let Some(key_members) = owner_key_index.get_mut(owner) else {
+                continue;
+            };
+            key_members.retain(|key, member_ids| {
+                member_ids.retain(|member_id| {
+                    let keep = !removed.contains(&member_id.file_id);
+                    if !keep {
+                        removed_entries.push((owner.clone(), key.clone(), *member_id));
+                    }
+                    keep
+                });
                 !member_ids.is_empty()
             });
-            !key_members.is_empty()
-        });
-    }
-
-    fn is_item_only_meta(&self, item: &LuaMemberIndexItem) -> bool {
-        match item {
-            LuaMemberIndexItem::One(id) => {
-                if let Some(member) = self.get_member(id) {
-                    return member.get_feature().is_meta_decl();
-                }
-            }
-            LuaMemberIndexItem::Many(ids) => {
-                for id in ids {
-                    if let Some(member) = self.get_member(id)
-                        && !member.get_feature().is_meta_decl()
-                    {
-                        return false;
-                    }
-                }
-                return true;
+            if key_members.is_empty() {
+                owner_key_index.remove(owner);
             }
         }
-
-        false
-    }
-
-    fn is_item_only_file_define(&self, item: &LuaMemberIndexItem) -> bool {
-        match item {
-            LuaMemberIndexItem::One(id) => self
-                .get_member(id)
-                .is_some_and(|member| member.get_feature().is_file_define()),
-            LuaMemberIndexItem::Many(ids) => ids.iter().all(|id| {
-                self.get_member(id)
-                    .is_some_and(|member| member.get_feature().is_file_define())
-            }),
-        }
+        removed_entries
     }
 
     fn is_assignment_file_define_member(&self, id: LuaMemberId) -> bool {
-        self.get_member(&id).is_some_and(|member| {
-            member.get_feature().is_file_define()
-                && member.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr
-        })
+        self.get_member(&id)
+            .is_some_and(LuaMember::is_assignment_define)
     }
 
     fn assignment_file_define_scope_for_member(&self, member: &LuaMember) -> Option<TextRange> {
-        if !member.get_feature().is_file_define()
-            || member.get_syntax_id().get_kind() != LuaSyntaxKind::IndexExpr
-        {
+        if !member.is_assignment_define() {
             return None;
         }
 
         self.enclosing_function_scope_range(member.get_file_id(), member.get_id().get_position())
     }
 
+    /// Records `owner` as `id`'s current owner, filing its history entry.
+    ///
+    /// Production callers always follow this with an item merge (see
+    /// [`Self::add_member_to_owner`]); a bare call without one would leave a
+    /// history entry the item does not list, which must clear that slot in
+    /// [`Self::preserved_co_writer_reconciled`].
+    ///
     pub fn set_member_owner(
         &mut self,
         owner: LuaMemberOwner,
         file_id: FileId,
         id: LuaMemberId,
     ) -> Option<()> {
+        self.write_filed(id, |index| {
+            index.home_member(owner, file_id, id, Homing::Filed)
+        })
+    }
+
+    /// [`Self::set_member_owner`] for a move by `homing`.
+    fn home_member(
+        &mut self,
+        owner: LuaMemberOwner,
+        file_id: FileId,
+        id: LuaMemberId,
+        homing: Homing,
+    ) -> Option<()> {
+        if homing == Homing::Filed {
+            self.note_derived_owner(id, &owner);
+        }
+        // Where the member is filed is the index's own placement, as in
+        // `file_member`: a later class binding or site registration re-homes it.
+        derivation::untracked(|| {
+            let owner = self
+                .effective_path_member_owner(id, &owner)
+                .unwrap_or(owner);
+            self.note_member_path_provenance(id, &owner, homing);
+            self.record_member_owner(owner, file_id, id, homing)
+        })
+    }
+
+    /// The filing half of [`Self::set_member_owner`], without the provenance
+    /// note. Callers that record provenance themselves route through here so
+    /// the note's drop branch cannot undo what they just recorded.
+    fn record_member_owner(
+        &mut self,
+        owner: LuaMemberOwner,
+        file_id: FileId,
+        id: LuaMemberId,
+        homing: Homing,
+    ) -> Option<()> {
+        let owner = self
+            .effective_path_member_owner(id, &owner)
+            .unwrap_or(owner);
+        let owner = self.canonical(&owner).clone();
+        // Read before the insert decides the bump: a real move, or a first
+        // homing for an id the index already holds (deferred resolution filed
+        // the member under an unknown owner and only now learned better).
+        // A pure first filing (unknown id) and a same-owner re-home are
+        // append-only and must not invalidate memos.
+        let already_indexed = self.members.contains_key(&id);
+        self.note_home_write(id, homing);
         let previous_owner = self.member_current_owner.insert(id, owner.clone());
+        self.note_home_write(id, homing);
+        if previous_owner.as_ref() != Some(&owner) {
+            self.note_object_write(id, homing);
+        }
+        match &previous_owner {
+            None if already_indexed => {
+                self.note_home_write(id, homing);
+            }
+            Some(previous) if previous != &owner => {
+                self.note_home_write(id, homing);
+            }
+            _ => {}
+        }
         if previous_owner.is_none() {
             self.add_current_member_key(id);
         }
@@ -921,34 +1815,584 @@ impl LuaMemberIndex {
             self.remove_current_owner_member(previous_owner, id);
         }
 
-        self.current_owner_member_history
-            .entry(owner.clone())
-            .or_default()
-            .insert(member_id_sort_key(id), id);
+        self.insert_current_owner_member(&owner, id);
 
-        self.add_member_to_owner_key_index(owner.clone(), id);
-        self.add_member_to_owner_key_history_index(owner.clone(), id);
-        if self.member_function_scope_range(id).is_none()
+        self.add_member_to_owner_key_indexes(owner.clone(), id);
+        if homing == Homing::Filed
+            && self.member_function_scope_range(id).is_none()
             && let Some(member) = self.get_member(&id)
         {
             let function_scope = self.assignment_file_define_scope_for_member(member);
             self.set_member_function_scope_range(id, function_scope);
         }
-        self.add_in_file_object(file_id, MemberOrOwner::Owner(owner));
+        self.add_file_owner(file_id, owner);
 
         Some(())
     }
 
     pub fn get_member(&self, id: &LuaMemberId) -> Option<&LuaMember> {
+        derivation::note_member_object_read(*id);
         self.members.get(id)
     }
 
     pub fn get_member_mut(&mut self, id: &LuaMemberId) -> Option<&mut LuaMember> {
+        self.snapshot_member(*id);
+        // The key lives on the member, so a mutable access may move it.
+        if self.members.contains_key(id) {
+            self.note_member_move(*id);
+        }
         self.members.get_mut(id)
     }
 
-    /// Every global path that currently has members parked on it, in a
-    /// stable order.
+    /// Records `site` as a table literal that initialises the global `path`.
+    ///
+    /// A path's members all live on [`LuaMemberOwner::GlobalPath`]; its literals
+    /// are definition sites, not owners. The site is decided by the file that
+    /// owns the range, and that file's declaration walk always precedes any
+    /// member insertion naming the range, so a member never has to be re-homed:
+    /// the decl walk is pre-order, so `X = {}` registers before the literal's
+    /// own fields are added, and every later phase runs after the whole batch's
+    /// decl phase. A file cannot name another file's literal range
+    /// syntactically, so a foreign write is always `a.b.c = v`, which the decl
+    /// analyzer already routes to the path.
+    pub fn set_definition_site(&mut self, path: GlobalId, site: crate::InFiled<TextRange>) {
+        let owner = LuaMemberOwner::GlobalPath(path.clone());
+        if self.definition_site_owner.get(&site) == Some(&owner) {
+            return;
+        }
+        self.forget_definition_site(&site);
+        Self::note_canonical_write(&path, Some(&site), &[]);
+        self.definition_site_owner.insert(site.clone(), owner);
+        let sites = self.path_definition_sites.entry(path.clone()).or_default();
+        if let Err(at) = sites.binary_search_by_key(&site_sort_key(&site), site_sort_key) {
+            sites.insert(at, site.clone());
+        }
+        self.definition_sites_by_file
+            .entry(site.file_id)
+            .or_default()
+            .push(site.clone());
+        // A member filed under the literal before the site was registered was
+        // homed onto the Element owner with no path provenance. Stamp it so a
+        // later `---@class` flip still takes it along. Idempotent, and rare:
+        // the decl walk registers each site before the writes it owns.
+        let member_ids: Vec<LuaMemberId> = self
+            .owner_members
+            .get(&LuaMemberOwner::Element(site))
+            .into_iter()
+            .flat_map(LuaOwnerMembers::get_member_items)
+            .flat_map(member_ids_from_item)
+            .collect();
+        self.stamp_path_provenance_if_absent(member_ids, &path);
+    }
+
+    /// The global path the table literal `site` initialises, if one is
+    /// registered for it.
+    pub fn definition_site_path(&self, site: &crate::InFiled<TextRange>) -> Option<GlobalId> {
+        derivation::note_definition_site_read(site);
+        self.definition_site_owner.get(site)?.get_path().cloned()
+    }
+
+    /// Whether `path` has at least one `---@class` proposal, so the class-flip
+    /// machinery ([`Self::set_global_path_class`]) owns its members' homing.
+    /// A path with no candidates can never flip, so provenance on it is inert
+    /// and must not exempt a member from settled owner re-derivation.
+    pub fn global_path_has_class_candidates(&self, path: &GlobalId) -> bool {
+        derivation::note_global_path_read(path);
+        self.global_path_class_candidates.contains_key(path)
+    }
+
+    /// Whether `path` is a global path the index knows about: it has members
+    /// filed under it, a registered definition site, or a `---@class`
+    /// proposal. Read-only and cheap, so producers may consult it per write.
+    ///
+    /// The membership arm is not covered by the `GlobalPath` domain epoch —
+    /// filing a member under the path only bumps membership clocks — so when
+    /// it decides the answer it records the owner presence read as well.
+    pub fn is_known_global_path(&self, path: &GlobalId) -> bool {
+        derivation::note_global_path_read(path);
+        if self.global_path_class_candidates.contains_key(path)
+            || self.path_definition_sites.contains_key(path)
+        {
+            return true;
+        }
+        let owner = LuaMemberOwner::GlobalPath(path.clone());
+        note_owner_presence_read(&owner);
+        self.owner_members.contains_key(&owner)
+    }
+
+    /// Records `path` as the provenance of members that do not have one yet.
+    ///
+    /// Members already carrying provenance keep it: the earliest evidence of
+    /// how a member reached its owner is the one its later homings honor, and
+    /// re-stamping the same path stays a no-op.
+    pub fn stamp_path_provenance_if_absent(
+        &mut self,
+        member_ids: impl IntoIterator<Item = LuaMemberId>,
+        path: &GlobalId,
+    ) {
+        let member_ids = member_ids.into_iter().collect::<Vec<_>>();
+        for id in &member_ids {
+            self.snapshot_member(*id);
+        }
+        for member_id in member_ids {
+            self.write_filed(member_id, |index| {
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    index.member_path_provenance.entry(member_id)
+                {
+                    slot.insert(path.clone());
+                    index.note_member_object_write(member_id);
+                }
+            });
+        }
+    }
+
+    /// The literals initialising `path`, sorted by `(file id, range)`.
+    pub fn definition_sites(&self, path: &GlobalId) -> &[crate::InFiled<TextRange>] {
+        derivation::note_global_path_read(path);
+        self.path_definition_sites
+            .get(path)
+            .map_or(&[], |sites| sites.as_slice())
+    }
+
+    /// The one owner a table literal's members belong to.
+    ///
+    /// A literal that initialises a global path is not an owner: its members
+    /// belong to the path, alongside every other literal's and every
+    /// `path.k = v` write's. Applied wherever an owner enters or is looked up
+    /// in this index, so producers keep building [`LuaMemberOwner::Element`]
+    /// and never see the difference.
+    pub fn canonical_owner(&self, owner: LuaMemberOwner) -> LuaMemberOwner {
+        match self.canonical(&owner) {
+            canonical if canonical == &owner => owner,
+            canonical => canonical.clone(),
+        }
+    }
+
+    fn canonical<'a>(&'a self, owner: &'a LuaMemberOwner) -> &'a LuaMemberOwner {
+        let owner = match owner {
+            LuaMemberOwner::Element(range) => {
+                derivation::note_definition_site_read(range);
+                self.definition_site_owner.get(range).unwrap_or(owner)
+            }
+            _ => owner,
+        };
+        match owner {
+            LuaMemberOwner::GlobalPath(path) => {
+                derivation::note_global_path_read(path);
+                self.global_path_class_owner.get(path).unwrap_or(owner)
+            }
+            _ => owner,
+        }
+    }
+
+    /// Records or drops `id`'s global-path provenance for a homing decision.
+    ///
+    /// A write that named global path `path` directly, or that filed the member
+    /// under a table literal initialising one, makes the member a path member:
+    /// it must follow the path when its winning `---@class` changes. A member
+    /// re-homed onto the path's current canonical owner keeps its provenance;
+    /// one re-homed anywhere else is no longer a path member and loses it.
+    fn note_member_path_provenance(
+        &mut self,
+        id: LuaMemberId,
+        raw_owner: &LuaMemberOwner,
+        homing: Homing,
+    ) {
+        if let Some(path) = raw_owner.get_path() {
+            self.stamp_member_path_provenance(id, path, homing);
+            return;
+        }
+        let canonical = self.canonical(raw_owner).clone();
+        if let Some(path) = canonical.get_path() {
+            self.stamp_member_path_provenance(id, path, homing);
+            return;
+        }
+        let Some(recorded) = self.member_path_provenance.get(&id).cloned() else {
+            return;
+        };
+        let recorded_canonical = self
+            .canonical(&LuaMemberOwner::GlobalPath(recorded))
+            .clone();
+        if recorded_canonical != canonical {
+            self.member_path_provenance.remove(&id);
+            self.note_object_write(id, homing);
+        }
+    }
+
+    /// Writes `id`'s provenance when it differs, so a re-file that re-derives
+    /// the same path does not stamp the member-object domain.
+    fn stamp_member_path_provenance(&mut self, id: LuaMemberId, path: &GlobalId, homing: Homing) {
+        if self.member_path_provenance.get(&id) == Some(path) {
+            return;
+        }
+        self.member_path_provenance.insert(id, path.clone());
+        self.note_object_write(id, homing);
+    }
+
+    /// Drops `id`'s provenance when it is detached from the owner the
+    /// provenance names, so a final detachment cannot leave a member the next
+    /// class flip would resurrect onto a path it left.
+    fn drop_member_path_provenance_on_detach(
+        &mut self,
+        detached_from: &LuaMemberOwner,
+        id: LuaMemberId,
+    ) {
+        let Some(recorded) = self.member_path_provenance.get(&id).cloned() else {
+            return;
+        };
+        let provenance_canonical = self
+            .canonical(&LuaMemberOwner::GlobalPath(recorded))
+            .clone();
+        if provenance_canonical == *detached_from {
+            self.member_path_provenance.remove(&id);
+            self.note_member_object_write(id);
+        }
+    }
+
+    /// The owner a path member's homing actually lands on.
+    ///
+    /// A path and its annotated classes are one table. A write that homes a
+    /// path-provenance member onto a class the path has already outranked
+    /// names the same table through a losing name — a re-indexed file still
+    /// binding its own (losing) class does this on every ripple — so the
+    /// winner decides and the member homes under it instead. Without this the
+    /// members surface under both classes. Homing to any other owner is a
+    /// genuine move and is left alone.
+    fn effective_path_member_owner(
+        &self,
+        id: LuaMemberId,
+        owner: &LuaMemberOwner,
+    ) -> Option<LuaMemberOwner> {
+        let class = owner.get_type_id()?;
+        derivation::note_member_marks_read(id);
+        let provenance = self.member_path_provenance.get(&id)?;
+        derivation::note_global_path_read(provenance);
+        let candidates = self.global_path_class_candidates.get(provenance)?;
+        let winner = candidates.iter().next()?.class.clone();
+        if *class == winner {
+            return None;
+        }
+        candidates
+            .iter()
+            .any(|candidate| candidate.class == *class)
+            .then(|| LuaMemberOwner::Type(winner))
+    }
+
+    /// Records that `path`'s declaration is annotated `---@class`, and moves
+    /// the path's members onto the winning class.
+    ///
+    /// A global with a class annotation has two names for one table, and every
+    /// reader of the annotated type looks the members up on the class. Every
+    /// proposal is recorded, and the winner is the name-lexicographic-min
+    /// candidate (ties broken by file id and class identity), so two files
+    /// annotating one global do not depend on which was analysed first. When
+    /// the winner changes, the members already on the losing class move to the
+    /// winner; members still parked on the path itself move too.
+    pub fn set_global_path_class(
+        &mut self,
+        path: GlobalId,
+        class: crate::LuaTypeDeclId,
+        file_id: FileId,
+    ) {
+        let candidate = GlobalPathClassCandidate {
+            class_name: class.get_name().into(),
+            file_id,
+            class,
+        };
+        let holder = if derivation::writes_source() {
+            None
+        } else {
+            derivation::current()
+        };
+        if let Some(id) = holder {
+            derivation::note_write(|| FactKey::PathClassContrib(id));
+            self.derived_path_classes
+                .entry(id)
+                .or_default()
+                .push((path.clone(), candidate.clone()));
+        }
+        let holders = self
+            .path_class_holders
+            .entry((path.clone(), candidate.clone()))
+            .or_default();
+        holders.push(holder);
+        if holders.len() > 1 {
+            return;
+        }
+        self.global_path_class_candidates
+            .entry(path.clone())
+            .or_default()
+            .insert(candidate);
+        derivation::note_write(|| FactKey::GlobalPath(path.clone()));
+        self.reselect_global_path_class(&path);
+    }
+
+    /// Withdraws the class candidates derivation `id` proposed, before it
+    /// runs again.
+    pub(crate) fn retract_path_classes(&mut self, id: &DerivationId) {
+        let Some(proposals) = self.derived_path_classes.remove(id) else {
+            return;
+        };
+        let mut affected = Vec::new();
+        for (path, candidate) in proposals {
+            if self.release_path_class(&path, candidate, Some(*id)) {
+                affected.push(path);
+            }
+        }
+        affected.sort_unstable_by(|left, right| left.get_name().cmp(right.get_name()));
+        affected.dedup();
+        for path in affected {
+            self.reselect_global_path_class(&path);
+        }
+    }
+
+    /// Drops one hold on a candidate; returns whether the candidate left.
+    fn release_path_class(
+        &mut self,
+        path: &GlobalId,
+        candidate: GlobalPathClassCandidate,
+        holder: Option<DerivationId>,
+    ) -> bool {
+        let key = (path.clone(), candidate);
+        let Some(holders) = self.path_class_holders.get_mut(&key) else {
+            return false;
+        };
+        let Some(at) = holders.iter().position(|existing| *existing == holder) else {
+            return false;
+        };
+        holders.remove(at);
+        if !holders.is_empty() {
+            return false;
+        }
+        let (path, candidate) = key;
+        self.path_class_holders
+            .remove(&(path.clone(), candidate.clone()));
+        derivation::note_write(|| FactKey::GlobalPath(path.clone()));
+        if let Some(candidates) = self.global_path_class_candidates.get_mut(&path) {
+            candidates.remove(&candidate);
+            if candidates.is_empty() {
+                self.global_path_class_candidates.remove(&path);
+            }
+        }
+        true
+    }
+
+    /// Installs the winning candidate as `path`'s class and moves the path's
+    /// members to it; with no candidate left the members go back onto the
+    /// path itself.
+    fn reselect_global_path_class(&mut self, path: &GlobalId) {
+        let winner = self
+            .global_path_class_candidates
+            .get(path)
+            .and_then(|candidates| candidates.iter().next())
+            .map(|candidate| candidate.class.clone());
+        let old = self
+            .global_path_class_owner
+            .get(path)
+            .and_then(LuaMemberOwner::get_type_id)
+            .cloned();
+        if old == winner {
+            return;
+        }
+        Self::note_canonical_write(path, None, &[old.as_ref(), winner.as_ref()]);
+        // Moving the members is the index's own placement: whichever write
+        // changed the candidates did not read where they lived, nor produce
+        // them.
+        derivation::untracked(|| {
+            derivation::rehoming(|| match winner {
+                Some(winner) => {
+                    self.global_path_class_owner
+                        .insert(path.clone(), LuaMemberOwner::Type(winner.clone()));
+                    self.rehome_global_path_class(
+                        path,
+                        old.as_ref(),
+                        &LuaMemberOwner::Type(winner),
+                    );
+                }
+                None => {
+                    self.global_path_class_owner.remove(path);
+                    self.rehome_global_path_class(
+                        path,
+                        old.as_ref(),
+                        &LuaMemberOwner::GlobalPath(path.clone()),
+                    );
+                }
+            })
+        })
+    }
+
+    /// Moves the members of `path` between its two homes: from the path slot
+    /// and, when one is losing it, from the losing class, onto `to`.
+    ///
+    /// Only members that reached their current home through `path` move:
+    /// members homed onto the losing class by any other route (a write through
+    /// a genuinely class-typed value) stay put, as do members whose owner was
+    /// decided by scripted-class synthesis. Owner-only members move only when
+    /// their provenance names `path` — a write through the path or an alias of
+    /// it — since an owner-only write through a genuinely class-typed value is
+    /// not a path member. The moved member's item is pruned from the owner it leaves —
+    /// `set_member_owner` rewrites the key indexes but leaves owner items
+    /// behind — so the losing class stops listing path members.
+    fn rehome_global_path_class(
+        &mut self,
+        path: &GlobalId,
+        from: Option<&crate::LuaTypeDeclId>,
+        to: &LuaMemberOwner,
+    ) {
+        let path_owner = LuaMemberOwner::GlobalPath(path.clone());
+        let mut member_ids = self
+            .owner_members
+            .get(&path_owner)
+            .into_iter()
+            .flat_map(|members| members.get_member_items())
+            .flat_map(member_ids_from_item)
+            .filter(|id| {
+                !self.is_pinned(id)
+                    && self.member_current_owner.get(id) == Some(&path_owner)
+                    && (!self.owner_only_members.contains(id)
+                        || self.member_path_provenance.get(id) == Some(path))
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(old) = from {
+            let old_owner = LuaMemberOwner::Type(old.clone());
+            member_ids.extend(
+                self.owner_members
+                    .get(&old_owner)
+                    .into_iter()
+                    .flat_map(|members| members.get_member_items())
+                    .flat_map(member_ids_from_item)
+                    .filter(|id| {
+                        !self.is_pinned(id)
+                            && self.member_current_owner.get(id) == Some(&old_owner)
+                            && self.member_path_provenance.get(id) == Some(path)
+                    }),
+            );
+        }
+
+        member_ids.sort_unstable_by_key(|id| member_id_sort_key(*id));
+        member_ids.dedup();
+        for member_id in member_ids {
+            self.write_filed(member_id, |index| {
+                index.remove_member_from_owner_item(&path_owner, member_id);
+                if let Some(old) = from {
+                    index.remove_member_from_owner_item(
+                        &LuaMemberOwner::Type(old.clone()),
+                        member_id,
+                    );
+                }
+                index.home_member(to.clone(), member_id.file_id, member_id, Homing::Filed);
+                index.list_member(to.clone(), member_id, Homing::Filed);
+            });
+        }
+        if *to != path_owner {
+            self.vacate_bound_path_owner(&path_owner);
+        }
+    }
+
+    /// Whether a synthesis pinned `id` to the class it transferred it to.
+    fn is_pinned(&self, id: &LuaMemberId) -> bool {
+        self.member_transfers
+            .get(id)
+            .is_some_and(|transfer| transfer.pinned)
+    }
+
+    /// Drops every item and key-index entry a class-bound path's own key
+    /// holds for members homed elsewhere.
+    ///
+    /// Every reader canonicalises the path to its class, so what is left
+    /// under the path itself is only a trace of whether its members were
+    /// filed before or after the class was bound.
+    fn vacate_bound_path_owner(&mut self, path_owner: &LuaMemberOwner) {
+        let listed = self
+            .owner_members
+            .get(path_owner)
+            .into_iter()
+            .flat_map(|members| members.get_member_items())
+            .flat_map(member_ids_from_item);
+        let indexed = [
+            &self.member_owner_key_index,
+            &self.member_owner_key_history_index,
+        ]
+        .into_iter()
+        .filter_map(|index| index.get(path_owner))
+        .flat_map(|slots| slots.values().flatten().copied());
+        let mut member_ids = listed
+            .chain(indexed)
+            .filter(|id| self.member_current_owner.get(id) != Some(path_owner))
+            .collect::<Vec<_>>();
+        member_ids.sort_unstable_by_key(|id| member_id_sort_key(*id));
+        member_ids.dedup();
+        for member_id in member_ids {
+            self.remove_member_from_all_owner_key_indexes(path_owner, member_id);
+            self.remove_member_from_owner_item(path_owner, member_id);
+        }
+    }
+
+    /// Drops `id` from the member item it occupies under `owner`, and the
+    /// owner once its map is empty, without touching the owner-key indexes or
+    /// the member itself.
+    fn remove_member_from_owner_item(&mut self, owner: &LuaMemberOwner, id: LuaMemberId) {
+        let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
+            return;
+        };
+        let Some(owner_members) = self.owner_members.get_mut(owner) else {
+            return;
+        };
+        if owner_members.remove_id(&key, id) {
+            note_slot_write(owner, &key);
+            note_owner_map_write(owner);
+        }
+        if owner_members.is_empty() {
+            self.remove_owner_entry(owner);
+        }
+    }
+
+    fn remove_file_definition_sites(&mut self, file_id: FileId) {
+        let Some(sites) = self.definition_sites_by_file.remove(&file_id) else {
+            return;
+        };
+        for site in sites {
+            self.forget_definition_site(&site);
+        }
+    }
+
+    fn forget_definition_site(&mut self, site: &crate::InFiled<TextRange>) {
+        let Some(path) = self
+            .definition_site_owner
+            .remove(site)
+            .and_then(|owner| owner.get_path().cloned())
+        else {
+            return;
+        };
+        Self::note_canonical_write(&path, Some(site), &[]);
+        if let Some(sites) = self.path_definition_sites.get_mut(&path) {
+            sites.retain(|held| held != site);
+            if sites.is_empty() {
+                self.path_definition_sites.remove(&path);
+            }
+        }
+        if let Some(sites) = self.definition_sites_by_file.get_mut(&site.file_id) {
+            sites.retain(|held| held != site);
+            if sites.is_empty() {
+                self.definition_sites_by_file.remove(&site.file_id);
+            }
+        }
+    }
+
+    /// Every path with at least one definition site, and its sites, in a stable
+    /// order. Used by the determinism harness to observe that ownership does
+    /// not depend on index order.
+    pub fn sorted_definition_sites(&self) -> Vec<(&GlobalId, &[crate::InFiled<TextRange>])> {
+        let mut entries: Vec<(&GlobalId, &[crate::InFiled<TextRange>])> = self
+            .path_definition_sites
+            .iter()
+            .map(|(path, sites)| (path, sites.as_slice()))
+            .collect();
+        entries.sort_unstable_by(|left, right| left.0.get_name().cmp(right.0.get_name()));
+        entries
+    }
+
     pub fn sorted_global_path_owners(&self) -> Vec<GlobalId> {
         let mut global_ids = self
             .owner_members
@@ -962,7 +2406,45 @@ impl LuaMemberIndex {
         global_ids
     }
 
+    /// Every table-literal range in `file_id` that currently owns a member.
+    ///
+    /// Used when the file is removed: its literals are all gone, and members
+    /// other files own on them are not reachable from any file the removal
+    /// sweep visits.
+    pub fn element_owner_ranges_in_file(&self, file_id: FileId) -> Vec<crate::InFiled<TextRange>> {
+        derivation::note_read(|| FactKey::MemberFile(file_id));
+        let mut ranges: Vec<crate::InFiled<TextRange>> = self
+            .owner_members
+            .file_entries(file_id)
+            .filter_map(|(owner, _)| match owner {
+                LuaMemberOwner::Element(range) => Some(range.clone()),
+                _ => None,
+            })
+            .collect();
+        ranges.sort_unstable_by_key(|range| (range.value.start(), range.value.end()));
+        ranges
+    }
+
+    /// Every table-literal range that currently owns at least one member.
+    #[cfg(test)]
+    pub(crate) fn element_owner_ranges(&self) -> Vec<crate::InFiled<TextRange>> {
+        let mut ranges: Vec<crate::InFiled<TextRange>> = self
+            .owner_members
+            .iter()
+            .filter(|(_, members)| !members.is_empty())
+            .filter_map(|(owner, _)| match owner {
+                LuaMemberOwner::Element(range) => Some(range.clone()),
+                _ => None,
+            })
+            .collect();
+        ranges
+            .sort_unstable_by_key(|range| (range.file_id, range.value.start(), range.value.end()));
+        ranges
+    }
+
     pub fn get_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
+        let owner = self.canonical(owner);
+        note_owner_map_read(owner);
         let owner_members = self.owner_members.get(owner)?;
         if owner_members.get_member_len() == 0 {
             return Some(Vec::new());
@@ -986,21 +2468,43 @@ impl LuaMemberIndex {
         )
     }
 
+    /// The owner's members that are not methods, in the order
+    /// [`Self::get_members`] would yield them.
+    pub fn get_field_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
+        let owner = self.canonical(owner);
+        derivation::note_read(|| FactKey::MemberOwnerFields(owner.clone()));
+        let owner_members = self.owner_members.get(owner)?;
+        Some(
+            self.field_member_ids(owner_members)
+                .filter_map(|member_id| self.get_member(&member_id))
+                .collect(),
+        )
+    }
+
+    fn field_member_ids<'a>(
+        &'a self,
+        owner_members: &'a LuaOwnerMembers,
+    ) -> impl Iterator<Item = LuaMemberId> + 'a {
+        owner_members
+            .sorted_member_ids()
+            .iter()
+            .copied()
+            .filter(|member_id| {
+                self.members
+                    .get(member_id)
+                    .is_some_and(|member| !member.get_feature().is_method_decl())
+            })
+    }
+
     /// The owner's members whose key is an expression rather than a name, in
     /// the same order [`Self::get_members`] would yield them.
     pub fn get_expr_key_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
+        let owner = self.canonical(owner);
+        derivation::note_read(|| FactKey::MemberOwnerExprKeys(owner.clone()));
         let owner_members = self.owner_members.get(owner)?;
-        let mut member_ids = Vec::new();
-        for key in owner_members.expr_keys() {
-            match owner_members.get_member(key) {
-                Some(LuaMemberIndexItem::One(id)) => member_ids.push(*id),
-                Some(LuaMemberIndexItem::Many(ids)) => member_ids.extend(ids.iter().copied()),
-                None => {}
-            }
-        }
-        member_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
         Some(
-            member_ids
+            owner_members
+                .sorted_expr_key_member_ids()
                 .iter()
                 .filter_map(|member_id| self.get_member(member_id))
                 .collect(),
@@ -1017,15 +2521,18 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
     ) -> Option<Vec<&LuaMember>> {
-        let owner_members = self.owner_members.get(owner)?;
-        let mut member_ids = match owner_members.get_member(key) {
-            Some(LuaMemberIndexItem::One(id)) => vec![*id],
-            Some(LuaMemberIndexItem::Many(ids)) => ids.clone(),
-            None => return Some(Vec::new()),
+        let owner = self.canonical(owner);
+        note_slot_read(owner, key);
+        let Some(owner_members) = self.owner_members.get(owner) else {
+            note_owner_presence_read(owner);
+            return None;
         };
-        member_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
+        let Some(item) = owner_members.get_member(key) else {
+            note_owner_presence_read(owner);
+            return Some(Vec::new());
+        };
         Some(
-            member_ids
+            item.member_ids_slice()
                 .iter()
                 .filter_map(|member_id| self.get_member(member_id))
                 .collect(),
@@ -1036,6 +2543,8 @@ impl LuaMemberIndex {
         &'a self,
         owner: &LuaMemberOwner,
     ) -> impl Iterator<Item = &'a LuaMemberKey> + 'a {
+        let owner = self.canonical(owner);
+        note_owner_map_read(owner);
         self.owner_members
             .get(owner)
             .into_iter()
@@ -1046,15 +2555,14 @@ impl LuaMemberIndex {
         &self,
         member_id: LuaMemberId,
     ) -> Option<&LuaMemberIndexItem> {
+        derivation::note_member_home_read(member_id);
+        derivation::note_member_object_read(member_id);
         let owner = self.member_current_owner.get(&member_id)?;
         let member_key = self.members.get(&member_id)?.get_key();
+        note_slot_read(owner, member_key);
         let member_items = self.owner_members.get(owner)?;
         let item = member_items.get_member(member_key)?;
         Some(item)
-    }
-
-    pub fn get_sorted_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
-        self.get_members(owner)
     }
 
     pub fn get_member_item(
@@ -1062,12 +2570,16 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
     ) -> Option<&LuaMemberIndexItem> {
+        let owner = self.canonical(owner);
+        note_slot_read(owner, key);
         self.owner_members
             .get(owner)
             .and_then(|map| map.get_member(key))
     }
 
     pub fn get_member_len(&self, owner: &LuaMemberOwner) -> usize {
+        let owner = self.canonical(owner);
+        note_owner_map_read(owner);
         self.owner_members
             .get(owner)
             .map_or(0, |map| map.get_member_len())
@@ -1080,6 +2592,8 @@ impl LuaMemberIndex {
     /// key can outlive the member it points at. Stops at the first live id
     /// rather than materialising the owner's whole member list.
     pub fn has_live_member(&self, owner: &LuaMemberOwner) -> bool {
+        let owner = self.canonical(owner);
+        note_owner_map_read(owner);
         let Some(owner_members) = self.owner_members.get(owner) else {
             return false;
         };
@@ -1090,10 +2604,19 @@ impl LuaMemberIndex {
     }
 
     pub fn get_current_owner(&self, id: &LuaMemberId) -> Option<&LuaMemberOwner> {
+        derivation::note_member_home_read(*id);
         self.member_current_owner.get(id)
     }
 
+    /// Whether `id` was written through an instance of its owner class and so
+    /// is not listed among the class's members.
+    pub fn is_member_owner_only(&self, id: &LuaMemberId) -> bool {
+        derivation::note_member_home_read(*id);
+        self.owner_only_members.contains(id)
+    }
+
     pub fn get_member_owner(&self, id: &LuaMemberId) -> Option<&LuaMemberOwner> {
+        derivation::note_member_home_read(*id);
         self.member_current_owner.get(id)
     }
 
@@ -1102,6 +2625,8 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
     ) -> usize {
+        let owner = self.canonical(owner);
+        note_slot_read(owner, key);
         self.member_owner_key_index
             .get(owner)
             .and_then(|owner_items| owner_items.get(key))
@@ -1115,6 +2640,8 @@ impl LuaMemberIndex {
         key: &LuaMemberKey,
         excluded_member_id: LuaMemberId,
     ) -> bool {
+        let owner = self.canonical(owner);
+        note_slot_read(owner, key);
         let Some(member_ids) = self
             .member_owner_key_index
             .get(owner)
@@ -1135,6 +2662,8 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
     ) -> Vec<&LuaMember> {
+        let owner = self.canonical(owner);
+        note_slot_read(owner, key);
         let Some(owner_items) = self.member_owner_key_index.get(owner) else {
             return Vec::new();
         };
@@ -1153,10 +2682,40 @@ impl LuaMemberIndex {
             })
             .collect()
     }
+    /// The number of live members keyed under `(owner, key)` — the writer
+    /// count [`get_members_for_owner_key`](Self::get_members_for_owner_key)
+    /// would return, without materialising the list. Read-versioning calls
+    /// this every read, so it must not allocate or record a member map.
+    pub fn get_member_count_for_owner_key(
+        &self,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+    ) -> usize {
+        let owner = self.canonical(owner);
+        note_slot_read(owner, key);
+        let Some(member_ids) = self
+            .member_owner_key_index
+            .get(owner)
+            .and_then(|owner_items| owner_items.get(key))
+        else {
+            return 0;
+        };
+        member_ids
+            .iter()
+            .filter(|member_id| {
+                self.member_current_owner
+                    .get(member_id)
+                    .is_some_and(|current_owner| current_owner == owner)
+                    && self.get_member(member_id).is_some()
+            })
+            .count()
+    }
 
     /// Every member ever keyed under `owner`, including ones hidden by the
     /// latest-assignment view and ones since re-homed to a concrete owner.
     pub fn get_member_history(&self, owner: &LuaMemberOwner) -> Vec<&LuaMember> {
+        let owner = self.canonical(owner);
+        note_owner_map_read(owner);
         let Some(owner_items) = self.member_owner_key_history_index.get(owner) else {
             return Vec::new();
         };
@@ -1177,27 +2736,30 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         global_id: &GlobalId,
     ) -> Vec<LuaMemberId> {
+        let owner = self.canonical(owner);
         // The member key is the part of the path below the owner, so the members
         // declaring it are one bucket of the owner's history rather than all of
         // it. Reading the whole history to filter it built and sorted every
         // member the owner has ever held, once per resolution event, against
         // paths that gain a member per assignment.
         let Some(owner_items) = self.member_owner_key_history_index.get(owner) else {
+            note_owner_map_read(owner);
             return Vec::new();
         };
         let name = global_id.get_name();
-        // Not the last dotted segment: a bracketed string key keeps its dots, so
-        // `T["a.b"] = v` stores one member keyed `a.b` under `T`.
-        let key_text = match owner {
+        // The segment below the owner: a string key that is no name, such as
+        // `a.b` in `T["a.b"] = v`, is one bracketed segment.
+        let segment = match owner {
             LuaMemberOwner::GlobalPath(owner_id) => name
                 .strip_prefix(owner_id.get_name())
                 .and_then(|rest| rest.strip_prefix('.'))
                 .unwrap_or(name),
-            _ => name.rsplit_once('.').map_or(name, |(_, last)| last),
+            _ => glua_parser::split_last_path_segment(name).map_or(name, |(_, last)| last),
         };
 
         let mut matched = Vec::new();
         let collect = |key: &LuaMemberKey, matched: &mut Vec<LuaMemberId>| {
+            note_slot_read(owner, key);
             let Some(member_ids) = owner_items.get(key) else {
                 return;
             };
@@ -1207,10 +2769,15 @@ impl LuaMemberIndex {
                     == Some(global_id)
             }));
         };
-        collect(&LuaMemberKey::Name(key_text.into()), &mut matched);
-        // A numeric field is keyed by its integer, not by its spelling.
-        if let Ok(index) = key_text.parse::<i64>() {
-            collect(&LuaMemberKey::Integer(index), &mut matched);
+        match glua_parser::path_segment_string_key(segment) {
+            Some(key) => collect(&LuaMemberKey::Name(key.into()), &mut matched),
+            None => {
+                collect(&LuaMemberKey::Name(segment.into()), &mut matched);
+                // A numeric field is keyed by its integer, not by its spelling.
+                if let Ok(index) = segment.parse::<i64>() {
+                    collect(&LuaMemberKey::Integer(index), &mut matched);
+                }
+            }
         }
 
         matched.sort_unstable_by_key(|member_id| member_id_sort_key(*member_id));
@@ -1227,45 +2794,11 @@ impl LuaMemberIndex {
     }
 
     pub fn add_function_scope_range(&mut self, file_id: FileId, range: TextRange) {
-        let ranges = self.function_scope_ranges.entry(file_id).or_default();
-        match ranges.binary_search_by_key(&range.start(), |range| range.start()) {
-            Ok(index) | Err(index) => ranges.insert(index, range),
-        }
-    }
-
-    pub fn add_conditional_branch_range(
-        &mut self,
-        file_id: FileId,
-        branch: TextRange,
-        if_range: TextRange,
-    ) {
-        let ranges = self.conditional_branch_ranges.entry(file_id).or_default();
-        match ranges.binary_search_by_key(&branch.start(), |(branch, _)| branch.start()) {
-            Ok(index) | Err(index) => ranges.insert(index, (branch, if_range)),
-        }
-    }
-
-    /// Every `if` branch containing `member_id`, each paired with the `if` it
-    /// belongs to, innermost first. Empty when the write is not inside any
-    /// branch.
-    fn enclosing_conditional_branches(
-        &self,
-        member_id: LuaMemberId,
-    ) -> Vec<(TextRange, TextRange)> {
-        let Some(ranges) = self.conditional_branch_ranges.get(&member_id.file_id) else {
-            return Vec::new();
-        };
-        let position = member_id.get_position();
-        let mut enclosing = Vec::new();
-        let mut index = ranges.partition_point(|(branch, _)| branch.start() <= position);
-        while index > 0 {
-            index -= 1;
-            let entry = ranges[index];
-            if entry.0.contains(position) {
-                enclosing.push(entry);
-            }
-        }
-        enclosing
+        self.function_scope_ranges
+            .entry(file_id)
+            .or_default()
+            .insert(range);
+        self.fold_file_fingerprint(file_id, file_scope_element(file_id, range), true);
     }
 
     pub fn enclosing_function_scope_range(
@@ -1273,16 +2806,14 @@ impl LuaMemberIndex {
         file_id: FileId,
         position: TextSize,
     ) -> Option<TextRange> {
-        let ranges = self.function_scope_ranges.get(&file_id)?;
-        let mut index = ranges.partition_point(|range| range.start() <= position);
-        while index > 0 {
-            index -= 1;
-            let range = ranges[index];
-            if range.contains(position) {
-                return Some(range);
-            }
-        }
-        None
+        derivation::note_function_scope_read(file_id, position);
+        self.innermost_function_scope(file_id, position)
+    }
+
+    fn innermost_function_scope(&self, file_id: FileId, position: TextSize) -> Option<TextRange> {
+        self.function_scope_ranges
+            .get(&file_id)?
+            .innermost(position)
     }
 
     pub fn set_member_function_scope_range(
@@ -1290,29 +2821,110 @@ impl LuaMemberIndex {
         member_id: LuaMemberId,
         range: Option<TextRange>,
     ) {
-        if let Some(range) = range {
-            self.member_function_scope_ranges.insert(member_id, range);
+        self.snapshot_member(member_id);
+        let changed = if let Some(range) = range {
+            self.member_function_scope_ranges.insert(member_id, range) != Some(range)
         } else {
-            self.member_function_scope_ranges.remove(&member_id);
+            self.member_function_scope_ranges
+                .remove(&member_id)
+                .is_some()
+        };
+        if changed {
+            self.note_member_move(member_id);
         }
     }
 
     pub fn member_function_scope_range(&self, member_id: LuaMemberId) -> Option<TextRange> {
+        derivation::note_member_marks_read(member_id);
         self.member_function_scope_ranges.get(&member_id).copied()
     }
 
     pub fn mark_non_overwriting_assignment_member(&mut self, member_id: LuaMemberId) {
-        self.non_overwriting_assignment_members.insert(member_id);
+        self.snapshot_member(member_id);
+        if self.non_overwriting_assignment_members.insert(member_id) {
+            self.note_member_move(member_id);
+        }
+        self.readmit_preserved_assignment_co_writers(member_id);
+    }
+
+    /// Re-admits the co-writers this member's slot lost before the member was
+    /// known to be a guarded self-assignment (`t.k = t.k or {}`).
+    ///
+    /// A write is marked *after* it is inserted, so a writer that arrives
+    /// before its mark can leave a slot its co-writers no longer cover: on a
+    /// cold build the co-writer is in the same batch and its own mark merges
+    /// it back, while re-indexing one file can drop a co-writer the batch
+    /// does not re-analyse, which nothing then restores. Re-applying the
+    /// accumulate rule here is the answer a different arrival order would
+    /// have produced, so both paths settle on it.
+    ///
+    /// Once a full scan of a slot merges nothing, later scans merge nothing
+    /// either, so the slot is remembered in
+    /// [`Self::preserved_co_writer_reconciled`] to skip them: every
+    /// production history write pairs with an item merge (`add_member`,
+    /// `add_member_to_owner`, `add_member_alias_to_owner`, `rekey_member`,
+    /// and `set_member_owner` only through those callers), every removal
+    /// touches both sides for the same id, and marking only ever covers an
+    /// already-listed member. Any future history write without a paired item
+    /// merge must clear that slot's entry.
+    ///
+    /// Exception: [`Self::set_member_owner_only`] calls `set_member_owner`
+    /// without an item merge (see the `set_member_owner_only` body), filing a
+    /// history entry the item never lists. That bare write is safe only
+    /// because readmission skips [`Self::owner_only_members`] when merging
+    /// co-writers back, so the unlisted id can never be merged in later.
+    fn readmit_preserved_assignment_co_writers(&mut self, member_id: LuaMemberId) -> Option<()> {
+        if !self.is_preserved_assignment_member(member_id) {
+            return None;
+        }
+        let owner = self.member_current_owner.get(&member_id)?.clone();
+        let key = self.get_member(&member_id)?.get_key().clone();
+        if self
+            .preserved_co_writer_reconciled
+            .contains(&(owner.clone(), key.clone()))
+        {
+            return Some(());
+        }
+        let visible = self
+            .owner_members
+            .get(&owner)
+            .and_then(|owner_members| owner_members.get_member(&key))
+            .map(member_ids_from_item)?;
+        // Only a slot whose every writer is a guarded assignment accumulates
+        // them all; one holding a real writer keeps deciding by the rules that
+        // put it there.
+        if !visible
+            .iter()
+            .all(|id| self.is_preserved_assignment_member(*id))
+        {
+            return None;
+        }
+        let visible_set: HashSet<LuaMemberId> = visible.iter().copied().collect();
+        let mut merged_any = false;
+        for co_writer in self.get_current_owner_member_ids_for_key_unsorted(&owner, &key) {
+            if co_writer != member_id
+                && !visible_set.contains(&co_writer)
+                && !self.owner_only_members.contains(&co_writer)
+                && self.is_preserved_assignment_member(co_writer)
+            {
+                self.merge_member_into_owner_item(owner.clone(), key.clone(), co_writer);
+                merged_any = true;
+            }
+        }
+        if !merged_any {
+            self.preserved_co_writer_reconciled.insert((owner, key));
+        }
+        Some(())
+    }
+
+    fn is_preserved_assignment_member(&self, member_id: LuaMemberId) -> bool {
+        self.non_overwriting_assignment_members.contains(&member_id)
+            && self.is_assignment_file_define_member(member_id)
     }
 
     pub fn is_non_overwriting_assignment_member(&self, member_id: LuaMemberId) -> bool {
+        derivation::note_member_marks_read(member_id);
         self.non_overwriting_assignment_members.contains(&member_id)
-    }
-
-    pub fn mark_conditional_branch_assignment_member(&mut self, member_id: LuaMemberId) {
-        self.non_overwriting_assignment_members.insert(member_id);
-        self.conditional_branch_assignment_members.insert(member_id);
-        self.resolve_conditional_branch_owner_key_item(member_id);
     }
 
     pub fn get_current_owner_members_for_key(
@@ -1320,6 +2932,29 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
     ) -> Vec<&LuaMember> {
+        let mut members = self
+            .get_current_owner_member_ids_for_key_unsorted(owner, key)
+            .into_iter()
+            .filter_map(|member_id| self.get_member(&member_id))
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| member_id_sort_key(member.get_id()));
+        members
+    }
+
+    /// History-slot ids still homed under `owner`/`key`, in the slot's id
+    /// order.
+    ///
+    /// The unsorted form of
+    /// [`get_current_owner_members_for_key`](Self::get_current_owner_members_for_key):
+    /// per-write callers that only need membership or a minimum must not pay
+    /// its sort on every write.
+    pub fn get_current_owner_member_ids_for_key_unsorted(
+        &self,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+    ) -> Vec<LuaMemberId> {
+        let owner = self.canonical(owner);
+        note_slot_read(owner, key);
         let Some(member_ids) = self
             .member_owner_key_history_index
             .get(owner)
@@ -1328,19 +2963,18 @@ impl LuaMemberIndex {
             return Vec::new();
         };
 
-        let mut members = member_ids
+        member_ids
             .iter()
             .copied()
-            .filter_map(|member_id| {
+            .filter(|member_id| {
                 self.member_current_owner
-                    .get(&member_id)
-                    .filter(|current_owner| *current_owner == owner)?;
-                self.get_member(&member_id)
-                    .filter(|member| member.get_key() == key)
+                    .get(member_id)
+                    .is_some_and(|current_owner| current_owner == owner)
+                    && self
+                        .get_member(member_id)
+                        .is_some_and(|member| member.get_key() == key)
             })
-            .collect::<Vec<_>>();
-        members.sort_by_key(|member| stable_member_sort_key(member));
-        members
+            .collect()
     }
 
     /// Returns every still-current member ever indexed under `owner`, including
@@ -1350,32 +2984,41 @@ impl LuaMemberIndex {
     /// owner region wholesale. Ordinary semantic lookup should continue using
     /// `get_members`, which applies runtime overwrite visibility.
     pub fn get_current_owner_member_history(&self, owner: &LuaMemberOwner) -> Vec<&LuaMember> {
+        let owner = self.canonical(owner);
+        note_owner_map_read(owner);
         let Some(member_ids) = self.current_owner_member_history.get(owner) else {
             return Vec::new();
         };
         member_ids
-            .values()
+            .iter()
             .filter_map(|member_id| self.get_member(member_id))
             .collect()
     }
 
     fn remove_current_owner_member(&mut self, owner: &LuaMemberOwner, member_id: LuaMemberId) {
-        let Some(members) = self.current_owner_member_history.get_mut(owner) else {
-            return;
+        let removed = {
+            let Some(members) = self.current_owner_member_history.get_mut(owner) else {
+                return;
+            };
+            let removed = members.remove_sorted(member_id);
+            if members.is_empty() {
+                self.current_owner_member_history.remove(owner);
+            }
+            removed
         };
-        members.remove(&member_id_sort_key(member_id));
-        if members.is_empty() {
-            self.current_owner_member_history.remove(owner);
+        if removed {
+            self.fold_history_fingerprint(owner, current_history_element(member_id), false);
         }
     }
 
     pub fn get_current_members_for_key(&self, key: &LuaMemberKey) -> Vec<&LuaMember> {
+        derivation::note_read(|| FactKey::MemberKey(key.clone()));
         let Some(member_ids) = self.current_members_by_key.get(key) else {
             return Vec::new();
         };
 
         member_ids
-            .values()
+            .iter()
             .filter_map(|member_id| self.get_member(member_id))
             .collect()
     }
@@ -1387,10 +3030,26 @@ impl LuaMemberIndex {
         else {
             return;
         };
-        self.current_members_by_key
-            .entry(key)
+        for file_id in expr_key_files(&key, member_id) {
+            self.expr_key_members_by_file
+                .entry(file_id)
+                .or_default()
+                .insert(member_id);
+        }
+        if self
+            .current_members_by_key
+            .entry(key.clone())
             .or_default()
-            .insert(member_id_sort_key(member_id), member_id);
+            .insert_sorted(member_id)
+        {
+            derivation::note_write(|| FactKey::MemberKey(key.clone()));
+            fold_fingerprint(
+                &mut self.key_fingerprints,
+                key.clone(),
+                fingerprint_of(&member_id),
+                true,
+            );
+        }
     }
 
     fn remove_current_member_key(&mut self, member_id: LuaMemberId) {
@@ -1400,102 +3059,93 @@ impl LuaMemberIndex {
         else {
             return;
         };
-        let Some(members) = self.current_members_by_key.get_mut(&key) else {
-            return;
-        };
-        members.remove(&member_id_sort_key(member_id));
-        if members.is_empty() {
-            self.current_members_by_key.remove(&key);
-        }
-    }
-
-    pub fn get_file_members(&self, file_id: FileId) -> Vec<&LuaMember> {
-        let Some(member_or_owners) = self.in_filed.get(&file_id) else {
-            return Vec::new();
-        };
-
-        member_or_owners
-            .iter()
-            .filter_map(|entry| match entry {
-                MemberOrOwner::Member(member_id) => self.get_member(member_id),
-                MemberOrOwner::Owner(_) => None,
-            })
-            .collect()
-    }
-
-    pub fn retain_only_member_for_owner_key(&mut self, member_id: LuaMemberId) -> Option<()> {
-        let owner = self.member_current_owner.get(&member_id)?.clone();
-        let key = self.get_member(&member_id)?.get_key().clone();
-        let member_ids = self.member_owner_key_index.get(&owner)?.get(&key)?;
-        if !member_ids
-            .iter()
-            .copied()
-            .all(|id| self.is_assignment_file_define_member(id))
-        {
-            return Some(());
-        }
-
-        let member_ids = self.member_owner_key_index.get_mut(&owner)?.get_mut(&key)?;
-        member_ids.retain(|id| *id == member_id);
-        Some(())
-    }
-
-    pub fn preserve_members_for_owner_key(
-        &mut self,
-        member_id: LuaMemberId,
-        member_ids: Vec<LuaMemberId>,
-    ) -> Option<()> {
-        let owner = self.member_current_owner.get(&member_id)?.clone();
-        let key = self.get_member(&member_id)?.get_key().clone();
-        let mut preserved_member_ids = Vec::with_capacity(member_ids.len());
-
-        for id in member_ids {
-            if self.member_current_owner.get(&id) != Some(&owner) {
-                continue;
+        for file_id in expr_key_files(&key, member_id) {
+            if let Some(members) = self.expr_key_members_by_file.get_mut(&file_id) {
+                members.remove(&member_id);
+                if members.is_empty() {
+                    self.expr_key_members_by_file.remove(&file_id);
+                }
             }
-            let Some(member) = self.get_member(&id) else {
-                continue;
+        }
+        let removed = {
+            let Some(members) = self.current_members_by_key.get_mut(&key) else {
+                return;
             };
-            if member.get_key() != &key || preserved_member_ids.contains(&id) {
-                continue;
+            let removed = members.remove_sorted(member_id);
+            if members.is_empty() {
+                self.current_members_by_key.remove(&key);
             }
-
-            preserved_member_ids.push(id);
-        }
-
-        let item = match preserved_member_ids.as_slice() {
-            [] => return Some(()),
-            [id] => LuaMemberIndexItem::One(*id),
-            _ => LuaMemberIndexItem::Many(preserved_member_ids.clone()),
+            removed
         };
+        if removed {
+            derivation::note_write(|| FactKey::MemberKey(key.clone()));
+            fold_fingerprint(
+                &mut self.key_fingerprints,
+                key.clone(),
+                fingerprint_of(&member_id),
+                false,
+            );
+        }
+    }
 
-        self.member_owner_key_index
-            .entry(owner.clone())
-            .or_default()
-            .insert(key.clone(), preserved_member_ids);
-        self.owner_members
-            .entry(owner)
-            .or_insert_with(LuaOwnerMembers::new)
-            .add_member(key, item);
+    /// The members filed under `file_id`, sorted.
+    pub(crate) fn file_member_ids(&self, file_id: FileId) -> Vec<LuaMemberId> {
+        derivation::note_read(|| FactKey::MemberFile(file_id));
+        let mut ids = self
+            .members
+            .file_entries(file_id)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        ids.sort_by_key(|id| member_id_sort_key(*id));
+        ids
+    }
 
-        Some(())
+    /// The members filed under `file_id`, sorted.
+    pub fn get_file_members(&self, file_id: FileId) -> Vec<&LuaMember> {
+        derivation::note_read(|| FactKey::MemberFile(file_id));
+        let mut members = self
+            .members
+            .file_entries(file_id)
+            .map(|(id, member)| {
+                derivation::note_member_object_read(*id);
+                member
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| member_id_sort_key(member.get_id()));
+        members
     }
 }
 
-fn stable_member_sort_key(member: &LuaMember) -> (u32, u32, u32, u16) {
-    let member_id = member.get_id();
-    member_id_sort_key(member_id)
+fn site_sort_key(site: &crate::InFiled<TextRange>) -> (u32, u32, u32) {
+    (
+        site.file_id.id,
+        site.value.start().into(),
+        site.value.end().into(),
+    )
 }
 
 // The owner-level sorted member-id cache depends on these file id, position,
 // range end, and kind components remaining immutable for a member's lifetime.
-pub(crate) fn member_id_sort_key(member_id: LuaMemberId) -> (u32, u32, u32, u16) {
+/// The files other than `member_id`'s own whose positions `key`'s expression
+/// type names.
+fn expr_key_files(key: &LuaMemberKey, member_id: LuaMemberId) -> Vec<FileId> {
+    let LuaMemberKey::ExprType(typ) = key else {
+        return Vec::new();
+    };
+    crate::db_index::r#type::type_referenced_files(typ)
+        .into_iter()
+        .filter(|file_id| *file_id != member_id.file_id)
+        .collect()
+}
+
+pub(crate) fn member_id_sort_key(member_id: LuaMemberId) -> (u32, u32, u32, u16, u32) {
     let syntax_id = member_id.get_syntax_id();
     (
         member_id.file_id.id,
         u32::from(member_id.get_position()),
         u32::from(syntax_id.get_range().end()),
         syntax_id.get_kind() as u16,
+        member_id.get_slot(),
     )
 }
 
@@ -1508,74 +3158,432 @@ fn sorted_member_pair(first: LuaMemberId, second: LuaMemberId) -> Vec<LuaMemberI
 }
 
 impl LuaMemberIndex {
+    /// Drops every trace of one member.
+    ///
+    /// The single place that knows the full set of side tables a member
+    /// appears in. Removal paths call this rather than listing the tables
+    /// themselves, so a new table cannot be added to the index and forgotten
+    /// by one path but not the other.
+    fn forget_member(&mut self, member_id: LuaMemberId) {
+        if self.members.contains_key(&member_id) {
+            self.note_member_move(member_id);
+        } else {
+            self.note_member_home_write(member_id);
+        }
+        if let Some(owner) = self.member_current_owner.get(&member_id).cloned() {
+            self.remove_member_from_all_owner_key_indexes(&owner, member_id);
+            self.remove_current_owner_member(&owner, member_id);
+            self.remove_current_member_key(member_id);
+        }
+        let removed = self.members.remove(&member_id).is_some();
+        self.source_members.remove(&member_id);
+        self.member_current_owner.remove(&member_id);
+        self.member_path_provenance.remove(&member_id);
+        self.non_overwriting_assignment_members.remove(&member_id);
+        self.owner_only_members.remove(&member_id);
+        self.filed_homes.remove(&member_id);
+        self.note_member_object_write(member_id);
+        self.deferred_index_expr_members.remove(&member_id);
+        self.member_function_scope_ranges.remove(&member_id);
+        if removed {
+            self.fold_file_fingerprint(member_id.file_id, file_member_element(member_id), false);
+        }
+    }
+
     /// The per-file half of removal: erase every entry keyed or owned by
     /// `file_id`. The whole-index owner-key sweeps are done once per batch in
     /// `remove_files`, not here — running them per file made removal cost
     /// O(files × index) and dominated incremental edits of high fan-in files.
     fn remove_file_owned_entries(&mut self, file_id: FileId) {
-        if let Some(member_ids) = self.in_filed.remove(&file_id) {
-            let mut owners = HashSet::default();
-            for member_id_or_owner in member_ids {
-                match member_id_or_owner {
-                    MemberOrOwner::Member(member_id) => {
-                        if let Some(owner) = self.member_current_owner.get(&member_id).cloned() {
-                            self.remove_member_from_all_owner_key_indexes(&owner, member_id);
-                            self.remove_current_owner_member(&owner, member_id);
-                            self.remove_current_member_key(member_id);
-                        }
-                        self.members.remove(&member_id);
-                        self.member_current_owner.remove(&member_id);
-                        self.non_overwriting_assignment_members.remove(&member_id);
-                        self.conditional_branch_assignment_members
-                            .remove(&member_id);
-                        self.synthesized_owner_members.remove(&member_id);
-                        self.deferred_index_expr_members.remove(&member_id);
-                        self.member_function_scope_ranges.remove(&member_id);
-                    }
-                    MemberOrOwner::Owner(owner) => {
-                        owners.insert(owner);
-                    }
-                }
+        let owners = self.in_filed.remove(&file_id);
+        let member_ids = self
+            .members
+            .file_entries(file_id)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for member_id in member_ids {
+            self.forget_member(member_id);
+        }
+        let transferred = self
+            .member_transfers
+            .file_entries(file_id)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for member_id in transferred {
+            self.member_transfers.remove(&member_id);
+            derivation::note_write(|| FactKey::MemberTransfer(member_id));
+        }
+        if let Some(owners) = owners {
+            self.unlist_from_owners(owners, |id| id.file_id == file_id);
+        }
+        let scopes = self
+            .function_scope_ranges
+            .remove(&file_id)
+            .unwrap_or_default();
+        for &range in scopes.ranges() {
+            self.fold_file_fingerprint(file_id, file_scope_element(file_id, range), false);
+        }
+        self.remove_file_definition_sites(file_id);
+        self.recompute_global_path_class_winners(file_id);
+    }
+
+    /// Unlists every id `gone` accepts from `owners`' items, dropping the keys
+    /// and owners left empty.
+    fn unlist_from_owners(
+        &mut self,
+        owners: impl IntoIterator<Item = LuaMemberOwner>,
+        gone: impl Fn(LuaMemberId) -> bool,
+    ) {
+        for owner in owners {
+            // Taking an owner mutably invalidates its revision, so an owner
+            // listing none of the ids must not be touched: an immutable peek
+            // finds what to unlist and keeps the others' reads fresh.
+            let unlisted = self
+                .owner_members
+                .get(&owner)
+                .into_iter()
+                .flat_map(LuaOwnerMembers::iter)
+                .flat_map(|(key, item)| {
+                    item.member_ids_slice()
+                        .iter()
+                        .filter(|id| gone(**id))
+                        .map(move |id| (key.clone(), *id))
+                })
+                .collect::<Vec<_>>();
+            if unlisted.is_empty() {
+                continue;
             }
-
-            let mut need_removed_owner = Vec::new();
-            for owner in owners {
-                if let Some(member_items) = self.owner_members.get_mut(&owner) {
-                    let mut need_removed_key = Vec::new();
-                    for (key, item) in member_items.iter_mut() {
-                        match item {
-                            LuaMemberIndexItem::One(id) => {
-                                if id.file_id == file_id {
-                                    need_removed_key.push(key.clone());
-                                }
-                            }
-                            LuaMemberIndexItem::Many(ids) => {
-                                ids.retain(|id| id.file_id != file_id);
-                                if ids.is_empty() {
-                                    need_removed_key.push(key.clone());
-                                }
-                            }
-                        }
-                    }
-
-                    for key in need_removed_key {
-                        member_items.remove_member(&key);
-                    }
-
-                    if member_items.is_empty() {
-                        need_removed_owner.push(owner);
-                    }
-                }
+            let Some(member_items) = self.owner_members.get_mut(&owner) else {
+                continue;
+            };
+            for (key, id) in &unlisted {
+                note_slot_write(&owner, key);
+                member_items.remove_id(key, *id);
             }
-
-            for owner in need_removed_owner {
-                self.owner_members.remove(&owner);
+            note_owner_map_write(&owner);
+            if member_items.is_empty() {
+                self.remove_owner_entry(&owner);
             }
         }
-        self.function_scope_ranges.remove(&file_id);
-        self.conditional_branch_ranges.remove(&file_id);
+    }
+
+    /// Recomputes the class winner of every global path this file proposed.
+    ///
+    /// A proposal is a vote: removing the file drops its vote and the winner
+    /// is recomputed from the survivors. A lost winner moves the path's
+    /// members onto the surviving class; a lost last proposal removes the
+    /// mapping and moves the members back onto the path itself, so nothing is
+    /// left stranded under a class no file declares. Per-file rehomes run
+    /// before the batch owner-key sweep in [`Self::remove_files`], so the
+    /// surviving members' re-written key indexes are never swept away.
+    fn recompute_global_path_class_winners(&mut self, file_id: FileId) {
+        let mut sourced = self
+            .path_class_holders
+            .file_entries(file_id)
+            .filter(|(_, holders)| holders.contains(&None))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        sourced.sort_unstable_by(|left, right| {
+            left.0
+                .get_name()
+                .cmp(right.0.get_name())
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        let mut affected: Vec<GlobalId> = Vec::new();
+        for (path, candidate) in sourced {
+            while self
+                .path_class_holders
+                .get(&(path.clone(), candidate.clone()))
+                .is_some_and(|holders| holders.contains(&None))
+            {
+                if self.release_path_class(&path, candidate.clone(), None) {
+                    affected.push(path.clone());
+                }
+            }
+        }
+        if affected.is_empty() {
+            return;
+        }
+        affected.dedup();
+        for path in affected {
+            self.reselect_global_path_class(&path);
+        }
+    }
+
+    /// Drops an owner entry from the files of `member_ids`, the members it
+    /// held.
+    ///
+    /// An owner is registered under each contributing member's file, so a
+    /// single Element owner can be registered by several files at once.
+    fn remove_owner_from_files(
+        &mut self,
+        owner: &LuaMemberOwner,
+        member_ids: impl IntoIterator<Item = LuaMemberId>,
+    ) {
+        let mut files = member_ids
+            .into_iter()
+            .map(|id| id.file_id)
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        files.dedup();
+        for file_id in files {
+            if let Some(owners) = self.in_filed.get_mut(&file_id) {
+                owners.remove(owner);
+                if owners.is_empty() {
+                    self.in_filed.remove(&file_id);
+                }
+            }
+        }
+    }
+
+    /// Re-homes every table-literal owner in the edited file onto its new
+    /// range, and purges the ones the edit destroyed.
+    ///
+    /// Returns the members forgotten with a destroyed owner: their cached
+    /// types have to come off with them, and their writers have to take them
+    /// again.
+    pub fn remap_file_element_owners(&mut self, remap: &crate::FileRemap) -> Vec<LuaMemberId> {
+        let mut moved: rustc_hash::FxHashMap<crate::InFiled<TextRange>, crate::InFiled<TextRange>> =
+            rustc_hash::FxHashMap::default();
+        let mut deleted: Vec<crate::InFiled<TextRange>> = Vec::new();
+        for range in self.element_owner_ranges_in_file(remap.file_id) {
+            match remap.table_range(&range) {
+                crate::Remap::Moved(new) => {
+                    if new != range {
+                        moved.insert(range, new);
+                    }
+                }
+                crate::Remap::Unrelated => {}
+                crate::Remap::Lost => deleted.push(range),
+            }
+        }
+
+        // A definition site is a literal range in the edited file too, and the
+        // edit moves it exactly as it moves an element owner's. It owns no
+        // members of its own, so a site the edit destroyed dirties nothing:
+        // the path keeps every other file's members, and this file re-registers
+        // its own sites when it is re-indexed.
+        let mut deleted_sites: Vec<crate::InFiled<TextRange>> = Vec::new();
+        let sites = self
+            .definition_sites_by_file
+            .get(&remap.file_id)
+            .cloned()
+            .unwrap_or_default();
+        for site in sites {
+            match remap.table_range(&site) {
+                crate::Remap::Moved(new) => {
+                    if new != site {
+                        moved.insert(site, new);
+                    }
+                }
+                crate::Remap::Unrelated => {}
+                crate::Remap::Lost => deleted_sites.push(site),
+            }
+        }
+        for site in &deleted_sites {
+            self.forget_definition_site(site);
+        }
+
+        self.remap_elements(&moved);
+        self.remove_deleted_element_owners(&deleted)
+    }
+
+    pub fn remap_elements(
+        &mut self,
+        map: &rustc_hash::FxHashMap<crate::InFiled<TextRange>, crate::InFiled<TextRange>>,
+    ) {
+        if map.is_empty() {
+            return;
+        }
+        // Driven off the map rather than a scan of every member in the
+        // workspace: `owner_members` already indexes members by owner, and the
+        // map holds only the literals one edited file shifted.
+        // Applied in a fixed order. Where one literal moves onto the range
+        // another is vacating, the resulting state depends on which move ran
+        // first, and hash-map iteration order is not stable.
+        let mut moves: Vec<(&crate::InFiled<TextRange>, &crate::InFiled<TextRange>)> =
+            map.iter().collect();
+        moves.sort_unstable_by_key(|(old, _)| (old.file_id, old.value.start(), old.value.end()));
+        let to_move: Vec<(LuaMemberId, LuaMemberOwner, LuaMemberOwner)> = moves
+            .into_iter()
+            .flat_map(|(old, new)| {
+                let old_owner = LuaMemberOwner::Element(old.clone());
+                let new_owner = LuaMemberOwner::Element(new.clone());
+                self.owner_members
+                    .get(&old_owner)
+                    .into_iter()
+                    .flat_map(|items| items.get_member_items())
+                    .flat_map(|item| match item {
+                        LuaMemberIndexItem::One(id) => vec![*id],
+                        LuaMemberIndexItem::Many(ids) => ids.clone(),
+                    })
+                    .map(move |id| (id, old_owner.clone(), new_owner.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        self.remap_definition_sites(map);
+        let mut moved_from: HashMap<LuaMemberOwner, Vec<LuaMemberId>> = HashMap::default();
+        for (member_id, old_owner, _) in &to_move {
+            moved_from
+                .entry(old_owner.clone())
+                .or_default()
+                .push(*member_id);
+        }
+        for (member_id, old_owner, new_owner) in to_move {
+            self.write_filed(member_id, |index| {
+                index.detach_filed_member(&old_owner, member_id);
+                index.home_member(
+                    new_owner.clone(),
+                    member_id.file_id,
+                    member_id,
+                    Homing::Filed,
+                );
+                index.list_member(new_owner.clone(), member_id, Homing::Filed);
+            });
+            if matches!(old_owner, LuaMemberOwner::Element(_))
+                && self
+                    .owner_members
+                    .get(&old_owner)
+                    .is_none_or(|m| m.is_empty())
+            {
+                self.remove_owner_entry(&old_owner);
+                // `set_member_owner` files the owner entry under the *member's*
+                // file, not the range's. For the cross-file case this pass
+                // exists for they are different files, and clearing the wrong
+                // one leaves a dead owner in the member file's set for the next
+                // sweep to act on.
+                let moved = moved_from.remove(&old_owner).unwrap_or_default();
+                self.remove_owner_from_files(&old_owner, moved);
+            }
+        }
+    }
+
+    /// Re-keys every member filed under an expression key naming a position of
+    /// `remap`'s file the edit moved. Returns the members whose key named a
+    /// position the edit destroyed: their writers have to take it again.
+    pub fn remap_expr_keys(&mut self, remap: &crate::FileRemap) -> Vec<LuaMemberId> {
+        let mut lost = Vec::new();
+        for member_id in self.members_with_moved_expr_keys(remap) {
+            let Some(LuaMemberKey::ExprType(typ)) =
+                self.members.get(&member_id).map(LuaMember::get_key)
+            else {
+                continue;
+            };
+            let result = crate::db_index::remap_identities_in_type(typ, remap);
+            if result.lost {
+                lost.push(member_id);
+            } else if let Some(moved) = result.typ {
+                self.rekey_member(member_id, LuaMemberKey::ExprType(moved));
+            }
+        }
+        lost
+    }
+
+    /// The members filed under an expression key naming a position of
+    /// `remap`'s file that the edit moved or destroyed.
+    fn members_with_moved_expr_keys(&self, remap: &crate::FileRemap) -> Vec<LuaMemberId> {
+        let mut members = self
+            .expr_key_members_by_file
+            .get(&remap.file_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(
+                |member_id| match self.members.get(member_id).map(LuaMember::get_key) {
+                    Some(LuaMemberKey::ExprType(typ)) => {
+                        let result = crate::db_index::remap_identities_in_type(typ, remap);
+                        result.lost || result.typ.is_some()
+                    }
+                    _ => false,
+                },
+            )
+            .collect::<Vec<_>>();
+        members.sort_unstable_by_key(|member_id| member_id_sort_key(*member_id));
+        members
+    }
+
+    /// Re-keys the definition sites an edit moved.
+    fn remap_definition_sites(
+        &mut self,
+        map: &rustc_hash::FxHashMap<crate::InFiled<TextRange>, crate::InFiled<TextRange>>,
+    ) {
+        let mut moves: Vec<(crate::InFiled<TextRange>, GlobalId)> = map
+            .keys()
+            .filter_map(|old| {
+                let path = self.definition_site_owner.get(old)?.get_path()?.clone();
+                Some((old.clone(), path))
+            })
+            .collect();
+        moves.sort_unstable_by_key(|(old, _)| site_sort_key(old));
+        for (old, _) in &moves {
+            self.forget_definition_site(old);
+        }
+        for (old, path) in moves {
+            self.set_definition_site(path, map[&old].clone());
+        }
+    }
+
+    /// Drops the owners for table literals an edit removed, and every member
+    /// filed under them.
+    ///
+    /// Those members can belong to files the edit does not re-index, so
+    /// nothing else will clean them up.
+    pub fn remove_deleted_element_owners(
+        &mut self,
+        deleted: &[crate::InFiled<TextRange>],
+    ) -> Vec<LuaMemberId> {
+        let mut forgotten = Vec::new();
+        for range in deleted {
+            // A file removal hands its literals here wholesale; a definition
+            // site among them leaves the store with the file, not with the
+            // path's members.
+            self.forget_definition_site(range);
+            let owner = LuaMemberOwner::Element(range.clone());
+            let mut held = Vec::new();
+            if let Some(member_items) = self.remove_owner_entry(&owner) {
+                let member_ids: Vec<LuaMemberId> = member_items
+                    .get_member_items()
+                    .flat_map(|item| item.member_ids_slice().iter().copied())
+                    .collect();
+                for id in member_ids {
+                    self.forget_member(id);
+                    forgotten.push(id);
+                    held.push(id);
+                }
+            }
+            let visible = self.member_owner_key_index.remove(&owner);
+            let history = self.member_owner_key_history_index.remove(&owner);
+            if let Some(current) = self.current_owner_member_history.remove(&owner) {
+                held.extend(current.iter().copied());
+            }
+            if derivation::recording() {
+                for key in visible.iter().chain(history.iter()).flat_map(HashMap::keys) {
+                    note_slot_write(&owner, key);
+                }
+            }
+            note_owner_map_write(&owner);
+            self.owner_history_fingerprints.remove(&owner);
+            self.remove_owner_from_files(&owner, held);
+        }
+        // Members forgotten with their literal may still be listed under
+        // other owners, which are registered under the members' files.
+        let gone = forgotten.iter().copied().collect::<HashSet<_>>();
+        let mut files = forgotten.iter().map(|id| id.file_id).collect::<Vec<_>>();
+        files.sort_unstable();
+        files.dedup();
+        for file_id in files {
+            let owners = self
+                .in_filed
+                .get(&file_id)
+                .map(|owners| owners.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            self.unlist_from_owners(owners, |id| gone.contains(&id));
+        }
+        forgotten
     }
 }
+
+impl LuaMemberIndex {}
 
 impl LuaIndex for LuaMemberIndex {
     fn remove(&mut self, file_id: FileId) {
@@ -1588,39 +3596,54 @@ impl LuaIndex for LuaMemberIndex {
         }
         let removed: HashSet<FileId> = file_ids.iter().copied().collect();
         self.remove_files_members_from_owner_key_indexes(&removed);
-        self.assignment_contributions.remove_files(&removed);
-        self.member_function_scope_ranges
-            .retain(|member_id, _| !removed.contains(&member_id.file_id));
+        for &file_id in file_ids {
+            let scoped = self
+                .member_function_scope_ranges
+                .file_entries(file_id)
+                .map(|(member_id, _)| *member_id)
+                .collect::<Vec<_>>();
+            for member_id in scoped {
+                derivation::note_write(|| FactKey::Member(member_id));
+                self.member_function_scope_ranges.remove(&member_id);
+            }
+        }
     }
 
     fn clear(&mut self) {
+        if derivation::recording() {
+            self.note_every_fact_written();
+        }
+        self.owner_history_fingerprints.clear();
+        self.key_fingerprints.clear();
+        self.file_fingerprints.clear();
         self.members.clear();
+        self.source_members.clear();
         self.in_filed.clear();
         self.owner_members.clear();
         self.member_current_owner.clear();
         self.member_owner_key_index.clear();
         self.member_owner_key_history_index.clear();
+        self.owner_key_index_owners_by_file.clear();
         self.current_owner_member_history.clear();
         self.current_members_by_key.clear();
+        self.expr_key_members_by_file.clear();
         self.non_overwriting_assignment_members.clear();
-        self.conditional_branch_assignment_members.clear();
-        self.synthesized_owner_members.clear();
+        self.preserved_co_writer_reconciled.clear();
+        self.owner_only_members.clear();
+        self.member_transfers.clear();
+        self.filed_homes.clear();
         self.deferred_index_expr_members.clear();
         self.function_scope_ranges.clear();
-        self.conditional_branch_ranges.clear();
         self.member_function_scope_ranges.clear();
-        self.assignment_contributions.clear();
+        self.definition_site_owner.clear();
+        self.path_definition_sites.clear();
+        self.definition_sites_by_file.clear();
+        self.global_path_class_owner.clear();
+        self.global_path_class_candidates.clear();
+        self.path_class_holders.clear();
+        self.derived_path_classes.clear();
+        self.member_path_provenance.clear();
     }
-}
-
-/// Picks the definition that wins when a key is redefined without a guard.
-fn latest_defined_member(existing_ids: &[LuaMemberId], incoming_id: LuaMemberId) -> LuaMemberId {
-    existing_ids
-        .iter()
-        .copied()
-        .chain(std::iter::once(incoming_id))
-        .max_by_key(|candidate| member_id_sort_key(*candidate))
-        .unwrap_or(incoming_id)
 }
 
 fn member_ids_from_item(item: &LuaMemberIndexItem) -> Vec<LuaMemberId> {
@@ -1630,1352 +3653,40 @@ fn member_ids_from_item(item: &LuaMemberIndexItem) -> Vec<LuaMemberId> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
-    use rowan::{TextRange, TextSize};
-
-    use super::*;
-    use crate::{FileId, LuaTypeDeclId};
-
-    fn make_member(member_id: LuaMemberId, key: &str) -> LuaMember {
-        make_member_with_feature(member_id, key, LuaMemberFeature::FileFieldDecl)
-    }
-
-    fn make_member_with_feature(
-        member_id: LuaMemberId,
-        key: &str,
-        feature: LuaMemberFeature,
-    ) -> LuaMember {
-        LuaMember::new(member_id, LuaMemberKey::Name(key.into()), feature, None)
-    }
-
-    fn make_member_id(file_id: FileId, start: u32) -> LuaMemberId {
-        let range = TextRange::new(TextSize::new(start), TextSize::new(start + 1));
-        LuaMemberId::new(
-            LuaSyntaxId::new(LuaSyntaxKind::NameExpr.into(), range),
-            file_id,
-        )
-    }
-
-    fn make_index_member_id(file_id: FileId, start: u32) -> LuaMemberId {
-        let range = TextRange::new(TextSize::new(start), TextSize::new(start + 1));
-        LuaMemberId::new(
-            LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), range),
-            file_id,
-        )
-    }
-
-    fn make_member_id_with_kind_and_end(
-        file_id: FileId,
-        kind: LuaSyntaxKind,
-        start: u32,
-        end: u32,
-    ) -> LuaMemberId {
-        LuaMemberId::new(
-            LuaSyntaxId::new(
-                kind.into(),
-                TextRange::new(TextSize::new(start), TextSize::new(end)),
-            ),
-            file_id,
-        )
-    }
-
-    fn owner_member_ids(index: &LuaMemberIndex, owner: &LuaMemberOwner) -> Vec<LuaMemberId> {
-        index
-            .get_members(owner)
-            .expect("owner should exist")
-            .into_iter()
-            .map(|member| member.get_id())
-            .collect()
-    }
-
-    #[test]
-    fn get_members_multi_key_owner_matches_member_id_sort_order() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let member_specs = [
-            (
-                make_member_id_with_kind_and_end(FileId::new(3), LuaSyntaxKind::NameExpr, 20, 24),
-                "gamma",
-            ),
-            (
-                make_member_id_with_kind_and_end(FileId::new(1), LuaSyntaxKind::IndexExpr, 40, 45),
-                "alpha",
-            ),
-            (
-                make_member_id_with_kind_and_end(FileId::new(1), LuaSyntaxKind::NameExpr, 10, 12),
-                "beta",
-            ),
-            (
-                make_member_id_with_kind_and_end(FileId::new(2), LuaSyntaxKind::NameExpr, 5, 6),
-                "delta",
-            ),
-            (
-                make_member_id_with_kind_and_end(FileId::new(1), LuaSyntaxKind::IndexExpr, 10, 11),
-                "epsilon",
-            ),
-        ];
-
-        let mut index = LuaMemberIndex::new();
-        for (member_id, key) in member_specs {
-            index.add_member(owner.clone(), make_member(member_id, key));
-        }
-
-        let mut expected_ids = member_specs.map(|(member_id, _)| member_id).to_vec();
-        expected_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
-
-        assert_eq!(owner_member_ids(&index, &owner), expected_ids);
-    }
-
-    #[test]
-    fn batch_removal_matches_sequential_removal_for_surviving_members() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("BatchRemoveType"));
-        let first = FileId::new(1);
-        let second = FileId::new(2);
-        let survivor = FileId::new(3);
-
-        let populate = || {
-            let mut index = LuaMemberIndex::new();
-            index.add_member(
-                owner.clone(),
-                make_member(make_member_id(first, 10), "alpha"),
-            );
-            index.add_member(
-                owner.clone(),
-                make_member(make_member_id(second, 20), "alpha"),
-            );
-            index.add_member(
-                owner.clone(),
-                make_member(make_member_id(second, 30), "beta"),
-            );
-            index.add_member(
-                owner.clone(),
-                make_member(make_member_id(survivor, 40), "alpha"),
-            );
-            index.add_member(
-                owner.clone(),
-                make_member(make_member_id(survivor, 50), "gamma"),
-            );
-            index
-        };
-
-        let mut sequential = populate();
-        sequential.remove(first);
-        sequential.remove(second);
-
-        let mut batched = populate();
-        batched.remove_files(&[second, first, second]);
-
-        assert_eq!(
-            owner_member_ids(&sequential, &owner),
-            owner_member_ids(&batched, &owner)
-        );
-        assert_eq!(
-            owner_member_ids(&batched, &owner),
-            vec![make_member_id(survivor, 40), make_member_id(survivor, 50)]
-        );
-        for index in [&sequential, &batched] {
-            assert!(index.get_file_members(first).is_empty());
-            assert!(index.get_file_members(second).is_empty());
-            assert!(index.get_member(&make_member_id(first, 10)).is_none());
-            assert!(index.get_member(&make_member_id(second, 20)).is_none());
-            assert!(index.get_member(&make_member_id(survivor, 40)).is_some());
-        }
-        assert_eq!(
-            sequential.member_owner_key_index,
-            batched.member_owner_key_index
-        );
-        assert_eq!(
-            sequential.member_owner_key_history_index,
-            batched.member_owner_key_history_index
-        );
-    }
-
-    #[test]
-    fn get_members_cache_invalidates_when_adding_earlier_member_after_warm() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let first_member_id = make_member_id(FileId::new(4), 20);
-        let second_member_id = make_member_id(FileId::new(5), 30);
-        let earlier_member_id = make_member_id(FileId::new(1), 5);
-        let mut index = LuaMemberIndex::new();
-
-        index.add_member(owner.clone(), make_member(first_member_id, "first"));
-        index.add_member(owner.clone(), make_member(second_member_id, "second"));
-
-        assert_eq!(
-            owner_member_ids(&index, &owner),
-            vec![first_member_id, second_member_id]
-        );
-
-        index.add_member(owner.clone(), make_member(earlier_member_id, "third"));
-
-        assert_eq!(
-            owner_member_ids(&index, &owner),
-            vec![earlier_member_id, first_member_id, second_member_id]
-        );
-    }
-
-    #[test]
-    fn set_member_owner_moves_member_between_owner_indexes() {
-        let file_id = FileId::new(1);
-        let old_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OldOwner"));
-        let new_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("NewOwner"));
-        let key = LuaMemberKey::Name("field".into());
-        let member_id = make_member_id(file_id, 1);
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(old_owner.clone(), make_member(member_id, "field"));
-        assert!(index.get_member_item(&old_owner, &key).is_some());
-
-        index
-            .set_member_owner(new_owner.clone(), file_id, member_id)
-            .expect("owner reassignment should succeed");
-
-        assert!(index.get_member_item(&old_owner, &key).is_some());
-        assert!(index.get_member_item(&new_owner, &key).is_none());
-        assert!(index.get_members_for_owner_key(&old_owner, &key).is_empty());
-        assert_eq!(index.get_members_for_owner_key(&new_owner, &key).len(), 1);
-        assert!(
-            index
-                .get_current_owner_member_history(&old_owner)
-                .is_empty()
-        );
-        assert_eq!(
-            index
-                .get_current_owner_member_history(&new_owner)
-                .iter()
-                .map(|member| member.get_id())
-                .collect::<Vec<_>>(),
-            vec![member_id]
-        );
-    }
-
-    #[test]
-    fn set_member_owner_keeps_other_old_owner_members() {
-        let file_id = FileId::new(2);
-        let old_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OriginalOwner"));
-        let new_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("ReassignedOwner"));
-        let key = LuaMemberKey::Name("field".into());
-        let first_member_id = make_member_id(file_id, 1);
-        let second_member_id = make_member_id(file_id, 3);
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(old_owner.clone(), make_member(first_member_id, "field"));
-        index.add_member(old_owner.clone(), make_member(second_member_id, "field"));
-
-        index
-            .set_member_owner(new_owner.clone(), file_id, first_member_id)
-            .expect("owner reassignment should succeed");
-
-        assert_eq!(index.get_members_for_owner_key(&old_owner, &key).len(), 1);
-        assert_eq!(index.get_members_for_owner_key(&new_owner, &key).len(), 1);
-
-        let old_owner_member_ids = index
-            .get_members_for_owner_key(&old_owner, &key)
-            .iter()
-            .map(|member| member.get_id())
-            .collect::<Vec<_>>();
-        assert_eq!(old_owner_member_ids, vec![second_member_id]);
-
-        let new_owner_member_ids = index
-            .get_members_for_owner_key(&new_owner, &key)
-            .iter()
-            .map(|member| member.get_id())
-            .collect::<Vec<_>>();
-        assert_eq!(new_owner_member_ids, vec![first_member_id]);
-        assert_eq!(
-            index
-                .get_current_owner_member_history(&old_owner)
-                .iter()
-                .map(|member| member.get_id())
-                .collect::<Vec<_>>(),
-            vec![second_member_id]
-        );
-        assert_eq!(
-            index
-                .get_current_owner_member_history(&new_owner)
-                .iter()
-                .map(|member| member.get_id())
-                .collect::<Vec<_>>(),
-            vec![first_member_id]
-        );
-
-        let new_owner_history_member_ids = index
-            .get_current_owner_members_for_key(&new_owner, &key)
-            .into_iter()
-            .map(|member| member.get_id())
-            .collect::<Vec<_>>();
-        assert_eq!(new_owner_history_member_ids, vec![first_member_id]);
-
-        let key_history_member_ids = index
-            .get_current_members_for_key(&key)
-            .into_iter()
-            .map(|member| member.get_id())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            key_history_member_ids,
-            vec![first_member_id, second_member_id]
-        );
-    }
-
-    #[test]
-    fn get_members_cache_invalidates_when_removing_file_after_warm() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let removed_member_id = make_member_id(FileId::new(4), 10);
-        let retained_member_id = make_member_id(FileId::new(5), 5);
-        let mut index = LuaMemberIndex::new();
-
-        index.add_member(owner.clone(), make_member(removed_member_id, "removed"));
-        index.add_member(owner.clone(), make_member(retained_member_id, "retained"));
-
-        assert_eq!(
-            owner_member_ids(&index, &owner),
-            vec![removed_member_id, retained_member_id]
-        );
-
-        index.remove(FileId::new(4));
-
-        assert_eq!(owner_member_ids(&index, &owner), vec![retained_member_id]);
-    }
-
-    #[test]
-    fn warming_get_members_does_not_break_owner_move_visibility() {
-        let file_id = FileId::new(6);
-        let old_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OldOwner"));
-        let new_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("NewOwner"));
-        let key = LuaMemberKey::Name("field".into());
-        let member_id = make_member_id(file_id, 1);
-        let mut index = LuaMemberIndex::new();
-
-        index.add_member(old_owner.clone(), make_member(member_id, "field"));
-        assert_eq!(owner_member_ids(&index, &old_owner), vec![member_id]);
-        assert!(index.get_members(&new_owner).is_none());
-
-        index
-            .set_member_owner(new_owner.clone(), file_id, member_id)
-            .expect("owner reassignment should succeed");
-
-        assert!(index.get_members_for_owner_key(&old_owner, &key).is_empty());
-        assert_eq!(
-            index
-                .get_members_for_owner_key(&new_owner, &key)
-                .into_iter()
-                .map(|member| member.get_id())
-                .collect::<Vec<_>>(),
-            vec![member_id]
-        );
-    }
-
-    #[test]
-    fn get_members_cache_invalidates_when_one_promotes_to_many_after_warm() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
-        let first_member_id = make_member_id(FileId::new(4), 20);
-        let second_member_id = make_member_id(FileId::new(4), 10);
-        let mut index = LuaMemberIndex::new();
-
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(
-                first_member_id,
-                key.clone(),
-                LuaMemberFeature::FileFieldDecl,
-                None,
-            ),
-        );
-        assert_eq!(owner_member_ids(&index, &owner), vec![first_member_id]);
-
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(second_member_id, key, LuaMemberFeature::FileFieldDecl, None),
-        );
-
-        assert_eq!(
-            owner_member_ids(&index, &owner),
-            vec![second_member_id, first_member_id]
-        );
-    }
-
-    #[test]
-    fn clear_resets_member_owner_tracking() {
-        let file_id = FileId::new(3);
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let member_id = make_member_id(file_id, 7);
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(owner, make_member(member_id, "field"));
-        assert!(index.get_member_owner(&member_id).is_some());
-        assert!(
-            !index
-                .get_current_members_for_key(&LuaMemberKey::Name("field".into()))
-                .is_empty()
-        );
-
-        index.clear();
-
-        assert!(index.get_member_owner(&member_id).is_none());
-        assert!(
-            index
-                .get_current_members_for_key(&LuaMemberKey::Name("field".into()))
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn key_lookup_cache_invalidates_after_member_mutation() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
-        let first_member_id = make_member_id(FileId::new(9), 1);
-        let second_member_id = make_member_id(FileId::new(10), 3);
-        let mut index = LuaMemberIndex::new();
-
-        index.add_member(owner.clone(), make_member(first_member_id, "field"));
-        assert_eq!(
-            index
-                .get_current_members_for_key(&key)
-                .into_iter()
-                .map(|member| member.get_id())
-                .collect::<Vec<_>>(),
-            vec![first_member_id]
-        );
-
-        index.add_member(owner.clone(), make_member(second_member_id, "field"));
-        assert_eq!(
-            index
-                .get_current_members_for_key(&key)
-                .into_iter()
-                .map(|member| member.get_id())
-                .collect::<Vec<_>>(),
-            vec![first_member_id, second_member_id]
-        );
-
-        index.remove(FileId::new(9));
-        assert_eq!(
-            index
-                .get_current_members_for_key(&key)
-                .into_iter()
-                .map(|member| member.get_id())
-                .collect::<Vec<_>>(),
-            vec![second_member_id]
-        );
-    }
-
-    #[test]
-    fn file_define_assignment_history_stays_visible_for_owner_key_queries() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
-        let first_member_id = LuaMemberId::new(
-            LuaSyntaxId::new(
-                LuaSyntaxKind::IndexExpr.into(),
-                TextRange::new(TextSize::new(1), TextSize::new(2)),
-            ),
-            FileId::new(4),
-        );
-        let second_member_id = LuaMemberId::new(
-            LuaSyntaxId::new(
-                LuaSyntaxKind::IndexExpr.into(),
-                TextRange::new(TextSize::new(3), TextSize::new(4)),
-            ),
-            FileId::new(5),
-        );
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(
-                first_member_id,
-                key.clone(),
-                LuaMemberFeature::FileDefine,
-                None,
-            ),
-        );
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(
-                second_member_id,
-                key.clone(),
-                LuaMemberFeature::FileDefine,
-                None,
-            ),
-        );
-
-        assert_eq!(
-            index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::One(second_member_id))
-        );
-        let member_ids = index
-            .get_members_for_owner_key(&owner, &key)
-            .into_iter()
-            .map(|member| member.get_id())
-            .collect::<Vec<_>>();
-        assert_eq!(member_ids, vec![first_member_id, second_member_id]);
-    }
-
-    #[test]
-    fn retained_file_define_keeps_owner_key_history() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
-        let first_member_id = LuaMemberId::new(
-            LuaSyntaxId::new(
-                LuaSyntaxKind::IndexExpr.into(),
-                TextRange::new(TextSize::new(1), TextSize::new(2)),
-            ),
-            FileId::new(4),
-        );
-        let second_member_id = LuaMemberId::new(
-            LuaSyntaxId::new(
-                LuaSyntaxKind::IndexExpr.into(),
-                TextRange::new(TextSize::new(3), TextSize::new(4)),
-            ),
-            FileId::new(4),
-        );
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(
-                first_member_id,
-                key.clone(),
-                LuaMemberFeature::FileDefine,
-                None,
-            ),
-        );
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(
-                second_member_id,
-                key.clone(),
-                LuaMemberFeature::FileDefine,
-                None,
-            ),
-        );
-
-        index
-            .retain_only_member_for_owner_key(second_member_id)
-            .expect("retain should succeed");
-
-        let visible_member_ids = index
-            .get_members_for_owner_key(&owner, &key)
-            .into_iter()
-            .map(|member| member.get_id())
-            .collect::<Vec<_>>();
-        assert_eq!(visible_member_ids, vec![second_member_id]);
-
-        let history_member_ids = index
-            .get_current_owner_members_for_key(&owner, &key)
-            .into_iter()
-            .map(|member| member.get_id())
-            .collect::<Vec<_>>();
-        assert_eq!(history_member_ids, vec![first_member_id, second_member_id]);
-    }
-
-    #[test]
-    fn visible_owner_key_other_member_check_uses_current_visible_members() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
-        let first_member_id = make_index_member_id(FileId::new(4), 1);
-        let second_member_id = make_index_member_id(FileId::new(4), 3);
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(
-                first_member_id,
-                key.clone(),
-                LuaMemberFeature::FileDefine,
-                None,
-            ),
-        );
-
-        assert!(!index.has_visible_member_for_owner_key_other_than(&owner, &key, first_member_id));
-
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(
-                second_member_id,
-                key.clone(),
-                LuaMemberFeature::FileDefine,
-                None,
-            ),
-        );
-
-        assert!(index.has_visible_member_for_owner_key_other_than(&owner, &key, second_member_id));
-    }
-
-    #[test]
-    fn meta_only_member_item_preserves_meta_when_assignment_is_added() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
-        let meta_member_id = make_member_id(FileId::new(4), 1);
-        let assignment_member_id = make_index_member_id(FileId::new(4), 3);
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(
-            owner.clone(),
-            make_member_with_feature(meta_member_id, "field", LuaMemberFeature::MetaFieldDecl),
-        );
-        index.add_member(
-            owner.clone(),
-            make_member_with_feature(assignment_member_id, "field", LuaMemberFeature::FileDefine),
-        );
-
-        assert_eq!(
-            index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::Many(vec![
-                assignment_member_id,
-                meta_member_id,
-            ]))
-        );
-    }
-
-    #[test]
-    fn retain_only_member_for_owner_key_keeps_mixed_visible_members() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
-        let declaration_member_id = make_member_id(FileId::new(4), 1);
-        let assignment_member_id = make_index_member_id(FileId::new(4), 3);
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(
-            owner.clone(),
-            make_member_with_feature(
-                declaration_member_id,
-                "field",
-                LuaMemberFeature::FileFieldDecl,
-            ),
-        );
-        index.add_member(
-            owner.clone(),
-            make_member_with_feature(assignment_member_id, "field", LuaMemberFeature::FileDefine),
-        );
-
-        index
-            .retain_only_member_for_owner_key(assignment_member_id)
-            .expect("retain should no-op for mixed visible members");
-
-        let visible_member_ids = index
-            .get_members_for_owner_key(&owner, &key)
-            .into_iter()
-            .map(|member| member.get_id())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            visible_member_ids,
-            vec![declaration_member_id, assignment_member_id]
-        );
-    }
-
-    #[test]
-    fn preserve_members_for_owner_key_filters_dedups_and_updates_visible_item() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let other_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OtherOwnedType"));
-        let key = LuaMemberKey::Name("field".into());
-        let first_member_id = make_index_member_id(FileId::new(4), 1);
-        let second_member_id = make_index_member_id(FileId::new(4), 3);
-        let other_owner_member_id = make_index_member_id(FileId::new(5), 1);
-        let other_key_member_id = make_index_member_id(FileId::new(4), 5);
-
-        let mut index = LuaMemberIndex::new();
-        for member_id in [first_member_id, second_member_id] {
-            index.add_member(
-                owner.clone(),
-                make_member_with_feature(member_id, "field", LuaMemberFeature::FileDefine),
-            );
-        }
-        index.add_member(
-            other_owner,
-            make_member_with_feature(other_owner_member_id, "field", LuaMemberFeature::FileDefine),
-        );
-        index.add_member(
-            owner.clone(),
-            make_member_with_feature(other_key_member_id, "other", LuaMemberFeature::FileDefine),
-        );
-
-        index
-            .preserve_members_for_owner_key(
-                first_member_id,
-                vec![
-                    second_member_id,
-                    other_owner_member_id,
-                    first_member_id,
-                    second_member_id,
-                    other_key_member_id,
-                ],
-            )
-            .expect("preserve should succeed");
-
-        assert_eq!(
-            index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::Many(vec![
-                second_member_id,
-                first_member_id,
-            ]))
-        );
-        let visible_member_ids = index
-            .get_members_for_owner_key(&owner, &key)
-            .into_iter()
-            .map(|member| member.get_id())
-            .collect::<Vec<_>>();
-        assert_eq!(visible_member_ids, vec![second_member_id, first_member_id]);
-    }
-
-    #[test]
-    fn preserved_assignment_duplicate_insertions_keep_existing_item_order() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
-        let first_member_id = make_index_member_id(FileId::new(4), 1);
-        let second_member_id = make_index_member_id(FileId::new(4), 3);
-
-        let mut index = LuaMemberIndex::new();
-        for member_id in [first_member_id, second_member_id] {
-            index.mark_non_overwriting_assignment_member(member_id);
-            index.add_member(
-                owner.clone(),
-                make_member_with_feature(member_id, "field", LuaMemberFeature::FileDefine),
-            );
-        }
-
-        index.merge_member_into_owner_item(owner.clone(), key.clone(), second_member_id);
-        index.merge_member_into_owner_item(owner.clone(), key.clone(), first_member_id);
-
-        assert_eq!(
-            index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::Many(vec![
-                first_member_id,
-                second_member_id,
-            ]))
-        );
-    }
-
-    #[test]
-    fn alias_merge_does_not_duplicate_an_id_already_in_an_unsorted_item() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
-        let earlier_member_id = make_member_id(FileId::new(1), 10);
-        let later_member_id = make_member_id(FileId::new(2), 20);
-
-        // Decl inserts append in arrival order, so adding the later id first
-        // leaves the stored item unsorted.
-        let mut index = LuaMemberIndex::new();
-        index.add_member(owner.clone(), make_member(later_member_id, "field"));
-        index.add_member(owner.clone(), make_member(earlier_member_id, "field"));
-        assert_eq!(
-            index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::Many(vec![
-                later_member_id,
-                earlier_member_id,
-            ]))
-        );
-
-        index.add_member_alias_to_owner(owner.clone(), later_member_id);
-
-        let Some(LuaMemberIndexItem::Many(member_ids)) = index.get_member_item(&owner, &key) else {
-            panic!("the item should still hold both members");
-        };
-        assert_eq!(
-            member_ids.len(),
-            2,
-            "aliasing an id already in the item must not add it again"
-        );
-        assert_eq!(owner_member_ids(&index, &owner).len(), 2);
-    }
-
-    #[test]
-    fn alias_to_owner_is_recorded_exactly_when_the_alias_is_a_no_op() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("SharedTable"));
-        let other_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OtherTable"));
-        let own_member_id = make_index_member_id(FileId::new(1), 10);
-        let aliased_member_id = make_index_member_id(FileId::new(2), 20);
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(
-            owner.clone(),
-            make_member_with_feature(own_member_id, "field", LuaMemberFeature::FileDefine),
-        );
-        index.add_member(
-            other_owner,
-            make_member_with_feature(aliased_member_id, "field", LuaMemberFeature::FileDefine),
-        );
-
-        // Everything `add_member_alias_to_owner` writes, read back in a
-        // deterministic order. Comparing the index's `Debug` instead would
-        // compare `HashSet` iteration order, which varies per process and makes
-        // the assertion pass or fail at random.
-        let key = LuaMemberKey::Name("field".into());
-        let written_state = |index: &LuaMemberIndex| {
-            let mut in_filed: Vec<String> = index
-                .in_filed
-                .get(&aliased_member_id.file_id)
-                .map(|objects| objects.iter().map(|object| format!("{object:?}")).collect())
-                .unwrap_or_default();
-            in_filed.sort();
-            (
-                index.get_member_item(&owner, &key).cloned(),
-                index
-                    .member_owner_key_index
-                    .get(&owner)
-                    .and_then(|keys| keys.get(&key))
-                    .cloned(),
-                index
-                    .member_owner_key_history_index
-                    .get(&owner)
-                    .and_then(|keys| keys.get(&key))
-                    .cloned(),
-                in_filed,
-            )
-        };
-
-        assert!(!index.alias_to_owner_is_recorded(&owner, aliased_member_id));
-        index.add_member_alias_to_owner(owner.clone(), aliased_member_id);
-        assert!(index.alias_to_owner_is_recorded(&owner, aliased_member_id));
-
-        let recorded = written_state(&index);
-        index.add_member_alias_to_owner(owner.clone(), aliased_member_id);
-        assert_eq!(
-            recorded,
-            written_state(&index),
-            "a recorded alias must write nothing when applied again"
-        );
-    }
-
-    #[test]
-    fn alias_adds_to_an_existing_file_define_without_displacing_it() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("SharedTable"));
-        let other_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OtherTable"));
-        let key = LuaMemberKey::Name("field".into());
-        let own_member_id = make_index_member_id(FileId::new(1), 10);
-        let aliased_member_id = make_index_member_id(FileId::new(2), 20);
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(
-            owner.clone(),
-            make_member_with_feature(own_member_id, "field", LuaMemberFeature::FileDefine),
-        );
-        index.add_member(
-            other_owner,
-            make_member_with_feature(aliased_member_id, "field", LuaMemberFeature::FileDefine),
-        );
-
-        index.add_member_alias_to_owner(owner.clone(), aliased_member_id);
-
-        assert_eq!(
-            index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::Many(vec![
-                own_member_id,
-                aliased_member_id,
-            ])),
-            "an alias only ever adds; it must never replace the owner's own writer"
-        );
-    }
-
-    #[test]
-    fn a_table_field_write_arriving_after_an_alias_still_takes_the_slot() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("SharedTable"));
-        let other_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OtherTable"));
-        let key = LuaMemberKey::Name("field".into());
-        // A table-literal field is a `FileDefine` that is not an index-expr
-        // assignment, so it falls through to the latest-defined rule.
-        let own_member_id = make_member_id(FileId::new(1), 10);
-        let aliased_member_id = make_index_member_id(FileId::new(2), 20);
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(
-            other_owner,
-            make_member_with_feature(aliased_member_id, "field", LuaMemberFeature::FileDefine),
-        );
-        index.add_member_alias_to_owner(owner.clone(), aliased_member_id);
-        index.add_member(
-            owner.clone(),
-            make_member_with_feature(own_member_id, "field", LuaMemberFeature::FileDefine),
-        );
-
-        assert_eq!(
-            index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::Many(vec![
-                own_member_id,
-                aliased_member_id,
-            ])),
-            "which of the two arrived first must not decide the slot"
-        );
-    }
-
-    #[test]
-    fn global_path_key_keeps_every_writer_in_history_while_one_wins_the_visible_slot() {
-        let owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new("cityrp"));
-        let first_member_id = make_member_id(FileId::new(1), 10);
-        let second_member_id = make_member_id(FileId::new(2), 20);
-
-        let mut index = LuaMemberIndex::new();
-        for member_id in [first_member_id, second_member_id] {
-            index.add_member(
-                owner.clone(),
-                make_member_with_feature(member_id, "menu", LuaMemberFeature::FileDefine),
-            );
-        }
-
-        assert_eq!(
-            index
-                .get_member_history(&owner)
-                .iter()
-                .map(|member| member.get_id())
-                .collect::<Vec<_>>(),
-            vec![first_member_id, second_member_id],
-            "history must enumerate every file that wrote the key"
-        );
-        assert_eq!(
-            owner_member_ids(&index, &owner),
-            vec![second_member_id],
-            "the visible slot is still last-writer-wins"
-        );
-    }
-
-    /// `cityrp.progresshud = {}` is written by both `cl_progress_hud.lua` and
-    /// `sv_progress_hud.lua`. Only one can hold the visible slot, and the
-    /// global-path reconciliation re-homes whichever one that is onto the
-    /// elected table — so if arrival decided the survivor, a re-index moved the
-    /// member's owner on unchanged source.
-    #[test]
-    fn cross_file_assignment_writers_elect_the_visible_slot_by_source_order() {
-        let owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new("cityrp"));
-        let earlier_member_id = make_index_member_id(FileId::new(1), 10);
-        let later_member_id = make_index_member_id(FileId::new(2), 20);
-
-        for arrival in [
-            [earlier_member_id, later_member_id],
-            [later_member_id, earlier_member_id],
-        ] {
-            let mut index = LuaMemberIndex::new();
-            for member_id in arrival {
-                index.add_member(
-                    owner.clone(),
-                    make_member_with_feature(
-                        member_id,
-                        "progresshud",
-                        LuaMemberFeature::FileDefine,
-                    ),
-                );
-            }
-
-            assert_eq!(
-                owner_member_ids(&index, &owner),
-                vec![later_member_id],
-                "the visible writer must not depend on which file was analysed first"
-            );
-        }
-    }
-
-    #[test]
-    fn marked_non_overwriting_file_defines_share_lookup_item() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
-        let first_member_id = LuaMemberId::new(
-            LuaSyntaxId::new(
-                LuaSyntaxKind::IndexExpr.into(),
-                TextRange::new(TextSize::new(1), TextSize::new(2)),
-            ),
-            FileId::new(4),
-        );
-        let second_member_id = LuaMemberId::new(
-            LuaSyntaxId::new(
-                LuaSyntaxKind::IndexExpr.into(),
-                TextRange::new(TextSize::new(3), TextSize::new(4)),
-            ),
-            FileId::new(4),
-        );
-
-        let mut index = LuaMemberIndex::new();
-        index.mark_non_overwriting_assignment_member(first_member_id);
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(
-                first_member_id,
-                key.clone(),
-                LuaMemberFeature::FileDefine,
-                None,
-            ),
-        );
-        index.mark_non_overwriting_assignment_member(second_member_id);
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(
-                second_member_id,
-                key.clone(),
-                LuaMemberFeature::FileDefine,
-                None,
-            ),
-        );
-
-        assert_eq!(
-            index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::Many(vec![
-                first_member_id,
-                second_member_id
-            ]))
-        );
-    }
-
-    #[test]
-    fn preserved_assignment_insertion_invalidates_get_members_cache_after_warm() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
-        let later_member_id = make_index_member_id(FileId::new(4), 30);
-        let earlier_member_id = make_index_member_id(FileId::new(4), 10);
-        let mut index = LuaMemberIndex::new();
-
-        index.mark_non_overwriting_assignment_member(later_member_id);
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(
-                later_member_id,
-                key.clone(),
-                LuaMemberFeature::FileDefine,
-                None,
-            ),
-        );
-        assert_eq!(owner_member_ids(&index, &owner), vec![later_member_id]);
-
-        index.mark_non_overwriting_assignment_member(earlier_member_id);
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(earlier_member_id, key, LuaMemberFeature::FileDefine, None),
-        );
-
-        assert_eq!(
-            owner_member_ids(&index, &owner),
-            vec![earlier_member_id, later_member_id]
-        );
-    }
-
-    #[test]
-    fn many_marked_non_overwriting_file_defines_share_lookup_item() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
-        let mut index = LuaMemberIndex::new();
-
-        for i in 0..128 {
-            let member_id = LuaMemberId::new(
-                LuaSyntaxId::new(
-                    LuaSyntaxKind::IndexExpr.into(),
-                    TextRange::new(TextSize::new(i), TextSize::new(i + 1)),
-                ),
-                FileId::new(4),
-            );
-            index.mark_non_overwriting_assignment_member(member_id);
-            index.add_member(
-                owner.clone(),
-                LuaMember::new(member_id, key.clone(), LuaMemberFeature::FileDefine, None),
-            );
-        }
-
-        let Some(LuaMemberIndexItem::Many(member_ids)) = index.get_member_item(&owner, &key) else {
-            panic!("marked assignments should be preserved as a shared lookup item");
-        };
-
-        assert_eq!(member_ids.len(), 128);
-        assert_eq!(
-            member_ids.first().copied(),
-            Some(make_index_member_id(FileId::new(4), 0))
-        );
-        assert_eq!(
-            member_ids.last().copied(),
-            Some(make_index_member_id(FileId::new(4), 127))
-        );
-    }
-
-    #[test]
-    fn marked_non_overwriting_file_defines_keep_stable_order_when_added_out_of_order() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
-        let mut index = LuaMemberIndex::new();
-
-        for start in [30, 10, 20] {
-            let member_id = make_index_member_id(FileId::new(4), start);
-            index.mark_non_overwriting_assignment_member(member_id);
-            index.add_member(
-                owner.clone(),
-                LuaMember::new(member_id, key.clone(), LuaMemberFeature::FileDefine, None),
-            );
-        }
-
-        assert_eq!(
-            index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::Many(vec![
-                make_index_member_id(FileId::new(4), 10),
-                make_index_member_id(FileId::new(4), 20),
-                make_index_member_id(FileId::new(4), 30),
-            ]))
-        );
-    }
-
-    #[test]
-    fn marked_non_overwriting_file_define_does_not_preserve_unmarked_assignment() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("field".into());
-        let class_assignment_id = LuaMemberId::new(
-            LuaSyntaxId::new(
-                LuaSyntaxKind::IndexExpr.into(),
-                TextRange::new(TextSize::new(1), TextSize::new(2)),
-            ),
-            FileId::new(4),
-        );
-        let guarded_assignment_id = LuaMemberId::new(
-            LuaSyntaxId::new(
-                LuaSyntaxKind::IndexExpr.into(),
-                TextRange::new(TextSize::new(3), TextSize::new(4)),
-            ),
-            FileId::new(4),
-        );
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(
-                class_assignment_id,
-                key.clone(),
-                LuaMemberFeature::FileDefine,
-                None,
-            ),
-        );
-        index.mark_non_overwriting_assignment_member(guarded_assignment_id);
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(
-                guarded_assignment_id,
-                key.clone(),
-                LuaMemberFeature::FileDefine,
-                None,
-            ),
-        );
-
-        assert_eq!(
-            index.get_member_item(&owner, &key),
-            Some(&LuaMemberIndexItem::One(guarded_assignment_id))
-        );
-    }
-
-    /// A guarded bootstrap in one file and a plain assignment in another is
-    /// the order-dependent case: whichever was processed last used to take the
-    /// visible slot, so the surviving writer followed load order. The
-    /// bootstrap contributes no type of its own, so the plain writer must win
-    /// either way.
-    #[test]
-    fn cross_file_bootstrap_never_displaces_a_plain_writer() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("stock".into());
-        let plain_id = make_index_member_id(FileId::new(1), 10);
-        let bootstrap_id = make_index_member_id(FileId::new(2), 20);
-
-        let visible_after = |bootstrap_first: bool| {
-            let mut index = LuaMemberIndex::new();
-            let order = if bootstrap_first {
-                [bootstrap_id, plain_id]
-            } else {
-                [plain_id, bootstrap_id]
-            };
-            for member_id in order {
-                if member_id == bootstrap_id {
-                    index.mark_non_overwriting_assignment_member(member_id);
-                }
-                index.add_member(
-                    owner.clone(),
-                    LuaMember::new(member_id, key.clone(), LuaMemberFeature::FileDefine, None),
-                );
-            }
-            owner_member_ids(&index, &owner)
-        };
-
-        assert_eq!(
-            visible_after(false),
-            vec![plain_id],
-            "plain writer analysed first"
-        );
-        assert_eq!(
-            visible_after(true),
-            vec![plain_id],
-            "bootstrap analysed first"
-        );
-    }
-
-    /// Transparency only applies when a real writer exists. With nothing but
-    /// bootstraps across files there is no placeholder to see through, so the
-    /// existing merge still has to keep every writer visible.
-    #[test]
-    fn cross_file_all_bootstrap_writers_still_merge() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let key = LuaMemberKey::Name("stock".into());
-        let first_id = make_index_member_id(FileId::new(1), 10);
-        let second_id = make_index_member_id(FileId::new(2), 20);
-
-        let mut index = LuaMemberIndex::new();
-        for member_id in [first_id, second_id] {
-            index.mark_non_overwriting_assignment_member(member_id);
-            index.add_member(
-                owner.clone(),
-                LuaMember::new(member_id, key.clone(), LuaMemberFeature::FileDefine, None),
-            );
-        }
-
-        assert_eq!(owner_member_ids(&index, &owner), vec![first_id, second_id]);
-    }
-
-    #[test]
-    fn file_removal_clears_previous_owner_history_entries() {
-        let file_id = FileId::new(6);
-        let old_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OldOwner"));
-        let new_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("NewOwner"));
-        let old_key = LuaMemberKey::Name("old_field".into());
-        let new_key = LuaMemberKey::Name("new_field".into());
-        let member_id = make_member_id(file_id, 10);
-        let mut index = LuaMemberIndex::new();
-
-        index.add_member(old_owner.clone(), make_member(member_id, "old_field"));
-        index
-            .set_member_owner(new_owner, file_id, member_id)
-            .expect("owner reassignment should succeed");
-        index.remove(file_id);
-        index.add_member(old_owner.clone(), make_member(member_id, "new_field"));
-
-        assert!(
-            index
-                .get_current_owner_members_for_key(&old_owner, &old_key)
-                .is_empty()
-        );
-        assert!(index.get_current_members_for_key(&old_key).is_empty());
-        assert_eq!(
-            index
-                .get_current_owner_members_for_key(&old_owner, &new_key)
-                .into_iter()
-                .map(|member| member.get_id())
-                .collect::<Vec<_>>(),
-            vec![member_id]
-        );
-        assert_eq!(
-            index
-                .get_current_members_for_key(&new_key)
-                .into_iter()
-                .map(|member| member.get_id())
-                .collect::<Vec<_>>(),
-            vec![member_id]
-        );
-    }
-
-    #[test]
-    fn function_scope_lookup_returns_innermost_range() {
-        let file_id = FileId::new(7);
-        let outer = TextRange::new(TextSize::new(10), TextSize::new(100));
-        let inner = TextRange::new(TextSize::new(30), TextSize::new(60));
-        let mut index = LuaMemberIndex::new();
-
-        index.add_function_scope_range(file_id, outer);
-        index.add_function_scope_range(file_id, inner);
-
-        assert_eq!(
-            index.enclosing_function_scope_range(file_id, TextSize::new(40)),
-            Some(inner)
-        );
-        assert_eq!(
-            index.enclosing_function_scope_range(file_id, TextSize::new(80)),
-            Some(outer)
-        );
-        assert_eq!(
-            index.enclosing_function_scope_range(file_id, TextSize::new(5)),
-            None
-        );
-    }
-
-    #[test]
-    fn file_removal_clears_function_scope_metadata() {
-        let file_id = FileId::new(8);
-        let range = TextRange::new(TextSize::new(10), TextSize::new(100));
-        let member_id = make_member_id(file_id, 20);
-        let mut index = LuaMemberIndex::new();
-
-        index.add_function_scope_range(file_id, range);
-        index.set_member_function_scope_range(member_id, Some(range));
-        assert_eq!(
-            index.enclosing_function_scope_range(file_id, TextSize::new(20)),
-            Some(range)
-        );
-        assert_eq!(index.member_function_scope_range(member_id), Some(range));
-
-        index.remove(file_id);
-
-        assert_eq!(
-            index.enclosing_function_scope_range(file_id, TextSize::new(20)),
-            None
-        );
-        assert_eq!(index.member_function_scope_range(member_id), None);
-
-        index.add_function_scope_range(file_id, range);
-        index.set_member_function_scope_range(member_id, Some(range));
-        index.clear();
-
-        assert_eq!(
-            index.enclosing_function_scope_range(file_id, TextSize::new(20)),
-            None
-        );
-        assert_eq!(index.member_function_scope_range(member_id), None);
-    }
-
-    /// `MYTBL["net.handler"] = f` keys one member `net.handler` under `MYTBL`.
-    /// Its global path is `MYTBL.net.handler`, whose last dotted segment is
-    /// `handler` — a key nothing is stored under.
-    #[test]
-    fn history_for_a_global_path_finds_a_member_whose_key_contains_dots() {
-        let owner = LuaMemberOwner::GlobalPath(GlobalId::new("MYTBL"));
-        let global_id = GlobalId::new("MYTBL.net.handler");
-        let member_id = make_index_member_id(FileId::new(1), 10);
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(
-                member_id,
-                LuaMemberKey::Name("net.handler".into()),
-                LuaMemberFeature::FileFieldDecl,
-                Some(global_id.clone()),
-            ),
-        );
-
-        assert_eq!(
-            index.get_member_history_for_global_path(&owner, &global_id),
-            vec![member_id]
-        );
-    }
-
-    #[test]
-    fn history_for_a_global_path_still_finds_a_plain_nested_member() {
-        let owner = LuaMemberOwner::GlobalPath(GlobalId::new("MYTBL.net"));
-        let global_id = GlobalId::new("MYTBL.net.handler");
-        let member_id = make_index_member_id(FileId::new(1), 10);
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(
-            owner.clone(),
-            LuaMember::new(
-                member_id,
-                LuaMemberKey::Name("handler".into()),
-                LuaMemberFeature::FileFieldDecl,
-                Some(global_id.clone()),
-            ),
-        );
-
-        assert_eq!(
-            index.get_member_history_for_global_path(&owner, &global_id),
-            vec![member_id]
-        );
-    }
-
-    #[test]
-    fn an_owner_whose_only_member_is_gone_has_no_live_member() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
-        let file_id = FileId::new(1);
-        let member_id = make_member_id(file_id, 10);
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(owner.clone(), make_member(member_id, "field"));
-        assert!(index.has_live_member(&owner));
-
-        index.remove(file_id);
-        assert!(!index.has_live_member(&owner));
-    }
-}
+crate::db_index::cow_shards::task_fork_fields!(LuaMemberIndex {
+    members,
+    source_members,
+    in_filed => crate::db_index::cow_shards::merge_set,
+    owner_members => LuaOwnerMembers::merge,
+    member_current_owner,
+    member_owner_key_index => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, merge_member_ids)
+    },
+    member_owner_key_history_index => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, merge_member_ids)
+    },
+    owner_key_index_owners_by_file => crate::db_index::cow_shards::merge_set,
+    current_owner_member_history => merge_member_ids,
+    current_members_by_key => merge_member_ids,
+    expr_key_members_by_file => crate::db_index::cow_shards::merge_set,
+    non_overwriting_assignment_members,
+    preserved_co_writer_reconciled,
+    owner_only_members,
+    member_transfers,
+    filed_homes,
+    deferred_index_expr_members => crate::db_index::cow_shards::merge_set,
+    function_scope_ranges,
+    member_function_scope_ranges,
+    definition_site_owner,
+    path_definition_sites,
+    definition_sites_by_file,
+    global_path_class_owner,
+    global_path_class_candidates,
+    path_class_holders,
+    derived_path_classes,
+    member_path_provenance,
+    owner_history_fingerprints => crate::db_index::cow_shards::rebuilt,
+    key_fingerprints => crate::db_index::cow_shards::rebuilt,
+    file_fingerprints => crate::db_index::cow_shards::rebuilt,
+} prepare fingerprints_to_rebuild then rebuild_fingerprints
+  by_field install_fingerprints => rebuild_fingerprints);

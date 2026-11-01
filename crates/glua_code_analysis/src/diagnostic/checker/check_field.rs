@@ -1,7 +1,5 @@
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::time::Duration;
 
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat, LuaExpr,
@@ -13,12 +11,11 @@ use smol_str::SmolStr;
 
 use crate::{
     DbIndex, DiagnosticCode, FileId, GlobalId, InferFailReason, LuaAliasCallKind, LuaAliasCallType,
-    LuaInferenceConfidence, LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType, SemanticModel,
+    LuaInferenceConfidence, LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, SemanticModel,
     check_type_compact, enum_variable_is_param, get_keyof_members, get_real_type,
     semantic::{
         infer_owner_raw_member_type_with_realm, infer_param_is_weak, is_doc_tag_table_const,
         member_key_matches_type, resolve_decl_backed_global_path_member_type,
-        unwrap_paren_to_name_expr,
     },
 };
 
@@ -34,22 +31,27 @@ impl Checker for CheckFieldChecker {
         DiagnosticCode::InjectField,
         DiagnosticCode::UndefinedField,
         DiagnosticCode::UndefinedMethod,
+        DiagnosticCode::InferUnguardedChild,
+        DiagnosticCode::InferUnknown,
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
-        let mut checked_index_expr = HashSet::new();
+        let mut checked_index_expr = HashSet::default();
         let assignment_prefixes = context.get_assignment_prefix_events(&root);
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
         let initialized_assignment_accesses =
             if has_reusable_table_literal_assignment(&assignment_prefixes) {
-                collect_initialized_assignment_accesses(&root, &assignment_prefixes)
+                collect_initialized_assignment_accesses(&buckets.assign_stats, &assignment_prefixes)
             } else {
-                HashSet::new()
+                HashSet::default()
             };
         let mut state = CheckFieldState::default();
         let profile_enabled = log::log_enabled!(log::Level::Info);
         let mut profile = profile_enabled.then(CheckFieldProfile::default);
-        for node in root.descendants::<LuaAst>() {
+        for node in buckets.all_nodes.iter().cloned() {
             if context.is_cancelled() {
                 return;
             }
@@ -76,8 +78,7 @@ impl Checker for CheckFieldChecker {
                                 context,
                                 semantic_model,
                                 index_expr,
-                                DiagnosticCode::InjectField,
-                                false,
+                                Access::Inject,
                                 &mut state,
                                 profile.as_mut(),
                             );
@@ -94,8 +95,7 @@ impl Checker for CheckFieldChecker {
                             context,
                             semantic_model,
                             &index_expr,
-                            DiagnosticCode::InjectField,
-                            false,
+                            Access::Inject,
                             &mut state,
                             profile.as_mut(),
                         );
@@ -117,20 +117,11 @@ impl Checker for CheckFieldChecker {
                         }
                         continue;
                     }
-                    let weak_receiver = index_expr
-                        .get_prefix_expr()
-                        .is_some_and(|prefix| is_weak_receiver(semantic_model, &prefix));
-                    let code = if is_colon_method_call(&index_expr) && !weak_receiver {
-                        DiagnosticCode::UndefinedMethod
-                    } else {
-                        DiagnosticCode::UndefinedField
-                    };
                     check_index_expr(
                         context,
                         semantic_model,
                         &index_expr,
-                        code,
-                        weak_receiver,
+                        Access::Read,
                         &mut state,
                         profile.as_mut(),
                     );
@@ -144,17 +135,29 @@ impl Checker for CheckFieldChecker {
     }
 }
 
+fn receiver_is_weak(semantic_model: &SemanticModel, index_expr: &LuaIndexExpr) -> bool {
+    index_expr
+        .get_prefix_expr()
+        .is_some_and(|prefix| is_weak_receiver(semantic_model, &prefix))
+}
+
 fn is_weak_receiver(semantic_model: &SemanticModel, prefix_expr: &LuaExpr) -> bool {
-    let db = semantic_model.get_db();
-    if let Some(name_expr) = unwrap_paren_to_name_expr(prefix_expr)
-        && let Some(decl_id) = db
-            .get_reference_index()
-            .get_local_reference(&semantic_model.get_file_id())
-            .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
-        && let Some(decl) = db.get_decl_index().get_decl(&decl_id)
-        && decl.is_param()
+    if let Some(decl) = super::inference_trust::local_read_declaration(semantic_model, prefix_expr)
     {
-        return infer_param_is_weak(db, &mut semantic_model.get_cache().borrow_mut(), decl);
+        if !super::inference_trust::param_read_rests_on_declaration(
+            semantic_model,
+            prefix_expr,
+            decl,
+        ) {
+            return false;
+        }
+        if decl.is_param() {
+            return infer_param_is_weak(
+                semantic_model.get_db(),
+                &mut semantic_model.get_cache().borrow_mut(),
+                decl,
+            );
+        }
     }
 
     semantic_model
@@ -187,11 +190,11 @@ fn has_reusable_table_literal_assignment(assignment_prefixes: &AssignmentPrefixE
 }
 
 fn collect_initialized_assignment_accesses(
-    root: &glua_parser::LuaChunk,
+    assign_stats: &[LuaAssignStat],
     assignment_prefixes: &AssignmentPrefixEvents,
 ) -> HashSet<LuaSyntaxNode> {
-    let mut initialized_accesses = HashSet::new();
-    for assign in root.descendants::<LuaAssignStat>() {
+    let mut initialized_accesses = HashSet::default();
+    for assign in assign_stats {
         let (vars, _) = assign.get_var_and_expr_list();
         for var in vars {
             let LuaVarExpr::IndexExpr(index_expr) = var else {
@@ -214,6 +217,8 @@ fn collect_initialized_assignment_accesses(
 #[derive(Default)]
 struct CheckFieldState {
     member_infer_cache: HashMap<(LuaType, LuaMemberKey, bool), bool>,
+    subtypes_with_member: crate::compilation::analyzer::SubtypesWithMember,
+    unguarded_child_sources: Option<HashSet<crate::InFiled<glua_parser::LuaSyntaxId>>>,
 }
 
 #[derive(Default)]
@@ -254,12 +259,21 @@ impl CheckFieldProfile {
     }
 }
 
+/// How an index expression uses the member it names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// Assigned or defined: a missing member is injected.
+    Inject,
+    /// Read: a colon call on a receiver whose type is certain reads as a
+    /// method, anything else as a field.
+    Read,
+}
+
 fn check_index_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     index_expr: &LuaIndexExpr,
-    code: DiagnosticCode,
-    weak_receiver: bool,
+    access: Access,
     state: &mut CheckFieldState,
     mut profile: Option<&mut CheckFieldProfile>,
 ) -> Option<()> {
@@ -288,17 +302,41 @@ fn check_index_expr(
 
     let index_key = index_expr.get_index_key()?;
 
+    // A member valid as a method is valid as a field too, so a colon read
+    // asks how sure its receiver is only when it is missing as a method.
+    let colon = access == Access::Read && is_colon_method_call(index_expr);
+    let first_code = match access {
+        Access::Inject => DiagnosticCode::InjectField,
+        Access::Read if colon => DiagnosticCode::UndefinedMethod,
+        Access::Read => DiagnosticCode::UndefinedField,
+    };
     let valid_member_start = profile.is_some().then(std::time::Instant::now);
-    let valid_member = is_valid_member_with_state(
+    let mut valid_member = is_valid_member_with_state(
         context,
         semantic_model,
         &prefix_typ,
         index_expr,
         &index_key,
-        code,
+        first_code,
         state,
     )
     .is_some();
+    let mut weak_receiver = None;
+    if !valid_member && colon {
+        let weak = receiver_is_weak(semantic_model, index_expr);
+        weak_receiver = Some(weak);
+        valid_member = weak
+            && is_valid_member_with_state(
+                context,
+                semantic_model,
+                &prefix_typ,
+                index_expr,
+                &index_key,
+                DiagnosticCode::UndefinedField,
+                state,
+            )
+            .is_some();
+    }
     if let (Some(profile), Some(valid_member_start)) = (profile.as_mut(), valid_member_start) {
         profile.valid_member_time += valid_member_start.elapsed();
     }
@@ -323,6 +361,17 @@ fn check_index_expr(
         return Some(());
     }
 
+    let weak_receiver = match access {
+        Access::Inject => false,
+        Access::Read => {
+            weak_receiver.unwrap_or_else(|| receiver_is_weak(semantic_model, index_expr))
+        }
+    };
+    let code = match access {
+        Access::Inject => DiagnosticCode::InjectField,
+        Access::Read if colon && !weak_receiver => DiagnosticCode::UndefinedMethod,
+        Access::Read => DiagnosticCode::UndefinedField,
+    };
     let field_name = SmolStr::new(index_key.get_path_part());
 
     if code == DiagnosticCode::UndefinedField
@@ -357,7 +406,16 @@ fn check_index_expr(
         code,
         DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
     ) && !is_enum_type(db, &prefix_typ)
-        && is_nil_guarded_in_scope(index_expr, weak_receiver)
+        && (is_nil_guarded_in_scope(index_expr, weak_receiver)
+            || (allows_nil_safe_expr_undefined_field_suppression(
+                semantic_model,
+                &prefix_typ,
+                &index_key,
+            ) && crate::compilation::analyzer::is_member_path_presence_guarded(
+                db,
+                &mut semantic_model.get_cache().borrow_mut(),
+                index_expr,
+            )))
     {
         return Some(());
     }
@@ -385,6 +443,87 @@ fn check_index_expr(
                 }
             }
         }
+    }
+
+    let guessed_receiver =
+        matches!(
+            code,
+            DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+        ) && super::inference_trust::is_guessed_declaration_read(semantic_model, index_expr);
+
+    // A member the receiver's class lacks but its children define is a read
+    // that needs a guard, as when inference meets it on a local.
+    if matches!(
+        code,
+        DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+    ) && let Some(children) =
+        class_union_partial_arms(semantic_model, state, &prefix_typ, index_expr).or_else(|| {
+            crate::compilation::analyzer::unguarded_child_candidates(
+                db,
+                &mut semantic_model.get_cache().borrow_mut(),
+                &mut state.subtypes_with_member,
+                context.get_file_id(),
+                index_expr,
+                &placeholder_constraint(db, &prefix_typ).unwrap_or_else(|| prefix_typ.clone()),
+                &LuaMemberKey::Name(field_name.clone()),
+            )
+            .map(|children| children.to_vec())
+        })
+    {
+        let mut children = children
+            .iter()
+            .map(|child| {
+                crate::humanize_type(db, &LuaType::Ref(child.clone()), crate::RenderLevel::Simple)
+            })
+            .collect::<Vec<_>>();
+        if is_covered_by_inference_event(context, semantic_model, state, index_expr) {
+            return Some(());
+        }
+        if guessed_receiver {
+            children.sort();
+            context.add_diagnostic(
+                DiagnosticCode::InferUnknown,
+                index_expr.get_range(),
+                super::inference_trust::inferred_from_usage_message(&children.join("|")),
+                None,
+            );
+            return Some(());
+        }
+        let found = crate::humanize_type(db, &prefix_typ, crate::RenderLevel::Simple);
+        let severity = super::inference_trust::unguarded_child_severity(
+            context,
+            semantic_model,
+            index_expr,
+            &prefix_typ,
+        );
+        context.add_diagnostic_with_severity(
+            DiagnosticCode::InferUnguardedChild,
+            index_expr.get_range(),
+            super::inference_trust::unguarded_children_message(
+                Some(field_name.as_str()),
+                &found,
+                &children,
+            ),
+            severity,
+            None,
+        );
+        return Some(());
+    }
+
+    if guessed_receiver {
+        if !is_covered_by_inference_event(context, semantic_model, state, index_expr) {
+            context.add_diagnostic(
+                DiagnosticCode::InferUnknown,
+                index_expr.get_range(),
+                super::inference_trust::inferred_from_usage_message(&crate::humanize_type(
+                    db,
+                    &prefix_typ,
+                    crate::RenderLevel::Simple,
+                )),
+                None,
+            );
+        }
+        return Some(());
     }
 
     match code {
@@ -432,6 +571,74 @@ fn check_index_expr(
     Some(())
 }
 
+/// Whether an unguarded-child inference event already reports the read at `index_expr`,
+/// which is then where its advisory is emitted.
+fn is_covered_by_inference_event(
+    context: &DiagnosticContext,
+    semantic_model: &SemanticModel,
+    state: &mut CheckFieldState,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let file_id = context.get_file_id();
+    state
+        .unguarded_child_sources
+        .get_or_insert_with(|| {
+            super::inference_trust::unguarded_child_event_sources(semantic_model, file_id)
+        })
+        .contains(&crate::InFiled::new(file_id, index_expr.get_syntax_id()))
+}
+
+/// The arms of the class union `arms` that have the member `index_expr` reads,
+/// or `None` when the read's key is dynamic or unresolved.
+fn class_union_arms_with_member(
+    semantic_model: &SemanticModel,
+    arms: &[LuaTypeDeclId],
+    index_expr: &LuaIndexExpr,
+) -> Option<Vec<LuaTypeDeclId>> {
+    let db = semantic_model.get_db();
+    let mut cache = semantic_model.get_cache().borrow_mut();
+    let index_key = index_expr.get_index_key()?;
+    if LuaMemberKey::index_key_is_dynamic(db, &mut cache, &index_key) {
+        return None;
+    }
+    let member_key = LuaMemberKey::from_index_key(db, &mut cache, &index_key).ok()?;
+    Some(crate::compilation::analyzer::class_union_arms_with_member(
+        db,
+        &mut cache,
+        arms,
+        &member_key,
+        semantic_model.get_file_id(),
+        index_expr.get_position(),
+    ))
+}
+
+/// The classes a read through a class union receiver needs a guard to narrow
+/// to, when some of its arms lack the member `index_expr` reads.
+fn class_union_partial_arms(
+    semantic_model: &SemanticModel,
+    state: &mut CheckFieldState,
+    prefix_typ: &LuaType,
+    index_expr: &LuaIndexExpr,
+) -> Option<Vec<LuaTypeDeclId>> {
+    let db = semantic_model.get_db();
+    let arms = crate::compilation::analyzer::class_union_arms(db, prefix_typ)?;
+    let mut cache = semantic_model.get_cache().borrow_mut();
+    let index_key = index_expr.get_index_key()?;
+    if LuaMemberKey::index_key_is_dynamic(db, &mut cache, &index_key) {
+        return None;
+    }
+    let member_key = LuaMemberKey::from_index_key(db, &mut cache, &index_key).ok()?;
+    crate::compilation::analyzer::class_union_partial_arms(
+        db,
+        &mut cache,
+        &mut state.subtypes_with_member,
+        &arms,
+        &member_key,
+        semantic_model.get_file_id(),
+        index_expr,
+    )
+}
+
 fn is_invalid_prefix_type(typ: &LuaType) -> bool {
     let mut current_typ = typ;
     loop {
@@ -447,10 +654,10 @@ fn is_invalid_prefix_type(typ: &LuaType) -> bool {
             // Treating it as invalid suppresses diagnostics like typed-object key mismatches.
             LuaType::TableConst(_) => return false,
             LuaType::Union(union) => {
-                return match union.as_ref() {
-                    LuaUnionType::Nullable(typ) => typ.is_nil() || is_invalid_prefix_type(typ),
-                    LuaUnionType::Multi(types) => types
-                        .iter()
+                return match union.nullable_inner() {
+                    Some(typ) => typ.is_nil() || is_invalid_prefix_type(typ),
+                    None => union
+                        .types()
                         .all(|typ| typ.is_nil() || is_invalid_prefix_type(typ)),
                 };
             }
@@ -492,43 +699,167 @@ fn is_colon_method_call(index_expr: &LuaIndexExpr) -> bool {
             })
 }
 
-fn has_unresolved_metatable_index(
+/// Whether nothing is known about the metatable written as `expr`, so its `__index`
+/// can provide any field at runtime.
+fn metatable_expr_type_is_unknown(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    expr: &crate::InFiled<rowan::TextRange>,
+) -> bool {
+    fn is_unknown_like(typ: &LuaType) -> bool {
+        match typ {
+            LuaType::Union(union) => union.types().any(is_unknown_like),
+            _ => typ.is_unknown() || typ.is_any(),
+        }
+    }
+    let Some(tree) = db.get_vfs().syntax_tree_around(&expr.file_id, expr.value) else {
+        return false;
+    };
+    let Some(metatable) = tree
+        .get_red_root()
+        .token_at_offset(expr.value.start())
+        .right_biased()
+        .and_then(|token| {
+            token
+                .parent_ancestors()
+                .filter_map(glua_parser::LuaExpr::cast)
+                .find(|candidate| candidate.get_range() == expr.value)
+        })
+    else {
+        return false;
+    };
+    let inferred = if expr.file_id == semantic_model.get_file_id() {
+        semantic_model.infer_expr(metatable)
+    } else {
+        let mut cache = crate::LuaInferCache::new(
+            expr.file_id,
+            semantic_model.get_cache().borrow_mut().get_config().clone(),
+        );
+        crate::infer_expr(db, &mut cache, metatable)
+    };
+    inferred.map_or(true, |typ| is_unknown_like(&typ))
+}
+
+/// Every metatable the table literal `table_range` was given, including those the files that
+/// `include` it gave the table it returns.
+fn table_metatables(
+    db: &DbIndex,
+    table_range: &crate::InFiled<rowan::TextRange>,
+) -> Vec<crate::BoundMetatable> {
+    let metatables = db.get_metatable_index();
+    let mut bound = metatables.bound_metatables(table_range);
+    let file_id = table_range.file_id;
+    let returns_table = db
+        .get_module_index()
+        .get_module(file_id)
+        .is_some_and(|module| module.export_type == Some(LuaType::TableConst(table_range.clone())));
+    if !returns_table {
+        return bound;
+    }
+    let static_includes = db
+        .get_file_dependencies_index()
+        .get_sites_loading(file_id)
+        .filter(|site| site.kind == crate::LuaDependencyKind::Include)
+        .map(|site| crate::InFiled::new(site.source_file_id, site.call_range));
+    let dynamic_includes = db
+        .get_gmod_load_index()
+        .get_file_info(&file_id)
+        .into_iter()
+        .flat_map(|info| info.incoming_edges.iter())
+        .filter(|edge| edge.original_expr.as_deref() == Some("gmod.file_find"))
+        .filter_map(|edge| Some(crate::InFiled::new(edge.source_file_id, edge.range?)));
+    for include_call in static_includes.chain(dynamic_includes) {
+        bound.extend(metatables.bound_metatables(&include_call));
+    }
+    bound
+}
+
+/// Whether `metatable` can provide fields the table's own members do not name.
+fn metatable_leaves_members_open(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    metatable: &crate::BoundMetatable,
+    position: Option<rowan::TextSize>,
+) -> bool {
+    let metatable = match metatable {
+        crate::BoundMetatable::Opaque(expr) => {
+            return metatable_expr_type_is_unknown(db, semantic_model, expr);
+        }
+        crate::BoundMetatable::Table(metatable) => metatable,
+    };
+    let index_member_key = LuaMemberKey::Name("__index".into());
+    let meta_owner = crate::semantic::metatable_member_owner(db, metatable);
+    let index_type = infer_owner_raw_member_type_with_realm(
+        db,
+        meta_owner,
+        &index_member_key,
+        semantic_model.get_file_id(),
+        position,
+        None,
+    );
+
+    // A present but unresolved Lua `__index`, or one that is a function, can provide any
+    // field at runtime, so field absence cannot be proven. Known table `__index` types
+    // still flow through normal checks.
+    index_type.is_ok_and(|typ| {
+        typ.is_unknown() || matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
+    })
+}
+
+pub(super) fn has_unresolved_metatable_index(
     db: &DbIndex,
     semantic_model: &SemanticModel,
     prefix_typ: &LuaType,
     position: Option<rowan::TextSize>,
 ) -> bool {
+    let mut visited = rustc_hash::FxHashSet::default();
+    has_unresolved_metatable_index_inner(db, semantic_model, prefix_typ, position, &mut visited)
+}
+
+fn has_unresolved_metatable_index_inner(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    prefix_typ: &LuaType,
+    position: Option<rowan::TextSize>,
+    visited: &mut rustc_hash::FxHashSet<LuaType>,
+) -> bool {
+    if !visited.insert(prefix_typ.clone()) {
+        return false;
+    }
     match prefix_typ {
         LuaType::TableConst(table_range) => {
-            let Some(metatable) = db.get_metatable_index().get(table_range) else {
-                return false;
-            };
-
-            let index_member_key = LuaMemberKey::Name("__index".into());
-            let meta_owner = LuaMemberOwner::Element(metatable.clone());
-            let index_type = infer_owner_raw_member_type_with_realm(
-                db,
-                meta_owner,
-                &index_member_key,
-                semantic_model.get_file_id(),
-                position,
-            );
-
-            // A present but unresolved Lua `__index` can provide fields at runtime, so field
-            // absence cannot be proven. Known `__index` types still flow through normal checks.
-            index_type.is_ok_and(|typ| typ.is_unknown())
+            table_metatables(db, table_range).iter().any(|metatable| {
+                metatable_leaves_members_open(db, semantic_model, metatable, position)
+            })
         }
-        LuaType::Instance(instance) => {
-            has_unresolved_metatable_index(db, semantic_model, instance.get_base(), position)
-        }
-        LuaType::Union(union) => match union.as_ref() {
-            LuaUnionType::Nullable(typ) => {
-                has_unresolved_metatable_index(db, semantic_model, typ, position)
+        LuaType::Instance(instance) => has_unresolved_metatable_index_inner(
+            db,
+            semantic_model,
+            instance.get_base(),
+            position,
+            visited,
+        ),
+        LuaType::Union(union) => match union.nullable_inner() {
+            Some(typ) => {
+                has_unresolved_metatable_index_inner(db, semantic_model, typ, position, visited)
             }
-            LuaUnionType::Multi(types) => types.iter().any(|typ| {
-                !typ.is_nil() && has_unresolved_metatable_index(db, semantic_model, typ, position)
+            None => union.types().any(|typ| {
+                !typ.is_nil()
+                    && has_unresolved_metatable_index_inner(
+                        db,
+                        semantic_model,
+                        typ,
+                        position,
+                        visited,
+                    )
             }),
         },
+        LuaType::MergedTable(merged) => merged.get_types().iter().any(|typ| {
+            has_unresolved_metatable_index_inner(db, semantic_model, typ, position, visited)
+        }),
+        LuaType::MultiLineUnion(union) => union.get_unions().iter().any(|(typ, _)| {
+            has_unresolved_metatable_index_inner(db, semantic_model, typ, position, visited)
+        }),
         _ => false,
     }
 }
@@ -622,8 +953,36 @@ fn is_valid_member_inner(
     code: DiagnosticCode,
     mut state: Option<&mut CheckFieldState>,
 ) -> Option<()> {
+    if matches!(
+        code,
+        DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+    ) && let Some(arms) =
+        crate::compilation::analyzer::class_union_arms(semantic_model.get_db(), prefix_typ)
+    {
+        if let Some(with_member) = class_union_arms_with_member(semantic_model, &arms, index_expr) {
+            if with_member.len() == arms.len() {
+                return Some(());
+            }
+            if !with_member.is_empty() {
+                return None;
+            }
+        }
+    }
     match prefix_typ {
         LuaType::Global | LuaType::Userdata => return Some(()),
+        // `type-not-found` already reports the missing class, so its members are not judged.
+        LuaType::Ref(id)
+            if matches!(
+                code,
+                DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+            ) && semantic_model
+                .get_db()
+                .get_type_index()
+                .get_type_decl(id)
+                .is_none() =>
+        {
+            return Some(());
+        }
         LuaType::Array(typ) => {
             if typ.get_base().is_unknown() {
                 return Some(());
@@ -665,53 +1024,46 @@ fn is_valid_member_inner(
             }
         }
         LuaType::TableConst(id) => {
-            if code == DiagnosticCode::UndefinedField
-                && !is_table_const_from_doc_tag(semantic_model, id)
-                && table_const_is_empty(semantic_model.get_db(), id)
-                && index_key_is_numeric(semantic_model, index_key)
-            {
-                return Some(());
+            match check_table_const_member(semantic_model, index_expr, index_key, code, id) {
+                TableConstMemberCheck::Valid => return Some(()),
+                TableConstMemberCheck::Unresolvable => return None,
+                TableConstMemberCheck::NotFound => {}
             }
-
-            if code == DiagnosticCode::UndefinedField
-                && matches!(index_key, LuaIndexKey::Expr(_))
-                && !is_table_const_from_doc_tag(semantic_model, id)
-            {
-                return Some(());
-            }
-
-            let key = LuaMemberKey::from_index_key(
-                semantic_model.get_db(),
-                &mut semantic_model.get_cache().borrow_mut(),
+        }
+        LuaType::Instance(_) => {
+            if any_table_const_component_valid(
+                semantic_model,
+                index_expr,
                 index_key,
-            )
-            .ok()?;
-            let owner = LuaMemberOwner::Element(id.clone());
-            match infer_owner_raw_member_type_with_realm(
-                semantic_model.get_db(),
-                owner,
-                &key,
-                semantic_model.get_file_id(),
-                Some(index_expr.get_position()),
+                code,
+                std::iter::once(prefix_typ),
             ) {
-                Ok(_) => return Some(()),
-                Err(InferFailReason::FieldNotFound)
-                    if code == DiagnosticCode::UndefinedField
-                        && is_table_const_from_doc_tag(semantic_model, id) =>
-                {
-                    return Some(());
-                }
-                Err(_) => {}
-            }
-
-            if code == DiagnosticCode::UndefinedField
-                && table_const_has_only_dynamic_key_members(semantic_model.get_db(), id)
-                && index_key_is_literal_member(index_key)
-            {
                 return Some(());
             }
-
-            if is_valid_global_path_table_member(semantic_model, index_expr, &key) {
+        }
+        // A composite of table literals is the set of shapes the value can
+        // take; each `TableConst` component keeps its own member rules — a
+        // field spelled by any literal writer is valid, and an empty literal
+        // arm keeps the open numeric-index semantics.
+        LuaType::MergedTable(merged_table) => {
+            if any_table_const_component_valid(
+                semantic_model,
+                index_expr,
+                index_key,
+                code,
+                merged_table.get_types().iter(),
+            ) {
+                return Some(());
+            }
+        }
+        LuaType::MultiLineUnion(union) => {
+            if any_table_const_component_valid(
+                semantic_model,
+                index_expr,
+                index_key,
+                code,
+                union.get_unions().iter().map(|(component, _)| component),
+            ) {
                 return Some(());
             }
         }
@@ -742,7 +1094,7 @@ fn is_valid_member_inner(
             }
         }
         LuaType::Ref(_) => {
-            // 如果类型是 Ref 的 enum, 那么需要检查变量是否为参数, 因为作为参数的 enum 本质上是 value 而不是 enum
+            // If the type is a Ref enum, check whether the variable is a parameter, since an enum used as a parameter is essentially a value rather than an enum
             if check_enum_is_param(semantic_model, prefix_typ, index_expr).is_some() {
                 return None;
             }
@@ -783,6 +1135,18 @@ fn is_valid_member_inner(
                         }
                     }
                 }
+            }
+            // Literal arms keep their own member rules: a field spelled by any
+            // literal writer is valid, and an empty literal arm keeps the open
+            // numeric-index semantics of a lone `TableConst`.
+            if any_table_const_component_valid(
+                semantic_model,
+                index_expr,
+                index_key,
+                code,
+                union.types(),
+            ) {
+                return Some(());
             }
         }
         _ => {}
@@ -880,13 +1244,13 @@ fn is_valid_member_inner(
 
         for child in index_expr.syntax().children_with_tokens() {
             if child.kind() == LuaTokenKind::TkLeftBracket.into() {
-                // 此时为 [] 访问, 大部分类型都可以直接通行
+                // This is a [] access; most types can pass directly
                 match prefix_typ {
                     LuaType::Ref(id) | LuaType::Def(id) => {
                         if let Some(decl) =
                             semantic_model.get_db().get_type_index().get_type_decl(id)
                         {
-                            // enum 仍然需要检查
+                            // enum still needs checking
                             if decl.is_enum() {
                                 break;
                             } else {
@@ -914,7 +1278,7 @@ fn is_valid_member_inner(
                 return Some(());
             }
             Ok(typ) => typ,
-            // 解析失败时认为其是合法的, 因为他可能没有标注类型
+            // Treat as valid on resolution failure, since it may have no type annotation
             Err(InferFailReason::UnResolveDeclType(_)) => {
                 return Some(());
             }
@@ -926,7 +1290,7 @@ fn is_valid_member_inner(
         return None;
     };
 
-    // 一些类型组合需要特殊处理
+    // Some type combinations need special handling
     if let (LuaType::Ref(id) | LuaType::Def(id), _) = (prefix_typ, &key_type)
         && let Some(decl) = semantic_model.get_db().get_type_index().get_type_decl(id)
         && decl.is_class()
@@ -940,7 +1304,7 @@ fn is_valid_member_inner(
     }
 
     /*
-    允许这种写法
+    This form is allowed
             ---@type string?
             local field
             local a = Class[field]
@@ -967,7 +1331,7 @@ fn is_valid_member_inner(
                 }
             }
             if members.is_empty() {
-                // 当没有任何成员信息且是 enum 类型时, 需要检查参数是否为自己
+                // When there is no member info and the type is an enum, check whether the parameter is itself
                 if check_enum_self_reference(semantic_model, &prefix_type, &key_types).is_some() {
                     return Some(());
                 }
@@ -1005,6 +1369,164 @@ fn all_runtime_components_are_non_indexable_primitives(db: &DbIndex, typ: &LuaTy
             .all(|(typ, _)| all_runtime_components_are_non_indexable_primitives(db, typ)),
         _ => false,
     }
+}
+
+fn any_table_const_component_valid<'a>(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+    index_key: &LuaIndexKey,
+    code: DiagnosticCode,
+    mut components: impl Iterator<Item = &'a LuaType>,
+) -> bool {
+    components.any(|component| match component {
+        LuaType::TableConst(id) => matches!(
+            check_table_const_member(semantic_model, index_expr, index_key, code, id),
+            TableConstMemberCheck::Valid
+        ),
+        LuaType::Instance(instance)
+            if table_const_is_empty(semantic_model.get_db(), instance.get_range()) =>
+        {
+            any_table_const_component_valid(
+                semantic_model,
+                index_expr,
+                index_key,
+                code,
+                std::iter::once(instance.get_base()),
+            )
+        }
+        _ => false,
+    })
+}
+
+/// Outcome of checking an index key against one `TableConst` literal.
+enum TableConstMemberCheck {
+    /// The key is valid on this literal: the member was found, or one of the
+    /// open-shape bail-outs applies (empty literal with a numeric key,
+    /// expression-key access on a non-doc literal, a literal whose members are
+    /// all dynamic-keyed, or a global-path member).
+    Valid,
+    /// The key cannot name a member at all. A lone literal reports this as an
+    /// invalid access; composite callers keep checking their other components.
+    Unresolvable,
+    /// The literal neither proves nor disproves the member, so the caller may
+    /// continue with the shared member-resolution fallbacks.
+    NotFound,
+}
+
+fn check_table_const_member(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+    index_key: &LuaIndexKey,
+    code: DiagnosticCode,
+    id: &crate::InFiled<rowan::TextRange>,
+) -> TableConstMemberCheck {
+    if code == DiagnosticCode::UndefinedField
+        && index_key_is_numeric(semantic_model, index_key)
+        && !is_table_const_from_doc_tag(semantic_model, id)
+        && table_const_is_empty(semantic_model.get_db(), id)
+    {
+        return TableConstMemberCheck::Valid;
+    }
+
+    if code == DiagnosticCode::UndefinedField
+        && matches!(index_key, LuaIndexKey::Expr(_))
+        && !is_table_const_from_doc_tag(semantic_model, id)
+    {
+        return TableConstMemberCheck::Valid;
+    }
+
+    let Ok(key) = LuaMemberKey::from_index_key(
+        semantic_model.get_db(),
+        &mut semantic_model.get_cache().borrow_mut(),
+        index_key,
+    ) else {
+        return TableConstMemberCheck::Unresolvable;
+    };
+    let owner = LuaMemberOwner::Element(id.clone());
+    match infer_owner_raw_member_type_with_realm(
+        semantic_model.get_db(),
+        owner,
+        &key,
+        semantic_model.get_file_id(),
+        Some(index_expr.get_position()),
+        None,
+    ) {
+        Ok(_) => return TableConstMemberCheck::Valid,
+        Err(InferFailReason::FieldNotFound)
+            if code == DiagnosticCode::UndefinedField
+                && is_table_const_from_doc_tag(semantic_model, id) =>
+        {
+            return TableConstMemberCheck::Valid;
+        }
+        Err(_) => {}
+    }
+
+    if code == DiagnosticCode::UndefinedField
+        && table_const_has_only_dynamic_key_members(semantic_model.get_db(), id)
+        && index_key_is_literal_member(index_key)
+    {
+        return TableConstMemberCheck::Valid;
+    }
+
+    if is_valid_global_path_table_member(semantic_model, index_expr, &key) {
+        return TableConstMemberCheck::Valid;
+    }
+
+    if is_unresolved_panel_registration_table(semantic_model, id) {
+        return TableConstMemberCheck::Valid;
+    }
+
+    TableConstMemberCheck::NotFound
+}
+
+/// Whether `id` is a table handed to a panel registration whose class could
+/// not be resolved, such as a name built at runtime. The panel still takes
+/// the members of its base, so the table's own members are not all it has.
+fn is_unresolved_panel_registration_table(
+    semantic_model: &SemanticModel,
+    id: &crate::InFiled<rowan::TextRange>,
+) -> bool {
+    if id.file_id != semantic_model.get_file_id() {
+        return false;
+    }
+    let db = semantic_model.get_db();
+    let Some(metadata) = db
+        .get_gmod_class_metadata_index()
+        .get_file_metadata(&id.file_id)
+    else {
+        return false;
+    };
+    let Some(tree) = db.get_vfs().get_syntax_tree(&id.file_id) else {
+        return false;
+    };
+    let root = tree.get_red_root();
+    [
+        (&metadata.vgui_register_calls, 1),
+        (&metadata.vgui_register_table_calls, 0),
+        (&metadata.derma_define_control_calls, 2),
+    ]
+    .into_iter()
+    .flat_map(|(calls, default_table_arg_idx)| {
+        calls.iter().map(move |call| {
+            (
+                call.vgui_panel_table_arg_source(default_table_arg_idx),
+                call,
+            )
+        })
+    })
+    .filter(|(source, _)| !source.is_derived())
+    .any(|(source, call)| {
+        call.args
+            .get(source.arg_idx)
+            .and_then(|arg| arg.syntax_id.to_node_from_root(&root))
+            .and_then(LuaExpr::cast)
+            .is_some_and(|expr| {
+                matches!(
+                    semantic_model.infer_expr(expr),
+                    Ok(LuaType::TableConst(table)) if &table == id
+                )
+            })
+    })
 }
 
 fn table_const_is_empty(db: &DbIndex, id: &crate::InFiled<rowan::TextRange>) -> bool {
@@ -1053,14 +1575,18 @@ fn is_table_const_from_doc_tag(
     semantic_model: &SemanticModel,
     id: &crate::InFiled<rowan::TextRange>,
 ) -> bool {
-    let Some(root) = semantic_model.get_root_by_file_id(id.file_id) else {
+    let Some(tree) = semantic_model
+        .get_db()
+        .get_vfs()
+        .syntax_tree_around(&id.file_id, id.value)
+    else {
         return false;
     };
 
-    is_doc_tag_table_const(root.syntax(), id.value)
+    is_doc_tag_table_const(&tree.get_red_root(), id.value)
 }
 
-/// 检查枚举类型的自引用
+/// Checks self-reference of an enum type
 fn check_enum_self_reference(
     semantic_model: &SemanticModel,
     prefix_type: &LuaType,
@@ -1080,9 +1606,9 @@ fn check_enum_self_reference(
 }
 
 fn get_prefix_types(context: &DiagnosticContext, prefix_typ: &LuaType) -> HashSet<LuaType> {
-    let mut type_set = HashSet::new();
+    let mut type_set = HashSet::default();
     let mut stack = vec![prefix_typ.clone()];
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
 
     while let Some(current_type) = stack.pop() {
         if context.is_cancelled() {
@@ -1108,9 +1634,9 @@ fn get_prefix_types(context: &DiagnosticContext, prefix_typ: &LuaType) -> HashSe
 }
 
 fn get_key_types(context: &DiagnosticContext, db: &DbIndex, typ: &LuaType) -> HashSet<LuaType> {
-    let mut type_set = HashSet::new();
+    let mut type_set = HashSet::default();
     let mut stack = vec![typ.clone()];
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
 
     while let Some(current_type) = stack.pop() {
         if context.is_cancelled() {
@@ -1151,25 +1677,25 @@ fn get_key_types(context: &DiagnosticContext, db: &DbIndex, typ: &LuaType) -> Ha
     type_set
 }
 
-/// 判断给定的AST节点是否位于判断语句的条件表达式中
+/// Determines whether the given AST node is inside the condition expression of a conditional statement
 ///
-/// 该函数检查节点是否位于以下语句的条件部分：
-/// - if语句的条件表达式
-/// - while循环的条件表达式
-/// - for循环的迭代表达式
-/// - repeat循环的条件表达式
-/// - elseif子句的条件表达式
+/// This function checks whether the node is in the condition part of the following statements:
+/// - the condition expression of an if statement
+/// - the condition expression of a while loop
+/// - the iterator expression of a for loop
+/// - the condition expression of a repeat loop
+/// - the condition expression of an elseif clause
 ///
-/// # 参数
-/// * `node` - 要检查的AST节点
+/// # Parameters
+/// * `node` - the AST node to check
 ///
-/// # 返回值
-/// * `true` - 节点位于判断语句的条件表达式中
-/// * `false` - 节点不在判断语句的条件表达式中
+/// # Returns
+/// * `true` - the node is in the condition expression of a conditional statement
+/// * `false` - the node is not in the condition expression of a conditional statement
 fn in_conditional_statement<T: LuaAstNode>(node: &T) -> bool {
     let node_range = node.get_range();
 
-    // 遍历所有祖先节点，查找条件语句
+    // Walk all ancestor nodes looking for conditional statements
     for ancestor in node.syntax().ancestors() {
         match ancestor.kind().into() {
             LuaSyntaxKind::IfStat => {
@@ -1519,8 +2045,8 @@ fn global_expr_access_path(
     }
 
     match expr {
-        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
-        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        LuaExpr::NameExpr(name_expr) => name_expr.get_owner_access_path(),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_owner_access_path(),
         _ => None,
     }
 }
@@ -1593,6 +2119,11 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr, weak_receiver: bool) -> bo
     let normalized_target = normalize_colon_access(&index_expr.syntax().text().to_string());
     let node_range = index_expr.syntax().text_range();
     let target_root_name = extract_root_identifier(&normalized_target);
+    // A member being called fails before `or`/`and` can act on the call's result.
+    let is_called = index_expr
+        .get_parent::<LuaCallExpr>()
+        .and_then(|call| call.get_prefix_expr())
+        .is_some_and(|prefix| prefix.syntax() == index_expr.syntax());
 
     for ancestor in index_expr.syntax().ancestors() {
         match ancestor.kind().into() {
@@ -1606,35 +2137,12 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr, weak_receiver: bool) -> bo
                             if is_truthy_check_in_condition(&condition_expr, &normalized_target) {
                                 return true;
                             }
-                        } else {
-                            // Field is in the body — check if the condition guards it.
+                        } else if if_stat
+                            .get_block()
+                            .is_some_and(|block| block.get_range().contains_range(node_range))
+                        {
+                            // Field is in the guarded block — check if the condition guards it.
                             if condition_nil_guards_field(&condition_expr, &normalized_target) {
-                                if let Some(root_name) = target_root_name
-                                    && has_root_reassignment_before_usage(index_expr, root_name)
-                                {
-                                    break;
-                                }
-                                return true;
-                            }
-                        }
-                    }
-
-                    for elseif_clause in if_stat.get_else_if_clause_list() {
-                        if !elseif_clause.get_range().contains_range(node_range) {
-                            continue;
-                        }
-
-                        if let Some(condition_expr) = elseif_clause.get_condition_expr() {
-                            let cond_range = condition_expr.get_range();
-                            if cond_range.contains_range(node_range) {
-                                if is_truthy_check_in_condition(&condition_expr, &normalized_target)
-                                {
-                                    return true;
-                                }
-                            } else if condition_nil_guards_field(
-                                &condition_expr,
-                                &normalized_target,
-                            ) {
                                 if let Some(root_name) = target_root_name
                                     && has_root_reassignment_before_usage(index_expr, root_name)
                                 {
@@ -1665,7 +2173,7 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr, weak_receiver: bool) -> bo
                         }
                     }
                 }
-                break;
+                continue;
             }
             // `or` default pattern: `field or DEFAULT` — field is nil-checked by the or.
             LuaSyntaxKind::BinaryExpr => {
@@ -1683,7 +2191,7 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr, weak_receiver: bool) -> bo
                             .collect();
                         if let Some(first) = exprs.first() {
                             let first_range = first.get_range();
-                            if first_range.contains_range(node_range) {
+                            if !is_called && first_range.contains_range(node_range) {
                                 return true;
                             }
                         }
@@ -1701,7 +2209,7 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr, weak_receiver: bool) -> bo
                             .collect();
                         if let Some(first) = exprs.first() {
                             let first_range = first.get_range();
-                            if first_range.contains_range(node_range) {
+                            if !is_called && first_range.contains_range(node_range) {
                                 return true;
                             }
                             // `obj.method and obj:method()` — the left operand
@@ -1823,14 +2331,12 @@ fn is_not_expr(unary: &LuaUnaryExpr) -> bool {
 }
 
 /// Whether `expr` tests `field_text` itself for presence: the member read alone,
-/// or as an operand of `and`/`or`. A negation inverts the test, and a mention in
-/// an unrelated call's arguments (`tostring(obj.x)`) does not test anything, so
-/// neither vouches for the member.
+/// compared `~= nil`, or as an operand of `and`/`or`. A negation inverts the test,
+/// and a mention in an unrelated call's arguments (`tostring(obj.x)`) does not test
+/// anything, so neither vouches for the member.
 fn is_positive_member_test(expr: &LuaExpr, field_text: &str) -> bool {
     match expr {
-        LuaExpr::IndexExpr(idx) => {
-            normalize_colon_access(&idx.syntax().text().to_string()) == field_text
-        }
+        LuaExpr::IndexExpr(_) => is_member_path(expr, field_text),
         LuaExpr::ParenExpr(paren) => paren
             .get_expr()
             .is_some_and(|inner| is_positive_member_test(&inner, field_text)),
@@ -1839,6 +2345,19 @@ fn is_positive_member_test(expr: &LuaExpr, field_text: &str) -> bool {
                 let kind = child.kind();
                 kind == LuaTokenKind::TkAnd.into() || kind == LuaTokenKind::TkOr.into()
             });
+            if binary
+                .get_op_token()
+                .is_some_and(|op| op.get_op() == glua_parser::BinaryOperator::OpNe)
+            {
+                return binary.get_exprs().is_some_and(|(left, right)| {
+                    [(&left, &right), (&right, &left)]
+                        .into_iter()
+                        .any(|(tested, other)| {
+                            crate::compilation::analyzer::is_nil_literal_expr(other)
+                                && is_member_path(tested, field_text)
+                        })
+                });
+            }
             has_and_or
                 && binary
                     .syntax()
@@ -1846,6 +2365,19 @@ fn is_positive_member_test(expr: &LuaExpr, field_text: &str) -> bool {
                     .filter_map(LuaExpr::cast)
                     .any(|operand| is_positive_member_test(&operand, field_text))
         }
+        _ => false,
+    }
+}
+
+/// Whether `expr` reads `field_text` itself, parentheses aside.
+fn is_member_path(expr: &LuaExpr, field_text: &str) -> bool {
+    match expr {
+        LuaExpr::IndexExpr(idx) => {
+            normalize_colon_access(&idx.syntax().text().to_string()) == field_text
+        }
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| is_member_path(&inner, field_text)),
         _ => false,
     }
 }
@@ -2105,13 +2637,17 @@ fn is_local_assign_with_nil_check(index_expr: &LuaIndexExpr, weak_receiver: bool
 
         if kind == LuaSyntaxKind::IfStat {
             // Check if the if-condition references the variable
-            if let Some(if_stat) = LuaIfStat::cast(sibling) {
+            if let Some(if_stat) = LuaIfStat::cast(sibling.clone()) {
                 if let Some(cond) = if_stat.get_condition_expr() {
                     if condition_references_var(&cond, var_name) {
                         return true;
                     }
                 }
             }
+        }
+        // A rewritten variable no longer holds the member's value.
+        if node_reassigns_root_name(&sibling, var_name) {
+            break;
         }
     }
 
@@ -2206,15 +2742,11 @@ fn cond_text_contains_field_exact(cond_text: &str, field_text: &str) -> bool {
 /// Whether a condition reads the named variable. Only a name reference counts:
 /// `cfg.mode` reads `cfg`, not a local called `mode`.
 fn condition_references_var(condition: &LuaExpr, var_name: &str) -> bool {
-    condition
-        .syntax()
-        .descendants()
-        .filter_map(LuaNameExpr::cast)
-        .any(|name_expr| {
-            name_expr
-                .get_name_text()
-                .is_some_and(|name| name == var_name)
-        })
+    condition.descendants::<LuaNameExpr>().any(|name_expr| {
+        name_expr
+            .get_name_text()
+            .is_some_and(|name| name == var_name)
+    })
 }
 
 /// Check if the body of an if-statement contains a return statement.
@@ -2233,6 +2765,29 @@ fn if_body_has_return(if_stat: &LuaIfStat) -> bool {
 /// A table literal with no members and no dynamic fields at all: nothing
 /// whatsoever is known about its shape.
 fn is_shapeless_table_const(db: &DbIndex, typ: &LuaType) -> bool {
+    // A composite of literals is shapeless only when every component is — a
+    // single shaped arm means the value can carry the field concretely.
+    match typ {
+        LuaType::Union(union) => {
+            return union
+                .types()
+                .all(|t| t.is_nil() || is_shapeless_table_const(db, t));
+        }
+        LuaType::MergedTable(merged) => {
+            return merged
+                .get_types()
+                .iter()
+                .all(|t| is_shapeless_table_const(db, t));
+        }
+        LuaType::MultiLineUnion(union) => {
+            return union
+                .get_unions()
+                .iter()
+                .all(|(t, _)| is_shapeless_table_const(db, t));
+        }
+        _ => {}
+    }
+
     let LuaType::TableConst(table_range) = typ else {
         return false;
     };
@@ -2242,7 +2797,10 @@ fn is_shapeless_table_const(db: &DbIndex, typ: &LuaType) -> bool {
         .is_none_or(|members| members.is_empty())
         && db
             .get_dynamic_field_index()
-            .get_fields(&crate::DynamicFieldOwner::Table(table_range.clone()))
+            .get_fields(&crate::canonical_dynamic_field_owner(
+                db,
+                crate::DynamicFieldOwner::Table(table_range.clone()),
+            ))
             .is_none_or(|fields| fields.is_empty())
 }
 
@@ -2275,6 +2833,21 @@ fn has_dynamic_field_for_type(
     typ: &LuaType,
     field_name: &SmolStr,
 ) -> bool {
+    let mut visited = rustc_hash::FxHashSet::default();
+    has_dynamic_field_for_type_inner(db, index, typ, field_name, false, &mut visited)
+}
+
+fn has_dynamic_field_for_type_inner(
+    db: &DbIndex,
+    index: &crate::DynamicFieldIndex,
+    typ: &LuaType,
+    field_name: &SmolStr,
+    direct_only: bool,
+    visited: &mut rustc_hash::FxHashSet<LuaType>,
+) -> bool {
+    if !visited.insert(typ.clone()) {
+        return false;
+    }
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => {
             let owner = crate::DynamicFieldOwner::Type(id.clone());
@@ -2297,16 +2870,56 @@ fn has_dynamic_field_for_type(
             })
         }
         LuaType::TableConst(table_range) => {
-            let owner = crate::DynamicFieldOwner::Table(table_range.clone());
-            index.has_field(&owner, field_name) || owner_wildcard_covers_any_field(db, &owner)
+            let owner = crate::canonical_dynamic_field_owner(
+                db,
+                crate::DynamicFieldOwner::Table(table_range.clone()),
+            );
+            let has_field = if direct_only {
+                index.has_direct_field(&owner, field_name)
+            } else {
+                index.has_field(&owner, field_name)
+            };
+            has_field || owner_wildcard_covers_any_field(db, &owner)
         }
-        LuaType::Instance(instance) => {
-            has_dynamic_field_for_type(db, index, instance.get_base(), field_name)
+        // A table one call made, or a copy of one, has its own writes and
+        // those into the table it was made from, not those into the other
+        // tables made from it.
+        LuaType::Instance(instance) if instance.get_kind() != crate::LuaInstanceKind::Shared => {
+            let owner = crate::canonical_dynamic_field_owner(
+                db,
+                crate::DynamicFieldOwner::Table(instance.get_range().clone()),
+            );
+            index.has_field(&owner, field_name)
+                || owner_wildcard_covers_any_field(db, &owner)
+                || has_dynamic_field_for_type_inner(
+                    db,
+                    index,
+                    instance.get_base(),
+                    field_name,
+                    true,
+                    visited,
+                )
         }
-        LuaType::TableOf(inner) => has_dynamic_field_for_type(db, index, inner, field_name),
-        LuaType::Union(union_type) => union_type
-            .types()
-            .any(|t| has_dynamic_field_for_type(db, index, t, field_name)),
+        LuaType::Instance(instance) => has_dynamic_field_for_type_inner(
+            db,
+            index,
+            instance.get_base(),
+            field_name,
+            direct_only,
+            visited,
+        ),
+        LuaType::TableOf(inner) => {
+            has_dynamic_field_for_type_inner(db, index, inner, field_name, direct_only, visited)
+        }
+        LuaType::Union(union_type) => union_type.types().any(|t| {
+            has_dynamic_field_for_type_inner(db, index, t, field_name, direct_only, visited)
+        }),
+        LuaType::MergedTable(merged) => merged.get_types().iter().any(|t| {
+            has_dynamic_field_for_type_inner(db, index, t, field_name, direct_only, visited)
+        }),
+        LuaType::MultiLineUnion(union) => union.get_unions().iter().any(|(t, _)| {
+            has_dynamic_field_for_type_inner(db, index, t, field_name, direct_only, visited)
+        }),
         _ => false,
     }
 }
@@ -2322,4 +2935,131 @@ fn owner_wildcard_covers_any_field(db: &DbIndex, owner: &crate::DynamicFieldOwne
             .get_fields(owner)
             .is_some_and(|fields| !fields.is_empty())
         || crate::is_pure_wildcard_registry(db, owner)
+}
+
+/// The constraint a call-site string template stood in for when `typ` is the
+/// class generated from it and nothing defines that name.
+fn placeholder_constraint(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
+    let LuaType::Ref(id) = typ else {
+        return None;
+    };
+    let type_index = db.get_type_index();
+    if type_index.has_non_auto_declaration(id) {
+        return None;
+    }
+    type_index.get_super_types_iter(id)?.next().cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DiagnosticCode, LuaType, valid_member_cache_key};
+    use crate::VirtualWorkspace;
+    use glua_parser::{LuaAstNode, LuaIndexExpr};
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn valid_member_cache_key_should_reject_uncacheable_prefixes() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def("local _probe = t.wanted");
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let index_key = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .next()
+            .expect("expected index expression")
+            .get_index_key()
+            .expect("expected index key");
+
+        for prefix in [
+            LuaType::Unknown,
+            LuaType::Any,
+            LuaType::Table,
+            LuaType::Never,
+        ] {
+            assert!(
+                valid_member_cache_key(
+                    &semantic_model,
+                    &prefix,
+                    &index_key,
+                    DiagnosticCode::UndefinedField,
+                )
+                .is_none(),
+                "uncacheable prefix {prefix:?} must not produce a member cache key",
+            );
+        }
+
+        let read_key = valid_member_cache_key(
+            &semantic_model,
+            &LuaType::String,
+            &index_key,
+            DiagnosticCode::UndefinedField,
+        )
+        .expect("string prefix must be cacheable");
+        let inject_key = valid_member_cache_key(
+            &semantic_model,
+            &LuaType::String,
+            &index_key,
+            DiagnosticCode::InjectField,
+        )
+        .expect("string prefix must be cacheable");
+        assert_ne!(
+            read_key, inject_key,
+            "read and inject checks must not share a member cache entry",
+        );
+    }
+
+    #[test]
+    fn poisoned_unknown_entry_should_not_validate_missing_member() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class D2Has
+            ---@field wanted string
+
+            ---@class D2Lacks
+            ---@field other string
+
+            ---@type any
+            local u
+            ---@type D2Has
+            local has
+            ---@type D2Lacks
+            local lacks
+
+            local _poison = u.wanted
+            local _ok = has.wanted
+            local _bad = lacks.wanted
+            "#,
+        );
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        let field_diagnostics = diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            field_diagnostics.len(),
+            1,
+            "expected only lacks.wanted, got {field_diagnostics:?}",
+        );
+        assert!(
+            field_diagnostics[0].message.contains("`wanted`"),
+            "expected missing-field diagnostic for lacks.wanted, got {:?}",
+            field_diagnostics[0].message,
+        );
+    }
 }

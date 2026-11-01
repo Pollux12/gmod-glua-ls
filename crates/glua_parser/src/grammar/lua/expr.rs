@@ -6,13 +6,20 @@ use crate::{
     parser_error::LuaParseError,
 };
 
-use super::{expect_token, if_token_bump, parse_block};
+use super::{expect_token, if_token_bump, parse_block, parser_stack_exhausted};
 
 pub fn parse_expr(p: &mut LuaParser) -> ParseResult {
     parse_sub_expr(p, 0)
 }
 
 fn parse_sub_expr(p: &mut LuaParser, limit: i32) -> ParseResult {
+    if parser_stack_exhausted() {
+        p.push_error(LuaParseError::syntax_error_from(
+            "expression is too deeply nested",
+            p.current_token_range(),
+        ));
+        return Err(ParseFailReason::UnexpectedToken);
+    }
     let uop = LuaOpKind::to_unary_operator(p.current_token());
     let mut cm = if uop != UnaryOperator::OpNop {
         let m = p.mark(LuaSyntaxKind::UnaryExpr);

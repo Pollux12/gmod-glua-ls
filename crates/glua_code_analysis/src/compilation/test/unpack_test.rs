@@ -31,6 +31,292 @@ mod test {
     }
 
     #[test]
+    fn test_unpack_unresolved_trailing_call_keeps_the_known_prefix() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            local packed = {123, missing_callee()}
+            a = table.unpack(packed)
+        "#,
+        );
+
+        let LuaType::Tuple(tuple) = ws.local_ty(file_id, "packed") else {
+            panic!("expected a tuple summary");
+        };
+        let types = tuple.get_types();
+        assert_eq!(types.len(), 2);
+        assert_eq!(types[0], LuaType::IntegerConst(123));
+        assert!(matches!(types[1], LuaType::Variadic(_)));
+        assert_eq!(ws.expr_ty("a"), LuaType::IntegerConst(123));
+    }
+
+    #[test]
+    fn test_unpack_declared_unknown_return_is_one_position() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@type fun(): unknown
+            local one
+
+            local packed = {123, one()}
+            a, b, c = table.unpack(packed)
+        "#,
+        );
+
+        let LuaType::Tuple(tuple) = ws.local_ty(file_id, "packed") else {
+            panic!("expected a tuple summary");
+        };
+        let types = tuple.get_types();
+        assert_eq!(types.len(), 2);
+        assert!(!matches!(types[1], LuaType::Variadic(_)));
+        assert_eq!(ws.expr_ty("a"), LuaType::IntegerConst(123));
+        assert!(ws.expr_ty("c").is_nil());
+    }
+
+    #[test]
+    fn test_unpack_broad_callable_has_an_open_return_tail() {
+        for annotation in ["function", "any"] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let file_id = ws.def(&format!(
+                r#"
+                ---@param producer {annotation}
+                local function pack(producer)
+                    local packed = {{123, producer()}}
+                    local first, second, third = table.unpack(packed)
+                    return first, third
+                end
+                "#,
+            ));
+            let LuaType::Tuple(tuple) = ws.local_ty(file_id, "packed") else {
+                panic!("expected a tuple summary for {annotation}");
+            };
+            let types = tuple.get_types();
+            assert_eq!(types.len(), 2, "{annotation}");
+            assert_eq!(types[0], LuaType::IntegerConst(123), "{annotation}");
+            assert!(
+                matches!(&types[1], LuaType::Variadic(tail)
+                    if matches!(tail.as_ref(), crate::VariadicType::Base(ty) if ty.is_unknown())),
+                "{annotation}"
+            );
+            assert_eq!(ws.local_ty(file_id, "first"), LuaType::IntegerConst(123));
+            assert!(ws.local_ty(file_id, "third").is_unknown(), "{annotation}");
+        }
+    }
+
+    #[test]
+    fn test_parenthesized_broad_callable_has_one_return_position() {
+        for annotation in ["function", "any"] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let file_id = ws.def(&format!(
+                r#"
+                ---@param producer {annotation}
+                local function pack(producer)
+                    local packed = {{123, (producer())}}
+                    local first, second, third = table.unpack(packed)
+                    return first, third
+                end
+                "#,
+            ));
+            let LuaType::Tuple(tuple) = ws.local_ty(file_id, "packed") else {
+                panic!("expected a tuple summary for {annotation}");
+            };
+            assert_eq!(tuple.get_types().len(), 2);
+            assert!(!matches!(tuple.get_types()[1], LuaType::Variadic(_)));
+            assert!(ws.local_ty(file_id, "third").is_nil(), "{annotation}");
+        }
+    }
+
+    #[test]
+    fn test_unpack_alias_and_union_return_contracts() {
+        for (annotation, parenthesized, open_tail) in [
+            ("OpaqueProducer", false, true),
+            ("any|fun(): number", false, true),
+            ("function|fun(): number", false, true),
+            ("any|fun(): number...", false, true),
+            ("function|fun(): number...", false, true),
+            ("fun(): any", false, false),
+            ("fun(): unknown", false, false),
+            ("OpaqueProducer", true, false),
+            ("any|fun(): number", true, false),
+            ("function|fun(): number", true, false),
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let call = if parenthesized {
+                "(producer())"
+            } else {
+                "producer()"
+            };
+            let file_id = ws.def(&format!(
+                r#"
+                ---@alias OpaqueProducer any
+
+                ---@param producer {annotation}
+                local function pack(producer)
+                    local packed = {{123, {call}}}
+                    local first, second, third = table.unpack(packed)
+                    return first, third
+                end
+                "#,
+            ));
+            let LuaType::Tuple(tuple) = ws.local_ty(file_id, "packed") else {
+                panic!("expected a tuple summary for {annotation}, {call}");
+            };
+            let types = tuple.get_types();
+            assert_eq!(types.len(), 2, "{annotation}, {call}");
+            assert_eq!(types[0], LuaType::IntegerConst(123), "{annotation}, {call}");
+            assert_eq!(ws.local_ty(file_id, "first"), LuaType::IntegerConst(123));
+            let third = ws.local_ty(file_id, "third");
+            if open_tail {
+                assert!(
+                    matches!(&types[1], LuaType::Variadic(tail)
+                        if matches!(tail.as_ref(), crate::VariadicType::Base(ty) if ty.is_unknown())),
+                    "{annotation}, {call}"
+                );
+                assert!(!third.is_nil(), "{annotation}, {call}");
+                assert!(third.is_unknown(), "{annotation}, {call}");
+            } else {
+                assert!(
+                    !matches!(types[1], LuaType::Variadic(_)),
+                    "{annotation}, {call}"
+                );
+                assert!(third.is_nil(), "{annotation}, {call}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_unpack_generic_constraint_return_contracts() {
+        for (generics, annotation, open_tail) in [
+            ("T: T|fun(): number", "T", true),
+            ("T: fun(): number", "T", false),
+            ("T: (fun(): number), U: T", "T|U|fun(): number", false),
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let file_id = ws.def(&format!(
+                r#"
+                ---@generic {generics}
+                ---@param producer {annotation}
+                local function pack(producer)
+                    local packed = {{123, producer()}}
+                    local first, second, third = table.unpack(packed)
+                    return first, third
+                end
+                "#,
+            ));
+            let LuaType::Tuple(tuple) = ws.local_ty(file_id, "packed") else {
+                panic!("expected a tuple summary for {generics}, {annotation}");
+            };
+            let types = tuple.get_types();
+            assert_eq!(types.len(), 2, "{generics}, {annotation}");
+            assert_eq!(
+                types[0],
+                LuaType::IntegerConst(123),
+                "{generics}, {annotation}"
+            );
+            assert_eq!(ws.local_ty(file_id, "first"), LuaType::IntegerConst(123));
+            let third = ws.local_ty(file_id, "third");
+            if open_tail {
+                assert!(
+                    matches!(&types[1], LuaType::Variadic(tail)
+                        if matches!(tail.as_ref(), crate::VariadicType::Base(ty) if ty.is_unknown())),
+                    "{generics}, {annotation}"
+                );
+                assert!(!third.is_nil(), "{generics}, {annotation}");
+                assert!(third.is_unknown(), "{generics}, {annotation}");
+            } else {
+                assert_eq!(types[1], LuaType::Number, "{generics}, {annotation}");
+                assert_eq!(ws.local_ty(file_id, "second"), LuaType::Number);
+                assert!(third.is_nil(), "{generics}, {annotation}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_unpack_unresolved_wrapped_call_keeps_an_open_tail() {
+        for setup in [
+            r#"
+                local target = {}
+                local wrapper = setmetatable({}, { __call = target })
+            "#,
+            r#"
+                local wrapper, other
+                wrapper = setmetatable({}, { __call = other })
+                other = setmetatable({}, { __call = wrapper })
+            "#,
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let file_id = ws.def(&format!(
+                r#"
+                {setup}
+                local packed = {{123, wrapper()}}
+                local first, second, third = table.unpack(packed)
+                "#,
+            ));
+            let LuaType::Tuple(tuple) = ws.local_ty(file_id, "packed") else {
+                panic!("expected a tuple summary for {setup}");
+            };
+            let types = tuple.get_types();
+            assert_eq!(types.len(), 2, "{setup}");
+            assert_eq!(types[0], LuaType::IntegerConst(123), "{setup}");
+            assert!(
+                matches!(&types[1], LuaType::Variadic(tail)
+                    if matches!(tail.as_ref(), crate::VariadicType::Base(ty) if ty.is_unknown())),
+                "{setup}"
+            );
+            assert_eq!(ws.local_ty(file_id, "first"), LuaType::IntegerConst(123));
+            let third = ws.local_ty(file_id, "third");
+            assert!(!third.is_nil(), "{setup}");
+            assert!(third.is_unknown(), "{setup}");
+        }
+    }
+
+    #[test]
+    fn test_unpack_declared_callable_table_has_a_finite_return_contract() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@type fun(self: table): number
+            local target
+            local wrapper = setmetatable({}, { __call = target })
+            local packed = {123, wrapper()}
+            local first, second, third = table.unpack(packed)
+            "#,
+        );
+        let LuaType::Tuple(tuple) = ws.local_ty(file_id, "packed") else {
+            panic!("expected a tuple summary");
+        };
+        assert_eq!(
+            tuple.get_types(),
+            &[LuaType::IntegerConst(123), LuaType::Number]
+        );
+        assert_eq!(ws.local_ty(file_id, "first"), LuaType::IntegerConst(123));
+        assert_eq!(ws.local_ty(file_id, "second"), LuaType::Number);
+        assert!(ws.local_ty(file_id, "third").is_nil());
+    }
+
+    #[test]
+    fn test_unpack_declared_variadic_return_keeps_the_typed_array() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@param producer fun(): number...
+            local function pack(producer)
+                local packed = {123, producer()}
+                local first, second, third = table.unpack(packed)
+                return first, third
+            end
+            "#,
+        );
+        let LuaType::Array(array) = ws.local_ty(file_id, "packed") else {
+            panic!("expected a typed variadic array summary");
+        };
+        assert_eq!(array.get_base(), &LuaType::Number);
+        let expected = ws.ty("number?");
+        assert_eq!(ws.local_ty(file_id, "first"), expected);
+        assert_eq!(ws.local_ty(file_id, "third"), expected);
+    }
+
+    #[test]
     fn test_unpack_alias_call_union() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         ws.def(

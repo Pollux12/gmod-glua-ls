@@ -93,6 +93,28 @@ mod test {
     }
 
     #[test]
+    fn module_table_literal_fields_belong_to_the_module_path() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/includes/modules/mymod.lua",
+            "module(\"mymod\", package.seeall)
+config = { enabled = true }
+",
+        );
+
+        let key = LuaMemberKey::Name("enabled".into());
+        let counts = ["config", "mymod.config"].map(|path| {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_member_index()
+                .get_members_for_owner_key(&LuaMemberOwner::GlobalPath(GlobalId::new(path)), &key)
+                .len()
+        });
+        assert_eq!(counts, [0, 1]);
+    }
+
+    #[test]
     fn legacy_module_bare_after_activation_resolves_in_file() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
@@ -821,6 +843,7 @@ local _ = tc
         let module_uri = ws.virtual_url_generator.new_uri("mymod.lua");
         ws.analysis
             .update_file_by_uri(&module_uri, Some(module_source.to_string()))
+            .map(|(id, _)| id)
             .expect("initial file update must succeed");
 
         let consumer_file = ws.def_file(
@@ -840,6 +863,7 @@ local _ = tc
         // analysis layer still removes-then-re-indexes the file).
         ws.analysis
             .update_file_by_uri(&module_uri, Some(module_source.to_string()))
+            .map(|(id, _)| id)
             .expect("reparse must succeed");
 
         // After reparse the alias entry must have been cleaned up and re-created

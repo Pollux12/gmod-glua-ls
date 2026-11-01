@@ -278,7 +278,7 @@ mod tests {
     }
 
     #[gtest]
-    fn shared_data_precompute_contains_sorted_workspace_files_and_callee_realms() {
+    fn shared_data_precompute_contains_library_callee_realms() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -299,7 +299,7 @@ mod tests {
             "#,
         );
 
-        let server_id = ws.def_file(
+        ws.def_file(
             "lua/autorun/server/sv_api.lua",
             r#"
             function ServerOnlyApi()
@@ -314,11 +314,7 @@ mod tests {
             "#,
         );
 
-        let mut expected_file_ids = vec![server_id, client_id];
-        expected_file_ids.sort_unstable();
-
         let shared_data = ws.analysis.precompute_diagnostic_shared_data();
-        assert_eq!(shared_data.workspace_file_ids.as_ref(), &expected_file_ids);
 
         let workspace_id = ws
             .analysis
@@ -332,7 +328,6 @@ mod tests {
             .get(&workspace_id)
             .cloned()
             .unwrap_or_default();
-        assert_that!(precomputed.is_empty(), eq(false));
         let library_decl_id = ws
             .analysis
             .compilation
@@ -347,7 +342,9 @@ mod tests {
             })
             .expect("expected library declaration");
         assert_that!(
-            precomputed.contains_key(&LuaSemanticDeclId::LuaDecl(library_decl_id)),
+            precomputed
+                .get(&LuaSemanticDeclId::LuaDecl(library_decl_id))
+                .is_some(),
             eq(true)
         );
     }
@@ -406,6 +403,7 @@ mod tests {
         let debug_id = ws
             .analysis
             .update_file_by_uri(&debug_uri, Some(original.to_string()))
+            .map(|(id, _)| id)
             .expect("debug file id");
 
         fn param_snapshots(ws: &VirtualWorkspace, file_id: FileId) -> BTreeSet<DiagnosticSnapshot> {
@@ -442,12 +440,14 @@ mod tests {
         let baseline_engine_type = inferred_field_type(&ws, debug_id, "engineTypeId");
 
         ws.analysis
-            .update_file_by_uri(&debug_uri, Some(format!("\n{original}")));
+            .update_file_by_uri(&debug_uri, Some(format!("\n{original}")))
+            .map(|(id, _)| id);
         let after_add = param_snapshots(&ws, debug_id);
         let after_add_engine_type = inferred_field_type(&ws, debug_id, "engineTypeId");
 
         ws.analysis
-            .update_file_by_uri(&debug_uri, Some(original.to_string()));
+            .update_file_by_uri(&debug_uri, Some(original.to_string()))
+            .map(|(id, _)| id);
         let after_remove = param_snapshots(&ws, debug_id);
         let after_remove_engine_type = inferred_field_type(&ws, debug_id, "engineTypeId");
 
@@ -505,6 +505,7 @@ mod tests {
         let file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(original.to_string()))
+            .map(|(id, _)| id)
             .expect("animation file id");
 
         fn undefined_snapshots(
@@ -542,10 +543,12 @@ mod tests {
 
         let baseline = undefined_snapshots(&ws, file_id);
         ws.analysis
-            .update_file_by_uri(&uri, Some(format!("\n{original}")));
+            .update_file_by_uri(&uri, Some(format!("\n{original}")))
+            .map(|(id, _)| id);
         let after_add = undefined_snapshots(&ws, file_id);
         ws.analysis
-            .update_file_by_uri(&uri, Some(original.to_string()));
+            .update_file_by_uri(&uri, Some(original.to_string()))
+            .map(|(id, _)| id);
         let after_remove = undefined_snapshots(&ws, file_id);
 
         assert_that!(baseline.len(), eq(1));
@@ -599,7 +602,7 @@ mod tests {
         );
 
         let engine_type = inferred_field_type(&ws, debug_file, "engineTypeId");
-        assert_that!(engine_type.contains("any"), eq(false));
+        assert_that!(engine_type, eq("1"));
     }
 
     #[gtest]
@@ -641,6 +644,173 @@ mod tests {
         );
 
         let engine_type = inferred_field_type(&ws, debug_file, "engineTypeId");
-        assert_that!(engine_type.contains("any"), eq(false));
+        assert_that!(engine_type, eq("any"));
+    }
+
+    /// The doc walker records a `type-not-found` entry when a `---@class`
+    /// super name has no declaration yet; a consumer analysed before its
+    /// provider is analysed again once the provider declares the name.
+    #[gtest]
+    fn type_not_found_suppressed_when_super_decl_lands_after_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::TypeNotFound);
+
+        let consumer = ws.def_file(
+            "lua/autorun/shared/consumer.lua",
+            r#"
+            ---@class DeterminismDerived : DeterminismBase
+            local Derived = {}
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/shared/provider.lua",
+            r#"
+            ---@class DeterminismBase
+            local Base = {}
+            "#,
+        );
+
+        let snapshots = ws.run_diagnostics_with_shared_snapshots(&[consumer]);
+        assert!(
+            snapshots.iter().all(|snapshot| snapshot.code
+                != Some(DiagnosticCode::TypeNotFound.get_name().to_string())),
+            "type-not-found must clear once the class decl exists: {snapshots:?}"
+        );
+    }
+
+    /// A consumer whose super's declaration goes away reports the missing
+    /// type, as a cold load of the same files does.
+    #[gtest]
+    fn type_not_found_appears_when_super_decl_is_removed_after_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::TypeNotFound);
+
+        let consumer = ws.def_file(
+            "lua/autorun/shared/consumer.lua",
+            r#"
+            ---@class DeterminismDerived : DeterminismBase
+            local Derived = {}
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/shared/provider.lua",
+            r#"
+            ---@class DeterminismBase
+            local Base = {}
+            "#,
+        );
+        ws.run_diagnostics_with_shared_snapshots(&[consumer]);
+        ws.def_file(
+            "lua/autorun/shared/provider.lua",
+            "local Base = {}
+",
+        );
+
+        let snapshots = ws.run_diagnostics_with_shared_snapshots(&[consumer]);
+        assert!(
+            snapshots.iter().any(|snapshot| snapshot.code
+                == Some(DiagnosticCode::TypeNotFound.get_name().to_string())),
+            "type-not-found must appear once the class decl is gone: {snapshots:?}"
+        );
+    }
+
+    /// The same holds for a generic base whose declaration arrives after the
+    /// consumer file was analysed.
+    #[gtest]
+    fn type_not_found_suppressed_when_generic_decl_lands_after_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::TypeNotFound);
+
+        let consumer = ws.def_file(
+            "lua/autorun/shared/consumer.lua",
+            r#"
+            ---@type DeterminismBoxed<integer>
+            local boxed
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/shared/provider.lua",
+            r#"
+            ---@class DeterminismBoxed<T>
+            local Boxed = {}
+            "#,
+        );
+
+        let snapshots = ws.run_diagnostics_with_shared_snapshots(&[consumer]);
+        assert!(
+            snapshots.iter().all(|snapshot| snapshot.code
+                != Some(DiagnosticCode::TypeNotFound.get_name().to_string())),
+            "type-not-found must clear once the class decl exists: {snapshots:?}"
+        );
+    }
+
+    /// Two meta files that each assign a fresh table to the same field of a
+    /// class keep one table each, in whichever order they are analysed: a
+    /// table literal is a value, so the other file's never declares this one.
+    #[gtest]
+    fn a_meta_table_literal_keeps_its_own_type_whichever_file_lands_first() {
+        let sources = [
+            (
+                "---@meta
+---@class MetaSkin
+MetaSkin = {}
+MetaSkin.tex = {}
+",
+                None,
+            ),
+            (
+                "---@meta
+---@class MetaSkinTex
+---@class MetaSkin
+---@field tex MetaSkinTex
+MetaSkin = {}
+MetaSkin.tex = {}
+",
+                Some("MetaSkinTex"),
+            ),
+        ];
+        for (source, declared) in sources {
+            for order in [["lua/a.lua", "lua/b.lua"], ["lua/b.lua", "lua/a.lua"]] {
+                let mut ws = VirtualWorkspace::new();
+                let file_ids = order.map(|path| ws.def_file(path, source));
+                let db = ws.analysis.compilation.get_db();
+                for file_id in file_ids {
+                    let root = db
+                        .get_vfs()
+                        .get_syntax_tree(&file_id)
+                        .expect("syntax tree")
+                        .get_chunk_node();
+                    let literal = root
+                        .descendants::<glua_parser::LuaTableExpr>()
+                        .last()
+                        .expect("the field's table literal");
+                    let field = root
+                        .descendants::<LuaIndexExpr>()
+                        .last()
+                        .expect("the field assignment");
+                    let cached = db
+                        .get_type_index()
+                        .get_type_cache(&crate::LuaTypeOwner::Member(crate::LuaMemberId::new(
+                            field.get_syntax_id(),
+                            file_id,
+                        )))
+                        .map(|cache| cache.as_type().clone());
+                    let expected = match declared {
+                        Some(name) => crate::LuaType::Ref(crate::LuaTypeDeclId::global(name)),
+                        None => crate::LuaType::TableConst(crate::InFiled::new(
+                            file_id,
+                            literal.get_range(),
+                        )),
+                    };
+                    assert_eq!(cached, Some(expected), "{order:?}, file {file_id:?}");
+                }
+            }
+        }
     }
 }

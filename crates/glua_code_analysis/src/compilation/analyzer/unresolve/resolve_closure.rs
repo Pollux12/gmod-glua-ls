@@ -3,108 +3,102 @@ use std::{ops::Deref, sync::Arc};
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexMemberExpr, LuaLiteralToken, LuaTableExpr, LuaVarExpr,
 };
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
+use smol_str::SmolStr;
 
 use crate::{
     DbIndex, GlobalId, GmodHookKind, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo,
     LuaDocReturnInfo, LuaFunctionType, LuaInferCache, LuaMemberKey, LuaMemberOwner, LuaSignature,
     LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel, ReturnTypeKind, SignatureReturnStatus,
     TypeOps, VariadicType, get_real_type, humanize_type, infer_call_expr_func, infer_expr,
-    infer_table_should_be,
+    infer_table_should_be, instantiate_outside_signature,
 };
 
 use super::{
     ResolveResult, UnResolveCallClosureParams, UnResolveClosureReturn, UnResolveParentAst,
     UnResolveParentClosureParams, UnResolveReturn, find_decl_function::find_decl_function_type,
-    resolve::try_resolve_return_point,
+    resolve::try_resolve_return_point, writes::ResolveWrites,
 };
 
 pub fn try_resolve_call_closure_params(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     cache: &mut LuaInferCache,
     closure_params: &mut UnResolveCallClosureParams,
 ) -> ResolveResult {
-    let call_expr = closure_params.call_expr.clone();
-    let prefix_expr = call_expr.get_prefix_expr().ok_or(InferFailReason::None)?;
-    let call_expr_type = infer_expr(db, cache, prefix_expr)?;
-
-    let call_doc_func = infer_call_expr_func(
+    let Some(callback_func) = callback_contract_for_arg(
         db,
         cache,
-        call_expr.clone(),
-        call_expr_type,
-        &InferGuard::new(),
-        None,
-    )?;
-
-    let colon_call = call_expr.is_colon_call();
-    let colon_define = call_doc_func.is_colon_define();
-
-    let mut param_idx = closure_params.param_idx;
-    match (colon_call, colon_define) {
-        (true, false) => {
-            param_idx += 1;
-        }
-        (false, true) => {
-            if param_idx == 0 {
-                return Ok(());
-            }
-
-            param_idx -= 1;
-        }
-        _ => {}
-    }
-
-    let Some(callback_func) = resolve_call_param_doc_function(
-        db,
-        &call_expr,
-        &call_doc_func,
-        param_idx,
+        &closure_params.call_expr,
+        closure_params.param_idx,
         closure_params.signature_id,
         closure_params.file_id,
-    ) else {
+    )?
+    else {
         return Ok(());
     };
     let async_state = callback_func.get_async_state();
     let params_to_insert = callback_func.get_params().to_vec();
 
-    let signature = db
-        .get_signature_index_mut()
-        .get_mut(&closure_params.signature_id)
-        .ok_or(InferFailReason::None)?;
-
-    let signature_params = &mut signature.param_docs;
-    for (idx, (name, type_ref)) in params_to_insert.iter().enumerate() {
-        if signature_params.contains_key(&idx) {
-            continue;
-        }
-
-        signature_params.insert(
-            idx,
-            LuaDocParamInfo {
-                name: name.clone(),
-                type_ref: type_ref.clone().unwrap_or(LuaType::Any),
-                default_value: None,
-                description: None,
-                nullable: false,
-                attributes: None,
-            },
-        );
-    }
-    if signature.params.len() < params_to_insert.len() {
-        let missing_start = signature.params.len();
-        for (name, _) in params_to_insert.iter().skip(missing_start) {
-            signature.params.push(name.clone());
-        }
+    let signature_id = closure_params.signature_id;
+    if db.get_signature_index().get(&signature_id).is_none() {
+        return Err(InferFailReason::None);
     }
 
-    signature.async_state = async_state;
+    // The mutation reads the signature's live state when it lands, so the
+    // deferred closure replays it verbatim against whatever the slot holds
+    // then — the same state the serial attempt would have seen.
+    writes.push(move |db, _| {
+        let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id) else {
+            return;
+        };
+
+        let params_before = signature.params.len();
+        let param_docs_before = signature.param_docs.len();
+        let async_before = signature.async_state;
+        let signature_params = &mut signature.param_docs;
+        for (idx, (name, type_ref)) in params_to_insert.iter().enumerate() {
+            if signature_params.contains_key(&idx) {
+                continue;
+            }
+
+            signature_params.insert(
+                idx,
+                LuaDocParamInfo {
+                    name: name.clone(),
+                    type_ref: type_ref.clone().unwrap_or(LuaType::Any),
+                    default_value: None,
+                    description: None,
+                    nullable: false,
+                    attributes: None,
+                },
+            );
+        }
+        if signature.params.len() < params_to_insert.len() {
+            let missing_start = signature.params.len();
+            for (name, _) in params_to_insert.iter().skip(missing_start) {
+                signature.params.push(SmolStr::new(name));
+            }
+        }
+
+        signature.async_state = async_state;
+        // Re-settling an identical contract moves nothing observable: only a
+        // novel fact may bump the param epoch, or the fixpoint filter degrades
+        // to a full requeue.
+        if signature.param_docs.len() != param_docs_before
+            || signature.params.len() != params_before
+            || signature.async_state != async_before
+        {
+            db.get_signature_index_mut().note_param_write(signature_id);
+        }
+    });
 
     Ok(())
 }
 
 pub fn try_resolve_closure_return(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     cache: &mut LuaInferCache,
     closure_return: &mut UnResolveClosureReturn,
 ) -> ResolveResult {
@@ -148,53 +142,113 @@ pub fn try_resolve_closure_return(
     };
     let ret_type = callback_func.get_ret().clone();
 
-    let signature = db
-        .get_signature_index_mut()
-        .get_mut(&closure_return.signature_id)
-        .ok_or(InferFailReason::None)?;
+    let signature_id = closure_return.signature_id;
+    if db.get_signature_index().get(&signature_id).is_none() {
+        return Err(InferFailReason::None);
+    }
 
     // An `unknown`/`any` contextual return carries no information, but taking it
     // would clear the body-derived return below and stamp `DocResolve` over the
     // result, which every later repair pass then refuses to touch. Fall back to
     // the body exactly as an unbound template return does.
-    if ret_type.contain_tpl() || ret_type.is_unknown() || ret_type.is_any() {
-        return try_convert_to_func_body_infer(db, cache, closure_return);
+    if is_uninformative_callback_return(&ret_type) {
+        return try_convert_to_func_body_infer(db, writes, cache, closure_return);
     }
 
-    match signature.resolve_return {
-        SignatureReturnStatus::UnResolve => {}
-        SignatureReturnStatus::InferResolve => {
-            signature.return_docs.clear();
+    // The slot's `resolve_return` is read when the write lands, matching the
+    // state the serial attempt would have mutated in place.
+    writes.push(move |db, _| {
+        let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id) else {
+            return;
+        };
+
+        match signature.resolve_return {
+            SignatureReturnStatus::UnResolve => {}
+            SignatureReturnStatus::InferResolve => {
+                signature.return_docs.clear();
+            }
+            _ => return,
         }
-        _ => return Ok(()),
-    }
 
-    signature.return_docs.push(LuaDocReturnInfo {
-        name: None,
-        type_ref: ret_type.clone(),
-        default_value: None,
-        description: None,
-        attributes: None,
-        return_kind: ReturnTypeKind::default(),
+        signature.return_docs.push(LuaDocReturnInfo {
+            name: None,
+            type_ref: ret_type.clone(),
+            default_value: None,
+            description: None,
+            attributes: None,
+            return_kind: ReturnTypeKind::default(),
+        });
+
+        signature.resolve_return = SignatureReturnStatus::DocResolve;
+        // A DocResolve install is a novel return fact for the signature's
+        // return readers.
+        db.get_signature_index_mut().note_return_write(signature_id);
     });
-
-    signature.resolve_return = SignatureReturnStatus::DocResolve;
     Ok(())
+}
+fn is_uninformative_callback_return(typ: &LuaType) -> bool {
+    if typ.contain_tpl() || typ.is_unknown() || typ.is_any() {
+        return true;
+    }
+    match typ {
+        LuaType::Variadic(variadic) => match variadic.as_ref() {
+            crate::VariadicType::Base(base) => is_uninformative_callback_return(base),
+            crate::VariadicType::Multi(multi) => multi.iter().all(is_uninformative_callback_return),
+        },
+        _ => false,
+    }
 }
 
 fn try_convert_to_func_body_infer(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     cache: &mut LuaInferCache,
     closure_return: &mut UnResolveClosureReturn,
 ) -> ResolveResult {
     let mut unresolve = UnResolveReturn {
         file_id: closure_return.file_id,
         signature_id: closure_return.signature_id,
-        body: closure_return.body.clone(),
         return_points: closure_return.return_points.clone(),
     };
 
-    try_resolve_return_point(db, cache, &mut unresolve)
+    try_resolve_return_point(db, writes, cache, &mut unresolve)
+}
+
+/// The function type the callee of `call_expr` declares for its argument at
+/// `arg_idx`: the contract a callback passed there is called with. `origin`
+/// is the callback's own signature, which a hook contract is chosen for.
+pub(crate) fn callback_contract_for_arg(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    arg_idx: usize,
+    origin: LuaSignatureId,
+    call_file_id: crate::FileId,
+) -> Result<Option<Arc<LuaFunctionType>>, InferFailReason> {
+    let prefix_expr = call_expr.get_prefix_expr().ok_or(InferFailReason::None)?;
+    let call_expr_type = infer_expr(db, cache, prefix_expr)?;
+    let call_doc_func = infer_call_expr_func(
+        db,
+        cache,
+        call_expr.clone(),
+        call_expr_type,
+        &InferGuard::new(),
+        None,
+    )?;
+    let param_idx = match (call_expr.is_colon_call(), call_doc_func.is_colon_define()) {
+        (true, false) => arg_idx + 1,
+        (false, true) if arg_idx == 0 => return Ok(None),
+        (false, true) => arg_idx - 1,
+        _ => arg_idx,
+    };
+    Ok(resolve_call_param_doc_function(
+        db,
+        call_expr,
+        &call_doc_func,
+        param_idx,
+        origin,
+        call_file_id,
+    ))
 }
 
 fn resolve_call_param_doc_function(
@@ -233,6 +287,19 @@ fn resolve_call_param_doc_function(
 
 fn stable_type_selection_key(db: &DbIndex, typ: &LuaType) -> String {
     humanize_type(db, typ, RenderLevel::Detailed)
+}
+/// Counts hook-candidate params carrying an informative (non-placeholder)
+/// type. Used to rank same-hook candidates by provenance quality instead of
+/// batch order: an annotated contract outranks a peer closure whose params
+/// this pass copied, and a return-only candidate never outranks either.
+fn informative_hook_param_count(func: &LuaFunctionType) -> usize {
+    func.get_params()
+        .iter()
+        .filter(|(_, ty)| match ty {
+            Some(t) => !(t.is_any() || t.is_unknown()),
+            None => false,
+        })
+        .count()
 }
 
 pub fn resolve_gmod_hook_add_callback_doc_function(
@@ -281,7 +348,7 @@ pub fn resolve_gmod_hook_callback_doc_function(
     let hook_name = hook_site.hook_name.as_ref()?.clone();
     let member_key = LuaMemberKey::Name(hook_name.clone().into());
     let mut candidates = Vec::new();
-    let mut seen_member_ids = HashSet::new();
+    let mut seen_member_ids = FxHashSet::default();
     for owner_name in iter_hook_owner_names(db) {
         for owner in [
             LuaMemberOwner::Type(LuaTypeDeclId::global(&owner_name)),
@@ -317,7 +384,24 @@ pub fn resolve_gmod_hook_callback_doc_function(
         }
     }
 
-    candidates.sort_by_key(|function| std::cmp::Reverse(function.get_params().len()));
+    // Several hook owners can declare the same hook (the annotated `GM`
+    // method plus a peer closure filling the slot): prefer the candidate
+    // with the most informative params so the pick is a function of settled
+    // inputs, not of which sibling the batch resolved first. A return-only
+    // candidate (no annotated params) still serves hover when it is the only
+    // one, but never outranks an annotated contract. Ties break on the
+    // candidate content so identically-informative candidates stay stable
+    // across orders.
+    candidates.sort_by(|a, b| {
+        informative_hook_param_count(a)
+            .cmp(&informative_hook_param_count(b))
+            .reverse()
+            .then_with(|| {
+                stable_type_selection_key(db, &LuaType::DocFunction(Arc::clone(a))).cmp(
+                    &stable_type_selection_key(db, &LuaType::DocFunction(Arc::clone(b))),
+                )
+            })
+    });
     let function = candidates.into_iter().next()?;
     Some(GmodHookCallbackDocFunction {
         hook_name,
@@ -326,12 +410,7 @@ pub fn resolve_gmod_hook_callback_doc_function(
 }
 
 fn iter_hook_owner_names(db: &DbIndex) -> Vec<String> {
-    let mut names = vec![
-        "GM".to_string(),
-        "GAMEMODE".to_string(),
-        "SANDBOX".to_string(),
-        "PLUGIN".to_string(),
-    ];
+    let mut names = crate::BUILTIN_HOOK_OWNERS.map(ToString::to_string).to_vec();
     for scoped_hook_owner in db
         .get_emmyrc()
         .gmod
@@ -385,7 +464,8 @@ pub fn extract_hook_name(call_expr: &LuaCallExpr) -> Option<String> {
 }
 
 pub fn try_resolve_closure_parent_params(
-    db: &mut DbIndex,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
     cache: &mut LuaInferCache,
     closure_params: &mut UnResolveParentClosureParams,
 ) -> ResolveResult {
@@ -394,7 +474,10 @@ pub fn try_resolve_closure_parent_params(
         .get_signature_index()
         .get(&closure_params.signature_id)
         .ok_or(InferFailReason::None)?;
-    if !signature.param_docs.is_empty() {
+    if !signature.param_docs.is_empty()
+        && !signature.params_filled_from_slot
+        && !signature.return_filled_from_slot
+    {
         return Ok(());
     }
     let self_type;
@@ -465,6 +548,7 @@ pub fn try_resolve_closure_parent_params(
 
     resolve_closure_member_type(
         db,
+        writes,
         closure_params,
         &member_type,
         self_type,
@@ -472,16 +556,48 @@ pub fn try_resolve_closure_parent_params(
     )
 }
 
+/// Defers one `resolve_doc_function` write. The signature's existence is the
+/// only thing the attempt can fail on, so it is checked up front; every other
+/// read the mutation makes is replayed inside the closure against the live
+/// slot, which is exactly the state the serial attempt would have seen.
+fn defer_resolve_doc_function(
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
+    signature_id: LuaSignatureId,
+    doc_func: &LuaFunctionType,
+    self_type: Option<LuaType>,
+) -> ResolveResult {
+    if db.get_signature_index().get(&signature_id).is_none() {
+        return Err(InferFailReason::None);
+    }
+    let doc_func = doc_func.clone();
+    writes.push(move |db, _| {
+        let _ = resolve_doc_function(db, signature_id, &doc_func, self_type);
+    });
+    Ok(())
+}
+
 fn resolve_closure_member_type(
-    db: &mut DbIndex,
-    closure_params: &UnResolveParentClosureParams,
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
+    closure_params: &mut UnResolveParentClosureParams,
     member_type: &LuaType,
     self_type: Option<LuaType>,
     infer_guard: &InferGuardRef,
 ) -> ResolveResult {
     match &member_type {
         LuaType::DocFunction(doc_func) => {
-            resolve_doc_function(db, closure_params, doc_func, self_type)
+            let target = db
+                .get_signature_index()
+                .get(&closure_params.signature_id)
+                .ok_or(InferFailReason::None)?;
+            defer_resolve_doc_function(
+                db,
+                writes,
+                closure_params.signature_id,
+                &contract_for_target(db, target, doc_func),
+                self_type,
+            )
         }
         LuaType::Signature(id) => {
             if id == &closure_params.signature_id {
@@ -499,8 +615,39 @@ fn resolve_closure_member_type(
                 if !signature.is_resolve_return() {
                     return Err(InferFailReason::UnResolveSignatureReturn(*id));
                 }
-                let fake_doc_function = signature.to_doc_func_type();
-                resolve_doc_function(db, closure_params, &fake_doc_function, self_type)
+                // See `filter_signature_type`: params this pass copied off a
+                // sibling's receiver are that sibling's answer, not the slot's.
+                // A slot-filled flag with no docs at all carries no params to
+                // inherit, so it must not suppress a typed union member.
+                if signature.params_filled_from_slot && !signature.param_docs.is_empty() {
+                    return Ok(());
+                }
+                // A return inferred from the base's body describes that body, not
+                // a contract its overrides keep, so only a documented one carries.
+                // The base's signature read is recorded, so an unsettled return
+                // re-runs this copy once the base settles.
+                let documented = signature.resolve_return == SignatureReturnStatus::DocResolve;
+                let source_return = if documented {
+                    signature.get_return_type()
+                } else {
+                    LuaType::Unknown
+                };
+                let target = db
+                    .get_signature_index()
+                    .get(&closure_params.signature_id)
+                    .ok_or(InferFailReason::None)?;
+                let source_contract = Arc::new(contract_outside_signature(
+                    db,
+                    signature,
+                    source_return.clone(),
+                ));
+                defer_resolve_doc_function(
+                    db,
+                    writes,
+                    closure_params.signature_id,
+                    &contract_for_target(db, target, &source_contract),
+                    self_type,
+                )
             } else {
                 Ok(())
             }
@@ -510,9 +657,6 @@ fn resolve_closure_member_type(
                 .get_signature_index()
                 .get(&closure_params.signature_id)
                 .ok_or(InferFailReason::None)?;
-            let mut final_params = signature.get_type_params().to_vec();
-            let mut final_ret = LuaType::Never;
-
             let mut multi_function_type = Vec::new();
             for typ in union_types.into_vec() {
                 match typ {
@@ -538,52 +682,15 @@ fn resolve_closure_member_type(
                 };
             }
 
-            let mut variadic_type = LuaType::Unknown;
-            for doc_func in multi_function_type {
-                let mut doc_params = doc_func.get_params().to_vec();
-                match (doc_func.is_colon_define(), signature.is_colon_define) {
-                    (true, false) => {
-                        // 原始签名是冒号定义, 但未解析的签名不是冒号定义, 即要插入第一个参数
-                        doc_params.insert(0, ("self".to_string(), Some(LuaType::SelfInfer)));
-                    }
-                    (false, true) => {
-                        // 原始签名不是冒号定义, 但未解析的签名是冒号定义, 即要删除第一个参数
-                        if !doc_params.is_empty() {
-                            doc_params.remove(0);
-                        }
-                    }
-                    _ => {}
-                }
-
-                for (idx, param) in doc_params.iter().enumerate() {
-                    if let Some(final_param) = final_params.get(idx) {
-                        if final_param.0 == "..." {
-                            // 如果`doc_params`当前与之后的参数的类型不一致, 那么`variadic_type`为`Any`
-                            for i in idx..doc_params.len() {
-                                if let Some(param) = doc_params.get(i)
-                                    && let Some(typ) = &param.1
-                                {
-                                    if variadic_type == LuaType::Unknown {
-                                        variadic_type = typ.clone();
-                                    } else if variadic_type != *typ {
-                                        variadic_type = LuaType::Any;
-                                    }
-                                }
-                            }
-
-                            break;
-                        }
-                        let new_type = TypeOps::Union.apply(
-                            db,
-                            final_param.1.as_ref().unwrap_or(&LuaType::Unknown),
-                            param.1.as_ref().unwrap_or(&LuaType::Unknown),
-                        );
-                        final_params[idx] = (final_param.0.clone(), Some(new_type));
-                    } else {
-                        final_params.push((param.0.clone(), param.1.clone()));
-                    }
-                }
-
+            let final_params = merge_contract_params(
+                db,
+                signature.get_type_params(),
+                signature.is_colon_define,
+                &multi_function_type,
+                ParamMerge::Union,
+            );
+            let mut final_ret = LuaType::Never;
+            for doc_func in &multi_function_type {
                 final_ret = TypeOps::Union.apply(db, &final_ret, doc_func.get_ret());
             }
 
@@ -593,15 +700,10 @@ fn resolve_closure_member_type(
                 final_ret = LuaType::Unknown;
             }
 
-            if !variadic_type.is_unknown()
-                && let Some(param) = final_params.last_mut()
-            {
-                param.1 = Some(variadic_type);
-            }
-
-            resolve_doc_function(
+            defer_resolve_doc_function(
                 db,
-                closure_params,
+                writes,
+                closure_params.signature_id,
                 &LuaFunctionType::new(
                     signature.async_state,
                     signature.is_colon_define,
@@ -624,6 +726,7 @@ fn resolve_closure_member_type(
             {
                 return resolve_closure_member_type(
                     db,
+                    writes,
                     closure_params,
                     &origin,
                     self_type,
@@ -638,22 +741,23 @@ fn resolve_closure_member_type(
 
 fn resolve_doc_function(
     db: &mut DbIndex,
-    closure_params: &UnResolveParentClosureParams,
+    signature_id: LuaSignatureId,
     doc_func: &LuaFunctionType,
     self_type: Option<LuaType>,
 ) -> ResolveResult {
     let signature = db
         .get_signature_index_mut()
-        .get_mut(&closure_params.signature_id)
+        .get_mut(&signature_id)
         .ok_or(InferFailReason::None)?;
 
+    let async_before = signature.async_state;
     signature.async_state = doc_func.get_async_state();
 
     let mut doc_params = doc_func.get_params().to_vec();
-    // doc_func 是往上追溯的有效签名, signature 是未解析的签名
+    // doc_func is the valid signature traced upwards, signature is the unresolved signature
     match (doc_func.is_colon_define(), signature.is_colon_define) {
         (true, false) => {
-            // 原始签名是冒号定义, 但未解析的签名不是冒号定义, 即要插入第一个参数
+            // The original signature is colon-defined but the unresolved one is not, so the first parameter must be inserted
             doc_params.insert(0, ("self".to_string(), Some(LuaType::SelfInfer)));
         }
         (false, true) => {
@@ -664,6 +768,10 @@ fn resolve_doc_function(
         _ => {}
     }
 
+    let receiver_filled_from_slot = !signature.is_colon_define
+        && doc_params
+            .first()
+            .is_some_and(|(_, typ)| typ.as_ref().is_some_and(LuaType::is_self_infer));
     if let Some(self_type) = self_type
         && let Some((_, Some(typ))) = doc_params.first()
         && typ.is_self_infer()
@@ -671,12 +779,20 @@ fn resolve_doc_function(
         doc_params[0].1 = Some(self_type);
     }
 
+    let params_before = signature.param_docs.clone();
+    let filled_from_slot_before = signature.params_filled_from_slot;
+    let receiver_from_slot_before = signature.receiver_filled_from_slot;
+    signature.params_filled_from_slot |= !doc_params.is_empty();
+    signature.receiver_filled_from_slot = receiver_filled_from_slot;
     for (index, param) in doc_params.iter().enumerate() {
-        let name = signature.params.get(index).unwrap_or(&param.0);
+        let name = signature
+            .params
+            .get(index)
+            .map_or(param.0.as_str(), SmolStr::as_str);
         signature.param_docs.insert(
             index,
             LuaDocParamInfo {
-                name: name.clone(),
+                name: name.to_string(),
                 type_ref: param.1.clone().unwrap_or(LuaType::Any),
                 default_value: None,
                 description: None,
@@ -685,9 +801,26 @@ fn resolve_doc_function(
             },
         );
     }
+    // Overwriting an identical contract moves nothing observable: only a
+    // novel fact may bump the param epoch. The tick fires below, after the
+    // signature borrow ends.
+    let params_changed = signature.param_docs != params_before
+        || signature.params_filled_from_slot != filled_from_slot_before
+        || signature.receiver_filled_from_slot != receiver_from_slot_before
+        || signature.async_state != async_before;
 
+    let return_before = (
+        signature.resolve_return,
+        signature.return_docs.clone(),
+        signature.return_filled_from_slot,
+    );
+
+    // An unknown contract return says nothing about the result, so the
+    // closure keeps the return its own body gives.
     let doc_return = doc_func.get_ret();
-    let inferred_tail = (signature.resolve_return == SignatureReturnStatus::InferResolve)
+    let constrains_return = !doc_return.is_unknown();
+    let inferred_tail = (constrains_return
+        && signature.resolve_return == SignatureReturnStatus::InferResolve)
         .then(|| {
             inferred_return_tail_matching_documented_first(
                 doc_return,
@@ -696,16 +829,18 @@ fn resolve_doc_function(
             )
         })
         .flatten();
-    let should_apply_return = match signature.resolve_return {
-        SignatureReturnStatus::UnResolve => true,
-        SignatureReturnStatus::InferResolve => {
-            should_doc_return_override_inferred(doc_return, &signature.get_return_type())
-        }
-        SignatureReturnStatus::DocResolve => false,
-    };
+    let should_apply_return = constrains_return
+        && match signature.resolve_return {
+            SignatureReturnStatus::UnResolve => true,
+            SignatureReturnStatus::InferResolve => {
+                should_doc_return_override_inferred(doc_return, &signature.get_return_type())
+            }
+            SignatureReturnStatus::DocResolve => signature.return_filled_from_slot,
+        };
 
     if let Some(inferred_tail) = inferred_tail {
         signature.resolve_return = SignatureReturnStatus::DocResolve;
+        signature.return_filled_from_slot = true;
         signature.return_docs.clear();
         signature.return_docs.push(LuaDocReturnInfo {
             name: None,
@@ -726,16 +861,44 @@ fn resolve_doc_function(
                 return_kind: ReturnTypeKind::default(),
             }));
     } else if should_apply_return {
+        let slot_refresh = signature.resolve_return == SignatureReturnStatus::DocResolve;
         signature.resolve_return = SignatureReturnStatus::DocResolve;
-        signature.return_docs.clear();
-        signature.return_docs.push(LuaDocReturnInfo {
-            name: None,
-            type_ref: doc_return.clone(),
-            default_value: None,
-            description: None,
-            attributes: None,
-            return_kind: ReturnTypeKind::default(),
-        });
+        signature.return_filled_from_slot = true;
+        if slot_refresh {
+            if let Some(first) = signature.return_docs.first_mut() {
+                first.type_ref = doc_return.clone();
+            } else {
+                signature.return_docs.push(LuaDocReturnInfo {
+                    name: None,
+                    type_ref: doc_return.clone(),
+                    default_value: None,
+                    description: None,
+                    attributes: None,
+                    return_kind: ReturnTypeKind::default(),
+                });
+            }
+        } else {
+            signature.return_docs.clear();
+            signature.return_docs.push(LuaDocReturnInfo {
+                name: None,
+                type_ref: doc_return.clone(),
+                default_value: None,
+                description: None,
+                attributes: None,
+                return_kind: ReturnTypeKind::default(),
+            });
+        }
+    }
+    // A DocResolve install is a novel return fact for the signature's return
+    // readers, routed through the return epoch like every other return write.
+    let return_changed = signature.resolve_return != return_before.0
+        || signature.return_docs != return_before.1
+        || signature.return_filled_from_slot != return_before.2;
+    if params_changed {
+        db.get_signature_index_mut().note_param_write(signature_id);
+    }
+    if return_changed {
+        db.get_signature_index_mut().note_return_write(signature_id);
     }
 
     Ok(())
@@ -866,6 +1029,158 @@ mod inferred_return_tail_tests {
     }
 }
 
+/// `sig`'s params with `ret`, as a contract for a closure outside `sig`'s
+/// generic context, merged over all of `sig`'s forms.
+fn contract_outside_signature(db: &DbIndex, sig: &LuaSignature, ret: LuaType) -> LuaFunctionType {
+    let instantiate_params = |params: &[(String, Option<LuaType>)]| -> Vec<_> {
+        params
+            .iter()
+            .map(|(name, typ)| {
+                (
+                    name.clone(),
+                    typ.as_ref()
+                        .map(|typ| instantiate_outside_signature(db, sig, typ)),
+                )
+            })
+            .collect()
+    };
+    let overloads: Vec<_> = sig
+        .overloads
+        .iter()
+        .map(|overload| {
+            Arc::new(LuaFunctionType::new(
+                overload.get_async_state(),
+                overload.is_colon_define(),
+                overload.is_variadic(),
+                instantiate_params(overload.get_params()),
+                LuaType::Unknown,
+            ))
+        })
+        .collect();
+    let params = merge_contract_params(
+        db,
+        instantiate_params(&sig.get_type_params()),
+        sig.is_colon_define,
+        &overloads,
+        ParamMerge::Agreement,
+    );
+    LuaFunctionType::new(
+        sig.async_state,
+        sig.is_colon_define,
+        sig.is_vararg,
+        params,
+        instantiate_outside_signature(db, sig, &ret),
+    )
+    .with_optional_params(sig.get_param_optional_flags())
+}
+
+/// `contract` as `target` takes it, by `target`'s own params.
+fn contract_for_target(
+    db: &DbIndex,
+    target: &LuaSignature,
+    contract: &Arc<LuaFunctionType>,
+) -> LuaFunctionType {
+    let target_params = target
+        .params
+        .iter()
+        .map(|name| (name.to_string(), None))
+        .collect();
+    LuaFunctionType::new(
+        contract.get_async_state(),
+        target.is_colon_define,
+        target.is_vararg,
+        merge_contract_params(
+            db,
+            target_params,
+            target.is_colon_define,
+            std::slice::from_ref(contract),
+            ParamMerge::Agreement,
+        ),
+        contract.get_ret().clone(),
+    )
+}
+
+/// How [`merge_contract_params`] settles a position its contracts type
+/// differently.
+#[derive(Clone, Copy)]
+enum ParamMerge {
+    /// The closure's own forms: the position takes any of their types.
+    Union,
+    /// A base's forms, for an override that declares none: the position is
+    /// `any`, as a `...` is over later positions that differ.
+    Agreement,
+}
+
+/// Merges `contracts` into the `params` of a closure defined with
+/// `is_colon_define`. A `...` takes the type of the contract's own `...`, and
+/// is `any` where the contract has a position there instead.
+fn merge_contract_params(
+    db: &DbIndex,
+    mut params: Vec<(String, Option<LuaType>)>,
+    is_colon_define: bool,
+    contracts: &[Arc<LuaFunctionType>],
+    merge: ParamMerge,
+) -> Vec<(String, Option<LuaType>)> {
+    let mut variadic_type = LuaType::Unknown;
+    for contract in contracts {
+        let mut contract_params = contract.get_params().to_vec();
+        match (contract.is_colon_define(), is_colon_define) {
+            (true, false) => {
+                // The original signature is colon-defined but the unresolved one is not, so the first parameter must be inserted
+                contract_params.insert(0, ("self".to_string(), Some(LuaType::SelfInfer)));
+            }
+            (false, true) => {
+                // The original signature is not colon-defined but the unresolved one is, so the first parameter must be removed
+                if !contract_params.is_empty() {
+                    contract_params.remove(0);
+                }
+            }
+            _ => {}
+        }
+
+        for (idx, param) in contract_params.iter().enumerate() {
+            if let Some(final_param) = params.get(idx) {
+                if final_param.0 == "..." {
+                    // Only a `...` in the contract types it; any other slot there is a position, not the forwarded values
+                    let typ = if param.0 == "..." {
+                        param.1.clone()
+                    } else {
+                        Some(LuaType::Any)
+                    };
+                    if let Some(typ) = typ {
+                        if variadic_type == LuaType::Unknown {
+                            variadic_type = typ;
+                        } else if variadic_type != typ {
+                            variadic_type = LuaType::Any;
+                        }
+                    }
+
+                    break;
+                }
+                let new_type = match (&final_param.1, &param.1) {
+                    (Some(seen), Some(typ)) if seen != typ => Some(match merge {
+                        ParamMerge::Union => TypeOps::Union.apply(db, seen, typ),
+                        ParamMerge::Agreement => LuaType::Any,
+                    }),
+                    (seen, typ) => seen.clone().or_else(|| typ.clone()),
+                };
+                params[idx] = (final_param.0.clone(), new_type);
+            } else {
+                params.push((param.0.clone(), param.1.clone()));
+            }
+        }
+    }
+
+    if !variadic_type.is_unknown()
+        && let Some(param) = params.last_mut()
+        && param.0 == "..."
+        && param.1.is_none()
+    {
+        param.1 = Some(variadic_type);
+    }
+    params
+}
+
 fn filter_signature_type(
     db: &DbIndex,
     typ: &LuaType,
@@ -894,28 +1209,24 @@ fn filter_signature_type(
                         // When preserve_returns is true (hook hover path), emit even for return-
                         // only hooks so that `@return`-annotated hooks with no params display
                         // correctly as `function() -> boolean` rather than silently degrading.
+                        // A peer closure filling the same slot has params only
+                        // because this pass copied them off its own receiver.
+                        // Inheriting them would make this closure's receiver a
+                        // question of which sibling the batch resolved first.
+                        let annotated_params =
+                            !sig.param_docs.is_empty() && !sig.params_filled_from_slot;
                         let has_useful_info = if preserve_returns {
-                            !sig.param_docs.is_empty() || !sig.get_return_type().is_nil()
+                            annotated_params || !sig.get_return_type().is_nil()
                         } else {
-                            !sig.param_docs.is_empty()
-                                || (preserve_implicit_receiver && sig.is_colon_define)
+                            annotated_params || (preserve_implicit_receiver && sig.is_colon_define)
                         };
                         if has_useful_info {
-                            let params = sig.get_type_params();
                             let ret = if preserve_returns {
                                 sig.get_return_type()
                             } else {
-                                LuaType::Nil
+                                LuaType::Unknown
                             };
-                            let doc_func = LuaFunctionType::new(
-                                sig.async_state,
-                                sig.is_colon_define,
-                                sig.is_vararg,
-                                params,
-                                ret,
-                            )
-                            .with_optional_params(sig.get_param_optional_flags());
-                            result.push(Arc::new(doc_func));
+                            result.push(Arc::new(contract_outside_signature(db, sig, ret)));
                         }
                     }
                 }
@@ -967,7 +1278,7 @@ fn find_best_function_type(
     origin_signature: &LuaSignature,
     origin_sig_id: Option<&LuaSignatureId>,
 ) -> Option<LuaType> {
-    // 寻找非自身定义的签名
+    // Find a signature that is not the one itself
     if let Ok(result) = find_decl_function_type(db, cache, prefix_type, index_member_expr) {
         let preserve_implicit_receiver = !origin_signature.is_colon_define
             && origin_signature

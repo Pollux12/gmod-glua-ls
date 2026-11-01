@@ -8,7 +8,7 @@ use smol_str::SmolStr;
 use super::lua_member_feature::LuaMemberFeature;
 use crate::{DbIndex, FileId, GlobalId, InferFailReason, LuaInferCache, LuaType, infer_expr};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LuaMember {
     member_id: LuaMemberId,
     key: LuaMemberKey,
@@ -33,6 +33,13 @@ impl LuaMember {
 
     pub fn get_key(&self) -> &LuaMemberKey {
         &self.key
+    }
+
+    /// Only [`crate::LuaMemberIndex::rekey_member`] may call this: every key
+    /// map has to move with the member, or a later removal reads the new key
+    /// back and leaves the old slot behind.
+    pub(crate) fn set_key(&mut self, key: LuaMemberKey) {
+        self.key = key;
     }
 
     pub fn get_file_id(&self) -> FileId {
@@ -68,17 +75,39 @@ impl LuaMember {
     pub fn get_global_id(&self) -> Option<&GlobalId> {
         self.global_id.as_ref()
     }
+
+    /// Whether this member exists because something assigned to it (`v.X = 1`),
+    /// rather than because a declaration named it.
+    ///
+    /// An assignment adds a field to a value; only a declaration states what the
+    /// type requires of one. Checkers that ask "must a literal supply this?"
+    /// have to tell the two apart.
+    pub fn is_assignment_define(&self) -> bool {
+        self.feature == LuaMemberFeature::FileDefine
+            && self.member_id.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr
+    }
 }
 
-#[derive(Debug, Eq, PartialEq, Clone, Copy, Hash, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub struct LuaMemberId {
     pub file_id: FileId,
     id: LuaSyntaxId,
+    /// Tells apart the members one node makes, such as the accessors of one generator
+    /// call; 0 for the member a node declares.
+    slot: u32,
 }
 
 impl LuaMemberId {
     pub fn new(id: LuaSyntaxId, file_id: FileId) -> Self {
-        Self { id, file_id }
+        Self::new_in_slot(id, file_id, 0)
+    }
+
+    pub fn new_in_slot(id: LuaSyntaxId, file_id: FileId, slot: u32) -> Self {
+        Self { id, file_id, slot }
+    }
+
+    pub fn get_slot(&self) -> u32 {
+        self.slot
     }
 
     pub fn get_syntax_id(&self) -> &LuaSyntaxId {
@@ -145,7 +174,20 @@ impl LuaMemberKey {
             LuaType::DocStringConst(s) => LuaMemberKey::Name(s.deref().clone()),
             LuaType::IntegerConst(i) => LuaMemberKey::Integer(i),
             LuaType::DocIntegerConst(i) => LuaMemberKey::Integer(i),
-            _ => LuaMemberKey::ExprType(expr_type),
+            _ => {
+                // An uninformative key type carries nothing to discriminate
+                // writers by -- `t[x] = v` where `x` reads `nil`, `any` or
+                // `unknown` is the same dynamic slot whichever of those the
+                // read happened to land on. Folding them all to `unknown`
+                // keeps the member under one key instead of letting the
+                // answer depend on how resolved the key expression was when
+                // the write was indexed.
+                if expr_type.contain_tpl() || !crate::db_index::is_informative_type(&expr_type) {
+                    LuaMemberKey::ExprType(LuaType::Unknown)
+                } else {
+                    LuaMemberKey::ExprType(expr_type)
+                }
+            }
         }
     }
 

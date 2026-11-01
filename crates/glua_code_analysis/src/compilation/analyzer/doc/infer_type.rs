@@ -8,14 +8,13 @@ use glua_parser::{
     LuaDocUnaryType, LuaDocVariadicType, LuaLiteralToken, LuaSyntaxKind, LuaTypeBinaryOperator,
     LuaTypeUnaryOperator, LuaVarExpr, NumberResult,
 };
-use internment::ArcIntern;
 use rowan::TextRange;
 use smol_str::SmolStr;
 
 use crate::{
     AsyncState, DiagnosticCode, GenericParam, GenericTpl, InFiled, LuaAliasCallKind, LuaArrayLen,
     LuaArrayType, LuaAttributeType, LuaMultiLineUnion, LuaTupleStatus, LuaTypeDeclId, TypeOps,
-    VariadicType,
+    VariadicType, analysis_stack_exhausted,
     db_index::{
         AnalyzeError, LuaAliasCallType, LuaConditionalType, LuaFunctionType, LuaGenericType,
         LuaIndexAccessKey, LuaIntersectionType, LuaMappedType, LuaObjectType, LuaStringTplType,
@@ -26,6 +25,9 @@ use crate::{
 use super::{DocAnalyzer, normalize_doc_string_const, preprocess_description};
 
 pub fn infer_type(analyzer: &mut DocAnalyzer, node: LuaDocType) -> LuaType {
+    if analysis_stack_exhausted() {
+        return LuaType::Unknown;
+    }
     match &node {
         LuaDocType::Name(name_type) => {
             if let Some(name) = name_type.get_name_text() {
@@ -122,7 +124,7 @@ pub fn infer_type(analyzer: &mut DocAnalyzer, node: LuaDocType) -> LuaType {
         }
         LuaDocType::Infer(infer_type) => {
             if let Some(name) = infer_type.get_generic_decl_name_text() {
-                return LuaType::ConditionalInfer(ArcIntern::new(SmolStr::new(&name)));
+                return LuaType::ConditionalInfer(crate::db_index::intern_smol_str(&name));
             }
         }
         LuaDocType::Mapped(mapped_type) => {
@@ -178,7 +180,7 @@ fn infer_buildin_or_ref_type(
             let type_id = if let Some(name_type_decl) = analyzer
                 .db
                 .get_type_index_mut()
-                .find_type_decl(analyzer.file_id, name)
+                .find_source_type_decl(analyzer.file_id, name)
             {
                 founded = true;
                 name_type_decl.get_id()
@@ -234,10 +236,11 @@ fn infer_generic_type(analyzer: &mut DocAnalyzer, generic_type: &LuaDocGenericTy
         let id = if let Some(name_type_decl) = analyzer
             .db
             .get_type_index_mut()
-            .find_type_decl(analyzer.file_id, &name)
+            .find_source_type_decl(analyzer.file_id, &name)
         {
             name_type_decl.get_id()
         } else {
+            let type_id = LuaTypeDeclId::global(&name);
             analyzer.db.get_diagnostic_index_mut().add_diagnostic(
                 analyzer.file_id,
                 AnalyzeError::new(
@@ -245,6 +248,11 @@ fn infer_generic_type(analyzer: &mut DocAnalyzer, generic_type: &LuaDocGenericTy
                     &format!("Type '{name}' not found", name = name),
                     generic_type.get_range(),
                 ),
+            );
+            analyzer.db.get_reference_index_mut().add_type_reference(
+                analyzer.file_id,
+                type_id,
+                name_type.get_range(),
             );
             return LuaType::Unknown;
         };
@@ -773,10 +781,10 @@ fn infer_conditional_type(
     cond_type: &LuaDocConditionalType,
 ) -> LuaType {
     if let Some((condition, when_true, when_false)) = cond_type.get_types() {
-        // 收集条件中的所有 infer 声明
+        // Collect all infer declarations in the condition
         let infer_params = collect_cond_infer_params(&condition);
         if !infer_params.is_empty() {
-            // 条件表达式中 infer 声明的类型参数只允许在`true`分支中使用
+            // Type parameters declared by infer in the condition may only be used in the `true` branch
             let true_range = when_true.get_range();
             let scope_id = analyzer
                 .generic_index
@@ -786,7 +794,7 @@ fn infer_conditional_type(
                 .append_generic_params(scope_id, infer_params.clone());
         }
 
-        // 处理条件和分支类型
+        // Process the condition and branch types
         let condition_type = infer_type(analyzer, condition);
         let true_type = infer_type(analyzer, when_true);
         let false_type = infer_type(analyzer, when_false);
@@ -804,7 +812,7 @@ fn infer_conditional_type(
     LuaType::Unknown
 }
 
-/// 收集条件类型中的条件表达式中所有 infer 声明
+/// Collects all infer declarations in the condition expression of a conditional type
 fn collect_cond_infer_params(doc_type: &LuaDocType) -> Vec<GenericParam> {
     let mut params = Vec::new();
     let doc_infer_types = doc_type.descendants::<LuaDocInferType>();
@@ -871,4 +879,107 @@ fn infer_index_access_type(
     LuaType::Call(
         LuaAliasCallType::new(LuaAliasCallKind::Index, vec![source_type, key_type]).into(),
     )
+}
+
+#[cfg(test)]
+mod test {
+    // The analyzer doc walker shares the analysis stack reserve with
+    // expression inference: suffixed `[]` types parse in a loop (zero parse
+    // errors on any thread) while `infer_type` recurses per level, so
+    // `Unknown` here can only come from this walker's guard.
+    use glua_parser::{LuaAstNode, LuaComment, LuaDocTagParam, LuaParser, ParserConfig};
+
+    use crate::{DbIndex, FileId, LuaType, WorkspaceId};
+
+    use super::super::DocAnalyzer;
+    use super::super::file_generic_index::FileGenericIndex;
+    use super::infer_type;
+
+    const SMALL_STACK: usize = 2 * 1024 * 1024;
+    const BIG_STACK: usize = 64 * 1024 * 1024;
+
+    fn array_type_source(depth: usize) -> String {
+        let mut body = String::from("---@param x T");
+        for _ in 0..depth {
+            body.push_str("[]");
+        }
+        body.push_str("\nlocal dummy = 1\n");
+        body
+    }
+
+    fn infer_first_param_type(body: &str) -> LuaType {
+        let tree = LuaParser::parse(body, ParserConfig::default());
+        assert!(
+            tree.get_errors().is_empty(),
+            "array nesting must parse cleanly, got {:?}",
+            tree.get_errors()
+                .iter()
+                .take(3)
+                .map(|e| &e.message)
+                .collect::<Vec<_>>()
+        );
+        let chunk = tree.get_chunk_node();
+        let comment = chunk
+            .descendants::<LuaComment>()
+            .next()
+            .expect("comment must exist");
+        let doc_type = chunk
+            .descendants::<LuaDocTagParam>()
+            .next()
+            .expect("param tag must exist")
+            .get_type()
+            .expect("param type must exist");
+        let mut db = DbIndex::new();
+        let mut generic_index = FileGenericIndex::new();
+        let mut analyzer = DocAnalyzer::new(
+            &mut db,
+            FileId::new(0),
+            &mut generic_index,
+            comment,
+            chunk.syntax().clone(),
+            WorkspaceId::MAIN,
+        );
+        let ty = infer_type(&mut analyzer, doc_type);
+        ty
+    }
+
+    #[test]
+    fn doc_analyzer_bails_via_stack_reserve_not_parse_errors() {
+        let body = array_type_source(20000);
+        let control_body = body.clone();
+        std::thread::Builder::new()
+            .stack_size(SMALL_STACK)
+            .spawn(move || {
+                let result = infer_first_param_type(&body);
+                assert!(
+                    result.is_unknown(),
+                    "deep doc nesting must bail to Unknown, got {result:?}"
+                );
+
+                let shallow = infer_first_param_type("---@param x T[]\nlocal dummy = 1\n");
+                assert!(
+                    !shallow.is_unknown(),
+                    "shallow doc nesting must infer normally, got {shallow:?}"
+                );
+            })
+            .expect("worker thread should spawn")
+            .join()
+            .expect("production-sized worker must not overflow its stack");
+
+        // Control: the same deep nesting resolves to a real type with room,
+        // so the small-stack `Unknown` comes from stack pressure, not from
+        // the shape itself.
+        std::thread::Builder::new()
+            .stack_size(BIG_STACK)
+            .spawn(move || {
+                let result = infer_first_param_type(&control_body);
+                assert!(
+                    !result.is_unknown(),
+                    "deep doc nesting must infer normally with room, got {result:?}"
+                );
+            })
+            .expect("worker thread should spawn")
+            .join()
+            .expect("large-stack inference must not overflow its stack");
+    }
 }

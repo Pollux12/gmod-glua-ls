@@ -1,16 +1,17 @@
-use std::collections::HashSet;
-
 use glua_parser::{
     LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaForRangeStat,
-    LuaGeneralToken, LuaIndexKey, LuaLiteralToken, LuaNameExpr,
+    LuaGeneralToken, LuaIndexKey, LuaLiteralToken,
 };
 
+use crate::semantic::{local_name_closure_signature_id, semantic_decl_closure_signature_id};
 use crate::{
     DbIndex, DiagnosticCode, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId,
-    LuaType, LuaTypeDeclId, SemanticDeclLevel, SemanticModel, get_member_value_expr,
+    LuaType, LuaTypeDeclId, SemanticDeclLevel, SemanticModel,
 };
 
 use super::{Checker, DiagnosticContext};
+
+pub(super) use crate::semantic::is_nullable;
 
 pub struct CheckParamCountChecker;
 
@@ -21,7 +22,10 @@ impl Checker for CheckParamCountChecker {
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        for node in semantic_model.get_root().descendants::<LuaAst>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for node in buckets.all_nodes.iter().cloned() {
             match node {
                 LuaAst::LuaCallExpr(call_expr) => {
                     check_call_expr(context, semantic_model, call_expr);
@@ -35,7 +39,7 @@ impl Checker for CheckParamCountChecker {
     }
 }
 
-/// 处理左值已绑定类型但右值为匿名函数的情况
+/// Handles the case where the left value has a bound type but the right value is an anonymous function
 fn check_closure_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
@@ -81,7 +85,7 @@ fn check_closure_expr(
         .get_params()
         .collect::<Vec<_>>();
 
-    // 只检查右值参数多于左值参数的情况, 右值参数少于左值参数的情况是能够接受的
+    // Only check when the right value has more parameters than the left; fewer is acceptable
     if source_params_len > params.len() {
         return Some(());
     }
@@ -111,7 +115,8 @@ fn check_call_expr(
     let func = semantic_model.infer_call_expr_func(call_expr.clone(), None)?;
     let mut fake_params = func.get_params().to_vec();
     let mut fake_param_optional = func.get_optional_params().to_vec();
-    if let Some(signature_id) = get_prefix_expr_signature_id(context.db, semantic_model, &call_expr)
+    let prefix_signature_id = get_prefix_expr_signature_id(context.db, semantic_model, &call_expr);
+    if let Some(signature_id) = prefix_signature_id
         && let Some(signature) = context.db.get_signature_index().get(&signature_id)
         && !signature.param_docs.is_empty()
     {
@@ -128,7 +133,7 @@ fn check_call_expr(
     let call_args = call_expr.get_args_list()?.get_args().collect::<Vec<_>>();
     let mut call_args_count = call_args.len();
     let last_arg_is_dots = call_args.last().is_some_and(is_dots_expr);
-    // 根据冒号定义与冒号调用的情况来调整调用参数的数量
+    // Adjust the number of call arguments according to colon definition and colon call
     let colon_call = call_expr.is_colon_call();
     let colon_define = func.is_colon_define();
     match (colon_call, colon_define) {
@@ -144,7 +149,7 @@ fn check_call_expr(
 
     // Check for missing parameters
     if call_args_count < fake_params.len() {
-        // 调用参数包含 `...`
+        // The call arguments contain `...`
         for arg in call_args.iter() {
             if let LuaExpr::LiteralExpr(literal_expr) = arg
                 && let Some(LuaLiteralToken::Dots(_)) = literal_expr.get_literal()
@@ -152,11 +157,12 @@ fn check_call_expr(
                 return Some(());
             }
         }
-        // 对调用参数的最后一个参数进行特殊处理
+        // Special handling for the last call argument
         if let Some(last_arg) = call_args.last()
-            && let Ok(LuaType::Variadic(variadic)) = semantic_model.infer_expr(last_arg.clone())
+            && let Ok(last_arg_type) = semantic_model.infer_expr(last_arg.clone())
+            && let Some(spread_len) = spread_arg_max_len(&last_arg_type)
         {
-            let len = match variadic.get_max_len() {
+            let len = match spread_len {
                 Some(len) => len,
                 None => {
                     return Some(());
@@ -188,6 +194,16 @@ fn check_call_expr(
 
         if !miss_parameter_info.is_empty() {
             if call_args_count == 0 && is_nonliteral_index_dispatch_call(&call_expr) {
+                return Some(());
+            }
+            // A hook's receiver is the one argument the engine passes that a Lua
+            // call must supply too.
+            let omits_receiver = !colon_call && colon_define && call_args.is_empty();
+            if !omits_receiver
+                && prefix_signature_id.is_some_and(|signature_id| {
+                    is_hook_signature(context.db, semantic_model, signature_id)
+                })
+            {
                 return Some(());
             }
 
@@ -234,7 +250,7 @@ fn check_call_expr(
             return Some(());
         }
 
-        // 参数定义中最后一个参数是 `...`
+        // The last parameter in the definition is `...`
         if fake_params.last().is_some_and(|(name, typ)| {
             name == "..." || typ.as_ref().is_some_and(|typ| typ.is_variadic())
         }) {
@@ -274,6 +290,35 @@ fn check_call_expr(
     Some(())
 }
 
+/// How many values the trailing argument spreads into, when it spreads at all.
+///
+/// `Some(None)` is an unbounded spread. A union counts too: an unannotated
+/// recursive function returns `(a, b) | unknown`, and the `unknown` arm says
+/// nothing about arity, so the multi-return arms decide it.
+fn spread_arg_max_len(typ: &LuaType) -> Option<Option<usize>> {
+    match typ {
+        LuaType::Variadic(variadic) => Some(variadic.get_max_len()),
+        LuaType::Union(union) => {
+            let mut max_len = None;
+            let mut saw_variadic = false;
+            for arm in union.types() {
+                let LuaType::Variadic(variadic) = arm else {
+                    continue;
+                };
+                saw_variadic = true;
+                match variadic.get_max_len() {
+                    Some(len) => {
+                        max_len = Some(max_len.map_or(len, |current: usize| current.max(len)))
+                    }
+                    None => return Some(None),
+                }
+            }
+            saw_variadic.then_some(max_len)
+        }
+        _ => None,
+    }
+}
+
 fn is_nonliteral_index_dispatch_call(call_expr: &LuaCallExpr) -> bool {
     let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr() else {
         return false;
@@ -298,114 +343,93 @@ fn get_prefix_expr_signature_id(
 ) -> Option<crate::LuaSignatureId> {
     let prefix_expr = call_expr.get_prefix_expr()?;
     if let LuaExpr::NameExpr(name_expr) = &prefix_expr
-        && let Some(signature_id) = get_local_name_signature_id(db, semantic_model, name_expr)
+        && let Some(signature_id) =
+            local_name_closure_signature_id(db, semantic_model.get_file_id(), name_expr)
     {
         return Some(signature_id);
     }
 
-    let semantic_decl = semantic_model.find_decl(
-        prefix_expr.syntax().clone().into(),
-        SemanticDeclLevel::default(),
-    )?;
-    get_signature_id_from_semantic_decl_value_expr(db, semantic_decl)
+    semantic_model
+        .find_decl(
+            prefix_expr.syntax().clone().into(),
+            SemanticDeclLevel::default(),
+        )
+        .and_then(|semantic_decl| {
+            db.get_property_index()
+                .get_signature_owner(&semantic_decl)
+                .or_else(|| semantic_decl_closure_signature_id(db, semantic_decl))
+        })
+        .or_else(|| match semantic_model.infer_expr(prefix_expr).ok()? {
+            LuaType::Signature(signature_id) => Some(signature_id),
+            _ => None,
+        })
 }
 
-fn get_local_name_signature_id(
+/// Whether `signature_id` is a hook: a function tagged `@hook`, or a method that
+/// overrides one. Its parameters are what the engine passes when it runs the hook;
+/// a direct Lua call may leave trailing ones off.
+fn is_hook_signature(
     db: &DbIndex,
     semantic_model: &SemanticModel,
-    name_expr: &LuaNameExpr,
-) -> Option<crate::LuaSignatureId> {
-    let decl_id = db
-        .get_reference_index()
-        .get_var_reference_decl(&semantic_model.get_file_id(), name_expr.get_range())?;
-    let decl = db.get_decl_index().get_decl(&decl_id)?;
-    let value_syntax_id = decl.get_value_syntax_id()?;
-    let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
-    let closure = LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)?;
-    let LuaExpr::ClosureExpr(closure) = closure else {
-        return None;
+    signature_id: LuaSignatureId,
+) -> bool {
+    if is_tagged_hook(db, signature_id) {
+        return true;
+    }
+    let Some(glua_parser::LuaVarExpr::IndexExpr(func_name)) = semantic_model
+        .get_signature_closure(signature_id)
+        .and_then(|closure| closure.get_parent::<glua_parser::LuaFuncStat>())
+        .and_then(|func_stat| func_stat.get_func_name())
+    else {
+        return false;
     };
-    Some(crate::LuaSignatureId::from_closure(
-        decl.get_file_id(),
-        &closure,
-    ))
+    let Some(LuaIndexKey::Name(name)) = func_name.get_index_key() else {
+        return false;
+    };
+    let file_id = signature_id.get_file_id();
+    let member_id = crate::LuaMemberId::new(func_name.get_syntax_id(), file_id);
+    let (Some(LuaMemberOwner::Type(owner)), Some(workspace_id)) = (
+        db.get_member_index().get_current_owner(&member_id),
+        db.get_module_index().get_workspace_id(file_id),
+    ) else {
+        return false;
+    };
+    crate::semantic::find_members_with_key_in_workspace_for_file_at_offset(
+        db,
+        &LuaType::Ref(owner.clone()),
+        LuaMemberKey::Name(name.get_name_text().into()),
+        true,
+        workspace_id,
+        file_id,
+        func_name.get_position(),
+    )
+    .into_iter()
+    .flatten()
+    .any(|member| {
+        matches!(member.typ, LuaType::Signature(overridden)
+            if overridden != signature_id && is_tagged_hook(db, overridden))
+    })
 }
 
-fn get_signature_id_from_semantic_decl_value_expr(
-    db: &DbIndex,
-    semantic_decl: LuaSemanticDeclId,
-) -> Option<crate::LuaSignatureId> {
-    if let Some(signature_id) = db.get_property_index().get_signature_owner(&semantic_decl) {
-        return Some(signature_id);
-    }
-    let file_id = match semantic_decl {
-        LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.file_id,
-        LuaSemanticDeclId::Member(member_id) => member_id.file_id,
-        LuaSemanticDeclId::Signature(signature_id) => return Some(signature_id),
-        LuaSemanticDeclId::TypeDecl(_) => return None,
-    };
-    let LuaExpr::ClosureExpr(closure) = get_semantic_decl_value_expr(db, semantic_decl)? else {
-        return None;
-    };
-    Some(crate::LuaSignatureId::from_closure(file_id, &closure))
-}
-
-fn get_semantic_decl_value_expr(db: &DbIndex, semantic_decl: LuaSemanticDeclId) -> Option<LuaExpr> {
-    match semantic_decl {
-        LuaSemanticDeclId::LuaDecl(decl_id) => {
-            let decl = db.get_decl_index().get_decl(&decl_id)?;
-            let value_syntax_id = decl.get_value_syntax_id()?;
-            let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
-            LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)
-        }
-        LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
-        LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => None,
-    }
+fn is_tagged_hook(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    db.get_property_index()
+        .get_property(&LuaSemanticDeclId::Signature(signature_id))
+        .and_then(|property| property.tag_content())
+        .is_some_and(|tags| {
+            tags.tags
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("hook"))
+        })
 }
 
 fn get_params_len(params: &[(String, Option<LuaType>)]) -> Option<usize> {
     if let Some((name, typ)) = params.last() {
-        // 如果最后一个参数是可变参数, 则直接返回, 不需要检查
+        // If the last parameter is variadic, return directly without checking
         if name == "..." || typ.as_ref().is_some_and(|typ| typ.is_variadic()) {
             return None;
         }
     }
     Some(params.len())
-}
-
-fn is_nullable(db: &DbIndex, typ: &LuaType) -> bool {
-    let mut stack: Vec<LuaType> = Vec::new();
-    stack.push(typ.clone());
-    let mut visited = HashSet::new();
-    while let Some(typ) = stack.pop() {
-        if visited.contains(&typ) {
-            continue;
-        }
-        visited.insert(typ.clone());
-        match typ {
-            LuaType::Any | LuaType::Unknown | LuaType::Nil => return true,
-            LuaType::Ref(decl_id) => {
-                if let Some(decl) = db.get_type_index().get_type_decl(&decl_id)
-                    && decl.is_alias()
-                    && let Some(alias_origin) = decl.get_alias_ref()
-                {
-                    stack.push(alias_origin.clone());
-                }
-            }
-            LuaType::Union(u) => {
-                for t in u.into_vec() {
-                    stack.push(t);
-                }
-            }
-            LuaType::MultiLineUnion(m) => {
-                for (t, _) in m.get_unions() {
-                    stack.push(t.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-    false
 }
 
 /// Whether the callee is a loop variable over an inferred table that is

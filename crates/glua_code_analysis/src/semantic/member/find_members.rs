@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use rowan::TextSize;
 use smol_str::SmolStr;
 
+use crate::db_index::derivation;
 use crate::{
     DbIndex, FileId, GlobalId, InferGuardRef, LuaGenericType, LuaInstanceType, LuaIntersectionType,
     LuaMemberKey, LuaMemberOwner, LuaMergedTableType, LuaObjectType, LuaSemanticDeclId,
@@ -20,13 +21,15 @@ use super::{
 
 #[derive(Debug, Clone)]
 pub enum FindMemberFilter {
-    /// 寻找所有成员
+    /// Finds all members
     All,
-    /// 根据指定的key寻找成员
+    /// Members that are not methods: what a structural check compares.
+    Fields,
+    /// Finds members by the given key
     ByKey {
-        /// 要搜索的成员key
+        /// The member key to search for
         member_key: LuaMemberKey,
-        /// 是否寻找所有匹配的成员,为`false`时,找到第一个匹配的成员后停止
+        /// Whether to find all matching members; when `false`, stops after the first match
         find_all: bool,
     },
 }
@@ -34,6 +37,17 @@ pub enum FindMemberFilter {
 pub fn find_members(db: &DbIndex, prefix_type: &LuaType) -> FindMembersResult {
     let ctx = FindMembersContext::new(InferGuard::new());
     find_members_guard(db, prefix_type, &ctx, &FindMemberFilter::All)
+}
+
+/// The members a structural check against `prefix_type` compares: no methods,
+/// and no dynamic fields, which outside a file are listed as `any` and never
+/// required.
+pub(crate) fn find_structural_members(db: &DbIndex, prefix_type: &LuaType) -> FindMembersResult {
+    let ctx = FindMembersContext {
+        dynamic_fields: false,
+        ..FindMembersContext::new(InferGuard::new())
+    };
+    find_members_guard(db, prefix_type, &ctx, &FindMemberFilter::Fields)
 }
 
 pub fn find_members_in_workspace_for_file(
@@ -152,6 +166,7 @@ struct FindMembersContext {
     workspace_id: Option<WorkspaceId>,
     file_id: Option<FileId>,
     caller_position: Option<TextSize>,
+    dynamic_fields: bool,
 }
 
 impl FindMembersContext {
@@ -162,6 +177,7 @@ impl FindMembersContext {
             workspace_id: None,
             file_id: None,
             caller_position: None,
+            dynamic_fields: true,
         }
     }
 
@@ -176,6 +192,7 @@ impl FindMembersContext {
             workspace_id: Some(workspace_id),
             file_id: Some(file_id),
             caller_position: None,
+            dynamic_fields: true,
         }
     }
 
@@ -191,6 +208,7 @@ impl FindMembersContext {
             workspace_id: Some(workspace_id),
             file_id: Some(file_id),
             caller_position: Some(caller_position),
+            dynamic_fields: true,
         }
     }
 
@@ -201,6 +219,7 @@ impl FindMembersContext {
             workspace_id: self.workspace_id,
             file_id: self.file_id,
             caller_position: self.caller_position,
+            dynamic_fields: self.dynamic_fields,
         }
     }
 
@@ -211,6 +230,7 @@ impl FindMembersContext {
             workspace_id: self.workspace_id,
             file_id: self.file_id,
             caller_position: self.caller_position,
+            dynamic_fields: self.dynamic_fields,
         }
     }
 
@@ -241,6 +261,31 @@ impl FindMembersContext {
     fn caller_position(&self) -> Option<TextSize> {
         self.caller_position
     }
+
+    /// The position dynamic-field visibility is judged from. `None` when the
+    /// request carries no position, where every definition is visible.
+    fn dynamic_field_access_site(&self, db: &DbIndex) -> Option<DynamicFieldAccessSite> {
+        let file_id = self.file_id?;
+        let position = self.caller_position?;
+        Some(DynamicFieldAccessSite {
+            file_id,
+            position,
+            // A listing asks about many fields from one position, and this is a
+            // binary search plus a backward scan over every function range in
+            // the file, so it is resolved per listing rather than per field.
+            in_function: db
+                .get_member_index()
+                .enclosing_function_scope_range(file_id, position)
+                .is_some(),
+        })
+    }
+}
+
+/// The position a dynamic-field listing is taken from.
+struct DynamicFieldAccessSite {
+    file_id: FileId,
+    position: TextSize,
+    in_function: bool,
 }
 
 fn find_members_guard(
@@ -306,15 +351,15 @@ fn find_members_guard(
     }
 }
 
-/// 检查成员是否应该被包含
+/// Checks whether a member should be included
 fn should_include_member(key: &LuaMemberKey, filter: &FindMemberFilter) -> bool {
     match filter {
-        FindMemberFilter::All => true,
+        FindMemberFilter::All | FindMemberFilter::Fields => true,
         FindMemberFilter::ByKey { member_key, .. } => member_key == key,
     }
 }
 
-/// 检查是否应该停止收集更多成员
+/// Checks whether collecting more members should stop
 fn should_stop_collecting(current_count: usize, filter: &FindMemberFilter) -> bool {
     match filter {
         FindMemberFilter::ByKey { find_all, .. } => !find_all && current_count > 0,
@@ -375,15 +420,20 @@ fn find_custom_type_members(
         }
     }
 
-    if members.is_empty()
-        && let Some(global_members) = find_owner_members(
-            db,
-            ctx,
-            &LuaMemberOwner::GlobalPath(GlobalId::new(type_decl_id.get_name())),
-            filter,
-        )
+    // The class's global holds the members written through it outside the
+    // class's own declaration; a key the class declares itself wins.
+    if let Some(global_owner) = type_decl_id.global_member_owner(db)
+        && let Some(global_members) = find_owner_members(db, ctx, &global_owner, filter)
     {
-        members.extend(global_members);
+        let declared_keys = members
+            .iter()
+            .map(|member| member.key.clone())
+            .collect::<HashSet<_>>();
+        members.extend(
+            global_members
+                .into_iter()
+                .filter(|member| !declared_keys.contains(&member.key)),
+        );
 
         if should_stop_collecting(members.len(), filter) {
             return Some(members);
@@ -486,16 +536,19 @@ fn super_types_for_context<'a>(
         |position| infer_index.get_realm_at_offset(&caller_file_id, position),
     );
     let module_index = db.get_module_index();
+    let gmod_enabled = db.get_emmyrc().gmod.enabled;
     let mut visible = entries
         .iter()
         .filter_map(|entry| {
-            if db.get_emmyrc().gmod.enabled
-                && !caller_realm.is_compatible_with(
+            if gmod_enabled {
+                derivation::note_type_super_realms_read(type_decl_id, entry.file_id);
+                let entry_realm = derivation::untracked(|| {
                     infer_index
-                        .get_realm_at_offset(&entry.file_id, entry.value.source_range.start()),
-                )
-            {
-                return None;
+                        .get_realm_at_offset(&entry.file_id, entry.value.source_range.start())
+                });
+                if !caller_realm.is_compatible_with(entry_realm) {
+                    return None;
+                }
             }
 
             let candidate_workspace_id = module_index
@@ -507,29 +560,21 @@ fn super_types_for_context<'a>(
                 workspace_key,
                 candidate_workspace_id != caller_workspace_id,
                 entry.file_id,
-                entry.value.source_range,
                 &entry.value.typ,
             ))
         })
         .collect::<Vec<_>>();
-    visible.sort_by_key(
-        |(workspace_key, is_other_workspace, file_id, source_range, _)| {
-            (
-                *workspace_key,
-                *is_other_workspace,
-                file_id.id,
-                u32::from(source_range.start()),
-                u32::from(source_range.end()),
-            )
-        },
-    );
-    let mut seen_super_types = HashSet::new();
-    visible.retain(|(_, _, _, _, super_type)| seen_super_types.insert(*super_type));
+    // The sort is stable, so a file's edges stay in position order.
+    visible.sort_by_key(|(workspace_key, is_other_workspace, file_id, _)| {
+        (*workspace_key, *is_other_workspace, file_id.id)
+    });
+    let mut seen_super_types = HashSet::default();
+    visible.retain(|(_, _, _, super_type)| seen_super_types.insert(*super_type));
 
     Some(
         visible
             .into_iter()
-            .map(|(_, _, _, _, super_type)| super_type)
+            .map(|(_, _, _, super_type)| super_type)
             .collect(),
     )
 }
@@ -562,6 +607,7 @@ fn find_unscoped_owner_members(
             member_index.get_members_with_key(owner, member_key)?
         }
         FindMemberFilter::All => member_index.get_members(owner)?,
+        FindMemberFilter::Fields => member_index.get_field_members(owner)?,
     };
 
     for member in owner_members {
@@ -600,9 +646,13 @@ fn find_workspace_scoped_owner_members(
     let member_index = db.get_member_index();
 
     match filter {
-        FindMemberFilter::All => {
-            let owner_members = member_index.get_members(owner)?;
-            let mut seen = HashSet::new();
+        FindMemberFilter::All | FindMemberFilter::Fields => {
+            let owner_members = if matches!(filter, FindMemberFilter::Fields) {
+                member_index.get_field_members(owner)?
+            } else {
+                member_index.get_members(owner)?
+            };
+            let mut seen = HashSet::default();
             let mut members = Vec::new();
 
             for member in owner_members {
@@ -775,7 +825,7 @@ fn find_intersection_members(
     filter: &FindMemberFilter,
 ) -> FindMembersResult {
     let mut order: Vec<LuaMemberKey> = Vec::new();
-    let mut members: HashMap<LuaMemberKey, LuaMemberInfo> = HashMap::new();
+    let mut members: HashMap<LuaMemberKey, LuaMemberInfo> = HashMap::default();
 
     for typ in intersection_type.get_types().iter() {
         let instantiated_type = ctx.instantiate_type(db, typ);
@@ -786,7 +836,7 @@ fn find_intersection_members(
         };
 
         // Within a single component type, treat duplicate keys as overrides (first wins).
-        let mut component_seen: HashSet<LuaMemberKey> = HashSet::new();
+        let mut component_seen: HashSet<LuaMemberKey> = HashSet::default();
         for member in sub_members {
             if !component_seen.insert(member.key.clone()) {
                 continue;
@@ -846,7 +896,7 @@ fn find_merged_table_members(
     filter: &FindMemberFilter,
 ) -> FindMembersResult {
     let mut order: Vec<LuaMemberKey> = Vec::new();
-    let mut members: HashMap<LuaMemberKey, LuaMemberInfo> = HashMap::new();
+    let mut members: HashMap<LuaMemberKey, LuaMemberInfo> = HashMap::default();
 
     for typ in merged_table.get_types().iter() {
         let instantiated_type = ctx.instantiate_type(db, typ);
@@ -862,7 +912,7 @@ fn find_merged_table_members(
         // table then disagrees with the union every other reader of that slot
         // gets from `resolve_member_item_type`. Union within the component,
         // then merge components as table fragments below.
-        let mut component_members: HashMap<LuaMemberKey, LuaMemberInfo> = HashMap::new();
+        let mut component_members: HashMap<LuaMemberKey, LuaMemberInfo> = HashMap::default();
         let mut component_order: Vec<LuaMemberKey> = Vec::new();
         for member in sub_members {
             match component_members.entry(member.key.clone()) {
@@ -888,9 +938,14 @@ fn find_merged_table_members(
                     entry.insert(member);
                 }
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    let merged_type =
-                        merge_open_table_types(db, vec![entry.get().typ.clone(), member.typ]);
-                    entry.get_mut().typ = merged_type;
+                    // Components that are one slot answer identically; merging
+                    // that answer with itself would fold a union of rival
+                    // tables into one table.
+                    if entry.get().typ != member.typ {
+                        let merged_type =
+                            merge_open_table_types(db, vec![entry.get().typ.clone(), member.typ]);
+                        entry.get_mut().typ = merged_type;
+                    }
                 }
             }
         }
@@ -948,7 +1003,19 @@ fn find_global_members(
     filter: &FindMemberFilter,
 ) -> FindMembersResult {
     let mut members = Vec::new();
-    let global_decls = db.get_global_index().get_all_global_decl_ids();
+    let global_index = db.get_global_index();
+    // A keyed read names one global: its declarations are the scan's matches,
+    // kept in the same canonical order.
+    let global_decls = match filter {
+        FindMemberFilter::ByKey {
+            member_key: LuaMemberKey::Name(name),
+            ..
+        } => global_index
+            .get_global_decl_ids(name)
+            .cloned()
+            .unwrap_or_default(),
+        _ => global_index.get_all_global_decl_ids(),
+    };
     for decl_id in global_decls {
         if let Some(current_workspace_id) = ctx.workspace_id {
             let candidate_workspace_id = db
@@ -1065,8 +1132,12 @@ fn find_namespace_members(
         &LuaMemberOwner::GlobalPath(GlobalId::new(ns)),
         filter,
     ) {
+        let mut existing = members
+            .iter()
+            .map(|member| member.key.clone())
+            .collect::<HashSet<_>>();
         for member in global_path_members {
-            if members.iter().any(|existing| existing.key == member.key) {
+            if !existing.insert(member.key.clone()) {
                 continue;
             }
 
@@ -1088,6 +1159,9 @@ fn append_dynamic_fields_for_type(
     members: &mut Vec<LuaMemberInfo>,
     filter: &FindMemberFilter,
 ) -> bool {
+    if !ctx.dynamic_fields || !crate::db_index::derivation::dynamic_fields_visible() {
+        return false;
+    }
     let emmyrc = db.get_emmyrc();
     if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
         return false;
@@ -1127,14 +1201,26 @@ fn append_dynamic_fields_for_type(
     };
 
     field_names.sort_unstable();
+    field_names.dedup();
+    let access_site = ctx.dynamic_field_access_site(db);
+    let existing = members
+        .iter()
+        .map(|member| member.key.clone())
+        .collect::<HashSet<_>>();
 
     for field_name in field_names {
-        let member_key = LuaMemberKey::Name(field_name);
+        let member_key = LuaMemberKey::Name(field_name.clone());
         if !should_include_member(&member_key, filter) {
             continue;
         }
 
-        if members.iter().any(|member| member.key == member_key) {
+        if existing.contains(&member_key) {
+            continue;
+        }
+
+        if let Some(site) = &access_site
+            && !dynamic_field_visible_at_offset(db, &owner, &field_name, site)
+        {
             continue;
         }
 
@@ -1167,12 +1253,18 @@ fn append_dynamic_fields_for_table(
     members: &mut Vec<LuaMemberInfo>,
     filter: &FindMemberFilter,
 ) -> bool {
+    if !ctx.dynamic_fields || !crate::db_index::derivation::dynamic_fields_visible() {
+        return false;
+    }
     let emmyrc = db.get_emmyrc();
     if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
         return false;
     }
 
-    let owner = crate::DynamicFieldOwner::Table(table_range.clone());
+    let owner = crate::canonical_dynamic_field_owner(
+        db,
+        crate::DynamicFieldOwner::Table(table_range.clone()),
+    );
     let prefix_type = LuaType::TableConst(table_range.clone());
     if let Some(should_stop) = append_keyed_dynamic_field(
         db,
@@ -1206,14 +1298,26 @@ fn append_dynamic_fields_for_table(
     };
 
     field_names.sort_unstable();
+    field_names.dedup();
+    let access_site = ctx.dynamic_field_access_site(db);
+    let existing = members
+        .iter()
+        .map(|member| member.key.clone())
+        .collect::<HashSet<_>>();
 
     for field_name in field_names {
-        let member_key = LuaMemberKey::Name(field_name);
+        let member_key = LuaMemberKey::Name(field_name.clone());
         if !should_include_member(&member_key, filter) {
             continue;
         }
 
-        if members.iter().any(|member| member.key == member_key) {
+        if existing.contains(&member_key) {
+            continue;
+        }
+
+        if let Some(site) = &access_site
+            && !dynamic_field_visible_at_offset(db, &owner, &field_name, site)
+        {
             continue;
         }
 
@@ -1237,6 +1341,50 @@ fn append_dynamic_fields_for_table(
     }
 
     false
+}
+
+/// A dynamic field is only as visible as its assignments. GLua load order only
+/// constrains *top-level* statements: a same-file, top-level definition that
+/// starts after the caller position has not executed yet, so the field must not
+/// be offered there. A definition inside a function body runs when that
+/// function is called, which load order does not pin down, and a caller inside
+/// a function body runs after the whole file has loaded — both stay visible.
+/// Definitions in other files are always visible; their load-order and realm
+/// rules are the member item's to decide.
+///
+/// This is deliberately broader than [`super::resolve_dynamic_field_member`]'s
+/// execution-region rule, which answers what a read *yields* at a position: a
+/// field a hook assigns further down its own body is a name the table has, even
+/// on the call that has not reached the assignment yet.
+fn dynamic_field_visible_at_offset(
+    db: &DbIndex,
+    owner: &crate::DynamicFieldOwner,
+    field_name: &str,
+    site: &DynamicFieldAccessSite,
+) -> bool {
+    let definitions = db
+        .get_dynamic_field_index()
+        .field_definitions(owner, field_name);
+    if definitions.is_empty() {
+        return true;
+    }
+
+    let member_index = db.get_member_index();
+    definitions.iter().any(|definition| {
+        if definition.file_id != site.file_id || definition.value.start() <= site.position {
+            return true;
+        }
+        // A caller inside a function body runs after the whole file has loaded,
+        // so every same-file definition is visible to it.
+        if site.in_function {
+            return true;
+        }
+        // A definition inside a function body runs when that function is
+        // called, which load order does not pin down, so it stays visible.
+        member_index
+            .enclosing_function_scope_range(definition.file_id, definition.value.start())
+            .is_some()
+    })
 }
 
 fn append_keyed_dynamic_field(
@@ -1270,6 +1418,11 @@ fn append_keyed_dynamic_field(
     if !is_visible {
         return Some(false);
     }
+    if let Some(site) = ctx.dynamic_field_access_site(db)
+        && !dynamic_field_visible_at_offset(db, owner, field_name, &site)
+    {
+        return Some(false);
+    }
 
     let resolved = ctx.file_id().and_then(|file_id| {
         resolve_dynamic_field_member_for_file(db, file_id, prefix_type, member_key)
@@ -1296,8 +1449,9 @@ mod tests {
     use rowan::{TextRange, TextSize};
 
     use super::{
-        FindMembersContext, find_members_in_workspace_for_file, find_members_with_key,
-        find_members_with_key_in_workspace_for_file, super_types_for_context,
+        FindMembersContext, find_members, find_members_in_workspace_for_file,
+        find_members_with_key, find_members_with_key_in_workspace_for_file,
+        find_structural_members, super_types_for_context,
     };
     use crate::{
         DbIndex, DynamicFieldOwner, Emmyrc, FileId, GlobalId, GmodRealm, GmodRealmFileMetadata,
@@ -1719,9 +1873,9 @@ mod tests {
         add_type_decl(&mut db, caller_file, type_decl_id.clone());
 
         db.get_dynamic_field_index_mut().add_field(
+            &InFiled::new(caller_file, definition_range),
             DynamicFieldOwner::Type(type_decl_id.clone()),
             field_name.into(),
-            caller_file,
             definition_range,
         );
         let table_range = InFiled::new(
@@ -1729,9 +1883,9 @@ mod tests {
             TextRange::new(TextSize::new(20), TextSize::new(21)),
         );
         db.get_dynamic_field_index_mut().add_field(
+            &InFiled::new(caller_file, definition_range),
             DynamicFieldOwner::Table(table_range.clone()),
             field_name.into(),
-            caller_file,
             definition_range,
         );
 
@@ -1780,5 +1934,46 @@ mod tests {
         )
         .expect("keyed global dynamic-field lookup should return a result");
         assert_eq!(global_members.len(), 1);
+    }
+
+    #[test]
+    fn context_free_dynamic_fields_are_untyped_and_left_out_of_declared_members() {
+        let mut db = make_db();
+        let file_id = FileId::new(61);
+        let type_decl_id = LuaTypeDeclId::global("PanelLike");
+        add_type_decl(&mut db, file_id, type_decl_id.clone());
+        let declared = make_member_id(file_id, 1);
+        db.get_member_index_mut().add_member(
+            LuaMemberOwner::Type(type_decl_id.clone()),
+            LuaMember::new(
+                declared,
+                LuaMemberKey::Name("declared".into()),
+                LuaMemberFeature::FileFieldDecl,
+                None,
+            ),
+        );
+        bind_member_type(&mut db, declared, LuaType::String);
+        for (at, name) in [(10, "dynamicA"), (20, "dynamicB")] {
+            let range = TextRange::new(TextSize::new(at), TextSize::new(at + 1));
+            db.get_dynamic_field_index_mut().add_field(
+                &InFiled::new(file_id, range),
+                DynamicFieldOwner::Type(type_decl_id.clone()),
+                name.into(),
+                range,
+            );
+        }
+        let prefix = LuaType::Ref(type_decl_id);
+
+        let all = find_members(&db, &prefix).expect("members");
+        let dynamic = all
+            .iter()
+            .filter(|member| member.property_owner_id.is_none())
+            .collect::<Vec<_>>();
+        assert_eq!(dynamic.len(), 2);
+        assert!(dynamic.iter().all(|member| member.typ == LuaType::Any));
+
+        let declared_only = find_structural_members(&db, &prefix).expect("members");
+        assert_eq!(declared_only.len(), 1);
+        assert_eq!(declared_only[0].key, LuaMemberKey::Name("declared".into()));
     }
 }

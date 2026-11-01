@@ -62,23 +62,84 @@ impl From<rowan::SyntaxKind> for LuaTokenKind {
     }
 }
 
-/// Per-thread memo for [`LuaSyntaxId::to_node_from_root`], keyed by root
-/// (MRU, a few roots kept). Holding each root alive keeps its green tree
-/// alive, which is what makes identity comparison sound.
-mod node_memo {
-    use super::{LuaSyntaxId, LuaSyntaxNode};
-    use rustc_hash::FxHashMap;
+/// A resolver for one red syntax root. Keeping the root alongside its
+/// nodes makes identity comparison sound for the resolver's lifetime.
+#[derive(Debug)]
+pub struct LuaSyntaxResolver {
+    pub(crate) root: LuaSyntaxNode,
+    pub(crate) entries: rustc_hash::FxHashMap<LuaSyntaxId, Option<LuaSyntaxNode>>,
+}
 
-    const MAX_ROOTS: usize = 4;
-    /// Each entry pins a red node, which holds an rc on its whole ancestor
-    /// chain, so a long-lived thread would otherwise retain most of a large
-    /// tree. Clearing beats evicting: the memo only pays off within one
-    /// traversal, so a fresh map costs a re-walk, not a lasting miss.
-    const MAX_ENTRIES_PER_ROOT: usize = 8192;
+impl LuaSyntaxResolver {
+    /// Creates a resolver whose cache is released when the resolver is dropped.
+    pub fn new(root: LuaSyntaxNode) -> Self {
+        Self {
+            root,
+            entries: rustc_hash::FxHashMap::default(),
+        }
+    }
+
+    /// Resolves an id against this resolver's root, retaining the result.
+    pub fn resolve(&mut self, id: LuaSyntaxId) -> Option<LuaSyntaxNode> {
+        if let Some(hit) = self.entries.get(&id) {
+            return hit.clone();
+        }
+
+        let resolved = if id.range.is_empty() {
+            id.walk_from_root(&self.root)
+        } else {
+            self.walk(id)
+        };
+        self.entries.insert(id, resolved.clone());
+        resolved
+    }
+
+    /// [`LuaSyntaxId::walk_from_root`], taking each node on the way down that
+    /// this resolver already holds and keeping each one it creates: nodes
+    /// resolved under one parent share it rather than each creating a copy.
+    fn walk(&mut self, id: LuaSyntaxId) -> Option<LuaSyntaxNode> {
+        let mut node = self.root.clone();
+        loop {
+            if node.text_range() == id.range && node.kind() == id.kind {
+                return Some(node);
+            }
+            let (kind, range, is_node) = node.child_at_range_info(id.range)?;
+            if !is_node {
+                return None;
+            }
+            let child_id = LuaSyntaxId { kind, range };
+            node = match self.entries.get(&child_id) {
+                Some(Some(child)) => child.clone(),
+                _ => {
+                    let child = node.child_or_token_at_range(id.range)?.into_node()?;
+                    self.entries.insert(child_id, Some(child.clone()));
+                    child
+                }
+            };
+        }
+    }
+}
+
+/// Per-thread memo for [`LuaSyntaxId::to_node_from_root`], keyed by root
+/// (MRU, bounded number of roots kept). Holding each root alive keeps its
+/// green tree alive, which is what makes identity comparison sound.
+///
+/// This is the only resolution store: it serves both the ad-hoc lookups and
+/// the long analysis passes that used to keep a per-scope cache. A per-scope
+/// cache rebuilt and then dropped every resolved id at each boundary — on a
+/// workspace pass that meant re-walking the same nodes every file and every
+/// wave — while a plain unbounded cache would retain every tree's resolved
+/// set for the thread's life. The MRU bound keeps the working set (the roots
+/// a pass is actually cycling) resident and lets colder roots rebuild their
+/// handful of re-requested entries instead.
+mod node_memo {
+    use super::{LuaSyntaxId, LuaSyntaxNode, LuaSyntaxResolver};
+
+    const MAX_ROOTS: usize = 32;
 
     #[derive(Default)]
     pub(super) struct NodeMemo {
-        roots: Vec<(LuaSyntaxNode, FxHashMap<LuaSyntaxId, Option<LuaSyntaxNode>>)>,
+        pub(super) roots: Vec<LuaSyntaxResolver>,
     }
 
     impl NodeMemo {
@@ -87,32 +148,24 @@ mod node_memo {
             id: LuaSyntaxId,
             root: &LuaSyntaxNode,
         ) -> Option<LuaSyntaxNode> {
-            let found = self.roots.iter().position(|(cached, _)| cached == root);
-            let index = match found {
-                Some(0) => 0,
-                Some(index) => {
-                    self.roots.swap(0, index);
-                    0
-                }
+            self.touch(root);
+            self.roots[0].resolve(id)
+        }
+
+        /// Marks `root` most-recently-used, installing its resolver on miss.
+        /// Returns after guaranteeing `roots[0]` resolves against `root`.
+        pub(super) fn touch(&mut self, root: &LuaSyntaxNode) {
+            let found = self.roots.iter().position(|cached| cached.root == *root);
+            match found {
+                Some(0) => {}
+                Some(index) => self.roots.swap(0, index),
                 None => {
                     if self.roots.len() == MAX_ROOTS {
                         self.roots.pop();
                     }
-                    self.roots.insert(0, (root.clone(), FxHashMap::default()));
-                    0
+                    self.roots.insert(0, LuaSyntaxResolver::new(root.clone()));
                 }
-            };
-
-            if let Some(hit) = self.roots[index].1.get(&id) {
-                return hit.clone();
             }
-            let resolved = id.walk_from_root(root);
-            let entries = &mut self.roots[index].1;
-            if entries.len() >= MAX_ENTRIES_PER_ROOT {
-                entries.clear();
-            }
-            entries.insert(id, resolved.clone());
-            resolved
         }
     }
 }
@@ -122,10 +175,163 @@ thread_local! {
         std::cell::RefCell::new(node_memo::NodeMemo::default());
 }
 
+/// Runs `f` with `root` the most recently used root of the current thread's
+/// bounded resolver memo, so resolved nodes stay warm across files and passes.
+pub fn with_syntax_resolver<R>(root: &LuaSyntaxNode, f: impl FnOnce() -> R) -> R {
+    NODE_MEMO.with(|memo| memo.borrow_mut().touch(root));
+    f()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{LuaParser, ParserConfig};
+
+    fn parsed_root(source: &str) -> LuaSyntaxNode {
+        LuaParser::parse(source, ParserConfig::default()).get_red_root()
+    }
+
+    fn memo_roots_len() -> usize {
+        NODE_MEMO.with(|memo| memo.borrow().roots.len())
+    }
+
+    fn memo_has_root(root: &LuaSyntaxNode) -> bool {
+        NODE_MEMO.with(|memo| memo.borrow().roots.iter().any(|r| r.root == *root))
+    }
+
+    fn memo_entries(root: &LuaSyntaxNode) -> Option<usize> {
+        NODE_MEMO.with(|memo| {
+            memo.borrow()
+                .roots
+                .iter()
+                .find(|r| r.root == *root)
+                .map(|r| r.entries.len())
+        })
+    }
+
+    #[test]
+    fn resolver_memo_caches_resolved_nodes() {
+        let root = parsed_root("local value = 1\n");
+        let id = LuaSyntaxId::from_node(&root.descendants().next().unwrap());
+
+        with_syntax_resolver(&root, || {
+            assert!(id.to_node_from_root(&root).is_some());
+            assert_eq!(memo_entries(&root), Some(1));
+        });
+    }
+
+    /// Every node resolves, from a fresh resolver and from one that already
+    /// holds its ancestors, to the node a walk from the root finds.
+    #[test]
+    fn a_resolver_reusing_resolved_ancestors_finds_what_a_walk_from_the_root_finds() {
+        let root = parsed_root(
+            "local shop = { items = { 1, 2 } }
+function shop:Buy(count)
+    if count > 0 then
+        return self.items[count] + helper(count, { a = 1 })
+    end
+end
+",
+        );
+        let ids = root
+            .descendants()
+            .map(|node| LuaSyntaxId::from_node(&node))
+            .collect::<Vec<_>>();
+        let mut resolver = LuaSyntaxResolver::new(root.clone());
+
+        for pass in 0..2 {
+            for id in &ids {
+                let expected = id.walk_from_root(&root);
+                assert_eq!(resolver.resolve(*id), expected, "pass {pass}, {id:?}");
+                assert_eq!(
+                    resolver.resolve(*id).and_then(|node| node.parent()),
+                    expected.and_then(|node| node.parent()),
+                    "pass {pass}, parent of {id:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolver_memo_supports_nested_roots_and_exact_matching() {
+        let outer_root = parsed_root("local outer = 1\n");
+        let inner_root = parsed_root("-- shift\nlocal inner = 2\n");
+        let equivalent_root = parsed_root("local outer = 1\n");
+        let outer_id = LuaSyntaxId::from_node(&outer_root.descendants().next().unwrap());
+        let inner_id = LuaSyntaxId::from_node(&inner_root.descendants().next().unwrap());
+
+        with_syntax_resolver(&outer_root, || {
+            assert!(outer_id.to_node_from_root(&outer_root).is_some());
+            with_syntax_resolver(&inner_root, || {
+                assert!(inner_id.to_node_from_root(&inner_root).is_some());
+                assert!(outer_id.to_node_from_root(&outer_root).is_some());
+                assert!(memo_has_root(&outer_root));
+                assert!(memo_has_root(&inner_root));
+                assert!(!memo_has_root(&equivalent_root));
+            });
+        });
+    }
+
+    #[test]
+    fn resolver_memo_survives_panic() {
+        let root = parsed_root("local value = 1\n");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_syntax_resolver(&root, || panic!("test resolver scope"));
+        }));
+
+        assert!(result.is_err());
+        let id = LuaSyntaxId::from_node(&root.descendants().next().unwrap());
+        assert!(id.to_node_from_root(&root).is_some());
+    }
+
+    #[test]
+    fn resolver_memo_handles_roots_rebuilt_from_one_tree() {
+        let tree = LuaParser::parse("local value = 1\n", ParserConfig::default());
+        let first_root = tree.get_red_root();
+        let second_root = tree.get_red_root();
+        let id = LuaSyntaxId::from_node(&first_root.descendants().next().unwrap());
+
+        assert!(id.to_node_from_root(&first_root).is_some());
+        assert!(id.to_node_from_root(&second_root).is_some());
+    }
+
+    #[test]
+    fn resolver_memo_retains_roots_within_bound() {
+        let roots = (0..8)
+            .map(|index| parsed_root(&format!("local value{index} = {index}\n")))
+            .collect::<Vec<_>>();
+        for root in roots.iter().chain(roots.iter().rev()) {
+            let id = LuaSyntaxId::from_node(&root.descendants().next().unwrap());
+            assert!(id.to_node_from_root(root).is_some());
+        }
+        for root in &roots {
+            assert_eq!(memo_entries(root), Some(1));
+        }
+        assert!(memo_roots_len() <= roots.len());
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LuaSyntaxId {
     kind: LuaKind,
     range: TextRange,
+}
+
+/// Source order: by range start, then range end, then kind.
+impl Ord for LuaSyntaxId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.range.start(), self.range.end(), self.kind).cmp(&(
+            other.range.start(),
+            other.range.end(),
+            other.kind,
+        ))
+    }
+}
+
+impl PartialOrd for LuaSyntaxId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl LuaSyntaxId {
@@ -172,6 +378,14 @@ impl LuaSyntaxId {
 
     pub fn get_range(&self) -> TextRange {
         self.range
+    }
+
+    /// The same syntax kind at `range`.
+    pub fn with_range(&self, range: TextRange) -> Self {
+        LuaSyntaxId {
+            kind: self.kind,
+            range,
+        }
     }
 
     pub fn to_node(&self, tree: &LuaSyntaxTree) -> Option<LuaSyntaxNode> {

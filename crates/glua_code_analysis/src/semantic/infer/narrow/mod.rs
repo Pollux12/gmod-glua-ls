@@ -15,8 +15,11 @@ use crate::{
         infer_name::{find_decl_member_type, infer_global_type},
     },
 };
-pub(crate) use condition_flow::InferConditionFlow;
-pub(crate) use get_type_at_cast_flow::cast_type;
+pub(crate) use condition_flow::{
+    InferConditionFlow, condition_has_concrete_type_evidence, condition_nominal_type,
+    presence_guard_target, type_name_test,
+};
+pub(crate) use get_type_at_cast_flow::apply_cast;
 pub use get_type_at_cast_flow::get_type_at_call_expr_inline_cast;
 pub use get_type_at_flow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
@@ -25,7 +28,9 @@ use glua_parser::{LuaAstNode, LuaChunk, LuaExpr};
 pub use narrow_type::{
     narrow_direct_name_false_or_nil, narrow_down_type, narrow_false_or_nil, remove_false_or_nil,
 };
+pub(crate) use var_ref_id::call_var_ref_root;
 pub use var_ref_id::{SelfRefId, VarRefId, VarRefRootId, get_var_expr_var_ref_id};
+pub(crate) use var_ref_id::{getter_access_path, raw_get_access_path};
 
 const GMOD_NULL_TYPE_NAME: &str = "NULL";
 
@@ -79,13 +84,53 @@ pub(crate) fn contains_gmod_null_type(db: &DbIndex, typ: &LuaType) -> bool {
     }
 }
 
+/// Whether `typ` can hold NULL and every other arm is an entity, nil or a
+/// boolean. A union that also carries numbers, strings or other plain values is
+/// a variant: its truthiness tests those values, so it is not an entity whose
+/// validity the caller confuses with truthiness.
+pub(crate) fn is_gmod_null_entity_candidate(db: &DbIndex, typ: &LuaType) -> bool {
+    contains_gmod_null_type(db, typ) && is_entity_nil_or_boolean(db, typ)
+}
+
+fn is_entity_nil_or_boolean(db: &DbIndex, typ: &LuaType) -> bool {
+    let entity_id = LuaTypeDeclId::global("Entity");
+    match get_real_type(db, typ).unwrap_or(typ) {
+        LuaType::Nil
+        | LuaType::Boolean
+        | LuaType::BooleanConst(_)
+        | LuaType::DocBooleanConst(_)
+        | LuaType::Unknown
+        | LuaType::Any => true,
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            type_id == &entity_id
+                || super::super::type_check::is_sub_type_of(db, type_id, &entity_id)
+        }
+        LuaType::Union(union_type) => union_type
+            .types()
+            .all(|member| is_entity_nil_or_boolean(db, member)),
+        LuaType::MultiLineUnion(multi_union) => multi_union
+            .get_unions()
+            .iter()
+            .all(|(member, _)| is_entity_nil_or_boolean(db, member)),
+        LuaType::Instance(instance_type) => is_entity_nil_or_boolean(db, instance_type.get_base()),
+        _ => false,
+    }
+}
+
 /// Whether the backward flow walk could possibly change `var_ref_id`'s type from
 /// its declared/origin type, given the file-wide narrowing capability. When this
 /// returns `false`, the walk is guaranteed to be a no-op and can be skipped.
-fn var_ref_can_be_narrowed(db: &DbIndex, file_id: &crate::FileId, var_ref_id: &VarRefId) -> bool {
-    // Special-call effects can narrow arbitrary var-refs at runtime positions and
-    // are populated after flow binding, so any file with them must not skip.
-    if db.get_flow_index().has_any_special_call_effect(file_id) {
+pub(crate) fn var_ref_can_be_narrowed(
+    db: &DbIndex,
+    file_id: &crate::FileId,
+    var_ref_id: &VarRefId,
+) -> bool {
+    // Special-call effects are populated after flow binding, so the file-wide
+    // capability misses them: a reference one narrows must not skip.
+    if db
+        .get_flow_index()
+        .has_special_call_effect_for(file_id, var_ref_id)
+    {
         return true;
     }
 
@@ -126,6 +171,17 @@ pub fn infer_expr_narrow_type(
     expr: LuaExpr,
     var_ref_id: VarRefId,
 ) -> InferResult {
+    infer_var_type_at_node(db, cache, &expr, var_ref_id)
+}
+
+/// The type of `var_ref_id` at the flow position bound to `node`: an expression
+/// it is read in or a statement it is observed at.
+pub(crate) fn infer_var_type_at_node(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    node: &impl LuaAstNode,
+    var_ref_id: VarRefId,
+) -> InferResult {
     let file_id = cache.get_file_id();
 
     // Fast path: if this reference can never be narrowed anywhere in the file,
@@ -139,18 +195,18 @@ pub fn infer_expr_narrow_type(
         return get_var_ref_type(db, cache, &var_ref_id);
     };
 
-    let Some(flow_id) = flow_tree.get_flow_id(expr.get_syntax_id()) else {
+    let Some(flow_id) = flow_tree.get_flow_id(node.get_syntax_id()) else {
         return get_var_ref_type(db, cache, &var_ref_id);
     };
 
-    let root = LuaChunk::cast(expr.get_root()).ok_or(InferFailReason::None)?;
+    let root = LuaChunk::cast(node.get_root()).ok_or(InferFailReason::None)?;
     let query_realm = db
         .get_gmod_infer_index()
-        .get_realm_at_offset(&file_id, expr.get_position());
-    let previous_query_realm = cache.flow_query_realm.replace(query_realm);
+        .get_realm_at_offset(&file_id, node.get_position());
+    let previous_query_realm = cache.set_query_realm(Some(query_realm));
     let result =
         get_type_at_flow::get_type_at_flow(db, flow_tree, cache, &root, &var_ref_id, flow_id);
-    cache.flow_query_realm = previous_query_realm;
+    cache.restore_query_realm(previous_query_realm);
     result
 }
 
@@ -160,21 +216,70 @@ pub(crate) fn infer_true_condition_narrowing(
     target_expr: LuaExpr,
     condition: LuaExpr,
 ) -> Option<(LuaType, LuaType)> {
+    infer_condition_narrowing(
+        db,
+        cache,
+        target_expr,
+        condition,
+        InferConditionFlow::TrueCondition,
+    )
+}
+
+pub(crate) fn infer_asserted_argument_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    argument: LuaExpr,
+) -> Option<LuaType> {
+    fn is_concrete(typ: &LuaType) -> bool {
+        match typ {
+            LuaType::Any | LuaType::Unknown => false,
+            LuaType::Union(union) => union.types().all(is_concrete),
+            LuaType::MultiLineUnion(union) => {
+                union.get_unions().iter().all(|(typ, _)| is_concrete(typ))
+            }
+            LuaType::Instance(instance) => is_concrete(instance.get_base()),
+            _ => true,
+        }
+    }
+    let subject = get_var_expr_var_ref_id(db, cache, argument.clone())?;
+    let tree = db.get_flow_index().get_flow_tree(&cache.get_file_id())?;
+    let at = tree.get_flow_id(argument.get_syntax_id())?;
+    let root = LuaChunk::cast(argument.get_root())?;
+    let policy = get_type_at_flow::FlowWalkPolicy::normal(FlowOrigin::Real);
+    let typ =
+        get_type_at_flow::get_type_at_flow_in_mode(db, tree, cache, &root, &subject, at, policy)
+            .ok()?;
+    (is_concrete(&typ) && !typ.is_never()).then_some(typ)
+}
+
+/// The target's type before `condition` and its type on the `edge` of it, when
+/// that edge narrows it.
+pub(crate) fn infer_condition_narrowing(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    target_expr: LuaExpr,
+    condition: LuaExpr,
+    edge: InferConditionFlow,
+) -> Option<(LuaType, LuaType)> {
     let var_ref_id = get_var_expr_var_ref_id(db, cache, target_expr.clone())?;
     let file_id = cache.get_file_id();
     let flow_tree = db.get_flow_index().get_flow_tree(&file_id)?;
     let flow_id = flow_tree.get_flow_id(target_expr.get_syntax_id())?;
     let root = LuaChunk::cast(condition.get_root())?;
+    let kind = match edge {
+        InferConditionFlow::TrueCondition => FlowNodeKind::TrueCondition(condition.to_ptr()),
+        InferConditionFlow::FalseCondition => FlowNodeKind::FalseCondition(condition.to_ptr()),
+    };
     let flow_node = FlowNode {
         id: flow_id,
-        kind: FlowNodeKind::TrueCondition(condition.to_ptr()),
+        kind,
         antecedent: Some(FlowAntecedent::Single(flow_id)),
     };
     let policy = get_type_at_flow::FlowWalkPolicy::normal(FlowOrigin::Real);
     let query_realm = db
         .get_gmod_infer_index()
         .get_realm_at_offset(&file_id, condition.get_position());
-    let previous_query_realm = cache.flow_query_realm.replace(query_realm);
+    let previous_query_realm = cache.set_query_realm(Some(query_realm));
     let result = (|| {
         let antecedent = condition_flow::get_condition_antecedent_type(
             db,
@@ -204,7 +309,7 @@ pub(crate) fn infer_true_condition_narrowing(
         };
         Some((antecedent, narrowed))
     })();
-    cache.flow_query_realm = previous_query_realm;
+    cache.restore_query_realm(previous_query_realm);
     result
 }
 
@@ -228,7 +333,7 @@ pub fn infer_expr_narrow_type_with_flow_origin(
     let query_realm = db
         .get_gmod_infer_index()
         .get_realm_at_offset(&file_id, expr.get_position());
-    let previous_query_realm = cache.flow_query_realm.replace(query_realm);
+    let previous_query_realm = cache.set_query_realm(Some(query_realm));
     let result = get_type_at_flow::get_type_at_flow_with_origin(
         db,
         flow_tree,
@@ -238,7 +343,7 @@ pub fn infer_expr_narrow_type_with_flow_origin(
         flow_id,
         flow_origin,
     );
-    cache.flow_query_realm = previous_query_realm;
+    cache.restore_query_realm(previous_query_realm);
     result
 }
 
@@ -264,11 +369,14 @@ pub fn infer_expr_narrow_type_with_self_base(
         return infer_expr_narrow_type(db, cache, expr, var_ref_id);
     };
 
-    let previous_seed = cache
-        .self_base_seed
-        .replace((var_ref_id.clone(), self_base));
-    let result = infer_expr_narrow_type(db, cache, expr, var_ref_id);
-    cache.self_base_seed = previous_seed;
+    let previous_flow_cache = cache.key_flow_cache(&var_ref_id, &self_base);
+    let previous_seed = cache.seed_self(var_ref_id.clone(), self_base.clone());
+    // The seed changes what every flow node of this reference holds: walks
+    // made without it, or with another region's seed, answer for a different
+    // origin, so the reference walks its entries for this seed.
+    let result = infer_expr_narrow_type(db, cache, expr, var_ref_id.clone());
+    cache.unkey_flow_cache(&var_ref_id, self_base, previous_flow_cache);
+    cache.restore_self_seed(previous_seed);
     result
 }
 
@@ -281,11 +389,17 @@ pub fn get_var_ref_type(
     // reference, use it as the flow origin type instead of resolving the
     // (position-insensitive) receiver decl/member cache. See
     // `infer_expr_narrow_type_with_self_base`.
-    if var_ref_id.is_self_ref()
-        && let Some((seed_ref, seed_type)) = cache.self_base_seed.as_ref()
-        && seed_ref == var_ref_id
-    {
-        return Ok(seed_type.clone());
+    if var_ref_id.is_self_ref() {
+        let key = LuaInferCache::flow_context_key(&crate::semantic::cache::VarRefCacheKey::from(
+            var_ref_id,
+        ));
+        if let Some((seed_ref, seed_type)) = cache.self_base_seed.as_ref()
+            && seed_ref == var_ref_id
+        {
+            crate::db_index::derivation::consult_absorbed(key, cache.self_base_seed_mark);
+            return Ok(seed_type.clone());
+        }
+        crate::db_index::derivation::consult_unkeyed(key);
     }
 
     if let Some(decl_id) = var_ref_id.get_decl_id_ref() {
@@ -294,11 +408,21 @@ pub fn get_var_ref_type(
             .get_decl(&decl_id)
             .ok_or(InferFailReason::None)?;
 
-        if decl.is_implicit_self()
-            && let Some((seed_ref, seed_type)) = cache.self_base_seed.as_ref()
-            && seed_ref.get_decl_id_ref() == Some(decl.get_id())
-        {
-            return Ok(seed_type.clone());
+        if decl.is_implicit_self() {
+            if let Some((seed_ref, seed_type)) = cache.self_base_seed.as_ref()
+                && seed_ref.get_decl_id_ref() == Some(decl.get_id())
+            {
+                crate::db_index::derivation::consult_absorbed(
+                    LuaInferCache::flow_context_key(&crate::semantic::cache::VarRefCacheKey::from(
+                        seed_ref,
+                    )),
+                    cache.self_base_seed_mark,
+                );
+                return Ok(seed_type.clone());
+            }
+            crate::db_index::derivation::consult_unkeyed(LuaInferCache::self_decl_context_key(
+                decl.get_id(),
+            ));
         }
 
         // Parameter declarations carry their canonical type in signature metadata.
@@ -317,7 +441,8 @@ pub fn get_var_ref_type(
                 return Ok(type_cache.as_type().clone());
             }
 
-            return Err(InferFailReason::UnResolveDeclType(decl.get_id()));
+            // Nothing gives the parameter a type: every source was read.
+            return Ok(LuaType::Unknown);
         }
 
         if decl.is_global() {
@@ -353,7 +478,7 @@ pub fn get_var_ref_type(
 
         if let Some(type_cache) = db.get_type_index().get_type_cache(&decl.get_id().into()) {
             let result = type_cache.as_type().clone();
-            // 不要在此阶段展开泛型别名, 必须让后续的泛型匹配阶段基于声明形态完成推断
+            // Do not expand generic aliases at this stage; the later generic matching stage must infer from the declared form
             return Ok(result);
         }
 
@@ -411,7 +536,7 @@ fn get_single_antecedent(tree: &FlowTree, flow: &FlowNode) -> Result<FlowId, Inf
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ResultTypeOrContinue {
     Result(LuaType),
     Continue,

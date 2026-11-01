@@ -1,10 +1,10 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use crate::{DbIndex, LuaType, LuaTypeDeclId};
 
-/// 检查子类型关系.
+/// Checks the subtype relation.
 ///
-/// 假设现在有一个类型定义`---@class C: A, B`, 那么`sub_type_ref_id`为`C`, `super_type_ref_id`可以为`A`或`B`.
+/// For a type definition `---@class C: A, B`, `sub_type_ref_id` is `C` and `super_type_ref_id` can be `A` or `B`.
 pub fn is_sub_type_of(
     db: &DbIndex,
     sub_type_ref_id: &LuaTypeDeclId,
@@ -24,7 +24,7 @@ fn check_sub_type_of_iterative(
 
     let type_index = db.get_type_index();
     let mut stack = Vec::with_capacity(4);
-    let mut visited = HashSet::with_capacity(4);
+    let mut visited = FxHashSet::with_capacity_and_hasher(4, Default::default());
 
     stack.push(sub_type_ref_id);
     while let Some(current_id) = stack.pop() {
@@ -40,7 +40,7 @@ fn check_sub_type_of_iterative(
         for super_type in supers_iter {
             match super_type {
                 LuaType::Ref(super_id) => {
-                    // TODO: 不相等时可以判断必要字段是否全部匹配, 如果匹配则认为相等
+                    // TODO: when not equal, check whether all required fields match and treat as equal if they do
                     if super_id == super_type_ref_id {
                         return Some(true);
                     }
@@ -48,7 +48,7 @@ fn check_sub_type_of_iterative(
                         stack.push(super_id);
                     }
                 }
-                // TODO: 应该检查泛型参数是否匹配
+                // TODO: should check whether the generic parameters match
                 LuaType::Generic(generic) => {
                     let base_type_id = generic.get_base_type_id_ref();
                     if base_type_id == super_type_ref_id {

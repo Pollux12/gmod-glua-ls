@@ -5,10 +5,10 @@ use std::str::FromStr;
 
 use build_annotator::build_annotators;
 pub use emmy_annotator_request::*;
-use lsp_types::Uri;
+use lsp_types::{Uri, request::Request};
 use tokio_util::sync::CancellationToken;
 
-use crate::context::ServerContextSnapshot;
+use crate::context::{Freshness, ServerContextSnapshot};
 
 pub async fn on_emmy_annotator_handler(
     context: ServerContextSnapshot,
@@ -20,14 +20,16 @@ pub async fn on_emmy_annotator_handler(
     }
 
     let uri = Uri::from_str(&params.uri).ok()?;
+    let references = params.references.unwrap_or(true);
 
-    // Wait for any pending reindex to finish so we compute against
-    // consistent tree + index data. Cancel-aware: bails out when a
-    // new didChange fires cancel_all_requests().
-    if !context
+    // Wait until this document's entries match its text so we compute
+    // against a consistent tree and index. Cancel-aware: bails out when a
+    // new didChange to this document cancels its requests.
+    if context
         .debounced_analysis()
-        .wait_until_fresh_for(&cancel_token, "gluals/emmyAnnotator")
+        .wait_until_file_fresh_for(&cancel_token, EmmyAnnotatorRequest::METHOD, &uri)
         .await
+        != Freshness::Fresh
     {
         return None;
     }
@@ -43,7 +45,7 @@ pub async fn on_emmy_annotator_handler(
 
         let file_id = analysis.get_file_id(&uri)?;
         let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
-        let annotators = build_annotators(&semantic_model);
+        let annotators = build_annotators(&semantic_model, references);
         EmmyAnnotatorResult { annotators }
     };
 

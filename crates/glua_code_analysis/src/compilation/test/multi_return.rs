@@ -3,6 +3,56 @@ mod test {
     use crate::VirtualWorkspace;
 
     #[test]
+    fn a_vararg_before_the_last_value_gives_one_value_and_keeps_the_rest() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+        ---@param ... integer
+        local function h(...)
+            return ..., true
+        end
+        "#,
+        );
+        let model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let return_stat =
+            glua_parser::LuaAstNode::descendants::<glua_parser::LuaReturnStat>(model.get_root())
+                .next()
+                .expect("return statement");
+        let exprs = return_stat.get_expr_list().collect::<Vec<_>>();
+
+        let values = |var_count| {
+            model
+                .infer_expr_list_types(&exprs, var_count)
+                .into_iter()
+                .map(|(typ, _)| typ)
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![crate::LuaType::Integer, crate::LuaType::BooleanConst(true)];
+        assert_eq!(values(None), expected);
+        assert_eq!(values(Some(3)), expected);
+    }
+
+    #[test]
+    fn a_return_after_a_vararg_is_checked_against_its_slot() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(!ws.check_code_for(
+            crate::DiagnosticCode::ReturnTypeMismatch,
+            r#"
+        ---@param ... integer
+        ---@return integer, string
+        local function h(...)
+            return ..., true
+        end
+        "#,
+        ));
+    }
+
+    #[test]
     fn test_pcall_return() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 

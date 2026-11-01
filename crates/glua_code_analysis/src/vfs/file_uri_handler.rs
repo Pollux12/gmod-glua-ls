@@ -66,6 +66,7 @@ mod tests {
         assert!(id2 != id);
 
         vfs.set_file_content(&uri, Some("content".to_string()));
+        vfs.take_staged(&[id]);
         let content = vfs.get_file_content(&id).unwrap();
         assert_eq!(content, "content");
 
@@ -79,10 +80,12 @@ mod tests {
         let uri = Uri::from_str("file:///C:/Users/username/Documents/test.lua").unwrap();
         let id = vfs.file_id(&uri);
         vfs.set_file_content(&uri, Some("content".to_string()));
+        vfs.take_staged(&[id]);
         let content = vfs.get_file_content(&id).unwrap();
         assert_eq!(content, "content");
 
         vfs.set_file_content(&uri, None);
+        vfs.take_staged(&[id]);
         let content = vfs.get_file_content(&id);
         assert!(content.is_none());
     }

@@ -57,6 +57,9 @@ pub const GMOD_DOMAIN_VGUI_PANEL: &str = "gmod.vgui_panel";
 /// Derma skin definition/reference domain.
 pub const GMOD_DOMAIN_DERMA_SKIN: &str = "gmod.derma_skin";
 
+/// Scripted entity/weapon registration domain (e.g. `scripted_ents.Register`).
+pub const GMOD_DOMAIN_SCRIPTED_CLASS: &str = "gmod.scripted_class";
+
 /// Net message definition/start/receive domain.
 pub const GMOD_DOMAIN_NET_MESSAGE: &str = "gmod.net_message";
 
@@ -94,6 +97,11 @@ pub const GMOD_ROLE_VGUI_CHILD_SELF: &str = "child_self";
 
 /// The call receiver is the runtime parent of the constructed VGUI panel.
 pub const GMOD_ROLE_VGUI_PARENT_SELF: &str = "parent_self";
+
+/// The parameter receives the receiver panel's own registered class name
+/// (e.g. the `class` parameter of `PANEL:GenerateExample`, which the
+/// `derma_controls` example UI fills with the registered name).
+pub const GMOD_ROLE_VGUI_OWN_CLASS: &str = "own_class";
 
 // ---------------------------------------------------------------------------
 // Phase 1 reserved metadata names.
@@ -135,6 +143,14 @@ pub const GMOD_DOMAIN_VALID_GUARD: &str = "gmod.valid_guard";
 /// remove false/nil/NULL from the guarded expression while preserving its known
 /// static type when one exists.
 pub const GMOD_ATTR_VALID_GUARD: &str = "valid_guard";
+
+pub const GMOD_ATTR_EXHAUSTIVE_TYPE_GUARD: &str = "exhaustive_type_guard";
+
+pub const GMOD_ATTR_FRESH_RESULT: &str = "fresh_result";
+
+/// Signature-level standalone attribute for functions returning a new table
+/// that starts as a copy of their first argument.
+pub const GMOD_ATTR_COPY_RESULT: &str = "copy_result";
 
 /// Signature-level standalone attribute name for calls whose write effects are
 /// bounded to the listed global/root identities.
@@ -187,6 +203,7 @@ pub const GMOD_CALL_ARG_DOMAINS: &[&str] = &[
     GMOD_DOMAIN_NET_MESSAGE,
     GMOD_DOMAIN_NET_PAYLOAD,
     GMOD_DOMAIN_NETWORK_VAR,
+    GMOD_DOMAIN_SCRIPTED_CLASS,
     GMOD_DOMAIN_TIMER,
     GMOD_DOMAIN_VGUI_PANEL,
 ];
@@ -382,6 +399,10 @@ pub fn find_signature_attribute_use<'a>(
         .find_attribute_use(attribute_name)
 }
 
+pub fn signature_is_exhaustive_type_guard(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    find_signature_attribute_use(db, signature_id, GMOD_ATTR_EXHAUSTIVE_TYPE_GUARD).is_some()
+}
+
 pub fn signature_is_valid_guard_in_realm(
     db: &DbIndex,
     signature_id: LuaSignatureId,
@@ -413,7 +434,7 @@ pub fn signature_net_send(db: &DbIndex, signature_id: LuaSignatureId) -> Option<
         _ => return None,
     };
 
-    let signature = db.get_signature_index().get(&signature_id)?;
+    let signature = db.get_signature_index().get_declared(&signature_id)?;
     Some(NetSendKind {
         receiver_realm,
         target_arg_idx: find_param_idx_with_role(
@@ -460,7 +481,7 @@ fn signature_has_net_message_role(
     signature_id: LuaSignatureId,
     roles: &[&str],
 ) -> bool {
-    let Some(signature) = db.get_signature_index().get(&signature_id) else {
+    let Some(signature) = db.get_signature_index().get_declared(&signature_id) else {
         return false;
     };
     (0..signature.params.len()).any(|param_idx| {
@@ -484,7 +505,7 @@ pub fn type_is_net_read_op(db: &DbIndex, typ: &LuaType) -> bool {
 /// Index of the bit-width parameter of a net payload op, when one is annotated.
 /// Replaces the old per-op-kind hardcoded argument index.
 pub fn signature_net_bits_param_idx(db: &DbIndex, signature_id: LuaSignatureId) -> Option<usize> {
-    let signature = db.get_signature_index().get(&signature_id)?;
+    let signature = db.get_signature_index().get_declared(&signature_id)?;
     find_param_idx_with_role(signature, GMOD_DOMAIN_NET_PAYLOAD, GMOD_ROLE_NET_BITS)
 }
 
@@ -559,33 +580,85 @@ fn attribute_string_param(attribute_use: &crate::LuaAttributeUse, name: &str) ->
     }
 }
 
+pub fn signature_copies_result(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    find_signature_attribute_use(db, signature_id, GMOD_ATTR_COPY_RESULT).is_some()
+}
+
+pub fn signature_has_fresh_result(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    find_signature_attribute_use(db, signature_id, GMOD_ATTR_FRESH_RESULT).is_some()
+}
+
 fn signature_has_valid_guard_attribute(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
     find_signature_attribute_use(db, signature_id, GMOD_ATTR_VALID_GUARD).is_some()
 }
 
-/// Rebuilds the effective valid-guard signature set consumed by hot flow paths.
-///
-/// Source functions can shadow metadata-bearing annotation declarations of the
-/// same global/member identity. Resolve that identity once after declarations
-/// and docs are indexed, before flow/lua analysis, so call narrowing remains an
-/// O(1) signature lookup instead of re-inferring semantic declarations per call.
+/// Rebuilds the effective valid-guard signature set consumed by hot flow
+/// paths: the union of every file's contributions.
 pub fn rebuild_effective_valid_guard_signatures(db: &mut DbIndex) {
-    db.get_signature_index_mut()
-        .clear_effective_valid_guard_signatures();
-
-    if !db.get_emmyrc().gmod.enabled {
+    let enabled = db.get_emmyrc().gmod.enabled;
+    let signature_index = db.get_signature_index_mut();
+    if !enabled {
+        signature_index.clear_effective_valid_guard_signatures();
         return;
     }
+    signature_index.rederive_effective_valid_guard_signatures();
+}
 
+/// One file's valid-guard signatures: its global declarations' and members'
+/// identities, resolved against the shadowing-aware semantic declaration.
+/// Source functions can shadow metadata-bearing annotation declarations of the
+/// same global or member identity, so the identity is resolved once here and
+/// call narrowing stays an O(1) signature lookup.
+pub fn compute_valid_guard_signatures(
+    db: &DbIndex,
+    file_id: FileId,
+) -> Vec<(LuaSignatureId, GmodStateMask)> {
+    if !db.get_emmyrc().gmod.enabled {
+        return Vec::new();
+    }
+    let mut found = valid_guard_globals_in_file(db, file_id);
+    found.extend(valid_guard_contributions_for_file(db, file_id));
+    found
+        .sort_by_key(|(signature_id, _)| (signature_id.get_file_id(), signature_id.get_position()));
+    found
+}
+
+/// Stores one file's valid-guard signatures, when it has any.
+pub fn store_valid_guard_signatures(
+    db: &mut DbIndex,
+    file_id: FileId,
+    found: Vec<(LuaSignatureId, GmodStateMask)>,
+) {
+    if found.is_empty() {
+        return;
+    }
+    db.get_signature_index_mut()
+        .store_valid_guard_file_contributions(file_id, found);
+}
+
+fn valid_guard_globals_in_file(
+    db: &DbIndex,
+    file_id: FileId,
+) -> Vec<(LuaSignatureId, GmodStateMask)> {
     let mut effective_signatures = Vec::new();
-
-    for decl_id in db.get_global_index().get_all_global_decl_ids() {
+    let Some(tree) = db.get_decl_index().get_decl_tree(&file_id) else {
+        return effective_signatures;
+    };
+    let signature_index = db.get_signature_index();
+    let mut decl_ids = tree
+        .get_decls()
+        .values()
+        .filter(|decl| {
+            matches!(decl.extra, LuaDeclExtra::Global { .. })
+                && signature_index.is_valid_guard_name(decl.get_name())
+        })
+        .map(|decl| decl.get_id())
+        .collect::<Vec<_>>();
+    decl_ids.sort_by_key(|decl_id| decl_id.position);
+    for decl_id in decl_ids {
         let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
             continue;
         };
-        if !matches!(decl.extra, LuaDeclExtra::Global { .. }) {
-            continue;
-        }
         let semantic_decl = LuaSemanticDeclId::from(decl_id);
         let Some(signature_id) = signature_id_for_semantic_decl(db, &semantic_decl) else {
             continue;
@@ -600,45 +673,49 @@ pub fn rebuild_effective_valid_guard_signatures(db: &mut DbIndex) {
             effective_signatures.push((signature_id, state_mask));
         }
     }
-
-    // The per-file member scan is read-only against `&DbIndex` and runs over
-    // every file in the workspace on every edit, so it is derived across files
-    // in parallel. Results are flattened in file order, so the marked set is
-    // identical to the previous sequential scan.
-    let all_file_ids = db.get_vfs().get_all_file_ids();
-    let per_file = crate::compilation::analyzer::parallel::map_files_collect(
-        db,
-        &all_file_ids,
-        |db, file_id| {
-            let mut found = Vec::new();
-            let member_ids = db
-                .get_member_index()
-                .get_file_members(file_id)
-                .into_iter()
-                .map(|member| member.get_id())
-                .collect::<Vec<_>>();
-            for member_id in member_ids {
-                let semantic_decl = LuaSemanticDeclId::from(member_id);
-                let Some(signature_id) = signature_id_for_semantic_decl(db, &semantic_decl) else {
-                    continue;
-                };
-                if let Some(state_mask) = member_identity_direct_valid_guard_mask(db, member_id)
-                    && state_mask.is_compatible_with(signature_realm_mask(db, signature_id))
-                {
-                    found.push((signature_id, state_mask));
-                }
-            }
-            found
-        },
-    );
-    effective_signatures.extend(per_file.into_iter().flatten());
-
-    let signature_index = db.get_signature_index_mut();
-    for (signature_id, state_mask) in effective_signatures {
-        signature_index.mark_effective_valid_guard_signature(signature_id, state_mask);
-    }
+    effective_signatures
 }
 
+/// The member-identity part for one file: every member's identity, resolved
+/// against the shadowing-aware semantic declaration.
+fn valid_guard_contributions_for_file(
+    db: &DbIndex,
+    file_id: FileId,
+) -> Vec<(LuaSignatureId, GmodStateMask)> {
+    let mut found = Vec::new();
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_red_root())
+    else {
+        return found;
+    };
+    let signature_index = db.get_signature_index();
+    let member_ids = db
+        .get_member_index()
+        .file_member_ids(file_id)
+        .into_iter()
+        .filter(|member_id| {
+            member_syntax_name(&root, member_id)
+                .is_some_and(|name| signature_index.is_valid_guard_name(&name))
+        })
+        .collect::<Vec<_>>();
+    for member_id in member_ids {
+        let semantic_decl = LuaSemanticDeclId::from(member_id);
+        let Some(signature_id) = signature_id_for_semantic_decl(db, &semantic_decl) else {
+            continue;
+        };
+        if let Some(state_mask) = member_identity_direct_valid_guard_mask(db, member_id)
+            && state_mask.is_compatible_with(signature_realm_mask(db, signature_id))
+        {
+            found.push((signature_id, state_mask));
+        }
+    }
+    found
+}
+
+/// Whether `signature_id` is a validity guard in `call_realm`: annotated as one, or the base
+/// runtime redeclaration in `lua/includes/util.lua` of a global annotated as one.
 pub fn signature_is_valid_guard_or_base_runtime_isvalid_in_realm(
     db: &DbIndex,
     signature_id: LuaSignatureId,
@@ -652,11 +729,87 @@ pub fn signature_is_valid_guard_or_base_runtime_isvalid_in_realm(
         return false;
     }
 
+    is_base_runtime_util_file(db, signature_id.get_file_id())
+        && global_function_name(db, signature_id)
+            .is_some_and(|name| db.get_signature_index().is_valid_guard_name(&name))
+}
+
+/// Whether `signature_id` classifies its argument as the `type` intrinsic does: it returns
+/// `std.type`, or it is the base runtime redeclaration in `lua/includes/util.lua` of a global
+/// whose other declarations return `std.type`.
+pub fn signature_is_type_classifier(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    if signature_returns_std_type(db, signature_id) {
+        return true;
+    }
+
+    db.get_emmyrc().gmod.enabled
+        && is_base_runtime_util_file(db, signature_id.get_file_id())
+        && global_function_name(db, signature_id).is_some_and(|name| {
+            db.get_global_index()
+                .get_global_decl_ids(&name)
+                .is_some_and(|decl_ids| {
+                    decl_ids.iter().any(|decl_id| {
+                        signature_id_for_semantic_decl(db, &LuaSemanticDeclId::LuaDecl(*decl_id))
+                            .is_some_and(|declared| signature_returns_std_type(db, declared))
+                    })
+                })
+        })
+}
+
+fn signature_returns_std_type(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    db.get_signature_index()
+        .get(&signature_id)
+        .is_some_and(|signature| {
+            matches!(signature.get_return_type(), LuaType::Ref(id) if id.get_name() == "std.type")
+        })
+}
+
+fn is_base_runtime_util_file(db: &DbIndex, file_id: FileId) -> bool {
     db.get_vfs()
-        .get_file_path(&signature_id.get_file_id())
+        .get_file_path(&file_id)
         .and_then(|path| path.to_str())
         .map(|path| path.replace('\\', "/"))
         .is_some_and(|path| path.ends_with("/lua/includes/util.lua"))
+}
+
+/// The global name `function name(...)` gives the closure `signature_id` describes.
+fn global_function_name(db: &DbIndex, signature_id: LuaSignatureId) -> Option<SmolStr> {
+    use glua_parser::{LuaAstNode, LuaClosureExpr, LuaFuncStat, LuaVarExpr};
+    let file_id = signature_id.get_file_id();
+    let position = signature_id.get_position();
+    let closure = db
+        .get_vfs()
+        .syntax_tree_around(&file_id, rowan::TextRange::empty(position))?
+        .get_red_root()
+        .token_at_offset(position)
+        .right_biased()?
+        .parent_ancestors()
+        .find_map(LuaClosureExpr::cast)
+        .filter(|closure| LuaSignatureId::from_closure(file_id, closure) == signature_id)?;
+    match closure.get_parent::<LuaFuncStat>()?.get_func_name()? {
+        LuaVarExpr::NameExpr(name) => Some(name.get_name_token()?.get_name_text().into()),
+        LuaVarExpr::IndexExpr(_) => None,
+    }
+}
+
+/// The name a member's own syntax gives it: the key of `x.name`, `x:name` or
+/// a `name = value` table field.
+fn member_syntax_name(
+    root: &glua_parser::LuaSyntaxNode,
+    member_id: &LuaMemberId,
+) -> Option<SmolStr> {
+    use glua_parser::{LuaAstNode, LuaIndexExpr, LuaIndexKey, LuaTableField};
+    let node = member_id.get_syntax_id().to_node_from_root(root)?;
+    let key = if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
+        index_expr.get_index_key()?
+    } else {
+        LuaTableField::cast(node)?.get_field_key()?
+    };
+    match key {
+        LuaIndexKey::Name(name) => Some(name.get_name_text().into()),
+        LuaIndexKey::String(string) => Some(string.get_value().into()),
+        _ => None,
+    }
 }
 
 fn global_identity_direct_valid_guard_mask(
@@ -804,7 +957,7 @@ pub fn signature_owner_for(
 mod tests {
     use super::*;
     use crate::{
-        LuaAttributeUse, LuaType, LuaTypeDeclId, VirtualWorkspace,
+        LuaAttributeUse, LuaSignatureId, LuaType, LuaTypeDeclId, VirtualWorkspace,
         db_index::signature::{CALL_ARG_ATTRIBUTE, LuaDocParamInfo, LuaSignature},
     };
     use smol_str::SmolStr;
@@ -831,7 +984,7 @@ mod tests {
 
     fn signature_with_param_roles(param_name: &str, roles: Vec<LuaAttributeUse>) -> LuaSignature {
         let mut signature = LuaSignature::new();
-        signature.params.push(param_name.to_string());
+        signature.params.push(param_name.into());
         signature.param_docs.insert(
             0,
             LuaDocParamInfo {
@@ -1131,6 +1284,170 @@ mod tests {
             copied.len(),
             GMOD_CALL_ARG_DOMAINS.len(),
             "GMOD_CALL_ARG_DOMAINS has no duplicates"
+        );
+    }
+
+    /// Only definitions named like an annotated guard can take its identity,
+    /// so a file of unrelated functions is not scanned member by member: its
+    /// valid-guard scan reads a handful of facts, not one per definition,
+    /// while a same-named shadow still becomes a guard.
+    #[test]
+    fn valid_guard_scan_reads_only_same_named_definitions() {
+        use crate::Emmyrc;
+        use crate::db_index::derivation::DerivationKind;
+
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/includes/valid_guard_anno.lua",
+            r#"
+            ---@meta
+            ---@attribute valid_guard()
+
+            ---@param value any
+            ---@return boolean
+            ---@[valid_guard]
+            function IsValid(value) end
+            "#,
+        );
+        let mut unrelated = String::from(
+            "Helpers = {}
+",
+        );
+        for i in 0..200 {
+            unrelated.push_str(&format!(
+                "function Helpers.f{i}(x) return x end
+"
+            ));
+        }
+        let unrelated_file = ws.def_file("lua/autorun/helpers.lua", &unrelated);
+        let shadow_file = ws.def_file(
+            "lua/autorun/shadow.lua",
+            "function IsValid(value)
+    return value ~= nil
+end
+",
+        );
+
+        let db = ws.analysis.compilation.get_db();
+        assert!(
+            db.get_signature_index()
+                .iter()
+                .any(|(id, _)| id.get_file_id() == shadow_file
+                    && db
+                        .get_signature_index()
+                        .effective_valid_guard_signature_mask(id)
+                        .is_some()),
+            "the same-named shadow is a guard"
+        );
+        let scan = db
+            .reader_graph()
+            .derivations_of_file(unrelated_file)
+            .find(|id| id.kind == DerivationKind::ValidGuardScan)
+            .expect("the file has a valid-guard scan");
+        let reads = db
+            .reader_graph()
+            .reads_of(scan)
+            .filter(|key| {
+                !matches!(
+                    key.key(),
+                    crate::db_index::derivation::FactKey::ValidGuardName(_)
+                )
+            })
+            .count();
+        assert!(
+            reads < 20,
+            "the scan read {reads} facts besides guard names"
+        );
+    }
+
+    /// Removing the file that shadows a valid-guard annotation drops its
+    /// contribution explicitly: the incremental rebuild must agree exactly
+    /// with a fresh workspace that never contained the shadow.
+    #[test]
+    fn incremental_valid_guard_rebuild_matches_fresh_after_shadow_removal() {
+        use crate::Emmyrc;
+
+        const ANNOTATION: &str = r#"
+            ---@meta
+            ---@attribute valid_guard()
+
+            ---@class Entity
+
+            ---@param value any
+            ---@return TypeGuard<Entity>
+            ---@[valid_guard]
+            function IsValid(value) end
+
+            ---@class Widget
+
+            ---@param value any
+            ---@return TypeGuard<Widget>
+            ---@[valid_guard]
+            function Widget:IsValid() end
+        "#;
+        const SHADOW: &str = r#"
+            function IsValid(value)
+                return value ~= nil
+            end
+        "#;
+
+        fn effective_snapshot(db: &crate::DbIndex) -> Vec<(LuaSignatureId, Option<GmodStateMask>)> {
+            let index = db.get_signature_index();
+            let mut entries: Vec<_> = index
+                .iter()
+                .map(|(id, _)| (*id, index.effective_valid_guard_signature_mask(id)))
+                .collect();
+            entries.sort_by_key(|(id, _)| (id.get_file_id(), id.get_position()));
+            entries
+        }
+
+        fn workspace_with_annotation() -> VirtualWorkspace {
+            let mut ws = VirtualWorkspace::new();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+            let uri = ws
+                .virtual_url_generator
+                .new_uri("lua/includes/valid_guard_anno.lua");
+            ws.analysis
+                .update_file_by_uri(&uri, Some(ANNOTATION.to_string()))
+                .map(|(id, _)| id)
+                .expect("annotation file indexed");
+            ws
+        }
+
+        let mut ws = workspace_with_annotation();
+        let shadow_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/shared/shadow.lua");
+        let shadow_file = ws
+            .analysis
+            .update_file_by_uri(&shadow_uri, Some(SHADOW.to_string()))
+            .map(|(id, _)| id)
+            .expect("shadow file indexed");
+        let before = effective_snapshot(ws.analysis.compilation.get_db());
+        assert!(
+            before
+                .iter()
+                .any(|(id, mask)| id.get_file_id() == shadow_file && mask.is_some()),
+            "the shadowing source contributes to the effective set while present",
+        );
+
+        ws.analysis.update_file_by_uri(&shadow_uri, None);
+        let after = effective_snapshot(ws.analysis.compilation.get_db());
+        assert!(
+            after.iter().all(|(id, _)| id.get_file_id() != shadow_file),
+            "the removed shadow leaves no signature behind at all",
+        );
+
+        let fresh = workspace_with_annotation();
+        assert_eq!(
+            after,
+            effective_snapshot(fresh.analysis.compilation.get_db()),
+            "incremental rebuild after removal agrees with a fresh workspace",
         );
     }
 }

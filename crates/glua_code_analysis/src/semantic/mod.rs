@@ -2,25 +2,39 @@ mod cache;
 mod decl;
 mod generic;
 pub(crate) mod gmod_call_effect;
+mod gmod_hook_owner;
 mod gmod_vgui_context;
 mod guard;
 mod infer;
 mod member;
+mod nullable;
 mod overload_resolve;
 mod reference;
 mod semantic_info;
 mod type_check;
 mod visibility;
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// Test-only work counter, re-exported so scaling guards can assert on the
-/// number of walks rather than on how long they took.
+/// Test-only work counters, re-exported so scaling guards can assert on the
+/// amount of work rather than on how long it took.
+#[cfg(test)]
+pub(crate) use infer::CONSTANT_EXPR_CLASSIFICATIONS;
 #[cfg(test)]
 pub(crate) use infer::narrow::get_type_at_flow::BASELINE_FLOW_WALKS;
 
-pub use cache::{CacheEntry, CacheOptions, LuaAnalysisPhase, LuaInferCache, PendingStrTplTypeDecl};
+pub(crate) use cache::MemoFootprint;
+pub(crate) use cache::detach_transaction;
+pub use cache::{
+    CacheEntry, CacheOptions, DynamicFieldDefinitionSyntax, LuaAnalysisPhase, LuaInferCache,
+    ScriptedSingletons, VarRefCacheRootKey,
+};
+pub(crate) use decl::value::{
+    decl_value_expr, known_signature_id, local_initializer_expr, local_name_closure_signature_id,
+    local_name_value, metatable_member_owner, semantic_decl_closure_signature_id,
+    semantic_decl_signature_id, semantic_decl_value, semantic_decl_value_expr,
+};
 pub use decl::{enum_variable_is_param, parse_require_module_info};
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaDocType,
@@ -28,33 +42,50 @@ use glua_parser::{
     LuaSyntaxKind, LuaSyntaxNode, LuaSyntaxToken, LuaTableExpr, LuaTokenKind, LuaVarExpr,
 };
 pub(crate) use gmod_vgui_context::{
-    resolve_registered_vgui_method_context, resolve_registered_vgui_method_context_for_func,
+    find_latest_decl_write_before_position, is_broad_panel_type,
+    registered_vgui_method_param_is_own_class, resolve_registered_vgui_method_context,
+    resolve_registered_vgui_method_context_for_func,
 };
 pub(crate) use infer::check_iter_var_range;
 pub(crate) use infer::get_prefix_expr_signature_id;
 pub(crate) use infer::infer_bind_value_type;
+pub(crate) use infer::infer_expr_list_types;
 pub use infer::infer_index_expr;
-pub(crate) use infer::narrow::infer_true_condition_narrowing;
-pub(crate) use infer::narrow::{InferConditionFlow, cast_type};
+pub(crate) use infer::local_call_reference_expectations;
+pub(crate) use infer::narrow::{InferConditionFlow, apply_cast};
 pub use infer::narrow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
 };
+pub(crate) use infer::narrow::{
+    get_var_ref_type, infer_true_condition_narrowing, infer_var_type_at_node, type_name_test,
+};
+pub(crate) use infer::pairs_iter_value_registry_path;
+pub(crate) use infer::presence_guard_target;
 pub(crate) use infer::resolve_decl_backed_global_path_member_type;
-use infer::{infer_call_arg_expr_list_types, infer_expr_list_types, infer_expr_list_value_type_at};
+pub(crate) use infer::table_backing_range_from_expr;
+pub(crate) use infer::{
+    AccessPaths, keep_access_paths, restore_access_path_snapshot, stop_keeping_access_paths,
+    take_access_path_snapshot, with_access_paths,
+};
+pub(crate) use infer::{declaring_for_range, try_infer_enclosing_for_range_iter_type};
+use infer::{infer_call_arg_expr_list_types, infer_expr_list_value_type_at};
 pub use infer::{infer_table_field_value_should_be, infer_table_should_be};
 use lsp_types::Uri;
 pub use member::LuaMemberInfo;
 pub use member::find_index_operations;
 use member::find_member_origin_owner;
 pub(crate) use member::find_members;
+pub(crate) use member::get_buildin_type_map_type_id;
 pub use member::get_member_map;
 pub use member::get_member_value_expr;
 pub(crate) use member::infer_owner_raw_member_type_with_realm;
 pub(crate) use member::infer_raw_member_type_with_cache;
 pub(crate) use member::member_key_matches_type;
 pub(crate) use member::merge_open_table_types;
-pub(crate) use member::resolve_dynamic_field_member;
 pub(crate) use member::visible_super_types_in_workspace_for_file_at_offset;
+pub(crate) use member::{MetatableIndexField, find_metatable_index_field};
+pub(crate) use member::{dynamic_field_type_without, resolve_dynamic_field_member};
+pub(crate) use nullable::is_nullable;
 use reference::is_reference_to;
 use rowan::{NodeOrToken, TextRange};
 pub(crate) use semantic_info::{
@@ -87,20 +118,27 @@ use crate::{
     FileId,
     db_index::{DbIndex, LuaType},
 };
-use crate::{LuaFunctionType, LuaMemberId, LuaMemberKey, LuaTypeOwner};
+use crate::{LuaFunctionType, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaTypeOwner};
 pub use generic::*;
+pub use gmod_hook_owner::{BUILTIN_HOOK_OWNERS, gmod_hook_owner_group, gmod_hook_owner_group_of};
 pub use guard::{InferGuard, InferGuardRef};
 pub use infer::InferFailReason;
+pub(crate) use infer::floors_unsettled;
 pub(crate) use infer::infer_authoritative_method_self_type;
 pub use infer::infer_call_expr_func;
 pub(crate) use infer::infer_enclosing_self_type;
 pub(crate) use infer::infer_expr;
-pub(crate) use infer::infer_param_is_weak;
 pub(crate) use infer::is_authoritative_self_receiver_type;
+pub(crate) use infer::is_concrete_self_receiver_type;
 pub(crate) use infer::remove_false_or_nil;
 pub(crate) use infer::type_decl_is_vgui_panel;
+pub(crate) use infer::{ParamInferenceSource, infer_param_is_weak, infer_param_source};
 pub use infer::{SelfRefId, VarRefId, VarRefRootId};
-pub(crate) use infer::{contains_gmod_null_type, get_var_expr_var_ref_id};
+pub(crate) use infer::{
+    condition_has_concrete_type_evidence, condition_nominal_type, contains_gmod_null_type,
+    get_var_expr_var_ref_id, getter_access_path, is_gmod_null_entity_candidate,
+    raw_get_access_path,
+};
 pub use infer::{infer_param, infer_param_with_cache};
 use overload_resolve::resolve_signature;
 pub use semantic_info::SemanticDeclLevel;
@@ -213,17 +251,32 @@ fn declared_call_contract_authority(
     let Some(member_owner) = db.get_member_index().get_member_owner(&member_id) else {
         return DeclaredCallContractAuthority::Independent;
     };
-    let expected_receiver_type = match member_owner {
-        LuaMemberOwner::Type(owner_id) => LuaType::Ref(owner_id.clone()),
-        LuaMemberOwner::Element(range) => LuaType::TableConst(range.clone()),
-        _ => return DeclaredCallContractAuthority::Independent,
+    let member_owner = member_owner.clone();
+    let expected_receiver_type = match &member_owner {
+        LuaMemberOwner::Type(owner_id) => Some(LuaType::Ref(owner_id.clone())),
+        LuaMemberOwner::Element(range) => Some(LuaType::TableConst(range.clone())),
+        // A global path's table has no type of its own; the receiver is
+        // compared to it as an owner below.
+        LuaMemberOwner::GlobalPath(_) => None,
+        LuaMemberOwner::LocalUnresolve => return DeclaredCallContractAuthority::Independent,
     };
     let Some(receiver) = index.get_prefix_expr() else {
         return DeclaredCallContractAuthority::Independent;
     };
     let receiver_fact = infer_expr_fact_with_cache(db, cache, receiver);
+    let receiver_owner = match receiver_fact.typ() {
+        LuaType::TableConst(range) => Some(range.clone()),
+        LuaType::Instance(instance) => Some(instance.get_range().clone()),
+        _ => None,
+    }
+    .map(|range| {
+        db.get_member_index()
+            .canonical_owner(LuaMemberOwner::Element(range))
+    });
     if receiver_fact.confidence() >= LuaInferenceConfidence::Certain
-        && check_type_compact(db, receiver_fact.typ(), &expected_receiver_type).is_ok()
+        && (expected_receiver_type.is_some_and(|expected_receiver_type| {
+            check_type_compact(db, receiver_fact.typ(), &expected_receiver_type).is_ok()
+        }) || receiver_owner == Some(member_owner))
     {
         DeclaredCallContractAuthority::Independent
     } else {
@@ -334,6 +387,20 @@ impl<'a> SemanticModel<'a> {
         )
     }
 
+    /// The closure `signature_id` is the signature of, if it is one.
+    pub fn get_signature_closure(&self, signature_id: LuaSignatureId) -> Option<LuaClosureExpr> {
+        let file_id = signature_id.get_file_id();
+        self.db
+            .get_vfs()
+            .syntax_tree_around(&file_id, TextRange::empty(signature_id.get_position()))?
+            .get_red_root()
+            .token_at_offset(signature_id.get_position())
+            .right_biased()?
+            .parent_ancestors()
+            .find_map(LuaClosureExpr::cast)
+            .filter(|closure| LuaSignatureId::from_closure(file_id, closure) == signature_id)
+    }
+
     pub fn get_file_parse_error(&self) -> Option<Vec<LuaParseError>> {
         self.db.get_vfs().get_file_parse_error(&self.file_id)
     }
@@ -437,10 +504,22 @@ impl<'a> SemanticModel<'a> {
         find_members_with_key(self.db, prefix_type, member_key, find_all)
     }
 
+    /// The class the global `name` names in this file: the one a
+    /// scripted-class scope binds it to, such as the gamemode class `GM` names
+    /// inside a gamemode folder, else the global class of that name.
+    pub fn resolve_global_class(&self, name: &str) -> LuaTypeDeclId {
+        infer::resolve_global_singleton_scripted_type_decl_id(
+            self.db,
+            &mut self.infer_cache.borrow_mut(),
+            name,
+        )
+        .unwrap_or_else(|| LuaTypeDeclId::global(name))
+    }
+
     pub fn get_member_info_map(
         &self,
         prefix_type: &LuaType,
-    ) -> Option<HashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
+    ) -> Option<FxHashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
         let module_index = self.db.get_module_index();
         if let Some(workspace_id) = module_index.get_workspace_id(self.file_id) {
             return member::get_member_map_in_workspace_for_file(
@@ -458,7 +537,7 @@ impl<'a> SemanticModel<'a> {
         &self,
         prefix_type: &LuaType,
         position_offset: rowan::TextSize,
-    ) -> Option<HashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
+    ) -> Option<FxHashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
         let module_index = self.db.get_module_index();
         if let Some(workspace_id) = module_index.get_workspace_id(self.file_id) {
             return member::get_member_map_in_workspace_for_file_at_offset(
@@ -496,7 +575,7 @@ impl<'a> SemanticModel<'a> {
         compact_type: &LuaType,
         compact_expr: &LuaExpr,
     ) -> TypeCheckResult {
-        let mut member_facts = HashMap::new();
+        let mut member_facts = FxHashMap::default();
         self.collect_table_expr_member_facts(compact_expr, &mut member_facts);
         let runtime_compact_type = self.infer_closure_body_type_for_check(compact_expr);
         check_type_compact_detail_with_member_facts(
@@ -519,7 +598,7 @@ impl<'a> SemanticModel<'a> {
     fn collect_table_expr_member_facts(
         &self,
         expr: &LuaExpr,
-        member_facts: &mut HashMap<LuaMemberId, LuaTypeFact>,
+        member_facts: &mut FxHashMap<LuaMemberId, LuaTypeFact>,
     ) {
         let Some(table_expr) = LuaTableExpr::cast(expr.syntax().clone()) else {
             return;
@@ -559,7 +638,7 @@ impl<'a> SemanticModel<'a> {
         .ok()
     }
 
-    /// 推断表达式列表类型, 位于最后的表达式会触发多值推断
+    /// Infers the types of an expression list; the last expression triggers multi-value inference
     pub fn infer_expr_list_types(
         &self,
         exprs: &[LuaExpr],
@@ -610,7 +689,7 @@ impl<'a> SemanticModel<'a> {
         &self,
         call_expr: LuaCallExpr,
         var_count: Option<usize>,
-    ) -> Vec<(LuaType, TextRange)> {
+    ) -> Arc<[(LuaType, TextRange)]> {
         infer_call_arg_expr_list_types(
             self.db,
             &mut self.infer_cache.borrow_mut(),
@@ -619,7 +698,7 @@ impl<'a> SemanticModel<'a> {
         )
     }
 
-    /// 推断值已经绑定的类型(不是推断值的类型). 例如从右值推断左值类型, 从调用参数推断函数参数类型
+    /// Infers the type a value is already bound to (not the type of the value itself). For example, inferring the left value type from the right value, or the function parameter type from call arguments
     pub fn infer_bind_value_type(&self, expr: LuaExpr) -> Option<LuaType> {
         infer_bind_value_type(self.db, &mut self.infer_cache.borrow_mut(), expr)
     }
@@ -693,6 +772,39 @@ impl<'a> SemanticModel<'a> {
         is_sub_type_of(self.db, sub_type_ref_id, super_type_ref_id)
     }
 
+    /// The members named `key` that subtypes of `type_id` define, one per
+    /// subtype, ordered by subtype name.
+    pub fn get_subtype_members_for_key(
+        &self,
+        type_id: &LuaTypeDeclId,
+        key: &LuaMemberKey,
+    ) -> Vec<(LuaTypeDeclId, LuaMemberId)> {
+        let member_index = self.db.get_member_index();
+        let mut owners = member_index
+            .get_current_members_for_key(key)
+            .into_iter()
+            .filter_map(
+                |member| match member_index.get_current_owner(&member.get_id())? {
+                    LuaMemberOwner::Type(owner) if owner != type_id => Some(owner.clone()),
+                    _ => None,
+                },
+            )
+            .filter(|owner| is_sub_type_of(self.db, owner, type_id))
+            .collect::<Vec<_>>();
+        owners.sort_by(|a, b| a.get_name().cmp(b.get_name()));
+        owners.dedup();
+        owners
+            .into_iter()
+            .filter_map(|owner| {
+                let member = member_index
+                    .get_current_owner_members_for_key(&LuaMemberOwner::Type(owner.clone()), key)
+                    .into_iter()
+                    .next()?;
+                Some((owner, member.get_id()))
+            })
+            .collect()
+    }
+
     pub fn get_emmyrc(&self) -> &Emmyrc {
         &self.emmyrc
     }
@@ -753,7 +865,6 @@ impl<'a> SemanticModel<'a> {
             &mut self.infer_cache.borrow_mut(),
             prefix_type,
             LuaIndexMemberExpr::IndexExpr(index_expr.clone()),
-            &InferGuard::new(),
         )
     }
 

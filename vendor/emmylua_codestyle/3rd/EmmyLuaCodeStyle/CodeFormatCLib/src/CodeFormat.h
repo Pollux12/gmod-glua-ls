@@ -40,7 +40,7 @@ public:
     Result<std::vector<LuaTypeFormat::Result>>
     TypeFormat(const std::string &uri, std::size_t line, std::size_t character, std::string &&text);
 
-    Result<std::vector<LuaDiagnosticInfo>> Diagnostic(const std::string &uri, std::string &&text);
+    Result<std::vector<LuaDiagnosticInfo>> Diagnostic(const std::string &uri, std::string &&text, bool nonStandardSymbol);
 
     LuaStyle &GetStyle(const std::string &uri);
 

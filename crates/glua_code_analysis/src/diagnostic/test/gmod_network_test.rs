@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::{DiagnosticCode, Emmyrc, GmodRealm, NetOpDirection, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaCallExpr};
     use googletest::prelude::*;
     use lsp_types::{Diagnostic, NumberOrString};
     use tokio_util::sync::CancellationToken;
@@ -32,6 +33,16 @@ mod tests {
             .iter()
             .filter(|diagnostic| diagnostic.code == expected_code)
             .count()
+    }
+
+    /// The `(line, start column, end column)` of a diagnostic's range.
+    fn diagnostic_span(diagnostic: &Diagnostic) -> (u32, u32, u32) {
+        let range = diagnostic.range;
+        assert_eq!(
+            range.start.line, range.end.line,
+            "expected a one-line range"
+        );
+        (range.start.line, range.start.character, range.end.character)
     }
 
     fn count_network_diagnostics(diagnostics: &[Diagnostic]) -> usize {
@@ -86,6 +97,8 @@ mod tests {
                 .contains("expected `net.ReadEntity`, got `net.ReadString`"),
             eq(true)
         );
+        // Reported on the read itself, not the whole receive block.
+        expect_that!(diagnostic_span(mismatch), eq((2, 26, 42)));
     }
 
     #[gtest]
@@ -120,6 +133,54 @@ mod tests {
             count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteOrderMismatch),
             eq(1usize)
         );
+        // Reported on the first read out of order, not the whole receive block.
+        expect_that!(diagnostic_span(&diagnostics[0]), eq((2, 29, 45)));
+    }
+
+    /// A mismatched read composed from a helper in another file has no range
+    /// in the receiving file, so the warning stays on the receive block.
+    #[gtest]
+    fn test_mismatch_from_helper_in_other_file_reports_on_receive_block() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteTypeMismatch);
+
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("Msg")
+            net.Start("Msg")
+            net.WriteEntity(e)
+            net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/cl_helpers.lua",
+            r#"
+            function ReadPayloadName()
+                return net.ReadString()
+            end
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("Msg", function()
+                local name = ReadPayloadName()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        let mismatch = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == diagnostic_code(DiagnosticCode::GmodNetReadWriteTypeMismatch)
+            })
+            .expect("expected gmod-net-read-write-type-mismatch diagnostic");
+        expect_that!(mismatch.range.start.line, eq(1));
+        expect_that!(mismatch.range.end.line, eq(3));
     }
 
     #[gtest]
@@ -180,6 +241,523 @@ mod tests {
             ),
             eq(1usize)
         );
+    }
+
+    fn missing_counterpart_messages(diagnostics: &[Diagnostic]) -> Vec<&str> {
+        let expected_code = diagnostic_code(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == expected_code)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect()
+    }
+
+    #[gtest]
+    fn test_server_receiver_does_not_satisfy_server_send() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/send_and_receive.lua",
+            r#"
+            util.AddNetworkString("SameRealm")
+            net.Start("SameRealm")
+            net.WriteUInt(3, 8)
+            net.Broadcast()
+            net.Receive("SameRealm", function()
+                local n = net.ReadUInt(8)
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        let messages = missing_counterpart_messages(&diagnostics);
+        assert_that!(messages.len(), eq(2usize));
+        expect_that!(
+            messages
+                .iter()
+                .any(|message| message.contains("`net.Receive` counterpart")
+                    && message.contains("client realm")),
+            eq(true)
+        );
+        expect_that!(
+            messages
+                .iter()
+                .any(|message| message.contains("sending counterpart")
+                    && message.contains("client realm")),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_client_receiver_does_not_satisfy_send_to_server() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/send_and_receive.lua",
+            r#"
+            net.Start("ToServer")
+            net.SendToServer()
+            net.Receive("ToServer", function() end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        let messages = missing_counterpart_messages(&diagnostics);
+        assert_that!(messages.len(), eq(2usize));
+        expect_that!(
+            messages
+                .iter()
+                .any(|message| message.contains("`net.Receive` counterpart")
+                    && message.contains("server realm")),
+            eq(true)
+        );
+        expect_that!(
+            messages
+                .iter()
+                .any(|message| message.contains("sending counterpart")
+                    && message.contains("server realm")),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_shared_receiver_satisfies_server_send() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("SharedReceiver")
+            net.Start("SharedReceiver")
+            net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_receive.lua",
+            r#"
+            net.Receive("SharedReceiver", function() end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(
+            count_diagnostic(
+                &diagnostics,
+                DiagnosticCode::GmodNetMissingNetworkCounterpart
+            ),
+            eq(0usize)
+        );
+    }
+
+    #[gtest]
+    fn test_never_called_sending_function_reports_missing_receiver_once() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("NeverCalled")
+
+            function SendNeverCalled()
+                net.Start("NeverCalled")
+                net.WriteString("hello")
+                net.Broadcast()
+            end
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(
+            count_diagnostic(
+                &diagnostics,
+                DiagnosticCode::GmodNetMissingNetworkCounterpart
+            ),
+            eq(1usize)
+        );
+    }
+
+    #[gtest]
+    fn test_menu_receiver_does_not_satisfy_server_send() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("MenuReceiver")
+            net.Start("MenuReceiver")
+            net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "lua/menu/receive.lua",
+            r#"
+            ---@realm menu
+
+            net.Receive("MenuReceiver", function() end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(missing_counterpart_messages(&diagnostics).len(), eq(1usize));
+    }
+
+    #[gtest]
+    fn test_menu_receiver_does_not_satisfy_uncalled_start_only_wrapper() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_prepare.lua",
+            r#"
+            util.AddNetworkString("Prepared")
+            function PrepareMessage()
+                net.Start("Prepared")
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/menu/receive.lua",
+            r#"
+            ---@realm menu
+
+            net.Receive("Prepared", function() end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(missing_counterpart_messages(&diagnostics).len(), eq(1usize));
+    }
+
+    #[gtest]
+    fn test_dead_branch_receiver_does_not_satisfy_uncalled_start_only_wrapper() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_prepare.lua",
+            r#"
+            util.AddNetworkString("PreparedDead")
+            function PrepareMessage()
+                net.Start("PreparedDead")
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/server/sv_dead.lua",
+            r#"
+            if CLIENT then
+                net.Receive("PreparedDead", function() end)
+            end
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(missing_counterpart_messages(&diagnostics).len(), eq(1usize));
+    }
+
+    #[gtest]
+    fn test_unreachable_receiver_with_a_live_pair_is_not_reported() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let send_id = ws.def_file(
+            "lua/autorun/server/sv_send.lua",
+            r#"
+            util.AddNetworkString("DeadBranch")
+            net.Start("DeadBranch")
+            net.Broadcast()
+            "#,
+        );
+        let receive_id = ws.def_file(
+            "lua/autorun/client/cl_receive.lua",
+            r#"
+            net.Receive("DeadBranch", function() end)
+            "#,
+        );
+        let dead_id = ws.def_file(
+            "lua/autorun/server/sv_dead.lua",
+            r#"
+            if CLIENT then
+                net.Receive("DeadBranch", function() end)
+            end
+            "#,
+        );
+        let orphan_id = ws.def_file(
+            "lua/autorun/client/cl_orphan.lua",
+            r#"
+            net.Receive("Orphan", function() end)
+            "#,
+        );
+
+        for file_id in [send_id, receive_id, dead_id] {
+            let diagnostics = file_diagnostics(&mut ws, file_id);
+            expect_that!(missing_counterpart_messages(&diagnostics).len(), eq(0usize));
+        }
+        let diagnostics = file_diagnostics(&mut ws, orphan_id);
+        expect_that!(missing_counterpart_messages(&diagnostics).len(), eq(1usize));
+    }
+
+    fn nested_guard_missing_count(send_path: &str, send_text: &str, receive_text: &str) -> usize {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+        let send_id = ws.def_file(send_path, send_text);
+        ws.def_file("lua/autorun/sh_receive.lua", receive_text);
+        let diagnostics = file_diagnostics(&mut ws, send_id);
+        missing_counterpart_messages(&diagnostics).len()
+    }
+
+    #[gtest]
+    fn test_server_inside_client_guard_receiver_does_not_satisfy_server_send() {
+        let missing = nested_guard_missing_count(
+            "lua/autorun/server/sv_send.lua",
+            r#"
+            util.AddNetworkString("NestedDead")
+            net.Start("NestedDead")
+            net.Broadcast()
+            "#,
+            r#"
+            if SERVER then
+                if CLIENT then
+                    net.Receive("NestedDead", function() end)
+                end
+            end
+            "#,
+        );
+        expect_that!(missing, eq(1usize));
+    }
+
+    #[gtest]
+    fn test_client_inside_server_guard_receiver_does_not_satisfy_client_send() {
+        let missing = nested_guard_missing_count(
+            "lua/autorun/client/cl_send.lua",
+            r#"
+            net.Start("NestedDeadUp")
+            net.SendToServer()
+            "#,
+            r#"
+            if CLIENT then
+                if SERVER then
+                    net.Receive("NestedDeadUp", function() end)
+                end
+            end
+            "#,
+        );
+        expect_that!(missing, eq(1usize));
+    }
+
+    #[gtest]
+    fn test_same_realm_nested_guard_receiver_satisfies_send() {
+        let missing = nested_guard_missing_count(
+            "lua/autorun/server/sv_send.lua",
+            r#"
+            util.AddNetworkString("NestedLive")
+            net.Start("NestedLive")
+            net.Broadcast()
+            "#,
+            r#"
+            if CLIENT then
+                if CLIENT then
+                    net.Receive("NestedLive", function() end)
+                end
+            end
+            "#,
+        );
+        expect_that!(missing, eq(0usize));
+    }
+
+    #[gtest]
+    fn test_unreachable_client_branch_receiver_does_not_satisfy_server_send() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_send.lua",
+            r#"
+            util.AddNetworkString("DeadBranch")
+            net.Start("DeadBranch")
+            net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/server/sv_dead.lua",
+            r#"
+            if CLIENT then
+                net.Receive("DeadBranch", function() end)
+            end
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(missing_counterpart_messages(&diagnostics).len(), eq(1usize));
+    }
+
+    #[gtest]
+    fn test_complete_wrapped_server_send_does_not_satisfy_server_receiver() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_example.lua",
+            r#"
+            util.AddNetworkString("Direction")
+            function SendDirection()
+                net.Start("Direction")
+                net.Broadcast()
+            end
+            hook.Add("PlayerInitialSpawn", "Direction", SendDirection)
+            net.Receive("Direction", function() end)
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/cl_example.lua",
+            r#"
+            net.Receive("Direction", function() end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        let messages = missing_counterpart_messages(&diagnostics);
+        assert_that!(messages.len(), eq(1usize));
+        expect_that!(
+            messages[0].contains("sending counterpart") && messages[0].contains("client realm"),
+            eq(true)
+        );
+    }
+
+    /// The call in `file_id` whose callee is the name `callee` names two
+    /// inferred signatures and no declared or unique one.
+    fn assert_ambiguous_callee(ws: &VirtualWorkspace, file_id: crate::FileId, callee: &str) {
+        let db = ws.analysis.compilation.get_db();
+        let root = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("the file is parsed")
+            .get_chunk_node();
+        let call = root
+            .descendants::<LuaCallExpr>()
+            .find(|call| {
+                call.get_prefix_expr()
+                    .is_some_and(|prefix| prefix.syntax().text() == callee)
+            })
+            .expect("the callee is called");
+        let target = db
+            .get_call_target_index()
+            .target(file_id, call.get_range())
+            .expect("the call's target is stored");
+        expect_that!(target.declared, eq(None));
+        expect_that!(target.unique, eq(None));
+        expect_that!(target.inferred.len(), eq(2usize));
+        expect_that!(target.inferred[0] != target.inferred[1], eq(true));
+    }
+
+    fn ambiguous_callee_mismatch_count(writers_first: bool, pairs_reversed: bool) -> usize {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteTypeMismatch);
+
+        let put_text = r#"
+            ---@param value any
+            ---@[net_payload("write", "string")]
+            function PutText(value) net.WriteString(value) end
+        "#;
+        let put_flag = r#"
+            ---@param value any
+            ---@[net_payload("write", "bool")]
+            function PutFlag(value) net.WriteBool(value) end
+        "#;
+        let get_flag = r#"
+            ---@return boolean
+            ---@[net_payload("read", "bool")]
+            function GetFlag() return net.ReadBool() end
+        "#;
+        let get_text = r#"
+            ---@return string
+            ---@[net_payload("read", "string")]
+            function GetText() return net.ReadString() end
+        "#;
+        let (writers, readers) = if pairs_reversed {
+            (
+                format!("{put_flag}{put_text}"),
+                format!("{get_text}{get_flag}"),
+            )
+        } else {
+            (
+                format!("{put_text}{put_flag}"),
+                format!("{get_flag}{get_text}"),
+            )
+        };
+        let library = if writers_first {
+            format!("{writers}{readers}")
+        } else {
+            format!("{readers}{writers}")
+        };
+        ws.def_file("lua/autorun/sh_choice_lib.lua", &library);
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_send.lua",
+            r#"
+            local useText = math.random() > 0.5
+            local writer = useText and PutText or PutFlag
+            util.AddNetworkString("Choice")
+            net.Start("Choice")
+            writer(useText and "hello" or true)
+            net.Broadcast()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/cl_receive.lua",
+            r#"
+            net.Receive("Choice", function()
+                local useText = math.random() > 0.5
+                local reader = useText and GetText or GetFlag
+                local value = reader()
+            end)
+            "#,
+        );
+
+        assert_ambiguous_callee(&ws, server_file_id, "writer");
+        assert_ambiguous_callee(&ws, client_file_id, "reader");
+        let server = file_diagnostics(&mut ws, server_file_id);
+        let client = file_diagnostics(&mut ws, client_file_id);
+        count_diagnostic(&server, DiagnosticCode::GmodNetReadWriteTypeMismatch)
+            + count_diagnostic(&client, DiagnosticCode::GmodNetReadWriteTypeMismatch)
+    }
+
+    #[gtest]
+    fn test_ambiguous_callee_alternatives_report_no_mismatch_writers_first() {
+        expect_that!(ambiguous_callee_mismatch_count(true, false), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_ambiguous_callee_alternatives_report_no_mismatch_readers_first_pairs_reversed() {
+        expect_that!(ambiguous_callee_mismatch_count(false, true), eq(0usize));
     }
 
     #[gtest]
@@ -3100,5 +3678,807 @@ mod tests {
             .get_gmod_network_index()
             .canonical_op_name("string", NetOpDirection::Read);
         expect_that!(canonical, eq(Some("net.ReadString")));
+    }
+
+    #[gtest]
+    fn test_sender_tie_break_uses_byte_order_of_path() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteTypeMismatch);
+
+        ws.def_file(
+            "lua/autorun/server/alpha.lua",
+            r#"
+            util.AddNetworkString("Msg")
+            net.Start("Msg")
+            net.WriteBool(true)
+            net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/server/Zeta.lua",
+            r#"
+            net.Start("Msg")
+            net.WriteEntity(e)
+            net.Broadcast()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("Msg", function()
+                local x = net.ReadString()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        assert_that!(
+            count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteTypeMismatch),
+            eq(1usize)
+        );
+        expect_that!(
+            diagnostics[0]
+                .message
+                .contains("expected `net.ReadEntity`, got `net.ReadString`"),
+            eq(true)
+        );
+    }
+
+    const PANEL_HELPER_PATH: &str = "gamemodes/cityrp/gamemode/core/libraries/cl_panel_net.lua";
+    const PANEL_CALLER_PATH: &str = "gamemodes/cityrp/plugins/deco/derma/cl_store.lua";
+
+    fn method_helper_receiver_realms(helper: &str, call: &str) -> Vec<GmodRealm> {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(PANEL_HELPER_PATH, helper);
+        let client_file_id = ws.def_file(PANEL_CALLER_PATH, call);
+        ws.get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(client_file_id)
+            .map(|data| {
+                data.send_flows
+                    .iter()
+                    .filter(|flow| flow.message_name == "deco_orderadd")
+                    .map(|flow| flow.send_kind.receiver_realm)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[gtest]
+    fn test_dot_defined_helper_called_as_method_binds_receiver_first() {
+        let realms = method_helper_receiver_realms(
+            r#"
+            PanelNet = {}
+            PanelNet.NetMessage = function(pnl, name)
+                net.Start(name)
+                net.SendToServer()
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd")
+            "#,
+        );
+        expect_that!(realms, elements_are![eq(&GmodRealm::Server)]);
+    }
+
+    #[gtest]
+    fn test_colon_defined_helper_called_with_explicit_receiver_binds_self() {
+        let realms = method_helper_receiver_realms(
+            r#"
+            PanelNet = {}
+            function PanelNet:NetMessage(name)
+                net.Start(name)
+                net.SendToServer()
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            PanelNet.NetMessage(button, "deco_orderadd")
+            "#,
+        );
+        expect_that!(realms, elements_are![eq(&GmodRealm::Server)]);
+    }
+
+    #[gtest]
+    fn test_helper_stored_on_local_table_resolves_as_method() {
+        let realms = method_helper_receiver_realms(
+            r#"
+            local classes = {}
+            classes.NetMessage = function(pnl, name)
+                net.Start(name)
+                net.SendToServer()
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd")
+            "#,
+        );
+        expect_that!(realms, elements_are![eq(&GmodRealm::Server)]);
+    }
+
+    #[gtest]
+    fn test_helper_in_a_local_table_constructor_resolves_as_method() {
+        let realms = method_helper_receiver_realms(
+            r#"
+            local classes = {
+                NetMessage = function(pnl, name)
+                    net.Start(name)
+                    net.SendToServer()
+                end,
+            }
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd")
+            "#,
+        );
+        expect_that!(realms, elements_are![eq(&GmodRealm::Server)]);
+    }
+
+    #[gtest]
+    fn test_a_local_tables_method_leaves_a_unique_global_helper_resolvable() {
+        let realms = method_helper_receiver_realms(
+            r#"
+            PanelNet = {}
+            PanelNet.NetMessage = function(pnl, name)
+                net.Start(name)
+                net.SendToServer()
+            end
+            local logger = {}
+            function logger:NetMessage(text)
+                print(text)
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd")
+            "#,
+        );
+        expect_that!(realms, elements_are![eq(&GmodRealm::Server)]);
+    }
+
+    #[gtest]
+    fn test_helper_sending_from_click_handler_counts_as_client_send() {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(
+            PANEL_HELPER_PATH,
+            r#"
+            local classes = {}
+            classes.On = function(pnl, name, fn)
+                pnl[name] = fn
+            end
+            classes.NetMessage = function(pnl, name, data)
+                pnl:On("DoClick", function()
+                    net.Start(name)
+                    data(pnl)
+                    net.SendToServer()
+                end)
+            end
+            "#,
+        );
+        ws.def_file(
+            PANEL_CALLER_PATH,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", function() end)
+            "#,
+        );
+        let server_file_id = ws.def_file(
+            "gamemodes/cityrp/plugins/deco/sv_plugin.lua",
+            r#"
+            util.AddNetworkString("deco_orderadd")
+            net.Receive("deco_orderadd", function(len, ply) end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(
+            count_diagnostic(
+                &diagnostics,
+                DiagnosticCode::GmodNetMissingNetworkCounterpart
+            ),
+            eq(0usize)
+        );
+    }
+
+    #[gtest]
+    fn test_click_handler_parameter_shadowing_helper_parameter_does_not_bind() {
+        let realms = method_helper_receiver_realms(
+            r#"
+            local classes = {}
+            classes.On = function(pnl, name, fn)
+                pnl[name] = fn
+            end
+            classes.NetMessage = function(pnl, name)
+                pnl:On("DoClick", function(name)
+                    net.Start(name)
+                    net.SendToServer()
+                end)
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd")
+            "#,
+        );
+        expect_that!(realms, is_empty());
+    }
+
+    const TDLIB_NET_MESSAGE: &str = r#"
+            local classes = {}
+            classes.On = function(pnl, name, fn)
+                pnl[name] = fn
+            end
+            classes.NetMessage = function(pnl, name, data)
+                pnl:On("DoClick", function()
+                    net.Start(name)
+                    data(pnl)
+                    net.SendToServer()
+                end)
+            end
+            "#;
+
+    const DECO_ORDER_RECEIVER: &str = r#"
+            util.AddNetworkString("deco_orderadd")
+            net.Receive("deco_orderadd", function(len, ply)
+                local item = net.ReadString()
+                local quantity = net.ReadUInt(16)
+            end)
+            "#;
+
+    /// The network diagnostics on the `deco_orderadd` receiver once `helper`
+    /// and `caller` are loaded, and the writes of the caller's send flows.
+    fn deco_order_check(helper: &str, caller: &str) -> (usize, Vec<Vec<String>>) {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(PANEL_HELPER_PATH, helper);
+        let client_file_id = ws.def_file(PANEL_CALLER_PATH, caller);
+        let server_file_id = ws.def_file(
+            "gamemodes/cityrp/plugins/deco/sv_plugin.lua",
+            DECO_ORDER_RECEIVER,
+        );
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        let writes = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(client_file_id)
+            .map(|data| {
+                data.send_flows
+                    .iter()
+                    .filter(|flow| flow.message_name == "deco_orderadd")
+                    .map(|flow| {
+                        flow.writes
+                            .iter()
+                            .map(|write| write.op.wire_format.as_str().to_string())
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (count_network_diagnostics(&diagnostics), writes)
+    }
+
+    #[gtest]
+    fn test_helper_payload_written_by_caller_closure_is_checked() {
+        let (diagnostics, writes) = deco_order_check(
+            TDLIB_NET_MESSAGE,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", function()
+                net.WriteString("chair")
+                net.WriteUInt(2, 16)
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(0usize));
+        expect_that!(
+            writes,
+            elements_are![elements_are![eq("string"), eq("uint")]]
+        );
+    }
+
+    #[gtest]
+    fn test_helper_payload_written_by_caller_closure_reports_a_mismatch() {
+        let (diagnostics, writes) = deco_order_check(
+            TDLIB_NET_MESSAGE,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", function()
+                net.WriteString("chair")
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(writes, elements_are![elements_are![eq("string")]]);
+    }
+
+    #[gtest]
+    fn test_helper_payload_written_by_named_local_function_is_checked() {
+        let (diagnostics, writes) = deco_order_check(
+            TDLIB_NET_MESSAGE,
+            r#"
+            local function writeOrder()
+                net.WriteString("chair")
+            end
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", writeOrder)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(writes, elements_are![elements_are![eq("string")]]);
+    }
+
+    #[gtest]
+    fn test_helper_payload_written_by_unresolvable_function_is_not_checked() {
+        let (diagnostics, _) = deco_order_check(
+            TDLIB_NET_MESSAGE,
+            r#"
+            local PANEL = {}
+            function PANEL:Init()
+                local button = vgui.Create("DButton", self)
+                button:NetMessage("deco_orderadd", self.WriteOrder)
+            end
+            "#,
+        );
+        expect_that!(diagnostics, eq(0usize));
+    }
+
+    #[gtest]
+    fn test_writer_forwarded_through_two_helpers_is_checked() {
+        let (diagnostics, writes) = deco_order_check(
+            r#"
+            local classes = {}
+            classes.Send = function(pnl, name, data)
+                net.Start(name)
+                data(pnl)
+                net.SendToServer()
+            end
+            classes.NetMessage = function(pnl, name, data)
+                pnl:Send(name, data)
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", function()
+                net.WriteString("chair")
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(writes, elements_are![elements_are![eq("string")]]);
+    }
+
+    #[gtest]
+    fn test_writer_passed_to_a_payload_helper_is_checked() {
+        let (diagnostics, writes) = deco_order_check(
+            r#"
+            local function writeWith(write)
+                write()
+            end
+            local classes = {}
+            classes.NetMessage = function(pnl, name, data)
+                net.Start(name)
+                writeWith(data)
+                net.SendToServer()
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", function()
+                net.WriteString("chair")
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(writes, elements_are![elements_are![eq("string")]]);
+    }
+
+    #[gtest]
+    fn test_writer_passed_through_two_payload_helpers_is_checked() {
+        let (diagnostics, writes) = deco_order_check(
+            r#"
+            local function writeWith(write)
+                write()
+            end
+            local function writeVia(write)
+                writeWith(write)
+            end
+            local classes = {}
+            classes.NetMessage = function(pnl, name, data)
+                net.Start(name)
+                writeVia(data)
+                net.SendToServer()
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", function()
+                net.WriteString("chair")
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(writes, elements_are![elements_are![eq("string")]]);
+    }
+
+    #[gtest]
+    fn test_callback_parameter_shadowing_the_writer_is_not_bound() {
+        let (diagnostics, _) = deco_order_check(
+            r#"
+            local classes = {}
+            classes.On = function(pnl, name, fn)
+                pnl[name] = fn
+            end
+            classes.NetMessage = function(pnl, name, data)
+                pnl:On("DoClick", function(_, _, data)
+                    net.Start(name)
+                    data(pnl)
+                    net.SendToServer()
+                end)
+            end
+            "#,
+            r#"
+            local button = vgui.Create("DButton")
+            button:NetMessage("deco_orderadd", function()
+                net.WriteString("chair")
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(0usize));
+    }
+
+    const LISTEN_HELPER: &str = r#"
+            function Listen(name, reader)
+                net.Receive(name, function(len, ply)
+                    reader(ply)
+                end)
+            end
+            "#;
+
+    const ORDER_SENDER: &str = r#"
+            net.Start("OrderPlaced")
+            net.WriteString("chair")
+            net.SendToServer()
+            "#;
+
+    /// The network diagnostics across the files once `helper`, `caller` and a
+    /// client sending `OrderPlaced` with one string are loaded, and the reads
+    /// and opacity of the caller's `OrderPlaced` receive flows.
+    fn order_listen_check(helper: &str, caller: &str) -> (usize, Vec<(Vec<String>, bool)>) {
+        let mut ws = new_gmod_workspace();
+        let helper_file_id = ws.def_file("lua/autorun/server/sv_listen.lua", helper);
+        let caller_file_id = ws.def_file("lua/autorun/server/sv_orders.lua", caller);
+        let client_file_id = ws.def_file("lua/autorun/client/cl_order.lua", ORDER_SENDER);
+        let diagnostics = [helper_file_id, caller_file_id, client_file_id]
+            .into_iter()
+            .map(|file_id| count_network_diagnostics(&file_diagnostics(&mut ws, file_id)))
+            .sum::<usize>();
+        let reads = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(caller_file_id)
+            .map(|data| {
+                data.receive_flows
+                    .iter()
+                    .filter(|flow| flow.message_name == "OrderPlaced")
+                    .map(|flow| {
+                        let reads = flow
+                            .reads
+                            .iter()
+                            .map(|read| read.op.wire_format.as_str().to_string())
+                            .collect();
+                        (reads, flow.reads_opaque)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (diagnostics, reads)
+    }
+
+    #[gtest]
+    fn test_receive_reading_through_a_passed_reader_is_checked() {
+        let (diagnostics, reads) = order_listen_check(
+            LISTEN_HELPER,
+            r#"
+            Listen("OrderPlaced", function(ply)
+                local item = net.ReadString()
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(0usize));
+        expect_that!(
+            reads,
+            elements_are![eq(&(vec!["string".to_string()], false))]
+        );
+    }
+
+    #[gtest]
+    fn test_receive_reading_through_a_passed_reader_reports_a_mismatch() {
+        let (diagnostics, reads) = order_listen_check(
+            LISTEN_HELPER,
+            r#"
+            Listen("OrderPlaced", function(ply)
+                local item = net.ReadString()
+                local quantity = net.ReadUInt(16)
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(
+            reads,
+            elements_are![eq(&(vec!["string".to_string(), "uint".to_string()], false))]
+        );
+    }
+
+    #[gtest]
+    fn test_receive_reading_through_a_named_local_reader_is_checked() {
+        let (diagnostics, reads) = order_listen_check(
+            LISTEN_HELPER,
+            r#"
+            local function readOrder(ply)
+                local item = net.ReadString()
+                local quantity = net.ReadUInt(16)
+            end
+            Listen("OrderPlaced", readOrder)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(
+            reads,
+            elements_are![eq(&(vec!["string".to_string(), "uint".to_string()], false))]
+        );
+    }
+
+    #[gtest]
+    fn test_receive_reading_through_an_unresolvable_reader_is_not_checked() {
+        let (diagnostics, reads) = order_listen_check(
+            LISTEN_HELPER,
+            r#"
+            local PANEL = {}
+            function PANEL:Init()
+                Listen("OrderPlaced", self.ReadOrder)
+            end
+            "#,
+        );
+        expect_that!(diagnostics, eq(0usize));
+        expect_that!(reads, elements_are![eq(&(Vec::<String>::new(), true))]);
+    }
+
+    #[gtest]
+    fn test_reader_forwarded_through_two_helpers_is_checked() {
+        let (diagnostics, reads) = order_listen_check(
+            r#"
+            local function register(name, reader)
+                net.Receive(name, function(len, ply)
+                    reader(ply)
+                end)
+            end
+            function Listen(name, reader)
+                register(name, reader)
+            end
+            "#,
+            r#"
+            Listen("OrderPlaced", function(ply)
+                local item = net.ReadString()
+                local quantity = net.ReadUInt(16)
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(
+            reads,
+            elements_are![eq(&(vec!["string".to_string(), "uint".to_string()], false))]
+        );
+    }
+
+    #[gtest]
+    fn test_reader_passed_as_the_receive_callback_is_checked() {
+        let (diagnostics, reads) = order_listen_check(
+            r#"
+            function Listen(name, reader)
+                net.Receive(name, reader)
+            end
+            "#,
+            r#"
+            Listen("OrderPlaced", function(len, ply)
+                local item = net.ReadString()
+                local quantity = net.ReadUInt(16)
+            end)
+            "#,
+        );
+        expect_that!(diagnostics, eq(1usize));
+        expect_that!(
+            reads,
+            elements_are![eq(&(vec!["string".to_string(), "uint".to_string()], false))]
+        );
+    }
+
+    #[gtest]
+    fn test_send_calling_a_writer_parameter_is_not_counted_as_empty() {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(
+            "lua/autorun/client/cl_order.lua",
+            r#"
+            function SendOrder(writePayload)
+                net.Start("OrderPlaced")
+                writePayload()
+                net.SendToServer()
+            end
+            "#,
+        );
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_order.lua",
+            r#"
+            util.AddNetworkString("OrderPlaced")
+            net.Receive("OrderPlaced", function(len, ply)
+                local item = net.ReadString()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_receive_calling_a_utility_that_runs_an_unbound_callback_is_still_checked() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteOrderMismatch);
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_orders.lua",
+            r#"
+            local function safely(fn)
+                fn()
+            end
+            util.AddNetworkString("OrderPlaced")
+            net.Receive("OrderPlaced", function(len, ply)
+                safely(ply.OnOrder)
+                local item = net.ReadString()
+            end)
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/cl_order.lua",
+            r#"
+            net.Start("OrderPlaced")
+            net.WriteString("chair")
+            net.WriteUInt(2, 16)
+            net.SendToServer()
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(
+            count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteOrderMismatch),
+            eq(1usize)
+        );
+    }
+
+    #[gtest]
+    fn test_a_helper_calling_an_enclosing_functions_writer_leaves_the_payload_unchecked() {
+        let mut ws = new_gmod_workspace();
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_orders.lua",
+            r#"
+            util.AddNetworkString("OrderPlaced")
+            net.Receive("OrderPlaced", function(len, ply)
+                local item = net.ReadString()
+                local count = net.ReadUInt(16)
+            end)
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/cl_order.lua",
+            r#"
+            function SendOrder(writer)
+                local function body()
+                    net.WriteString("chair")
+                    writer()
+                end
+                net.Start("OrderPlaced")
+                body()
+                net.SendToServer()
+            end
+            SendOrder(function() net.WriteUInt(2, 16) end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_a_receive_handing_an_enclosing_functions_reader_to_a_utility_is_unchecked() {
+        let mut ws = new_gmod_workspace();
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_orders.lua",
+            r#"
+            local function safely(fn, ...)
+                fn(...)
+            end
+            util.AddNetworkString("OrderPlaced")
+            function Listen(reader)
+                net.Receive("OrderPlaced", function(len, ply)
+                    safely(reader, ply)
+                end)
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/cl_order.lua",
+            r#"
+            net.Start("OrderPlaced")
+            net.WriteString("chair")
+            net.SendToServer()
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_a_start_helper_that_writes_after_its_start_leaves_the_payload_unchecked() {
+        let mut ws = new_gmod_workspace();
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_orders.lua",
+            r#"
+            util.AddNetworkString("OrderPlaced")
+            net.Receive("OrderPlaced", function(len, ply)
+                local version = net.ReadUInt(8)
+                local item = net.ReadString()
+            end)
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/cl_order.lua",
+            r#"
+            local function Begin(name)
+                net.Start(name)
+                net.WriteUInt(1, 8)
+            end
+            Begin("OrderPlaced")
+            net.WriteString("chair")
+            net.SendToServer()
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_a_send_helper_that_writes_before_its_send_leaves_the_payload_unchecked() {
+        let mut ws = new_gmod_workspace();
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/sv_orders.lua",
+            r#"
+            util.AddNetworkString("OrderPlaced")
+            net.Receive("OrderPlaced", function(len, ply)
+                local item = net.ReadString()
+                local count = net.ReadUInt(8)
+            end)
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/cl_order.lua",
+            r#"
+            local function Finish()
+                net.WriteUInt(1, 8)
+                net.SendToServer()
+            end
+            net.Start("OrderPlaced")
+            net.WriteString("chair")
+            Finish()
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
     }
 }

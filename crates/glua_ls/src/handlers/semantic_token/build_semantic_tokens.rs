@@ -544,11 +544,8 @@ fn build_node_semantic_token(
                         );
                     }
                     LuaExpr::IndexExpr(index_expr) => {
-                        let position = index_expr.syntax().text_range().start();
-                        let len = index_expr.syntax().text_range().len();
-                        builder.push_at_position(
-                            position,
-                            len.into(),
+                        builder.push_range_force(
+                            index_expr.syntax().text_range(),
                             SemanticTokenType::VARIABLE,
                             None,
                         );
@@ -652,7 +649,7 @@ fn build_node_semantic_token(
                 true,
             )
             .unwrap_or_else(|| {
-                // 改进：为未知名称提供更好的默认分类
+                // Improvement: provide a better default classification for unknown names
                 let name_text = name_token.get_name_text();
                 builder.push(
                     name_token.syntax(),
@@ -828,7 +825,7 @@ fn build_node_semantic_token(
                 || name_text == "userdata"
                 || name_text == "thread"
             {
-                // Lua内置类型
+                // Lua built-in types
                 builder.push_with_modifier(
                     name.syntax(),
                     SemanticTokenType::TYPE,
@@ -878,7 +875,7 @@ fn build_node_semantic_token(
             }
         }
         LuaAst::LuaIndexExpr(index_expr) => {
-            // 处理模块前缀
+            // Handle the module prefix
             if let Some(LuaExpr::NameExpr(prefix_name_expr)) = index_expr.get_prefix_expr()
                 && let Some(prefix_name) = prefix_name_expr.get_name_token()
                 && !builder.contains_token(prefix_name.syntax())
@@ -1028,7 +1025,7 @@ fn build_node_semantic_token(
                 return Some(());
             }
 
-            // 默认情况：检查是否在调用上下文中
+            // Default case: check whether it is in a call context
             if index_expr
                 .syntax()
                 .parent()
@@ -1173,12 +1170,11 @@ fn build_node_semantic_token(
                 }
                 return None;
             }
-            // 如果文档的开始是 #, 则需要将其渲染为注释而不是文档
+            // If the doc starts with #, render it as a comment instead of a doc
             if let Some(start_token) = description.tokens::<LuaGeneralToken>().next() {
                 if start_token.get_text().starts_with('#') {
-                    builder.push_at_position(
-                        start_token.get_range().start(),
-                        1,
+                    builder.push_range_force(
+                        TextRange::at(start_token.get_range().start(), 1.into()),
                         SemanticTokenType::COMMENT,
                         None,
                     );
@@ -1220,15 +1216,15 @@ fn build_node_semantic_token(
             }
         }
         LuaAst::LuaDocTagAttributeUse(tag_use) => {
-            // 给 `@[` 染色
+            // Color `@[`
             if let Some(token) = tag_use.token_by_kind(LuaTokenKind::TkDocAttributeUse) {
                 builder.push(token.syntax(), SemanticTokenType::KEYWORD);
             }
-            // `]`染色
+            // Color `]`
             if let Some(token) = tag_use.syntax().last_token() {
                 builder.push(&token, SemanticTokenType::KEYWORD);
             }
-            // 名称染色
+            // Color the name
             for attribute_use in tag_use.get_attribute_uses() {
                 if let Some(token) = attribute_use.get_type()?.get_name_token() {
                     builder.push_with_modifiers(
@@ -1259,12 +1255,12 @@ fn build_node_semantic_token(
             }
         }
         LuaAst::LuaDocInferType(infer_type) => {
-            // 推断出的泛型定义
+            // Inferred generic definition
             if let Some(gen_decl) = infer_type.get_generic_decl() {
                 render_type_parameter(builder, &gen_decl);
             }
             if let Some(name) = infer_type.token::<LuaNameToken>() {
-                // 应该单独设置颜色
+                // Should set the color separately
                 if name.get_name_text() == "infer" {
                     builder.push(name.syntax(), SemanticTokenType::COMMENT);
                 }
@@ -1276,7 +1272,7 @@ fn build_node_semantic_token(
     Some(())
 }
 
-// 处理`local a = class``local a = class.method/field`
+// Handle `local a = class` and `local a = class.method/field`
 fn handle_name_node(
     semantic_model: &SemanticModel,
     builder: &mut SemanticBuilder,
@@ -1485,7 +1481,7 @@ fn handle_name_node(
         _ => {}
     }
 
-    // 默认情况：如果不能确定类型，根据名称约定推断
+    // Default case: if the type cannot be determined, infer from naming conventions
     builder.push(
         name_token.syntax(),
         default_identifier_token_type(name_text),
@@ -1994,7 +1990,7 @@ fn render_desc_ranges(
     }
 }
 
-// 检查导入语句是否是类定义
+// Check whether the import statement is a class definition
 fn check_ref_is_require_def(
     semantic_model: &SemanticModel,
     decl: &LuaDecl,
@@ -2174,7 +2170,7 @@ fn expr_access_path_root_is_local(semantic_model: &SemanticModel, value_expr: &L
         .unwrap_or(false)
 }
 
-/// 是否为 `local x = require(...)` 的导入别名
+/// Whether it is an import alias of `local x = require(...)`
 fn is_require_decl(semantic_model: &SemanticModel, decl: &LuaDecl) -> bool {
     parse_require_module_info(semantic_model, decl).is_some()
 }

@@ -1,10 +1,20 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::hash::{Hash, Hasher};
 
 use glua_parser::{LuaAstPtr, LuaExpr, LuaSyntaxId};
 use internment::ArcIntern;
 use smol_str::SmolStr;
 
+use crate::db_index::derivation::{self, Fingerprint, Local};
 use crate::{FlowId, FlowNode, FlowNodeKind, LuaDeclId, LuaDefinitionId};
+
+/// Order-independent hash of a set's elements.
+fn unordered_fingerprint<T: Hash>(items: impl IntoIterator<Item = T>) -> Fingerprint {
+    items
+        .into_iter()
+        .map(|item| derivation::fingerprint_of(&item))
+        .fold(0, u64::wrapping_add)
+}
 
 /// File-wide summary of which variables/paths can possibly be narrowed by the
 /// backward flow walk. Used to skip the (expensive) walk entirely for variable
@@ -30,8 +40,18 @@ pub struct FileNarrowingCapability {
     /// respectively to stay sound.
     pub has_opaque_name_target: bool,
     pub has_opaque_index_target: bool,
-    /// Condition flow nodes keyed by stable index path.
-    pub condition_flows_by_path: HashMap<ArcIntern<SmolStr>, HashSet<FlowId>>,
+}
+
+/// Names hash by their text: an interned name hashes its pointer, which a name
+/// freed and interned again does not keep.
+impl Hash for FileNarrowingCapability {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        unordered_fingerprint(self.referenced_names.iter().map(|name| name.as_str())).hash(state);
+        unordered_fingerprint(self.referenced_index_paths.iter().map(|path| path.as_str()))
+            .hash(state);
+        self.has_opaque_name_target.hash(state);
+        self.has_opaque_index_target.hash(state);
+    }
 }
 
 impl FileNarrowingCapability {
@@ -45,10 +65,6 @@ impl FileNarrowingCapability {
     pub fn index_path_can_be_narrowed(&self, path: &ArcIntern<SmolStr>) -> bool {
         self.has_opaque_index_target || self.referenced_index_paths.contains(path)
     }
-
-    fn condition_flows(&self, path: &ArcIntern<SmolStr>) -> Option<&HashSet<FlowId>> {
-        self.condition_flows_by_path.get(path)
-    }
 }
 
 /// Metadata for BranchLabel nodes that enables the merge-skip optimisation.
@@ -58,7 +74,7 @@ impl FileNarrowingCapability {
 /// all branches are alive), the merge is guaranteed to produce the same type as
 /// the node before the branch (`common_predecessor`).  The walk can skip
 /// directly to that predecessor, turning an O(branches × depth) merge into O(1).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct BranchLabelInfo {
     /// FlowId of the node immediately before the if/elseif/else split.
     pub common_predecessor: FlowId,
@@ -80,6 +96,10 @@ pub struct BranchLabelInfo {
     /// This lets the flow walk skip branch merges for variables unrelated to
     /// assignments and inner conditions in the branch.
     pub narrowing_capability: FileNarrowingCapability,
+    /// The part of `narrowing_capability` the branches write rather than only
+    /// test: a variable outside it keeps the value it had at
+    /// `common_predecessor` on every branch, narrowed at most.
+    pub written_capability: FileNarrowingCapability,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -87,6 +107,18 @@ pub struct AssignmentFlowInfo {
     pub name_targets: Vec<AssignmentNameTarget>,
     pub index_paths: Vec<ArcIntern<SmolStr>>,
     pub has_unknown_index_target: bool,
+}
+
+/// Paths hash by their text, as in [`FileNarrowingCapability`].
+impl Hash for AssignmentFlowInfo {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name_targets.hash(state);
+        self.index_paths.len().hash(state);
+        for path in &self.index_paths {
+            path.as_str().hash(state);
+        }
+        self.has_unknown_index_target.hash(state);
+    }
 }
 
 #[cfg(test)]
@@ -119,11 +151,12 @@ mod tests {
         infos: Vec<AssignmentFlowInfo>,
     ) -> FlowTree {
         FlowTree::new(
-            HashMap::new(),
+            HashMap::default(),
             nodes,
             branches,
-            HashMap::new(),
-            HashMap::new(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
             infos,
             FileNarrowingCapability::default(),
         )
@@ -347,7 +380,7 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AssignmentNameTarget {
     pub decl_id: LuaDeclId,
     pub target_idx: u16,
@@ -361,75 +394,83 @@ impl AssignmentFlowInfo {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FlowTree {
     decl_bind_expr_ref: HashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
     flow_nodes: Vec<FlowNode>,
-    multiple_antecedents: Vec<Vec<FlowId>>,
+    multiple_antecedents: Vec<Box<[FlowId]>>,
     // labels: HashMap<LuaClosureId, HashMap<SmolStr, FlowId>>,
     bindings: HashMap<LuaSyntaxId, FlowId>,
     /// Per-BranchLabel metadata used to skip redundant merges.
     branch_label_info: HashMap<FlowId, BranchLabelInfo>,
-    assignment_flow_info: Vec<AssignmentFlowInfo>,
+    /// Branch labels reached only by one condition's outcomes, mapped to the
+    /// node the condition is evaluated from.
+    condition_label_entries: HashMap<FlowId, FlowId>,
+    assignment_flow_info: Vec<Option<Box<AssignmentFlowInfo>>>,
     narrowing_capability: FileNarrowingCapability,
 }
 
 impl FlowTree {
     pub fn new(
         decl_bind_expr_ref: HashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
-        flow_nodes: Vec<FlowNode>,
+        mut flow_nodes: Vec<FlowNode>,
         multiple_antecedents: Vec<Vec<FlowId>>,
         // labels: HashMap<LuaClosureId, HashMap<SmolStr, FlowId>>,
         bindings: HashMap<LuaSyntaxId, FlowId>,
         branch_label_info: HashMap<FlowId, BranchLabelInfo>,
+        condition_label_entries: HashMap<FlowId, FlowId>,
         assignment_flow_info: Vec<AssignmentFlowInfo>,
-        mut narrowing_capability: FileNarrowingCapability,
+        narrowing_capability: FileNarrowingCapability,
     ) -> Self {
-        let mut successors = vec![Vec::new(); flow_nodes.len()];
-        for node in &flow_nodes {
-            let Some(antecedent) = &node.antecedent else {
-                continue;
-            };
-            match antecedent {
-                crate::FlowAntecedent::Single(antecedent) => {
-                    if let Some(flow_successors) = successors.get_mut(antecedent.0 as usize) {
-                        flow_successors.push(node.id);
-                    }
-                }
-                crate::FlowAntecedent::Multiple(id) => {
-                    if let Some(antecedents) = multiple_antecedents.get(*id as usize) {
-                        for antecedent in antecedents {
-                            if let Some(flow_successors) = successors.get_mut(antecedent.0 as usize)
-                            {
-                                flow_successors.push(node.id);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for reachable in narrowing_capability.condition_flows_by_path.values_mut() {
-            let mut pending = reachable.iter().copied().collect::<Vec<_>>();
-            while let Some(flow_id) = pending.pop() {
-                let Some(flow_successors) = successors.get(flow_id.0 as usize) else {
-                    continue;
-                };
-                for successor in flow_successors {
-                    if reachable.insert(*successor) {
-                        pending.push(*successor);
-                    }
-                }
-            }
-        }
+        flow_nodes.shrink_to_fit();
+        let mut multiple_antecedents = multiple_antecedents
+            .into_iter()
+            .map(Vec::into_boxed_slice)
+            .collect::<Vec<_>>();
+        multiple_antecedents.shrink_to_fit();
+        let mut assignment_flow_info = assignment_flow_info
+            .into_iter()
+            .map(|info| (!info.is_empty()).then(|| Box::new(info)))
+            .collect::<Vec<_>>();
+        assignment_flow_info.shrink_to_fit();
         Self {
             decl_bind_expr_ref,
             flow_nodes,
             multiple_antecedents,
             bindings,
             branch_label_info,
+            condition_label_entries,
             assignment_flow_info,
             narrowing_capability,
         }
+    }
+
+    /// Content hash of everything the tree's accessors can observe, with its
+    /// positions hashed as positions of the file being fingerprinted.
+    pub fn content_fingerprint(&self) -> Fingerprint {
+        derivation::fingerprint_of(&(
+            unordered_fingerprint(
+                self.decl_bind_expr_ref
+                    .iter()
+                    .map(|(decl_id, ptr)| (decl_id, Local(&ptr.syntax_id))),
+            ),
+            &self.flow_nodes,
+            &self.multiple_antecedents,
+            unordered_fingerprint(
+                self.bindings
+                    .iter()
+                    .map(|(syntax_id, flow_id)| (Local(syntax_id), flow_id)),
+            ),
+            unordered_fingerprint(&self.branch_label_info),
+            unordered_fingerprint(&self.condition_label_entries),
+            &self.assignment_flow_info,
+            &self.narrowing_capability,
+        ))
+    }
+
+    /// How many name and index expressions the file's flow analysis bound.
+    pub fn binding_count(&self) -> usize {
+        self.bindings.len()
     }
 
     pub fn get_narrowing_capability(&self) -> &FileNarrowingCapability {
@@ -444,20 +485,10 @@ impl FlowTree {
         self.flow_nodes.get(flow_id.0 as usize)
     }
 
-    pub fn has_condition_path_antecedent(
-        &self,
-        flow_id: FlowId,
-        path: &ArcIntern<SmolStr>,
-    ) -> bool {
-        self.narrowing_capability
-            .condition_flows(path)
-            .is_some_and(|flows| flows.contains(&flow_id))
-    }
-
     pub fn get_multi_antecedents(&self, id: u32) -> Option<&[FlowId]> {
         self.multiple_antecedents
             .get(id as usize)
-            .map(|v| v.as_slice())
+            .map(|antecedents| &**antecedents)
     }
 
     pub fn get_decl_ref_expr(&self, decl_id: &LuaDeclId) -> Option<LuaAstPtr<LuaExpr>> {
@@ -468,9 +499,58 @@ impl FlowTree {
         self.branch_label_info.get(&flow_id)
     }
 
+    pub fn get_condition_label_entry(&self, flow_id: FlowId) -> Option<FlowId> {
+        self.condition_label_entries.get(&flow_id).copied()
+    }
+
     pub fn get_assignment_flow_info(&self, flow_id: FlowId) -> Option<&AssignmentFlowInfo> {
-        let info = self.assignment_flow_info.get(flow_id.0 as usize)?;
-        (!info.is_empty()).then_some(info)
+        self.assignment_flow_info
+            .get(flow_id.0 as usize)?
+            .as_deref()
+    }
+
+    /// Whether every live path back from `flow_id` meets a node that `settle`
+    /// answers `Some(true)` for before it meets one answering `Some(false)`, the
+    /// start of the flow, or a deferred closure's entry.
+    pub fn every_path_settles(
+        &self,
+        flow_id: FlowId,
+        mut settle: impl FnMut(&FlowNode) -> Option<bool>,
+    ) -> bool {
+        let mut pending = vec![flow_id];
+        let mut visited = HashSet::default();
+
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            let Some(node) = self.get_flow_node(current) else {
+                return false;
+            };
+            if let Some(settled) = settle(node) {
+                if settled {
+                    continue;
+                }
+                return false;
+            }
+
+            match node.kind {
+                FlowNodeKind::Unreachable | FlowNodeKind::Return | FlowNodeKind::Break => continue,
+                FlowNodeKind::Start | FlowNodeKind::ClosureEntry(_) => return false,
+                _ => {}
+            }
+            match node.antecedent {
+                Some(crate::FlowAntecedent::Single(antecedent)) => pending.push(antecedent),
+                Some(crate::FlowAntecedent::Multiple(index)) => {
+                    let Some(antecedents) = self.get_multi_antecedents(index) else {
+                        return false;
+                    };
+                    pending.extend(antecedents.iter().copied());
+                }
+                None => return false,
+            }
+        }
+        true
     }
 
     pub fn reaching_definitions(
@@ -480,7 +560,7 @@ impl FlowTree {
     ) -> std::sync::Arc<[LuaDefinitionId]> {
         let mut definitions = Vec::new();
         let mut pending = vec![flow_id];
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
 
         while let Some(current) = pending.pop() {
             if !visited.insert(current) {

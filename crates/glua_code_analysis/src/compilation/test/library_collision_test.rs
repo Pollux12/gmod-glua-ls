@@ -29,6 +29,34 @@ mod tests {
         return guarded
     "#;
 
+    /// `lib_a` is the earlier configured library, so its declaration must own
+    /// the `Choice` alias: `Choice<string, integer>` resolves to `string`.
+    const ALIAS_FIRST: &str = r#"
+        ---@meta
+        ---@alias Choice<A, B> A
+    "#;
+
+    /// Same arity with swapped formal names; if the shadowed declaration wins,
+    /// `Choice<string, integer>` resolves to `integer` instead of `string`.
+    const ALIAS_SECOND: &str = r#"
+        ---@meta
+        ---@alias Choice<B, A> A
+    "#;
+
+    /// Conflicting generic constraints: the earlier library constrains `T` to
+    /// `string`, the shadowed one to `integer`. Because template params are
+    /// positional, this independently proves the winning declaration's
+    /// constraint vector is the one consumers are checked against.
+    const CONSTRAINED_ALIAS_FIRST: &str = r#"
+        ---@meta
+        ---@alias Choice<T: string> T
+    "#;
+
+    const CONSTRAINED_ALIAS_SECOND: &str = r#"
+        ---@meta
+        ---@alias Choice<T: integer> T
+    "#;
+
     fn workspace_with_libraries(libraries: &[&str]) -> VirtualWorkspace {
         let mut workspace = VirtualWorkspace::new();
         for library in libraries {
@@ -247,6 +275,7 @@ mod tests {
         workspace
             .analysis
             .remove_file_by_uri(&preferred_uri)
+            .0
             .expect("preferred library file should exist");
         assert!(
             workspace
@@ -266,6 +295,7 @@ mod tests {
         workspace
             .analysis
             .update_file_by_uri(&preferred_uri, Some(DUPLICATE_ANNOTATIONS.to_string()))
+            .map(|(id, _)| id)
             .expect("preferred library file should reopen");
         assert_eq!(workspace.analysis.library_definition_collisions().len(), 1);
         assert_eq!(
@@ -353,5 +383,179 @@ mod tests {
         );
         assert!(warning.contains("2 types, 2 members"));
         assert!(warning.contains("Critter:IsBird"));
+    }
+
+    #[test]
+    fn earlier_library_alias_wins_regardless_of_ingestion_order() {
+        let mut defined_first = workspace_with_libraries(&["lib_a", "lib_b"]);
+        defined_first.def_file("lib_a/annotations.lua", ALIAS_FIRST);
+        defined_first.def_file("lib_b/annotations.lua", ALIAS_SECOND);
+
+        let mut defined_second = workspace_with_libraries(&["lib_a", "lib_b"]);
+        defined_second.def_file("lib_b/annotations.lua", ALIAS_SECOND);
+        defined_second.def_file("lib_a/annotations.lua", ALIAS_FIRST);
+
+        for workspace in [&mut defined_first, &mut defined_second] {
+            let consumer = workspace.ty("Choice<string, integer>");
+            assert!(
+                workspace.check_type(&consumer, &crate::LuaType::String),
+                "earlier library alias must resolve Choice<string, integer> to string"
+            );
+            assert!(
+                !workspace.check_type(&consumer, &crate::LuaType::Integer),
+                "shadowed library alias must not resolve Choice<string, integer> to integer"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_winner_survives_delete_and_reopen_lifecycle() {
+        let mut workspace = workspace_with_libraries(&["lib_a", "lib_b"]);
+        let winner_uri = workspace
+            .virtual_url_generator
+            .new_uri("lib_a/annotations.lua");
+        workspace.def_file("lib_b/annotations.lua", ALIAS_SECOND);
+        workspace.def_file("lib_a/annotations.lua", ALIAS_FIRST);
+
+        let consumer = workspace.ty("Choice<string, integer>");
+        assert!(workspace.check_type(&consumer, &crate::LuaType::String));
+
+        // Removing the winning declaration exposes the shadowed survivor.
+        workspace
+            .analysis
+            .remove_file_by_uri(&winner_uri)
+            .0
+            .expect("winner library file should exist");
+        let survivor = workspace.ty("Choice<string, integer>");
+        assert!(
+            workspace.check_type(&survivor, &crate::LuaType::Integer),
+            "surviving library alias must resolve Choice<string, integer> to integer"
+        );
+
+        // Reopening restores the earlier configured library as the winner.
+        workspace
+            .analysis
+            .update_file_by_uri(&winner_uri, Some(ALIAS_FIRST.to_string()))
+            .map(|(id, _)| id)
+            .expect("winner library file should reopen");
+        let restored = workspace.ty("Choice<string, integer>");
+        assert!(
+            workspace.check_type(&restored, &crate::LuaType::String),
+            "reopened earlier library alias must resolve Choice<string, integer> to string"
+        );
+    }
+
+    #[test]
+    fn alias_declarations_keep_their_registration_namespace() {
+        let mut workspace = VirtualWorkspace::new();
+        workspace.def_file(
+            "lua/autorun/shared/namespaces.lua",
+            "---@alias Root string\n---@namespace First\n---@alias Value integer\n---@namespace Second\n---@alias Value boolean",
+        );
+        for (name, expected) in [
+            ("Root", crate::LuaType::String),
+            ("First.Value", crate::LuaType::Integer),
+            ("Second.Value", crate::LuaType::Boolean),
+        ] {
+            let typ = workspace.ty(name);
+            let db = workspace.analysis.compilation.get_db();
+            assert_eq!(crate::resolve_alias_type(db, &typ).typ, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn using_namespace_does_not_redirect_alias_declaration() {
+        let mut workspace = VirtualWorkspace::new();
+        workspace.def_file(
+            "lua/autorun/shared/imported.lua",
+            "---@namespace Imported\n---@alias Value integer",
+        );
+        workspace.def_file(
+            "lua/autorun/shared/own.lua",
+            "---@using Imported\n---@alias Value string",
+        );
+        let imported = workspace.ty("Imported.Value");
+        let own = workspace.ty("Value");
+        let db = workspace.analysis.compilation.get_db();
+        assert_eq!(
+            crate::resolve_alias_type(db, &imported).typ,
+            crate::LuaType::Integer
+        );
+        assert_eq!(
+            crate::resolve_alias_type(db, &own).typ,
+            crate::LuaType::String
+        );
+    }
+
+    #[test]
+    fn earlier_library_alias_constraint_governs_consumer_checks() {
+        let mut workspace = workspace_with_libraries(&["lib_a", "lib_b"]);
+        workspace.def_file("lib_a/annotations.lua", CONSTRAINED_ALIAS_FIRST);
+        workspace.def_file("lib_b/annotations.lua", CONSTRAINED_ALIAS_SECOND);
+
+        let satisfied = workspace.def_file(
+            "consumer_ok.lua",
+            r#"
+            ---@type Choice<string>
+            local ok
+            "#,
+        );
+        let violated = workspace.def_file(
+            "consumer_bad.lua",
+            r#"
+            ---@type Choice<integer>
+            local bad
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_count(
+                &mut workspace,
+                satisfied,
+                DiagnosticCode::GenericConstraintMismatch
+            ),
+            0,
+            "Choice<string> must satisfy the earlier library's `T: string` constraint"
+        );
+        assert_eq!(
+            diagnostic_count(
+                &mut workspace,
+                violated,
+                DiagnosticCode::GenericConstraintMismatch
+            ),
+            1,
+            "Choice<integer> must violate the earlier library's `T: string` constraint"
+        );
+    }
+
+    /// Annotations load, and elect writes, ahead of the workspace, as the std
+    /// lib does, wherever the two sit on disk: here the library's path sorts
+    /// after the workspace's files.
+    #[test]
+    fn an_annotation_file_orders_before_every_workspace_file_wherever_it_lives() {
+        let mut ws = VirtualWorkspace::new();
+        let library_root = ws.virtual_url_generator.new_path("zz_annotations");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("gm.lua")).unwrap();
+        let (library_file, _) = ws
+            .analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    "---@class GM
+"
+                    .to_string(),
+                ),
+            )
+            .expect("the library file is indexed");
+        let workspace_file = ws.def_file(
+            "gamemode/core/sv_hooks.lua",
+            "local hooks = {}
+",
+        );
+
+        let vfs = ws.analysis.compilation.get_db().get_vfs();
+        assert!(vfs.file_order_key(&library_file) < vfs.file_order_key(&workspace_file));
     }
 }

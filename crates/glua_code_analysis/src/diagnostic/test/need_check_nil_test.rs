@@ -1,4 +1,628 @@
 #[cfg(test)]
+mod null_accepting_argument_tests {
+    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
+
+    fn creator_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut config = Emmyrc::default();
+        config.gmod.enabled = true;
+        ws.update_emmyrc(config);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/entity_creator.lua",
+            r#"
+            ---@class Entity
+            Entity = {}
+            ---@class NULL: Entity
+            local NullEntity = {}
+            ---@class Player: Entity
+            local Player = {}
+            ---@type NULL
+            NULL = nil
+            ---@realm server
+            ---@param ply Entity|NULL|nil
+            function Entity:SetCreator(ply) end
+            ---@param owner Entity
+            function Entity:SetOwner(owner) end
+            function Entity:GetPos() end
+            ---@param value any
+            ---@return boolean
+            function isentity(value) end
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            ---@[valid_guard]
+            function IsValid(value) end
+        "#,
+        );
+        ws
+    }
+
+    #[test]
+    fn a_truthiness_guard_only_excuses_null_accepting_value_arguments() {
+        for (body, warns) in [
+            ("if ply then vehicle:SetCreator(ply) end", false),
+            (
+                "if ply then vehicle:SetCreator(ply); ply:GetPos() end",
+                true,
+            ),
+            (
+                "if ply then vehicle:SetCreator(ply) end; ply:GetPos()",
+                true,
+            ),
+            (
+                "if ply then if flag then vehicle:SetCreator(ply) else vehicle:SetOwner(ply) end end",
+                true,
+            ),
+            ("if ply then vehicle:SetOwner(ply) end", true),
+            ("if ( ply ) then vehicle:SetCreator( ply ) end", false),
+            (
+                "if ( ply ) then vehicle:SetCreator( ply ) end; if ( IsValid(ply) ) then vehicle:SetOwner(ply) end",
+                false,
+            ),
+            ("if ply ~= nil then vehicle:SetCreator(ply) end", false),
+            ("if ply ~= nil then vehicle:SetOwner(ply) end", true),
+            (
+                "if ply ~= nil then vehicle:SetCreator(ply or NULL) end",
+                false,
+            ),
+            ("if ply ~= nil then vehicle:SetOwner(ply or NULL) end", true),
+            ("if ply ~= nil then local position = ply:GetPos() end", true),
+        ] {
+            let mut ws = creator_workspace();
+            let file = ws.def_file(
+                "gamemodes/sandbox/gamemode/commands.lua",
+                &format!(
+                    r#"
+                    ---@param ply Player|NULL|nil
+                    ---@param vehicle Entity
+                    ---@param flag boolean
+                    function SpawnVehicle(ply, vehicle, flag)
+                        {body}
+                    end
+                "#
+                ),
+            );
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::GmodNullCheck);
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file, CancellationToken::new())
+                .unwrap();
+            let count = diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code
+                        == Some(NumberOrString::String(
+                            DiagnosticCode::GmodNullCheck.get_name().to_string(),
+                        ))
+                })
+                .count();
+            assert_eq!(count, usize::from(warns), "{body}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn a_truthiness_test_on_a_variant_holding_null_is_not_an_entity_validity_test() {
+        let mut ws = creator_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::GmodNullCheck,
+            r#"
+            ---@return number|boolean|string|Entity|NULL
+            function GetSetting() end
+
+            local function save()
+                if GetSetting() then
+                    return true
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_truthiness_test_on_a_false_or_null_entity_still_reports() {
+        let mut ws = creator_workspace();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::GmodNullCheck,
+            r#"
+            ---@return Entity|NULL|false
+            function GetEntityOrFalse() end
+
+            local function save()
+                if GetEntityOrFalse() then
+                    return true
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_nil_comparison_followed_only_by_comparisons_still_reports() {
+        let mut ws = creator_workspace();
+        let file = ws.def_file(
+            "gamemodes/sandbox/entities/entities/gmod_wheel.lua",
+            r#"
+            ---@param owner Player|NULL|nil
+            ---@param activator Entity
+            function UseWheel(owner, activator)
+                if owner == nil or owner == activator then
+                    return true
+                end
+            end
+        "#,
+        );
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNullCheck);
+        let reports = ws
+            .analysis
+            .diagnose_file(file, CancellationToken::new())
+            .unwrap();
+        let comparisons = reports
+            .iter()
+            .filter(|report| report.message.contains("comparing to nil"))
+            .count();
+        assert_eq!(comparisons, 1, "{reports:?}");
+    }
+
+    /// The engine's util.lua redefines `isentity` and `type` without annotations; handing the
+    /// value to such a parameter claims nothing about its validity.
+    #[test]
+    fn creator_nil_default_checked_by_an_undocumented_redefinition_does_not_claim_validity() {
+        for (branch, warns) in [("", false), ("else ply:GetPos()", true)] {
+            let mut ws = creator_workspace();
+            ws.def_file(
+                "lua/includes/util.lua",
+                r#"
+                local C_type = type
+                function type( v )
+                    return C_type( v )
+                end
+                function isentity( v )
+                    if ( C_type( v ) == "userdata" ) then
+                        local vMeta = getmetatable( v )
+                        return vMeta ~= nil and vMeta.MetaName == "Entity"
+                    end
+                    return false
+                end
+            "#,
+            );
+            let file = ws.def_file("lua/includes/extensions/entity.lua", &format!(r#"
+                local meta = Entity
+                if SERVER then
+                    ---@param ply Entity|NULL|nil
+                    function meta:SetCreator( ply )
+                        if ( ply == nil ) then
+                            ply = NULL
+                        elseif ( !isentity( ply ) ) then
+                            error( "bad argument #1 to 'SetCreator' (Entity expected, got " .. type( ply ) .. ")", 2 )
+                        {branch}
+                        end
+                        self.m_PlayerCreator = ply
+                    end
+                end
+            "#));
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::GmodNullCheck);
+            let reports = ws
+                .analysis
+                .diagnose_file(file, CancellationToken::new())
+                .unwrap();
+            let comparisons = reports
+                .iter()
+                .filter(|report| report.message.contains("comparing to nil"))
+                .count();
+            assert_eq!(comparisons, usize::from(warns), "{branch}: {reports:?}");
+        }
+    }
+
+    #[test]
+    fn a_null_accepting_declaration_from_another_realm_does_not_describe_the_call() {
+        let contract = "---@param value any
+---@return string
+function AuditSink(value) end";
+        for (path, source) in [
+            ("lua/autorun/client/a_contract.lua", contract.to_string()),
+            (
+                "lua/autorun/a_contract.lua",
+                format!(
+                    "if CLIENT then
+{contract}
+end"
+                ),
+            ),
+        ] {
+            let mut ws = creator_workspace();
+            ws.def_file(path, &source);
+            ws.def_file(
+                "lua/autorun/server/sv_sink.lua",
+                "function AuditSink(v) return v:GetClass() end",
+            );
+            let file = ws.def_file(
+                "lua/includes/extensions/entity.lua",
+                r#"
+                if SERVER then
+                    ---@param ply Entity|NULL|nil
+                    function Entity:AuditCreator(ply)
+                        if ply ~= nil then AuditSink(ply) end
+                    end
+                end
+            "#,
+            );
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::GmodNullCheck);
+            let reports = ws
+                .analysis
+                .diagnose_file(file, CancellationToken::new())
+                .unwrap();
+            let comparisons = reports
+                .iter()
+                .filter(|report| report.message.contains("comparing to nil"))
+                .count();
+            assert_eq!(comparisons, 1, "{path}: {reports:?}");
+        }
+    }
+
+    #[test]
+    fn a_shared_call_requires_null_accepting_contracts_in_every_execution_realm() {
+        let callers = [
+            ("", "AuditSink"),
+            ("local sink = AuditSink", "sink"),
+            ("local box = {sink = AuditSink}", "box.sink"),
+        ];
+        for ((prelude, callee), server_contract) in callers.into_iter().flat_map(|caller| {
+            ["", "---@param v Entity", "---@param v any"].map(|contract| (caller, contract))
+        }) {
+            let mut ws = creator_workspace();
+            ws.def_file(
+                "lua/autorun/client/a_contract.lua",
+                "---@param value any\n---@return string\nfunction AuditSink(value) end",
+            );
+            ws.def_file(
+                "lua/autorun/server/sv_sink.lua",
+                &format!("{server_contract}\nfunction AuditSink(v) return v:GetClass() end"),
+            );
+            let text = format!(
+                "{prelude}\n---@param ply Entity|NULL|nil\nfunction Entity:AuditCreator(ply)\n    if ply ~= nil then {callee}(ply) end\nend"
+            );
+            let file = ws.def_file("lua/includes/extensions/entity.lua", &text);
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::GmodNullCheck);
+            let reports = ws
+                .analysis
+                .diagnose_file(file, CancellationToken::new())
+                .unwrap();
+            let actual = reports
+                .iter()
+                .map(|report| (report.range, report.code.clone(), report.message.clone()))
+                .collect::<Vec<_>>();
+            let expected = if server_contract == "---@param v any" {
+                vec![]
+            } else {
+                vec![(lsp_types::Range::new(lsp_types::Position::new(3, 7), lsp_types::Position::new(3, 17)),
+                    Some(NumberOrString::String(DiagnosticCode::GmodNullCheck.get_name().to_string())),
+                    "ply may be NULL; comparing to nil does not prove entity validity, use IsValid(...) instead".to_string())]
+            };
+            assert_eq!(actual, expected, "{callee} {server_contract}");
+        }
+    }
+
+    #[test]
+    fn every_definition_of_a_realm_dependent_global_must_accept_null() {
+        let definitions = [
+            (
+                "---@param value any
+function _G.AuditSink(value) end",
+                "function _G.AuditSink(v) return v:GetClass() end",
+                "AuditSink",
+            ),
+            (
+                "---@param value any
+local function accepting(value) end
+AuditSink = accepting",
+                "function AuditSink(v) return v:GetClass() end",
+                "AuditSink",
+            ),
+            (
+                "AuditAPI = {}
+---@param value any
+function AuditAPI.Sink(value) end",
+                "AuditAPI = {}
+function AuditAPI.Sink(v) return v:GetClass() end",
+                "AuditAPI.Sink",
+            ),
+        ];
+        let callees = |global: &str| {
+            let mut callees = vec![
+                (String::new(), global.to_string()),
+                (format!("local sink = {global}"), "sink".to_string()),
+                (
+                    format!("local box = {{sink = {global}}}"),
+                    "box.sink".to_string(),
+                ),
+            ];
+            if let Some(key) = global.strip_prefix("AuditAPI.") {
+                callees.push(("local api = AuditAPI".to_string(), format!("api.{key}")));
+            }
+            callees
+        };
+        for (client, server, global) in definitions {
+            for ((prelude, callee), server_contract) in
+                callees(global).into_iter().flat_map(|callee| {
+                    ["", "---@param v any"].map(|contract| (callee.clone(), contract))
+                })
+            {
+                let mut ws = creator_workspace();
+                ws.def_file("lua/autorun/client/a_contract.lua", client);
+                ws.def_file(
+                    "lua/autorun/server/sv_sink.lua",
+                    &server.replace(
+                        "function",
+                        &format!(
+                            "{server_contract}
+function"
+                        ),
+                    ),
+                );
+                let text = format!(
+                    "{prelude}
+---@param ply Entity|NULL|nil
+function Entity:AuditCreator(ply)
+    if ply ~= nil then {callee}(ply) end
+end"
+                );
+                let file = ws.def_file("lua/includes/extensions/entity.lua", &text);
+                ws.analysis
+                    .diagnostic
+                    .enable_only(DiagnosticCode::GmodNullCheck);
+                let ranges = ws
+                    .analysis
+                    .diagnose_file(file, CancellationToken::new())
+                    .unwrap()
+                    .into_iter()
+                    .map(|report| report.range)
+                    .collect::<Vec<_>>();
+                let expected = if server_contract.is_empty() {
+                    vec![lsp_types::Range::new(
+                        lsp_types::Position::new(3, 7),
+                        lsp_types::Position::new(3, 17),
+                    )]
+                } else {
+                    vec![]
+                };
+                assert_eq!(ranges, expected, "{client} | {callee} | {server_contract}");
+            }
+        }
+    }
+
+    #[test]
+    fn creator_nil_default_and_storage_do_not_claim_entity_validity() {
+        for (branch, warns) in [("", false), ("else ply:GetPos()", true)] {
+            let mut ws = creator_workspace();
+            let file = ws.def_file("lua/includes/extensions/entity.lua", &format!(r#"
+                local meta = Entity
+                if SERVER then
+                    ---@param ply Entity|NULL|nil
+                    function meta:SetCreator( ply )
+                        if ( ply == nil ) then
+                            ply = NULL
+                        elseif ( !isentity( ply ) ) then
+                            error( "bad argument #1 to 'SetCreator' (Entity expected, got " .. type( ply ) .. ")", 2 )
+                        {branch}
+                        end
+                        self.m_PlayerCreator = ply
+                    end
+                end
+            "#));
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::GmodNullCheck);
+            let reports = ws
+                .analysis
+                .diagnose_file(file, CancellationToken::new())
+                .unwrap();
+            let comparisons = reports
+                .iter()
+                .filter(|report| report.message.contains("comparing to nil"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                comparisons.len(),
+                usize::from(warns),
+                "{branch}: {reports:?}"
+            );
+            if !warns {
+                assert!(reports.is_empty(), "{reports:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod null_receiver_severity_tests {
+    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace, config::DiagnosticSeveritySetting};
+    use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
+    use tokio_util::sync::CancellationToken;
+
+    fn diagnostics(
+        return_type: &str,
+        body: &str,
+        severity: Option<DiagnosticSeveritySetting>,
+    ) -> Vec<Diagnostic> {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        if let Some(severity) = severity {
+            let mut config = Emmyrc::default();
+            config
+                .diagnostics
+                .severity
+                .insert(DiagnosticCode::NeedCheckNil, severity);
+            ws.update_emmyrc(config);
+        }
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/includes/null_constructor_contract.lua",
+            &format!(
+                r#"
+                ---@class Entity
+                ---@class NULL: Entity
+                ---@class widget_axis_arrow: Entity
+                ---@field SetAxisIndex fun(self: widget_axis_arrow, axis: integer)
+                ents = {{}}
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return {return_type}
+                function ents.Create(class) end
+                ---@param value any
+                ---@return TypeGuard<any>
+                ---@return_cast value -NULL
+                function IsValid(value) end
+                "#
+            ),
+        );
+        let file = ws.def_file("lua/entities/widget_axis/init.lua", body);
+        let receiver_codes = [
+            DiagnosticCode::NeedCheckNil,
+            DiagnosticCode::UncheckedNilAccess,
+            DiagnosticCode::GmodNullCheck,
+        ];
+        ws.analysis
+            .diagnose_file(file, CancellationToken::new())
+            .unwrap()
+            .into_iter()
+            .filter(|diagnostic| {
+                receiver_codes.iter().any(|code| {
+                    diagnostic.code == Some(NumberOrString::String(code.get_name().to_string()))
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unchecked_fallible_constructor_null_receiver_is_a_hint() {
+        for return_type in ["(instance) T|NULL", "(instance) T|NULL|nil"] {
+            let diagnostics = diagnostics(
+                return_type,
+                "local e = ents.Create('widget_axis_arrow'); e:SetAxisIndex(1)",
+                None,
+            );
+            assert_eq!(diagnostics.len(), 1, "{return_type}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::HINT));
+            assert_eq!(
+                diagnostics[0].code,
+                Some(NumberOrString::String(
+                    DiagnosticCode::NeedCheckNil.get_name().to_string()
+                ))
+            );
+            assert!(diagnostics[0].message.contains("NULL"), "{diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn isvalid_guarded_fallible_constructor_receiver_is_safe() {
+        for body in [
+            "local e = ents.Create('widget_axis_arrow'); if IsValid(e) then e:SetAxisIndex(1) end",
+            "local e = ents.Create('widget_axis_arrow'); if not IsValid(e) then return end; e:SetAxisIndex(1)",
+        ] {
+            assert!(diagnostics("T|NULL", body, None).is_empty(), "{body}");
+        }
+    }
+
+    #[test]
+    fn plain_nil_receiver_severities_are_unchanged() {
+        for (return_type, code, severity) in [
+            (
+                "T|nil",
+                DiagnosticCode::NeedCheckNil,
+                DiagnosticSeverity::HINT,
+            ),
+            (
+                "nil",
+                DiagnosticCode::UncheckedNilAccess,
+                DiagnosticSeverity::WARNING,
+            ),
+        ] {
+            let diagnostics = diagnostics(
+                return_type,
+                "local e = ents.Create('widget_axis_arrow'); e:SetAxisIndex(1)",
+                None,
+            );
+            assert_eq!(diagnostics.len(), 1, "{return_type}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].severity, Some(severity));
+            assert_eq!(
+                diagnostics[0].code,
+                Some(NumberOrString::String(code.get_name().to_string()))
+            );
+            assert_eq!(diagnostics[0].message, "e may be nil");
+        }
+    }
+
+    #[test]
+    fn invalidated_dynamic_slot_guard_keeps_null_receiver_severity_and_message() {
+        let body = r#"
+            ---@param slots table<string, widget_axis_arrow|NULL>
+            ---@param key string
+            local function replace(slots, key)
+                if not slots[key] then return end
+                slots[key] = ents.Create("widget_axis_arrow")
+                slots[key]:SetAxisIndex(1)
+            end
+        "#;
+        for (configured, expected) in [
+            (None, DiagnosticSeverity::HINT),
+            (
+                Some(DiagnosticSeveritySetting::Information),
+                DiagnosticSeverity::INFORMATION,
+            ),
+        ] {
+            let diagnostics = diagnostics("(instance) T|NULL", body, configured)
+                .into_iter()
+                .filter(|diagnostic| {
+                    diagnostic.code
+                        == Some(NumberOrString::String(
+                            DiagnosticCode::NeedCheckNil.get_name().to_string(),
+                        ))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            assert_eq!(diagnostics[0].severity, Some(expected));
+            assert_eq!(
+                diagnostics[0].code,
+                Some(NumberOrString::String(
+                    DiagnosticCode::NeedCheckNil.get_name().to_string()
+                ))
+            );
+            assert!(diagnostics[0].message.starts_with("slots[key] may be"));
+            assert!(diagnostics[0].message.contains("NULL"), "{diagnostics:?}");
+            assert!(
+                diagnostics[0].message.contains("IsValid"),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_null_receiver_severity_override_is_preserved() {
+        let diagnostics = diagnostics(
+            "T|NULL",
+            "local e = ents.Create('widget_axis_arrow'); e:SetAxisIndex(1)",
+            Some(DiagnosticSeveritySetting::Information),
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(DiagnosticSeverity::INFORMATION)
+        );
+    }
+}
+
+#[cfg(test)]
 mod test {
     use crate::{DiagnosticCode, Emmyrc, LuaSignatureId, VirtualWorkspace};
     use glua_parser::{LuaAstNode, LuaClosureExpr};
@@ -33,6 +657,67 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = true;
         ws.update_emmyrc(emmyrc);
         ws
+    }
+
+    #[test]
+    fn exhaustive_branch_returns_have_no_implicit_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let file_id = ws.def_file(
+            "gamemodes/terrortown/gamemode/cl_voice.lua",
+            r#"
+            local function drain(active, admin, detective)
+                if not active then return 0 end
+                if admin then
+                    return 1
+                elseif detective then
+                    return 2
+                else
+                    return 3
+                end
+            end
+            local function unreachable(active)
+                if active then return 1 else return 2 end
+                return nil
+            end
+            local function terminating(active)
+                if active then return 1 else error("inactive") end
+            end
+            local function looped(active)
+                for i = 1, 2 do
+                    if active then break else return 1 end
+                    return nil
+                end
+                return 2
+            end
+            local function partial(active)
+                if active then return 1 end
+            end
+            local function empty_branch(active)
+                if active then else return 1 end
+            end
+            local amount = drain(true, false, false) + 1
+            local reached = unreachable(true) + 1
+            local total = terminating(true) + 1
+            local loop_result = looped(true) + 1
+            local unsafe = partial(false) + 1
+            local also_unsafe = empty_branch(true) + 1
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap();
+        let mut messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        messages.sort();
+        assert_eq!(messages.len(), 2, "{diagnostics:?}");
+        assert!(messages[0].contains("empty_branch(true)"), "{messages:?}");
+        assert!(messages[1].contains("partial(false)"), "{messages:?}");
     }
 
     #[test]
@@ -179,6 +864,30 @@ mod test {
             function timer.Simple(delay, callback) end
             "#,
         );
+    }
+
+    #[test]
+    fn an_integer_index_on_a_known_class_or_an_unknown_value_is_not_nullable() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Angle
+            ---@field [1] number
+            ---@field [2] number
+            ---@return Angle
+            function Angle() end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function think(u)
+                local a = Angle()
+                if u then a = u end
+                return a[2] + 1
+            end
+            "#
+        ));
     }
 
     #[test]
@@ -1179,19 +1888,7 @@ mod test {
         );
     }
 
-    /// Known edge, no measured occurrences: an unresolved prefix reaches
-    /// `report_unsafe_receiver` as `FieldNotFound`, which that path reads as a
-    /// runtime `nil`, so the chain warns as if nil were proven.
-    ///
-    /// Both obvious fixes are worse than the edge. Skipping the
-    /// `FieldNotFound`→`nil` conversion when the prefix is unresolved breaks
-    /// four tests that rely on it to report genuinely absent fields (e.g.
-    /// `test_gmod_vehicle_sound_unguarded_turbo_parameter_field_reports_unchecked_nil`),
-    /// and returning `Ok(Unknown)` for an `Unknown` prefix in
-    /// `infer_member_by_index` breaks seven — `FieldNotFound` is what drives
-    /// unresolve deferral. Zero hits on CityRP (2035 files) and StarfallEx.
     #[test]
-    #[ignore = "known edge: unresolved prefix reads as proven nil; see doc comment"]
     fn test_unresolved_prefix_chain_is_not_warned() {
         let mut ws = VirtualWorkspace::new();
         assert_that!(
@@ -1205,6 +1902,25 @@ mod test {
             ),
             eq(true)
         );
+    }
+
+    #[test]
+    fn test_receiver_chain_distinguishes_unknown_from_missing_fields() {
+        for (declaration, clean) in [
+            ("local m = require(SomeUndefinedGlobal)", true),
+            ("---@type unknown\nlocal m", true),
+            ("---@class ReceiverChain\nlocal m = {}", false),
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert_that!(
+                ws.check_code_for(
+                    DiagnosticCode::UncheckedNilAccess,
+                    &format!("{declaration}\nm.foo.child:bar()"),
+                ),
+                eq(clean),
+                "{declaration}"
+            );
+        }
     }
 
     #[gtest]
@@ -1963,6 +2679,597 @@ mod test {
         );
     }
 
+    fn def_entity_or_null_fixture(ws: &mut VirtualWorkspace) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(ws);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+
+            ---@return Entity|NULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+    }
+
+    #[gtest]
+    fn test_nil_comparison_after_failed_isvalid_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local ply = GetEntityOrNULL()
+                if IsValid(ply) then
+                    ply:GetPos()
+                elseif ply ~= nil then
+                    print("disconnected")
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_nil_comparison_after_reassignment_reports_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        for code in [
+            r#"
+            local ent = GetEntityOrNULL()
+            if not IsValid(ent) then
+                ent = GetEntityOrNULL()
+                if ent ~= nil then print("replaced"); ent:GetPos() end
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if not IsValid(holder.ent) then
+                holder.ent = GetEntityOrNULL()
+                if holder.ent ~= nil then print("replaced"); holder.ent:GetPos() end
+            end
+            "#,
+        ] {
+            assert_that!(
+                ws.check_code_for(DiagnosticCode::GmodNullCheck, code),
+                eq(false)
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_nil_comparison_of_shadowing_local_reports_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local ent = GetEntityOrNULL()
+                if not IsValid(ent) then
+                    local ent = GetEntityOrNULL()
+                    if ent ~= nil then print("shadowed"); ent:GetPos() end
+                end
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_isvalid_inside_condition_closure_does_not_exempt_nil_comparison() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local ent = GetEntityOrNULL()
+                if (function() return IsValid(ent) end) then
+                    if ent ~= nil then print("closure"); ent:GetPos() end
+                end
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_truthiness_after_enclosing_isvalid_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local carry = { held = GetEntityOrNULL(), hack = GetEntityOrNULL() }
+                if (not IsValid(carry.held)) or (not IsValid(carry.hack)) then
+                    if (carry.held or carry.hack) then
+                        carry.held = nil
+                    end
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_validity_retested_at_head_of_truthy_block_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_entity_or_null_fixture(&mut ws);
+
+        for code in [
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if ( holder.ent ) then
+                if ( !IsValid( holder.ent ) ) then holder.ent = nil return end
+                holder.ent:GetPos()
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if enabled then
+                print("enabled")
+            elseif ( holder.ent ) then
+                if not IsValid( holder.ent ) then error("invalid") end
+                holder.ent:GetPos()
+            end
+            "#,
+        ] {
+            assert_that!(
+                ws.check_code_for(DiagnosticCode::GmodNullCheck, code),
+                eq(true),
+                "{code}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_truthy_block_without_exiting_head_validity_retest_reports_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        for code in [
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent then
+                if not IsValid(holder.ent) then goto use end
+                ::use::
+                holder.ent:GetPos()
+            end
+            "#,
+            r#"
+            local function IsValid(value) return true end
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent then
+                if not IsValid(holder.ent) then return end
+                holder.ent:GetPos()
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if ( holder.ent ) then
+                holder.ent:GetPos()
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if ( holder.ent ) then
+                if ( !IsValid( holder.ent ) ) then print("invalid") end
+                holder.ent:GetPos()
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL(), other = GetEntityOrNULL() }
+            if ( holder.ent ) then
+                if ( !IsValid( holder.other ) ) then return end
+                holder.ent:GetPos()
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if ( holder.ent ) then
+                print("before")
+                if ( !IsValid( holder.ent ) ) then return end
+                holder.ent:GetPos()
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if ( holder.ent ) then
+                if ( IsValid( holder.ent ) ) then return end
+                holder.ent:GetPos()
+            end
+            "#,
+        ] {
+            assert_that!(
+                ws.check_code_for(DiagnosticCode::GmodNullCheck, code),
+                eq(false),
+                "{code}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_nil_sentinel_followed_by_isvalid_exit_guard_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local holder = { ent = GetEntityOrNULL() }
+                if ( holder.ent == nil ) then return end
+                if ( !IsValid( holder.ent ) ) then holder.ent = nil return end
+                holder.ent:GetPos()
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_nil_sentinel_without_adjacent_isvalid_guard_reports_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        for code in [
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent == nil then return end
+            if not IsValid(holder.ent) then print("invalid") end
+            holder.ent:GetPos()
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent == nil then return end
+            if IsValid(holder.ent) then return end
+            holder.ent:GetPos()
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent ~= nil then holder.ent:GetPos() return end
+            if not IsValid(holder.ent) then return end
+            "#,
+            r#"
+            local function IsValid(value) return true end
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent == nil then return end
+            if not IsValid(holder.ent) then return end
+            holder.ent:GetPos()
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if ( holder.ent == nil ) then return end
+            holder.ent:GetPos()
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL(), other = GetEntityOrNULL() }
+            if ( holder.ent == nil ) then return end
+            if ( !IsValid( holder.other ) ) then return end
+            holder.ent:GetPos()
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if ( holder.ent == nil ) then return end
+            print("between")
+            if ( !IsValid( holder.ent ) ) then return end
+            holder.ent:GetPos()
+            "#,
+        ] {
+            assert_that!(
+                ws.check_code_for(DiagnosticCode::GmodNullCheck, code),
+                eq(false),
+                "{code}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_annotated_alternative_validity_exit_guards_do_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_entity_or_null_fixture(&mut ws);
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return boolean
+            ---@[valid_guard]
+            function EntityUsable(value) end
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function EntityPresent(value) end
+
+            ---@return boolean
+            ---@return_cast self -NULL
+            function Entity:IsValid() end
+            "#,
+        );
+
+        for guard in [
+            "EntityUsable(holder.ent)",
+            "EntityPresent(holder.ent)",
+            "holder.ent:IsValid()",
+        ] {
+            for code in [
+                format!(
+                    "local holder = {{ ent = GetEntityOrNULL() }}
+                    if holder.ent == nil then return end
+                    if not {guard} then return end
+                    holder.ent:GetPos()"
+                ),
+                format!(
+                    "local holder = {{ ent = GetEntityOrNULL() }}
+                    if (holder.ent) then
+                        if not {guard} then return end
+                        holder.ent:GetPos()
+                    end"
+                ),
+            ] {
+                assert_that!(
+                    ws.check_code_for(DiagnosticCode::GmodNullCheck, &code),
+                    eq(true),
+                    "{code}"
+                );
+            }
+        }
+    }
+
+    #[gtest]
+    fn test_validity_exit_guard_rejects_nested_jumps_and_ignores_nested_function_exits() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        for (body, safe) in [
+            ("if skip then goto use end\nreturn", false),
+            ("local function cleanup() return end", false),
+            (
+                "local function cleanup() goto done ::done:: return end\nreturn",
+                true,
+            ),
+        ] {
+            for (presence, close) in [
+                ("if holder.ent then", "end"),
+                ("if holder.ent == nil then return end", ""),
+            ] {
+                let code = format!(
+                    "local holder = {{ ent = GetEntityOrNULL() }}
+                    {presence}
+                        if not IsValid(holder.ent) then {body} end
+                        ::use::
+                        holder.ent:GetPos()
+                    {close}"
+                );
+                assert_that!(
+                    ws.check_code_for(DiagnosticCode::GmodNullCheck, &code),
+                    eq(safe),
+                    "{code}"
+                );
+            }
+        }
+    }
+
+    #[gtest]
+    fn test_shadowed_error_does_not_prove_validity_exit() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        for (shadow, finish) in [
+            ("local function error(message) print(message) end", ""),
+            (
+                "---@param error fun(message: any)\nlocal function use(error)",
+                "end",
+            ),
+        ] {
+            for (presence, close) in [
+                ("if holder.ent then", "end"),
+                ("if holder.ent == nil then return end", ""),
+            ] {
+                let code = format!(
+                    "{shadow}
+                    local holder = {{ ent = GetEntityOrNULL() }}
+                    {presence}
+                        if not IsValid(holder.ent) then error('invalid') end
+                        holder.ent:GetPos()
+                    {close}
+                    {finish}"
+                );
+                assert_that!(
+                    ws.check_code_for(DiagnosticCode::GmodNullCheck, &code),
+                    eq(false),
+                    "{code}"
+                );
+            }
+        }
+    }
+
+    #[gtest]
+    fn test_builtin_and_annotated_non_returning_validity_exits_are_accepted() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_entity_or_null_fixture(&mut ws);
+        ws.def(
+            r#"
+            ---@return never
+            function StopInvalid() end
+            "#,
+        );
+
+        for exit in ["error('invalid')", "StopInvalid()"] {
+            for (presence, close) in [
+                ("if (holder.ent) then", "end"),
+                ("if holder.ent == nil then return end", ""),
+            ] {
+                let code = format!(
+                    "local holder = {{ ent = GetEntityOrNULL() }}
+                    {presence}
+                        if not IsValid(holder.ent) then {exit} end
+                        holder.ent:GetPos()
+                    {close}"
+                );
+                assert_that!(
+                    ws.check_code_for(DiagnosticCode::GmodNullCheck, &code),
+                    eq(true),
+                    "{code}"
+                );
+            }
+        }
+    }
+
+    #[gtest]
+    fn test_validity_retest_after_unsafe_use_does_not_exempt_presence_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        for code in [
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent and holder.ent:GetPos() then
+                if not IsValid(holder.ent) then return end
+            end
+            "#,
+            r#"
+            local holder = { ent = GetEntityOrNULL() }
+            if holder.ent then
+                holder.ent:GetPos()
+                if not IsValid(holder.ent) then return end
+            end
+            "#,
+        ] {
+            assert_that!(
+                ws.check_code_for(DiagnosticCode::GmodNullCheck, code),
+                eq(false),
+                "{code}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_validity_loop_exit_requires_enclosing_loop_in_same_function() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        for exit in ["break", "continue"] {
+            for (start, finish, safe) in [
+                ("", "", false),
+                ("while true do", "break\nend", true),
+                (
+                    "while true do\nlocal function use()",
+                    "end\nbreak\nend",
+                    false,
+                ),
+            ] {
+                for (presence, close) in [
+                    ("if holder.ent then", "end"),
+                    ("if holder.ent == nil then return end", ""),
+                ] {
+                    let code = format!(
+                        "{start}
+                        local holder = {{ ent = GetEntityOrNULL() }}
+                        {presence}
+                            if not IsValid(holder.ent) then {exit} end
+                            holder.ent:GetPos()
+                        {close}
+                        {finish}"
+                    );
+                    assert_that!(
+                        ws.check_code_for(DiagnosticCode::GmodNullCheck, &code),
+                        eq(safe),
+                        "{code}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[gtest]
+    fn test_parenthesized_truthiness_without_isvalid_reports_each_operand() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::GmodNullCheck,
+            r#"
+            local held, hack = GetEntityOrNULL(), GetEntityOrNULL()
+            if (held or hack) then
+                print("holding")
+            end
+            "#,
+        );
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect::<Vec<_>>(),
+            unordered_elements_are![
+                eq("held may be NULL; NULL is truthy, use IsValid(...) to check entity validity"),
+                eq("hack may be NULL; NULL is truthy, use IsValid(...) to check entity validity"),
+            ]
+        );
+    }
+
+    #[gtest]
+    fn test_parenthesized_negation_of_created_entity_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local function MakeConstraint(enabled)
+                    local Constraint = nil
+                    if ( enabled ) then
+                        Constraint = GetEntityOrNULL()
+                        Constraint:GetPos()
+                    end
+                    return Constraint
+                end
+
+                local Constraint = MakeConstraint(true)
+                if ( not Constraint ) then return end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_method_call_after_failed_isvalid_truthiness_still_reports_null_receiver() {
+        let mut ws = VirtualWorkspace::new();
+        def_entity_or_null_fixture(&mut ws);
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local ent = GetEntityOrNULL()
+                if not IsValid(ent) then
+                    if ent then
+                        ent:GetPos()
+                    end
+                end
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
     #[gtest]
     fn test_negated_conjunction_early_return_guards_each_stable_operand() {
         let mut ws = VirtualWorkspace::new();
@@ -2074,10 +3381,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("dtree_node.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@class DListLayout
             local DListLayout = {}
             function DListLayout:Add() end
@@ -2089,9 +3397,10 @@ mod test {
             ---@outparam self.ChildNodes DListLayout
             function DTree_Node:CreateChildNodes() end
             "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let diagnostics = diagnostics_for_code(
             &mut ws,
@@ -6048,10 +7357,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("global.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@class Color
 
             ---@return Color
@@ -6067,9 +7377,10 @@ mod test {
             ---@param l number
             function _G.HSLToColor(h, s, l) end
         "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         ws.def_file(
             "lua/autorun/shared/sh_colors.lua",
@@ -6283,6 +7594,7 @@ mod test {
             ROLE_COLORS = {}
             COLOR_WHITE = { r = 255 }
 
+            ---@param color table
             local function ModifyColor(color, mode)
                 if mode == "bad" then
                     color = nil
@@ -7911,10 +9223,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("isvalid.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             ---@class Entity
             ---@field GetEditingData fun(self: Entity): table
             ---@class NULL : Entity
@@ -7924,9 +9237,10 @@ mod test {
             ---@return_cast toBeValidated -NULL
             function _G.IsValid(toBeValidated) end
             "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
@@ -7955,10 +9269,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("global.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                 ---@class Entity
                 ---@field GetEditingData fun(self: Entity): table
                 ---@class NULL : Entity
@@ -7969,9 +9284,10 @@ mod test {
                 ---@return_cast value -NULL
                 function _G.IsValid(value) end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
@@ -8269,6 +9585,156 @@ mod test {
             end
             "#,
         ));
+    }
+
+    #[gtest]
+    fn test_nullable_child_override_of_non_nullable_parent_member_is_flagged() {
+        // Issue 12: the first visible member hit (Child.value: string?) must
+        // decide nullability; the non-nullable Parent.value must not mask it.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class ParentNil12
+            ---@field value string
+
+            ---@class ChildNil12 : ParentNil12
+            ---@field value string?
+            "#,
+        );
+
+        let flagged = ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param child ChildNil12
+            local function test(child)
+                child.value:upper()
+            end
+            "#,
+        );
+        assert_that!(
+            flagged,
+            eq(false),
+            "Expected NeedCheckNil for nullable Child.value override"
+        );
+    }
+
+    #[gtest]
+    fn test_nullable_child_override_of_non_nullable_parent_member_is_flagged_in_arithmetic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class ParentNum12
+            ---@field amount number
+
+            ---@class ChildNum12 : ParentNum12
+            ---@field amount number?
+            "#,
+        );
+
+        let flagged = ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param child ChildNum12
+            local function test(child)
+                local total = child.amount + 1
+            end
+            "#,
+        );
+        assert_that!(
+            flagged,
+            eq(false),
+            "Expected NeedCheckNil for nullable Child.amount override in arithmetic"
+        );
+    }
+
+    #[gtest]
+    fn test_non_nullable_child_override_of_nullable_parent_member_is_suppressed() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class ParentOpt12
+            ---@field value string?
+
+            ---@class ChildConc12 : ParentOpt12
+            ---@field value string
+            "#,
+        );
+
+        let flagged = ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param child ChildConc12
+            local function test(child)
+                child.value:upper()
+            end
+            "#,
+        );
+        assert_that!(
+            flagged,
+            eq(true),
+            "Child.value (string) override decides; no NeedCheckNil"
+        );
+    }
+
+    #[gtest]
+    fn test_parent_member_decides_when_child_has_no_override() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class ParentStr12
+            ---@field value string
+
+            ---@class ChildNoDecl12 : ParentStr12
+            "#,
+        );
+
+        let suppressed = ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param child ChildNoDecl12
+            local function test(child)
+                child.value:upper()
+            end
+            "#,
+        );
+        assert_that!(
+            suppressed,
+            eq(true),
+            "Parent.value (string) decides when child has no override"
+        );
+    }
+
+    #[gtest]
+    fn test_nullable_parent_member_still_flagged_when_child_has_no_override() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class ParentOptOnly12
+            ---@field value string?
+
+            ---@class ChildNoDeclOpt12 : ParentOptOnly12
+            "#,
+        );
+
+        let flagged = ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param child ChildNoDeclOpt12
+            local function test(child)
+                child.value:upper()
+            end
+            "#,
+        );
+        assert_that!(
+            flagged,
+            eq(false),
+            "Parent.value (string?) decides when child has no override"
+        );
     }
 
     #[gtest]
@@ -8906,10 +10372,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("cl_lang.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
             LANG = {
                 Strings = {}
             }
@@ -8936,9 +10403,10 @@ mod test {
                 return LANG.Strings[lang_name]
             end
         "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let diagnostics = diagnostics_for_code(
             &mut ws,
@@ -11492,16 +12960,18 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("globals.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                     ---@type SpawnMenu
                     g_SpawnMenu = nil
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         // Main workspace file with nil + create lifecycle
         ws.def_file(
@@ -11568,10 +13038,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("globals.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                     ---@meta
 
                     ---@class MyType
@@ -11580,9 +13051,10 @@ mod test {
                     ---@type MyType
                     g_AllNil = nil
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         ws.def_file(
             "main.lua",
@@ -11681,10 +13153,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("toolobj.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                     ---@meta
 
                     ---@class Weapon
@@ -11696,9 +13169,10 @@ mod test {
                     ---@class ToolObj : Tool
                     ToolObj = ToolObj or {}
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         // --- Main workspace: shipped runtime pattern (garrysmod stool.lua) ---
         // Includes the `o.SWEP = nil` initializer in Create() and the
@@ -11780,10 +13254,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("globals.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                     ---@meta
 
                     ---@class MyType
@@ -11792,19 +13267,22 @@ mod test {
                     ---@type MyType
                     g_Mixed = nil
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
+        // The nil declaration is first by path, so reads resolve through it
+        // and fall back to the tier's merge.
         ws.def_file(
-            "main_nil.lua",
+            "main_a_nil.lua",
             r#"
                 g_Mixed = nil
             "#,
         );
 
         ws.def_file(
-            "main_int.lua",
+            "main_b_int.lua",
             r#"
                 g_Mixed = 123
             "#,
@@ -11948,10 +13426,11 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let tool_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("tool.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &tool_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &tool_uri,
+                Some(
+                    r#"
                     ---@meta
 
                     ---@class Entity
@@ -11979,9 +13458,10 @@ mod test {
                     ---@return any
                     function Tool:GetPos(id) end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         let custom_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("custom_classes.lua")).unwrap();
         ws.analysis.update_file_by_uri(
@@ -11997,7 +13477,7 @@ mod test {
                 "#
                 .to_string(),
             ),
-        );
+        ).map(|(id, _)| id);
 
         ws.def_file(
             "gamemodes/sandbox/entities/weapons/gmod_tool/stool.lua",
@@ -12845,6 +14325,44 @@ mod test {
     }
 
     #[test]
+    fn test_truthiness_guard_does_not_suppress_repeated_call_expr() {
+        // The positive form of `test_negation_guard_does_not_suppress_repeated_call_expr`:
+        // `if maybeEnt() then` proves only that the call it made returned
+        // non-nil, so a second call inside the block is still unguarded.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): Vector
+
+            ---@return Entity?
+            local function maybeEnt() end
+
+            local function useEntity()
+                if maybeEnt() then
+                    maybeEnt():GetPos()
+                end
+            end
+            "#,
+        );
+
+        let call_warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("may be nil"))
+            .collect();
+        assert_that!(
+            call_warnings,
+            not(is_empty()),
+            "`if maybeEnt() then` should NOT suppress the nil diagnostic on the \
+             second `maybeEnt()` call — each call may return a different value. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
     fn test_negation_guard_invalidated_by_indexed_key_reassignment() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
@@ -13159,6 +14677,53 @@ mod test {
             is_empty(),
             "Optional parameter defaulted via assignment then used arithmetically should not report NeedCheckNil"
         );
+    }
+
+    #[gtest]
+    fn shadowed_error_does_not_exit_a_correlated_return_guard() {
+        for (binding, call, warns) in [
+            ("", "error", false),
+            ("local error = function(...) end", "error", true),
+            ("local returning = function(...) end", "returning", true),
+        ] {
+            let source = format!(
+                r#"{binding}
+---@param enabled boolean
+local function lookup(enabled)
+    if enabled then return true, 'ok' end
+    return false, nil
+end
+---@param enabled boolean
+local function use(enabled)
+    local ok, value = lookup(enabled)
+    if not ok then {call}('ignored') end
+    print(value:sub(1))
+end
+"#
+            );
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::NeedCheckNil);
+            let file = ws.def_file("lua/autorun/server/sv_correlated_error.lua", &source);
+            let actual = ws
+                .analysis
+                .diagnose_file(file, CancellationToken::new())
+                .unwrap();
+            let ranges = actual
+                .into_iter()
+                .map(|diagnostic| diagnostic.range)
+                .collect::<Vec<_>>();
+            let expected = if warns {
+                vec![lsp_types::Range::new(
+                    lsp_types::Position::new(10, 10),
+                    lsp_types::Position::new(10, 15),
+                )]
+            } else {
+                vec![]
+            };
+            assert_eq!(ranges, expected, "{source}");
+        }
     }
 
     #[gtest]
@@ -14532,5 +16097,642 @@ mod test {
         // Only the unguarded trailing call is reported.
         assert_that!(diagnostics.len(), eq(1_usize));
         assert_that!(diagnostics[0].range.start.line, eq(19_u32));
+    }
+
+    /// A truthiness test excludes `nil` *and* `false`, so it can never narrow
+    /// less than `~= nil` does. An undeclared field resolves to `unknown?`, and
+    /// that was the one shape where it did.
+    #[test]
+    fn truthiness_guard_narrows_an_unknown_typed_field() {
+        let mut ws = VirtualWorkspace::new();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::UncheckedNilAccess,
+            r#"
+            ---@class snd_obj
+            ---@field Stop fun(self: snd_obj)
+
+            ---@class hFire
+            ---@param h hFire
+            local function fires(h)
+                if h.snd then h.snd:Stop() end
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    /// The report's own controls: `~= nil`, a cached local, and a declared
+    /// nilable field all narrow the same field, and none of them may start
+    /// reporting when the bare truthiness form stops.
+    #[test]
+    fn nil_guard_controls_on_an_unknown_typed_field_stay_clean() {
+        let mut ws = VirtualWorkspace::new();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::UncheckedNilAccess,
+            r#"
+            ---@class snd_obj
+            ---@field Stop fun(self: snd_obj)
+
+            ---@class hC1
+            ---@param h hC1
+            local function c1(h)
+                if h.snd ~= nil then h.snd:Stop() end
+            end
+
+            ---@class hC2
+            ---@param h hC2
+            local function c2(h)
+                local s = h.snd
+                if s then s:Stop() end
+            end
+
+            ---@class hC3
+            ---@field snd snd_obj?
+            ---@param h hC3
+            local function c3(h)
+                if h.snd then h.snd:Stop() end
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    /// An unguarded access still reports, so the guard above is doing the work
+    /// rather than the check having been switched off for unknown fields.
+    #[test]
+    fn unguarded_unknown_typed_field_access_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::UncheckedNilAccess,
+            r#"
+            ---@class snd_obj
+            ---@field Stop fun(self: snd_obj)
+
+            ---@class hBare
+            ---@param h hBare
+            local function bare(h)
+                h.snd:Stop()
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
+
+    /// A truthiness guard stops proving anything once the body puts a nil back,
+    /// and that is true of a `while` condition and an `elseif` exactly as it is
+    /// of an `if` — the body runs the same statements in the same order.
+    #[test]
+    fn truthiness_guard_stops_at_a_reassignment_in_every_arm() {
+        for arm in [
+            "if h.snd then",
+            "while h.snd do",
+            "if flag then\nelseif h.snd then",
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let diagnostics = diagnostics_for_code(
+                &mut ws,
+                DiagnosticCode::NeedCheckNil,
+                &format!(
+                    r#"
+                    ---@class Snd
+                    ---@field Stop fun(self: Snd)
+
+                    ---@class SndHolder
+                    ---@field snd Snd?
+
+                    ---@param h SndHolder
+                    ---@param flag boolean
+                    ---@return Snd?
+                    local function maybe(h, flag) return h.snd end
+
+                    ---@param h SndHolder
+                    ---@param flag boolean
+                    local function play(h, flag)
+                        {arm}
+                            h.snd = maybe(h, flag)
+                            h.snd:Stop()
+                        end
+                    end
+                    "#
+                ),
+            );
+            assert_eq!(
+                diagnostics.len(),
+                1,
+                "reassignment before the access voids the guard in `{arm}`: {diagnostics:?}"
+            );
+        }
+    }
+
+    /// `self` fields persist across calls, so a read placed before the
+    /// in-function write is not definite nil. `not self.x or not self.x:M()`
+    /// guards the call in the `or` RHS either way.
+    #[gtest]
+    fn or_rhs_self_field_read_before_in_function_write_is_not_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            ---@class PartSnd
+            function PartSnd:IsPlaying() return true end
+            function PartSnd:Stop() end
+
+            ---@class PartCls
+            ---@field snd2 PartSnd?
+
+            ---@param self PartCls
+            ---@param moving boolean
+            local function animate(self, moving)
+                if moving and self.snd and self.snd:IsPlaying() then
+                    self.snd:Stop()
+                    self.snd = nil
+                elseif moving and (not self.snd or not self.snd:IsPlaying()) then
+                    self.snd = PartSnd
+                end
+                if moving and self.snd2 and self.snd2:IsPlaying() then
+                end
+                if moving and (not self.snd2 or not self.snd2:IsPlaying()) then
+                end
+            end
+        "#;
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
+
+    /// The `or` short-circuit only protects the RHS when the LHS *falsy* case
+    /// proves the receiver non-nil. A bare `x or x:M()` reaches the call with
+    /// `x` falsy — possibly nil — so it must still report, as must an
+    /// unguarded use of a different field.
+    #[gtest]
+    fn or_rhs_with_falsy_receiver_still_reports_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            ---@class PartSnd
+            function PartSnd:IsPlaying() return true end
+
+            ---@class PartCls
+
+            ---@param self PartCls
+            local function animate(self)
+                local a = self.snd or self.snd:IsPlaying()
+                self.other:Stop()
+            end
+        "#;
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(false)
+        );
+    }
+
+    /// `amt` is proven non-nil before it is given an `any` value, so the nil
+    /// its `tonumber` initializer could hold does not come back.
+    #[gtest]
+    fn an_any_value_assigned_after_a_nil_check_stays_non_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            ---@param args string[]
+            ---@param gam any
+            local function BuyIn(args, gam)
+                local amt = tonumber(args[1])
+                if amt then
+                    amt = math.abs(amt)
+                    if amt < gam.minBuyIn then
+                        amt = gam.minBuyIn - gam.chips
+                    end
+                    return 10 + amt
+                end
+            end
+        "#;
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
+
+    /// `prone * 1` is an `any` value: `TargetPos` keeps holding a vector, but
+    /// not the nil the replaced `maybe` could have been.
+    #[gtest]
+    fn an_any_value_does_not_inherit_the_nil_of_the_value_it_replaces() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            ---@class Vector
+            ---@field x number
+
+            ---@param maybe Vector?
+            ---@param prone any
+            local function Model(maybe, prone)
+                local TargetPos = maybe
+                TargetPos = prone * 1
+                return TargetPos.x
+            end
+        "#;
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
+
+    /// `ArrestTime * 0.75` infers as `any`, which keeps `ArrestTime` a number,
+    /// but the path that skips the `if` still carries the field's nil.
+    #[gtest]
+    fn an_any_value_assigned_on_one_path_keeps_the_nil_of_the_other() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@class ArrestPlayer
+            ---@field _WarrantedTime number?
+
+            ---@param ply ArrestPlayer
+            ---@param supporter boolean
+            local function Arrest(ply, supporter)
+                local ArrestTime = ply._WarrantedTime
+                if supporter then
+                    ArrestTime = ArrestTime * 0.75
+                end
+                return 10 + ArrestTime
+            end
+            "#,
+        );
+
+        let diagnostics = need_check_nil_for_file(&mut ws, file_id);
+        assert_that!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.range.start.line == 11)
+                .count(),
+            eq(1)
+        );
+    }
+
+    fn def_local_player_stubs(ws: &mut VirtualWorkspace) {
+        ws.def_file(
+            "lua/aaa_annotations/player.lua",
+            r#"
+            ---@class Player
+            local Player = {}
+
+            ---@return string
+            function Player:Nick() end
+
+            ---@return Player
+            function LocalPlayer() end
+            "#,
+        );
+    }
+
+    /// Exactly one of `CLIENT` and `SERVER` holds, so the fall-through with
+    /// `client` still falsy (both flags false) is never taken.
+    #[gtest]
+    fn client_and_server_guards_leave_no_realm_with_a_nil_client() {
+        let mut ws = gmod_ws();
+        def_local_player_stubs(&mut ws);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_can_buy.lua",
+            r#"
+            local M = {}
+
+            ---@param client Player?
+            function M.CanBuyItem(uniqueID, client)
+                if not client and CLIENT then
+                    client = LocalPlayer()
+                elseif not client and SERVER then
+                    return false
+                end
+                return client:Nick()
+            end
+
+            ---@param client Player?
+            function M.CanSellItem(uniqueID, client)
+                if not client and SERVER then
+                    return false
+                elseif not client and CLIENT then
+                    client = LocalPlayer()
+                end
+                return client:Nick()
+            end
+
+            return M
+            "#,
+        );
+
+        assert_that!(need_check_nil_for_file(&mut ws, file_id), is_empty());
+    }
+
+    /// The `if` only tests `state` (its body narrows it further but never
+    /// writes it), so past the `if` it is the unknown `wheel.state` it was.
+    #[gtest]
+    fn an_if_that_only_tests_an_unknown_value_does_not_make_it_nullable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            local function Update(wheel)
+                local state = wheel.state
+                if state then
+                    if state.groundAngularVelocity then
+                        print(state.groundAngularVelocity)
+                    end
+                end
+                return state.distributionFactor
+            end
+        "#;
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn a_client_only_guard_leaves_the_server_path_with_a_nil_client() {
+        let mut ws = gmod_ws();
+        def_local_player_stubs(&mut ws);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_can_buy.lua",
+            r#"
+            local M = {}
+
+            ---@param client Player?
+            function M.CanBuyItem(uniqueID, client)
+                if not client and CLIENT then
+                    client = LocalPlayer()
+                end
+                return client:Nick()
+            end
+
+            return M
+            "#,
+        );
+
+        assert_that!(need_check_nil_for_file(&mut ws, file_id), len(eq(1)));
+    }
+
+    /// Past `if (!argument and !bOptional) then return end`, `argument` is
+    /// whatever `given[i]` held: the guard splits the unknown value by
+    /// truthiness, and the fall-through merges both pieces back into it.
+    #[gtest]
+    fn compound_guard_on_an_unknown_value_does_not_make_it_nullable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let code = r#"
+            local function Stub(command, given)
+                local arguments = command.arguments
+                for i = 1, #arguments do
+                    local bOptional = arguments[i] > 100
+                    local argument = given[i]
+                    if (!argument and !bOptional) then
+                        return "invalid"
+                    end
+                    local value = argument
+                    if (value:match("STEAM_(%d+)")) then
+                        value = argument
+                    end
+                end
+            end
+
+            local function ExpandCamelCase(input, bNoUpperFirst)
+                input = bNoUpperFirst and input or input:upper()
+                return input
+            end
+        "#;
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
+
+    /// Whether a nil warning is reported for the body of `if x then ... end`,
+    /// where `x` may be nil.
+    fn warns_in_guarded_body(body: &str) -> bool {
+        let mut ws = VirtualWorkspace::new();
+        !ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            &format!(
+                r#"
+                ---@type {{foo: string}}?
+                local x
+                local cond = true
+
+                if x then
+                    {body}
+                end
+                "#
+            ),
+        )
+    }
+
+    /// The truthiness guard stops holding where a statement before the read,
+    /// at any depth in the guarded block, sets the guarded value again; a
+    /// write after the read, in a branch the read is not on, or to another
+    /// variable of the same name leaves it holding.
+    #[test]
+    fn a_write_before_the_read_ends_the_guard_at_any_depth() {
+        let bodies = [
+            "x = nil print(x.foo)",
+            "do x = nil print(x.foo) end",
+            "while cond do x = nil print(x.foo) end",
+            "do print(x.foo) x = nil end",
+            "if cond then x = nil else print(x.foo) end",
+            r#"do local x = { foo = "a" } print(x.foo) end"#,
+        ];
+
+        assert_eq!(
+            bodies.map(warns_in_guarded_body),
+            [true, true, true, false, false, false]
+        );
+    }
+
+    /// A local holding a guard call's result narrows like the call, while what it checked keeps its value.
+    #[gtest]
+    fn a_local_holding_an_isvalid_result_narrows_what_it_checked() {
+        let warns = |body: &str| {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            def_isvalid_type_guard(&mut ws);
+            !ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                &format!(
+                    r#"
+            ---@class Entity
+            ---@field GetEditingData fun(self: Entity): table
+
+            ---@return Entity?
+            function maybeEntity() end
+
+            local function run()
+                local maybe = maybeEntity()
+                {body}
+            end
+            "#
+                ),
+            )
+        };
+        assert_eq!(
+            [
+                "local valid = IsValid(maybe)\nif valid then maybe:GetEditingData() end",
+                "local valid = IsValid(maybe)\nif not valid then return end\nmaybe:GetEditingData()",
+                "local holder = { maybe = maybe }\nlocal valid = IsValid(holder.maybe)\nif valid then holder.maybe:GetEditingData() end",
+                "local valid = IsValid(maybe)\nmaybe = maybeEntity()\nif valid then maybe:GetEditingData() end",
+                "local valid = IsValid(maybe)\nlocal function later() if valid then maybe:GetEditingData() end end\nlater()",
+                "local valid = IsValid(maybe)\nvalid = true\nif valid then maybe:GetEditingData() end",
+                "local valid = IsValid(maybe)\nwhile valid do\nmaybe:GetEditingData()\nmaybe = maybeEntity()\nend",
+                "local valid = IsValid(maybe)\n::again::\nif valid then maybe:GetEditingData() end\nmaybe = maybeEntity()\ngoto again",
+                "local holder = { maybe = maybe }\nlocal valid = IsValid(holder.maybe)\nlocal key = \"maybe\"\nholder[key] = maybeEntity()\nif valid then holder.maybe:GetEditingData() end",
+            ]
+            .map(warns),
+            [false, false, false, true, true, true, true, true, true]
+        );
+    }
+
+    /// Whether a nil-access warning is reported for `body`, a function body over `U.Entities`
+    /// (an inferred table whose elements come from `table.insert`) and the declared controls.
+    fn slot_alias_warns(ws: &mut VirtualWorkspace, file_name: &str, body: &str) -> bool {
+        let code = format!(
+            r#"
+            ---@class Entity
+            ---@field Remove fun(self: Entity)
+            ---@class NULL : Entity
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+
+            local U = nil
+            function Mk() U = {{}}; U.Entities = {{}} end
+            function Add(e) if not U then return end; table.insert(U.Entities, e) end
+
+            ---@type {{n: Entity?}}
+            local V = {{}}
+            ---@type (Entity|nil)[]
+            local arr = {{}}
+
+            function Run()
+                if not U then return end
+                {body}
+            end
+            "#
+        );
+        [
+            DiagnosticCode::NeedCheckNil,
+            DiagnosticCode::UncheckedNilAccess,
+        ]
+        .into_iter()
+        .any(|diagnostic_code| !ws.check_file_for(diagnostic_code, file_name, &code))
+    }
+
+    /// A local initialised from a slot an `IsValid` call guards holds the guarded value, as the
+    /// slot read directly does, whether or not the table's element type is known.
+    #[gtest]
+    fn a_local_initialised_from_a_guarded_missing_slot_is_not_nullable() {
+        let guarded =
+            |read: &str| format!("if IsValid({read}) then local e = {read}; e:Remove() end");
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        expect_that!(
+            slot_alias_warns(
+                &mut ws,
+                "lua/autorun/slot_direct.lua",
+                "if IsValid(U.Entities[1]) then U.Entities[1]:Remove() end"
+            ),
+            eq(false)
+        );
+        for (index, read) in ["U.Entities[1]", "V.n", "arr[1]"].into_iter().enumerate() {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            expect_that!(
+                slot_alias_warns(
+                    &mut ws,
+                    &format!("lua/autorun/slot_guarded_{index}.lua"),
+                    &guarded(read)
+                ),
+                eq(false),
+                "{read}"
+            );
+        }
+    }
+
+    /// The same alias outside the guard is still nullable.
+    #[gtest]
+    fn a_local_initialised_from_an_unguarded_missing_slot_is_nullable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        expect_that!(
+            slot_alias_warns(
+                &mut ws,
+                "lua/autorun/slot_unguarded.lua",
+                "local e = U.Entities[1]; e:Remove()"
+            ),
+            eq(true)
+        );
+    }
+
+    /// Removing the guard from an analysed file brings the warning back, as a cold analysis of the
+    /// edited file reports it.
+    #[gtest]
+    fn removing_the_guard_around_a_slot_alias_brings_the_warning_back() {
+        let file = "lua/autorun/slot_edit.lua";
+        let guarded = "if IsValid(U.Entities[1]) then local e = U.Entities[1]; e:Remove() end";
+        let unguarded = "do local e = U.Entities[1]; e:Remove() end";
+        let mut warm = VirtualWorkspace::new_with_init_std_lib();
+        expect_that!(slot_alias_warns(&mut warm, file, guarded), eq(false));
+        let warm_after_edit = slot_alias_warns(&mut warm, file, unguarded);
+        let mut cold = VirtualWorkspace::new_with_init_std_lib();
+        let cold_after_edit = slot_alias_warns(&mut cold, file, unguarded);
+        expect_that!(warm_after_edit, eq(true));
+        expect_that!(warm_after_edit, eq(cold_after_edit));
+    }
+}
+
+#[cfg(test)]
+mod table_seed_tests {
+    use crate::{DiagnosticCode, VirtualWorkspace};
+
+    fn reports_field_write(body: &str) -> bool {
+        let mut ws = VirtualWorkspace::new();
+        !ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            &format!(
+                r#"
+                ---@class Holder
+                ---@field k table?
+                ---@param t Holder
+                ---@param c boolean
+                ---@param d boolean
+                local function f(t, c, d)
+                    {body}
+                end
+                "#
+            ),
+        )
+    }
+
+    #[test]
+    fn an_absence_guard_seeds_the_field_only_when_nothing_else_in_the_if_writes_it() {
+        assert!(!reports_field_write(
+            "if not t.k then t.k = {} end t.k.x = 1"
+        ));
+        assert!(reports_field_write(
+            "if not t.k then t.k = {} else t.k = nil end t.k.x = 1"
+        ));
+        assert!(reports_field_write(
+            "if not t.k then t.k = {} t.k = nil end t.k.x = 1"
+        ));
+    }
+
+    #[test]
+    fn a_nested_reset_of_the_field_outlasts_an_earlier_seed() {
+        assert!(!reports_field_write("t.k = {} if d then t.k.x = 1 end"));
+        assert!(reports_field_write(
+            "t.k = {} if c then t.k = nil end t.k.x = 1"
+        ));
+        assert!(reports_field_write(
+            "t.k = {} if c then t.k = nil end if d then t.k.x = 1 end"
+        ));
     }
 }

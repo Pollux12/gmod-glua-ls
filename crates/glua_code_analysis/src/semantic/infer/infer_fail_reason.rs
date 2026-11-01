@@ -1,4 +1,4 @@
-use glua_parser::LuaExpr;
+use glua_parser::LuaSyntaxId;
 
 use crate::{FileId, InFiled, LuaDeclId, LuaMemberId, LuaSignatureId, LuaTypeDeclId};
 
@@ -6,7 +6,7 @@ use crate::{FileId, InFiled, LuaDeclId, LuaMemberId, LuaSignatureId, LuaTypeDecl
 pub enum InferFailReason {
     None,
     RecursiveInfer,
-    UnResolveExpr(InFiled<LuaExpr>),
+    UnResolveExpr(InFiled<LuaSyntaxId>),
     UnResolveSignatureReturn(LuaSignatureId),
     FieldNotFound,
     UnResolveDeclType(LuaDeclId),
@@ -14,10 +14,6 @@ pub enum InferFailReason {
     UnResolveMemberType(LuaMemberId),
     UnResolveOperatorCall,
     UnResolveModuleExport(FileId),
-    /// The dynamic-field index is still being built, so a read of it would
-    /// answer from however far the batch walk happened to get. Clears when the
-    /// index seals.
-    UnSealedDynamicFields,
     /// A `for ... in` iterator variable holds a raw template ref because nothing
     /// bound the iterator function's generic. The placeholder is already cached,
     /// so this group only ever upgrades it; failures stay inside the group rather
@@ -37,7 +33,6 @@ impl InferFailReason {
                 | InferFailReason::UnResolveMemberType(_)
                 | InferFailReason::UnResolveOperatorCall
                 | InferFailReason::UnResolveModuleExport(_)
-                | InferFailReason::UnSealedDynamicFields
                 | InferFailReason::UnResolveIterTemplate
         )
     }

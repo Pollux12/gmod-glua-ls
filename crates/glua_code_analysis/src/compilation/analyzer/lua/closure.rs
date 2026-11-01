@@ -1,10 +1,12 @@
+use super::{SignatureChange, StatementWrite, stats::is_local_mutable};
+use glua_parser::LuaSyntaxNodeExt;
 use std::ops::Deref;
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallArgList,
     LuaCallExpr, LuaClosureExpr, LuaComment, LuaDocTagReturn, LuaExpr, LuaFuncStat, LuaIfStat,
     LuaIndexExpr, LuaIndexKey, LuaLiteralToken, LuaLocalStat, LuaReturnStat, LuaStat,
-    LuaSyntaxKind, LuaVarExpr, PathTrait, UnaryOperator,
+    LuaSyntaxKind, LuaTableExpr, LuaVarExpr, PathTrait, UnaryOperator,
 };
 use rowan::{TextRange, TextSize};
 
@@ -15,7 +17,10 @@ use crate::{
         UnResolveCallClosureParams, UnResolveClosureReturn, UnResolveParentAst,
         UnResolveParentClosureParams, UnResolveReturn,
     },
-    db_index::{LuaDocReturnInfo, LuaMemberOwner, LuaReturnCorrelation, LuaSignatureId},
+    db_index::{
+        LuaClassNameReturnAlias, LuaDocReturnInfo, LuaMemberOwner, LuaReturnCorrelation,
+        LuaSignatureId,
+    },
     infer_expr,
 };
 
@@ -49,13 +54,14 @@ fn closure_own_return_stats(
 pub fn analyze_closure(analyzer: &mut LuaAnalyzer, closure: LuaClosureExpr) -> Option<()> {
     let signature_id = LuaSignatureId::from_closure(analyzer.file_id, &closure);
 
-    analyze_colon_define(analyzer, &signature_id, &closure);
     analyze_lambda_params(analyzer, &signature_id, &closure);
     analyze_require_guard_param(analyzer, &signature_id, &closure);
     analyze_nil_return_guard_params(analyzer, &signature_id, &closure);
     analyze_falsy_param_nil_free_return_slots(analyzer, &signature_id, &closure);
     analyze_direct_param_return_alias(analyzer, &signature_id, &closure);
     analyze_class_name_param_return_alias(analyzer, &signature_id, &closure);
+    analyze_returns_receiver(analyzer, &signature_id, &closure);
+    analyze_fresh_returned_values(analyzer, &signature_id, &closure);
     analyze_return(analyzer, &signature_id, &closure);
     Some(())
 }
@@ -124,11 +130,10 @@ fn analyze_direct_param_return_alias(
         return Some(());
     }
 
-    analyzer
-        .db
-        .get_signature_index_mut()
-        .get_or_create(*signature_id)
-        .set_direct_param_return_alias(param_idx);
+    analyzer.write(StatementWrite::Signature {
+        signature_id: *signature_id,
+        change: SignatureChange::DirectParamReturnAlias(param_idx),
+    });
     Some(())
 }
 
@@ -184,48 +189,204 @@ fn analyze_class_name_param_return_alias(
         return Some(());
     };
 
-    let create = find_class_name_create_for_return(analyzer, &block, return_expr)?;
-    let class_param_name = expr_name_text(&create.class_arg)?;
-    let param_idx = params.iter().position(|p| p == &class_param_name)?;
-
-    if classname_param_is_tainted(&block, &return_stat, &class_param_name) {
+    let create = find_class_name_create_for_return(&params, &block, return_expr)?;
+    let forwarded = create
+        .forwarded
+        .into_iter()
+        .filter(|(param_idx, _)| {
+            !classname_param_is_tainted(&block, &return_stat, &params[*param_idx])
+        })
+        .collect::<Vec<_>>();
+    if forwarded.is_empty() {
         return Some(());
     }
 
-    analyzer
-        .db
-        .get_signature_index_mut()
-        .get_or_create(*signature_id)
-        .set_class_name_param_return_alias(param_idx);
+    let closure_start = closure.get_range().start();
+    analyzer.write(StatementWrite::Signature {
+        signature_id: *signature_id,
+        change: SignatureChange::ClassNameParamReturnAlias(LuaClassNameReturnAlias {
+            create_call: create.call_range - closure_start,
+            forwarded,
+            receiver_call: create.receiver_call.map(|range| range - closure_start),
+        }),
+    });
     Some(())
 }
 
-struct ClassNameCreateCall {
-    class_arg: LuaExpr,
+/// Records that a colon method returns its receiver: its every return is a
+/// lone `self`, the body ends in one, and nothing in it rebinds `self`.
+fn analyze_returns_receiver(
+    analyzer: &mut LuaAnalyzer,
+    signature_id: &LuaSignatureId,
+    closure: &LuaClosureExpr,
+) -> Option<()> {
+    let signature = analyzer.db.get_signature_index().get(signature_id)?;
+    if !signature.is_colon_define
+        || !signature.overloads.is_empty()
+        || (signature.resolve_return == SignatureReturnStatus::DocResolve
+            && !signature.return_docs.is_empty())
+    {
+        return Some(());
+    }
+
+    let block = closure.get_block()?;
+    if !matches!(block.get_stats().last(), Some(LuaStat::ReturnStat(_))) {
+        return Some(());
+    }
+    let returns_self = |return_stat: &LuaReturnStat| {
+        let exprs = return_stat.get_expr_list().collect::<Vec<_>>();
+        matches!(exprs.as_slice(), [expr] if expr_name_text(expr).as_deref() == Some("self"))
+    };
+    if !closure_own_return_stats(analyzer, closure, &block)
+        .iter()
+        .all(returns_self)
+    {
+        return Some(());
+    }
+    let rebinds_self = block.descendants::<LuaAssignStat>().any(|assign| {
+        assign
+            .get_var_and_expr_list()
+            .0
+            .iter()
+            .any(|var| var_source_text(var) == "self")
+    }) || block.descendants::<LuaLocalStat>().any(|local_stat| {
+        local_stat
+            .get_local_name_list()
+            .filter_map(|local| local.get_name_token())
+            .any(|token| token.get_name_text() == "self")
+    });
+    if rebinds_self {
+        return Some(());
+    }
+
+    analyzer.write(StatementWrite::Signature {
+        signature_id: *signature_id,
+        change: SignatureChange::ReturnsReceiver,
+    });
+    Some(())
 }
 
-fn find_class_name_create_for_return(
+/// Records the table constructors and calls a function returns on its own,
+/// which every call of it evaluates anew: the expression of a `return`, or the
+/// initializer of a never-reassigned local of the function. A value the
+/// function takes from outside its body, such as a module-level local, is one
+/// value for every call and is left out.
+fn analyze_fresh_returned_values(
     analyzer: &mut LuaAnalyzer,
-    block: &LuaBlock,
-    return_expr: &LuaExpr,
-) -> Option<ClassNameCreateCall> {
-    match return_expr {
-        LuaExpr::CallExpr(call) => class_name_create_call_info(analyzer, call),
-        LuaExpr::NameExpr(name_expr) => {
-            let local_name = name_expr.get_name_text()?;
-            find_local_init_create(analyzer, block, &local_name)
+    signature_id: &LuaSignatureId,
+    closure: &LuaClosureExpr,
+) -> Option<()> {
+    let block = closure.get_block()?;
+    let closure_range = closure.get_range();
+    let mut values = Vec::new();
+    for return_stat in closure_own_return_stats(analyzer, closure, &block).iter() {
+        let mut exprs = return_stat.get_expr_list();
+        let (Some(expr), None) = (exprs.next(), exprs.next()) else {
+            continue;
+        };
+        if let Some(value) = fresh_value_range(analyzer, closure_range, expr) {
+            values.push(value - closure_range.start());
         }
-        LuaExpr::IndexExpr(index_expr) => resolve_index_to_create_call(analyzer, block, index_expr),
-        LuaExpr::ParenExpr(paren) => {
-            let inner = paren.get_expr()?;
-            find_class_name_create_for_return(analyzer, block, &inner)
+    }
+    if values.is_empty() {
+        return Some(());
+    }
+    values.sort_by_key(|range| (range.start(), range.end()));
+    values.dedup();
+    analyzer.write(StatementWrite::Signature {
+        signature_id: *signature_id,
+        change: SignatureChange::FreshReturnedValues(values),
+    });
+    Some(())
+}
+
+fn fresh_value_range(
+    analyzer: &LuaAnalyzer,
+    closure_range: TextRange,
+    expr: LuaExpr,
+) -> Option<TextRange> {
+    match expr {
+        LuaExpr::TableExpr(table_expr) => Some(table_expr.get_range()),
+        LuaExpr::CallExpr(call_expr) => Some(call_expr.get_range()),
+        LuaExpr::ParenExpr(paren_expr) => {
+            fresh_value_range(analyzer, closure_range, paren_expr.get_expr()?)
+        }
+        LuaExpr::NameExpr(name_expr) => {
+            let decl_id = analyzer
+                .db
+                .get_reference_index()
+                .get_local_reference(&analyzer.file_id)?
+                .get_decl_id(&name_expr.get_range())?;
+            if !closure_range.contains(decl_id.position) || is_local_mutable(analyzer, decl_id) {
+                return None;
+            }
+            let initializer = analyzer
+                .db
+                .get_decl_index()
+                .get_decl(&decl_id)?
+                .get_initializer()?;
+            (initializer.get_ret_idx() == 0
+                && (LuaTableExpr::can_cast(initializer.get_expr_syntax_id().get_kind())
+                    || LuaCallExpr::can_cast(initializer.get_expr_syntax_id().get_kind())))
+            .then(|| initializer.get_expr_syntax_id().get_range())
         }
         _ => None,
     }
 }
 
+struct ClassNameCreateCall {
+    call_range: TextRange,
+    forwarded: Vec<(usize, usize)>,
+    receiver_call: Option<TextRange>,
+}
+
+fn find_class_name_create_for_return(
+    params: &[String],
+    block: &LuaBlock,
+    return_expr: &LuaExpr,
+) -> Option<ClassNameCreateCall> {
+    match return_expr {
+        LuaExpr::CallExpr(call) => class_name_create_call_info(params, call)
+            .or_else(|| receiver_method_create_call(params, block, call)),
+        LuaExpr::NameExpr(name_expr) => {
+            let local_name = name_expr.get_name_text()?;
+            find_local_init_create(params, block, &local_name)
+        }
+        LuaExpr::IndexExpr(index_expr) => resolve_index_to_create_call(params, block, index_expr),
+        LuaExpr::ParenExpr(paren) => {
+            let inner = paren.get_expr()?;
+            find_class_name_create_for_return(params, block, &inner)
+        }
+        _ => None,
+    }
+}
+
+/// `local pnl = create(c); return pnl:Method()`: the create, kept only at a
+/// call site where `Method` returns its receiver.
+fn receiver_method_create_call(
+    params: &[String],
+    block: &LuaBlock,
+    call: &LuaCallExpr,
+) -> Option<ClassNameCreateCall> {
+    if !call.is_colon_call() {
+        return None;
+    }
+    let LuaExpr::IndexExpr(method) = call.get_prefix_expr()? else {
+        return None;
+    };
+    let LuaExpr::NameExpr(receiver) = method.get_prefix_expr()? else {
+        return None;
+    };
+    let local_name = receiver.get_name_text()?;
+    let create = find_local_init_create(params, block, &local_name)?;
+    Some(ClassNameCreateCall {
+        receiver_call: Some(call.get_range()),
+        ..create
+    })
+}
+
 fn find_local_init_create(
-    analyzer: &mut LuaAnalyzer,
+    params: &[String],
     block: &LuaBlock,
     local_name: &str,
 ) -> Option<ClassNameCreateCall> {
@@ -247,7 +408,7 @@ fn find_local_init_create(
                 continue;
             };
             if let LuaExpr::CallExpr(call) = value
-                && let Some(info) = class_name_create_call_info(analyzer, call)
+                && let Some(info) = class_name_create_call_info(params, call)
             {
                 if found.is_some() {
                     return None;
@@ -262,7 +423,7 @@ fn find_local_init_create(
 }
 
 fn resolve_index_to_create_call(
-    analyzer: &mut LuaAnalyzer,
+    params: &[String],
     block: &LuaBlock,
     index_expr: &LuaIndexExpr,
 ) -> Option<ClassNameCreateCall> {
@@ -293,7 +454,7 @@ fn resolve_index_to_create_call(
                 continue;
             };
             if let LuaExpr::CallExpr(call) = value
-                && let Some(info) = class_name_create_call_info(analyzer, call)
+                && let Some(info) = class_name_create_call_info(params, call)
             {
                 if found.is_some() {
                     return None;
@@ -315,30 +476,25 @@ fn index_key_name(index_expr: &LuaIndexExpr) -> Option<String> {
     }
 }
 
+/// A call handed some of `params` unchanged.
 fn class_name_create_call_info(
-    _analyzer: &mut LuaAnalyzer,
+    params: &[String],
     call: &LuaCallExpr,
 ) -> Option<ClassNameCreateCall> {
-    let prefix = call.get_prefix_expr()?;
-    let LuaExpr::IndexExpr(index) = prefix else {
-        return None;
-    };
-    let method = index_key_name(&index)?;
-    if method != "Create" {
-        return None;
-    }
-    let owner = index.get_prefix_expr().and_then(|p| expr_name_text(&p))?;
-    if owner != "vgui" && owner != "ents" {
-        return None;
-    }
-
-    let args = call
-        .get_args_list()
-        .map(|a| a.get_args().collect::<Vec<_>>())
-        .unwrap_or_default();
-    let class_arg = args.first()?.clone();
-    let _ = expr_name_text(&class_arg)?;
-    Some(ClassNameCreateCall { class_arg })
+    let forwarded = call
+        .get_args_list()?
+        .get_args()
+        .enumerate()
+        .filter_map(|(arg_idx, arg)| {
+            let name = expr_name_text(&arg)?;
+            Some((params.iter().position(|param| *param == name)?, arg_idx))
+        })
+        .collect::<Vec<_>>();
+    (!forwarded.is_empty()).then(|| ClassNameCreateCall {
+        call_range: call.get_range(),
+        forwarded,
+        receiver_call: None,
+    })
 }
 
 fn classname_param_is_tainted(
@@ -419,11 +575,14 @@ fn analyze_falsy_param_nil_free_return_slots(
         if let Some((falsy_param_idx, aliased_param_idx, return_slot)) =
             falsy_param_return_alias(&params, &block, &if_stat)
         {
-            analyzer
-                .db
-                .get_signature_index_mut()
-                .get_or_create(*signature_id)
-                .add_falsy_param_return_alias(falsy_param_idx, aliased_param_idx, return_slot);
+            analyzer.write(StatementWrite::Signature {
+                signature_id: *signature_id,
+                change: SignatureChange::FalsyParamReturnAlias {
+                    falsy_param_idx,
+                    aliased_param_idx,
+                    return_slot,
+                },
+            });
         }
         let Some(condition) = if_stat.get_condition_expr() else {
             continue;
@@ -437,11 +596,13 @@ fn analyze_falsy_param_nil_free_return_slots(
         if let Some(return_slot) =
             falsy_param_nil_free_return_slot(analyzer, closure, &block, &if_stat, &param_name)
         {
-            analyzer
-                .db
-                .get_signature_index_mut()
-                .get_or_create(*signature_id)
-                .add_falsy_param_nil_free_return_slot(param_idx, return_slot);
+            analyzer.write(StatementWrite::Signature {
+                signature_id: *signature_id,
+                change: SignatureChange::FalsyParamNilFreeReturnSlot {
+                    param_idx,
+                    return_slot,
+                },
+            });
         }
     }
 
@@ -449,11 +610,13 @@ fn analyze_falsy_param_nil_free_return_slots(
         if return_call_is_nil_free_when_param_falsy(
             analyzer, &params, &block, param_idx, param_name,
         ) {
-            analyzer
-                .db
-                .get_signature_index_mut()
-                .get_or_create(*signature_id)
-                .add_falsy_param_nil_free_return_slot(param_idx, 0);
+            analyzer.write(StatementWrite::Signature {
+                signature_id: *signature_id,
+                change: SignatureChange::FalsyParamNilFreeReturnSlot {
+                    param_idx,
+                    return_slot: 0,
+                },
+            });
         }
     }
 
@@ -482,7 +645,7 @@ fn return_call_is_nil_free_when_param_falsy(
         return false;
     };
     let typ_dbg = infer_expr(
-        analyzer.db,
+        &analyzer.db,
         analyzer
             .context
             .infer_manager
@@ -847,14 +1010,23 @@ fn expr_is_proven_non_nil(analyzer: &mut LuaAnalyzer, expr: &LuaExpr) -> bool {
         return expr_is_syntactically_non_nil(expr);
     }
     infer_expr(
-        analyzer.db,
+        &analyzer.db,
         analyzer
             .context
             .infer_manager
             .get_infer_cache(analyzer.file_id),
         expr.clone(),
     )
-    .is_ok_and(|typ| !typ.is_nullable())
+    .is_ok_and(|typ| !typ.is_nullable() && !may_hold_unknown(&typ))
+}
+
+/// Whether some alternative of `typ` is `unknown`, which proves nothing.
+fn may_hold_unknown(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Unknown => true,
+        LuaType::Union(union) => union.types().any(|typ| typ.is_unknown()),
+        _ => false,
+    }
 }
 
 fn call_expr_is_known_nil_free_for_falsy_args(
@@ -865,7 +1037,7 @@ fn call_expr_is_known_nil_free_for_falsy_args(
         return false;
     };
     let Ok(LuaType::Signature(signature_id)) = infer_expr(
-        analyzer.db,
+        &analyzer.db,
         analyzer
             .context
             .infer_manager
@@ -889,7 +1061,7 @@ fn call_expr_is_known_nil_free_for_falsy_args(
             && call_arg_for_param_signature(call_expr, is_colon_define, &args, fact.param_idx)
                 .map(|arg| {
                     infer_expr(
-                        analyzer.db,
+                        &analyzer.db,
                         analyzer
                             .context
                             .infer_manager
@@ -943,11 +1115,10 @@ fn analyze_nil_return_guard_params(
     }
 
     for param_idx in guard_param_indices {
-        analyzer
-            .db
-            .get_signature_index_mut()
-            .get_or_create(*signature_id)
-            .add_nil_return_guard_param(param_idx);
+        analyzer.write(StatementWrite::Signature {
+            signature_id: *signature_id,
+            change: SignatureChange::NilReturnGuardParam(param_idx),
+        });
     }
 
     Some(())
@@ -1031,7 +1202,7 @@ fn non_guard_returns_are_proven_non_nil(
         }
 
         let Ok(ret_type) = infer_expr(
-            analyzer.db,
+            &analyzer.db,
             analyzer
                 .context
                 .infer_manager
@@ -1407,8 +1578,7 @@ fn predicate_call_proves_index_exists(
     };
 
     let matching_predicates = root
-        .descendants()
-        .filter_map(LuaFuncStat::cast)
+        .descendants_of::<LuaFuncStat>()
         .filter(|func_stat| func_stat.ancestors::<LuaClosureExpr>().next().is_none())
         .filter(|func_stat| !func_stat_is_colon_defined(func_stat))
         .filter(|func_stat| {
@@ -1593,31 +1763,14 @@ fn var_source_text(var: &LuaVarExpr) -> String {
     var.syntax().text().to_string().split_whitespace().collect()
 }
 
-fn analyze_colon_define(
-    analyzer: &mut LuaAnalyzer,
-    signature_id: &LuaSignatureId,
-    closure: &LuaClosureExpr,
-) -> Option<()> {
-    let signature = analyzer
-        .db
-        .get_signature_index_mut()
-        .get_or_create(*signature_id);
-
-    let func_stat = closure.get_parent::<LuaFuncStat>()?;
-    let func_name = func_stat.get_func_name()?;
-    if let LuaVarExpr::IndexExpr(index_expr) = func_name {
-        let index_token = index_expr.get_index_token()?;
-        signature.is_colon_define = index_token.is_colon();
-    }
-
-    Some(())
-}
-
 fn analyze_lambda_params(
     analyzer: &mut LuaAnalyzer,
     signature_id: &LuaSignatureId,
     closure: &LuaClosureExpr,
 ) -> Option<()> {
+    // Each item is attempted once the statement's walk is done. The only
+    // items not enqueued are the syntactic no-ops below, which read no index
+    // state and write nothing.
     let ast_node = closure.get_parent::<LuaAst>()?;
     match ast_node {
         LuaAst::LuaCallArgList(call_arg_list) => {
@@ -1634,20 +1787,22 @@ fn analyze_lambda_params(
                 param_idx: founded_idx,
             };
 
-            analyzer
-                .context
-                .add_unresolve(unresolved.into(), InferFailReason::None);
+            analyzer.context.add_unresolve(unresolved.into());
         }
         LuaAst::LuaFuncStat(func_stat) => {
+            // `try_resolve_closure_parent_params` returns `Ok` without reading
+            // or writing anything unless the defined name is an index expression,
+            // so a plain `function foo() end` is not enqueued.
+            if !func_stat_defines_index_target(&func_stat) {
+                return Some(());
+            }
             let unresolved = UnResolveParentClosureParams {
                 file_id: analyzer.file_id,
                 signature_id: *signature_id,
                 parent_ast: UnResolveParentAst::LuaFuncStat(func_stat.clone()),
             };
 
-            analyzer
-                .context
-                .add_unresolve(unresolved.into(), InferFailReason::None);
+            analyzer.context.add_unresolve(unresolved.into());
         }
         LuaAst::LuaTableField(table_field) => {
             let unresolved = UnResolveParentClosureParams {
@@ -1656,25 +1811,47 @@ fn analyze_lambda_params(
                 parent_ast: UnResolveParentAst::LuaTableField(table_field.clone()),
             };
 
-            analyzer
-                .context
-                .add_unresolve(unresolved.into(), InferFailReason::None);
+            analyzer.context.add_unresolve(unresolved.into());
         }
         LuaAst::LuaAssignStat(assign_stat) => {
+            // Same no-op rule as the `FuncStat` arm: an assignment whose slot for
+            // this closure is a plain name returns `Ok` with no reads or writes.
+            // Only the slot at this closure's position matters; when it cannot
+            // be identified the item is enqueued as before.
+            if assign_slot_is_plain_name(&assign_stat, closure.get_position()) {
+                return Some(());
+            }
             let unresolved = UnResolveParentClosureParams {
                 file_id: analyzer.file_id,
                 signature_id: *signature_id,
                 parent_ast: UnResolveParentAst::LuaAssignStat(assign_stat.clone()),
             };
 
-            analyzer
-                .context
-                .add_unresolve(unresolved.into(), InferFailReason::None);
+            analyzer.context.add_unresolve(unresolved.into());
         }
         _ => {}
     }
 
     Some(())
+}
+
+/// Whether a `FuncStat` parent can contribute a parameter contract: only an
+/// `a.b.c` / `a:b()` definition reads the prefix type.
+fn func_stat_defines_index_target(func_stat: &LuaFuncStat) -> bool {
+    matches!(func_stat.get_func_name(), Some(LuaVarExpr::IndexExpr(_)))
+}
+
+/// Whether the assignment slot holding the closure at `closure_pos` is a plain
+/// name. Mirrors the `UnResolveParentClosureParams::LuaAssignStat` attempt,
+/// which returns `Ok` without reads or writes for any non-index target. A slot
+/// that cannot be found is enqueued.
+fn assign_slot_is_plain_name(assign_stat: &LuaAssignStat, closure_pos: rowan::TextSize) -> bool {
+    let (vars, exprs) = assign_stat.get_var_and_expr_list();
+    exprs
+        .iter()
+        .position(|expr| expr.get_position() == closure_pos)
+        .and_then(|idx| vars.get(idx))
+        .is_some_and(|var| !matches!(var, LuaVarExpr::IndexExpr(_)))
 }
 
 fn analyze_require_guard_param(
@@ -1709,11 +1886,10 @@ fn analyze_require_guard_param(
         .map(|candidate| candidate.param_idx);
 
     if let Some(param_idx) = param_idx {
-        let signature = analyzer
-            .db
-            .get_signature_index_mut()
-            .get_or_create(*signature_id);
-        signature.set_require_guard_param(param_idx);
+        analyzer.write(StatementWrite::Signature {
+            signature_id: *signature_id,
+            change: SignatureChange::RequireGuardParam(param_idx),
+        });
     }
 
     Some(())
@@ -2027,41 +2203,25 @@ fn analyze_return(
     let block = match closure.get_block() {
         Some(block) => block,
         None => {
-            let signature = analyzer
-                .db
-                .get_signature_index_mut()
-                .get_or_create(*signature_id);
-            signature.resolve_return = SignatureReturnStatus::InferResolve;
-            signature.set_return_correlations(Vec::new());
+            analyzer.write(StatementWrite::Signature {
+                signature_id: *signature_id,
+                change: SignatureChange::BodilessReturn,
+            });
             return Some(());
         }
     };
 
-    let return_points = analyze_func_body_returns(block.clone());
-    analyzer
-        .context
-        .add_inferred_return_candidate(UnResolveReturn {
-            file_id: analyzer.file_id,
-            signature_id: *signature_id,
-            body: Some(block.clone()),
-            return_points: return_points.clone(),
-        });
-    let return_correlations = analyze_return_correlations(
-        analyzer.db,
+    let return_points =
+        analyze_func_body_returns(Some((analyzer.db, analyzer.file_id)), block.clone());
+    let (return_correlations, returns) = derive_inferred_return_with_reads(
+        &analyzer.db,
         analyzer
             .context
             .infer_manager
             .get_infer_cache(analyzer.file_id),
         &return_points,
     );
-    let returns = match analyze_return_point(
-        analyzer.db,
-        analyzer
-            .context
-            .infer_manager
-            .get_infer_cache(analyzer.file_id),
-        &return_points,
-    ) {
+    let returns = match returns {
         Ok(returns) => returns,
         Err(InferFailReason::None) => {
             vec![LuaDocReturnInfo {
@@ -2073,29 +2233,39 @@ fn analyze_return(
                 return_kind: ReturnTypeKind::default(),
             }]
         }
-        Err(reason) => {
+        Err(_) => {
             let unresolve = UnResolveReturn {
                 file_id: analyzer.file_id,
                 signature_id: *signature_id,
-                body: Some(block),
                 return_points,
             };
 
-            analyzer.context.add_unresolve(unresolve.into(), reason);
+            analyzer.context.add_unresolve(unresolve.into());
             return None;
         }
     };
-    let signature = analyzer
-        .db
-        .get_signature_index_mut()
-        .get_or_create(*signature_id);
-
-    signature.resolve_return = SignatureReturnStatus::InferResolve;
-
-    signature.return_docs = returns;
-    signature.set_return_correlations(return_correlations);
+    analyzer.write(StatementWrite::Signature {
+        signature_id: *signature_id,
+        change: SignatureChange::InferredReturns {
+            returns,
+            correlations: return_correlations,
+        },
+    });
 
     Some(())
+}
+
+pub fn derive_inferred_return_with_reads(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    return_points: &Vec<LuaReturnPoint>,
+) -> (
+    Vec<LuaReturnCorrelation>,
+    Result<Vec<LuaDocReturnInfo>, InferFailReason>,
+) {
+    let correlations = analyze_return_correlations(db, cache, return_points);
+    let returns = analyze_return_point(db, cache, return_points);
+    (correlations, returns)
 }
 
 fn signature_has_uninformative_return(signature: &crate::LuaSignature) -> bool {
@@ -2133,19 +2303,17 @@ fn analyze_lambda_returns(
         .get_args()
         .position(|arg| arg.get_position() == pos)?;
     let block = closure.get_block()?;
-    let return_points = analyze_func_body_returns(block.clone());
+    let return_points =
+        analyze_func_body_returns(Some((analyzer.db, analyzer.file_id)), block.clone());
     let unresolved = UnResolveClosureReturn {
         file_id: analyzer.file_id,
         signature_id: *signature_id,
         call_expr,
         param_idx: founded_idx,
-        body: Some(block),
         return_points,
     };
 
-    analyzer
-        .context
-        .add_unresolve(unresolved.into(), InferFailReason::None);
+    analyzer.context.add_unresolve(unresolved.into());
 
     Some(())
 }
@@ -2160,6 +2328,12 @@ pub fn analyze_return_point(
         match point {
             LuaReturnPoint::Expr(expr) => {
                 let expr_type = infer_expr(db, cache, expr.clone())?;
+                let expr_type = super::super::common::widen_mutable_local_name_copy(
+                    db,
+                    cache.get_file_id(),
+                    expr,
+                    expr_type,
+                );
                 return_type = Some(match return_type {
                     Some(current) => union_return_expr(db, current, expr_type),
                     None => expr_type,
@@ -2169,6 +2343,12 @@ pub fn analyze_return_point(
                 let mut multi_return = vec![];
                 for expr in exprs {
                     let expr_type = infer_expr(db, cache, expr.clone())?;
+                    let expr_type = super::super::common::widen_mutable_local_name_copy(
+                        db,
+                        cache.get_file_id(),
+                        expr,
+                        expr_type,
+                    );
                     multi_return.push(expr_type);
                 }
                 let typ = LuaType::Variadic(VariadicType::Multi(multi_return).into());
@@ -2183,7 +2363,7 @@ pub fn analyze_return_point(
                     None => LuaType::Nil,
                 });
             }
-            LuaReturnPoint::Error => {}
+            LuaReturnPoint::Error(_) => {}
         }
     }
 
@@ -2240,7 +2420,7 @@ fn return_point_shape(
 ) -> Option<Vec<LuaType>> {
     match point {
         LuaReturnPoint::Nil => Some(vec![LuaType::Nil]),
-        LuaReturnPoint::Error => Some(Vec::new()),
+        LuaReturnPoint::Error(_) => Some(Vec::new()),
         LuaReturnPoint::Expr(expr) => Some(first_class_return_shape(
             infer_expr(db, cache, expr.clone()).ok()?,
         )),
@@ -2314,11 +2494,15 @@ fn union_return_expr(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
         {
             left.clone()
         }
+        // A branch returning `any` must not swallow the branches that return
+        // something concrete, so the `any` stays an arm instead of absorbing
+        // the union. It is not rewritten to `unknown`: `unknown` marks a read
+        // that has not settled, and this one has.
         (LuaType::Any, right) if should_union_any_as_unknown(right) => {
-            LuaType::from_vec(vec![LuaType::Unknown, right.clone()])
+            LuaType::from_vec_structural(vec![right.clone(), LuaType::Any])
         }
         (left, LuaType::Any) if should_union_any_as_unknown(left) => {
-            LuaType::from_vec(vec![left.clone(), LuaType::Unknown])
+            LuaType::from_vec_structural(vec![left.clone(), LuaType::Any])
         }
         (LuaType::Unknown, LuaType::Unknown) => LuaType::Unknown,
         (LuaType::Unknown, _) | (_, LuaType::Unknown) => {
@@ -2423,5 +2607,112 @@ fn should_union_any_as_unknown(typ: &LuaType) -> bool {
             | LuaType::Nil
             | LuaType::BooleanConst(_)
             | LuaType::DocBooleanConst(_)
-    ) && !typ.is_nullable()
+    )
+}
+
+#[cfg(test)]
+mod closure_parent_enqueue_tests {
+    use glua_parser::{
+        LuaAssignStat, LuaAstNode, LuaClosureExpr, LuaFuncStat, LuaParser, ParserConfig,
+    };
+
+    use super::{assign_slot_is_plain_name, func_stat_defines_index_target};
+
+    fn single_func_stat(code: &str) -> LuaFuncStat {
+        let tree = LuaParser::parse(code, ParserConfig::default());
+        tree.get_chunk_node()
+            .descendants::<LuaFuncStat>()
+            .next()
+            .expect("expected func stat")
+    }
+
+    fn single_assign_and_closures(code: &str) -> (LuaAssignStat, Vec<LuaClosureExpr>) {
+        let tree = LuaParser::parse(code, ParserConfig::default());
+        let root = tree.get_chunk_node();
+        let assign = root
+            .descendants::<LuaAssignStat>()
+            .next()
+            .expect("expected assign stat");
+        let closures = root.descendants::<LuaClosureExpr>().collect::<Vec<_>>();
+        (assign, closures)
+    }
+
+    #[test]
+    fn plain_function_name_needs_no_parent_param_item() {
+        assert!(!func_stat_defines_index_target(&single_func_stat(
+            "function foo() end"
+        )));
+    }
+
+    #[test]
+    fn dotted_and_colon_definitions_keep_parent_param_item() {
+        assert!(func_stat_defines_index_target(&single_func_stat(
+            "function foo.bar() end"
+        )));
+        assert!(func_stat_defines_index_target(&single_func_stat(
+            "function foo:bar() end"
+        )));
+    }
+
+    #[test]
+    fn plain_assign_slot_needs_no_parent_param_item() {
+        let (assign, closures) = single_assign_and_closures("foo = function() end");
+        assert_eq!(closures.len(), 1);
+        assert!(assign_slot_is_plain_name(
+            &assign,
+            closures[0].get_position()
+        ));
+    }
+
+    #[test]
+    fn index_assign_slot_keeps_parent_param_item() {
+        let (assign, closures) = single_assign_and_closures("foo.bar = function() end");
+        assert_eq!(closures.len(), 1);
+        assert!(!assign_slot_is_plain_name(
+            &assign,
+            closures[0].get_position()
+        ));
+    }
+
+    #[test]
+    fn mixed_assign_slots_are_decided_per_closure() {
+        let (assign, closures) =
+            single_assign_and_closures("foo, bar.baz = function() end, function() end");
+        assert_eq!(closures.len(), 2);
+        assert!(assign_slot_is_plain_name(
+            &assign,
+            closures[0].get_position()
+        ));
+        assert!(!assign_slot_is_plain_name(
+            &assign,
+            closures[1].get_position()
+        ));
+    }
+
+    #[test]
+    fn unknown_assign_slot_keeps_parent_param_item() {
+        let (assign, _) = single_assign_and_closures("foo = function() end");
+        assert!(!assign_slot_is_plain_name(
+            &assign,
+            rowan::TextSize::new(10_000)
+        ));
+    }
+
+    #[test]
+    fn plain_and_index_definitions_still_index() {
+        let mut ws = crate::VirtualWorkspace::new();
+        let file_id =
+            ws.def("function foo(a) return a end\nfoo.bar = function(self, x) return x end\n");
+        assert!(
+            ws.analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("semantic model")
+                .get_db()
+                .get_decl_index()
+                .get_decl_tree(&file_id)
+                .is_some(),
+            "file failed to index"
+        );
+    }
 }

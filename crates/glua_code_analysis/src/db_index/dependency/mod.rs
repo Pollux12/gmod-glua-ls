@@ -1,11 +1,19 @@
 mod file_dependency_relation;
+mod load_path_rename;
 
-use std::collections::{HashMap, HashSet};
+use crate::db_index::cow_shards::{CowCell, CowShards};
+use crate::db_index::derivation::FilePosition;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::hash::{Hash, Hasher};
 
 use file_dependency_relation::FileDependencyRelation;
+pub use load_path_rename::{LoadPathEdit, load_path_rename_edits};
 use rowan::TextRange;
 
-use crate::FileId;
+use crate::{
+    FileId,
+    db_index::derivation::{self, FactKey, Fingerprint},
+};
 
 use super::LuaIndex;
 
@@ -34,21 +42,75 @@ pub struct LuaDependencySite {
     pub range: TextRange,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+impl Hash for LuaDependencySite {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            source_file_id,
+            target_file_id,
+            kind,
+            path,
+            path_keys,
+            original_expr,
+            call_range,
+            range,
+        } = self;
+        source_file_id.hash(state);
+        target_file_id.hash(state);
+        kind.hash(state);
+        path.hash(state);
+        path_keys.hash(state);
+        original_expr.hash(state);
+        call_range.hash_in_file(*source_file_id, state);
+        range.hash_in_file(*source_file_id, state);
+    }
+}
+
+impl LuaDependencySite {
+    /// Whether `other` is the same load site, whatever each resolves to now:
+    /// removing or re-indexing a target flips a site's resolution in place.
+    fn is_same_site(&self, other: &Self) -> bool {
+        let Self {
+            source_file_id,
+            target_file_id: _,
+            kind,
+            path,
+            path_keys,
+            original_expr,
+            call_range,
+            range,
+        } = self;
+        *source_file_id == other.source_file_id
+            && *kind == other.kind
+            && *path == other.path
+            && *path_keys == other.path_keys
+            && *original_expr == other.original_expr
+            && *call_range == other.call_range
+            && *range == other.range
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct DependencySiteLocation {
     source_file_id: FileId,
     site_index: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaDependencyIndex {
-    dependencies: HashMap<FileId, HashSet<FileId>>,
-    dependency_kinds: HashMap<FileId, HashMap<FileId, HashSet<LuaDependencyKind>>>,
-    dependency_callers_by_target: HashMap<FileId, HashSet<FileId>>,
-    dependency_sites: HashMap<FileId, Vec<LuaDependencySite>>,
-    resolved_sites_by_target: HashMap<FileId, Vec<DependencySiteLocation>>,
+    dependencies: CowShards<FileId, HashSet<FileId>>,
+    dependency_kinds: CowShards<FileId, HashMap<FileId, HashSet<LuaDependencyKind>>>,
+    dependency_callers_by_target: CowCell<HashMap<FileId, HashSet<FileId>>>,
+    dependency_sites: CowShards<FileId, Vec<LuaDependencySite>>,
+    resolved_sites_by_target: CowShards<FileId, Vec<DependencySiteLocation>>,
     /// Normalized target path key -> unresolved callers.
-    unresolved_dependents_by_path_key: HashMap<String, HashSet<FileId>>,
+    unresolved_dependents_by_path_key: CowShards<String, HashSet<FileId>>,
+    /// The sites a file's removal unresolved, so re-indexing it can put them
+    /// back. Keyed by the removed target; each entry is the site's source file
+    /// and the path it named.
+    unresolved_by_removal: CowCell<HashMap<FileId, Vec<(FileId, Option<String>)>>>,
+    /// The sites derivations added, per source file, so a re-run can take
+    /// them back without the source layer's.
+    derived_sites: CowShards<FileId, Vec<LuaDependencySite>>,
     #[cfg(test)]
     target_transition_site_visits: usize,
 }
@@ -62,12 +124,14 @@ impl Default for LuaDependencyIndex {
 impl LuaDependencyIndex {
     pub fn new() -> Self {
         Self {
-            dependencies: HashMap::new(),
-            dependency_kinds: HashMap::new(),
-            dependency_callers_by_target: HashMap::new(),
-            dependency_sites: HashMap::new(),
-            resolved_sites_by_target: HashMap::new(),
-            unresolved_dependents_by_path_key: HashMap::new(),
+            dependencies: Default::default(),
+            dependency_kinds: Default::default(),
+            dependency_callers_by_target: Default::default(),
+            dependency_sites: Default::default(),
+            resolved_sites_by_target: Default::default(),
+            unresolved_dependents_by_path_key: Default::default(),
+            unresolved_by_removal: Default::default(),
+            derived_sites: Default::default(),
             #[cfg(test)]
             target_transition_site_visits: 0,
         }
@@ -83,6 +147,7 @@ impl LuaDependencyIndex {
         dependency_id: FileId,
         kind: LuaDependencyKind,
     ) {
+        derivation::note_write(|| FactKey::Dependency(file_id));
         let inserted = self
             .dependencies
             .entry(file_id)
@@ -110,6 +175,14 @@ impl LuaDependencyIndex {
         if !is_new {
             return;
         }
+        if !derivation::writes_source() {
+            derivation::note_write(|| FactKey::LoadSites(site.source_file_id));
+            self.derived_sites
+                .entry(site.source_file_id)
+                .or_default()
+                .push(site.clone());
+        }
+        derivation::note_write(|| FactKey::Dependency(site.source_file_id));
 
         let site_index = self
             .dependency_sites
@@ -133,7 +206,30 @@ impl LuaDependencyIndex {
             .push(site);
     }
 
+    /// Drops the sites derivations found in `file_id` and rebuilds its edges
+    /// from the source layer's sites.
+    pub(crate) fn reset_derived_sites(&mut self, file_id: FileId) {
+        let Some(mut derived) = self.derived_sites.remove(&file_id) else {
+            return;
+        };
+        derivation::note_write(|| FactKey::Dependency(file_id));
+        let sites = self.dependency_sites.remove(&file_id).unwrap_or_default();
+        self.unindex_source_sites(file_id, &sites);
+        self.remove_source_dependency_edges(file_id);
+        for site in sites {
+            if let Some(at) = derived
+                .iter()
+                .position(|existing| existing.is_same_site(&site))
+            {
+                derived.swap_remove(at);
+                continue;
+            }
+            self.add_dependency_site(site);
+        }
+    }
+
     pub fn get_required_files(&self, file_id: &FileId) -> Option<&HashSet<FileId>> {
+        derivation::note_read(|| FactKey::Dependency(*file_id));
         self.dependencies.get(file_id)
     }
 
@@ -142,26 +238,48 @@ impl LuaDependencyIndex {
         file_id: &FileId,
         dependency_id: &FileId,
     ) -> Option<&HashSet<LuaDependencyKind>> {
+        derivation::note_read(|| FactKey::Dependency(*file_id));
         self.dependency_kinds
             .get(file_id)
             .and_then(|dependencies| dependencies.get(dependency_id))
     }
 
+    /// Whether `file_id` loads a file by a path, which it resolves from where
+    /// it is.
+    pub(crate) fn loads_by_path(&self, file_id: FileId) -> bool {
+        self.dependency_sites
+            .get(&file_id)
+            .is_some_and(|sites| sites.iter().any(|site| site.path.is_some()))
+    }
+
     pub fn get_dependency_sites(&self, file_id: &FileId) -> Option<&[LuaDependencySite]> {
+        derivation::note_read(|| FactKey::Dependency(*file_id));
         self.dependency_sites.get(file_id).map(Vec::as_slice)
     }
 
-    pub fn iter_dependency_sites(&self) -> impl Iterator<Item = (&FileId, &[LuaDependencySite])> {
-        self.dependency_sites
-            .iter()
-            .map(|(file_id, sites)| (file_id, sites.as_slice()))
+    /// The sites that resolve to `target_file_id`.
+    pub fn get_sites_loading(
+        &self,
+        target_file_id: FileId,
+    ) -> impl Iterator<Item = &LuaDependencySite> {
+        self.resolved_sites_by_target
+            .get(&target_file_id)
+            .into_iter()
+            .flatten()
+            .filter_map(move |location| {
+                derivation::note_read(|| FactKey::Dependency(location.source_file_id));
+                self.dependency_sites
+                    .get(&location.source_file_id)?
+                    .get(location.site_index)
+                    .filter(|site| site.target_file_id == Some(target_file_id))
+            })
     }
 
     pub fn collect_unresolved_path_dependents(
         &self,
         path_keys: impl IntoIterator<Item = String>,
     ) -> Vec<FileId> {
-        let mut dependents = HashSet::new();
+        let mut dependents = HashSet::default();
         for path_key in path_keys {
             if let Some(path_dependents) = self.unresolved_dependents_by_path_key.get(&path_key) {
                 dependents.extend(path_dependents.iter().copied());
@@ -174,7 +292,7 @@ impl LuaDependencyIndex {
     }
 
     fn index_unresolved_site(
-        reverse_index: &mut HashMap<String, HashSet<FileId>>,
+        reverse_index: &mut CowShards<String, HashSet<FileId>>,
         site: &LuaDependencySite,
     ) {
         for path_key in &site.path_keys {
@@ -250,6 +368,7 @@ impl LuaDependencyIndex {
             return;
         };
         for source_file_id in callers {
+            derivation::note_write(|| FactKey::Dependency(source_file_id));
             let remove_dependencies =
                 self.dependencies
                     .get_mut(&source_file_id)
@@ -274,6 +393,63 @@ impl LuaDependencyIndex {
         }
     }
 
+    /// Forgets the sites `target_file_id`'s removal left unresolved: the file
+    /// came back at another path, so the paths they name are resolved anew.
+    pub fn forget_unresolved_target(&mut self, target_file_id: FileId) {
+        self.unresolved_by_removal.remove(&target_file_id);
+    }
+
+    /// The exact inverse of [`transition_target_sites_to_unresolved`]: a file
+    /// that is indexed again re-resolves the sites its removal unresolved.
+    ///
+    /// Removing a file unresolves its callers' sites in place, so a path that
+    /// re-indexes the target alone would leave every includer pointing at
+    /// nothing. Only the sites the removal actually flipped are restored, so
+    /// this cannot resolve a site a build would have left unresolved on its
+    /// own.
+    ///
+    /// [`transition_target_sites_to_unresolved`]: Self::transition_target_sites_to_unresolved
+    pub fn relink_unresolved_target(&mut self, target_file_id: FileId) {
+        let Some(unresolved_by_removal) = self.unresolved_by_removal.remove(&target_file_id) else {
+            return;
+        };
+
+        let mut restored: Vec<(FileId, usize, LuaDependencySite)> = Vec::new();
+        for (source_file_id, path) in unresolved_by_removal {
+            let Some(sites) = self.dependency_sites.get_mut(&source_file_id) else {
+                continue;
+            };
+            for (site_index, site) in sites.iter_mut().enumerate() {
+                if site.target_file_id.is_some() || site.path != path {
+                    continue;
+                }
+                derivation::note_write(|| FactKey::Dependency(source_file_id));
+                let unresolved = site.clone();
+                site.target_file_id = Some(target_file_id);
+                restored.push((source_file_id, site_index, unresolved));
+            }
+        }
+        if restored.is_empty() {
+            return;
+        }
+
+        let unresolved = restored
+            .iter()
+            .map(|(_, _, site)| site.clone())
+            .collect::<Vec<_>>();
+        self.unindex_unresolved_sites(&unresolved);
+        for (source_file_id, site_index, site) in restored {
+            self.add_dependency_file(source_file_id, target_file_id, site.kind);
+            self.resolved_sites_by_target
+                .entry(target_file_id)
+                .or_default()
+                .push(DependencySiteLocation {
+                    source_file_id,
+                    site_index,
+                });
+        }
+    }
+
     fn transition_target_sites_to_unresolved(&mut self, target_file_id: FileId) {
         let Some(mut locations) = self.resolved_sites_by_target.remove(&target_file_id) else {
             return;
@@ -283,6 +459,7 @@ impl LuaDependencyIndex {
         let mut site_visits = 0;
         let dependency_sites = &mut self.dependency_sites;
         let unresolved_dependents_by_path_key = &mut self.unresolved_dependents_by_path_key;
+        let mut flipped = Vec::new();
         for location in locations {
             #[cfg(test)]
             {
@@ -296,7 +473,12 @@ impl LuaDependencyIndex {
                 continue;
             };
             site.target_file_id = None;
+            derivation::note_write(|| FactKey::Dependency(location.source_file_id));
             Self::index_unresolved_site(unresolved_dependents_by_path_key, site);
+            flipped.push((location.source_file_id, site.path.clone()));
+        }
+        if !flipped.is_empty() {
+            self.unresolved_by_removal.insert(target_file_id, flipped);
         }
         #[cfg(test)]
         {
@@ -312,10 +494,44 @@ impl LuaDependencyIndex {
     pub fn get_file_dependencies<'a>(&'a self) -> FileDependencyRelation<'a> {
         FileDependencyRelation::new(&self.dependencies)
     }
+
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        if let FactKey::LoadSites(file_id) = key {
+            return derivation::fingerprint_opt(self.derived_sites.get(file_id));
+        }
+        let FactKey::Dependency(file_id) = key else {
+            debug_assert!(false, "{key:?} is not a dependency fact");
+            return derivation::ABSENT;
+        };
+        let dependencies = self.dependencies.get(file_id).map(|dependencies| {
+            let mut dependencies = dependencies.iter().copied().collect::<Vec<_>>();
+            dependencies.sort_unstable();
+            dependencies
+        });
+        let kinds = self.dependency_kinds.get(file_id).map(|kinds| {
+            let mut kinds = kinds
+                .iter()
+                .map(|(dependency_id, kinds)| {
+                    let mut kinds = kinds.iter().map(|kind| *kind as u8).collect::<Vec<_>>();
+                    kinds.sort_unstable();
+                    (*dependency_id, kinds)
+                })
+                .collect::<Vec<_>>();
+            kinds.sort_unstable();
+            kinds
+        });
+        let sites = self.dependency_sites.get(file_id);
+        if dependencies.is_none() && kinds.is_none() && sites.is_none() {
+            return derivation::ABSENT;
+        }
+        derivation::fingerprint_of(&(dependencies, kinds, sites))
+    }
 }
 
 impl LuaIndex for LuaDependencyIndex {
     fn remove(&mut self, file_id: FileId) {
+        derivation::note_write(|| FactKey::Dependency(file_id));
+        self.derived_sites.remove(&file_id);
         if let Some(sites) = self.dependency_sites.remove(&file_id) {
             self.unindex_source_sites(file_id, &sites);
         }
@@ -334,12 +550,24 @@ impl LuaIndex for LuaDependencyIndex {
     }
 
     fn clear(&mut self) {
+        if derivation::recording() {
+            for file_id in self
+                .dependencies
+                .keys()
+                .chain(self.dependency_kinds.keys())
+                .chain(self.dependency_sites.keys())
+            {
+                derivation::note_write(|| FactKey::Dependency(*file_id));
+            }
+        }
         self.dependencies.clear();
         self.dependency_kinds.clear();
         self.dependency_callers_by_target.clear();
         self.dependency_sites.clear();
         self.resolved_sites_by_target.clear();
         self.unresolved_dependents_by_path_key.clear();
+        self.unresolved_by_removal.clear();
+        self.derived_sites.clear();
         #[cfg(test)]
         {
             self.target_transition_site_visits = 0;
@@ -496,6 +724,31 @@ mod tests {
     }
 
     #[test]
+    fn a_derived_site_whose_target_was_removed_is_taken_back_with_its_derivation() {
+        use crate::db_index::derivation::{self, DerivationId, DerivationKind};
+        let source = FileId::new(1);
+        let target = FileId::new(2);
+        let mut index = LuaDependencyIndex::new();
+        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
+        index.add_dependency_site(LuaDependencySite {
+            source_file_id: source,
+            target_file_id: Some(target),
+            kind: LuaDependencyKind::Include,
+            path: Some("target.lua".to_string()),
+            path_keys: vec!["target.lua".to_string()],
+            original_expr: "MyInclude(\"target.lua\")".to_string(),
+            call_range: TextRange::new(TextSize::new(0), TextSize::new(1)),
+            range: TextRange::new(TextSize::new(0), TextSize::new(1)),
+        });
+        derivation::end();
+
+        index.remove(target);
+        index.reset_derived_sites(source);
+
+        assert_eq!(index.get_dependency_sites(&source), None);
+    }
+
+    #[test]
     fn resolved_target_removal_visits_only_reverse_indexed_sites() {
         let mut index = LuaDependencyIndex::new();
         let range = TextRange::new(TextSize::new(0), TextSize::new(1));
@@ -539,3 +792,18 @@ mod tests {
         );
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(LuaDependencyIndex {
+    dependencies,
+    dependency_kinds,
+    dependency_callers_by_target => |current, frozen, fork| {
+        crate::db_index::cow_shards::merge_map(current, frozen, fork, crate::db_index::cow_shards::merge_set)
+    },
+    dependency_sites,
+    resolved_sites_by_target => crate::db_index::cow_shards::merge_list,
+    unresolved_dependents_by_path_key => crate::db_index::cow_shards::merge_set,
+    unresolved_by_removal,
+    derived_sites,
+    #[cfg(test)]
+    target_transition_site_visits,
+});

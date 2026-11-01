@@ -756,6 +756,32 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_unresolved_method_names_the_member() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@class Ent
+                local Ent = {}
+                ---@return Ent
+                function GetWorld() end
+                local force = GetWorld():Get<??>Force()
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nGetForce: nil\n```".to_string(),
+            },
+        ));
+        check!(ws.check_hover(
+            r#"
+                local value = Some<??>Global()
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nSomeGlobal: unknown\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_dynamic_key_read_from_known_table_fields_stays_table() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = ws.get_emmyrc();
@@ -1472,6 +1498,110 @@ local EscapeStringMap: {
         Ok(())
     }
 
+    /// A hook of a gamemode class based on `GM` shows the docs `GM`'s would.
+    #[gtest]
+    fn a_hook_of_a_class_based_on_gm_shows_the_sandbox_docs() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "library/lua/includes/extensions/sandbox_hooks.lua",
+            r#"
+                ---@class GM
+                GM = GM or {}
+
+                ---@class SANDBOX
+                SANDBOX = SANDBOX or {}
+
+                ---Called when a player attempts to spawn a SENT.
+                ---@param ply Player
+                ---@param class string
+                ---@return boolean
+                function SANDBOX:PlayerSpawnSENT(ply, class)
+                end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@class MYGM : GM
+                local MYGM = {}
+
+                function MYGM:PlayerSpawnSE<??>NT(ply, class)
+                    return true
+                end
+            "#,
+        )?;
+        let file_id = ws.def_file("gamemodes/mygm/gamemode/init.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+        verify_that!(
+            markup.value,
+            contains_substring("Called when a player attempts to spawn a SENT")
+        )
+    }
+
+    /// The hover of `source` in a plugin of a Helix schema at `root`
+    /// ([`ProviderVirtualWorkspace::def_helix_schema`]).
+    fn helix_plugin_hover(root: &str, source: &str) -> Result<String> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_helix_schema(root);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(source)?;
+        let file_id = ws.def_file(&format!("{root}plugins/writing/sv_hooks.lua"), &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return Err(
+                googletest::internal::test_outcome::TestAssertionFailure::create(
+                    "expected HoverContents::Markup".to_string(),
+                ),
+            );
+        };
+        Ok(markup.value)
+    }
+
+    #[gtest]
+    fn test_hover_plugin_hook_definition_shows_derived_gamemode_hook_docs() -> Result<()> {
+        for root in ["", "gamemodes/ixhl2rp/"] {
+            verify_that!(
+                helix_plugin_hover(
+                    root,
+                    "function PLUGIN:CanPlayerTake<??>Item(client, item) end\n",
+                )?,
+                contains_substring("Whether a player can take an item.")
+            )?;
+        }
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_hook_add_string_in_plugin_shows_derived_gamemode_hook_docs() -> Result<()> {
+        for root in ["", "gamemodes/ixhl2rp/"] {
+            verify_that!(
+                helix_plugin_hover(
+                    root,
+                    "hook.Add(\"CanPlayerTake<??>Item\", \"test\", function() end)\n",
+                )?,
+                contains_substring("Whether a player can take an item.")
+            )?;
+        }
+        Ok(())
+    }
+
     #[gtest]
     fn test_hover_hook_add_string_uses_registered_hook_docs() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
@@ -1674,6 +1804,50 @@ local EscapeStringMap: {
     }
 
     #[gtest]
+    fn test_hover_member_only_subtypes_define_shows_their_member() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@class gmod_balloon: Entity
+                local gmod_balloon = {}
+
+                ---@return number
+                function gmod_balloon:GetForce() end
+            "#,
+        );
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@type Entity
+                local ent
+                print(ent:GetFo<??>rce())
+            "#,
+        )?;
+        let file_id = ws.def_file("report.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        verify_that!(
+            markup.value.as_str(),
+            contains_substring("gmod_balloon:GetForce()")
+        )?;
+        verify_that!(
+            markup.value.as_str(),
+            contains_substring("`GetForce` is not defined on `Entity`. Defined on `gmod_balloon`.")
+        )?;
+        verify_that!(
+            markup.value.as_str(),
+            not(contains_substring("GetForce: nil"))
+        )
+    }
+
+    #[gtest]
     fn test_hover_badge_prefers_annotation_realm_over_inferred_realm() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
@@ -1782,6 +1956,95 @@ local EscapeStringMap: {
         );
 
         Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_annotated_g_function_shows_its_realm_badge() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let annotations_root = ws.virtual_url_generator.base.join("annotations");
+        ws.analysis.add_library_workspace(annotations_root);
+        ws.def_file(
+            "annotations/global.lua",
+            r#"
+            ---@meta
+
+            ---Returns the player object of the current client.
+            ---@realm client
+            ---@return Player # The player object representing the client.
+            function _G.LocalPlayer() end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local ply = Local<??>Player()
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/client/cl_hud.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        verify_that!(
+            markup.value,
+            all!(
+                contains_substring("Returns the player object of the current client."),
+                contains_substring("**CLIENT**")
+            )
+        )
+    }
+
+    #[gtest]
+    fn test_hover_client_library_function_called_from_server_shows_its_signature() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let annotations_root = ws.virtual_url_generator.base.join("annotations");
+        ws.analysis.add_library_workspace(annotations_root);
+        ws.def_file(
+            "annotations/surface.lua",
+            r#"
+            ---@meta
+
+            surface = {}
+
+            ---Plays a sound file directly on the client.
+            ---@realm client
+            ---@param soundfile string The path to the sound file.
+            function surface.PlaySound(soundfile) end
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                surface.Play<??>Sound("buttons/button14.wav")
+            "#,
+        )?;
+        let file_id = ws.def_file("lua/autorun/server/sv_shop.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        verify_that!(
+            markup.value,
+            all!(
+                contains_substring("surface.PlaySound(soundfile: string)"),
+                contains_substring("Plays a sound file directly on the client."),
+                contains_substring("**CLIENT**")
+            )
+        )
     }
 
     #[gtest]
@@ -2671,7 +2934,7 @@ local EscapeStringMap: {
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
                 ---@class Vector
-                local Vector = {}
+                local VectorMeta = {}
                 ---@return Vector
                 function _G.Vector() end
 
@@ -2732,7 +2995,7 @@ local EscapeStringMap: {
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
                 ---@class Vector
-                local Vector = {}
+                local VectorMeta = {}
                 ---@return Vector
                 function _G.Vector() end
 
@@ -3977,7 +4240,7 @@ local EscapeStringMap: {
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
                 ---@class Vector
-                local Vector = {}
+                local VectorMeta = {}
                 ---@param x? number
                 ---@param y? number
                 ---@param z? number
@@ -4049,7 +4312,7 @@ local EscapeStringMap: {
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
                 ---@class Vector
-                local Vector = {}
+                local VectorMeta = {}
                 ---@param x? number
                 ---@param y? number
                 ---@param z? number
@@ -4114,7 +4377,7 @@ local EscapeStringMap: {
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
                 ---@class Vector
-                local Vector = {}
+                local VectorMeta = {}
                 ---@param x? number
                 ---@param y? number
                 ---@param z? number
@@ -4251,155 +4514,6 @@ local EscapeStringMap: {
         assert!(
             !hover_ret.contains("unknown"),
             "return variable should not infer as unknown: {hover_ret}"
-        );
-
-        Ok(())
-    }
-
-    #[gtest]
-    fn test_real_cityrp_base_glide_car_hover() -> Result<()> {
-        use glua_code_analysis::{WorkspaceFolder, collect_workspace_files};
-
-        let mut analysis = glua_code_analysis::EmmyLuaAnalysis::new();
-        let mut emmyrc = glua_code_analysis::Emmyrc::default();
-        emmyrc.gmod.enabled = true;
-        emmyrc.gmod.infer_dynamic_fields = true;
-        emmyrc
-            .gmod
-            .scripted_class_scopes
-            .set_include(vec![legacy_scope("entities/**")]);
-
-        let codebase_path = std::path::PathBuf::from(r"D:\Source\Repos\GitHub\cityrp-vehicle-base");
-        if !codebase_path.exists() {
-            return Ok(());
-        }
-        let annot_path =
-            std::path::PathBuf::from(r"D:\Source\Repos\GitHub\annotations-gmod-glua-ls");
-
-        let mut folders = Vec::new();
-        if annot_path.exists() {
-            analysis.add_library_workspace(annot_path.clone());
-            folders.push(WorkspaceFolder::new(annot_path.clone(), true));
-        }
-
-        analysis.add_main_workspace(codebase_path.clone());
-        folders.push(WorkspaceFolder::new(codebase_path.clone(), false));
-
-        analysis.update_config(std::sync::Arc::new(emmyrc.clone()));
-
-        let collected = collect_workspace_files(&folders, &emmyrc, None, None);
-        let files: Vec<(std::path::PathBuf, Option<String>)> = collected
-            .into_iter()
-            .filter_map(|f| {
-                let path = std::path::PathBuf::from(&f.path);
-                let text = std::fs::read_to_string(&path).ok()?;
-                Some((path, Some(text)))
-            })
-            .collect();
-        analysis.update_files_by_path(files);
-
-        let vfs = analysis.compilation.get_db().get_vfs();
-        let file_id = vfs
-            .get_all_file_ids()
-            .into_iter()
-            .find(|id| {
-                vfs.get_file_path(id).is_some_and(|p| {
-                    p.ends_with("base_glide_car/init.lua")
-                        || p.ends_with(r"base_glide_car\init.lua")
-                })
-            })
-            .expect("base_glide_car/init.lua file_id");
-
-        // Line 781 is index 780 in 0-indexed LSP line coordinates:
-        // "        local freeLookHeld = self:GetInputBool(1, "free_look")"
-        // Col for self: 29
-        // Col for GetInputBool: 35
-        // Col for freeLookHeld: 14
-
-        // 1. Hover on `self` at line 781: must show `self: base_glide_car` (not method `OnSeatInput`)
-        let pos_self = lsp_types::Position::new(780, 29);
-        let hover_self =
-            crate::handlers::hover::hover(&analysis, file_id, pos_self, None).expect("hover self");
-        let HoverContents::Markup(self_markup) = hover_self.contents else {
-            panic!("expected markup")
-        };
-        assert!(
-            self_markup.value.contains("self: base_glide_car"),
-            "hover self should show self: base_glide_car, got: {}",
-            self_markup.value
-        );
-        assert!(
-            !self_markup
-                .value
-                .contains("(method) base_glide_car:OnSeatInput"),
-            "hover self must not resolve to the method definition itself: {}",
-            self_markup.value
-        );
-        assert!(
-            self_markup.value.contains("Scripted Entity:")
-                && self_markup.value.contains("base_glide_car"),
-            "hover self should include scripted entity info: {}",
-            self_markup.value
-        );
-
-        // 2. Hover on `GetInputBool` at line 781: must show inherited method `base_glide:GetInputBool`
-        let pos_input = lsp_types::Position::new(780, 35);
-        let hover_input = crate::handlers::hover::hover(&analysis, file_id, pos_input, None)
-            .expect("hover GetInputBool");
-        let HoverContents::Markup(input_markup) = hover_input.contents else {
-            panic!("expected markup")
-        };
-        assert!(
-            input_markup
-                .value
-                .contains("GetInputBool(seatIndex: number, action: string, entTbl: table?) -> any"),
-            "hover GetInputBool should show signature with return type, got: {}",
-            input_markup.value
-        );
-        assert!(
-            input_markup
-                .value
-                .contains("Get the action's boolean value from a specific seat."),
-            "hover GetInputBool should show docstring: {}",
-            input_markup.value
-        );
-
-        // 3. Hover on `freeLookHeld` variable at line 781: must show `local freeLookHeld: any` (not unknown)
-        let pos_var = lsp_types::Position::new(780, 15);
-        let hover_var = crate::handlers::hover::hover(&analysis, file_id, pos_var, None)
-            .expect("hover freeLookHeld");
-        let HoverContents::Markup(var_markup) = hover_var.contents else {
-            panic!("expected markup")
-        };
-        assert!(
-            var_markup.value.contains("local freeLookHeld: any"),
-            "hover freeLookHeld should infer return type `any`, got: {}",
-            var_markup.value
-        );
-
-        // 4. Definition site sv_input.lua: GetInputBool
-        let sv_file_id = vfs
-            .get_all_file_ids()
-            .into_iter()
-            .find(|id| {
-                vfs.get_file_path(id).is_some_and(|p| {
-                    p.ends_with("base_glide/sv_input.lua")
-                        || p.ends_with(r"base_glide\sv_input.lua")
-                })
-            })
-            .expect("base_glide/sv_input.lua file_id");
-        let pos_def = lsp_types::Position::new(62, 14);
-        let hover_def = crate::handlers::hover::hover(&analysis, sv_file_id, pos_def, None)
-            .expect("hover GetInputBool def");
-        let HoverContents::Markup(def_markup) = hover_def.contents else {
-            panic!("expected markup")
-        };
-        assert!(
-            def_markup
-                .value
-                .contains("(method) base_glide:GetInputBool"),
-            "definition hover should show method base_glide:GetInputBool, got: {}",
-            def_markup.value
         );
 
         Ok(())
@@ -4581,5 +4695,44 @@ end
              super graph forms a diamond, got: {hover}"
         );
         Ok(())
+    }
+
+    /// A hover resolving into another file reads that file's taken text while
+    /// shorter text for it is staged: never the staged tree against the
+    /// index built from the taken one.
+    #[gtest]
+    fn hover_reads_another_files_taken_text_while_its_edit_is_staged() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/sh_config.lua",
+            "Config = {}
+
+--- The money every player starts with.
+Config.StartingMoney = 100
+",
+        );
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            "local money = Config.Starting<??>Money
+",
+        )?;
+        let reader = ws.def_file("lua/autorun/sh_reader.lua", &content);
+        let hover_text = |ws: &ProviderVirtualWorkspace| {
+            crate::handlers::hover::hover(&ws.analysis, reader, position, None)
+                .map(|hover| format!("{:?}", hover.contents))
+        };
+        let before = hover_text(&ws);
+        verify_that!(before, some(contains_substring("starts with")))?;
+
+        let config = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/sh_config.lua");
+        ws.analysis.update_file_text_only(
+            &config,
+            "Config = {}
+"
+            .to_string(),
+        );
+
+        verify_that!(hover_text(&ws), eq(&before))
     }
 }

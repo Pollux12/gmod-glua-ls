@@ -12,7 +12,7 @@ use crate::handlers::hover::humanize_types::{
 };
 
 use super::build_hover::{add_signature_param_description, add_signature_ret_description};
-use super::realm_badge::{badge_header_markdown, badge_markdown};
+use super::realm_badge::badge_header_markdown;
 
 const INFER_HOVER_PREFIX: &str = "(infer) ";
 
@@ -54,7 +54,7 @@ pub struct HoverBuilder<'a> {
     pub annotation_description: Vec<MarkedString>,
     /// Dedicated @source annotation rendered as a clickable link in hover.
     source: Option<String>,
-    /// 一些类型的完整追加显示, 通常是 @alias
+    /// Full additional display for some types, usually @alias
     pub type_expansion: Option<Vec<String>>,
     /// For `@see` and unknown tags tags
     tag_content: Option<Vec<(String, String)>>,
@@ -68,7 +68,7 @@ pub struct HoverBuilder<'a> {
     pub detail_render_level: RenderLevel,
 
     pub is_completion: bool,
-    // 默认的泛型替换器
+    // Default generic replacer
     pub substitutor: Option<TypeSubstitutor>,
 }
 
@@ -278,8 +278,8 @@ impl<'a> HoverBuilder<'a> {
         }
     }
 
-    pub fn realm_badge_markdown(&self) -> Option<&'static str> {
-        badge_markdown(self.realm?)
+    pub fn realm_badge_markdown(&self) -> Option<String> {
+        badge_header_markdown(self.realm?)
     }
 
     pub fn add_signature_params_rets_description(&mut self, typ: LuaType) {
@@ -326,9 +326,7 @@ impl<'a> HoverBuilder<'a> {
         let description_content = {
             let mut content = Vec::new();
 
-            if let Some(realm) = self.realm
-                && let Some(realm_header) = badge_header_markdown(realm)
-            {
+            if let Some(realm_header) = self.realm_badge_markdown() {
                 content.push(realm_header);
             }
 
@@ -401,7 +399,7 @@ impl<'a> HoverBuilder<'a> {
 
         let mut result = sections.join("\n\n---\n\n");
 
-        // 清除空白字符
+        // Clear whitespace characters
         result = result.trim().to_string();
 
         Some(Hover {
@@ -435,7 +433,7 @@ fn marked_string_to_markdown(marked_string: &MarkedString) -> String {
     }
 }
 
-// 推断基础泛型替换器
+// Infer the base generic replacer
 fn infer_substitutor_base_type(
     semantic_model: &SemanticModel,
     trigger_token: LuaSyntaxToken,

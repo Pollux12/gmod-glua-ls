@@ -8,6 +8,8 @@ mod tags;
 mod type_def_tags;
 mod type_ref_tags;
 
+pub(crate) use type_ref_tags::register_inferred_accessor_generators;
+
 use super::AnalyzeContext;
 use crate::{
     FileId, LuaDocDefaultValue, LuaSemanticDeclId, LuaType, TypeOps, WorkspaceId,
@@ -55,6 +57,7 @@ impl AnalysisPipeline for DocAnalysisPipeline {
         let workspace_id = context.workspace_id.unwrap_or(WorkspaceId::MAIN);
         for in_filed_tree in tree_list.iter() {
             let root = &in_filed_tree.value;
+            register_property_merge_order(db, in_filed_tree.file_id);
             let mut generic_index = FileGenericIndex::new();
             for comment in root.descendants::<LuaComment>() {
                 let mut analyzer = DocAnalyzer::new(
@@ -69,6 +72,19 @@ impl AnalysisPipeline for DocAnalysisPipeline {
             }
         }
     }
+}
+
+/// A class documented in several files shares one property. Tell the property index how those
+/// files order against each other. A file in no known workspace sorts after every ranked one.
+fn register_property_merge_order(db: &mut DbIndex, file_id: FileId) {
+    let module_index = db.get_module_index();
+    let workspace_rank = module_index
+        .get_workspace_id(file_id)
+        .map(|workspace_id| module_index.get_workspace_kind(workspace_id).merge_rank())
+        .unwrap_or(crate::WorkspaceKind::MERGE_RANK_NONE);
+    let path = db.get_vfs().file_order_key(&file_id);
+    db.get_property_index_mut()
+        .set_file_merge_order(file_id, workspace_rank, path);
 }
 
 fn analyze_comment(analyzer: &mut DocAnalyzer) -> Option<()> {

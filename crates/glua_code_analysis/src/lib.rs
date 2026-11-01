@@ -28,166 +28,51 @@ pub use db_index::*;
 pub use diagnostic::*;
 pub use gamemode_base::detect_gamemode_base_libraries;
 pub use glua_codestyle::*;
-use glua_parser::{
-    LineIndex, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey, LuaLocalStat, LuaNameExpr,
-    LuaParenExpr, LuaParser, LuaSyntaxTree,
-};
+use glua_parser::{LineIndex, LuaCallExpr, LuaSyntaxTree};
 pub use library_collision::LibraryDefinitionCollision;
 use lsp_types::Uri;
 pub use profile::Profile;
 use resources::load_resource_std;
+use rustc_hash::FxHashSet;
 use schema_to_glua::SchemaConverter;
 pub use semantic::*;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path};
 use std::str::FromStr;
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 pub use test_lib::{GMOD_CALL_ARG_BUILTINS_FIXTURE, VirtualWorkspace};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 pub use vfs::*;
 
-#[derive(Default)]
-/// The cross-file facts an edit can invalidate, captured before
-/// re-analysis.
-struct InferredGuardSnapshot {
-    facts: HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
-    consumers: HashMap<LuaInferredGuardOwner, HashSet<FileId>>,
-    /// Parameter types inferred from the snapshotted files' call sites, keyed by
-    /// the callee signature they belong to.
-    inferred_params: HashMap<(LuaSignatureId, usize), LuaType>,
-    /// The files the snapshot was taken for, needed to recompute the same set.
-    snapshot_file_ids: HashSet<FileId>,
-}
+/// Stack size for any thread that runs analysis.
+///
+/// Inference and the type-graph walks recurse to the depth of the source, which
+/// a generated or deeply nested GLua file can push past a default thread stack.
+/// Every thread the binaries analyse on gets it: their runtime's threads, the
+/// thread driving that runtime and the worker pool, so how deep a file may nest
+/// does not depend on which thread picked it up. The reservation is virtual and committed lazily, so a worker that never
+/// recurses costs nothing.
+pub const ANALYSIS_STACK_SIZE: usize = 256 * 1024 * 1024;
 
-#[derive(Default)]
-struct InferredGuardReferenceFiles {
-    files: HashSet<FileId>,
-    alias_calls: HashSet<FileId>,
-}
+/// Minimum stack bytes that must remain to keep inferring.
+///
+/// Source-controlled nesting (expressions, doc types) recurses per level and
+/// can exhaust small worker stacks on generated files. Exhaustion bails to the
+/// existing `RecursiveInfer` path (an `Unknown` fallback), the same graceful
+/// failure cyclic inputs already produce, instead of aborting the process.
+pub(crate) const ANALYSIS_STACK_RESERVE: usize = 256 * 1024;
 
-#[cfg(test)]
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct InferredGuardPropagationStats {
-    pub changed_facts: usize,
-    pub reference_edges: usize,
-    pub frontiers: usize,
-    pub reindexed_files: usize,
-    pub broad_stabilizations: usize,
-}
-
-fn sort_inferred_guard_owners(owners: &mut [LuaInferredGuardOwner]) {
-    owners.sort_by(|left, right| {
-        (left.source_file_id(), left.source_position(), left.path()).cmp(&(
-            right.source_file_id(),
-            right.source_position(),
-            right.path(),
-        ))
-    });
-}
-
-fn global_path_for_expr(expr: &LuaExpr) -> Option<Vec<smol_str::SmolStr>> {
-    let mut path = match expr {
-        LuaExpr::NameExpr(name_expr) => {
-            Some(vec![name_expr.get_name_token()?.get_name_text().into()])
-        }
-        LuaExpr::IndexExpr(index_expr) => {
-            if index_expr.get_index_token()?.is_colon() {
-                return None;
-            }
-            let mut path = global_path_for_expr(&index_expr.get_prefix_expr()?)?;
-            let member = match index_expr.get_index_key()? {
-                LuaIndexKey::Name(name) => name.get_name_text().into(),
-                LuaIndexKey::String(string) => string.get_value().into(),
-                _ => return None,
-            };
-            path.push(member);
-            Some(path)
-        }
-        _ => None,
-    }?;
-    canonicalize_global_root_path(&mut path);
-    Some(path)
-}
-
-fn immutable_local_alias_decl(
-    db: &DbIndex,
-    file_id: FileId,
-    alias_value: &LuaExpr,
-) -> Option<LuaDeclId> {
-    let alias_value = enclosing_parenthesized_expr(alias_value);
-    let local_stat = alias_value.get_parent::<LuaLocalStat>()?;
-    let local_name = local_stat.get_local_name_by_value(alias_value.clone())?;
-    let decl_id = LuaDeclId::new(file_id, local_name.get_position());
-    let decl = db.get_decl_index().get_decl(&decl_id)?;
-    if !matches!(decl.extra, LuaDeclExtra::Local { .. })
-        || decl.get_value_syntax_id() != Some(alias_value.get_syntax_id())
-        || db
-            .get_reference_index()
-            .get_decl_references(&file_id, &decl_id)
-            .is_none_or(|references| references.mutable)
-    {
-        return None;
+/// Fail-closed remaining-stack probe shared by expression and doc inference.
+///
+/// `None` (unsupported target / OS query failure) counts as exhausted rather
+/// than safe, mirroring how `stacker::maybe_grow` treats `None` as
+/// insufficient.
+pub(crate) fn analysis_stack_exhausted() -> bool {
+    match stacker::remaining_stack() {
+        Some(remaining) => remaining < ANALYSIS_STACK_RESERVE,
+        None => true,
     }
-    Some(decl_id)
-}
-
-fn enclosing_parenthesized_expr(expr: &LuaExpr) -> LuaExpr {
-    let mut expr = expr.clone();
-    while let Some(paren_expr) = expr.get_parent::<LuaParenExpr>() {
-        if paren_expr
-            .get_expr()
-            .is_none_or(|inner| inner.get_syntax_id() != expr.get_syntax_id())
-        {
-            break;
-        }
-        expr = LuaExpr::ParenExpr(paren_expr);
-    }
-    expr
-}
-
-fn is_call_prefix(expr: &LuaExpr) -> bool {
-    let expr = enclosing_parenthesized_expr(expr);
-    expr.get_parent::<LuaCallExpr>()
-        .and_then(|call| call.get_prefix_expr())
-        .is_some_and(|prefix| prefix.get_syntax_id() == expr.get_syntax_id())
-}
-
-fn expr_resolves_to_inferred_guard_owner(
-    db: &DbIndex,
-    caches: &mut HashMap<FileId, LuaInferCache>,
-    owner: &LuaInferredGuardOwner,
-    file_id: FileId,
-    expr: &LuaExpr,
-) -> bool {
-    let cache = caches
-        .entry(file_id)
-        .or_insert_with(|| LuaInferCache::new(file_id, Default::default()));
-    semantic::infer_expr(db, cache, expr.clone()).ok()
-        == Some(LuaType::Signature(owner.signature_id()))
-}
-
-fn call_resolves_to_inferred_guard_owner(
-    db: &DbIndex,
-    caches: &mut HashMap<FileId, LuaInferCache>,
-    owner: &LuaInferredGuardOwner,
-    file_id: FileId,
-    prefix_expr: &LuaExpr,
-) -> bool {
-    let prefix_expr = enclosing_parenthesized_expr(prefix_expr);
-    let Some(call) = prefix_expr.get_parent::<LuaCallExpr>() else {
-        return false;
-    };
-    if call
-        .get_prefix_expr()
-        .is_none_or(|prefix| prefix.get_syntax_id() != prefix_expr.get_syntax_id())
-    {
-        return false;
-    }
-    let cache = caches
-        .entry(file_id)
-        .or_insert_with(|| LuaInferCache::new(file_id, Default::default()));
-    semantic::get_prefix_expr_signature_id(db, cache, &call) == Some(owner.signature_id())
 }
 
 /// True when `call_expr` calls an annotated net operation — a message start, a
@@ -215,7 +100,7 @@ pub fn call_expr_is_net_op(
 }
 
 pub async fn fetch_schema_urls(urls: Vec<Url>) -> HashMap<Url, String> {
-    let mut url_contents = HashMap::new();
+    let mut url_contents = HashMap::default();
     for url in urls {
         if url.scheme() == "file" {
             if let Ok(path) = url.to_file_path()
@@ -266,7 +151,7 @@ pub(crate) fn dependency_site_path_keys(
         return Vec::new();
     }
 
-    let mut keys = HashSet::new();
+    let mut keys = FxHashSet::default();
     insert_dependency_path_key_variants(&mut keys, dependency_path.clone());
 
     if let Some(source_parent) = db
@@ -284,37 +169,7 @@ pub(crate) fn dependency_site_path_keys(
     keys
 }
 
-fn dependency_path_keys_for_target(db: &DbIndex, target_path: &Path) -> Vec<String> {
-    let mut keys = HashSet::new();
-    let Some(target_path_text) = target_path.to_str() else {
-        return Vec::new();
-    };
-
-    let normalized_target_path = normalize_file_path(target_path);
-    insert_dependency_path_key_variants(&mut keys, normalized_target_path.clone());
-
-    if let Some(lua_idx) = normalized_target_path.find("/lua/") {
-        let lua_relative = normalized_target_path[(lua_idx + 1)..].to_string();
-        insert_dependency_path_key_variants(&mut keys, lua_relative.clone());
-        insert_dependency_path_key_variants(&mut keys, lua_relative.replace('/', "."));
-        if let Some(without_lua) = lua_relative.strip_prefix("lua/") {
-            insert_dependency_path_key_variants(&mut keys, without_lua.to_string());
-            insert_dependency_path_key_variants(&mut keys, without_lua.replace('/', "."));
-        }
-    }
-
-    if let Some((module_path, _)) = db.get_module_index().extract_module_path(target_path_text) {
-        let module_path = normalize_dependency_path(&module_path.replace('\\', "/"));
-        insert_dependency_path_key_variants(&mut keys, module_path.replace('.', "/"));
-        insert_dependency_path_key_variants(&mut keys, module_path);
-    }
-
-    let mut keys = keys.into_iter().collect::<Vec<_>>();
-    keys.sort_unstable();
-    keys
-}
-
-fn insert_dependency_path_key_variants(keys: &mut HashSet<String>, path: String) {
+fn insert_dependency_path_key_variants(keys: &mut FxHashSet<String>, path: String) {
     let normalized = normalize_dependency_path(&path);
     if normalized.is_empty() {
         return;
@@ -375,10 +230,6 @@ pub struct EmmyLuaAnalysis {
     pub compilation: LuaCompilation,
     pub diagnostic: LuaDiagnostic,
     pub emmyrc: Arc<Emmyrc>,
-    #[cfg(test)]
-    pub(crate) inferred_guard_propagation_stats: InferredGuardPropagationStats,
-    #[cfg(test)]
-    cross_file_stabilization_invocations: usize,
 }
 
 impl EmmyLuaAnalysis {
@@ -388,10 +239,17 @@ impl EmmyLuaAnalysis {
             compilation: LuaCompilation::new(emmyrc.clone()),
             diagnostic: LuaDiagnostic::new(),
             emmyrc,
-            #[cfg(test)]
-            inferred_guard_propagation_stats: InferredGuardPropagationStats::default(),
-            #[cfg(test)]
-            cross_file_stabilization_invocations: 0,
+        }
+    }
+
+    /// An independent copy-on-write copy: index domains and the vfs are
+    /// shared until one side first writes them, and edits to either side never
+    /// reach the other.
+    pub fn fork(&self) -> Self {
+        Self {
+            compilation: self.compilation.fork(),
+            diagnostic: self.diagnostic.clone(),
+            emmyrc: self.emmyrc.clone(),
         }
     }
 
@@ -406,6 +264,19 @@ impl EmmyLuaAnalysis {
         self.init_std_lib_from_files(std_root, files);
     }
 
+    /// Hands the workspace roots and their load tiers to the VFS, which orders
+    /// files by them.
+    fn sync_file_order(&mut self) {
+        let db = self.compilation.get_db_mut();
+        let roots = db
+            .get_module_index()
+            .workspaces()
+            .iter()
+            .map(|workspace| (workspace.root.clone(), workspace.kind.merge_rank()))
+            .collect::<Vec<_>>();
+        db.get_vfs_mut().set_order_roots(roots);
+    }
+
     /// Register a pre-built set of embedded std files directly into the analysis
     /// workspace without going through the resource-loading pipeline.
     pub(crate) fn init_std_lib_from_files(&mut self, std_root: PathBuf, files: Vec<LuaFileInfo>) {
@@ -413,6 +284,7 @@ impl EmmyLuaAnalysis {
             .get_db_mut()
             .get_module_index_mut()
             .add_workspace_root_with_kind(std_root, WorkspaceId::STD, WorkspaceKind::Std);
+        self.sync_file_order();
 
         let files = files
             .into_iter()
@@ -442,6 +314,7 @@ impl EmmyLuaAnalysis {
             id: module_index.next_main_workspace_id(),
         };
         module_index.add_workspace_root_with_kind(root, id, WorkspaceKind::Main);
+        self.sync_file_order();
     }
 
     pub fn add_library_workspace(&mut self, root: PathBuf) {
@@ -451,90 +324,74 @@ impl EmmyLuaAnalysis {
             id: module_index.next_library_workspace_id(),
         };
         module_index.add_workspace_root_with_kind(root, id, WorkspaceKind::Library);
+        self.sync_file_order();
     }
 
-    pub fn update_file_by_uri(&mut self, uri: &Uri, text: Option<String>) -> Option<FileId> {
-        let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(uri);
-        if let Some(file_id) = existing_file_id {
-            if let (Some(new_text), Some(old_text)) = (
-                text.as_deref(),
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_file_content(&file_id)
-                    .map(String::as_str),
-            ) && old_text == new_text
-            {
-                // Text unchanged — if the index is already built (has module info),
-                // skip the costly remove+re-add cycle. This avoids unnecessary
-                // reindexing when VS Code opens already-loaded files for
-                // peek/definition (e.g. annotation/library files).
-                if self
-                    .compilation
-                    .get_db()
-                    .get_module_index()
-                    .get_module(file_id)
-                    .is_some()
-                {
-                    return Some(file_id);
-                }
-
-                // Index was cleared — fall through to rebuild it.
-                self.compilation.remove_index(vec![file_id]);
-                self.compilation.update_index(vec![file_id]);
-                return Some(file_id);
+    /// Registers `folders` as the main and library workspace roots, in order,
+    /// as a first load registers them, unregistering every other one. Returns
+    /// whether the index must be rebuilt: the registration changed while
+    /// files outside std, whose module paths derive from it, are loaded.
+    pub fn set_workspace_roots<'a>(
+        &mut self,
+        folders: impl IntoIterator<Item = &'a WorkspaceFolder>,
+    ) -> bool {
+        let before = self
+            .compilation
+            .get_db()
+            .get_module_index()
+            .workspaces()
+            .to_vec();
+        self.compilation
+            .get_db_mut()
+            .get_module_index_mut()
+            .remove_main_and_library_workspaces();
+        for folder in folders {
+            if folder.is_library {
+                self.add_library_workspace(folder.root.clone());
+            } else {
+                self.add_main_workspace(folder.root.clone());
             }
-        } else if text.is_none() {
-            return None;
         }
+        self.sync_file_order();
+        let db = self.compilation.get_db();
+        let module_index = db.get_module_index();
+        module_index.workspaces() != before.as_slice()
+            && db
+                .get_vfs()
+                .get_all_local_file_ids()
+                .iter()
+                .any(|file_id| !module_index.is_std(file_id))
+    }
 
-        // An edit whose significant token stream is unchanged — same kinds,
-        // same offsets, same texts, comments included — cannot change any
-        // derived fact, so re-indexing it (and its whole dependency
-        // expansion) would only re-derive facts the index already holds.
-        // Store the text and stop.
-        if let (Some(file_id), Some(new_text)) = (existing_file_id, text.as_deref())
-            && self
-                .compilation
-                .get_db()
-                .get_module_index()
-                .get_module(file_id)
-                .is_some()
-            && self
-                .compilation
-                .get_db_mut()
-                .get_vfs_mut()
-                .content_semantically_matches(file_id, new_text)
+    /// Sets `uri`'s text (`None` removes it) and re-analyses. Returns the file
+    /// and every live file whose diagnostics may have changed.
+    pub fn update_file_by_uri(
+        &mut self,
+        uri: &Uri,
+        text: Option<String>,
+    ) -> Option<(FileId, Vec<FileId>)> {
+        let Some(text) = text else {
+            let (file_id, affected) = self.remove_file_by_uri(uri);
+            return file_id.map(|file_id| (file_id, affected));
+        };
+        let existing = self.compilation.get_db().get_vfs().get_file_id(uri);
+        if let Some(file_id) = existing
+            && self.text_is_indexed(file_id, Some(&text))
         {
-            self.compilation
-                .get_db_mut()
-                .get_vfs_mut()
-                .set_file_content(uri, text);
-            return Some(file_id);
+            return Some((file_id, Vec::new()));
         }
-
-        // The expansion has to be derived before the new text lands, because
-        // re-indexing a file drops the record of what depends on it.
-        let existing_reindex_file_ids = profile::phase("edit/expand", || {
-            existing_file_id.map(|file_id| self.expand_reindex_file_ids(vec![file_id]))
-        });
-
         let file_id = self
             .compilation
             .get_db_mut()
             .get_vfs_mut()
-            .set_file_content(uri, text);
-
-        let expansion = existing_reindex_file_ids
-            .unwrap_or_else(|| self.expand_reindex_file_ids(vec![file_id]));
-        profile::phase("edit/reindex", || {
-            self.reindex_expanded_files(vec![file_id], expansion)
-        });
-        profile::phase_report("update_file_by_uri");
-
-        Some(file_id)
+            .set_file_content(uri, Some(text));
+        let affected = self.reindex_files(vec![file_id]);
+        Some((file_id, affected))
     }
 
+    /// [`update_file_by_uri`](Self::update_file_by_uri) with a tree parsed
+    /// off the analysis lock. A stale `version` is ignored; `trigger_reindex`
+    /// false only stores the text.
     pub fn update_file_preparsed(
         &mut self,
         uri: Uri,
@@ -543,118 +400,33 @@ impl EmmyLuaAnalysis {
         line_index: LineIndex,
         version: Option<i32>,
         trigger_reindex: bool,
-    ) -> Option<FileId> {
-        let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(&uri);
-        if let Some(file_id) = existing_file_id {
-            if let (Some(incoming_version), Some(current_version)) = (
-                version,
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_file_version(&file_id),
-            ) && incoming_version < current_version
-            {
+    ) -> Option<(FileId, Vec<FileId>)> {
+        let existing = self.compilation.get_db().get_vfs().get_file_id(&uri);
+        if let Some(file_id) = existing {
+            if self.is_stale_version(file_id, version) {
                 return None;
             }
-
-            if let (Some(new_text), Some(old_text)) = (
-                text.as_deref(),
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_file_content(&file_id)
-                    .map(String::as_str),
-            ) && old_text == new_text
-            {
-                if self
-                    .compilation
-                    .get_db()
-                    .get_module_index()
-                    .get_module(file_id)
-                    .is_some()
-                {
-                    self.compilation
-                        .get_db_mut()
-                        .get_vfs_mut()
-                        .update_file_version(&file_id, version);
-                    return Some(file_id);
-                }
-
-                if trigger_reindex {
-                    self.compilation.remove_index(vec![file_id]);
-                    self.compilation.update_index(vec![file_id]);
-                }
-
-                self.compilation
-                    .get_db_mut()
-                    .get_vfs_mut()
-                    .update_file_version(&file_id, version);
-                return Some(file_id);
+            if self.text_is_indexed(file_id, text.as_deref()) {
+                self.compilation.set_file_version(&file_id, version);
+                return Some((file_id, Vec::new()));
             }
         } else if text.is_none() {
             return None;
         }
-
-        let is_removed = text.is_none();
-        let (existing_reindex_file_ids, old_guard_facts) = if trigger_reindex {
-            let removed_file_ids = existing_file_id
-                .filter(|_| is_removed)
-                .into_iter()
-                .collect::<HashSet<_>>();
-            let mut reindex_file_ids =
-                existing_file_id.map(|file_id| self.expand_reindex_file_ids(vec![file_id]));
-            if let Some(reindex_file_ids) = &mut reindex_file_ids {
-                self.add_vgui_forwarding_removal_seed(&removed_file_ids, reindex_file_ids);
-            }
-            let old_guard_fact_file_ids = reindex_file_ids
-                .iter()
-                .flatten()
-                .copied()
-                .collect::<HashSet<_>>();
-            (
-                reindex_file_ids,
-                self.inferred_guard_snapshot(&old_guard_fact_file_ids),
-            )
-        } else {
-            (None, InferredGuardSnapshot::default())
-        };
-
         let file_id = self
             .compilation
             .get_db_mut()
             .get_vfs_mut()
             .set_file_content_preparsed(&uri, text, tree, line_index, version)?;
-        let incremental_source_file_ids = HashSet::from([file_id]);
-
-        if trigger_reindex {
-            let reindex_file_ids = existing_reindex_file_ids
-                .unwrap_or_else(|| self.expand_reindex_file_ids(vec![file_id]));
-            self.compilation.remove_index(reindex_file_ids.clone());
-
-            let update_file_ids = reindex_file_ids
-                .iter()
-                .copied()
-                .filter(|id| !is_removed || *id != file_id)
-                .collect::<Vec<_>>();
-            if !update_file_ids.is_empty() {
-                self.compilation.update_index(update_file_ids);
-            }
-            self.compilation
-                .get_db_mut()
-                .get_call_site_param_index_mut()
-                .refresh_file_source_dependencies(file_id);
-            self.reindex_changed_inferred_guard_references(
-                &reindex_file_ids.iter().copied().collect(),
-                &old_guard_facts,
-                &reindex_file_ids,
-                &incremental_source_file_ids,
-            );
-            self.reindex_changed_inferred_param_consumers(&old_guard_facts, &reindex_file_ids);
+        if !trigger_reindex {
+            return Some((file_id, Vec::new()));
         }
-
-        Some(file_id)
+        let affected = self.reindex_files(vec![file_id]);
+        Some((file_id, affected))
     }
 
+    /// Stores a pre-parsed text without re-analysing, handing back the
+    /// replaced tree so the caller can drop it off the lock.
     pub fn update_file_preparsed_deferred(
         &mut self,
         uri: Uri,
@@ -663,1100 +435,263 @@ impl EmmyLuaAnalysis {
         line_index: LineIndex,
         version: Option<i32>,
     ) -> Option<(FileId, DeferredVfsDrop)> {
-        let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(&uri);
-        if let Some(file_id) = existing_file_id {
-            if let (Some(incoming_version), Some(current_version)) = (
-                version,
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_file_version(&file_id),
-            ) && incoming_version < current_version
-            {
+        let existing = self.compilation.get_db().get_vfs().get_file_id(&uri);
+        if let Some(file_id) = existing {
+            if self.is_stale_version(file_id, version) {
                 return None;
             }
-
-            if let (Some(new_text), Some(old_text)) = (
-                text.as_deref(),
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_file_content(&file_id)
-                    .map(String::as_str),
-            ) && old_text == new_text
-            {
-                self.compilation
-                    .get_db_mut()
-                    .get_vfs_mut()
-                    .update_file_version(&file_id, version);
+            if self.vfs_text_equals(file_id, text.as_deref()) {
+                self.compilation.set_file_version(&file_id, version);
                 return Some((file_id, DeferredVfsDrop::default()));
             }
         } else if text.is_none() {
             return None;
         }
-
         self.compilation
             .get_db_mut()
             .get_vfs_mut()
             .set_file_content_preparsed_deferred(&uri, text, tree, line_index, version)
     }
 
-    /// VFS-only update: parse and store the new text without touching the index.
-    /// The index remains stale but functional until `reindex_files` is called.
-    /// This is much faster than `update_file_by_uri`
-    pub fn update_file_text_only(&mut self, uri: &Uri, text: String) -> Option<FileId> {
-        let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(uri);
-        if let Some(file_id) = existing_file_id {
-            if let Some(old_text) = self
-                .compilation
-                .get_db()
-                .get_vfs()
-                .get_file_content(&file_id)
-                .map(String::as_str)
-            {
-                if old_text == text.as_str() {
-                    return Some(file_id);
-                }
-            }
+    /// Forgets `uri`'s editor version, which orders the edits of one
+    /// open-document session only.
+    pub fn forget_document_version(&mut self, uri: &Uri) {
+        if let Some(file_id) = self.compilation.get_db().get_vfs().get_file_id(uri) {
+            self.compilation.forget_file_version(&file_id);
         }
+    }
 
+    /// Stores `text` without re-analysing; [`reindex_files`](Self::reindex_files)
+    /// brings the index up to date.
+    pub fn update_file_text_only(&mut self, uri: &Uri, text: String) -> Option<FileId> {
+        if let Some(file_id) = self.compilation.get_db().get_vfs().get_file_id(uri)
+            && self.vfs_text_equals(file_id, Some(&text))
+        {
+            return Some(file_id);
+        }
+        Some(
+            self.compilation
+                .get_db_mut()
+                .get_vfs_mut()
+                .set_file_content(uri, Some(text)),
+        )
+    }
+
+    /// Whether `file_id` holds text no re-analysis has taken yet.
+    pub fn has_untaken_text(&self, file_id: FileId) -> bool {
+        self.compilation
+            .get_db()
+            .get_vfs()
+            .has_untaken_edit(&file_id)
+    }
+
+    /// Starts re-analysing `file_ids` from the text the VFS holds for them, or
+    /// takes them into the re-analysis in progress, which settles them first.
+    /// A file whose text an earlier take already took is not taken again.
+    /// Advance it with [`Self::advance_reindex`].
+    pub fn begin_reindex(&mut self, mut file_ids: Vec<FileId>) {
+        file_ids.retain(|file_id| self.has_untaken_text(*file_id));
+        self.compilation.begin_update(file_ids);
+    }
+
+    /// Advances the re-analysis in progress by `slice`. Once it settles,
+    /// returns every live file whose diagnostics read a fact that moved.
+    pub fn advance_reindex(&mut self, slice: Slice) -> UpdateProgress {
+        match self.compilation.advance_update(slice) {
+            UpdateProgress::Settled(mut affected) => {
+                let vfs = self.compilation.get_db_mut().get_vfs_mut();
+                vfs.forget_taken_deletions();
+                affected.retain(|file_id| vfs.get_syntax_tree(file_id).is_some());
+                UpdateProgress::Settled(affected)
+            }
+            progress => progress,
+        }
+    }
+
+    /// Re-analyses `file_ids` from the text the VFS holds for them, settling
+    /// any re-analysis in progress with them. Returns every live file whose
+    /// diagnostics may have changed: the files themselves and every file whose
+    /// diagnostics read a fact that moved.
+    pub fn reindex_files(&mut self, file_ids: Vec<FileId>) -> Vec<FileId> {
+        let mut affected = self.compilation.update_index(file_ids.clone());
+        affected.extend(file_ids);
+        let vfs = self.compilation.get_db().get_vfs();
+        affected.retain(|file_id| vfs.get_syntax_tree(file_id).is_some());
+        affected.sort_unstable();
+        affected.dedup();
+        affected
+    }
+
+    pub fn update_remote_file_by_uri(&mut self, uri: &Uri, text: Option<String>) -> FileId {
         let file_id = self
             .compilation
             .get_db_mut()
             .get_vfs_mut()
-            .set_file_content(uri, Some(text));
-
-        Some(file_id)
+            .set_remote_file_content(uri, text);
+        self.reindex_files(vec![file_id]);
+        file_id
     }
 
-    /// Reindex specific files: remove old index entries + run full analysis pipeline.
-    /// Call this after `update_file_text_only` once the user has paused typing.
-    pub fn reindex_files(&mut self, file_ids: Vec<FileId>) {
-        let expansion = self.expand_reindex_file_ids(file_ids.clone());
-        self.reindex_expanded_files(file_ids, expansion);
+    /// Sets every file's text in one batch and re-analyses them together.
+    /// Returns every live file whose diagnostics may have changed.
+    pub fn update_files_by_uri(&mut self, files: Vec<(Uri, Option<String>)>) -> Vec<FileId> {
+        self.apply_file_system_changes(files)
     }
 
-    /// [`reindex_files`](Self::reindex_files) against an expansion that was
-    /// computed earlier.
-    ///
-    /// The expansion has to be derived from the state *before* the edit landed,
-    /// so a caller that wants to do anything in between — re-index the edited
-    /// file on its own first, say, and release the write lock so a completion
-    /// can be answered — has to capture it up front and hand it back here.
-    /// Recomputing it against a partly-updated index under-expands badly:
-    /// measured on a gamemode workspace, an expansion of 739 files collapsed to
-    /// 8 and the workspace ended up with 18 diagnostics that a cold build does
-    /// not produce.
-    pub fn reindex_expanded_files(&mut self, file_ids: Vec<FileId>, expansion: Vec<FileId>) {
-        let incremental_source_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
-        let removed_file_ids = file_ids
-            .iter()
-            .copied()
-            .filter(|file_id| {
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_syntax_tree(file_id)
-                    .is_none()
-            })
-            .collect::<HashSet<_>>();
+    /// Removes a file the way the filesystem did, and reports what to
+    /// re-diagnose.
+    pub fn remove_file_by_uri(&mut self, uri: &Uri) -> (Option<FileId>, Vec<FileId>) {
+        let Some(file_id) = self.compilation.get_db().get_vfs().get_file_id(uri) else {
+            return (None, Vec::new());
+        };
+        let affected = self.apply_file_system_changes(vec![(uri.clone(), None)]);
+        (Some(file_id), affected)
+    }
 
-        let mut file_ids = expansion;
-        self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut file_ids);
-        let guard_fact_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
-        let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
-        self.compilation.remove_index(file_ids.clone());
-        let update_file_ids = file_ids
-            .iter()
-            .copied()
-            .filter(|file_id| !removed_file_ids.contains(file_id))
-            .collect::<Vec<_>>();
-        if !update_file_ids.is_empty() {
-            self.compilation.update_index(update_file_ids.clone());
-            self.stabilize_cross_file_type_caches(&update_file_ids);
+    /// Applies a batch of file-system events, the last event per file
+    /// winning, and re-analyses what changed.
+    pub fn apply_file_system_changes(&mut self, files: Vec<(Uri, Option<String>)>) -> Vec<FileId> {
+        let changed = self.stage_file_system_changes(files);
+        if changed.is_empty() {
+            return Vec::new();
         }
-        for file_id in &incremental_source_file_ids {
-            self.compilation
-                .get_db_mut()
-                .get_call_site_param_index_mut()
-                .refresh_file_source_dependencies(*file_id);
-        }
-        self.reindex_changed_inferred_guard_references(
-            &guard_fact_file_ids,
-            &old_guard_facts,
-            &file_ids,
-            &incremental_source_file_ids,
-        );
-        self.reindex_changed_inferred_param_consumers(&old_guard_facts, &file_ids);
+        let affected = self.reindex_files(changed);
+        self.compilation
+            .get_db_mut()
+            .get_vfs_mut()
+            .forget_taken_deletions();
+        affected
     }
 
-    /// Rebuilds only these files' own index entries.
-    ///
-    /// Nothing cross-file is settled: dependents keep whatever they inferred
-    /// before, and the caller still owes them a
-    /// [`reindex_expanded_files`](Self::reindex_expanded_files) against an
-    /// expansion captured beforehand. What this does buy is that the edited
-    /// file's declarations, members and signatures line up with its text again,
-    /// which is all a request positioned *inside that file* needs — the index
-    /// entries are keyed by position, so an edit that shifts offsets is exactly
-    /// what makes them stop matching the tree.
-    pub fn self_index_files(&mut self, file_ids: Vec<FileId>) {
-        self.compilation.remove_index(file_ids.clone());
-        self.compilation.update_index(file_ids);
-    }
-
-    /// Re-analyses exactly `file_ids`, skipping dependency expansion.
-    pub fn reindex_files_without_expansion(&mut self, file_ids: Vec<FileId>) {
-        self.compilation.remove_index(file_ids.clone());
-        self.compilation.update_index(file_ids.clone());
-        self.stabilize_cross_file_type_caches(&file_ids);
-    }
-
-    pub fn expand_reindex_file_ids(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
-        let _p = Profile::new("expand_reindex_file_ids");
-        let mut expanded = file_ids.into_iter().collect::<HashSet<_>>();
-        loop {
-            // Include/require callers must be rebuilt with their changed target.
-            // Traverse the indexed dependency graph; never rescan workspace ASTs.
-            let dependency_dependents = self
-                .compilation
-                .get_db()
-                .get_file_dependencies_index()
-                .get_file_dependencies()
-                .collect_file_dependents(expanded.iter().copied().collect());
-            let unresolved_path_dependents = self.unresolved_path_dependency_dependents(&expanded);
-            let dependent_files = self
-                .compilation
-                .get_db()
-                .get_type_index()
-                .files_with_type_caches_referencing_files(&expanded);
-            let inference_dependents = self
-                .compilation
-                .get_db()
-                .get_type_index()
-                .files_depending_on_inference_support(&expanded);
-            let callback_dependents = self
-                .compilation
-                .get_db()
-                .get_call_site_param_index()
-                .collect_source_dependents(&expanded);
-            let callback_source_paths = expanded
-                .iter()
-                .filter_map(|file_id| self.compilation.get_db().get_vfs().get_file_path(file_id))
-                .collect::<Vec<_>>();
-            let callback_path_dependents = self
-                .compilation
-                .get_db()
-                .get_call_site_param_index()
-                .collect_source_path_dependents(callback_source_paths);
-            let mut added = false;
-            for file_id in dependency_dependents
-                .into_iter()
-                .chain(unresolved_path_dependents)
-                .chain(dependent_files)
-                .chain(inference_dependents)
-                .chain(callback_dependents)
-                .chain(callback_path_dependents)
-            {
-                added |= expanded.insert(file_id);
-            }
-
-            if !added {
-                break;
+    /// Sets the text of a batch of file-system events, the last event per
+    /// file winning, without re-analysing. A deleted file whose text a created
+    /// one has is taken as moved there ([`Self::move_file`]). Returns the
+    /// files whose text or path changed, deleted ones included, for
+    /// [`Self::begin_reindex`].
+    pub fn stage_file_system_changes(&mut self, files: Vec<(Uri, Option<String>)>) -> Vec<FileId> {
+        let mut files = files;
+        let vfs = self.compilation.get_db().get_vfs();
+        files.sort_by_cached_key(|(uri, _)| vfs.order_key_for_uri(uri));
+        let mut latest: Vec<(Uri, Option<String>)> = Vec::with_capacity(files.len());
+        for (uri, text) in files {
+            match latest.last_mut() {
+                Some(last) if last.0 == uri => last.1 = text,
+                _ => latest.push((uri, text)),
             }
         }
 
-        let mut expanded = expanded.into_iter().collect::<Vec<_>>();
-        expanded.sort_unstable();
-        expanded
-    }
-
-    fn add_vgui_forwarding_removal_seed(
-        &self,
-        removed_file_ids: &HashSet<FileId>,
-        reindex_file_ids: &mut Vec<FileId>,
-    ) {
-        if removed_file_ids.is_empty() {
-            return;
-        }
-        let db = self.compilation.get_db();
-        let vfs = db.get_vfs();
-        let module_index = db.get_module_index();
-        let gmod_index = db.get_gmod_class_metadata_index();
-        let affected_workspace_id = reindex_file_ids
-            .iter()
-            .filter(|file_id| removed_file_ids.contains(file_id))
-            .find_map(|file_id| {
-                gmod_index
-                    .has_annotated_vgui_parent_calls(*file_id)
-                    .then(|| module_index.get_workspace_id(*file_id))
-                    .flatten()
-            });
-        let Some(affected_workspace_id) = affected_workspace_id else {
-            return;
-        };
-        if reindex_file_ids.iter().any(|file_id| {
-            !removed_file_ids.contains(file_id) && vfs.get_syntax_tree(file_id).is_some()
-        }) {
-            return;
-        }
-
-        let all_file_ids = vfs.get_all_file_ids();
-        let seed_file_id = all_file_ids
-            .iter()
-            .copied()
-            .filter(|file_id| {
-                !removed_file_ids.contains(file_id) && vfs.get_syntax_tree(file_id).is_some()
-            })
-            .find(|file_id| module_index.get_workspace_id(*file_id) == Some(affected_workspace_id))
-            .or_else(|| {
-                all_file_ids.iter().copied().find(|file_id| {
-                    !removed_file_ids.contains(file_id) && vfs.get_syntax_tree(file_id).is_some()
-                })
-            });
-        let Some(seed_file_id) = seed_file_id else {
-            return;
-        };
-        reindex_file_ids.push(seed_file_id);
-        reindex_file_ids.sort_unstable();
-        reindex_file_ids.dedup();
-    }
-
-    fn unresolved_path_dependency_dependents(&self, file_ids: &HashSet<FileId>) -> Vec<FileId> {
-        let db = self.compilation.get_db();
-        let target_path_keys = file_ids
-            .iter()
-            .filter_map(|file_id| db.get_vfs().get_file_path(file_id).cloned())
-            .flat_map(|target_path| dependency_path_keys_for_target(db, &target_path))
-            .collect::<HashSet<_>>();
-
-        db.get_file_dependencies_index()
-            .collect_unresolved_path_dependents(target_path_keys)
-    }
-
-    fn reindex_changed_inferred_guard_references(
-        &mut self,
-        source_file_ids: &HashSet<FileId>,
-        old_snapshot: &InferredGuardSnapshot,
-        already_reindexed: &[FileId],
-        incremental_source_file_ids: &HashSet<FileId>,
-    ) {
-        #[cfg(test)]
-        let initial_stabilization_invocations = self.cross_file_stabilization_invocations;
-        let profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
-        let mut profile_changed_facts = 0usize;
-        let mut profile_reference_edges = 0usize;
-        let mut profile_waves = 0usize;
-        let mut profile_reindexed_files = 0usize;
-        let mut propagation_reindexed_files = source_file_ids
-            .iter()
-            .copied()
-            .chain(already_reindexed.iter().copied())
-            .collect::<HashSet<_>>();
-        let mut new_facts = self
-            .compilation
-            .get_db()
-            .get_signature_index()
-            .inferred_guard_facts_for_files(source_file_ids);
-        let equivalent_owners = self.reconcile_equivalent_inferred_guard_owners(
-            old_snapshot,
-            &new_facts,
-            &propagation_reindexed_files,
-        );
-        let old_facts = &old_snapshot.facts;
-        let mut changed_owners = old_facts
-            .keys()
-            .chain(new_facts.keys())
-            .filter(|owner| {
-                !equivalent_owners.contains(*owner)
-                    && old_facts.get(*owner) != new_facts.get(*owner)
-            })
-            .cloned()
-            .collect::<HashSet<_>>()
+        let pending: Vec<(Uri, Option<String>)> = latest
             .into_iter()
-            .collect::<Vec<_>>();
-        if changed_owners.is_empty() {
-            #[cfg(test)]
-            {
-                self.inferred_guard_propagation_stats = InferredGuardPropagationStats::default();
-            }
-            if profile_enabled {
-                eprintln!(
-                    "[profile] inferred_guard_incremental changed_facts=0 reference_edges=0 waves=0 reindexed_files=0"
-                );
-            }
-            return;
-        }
-        profile_changed_facts += changed_owners.len();
-        sort_inferred_guard_owners(&mut changed_owners);
-        let mut frontier_old_facts = old_snapshot.facts.clone();
-        let mut frontier_old_consumers = old_snapshot.consumers.clone();
-
-        while !changed_owners.is_empty() {
-            let mut reference_files = HashSet::new();
-            for owner in &changed_owners {
-                let newly_added =
-                    !frontier_old_facts.contains_key(owner) && new_facts.contains_key(owner);
-                let old_consumers = frontier_old_consumers
-                    .get(owner)
-                    .into_iter()
-                    .flatten()
-                    .copied();
-                let current_consumers = self
-                    .compilation
-                    .get_db()
-                    .get_signature_index()
-                    .inferred_guard_consumers(owner);
-                for file_id in old_consumers.chain(current_consumers) {
-                    if !propagation_reindexed_files.contains(&file_id) {
-                        profile_reference_edges += 1;
-                        reference_files.insert(file_id);
-                    }
-                }
-                if newly_added {
-                    let allow_alias_retry =
-                        incremental_source_file_ids.contains(&owner.source_file_id());
-                    let discovered = self.resolve_inferred_guard_reference_files(owner, true);
-                    for file_id in discovered.files {
-                        // Cold batches resolve aliases in the main pipeline. Only edits need a
-                        // post-publication retry for alias calls analyzed with the old guard fact.
-                        let alias_retry = allow_alias_retry
-                            && discovered.alias_calls.contains(&file_id)
-                            && file_id != owner.source_file_id();
-                        if !propagation_reindexed_files.contains(&file_id) || alias_retry {
-                            profile_reference_edges += 1;
-                            reference_files.insert(file_id);
-                        }
-                    }
-                }
-            }
-            if reference_files.is_empty() {
-                break;
-            }
-
-            let mut reindex_file_ids = reference_files.into_iter().collect::<Vec<_>>();
-            reindex_file_ids.sort_unstable();
-            let wave_file_ids = reindex_file_ids.iter().copied().collect::<HashSet<_>>();
-            let old_wave_snapshot = self.inferred_guard_snapshot(&wave_file_ids);
-            self.compilation.remove_index(reindex_file_ids.clone());
-            let update_file_ids = reindex_file_ids
-                .into_iter()
-                .filter(|file_id| {
-                    self.compilation
-                        .get_db()
-                        .get_vfs()
-                        .get_syntax_tree(file_id)
-                        .is_some()
-                })
-                .collect::<Vec<_>>();
-            if update_file_ids.is_empty() {
-                break;
-            }
-            profile_waves += 1;
-            profile_reindexed_files += update_file_ids.len();
-            propagation_reindexed_files.extend(wave_file_ids.iter().copied());
-            self.compilation.update_index(update_file_ids.clone());
-
-            new_facts = self
-                .compilation
-                .get_db()
-                .get_signature_index()
-                .inferred_guard_facts_for_files(&wave_file_ids);
-            let equivalent_owners = self.reconcile_equivalent_inferred_guard_owners(
-                &old_wave_snapshot,
-                &new_facts,
-                &propagation_reindexed_files,
-            );
-            changed_owners = old_wave_snapshot
-                .facts
-                .keys()
-                .chain(new_facts.keys())
-                .filter(|owner| {
-                    !equivalent_owners.contains(*owner)
-                        && old_wave_snapshot.facts.get(*owner) != new_facts.get(*owner)
-                })
-                .cloned()
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            frontier_old_facts = old_wave_snapshot.facts;
-            frontier_old_consumers = old_wave_snapshot.consumers;
-            profile_changed_facts += changed_owners.len();
-            sort_inferred_guard_owners(&mut changed_owners);
-        }
-        if profile_enabled {
-            eprintln!(
-                "[profile] inferred_guard_incremental changed_facts={} reference_edges={} waves={} reindexed_files={}",
-                profile_changed_facts,
-                profile_reference_edges,
-                profile_waves,
-                profile_reindexed_files
-            );
-        }
-        #[cfg(test)]
-        {
-            self.inferred_guard_propagation_stats = InferredGuardPropagationStats {
-                changed_facts: profile_changed_facts,
-                reference_edges: profile_reference_edges,
-                frontiers: profile_waves,
-                reindexed_files: profile_reindexed_files,
-                broad_stabilizations: self
-                    .cross_file_stabilization_invocations
-                    .saturating_sub(initial_stabilization_invocations),
-            };
-        }
-    }
-
-    fn inferred_guard_snapshot(&self, file_ids: &HashSet<FileId>) -> InferredGuardSnapshot {
-        let signature_index = self.compilation.get_db().get_signature_index();
-        let facts = signature_index.inferred_guard_facts_for_files(file_ids);
-        let consumers = facts
-            .keys()
-            .map(|owner| {
-                (
-                    owner.clone(),
-                    signature_index.inferred_guard_consumers(owner).collect(),
-                )
+            .filter(|(uri, text)| {
+                let existing = self.compilation.get_db().get_vfs().get_file_id(uri);
+                !existing.is_some_and(|file_id| self.text_is_indexed(file_id, text.as_deref()))
             })
             .collect();
-        let inferred_params = self
-            .compilation
-            .get_db()
-            .get_call_site_param_index()
-            .inferred_params_for_contributor_files(file_ids);
-        InferredGuardSnapshot {
-            facts,
-            consumers,
-            inferred_params,
-            snapshot_file_ids: file_ids.clone(),
-        }
-    }
-
-    /// Re-analyses callee files whose call-site-inferred parameter types
-    /// changed.
-    fn reindex_changed_inferred_param_consumers(
-        &mut self,
-        old_snapshot: &InferredGuardSnapshot,
-        already_reindexed: &[FileId],
-    ) {
-        let new_params = self
-            .compilation
-            .get_db()
-            .get_call_site_param_index()
-            .inferred_params_for_contributor_files(&old_snapshot.snapshot_file_ids);
-        let old_params = &old_snapshot.inferred_params;
-        if old_params.is_empty() && new_params.is_empty() {
-            return;
-        }
-
-        let already_reindexed = already_reindexed
+        let (moves, pending) = self.pair_moves(pending);
+        let mut changed = moves
+            .into_iter()
+            .filter_map(|(old, new, text)| self.move_file(&old, &new, text))
+            .collect::<Vec<_>>();
+        let texts: Vec<&str> = pending
             .iter()
-            .copied()
-            .chain(old_snapshot.snapshot_file_ids.iter().copied())
-            .collect::<HashSet<_>>();
-        let mut changed_files = old_params
-            .keys()
-            .chain(new_params.keys())
-            .filter(|key| old_params.get(*key) != new_params.get(*key))
-            .map(|(signature_id, _)| signature_id.get_file_id())
-            .filter(|file_id| !already_reindexed.contains(file_id))
-            .collect::<Vec<_>>();
-        changed_files.sort_unstable();
-        changed_files.dedup();
-        if changed_files.is_empty() {
-            return;
-        }
+            .filter_map(|(_, text)| text.as_deref())
+            .collect();
+        let mut parsed = self
+            .compilation
+            .get_db()
+            .get_vfs()
+            .parse_concurrently(&texts)
+            .map(Vec::into_iter);
 
-        let expanded = self.expand_reindex_file_ids(changed_files);
-        let expanded = expanded
-            .into_iter()
-            .filter(|file_id| {
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_syntax_tree(file_id)
-                    .is_some()
-            })
-            .collect::<Vec<_>>();
-        if expanded.is_empty() {
-            return;
-        }
-        self.compilation.remove_index(expanded.clone());
-        self.compilation.update_index(expanded);
-    }
-
-    fn reconcile_equivalent_inferred_guard_owners(
-        &mut self,
-        old_snapshot: &InferredGuardSnapshot,
-        new_facts: &HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
-        reindexed_file_ids: &HashSet<FileId>,
-    ) -> HashSet<LuaInferredGuardOwner> {
-        let mut reconciled = HashSet::new();
-        for owner in old_snapshot
-            .facts
-            .keys()
-            .filter(|owner| old_snapshot.facts.get(*owner) == new_facts.get(*owner))
-        {
-            if let Some(consumers) = old_snapshot.consumers.get(owner) {
-                self.compilation
-                    .get_db_mut()
-                    .get_signature_index_mut()
-                    .migrate_inferred_guard_consumers(owner.clone(), consumers, reindexed_file_ids);
-            }
-            reconciled.insert(owner.clone());
-        }
-
-        let mut old_owners = old_snapshot
-            .facts
-            .keys()
-            .filter(|owner| !new_facts.contains_key(*owner))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut new_owners = new_facts
-            .keys()
-            .filter(|owner| !old_snapshot.facts.contains_key(*owner))
-            .cloned()
-            .collect::<Vec<_>>();
-        sort_inferred_guard_owners(&mut old_owners);
-        sort_inferred_guard_owners(&mut new_owners);
-
-        for old_owner in old_owners {
-            let Some(new_idx) = new_owners.iter().position(|new_owner| {
-                old_owner.source_file_id() == new_owner.source_file_id()
-                    && old_owner.path() == new_owner.path()
-                    && old_owner.state_mask() == new_owner.state_mask()
-                    && old_snapshot.facts.get(&old_owner) == new_facts.get(new_owner)
-            }) else {
-                continue;
+        let vfs = self.compilation.get_db_mut().get_vfs_mut();
+        for (uri, text) in pending {
+            let file_id = match text {
+                Some(text) => match parsed.as_mut().and_then(Iterator::next) {
+                    Some((tree, line_index)) => {
+                        vfs.set_file_content_preparsed(&uri, Some(text), tree, line_index, None)
+                    }
+                    None => Some(vfs.set_file_content(&uri, Some(text))),
+                },
+                None => vfs.delete_file_content(&uri),
             };
-            let new_owner = new_owners.remove(new_idx);
-            if let Some(consumers) = old_snapshot.consumers.get(&old_owner) {
-                self.compilation
-                    .get_db_mut()
-                    .get_signature_index_mut()
-                    .migrate_inferred_guard_consumers(
-                        new_owner.clone(),
-                        consumers,
-                        reindexed_file_ids,
-                    );
-            }
-            reconciled.insert(old_owner);
-            reconciled.insert(new_owner);
+            changed.extend(file_id);
         }
-        reconciled
+        changed
     }
 
-    fn resolve_inferred_guard_reference_files(
+    /// Splits `events`, sorted by order key, into the moves among them and
+    /// the rest. A deletion of a file pairs with the first creation, in order,
+    /// of a path no file has whose text is the deleted file's newest; which of
+    /// several equal texts pair decides nothing, since file ids never do.
+    #[allow(clippy::type_complexity)]
+    fn pair_moves(
         &self,
-        owner: &LuaInferredGuardOwner,
-        discover_aliases: bool,
-    ) -> InferredGuardReferenceFiles {
-        let Some(member_name) = owner.path().last() else {
-            return InferredGuardReferenceFiles::default();
-        };
-        let references = if owner.path().len() == 1 {
-            self.compilation
-                .get_db()
-                .get_reference_index()
-                .get_global_references(member_name)
-        } else {
-            self.compilation
-                .get_db()
-                .get_reference_index()
-                .get_index_references(&LuaMemberKey::Name(member_name.clone()))
-        };
-        let Some(references) = references else {
-            return InferredGuardReferenceFiles::default();
-        };
-
-        let db = self.compilation.get_db();
-        let mut caches = HashMap::<FileId, LuaInferCache>::new();
-        let mut matching_references = references
-            .into_iter()
-            .filter_map(|reference| {
-                let root = db
-                    .get_vfs()
-                    .get_syntax_tree(&reference.file_id)?
-                    .get_red_root();
-                let expr = LuaExpr::cast(reference.value.to_node_from_root(&root)?)?;
-                (global_path_for_expr(&expr).as_deref() == Some(owner.path())
-                    && db.get_gmod_infer_index().are_offsets_compatible(
-                        &reference.file_id,
-                        expr.get_range().start(),
-                        &owner.source_file_id(),
-                        owner.signature_id().get_position(),
-                    ))
-                .then_some((reference.file_id, expr))
-            })
-            .collect::<Vec<_>>();
-        matching_references.sort_by_key(|(file_id, expr)| (*file_id, expr.get_range().start()));
-
-        let mut result = InferredGuardReferenceFiles::default();
-        let mut alias_queue = VecDeque::new();
-        let mut visited_aliases = HashSet::new();
-        for (file_id, expr) in matching_references {
-            if call_resolves_to_inferred_guard_owner(db, &mut caches, owner, file_id, &expr) {
-                result.files.insert(file_id);
+        events: Vec<(Uri, Option<String>)>,
+    ) -> (Vec<(Uri, Uri, String)>, Vec<(Uri, Option<String>)>) {
+        let moved_to = {
+            let vfs = self.compilation.get_db().get_vfs();
+            let mut creations: HashMap<&str, VecDeque<usize>> = HashMap::new();
+            for (at, (uri, text)) in events.iter().enumerate() {
+                if let Some(text) = text
+                    && vfs.get_file_id(uri).is_none()
+                {
+                    creations.entry(text.as_str()).or_default().push_back(at);
+                }
             }
-            if discover_aliases
-                && expr_resolves_to_inferred_guard_owner(db, &mut caches, owner, file_id, &expr)
-                && let Some(decl_id) = immutable_local_alias_decl(db, file_id, &expr)
-            {
-                alias_queue.push_back(decl_id);
-            }
-        }
-
-        while let Some(decl_id) = alias_queue.pop_front() {
-            if !visited_aliases.insert(decl_id) {
-                continue;
-            }
-            let Some(root) = db
-                .get_vfs()
-                .get_syntax_tree(&decl_id.file_id)
-                .map(|tree| tree.get_red_root())
-            else {
-                continue;
-            };
-            let Some(decl_references) = db
-                .get_reference_index()
-                .get_decl_references(&decl_id.file_id, &decl_id)
-            else {
-                continue;
-            };
-            let mut cells = decl_references.cells.clone();
-            cells.sort_by_key(|cell| cell.range.start());
-            for cell in cells {
-                if cell.is_write {
+            let mut moved_to = vec![None; events.len()];
+            for (at, (uri, text)) in events.iter().enumerate() {
+                if text.is_some() {
                     continue;
                 }
-                let Some(name_expr) = root
-                    .covering_element(cell.range)
-                    .ancestors()
-                    .find_map(LuaNameExpr::cast)
-                    .filter(|name_expr| name_expr.get_range() == cell.range)
+                let Some(old_text) = vfs
+                    .get_file_id(uri)
+                    .and_then(|file_id| vfs.latest_content(&file_id))
                 else {
                     continue;
                 };
-                let expr = LuaExpr::NameExpr(name_expr);
-                if !db.get_gmod_infer_index().are_offsets_compatible(
-                    &decl_id.file_id,
-                    expr.get_range().start(),
-                    &owner.source_file_id(),
-                    owner.signature_id().get_position(),
-                ) {
-                    continue;
-                }
-                if is_call_prefix(&expr) {
-                    result.files.insert(decl_id.file_id);
-                    result.alias_calls.insert(decl_id.file_id);
-                }
-                if let Some(next_decl_id) = immutable_local_alias_decl(db, decl_id.file_id, &expr) {
-                    alias_queue.push_back(next_decl_id);
-                }
+                moved_to[at] = creations
+                    .get_mut(old_text.as_str())
+                    .and_then(VecDeque::pop_front);
+            }
+            moved_to
+        };
+        let mut events = events.into_iter().map(Some).collect::<Vec<_>>();
+        let mut moves = Vec::new();
+        for (at, created) in moved_to.into_iter().enumerate() {
+            if let Some(created) = created
+                && let (Some((old, _)), Some((new, Some(text)))) =
+                    (events[at].take(), events[created].take())
+            {
+                moves.push((old, new, text));
             }
         }
-
-        result
+        (moves, events.into_iter().flatten().collect())
     }
 
-    fn stabilize_cross_file_type_caches(&mut self, file_ids: &[FileId]) {
-        #[cfg(test)]
-        {
-            self.cross_file_stabilization_invocations += 1;
-        }
-        if file_ids.is_empty() {
-            return;
-        }
-
-        let changed = file_ids.iter().copied().collect::<HashSet<_>>();
-        let all_dependents = self
-            .compilation
-            .get_db()
-            .get_type_index()
-            .files_with_cross_file_type_caches_referencing_files(&changed);
-        let dependents = select_cross_file_stabilization_dependents(all_dependents, &changed)
-            .into_iter()
-            .filter(|file_id| {
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_syntax_tree(file_id)
-                    .is_some()
-            })
-            .collect::<Vec<_>>();
-        if dependents.is_empty() {
-            return;
-        }
-
-        self.compilation.remove_index(dependents.clone());
-        self.compilation.update_index(dependents);
-    }
-
-    pub fn update_remote_file_by_uri(&mut self, uri: &Uri, text: Option<String>) -> FileId {
-        let is_removed = text.is_none();
-        let fid = self
-            .compilation
+    /// Moves the file at `old` to `new`, whose text is `text`, keeping its id,
+    /// without re-analysing. `None` when `old` names no file or `new` already
+    /// names one.
+    pub fn move_file(&mut self, old: &Uri, new: &Uri, text: String) -> Option<FileId> {
+        self.compilation
             .get_db_mut()
             .get_vfs_mut()
-            .set_remote_file_content(uri, text);
+            .move_file(old, new, text)
+    }
 
-        let removed_file_ids = is_removed
-            .then_some(fid)
+    /// For every file, the other files whose analysis read a fact it owns,
+    /// sorted.
+    pub fn dependent_files(&self) -> HashMap<FileId, Vec<FileId>> {
+        self.compilation
+            .get_db()
+            .reader_graph()
+            .dependent_files()
             .into_iter()
-            .collect::<HashSet<_>>();
-        let mut reindex_file_ids = vec![fid];
-        self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut reindex_file_ids);
-        self.compilation.remove_index(reindex_file_ids.clone());
-        let update_file_ids = reindex_file_ids
-            .into_iter()
-            .filter(|file_id| !removed_file_ids.contains(file_id))
-            .collect::<Vec<_>>();
-        if !update_file_ids.is_empty() {
-            self.compilation.update_index(update_file_ids);
-        }
-        fid
-    }
-
-    pub fn update_file_by_path(&mut self, path: &PathBuf, text: Option<String>) -> Option<FileId> {
-        let uri = file_path_to_uri(path)?;
-        self.update_file_by_uri(&uri, text)
-    }
-
-    pub fn update_files_by_uri(&mut self, files: Vec<(Uri, Option<String>)>) -> Vec<FileId> {
-        let mut removed_files = HashSet::new();
-        let mut updated_files = HashSet::new();
-        let mut files = files;
-        files.sort_by_cached_key(|(uri, _)| {
-            uri_to_file_path(uri)
-                .map(|path| crate::vfs::normalize_path_for_ordering(&path.to_string_lossy()))
-                .unwrap_or_else(|| uri.as_str().to_string())
-        });
-        let old_source_file_ids = files
-            .iter()
-            .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
-            .collect::<HashSet<_>>();
-        let removed_source_file_ids = files
-            .iter()
-            .filter(|(_, text)| text.is_none())
-            .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
-            .collect::<HashSet<_>>();
-        let mut old_guard_fact_file_ids =
-            self.expand_reindex_file_ids(old_source_file_ids.iter().copied().collect());
-        self.add_vgui_forwarding_removal_seed(
-            &removed_source_file_ids,
-            &mut old_guard_fact_file_ids,
-        );
-        let old_guard_fact_file_ids = old_guard_fact_file_ids.into_iter().collect::<HashSet<_>>();
-        let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
-
-        // Separate files into: unchanged (skip), to-remove, and to-parse
-        let mut to_parse: Vec<(Uri, String)> = Vec::new();
-        {
-            let _p = Profile::new("update files: classify");
-            for (uri, text) in files {
-                let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(&uri);
-                if let Some(file_id) = existing_file_id {
-                    if let (Some(new_text), Some(old_text)) = (
-                        text.as_deref(),
-                        self.compilation
-                            .get_db()
-                            .get_vfs()
-                            .get_file_content(&file_id)
-                            .map(String::as_str),
-                    ) && old_text == new_text
-                    {
-                        removed_files.insert(file_id);
-                        updated_files.insert(file_id);
-                        continue;
-                    }
-                } else if text.is_none() {
-                    continue;
-                }
-
-                if let Some(text) = text {
-                    to_parse.push((uri, text));
-                } else {
-                    // File removal: assign ID and mark for removal
-                    let file_id = self
-                        .compilation
-                        .get_db_mut()
-                        .get_vfs_mut()
-                        .set_file_content(&uri, None);
-                    removed_files.insert(file_id);
-                }
-            }
-        }
-
-        // Parse files — parallel when enough files to benefit
-        const PARALLEL_THRESHOLD: usize = 50;
-        {
-            let _p = Profile::new("update files: parse");
-            if to_parse.len() >= PARALLEL_THRESHOLD {
-                // Pre-assign file IDs (sequential, fast)
-                let file_ids: Vec<FileId> = to_parse
-                    .iter()
-                    .map(|(uri, _)| self.compilation.get_db_mut().get_vfs_mut().file_id(uri))
-                    .collect();
-
-                // Parse in parallel
-                let config = self.emmyrc.clone();
-                let n_threads = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-                    .min(16);
-                let next_idx = std::sync::atomic::AtomicUsize::new(0);
-
-                // Each slot stores the parsed result
-                let parsed: Vec<std::sync::Mutex<Option<(LuaSyntaxTree, LineIndex)>>> = (0
-                    ..to_parse.len())
-                    .map(|_| std::sync::Mutex::new(None))
-                    .collect();
-
-                std::thread::scope(|s| {
-                    for _ in 0..n_threads {
-                        let next = &next_idx;
-                        let files = &to_parse;
-                        let results = &parsed;
-                        let cfg = &config;
-                        s.spawn(move || {
-                            let mut node_cache = rowan::NodeCache::default();
-                            loop {
-                                let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if idx >= files.len() {
-                                    break;
-                                }
-                                let (_, text) = &files[idx];
-                                let parse_config = cfg.get_parse_config(&mut node_cache);
-                                let tree = LuaParser::parse(text, parse_config);
-                                let line_index = LineIndex::parse(text);
-                                *results[idx].lock().expect("mutex poisoned") =
-                                    Some((tree, line_index));
-                            }
-                        });
-                    }
-                });
-
-                // Insert pre-parsed results (sequential, fast HashMap inserts)
-                let vfs = self.compilation.get_db_mut().get_vfs_mut();
-                for (i, ((_uri, text), file_id)) in
-                    to_parse.into_iter().zip(file_ids.iter()).enumerate()
-                {
-                    let (tree, line_index) = parsed[i]
-                        .lock()
-                        .expect("mutex poisoned")
-                        .take()
-                        .expect("parsed result missing");
-                    vfs.insert_preparsed(*file_id, text, tree, line_index);
-                    removed_files.insert(*file_id);
-                    updated_files.insert(*file_id);
-                }
-            } else {
-                // Small batch: parse sequentially (avoids thread spawn overhead)
-                for (uri, text) in to_parse {
-                    let file_id = self
-                        .compilation
-                        .get_db_mut()
-                        .get_vfs_mut()
-                        .set_file_content(&uri, Some(text));
-                    removed_files.insert(file_id);
-                    updated_files.insert(file_id);
-                }
-            }
-        }
-
-        if removed_files.is_empty() {
-            return Vec::new();
-        }
-
-        let mut removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
-        self.add_vgui_forwarding_removal_seed(&removed_source_file_ids, &mut removed_files);
-        let guard_fact_file_ids = removed_files.iter().copied().collect::<HashSet<_>>();
-        self.compilation.remove_index(removed_files.clone());
-        updated_files.extend(removed_files.into_iter().filter(|file_id| {
-            self.compilation
-                .get_db()
-                .get_vfs()
-                .get_syntax_tree(file_id)
-                .is_some()
-        }));
-        let mut updated_files: Vec<FileId> = updated_files.into_iter().collect();
-        updated_files.sort();
-        self.compilation.update_index(updated_files.clone());
-        {
-            let _p = Profile::new("post: stabilize_cross_file_type_caches");
-            self.stabilize_cross_file_type_caches(&updated_files);
-        }
-        {
-            let _p = Profile::new("post: refresh_file_source_dependencies");
-            for file_id in &old_source_file_ids {
-                self.compilation
-                    .get_db_mut()
-                    .get_call_site_param_index_mut()
-                    .refresh_file_source_dependencies(*file_id);
-            }
-        }
-        {
-            let _p = Profile::new("post: reindex_changed_inferred_guard_references");
-            self.reindex_changed_inferred_guard_references(
-                &guard_fact_file_ids,
-                &old_guard_facts,
-                &updated_files,
-                &old_source_file_ids,
-            );
-        }
-        {
-            let _p = Profile::new("post: reindex_changed_inferred_param_consumers");
-            self.reindex_changed_inferred_param_consumers(&old_guard_facts, &updated_files);
-        }
-        updated_files
-    }
-
-    #[allow(unused)]
-    pub(crate) fn update_files_by_uri_sorted(
-        &mut self,
-        files: Vec<(Uri, Option<String>)>,
-    ) -> Vec<FileId> {
-        let mut files = files;
-        files.sort_by_cached_key(|(uri, _)| {
-            uri_to_file_path(uri)
-                .map(|path| crate::vfs::normalize_path_for_ordering(&path.to_string_lossy()))
-                .unwrap_or_else(|| uri.as_str().to_string())
-        });
-        let old_source_file_ids = files
-            .iter()
-            .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
-            .collect::<HashSet<_>>();
-        let removed_source_file_ids = files
-            .iter()
-            .filter(|(_, text)| text.is_none())
-            .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
-            .collect::<HashSet<_>>();
-        let mut old_guard_fact_file_ids =
-            self.expand_reindex_file_ids(old_source_file_ids.iter().copied().collect());
-        self.add_vgui_forwarding_removal_seed(
-            &removed_source_file_ids,
-            &mut old_guard_fact_file_ids,
-        );
-        let old_guard_fact_file_ids = old_guard_fact_file_ids.into_iter().collect::<HashSet<_>>();
-        let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
-        let mut removed_files = HashSet::new();
-        let mut updated_files = HashSet::new();
-        {
-            let _p = Profile::new("update files");
-            for (uri, text) in files {
-                let existing_file_id = self.compilation.get_db().get_vfs().get_file_id(&uri);
-                if let Some(file_id) = existing_file_id {
-                    if let (Some(new_text), Some(old_text)) = (
-                        text.as_deref(),
-                        self.compilation
-                            .get_db()
-                            .get_vfs()
-                            .get_file_content(&file_id)
-                            .map(String::as_str),
-                    ) && old_text == new_text
-                    {
-                        removed_files.insert(file_id);
-                        updated_files.insert(file_id);
-                        continue;
-                    }
-                } else if text.is_none() {
-                    continue;
-                }
-
-                let is_new_text = text.is_some();
-                let file_id = self
-                    .compilation
-                    .get_db_mut()
-                    .get_vfs_mut()
-                    .set_file_content(&uri, text);
-                removed_files.insert(file_id);
-                if is_new_text {
-                    updated_files.insert(file_id);
-                }
-            }
-        }
-        if removed_files.is_empty() {
-            return Vec::new();
-        }
-
-        let mut removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
-        self.add_vgui_forwarding_removal_seed(&removed_source_file_ids, &mut removed_files);
-        let guard_fact_file_ids = removed_files.iter().copied().collect::<HashSet<_>>();
-        self.compilation.remove_index(removed_files.clone());
-        updated_files.extend(removed_files.into_iter().filter(|file_id| {
-            self.compilation
-                .get_db()
-                .get_vfs()
-                .get_syntax_tree(file_id)
-                .is_some()
-        }));
-        let mut updated_files: Vec<FileId> = updated_files.into_iter().collect();
-        updated_files.sort();
-        self.compilation.update_index(updated_files.clone());
-        self.stabilize_cross_file_type_caches(&updated_files);
-        for file_id in &old_source_file_ids {
-            self.compilation
-                .get_db_mut()
-                .get_call_site_param_index_mut()
-                .refresh_file_source_dependencies(*file_id);
-        }
-        self.reindex_changed_inferred_guard_references(
-            &guard_fact_file_ids,
-            &old_guard_facts,
-            &updated_files,
-            &old_source_file_ids,
-        );
-        self.reindex_changed_inferred_param_consumers(&old_guard_facts, &updated_files);
-        updated_files
-    }
-
-    pub fn remove_file_by_uri(&mut self, uri: &Uri) -> Option<FileId> {
-        if let Some(file_id) = self.compilation.get_db().get_vfs().get_file_id(uri) {
-            let mut reindex_file_ids = self.expand_reindex_file_ids(vec![file_id]);
-            reindex_file_ids.extend(
-                self.compilation
-                    .get_db()
-                    .get_call_site_param_index()
-                    .collect_contribution_signature_files(&HashSet::from([file_id])),
-            );
-            reindex_file_ids.sort_unstable();
-            reindex_file_ids.dedup();
-            let removed_file_ids = HashSet::from([file_id]);
-            self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut reindex_file_ids);
-            let guard_fact_file_ids = reindex_file_ids.iter().copied().collect::<HashSet<_>>();
-            let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
-            self.compilation
-                .get_db_mut()
-                .get_vfs_mut()
-                .remove_file(uri)?;
-            log::info!(
-                "remove_file_by_uri: uri={} file_id={:?}",
-                uri.as_str(),
-                file_id
-            );
-            self.compilation.remove_index(reindex_file_ids.clone());
-            let update_file_ids = reindex_file_ids
-                .iter()
-                .copied()
-                .filter(|id| *id != file_id)
-                .collect::<Vec<_>>();
-            if !update_file_ids.is_empty() {
-                self.compilation.update_index(update_file_ids);
-            }
-            self.compilation
-                .get_db_mut()
-                .get_call_site_param_index_mut()
-                .refresh_file_source_dependencies(file_id);
-            self.reindex_changed_inferred_guard_references(
-                &guard_fact_file_ids,
-                &old_guard_facts,
-                &reindex_file_ids,
-                &HashSet::new(),
-            );
-            return Some(file_id);
-        }
-
-        None
+            .map(|(file_id, dependents)| {
+                let mut dependents = dependents.into_iter().collect::<Vec<_>>();
+                dependents.sort_unstable();
+                (file_id, dependents)
+            })
+            .collect()
     }
 
     pub fn update_files_by_path(&mut self, files: Vec<(PathBuf, Option<String>)>) -> Vec<FileId> {
@@ -1770,21 +705,58 @@ impl EmmyLuaAnalysis {
         self.update_files_by_uri(files)
     }
 
-    pub fn update_config(&mut self, config: Arc<Emmyrc>) {
+    /// Whether the newest text the VFS holds for `file_id` is exactly `text`.
+    fn vfs_text_equals(&self, file_id: FileId, text: Option<&str>) -> bool {
+        let current = self
+            .compilation
+            .get_db()
+            .get_vfs()
+            .latest_content(&file_id)
+            .map(String::as_str);
+        text.is_some() && current == text
+    }
+
+    /// Whether `file_id` already holds `text`, taken or staged for the next
+    /// take, and has an index.
+    fn text_is_indexed(&self, file_id: FileId, text: Option<&str>) -> bool {
+        self.vfs_text_equals(file_id, text) && self.compilation.is_indexed(file_id)
+    }
+
+    fn is_stale_version(&self, file_id: FileId, version: Option<i32>) -> bool {
+        let current = self.compilation.get_db().get_vfs().latest_version(&file_id);
+        matches!((version, current), (Some(incoming), Some(current)) if incoming < current)
+    }
+
+    /// Applies `config`, re-analysing every file when the change reaches the
+    /// index: facts are derived under the config they were built with.
+    pub fn update_config(&mut self, config: Arc<Emmyrc>) -> EmmyrcChange {
+        let change = self.apply_config(config);
+        if change.affects_index() {
+            self.reindex();
+        }
+        change
+    }
+
+    /// Applies `config` without re-analysing: a change that reaches the index
+    /// leaves it to be rebuilt, as [`Self::begin_full_reindex`] does.
+    pub fn apply_config(&mut self, config: Arc<Emmyrc>) -> EmmyrcChange {
         let mut refreshed_config = (*config).clone();
         refreshed_config
             .gmod
             .scripted_class_scopes
             .refresh_resolved_definitions();
+        let change = self.emmyrc.change_to(&refreshed_config);
         let config = Arc::new(refreshed_config);
         self.emmyrc = config.clone();
-        self.compilation.update_config(config.clone());
+        self.compilation
+            .update_config(config.clone(), change.affects_index());
         self.diagnostic.update_config(config);
+        change
     }
 
     pub fn set_workspace_diagnostic_configs(
         &mut self,
-        configs: HashMap<WorkspaceId, Arc<LuaDiagnosticConfig>>,
+        configs: std::collections::HashMap<WorkspaceId, Arc<LuaDiagnosticConfig>>,
     ) {
         self.diagnostic.set_workspace_configs(configs);
     }
@@ -1805,8 +777,10 @@ impl EmmyLuaAnalysis {
         file_id: FileId,
         cancel_token: CancellationToken,
     ) -> Option<Vec<lsp_types::Diagnostic>> {
-        self.diagnostic
-            .diagnose_file(&self.compilation, file_id, cancel_token)
+        self.compilation.record_diagnostic_reads(file_id, || {
+            self.diagnostic
+                .diagnose_file(&self.compilation, file_id, cancel_token)
+        })
     }
 
     pub fn diagnose_file_with_shared(
@@ -1815,14 +789,18 @@ impl EmmyLuaAnalysis {
         cancel_token: CancellationToken,
         shared_data: std::sync::Arc<diagnostic::SharedDiagnosticData>,
     ) -> Option<Vec<lsp_types::Diagnostic>> {
-        self.diagnostic.diagnose_file_with_shared(
-            &self.compilation,
-            file_id,
-            cancel_token,
-            shared_data,
-        )
+        self.compilation.record_diagnostic_reads(file_id, || {
+            self.diagnostic.diagnose_file_with_shared(
+                &self.compilation,
+                file_id,
+                cancel_token,
+                shared_data,
+            )
+        })
     }
 
+    /// The data every file's diagnostics share, computed outside any file's
+    /// recorded reads, as the language server computes it.
     pub fn precompute_diagnostic_shared_data(
         &self,
     ) -> std::sync::Arc<diagnostic::SharedDiagnosticData> {
@@ -1830,65 +808,67 @@ impl EmmyLuaAnalysis {
     }
 
     /// Return main-workspace files in an order that keeps parallel diagnostic
-    /// workers busy. Source size is a cheap proxy for diagnostic cost, so
-    /// processing larger files first avoids leaving one expensive file on the
-    /// critical path after the other workers have gone idle.
+    /// workers busy: files with the most name and index expressions first, since
+    /// those are where inference and flow narrowing spend their time, which raw
+    /// source size misses (large data files are cheap, mid-size code files are
+    /// not). Dispatching the expensive files first keeps one of them from being
+    /// left alone on the critical path after the other workers have gone idle.
     pub fn get_main_workspace_file_ids_for_diagnostics(&self) -> Vec<FileId> {
+        let file_ids = self
+            .compilation
+            .get_db()
+            .get_module_index()
+            .get_main_workspace_file_ids();
+        self.order_for_diagnostics(file_ids)
+    }
+
+    /// `file_ids` with the files that cost the most to diagnose first; see
+    /// [`Self::get_main_workspace_file_ids_for_diagnostics`].
+    pub fn order_for_diagnostics(&self, mut file_ids: Vec<FileId>) -> Vec<FileId> {
         let db = self.compilation.get_db();
         let vfs = db.get_vfs();
-        let mut file_ids = db.get_module_index().get_main_workspace_file_ids();
-        file_ids.sort_unstable_by(|left, right| {
-            let left_len = vfs.get_file_content(left).map_or(0, String::len);
-            let right_len = vfs.get_file_content(right).map_or(0, String::len);
-            right_len.cmp(&left_len).then_with(|| left.cmp(right))
+        let flow_index = db.get_flow_index();
+        file_ids.sort_by_cached_key(|file_id| {
+            let bindings = flow_index
+                .get_flow_tree(file_id)
+                .map_or(0, |flow_tree| flow_tree.binding_count());
+            let len = vfs.get_file_content(file_id).map_or(0, String::len);
+            (
+                std::cmp::Reverse(bindings),
+                std::cmp::Reverse(len),
+                *file_id,
+            )
         });
         file_ids
     }
 
     pub fn reindex(&mut self) {
-        let file_ids = self.compilation.get_db().get_vfs().get_all_file_ids();
-        self.compilation.clear_index();
-        self.compilation.update_index(file_ids);
+        self.begin_full_reindex();
+        self.compilation.advance_update(Slice::Whole);
     }
 
-    /// 清理文件系统中不再存在的文件
-    pub fn cleanup_nonexistent_files(&mut self) {
-        let mut files_to_remove = Vec::new();
+    /// Drops the index and any re-analysis in progress, then starts
+    /// re-analysing every file from the text the VFS holds, as a cold build
+    /// does. Advance it with [`Self::advance_reindex`].
+    pub fn begin_full_reindex(&mut self) {
+        let file_ids = self.compilation.get_db().get_vfs().get_all_file_ids();
+        self.compilation.clear_index();
+        self.compilation.begin_update(file_ids);
+    }
 
-        // 获取所有当前在VFS中的文件
-        let vfs = self.compilation.get_db().get_vfs();
-        for file_id in vfs.get_all_local_file_ids() {
-            if self
-                .compilation
-                .get_db()
-                .get_module_index()
-                .is_std(&file_id)
-            {
-                continue;
-            }
-            if let Some(path) = vfs.get_file_path(&file_id).filter(|path| !path.exists())
-                && let Some(uri) = file_path_to_uri(path)
-            {
-                log::info!(
-                    "cleanup_nonexistent_files: removing file_id={:?} path={}",
-                    file_id,
-                    path.display(),
-                );
-                files_to_remove.push(uri);
-            }
-        }
-
-        if !files_to_remove.is_empty() {
-            log::info!(
-                "cleanup_nonexistent_files: removing {} files total",
-                files_to_remove.len()
-            );
-        }
-
-        // 移除不存在的文件
-        for uri in files_to_remove {
-            self.remove_file_by_uri(&uri);
-        }
+    /// Every local file outside the standard library, with its path: what a
+    /// check for files deleted behind the editor's back looks at.
+    pub fn local_file_paths(&self) -> Vec<(Uri, PathBuf)> {
+        let db = self.compilation.get_db();
+        let vfs = db.get_vfs();
+        vfs.get_all_local_file_ids()
+            .into_iter()
+            .filter(|file_id| !db.get_module_index().is_std(file_id))
+            .filter_map(|file_id| {
+                let path = vfs.get_file_path(&file_id)?;
+                Some((file_path_to_uri(path)?, path.clone()))
+            })
+            .collect()
     }
 
     pub fn check_schema_update(&self) -> bool {
@@ -1911,6 +891,7 @@ impl EmmyLuaAnalysis {
         }
 
         let converter = SchemaConverter::new(true);
+        let mut users = Vec::new();
         for (url, json_content) in url_contents {
             // let short_name = get_schema_short_name(&url);
             match converter.convert_from_str(&json_content) {
@@ -1935,6 +916,12 @@ impl EmmyLuaAnalysis {
                             &convert_result.root_type_name,
                         ));
                     }
+                    users.extend(
+                        self.compilation
+                            .get_db()
+                            .get_json_schema_index()
+                            .users_of(&url),
+                    );
                 }
                 Err(e) => {
                     log::error!("Failed to convert schema from URL {:?}: {}", url, e);
@@ -1946,6 +933,10 @@ impl EmmyLuaAnalysis {
             .get_db_mut()
             .get_json_schema_index_mut()
             .reset_rest_schemas();
+        // Their tags bound nothing while the schema was unresolved.
+        if !users.is_empty() {
+            self.reindex_files(users);
+        }
     }
 
     pub async fn update_schema(&mut self) {
@@ -1953,19 +944,6 @@ impl EmmyLuaAnalysis {
         let url_contents = fetch_schema_urls(urls).await;
         self.apply_fetched_schemas(url_contents);
     }
-}
-
-fn select_cross_file_stabilization_dependents(
-    all_dependents: impl IntoIterator<Item = FileId>,
-    changed: &HashSet<FileId>,
-) -> Vec<FileId> {
-    let mut dependents = all_dependents
-        .into_iter()
-        .filter(|file_id| !changed.contains(file_id))
-        .collect::<Vec<_>>();
-    dependents.sort_unstable();
-    dependents.dedup();
-    dependents
 }
 
 impl Default for EmmyLuaAnalysis {
@@ -1976,193 +954,18 @@ impl Default for EmmyLuaAnalysis {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+
     use std::path::PathBuf;
 
-    use glua_parser::LuaSyntaxId;
     use lsp_types::Uri;
     use tokio_util::sync::CancellationToken;
 
-    use crate::{
-        EmmyLuaAnalysis, FileId, GmodVguiParentCallMetadata, GmodVguiParentCallOrigin,
-        GmodVguiParentSource, LuaDependencyKind, select_cross_file_stabilization_dependents,
-    };
-
-    #[test]
-    fn reindex_expansion_includes_indexed_file_dependents() {
-        let changed = FileId { id: 1 };
-        let direct_caller = FileId { id: 2 };
-        let transitive_caller = FileId { id: 3 };
-        let unrelated = FileId { id: 4 };
-        let mut analysis = EmmyLuaAnalysis::new();
-        let dependencies = analysis
-            .compilation
-            .get_db_mut()
-            .get_file_dependencies_index_mut();
-        dependencies.add_dependency_file(direct_caller, changed, LuaDependencyKind::Include);
-        dependencies.add_dependency_file(
-            transitive_caller,
-            direct_caller,
-            LuaDependencyKind::Include,
-        );
-        dependencies.add_dependency_file(unrelated, unrelated, LuaDependencyKind::Include);
-
-        assert_eq!(
-            analysis.expand_reindex_file_ids(vec![changed]),
-            vec![changed, direct_caller, transitive_caller]
-        );
-    }
-
-    #[test]
-    fn reindex_expansion_includes_unresolved_path_dependents_for_reopened_file() {
-        let workspace = std::env::temp_dir().join("gmod_glua_ls_reopen_dependency_workspace");
-        let uri = |name: &str| {
-            Uri::parse_from_file_path(&workspace.join(name)).expect("uri should parse")
-        };
-        let target_uri = uri("lua/mixins/reopened.lua");
-        let caller_uri = uri("lua/autorun/reopen_consumer.lua");
-        let mut analysis = EmmyLuaAnalysis::new();
-        analysis.add_main_workspace(workspace);
-        let old_target = analysis
-            .update_file_by_uri(&target_uri, Some("return {}".to_string()))
-            .expect("target should be created");
-        let caller = analysis
-            .update_file_by_uri(
-                &caller_uri,
-                Some(r#"local reopened = include("mixins/reopened.lua")"#.to_string()),
-            )
-            .expect("caller should be created");
-
-        analysis
-            .remove_file_by_uri(&target_uri)
-            .expect("target should be removed");
-        assert_ne!(
-            analysis
-                .compilation
-                .get_db()
-                .get_vfs()
-                .get_file_id(&target_uri),
-            Some(old_target)
-        );
-
-        let reopened_target = analysis
-            .compilation
-            .get_db_mut()
-            .get_vfs_mut()
-            .set_file_content(&target_uri, Some("return {}".to_string()));
-
-        assert!(
-            analysis
-                .expand_reindex_file_ids(vec![reopened_target])
-                .contains(&caller)
-        );
-    }
-
-    fn reopen_path_expands_to_caller(
-        target_path: &str,
-        caller_path: &str,
-        dependency_expr: &str,
-    ) -> bool {
-        let workspace = std::env::temp_dir().join(format!(
-            "gmod_glua_ls_reopen_path_variants_{}",
-            target_path.replace(['/', '.'], "_")
-        ));
-        let uri = |name: &str| {
-            Uri::parse_from_file_path(&workspace.join(name)).expect("uri should parse")
-        };
-        let target_uri = uri(target_path);
-        let caller_uri = uri(caller_path);
-        let mut analysis = EmmyLuaAnalysis::new();
-        analysis.add_main_workspace(workspace);
-        analysis
-            .update_file_by_uri(&target_uri, Some("return {}".to_string()))
-            .expect("target should be created");
-        let caller = analysis
-            .update_file_by_uri(
-                &caller_uri,
-                Some(format!("local reopened = {dependency_expr}")),
-            )
-            .expect("caller should be created");
-
-        analysis
-            .remove_file_by_uri(&target_uri)
-            .expect("target should be removed");
-        let reopened_target = analysis
-            .compilation
-            .get_db_mut()
-            .get_vfs_mut()
-            .set_file_content(&target_uri, Some("return {}".to_string()));
-
-        analysis
-            .expand_reindex_file_ids(vec![reopened_target])
-            .contains(&caller)
-    }
-
-    #[test]
-    fn reindex_expansion_matches_reopened_dependency_path_variants() {
-        for (target_path, caller_path, dependency_expr) in [
-            (
-                "lua/autorun/mixins/parent.lua",
-                "lua/autorun/sub/parent_consumer.lua",
-                r#"include("../mixins/parent.lua")"#,
-            ),
-            (
-                "lua/mixins/lua_prefixed.lua",
-                "lua/autorun/lua_prefixed_consumer.lua",
-                r#"include("lua/mixins/lua_prefixed.lua")"#,
-            ),
-            (
-                "lua/mixins/extensionless.lua",
-                "lua/autorun/extensionless_consumer.lua",
-                r#"include("mixins/extensionless")"#,
-            ),
-            (
-                "lua/mixins/required.lua",
-                "lua/autorun/required_consumer.lua",
-                r#"require("mixins.required")"#,
-            ),
-        ] {
-            assert!(
-                reopen_path_expands_to_caller(target_path, caller_path, dependency_expr),
-                "{dependency_expr} should match {target_path}"
-            );
-        }
-    }
-
-    #[test]
-    fn reindex_expansion_path_case_matches_vfs_platform_semantics() {
-        let matched = reopen_path_expands_to_caller(
-            "lua/mixins/CaseSensitive.lua",
-            "lua/autorun/case_consumer.lua",
-            r#"include("mixins/casesensitive.lua")"#,
-        );
-        assert_eq!(matched, cfg!(target_os = "windows"));
-    }
-
-    #[test]
-    fn stabilization_dependents_exclude_files_already_analyzed_in_batch() {
-        let changed_a = FileId { id: 1 };
-        let changed_b = FileId { id: 2 };
-        let unchanged_dependent = FileId { id: 3 };
-        let changed = HashSet::from([changed_a, changed_b]);
-
-        assert_eq!(
-            select_cross_file_stabilization_dependents(
-                [
-                    changed_b,
-                    unchanged_dependent,
-                    changed_a,
-                    unchanged_dependent
-                ],
-                &changed,
-            ),
-            vec![unchanged_dependent]
-        );
-    }
+    use crate::{EmmyLuaAnalysis, FileId};
 
     #[test]
     fn diagnostic_file_ids_are_prioritized_by_source_size_then_file_id() {
-        let workspace = std::env::temp_dir().join("gmod_glua_ls_diagnostic_priority_workspace");
+        let workspace =
+            crate::test_lib::unique_temp_dir("gmod_glua_ls_diagnostic_priority_workspace");
         let make_uri = |name: &str| {
             Uri::parse_from_file_path(&workspace.join(name)).expect("uri should parse")
         };
@@ -2201,7 +1004,7 @@ mod tests {
     }
 
     fn test_workspace_and_uri() -> (PathBuf, Uri) {
-        let workspace = std::env::temp_dir().join("gmod_glua_ls_analysis_test_workspace");
+        let workspace = crate::test_lib::unique_temp_dir("gmod_glua_ls_analysis_test_workspace");
         let test_file = workspace.join("test.lua");
         let uri = Uri::parse_from_file_path(&test_file).expect("uri should parse");
         (workspace, uri)
@@ -2216,6 +1019,7 @@ mod tests {
         let content = "local IsValid = IsValid";
         let file_id = analysis
             .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id)
             .expect("file id should exist");
 
         analysis.compilation.clear_index();
@@ -2228,7 +1032,9 @@ mod tests {
                 .is_none()
         );
 
-        analysis.update_file_by_uri(&uri, Some(content.to_string()));
+        analysis
+            .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id);
         assert!(
             analysis
                 .compilation
@@ -2248,6 +1054,7 @@ mod tests {
         let content = "local IsValid = IsValid";
         let file_id = analysis
             .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id)
             .expect("file id should exist");
 
         analysis.compilation.clear_index();
@@ -2270,8 +1077,8 @@ mod tests {
             Uri::parse_from_file_path(&file).expect("uri should parse")
         };
 
-        let workspace_a = std::env::temp_dir().join("gmod_glua_ls_stable_ids_a");
-        let workspace_b = std::env::temp_dir().join("gmod_glua_ls_stable_ids_b");
+        let workspace_a = crate::test_lib::unique_temp_dir("gmod_glua_ls_stable_ids_a");
+        let workspace_b = crate::test_lib::unique_temp_dir("gmod_glua_ls_stable_ids_b");
 
         let mut analysis_a = EmmyLuaAnalysis::new();
         analysis_a.add_main_workspace(workspace_a.clone());
@@ -2316,162 +1123,11 @@ mod tests {
     }
 
     #[test]
-    fn vgui_forwarding_removal_seed_falls_back_to_another_workspace() {
-        let root = std::env::temp_dir().join("gmod_glua_ls_vgui_forwarding_seed_workspace");
-        let main_workspace = root.join("main");
-        let library_workspace = root.join("library");
-        let main_uri = Uri::parse_from_file_path(&main_workspace.join("consumer.lua"))
-            .expect("uri should parse");
-        let helper_uri = Uri::parse_from_file_path(&library_workspace.join("helper.lua"))
-            .expect("uri should parse");
-
-        let mut analysis = EmmyLuaAnalysis::new();
-        analysis.add_main_workspace(main_workspace);
-        analysis.add_library_workspace(library_workspace);
-        let main_file_id = analysis
-            .update_file_by_uri(&main_uri, Some("return true".to_string()))
-            .expect("main file should be indexed");
-        let helper_file_id = analysis
-            .update_file_by_uri(&helper_uri, Some("return true".to_string()))
-            .expect("helper file should be indexed");
-        let helper_syntax_id = LuaSyntaxId::from_node(
-            &analysis
-                .compilation
-                .get_db()
-                .get_vfs()
-                .get_syntax_tree(&helper_file_id)
-                .expect("helper syntax tree should exist")
-                .get_red_root(),
-        );
-        analysis
-            .compilation
-            .get_db_mut()
-            .get_gmod_class_metadata_index_mut()
-            .add_vgui_parent_call(
-                helper_file_id,
-                GmodVguiParentCallMetadata {
-                    syntax_id: helper_syntax_id,
-                    child: GmodVguiParentSource::Unknown,
-                    parent: GmodVguiParentSource::Unknown,
-                    relations: Vec::new(),
-                    resolved_source: None,
-                    origin: GmodVguiParentCallOrigin::Annotated,
-                },
-            );
-
-        let removed_file_ids = HashSet::from([helper_file_id]);
-        let mut reindex_file_ids = vec![helper_file_id];
-        analysis.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut reindex_file_ids);
-
-        assert_eq!(reindex_file_ids, vec![main_file_id, helper_file_id]);
-    }
-
-    /// The language server re-indexes an edited file on its own before running
-    /// its dependency ripple, so a completion positioned in that file can be
-    /// answered without waiting seconds for the ripple. This checks the split
-    /// path reaches the same diagnostics as doing it in one go.
-    ///
-    /// It does **not** pin the ordering constraint that makes the split safe —
-    /// that the expansion is captured *before* the self-index, because a
-    /// self-index drops the edited file's declarations and inbound dependency
-    /// edges and an expansion taken afterwards under-invalidates. That was
-    /// measured on a gamemode workspace (739 files before the self-index, 6
-    /// after) and this fixture is far too small to reproduce it: it passes with
-    /// the two swapped. The real guard is `tools/determinism` against a real
-    /// workspace, and the reasoning lives on `reindex_expanded_files`.
-    #[test]
-    fn two_phase_reindex_matches_single_phase_diagnostics() {
-        // A class definition plus a consumer whose inferred type references it:
-        // the expansion reaches the consumer through the type-cache relation,
-        // which is the one that collapses once the definition site is dropped.
-        let producer_source = |member: &str| {
-            format!(
-                "---@class Thing
-local Thing = {{}}
-function Thing:{member}() end
-return Thing
-"
-            )
-        };
-        let consumer_source = "---@type Thing
-local thing
-thing:name()
-consume(thing)
-";
-        let helper_source = "function consume(value) end
-";
-
-        let build = |dir: &str| {
-            let workspace = std::env::temp_dir().join(dir);
-            let uri = |name: &str| {
-                Uri::parse_from_file_path(&workspace.join(name)).expect("uri should parse")
-            };
-            let uris = [uri("producer.lua"), uri("consumer.lua"), uri("helper.lua")];
-            let mut analysis = EmmyLuaAnalysis::new();
-            analysis.add_main_workspace(workspace);
-            analysis.update_files_by_uri(vec![
-                (uris[0].clone(), Some(producer_source("name"))),
-                (uris[1].clone(), Some(consumer_source.to_string())),
-                (uris[2].clone(), Some(helper_source.to_string())),
-            ]);
-            (analysis, uris)
-        };
-
-        let snapshot = |analysis: &EmmyLuaAnalysis, uris: &[Uri; 3]| {
-            let shared = analysis.precompute_diagnostic_shared_data();
-            uris.iter()
-                .map(|uri| {
-                    let file_id = analysis.get_file_id(uri).expect("file should be indexed");
-                    analysis
-                        .diagnose_file_with_shared(
-                            file_id,
-                            CancellationToken::new(),
-                            shared.clone(),
-                        )
-                        .unwrap_or_default()
-                })
-                .collect::<Vec<_>>()
-        };
-
-        // Renaming the produced field is a real change: the consumer reads the
-        // old name, so the edit has to reach it.
-        let (mut single, single_uris) = build("gmod_glua_ls_two_phase_single");
-        let single_producer = single
-            .update_file_text_only(&single_uris[0], producer_source("title"))
-            .expect("producer should exist");
-        single.reindex_files(vec![single_producer]);
-
-        let (mut split, split_uris) = build("gmod_glua_ls_two_phase_split");
-        let split_producer = split
-            .get_file_id(&split_uris[0])
-            .expect("producer should be indexed");
-        let expansion = split.expand_reindex_file_ids(vec![split_producer]);
-        split
-            .update_file_text_only(&split_uris[0], producer_source("title"))
-            .expect("producer should exist");
-        split.self_index_files(vec![split_producer]);
-        split.reindex_expanded_files(vec![split_producer], expansion);
-
-        let single_diagnostics = snapshot(&single, &single_uris);
-        assert!(
-            single_diagnostics
-                .iter()
-                .any(|diagnostics| !diagnostics.is_empty()),
-            "fixture should exercise observable diagnostics"
-        );
-        assert_eq!(
-            snapshot(&split, &split_uris),
-            single_diagnostics,
-            "self-indexing the edited file first must not change the outcome"
-        );
-    }
-
-    #[test]
     fn multi_file_batch_reindex_matches_clean_build_diagnostics() {
         let incremental_workspace =
-            std::env::temp_dir().join("gmod_glua_ls_batch_reindex_incremental_workspace");
+            crate::test_lib::unique_temp_dir("gmod_glua_ls_batch_reindex_incremental_workspace");
         let clean_workspace =
-            std::env::temp_dir().join("gmod_glua_ls_batch_reindex_clean_workspace");
+            crate::test_lib::unique_temp_dir("gmod_glua_ls_batch_reindex_clean_workspace");
         let uris = |workspace: &PathBuf| {
             ["producer.lua", "consumer.lua", "helper.lua"].map(|name| {
                 Uri::parse_from_file_path(&workspace.join(name)).expect("uri should parse")
@@ -2590,5 +1246,31 @@ consume(thing)
                 "clean build should index module ownership for {clean_file_id:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_parse_config_change_reparses_loaded_files() {
+        let mut ws = crate::VirtualWorkspace::new();
+        let file_id = ws.def(
+            "local x = 1 // note
+",
+        );
+        let parse_errors = |ws: &crate::VirtualWorkspace| {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_syntax_tree(&file_id)
+                .expect("tree")
+                .get_errors()
+                .len()
+        };
+        assert_eq!(parse_errors(&ws), 0);
+
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.runtime.nonstandard_symbol.clear();
+        ws.update_emmyrc(emmyrc);
+
+        assert_ne!(parse_errors(&ws), 0);
     }
 }

@@ -8,8 +8,8 @@ mod test {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        DiagnosticCode, Emmyrc, GmodRealm, LuaSignatureId, LuaType, LuaTypeDeclId, LuaUnionType,
-        VirtualWorkspace,
+        DiagnosticCode, Emmyrc, GMOD_CALL_ARG_BUILTINS_FIXTURE, GmodRealm, LuaSignatureId, LuaType,
+        LuaTypeDeclId, LuaUnionType, Schedule, VirtualWorkspace,
     };
     use smol_str::SmolStr;
 
@@ -517,6 +517,57 @@ mod test {
     }
 
     #[gtest]
+    fn test_str_tpl_class_named_by_a_defaulted_argument_is_declared_like_a_literal_one()
+    -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field SetPos fun(self: Entity, pos: any)
+
+            ents = {}
+
+            ---@generic T: Entity
+            ---@param class `T`
+            ---@return T
+            function ents.Create(class) end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/server/sv_scanner.lua",
+            r#"
+            local function CreateScanner(client, class)
+                class = class or "npc_cscanner"
+                local entity = ents.Create(class)
+                entity:SetPos(client)
+            end
+            return CreateScanner
+            "#,
+        );
+
+        let declared = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_type_decl(&LuaTypeDeclId::global("npc_cscanner"))
+            .map(|decl| decl.is_auto_generated());
+        verify_that!(declared, some(eq(true)))?;
+        verify_that!(
+            ws.analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default()
+                .iter()
+                .any(|diagnostic| diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string()
+                    ))),
+            eq(false)
+        )
+    }
+
+    #[gtest]
     fn test_str_tpl_generic_override_with_extra_param_preserves_instantiated_return() {
         let mut ws = VirtualWorkspace::new();
 
@@ -584,7 +635,7 @@ mod test {
         );
 
         let wheel_ty = ws.expr_ty("ENT:CreateWheel()");
-        let expected = ws.ty("glide_wheel|unknown");
+        let expected = ws.ty("glide_wheel|any");
         assert_eq!(wheel_ty, expected);
     }
 
@@ -993,7 +1044,26 @@ mod test {
             ws.expr_ty("generated_entity"),
             ws.ty("sent_realm_generated")
         );
-        ws.def_file(
+        {
+            let db = ws.get_db_mut();
+            let edge = db
+                .get_type_index()
+                .get_super_type_entries(&LuaTypeDeclId::global("sent_realm_generated"))
+                .and_then(|entries| entries.first())
+                .expect("generated superclass edge");
+            assert_eq!(edge.file_id, file_id);
+            assert_eq!(
+                db.get_gmod_infer_index()
+                    .get_realm_at_offset(&file_id, edge.value.source_range.start()),
+                GmodRealm::Client
+            );
+        }
+
+        // A real declaration of the same class supersedes the generated one:
+        // `should_attach_super` only fires while the only declaration is
+        // auto-generated. Asserted here because it is what a cold build of both
+        // files produces, and an incremental one has to match it.
+        let contract_file_id = ws.def_file(
             "sv_generated_contract.lua",
             r#"
                 ---@class GeneratedRightBase
@@ -1011,16 +1081,16 @@ mod test {
         assert_eq!(ws.expr_ty("generated_realm_param"), LuaType::Number);
 
         let db = ws.get_db_mut();
-        let edge = db
+        let entries = db
             .get_type_index()
             .get_super_type_entries(&LuaTypeDeclId::global("sent_realm_generated"))
-            .and_then(|entries| entries.first())
-            .expect("generated superclass edge");
-        assert_eq!(edge.file_id, file_id);
+            .expect("superclass edge");
         assert_eq!(
-            db.get_gmod_infer_index()
-                .get_realm_at_offset(&file_id, edge.value.source_range.start()),
-            GmodRealm::Client
+            entries
+                .iter()
+                .map(|entry| entry.file_id)
+                .collect::<Vec<_>>(),
+            vec![contract_file_id]
         );
     }
 
@@ -2040,6 +2110,7 @@ mod test {
         let file_id = ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
                 ---@class DScrollPanel: Panel
                 ---@class DCategoryList: DScrollPanel
                 ---@class DCollapsibleCategory: Panel
@@ -2094,6 +2165,7 @@ mod test {
         ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
                 ---@class DButton: Panel
 
                 ---@generic T: Panel
@@ -2133,6 +2205,7 @@ mod test {
         ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
 
                 ---@generic T: Panel
                 ---@[call_arg("gmod.vgui_panel", "reference")]
@@ -2171,6 +2244,7 @@ mod test {
         ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
 
                 local PANEL = {}
                 derma.DefineControl("FirstPanel", "", PANEL, "Panel")
@@ -2204,6 +2278,7 @@ mod test {
         ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
 
                 local PANEL = {}
                 derma.DefineControl("FirstPanel", "", PANEL, "Panel")
@@ -2235,6 +2310,7 @@ mod test {
         ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
 
                 ---@param name string
                 function someFunction(name)
@@ -2264,6 +2340,7 @@ mod test {
         ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
 
                 local PANEL = {}
 
@@ -2296,6 +2373,7 @@ mod test {
         ws.def(
             r#"
                 ---@class Panel
+                Panel = Panel or {}
                 ---@class DCategoryList: Panel
 
                 local ctrl = vgui.Create("DCategoryList")
@@ -2309,7 +2387,48 @@ mod test {
         let expected = ws.ty("DCategoryList");
         assert_eq!(base, expected);
         let unknown_ty = ws.expr_ty("b");
-        assert!(unwrap_instance(&unknown_ty).is_nullable());
+        assert!(
+            unwrap_instance(&unknown_ty).is_nullable(),
+            "unknown VGUI class must preserve the declared nullable return, got {} ({unknown_ty:?})",
+            ws.humanize_type_detailed(unknown_ty.clone())
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_explicit_class_supersedes_generated_placeholder_for_nullability() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DCategoryList: Panel
+                known = vgui.Create("DCategoryList")
+                placeholder = vgui.Create("LatePanel")
+            "#,
+        );
+        let first_ty = ws.expr_ty("placeholder");
+        assert!(
+            unwrap_instance(&first_ty).is_nullable(),
+            "generated placeholder must keep the declared nullable return, got {} ({first_ty:?})",
+            ws.humanize_type_detailed(first_ty.clone())
+        );
+
+        ws.def(
+            r#"
+                ---@class LatePanel: Panel
+            "#,
+        );
+        let declared_ty = ws.expr_ty("vgui.Create('LatePanel')");
+        assert!(
+            !unwrap_instance(&declared_ty).is_nullable(),
+            "explicit panel declaration must supersede the generated placeholder, got {} ({declared_ty:?})",
+            ws.humanize_type_detailed(declared_ty.clone())
+        );
     }
 
     #[gtest]
@@ -2326,6 +2445,7 @@ mod test {
             "lua/autorun/client/vgui_reassigned_color_mixer.lua",
             r#"
                 ---@class Panel
+                Panel = Panel or {}
                 ---@class DForm: Panel
                 local DForm = {}
 
@@ -2386,6 +2506,1095 @@ mod test {
                 .iter()
                 .all(|diagnostic| !undefined_member_codes.contains(&diagnostic.code)),
             "DColorMixer reassignment should replace the older local panel type, got {diagnostics:?}"
+        );
+    }
+
+    // ── VGUI panel reference: annotation-driven contextual binding ────
+
+    #[gtest]
+    fn test_vgui_panel_ref_does_not_infer_for_arbitrary_method_param() {
+        // `vgui.Create(panelClass)` inside an ordinary method of a registered
+        // panel must NOT resolve to the enclosing class `TF`: a non-literal
+        // class name keeps the generic `Panel` constraint.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+
+                local TF = {}
+
+                function TF:AddTab(panelClass)
+                    local p = vgui.Create(panelClass, self)
+                    a = p
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("Panel");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_still_infers_generate_example_class_param() {
+        // `Panel:GenerateExample`'s `class` parameter carries the
+        // `call_arg("gmod.vgui_panel", "own_class")` role in the test
+        // builtins, so `vgui.Create(ClassName)` inside the override binds the
+        // registered class.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+
+                local TF = {}
+
+                function TF:GenerateExample(ClassName)
+                    local p = vgui.Create(ClassName)
+                    a = p
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("TF");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_literal_reassignment_uses_the_value_at_the_read() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/vgui/own_class_literal_reassignment.lua",
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+                ---@class DScrollPanel: DPanel
+
+                local TF = {}
+                function TF:OnlyTF() end
+
+                function TF:GenerateExample(class)
+                    class = "DScrollPanel"
+                    local panel = vgui.Create(class)
+                    a = panel
+                    panel:OnlyTF()
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let product = ws.expr_ty("a");
+        assert_eq!(unwrap_instance(&product), &ws.ty("DScrollPanel"));
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let invalid_member_codes = [
+            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
+            DiagnosticCode::InferUnguardedChild,
+        ]
+        .map(|code| Some(NumberOrString::String(code.get_name().to_string())));
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                invalid_member_codes.contains(&diagnostic.code)
+                    && diagnostic.message.contains("OnlyTF")
+            }),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_unknown_reassignment_uses_the_value_at_the_read() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/vgui/own_class_unknown_reassignment.lua",
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+                ---@class DScrollPanel: DPanel
+
+                local TF = {}
+                function TF:OnlyTF() end
+
+                ---@param replacement unknown
+                function TF:GenerateExample(class, replacement)
+                    class = replacement
+                    local panel = vgui.Create(class)
+                    a = panel
+                    panel:OnlyTF()
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let product = ws.expr_ty("a");
+        assert_eq!(unwrap_instance(&product), &ws.ty("Panel"));
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let invalid_member_codes = [
+            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
+            DiagnosticCode::InferUnguardedChild,
+        ]
+        .map(|code| Some(NumberOrString::String(code.get_name().to_string())));
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                invalid_member_codes.contains(&diagnostic.code)
+                    && (diagnostic.message.contains("OnlyTF")
+                        || diagnostic.message.contains("expected `TF`"))
+            }),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_survives_a_completed_branch_that_leaves_the_param_unchanged() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/vgui/own_class_completed_branch.lua",
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+
+                local TF = {}
+                function TF:OnlyTF() end
+
+                function TF:GenerateExample(class)
+                    if class == "TF" then print("preview") end
+                    local panel = vgui.Create(class)
+                    a = panel
+                    panel:OnlyTF()
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let product = ws.expr_ty("a");
+        assert_eq!(unwrap_instance(&product), &ws.ty("TF"));
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let invalid_member_codes = [
+            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
+            DiagnosticCode::InferUnguardedChild,
+        ]
+        .map(|code| Some(NumberOrString::String(code.get_name().to_string())));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| invalid_member_codes.contains(&diagnostic.code)),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_branch_narrowing_uses_the_value_at_the_read() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/vgui/own_class_branch_narrowing.lua",
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+                ---@class DScrollPanel: DPanel
+
+                local TF = {}
+                function TF:OnlyTF() end
+
+                function TF:GenerateExample(class)
+                    if class == "DScrollPanel" then
+                        local panel = vgui.Create(class)
+                        a = panel
+                        panel:OnlyTF()
+                    end
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let product = ws.expr_ty("a");
+        assert_eq!(unwrap_instance(&product), &ws.ty("DScrollPanel"));
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let invalid_member_codes = [
+            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
+            DiagnosticCode::InferUnguardedChild,
+        ]
+        .map(|code| Some(NumberOrString::String(code.get_name().to_string())));
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                invalid_member_codes.contains(&diagnostic.code)
+                    && diagnostic.message.contains("OnlyTF")
+            }),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_generate_example_later_param_does_not_bind() {
+        // Only `class` (parameter index 0) carries the `own_class` role on
+        // `Panel:GenerateExample`; a parameter in a later slot names an
+        // arbitrary class and does not bind.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+
+                local TF = {}
+
+                function TF:GenerateExample(PropertySheet, ClassName)
+                    local p = vgui.Create(ClassName)
+                    a = p
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("Panel");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_without_own_class_role_does_not_bind() {
+        // The binding is annotation-driven, not name-driven: a method named
+        // `GenerateExample` whose inherited declaration carries no
+        // `own_class` role must not resolve to the enclosing class.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+                ---@meta
+                ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+                vgui = vgui or {}
+
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+
+                ---@generic T: Panel
+                ---@[call_arg("gmod.vgui_panel", "reference")]
+                ---@param className `T`
+                ---@return (instance) T?
+                function vgui.Create(className, parent, name) end
+
+                ---@[call_arg("gmod.vgui_panel", "define")]
+                ---@param name string
+                ---@[call_arg("gmod.vgui_panel", "table")]
+                ---@param panel table
+                ---@[call_arg("gmod.vgui_panel", "base")]
+                ---@param base string
+                function vgui.Register(name, panel, base) end
+
+                ---@param class string
+                ---@param dpropertysheet any
+                function Panel:GenerateExample(class, dpropertysheet) end
+
+                local TF = {}
+
+                function TF:GenerateExample(ClassName)
+                    local p = vgui.Create(ClassName)
+                    a = p
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("Panel");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_literal_inside_registered_method_still_binds() {
+        // A literal class name inside a registered panel's method still binds
+        // the template to the named class.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+                ---@class DScrollPanel: DPanel
+
+                local TF = {}
+
+                function TF:Init()
+                    local p = vgui.Create("DScrollPanel", self)
+                    a = p
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("DScrollPanel");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_vgui_panel_ref_local_const_inside_registered_method_still_binds() {
+        // A non-literal argument whose declared value is a constant string
+        // still binds the template to that constant: the class name is known
+        // even though the argument expression is not itself a literal.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                Panel = Panel or {}
+                ---@class DPanel: Panel
+                ---@class DScrollPanel: DPanel
+
+                local TF = {}
+
+                function TF:Init()
+                    local className = "DScrollPanel"
+                    local p = vgui.Create(className)
+                    a = p
+                end
+
+                vgui.Register("TF", TF, "DPanel")
+            "#,
+        );
+
+        let a_ty = ws.expr_ty("a");
+        let base = unwrap_instance(&a_ty).clone();
+        let expected = ws.ty("DScrollPanel");
+        assert_eq!(base, expected);
+    }
+
+    #[gtest]
+    fn test_str_tpl_constructor_call_contributes_single_supertype_edge() {
+        use glua_parser::LuaCallExpr;
+
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def_file(
+            "defs.lua",
+            r#"
+                ---@attribute constructor(name: string, root_class: string?, strip_self: boolean?, return_self: boolean?)
+
+                ---@class Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@[constructor("__init", "Entity")]
+                ---@param class `T`
+                ---@return T[]
+                function ents.FindByClass(class)
+                end
+            "#,
+        );
+
+        let caller_text = r#"local found = ents.FindByClass("prop_vehicle_jeep")"#;
+        let caller_path = "caller.lua";
+        let caller_id = ws.def_file(caller_path, caller_text);
+
+        let generated_id = LuaTypeDeclId::global("prop_vehicle_jeep");
+        let entity_ty = LuaType::Ref(LuaTypeDeclId::global("Entity"));
+
+        let super_types: Vec<_> = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_super_types_iter(&generated_id)
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            super_types.contains(&entity_ty),
+            "expected `prop_vehicle_jeep` to inherit `Entity`, got {super_types:?}"
+        );
+
+        let collect_caller_entity_edges = |ws: &VirtualWorkspace| {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_type_index()
+                .get_super_type_entries(&generated_id)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|entry| entry.file_id == caller_id && entry.value.typ == entity_ty)
+                        .map(|entry| entry.value.source_range)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(caller_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let call_expr = root
+            .descendants::<LuaCallExpr>()
+            .next()
+            .expect("expected FindByClass call");
+        let call_range = call_expr.get_range();
+        let arg_expr = call_expr
+            .get_args_list()
+            .expect("expected args")
+            .get_args()
+            .next()
+            .expect("expected class arg");
+        let arg_range = arg_expr.get_range();
+
+        let edges = collect_caller_entity_edges(&ws);
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one raw `prop_vehicle_jeep -> Entity` edge from the caller, got {edges:?} (arg_range={arg_range:?}, call_range={call_range:?})"
+        );
+        assert_eq!(
+            edges[0], arg_range,
+            "supertype edge must use the string argument range, got {:?} (arg_range={arg_range:?}, call_range={call_range:?})",
+            edges[0],
+        );
+        assert_ne!(
+            edges[0], call_range,
+            "supertype edge must not use the enclosing call range (arg_range={arg_range:?}, call_range={call_range:?})"
+        );
+
+        ws.def_file(caller_path, &format!("{caller_text}\n"));
+
+        let edges_after = collect_caller_entity_edges(&ws);
+        assert_eq!(
+            edges_after.len(),
+            1,
+            "reindex must not accumulate duplicate supertype edges, got {edges_after:?} (arg_range={arg_range:?}, call_range={call_range:?})"
+        );
+        assert_eq!(
+            edges_after[0], arg_range,
+            "reindexed supertype edge must keep the string argument range, got {:?} (arg_range={arg_range:?}, call_range={call_range:?})",
+            edges_after[0],
+        );
+    }
+
+    const PANEL_CLASSES: &str = "---@class Panel
+---@class EditablePanel: Panel
+---@class DButton: Panel
+";
+
+    /// `class_name`'s super types, whether it reads as auto-generated, and the
+    /// generic-constraint-mismatch messages of each file, after cold-building
+    /// `files` in one batch under `schedule`.
+    fn registered_panel_class(
+        schedule: Schedule,
+        files: &[(&str, &str)],
+        class_name: &str,
+    ) -> (Vec<LuaType>, bool, Vec<String>) {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis.compilation.set_schedule(schedule);
+        ws.enable_check(DiagnosticCode::GenericConstraintMismatch);
+        let mut batch = vec![
+            ("lua/includes/builtins.lua", GMOD_CALL_ARG_BUILTINS_FIXTURE),
+            ("lua/includes/panels.lua", PANEL_CLASSES),
+        ];
+        batch.extend_from_slice(files);
+        let file_ids = ws.def_files(batch);
+        let messages = file_ids
+            .into_iter()
+            .flat_map(|file_id| {
+                ws.analysis
+                    .diagnose_file(file_id, CancellationToken::new())
+                    .unwrap_or_default()
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        let db = ws.analysis.compilation.get_db();
+        let class_id = LuaTypeDeclId::global(class_name);
+        let supers = db
+            .get_type_index()
+            .get_super_types_iter(&class_id)
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        let auto_generated = db
+            .get_type_index()
+            .get_type_decl(&class_id)
+            .expect("registered class")
+            .is_auto_generated();
+        (supers, auto_generated, messages)
+    }
+
+    #[gtest]
+    fn a_created_panel_class_keeps_only_the_base_its_registration_names() {
+        let files = [
+            (
+                "gamemodes/cityrp/gamemode/core/derma/cl_new_fl_derma_elements.lua",
+                "local PANEL = {}
+function PANEL:AddSheet(label, panel) end
+derma.DefineControl(\"FLMenu\", \"\", PANEL, \"EditablePanel\")
+",
+            ),
+            (
+                "gamemodes/cityrp/gamemode/core/derma/cl_menu.lua",
+                "cityrp_menu_panel = vgui.Create(\"FLMenu\")\n",
+            ),
+        ];
+        for schedule in [Schedule::Canonical, Schedule::Reversed] {
+            let (supers, auto_generated, _) = registered_panel_class(schedule, &files, "FLMenu");
+            assert_eq!(
+                supers,
+                vec![LuaType::Ref(LuaTypeDeclId::global("EditablePanel"))],
+                "{schedule:?}"
+            );
+            assert!(!auto_generated, "{schedule:?}");
+        }
+    }
+
+    #[gtest]
+    fn a_panel_class_created_from_two_sites_keeps_only_the_base_its_registration_names() {
+        let files = [
+            (
+                "gamemodes/cityrp/gamemode/core/derma/cl_new_fl_derma_elements.lua",
+                "local PANEL = {}
+function PANEL:SetModelName(model) end
+vgui.Register(\"MModelIcon\", PANEL, \"DButton\")
+",
+            ),
+            (
+                "gamemodes/cityrp/plugins/deco/derma/cl_store.lua",
+                "local PANEL = {}
+function PANEL:SetItem()
+    self.spawnIcon = vgui.Create(\"MModelIcon\", self)
+end
+function PANEL:SetDeco()
+    self.spawnIcon = vgui.Create(\"MModelIcon\", self)
+end
+vgui.Register(\"cityrpStoreItem\", PANEL, \"EditablePanel\")
+",
+            ),
+        ];
+        for schedule in [Schedule::Canonical, Schedule::Reversed] {
+            let (supers, auto_generated, messages) =
+                registered_panel_class(schedule, &files, "MModelIcon");
+            assert_eq!(
+                supers,
+                vec![LuaType::Ref(LuaTypeDeclId::global("DButton"))],
+                "{schedule:?}"
+            );
+            assert!(!auto_generated, "{schedule:?}");
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| message.contains("is not explicitly defined")),
+                "{schedule:?}: {messages:?}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn a_class_name_known_only_at_runtime_binds_the_constraint() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@field BeingRemoved boolean?
+
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return T[]
+            local function find_by_class(class) end
+
+            ---@type string
+            local classname = GetConVarString("ttt_spawn_class")
+            local named = find_by_class(classname)
+
+            local function by_unknown(cls) return find_by_class(cls) end
+            local unknown = by_unknown(nil)
+            "#,
+        );
+
+        let named = ws.local_ty(file_id, "named");
+        expect_that!(ws.humanize_type(named), eq("Entity[]"));
+        let unknown = ws.local_ty(file_id, "unknown");
+        expect_that!(ws.humanize_type(unknown), eq("Entity[]"));
+    }
+
+    #[gtest]
+    fn a_class_overload_materializes_the_class_its_first_argument_names() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/registry.lua",
+            r#"
+            ---@class Entity
+
+            ---@class Registry
+            ---@overload fun<T: Entity>(class: `T`): T
+            Registry = {}
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/server/sv_spawn.lua",
+            r#"
+            local entity = Registry("npc_registered")
+            "#,
+        );
+
+        let declared = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_type_decl(&LuaTypeDeclId::global("npc_registered"))
+            .map(|decl| decl.is_auto_generated());
+        verify_that!(declared, some(eq(true)))
+    }
+
+    #[gtest]
+    fn a_union_of_class_names_materializes_a_class_for_each_name() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+
+            ents = {}
+
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return T[]
+            function ents.FindByClass(class) end
+
+            local classname = "ttt_union_first"
+            if cond then
+                classname = "ttt_union_second"
+            end
+            found = ents.FindByClass(classname)
+            "#,
+        );
+
+        let entity = LuaType::Ref(LuaTypeDeclId::global("Entity"));
+        for name in ["ttt_union_first", "ttt_union_second"] {
+            let class_id = LuaTypeDeclId::global(name);
+            let supers: Vec<LuaType> = ws
+                .analysis
+                .compilation
+                .get_db()
+                .get_type_index()
+                .get_super_types_iter(&class_id)
+                .map(|iter| iter.cloned().collect())
+                .unwrap_or_default();
+            assert!(
+                supers.contains(&entity),
+                "expected `{name}` to inherit `Entity`, got {supers:?}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn a_union_of_class_names_follows_edits_deletion_and_reopen_of_its_call() {
+        const DEFS: &str = r#"
+            ---@class Entity
+
+            ents = {}
+
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return T[]
+            function ents.FindByClass(class) end
+        "#;
+        fn find_either(first: &str, second: &str) -> String {
+            format!(
+                "local classname = \"{first}\"\nif cond then\n    classname = \"{second}\"\nend\nfound = ents.FindByClass(classname)\n"
+            )
+        }
+        fn class_state(ws: &VirtualWorkspace) -> Vec<String> {
+            let db = ws.analysis.compilation.get_db();
+            let type_index = db.get_type_index();
+            let file_name = |file_id: crate::FileId| {
+                db.get_vfs()
+                    .get_file_path(&file_id)
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+            };
+            ["tpl_a", "tpl_b", "tpl_c"]
+                .into_iter()
+                .map(|name| {
+                    let class_id = LuaTypeDeclId::global(name);
+                    let locations = type_index.get_type_decl(&class_id).map(|decl| {
+                        let mut locations = decl
+                            .get_locations()
+                            .iter()
+                            .map(|location| {
+                                format!("{:?}@{:?}", file_name(location.file_id), location.range)
+                            })
+                            .collect::<Vec<_>>();
+                        locations.sort();
+                        locations
+                    });
+                    let mut supers = type_index
+                        .get_super_type_entries(&class_id)
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .map(|entry| {
+                                    format!(
+                                        "{:?}@{:?} {:?}",
+                                        file_name(entry.file_id),
+                                        entry.value.source_range,
+                                        entry.value.typ
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    supers.sort();
+                    format!("{name}: {locations:?} {supers:?}")
+                })
+                .collect()
+        }
+        fn cold_state(schedule: Schedule, files: &[(&str, &str)]) -> Vec<String> {
+            let mut cold = VirtualWorkspace::new();
+            cold.analysis.compilation.set_schedule(schedule);
+            cold.def_files(files.to_vec());
+            class_state(&cold)
+        }
+        fn has_class(ws: &VirtualWorkspace, name: &str) -> bool {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_type_index()
+                .get_type_decl(&LuaTypeDeclId::global(name))
+                .is_some()
+        }
+
+        let ab = find_either("tpl_a", "tpl_b");
+        let bc = find_either("tpl_b", "tpl_c");
+        let second_b = "found = ents.FindByClass(\"tpl_b\")\n";
+
+        for schedule in [Schedule::Canonical, Schedule::Reversed] {
+            let mut ws = VirtualWorkspace::new();
+            ws.analysis.compilation.set_schedule(schedule);
+            ws.def_files(vec![
+                ("defs.lua", DEFS),
+                ("first.lua", ab.as_str()),
+                ("second.lua", second_b),
+            ]);
+            expect_that!(
+                class_state(&ws),
+                eq(&cold_state(
+                    schedule,
+                    &[
+                        ("defs.lua", DEFS),
+                        ("first.lua", ab.as_str()),
+                        ("second.lua", second_b)
+                    ]
+                )),
+                "{schedule:?}"
+            );
+
+            ws.def_file("first.lua", bc.as_str());
+            let edited = [
+                ("defs.lua", DEFS),
+                ("first.lua", bc.as_str()),
+                ("second.lua", second_b),
+            ];
+            expect_that!(
+                class_state(&ws),
+                eq(&cold_state(schedule, &edited)),
+                "{schedule:?}"
+            );
+            expect_that!(has_class(&ws, "tpl_a"), eq(false), "{schedule:?}");
+
+            let first_uri = ws.virtual_url_generator.new_uri("first.lua");
+            ws.analysis.remove_file_by_uri(&first_uri);
+            let first_deleted = [("defs.lua", DEFS), ("second.lua", second_b)];
+            expect_that!(
+                class_state(&ws),
+                eq(&cold_state(schedule, &first_deleted)),
+                "{schedule:?}"
+            );
+            expect_that!(has_class(&ws, "tpl_b"), eq(true), "{schedule:?}");
+
+            let second_uri = ws.virtual_url_generator.new_uri("second.lua");
+            ws.analysis.remove_file_by_uri(&second_uri);
+            expect_that!(
+                class_state(&ws),
+                eq(&cold_state(schedule, &[("defs.lua", DEFS)])),
+                "{schedule:?}"
+            );
+            expect_that!(has_class(&ws, "tpl_b"), eq(false), "{schedule:?}");
+
+            ws.def_file("second.lua", second_b);
+            expect_that!(
+                class_state(&ws),
+                eq(&cold_state(schedule, &first_deleted)),
+                "{schedule:?}"
+            );
+
+            ws.def_file("first.lua", bc.as_str());
+            expect_that!(
+                class_state(&ws),
+                eq(&cold_state(schedule, &edited)),
+                "{schedule:?}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn a_misspelled_field_on_a_found_class_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field Health number
+
+            ents = {}
+
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return T[]
+            function ents.FindByClass(class) end
+            "#,
+        );
+
+        expect_that!(
+            ws.check_code_for(
+                DiagnosticCode::UndefinedField,
+                r#"
+                local single = ents.FindByClass("ttt_single")
+                local _ = single[1].Helth
+                "#,
+            ),
+            eq(false)
+        );
+        expect_that!(
+            ws.check_code_for(
+                DiagnosticCode::UndefinedField,
+                r#"
+                local classname = "ttt_union_a"
+                if cond then
+                    classname = "ttt_union_b"
+                end
+                local union = ents.FindByClass(classname)
+                local _ = union[1].Helth
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn a_wildcard_class_pattern_binds_the_constraint_without_minting_a_class() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GenericConstraintMismatch);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return T[]
+            local function find_by_class(class) end
+
+            local weapons = find_by_class("weapon_*")
+            "#,
+        );
+
+        let weapons = ws.local_ty(file_id, "weapons");
+        expect_that!(ws.humanize_type(weapons), eq("Entity[]"));
+        expect_that!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_type_index()
+                .get_type_decl(&LuaTypeDeclId::global("weapon_*")),
+            none()
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        expect_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn a_callee_gaining_or_losing_a_class_template_retypes_its_callers_like_a_cold_run() {
+        let class = "---@class Foo
+---@field foo_field integer
+local Foo = {}
+";
+        let template = "---@generic T
+---@param name `T`
+---@return T
+";
+        let plain = "---@param name string
+---@return string
+";
+        let callees = [
+            (
+                "{docs}function MyNet(name) end
+",
+                "MyNet",
+            ),
+            (
+                "{docs}MyNet = function(name) end
+",
+                "MyNet",
+            ),
+            (
+                "Lib = {}
+{docs}function Lib.Make(name) end
+",
+                "Lib.Make",
+            ),
+        ];
+        for (callee, call) in callees {
+            let caller = format!(
+                "local x = {call}(\"Foo\")
+Y = x
+"
+            );
+            let templated = callee.replace("{docs}", template);
+            let plain = callee.replace("{docs}", plain);
+            for (from, to, expected) in
+                [(&templated, &plain, "string"), (&plain, &templated, "Foo")]
+            {
+                let mut ws = VirtualWorkspace::assert_warm_matches_cold(
+                    |_| {},
+                    &[
+                        ("lua/autorun/c.lua", class),
+                        ("lua/autorun/a.lua", from),
+                        ("lua/autorun/b.lua", &caller),
+                    ],
+                    &[("lua/autorun/a.lua", to)],
+                );
+                let y = ws.expr_ty("Y");
+                expect_that!(ws.humanize_type(y), eq(expected), "{call} edited to {to}");
+            }
+        }
+    }
+
+    #[gtest]
+    fn a_member_read_on_a_never_defined_materialized_name_is_a_guard_warning_not_an_error() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/tools/materialized_panel_name.lua",
+            r#"
+                ---@class Panel
+                local Panel = {}
+                ---@generic T : Panel
+                ---@param class `T`
+                ---@return T
+                function Panel:Add(class) end
+
+                ---@class DListLayout: Panel
+                local DListLayout = {}
+                function DListLayout:SetContents(contents) end
+
+                local function Populate(name, pnl)
+                    local list = pnl:Add(name)
+                    list:SetContents(1)
+                end
+                ---@type Panel
+                local root
+                Populate("General", root)
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let has = |code: DiagnosticCode| {
+            let code = Some(NumberOrString::String(code.get_name().to_string()));
+            diagnostics.iter().any(|diagnostic| diagnostic.code == code)
+        };
+        expect_that!(
+            has(DiagnosticCode::UndefinedMethod),
+            eq(false),
+            "{diagnostics:?}"
+        );
+        expect_that!(
+            has(DiagnosticCode::InferUnguardedChild),
+            eq(true),
+            "{diagnostics:?}"
         );
     }
 }

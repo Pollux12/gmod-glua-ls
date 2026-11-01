@@ -1,9 +1,9 @@
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::db_index::LuaDeclId;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileReference {
     decl_references: HashMap<LuaDeclId, DeclReference>,
     references_to_decl: HashMap<TextRange, LuaDeclId>,
@@ -48,6 +48,11 @@ impl FileReference {
     pub fn get_decl_id(&self, range: &TextRange) -> Option<LuaDeclId> {
         self.references_to_decl.get(range).copied()
     }
+
+    /// Borrowed entries of the range → decl inverse map, in storage order.
+    pub fn iter_references_to_decl(&self) -> impl Iterator<Item = (&TextRange, &LuaDeclId)> + '_ {
+        self.references_to_decl.iter()
+    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
@@ -82,5 +87,13 @@ impl DeclReference {
         }
 
         self.cells.push(cell);
+    }
+
+    /// Whether anything but its declaration at `decl_position` writes the
+    /// variable.
+    pub fn is_written_after_declaration(&self, decl_position: TextSize) -> bool {
+        self.cells
+            .iter()
+            .any(|cell| cell.is_write && cell.range.start() != decl_position)
     }
 }

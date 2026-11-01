@@ -1,14 +1,17 @@
 #[cfg(test)]
 mod test {
-    use glua_parser::{LuaAst, LuaAstNode, LuaAstToken, LuaExpr, LuaLocalName, LuaNameExpr};
+    use glua_parser::{
+        LuaAst, LuaAstNode, LuaAstToken, LuaExpr, LuaFuncStat, LuaIndexKey, LuaLocalName,
+        LuaNameExpr, LuaVarExpr,
+    };
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
     use crate::{
         DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, GlobalId, GmodClassCallLiteral,
-        LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
-        VirtualWorkspace,
+        LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType,
+        LuaTypeDeclId, VirtualWorkspace,
     };
 
     fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
@@ -20,6 +23,29 @@ mod test {
             .iter()
             .map(|pattern| legacy_scope(pattern))
             .collect()
+    }
+
+    fn data_table_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/includes/glua_ls_data_table_types.lua",
+            &format!(
+                r#"
+            ---@meta
+            ---@class Entity
+            local Entity = {{}}
+            ---@class Weapon: Entity
+            local Weapon = {{}}
+            ---@class Vector
+            local Vector = {{}}
+            ---@class Angle
+            local Angle = {{}}
+            {}
+            "#,
+                crate::test_lib::GMOD_CALL_ARG_BUILTINS_FIXTURE
+            ),
+        );
+        ws
     }
 
     fn index_expr_type(
@@ -186,16 +212,18 @@ mod test {
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
             lsp_types::Uri::parse_from_file_path(&library_root.join("gm.lua")).unwrap();
-        ws.analysis.update_file_by_uri(
-            &library_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &library_uri,
+                Some(
+                    r#"
                 ---@class GM
                 function GM:SetupMove(ply, mv, cmd) end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
     }
 
     #[gtest]
@@ -600,6 +628,55 @@ mod test {
     }
 
     #[gtest]
+    fn a_hook_two_plugins_override_types_each_override_from_the_hook() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_files(vec![
+            (
+                "lua/aaa_annotations/gm.lua",
+                "---@class Player
+---@param victim Player
+function GM:PlayerDeath(victim, inflictor, attacker) end
+",
+            ),
+            (
+                "gamemodes/cityrp/gamemode/core/libraries/sh_plugin.lua",
+                "--- @class PLUGIN
+",
+            ),
+            (
+                "gamemodes/cityrp/plugins/accessories/sv_plugin.lua",
+                "---@type PLUGIN
+local PLUGIN = PLUGIN
+function PLUGIN:PlayerDeath(client)
+    local _ = client
+end
+",
+            ),
+            (
+                "gamemodes/cityrp/plugins/kevlar/sv_init.lua",
+                "---@type PLUGIN
+local PLUGIN = PLUGIN
+function PLUGIN:PlayerDeath(ply)
+    local _ = ply
+end
+",
+            ),
+        ]);
+
+        let digest = ws.semantic_digest();
+        for param in ["client", "ply"] {
+            let suffix = format!(": {param} = Player");
+            expect_true!(
+                digest.iter().any(|line| line.ends_with(&suffix)),
+                "{param} should take the hook's Player, digest: {digest:#?}"
+            );
+        }
+    }
+
+    #[gtest]
     fn test_plugin_scope_binds_plugin_decl_with_self_reference_initializer() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -741,6 +818,37 @@ mod test {
         assert_eq!(
             semantic_info.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("vehicles_money"))
+        );
+    }
+
+    /// Which files are scripted scopes is worked out again when a file joins
+    /// the workspace after it loaded.
+    #[gtest]
+    fn an_entity_file_created_after_the_workspace_loaded_binds_its_ent() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/entities/first_entity/shared.lua",
+            "ENT.Type = \"anim\"
+",
+        );
+
+        let file_id = ws.def_file(
+            "lua/entities/second_entity/shared.lua",
+            "ENT.Type = \"anim\"
+",
+        );
+
+        assert_eq!(
+            index_expr_prefix_type(&mut ws, file_id, "ENT.Type"),
+            LuaType::Def(LuaTypeDeclId::global("second_entity"))
         );
     }
 
@@ -1112,6 +1220,696 @@ mod test {
         );
     }
 
+    /// A function that makes a `Get`/`Set` pair from a name, as TTT's
+    /// `AccessorFuncDT` does, synthesizes members at its calls as an
+    /// `@accessorfunc` one does, from a function or a method.
+    #[gtest]
+    fn test_inferred_accessor_generator_synthesizes_get_set_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/autorun/sh_accessor_util.lua",
+            r#"
+            function AccessorFuncDT(tbl, varname, name)
+               tbl["Get" .. name] = function(s) return s.dt and s.dt[varname] end
+               tbl["Set" .. name] = function(s, v) if s.dt then s.dt[varname] = v end end
+            end
+
+            function NotAnAccessor(tbl, name)
+               tbl[name] = function() end
+            end
+        "#,
+        );
+        ws.def_file(
+            "lua/entities/my_entity/shared.lua",
+            r#"
+            function ENT:RegisterProperty(name)
+               self["Get" .. name] = function(s) return s[name] end
+               self["Set" .. name] = function(s, v) s[name] = v end
+            end
+
+            AccessorFuncDT(ENT, "armed", "Armed")
+            NotAnAccessor(ENT, "Plain")
+            ENT:RegisterProperty("Health")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("my_entity"));
+        let member_names: Vec<_> = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members on my_entity class")
+            .iter()
+            .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+            .collect();
+
+        for expected in ["GetArmed", "SetArmed", "GetHealth", "SetHealth"] {
+            assert!(
+                member_names.iter().any(|name| name == expected),
+                "missing {expected} in {member_names:?}"
+            );
+        }
+        assert!(
+            !member_names.iter().any(|name| name == "GetPlain"),
+            "{member_names:?}"
+        );
+    }
+
+    /// Generators that make accessors on a metatable a local holds, under prefixes a
+    /// local holds, synthesize them at the calls of a function that passes its name on.
+    #[gtest]
+    fn test_split_accessor_generators_synthesize_members_on_a_named_metatable() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/annotations/meta.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@class Player : Entity
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return (definition) T
+            function FindMetaTable(metaName) end
+            "#,
+        );
+        let generators_path = "gamemodes/cityrp/gamemode/core/metatables/sh_player.lua";
+        let generators = r#"
+            function PlayerNSReader(name, key, iForce, default, prefix)
+                local pMeta = FindMetaTable("Player")
+                if iForce == FORCE_BOOL then
+                    local fn = (prefix or "Is") .. name
+                    pMeta[fn] = function(self) return self:GetNetVar(key, default) end
+                    return
+                end
+                local fn = (prefix or "Get") .. name
+                pMeta[fn] = function(self, def) return self:GetNetVar(key, def) end
+            end
+
+            function PlayerNSWriter(name, key)
+                local pMeta = FindMetaTable("Player")
+                local fn = "Set" .. name
+                pMeta[fn] = function(self, value) self:SetNetVar(key, value) end
+            end
+
+            function PlayerNSAccessor(name, key, iForce, default, readPrefix)
+                PlayerNSReader(name, key, iForce, default, readPrefix)
+                PlayerNSWriter(name, key)
+            end
+        "#;
+        ws.def_file(generators_path, generators);
+        ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sh_accessors.lua",
+            r#"
+            PlayerNSAccessor("Pass", "pass")
+            PlayerNSAccessor("AdminHelp", "AdminHelp", FORCE_BOOL, false, "Has")
+            "#,
+        );
+
+        let member_names = |ws: &mut VirtualWorkspace| {
+            let mut names: Vec<String> = ws
+                .get_db_mut()
+                .get_member_index()
+                .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global("Player")))
+                .map(|members| {
+                    members
+                        .iter()
+                        .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            member_names(&mut ws),
+            [
+                "GetPass",
+                "HasAdminHelp",
+                "IsPass",
+                "SetAdminHelp",
+                "SetPass"
+            ]
+        );
+        assert!(ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "gamemodes/cityrp/gamemode/core/sh_pass.lua",
+            "---@param ent Entity\nlocal function Pass(ent) return ent:GetPass() end\nprint(Pass)\n",
+        ));
+
+        let uri = ws.virtual_url_generator.new_uri(generators_path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert!(member_names(&mut ws).is_empty());
+        ws.def_file(generators_path, generators);
+        assert_eq!(
+            member_names(&mut ws),
+            [
+                "GetPass",
+                "HasAdminHelp",
+                "IsPass",
+                "SetAdminHelp",
+                "SetPass"
+            ]
+        );
+    }
+
+    /// A generator that makes accessors itself and forwards its name makes both sets,
+    /// through wrappers defined before what they wrap; `false` picks a prefix's default;
+    /// a metatable from a local function of the same name names no class.
+    #[gtest]
+    fn test_accessor_generators_merge_forwarded_templates_in_any_order() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/annotations/meta.lua",
+            r#"
+            ---@meta
+            ---@class Player
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return (definition) T
+            function FindMetaTable(metaName) end
+            ---@generic T
+            ---@param className `T`
+            ---@return table
+            function NewTable(className) end
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sh_generators.lua",
+            r#"
+            function Wrap(name) Mixed(name) end
+
+            function Mixed(name)
+                local meta = FindMetaTable("Player")
+                meta["Get" .. name] = function() end
+                Writer(name)
+            end
+
+            function Writer(name)
+                local meta = FindMetaTable("Player")
+                meta["Set" .. name] = function() end
+            end
+
+            function Reader(name, prefix)
+                local meta = FindMetaTable("Player")
+                meta[(prefix or "Is") .. name] = function() end
+            end
+
+            local function LocalWriter(name)
+                local meta = FindMetaTable("Player")
+                meta["Set" .. name] = function() end
+            end
+            function LocalWrap(name) LocalWriter(name) end
+
+            function ShadowedWrap(name, Writer) Writer(name) end
+
+            function Swapped(t, a, b)
+                t["Get" .. a] = function() end
+                SwappedBack(t, b, a)
+            end
+            function SwappedBack(t, a, b) Swapped(t, a, b) end
+
+            function CycleA(t, n) CycleB(t, n) MakeGet(t, n) end
+            function CycleB(t, n) CycleC(t, n) MakeSet(t, n) end
+            function CycleC(t, n) CycleA(t, n) MakeIs(t, n) end
+            function MakeGet(t, n) t["Get" .. n] = function() end end
+            function MakeSet(t, n) t["Set" .. n] = function() end end
+            function MakeIs(t, n) t["Is" .. n] = function() end end
+
+            function LoopA(t, n) LoopB(t, n) LoopD(t, n, n) end
+            function LoopB(t, n) LoopC(t, n) end
+            function LoopC(t, n) LoopA(t, n) end
+            function LoopD(t, a, b) t["Get" .. a] = function() end LoopE(t, b) end
+            function LoopE(t, n) t["Set" .. n] = function() end end
+
+            function OrderA(t, a, b) t["Is" .. a] = function() end OrderD(t, b, a) end
+            function OrderD(t, a, b) t["Get" .. a] = function() end OrderE(t, b) end
+            function OrderE(t, n) t["Set" .. n] = function() end end
+            function ReverseE(t, n) t["Set" .. n] = function() end end
+            function ReverseD(t, a, b) t["Get" .. a] = function() end ReverseE(t, b) end
+            function ReverseA(t, a, b) t["Is" .. a] = function() end ReverseD(t, b, a) end
+
+            function Reprefix(name, prefix)
+                local meta = FindMetaTable("Player")
+                prefix = "Is"
+                meta[(prefix or "Get") .. name] = function() end
+            end
+
+            function PlainTable(name)
+                local meta = NewTable("Player")
+                meta["Get" .. name] = function() end
+            end
+
+            function LoopName(name)
+                local meta = FindMetaTable("Player")
+                for name in pairs({ Actual = true }) do
+                    meta["Get" .. name] = function() end
+                end
+            end
+
+            local function LocalSetter(name)
+                local meta = FindMetaTable("Player")
+                meta["Set" .. name] = function() end
+            end
+            LocalSetter = function() end
+            function ReassignedWrap(name) LocalSetter(name) end
+
+            function GlobalWriter(name)
+                local meta = FindMetaTable("Player")
+                meta["Set" .. name] = function() end
+            end
+            GlobalWriter = function() end
+            function GlobalWrap(name) GlobalWriter(name) end
+
+            function Player:Remake(name)
+                self = {}
+                self["Is" .. name] = function() end
+            end
+
+            local function DirectSetter(name)
+                local meta = FindMetaTable("Player")
+                meta["Set" .. name] = function() end
+            end
+            DirectSetter("Direct")
+            do
+                local Wrap = function() end
+                Wrap("SameFileShadow")
+            end
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sh_shadowed.lua",
+            r#"
+            local FindMetaTable = function() return {} end
+            function LocalReader(name)
+                local meta = FindMetaTable("Player")
+                meta["Get" .. name] = function() end
+            end
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/cityrp/gamemode/core/sh_accessors.lua",
+            r#"
+            Wrap("Pass")
+            Reader("Hidden", false)
+            LocalReader("Shadow")
+            LocalWrap("Local")
+            ShadowedWrap("Ghost", function() end)
+            Reprefix("Changed")
+            PlainTable("Fake")
+            LoopName("Loop")
+            ReassignedWrap("Again")
+            do
+                local Wrap = function() end
+                Wrap("Shadowed")
+            end
+            "#,
+        );
+
+        let accessors = ws.get_db_mut().get_accessor_func_index();
+        for name in [
+            "Swapped",
+            "SwappedBack",
+            "ShadowedWrap",
+            "LoopD",
+            "OrderA",
+            "OrderD",
+            "ReverseA",
+            "ReverseD",
+            "Reprefix",
+            "LoopName",
+            "ReassignedWrap",
+            "GlobalWrap",
+            "Remake",
+        ] {
+            assert!(!accessors.contains_name(name), "{name}");
+        }
+        let accessor_count = |name: &str| {
+            accessors
+                .get_annotations(name)
+                .and_then(|annotations| annotations.first())
+                .map(|annotation| annotation.accessors.len())
+        };
+        for (name, count) in [
+            ("CycleA", 3),
+            ("CycleB", 3),
+            ("CycleC", 3),
+            ("LoopA", 2),
+            ("LoopB", 2),
+            ("LoopC", 2),
+            ("OrderE", 1),
+            ("ReverseE", 1),
+        ] {
+            assert_eq!(accessor_count(name), Some(count), "{name}");
+        }
+        let mut names: Vec<String> = ws
+            .get_db_mut()
+            .get_member_index()
+            .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global("Player")))
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        assert_eq!(
+            names,
+            ["GetPass", "IsHidden", "SetDirect", "SetLocal", "SetPass"]
+        );
+    }
+
+    /// The accessors of a generator call keep their identities when an edit moves the
+    /// call, so a shift settles as a cold analysis of the moved text does.
+    #[gtest]
+    fn test_accessor_generator_members_survive_a_shift() {
+        let setup = |ws: &mut VirtualWorkspace| {
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+        };
+        let generator = r#"
+            function G(name)
+                local player = FindMetaTable("Player")
+                player["Get" .. name] = function() return 1 end
+                player["Set" .. name] = function() end
+                player["Is" .. name] = function() return true end
+                player["Has" .. name] = function() return "" end
+            end
+            G("X")
+            "#;
+        let shifted = format!("\n\n{generator}");
+        VirtualWorkspace::assert_warm_matches_cold(
+            setup,
+            &[
+                (
+                    "lua/annotations/meta.lua",
+                    "---@meta\n---@class Player\n---@generic T : table\n---@param metaName `T`\n---@return (definition) T\nfunction FindMetaTable(metaName) end\n",
+                ),
+                ("lua/autorun/sh_generate.lua", generator),
+                (
+                    "lua/autorun/sh_use.lua",
+                    "---@param ply Player\nfunction UseX(ply) return ply:GetX(), ply:IsX(), ply:HasX() end\n",
+                ),
+            ],
+            &[("lua/autorun/sh_generate.lua", &shifted)],
+        );
+    }
+
+    const HELIX_CHARACTER_META: &str = r#"
+        ix = ix or {}
+        ix.meta = ix.meta or {}
+        ix.char = ix.char or {}
+        ix.char.vars = ix.char.vars or {}
+
+        local CHAR = ix.meta.character or {}
+        CHAR.__index = CHAR
+
+        function CHAR:GetID() return self.id end
+
+        function ix.char.RegisterVar(key, data)
+            ix.char.vars[key] = data
+            local upperName = key:sub(1, 1):upper() .. key:sub(2)
+            if (SERVER) then
+                if (data.bNoNetworking) then
+                    CHAR["Set" .. upperName] = function(self, value) self.vars[key] = value end
+                else
+                    CHAR["Set" .. upperName] = function(self, value) self.vars[key] = value end
+                end
+            end
+            if (data.OnGet) then
+                CHAR["Get" .. upperName] = data.OnGet
+            else
+                CHAR["Get" .. upperName] = function(self, default) return self.vars[key] end
+            end
+        end
+
+        ix.meta.character = CHAR
+    "#;
+    const HELIX_CHARACTER_META_PATH: &str = "gamemodes/helix/gamemode/core/meta/sh_character.lua";
+    const HELIX_CHARACTER_LIB: &str = r#"
+        function ix.char.New(data, id)
+            local character = setmetatable({vars = {}}, ix.meta.character)
+            character.id = id
+            return character
+        end
+
+        ix.char.RegisterVar("name", { default = "" })
+        ix.char.RegisterVar("Inventory", {
+            OnGet = function(character, index) return character.vars.inv end
+        })
+    "#;
+    const HELIX_CHARACTER_LIB_PATH: &str = "gamemodes/helix/gamemode/core/libs/sh_character.lua";
+    const HELIX_CHARACTER_PROBE: &str = r#"
+        local character = ix.char.New({}, 1)
+        local get_name = character.GetName
+        local set_name = character.SetName
+        local get_inventory = character.GetInventory
+        local uncapitalised = character.Getname
+    "#;
+    const HELIX_CHARACTER_PROBE_PATH: &str = "gamemodes/ixhl2rp/schema/sh_probe.lua";
+
+    fn is_function_type(typ: &LuaType) -> bool {
+        matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
+    }
+
+    /// A generator that writes capitalised accessors on a table it closes over, as
+    /// Helix's `ix.char.RegisterVar` does on `CHAR`, makes them on that table at
+    /// each call, so instances of the table's metatable see them.
+    #[gtest]
+    fn test_generator_on_a_closed_over_table_makes_capitalised_accessors() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(HELIX_CHARACTER_META_PATH, HELIX_CHARACTER_META);
+        ws.def_file(HELIX_CHARACTER_LIB_PATH, HELIX_CHARACTER_LIB);
+        let probe = ws.def_file(HELIX_CHARACTER_PROBE_PATH, HELIX_CHARACTER_PROBE);
+
+        for accessor in ["get_name", "set_name", "get_inventory"] {
+            let typ = ws.local_ty(probe, accessor);
+            assert!(is_function_type(&typ), "{accessor}: {typ:?}");
+        }
+        let uncapitalised = ws.local_ty(probe, "uncapitalised");
+        assert!(!is_function_type(&uncapitalised), "{uncapitalised:?}");
+    }
+
+    /// The capitalisation may be written inline with `string.upper` and
+    /// `string.sub`.
+    #[gtest]
+    fn test_generator_capitalises_a_name_through_the_string_library() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/autorun/sh_things.lua",
+            r#"
+            local Thing = {}
+            function RegisterThing(name)
+                Thing["Get" .. string.upper(string.sub(name, 1, 1)) .. string.sub(name, 2)] = function() end
+            end
+            RegisterThing("health")
+            THING = Thing
+            "#,
+        );
+        let probe = ws.def_file(
+            "lua/autorun/sh_probe.lua",
+            "local get_health = THING.GetHealth\n",
+        );
+
+        let typ = ws.local_ty(probe, "get_health");
+        assert!(is_function_type(&typ), "{typ:?}");
+    }
+
+    /// A table the generator makes afresh, or a closed-over local that is later
+    /// replaced, is not a table the accessors can land on.
+    #[gtest]
+    fn test_generator_on_a_fresh_or_reassigned_table_makes_no_accessors() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/autorun/sh_things.lua",
+            r#"
+            function MakeFresh(name)
+                local fresh = {}
+                fresh["Get" .. name] = function() end
+                return fresh
+            end
+
+            local Swapped = {}
+            function RegisterSwapped(name)
+                Swapped["Get" .. name] = function() end
+            end
+            Swapped = {}
+            "#,
+        );
+
+        let generators = ws.get_db_mut().get_accessor_func_index();
+        assert!(generators.get_annotations("MakeFresh").is_none());
+        assert!(generators.get_annotations("RegisterSwapped").is_none());
+    }
+
+    /// The accessors follow an edit that renames a call's variable and a later one
+    /// that moves the generator's table, as a cold analysis of the edited text has them.
+    #[gtest]
+    fn test_closed_over_table_accessors_settle_across_shift_and_rename() {
+        let shifted_meta = format!("\n\n{HELIX_CHARACTER_META}");
+        let renamed_lib = HELIX_CHARACTER_LIB.replace("\"name\"", "\"title\"");
+        let probe_text =
+            "local character = ix.char.New({}, 1)\nlocal get_title = character.GetTitle\n";
+        let mut ws = VirtualWorkspace::assert_warm_matches_cold(
+            |_| {},
+            &[
+                (HELIX_CHARACTER_META_PATH, HELIX_CHARACTER_META),
+                (HELIX_CHARACTER_LIB_PATH, HELIX_CHARACTER_LIB),
+                (HELIX_CHARACTER_PROBE_PATH, probe_text),
+            ],
+            &[
+                (HELIX_CHARACTER_LIB_PATH, &renamed_lib),
+                (HELIX_CHARACTER_META_PATH, &shifted_meta),
+            ],
+        );
+        let probe = ws.def_file(HELIX_CHARACTER_PROBE_PATH, probe_text);
+        let typ = ws.local_ty(probe, "get_title");
+        assert!(is_function_type(&typ), "{typ:?}");
+    }
+
+    /// Removing the file that calls the generator takes its accessors away, and
+    /// reopening it brings them back.
+    #[gtest]
+    fn test_closed_over_table_accessors_follow_delete_and_reopen_of_the_call() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(HELIX_CHARACTER_META_PATH, HELIX_CHARACTER_META);
+        ws.def_file(HELIX_CHARACTER_LIB_PATH, HELIX_CHARACTER_LIB);
+        let probe = ws.def_file(HELIX_CHARACTER_PROBE_PATH, HELIX_CHARACTER_PROBE);
+        assert!(is_function_type(&ws.local_ty(probe, "get_name")));
+
+        let lib_uri = ws.virtual_url_generator.new_uri(HELIX_CHARACTER_LIB_PATH);
+        ws.analysis
+            .remove_file_by_uri(&lib_uri)
+            .0
+            .expect("character library must be removed");
+        let removed = ws.local_ty(probe, "get_name");
+        assert!(!is_function_type(&removed), "{removed:?}");
+
+        ws.def_file(HELIX_CHARACTER_LIB_PATH, HELIX_CHARACTER_LIB);
+        let reopened = ws.local_ty(probe, "get_name");
+        assert!(is_function_type(&reopened), "{reopened:?}");
+    }
+
+    /// An inferred generator's accessors take whatever its functions do, whichever
+    /// prefix a call gives them.
+    #[gtest]
+    fn test_inferred_accessors_accept_the_arguments_their_functions_take() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/annotations/meta.lua",
+            "---@meta\n---@class Player\n---@generic T : table\n---@param metaName `T`\n---@return (definition) T\nfunction FindMetaTable(metaName) end\n",
+        );
+        ws.def_file(
+            "lua/autorun/sh_accessors.lua",
+            r#"
+            function Writer(name, prefix)
+                local meta = FindMetaTable("Player")
+                meta[(prefix or "Set") .. name] = function(self, value) end
+            end
+            function Reader(name)
+                local meta = FindMetaTable("Player")
+                meta["Get" .. name] = function(self, default) return default end
+            end
+            Writer("Health", "Write")
+            Reader("Pass")
+            "#,
+        );
+        assert!(ws.check_file_for(
+            DiagnosticCode::RedundantParameter,
+            "lua/autorun/sh_use.lua",
+            "---@param ply Player\nfunction UseAccessors(ply) ply:WriteHealth(100) return ply:GetPass(\"none\") end\n",
+        ));
+    }
+
+    /// Each call makes every member its generator does, more than the call has
+    /// nodes, and a call nested in another's arguments keeps its own.
+    #[gtest]
+    fn test_accessor_generator_calls_make_every_member_nested_or_not() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/annotations/meta.lua",
+            r#"
+            ---@meta
+            ---@class Player
+            ---@class Weapon
+            ---@class NPC
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return (definition) T
+            function FindMetaTable(metaName) end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_generate.lua",
+            r#"
+            function G(name)
+                local player = FindMetaTable("Player")
+                local weapon = FindMetaTable("Weapon")
+                local npc = FindMetaTable("NPC")
+                player["Get" .. name] = function() end
+                player["Set" .. name] = function() end
+                player["Is" .. name] = function() end
+                player["Has" .. name] = function() end
+                weapon["Get" .. name] = function() end
+                weapon["Set" .. name] = function() end
+                weapon["Is" .. name] = function() end
+                weapon["Has" .. name] = function() end
+                npc["Get" .. name] = function() end
+                npc["Set" .. name] = function() end
+                npc["Is" .. name] = function() end
+                npc["Has" .. name] = function() end
+            end
+            G("X")
+            G("Outer", G("Inner"))
+            "#,
+        );
+
+        for class in ["Player", "Weapon", "NPC"] {
+            let mut names: Vec<String> = ws
+                .get_db_mut()
+                .get_member_index()
+                .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global(class)))
+                .map(|members| {
+                    members
+                        .iter()
+                        .filter_map(|m| m.get_key().get_name().map(|n| n.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            assert_eq!(
+                names,
+                [
+                    "GetInner", "GetOuter", "GetX", "HasInner", "HasOuter", "HasX", "IsInner",
+                    "IsOuter", "IsX", "SetInner", "SetOuter", "SetX"
+                ],
+                "{class}"
+            );
+        }
+    }
+
     #[gtest]
     fn test_accessor_func_force_type_resolves_correctly() {
         let mut ws = VirtualWorkspace::new();
@@ -1265,6 +2063,412 @@ mod test {
         assert!(
             member_names.contains(&"SetOwner".to_string()),
             "missing SetOwner in {member_names:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_data_table_network_var_slots_have_declared_types() {
+        let mut ws = data_table_workspace();
+        let file_id = ws.def_file(
+            "addons/dt_slots/lua/entities/dt_entity/shared.lua",
+            r#"
+            function ENT:SetupDataTables()
+                self:NetworkVar("Bool", 0, "Enabled")
+                self:NetworkVar("Int", 0, "Count")
+                self:NetworkVar("Float", "Speed")
+                self:NetworkVar("String", 0, "Label")
+                self:NetworkVar("Entity", 0, "Owner")
+                self:NetworkVar("Vector", 0, "Offset")
+                self:NetworkVar("Angle", 0, "Direction")
+            end
+            function ENT:ReadSlots()
+                return self.dt.Enabled, self.dt.Count, self.dt.Speed, self.dt.Label,
+                    self.dt.Owner, self.dt.Offset, self.dt.Direction
+            end
+            ---@param ent dt_entity
+            local function _read(ent)
+                return ent.dt.Speed
+            end
+            "#,
+        );
+        for (expr, expected) in [
+            ("self.dt.Enabled", LuaType::Boolean),
+            ("self.dt.Count", LuaType::Integer),
+            ("self.dt.Speed", LuaType::Number),
+            ("self.dt.Label", LuaType::String),
+            (
+                "self.dt.Owner",
+                LuaType::Ref(LuaTypeDeclId::global("Entity")),
+            ),
+            (
+                "self.dt.Offset",
+                LuaType::Ref(LuaTypeDeclId::global("Vector")),
+            ),
+            (
+                "self.dt.Direction",
+                LuaType::Ref(LuaTypeDeclId::global("Angle")),
+            ),
+            ("ent.dt.Speed", LuaType::Number),
+        ] {
+            assert_eq!(index_expr_type(&mut ws, file_id, expr), expected, "{expr}");
+        }
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[gtest]
+    fn test_data_table_slots_inherit_through_weapon_bases() {
+        let mut ws = data_table_workspace();
+        ws.def_files(vec![
+            (
+                "addons/dt_slots/lua/weapons/weapon_dt_base.lua",
+                r#"
+                function SWEP:SetupDataTables()
+                    self:NetworkVar("Bool", 0, "ironsights")
+                end
+                "#,
+            ),
+            (
+                "addons/dt_slots/lua/weapons/weapon_dt_middle.lua",
+                r#"SWEP.Base = "weapon_dt_base""#,
+            ),
+        ]);
+        let file_id = ws.def_file(
+            "addons/dt_slots/lua/weapons/weapon_dt_child.lua",
+            r#"
+            SWEP.Base = "weapon_dt_middle"
+            function SWEP:SetupDataTables()
+                self.BaseClass.SetupDataTables(self)
+                self:NetworkVar("Float", 0, "charge")
+            end
+            function SWEP:ReadSlots()
+                return self.dt.ironsights, self.dt.charge
+            end
+            "#,
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.ironsights"),
+            LuaType::Boolean
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.charge"),
+            LuaType::Number
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[gtest]
+    fn test_data_table_slots_inherit_through_configured_scope() {
+        let mut ws = data_table_workspace();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.scripted_class_scopes = serde_json::from_str(
+            r#"{
+                "include": [{
+                    "id": "custom-entities",
+                    "label": "Custom entities",
+                    "classGlobal": "SCRIPT",
+                    "path": ["custom", "entities"],
+                    "include": ["custom/entities/**"],
+                    "superTypes": ["Entity"]
+                }]
+            }"#,
+        )
+        .unwrap();
+        ws.update_emmyrc(emmyrc);
+        ws.def_files(vec![
+            (
+                "addons/dt_slots/lua/custom/entities/dt_base/shared.lua",
+                r#"
+                function SCRIPT:SetupDataTables()
+                    self:NetworkVar("Bool", 0, "armed")
+                end
+                "#,
+            ),
+            (
+                "addons/dt_slots/lua/custom/entities/dt_middle/shared.lua",
+                r#"SCRIPT.Base = "dt_base""#,
+            ),
+        ]);
+        let file_id = ws.def_file(
+            "addons/dt_slots/lua/custom/entities/dt_child/shared.lua",
+            r#"
+            SCRIPT.Base = "dt_middle"
+            function SCRIPT:SetupDataTables()
+                self:NetworkVar("Float", 0, "charge")
+            end
+            function SCRIPT:ReadSlots() return self.dt.armed, self.dt.charge end
+            "#,
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.armed"),
+            LuaType::Boolean
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.charge"),
+            LuaType::Number
+        );
+        let empty_file = ws.def_file(
+            "addons/dt_slots/lua/custom/entities/dt_empty/shared.lua",
+            "function SCRIPT:Initialize() end",
+        );
+        assert!(
+            ws.get_db_mut()
+                .get_member_index()
+                .get_file_members(empty_file)
+                .iter()
+                .all(|member| member.get_key().get_name().is_none_or(|name| name != "dt"))
+        );
+    }
+
+    #[gtest]
+    fn test_data_table_dtvar_roles_register_slots_without_accessors() {
+        let mut ws = data_table_workspace();
+        let file_id = ws.def_file(
+            "addons/dt_slots/lua/entities/dt_bomb/shared.lua",
+            r#"
+            function ENT:SetupDataTables()
+                self:DTVar("Bool", 0, "armed")
+                self:DTVar("Int", "charge")
+                self:DTVar("Float", nil, "explode_time")
+            end
+            function ENT:ReadSlots()
+                return self.dt.armed, self.dt.charge, self.dt.explode_time
+            end
+            "#,
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.armed"),
+            LuaType::Boolean
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.charge"),
+            LuaType::Integer
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.explode_time"),
+            LuaType::Number
+        );
+        let db = ws.get_db_mut();
+        let calls = &db
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(&file_id)
+            .unwrap()
+            .network_var_calls;
+        assert_eq!(calls.len(), 3);
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.network_var_roles.is_some_and(|roles| roles.slot_only))
+        );
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("dt_bomb"));
+        let members = db.get_member_index().get_members(&owner).unwrap();
+        for name in [
+            "Getarmed",
+            "Setarmed",
+            "Getcharge",
+            "Setcharge",
+            "Getexplode_time",
+            "Setexplode_time",
+        ] {
+            assert!(
+                members
+                    .iter()
+                    .all(|member| member.get_key().get_name() != Some(name)),
+                "unexpected accessor {name}"
+            );
+        }
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[gtest]
+    fn test_data_table_slot_removal_edit_delete_and_reopen() {
+        let mut ws = data_table_workspace();
+        let path = "addons/dt_slots/lua/entities/dt_edit/shared.lua";
+        let source = r#"
+            function ENT:SetupDataTables()
+                self:NetworkVar("Bool", 0, "Enabled")
+                self:NetworkVar("Float", 0, "Speed")
+            end
+        "#;
+        ws.def_file(path, source);
+        let reader_id = ws.def_file(
+            "addons/dt_slots/lua/entities/dt_edit/cl_init.lua",
+            "function ENT:ReadSpeed() return self.dt.Speed end",
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, reader_id, "self.dt.Speed"),
+            LuaType::Number
+        );
+        ws.def_file(
+            path,
+            &source.replace("self:NetworkVar(\"Float\", 0, \"Speed\")", ""),
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(reader_id, CancellationToken::new())
+            .unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Speed")
+                    && diagnostic.code
+                        == Some(NumberOrString::String(
+                            DiagnosticCode::UndefinedField.get_name().to_string()
+                        ))),
+            "{diagnostics:?}"
+        );
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("dt_edit.dt"));
+        assert!(
+            ws.get_db_mut()
+                .get_member_index()
+                .get_members(&owner)
+                .unwrap()
+                .iter()
+                .all(|member| member.get_key().get_name() != Some("Speed"))
+        );
+        ws.def_file(path, source);
+        assert_eq!(
+            index_expr_type(&mut ws, reader_id, "self.dt.Speed"),
+            LuaType::Number
+        );
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert!(
+            ws.get_db_mut()
+                .get_member_index()
+                .get_members(&owner)
+                .is_none()
+        );
+        ws.def_file(path, source);
+        assert_eq!(
+            index_expr_type(&mut ws, reader_id, "self.dt.Speed"),
+            LuaType::Number
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(reader_id, CancellationToken::new())
+            .unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[gtest]
+    fn test_data_table_slot_role_on_custom_receiver_method() {
+        let mut ws = data_table_workspace();
+        let file_id = ws.def_file(
+            "addons/dt_slots/lua/entities/dt_wrapper/shared.lua",
+            r#"
+            ---@[call_arg("gmod.network_var", "type")]
+            ---@param type string
+            ---@[call_arg("gmod.network_var", "define_slot")]
+            ---@param name string
+            function ENT:RegisterSlot(type, name) end
+            function ENT:SetupDataTables()
+                self:RegisterSlot("Bool", "armed")
+            end
+            function ENT:ReadArmed() return self.dt.armed end
+            "#,
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.armed"),
+            LuaType::Boolean
+        );
+    }
+
+    #[gtest]
+    fn test_data_table_unannotated_dtvar_override_does_not_register_slots() {
+        let mut ws = data_table_workspace();
+        ws.def_file(
+            "addons/dt_slots/lua/entities/dt_override/shared.lua",
+            r#"
+            function ENT:DTVar(type, slot, name) end
+            function ENT:SetupDataTables()
+                self:DTVar("Bool", 0, "armed")
+            end
+            "#,
+        );
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("dt_override.dt"));
+        assert!(
+            ws.get_db_mut()
+                .get_member_index()
+                .get_members(&owner)
+                .is_none()
+        );
+    }
+
+    #[gtest]
+    fn test_data_table_registration_preserves_surrounding_array_type() {
+        let mut ws = data_table_workspace();
+        let file_id = ws.def_file(
+            "addons/dt_slots/lua/entities/dt_array/shared.lua",
+            r#"
+            ---@[call_arg("gmod.network_var", "type")]
+            ---@param type string
+            ---@[call_arg("gmod.network_var", "define_slot")]
+            ---@param name string
+            ---@return integer
+            function ENT:RegisterSlot(type, name) return 1 end
+            function ENT:SetupDataTables()
+                self.Registered = { self:RegisterSlot("Bool", "armed") }
+                local _value = self.Registered[1]
+            end
+            function ENT:ReadArmed() return self.dt.armed end
+            "#,
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.Registered[1]"),
+            LuaType::Integer
+        );
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.armed"),
+            LuaType::Boolean
+        );
+    }
+
+    #[gtest]
+    fn test_data_table_slots_follow_weapon_rename_in_analysis_fork() {
+        let mut ws = data_table_workspace();
+        let old_path = "addons/dt_slots/lua/weapons/weapon_dt_original.lua";
+        let new_path = "addons/dt_slots/lua/weapons/weapon_dt_renamed.lua";
+        let source = r#"
+            function SWEP:SetupDataTables()
+                self:NetworkVar("Float", 0, "Speed")
+            end
+            function SWEP:ReadSpeed() return self.dt.Speed end
+        "#;
+        ws.def_file(old_path, source);
+        let old_uri = ws.virtual_url_generator.new_uri(old_path);
+        let new_uri = ws.virtual_url_generator.new_uri(new_path);
+        ws.analysis = ws.analysis.fork();
+        ws.analysis.update_files_by_uri(vec![
+            (old_uri, None),
+            (new_uri.clone(), Some(source.to_string())),
+        ]);
+        let file_id = ws.analysis.get_file_id(&new_uri).unwrap();
+        assert_eq!(
+            index_expr_type(&mut ws, file_id, "self.dt.Speed"),
+            LuaType::Number
+        );
+        let db = ws.get_db_mut();
+        let old_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("weapon_dt_original.dt"));
+        let new_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("weapon_dt_renamed.dt"));
+        assert!(db.get_member_index().get_members(&old_owner).is_none());
+        assert!(
+            db.get_member_index()
+                .get_members(&new_owner)
+                .unwrap()
+                .iter()
+                .any(|member| member.get_key().get_name() == Some("Speed"))
         );
     }
 
@@ -1429,6 +2633,521 @@ mod test {
         );
     }
 
+    fn gmod_baseclass_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws
+    }
+
+    fn baseclass_reference_types(ws: &VirtualWorkspace, file_id: crate::FileId) -> Vec<LuaType> {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter(|name_expr| name_expr.get_name_text().as_deref() == Some("BaseClass"))
+            .map(|name_expr| {
+                semantic_model
+                    .infer_expr(LuaExpr::NameExpr(name_expr))
+                    .unwrap_or(LuaType::Unknown)
+            })
+            .collect()
+    }
+
+    fn global_ref(name: &str) -> LuaType {
+        LuaType::Ref(LuaTypeDeclId::global(name))
+    }
+
+    #[gtest]
+    fn test_define_baseclass_each_top_level_call_scopes_baseclass_until_the_next() {
+        let mut ws = gmod_baseclass_workspace();
+        let file_id = ws.def_file(
+            "gamemodes/cityrp/gamemode/core/derma/cl_panels.lua",
+            r#"
+            ---@class BaseA
+            ---@class BaseB
+
+            DEFINE_BASECLASS("BaseA")
+            local FIRST = {}
+            function FIRST:Init()
+                local _ = BaseClass
+            end
+            vgui.Register("cityrpFirst", FIRST, "BaseA")
+
+            DEFINE_BASECLASS("BaseB")
+            local SECOND = {}
+            function SECOND:Init()
+                local _ = BaseClass
+            end
+            vgui.Register("cityrpSecond", SECOND, "BaseB")
+        "#,
+        );
+
+        assert_eq!(
+            baseclass_reference_types(&ws, file_id),
+            vec![global_ref("BaseA"), global_ref("BaseB")]
+        );
+    }
+
+    #[gtest]
+    fn test_define_baseclass_inside_function_body_stays_in_that_function() {
+        let mut ws = gmod_baseclass_workspace();
+        let file_id = ws.def_file(
+            "gamemodes/cityrp/gamemode/core/derma/cl_builder.lua",
+            r#"
+            ---@class OuterBase
+            ---@class InnerBase
+
+            DEFINE_BASECLASS("OuterBase")
+            local function build()
+                DEFINE_BASECLASS("InnerBase")
+                local _ = BaseClass
+            end
+            local _ = BaseClass
+        "#,
+        );
+
+        assert_eq!(
+            baseclass_reference_types(&ws, file_id),
+            vec![global_ref("InnerBase"), global_ref("OuterBase")]
+        );
+    }
+
+    #[gtest]
+    fn test_define_baseclass_method_called_with_subclass_self_has_no_param_type_mismatch() {
+        let mut ws = gmod_baseclass_workspace();
+        ws.def_file(
+            "lua/includes/extensions/client/panel.lua",
+            r#"
+            ---@class Panel
+            local Panel = {}
+            function Panel:Remove() end
+
+            ---@class EditablePanel : Panel
+
+            ---@class DScrollPanel : Panel
+            local DScrollPanel = {}
+            function DScrollPanel:Remove() end
+        "#,
+        );
+
+        assert!(ws.check_file_for(
+            DiagnosticCode::ParamTypeMismatch,
+            "gamemodes/cityrp/gamemode/core/derma/cl_settings.lua",
+            r#"
+            DEFINE_BASECLASS("Panel")
+            local ROW = {}
+            function ROW:Remove()
+                BaseClass.Remove(self)
+            end
+            vgui.Register("cityrpSettingsRow", ROW, "EditablePanel")
+
+            DEFINE_BASECLASS("DScrollPanel")
+            local LIST = {}
+            function LIST:Remove()
+                BaseClass.Remove(self)
+            end
+            vgui.Register("cityrpSettingsList", LIST, "DScrollPanel")
+        "#,
+        ));
+    }
+
+    // `PANEL = Panel` types the global every derma file reuses, so each
+    // `function PANEL:Add` fills its params from the base `Panel:Add`.
+    const PANEL_ADD_LIBRARY: &str = r#"
+            ---@meta
+            ---@class Panel
+            Panel = Panel or {}
+
+            ---@class PANEL : Panel
+            PANEL = Panel
+
+            ---@generic T : Panel
+            ---@overload fun(self: Panel, panel: Panel): Panel
+            ---@overload fun(self: Panel, panelTable: table): Panel
+            ---@overload fun(self: Panel, className: `T`, parent: Panel): T
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@[call_arg("gmod.vgui_panel", "parent_self")]
+            ---@param className `T`
+            ---@return (instance) T
+            function Panel:Add(className) end
+
+            ---@param painted boolean
+            function Panel:SetPaintedManually(painted) end
+
+            ---@param x number
+            function Panel:SetWide(x) end
+
+            ---@param name string
+            ---@param func function
+            ---@param menu? table
+            function Panel:Receiver(name, func, menu) end
+
+            ---@param text string
+            function Panel:SetText(text) end
+
+            ---@param childIndex integer
+            ---@return Panel
+            function Panel:GetChild(childIndex) end
+
+            ---@class DPanel : Panel
+            local DPanel = {}
+
+            ---@param color table
+            function DPanel:SetBackgroundColor(color) end
+
+            vgui = vgui or {}
+
+            ---@generic T : Panel
+            ---@param classname `T`
+            ---@param parent? Panel
+            ---@param name? string
+            ---@return T
+            function vgui.Create(classname, parent, name) end
+        "#;
+
+    const VARARG_TOOLTIP_PATH: &str = "gamemodes/cityrp/gamemode/core/derma/cl_tooltip.lua";
+
+    const VARARG_TOOLTIP: &str = r#"
+            DEFINE_BASECLASS("Panel")
+            PANEL = {} ---@class cityrpTooltip : Panel
+
+            function PANEL:Add(...)
+                local panel = BaseClass.Add(self, ...)
+                panel:SetPaintedManually(true)
+                return panel
+            end
+
+            vgui.Register("cityrpTooltip", PANEL, "Panel")
+
+            PANEL = {}
+            vgui.Register("cityrpTooltipMinimalRow", PANEL, "Panel")
+
+            DEFINE_BASECLASS("cityrpTooltip")
+            PANEL = {}
+
+            function PANEL:Add(...)
+                local panel = BaseClass.Add(self, ...)
+                panel:SetPaintedManually(false)
+                return panel
+            end
+
+            function PANEL:AddRow(id)
+                local panel = self:Add("cityrpTooltipMinimalRow")
+                panel.id = id
+                panel:SetPaintedManually(true)
+                added_row = panel
+                return panel
+            end
+
+            vgui.Register("cityrpTooltipMinimal", PANEL, "cityrpTooltip")
+        "#;
+
+    fn panel_library_workspace(ws: &mut VirtualWorkspace, panel_library: &str) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file("library/panel.lua", panel_library);
+    }
+
+    fn vararg_override_param_types(ws: &VirtualWorkspace, file_id: crate::FileId) -> Vec<LuaType> {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let signature_index = semantic_model.get_db().get_signature_index();
+        semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaClosureExpr>()
+            .filter_map(|closure| {
+                let signature =
+                    signature_index.get(&LuaSignatureId::from_closure(file_id, &closure))?;
+                (signature.params.first()? == "...")
+                    .then(|| signature.get_type_params()[0].1.clone())
+                    .flatten()
+            })
+            .collect()
+    }
+
+    #[gtest]
+    fn test_vararg_override_of_generic_base_method_takes_every_base_form() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+        let file_id = ws.def_file(VARARG_TOOLTIP_PATH, VARARG_TOOLTIP);
+
+        expect_that!(
+            vararg_override_param_types(&ws, file_id),
+            elements_are![eq(&LuaType::Any), eq(&LuaType::Any)]
+        );
+    }
+
+    #[gtest]
+    fn test_vararg_override_takes_every_remaining_base_param() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+        let file_id = ws.def_file(
+            "gamemodes/cityrp/gamemode/core/derma/cl_dropzone.lua",
+            r#"
+            DEFINE_BASECLASS("Panel")
+            PANEL = {}
+            function PANEL:Receiver(...)
+                BaseClass.Receiver(self, ...)
+            end
+        "#,
+        );
+
+        expect_that!(
+            vararg_override_param_types(&ws, file_id),
+            elements_are![eq(&LuaType::Any)]
+        );
+    }
+
+    #[gtest]
+    fn test_override_param_is_any_where_base_forms_disagree() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+
+        expect_true!(ws.check_file_for(
+            DiagnosticCode::ParamTypeMismatch,
+            "gamemodes/cityrp/gamemode/core/derma/cl_category.lua",
+            r#"
+            PANEL = {}
+            function PANEL:Add(strName)
+                local button = vgui.Create("Panel", self)
+                button:SetText(strName)
+                return button
+            end
+        "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_any_argument_keeps_the_main_signature_return() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+
+        expect_false!(ws.check_file_for(
+            DiagnosticCode::InferUnguardedChild,
+            "gamemodes/cityrp/gamemode/core/derma/cl_any_child.lua",
+            r#"
+            ---@param parent Panel
+            ---@param child any
+            function AddAnyChild(parent, child)
+                local panel = parent:Add(child)
+                any_child_result = panel
+                panel:SetBackgroundColor({})
+            end
+        "#,
+        ));
+        let typ = ws.expr_ty("any_child_result");
+        expect_that!(ws.humanize_type(typ), eq("Panel"));
+    }
+
+    #[gtest]
+    fn test_unguarded_child_reached_by_two_definitions_reports_once() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::InferUnguardedChild);
+        let file_id = ws.def_file(
+            "gamemodes/cityrp/plugins/vehicles/cl_hooks.lua",
+            r#"
+            ---@param tooltip Panel
+            function UpdateRow(tooltip)
+                local row = tooltip:GetChild(0)
+                if not row then
+                    row = tooltip:GetChild(1)
+                end
+                row:SetBackgroundColor({})
+            end
+        "#,
+        );
+
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::InferUnguardedChild.get_name().to_string(),
+        ));
+        let found = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .count();
+        expect_that!(found, eq(1));
+    }
+
+    #[gtest]
+    fn test_override_param_accepts_every_base_overload() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+
+        expect_true!(ws.check_file_for(
+            DiagnosticCode::AssignTypeMismatch,
+            "gamemodes/cityrp/plugins/images/library/ui_nstable.lua",
+            r#"
+            PANEL = {}
+            function PANEL:Add(comp)
+                if not comp then
+                    comp = vgui.Create("Panel")
+                end
+                return comp
+            end
+        "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_vararg_override_of_generic_base_method_returns_the_base_panel() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+        ws.def_file(VARARG_TOOLTIP_PATH, VARARG_TOOLTIP);
+
+        let added_row = ws.expr_ty("added_row");
+        expect_false!(
+            added_row.is_nullable() || added_row.is_unknown(),
+            "{}",
+            ws.humanize_type(added_row.clone())
+        );
+        for code in [
+            DiagnosticCode::UncheckedNilAccess,
+            DiagnosticCode::NeedCheckNil,
+        ] {
+            expect_true!(
+                ws.check_file_for(code, VARARG_TOOLTIP_PATH, VARARG_TOOLTIP),
+                "unexpected {code:?}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_vararg_override_forwarding_to_string_template_base_has_no_constraint_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        let without_overloads = PANEL_ADD_LIBRARY
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("---@overload"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panel_library_workspace(&mut ws, &without_overloads);
+
+        expect_true!(ws.check_file_for(
+            DiagnosticCode::GenericConstraintMismatch,
+            VARARG_TOOLTIP_PATH,
+            VARARG_TOOLTIP,
+        ));
+    }
+
+    #[gtest]
+    fn test_override_filled_from_annotated_base_keeps_its_body_return() {
+        let mut ws = VirtualWorkspace::new();
+        panel_library_workspace(&mut ws, PANEL_ADD_LIBRARY);
+        ws.def_file(
+            "gamemodes/cityrp/gamemode/core/derma/cl_width.lua",
+            r#"
+            PANEL = {}
+            function PANEL:SetWide(x)
+                return x > 10
+            end
+            wide_result = PANEL:SetWide(20)
+        "#,
+        );
+
+        expect_that!(ws.expr_ty("wide_result"), eq(&LuaType::Boolean));
+    }
+
+    #[gtest]
+    fn test_vararg_override_of_generic_base_method_matches_cold_after_edit() {
+        let edited = VARARG_TOOLTIP.replace("panel:SetPaintedManually(false)", "");
+        VirtualWorkspace::assert_warm_matches_cold(
+            |ws| panel_library_workspace(ws, PANEL_ADD_LIBRARY),
+            &[(VARARG_TOOLTIP_PATH, VARARG_TOOLTIP)],
+            &[(VARARG_TOOLTIP_PATH, &edited)],
+        );
+    }
+
+    #[gtest]
+    fn test_define_baseclass_local_is_neither_unused_nor_redefined() {
+        const PANELS: &str = r#"
+            DEFINE_BASECLASS("BaseA")
+            local FIRST = {}
+            vgui.Register("cityrpFirst", FIRST, "BaseA")
+
+            DEFINE_BASECLASS("BaseB")
+            local SECOND = {}
+            vgui.Register("cityrpSecond", SECOND, "BaseB")
+        "#;
+        let mut ws = gmod_baseclass_workspace();
+        assert!(ws.check_file_for(
+            DiagnosticCode::Unused,
+            "gamemodes/cityrp/gamemode/core/derma/cl_unused.lua",
+            PANELS,
+        ));
+        assert!(ws.check_file_for(
+            DiagnosticCode::RedefinedLocal,
+            "gamemodes/cityrp/gamemode/core/derma/cl_redefined.lua",
+            PANELS,
+        ));
+    }
+
+    #[gtest]
+    fn test_define_baseclass_scope_follows_edit_delete_and_reopen() {
+        const PATH: &str = "gamemodes/cityrp/gamemode/core/derma/cl_edit.lua";
+        const FIRST: &str = r#"
+            DEFINE_BASECLASS("BaseA")
+            local _ = BaseClass
+            DEFINE_BASECLASS("BaseB")
+            local _ = BaseClass
+        "#;
+        const EDITED: &str = r#"
+            DEFINE_BASECLASS("BaseC")
+            local _ = BaseClass
+            local function build()
+                DEFINE_BASECLASS("BaseB")
+            end
+            local _ = BaseClass
+        "#;
+        let mut ws = gmod_baseclass_workspace();
+        let file_id = ws.def_file(PATH, FIRST);
+        assert_eq!(
+            baseclass_reference_types(&ws, file_id),
+            vec![global_ref("BaseA"), global_ref("BaseB")]
+        );
+
+        let file_id = ws.def_file(PATH, EDITED);
+        assert_eq!(
+            baseclass_reference_types(&ws, file_id),
+            vec![global_ref("BaseC"), global_ref("BaseC")]
+        );
+
+        let uri = ws.virtual_url_generator.new_uri(PATH);
+        ws.analysis.remove_file_by_uri(&uri);
+        let file_id = ws.def_file(PATH, EDITED);
+        assert_eq!(
+            baseclass_reference_types(&ws, file_id),
+            vec![global_ref("BaseC"), global_ref("BaseC")]
+        );
+
+        VirtualWorkspace::assert_warm_matches_cold(
+            |ws| {
+                let mut emmyrc = Emmyrc::default();
+                emmyrc.gmod.enabled = true;
+                ws.update_emmyrc(emmyrc);
+                ws.def_gmod_call_arg_builtins();
+            },
+            &[(PATH, FIRST)],
+            &[(PATH, EDITED)],
+        );
+    }
+
     #[gtest]
     fn test_derma_define_control_baseclass_member_uses_base_arg_syntax_id() {
         let mut ws = VirtualWorkspace::new();
@@ -1513,11 +3232,11 @@ mod test {
         let db = ws.get_db_mut();
         let definitions = db
             .get_gmod_class_metadata_index()
-            .find_vgui_panel_definitions("AnnotatedPanel");
+            .find_vgui_panel_definitions(db.get_vfs(), "AnnotatedPanel");
         assert_eq!(definitions.len(), 1);
         assert_eq!(
             db.get_gmod_class_metadata_index()
-                .get_vgui_panel_base("AnnotatedPanel"),
+                .get_vgui_panel_base(db.get_vfs(), "AnnotatedPanel"),
             Some(Some("DFrame".to_string()))
         );
 
@@ -1572,11 +3291,11 @@ mod test {
         let db = ws.get_db_mut();
         let definitions = db
             .get_gmod_class_metadata_index()
-            .find_vgui_panel_definitions("CrossFilePanel");
+            .find_vgui_panel_definitions(db.get_vfs(), "CrossFilePanel");
         assert_eq!(definitions.len(), 1);
         assert_eq!(
             db.get_gmod_class_metadata_index()
-                .get_vgui_panel_base("CrossFilePanel"),
+                .get_vgui_panel_base(db.get_vfs(), "CrossFilePanel"),
             Some(Some("DFrame".to_string()))
         );
 
@@ -1626,11 +3345,11 @@ mod test {
         let db = ws.get_db_mut();
         let definitions = db
             .get_gmod_class_metadata_index()
-            .find_vgui_panel_definitions("ColonPanel");
+            .find_vgui_panel_definitions(db.get_vfs(), "ColonPanel");
         assert_eq!(definitions.len(), 1);
         assert_eq!(
             db.get_gmod_class_metadata_index()
-                .get_vgui_panel_base("ColonPanel"),
+                .get_vgui_panel_base(db.get_vfs(), "ColonPanel"),
             Some(Some("DFrame".to_string()))
         );
 
@@ -1642,6 +3361,118 @@ mod test {
             paint_member.is_some(),
             "expected colon-call annotated wrapper to synthesize panel members"
         );
+    }
+
+    const SHARED_PANEL_A: &str = "lua/vgui/a_panel.lua";
+    const SHARED_PANEL_A_TEXT: &str = r#"
+            local PANEL = {}
+            function PANEL:Init() end
+            vgui.Register("SharedPanel", PANEL, "DFrame")
+        "#;
+    const SHARED_PANEL_B: &str = "lua/vgui/b_panel.lua";
+    const SHARED_PANEL_B_TEXT: &str = r#"
+            local PANEL = {}
+            function PANEL:Init() end
+            vgui.Register("SharedPanel", PANEL, "DPanel")
+        "#;
+
+    fn shared_panel_workspace(ws: &mut VirtualWorkspace) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+    }
+
+    fn shared_panel_base(ws: &VirtualWorkspace) -> Option<Option<String>> {
+        let db = ws.analysis.compilation.get_db();
+        db.get_gmod_class_metadata_index()
+            .get_vgui_panel_base(db.get_vfs(), "SharedPanel")
+    }
+
+    fn shared_panel_definition_files(ws: &VirtualWorkspace) -> Vec<crate::FileId> {
+        let db = ws.analysis.compilation.get_db();
+        db.get_gmod_class_metadata_index()
+            .find_vgui_panel_definitions(db.get_vfs(), "SharedPanel")
+            .into_iter()
+            .map(|(file_id, _)| file_id)
+            .collect()
+    }
+
+    /// Two files registering one panel elect the base of the one first by
+    /// path, whichever was defined first.
+    #[gtest]
+    fn test_duplicate_vgui_panel_base_follows_file_path_not_definition_order() {
+        for files in [
+            [
+                (SHARED_PANEL_A, SHARED_PANEL_A_TEXT),
+                (SHARED_PANEL_B, SHARED_PANEL_B_TEXT),
+            ],
+            [
+                (SHARED_PANEL_B, SHARED_PANEL_B_TEXT),
+                (SHARED_PANEL_A, SHARED_PANEL_A_TEXT),
+            ],
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            shared_panel_workspace(&mut ws);
+            for (path, text) in files {
+                ws.def_file(path, text);
+            }
+            let a_panel = ws
+                .analysis
+                .get_file_id(&ws.virtual_url_generator.new_uri(SHARED_PANEL_A))
+                .expect("a_panel file id");
+            let b_panel = ws
+                .analysis
+                .get_file_id(&ws.virtual_url_generator.new_uri(SHARED_PANEL_B))
+                .expect("b_panel file id");
+
+            assert_eq!(shared_panel_base(&ws), Some(Some("DFrame".to_string())));
+            assert_eq!(shared_panel_definition_files(&ws), vec![a_panel, b_panel]);
+        }
+    }
+
+    /// Deleting and re-creating the file first by path gives it the larger
+    /// id; its base still wins, and the workspace matches a cold build.
+    #[gtest]
+    fn test_duplicate_vgui_panel_base_survives_recreating_the_earlier_file() {
+        let shifted_a = format!("\n{SHARED_PANEL_A_TEXT}");
+        let mut warm = VirtualWorkspace::assert_warm_matches_cold(
+            shared_panel_workspace,
+            &[
+                (SHARED_PANEL_A, SHARED_PANEL_A_TEXT),
+                (SHARED_PANEL_B, SHARED_PANEL_B_TEXT),
+            ],
+            &[(SHARED_PANEL_A, shifted_a.as_str())],
+        );
+        assert_eq!(shared_panel_base(&warm), Some(Some("DFrame".to_string())));
+
+        let a_uri = warm.virtual_url_generator.new_uri(SHARED_PANEL_A);
+        let old_a_panel = warm
+            .analysis
+            .remove_file_by_uri(&a_uri)
+            .0
+            .expect("a_panel should be removed");
+        assert_eq!(shared_panel_base(&warm), Some(Some("DPanel".to_string())));
+
+        let a_panel = warm.def_file(SHARED_PANEL_A, SHARED_PANEL_A_TEXT);
+        let b_panel = warm
+            .analysis
+            .get_file_id(&warm.virtual_url_generator.new_uri(SHARED_PANEL_B))
+            .expect("b_panel file id");
+        assert_ne!(a_panel, old_a_panel);
+        assert!(a_panel.id > b_panel.id);
+        assert_eq!(shared_panel_base(&warm), Some(Some("DFrame".to_string())));
+        assert_eq!(shared_panel_definition_files(&warm), vec![a_panel, b_panel]);
+
+        let mut cold = VirtualWorkspace::new();
+        shared_panel_workspace(&mut cold);
+        cold.def_files(vec![
+            (SHARED_PANEL_A, SHARED_PANEL_A_TEXT),
+            (SHARED_PANEL_B, SHARED_PANEL_B_TEXT),
+        ]);
+        assert_eq!(shared_panel_base(&cold), shared_panel_base(&warm));
+        assert_eq!(warm.semantic_digest(), cold.semantic_digest());
+        assert!(warm.stale_derivations().is_empty());
     }
 
     #[gtest]
@@ -1846,10 +3677,10 @@ mod test {
         "#,
         );
 
-        let definitions = ws
-            .get_db_mut()
+        let db = ws.get_db_mut();
+        let definitions = db
             .get_gmod_class_metadata_index()
-            .find_derma_skin_definitions("AnnotatedSkin");
+            .find_derma_skin_definitions(db.get_vfs(), "AnnotatedSkin");
 
         assert_eq!(definitions.len(), 1);
     }
@@ -1885,17 +3716,17 @@ mod test {
         );
         assert!(
             db.get_gmod_class_metadata_index()
-                .find_vgui_panel_definitions("LookalikePanel")
+                .find_vgui_panel_definitions(db.get_vfs(), "LookalikePanel")
                 .is_empty()
         );
         assert!(
             db.get_gmod_class_metadata_index()
-                .find_vgui_panel_definitions("LookalikeControl")
+                .find_vgui_panel_definitions(db.get_vfs(), "LookalikeControl")
                 .is_empty()
         );
         assert!(
             db.get_gmod_class_metadata_index()
-                .find_derma_skin_definitions("LookalikeSkin")
+                .find_derma_skin_definitions(db.get_vfs(), "LookalikeSkin")
                 .is_empty()
         );
     }
@@ -2079,6 +3910,134 @@ mod test {
             super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("NextBot"))),
             "expected NextBot super type for my_nextbot (scripted_ents.Register table), got {super_types:?}"
         );
+    }
+
+    /// `scripted_ents.Register` gives a table that sets no `Base` the base its
+    /// `Type` names, reading the table as it stands at the call.
+    #[gtest]
+    fn test_register_without_base_inherits_the_base_its_type_assignment_names() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/weapons/gmod_tool/stools/resizer.lua",
+            r#"
+            local ENT = {}
+            ENT.Type = "anim"
+
+            scripted_ents.Register(ENT, "size_handler")
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let super_types: Vec<_> = db
+            .get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global("size_handler"))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("base_anim"))),
+            "expected base_anim super type for size_handler, got {super_types:?}"
+        );
+    }
+
+    /// A `Base` assigned before `scripted_ents.Register` wins over the base the
+    /// table's `Type` would select.
+    #[gtest]
+    fn test_register_with_an_assigned_base_ignores_the_type_fallback() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/weapons/gmod_tool/stools/resizer.lua",
+            r#"
+            local ENT = {}
+            ENT.Type = "anim"
+            ENT.Base = "base_gmodentity"
+
+            scripted_ents.Register(ENT, "size_handler")
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let super_types: Vec<_> = db
+            .get_type_index()
+            .get_super_types_iter(&LuaTypeDeclId::global("size_handler"))
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+
+        assert_eq!(
+            super_types,
+            vec![LuaType::Ref(LuaTypeDeclId::global("base_gmodentity"))]
+        );
+    }
+
+    /// A registered class is named by its id's last segment, like a doc class,
+    /// whichever site created its declaration.
+    #[gtest]
+    fn test_registered_namespaced_panel_class_is_named_by_its_last_segment() {
+        const REGISTER_PATH: &str = "plugins/contextmenu/derma/cl_singlestringentry.lua";
+        const REGISTER: &str = "local PANEL = {}
+function PANEL:SetText(text) end
+vgui.Register(\"FL.SingleStringEntry\", PANEL, \"EditablePanel\")
+";
+        let class_name = |ws: &mut VirtualWorkspace| {
+            ws.get_db_mut()
+                .get_type_index()
+                .get_type_decl(&LuaTypeDeclId::global("FL.SingleStringEntry"))
+                .expect("registered class")
+                .get_name()
+                .to_string()
+        };
+        for create_sites in [false, true] {
+            let mut ws = VirtualWorkspace::new();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+            let mut files = vec![
+                (
+                    "lua/includes/builtins.lua",
+                    crate::GMOD_CALL_ARG_BUILTINS_FIXTURE,
+                ),
+                (
+                    "lua/includes/panels.lua",
+                    "---@class Panel
+---@class EditablePanel: Panel
+",
+                ),
+                (REGISTER_PATH, REGISTER),
+            ];
+            if create_sites {
+                files.push((
+                    "plugins/contextmenu/contexts/sh_admin.lua",
+                    "if CLIENT then
+    first_reason = vgui.Create(\"FL.SingleStringEntry\")
+    second_reason = vgui.Create(\"FL.SingleStringEntry\")
+end
+",
+                ));
+            }
+            ws.def_files(files);
+            assert_eq!(class_name(&mut ws), "SingleStringEntry", "{create_sites}");
+
+            ws.def_file(
+                REGISTER_PATH,
+                &format!(
+                    "{REGISTER}
+"
+                ),
+            );
+            assert_eq!(class_name(&mut ws), "SingleStringEntry", "{create_sites}");
+        }
     }
 
     /// Verifies that `SWEP.Type = "nextbot"` does NOT inject `NextBot` as a
@@ -2352,6 +4311,420 @@ mod test {
         }
     }
 
+    /// A workspace that *is* a gamemode checkout (`gamemode/` directly under
+    /// the workspace root, e.g. opening `gamemodes/<name>` itself in the
+    /// editor) has no `gamemodes/` path segment for the scope rules to anchor
+    /// on, but its `gamemode/**` files author the `GM` table all the same.
+    /// `DeriveGamemode` must still synthesize `BaseClass` on the scoped class.
+    #[gtest]
+    fn test_gamemode_self_baseclass_members_resolve_in_root_gamemode_layout() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        let file_ids = ws.def_files(vec![
+            // The base gamemode the root workspace derives from.
+            (
+                "gamemodes/sandbox/gamemode/init.lua",
+                r#"
+                function GM:Initialize() end
+                function GM:HUDShouldDraw(name) return true end
+                "#,
+            ),
+            (
+                "gamemode/shared.lua",
+                r#"
+                DeriveGamemode("sandbox")
+
+                function GM:DrawInformation() end
+                "#,
+            ),
+            (
+                "gamemode/init.lua",
+                r#"
+                function GM:Initialize()
+                    self.BaseClass:Initialize()
+                end
+                "#,
+            ),
+            (
+                "gamemode/cl_hud.lua",
+                r#"
+                function GM:HUDShouldDraw(name)
+                    return self.BaseClass.HUDShouldDraw(self, name)
+                end
+                "#,
+            ),
+            // `GAMEMODE` is the runtime global for the current gamemode
+            // table, so plugin files must see the gamemode class members too.
+            (
+                "plugins/foo/sh_main.lua",
+                r#"
+                GAMEMODE = GM
+                function PLUGIN:Init()
+                    GAMEMODE:DrawInformation()
+                    GAMEMODE.BaseClass:Initialize()
+                end
+                "#,
+            ),
+        ]);
+
+        let checked_codes = [
+            NumberOrString::String(DiagnosticCode::UndefinedField.get_name().to_string()),
+            NumberOrString::String(DiagnosticCode::UndefinedMethod.get_name().to_string()),
+        ];
+
+        for (index, file_id) in file_ids.into_iter().enumerate() {
+            let db = ws.get_db_mut();
+            if index < 4 {
+                let scope_info = db
+                    .get_gmod_infer_index()
+                    .get_scoped_class_info(&file_id)
+                    .expect("expected gamemode scope info");
+                assert_eq!(scope_info.global_name, "GM");
+                assert!(
+                    scope_info.class_name.starts_with("gamemode_"),
+                    "expected gamemode_* class name, got {:?}",
+                    scope_info.class_name
+                );
+            }
+
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default();
+            let flagged: Vec<_> = diagnostics
+                .into_iter()
+                .filter(|diag| {
+                    diag.code
+                        .as_ref()
+                        .is_some_and(|code| checked_codes.contains(code))
+                })
+                .collect();
+            assert!(
+                flagged.is_empty(),
+                "unexpected gamemode diagnostics in file {index}: {flagged:?}"
+            );
+        }
+    }
+
+    /// A workspace rooted at `garrysmod/` holds many gamemodes. `GAMEMODE` in
+    /// a file under `gamemodes/<name>/` outside `gamemode/**` (a schema
+    /// plugin) is that gamemode's table, so the hooks its base gamemode
+    /// defines resolve there.
+    #[gtest]
+    fn test_gamemode_global_in_game_root_plugin_resolves_derived_gamemode_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+        let annotations_root = ws.virtual_url_generator.base.join("annotations");
+        ws.analysis.add_library_workspace(annotations_root);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "annotations/gm.lua",
+                r#"
+                ---@meta
+                ---@class GM
+                GM = {}
+
+                ---@type GM
+                GAMEMODE = nil
+                "#,
+            ),
+            (
+                "gamemodes/helix/gamemode/init.lua",
+                r#"
+                function GM:CanPlayerTakeItem(client, item) return true end
+                "#,
+            ),
+            (
+                "gamemodes/ixhl2rp/gamemode/init.lua",
+                r#"
+                DeriveGamemode("helix")
+                "#,
+            ),
+            (
+                "gamemodes/ixhl2rp/plugins/writing/sv_hooks.lua",
+                r#"
+                function PLUGIN:Init()
+                    return GAMEMODE:CanPlayerTakeItem(nil, nil)
+                end
+                "#,
+            ),
+        ]);
+
+        let checked_codes = [
+            NumberOrString::String(DiagnosticCode::UndefinedField.get_name().to_string()),
+            NumberOrString::String(DiagnosticCode::UndefinedMethod.get_name().to_string()),
+        ];
+        let flagged: Vec<_> = ws
+            .analysis
+            .diagnose_file(file_ids[3], CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diag| {
+                diag.code
+                    .as_ref()
+                    .is_some_and(|code| checked_codes.contains(code))
+            })
+            .collect();
+        assert!(
+            flagged.is_empty(),
+            "unexpected gamemode diagnostics in the plugin: {flagged:?}"
+        );
+    }
+
+    /// `DeriveGamemode` runs once per realm entry file (`init.lua`
+    /// server-side, `cl_init.lua` client-side). The synthesized `BaseClass`
+    /// member must exist per realm: a bare existence dedup lets whichever
+    /// file analyzes first own the only record, and that record's realm then
+    /// hides the base edge from the other realm's readers — so the answer
+    /// depends on analysis order.
+    #[gtest]
+    fn test_derive_gamemode_baseclass_member_is_filed_per_realm() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        // Sorted order: cl_hud, cl_init, init, sv_main, sandbox init. The
+        // client entry analyzes ahead of the server entry, so a first-writer
+        // dedup would leave only the client member.
+        let file_ids = ws.def_files(vec![
+            (
+                "gamemodes/sandbox/gamemode/init.lua",
+                r#"
+                function GM:Initialize() end
+                "#,
+            ),
+            (
+                "gamemode/cl_init.lua",
+                r#"
+                DeriveGamemode("sandbox")
+                "#,
+            ),
+            (
+                "gamemode/init.lua",
+                r#"
+                DeriveGamemode("sandbox")
+                "#,
+            ),
+            (
+                "gamemode/cl_hud.lua",
+                r#"
+                function GM:Draw()
+                    local clientBase = self.BaseClass
+                end
+                "#,
+            ),
+            (
+                "gamemode/sv_main.lua",
+                r#"
+                function GM:Init()
+                    local serverBase = self.BaseClass
+                end
+                "#,
+            ),
+        ]);
+
+        let (cl_hud_id, cl_init_id, init_id, sv_main_id) =
+            (file_ids[0], file_ids[1], file_ids[2], file_ids[3]);
+
+        let class_name = {
+            let db = ws.get_db_mut();
+            db.get_gmod_infer_index()
+                .get_scoped_class_info(&init_id)
+                .expect("expected gamemode scope info")
+                .class_name
+                .clone()
+        };
+
+        // Both derives file a member under the scoped class — one per realm —
+        // and each realm's reader resolves it to the same base class.
+        {
+            let db = ws.get_db_mut();
+            let owner = LuaMemberOwner::Type(LuaTypeDeclId::global(&class_name));
+            let member_files: Vec<crate::FileId> = db
+                .get_member_index()
+                .get_member_item(&owner, &LuaMemberKey::Name("BaseClass".into()))
+                .map(|item| {
+                    item.get_member_ids()
+                        .iter()
+                        .map(|member_id| member_id.file_id)
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                {
+                    let mut sorted = member_files.clone();
+                    sorted.sort();
+                    sorted
+                },
+                vec![cl_init_id, init_id],
+                "expected one BaseClass member per realm entry file"
+            );
+        }
+
+        for (reader_id, local) in [(cl_hud_id, "clientBase"), (sv_main_id, "serverBase")] {
+            let typ = local_name_type(&mut ws, reader_id, local);
+            assert_eq!(
+                ws.humanize_type(typ),
+                "gamemode_sandbox",
+                "BaseClass must resolve in the reader's own realm"
+            );
+        }
+    }
+
+    /// A table a loader publishes under two scope globals is the base of
+    /// both scopes' classes.
+    #[gtest]
+    fn test_a_table_published_under_two_scope_globals_declares_both_classes() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "gamemode/core/libs/sh_plugin.lua",
+            r#"
+            local PLUGIN = {}
+            _G["PLUGIN"] = PLUGIN
+            _G["SCHEMA"] = PLUGIN
+            "#,
+        );
+
+        let type_index = ws.get_db_mut().get_type_index();
+        let declared = ["PLUGIN", "SCHEMA"].map(|name| {
+            type_index
+                .get_type_decl(&LuaTypeDeclId::global(name))
+                .is_some()
+        });
+        expect_that!(declared, eq([true, true]));
+    }
+
+    #[gtest]
+    fn test_scoped_class_helpers_target_only_scope_table() {
+        // A gamemode-scope file can author other scripted tables (panels,
+        // skins). AccessorFunc/NetworkVar/DEFINE_BASECLASS inside it must
+        // target the table the file registers, not leak onto the scope's
+        // class (gamemode_*): otherwise the gamemode type gains panel
+        // members and panel supertypes it does not have at runtime.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_ids = ws.def_files(vec![
+            (
+                "gamemode/init.lua",
+                r#"
+                DeriveGamemode("sandbox")
+                AccessorFunc(GM, "m_GamemodeKey", "GamemodeKey", FORCE_BOOL)
+                "#,
+            ),
+            (
+                "gamemode/core/derma/cl_row.lua",
+                r#"
+                DEFINE_BASECLASS("EditablePanel")
+                local PANEL = {}
+                AccessorFunc(PANEL, "backgroundIndex", "BackgroundIndex", FORCE_NUMBER)
+                vgui.Register("cityrpRow", PANEL, "EditablePanel")
+                "#,
+            ),
+            // Same shapes in a `gamemodes/*` layout: the leaks must not
+            // depend on where the workspace root sits.
+            (
+                "gamemodes/ttt/gamemode/cl_row.lua",
+                r#"
+                DEFINE_BASECLASS("DPanel")
+                local PANEL = {}
+                AccessorFunc(PANEL, "otherKey", "OtherKey", FORCE_NUMBER)
+                vgui.Register("tttRow", PANEL, "DPanel")
+                "#,
+            ),
+        ]);
+
+        let db = ws.get_db_mut();
+        let root_class_name = db
+            .get_gmod_infer_index()
+            .get_scoped_class_info(&file_ids[0])
+            .expect("expected gamemode scope info")
+            .class_name
+            .clone();
+        let members_of = |name: &str| -> Vec<String> {
+            db.get_member_index()
+                .get_members(&LuaMemberOwner::Type(LuaTypeDeclId::global(name)))
+                .map(|members| {
+                    members
+                        .iter()
+                        .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let supers_of = |name: &str| -> Vec<String> {
+            db.get_type_index()
+                .get_super_types(&LuaTypeDeclId::global(name))
+                .unwrap_or_default()
+                .iter()
+                .map(|typ| format!("{typ:?}"))
+                .collect()
+        };
+
+        for gamemode_class in [root_class_name.as_str(), "gamemode_ttt"] {
+            let members = members_of(gamemode_class);
+            for leaked in [
+                "GetBackgroundIndex",
+                "SetBackgroundIndex",
+                "backgroundIndex",
+                "GetOtherKey",
+                "SetOtherKey",
+                "otherKey",
+            ] {
+                assert!(
+                    !members.iter().any(|m| m == leaked),
+                    "{gamemode_class} must not gain panel member {leaked}: {members:?}"
+                );
+            }
+            let supers = supers_of(gamemode_class);
+            for leaked_super in ["EditablePanel", "DPanel"] {
+                assert!(
+                    !supers.iter().any(|s| s.contains(leaked_super)),
+                    "{gamemode_class} must not gain panel supertype {leaked_super}: {supers:?}"
+                );
+            }
+        }
+
+        // GM-targeted AccessorFunc still attaches to the scope class.
+        let members = members_of(&root_class_name);
+        for wanted in ["GetGamemodeKey", "SetGamemodeKey", "m_GamemodeKey"] {
+            assert!(
+                members.iter().any(|m| m == wanted),
+                "gamemode class lost its own accessor member {wanted}: {members:?}"
+            );
+        }
+
+        // Panel tables still receive their accessor members via the
+        // arg0-typed accessor index.
+        for panel in ["cityrpRow", "tttRow"] {
+            let members = members_of(panel);
+            assert!(
+                !members.is_empty(),
+                "{panel} kept its accessor members: {members:?}"
+            );
+        }
+    }
+
     #[gtest]
     fn test_doc_param_resolves_scoped_entity_type_without_type_not_found() {
         let mut ws = VirtualWorkspace::new();
@@ -2404,6 +4777,66 @@ mod test {
         );
     }
 
+    fn vgui_table_class_setup(ws: &mut VirtualWorkspace) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+    }
+
+    const VGUI_PANEL_FILE: &str = "lua/vgui/panel_table.lua";
+    const VGUI_PANEL_UNREGISTERED: &str = r#"
+            local PANEL = {}
+            function PANEL:Init() end
+            MYPANEL = PANEL
+        "#;
+    const VGUI_PANEL_REGISTERED: &str = r#"
+            local PANEL = {}
+            function PANEL:Init() end
+            MYPANEL = PANEL
+            vgui.Register("MyPanel", PANEL, "DPanel")
+        "#;
+    const VGUI_PANEL_READER: (&str, &str) = (
+        "lua/vgui/panel_reader.lua",
+        r#"
+            local panel = MYPANEL
+            panel:Init()
+        "#,
+    );
+
+    fn reader_names_my_panel(ws: &VirtualWorkspace) -> bool {
+        ws.semantic_digest()
+            .iter()
+            .any(|line| line.contains("panel_reader") && line.contains("MyPanel"))
+    }
+
+    /// Dropping the registration turns another file's view of the table back
+    /// into the table, as in a build that never saw it.
+    #[gtest]
+    fn removing_a_vgui_registration_unclasses_the_table_elsewhere() {
+        let warm = VirtualWorkspace::assert_warm_matches_cold(
+            vgui_table_class_setup,
+            &[(VGUI_PANEL_FILE, VGUI_PANEL_REGISTERED), VGUI_PANEL_READER],
+            &[(VGUI_PANEL_FILE, VGUI_PANEL_UNREGISTERED)],
+        );
+        expect_false!(reader_names_my_panel(&warm));
+    }
+
+    /// Adding the registration classes another file's view of the table, as
+    /// in a build that saw it from the start.
+    #[gtest]
+    fn adding_a_vgui_registration_classes_the_table_elsewhere() {
+        let warm = VirtualWorkspace::assert_warm_matches_cold(
+            vgui_table_class_setup,
+            &[
+                (VGUI_PANEL_FILE, VGUI_PANEL_UNREGISTERED),
+                VGUI_PANEL_READER,
+            ],
+            &[(VGUI_PANEL_FILE, VGUI_PANEL_REGISTERED)],
+        );
+        expect_true!(reader_names_my_panel(&warm));
+    }
+
     #[gtest]
     fn test_vgui_register_creates_panel_class() {
         let mut ws = VirtualWorkspace::new();
@@ -2445,6 +4878,59 @@ mod test {
             super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("DPanel"))),
             "expected DPanel super type, got {super_types:?}"
         );
+    }
+
+    /// A library localised for speed, `local vgui = vgui`, registers panels as
+    /// the global does.
+    #[gtest]
+    fn test_vgui_register_through_a_localised_library_creates_panel_class() {
+        for alias in ["local vgui = vgui", "local vgui = _G.vgui"] {
+            let mut ws = VirtualWorkspace::new();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+            ws.def_gmod_call_arg_builtins();
+
+            let file_id = ws.def_file(
+                "lua/vgui/localised_panel.lua",
+                &format!(
+                    r#"
+                    {alias}
+
+                    local PANEL = {{}}
+                    function PANEL:Init()
+                    end
+                    vgui.Register("LocalisedPanel", PANEL, "DPanel")
+                "#
+                ),
+            );
+
+            let db = ws.get_db_mut();
+            let class_id = LuaTypeDeclId::global("LocalisedPanel");
+            let super_types: Vec<_> = db
+                .get_type_index()
+                .get_super_types_iter(&class_id)
+                .map(|iter| iter.cloned().collect())
+                .unwrap_or_default();
+            assert!(
+                super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("DPanel"))),
+                "{alias}: expected DPanel super type, got {super_types:?}"
+            );
+            let panel_decl = db
+                .get_decl_index()
+                .get_decl_tree(&file_id)
+                .expect("expected decl tree")
+                .get_decls()
+                .values()
+                .find(|decl| decl.get_name() == "PANEL" && decl.is_local())
+                .map(|decl| decl.get_id())
+                .expect("expected the PANEL local");
+            let panel_type = db
+                .get_type_index()
+                .get_type_cache(&panel_decl.into())
+                .map(|cache| cache.as_type().clone());
+            assert_eq!(panel_type, Some(LuaType::Def(class_id)), "{alias}");
+        }
     }
 
     #[gtest]
@@ -3308,14 +5794,86 @@ mod test {
         );
     }
 
-    /// Verifies that `find_registered_table_expr` does NOT fall back to the
-    /// original local initializer when the latest write is an unrelated
-    /// reassignment (not the registration call). This is a regression guard
-    /// for the narrowed fallback in `find_registered_table_expr`: only when
-    /// the registration call IS the reassignment RHS (e.g.
-    /// `PANEL = vgui.RegisterTable(PANEL, ...)`) should the original local
-    /// initializer be used. An unrelated `PANEL = MakePanel()` should NOT
-    /// trigger the fallback.
+    /// The shipped `vgui.Register` signature: the call returns the table it
+    /// registers.
+    const VGUI_REGISTER_RETURNING_TABLE: (&str, &str) = (
+        "lua/aaa_annotations/vgui.lua",
+        r#"---@meta
+---@class Panel
+vgui = {}
+
+---@generic T: Panel
+---@[call_arg("gmod.vgui_panel", "define")]
+---@param classname string Classname of the panel to register.
+---@[call_arg("gmod.vgui_panel", "table")]
+---@param panelTable T The table containing the panel information.
+---@[call_arg("gmod.vgui_panel", "base")]
+---@param baseName? string Classname of a panel to inherit functionality from.
+---@return T # The given panel table from second argument.
+function vgui.Register(classname, panelTable, baseName) end
+"#,
+    );
+
+    /// A panel registered from an inline table, its methods defined on the
+    /// local the call initialises (dermaflex's `Flex`).
+    const INLINE_REGISTERED_PANEL: (&str, &str) = (
+        "addons/flex/lua/autorun/client/cl_flex.lua",
+        r#"local FLEX = vgui.Register("InlineFlex", { w = 0 }, "Panel")
+function FLEX:Init() self.offsetX = 0 end
+function FLEX:OnMousePressed() self.clickOffset = 5 end
+function FLEX:Paint(w, h)
+	local x = self.offsetX + 1
+	local y = self.clickOffset + 1
+end
+"#,
+    );
+
+    /// The local an inline `vgui.Register` call initialises is the registered
+    /// table, as a `local PANEL = {}` declaration is: a field its `Init`
+    /// assigns through `self` is the class's, so another method reads it
+    /// without a nil check.
+    #[gtest]
+    fn test_vgui_register_inline_table_fields_set_in_init_are_class_fields() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+        ws.def_file(
+            VGUI_REGISTER_RETURNING_TABLE.0,
+            VGUI_REGISTER_RETURNING_TABLE.1,
+        );
+        let file_id = ws.def_file(INLINE_REGISTERED_PANEL.0, INLINE_REGISTERED_PANEL.1);
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let need_check_nil = Some(NumberOrString::String(
+            DiagnosticCode::NeedCheckNil.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != need_check_nil),
+            "fields an inline-registered panel's Init assigns are class fields: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_register_inline_table_settles_in_any_order() {
+        crate::compilation::test::schedule_order_test::test::assert_schedule_independent(&[
+            (
+                "lua/includes/glua_ls_gmod_call_arg_builtins.lua",
+                crate::test_lib::GMOD_CALL_ARG_BUILTINS_FIXTURE,
+            ),
+            VGUI_REGISTER_RETURNING_TABLE,
+            INLINE_REGISTERED_PANEL,
+        ]);
+    }
+
     #[gtest]
     fn test_vgui_register_table_unrelated_reassignment_does_not_bind_stale_initializer() {
         let mut ws = VirtualWorkspace::new();
@@ -3377,11 +5935,11 @@ mod test {
             "self-assignment RegisterTable should bind the table literal; got nil diagnostics: {valid_diagnostics:?}"
         );
 
-        // Case 2: Unrelated reassignment — PANEL = MakePanel(), then separate vgui.RegisterTable(PANEL, ...)
-        // The stale initializer should NOT be used, so the `Init` function's
-        // `self.Btn` access should produce diagnostics (since self resolves to
-        // Unknown instead of the synthesized panel class).
-        let _unrelated_file_id = ws.def_file(
+        assert!(matches!(
+            index_expr_prefix_type(&mut ws, valid_file_id, "self:Add"),
+            LuaType::Def(_)
+        ));
+        let unrelated_file_id = ws.def_file(
             "lua/vgui/register_table_unrelated_reassign.lua",
             r#"
             local function MakePanel() return {} end
@@ -3399,19 +5957,21 @@ mod test {
             "#,
         );
 
-        let unrelated_diagnostics = ws
-            .analysis
-            .diagnose_file(_unrelated_file_id, CancellationToken::new())
-            .unwrap_or_default();
-        // With the narrowed fallback, the stale initializer is NOT bound, so
-        // `self.Btn2` should produce `unchecked-nil-access` because `self`
-        // resolves to Unknown (no table expr found).
-        let has_nil_diag = unrelated_diagnostics
-            .iter()
-            .any(|d| nil_codes.contains(&d.code));
+        assert_eq!(
+            index_expr_prefix_type(&mut ws, unrelated_file_id, "self:Add"),
+            LuaType::Unknown,
+        );
+        assert!(matches!(
+            local_assignment_value_type(&mut ws, unrelated_file_id, "PANEL2"),
+            LuaType::TableConst(_)
+        ));
         assert!(
-            has_nil_diag,
-            "unrelated reassignment should NOT bind the stale initializer; expected nil diagnostics on self.Btn2, got: {unrelated_diagnostics:?}"
+            ws.analysis
+                .diagnose_file(unrelated_file_id, CancellationToken::new())
+                .unwrap_or_default()
+                .iter()
+                .all(|diagnostic| !nil_codes.contains(&diagnostic.code)),
+            "an unknown receiver does not prove nil"
         );
     }
 
@@ -4388,26 +6948,28 @@ mod test {
         );
     }
 
-    /// Regression for Oracle Blocker 2: `write_position_contains_register`
-    /// must check the specific RHS expression for the matching LHS variable,
-    /// not the entire assignment statement range. In a multi-assignment like
-    /// `PANEL, OTHER = MakePanel(), vgui.RegisterTable(PANEL, "DPanel")`,
-    /// the registration call is inside the statement range but PANEL's RHS is
-    /// `MakePanel()`, so the stale initializer fallback must NOT fire.
+    /// Lua evaluates all right-hand expressions before assigning any left-hand
+    /// variable. Registration therefore receives the original table while the
+    /// replacement value is assigned to `PANEL`.
     #[gtest]
-    fn test_vgui_register_table_multi_assign_does_not_bind_stale_initializer() {
-        let mut ws = VirtualWorkspace::new();
-        let mut emmyrc = Emmyrc::default();
-        emmyrc.gmod.enabled = true;
-        emmyrc.gmod.infer_dynamic_fields = false;
-        ws.update_emmyrc(emmyrc);
-        ws.def_gmod_call_arg_builtins();
-        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
-        ws.enable_check(DiagnosticCode::NeedCheckNil);
+    fn test_vgui_register_table_multi_assign_registers_original_table() {
+        for assignment in [
+            "PANEL, OTHER = MakePanel(), vgui.RegisterTable(PANEL, \"DPanel\")",
+            "PANEL, OTHER = {}, vgui.RegisterTable(PANEL, \"DPanel\")",
+            "OTHER, PANEL = vgui.RegisterTable(PANEL, \"DPanel\"), MakePanel()",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            emmyrc.gmod.infer_dynamic_fields = false;
+            ws.update_emmyrc(emmyrc);
+            ws.def_gmod_call_arg_builtins();
+            ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+            ws.enable_check(DiagnosticCode::NeedCheckNil);
 
-        let file_id = ws.def_file(
-            "lua/vgui/register_table_multi_assign.lua",
-            r#"
+            let file_id = ws.def_file(
+                "lua/vgui/register_table_multi_assign.lua",
+                r#"
             ---@class Panel
             ---@field Add fun(self: Panel, className: string): Panel
             ---@field Dock fun(self: Panel, dock: integer)
@@ -4433,33 +6995,58 @@ mod test {
             }
 
             local OTHER
-            -- Multi-assignment: PANEL's RHS is MakePanel(), not RegisterTable.
-            -- The RegisterTable call is on OTHER's RHS, not PANEL's.
-            -- The stale initializer fallback must NOT fire for PANEL.
-            PANEL, OTHER = MakePanel(), vgui.RegisterTable(PANEL, "DPanel")
-            "#,
-        );
+            ASSIGNMENT
+            local replacement = PANEL
+            local registered = OTHER
+            "#
+                .replace("ASSIGNMENT", assignment)
+                .as_str(),
+            );
 
-        let diagnostics = ws
-            .analysis
-            .diagnose_file(file_id, CancellationToken::new())
-            .unwrap_or_default();
-        let nil_codes = [
-            Some(NumberOrString::String(
-                DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
-            )),
-            Some(NumberOrString::String(
-                DiagnosticCode::NeedCheckNil.get_name().to_string(),
-            )),
-        ];
-        // Since PANEL's RHS is MakePanel() (not the registration call),
-        // the stale initializer fallback should NOT bind. `self.Btn` inside
-        // Init should produce nil diagnostics because self resolves to Unknown.
-        let has_nil_diag = diagnostics.iter().any(|d| nil_codes.contains(&d.code));
-        assert!(
-            has_nil_diag,
-            "multi-assignment with RegisterTable on a different LHS should NOT bind the stale initializer; expected nil diagnostics, got: {diagnostics:?}"
-        );
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default();
+            let nil_codes = [
+                Some(NumberOrString::String(
+                    DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+                )),
+                Some(NumberOrString::String(
+                    DiagnosticCode::NeedCheckNil.get_name().to_string(),
+                )),
+            ];
+            let LuaType::Def(original_class) =
+                local_assignment_value_type(&mut ws, file_id, "PANEL")
+            else {
+                panic!("original table must be registered: {assignment}");
+            };
+            for typ in [
+                index_expr_prefix_type(&mut ws, file_id, "self:Add"),
+                local_name_type(&mut ws, file_id, "registered"),
+            ] {
+                let (LuaType::Def(class) | LuaType::Ref(class)) = typ else {
+                    panic!("expected registered panel type, got {typ:?}: {assignment}");
+                };
+                assert_eq!(class, original_class, "{assignment}");
+            }
+            let replacement_type = local_name_type(&mut ws, file_id, "replacement");
+            assert!(
+                matches!(
+                    replacement_type,
+                    LuaType::TableConst(_) | LuaType::Instance(_)
+                ),
+                "replacement {replacement_type:?}: {assignment}"
+            );
+            assert_eq!(
+                replacement_type,
+                assign_value_type(&mut ws, file_id, "PANEL"),
+                "{assignment}"
+            );
+            assert!(
+                diagnostics.iter().all(|d| !nil_codes.contains(&d.code)),
+                "registered original table should retain panel methods: {diagnostics:?}"
+            );
+        }
     }
 
     /// Regression: PANEL reassignment (`PANEL = {}`) should create distinct classes
@@ -8075,6 +10662,7 @@ mod test {
 
         ws.analysis
             .update_file_by_uri(&init_uri, Some(format!("{init_code}\n")))
+            .map(|(id, _)| id)
             .expect("expected touched init file id");
 
         let alias_seats_after_touch = index_expr_type(&mut ws, file_id, "selfTbl.seats");
@@ -8257,6 +10845,7 @@ mod test {
 
         ws.analysis
             .update_file_by_uri(&car_uri, Some(format!("{car_code}\n")))
+            .map(|(id, _)| id)
             .expect("expected touched car cl_init file id");
 
         let touched_sounds_type = local_name_type(&mut ws, file_id, "sounds");
@@ -8930,6 +11519,7 @@ mod test {
         let consumer_uri = ws.virtual_url_generator.new_uri(consumer_path);
         ws.analysis
             .update_file_by_uri(&consumer_uri, Some(format!("{consumer_code}\n")))
+            .map(|(id, _)| id)
             .expect("expected touched consumer file id");
 
         let touched_pos_type = local_name_type(&mut ws, consumer_file, "pos");
@@ -9893,12 +12483,13 @@ mod test {
             crate::LuaMemberIndexItem::Many(ids) => ids.len(),
         };
         assert_eq!(
-            member_count_before, 1,
-            "expected latest assignment to replace previous assignment"
+            member_count_before, 2,
+            "every writer of the slot stays visible"
         );
 
         ws.analysis
             .update_file_by_uri(&shared_uri, Some(format!("\n{shared_text}")))
+            .map(|(id, _)| id)
             .expect("shared file should update");
 
         let member_item_after = ws
@@ -9913,8 +12504,8 @@ mod test {
             crate::LuaMemberIndexItem::Many(ids) => ids.len(),
         };
         assert_eq!(
-            member_count_after, 1,
-            "single-file reindex should retain the latest assignment"
+            member_count_after, 2,
+            "single-file reindex keeps every writer of the slot"
         );
     }
 
@@ -11628,6 +14219,97 @@ GM.TestValue = 1"#,
         );
     }
 
+    fn gm_signature_return_type(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        method: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let closure = root
+            .descendants::<LuaFuncStat>()
+            .find(|stat| match stat.get_func_name() {
+                Some(LuaVarExpr::IndexExpr(index_expr)) => {
+                    matches!(
+                        index_expr.get_index_key(),
+                        Some(LuaIndexKey::Name(name)) if name.get_name_text() == method
+                    )
+                }
+                _ => false,
+            })
+            .and_then(|stat| stat.get_closure())
+            .expect("expected GM method closure");
+        let signature_id = LuaSignatureId::from_closure(file_id, &closure);
+        semantic_model
+            .get_db()
+            .get_signature_index()
+            .get(&signature_id)
+            .expect("expected signature")
+            .get_return_type()
+    }
+
+    /// Re-indexing a file whose hook returns `self.BaseClass:Hook()` must not
+    /// change the inferred return. Cold analysis settles the call to the
+    /// derived gamemode's synthesized `BaseClass` member; a no-op reindex used
+    /// to keep a leftover `Unknown` arm instead.
+    #[gtest]
+    fn test_derived_gamemode_baseclass_return_converges_on_reindex() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_ids = ws.def_files(vec![
+            // Stand-in for the shipped annotations library: `GM` carries a
+            // generic `BaseClass` table field, and the base hook returns a
+            // concrete type. `gamemode_sandbox` itself has no real files — it
+            // is materialized empty by `DeriveGamemode` with `GM` as super.
+            (
+                "annotations/gm.lua",
+                r#"
+                ---@class GM
+                ---@field BaseClass table
+                ---@return boolean
+                function GM:PhysgunPickup(player, entity) end
+                "#,
+            ),
+            (
+                "gamemode/init.lua",
+                r#"
+                DeriveGamemode("sandbox")
+                "#,
+            ),
+            (
+                "gamemode/cl_init.lua",
+                r#"
+                DeriveGamemode("sandbox")
+                "#,
+            ),
+            (
+                "gamemode/sv_hooks.lua",
+                r#"
+                function GM:PhysgunPickup(player, entity)
+                    if entity then
+                        return false
+                    end
+                    return self.BaseClass:PhysgunPickup(player, entity)
+                end
+                "#,
+            ),
+        ]);
+        let hooks_file = file_ids[3];
+
+        let cold = gm_signature_return_type(&mut ws, hooks_file, "PhysgunPickup");
+        ws.analysis.reindex_files(vec![hooks_file]);
+        let warm = gm_signature_return_type(&mut ws, hooks_file, "PhysgunPickup");
+        assert_eq!(warm, cold, "cold={cold:?} warm={warm:?}");
+    }
+
     #[gtest]
     fn test_vgui_named_field_preferred_over_global_pairs_override_wildcard() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
@@ -11977,5 +14659,422 @@ GM.TestValue = 1"#,
             }
         }
         assert!(found_call, "should find GetInputBool CallExpr");
+    }
+
+    /// Two addons ship an `init.lua` for one class. Their `NetworkVar` calls are replayed into
+    /// a delegating class in the order `build_class_file_map` produced, and `add_call` dedups on
+    /// a syntax id that carries no file id, so the same byte offsets in both files collide and
+    /// the later file wins. That order has to come from the paths, not from file ids, which
+    /// differ between a cold build and an incremental session.
+    fn delegating_members_for_class_file_order(reversed: bool) -> Vec<String> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let first = (
+            "lua/entities/target_ent/init.lua",
+            r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("String", "Alpha")
+                end
+            "#,
+        );
+        let second = (
+            "addons/z_other/lua/entities/target_ent/init.lua",
+            r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("String", "Bravo")
+                end
+            "#,
+        );
+
+        if reversed {
+            ws.def_file(second.0, second.1);
+            ws.def_file(first.0, first.1);
+        } else {
+            ws.def_file(first.0, first.1);
+            ws.def_file(second.0, second.1);
+        }
+        ws.def_file(
+            "lua/entities/delegating_ent/init.lua",
+            r#"
+                function ENT:SetupDataTables()
+                    scripted_ents.GetMember("target_ent", "SetupDataTables")(self)
+                end
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("delegating_ent"));
+        let mut member_names = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members")
+            .iter()
+            .filter_map(|member| member.get_key().get_name().map(|name| name.to_string()))
+            .collect::<Vec<_>>();
+        member_names.sort();
+        member_names
+    }
+
+    #[gtest]
+    fn test_class_file_order_does_not_depend_on_definition_order() {
+        let forward = delegating_members_for_class_file_order(false);
+        let reversed = delegating_members_for_class_file_order(true);
+
+        assert!(
+            forward.iter().any(|name| name.starts_with("Get")),
+            "fixture produced no synthesized members: {forward:?}"
+        );
+        assert_eq!(forward, reversed);
+    }
+
+    /// A `PANEL` block with no `vgui.Register` before the next `PANEL = {}`
+    /// keeps the `PANEL` fallback owner; another file's *global* `PANEL`
+    /// registration must not rebind it later.
+    ///
+    /// CityRP's `cl_categorylist.lua` has four `PANEL` regions and the third
+    /// is a bare `PANEL = {}` + `AccessorFunc` block that is never registered.
+    /// `cl_credits.lua` binds a *global* `PANEL` to `cityrp_credits`. When the
+    /// local file is re-analysed while that global binding exists, the
+    /// unregistered region's members must still resolve `PANEL` locally —
+    /// they must not move to `Type(cityrp_credits)`.
+    #[gtest]
+    fn test_unregistered_local_panel_region_is_not_rebound_by_global_panel() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/vgui/0_accessor_builtin.lua",
+            r#"
+            ---@class PANEL
+            PANEL = {}
+
+            ---@accessorfunc 3
+            ---@param tbl any
+            ---@param varname string
+            ---@param name string
+            function AccessorFunc(tbl, varname, name) end
+        "#,
+        );
+        // Analysed first (path sorts earlier): a *local* PANEL whose middle
+        // region is never registered.
+        let local_source = r#"
+            local PANEL = {}
+            vgui.Register("PanelA", PANEL, "Panel")
+            PANEL = {}
+            AccessorFunc(PANEL, "text", "Text")
+            PANEL = {}
+            vgui.Register("PanelB", PANEL, "Panel")
+        "#;
+        let local_file = ws.def_file("lua/vgui/a_local_panel.lua", local_source);
+        // Analysed second: binds the *global* PANEL to its own class. The
+        // register call sits past the local file's member offsets so the
+        // registration-region position window would admit the foreign
+        // members if the gather reached them.
+        let global_source = r#"
+            PANEL = {}
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            -- filler
+            vgui.Register("cityrp_credits", PANEL, "Panel")
+            local PANEL = {}
+            vgui.Register("OtherGlobalPanelClass", PANEL, "Panel")
+        "#;
+        let global_file = ws.def_file("lua/vgui/b_global_panel.lua", global_source);
+
+        let owner_of = |db: &crate::DbIndex, key: &str| {
+            db.get_member_index()
+                .get_file_members(local_file)
+                .iter()
+                .filter(|m| m.get_key().get_name().is_some_and(|n| n == key))
+                .filter_map(|m| db.get_member_index().get_member_owner(&m.get_id()).cloned())
+                .collect::<Vec<_>>()
+        };
+        let assert_local_owner = |db: &crate::DbIndex, when: &str| {
+            for key in ["SetText", "GetText"] {
+                let owners = owner_of(db, key);
+                assert!(
+                    !owners.is_empty(),
+                    "expected {key} member in local panel file ({when})"
+                );
+                for owner in owners {
+                    assert_ne!(
+                        owner,
+                        LuaMemberOwner::Type(LuaTypeDeclId::global("cityrp_credits")),
+                        "{key} must not be rebound to the other file's global PANEL class ({when})"
+                    );
+                }
+            }
+        };
+        assert_local_owner(ws.get_db_mut(), "cold");
+
+        // Re-analyse the *registering* file: its synthesis gathers the member
+        // history of its global `PANEL = {}` literal, which canonicalizes to
+        // `Type(PANEL)` — the shared owner the local file's unregistered
+        // AccessorFunc members also sit under. Without a file filter the
+        // transfer sweeps the foreign members into `cityrp_credits`.
+        let uri = ws
+            .virtual_url_generator
+            .new_uri("lua/vgui/b_global_panel.lua");
+        ws.analysis
+            .update_file_text_only(&uri, global_source.to_string())
+            .expect("restage global file");
+        ws.analysis.reindex_files(vec![global_file]);
+        assert_local_owner(ws.get_db_mut(), "warm");
+    }
+
+    /// `self.Entity` inside an entity-scope method is the canonical scripted
+    /// entity back-reference: every ENT script table carries an `Entity` member
+    /// holding the backing engine entity. Declared `self`, the read resolves to
+    /// the scoped class through the `ENT` super type.
+    #[gtest]
+    fn test_entity_scope_self_entity_back_reference() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/autorun/ent_lib.lua",
+            r#"
+            ---@class Entity
+            function Entity:DrawModel() end
+
+            ---@class ENTITY : Entity
+            ENTITY = {}
+
+            ---@class ENT : ENTITY
+            ---@field Entity self
+            ENT = {}
+        "#,
+        );
+
+        let file_id = ws.def_file(
+            "entities/entities/ent_fballoon/cl_init.lua",
+            r#"
+            function ENT:Draw()
+                self.Entity:DrawModel()
+            end
+        "#,
+        );
+
+        let ty = index_expr_type(&mut ws, file_id, "self.Entity");
+        assert_eq!(
+            ty,
+            LuaType::Def(LuaTypeDeclId::global("ent_fballoon")),
+            "self.Entity should resolve to the scoped entity class, got {ty:?}"
+        );
+
+        let diags = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .expect("diagnostics");
+        let field_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.code,
+                    Some(NumberOrString::String(ref c))
+                        if c == "undefined-field" || c == "unchecked-nil-access"
+                )
+            })
+            .collect();
+        assert!(
+            field_diags.is_empty(),
+            "self.Entity should not be flagged, got {field_diags:?}"
+        );
+    }
+
+    /// `ent.Entity` is a self-reference: the field returns the entity itself via
+    /// script-table delegation. Declared `self` on both `ENT` and `Entity`, the
+    /// member read must resolve to the receiver's type so `GetClass` guards
+    /// narrow `ent.Entity` too. `ENT.Entity` is declared `self` because the
+    /// scoped class's `ENT` super type shadows `Entity`'s member.
+    #[gtest]
+    fn test_entity_self_back_reference_resolves_receiver_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/autorun/ent_lib.lua",
+            r#"
+            ---@class Entity
+            ---@field Entity self
+            ---@return string
+            function Entity:GetClass() end
+
+            ---@class ENTITY : Entity
+            ENTITY = {}
+
+            ---@class ENT : ENTITY
+            ---@field Entity self
+            ENT = {}
+
+            ---@class TraceResult
+            ---@field Entity Entity
+
+            ---@param p Entity
+            ---@return TraceResult
+            function GetEyeTrace(p) end
+        "#,
+        );
+
+        ws.def_file(
+            "entities/entities/cityrp_farmplot/init.lua",
+            r#"
+            function ENT:GetIsSoiled() end
+        "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/test/plant.lua",
+            r#"
+            local function f(player)
+                local trace = GetEyeTrace(player).Entity
+                if trace:GetClass() == "cityrp_farmplot" then
+                    trace.Entity:GetIsSoiled()
+                end
+            end
+        "#,
+        );
+
+        let ty = index_expr_type(&mut ws, file_id, "trace.Entity");
+        assert_eq!(
+            ty,
+            LuaType::Ref(LuaTypeDeclId::global("cityrp_farmplot")),
+            "trace.Entity should resolve to the narrowed receiver type, got {ty:?}"
+        );
+
+        let diags = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .expect("diagnostics");
+        let field_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.code,
+                    Some(NumberOrString::String(ref c))
+                        if c == "undefined-field"
+                            || c == "unchecked-nil-access"
+                            || c == "infer-unguarded-child"
+                )
+            })
+            .collect();
+        assert!(
+            field_diags.is_empty(),
+            "guarded trace.Entity access should not be flagged, got {field_diags:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_create_field_keeps_created_class_when_registration_binds_after_statements() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "annotations/panel.lua",
+                r#"
+                ---@meta
+                ---@class Panel
+                Panel = Panel or {}
+
+                ---@class (partial) DPanel : Panel
+                local DPanel = {}
+
+                ---@class (partial) DImage : DPanel
+                local DImage = {}
+
+                ---@param strImage string
+                ---@param strBackup? string
+                function DImage:SetImage(strImage, strBackup) end
+                "#,
+            ),
+            (
+                "annotations/vgui.lua",
+                r#"
+                ---@meta
+                vgui = {}
+                derma = {}
+
+                ---@generic T: Panel
+                ---@overload fun(classname: string, parent?: Panel, name?: string): Panel?
+                ---@[call_arg("gmod.vgui_panel", "reference")]
+                ---@param classname `T`
+                ---@[call_arg("gmod.vgui_panel", "parent")]
+                ---@param parent Panel?
+                ---@param name string?
+                ---@return (instance) T?
+                function vgui.Create(classname, parent, name) end
+
+                ---@[call_arg("gmod.vgui_panel", "define_control")]
+                ---@param name string
+                ---@param description string
+                ---@[call_arg("gmod.vgui_panel", "table")]
+                ---@param tab table
+                ---@[call_arg("gmod.vgui_panel", "base")]
+                ---@param derive string
+                function derma.DefineControl(name, description, tab, derive) end
+                "#,
+            ),
+            (
+                "gamemodes/cityrp/gamemode/core/derma/cl_hud_vehicle.lua",
+                r#"
+                local PANEL = {}
+
+                function PANEL:Init()
+                    self.fuelPanel = vgui.Create("DImage", self)
+                end
+
+                function PANEL:Think()
+                    self.fuelPanel:SetImage("a.png", "b.png")
+                end
+
+                derma.DefineControl("HudVehicle", "", PANEL, "DPanel")
+                "#,
+            ),
+        ]);
+        let hud_file_id = *file_ids.last().expect("hud file");
+
+        let mut field_type =
+            index_expr_prefix_type(&mut ws, hud_file_id, "self.fuelPanel:SetImage");
+        while let LuaType::Instance(instance) = field_type {
+            field_type = instance.get_base().clone();
+        }
+        assert_eq!(field_type, LuaType::Ref(LuaTypeDeclId::global("DImage")));
     }
 }

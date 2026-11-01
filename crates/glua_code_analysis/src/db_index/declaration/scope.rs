@@ -1,4 +1,6 @@
+use crate::db_index::derivation::hash_local;
 use rowan::{TextRange, TextSize};
+use std::hash::{Hash, Hasher};
 
 use crate::FileId;
 
@@ -15,13 +17,30 @@ pub enum LuaScopeKind {
     MethodStat,
 }
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub struct LuaScope {
     parent: Option<LuaScopeId>,
     children: Vec<ScopeOrDeclId>,
     range: TextRange,
     kind: LuaScopeKind,
     id: LuaScopeId,
+}
+
+impl Hash for LuaScope {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            parent,
+            children,
+            range,
+            kind,
+            id,
+        } = self;
+        parent.hash(state);
+        children.hash(state);
+        hash_local(range, state);
+        kind.hash(state);
+        id.hash(state);
+    }
 }
 
 impl LuaScope {

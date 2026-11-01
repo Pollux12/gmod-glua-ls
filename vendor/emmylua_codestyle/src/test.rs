@@ -135,7 +135,7 @@ mod tests {
         print(a+b)
         "#;
 
-        let result = crate::check_code_style("test.lua", code);
+        let result = crate::check_code_style("test.lua", code, false);
         println!("{:?}", result);
     }
 

@@ -5,6 +5,7 @@ use schemars::JsonSchema;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 
+/// Lua runtime settings.
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcRuntime {
@@ -36,8 +37,18 @@ impl Default for EmmyrcRuntime {
             extensions: Vec::new(),
             require_pattern: Vec::new(),
             nonstandard_symbol: default_nonstandard_symbols(),
-            special: HashMap::new(),
+            special: HashMap::default(),
         }
+    }
+}
+
+impl EmmyrcRuntime {
+    /// Whether text parses the same under `other`: the settings the parser
+    /// config is built from agree.
+    pub fn parses_like(&self, other: &Self) -> bool {
+        self.special == other.special
+            && self.require_like_function == other.require_like_function
+            && self.nonstandard_symbol == other.nonstandard_symbol
     }
 }
 
@@ -185,7 +196,7 @@ impl<'de> Deserialize<'de> for EmmyrcSpecialSymbol {
     where
         D: Deserializer<'de>,
     {
-        // 首先尝试使用默认的 derive 实现
+        // Try the default derive implementation first
         let s = String::deserialize(deserializer)?;
         match s.as_str() {
             "none" => Ok(EmmyrcSpecialSymbol::None),
@@ -194,7 +205,7 @@ impl<'de> Deserialize<'de> for EmmyrcSpecialSymbol {
             "assert" => Ok(EmmyrcSpecialSymbol::Assert),
             "type" => Ok(EmmyrcSpecialSymbol::Type),
             "setmetatable" => Ok(EmmyrcSpecialSymbol::Setmetatable),
-            // 对于任何不匹配的值，返回 None
+            // Return None for any value that does not match
             _ => Ok(EmmyrcSpecialSymbol::None),
         }
     }

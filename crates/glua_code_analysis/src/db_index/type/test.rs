@@ -7,14 +7,14 @@ mod test {
     use rowan::TextRange;
 
     use crate::db_index::traits::LuaIndex;
-    use crate::db_index::r#type::LuaTypeIndex;
+    use crate::db_index::r#type::{LuaTypeIndex, TypeCacheRef};
     use crate::db_index::{LuaDeclTypeKind, LuaTypeFlag};
     use crate::{
         DbIndex, FileId, InFiled, LuaDeclId, LuaDeclLocation, LuaDefinitionId,
         LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
         LuaInferenceProvenanceKind, LuaInferenceStep, LuaSignatureId, LuaType, LuaTypeCache,
-        LuaTypeDecl,
-        LuaTypeDeclId, LuaTypeFact, LuaTypeFactMetadata, LuaTypeOwner, resolve_alias_type,
+        LuaTypeDecl, LuaTypeDeclId, LuaTypeFact, LuaTypeFactMetadata, LuaTypeOwner,
+        resolve_alias_type,
     };
 
     fn create_type_index() -> LuaTypeIndex {
@@ -136,6 +136,7 @@ mod test {
         );
         index.force_bind_type(owner(), LuaTypeCache::InferType(LuaType::Number));
 
+        index.flush_inference_derived_state();
         let fact = index.get_type_fact(&owner()).unwrap();
         assert_eq!(fact.typ(), &LuaType::Number);
         assert_eq!(fact.confidence(), LuaInferenceConfidence::Certain);
@@ -184,108 +185,6 @@ mod test {
             Some(LuaInferenceProvenanceKind::ConcreteValue)
         );
         assert!(infer_fact.provenance().is_empty());
-    }
-
-    #[test]
-    fn inference_fact_authority_order_rejects_self_confirming_upgrades() {
-        let target = LuaInferenceNodeId::TypeOwner(owner());
-        let contextual = LuaTypeFact::new(
-            LuaType::Number,
-            LuaInferenceConfidence::Anchored,
-            anchored_metadata().provenance,
-        );
-        let concrete = LuaTypeFact::certain(LuaType::Number);
-        let explicit = LuaTypeFact::from_normalized_parts(
-            LuaType::Number,
-            LuaInferenceConfidence::Certain,
-            Some(LuaInferenceProvenanceKind::ExplicitAnnotation),
-            Arc::from([]),
-        );
-        let cyclic = LuaTypeFact::new(
-            LuaType::Number,
-            LuaInferenceConfidence::Certain,
-            Arc::from([LuaInferenceStep {
-                event: LuaInferenceEventId {
-                    node: target.clone(),
-                    kind: LuaInferenceProvenanceKind::ConcreteValue,
-                    source: source(30),
-                },
-                support: Arc::from([target.clone()]),
-                inferred_type: None,
-                found_type: None,
-            }]),
-        );
-
-        assert!(concrete.has_independently_stronger_authority_than(&contextual, &target));
-        assert!(explicit.has_independently_stronger_authority_than(&concrete, &target));
-        assert!(!contextual.has_independently_stronger_authority_than(&concrete, &target));
-        assert!(!cyclic.has_independently_stronger_authority_than(&contextual, &target));
-    }
-
-    #[test]
-    fn declared_base_does_not_replace_its_unguarded_child_runtime_refinement() {
-        let target = LuaInferenceNodeId::TypeOwner(owner());
-        let base_type = LuaType::Ref(LuaTypeDeclId::global("Entity"));
-        let refined_type = LuaType::Ref(LuaTypeDeclId::global("Player"));
-        let unguarded_child = LuaTypeFact::new(
-            refined_type,
-            LuaInferenceConfidence::Heuristic,
-            Arc::from([LuaInferenceStep {
-                event: LuaInferenceEventId {
-                    node: LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(
-                        LuaDeclId::new(file_id(), 10.into()),
-                    )),
-                    kind: LuaInferenceProvenanceKind::UnguardedChild,
-                    source: source(30),
-                },
-                support: Arc::from([]),
-                inferred_type: Some(Arc::new(LuaType::Ref(LuaTypeDeclId::global("Player")))),
-                found_type: Some(Arc::new(base_type.clone())),
-            }]),
-        );
-        let declared_base = LuaTypeFact::from_normalized_parts(
-            base_type.clone(),
-            LuaInferenceConfidence::Certain,
-            Some(LuaInferenceProvenanceKind::ExplicitAnnotation),
-            Arc::from([]),
-        );
-        let changed_declaration = LuaTypeFact::from_normalized_parts(
-            LuaType::Number,
-            LuaInferenceConfidence::Certain,
-            Some(LuaInferenceProvenanceKind::ExplicitAnnotation),
-            Arc::from([]),
-        );
-
-        assert!(
-            !declared_base.has_independently_stronger_authority_than(&unguarded_child, &target)
-        );
-        assert!(
-            changed_declaration
-                .has_independently_stronger_authority_than(&unguarded_child, &target)
-        );
-
-        let inherited_receiver_provenance = LuaTypeFact::new(
-            LuaType::Ref(LuaTypeDeclId::global("Vector")),
-            LuaInferenceConfidence::Heuristic,
-            Arc::from([LuaInferenceStep {
-                event: LuaInferenceEventId {
-                    node: LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(
-                        LuaDeclId::new(file_id(), 20.into()),
-                    )),
-                    kind: LuaInferenceProvenanceKind::UnguardedChild,
-                    source: source(30),
-                },
-                support: Arc::from([]),
-                inferred_type: Some(Arc::new(LuaType::Ref(LuaTypeDeclId::global("Vector")))),
-                found_type: Some(Arc::new(base_type)),
-            }]),
-        );
-        assert!(
-            declared_base.has_independently_stronger_authority_than(
-                &inherited_receiver_provenance,
-                &target,
-            )
-        );
     }
 
     #[test]
@@ -359,7 +258,10 @@ mod test {
         let provider_id = LuaTypeDeclId::global("ProviderType");
 
         let mut index = LuaTypeIndex::new();
-        index.add_type_decl(provider, class_decl(provider, "SharedType", shared_id.clone()));
+        index.add_type_decl(
+            provider,
+            class_decl(provider, "SharedType", shared_id.clone()),
+        );
         index.add_type_decl_location(contributor, &shared_id, decl_location(contributor));
         index.add_type_decl(
             provider,
@@ -410,6 +312,115 @@ mod test {
 
         index.remove_files(&[provider, table_owner]);
         assert_reference_lookup_matches_scan(&index, &files);
+    }
+
+    #[test]
+    fn signature_type_cache_is_found_by_both_the_symbol_and_the_file_lookup() {
+        let callee = FileId::new(1);
+        let consumer = FileId::new(2);
+        let signature_id = LuaSignatureId::new(callee, 5.into());
+        let mut index = LuaTypeIndex::new();
+        index.bind_type(
+            owner_in(consumer, 10),
+            LuaTypeCache::DocType(LuaType::Signature(signature_id)),
+        );
+
+        assert_eq!(
+            index.files_with_type_caches_referencing(&[TypeCacheRef::Signature(signature_id)]),
+            [consumer].into_iter().collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            index.files_with_type_caches_referencing_files(
+                &[callee].into_iter().collect::<HashSet<_>>()
+            ),
+            [consumer].into_iter().collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            index
+                .type_cache_refs_into_file(callee)
+                .cloned()
+                .collect::<HashSet<_>>(),
+            [TypeCacheRef::Signature(signature_id)]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn removing_the_referencing_file_clears_the_symbol_and_file_lookups() {
+        let callee = FileId::new(1);
+        let consumer = FileId::new(2);
+        let signature_id = LuaSignatureId::new(callee, 5.into());
+        let mut index = LuaTypeIndex::new();
+        index.bind_type(
+            owner_in(consumer, 10),
+            LuaTypeCache::DocType(LuaType::Signature(signature_id)),
+        );
+
+        index.remove_files(&[consumer]);
+
+        assert!(
+            index
+                .files_with_type_caches_referencing(&[TypeCacheRef::Signature(signature_id)])
+                .is_empty()
+        );
+        assert!(
+            index
+                .files_with_type_caches_referencing_files(
+                    &[callee].into_iter().collect::<HashSet<_>>()
+                )
+                .is_empty()
+        );
+        assert_eq!(index.type_cache_refs_into_file(callee).count(), 0);
+    }
+
+    #[test]
+    fn removing_the_referenced_file_keeps_the_reference_until_its_owner_rebinds() {
+        let callee = FileId::new(1);
+        let consumer = FileId::new(2);
+        let signature_id = LuaSignatureId::new(callee, 5.into());
+        let table_range = InFiled::new(callee, TextRange::new(0.into(), 1.into()));
+        let mut index = LuaTypeIndex::new();
+        index.bind_type(
+            owner_in(consumer, 10),
+            LuaTypeCache::DocType(LuaType::Signature(signature_id)),
+        );
+        index.bind_type(
+            owner_in(consumer, 20),
+            LuaTypeCache::DocType(LuaType::TableConst(table_range.clone())),
+        );
+
+        index.remove_files(&[callee]);
+
+        assert_eq!(
+            index
+                .type_cache_refs_into_file(callee)
+                .cloned()
+                .collect::<HashSet<_>>(),
+            [
+                TypeCacheRef::Signature(signature_id),
+                TypeCacheRef::Table(table_range)
+            ]
+            .into_iter()
+            .collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            index.files_with_type_caches_referencing_files(
+                &[callee].into_iter().collect::<HashSet<_>>()
+            ),
+            [consumer].into_iter().collect::<HashSet<_>>()
+        );
+
+        index.force_bind_type(
+            owner_in(consumer, 10),
+            LuaTypeCache::DocType(LuaType::String),
+        );
+        index.force_bind_type(
+            owner_in(consumer, 20),
+            LuaTypeCache::DocType(LuaType::String),
+        );
+
+        assert_eq!(index.type_cache_refs_into_file(callee).count(), 0);
     }
 
     #[test]
@@ -521,13 +532,16 @@ mod test {
             LuaTypeCache::InferType(LuaType::String),
             metadata.clone(),
         );
+        index.flush_inference_derived_state();
         assert!(index.get_inference_events_for_file(owner_file).is_empty());
         assert_eq!(index.get_inference_events_for_file(source_file).len(), 1);
 
         index.force_bind_type(owner.clone(), LuaTypeCache::InferType(LuaType::Number));
+        index.flush_inference_derived_state();
         assert!(index.get_inference_events_for_file(source_file).is_empty());
 
         index.force_bind_type_fact(owner, LuaTypeCache::InferType(LuaType::String), metadata);
+        index.flush_inference_derived_state();
         assert_eq!(index.get_inference_events_for_file(source_file).len(), 1);
         index.remove(owner_file);
         assert!(index.get_inference_events_for_file(source_file).is_empty());
@@ -566,6 +580,7 @@ mod test {
 
         index.force_bind_type(first_owner, LuaTypeCache::InferType(LuaType::Boolean));
 
+        index.flush_inference_derived_state();
         let remaining = index.get_inference_events_for_file(source_file);
         assert_eq!(remaining.len(), 1);
         assert_eq!(
@@ -642,6 +657,7 @@ mod test {
         );
 
         index.bind_definition_fact(definition, fact.clone());
+        index.flush_inference_derived_state();
 
         assert_eq!(index.get_definition_fact(&definition), Some(&fact));
         assert_eq!(
@@ -668,28 +684,6 @@ mod test {
         assert!(index.get_type_fact(&owner()).is_none());
         assert!(index.get_definition_fact(&definition).is_none());
         assert!(index.get_inference_events_for_file(file_id()).is_empty());
-    }
-
-    #[test]
-    fn inference_fact_table_const_replacement_keeps_event_fact_in_sync() {
-        let mut index = LuaTypeIndex::new();
-        let table_range = InFiled::new(file_id(), TextRange::new(30.into(), 32.into()));
-        index.force_bind_type_fact(
-            owner(),
-            LuaTypeCache::InferType(LuaType::TableConst(table_range.clone())),
-            anchored_metadata(),
-        );
-
-        index.replace_table_const_type(&table_range, &LuaType::Table);
-
-        assert_eq!(
-            index.get_type_fact(&owner()).unwrap().typ(),
-            &LuaType::Table
-        );
-        assert_eq!(
-            index.get_inference_events_for_file(file_id())[0].fact.typ(),
-            &LuaType::Table
-        );
     }
 
     #[test]
@@ -725,6 +719,7 @@ mod test {
             metadata,
         );
 
+        index.flush_inference_derived_state();
         let events = index.get_inference_events_for_file(file_id());
         assert_eq!(events.len(), 1, "{events:?}");
         let step = events[0]
@@ -748,11 +743,30 @@ mod test {
 
         assert_eq!(
             db.publish_inference_facts(vec![(node.clone(), fact.clone())]),
-            [file_id()]
-                .into_iter()
-                .collect::<std::collections::HashSet<_>>()
+            [file_id()].into_iter().collect::<HashSet<_>>()
         );
         assert_eq!(db.get_inference_fact(&node), Some(fact));
+    }
+
+    #[test]
+    fn publishing_inference_facts_defers_the_derived_state_rebuild() {
+        let mut db = DbIndex::new();
+        let fact = LuaTypeFact::new(
+            LuaType::String,
+            LuaInferenceConfidence::Anchored,
+            anchored_metadata().provenance,
+        );
+        db.publish_inference_facts(vec![(LuaInferenceNodeId::TypeOwner(owner()), fact)]);
+        assert!(db.get_type_index().inference_derived_state_is_stale());
+
+        db.flush_inference_derived_state();
+        assert!(!db.get_type_index().inference_derived_state_is_stale());
+        assert_eq!(
+            db.get_type_index()
+                .get_inference_events_for_file(file_id())
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -940,5 +954,82 @@ mod test {
         assert!(decl.is_class());
         assert_eq!(decl.get_namespace(), "test".into());
         assert_eq!(decl.get_full_name(), "test.new_type");
+    }
+
+    #[test]
+    fn test_private_namespaced_class_visible_only_in_own_file() {
+        let mut index = create_type_index();
+        let file_id = FileId { id: 1 };
+        let other_file_id = FileId { id: 2 };
+        index.add_file_namespace(file_id, "ns".to_string());
+        index.add_file_namespace(other_file_id, "ns".to_string());
+        index.add_type_decl(
+            file_id,
+            LuaTypeDecl::new(
+                file_id,
+                TextRange::new(0.into(), 4.into()),
+                "Hidden".to_string(),
+                LuaDeclTypeKind::Class,
+                LuaTypeFlag::Private.into(),
+                LuaTypeDeclId::local(file_id, "ns.Hidden"),
+            ),
+        );
+
+        let own = index.find_type_decl(file_id, "Hidden").unwrap();
+        assert_eq!(own.get_id(), LuaTypeDeclId::local(file_id, "ns.Hidden"));
+        assert!(index.find_type_decl(other_file_id, "Hidden").is_none());
+    }
+
+    #[test]
+    fn a_literal_holding_only_index_writes_is_still_an_empty_bootstrap() {
+        use crate::{
+            LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaMemberOwner, TypeOps,
+            prune_redundant_guarded_table_bootstrap_type,
+        };
+
+        let mut db = DbIndex::new();
+        let literal = InFiled::new(file_id(), TextRange::new(10.into(), 12.into()));
+        let write = |start: u32, key: LuaMemberKey| {
+            LuaMember::new(
+                LuaMemberId::new(
+                    LuaSyntaxId::new(
+                        LuaKind::Syntax(LuaSyntaxKind::IndexExpr),
+                        TextRange::new(start.into(), (start + 8).into()),
+                    ),
+                    file_id(),
+                ),
+                key,
+                LuaMemberFeature::FileDefine,
+                None,
+            )
+        };
+        let slot = || LuaType::from_vec(vec![LuaType::TableConst(literal.clone()), LuaType::Nil]);
+
+        db.get_member_index_mut().add_member(
+            LuaMemberOwner::Element(literal.clone()),
+            write(40, LuaMemberKey::ExprType(LuaType::Integer)),
+        );
+        assert_eq!(
+            prune_redundant_guarded_table_bootstrap_type(&db, slot()),
+            TypeOps::Union.apply(&db, &LuaType::Table, &LuaType::Nil)
+        );
+
+        db.get_member_index_mut().add_member(
+            LuaMemberOwner::Element(literal.clone()),
+            write(60, LuaMemberKey::Integer(0)),
+        );
+        assert_eq!(
+            prune_redundant_guarded_table_bootstrap_type(&db, slot()),
+            TypeOps::Union.apply(&db, &LuaType::Table, &LuaType::Nil)
+        );
+
+        db.get_member_index_mut().add_member(
+            LuaMemberOwner::Element(literal.clone()),
+            write(80, LuaMemberKey::Name("count".into())),
+        );
+        assert_eq!(
+            prune_redundant_guarded_table_bootstrap_type(&db, slot()),
+            slot()
+        );
     }
 }

@@ -10,8 +10,10 @@ impl Checker for RequireModuleVisibilityChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::RequireModuleNotVisible];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        for call_expr in root.descendants::<LuaCallExpr>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for call_expr in buckets.call_exprs.iter().cloned() {
             if call_expr.is_require() {
                 check_require_call_expr(context, semantic_model, call_expr);
             }
@@ -27,7 +29,7 @@ fn check_require_call_expr(
     let args_list = call_expr.get_args_list()?;
     let arg_expr = args_list.get_args().next()?;
 
-    // 获取模块路径
+    // Get the module path
     let ty = semantic_model
         .infer_expr(arg_expr.clone())
         .unwrap_or(LuaType::Any);
@@ -36,13 +38,13 @@ fn check_require_call_expr(
         _ => return Some(()),
     };
 
-    // 查找模块信息
+    // Look up the module info
     let module_info = semantic_model
         .get_db()
         .get_module_index()
         .find_module_for_file(&module_path, semantic_model.get_file_id())?;
 
-    // 检查可见性
+    // Check visibility
     if !check_export_visibility(semantic_model, module_info).unwrap_or(false) {
         context.add_diagnostic(
             DiagnosticCode::RequireModuleNotVisible,

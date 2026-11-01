@@ -13,7 +13,7 @@ use crate::{
     AsyncState, DbIndex, FileId, InFiled, LuaAliasCallKind, LuaAliasCallType, LuaArrayLen,
     LuaArrayType, LuaAttributeType, LuaFunctionType, LuaGenericType, LuaIndexAccessKey,
     LuaIntersectionType, LuaMultiLineUnion, LuaObjectType, LuaStringTplType, LuaTupleStatus,
-    LuaTupleType, LuaType, LuaTypeDeclId, TypeOps, VariadicType,
+    LuaTupleType, LuaType, LuaTypeDeclId, TypeOps, VariadicType, analysis_stack_exhausted,
 };
 
 #[derive(Clone, Copy)]
@@ -29,6 +29,9 @@ impl<'a> DocTypeInferContext<'a> {
 }
 
 pub fn infer_doc_type(ctx: DocTypeInferContext<'_>, node: &LuaDocType) -> LuaType {
+    if analysis_stack_exhausted() {
+        return LuaType::Unknown;
+    }
     match node {
         LuaDocType::Name(name_type) => {
             if let Some(name) = name_type.get_name_text() {

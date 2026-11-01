@@ -1,0 +1,100 @@
+---
+title: Fix common warnings
+description: Quick fixes for unknown globals, realm warnings and other common problems.
+---
+
+Most warnings point at a real mistake. When one does not, these are the usual causes and fixes. If a warning is plainly wrong, please [report it](https://github.com/Pollux12/gmod-glua-ls/issues) so it can be fixed for everyone.
+
+## "Undefined global"
+
+This usually means the global comes from an addon or gamemode that is not open in VS Code.
+
+- **Open or add the code that defines it.** Add the addon to your [multi-root workspace](/getting-started/workspace-setup#several-addons-or-a-gamemode-with-addons), or add its folder to [`workspace.library`](/getting-started/workspace-setup#code-from-outside-your-project). This also gives you completion for it.
+- **Mark it as known.** Click the warning, press `Ctrl+.` and choose **Add unknown '…' to global table (config)**. This adds the name to `diagnostics.globals` in `.gluarc.json`.
+
+```json .gluarc.json
+{
+  "diagnostics": {
+    "globals": ["DarkRP", "ix"]
+  }
+}
+```
+
+## Wrong realm warnings
+
+GLuaLS works out whether code runs on the client, the server or both (shared). It looks at:
+
+- `if CLIENT then` and `if SERVER then` blocks
+- File names starting with `cl_`, `sv_` or `sh_`
+- Standard folders, such as `lua/autorun/client` and `lua/autorun/server`
+- How the file is loaded, such as `AddCSLuaFile` and `include`
+- A `---@realm client`, `---@realm server` or `---@realm shared` annotation, which takes priority over everything else
+
+<Frame>
+  <img src="/images/showcase/realm-check.gif" alt="A client-only function in a server net.Receive gets a realm warning, and its hover shows the CLIENT badge" />
+</Frame>
+
+If a warning says code runs in the wrong realm, check these first. Usually the fix is to wrap the code in `if CLIENT then` / `if SERVER then`, or to rename the file with the right prefix.
+
+When only one function is different, annotate that function:
+
+```lua
+---@realm server
+function MyAddon.KickPlayer(ply, reason)
+    ply:Kick(reason)
+end
+```
+
+Files with no signal at all are treated as shared. Change that with `gmod.defaultRealm` in [Garry's Mod settings](/configuration/gmod).
+
+## Hide one warning
+
+Click the warning, press `Ctrl+.` and choose **Disable current line diagnostic**. This adds a comment:
+
+```lua
+---@diagnostic disable-next-line: undefined-field
+ent.SomeCustomField = true
+```
+
+To hide a block of code, use `---@diagnostic disable: code` and `---@diagnostic enable: code` around it. See [`@diagnostic`](/annotations/diagnostic).
+
+## Turn off a warning everywhere
+
+Click the warning, press `Ctrl+.` and choose **Disable all diagnostics in current project**. You can also turn the code off in the [settings panel](/configuration/overview) under **Diagnostics**, or add it to `diagnostics.disable` yourself:
+
+```json .gluarc.json
+{
+  "diagnostics": {
+    "disable": ["unused"]
+  }
+}
+```
+
+You can also make a warning less prominent instead of turning it off:
+
+```json .gluarc.json
+{
+  "diagnostics": {
+    "severity": {
+      "need-check-nil": "hint"
+    }
+  }
+}
+```
+
+The code name is shown at the end of each warning. [Diagnostics settings](/configuration/diagnostics) lists every code.
+
+## Missing completions or "type not found"
+
+- Check that the Garry's Mod annotations loaded. Run **GLuaLS: Update GLuaLS Annotations** from the Command Palette (`Ctrl+Shift+P`).
+- Check that the file is in **GLua** mode, shown in the bottom right of VS Code.
+- Check that the code that defines the type is open in VS Code or added as a library.
+
+## Slow analysis
+
+- Make sure you did not open the whole `garrysmod/` folder. Open each addon or gamemode instead.
+- Skip large folders you do not work on. Right-click a folder in the Explorer and choose **Add Directory to Ignore List**.
+
+## Still stuck
+
+Click **GLuaLS** in the status bar and choose **Show Output**. The output often explains what went wrong, and it is useful to include when you [open an issue](https://github.com/Pollux12/gmod-glua-ls/issues).

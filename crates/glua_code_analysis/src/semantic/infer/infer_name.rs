@@ -1,21 +1,26 @@
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr,
-    LuaForRangeStat, LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr,
-    LuaReturnStat, LuaSyntaxId, LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr,
+    LuaForRangeStat, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat, LuaLocalStat,
+    LuaNameExpr, LuaReturnStat, LuaStat, LuaSyntaxId, LuaSyntaxNode, LuaTableExpr, LuaTableField,
+    LuaVarExpr, PathTrait,
 };
-use rowan::TextSize;
+use rowan::{TextRange, TextSize};
 use std::sync::Arc;
 
 use super::{
     InferFailReason, InferResult, infer_expr, infer_table_field_value_should_be,
     infer_table_should_be,
 };
+use crate::semantic::local_initializer_expr;
 use crate::{
-    CacheEntry, FileId, GmodStateMask, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache,
-    LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
-    SemanticDeclLevel, TypeOps,
+    CacheEntry, FileId, GmodStateMask, LuaArrayLen, LuaArrayType, LuaDecl, LuaDeclExtra, LuaDeclId,
+    LuaInferCache, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType,
+    LuaTypeDeclId, ScriptedSingletons, SemanticDeclLevel, TypeOps,
     compilation::analyzer::{
-        gmod::{get_scripted_class_type_decl_id, name_expr_resolves_to_scoped_authoring_table},
+        gmod::{
+            detect_file_gamemode_scope, get_scripted_class_type_decl_id,
+            name_expr_resolves_to_scoped_authoring_table,
+        },
         infer_for_range_iter_expr_func,
     },
     db_index::{DbIndex, LuaDeclOrMemberId, LuaSignature, LuaSignatureId},
@@ -91,10 +96,6 @@ pub fn infer_name_expr(
             return Ok(implicit_module_type);
         }
 
-        if let Some(define_baseclass_type) = infer_define_baseclass_type(db, file_id, name) {
-            return Ok(define_baseclass_type);
-        }
-
         if let Some(class_decl_id) = resolve_global_singleton_scripted_type_decl_id(db, cache, name)
         {
             return Ok(LuaType::Def(class_decl_id));
@@ -127,31 +128,12 @@ pub fn infer_name_expr(
                         LuaExpr::NameExpr(name_expr.clone()),
                         var_ref_id,
                     );
-                    if decl_id.is_none() {
-                        if let Ok(ref typ) = narrow_res {
-                            let should_fallback =
-                                typ.is_nil() || matches!(typ, LuaType::TableConst(_));
-                            if should_fallback {
-                                if let Ok(global_type) = infer_global_type(
-                                    db,
-                                    Some(file_id),
-                                    Some(name_expr.get_position()),
-                                    name,
-                                ) {
-                                    if global_type.is_custom_type()
-                                        || (!global_type.is_nil()
-                                            && !global_type.is_nullable()
-                                            && !global_type.is_unknown()
-                                            && !matches!(
-                                                global_type,
-                                                LuaType::Any | LuaType::Never
-                                            ))
-                                    {
-                                        return Ok(global_type);
-                                    }
-                                }
-                            }
-                        }
+                    if decl_id.is_none()
+                        && let Ok(typ) = &narrow_res
+                        && let Some(global_type) =
+                            positional_global_table_fallback(db, file_id, &name_expr, typ)
+                    {
+                        return Ok(global_type);
                     }
                     narrow_res.or_else(|_| {
                         infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
@@ -165,7 +147,7 @@ pub fn infer_name_expr(
     if let Some(decl_id) = decl_id
         && result.as_ref().is_ok_and(|typ| typ.contain_tpl())
         && let Some(iter_type) =
-            try_infer_enclosing_for_range_iter_type(db, cache, &name_expr, decl_id)
+            try_infer_enclosing_for_range_iter_type(db, cache, name_expr.syntax(), decl_id)
     {
         return Ok(iter_type);
     }
@@ -185,44 +167,93 @@ pub fn infer_name_expr(
     result
 }
 
-fn resolve_global_singleton_scripted_type_decl_id(
+pub(crate) fn resolve_global_singleton_scripted_type_decl_id(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     name: &str,
 ) -> Option<LuaTypeDeclId> {
-    if cache.scripted_global_singleton_type_cache.is_none() {
-        let emmyrc = db.get_emmyrc();
-        let mut lookup = rustc_hash::FxHashMap::default();
-
-        if emmyrc.gmod.enabled {
-            for definition in emmyrc
-                .gmod
-                .scripted_class_scopes
-                .resolved_definitions_slice()
-                .iter()
-                .filter(|definition| definition.is_global_singleton)
-            {
-                let class_name = definition
-                    .fixed_class_name
-                    .as_deref()
-                    .unwrap_or(&definition.class_global);
-                let type_decl_id =
-                    get_scripted_class_type_decl_id(&definition.class_global, class_name);
-                lookup.insert(definition.class_global.clone(), type_decl_id.clone());
-                for alias in &definition.aliases {
-                    lookup.insert(alias.clone(), type_decl_id.clone());
-                }
-            }
-        }
-
-        cache.scripted_global_singleton_type_cache = Some(lookup);
+    let singletons = cache
+        .scripted_global_singleton_type_cache
+        .get_or_insert_with(|| scripted_singletons(db));
+    if singletons.gamemode_names.contains(name)
+        && let Some(type_decl_id) = file_gamemode_class(db, cache)
+    {
+        return Some(type_decl_id);
     }
-
     cache
         .scripted_global_singleton_type_cache
-        .as_ref()
-        .and_then(|lookup| lookup.get(name))
+        .as_ref()?
+        .classes
+        .get(name)
         .cloned()
+}
+
+/// The global singleton names the config's scripted-class scopes bind.
+fn scripted_singletons(db: &DbIndex) -> ScriptedSingletons {
+    let mut singletons = ScriptedSingletons::default();
+    let emmyrc = db.get_emmyrc();
+    if !emmyrc.gmod.enabled {
+        return singletons;
+    }
+    let definitions = emmyrc
+        .gmod
+        .scripted_class_scopes
+        .resolved_definitions_slice();
+    for definition in definitions
+        .iter()
+        .filter(|definition| definition.is_global_singleton)
+    {
+        let class_name = definition
+            .fixed_class_name
+            .as_deref()
+            .unwrap_or(&definition.class_global);
+        let type_decl_id = get_scripted_class_type_decl_id(&definition.class_global, class_name);
+        singletons
+            .classes
+            .insert(definition.class_global.clone(), type_decl_id.clone());
+        for alias in &definition.aliases {
+            singletons
+                .classes
+                .insert(alias.clone(), type_decl_id.clone());
+        }
+    }
+    // A file inside a gamemode folder scopes `GM`/`GAMEMODE` to that
+    // gamemode's class: the runtime global `GAMEMODE` is the gamemode table,
+    // so plugin and entity files see the same members `gamemode/**` files
+    // author.
+    if let Some(definition) = definitions
+        .iter()
+        .find(|definition| definition.id == "gamemodes")
+    {
+        singletons
+            .gamemode_names
+            .insert(definition.class_global.clone());
+        singletons
+            .gamemode_names
+            .extend(definition.aliases.iter().cloned());
+        if definition.class_global == "GM" {
+            singletons.gamemode_names.insert("GAMEMODE".to_string());
+        }
+    }
+    singletons
+}
+
+/// The class of the gamemode the cache's file belongs to.
+fn file_gamemode_class(db: &DbIndex, cache: &mut LuaInferCache) -> Option<LuaTypeDeclId> {
+    if let Some(class) = cache.tracked_get(|cache| &mut cache.gamemode_class_cache, &()) {
+        return class;
+    }
+    let frame = crate::db_index::derivation::open_frame();
+    let class = detect_file_gamemode_scope(db, cache.get_file_id()).map(|(_, scope_match)| {
+        get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name)
+    });
+    cache.tracked_insert(
+        |cache| &mut cache.gamemode_class_cache,
+        (),
+        class.clone(),
+        frame,
+    );
+    class
 }
 
 fn infer_local_decl_name_type(
@@ -241,27 +272,11 @@ fn infer_local_decl_name_type(
         .get_decl(&decl_id)
         .is_some_and(|decl| decl.is_global());
 
-    if is_global {
-        if let Ok(ref typ) = result {
-            let should_fallback = typ.is_nil() || matches!(typ, LuaType::TableConst(_));
-            if should_fallback {
-                if let Some(name_token) = name_expr.get_name_token() {
-                    let name = name_token.get_name_text();
-                    if let Ok(global_type) =
-                        infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
-                    {
-                        if global_type.is_custom_type()
-                            || (!global_type.is_nil()
-                                && !global_type.is_nullable()
-                                && !global_type.is_unknown()
-                                && !matches!(global_type, LuaType::Any | LuaType::Never))
-                        {
-                            return Ok(global_type);
-                        }
-                    }
-                }
-            }
-        }
+    if is_global
+        && let Ok(typ) = &result
+        && let Some(global_type) = positional_global_table_fallback(db, file_id, name_expr, typ)
+    {
+        return Ok(global_type);
     }
 
     if let Ok(typ) = &result
@@ -273,16 +288,310 @@ fn infer_local_decl_name_type(
             name_expr.get_position(),
         )
     {
+        if is_global
+            && let Some(global_type) =
+                positional_global_table_fallback(db, file_id, name_expr, &initializer_type)
+        {
+            return Ok(global_type);
+        }
         return Ok(initializer_type);
+    }
+
+    if let Ok(typ) = &result
+        && let Some(transformed) =
+            try_in_place_ipairs_transform_element_type(db, cache, name_expr, decl_id, typ)
+    {
+        return Ok(transformed);
     }
 
     result
 }
 
-fn try_infer_enclosing_for_range_iter_type(
+fn positional_global_table_fallback(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+    typ: &LuaType,
+) -> Option<LuaType> {
+    if !typ.is_nil() && !matches!(typ, LuaType::TableConst(_) | LuaType::MergedTable(_)) {
+        return None;
+    }
+    let name_token = name_expr.get_name_token()?;
+    let name = name_token.get_name_text();
+    let global_type =
+        infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name).ok()?;
+    (global_type.is_custom_type()
+        || (!global_type.is_nil()
+            && !global_type.is_nullable()
+            && !global_type.is_unknown()
+            && !matches!(global_type, LuaType::Any | LuaType::Never)))
+    .then_some(global_type)
+}
+
+/// Recognises the in-place `ipairs` transform idiom
+/// `for k, v in ipairs(arr) do arr[k] = expr end` and returns the array type the
+/// loop leaves behind for a read that follows it. `ipairs` walks exactly the
+/// array's sequential part and the body rewrites every element it visits, so
+/// after the loop each element is the RHS type -- provable coverage, not a
+/// guess. The read has to sit past the loop's end; the loop's own header and
+/// body still see the pre-transform element type.
+fn try_in_place_ipairs_transform_element_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,
+    decl_id: LuaDeclId,
+    current_type: &LuaType,
+) -> Option<LuaType> {
+    if !matches!(current_type, LuaType::Array(_)) {
+        return None;
+    }
+    let file_id = cache.get_file_id();
+    if decl_id.file_id != file_id {
+        return None;
+    }
+
+    if !cache.in_place_ipairs_transform_cache.contains_key(&decl_id) {
+        // Seed `None` before computing: inferring the loop's RHS re-reads the
+        // array (through `ipairs`), and those reads sit inside the loop, so they
+        // must resolve to the pre-transform element type rather than re-enter
+        // this recogniser.
+        cache.in_place_ipairs_transform_cache.insert(decl_id, None);
+        let computed = compute_in_place_ipairs_transform(db, cache, decl_id, file_id);
+        cache
+            .in_place_ipairs_transform_cache
+            .insert(decl_id, computed);
+    }
+
+    let (loop_end, element_type) = cache
+        .in_place_ipairs_transform_cache
+        .get(&decl_id)?
+        .clone()?;
+
+    let read_position = name_expr.get_position();
+    if read_position < loop_end || is_written_between(db, decl_id, loop_end, read_position) {
+        return None;
+    }
+    Some(LuaType::Array(Arc::new(LuaArrayType::new(
+        element_type,
+        LuaArrayLen::None,
+    ))))
+}
+
+/// Whether `decl_id` is assigned anywhere from `start` up to `end`.
+fn is_written_between(db: &DbIndex, decl_id: LuaDeclId, start: TextSize, end: TextSize) -> bool {
+    db.get_reference_index()
+        .get_local_reference(&decl_id.file_id)
+        .and_then(|references| references.get_decl_references(&decl_id))
+        .is_some_and(|references| {
+            references.cells.iter().any(|cell| {
+                cell.is_write && cell.range.start() >= start && cell.range.start() < end
+            })
+        })
+}
+
+/// Scans the array local's declaring block once for the in-place `ipairs`
+/// transform loop and returns where it ends together with the element type it
+/// leaves, or `None` when the block holds no such loop.
+fn compute_in_place_ipairs_transform(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl_id: LuaDeclId,
+    file_id: FileId,
+) -> Option<(TextSize, LuaType)> {
+    let root = db.get_vfs().get_syntax_tree(&file_id)?.get_red_root();
+    let decl_token = root.token_at_offset(decl_id.position).right_biased()?;
+    let block = decl_token.parent_ancestors().find_map(LuaBlock::cast)?;
+
+    for stat in block.get_stats() {
+        let LuaStat::ForRangeStat(for_range) = stat else {
+            continue;
+        };
+        if for_range.get_position() <= decl_id.position {
+            continue;
+        }
+        if let Some(element_type) =
+            ipairs_transform_element_type(db, cache, &for_range, decl_id, file_id)
+        {
+            return Some((for_range.get_range().end(), element_type));
+        }
+    }
+    None
+}
+
+/// The element type a `for k, v in ipairs(arr) do arr[k] = expr end` loop writes,
+/// or `None` when the loop is not that exact shape over `decl_id`. The body's
+/// write must be an unconditional direct child and the body itself must have no
+/// control flow that skips or exits elements, so every visited element really
+/// takes the RHS type.
+fn ipairs_transform_element_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    for_range: &LuaForRangeStat,
+    decl_id: LuaDeclId,
+    file_id: FileId,
+) -> Option<LuaType> {
+    let iter_exprs = for_range.get_expr_list().collect::<Vec<_>>();
+    let [LuaExpr::CallExpr(iter_call)] = iter_exprs.as_slice() else {
+        return None;
+    };
+    if !is_global_ipairs_call(db, cache, file_id, iter_call) {
+        return None;
+    }
+
+    let body = for_range.get_block()?;
+    if loop_body_has_partial_coverage_risk(&body) {
+        return None;
+    }
+
+    let iter_args = iter_call.get_args_list()?.get_args().collect::<Vec<_>>();
+    let [LuaExpr::NameExpr(iter_arg)] = iter_args.as_slice() else {
+        return None;
+    };
+    if !name_expr_resolves_to_decl(db, file_id, iter_arg, decl_id) {
+        return None;
+    }
+
+    let key_name = for_range
+        .get_var_name_list()
+        .next()?
+        .get_name_text()
+        .to_string();
+
+    let mut transform_rhs = None;
+    for stat in body.get_stats() {
+        let LuaStat::AssignStat(assign) = stat else {
+            continue;
+        };
+        let (vars, exprs) = assign.get_var_and_expr_list();
+        let ([LuaVarExpr::IndexExpr(index_expr)], [rhs]) = (vars.as_slice(), exprs.as_slice())
+        else {
+            continue;
+        };
+        let Some(LuaExpr::NameExpr(prefix)) = index_expr.get_prefix_expr() else {
+            continue;
+        };
+        if !name_expr_resolves_to_decl(db, file_id, &prefix, decl_id) {
+            continue;
+        }
+        let Some(LuaIndexKey::Expr(LuaExpr::NameExpr(key))) = index_expr.get_index_key() else {
+            continue;
+        };
+        if key.get_name_text().as_deref() != Some(key_name.as_str()) {
+            continue;
+        }
+        transform_rhs = Some(rhs.clone());
+        break;
+    }
+
+    let element_type = infer_expr(db, cache, transform_rhs?).ok()?;
+    (!element_type.is_unknown()).then_some(element_type)
+}
+
+/// Matches a bare `ipairs(...)` call that really resolves to the global builtin:
+/// an `_G.ipairs(...)` index call, a local/param shadow, or a user-workspace
+/// global redefinition of `ipairs` all fail, so their loops never get the
+/// transform. The global must resolve to a declaration in the std or library
+/// workspace; unresolved names and main/remote definitions are rejected.
+fn is_global_ipairs_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    call: &LuaCallExpr,
+) -> bool {
+    let Some(LuaExpr::NameExpr(name_expr)) = call.get_prefix_expr() else {
+        return false;
+    };
+    if name_expr.get_name_text().as_deref() != Some("ipairs") {
+        return false;
+    }
+
+    if db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        .is_some()
+    {
+        return false;
+    }
+
+    match resolve_global_decl_id(db, cache, "ipairs", Some(&name_expr)) {
+        None => false,
+        Some(decl_id) => db
+            .get_module_index()
+            .get_workspace_id(decl_id.file_id)
+            .is_some_and(|workspace_id| {
+                let module_index = db.get_module_index();
+                module_index.is_std_workspace_id(workspace_id)
+                    || module_index.is_library_workspace_id(workspace_id)
+            }),
+    }
+}
+
+/// Whether the loop body contains control flow that can skip or exit elements,
+/// which would leave parts of the array unrewritten by the transform's
+/// unconditional element write. Mirrors the rejected-control-flow scan in the
+/// numeric range population analyzer: nested closures are transparent, since
+/// their control flow never escapes the enclosing loop.
+fn loop_body_has_partial_coverage_risk(body: &LuaBlock) -> bool {
+    for stat in body.descendants::<LuaStat>() {
+        if is_node_in_nested_closure(stat.syntax(), body.syntax()) {
+            continue;
+        }
+        match stat {
+            LuaStat::BreakStat(_)
+            | LuaStat::ReturnStat(_)
+            | LuaStat::GotoStat(_)
+            | LuaStat::LabelStat(_)
+            | LuaStat::IfStat(_)
+            | LuaStat::WhileStat(_)
+            | LuaStat::RepeatStat(_)
+            | LuaStat::ForStat(_)
+            | LuaStat::ForRangeStat(_) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn is_node_in_nested_closure(node: &LuaSyntaxNode, boundary: &LuaSyntaxNode) -> bool {
+    node.ancestors()
+        .take_while(|ancestor| ancestor != boundary)
+        .any(|ancestor| LuaClosureExpr::can_cast(ancestor.kind().into()))
+}
+
+fn name_expr_resolves_to_decl(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+    decl_id: LuaDeclId,
+) -> bool {
+    db.get_reference_index()
+        .get_var_reference_decl(&file_id, name_expr.get_range())
+        == Some(decl_id)
+}
+
+/// The `for ... in` loop around `name_expr` that declares `decl_id`, with the
+/// variable's index among the loop's.
+pub(crate) fn declaring_for_range(
+    node: &LuaSyntaxNode,
+    decl_id: LuaDeclId,
+) -> Option<(LuaForRangeStat, usize)> {
+    node.ancestors()
+        .filter_map(LuaForRangeStat::cast)
+        .find_map(|for_range| {
+            let var_idx = for_range
+                .get_var_name_list()
+                .position(|var_name| var_name.get_position() == decl_id.position)?;
+            Some((for_range, var_idx))
+        })
+}
+
+/// The type of the loop variable `decl_id`, inferred from its loop's
+/// iterator under `cache`'s view.
+pub(crate) fn try_infer_enclosing_for_range_iter_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    node: &LuaSyntaxNode,
     decl_id: LuaDeclId,
 ) -> Option<LuaType> {
     if let Some(cached) = cache.for_range_iter_var_type_cache.get(&decl_id).cloned() {
@@ -292,14 +601,7 @@ fn try_infer_enclosing_for_range_iter_type(
         };
     }
 
-    let for_range = name_expr
-        .syntax()
-        .ancestors()
-        .find_map(LuaForRangeStat::cast)?;
-    let var_idx = for_range
-        .get_var_name_list()
-        .enumerate()
-        .find_map(|(idx, var_name)| (var_name.get_position() == decl_id.position).then_some(idx))?;
+    let (for_range, var_idx) = declaring_for_range(node, decl_id)?;
     let iter_exprs = for_range.get_expr_list().collect::<Vec<_>>();
     cache
         .for_range_iter_var_type_cache
@@ -309,7 +611,7 @@ fn try_infer_enclosing_for_range_iter_type(
         Err(reason) => {
             cache
                 .for_range_iter_var_type_cache
-                .insert(decl_id, CacheEntry::Error(reason));
+                .insert(decl_id, CacheEntry::error(reason));
             return None;
         }
     };
@@ -317,6 +619,15 @@ fn try_infer_enclosing_for_range_iter_type(
         .get_type(var_idx)
         .cloned()
         .unwrap_or(LuaType::Unknown);
+    let ret_type = if ret_type.contain_tpl() {
+        if let Some(Some(proven)) = iter_var_types.settled_overrides.get(var_idx) {
+            proven.clone()
+        } else {
+            ret_type
+        }
+    } else {
+        ret_type
+    };
     let ret_type = TypeOps::Remove.apply(db, &ret_type, &LuaType::Nil);
     cache
         .for_range_iter_var_type_cache
@@ -423,72 +734,9 @@ fn has_local_reassignment_between(
         return false;
     }
 
-    if !cache.local_reassignments_indexed {
-        collect_local_reassignment_positions(db, cache);
-    }
-
-    cache
-        .local_reassignment_positions_cache
-        .get(&decl_id)
-        .and_then(|positions| positions.first())
-        .is_some_and(|position| *position < query_position)
-}
-
-fn collect_local_reassignment_positions(db: &DbIndex, cache: &mut LuaInferCache) {
-    cache.local_reassignments_indexed = true;
-    let file_id = cache.get_file_id();
-    let Some(root) = db
-        .get_vfs()
-        .get_syntax_tree(&file_id)
-        .map(|tree| tree.get_red_root())
-    else {
-        return;
-    };
-
-    let references = db.get_reference_index().get_local_reference(&file_id);
-    let decl_tree = db.get_decl_index().get_decl_tree(&file_id);
-    for assign_stat in root.descendants().filter_map(LuaAssignStat::cast) {
-        let position = assign_stat.get_position();
-
-        let (vars, _) = assign_stat.get_var_and_expr_list();
-        for var in vars {
-            let LuaVarExpr::NameExpr(name_expr) = var else {
-                continue;
-            };
-
-            let assigned_decl_id = references
-                .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))
-                .or_else(|| assignment_name_decl_id(decl_tree, &name_expr));
-            let Some(assigned_decl_id) = assigned_decl_id else {
-                continue;
-            };
-            if assigned_decl_id.file_id != file_id || position <= assigned_decl_id.position {
-                continue;
-            }
-
-            cache
-                .local_reassignment_positions_cache
-                .entry(assigned_decl_id)
-                .or_default()
-                .push(position);
-        }
-    }
-
-    for positions in cache.local_reassignment_positions_cache.values_mut() {
-        positions.sort_unstable();
-        positions.dedup();
-    }
-}
-
-fn assignment_name_decl_id(
-    decl_tree: Option<&crate::LuaDeclarationTree>,
-    name_expr: &LuaNameExpr,
-) -> Option<LuaDeclId> {
-    let name = name_expr.get_name_text()?;
-
-    decl_tree
-        .and_then(|tree| tree.find_local_decl(&name, name_expr.get_position()))
-        .map(|decl| decl.get_id())
+    db.get_reference_index()
+        .first_local_reassignment(cache.get_file_id(), &decl_id)
+        .is_some_and(|position| position < query_position)
 }
 
 fn try_infer_local_initializer_type(
@@ -511,17 +759,6 @@ fn try_infer_local_initializer_type(
     (!init_type.is_never() && !init_type.is_nil()).then_some(init_type)
 }
 
-fn local_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<(usize, LuaExpr)> {
-    let decl = db.get_decl_index().get_decl(&decl_id)?;
-    let initializer = decl.get_initializer()?;
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&decl_id.file_id)?
-        .get_red_root();
-    let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
-    Some((initializer.get_ret_idx(), LuaExpr::cast(node)?))
-}
-
 fn local_decl_type_cache_is_inferred(db: &DbIndex, decl_id: LuaDeclId) -> bool {
     db.get_type_index()
         .get_type_cache(&decl_id.into())
@@ -539,21 +776,19 @@ fn is_gmod_dynamic_initializer(db: &DbIndex, decl_id: LuaDeclId) -> bool {
     )
 }
 
-fn infer_define_baseclass_type(db: &DbIndex, file_id: FileId, name: &str) -> Option<LuaType> {
-    if !db.get_emmyrc().gmod.enabled || name != "BaseClass" {
-        return None;
-    }
-
-    let base_name = db
-        .get_gmod_class_metadata_index()
-        .get_define_baseclass_name(&file_id)?;
-    Some(LuaType::Ref(LuaTypeDeclId::global(base_name)))
-}
-
 fn infer_self(db: &DbIndex, cache: &mut LuaInferCache, name_expr: LuaNameExpr) -> InferResult {
-    let self_ref_id = match get_name_expr_var_ref_id(db, cache, &name_expr) {
-        Some(VarRefId::SelfRef(self_ref_id)) => self_ref_id,
-        _ => return Err(InferFailReason::None),
+    let var_ref_id = get_name_expr_var_ref_id(db, cache, &name_expr);
+    let self_ref_id = match var_ref_id {
+        Some(VarRefId::SelfRef(self_ref_id)) => Some(self_ref_id),
+        // Receiver-id resolution can fail even when the receiver's type is
+        // still derivable: `find_self_receiver_id` resolves the colon-method
+        // prefix through semantic-decl lookup, which has no route for a
+        // shapeless (bare `table`) intermediate link — e.g. after the settled
+        // widening of a guarded `x.y = x.y or {}` bootstrap. The seed below
+        // re-derives the receiver type through prefix inference, which does
+        // resolve such chains, so fall back to it instead of erroring: an
+        // error here silently empties `self.` member completions and hover.
+        _ => None,
     };
 
     // Compute a region-aware base for the implicit `self` (the colon-method
@@ -567,6 +802,9 @@ fn infer_self(db: &DbIndex, cache: &mut LuaInferCache, name_expr: LuaNameExpr) -
     // so generic `SelfInfer`/declared-parameter `self` still falls through to
     // the canonical `get_var_ref_type` resolution.
     let base_seed = infer_implicit_method_self_type(db, cache, &name_expr);
+    let Some(self_ref_id) = self_ref_id else {
+        return base_seed.ok_or(InferFailReason::None);
+    };
 
     infer_expr_narrow_type_with_self_base(
         db,
@@ -608,13 +846,24 @@ fn infer_implicit_method_self_type(
     let func_syntax_id = func_stat.get_syntax_id();
 
     // Cache the unified result (including a negative result) for subsequent
-    // `self` references in the same method body.
-    if let Some(cached) = cache.self_type_cache.get(&func_syntax_id) {
-        return cached.clone();
+    // `self` references in the same method body. A result that consulted the
+    // call-site gate is only reused under the same view.
+    cache.watch_reuse();
+    if let Some(cached) = cache.tracked_get(|cache| &mut cache.self_type_cache, &func_syntax_id) {
+        cache.check_reuse(func_syntax_id, &cached, |fresh| {
+            Some(infer_implicit_method_self_type_inner(db, fresh, name_expr))
+        });
+        return cached;
     }
 
+    let frame = crate::db_index::derivation::open_frame();
     let result = infer_implicit_method_self_type_inner(db, cache, name_expr);
-    cache.self_type_cache.insert(func_syntax_id, result.clone());
+    cache.tracked_insert(
+        |cache| &mut cache.self_type_cache,
+        func_syntax_id,
+        result.clone(),
+        frame,
+    );
     result
 }
 
@@ -631,9 +880,7 @@ fn infer_implicit_method_self_type_inner(
     // A colon method selected as a raw table member can be invoked with an
     // explicit receiver (`callback(self, ...)`). Call-site analysis stores that
     // receiver in the synthetic slot immediately after the explicit params.
-    if let Some(call_site_type) =
-        infer_implicit_self_type_from_call_site(db, cache.get_file_id(), name_expr)
-    {
+    if let Some(call_site_type) = infer_implicit_self_type_from_call_site(db, cache, name_expr) {
         return Some(call_site_type);
     }
 
@@ -641,18 +888,23 @@ fn infer_implicit_method_self_type_inner(
     //    This is region-aware, so a reused local resolves `self` to the class
     //    of the table backing the current region.
     let prefix_type = infer_method_prefix_type(db, cache, &func_stat)?;
-    is_concrete_self_receiver_type(&prefix_type).then_some(prefix_type)
+    (prefix_type.is_unknown() || is_concrete_self_receiver_type(&prefix_type))
+        .then_some(prefix_type)
 }
 
 fn infer_implicit_self_type_from_call_site(
     db: &DbIndex,
-    file_id: FileId,
+    cache: &LuaInferCache,
     name_expr: &LuaNameExpr,
 ) -> Option<LuaType> {
+    let file_id = cache.get_file_id();
     let closure = name_expr.ancestors::<LuaClosureExpr>().next()?;
     let signature_id = LuaSignatureId::from_closure(file_id, &closure);
     let signature = db.get_signature_index().get(&signature_id)?;
     if !signature.is_colon_define {
+        return None;
+    }
+    if !cache.call_site_params_visible() {
         return None;
     }
     db.get_call_site_param_index()
@@ -703,7 +955,7 @@ pub(crate) fn is_authoritative_self_receiver_type(typ: &LuaType) -> bool {
 /// directly as an implicit `self` type. Rejects unconstrained/unknown types so
 /// the caller falls back to the generic `SelfRef` resolution path (preserving
 /// generic `SelfInfer` and declared-parameter behavior).
-fn is_concrete_self_receiver_type(typ: &LuaType) -> bool {
+pub(crate) fn is_concrete_self_receiver_type(typ: &LuaType) -> bool {
     match typ {
         LuaType::Def(_)
         | LuaType::Ref(_)
@@ -721,10 +973,31 @@ pub fn get_name_expr_var_ref_id(
     name_expr: &LuaNameExpr,
 ) -> Option<VarRefId> {
     let syntax_id = name_expr.get_syntax_id();
-    if let Some(var_ref_id) = cache.expr_var_ref_id_cache.get(&syntax_id) {
-        return Some(var_ref_id.clone());
+    if let Some(var_ref_id) =
+        cache.tracked_get(|cache| &mut cache.expr_var_ref_id_cache, &syntax_id)
+    {
+        return Some(var_ref_id);
     }
 
+    let frame = crate::db_index::derivation::open_frame();
+    let Some(var_ref_id) = name_expr_var_ref_id_uncached(db, cache, name_expr) else {
+        cache.close_frame(frame);
+        return None;
+    };
+    cache.tracked_insert(
+        |cache| &mut cache.expr_var_ref_id_cache,
+        syntax_id,
+        var_ref_id.clone(),
+        frame,
+    );
+    Some(var_ref_id)
+}
+
+fn name_expr_var_ref_id_uncached(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+) -> Option<VarRefId> {
     let name_token = name_expr.get_name_token()?;
     let name = name_token.get_name_text();
     let var_ref_id = match name {
@@ -747,21 +1020,28 @@ pub fn get_name_expr_var_ref_id(
                 VarRefId::VarRef(global_decl_id)
             } else {
                 VarRefId::GlobalName(
-                    internment::ArcIntern::new(smol_str::SmolStr::new(name)),
+                    crate::db_index::intern_smol_str(name),
                     name_expr.get_position(),
                 )
             }
         }
     };
-
-    cache
-        .expr_var_ref_id_cache
-        .insert(syntax_id, var_ref_id.clone());
     Some(var_ref_id)
 }
 
 pub fn infer_param(db: &DbIndex, decl: &LuaDecl) -> InferResult {
-    infer_param_inner(db, None, decl).map(|(typ, _)| typ)
+    infer_param_inner(db, None, decl, true).map(|(typ, _)| typ)
+}
+
+/// What declares or contracts the param `decl`, leaving out what its callers pass.
+fn infer_param_contract(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl: &LuaDecl,
+) -> Option<LuaType> {
+    infer_param_inner(db, Some(cache), decl, false)
+        .ok()
+        .map(|(typ, _)| typ)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -782,6 +1062,7 @@ fn infer_param_inner(
     db: &DbIndex,
     mut cache: Option<&mut LuaInferCache>,
     decl: &LuaDecl,
+    with_callers: bool,
 ) -> Result<(LuaType, ParamInferenceSource), InferFailReason> {
     let (param_idx, signature_id, member_id) = match &decl.extra {
         LuaDeclExtra::Param {
@@ -794,7 +1075,7 @@ fn infer_param_inner(
 
     let mut colon_define = false;
     // find local annotation
-    if let Some(signature) = db.get_signature_index().get(&signature_id) {
+    if let Some(signature) = db.get_signature_index().get_declared(&signature_id) {
         colon_define = signature.is_colon_define;
         if let Some(param_info) = signature.get_param_info_by_id(param_idx) {
             let mut typ = param_info.type_ref.clone();
@@ -808,7 +1089,7 @@ fn infer_param_inner(
                 typ,
                 param_idx,
                 colon_define,
-                decl.get_name() == "...",
+                false,
             );
 
             if let Some(member_id) = member_id
@@ -817,14 +1098,19 @@ fn infer_param_inner(
                     member_id,
                     param_idx,
                     colon_define,
-                    decl.get_name() == "...",
+                    false,
                     Some(&typ),
                 )
             {
                 typ = TypeOps::Union.apply(db, &typ, &sibling_type);
             }
 
-            return Ok((typ, ParamInferenceSource::Explicit));
+            let source = if param_idx == 0 && signature.receiver_filled_from_slot {
+                ParamInferenceSource::Contextual
+            } else {
+                ParamInferenceSource::Explicit
+            };
+            return Ok((typ, source));
         }
     }
 
@@ -893,21 +1179,45 @@ fn infer_param_inner(
         return Ok((file_hint_type, ParamInferenceSource::Explicit));
     }
 
+    if let Some(cache) = cache.as_mut()
+        && let Some(contract_type) =
+            infer_param_type_from_callback_slots(db, cache, decl, signature_id, param_idx)
+    {
+        return Ok((contract_type, ParamInferenceSource::Concrete));
+    }
+
+    // A closure passed as an argument holds what its callee passes it; any other
+    // function's call-site facts are what its callers pass.
     if let Some(call_site_type) = db
         .get_call_site_param_index()
         .get_inferred_param(&signature_id, param_idx)
+        && (with_callers || is_call_argument_closure(db, signature_id))
     {
         let source = db
             .get_call_site_param_index()
             .get_inferred_param_fact(&signature_id, param_idx)
             .map_or(ParamInferenceSource::Concrete, |fact| {
-                if fact.confidence() >= crate::LuaInferenceConfidence::Certain {
+                let concrete_provenance = !fact.provenance().is_empty()
+                    && fact.provenance().iter().all(|step| {
+                        matches!(
+                            step.event.kind,
+                            crate::LuaInferenceProvenanceKind::ConcreteValue
+                                | crate::LuaInferenceProvenanceKind::ExplicitAnnotation
+                        )
+                    });
+                if fact.confidence() >= crate::LuaInferenceConfidence::Certain
+                    || (concrete_provenance)
+                {
                     ParamInferenceSource::Concrete
                 } else {
                     ParamInferenceSource::Contextual
                 }
             });
         return Ok((call_site_type.clone(), source));
+    }
+
+    if !with_callers {
+        return Err(InferFailReason::None);
     }
 
     if let Some(cache) = cache.as_mut()
@@ -917,7 +1227,11 @@ fn infer_param_inner(
         return Ok((call_arg_type, ParamInferenceSource::Concrete));
     }
 
-    if let Some(param_hint_type) = infer_param_type_from_gmod_name_hint(db, decl.get_name()) {
+    // A name is a guess for a param no evidence types, and call-site evidence
+    // is only complete once the engine run has closed.
+    if let Some(param_hint_type) = infer_param_type_from_gmod_name_hint(db, decl.get_name())
+        && db.stage_rule_holds(crate::db_index::derivation::StageRule::FloorUnsettled)
+    {
         if let Some(cache) = cache.as_mut()
             && let Some(arg_type) =
                 infer_unread_local_call_site_args(db, cache, signature_id, param_idx)?
@@ -928,6 +1242,84 @@ fn infer_param_inner(
     }
 
     Err(InferFailReason::UnResolveDeclType(decl.get_id()))
+}
+
+/// What the callback slots a local function is passed into declare for its
+/// parameter `param_idx`: `concommand.Add("x", handler)` types `handler`'s
+/// params as a closure written there is typed, without binding the
+/// function's other callers to that contract.
+fn infer_param_type_from_callback_slots(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl: &LuaDecl,
+    signature_id: LuaSignatureId,
+    param_idx: usize,
+) -> Option<LuaType> {
+    let file_id = signature_id.get_file_id();
+    if decl.get_file_id() != file_id {
+        return None;
+    }
+    let target_decl_id = db
+        .get_signature_index()
+        .local_func_decl_for(&signature_id)?;
+    let decl_refs = db
+        .get_reference_index()
+        .get_local_reference(&file_id)?
+        .get_decl_references(&target_decl_id)?;
+    if decl_refs.mutable {
+        return None;
+    }
+    let mut cells = decl_refs.cells.clone();
+    cells.sort_by_key(|cell| cell.range.start());
+    let mut inferred: Option<LuaType> = None;
+    for cell in cells.iter().filter(|cell| !cell.is_write) {
+        let Some(name_expr) = db
+            .get_vfs()
+            .syntax_tree_around(&file_id, cell.range)
+            .and_then(|tree| {
+                tree.get_red_root()
+                    .covering_element(cell.range)
+                    .ancestors()
+                    .find_map(LuaNameExpr::cast)
+            })
+            .filter(|name_expr| name_expr.get_range() == cell.range)
+        else {
+            continue;
+        };
+        let Some(arg_list) = name_expr.get_parent::<glua_parser::LuaCallArgList>() else {
+            continue;
+        };
+        let (Some(call_expr), Some(arg_idx)) = (
+            arg_list.get_parent::<LuaCallExpr>(),
+            arg_list
+                .get_args()
+                .position(|arg| arg.get_position() == name_expr.get_position()),
+        ) else {
+            continue;
+        };
+        let Ok(Some(contract)) = crate::compilation::analyzer::unresolve::callback_contract_for_arg(
+            db,
+            cache,
+            &call_expr,
+            arg_idx,
+            signature_id,
+            file_id,
+        ) else {
+            continue;
+        };
+        let Some(param_type) = contract
+            .get_params()
+            .get(param_idx)
+            .and_then(|(_, typ)| typ.clone())
+        else {
+            continue;
+        };
+        inferred = Some(match inferred {
+            Some(current) => TypeOps::Union.apply(db, &current, &param_type),
+            None => param_type,
+        });
+    }
+    inferred
 }
 
 fn infer_param_type_from_call_sites(
@@ -941,16 +1333,50 @@ fn infer_param_type_from_call_sites(
         return None;
     }
 
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&signature_id.get_file_id())?
-        .get_red_root();
     let target_decl_id = db
         .get_signature_index()
         .local_func_decl_for(&signature_id)?;
     let call_sites =
-        local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id);
-    infer_param_type_from_local_call_sites_inner(db, cache, call_sites, param_idx, true)
+        local_function_call_sites(db, cache, signature_id.get_file_id(), target_decl_id);
+    infer_param_type_from_local_call_sites_inner(
+        db,
+        cache,
+        call_sites,
+        param_idx,
+        true,
+        decl.get_name() == "...",
+    )
+}
+
+/// The flow-narrowed type of `arg` when it stays within the nominal `baseline`
+/// the callee's contract gives it: `None` when the baseline is not nominal or
+/// the argument narrows to something the contract does not accept.
+pub(crate) fn call_argument_flow_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    arg: &LuaExpr,
+    baseline: &LuaType,
+) -> Option<LuaType> {
+    fn nominal(db: &DbIndex, typ: &LuaType) -> bool {
+        match crate::get_real_type(db, typ).unwrap_or(typ) {
+            LuaType::Ref(_) | LuaType::Def(_) => true,
+            LuaType::Instance(instance) => nominal(db, instance.get_base()),
+            LuaType::Union(union) => {
+                union.types().all(|arm| arm.is_nil() || nominal(db, arm))
+                    && union.types().any(|arm| nominal(db, arm))
+            }
+            _ => false,
+        }
+    }
+    if !nominal(db, baseline) {
+        return None;
+    }
+    let typ = infer_expr(db, cache, arg.clone()).ok()?;
+    if !nominal(db, &typ) && !typ.is_nil() {
+        return None;
+    }
+    crate::semantic::type_check::check_type_compact(db, baseline, &typ).ok()?;
+    Some(typ)
 }
 
 fn infer_param_type_from_local_call_sites_inner(
@@ -959,6 +1385,7 @@ fn infer_param_type_from_local_call_sites_inner(
     call_sites: Vec<(FileId, LuaCallExpr)>,
     param_idx: usize,
     allow_param_args: bool,
+    is_dots: bool,
 ) -> Option<LuaType> {
     let mut inferred_type: Option<LuaType> = None;
     for (file_id, call_expr) in call_sites {
@@ -979,20 +1406,60 @@ fn infer_param_type_from_local_call_sites_inner(
                 continue;
             };
             arg_type
-        } else if let Some(arg_param_decl) = param_arg_decl(db, file_id, &arg) {
+        } else if let Some(decl) = param_arg_decl(db, file_id, &arg) {
             if !allow_param_args {
                 continue;
             }
-            let Some(arg_type) = infer_forwarded_param_arg_type(db, cache, arg_param_decl) else {
-                continue;
-            };
-            arg_type
+            // A param narrows its contract at the call; one only its callers type
+            // forwards what they pass, never what their own params were passed.
+            let contract = infer_param_contract(db, cache, decl);
+            let narrowed = contract
+                .as_ref()
+                .and_then(|contract| call_argument_flow_type(db, cache, &arg, contract));
+            let asserted = narrowed.or_else(|| {
+                if contract.is_none() {
+                    super::narrow::infer_asserted_argument_type(db, cache, arg.clone())
+                } else {
+                    None
+                }
+            });
+            match asserted {
+                Some(narrowed) => narrowed,
+                None => {
+                    let Some(forwarded) = infer_forwarded_param_arg_type(db, cache, decl) else {
+                        continue;
+                    };
+                    if contract.is_some() {
+                        forwarded
+                    } else {
+                        call_argument_flow_type(db, cache, &arg, &forwarded).unwrap_or(forwarded)
+                    }
+                }
+            }
         } else {
             let Some(arg_type) = infer_supported_non_param_call_arg_type(db, cache, file_id, arg)
             else {
                 continue;
             };
             arg_type
+        };
+        let arg_type = match &arg_type {
+            // `f(...)` forwards the whole pack into the callee's `...`;
+            // the param collects the value types the pack can hold, not
+            // the pack marker itself.
+            LuaType::Variadic(variadic) if is_dots => {
+                let elements = variadic.element_types();
+                if elements.is_empty() {
+                    continue;
+                }
+                TypeOps::union_all(db, elements.into_iter().cloned().collect())
+            }
+            // An argument position holds a single value: the pack's first.
+            LuaType::Variadic(variadic) => match variadic.get_type(0) {
+                Some(first) => first.clone(),
+                None => continue,
+            },
+            _ => arg_type,
         };
         if arg_type.is_unknown() || arg_type.is_never() {
             continue;
@@ -1018,25 +1485,51 @@ fn infer_supported_non_param_call_arg_type(
             infer_expr(db, cache, arg).ok()
         }
         LuaExpr::NameExpr(name_expr) => {
-            let decl_id = db
-                .get_reference_index()
-                .get_local_reference(&file_id)
-                .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))?;
-            let decl = db.get_decl_index().get_decl(&decl_id)?;
-            if !matches!(decl.extra, LuaDeclExtra::Local { .. }) {
-                return None;
-            }
-            let root = db.get_vfs().get_syntax_tree(&file_id)?.get_red_root();
-            let value_node = decl.get_value_syntax_id()?.to_node_from_root(&root)?;
-            let value_expr = LuaExpr::cast(value_node)?;
-            match &value_expr {
-                LuaExpr::LiteralExpr(_) => {}
-                LuaExpr::CallExpr(call_expr) if is_zero_arg_call(call_expr) => {}
-                _ => return None,
-            }
+            let value_expr = supported_local_value_expr(db, file_id, name_expr)?;
             infer_expr(db, cache, value_expr).ok()
         }
         _ => None,
+    }
+}
+
+/// The value of the local `name_expr` names when local param inference reads
+/// it from there: a literal or a zero-argument call.
+fn supported_local_value_expr(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaExpr> {
+    let decl_id = db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    if !matches!(decl.extra, LuaDeclExtra::Local { .. }) {
+        return None;
+    }
+    let value_syntax_id = decl.get_value_syntax_id()?;
+    let root = db
+        .get_vfs()
+        .syntax_tree_around(&file_id, value_syntax_id.get_range())?
+        .get_red_root();
+    let value_expr = LuaExpr::cast(value_syntax_id.to_node_from_root(&root)?)?;
+    match &value_expr {
+        LuaExpr::LiteralExpr(_) => Some(value_expr),
+        LuaExpr::CallExpr(call_expr) if is_zero_arg_call(call_expr) => Some(value_expr),
+        _ => None,
+    }
+}
+
+/// Whether local param inference reads `arg` itself rather than leaving it
+/// to the fallback a parameter name hint consults.
+fn is_local_call_site_arg_read(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> bool {
+    match arg {
+        LuaExpr::NameExpr(name_expr) => {
+            param_arg_decl(db, file_id, arg).is_some()
+                || is_global_pairs_for_range_var_arg(db, file_id, arg)
+                || supported_local_value_expr(db, file_id, name_expr).is_some()
+        }
+        _ => is_local_call_site_arg_shape_supported(arg),
     }
 }
 
@@ -1053,23 +1546,15 @@ fn infer_unread_local_call_site_args(
     let Some(target_decl_id) = db.get_signature_index().local_func_decl_for(&signature_id) else {
         return Ok(None);
     };
-    let Some(root) = db
-        .get_vfs()
-        .get_syntax_tree(&signature_id.get_file_id())
-        .map(|tree| tree.get_red_root())
-    else {
-        return Ok(None);
-    };
-
     let unread_args =
-        local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id)
+        local_function_call_sites(db, cache, signature_id.get_file_id(), target_decl_id)
             .into_iter()
-            .filter_map(|(_, call_expr)| {
+            .filter_map(|(file_id, call_expr)| {
                 call_expr
                     .get_args_list()
                     .and_then(|args| args.get_args().nth(param_idx))
-            })
-            .filter(|arg| !is_local_call_site_arg_shape_supported(arg));
+                    .filter(|arg| !is_local_call_site_arg_read(db, file_id, arg))
+            });
 
     let mut inferred_type: Option<LuaType> = None;
     for arg in unread_args {
@@ -1126,36 +1611,57 @@ fn infer_forwarded_param_arg_type(
     if decl.get_file_id() != signature_id.get_file_id() {
         return None;
     }
+    let closure = signature_closure(db, signature_id)?;
+    let name = closure.get_parent::<LuaLocalFuncStat>()?.get_local_name()?;
+    let target = LuaDeclId::new(signature_id.get_file_id(), name.get_position());
+    let calls = local_function_call_sites(db, cache, signature_id.get_file_id(), target);
+    infer_param_type_from_local_call_sites_inner(
+        db,
+        cache,
+        calls,
+        idx,
+        false,
+        decl.get_name() == "...",
+    )
+}
 
+/// The closure whose signature `signature_id` is.
+fn signature_closure(db: &DbIndex, signature_id: LuaSignatureId) -> Option<LuaClosureExpr> {
     let root = db
         .get_vfs()
-        .get_syntax_tree(&signature_id.get_file_id())?
+        .syntax_tree_around(
+            &signature_id.get_file_id(),
+            TextRange::empty(signature_id.get_position()),
+        )?
         .get_red_root();
-    // The signature's position is where its closure starts, so descend to that
-    // offset instead of scanning every node in the file.
-    let closure = root
-        .token_at_offset(signature_id.get_position())
+    root.token_at_offset(signature_id.get_position())
         .right_biased()?
         .parent_ancestors()
         .filter_map(LuaClosureExpr::cast)
-        .find(|closure| closure.get_position() == signature_id.get_position())?;
-    let local_func_name = closure
-        .get_parent::<LuaLocalFuncStat>()
-        .and_then(|local_func| local_func.get_local_name())?;
-    let target_decl_id = LuaDeclId::new(signature_id.get_file_id(), local_func_name.get_position());
-
-    let call_sites =
-        local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id);
-    infer_param_type_from_local_call_sites_inner(db, cache, call_sites, idx, false)
+        .find(|closure| closure.get_position() == signature_id.get_position())
 }
 
+/// Whether the closure of `signature_id` is written as an argument of a call.
+fn is_call_argument_closure(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    signature_closure(db, signature_id).is_some_and(|closure| {
+        closure
+            .get_parent::<glua_parser::LuaCallArgList>()
+            .is_some()
+    })
+}
+
+/// The calls of a local function in `file_id`, read out of the file's
+/// references, which a call added or removed moves, and the top-level
+/// statement of each.
 fn local_function_call_sites(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     file_id: FileId,
-    root: &LuaSyntaxNode,
     target_decl_id: LuaDeclId,
 ) -> Vec<(FileId, LuaCallExpr)> {
+    let Some(file_refs) = db.get_reference_index().get_local_reference(&file_id) else {
+        return Vec::new();
+    };
     // Parameter inference asks for the same function's call sites once per
     // parameter index, and each miss walks the tree from the root for every
     // reference. Derive the set once and re-resolve the ids on later calls.
@@ -1165,7 +1671,7 @@ fn local_function_call_sites(
             let ids = Arc::new(find_local_function_call_sites(
                 db,
                 file_id,
-                root,
+                file_refs,
                 target_decl_id,
             ));
             cache
@@ -1178,7 +1684,11 @@ fn local_function_call_sites(
     syntax_ids
         .iter()
         .filter_map(|syntax_id| {
-            let node = syntax_id.to_node_from_root(root)?;
+            let root = db
+                .get_vfs()
+                .syntax_tree_around(&file_id, syntax_id.get_range())?
+                .get_red_root();
+            let node = syntax_id.to_node_from_root(&root)?;
             Some((file_id, LuaCallExpr::cast(node)?))
         })
         .collect()
@@ -1187,14 +1697,10 @@ fn local_function_call_sites(
 fn find_local_function_call_sites(
     db: &DbIndex,
     file_id: FileId,
-    root: &LuaSyntaxNode,
+    file_refs: &crate::FileReference,
     target_decl_id: LuaDeclId,
 ) -> Vec<LuaSyntaxId> {
-    let Some(decl_refs) = db
-        .get_reference_index()
-        .get_local_reference(&file_id)
-        .and_then(|file_refs| file_refs.get_decl_references(&target_decl_id))
-    else {
+    let Some(decl_refs) = file_refs.get_decl_references(&target_decl_id) else {
         return Vec::new();
     };
 
@@ -1204,7 +1710,10 @@ fn find_local_function_call_sites(
     cells
         .into_iter()
         .filter_map(|cell| {
-            root.covering_element(cell.range)
+            db.get_vfs()
+                .syntax_tree_around(&file_id, cell.range)?
+                .get_red_root()
+                .covering_element(cell.range)
                 .ancestors()
                 .find_map(LuaNameExpr::cast)
                 .filter(|name_expr| name_expr.get_range() == cell.range)
@@ -1373,88 +1882,8 @@ fn find_param_type_from_sibling_members(
     final_type
 }
 
-type InheritedParamKey = (LuaMemberId, usize, bool, bool, FileId, TextSize);
-
-thread_local! {
-    /// Memo for [`find_param_type_from_inherited_members`], paired with the
-    /// `type_structure_revision` it was built against.
-    ///
-    /// Thread-local rather than a field on `DbIndex` because `&DbIndex` is
-    /// shared across worker threads, so the memo cannot live behind a `RefCell`
-    /// on the struct without giving up `Sync`.
-    static INHERITED_PARAM_MEMO: std::cell::RefCell<(u64, rustc_hash::FxHashMap<InheritedParamKey, Option<LuaType>>)> =
-        std::cell::RefCell::new((u64::MAX, rustc_hash::FxHashMap::default()));
-}
-
 /// The parameter's type as declared by an inherited member, if any.
-///
-/// This is the most expensive step of parameter inference: the unresolve
-/// pipeline's reachability probe calls it once per deferred parameter, and the
-/// cost is almost entirely the visibility-aware member lookup it performs per
-/// super type.
-///
-/// The same key is asked repeatedly across the retry loop's iterations, so the
-/// answer is memoized against `type_structure_revision`. Mutating the member,
-/// type, signature or module index bumps that revision, which covers the inputs
-/// the loop itself moves as it resolves.
-///
-/// It is not a complete read set. The visibility-aware lookup below also reads
-/// the dynamic-field and gmod-infer indexes, and neither bumps the revision, so
-/// a member that becomes visible between two unresolve runs can be missed by a
-/// memo entry computed before it existed.
 fn find_param_type_from_inherited_members(
-    db: &DbIndex,
-    current_member_id: LuaMemberId,
-    param_idx: usize,
-    colon_define: bool,
-    is_dots: bool,
-    caller_file_id: FileId,
-    caller_position: TextSize,
-) -> Option<LuaType> {
-    let revision = db.type_structure_revision();
-    let key = (
-        current_member_id,
-        param_idx,
-        colon_define,
-        is_dots,
-        caller_file_id,
-        caller_position,
-    );
-
-    let cached = INHERITED_PARAM_MEMO.with(|memo| {
-        let mut memo = memo.borrow_mut();
-        if memo.0 != revision {
-            memo.0 = revision;
-            memo.1.clear();
-            return None;
-        }
-        memo.1.get(&key).cloned()
-    });
-    if let Some(cached) = cached {
-        return cached;
-    }
-
-    let found = find_param_type_from_inherited_members_uncached(
-        db,
-        current_member_id,
-        param_idx,
-        colon_define,
-        is_dots,
-        caller_file_id,
-        caller_position,
-    );
-
-    INHERITED_PARAM_MEMO.with(|memo| {
-        let mut memo = memo.borrow_mut();
-        // Only store if nothing bumped the revision while we were computing.
-        if memo.0 == revision {
-            memo.1.insert(key, found.clone());
-        }
-    });
-    found
-}
-
-fn find_param_type_from_inherited_members_uncached(
     db: &DbIndex,
     current_member_id: LuaMemberId,
     param_idx: usize,
@@ -1520,7 +1949,7 @@ fn find_param_type_from_outer_factory_member(
 ) -> Option<LuaType> {
     let root = db
         .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
+        .syntax_tree_around(&member_id.file_id, member_id.get_syntax_id().get_range())?
         .get_red_root();
     let current_node = member_id.get_syntax_id().to_node_from_root(&root)?;
     let outer_func = current_node
@@ -1716,13 +2145,13 @@ pub fn infer_param_with_cache(
     if let Some(cache_entry) = cache.param_type_cache.get(&decl_id) {
         return match cache_entry {
             CacheEntry::Cache(typ) => Ok(typ.clone()),
-            CacheEntry::Error(reason) => Err(reason.clone()),
+            CacheEntry::Error(reason) => Err(InferFailReason::clone(reason)),
             CacheEntry::Ready => Err(InferFailReason::RecursiveInfer),
         };
     }
 
     cache.param_type_cache.insert(decl_id, CacheEntry::Ready);
-    let result = infer_param_inner(db, Some(cache), decl);
+    let result = infer_param_inner(db, Some(cache), decl, true);
     match &result {
         Ok((typ, source)) => {
             cache
@@ -1735,10 +2164,10 @@ pub fn infer_param_with_cache(
         Err(reason) if cache.get_config().analysis_phase.is_diagnostics() => {
             cache
                 .param_type_cache
-                .insert(decl_id, CacheEntry::Error(reason.clone()));
+                .insert(decl_id, CacheEntry::error(reason.clone()));
             cache
                 .param_type_source_cache
-                .insert(decl_id, CacheEntry::Error(reason.clone()));
+                .insert(decl_id, CacheEntry::error(reason.clone()));
         }
         Err(_) => {
             cache.param_type_cache.remove(&decl_id);
@@ -1750,11 +2179,20 @@ pub fn infer_param_with_cache(
 }
 
 pub(crate) fn infer_param_is_weak(db: &DbIndex, cache: &mut LuaInferCache, decl: &LuaDecl) -> bool {
+    infer_param_source(db, cache, decl).is_some_and(ParamInferenceSource::is_weak)
+}
+
+/// Where the type of the param `decl` came from, when it has one.
+pub(crate) fn infer_param_source(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    decl: &LuaDecl,
+) -> Option<ParamInferenceSource> {
     let _ = infer_param_with_cache(db, cache, decl);
-    matches!(
-        cache.param_type_source_cache.get(&decl.get_id()),
-        Some(CacheEntry::Cache(source)) if source.is_weak()
-    )
+    match cache.param_type_source_cache.get(&decl.get_id()) {
+        Some(CacheEntry::Cache(source)) => Some(*source),
+        _ => None,
+    }
 }
 
 fn direct_table_field_from_member_id(
@@ -1777,9 +2215,13 @@ fn find_param_type_from_contextual_member(
     is_self_param: bool,
     is_dots: bool,
 ) -> Option<LuaType> {
+    let syntax_id = member_id.get_syntax_id();
+    if !LuaTableField::can_cast(syntax_id.get_kind()) {
+        return None;
+    }
     let root = db
         .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
+        .syntax_tree_at_statement(&member_id.file_id, syntax_id.get_range())?
         .get_chunk_node();
     let table_field = direct_table_field_from_member_id(&root, member_id)?;
     let field_type = infer_table_field_value_should_be(db, cache, table_field.clone()).ok()?;
@@ -1922,20 +2364,24 @@ fn adjust_param_idx(
     adjusted_idx
 }
 
+/// `any` for a `...` over a contract position that is not itself a `...`.
 fn check_dots_param_types(
     params: &[(String, Option<LuaType>)],
     param_idx: usize,
-    cur_type: &Option<LuaType>,
 ) -> Option<LuaType> {
-    for (_, typ) in params.iter().skip(param_idx) {
-        if let Some(typ) = typ
-            && let Some(cur_type) = cur_type
-            && cur_type != typ
-        {
-            return Some(LuaType::Any);
-        }
-    }
-    None
+    params
+        .get(param_idx)
+        .is_some_and(|(name, _)| name != "...")
+        .then_some(LuaType::Any)
+}
+
+/// Whether the declared signature takes a `...` where argument `param_idx` goes.
+fn signature_slot_is_dots(signature: &LuaSignature, param_idx: usize) -> bool {
+    signature
+        .params
+        .get(param_idx)
+        .or_else(|| signature.params.last())
+        .is_some_and(|name| name == "...")
 }
 
 fn union_signature_overload_param_types(
@@ -1972,8 +2418,7 @@ fn find_signature_overload_param_type(
         };
 
         if is_dots
-            && let Some(any_type) =
-                check_dots_param_types(overload.get_params(), adjusted_idx, cur_type)
+            && let Some(any_type) = check_dots_param_types(overload.get_params(), adjusted_idx)
         {
             return Some(any_type);
         }
@@ -1998,11 +2443,14 @@ fn find_param_type_from_type(
 ) -> Option<LuaType> {
     match source_type {
         LuaType::Signature(signature_id) => {
-            let signature = db.get_signature_index().get(&signature_id)?;
+            let signature = db.get_signature_index().get_declared(&signature_id)?;
             let adjusted_idx =
                 adjust_param_idx(param_idx, current_colon_define, signature.is_colon_define);
 
             match signature.get_param_info_by_id(adjusted_idx) {
+                Some(_) if is_dots && !signature_slot_is_dots(signature, adjusted_idx) => {
+                    Some(LuaType::Any)
+                }
                 Some(param_info) => {
                     let mut typ = param_info.type_ref.clone();
                     if param_info.nullable && !typ.is_nullable() {
@@ -2038,11 +2486,8 @@ fn find_param_type_from_type(
                             };
 
                         if is_dots
-                            && let Some(any_type) = check_dots_param_types(
-                                overload.get_params(),
-                                adjusted_idx,
-                                &cur_type,
-                            )
+                            && let Some(any_type) =
+                                check_dots_param_types(overload.get_params(), adjusted_idx)
                         {
                             return Some(any_type);
                         }
@@ -2064,8 +2509,7 @@ fn find_param_type_from_type(
             if let Some((_, typ)) = f.get_params().get(adjusted_idx) {
                 let cur_type = typ.clone();
                 if is_dots
-                    && let Some(any_type) =
-                        check_dots_param_types(f.get_params(), adjusted_idx, &cur_type)
+                    && let Some(any_type) = check_dots_param_types(f.get_params(), adjusted_idx)
                 {
                     return Some(any_type);
                 }
@@ -2094,6 +2538,12 @@ fn find_param_type_from_union(
             if !signature.param_docs.is_empty() {
                 let adjusted_idx =
                     adjust_param_idx(param_idx, origin_colon_define, signature.is_colon_define);
+                if is_dots
+                    && signature.get_param_info_by_id(adjusted_idx).is_some()
+                    && !signature_slot_is_dots(signature, adjusted_idx)
+                {
+                    return Some(LuaType::Any);
+                }
                 return if let Some(param_info) = signature.get_param_info_by_id(adjusted_idx) {
                     let mut typ = param_info.type_ref.clone();
                     if param_info.nullable && !typ.is_nullable() {
@@ -2124,7 +2574,7 @@ fn find_param_type_from_union(
 
                 if is_dots
                     && let Some(any_type) =
-                        check_dots_param_types(overload.get_params(), adjusted_idx, &cur_type)
+                        check_dots_param_types(overload.get_params(), adjusted_idx)
                 {
                     return Some(any_type);
                 }
@@ -2147,9 +2597,7 @@ fn find_param_type_from_union(
                 return None;
             };
 
-            if is_dots
-                && let Some(any_type) =
-                    check_dots_param_types(f.get_params(), adjusted_idx, &cur_type)
+            if is_dots && let Some(any_type) = check_dots_param_types(f.get_params(), adjusted_idx)
             {
                 return Some(any_type);
             }
@@ -2222,6 +2670,12 @@ pub fn infer_global_type(
     infer_global_type_impl(db, current_file_id, call_offset, name, false)
 }
 
+fn record_missing_global_read(db: &DbIndex, name: &str) {
+    let owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(name));
+    let key = LuaMemberKey::Name(name.into());
+    crate::semantic::member::record_member_slot_read(db, &owner, &key);
+}
+
 fn infer_global_type_impl(
     db: &DbIndex,
     current_file_id: Option<FileId>,
@@ -2262,6 +2716,7 @@ fn infer_global_type_impl(
         ) {
             Some(tiers) => tiers,
             None => {
+                record_missing_global_read(db, name);
                 return Err(InferFailReason::None);
             }
         }
@@ -2269,12 +2724,14 @@ fn infer_global_type_impl(
         vec![match global_index.get_global_decl_ids(name).cloned() {
             Some(decls) => (0, decls),
             None => {
+                record_missing_global_read(db, name);
                 return Err(InferFailReason::None);
             }
         }]
     };
 
     if priority_tiers.is_empty() {
+        record_missing_global_read(db, name);
         return Err(InferFailReason::None);
     }
 
@@ -2424,12 +2881,12 @@ fn infer_global_type_from_decl_ids(db: &DbIndex, decl_ids: Vec<LuaDeclId>) -> In
         };
     }
 
+    // Within a tier the order *is* the answer: `def_or_ref_type` keeps the
+    // first declaration that names one and the table merge folds in the rest
+    // in order. The tiers keep the global index's canonical order; the
+    // standard library's declarations go first.
     let mut sorted_decl_ids = decl_ids;
-    sorted_decl_ids.sort_by(|a, b| {
-        let a_is_std = db.get_module_index().is_std(&a.file_id);
-        let b_is_std = db.get_module_index().is_std(&b.file_id);
-        b_is_std.cmp(&a_is_std)
-    });
+    sorted_decl_ids.sort_by_key(|decl_id| !db.get_module_index().is_std(&decl_id.file_id));
 
     let mut callable_type: Option<LuaType> = None;
     let mut def_or_ref_type: Option<LuaType> = None;
@@ -2498,10 +2955,16 @@ fn infer_global_type_from_decl_ids(db: &DbIndex, decl_ids: Vec<LuaDeclId>) -> In
     // the table merge pick a different winner, and `saw_nil` cannot know whether
     // the absent declaration was nil.
     //
-    // Defer instead. The unresolve pass retries once that declaration carries a
-    // type and floors it to `Unknown` if it never does, so this cannot stall.
+    // Defer instead, until the run skips untyped writers: from then on the
+    // merge is of the declarations that carry a type, and with none it reads as
+    // a global nothing declares yet. Each declaration landing only adds to it.
     if !matches!(last_resolve_reason, InferFailReason::None) {
-        return Err(last_resolve_reason);
+        if !db.stage_rule_holds(crate::db_index::derivation::StageRule::SkipUntypedWriters) {
+            return Err(last_resolve_reason);
+        }
+        if !saw_resolved_decl_type {
+            return Err(InferFailReason::None);
+        }
     }
 
     if let Some(callable_type) = callable_type {
@@ -2746,7 +3209,7 @@ fn find_self_receiver_id(
 }
 
 /// Returns true if the type contains an unresolved `SelfInfer`.
-fn contains_self_infer(typ: &LuaType) -> bool {
+pub(crate) fn contains_self_infer(typ: &LuaType) -> bool {
     match typ {
         LuaType::SelfInfer => true,
         LuaType::TableOf(inner) => contains_self_infer(inner),
@@ -2819,11 +3282,10 @@ fn infer_method_prefix_type(
 mod test {
     use super::{
         direct_table_field_from_member_id, find_param_type_from_contextual_member,
-        get_name_expr_var_ref_id, infer_name_expr,
+        find_self_ref_id, infer_global_type, infer_name_expr,
     };
     use crate::{
-        Emmyrc, LuaInferCache, LuaMemberId, LuaSignatureId, LuaType, LuaTypeCache, VarRefId,
-        VirtualWorkspace,
+        Emmyrc, FileId, LuaInferCache, LuaMemberId, LuaSignatureId, LuaType, VirtualWorkspace,
     };
     use glua_parser::{
         LuaAstNode, LuaAstToken, LuaClosureExpr, LuaIndexKey, LuaLocalName, LuaNameExpr,
@@ -2890,6 +3352,72 @@ mod test {
             .expect("expected closure")
     }
 
+    #[test]
+    fn merged_global_table_falls_back_to_the_reader_realm() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/autorun/client/dispatch_writer.lua",
+                "areas = { client = true }",
+            ),
+            (
+                "lua/autorun/server/dispatch_writer.lua",
+                "areas = { server = true }",
+            ),
+            (
+                "lua/autorun/client/dispatch_reader.lua",
+                "local AllAreas = areas",
+            ),
+        ]);
+        let file_id = |suffix: &str| {
+            file_ids
+                .iter()
+                .copied()
+                .find(|file_id| {
+                    ws.analysis
+                        .compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_file_path(file_id)
+                        .is_some_and(|path| path.ends_with(suffix))
+                })
+                .expect("fixture file")
+        };
+        let client_file_id = file_id("lua/autorun/client/dispatch_writer.lua");
+        let reader_file_id = file_id("lua/autorun/client/dispatch_reader.lua");
+        let model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(reader_file_id)
+            .expect("reader semantic model");
+        let areas = model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|expr| expr.get_name_text().as_deref() == Some("areas"))
+            .expect("areas read");
+        let mut cache = LuaInferCache::new(reader_file_id, Default::default());
+
+        let direct = infer_global_type(
+            model.get_db(),
+            Some(reader_file_id),
+            Some(areas.get_position()),
+            "areas",
+        )
+        .expect("positional global type");
+        assert!(
+            matches!(&direct, LuaType::TableConst(table) if table.file_id == client_file_id),
+            "expected positional lookup to return the client table, got {direct:?}"
+        );
+
+        match infer_name_expr(model.get_db(), &mut cache, areas).expect("areas type") {
+            LuaType::TableConst(table) => assert_eq!(table.file_id, client_file_id),
+            other => panic!("expected the client table, got {other:?}"),
+        }
+    }
+
     fn find_closure_signature_ids(
         ws: &VirtualWorkspace,
         file_id: crate::FileId,
@@ -2935,94 +3463,113 @@ mod test {
         let mut cache = LuaInferCache::new(file_id, Default::default());
 
         expect_that!(
-            cache.expr_var_ref_id_cache.contains_key(&syntax_id),
+            cache.expr_var_ref_id_cache.peek(&syntax_id).is_some(),
             eq(false)
         );
         expect_that!(infer_name_expr(db, &mut cache, self_expr).is_ok(), eq(true));
         expect_that!(
-            cache.expr_var_ref_id_cache.contains_key(&syntax_id),
+            cache.expr_var_ref_id_cache.peek(&syntax_id).is_some(),
             eq(true)
         );
 
         Ok(())
     }
 
-    #[test]
-    fn clear_for_unresolve_drops_global_var_ref_selected_from_mutable_types() {
-        let mut ws = VirtualWorkspace::new();
-        ws.def_file("a.lua", "Choice = 1");
-        ws.def_file("b.lua", "Choice = function() end");
-        let consumer_id = ws.def_file("consumer.lua", "local selected = Choice");
+    /// The bootstrap fixture both `self` tests use: `cityrp.configuration`
+    /// comes from a shapeless bootstrap link, and `self` is used inside a
+    /// function on its `ranks` member.
+    fn def_bootstrap_fixture(ws: &mut VirtualWorkspace) -> FileId {
+        ws.def_file(
+            "gamemode/shared.lua",
+            r#"
+cityrp = cityrp or {}
 
-        let choice_expr = ws
-            .analysis
-            .compilation
-            .get_semantic_model(consumer_id)
-            .expect("consumer semantic model should exist")
-            .get_root()
-            .descendants::<LuaNameExpr>()
-            .find(|expr| expr.get_name_text().as_deref() == Some("Choice"))
-            .expect("consumer Choice expression should exist");
-        let decl_ids = ws
-            .analysis
-            .compilation
-            .get_db()
-            .get_global_index()
-            .get_global_decl_ids("Choice")
-            .expect("Choice declarations should exist")
-            .clone();
-        assert_eq!(decl_ids.len(), 2);
-        let first = decl_ids[0];
-        let second = decl_ids[1];
+---@return table
+function cityrp.bootstrap() end
 
-        let db = ws.analysis.compilation.get_db_mut();
-        db.get_type_index_mut()
-            .force_bind_type(first.into(), LuaTypeCache::InferType(LuaType::Integer));
-        db.get_type_index_mut()
-            .force_bind_type(second.into(), LuaTypeCache::InferType(LuaType::Function));
-        let mut cache = LuaInferCache::new(consumer_id, Default::default());
-        assert_eq!(
-            get_name_expr_var_ref_id(db, &mut cache, &choice_expr),
-            Some(VarRefId::VarRef(second))
+cityrp.configuration = cityrp.bootstrap()
+"#,
         );
+        ws.def_file(
+            "gamemode/core/sh_configuration.lua",
+            r#"
+cityrp.configuration.ranks = {
+    owner = { level = 5 },
+    remap = { admin = "mod" },
+}
 
-        db.get_type_index_mut()
-            .force_bind_type(first.into(), LuaTypeCache::InferType(LuaType::Function));
-        cache.clear_for_unresolve(db);
-
-        assert_eq!(
-            get_name_expr_var_ref_id(db, &mut cache, &choice_expr),
-            Some(VarRefId::VarRef(first))
-        );
+function cityrp.configuration.ranks:Get(rank)
+    return self.remap
+end
+"#,
+        )
     }
 
-    #[test]
-    fn clear_for_unresolve_preserves_local_var_ref_identity() {
+    #[gtest]
+    fn test_infer_self_falls_back_to_seed_when_receiver_id_resolution_is_shapeless() -> Result<()> {
         let mut ws = VirtualWorkspace::new();
-        let file_id = ws.def("local source = 1\nlocal selected = source");
-        let source_reference = ws
+        let config_id = def_bootstrap_fixture(&mut ws);
+
+        // The intermediate link `cityrp.configuration` is shapeless (bare
+        // `table`), so semantic-decl receiver resolution cannot see through it
+        // and no receiver id is derived. Prefix inference through the member
+        // index still resolves the chain, so `self` must fall back to the seed
+        // instead of degrading to `Unknown` (which empties `self.` completion).
+        let semantic_model = ws
             .analysis
             .compilation
-            .get_semantic_model(file_id)
-            .expect("semantic model should exist")
+            .get_semantic_model(config_id)
+            .expect("semantic model must exist");
+        let self_expr = semantic_model
             .get_root()
             .descendants::<LuaNameExpr>()
-            .find(|expr| expr.get_name_text().as_deref() == Some("source"))
-            .expect("source reference should exist");
-        let syntax_id = source_reference.get_syntax_id();
+            .find(|expr| expr.get_name_text().as_deref() == Some("self"))
+            .expect("expected self name expr");
         let db = ws.analysis.compilation.get_db();
-        let mut cache = LuaInferCache::new(file_id, Default::default());
+        let mut cache = LuaInferCache::new(config_id, Default::default());
+        let self_type =
+            infer_name_expr(db, &mut cache, self_expr).expect("self inference should succeed");
 
-        let local_ref = get_name_expr_var_ref_id(db, &mut cache, &source_reference)
-            .expect("source should resolve to a local reference");
-        assert!(matches!(local_ref, VarRefId::VarRef(_)));
+        let LuaType::TableConst(in_file) = self_type else {
+            panic!("expected self to resolve to the ranks table literal, got {self_type:?}");
+        };
+        expect_that!(in_file.file_id, eq(config_id));
 
-        cache.clear_for_unresolve(db);
+        Ok(())
+    }
 
-        assert_eq!(
-            cache.expr_var_ref_id_cache.get(&syntax_id),
-            Some(&local_ref)
+    #[gtest]
+    fn test_self_receiver_id_resolves_through_shapeless_bootstrap_link() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let config_id = def_bootstrap_fixture(&mut ws);
+
+        // The bootstrap link `cityrp.configuration` resolves to an empty
+        // literal, so the prefix-type member lookup misses. The global-path
+        // fallback must still resolve the chain's declaration, so `self`'s
+        // receiver id resolves to the `ranks` member instead of failing.
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(config_id)
+            .expect("semantic model must exist");
+        let self_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|expr| expr.get_name_text().as_deref() == Some("self"))
+            .expect("expected self name expr");
+        let db = ws.analysis.compilation.get_db();
+        let mut cache = LuaInferCache::new(config_id, Default::default());
+        let self_ref_id =
+            find_self_ref_id(db, &mut cache, &self_expr).expect("receiver id should resolve");
+        expect_that!(
+            matches!(
+                self_ref_id.receiver,
+                crate::db_index::LuaDeclOrMemberId::Member(_)
+            ),
+            eq(true)
         );
+
+        Ok(())
     }
 
     #[gtest]
@@ -3308,6 +3855,7 @@ mod test {
                     .to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("file id must be present");
 
         let initial_signature_id = find_first_closure_signature_id(&ws, file_id);
@@ -3319,18 +3867,20 @@ mod test {
             .local_func_decl_for(&initial_signature_id)
             .expect("expected initial local function decl mapping");
 
-        ws.analysis.update_file_by_uri(
-            &uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &uri,
+                Some(
+                    r#"
                 -- shift signature position to verify stale map cleanup
                 local function replacement(value)
                     return value
                 end
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         let updated_signature_id = find_first_closure_signature_id(&ws, file_id);
         let db = ws.analysis.compilation.get_db();

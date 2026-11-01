@@ -112,7 +112,7 @@ pub fn analyze_field(analyzer: &mut DocAnalyzer, tag: LuaDocTagField) -> Option<
                     field_type.clone(),
                 ))),
             );
-            analyzer.db.get_operator_index_mut().add_operator(operator);
+            analyzer.db.add_operator(operator);
             LuaMemberKey::ExprType(key_type_ref)
         }
     };
@@ -151,8 +151,8 @@ pub fn analyze_field(analyzer: &mut DocAnalyzer, tag: LuaDocTagField) -> Option<
     }
 
     if !description.is_empty() {
-        // 不需要传入`owner`, 当前`owner`的效果是判断是否为`signature`, 如果是则不移除`['#', '@']`首字符
-        // 但以`field`定义的必须移除首字符
+        // `owner` need not be passed in; it only decides whether the owner is a `signature`, in which case the leading `['#', '@']` is not removed
+        // but a `field` definition must always remove the leading character
         let description = preprocess_description(&description, None);
         analyzer.db.get_property_index_mut().add_description(
             analyzer.file_id,
@@ -185,14 +185,23 @@ pub fn analyze_operator(analyzer: &mut DocAnalyzer, tag: LuaDocTagOperator) -> O
                 .collect()
         })
         .unwrap_or_default();
+    let unlisted_call_args =
+        op_kind == LuaOperatorMetaMethod::Call && tag.get_param_list().is_none();
+    if unlisted_call_args {
+        operands.push(("...".to_string(), Some(LuaType::Any)));
+    }
 
-    operands.insert(
-        0,
-        (
-            "self".to_string(),
-            Some(LuaType::Ref(current_type_id.clone())),
-        ),
-    );
+    // An operator's operands start with the value it is defined on, except a
+    // call's: `Module(x)` passes `x` alone, like any `---@overload`.
+    if op_kind != LuaOperatorMetaMethod::Call {
+        operands.insert(
+            0,
+            (
+                "self".to_string(),
+                Some(LuaType::Ref(current_type_id.clone())),
+            ),
+        );
+    }
 
     let return_type = if let Some(return_type) = tag.get_return_type() {
         infer_type(analyzer, return_type)
@@ -208,13 +217,13 @@ pub fn analyze_operator(analyzer: &mut DocAnalyzer, tag: LuaDocTagOperator) -> O
         OperatorFunction::Func(Arc::new(LuaFunctionType::new(
             AsyncState::None,
             false,
-            false,
+            unlisted_call_args,
             operands,
             return_type,
         ))),
     );
 
-    analyzer.db.get_operator_index_mut().add_operator(operator);
+    analyzer.db.add_operator(operator);
 
     Some(())
 }

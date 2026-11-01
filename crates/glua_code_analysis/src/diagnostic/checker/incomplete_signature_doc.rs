@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use glua_parser::{LuaAstNode, LuaClosureExpr, LuaDocTagParam, LuaDocTagReturn, LuaStat};
 
@@ -15,9 +15,11 @@ impl Checker for IncompleteSignatureDocChecker {
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root();
-        for closure_expr in root.descendants::<LuaClosureExpr>() {
-            check_doc(context, semantic_model, &closure_expr);
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for closure_expr in buckets.closure_exprs.iter() {
+            check_doc(context, semantic_model, closure_expr);
         }
     }
 }
@@ -70,7 +72,7 @@ fn check_doc(
         DiagnosticCode::IncompleteSignatureDoc
     };
 
-    let doc_param_names: HashSet<String> = comment
+    let doc_param_names: FxHashSet<String> = comment
         .children::<LuaDocTagParam>()
         .filter_map(|param| {
             param
@@ -84,7 +86,7 @@ fn check_doc(
         .map(|return_doc| return_doc.get_types().count())
         .sum();
 
-    // 如果文档中没有参数和返回值注解, 且不是全局函数, 则不检查
+    // Skip the check if the doc has no parameter or return annotations and the function is not global
     if doc_param_names.is_empty() && doc_return_len == 0 && !is_global {
         return Some(());
     }
@@ -114,7 +116,7 @@ fn check_doc(
 fn check_params(
     context: &mut DiagnosticContext,
     closure_expr: &LuaClosureExpr,
-    doc_param_names: &HashSet<String>,
+    doc_param_names: &FxHashSet<String>,
     code: DiagnosticCode,
     is_global: bool,
     function_name: &str,

@@ -36,4 +36,14 @@ impl TypeOps {
             }
         }
     }
+
+    /// Batch equivalent of folding [`TypeOps::Union`] from [`LuaType::Never`].
+    ///
+    /// Collect loop outputs and finalize once instead of unioning pairwise.
+    /// The answer is exactly the ordered fold for every input; a structural
+    /// fast path is taken only when proven equivalent, otherwise the fold
+    /// itself runs.
+    pub fn union_all(db: &DbIndex, types: Vec<LuaType>) -> LuaType {
+        union_type::union_all(db, types)
+    }
 }

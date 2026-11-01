@@ -69,8 +69,16 @@ impl<'a> LuaDocument<'a> {
         self.line_index.get_col(offset, self.text)
     }
 
-    pub fn get_offset(&self, line: usize, col: usize) -> Option<TextSize> {
+    pub fn get_offset(&self, line: usize, col: usize) -> TextSize {
         self.line_index.get_offset(line, col, self.text)
+    }
+
+    pub fn get_offset_by_char_col(&self, line: usize, col: usize) -> TextSize {
+        self.line_index.get_offset_by_char_col(line, col, self.text)
+    }
+
+    pub fn to_offset(&self, position: lsp_types::Position) -> TextSize {
+        self.get_offset(position.line as usize, position.character as usize)
     }
 
     pub fn get_col_offset_at_line(&self, line: usize, col: usize) -> Option<TextSize> {
@@ -122,9 +130,9 @@ impl<'a> LuaDocument<'a> {
     }
 
     pub fn to_rowan_range(&self, range: lsp_types::Range) -> Option<TextRange> {
-        let start = self.get_offset(range.start.line as usize, range.start.character as usize)?;
-        let end = self.get_offset(range.end.line as usize, range.end.character as usize)?;
-        Some(TextRange::new(start, end))
+        let start = self.to_offset(range.start);
+        let end = self.to_offset(range.end);
+        (start <= end).then(|| TextRange::new(start, end))
     }
 
     pub fn get_document_lsp_range(&self) -> lsp_types::Range {
@@ -163,6 +171,7 @@ mod tests {
         let vg = VirtualUrlGenerator::new();
         let uri = vg.new_uri("test.lua");
         let id = vfs.set_file_content(&uri, Some(code.to_string()));
+        vfs.take_staged(&[id]);
         let document = vfs.get_document(&id).unwrap();
 
         assert_eq!(document.get_file_id(), id);
@@ -179,6 +188,7 @@ mod tests {
         let vg = VirtualUrlGenerator::new();
         let uri = vg.new_uri("slice.lua");
         let id = vfs.set_file_content(&uri, Some(code.to_string()));
+        vfs.take_staged(&[id]);
         let document = vfs.get_document(&id).unwrap();
 
         // Slice "Hello" from "Hello, World!"
@@ -194,6 +204,7 @@ mod tests {
         let vg = VirtualUrlGenerator::new();
         let uri = vg.new_uri("conversion.lua");
         let id = vfs.set_file_content(&uri, Some(code.to_string()));
+        vfs.take_staged(&[id]);
         let document = vfs.get_document(&id).unwrap();
 
         // Test conversion of offset to lsp position.
@@ -234,6 +245,7 @@ mod tests {
         let vg = VirtualUrlGenerator::new();
         let uri = vg.new_uri("filename_test.lua");
         let id = vfs.set_file_content(&uri, Some(code.to_string()));
+        vfs.take_staged(&[id]);
         let document = vfs.get_document(&id).unwrap();
 
         assert_eq!(
@@ -250,6 +262,7 @@ mod tests {
         let vg = VirtualUrlGenerator::new();
         let uri = vg.new_uri("doc_range.lua");
         let id = vfs.set_file_content(&uri, Some(code.to_string()));
+        vfs.take_staged(&[id]);
         let document = vfs.get_document(&id).unwrap();
 
         let doc_range = document.get_document_lsp_range();

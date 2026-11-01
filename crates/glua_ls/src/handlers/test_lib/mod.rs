@@ -149,6 +149,7 @@ impl ProviderVirtualWorkspace {
 
         self.analysis
             .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id)
             .unwrap()
     }
 
@@ -157,6 +158,49 @@ impl ProviderVirtualWorkspace {
             "lua/includes/glua_ls_gmod_call_arg_builtins.lua",
             GMOD_CALL_ARG_BUILTINS_FIXTURE,
         )
+    }
+
+    /// The annotated `GM` and `GAMEMODE` in a library, laid out as the GMod
+    /// annotations ship them, the Helix gamemode with a hook of its own, and a
+    /// schema at `schema_root` (`""` when the workspace is the schema folder)
+    /// that derives from Helix.
+    pub fn def_helix_schema(&mut self, schema_root: &str) {
+        let annotations_root = self.virtual_url_generator.base.join("annotations");
+        self.analysis.add_library_workspace(annotations_root);
+        self.def_file(
+            "annotations/gm.lua",
+            r#"
+            ---@meta
+
+            ---@class GM
+            ---@field FolderName string
+
+            GM = {}
+
+            ---Called whenever a player spawns.
+            ---@realm server
+            ---@param ply Player
+            function GM:PlayerSpawn(ply) end
+
+            ---@type GM
+            GAMEMODE = nil
+            "#,
+        );
+        self.def_file(
+            "gamemodes/helix/gamemode/init.lua",
+            "DeriveGamemode(\"sandbox\")\n",
+        );
+        self.def_file(
+            "gamemodes/helix/gamemode/core/hooks/sh_hooks.lua",
+            r#"
+            ---Whether a player can take an item.
+            function GM:CanPlayerTakeItem(client, item) end
+            "#,
+        );
+        self.def_file(
+            &format!("{schema_root}gamemode/init.lua"),
+            "DeriveGamemode(\"helix\")\n",
+        );
     }
 
     pub fn def_files(&mut self, files: Vec<(&str, &str)>) -> Vec<FileId> {
@@ -194,7 +238,7 @@ impl ProviderVirtualWorkspace {
         self.analysis.update_config(Arc::new(emmyrc));
     }
 
-    /// 处理文件内容
+    /// Processes the file content
     pub fn handle_file_content(content: &str) -> Result<(String, Position)> {
         let (content, position) = Self::handle_file_content_option(content)?;
         Ok((
@@ -225,7 +269,7 @@ impl ProviderVirtualWorkspace {
                 line += 1;
                 column = 0;
             } else {
-                column += 1;
+                column += c.len_utf16();
             }
         }
 
@@ -281,7 +325,7 @@ impl ProviderVirtualWorkspace {
         )
         .ok_or("failed to get completion")
         .or_fail()?;
-        // 对比
+        // Compare
         let mut items = match result {
             CompletionResponse::Array(items) => items,
             CompletionResponse::List(list) => list.items,
@@ -475,11 +519,27 @@ impl ProviderVirtualWorkspace {
         block_str: &str,
         expected: Vec<VirtualInlayHint>,
     ) -> Result<()> {
+        self.check_inlay_hint_in(block_str, None, expected)
+    }
+
+    /// [`Self::check_inlay_hint`] for the hints a request for `range` gets.
+    pub fn check_inlay_hint_in(
+        &mut self,
+        block_str: &str,
+        range: Option<lsp_types::Range>,
+        expected: Vec<VirtualInlayHint>,
+    ) -> Result<()> {
         let file_id = self.def(block_str);
         let cancel_token = tokio_util::sync::CancellationToken::new();
-        let result = inlay_hint(&self.analysis, file_id, ClientId::VSCode, &cancel_token)
-            .ok_or("failed to get inlay hints")
-            .or_fail()?;
+        let result = inlay_hint(
+            &self.analysis,
+            file_id,
+            range,
+            ClientId::VSCode,
+            &cancel_token,
+        )
+        .ok_or("failed to get inlay hints")
+        .or_fail()?;
 
         let items = result
             .into_iter()

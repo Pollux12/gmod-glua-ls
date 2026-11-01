@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::FileId;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ModuleNode {
     pub parent: Option<ModuleNodeId>,
     pub children: HashMap<String, ModuleNodeId>,

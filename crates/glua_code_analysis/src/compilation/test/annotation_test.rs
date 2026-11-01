@@ -584,6 +584,112 @@ mod test {
     }
 
     #[test]
+    fn alias_parameters_do_not_bind_later_type_or_parameter_tags() {
+        for usage in [
+            "---@type S13ScopedAlias<T>\nlocal value",
+            "---@param value T\nlocal function consume(value) end",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(!ws.check_code_for(
+                DiagnosticCode::TypeNotFound,
+                &format!("---@alias S13ScopedAlias<T> {{ value: T }}\n{usage}\n"),
+            ));
+        }
+    }
+
+    #[test]
+    fn an_explicit_generic_binder_remains_visible_after_an_alias_tag() {
+        for usage in [
+            "---@type S13ScopedAlias<T>\nlocal value",
+            "---@param value T\nlocal function consume(value) end",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(ws.check_code_for(
+                DiagnosticCode::TypeNotFound,
+                &format!("---@alias S13ScopedAlias<T> {{ value: T }}\n---@generic T\n{usage}\n"),
+            ));
+        }
+        let mut ws = VirtualWorkspace::new();
+        let file = ws.def(
+            r#"
+---@alias S13ScopedAlias<T> { value: T }
+---@generic T
+---@param value T
+---@return S13ScopedAlias<T>
+local function wrap(value)
+    return { value = value }
+end
+---@type string
+local input
+local value = wrap(input).value
+"#,
+        );
+        assert_eq!(ws.local_ty(file, "value"), LuaType::String);
+    }
+
+    #[test]
+    fn two_alias_tags_keep_their_own_generic_parameter_lists() {
+        let mut ws = VirtualWorkspace::new();
+        let file = ws.def(
+            r#"
+---@alias S13FirstAlias<T> { value: T }
+---@alias S13SecondAlias<U> { value: U }
+local aliases
+---@type S13FirstAlias<string>
+local first
+---@type S13SecondAlias<number>
+local second
+local firstValue = first.value
+local secondValue = second.value
+"#,
+        );
+        assert_eq!(ws.local_ty(file, "firstValue"), LuaType::String);
+        assert_eq!(ws.local_ty(file, "secondValue"), LuaType::Number);
+    }
+
+    #[test]
+    fn multiline_alias_origins_keep_the_alias_generic_parameter_in_scope() {
+        let mut ws = VirtualWorkspace::new();
+        let file = ws.def(
+            r#"
+---@alias S13MultilineAlias<T>
+---| { value: T }
+---| { other: T }
+local aliases
+---@type S13MultilineAlias<string>
+local receiver
+local value = receiver.value
+local other = receiver.other
+"#,
+        );
+        let db = ws.analysis.compilation.get_db();
+        for name in ["value", "other"] {
+            assert_eq!(
+                crate::TypeOps::Remove.apply(db, &ws.local_ty(file, name), &LuaType::Nil),
+                LuaType::String
+            );
+        }
+    }
+
+    #[test]
+    fn a_generic_class_after_an_alias_uses_its_own_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let file = ws.def(
+            r#"
+---@class S13AliasPayload
+---@field value string
+---@alias S13Passthrough<T> T
+---@class S13SubstitutedSibling<T> : S13Passthrough<T>
+local classes
+---@type S13SubstitutedSibling<S13AliasPayload>
+local receiver
+local value = receiver.value
+"#,
+        );
+        assert_eq!(ws.local_ty(file, "value"), LuaType::String);
+    }
+
+    #[test]
     fn test_generic_type_extends() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         ws.def(
@@ -1450,6 +1556,64 @@ mod test {
         );
     }
 
+    /// A local whose `---@schema` was read before its schema was fetched is
+    /// typed once the schema resolves.
+    #[test]
+    fn a_schema_fetched_after_its_tag_was_read_types_the_local() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_config.lua",
+            "---@schema https://example.com/config.json\nlocal config = {}\n",
+        );
+        let url = url::Url::parse("https://example.com/config.json").expect("a URL");
+        let schema =
+            r#"{"title":"Config","type":"object","properties":{"port":{"type":"integer"}}}"#;
+
+        ws.analysis
+            .apply_fetched_schemas(std::collections::HashMap::from([(url, schema.to_string())]));
+
+        let typ = ws.local_ty(file_id, "config");
+        assert!(matches!(typ, LuaType::Ref(_)), "{typ:?}");
+    }
+
+    /// A receiver out-param added to or taken from a method in another file
+    /// reaches its callers as a cold build of the same text does.
+    #[test]
+    fn an_edited_receiver_outparam_reaches_its_callers_like_a_cold_run() {
+        const WITHOUT: &str = r#"
+                ---@class Panel
+                ---@class Node
+                ---@field ChildNodes? Panel
+                local Node = {}
+
+                ---@param x Panel
+                function Node:CreateChildNodes(x) end
+            "#;
+        const WITH: &str = r#"
+                ---@class Panel
+                ---@class Node
+                ---@field ChildNodes? Panel
+                local Node = {}
+
+                ---@outparam self.ChildNodes Panel
+                function Node:CreateChildNodes(x) end
+            "#;
+        const CALLER: &str = r#"
+                ---@type Node
+                local node = {}
+
+                node:CreateChildNodes()
+                local children = node.ChildNodes
+            "#;
+        for (before, after) in [(WITHOUT, WITH), (WITH, WITHOUT)] {
+            VirtualWorkspace::assert_warm_matches_cold(
+                |_| {},
+                &[("lib.lua", before), ("test.lua", CALLER)],
+                &[("lib.lua", after)],
+            );
+        }
+    }
+
     #[test]
     fn test_outparam_self_receiver_updates_field_after_colon_call() {
         let mut ws = VirtualWorkspace::new();
@@ -1569,5 +1733,93 @@ mod test {
             function CreateChildNodes() end
             "#,
         ));
+    }
+
+    /// A class documented in two files is one shared property. The merged view takes each
+    /// scalar field from the lowest-sorting contributor, whichever order the files arrive in,
+    /// and re-indexing one file leaves the other's contribution standing.
+    fn shared_doc_description(ws: &mut VirtualWorkspace) -> Option<String> {
+        ws.get_db_mut()
+            .get_property_index()
+            .get_property(&LuaSemanticDeclId::TypeDecl(LuaTypeDeclId::global(
+                "SharedDoc",
+            )))
+            .and_then(|property| property.description().cloned())
+    }
+
+    const SHARED_DOC_A: (&str, &str) = (
+        "lua/shared_doc_a.lua",
+        "--- doc from a\n---@class SharedDoc\n---@field alpha integer\n",
+    );
+    const SHARED_DOC_B: (&str, &str) = (
+        "lua/shared_doc_b.lua",
+        "--- doc from b\n---@class SharedDoc\n---@field beta integer\n",
+    );
+
+    #[test]
+    fn test_class_documented_in_two_files_merges_in_path_order() {
+        let mut a_first = VirtualWorkspace::new();
+        a_first.def_file(SHARED_DOC_A.0, SHARED_DOC_A.1);
+        a_first.def_file(SHARED_DOC_B.0, SHARED_DOC_B.1);
+
+        let mut b_first = VirtualWorkspace::new();
+        b_first.def_file(SHARED_DOC_B.0, SHARED_DOC_B.1);
+        b_first.def_file(SHARED_DOC_A.0, SHARED_DOC_A.1);
+
+        assert_eq!(
+            shared_doc_description(&mut a_first).as_deref(),
+            Some("doc from a")
+        );
+        assert_eq!(
+            shared_doc_description(&mut b_first).as_deref(),
+            Some("doc from a")
+        );
+    }
+
+    #[test]
+    fn test_reindexing_one_documenting_file_keeps_the_other_contribution() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(SHARED_DOC_A.0, SHARED_DOC_A.1);
+        ws.def_file(SHARED_DOC_B.0, SHARED_DOC_B.1);
+
+        // Re-index the winner; b's contribution has to be what is left.
+        ws.def_file(SHARED_DOC_A.0, "---@class SharedDoc\n");
+
+        assert_eq!(
+            shared_doc_description(&mut ws).as_deref(),
+            Some("doc from b")
+        );
+
+        // And the winner coming back retakes the field.
+        ws.def_file(SHARED_DOC_A.0, SHARED_DOC_A.1);
+
+        assert_eq!(
+            shared_doc_description(&mut ws).as_deref(),
+            Some("doc from a")
+        );
+    }
+
+    #[test]
+    fn test_reindexing_a_documenting_file_does_not_accumulate_tags() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(SHARED_DOC_A.0, SHARED_DOC_A.1);
+        ws.def_file(
+            SHARED_DOC_B.0,
+            "--- doc from b\n---@class SharedDoc\n---@see Other\n",
+        );
+        ws.def_file(
+            SHARED_DOC_B.0,
+            "--- doc from b\n---@class SharedDoc\n---@see Other\n",
+        );
+
+        let tags = ws
+            .get_db_mut()
+            .get_property_index()
+            .get_property(&LuaSemanticDeclId::TypeDecl(LuaTypeDeclId::global(
+                "SharedDoc",
+            )))
+            .and_then(|property| property.tag_content().map(|tags| tags.get_all_tags().len()));
+
+        assert_eq!(tags, Some(1));
     }
 }

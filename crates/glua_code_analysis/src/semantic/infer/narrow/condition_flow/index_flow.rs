@@ -1,13 +1,14 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexMemberExpr};
 
 use crate::{
-    DbIndex, FlowNode, FlowTree, GmodRealm, InferFailReason, InferGuard, LuaInferCache,
-    LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId,
+    DbIndex, FlowNode, FlowTree, GmodRealm, InferFailReason, LuaInferCache, LuaMemberKey,
+    LuaMemberOwner, LuaType, LuaTypeDeclId,
     semantic::{
+        decl::value::local_initializer_expr,
         infer::{
-            VarRefId,
+            VarRefId, infer_expr,
             infer_index::infer_member_by_member_key,
             narrow::{
                 ResultTypeOrContinue,
@@ -20,6 +21,7 @@ use crate::{
                 },
             },
         },
+        resolve_dynamic_field_member,
         type_check::is_sub_type_of,
     },
 };
@@ -94,7 +96,9 @@ fn maybe_field_exist_narrow(
 
     let maybe_var_ref_id = get_var_expr_var_ref_id(db, cache, prefix_expr.clone());
 
-    if maybe_var_ref_id.as_ref() != Some(var_ref_id) {
+    if maybe_var_ref_id.as_ref() != Some(var_ref_id)
+        && entity_table_owner(db, cache, &prefix_expr).as_ref() != Some(var_ref_id)
+    {
         // Direct prefix doesn't match the queried var. For an Unknown base in
         // the truthy branch we still want to narrow the *transitive* leftmost
         // name (e.g. `if a.b.c then` → `a` is non-nil), so fall through to the
@@ -169,13 +173,7 @@ fn maybe_field_exist_narrow(
 
     let mut result = vec![];
     for sub_type in &candidates {
-        let member_type = match infer_member_by_member_key(
-            db,
-            cache,
-            sub_type,
-            index.clone(),
-            &InferGuard::new(),
-        ) {
+        let member_type = match infer_member_by_member_key(db, cache, sub_type, index.clone()) {
             Ok(member_type) => member_type,
             Err(_) => continue, // If we cannot infer the member type, skip this type
         };
@@ -187,6 +185,8 @@ fn maybe_field_exist_narrow(
             result.push(sub_type.clone());
         }
     }
+
+    let result = drop_subtypes_of_arms_holding_the_field(db, &left_type, &member_key, result);
 
     match condition_flow {
         InferConditionFlow::TrueCondition => {
@@ -240,6 +240,95 @@ fn maybe_field_exist_narrow(
     Ok(ResultTypeOrContinue::Continue)
 }
 
+/// An antecedent arm that declares the field, directly or inherited, stands
+/// for its subtypes: the guard tells nothing more about them, and narrowing
+/// the arm to a subclass that overrides the field would replace a base class
+/// with one of its own derived panels. An arm whose field only infers as
+/// present, as on an open entity, still narrows to the subtypes declaring it.
+fn drop_subtypes_of_arms_holding_the_field(
+    db: &DbIndex,
+    left_type: &LuaType,
+    member_key: &LuaMemberKey,
+    result: Vec<LuaType>,
+) -> Vec<LuaType> {
+    let arms = collect_antecedent_nominal_arms(left_type)
+        .into_iter()
+        .filter(|arm| result.contains(arm))
+        .filter(|arm| match arm {
+            LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+                type_or_super_owns_member(db, type_id, member_key)
+            }
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    if arms.is_empty() {
+        return result;
+    }
+    result
+        .into_iter()
+        .filter(|candidate| {
+            !arms
+                .iter()
+                .any(|arm| is_strict_sub_type_of(db, candidate, arm))
+        })
+        .collect()
+}
+
+/// The variable whose entity table `table_expr` names: a local whose only
+/// value is a call returning `tableof<self>` of that variable, such as
+/// `local t = GetTable(ent)` or `local t = ent:GetTable()`, of a variable no
+/// write reaches after the call, loops included. A field read off the table
+/// is a field read off the variable.
+fn entity_table_owner(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    table_expr: &LuaExpr,
+) -> Option<VarRefId> {
+    let LuaExpr::NameExpr(name_expr) = table_expr else {
+        return None;
+    };
+    let file_id = cache.get_file_id();
+    let table_decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, name_expr.get_range())?;
+    if db
+        .get_reference_index()
+        .get_decl_references(&file_id, &table_decl_id)
+        .is_none_or(|references| references.mutable)
+    {
+        return None;
+    }
+    let (0, LuaExpr::CallExpr(call_expr)) = local_initializer_expr(db, table_decl_id)? else {
+        return None;
+    };
+    if !matches!(
+        infer_expr(db, cache, LuaExpr::CallExpr(call_expr.clone())),
+        Ok(LuaType::TableOf(_))
+    ) {
+        return None;
+    }
+    let owner_expr = if call_expr.is_colon_call() {
+        let LuaExpr::IndexExpr(method) = call_expr.get_prefix_expr()? else {
+            return None;
+        };
+        method.get_prefix_expr()?
+    } else {
+        call_expr.get_args_list()?.get_args().next()?
+    };
+    let owner = get_var_expr_var_ref_id(db, cache, owner_expr)?;
+    let owner_decl_id = owner.get_decl_id_ref()?;
+    let aliased_at = call_expr.get_position();
+    db.get_reference_index()
+        .get_decl_references(&owner_decl_id.file_id, &owner_decl_id)
+        .is_some_and(|references| {
+            !references
+                .cells
+                .iter()
+                .any(|cell| cell.is_write && cell.range.start() > aliased_at)
+        })
+        .then_some(owner)
+}
+
 fn type_directly_owns_member(
     db: &DbIndex,
     type_id: &crate::LuaTypeDeclId,
@@ -255,6 +344,48 @@ fn type_directly_owns_member(
     member_index
         .get_member_item(&global_owner, member_key)
         .is_some()
+}
+
+fn type_or_super_owns_member(
+    db: &DbIndex,
+    type_id: &LuaTypeDeclId,
+    member_key: &LuaMemberKey,
+) -> bool {
+    let mut seen = FxHashSet::default();
+    let mut pending = vec![type_id.clone()];
+    while let Some(type_id) = pending.pop() {
+        if !seen.insert(type_id.clone()) {
+            continue;
+        }
+        if type_directly_owns_member(db, &type_id, member_key) {
+            return true;
+        }
+        if let Some(super_types) = db.get_type_index().get_super_types_iter(&type_id) {
+            pending.extend(super_types.filter_map(|super_type| match super_type {
+                LuaType::Ref(id) | LuaType::Def(id) => Some(id.clone()),
+                _ => None,
+            }));
+        }
+    }
+    false
+}
+
+pub(super) fn infer_field_guard_member(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    prefix: &LuaType,
+    member_key: &LuaMemberKey,
+    index: LuaIndexMemberExpr,
+) -> Result<LuaType, InferFailReason> {
+    let position = index.get_position();
+    match infer_member_by_member_key(db, cache, prefix, index) {
+        Err(InferFailReason::FieldNotFound) => {
+            resolve_dynamic_field_member(db, cache, prefix, member_key, Some(position))?
+                .map(|field| field.typ)
+                .ok_or(InferFailReason::FieldNotFound)
+        }
+        result => result,
+    }
 }
 
 fn collect_field_exist_narrow_candidates(
@@ -274,7 +405,7 @@ fn collect_field_exist_narrow_candidates(
     // open bases must not fan out into every scripted subclass.
     let reverse_owners = collect_reverse_member_owner_types(db, member_key);
     let mut candidates = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
 
     for owner in reverse_owners {
         if !owner_fits_antecedent(db, &owner, &antecedent_arms) {
@@ -345,7 +476,7 @@ fn collect_field_exist_narrow_candidates(
 
 fn collect_antecedent_nominal_arms(left_type: &LuaType) -> Vec<LuaType> {
     let mut arms = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     collect_antecedent_nominal_arms_into(left_type, &mut arms, &mut seen);
     arms
 }
@@ -353,7 +484,7 @@ fn collect_antecedent_nominal_arms(left_type: &LuaType) -> Vec<LuaType> {
 fn collect_antecedent_nominal_arms_into(
     left_type: &LuaType,
     arms: &mut Vec<LuaType>,
-    seen: &mut HashSet<LuaType>,
+    seen: &mut FxHashSet<LuaType>,
 ) {
     match left_type {
         LuaType::Union(union_type) => {
@@ -375,7 +506,7 @@ fn collect_antecedent_nominal_arms_into(
 
 fn collect_reverse_member_owner_types(db: &DbIndex, member_key: &LuaMemberKey) -> Vec<LuaType> {
     let mut owners = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     for member in db
         .get_member_index()
         .get_current_members_for_key(member_key)
@@ -467,7 +598,7 @@ fn expand_surviving_subtypes_for_falsy_overrides(
             if !is_strict_sub_type_of(db, owner, candidate) {
                 return false;
             }
-            match infer_member_by_member_key(db, cache, owner, index.clone(), &InferGuard::new()) {
+            match infer_member_by_member_key(db, cache, owner, index.clone()) {
                 Ok(member_type) => member_type.is_always_falsy() || member_type.is_never(),
                 Err(_) => false,
             }
@@ -482,7 +613,7 @@ fn expand_surviving_subtypes_for_falsy_overrides(
     }
 
     let mut expanded = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     for candidate in &candidates {
         if falsy_override_parents.iter().any(|p| p == candidate) {
             continue;
@@ -509,8 +640,7 @@ fn expand_surviving_subtypes_for_falsy_overrides(
             if !seen.insert(sub_ty.clone()) {
                 continue;
             }
-            match infer_member_by_member_key(db, cache, &sub_ty, index.clone(), &InferGuard::new())
-            {
+            match infer_member_by_member_key(db, cache, &sub_ty, index.clone()) {
                 Ok(member_type) if !member_type.is_always_falsy() && !member_type.is_never() => {
                     expanded.push(sub_ty);
                     added_subtype = true;

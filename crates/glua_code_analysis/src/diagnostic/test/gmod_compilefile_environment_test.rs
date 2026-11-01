@@ -367,60 +367,72 @@ mod test {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         ws.def_gmod_call_arg_builtins();
         let loader_uri = ws.virtual_url_generator.new_uri("lua/loader.lua");
-        ws.analysis.update_file_by_uri(
-            &loader_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &loader_uri,
+                Some(
+                    r#"
                 local chunk = CompileFile("target.lua")
                 setfenv(chunk, { simple = true })
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         let target_uri = ws.virtual_url_generator.new_uri("lua/target.lua");
         let target_id = ws
             .analysis
             .update_file_by_uri(&target_uri, Some("simple()".to_string()))
+            .map(|(id, _)| id)
             .expect("target file is created");
         assert!(undefined_global_names(&mut ws, target_id).is_empty());
 
-        ws.analysis.update_file_by_uri(
-            &loader_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &loader_uri,
+                Some(
+                    r#"
                 local chunk = CompileFile("target.lua")
                 setfenv(chunk, { other = true })
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         assert_eq!(
             undefined_global_names(&mut ws, target_id),
             BTreeSet::from(["simple".to_string()]),
         );
 
-        ws.analysis.update_file_by_uri(&loader_uri, None);
+        ws.analysis
+            .update_file_by_uri(&loader_uri, None)
+            .map(|(id, _)| id);
         assert_eq!(
             undefined_global_names(&mut ws, target_id),
             BTreeSet::from(["simple".to_string()]),
         );
 
-        ws.analysis.update_file_by_uri(
-            &loader_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &loader_uri,
+                Some(
+                    r#"
                 local chunk = CompileFile("target.lua")
                 setfenv(chunk, { simple = true })
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
         assert!(undefined_global_names(&mut ws, target_id).is_empty());
 
-        ws.analysis.update_file_by_uri(&target_uri, None);
+        ws.analysis
+            .update_file_by_uri(&target_uri, None)
+            .map(|(id, _)| id);
         let reopened_target_id = ws
             .analysis
             .update_file_by_uri(&target_uri, Some("simple()".to_string()))
+            .map(|(id, _)| id)
             .expect("target file is reopened");
         assert!(undefined_global_names(&mut ws, reopened_target_id).is_empty());
     }

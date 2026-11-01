@@ -1,11 +1,13 @@
 use glua_parser::{
-    LuaAst, LuaAstNode, LuaDocTagAttributeUse, LuaDocType, LuaExpr, LuaKind, LuaLiteralExpr,
-    LuaLiteralToken, LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind, NumberResult,
+    LuaAst, LuaAstNode, LuaDocTagAttributeUse, LuaDocType, LuaExpr, LuaIndexKey, LuaKind,
+    LuaLiteralExpr, LuaLiteralToken, LuaLocalName, LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind,
+    LuaVarExpr, NumberResult,
 };
 use smol_str::SmolStr;
 
 use crate::{
-    GMOD_ATTR_WRITES_GLOBAL, LuaAttributeUse, LuaSemanticDeclId, LuaType,
+    GMOD_ATTR_EXHAUSTIVE_TYPE_GUARD, GMOD_ATTR_VALID_GUARD, GMOD_ATTR_WRITES_GLOBAL,
+    LuaAttributeUse, LuaSemanticDeclId, LuaType,
     compilation::analyzer::doc::{
         DocAnalyzer,
         infer_type::infer_type,
@@ -27,13 +29,30 @@ pub fn analyze_tag_attribute_use(
         }
     };
 
-    if let Some(owner) = owner {
+    if let Some(owner) = owner.clone() {
         match (owner, &owner_id) {
             (LuaAst::LuaDocTagParam(_), LuaSemanticDeclId::Signature(_))
             | (LuaAst::LuaDocTagReturn(_), LuaSemanticDeclId::Signature(_)) => {
                 let attribute_uses = infer_attribute_uses(analyzer, tag_use)?;
                 for attribute_use in attribute_uses {
-                    if attribute_use.id.get_name() == GMOD_ATTR_WRITES_GLOBAL {
+                    if attribute_use.id.get_name() == GMOD_ATTR_VALID_GUARD
+                        && let Some(name) = analyzer
+                            .comment
+                            .get_owner()
+                            .as_ref()
+                            .and_then(documented_definition_name)
+                    {
+                        analyzer
+                            .db
+                            .get_signature_index_mut()
+                            .add_valid_guard_name(analyzer.file_id, name);
+                    }
+                    if matches!(
+                        attribute_use.id.get_name(),
+                        GMOD_ATTR_WRITES_GLOBAL
+                            | GMOD_ATTR_VALID_GUARD
+                            | GMOD_ATTR_EXHAUSTIVE_TYPE_GUARD
+                    ) {
                         analyzer.db.get_property_index_mut().add_attribute_use(
                             analyzer.file_id,
                             owner_id.clone(),
@@ -49,6 +68,14 @@ pub fn analyze_tag_attribute_use(
 
     let attribute_uses = infer_attribute_uses(analyzer, tag_use)?;
     for attribute_use in attribute_uses {
+        if attribute_use.id.get_name() == GMOD_ATTR_VALID_GUARD
+            && let Some(name) = owner.as_ref().and_then(documented_definition_name)
+        {
+            analyzer
+                .db
+                .get_signature_index_mut()
+                .add_valid_guard_name(analyzer.file_id, name);
+        }
         analyzer.db.get_property_index_mut().add_attribute_use(
             analyzer.file_id,
             owner_id.clone(),
@@ -56,6 +83,41 @@ pub fn analyze_tag_attribute_use(
         );
     }
     Some(())
+}
+
+/// The name of the definition a doc comment documents: the function, local,
+/// assignment target or table field it is attached to.
+fn documented_definition_name(owner: &LuaAst) -> Option<SmolStr> {
+    let var_name = |var: LuaVarExpr| match var {
+        LuaVarExpr::NameExpr(name) => name.get_name_text().map(SmolStr::new),
+        LuaVarExpr::IndexExpr(index) => index_key_name(index.get_index_key()?),
+    };
+    match owner {
+        LuaAst::LuaFuncStat(stat) => var_name(stat.get_func_name()?),
+        LuaAst::LuaLocalFuncStat(stat) => Some(
+            stat.get_local_name()?
+                .get_name_token()?
+                .get_name_text()
+                .into(),
+        ),
+        LuaAst::LuaAssignStat(stat) => var_name(stat.child::<LuaVarExpr>()?),
+        LuaAst::LuaLocalStat(stat) => Some(
+            stat.child::<LuaLocalName>()?
+                .get_name_token()?
+                .get_name_text()
+                .into(),
+        ),
+        LuaAst::LuaTableField(field) => index_key_name(field.get_field_key()?),
+        _ => None,
+    }
+}
+
+fn index_key_name(key: LuaIndexKey) -> Option<SmolStr> {
+    match key {
+        LuaIndexKey::Name(name) => Some(name.get_name_text().into()),
+        LuaIndexKey::String(string) => Some(string.get_value().into()),
+        _ => None,
+    }
 }
 
 pub fn infer_attribute_uses(
@@ -74,7 +136,7 @@ pub fn infer_attribute_uses(
             let param_names = analyzer
                 .db
                 .get_type_index()
-                .get_type_decl(&type_id)
+                .get_source_type_decl(&type_id)
                 .and_then(|decl| decl.get_attribute_type())
                 .and_then(|typ| match typ {
                     LuaType::DocAttribute(attr_type) => Some(
@@ -137,7 +199,7 @@ fn infer_attribute_arg_type(expr: LuaLiteralExpr) -> LuaType {
     LuaType::Unknown
 }
 
-/// 寻找特性的所有者
+/// Finds the owner of an attribute
 fn attribute_use_get_owner(
     analyzer: &mut DocAnalyzer,
     attribute_use: &LuaDocTagAttributeUse,
@@ -198,7 +260,7 @@ fn find_up_attribute(
                         }
                     }
                 }
-                // 某些情况下我们需要以 --- 为分割中断寻找
+                // In some cases the search must stop at a --- separator
                 LuaKind::Token(LuaTokenKind::TkDocContinue) => {
                     if stop_by_continue {
                         return None;
@@ -228,5 +290,39 @@ pub fn find_attach_attribute(ast: LuaAst) -> Option<Vec<LuaDocTagAttributeUse>> 
             Some(result)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use glua_parser::{LuaAstNode, LuaClosureExpr};
+
+    use crate::{GmodRealm, LuaSignatureId, VirtualWorkspace, signature_is_valid_guard_in_realm};
+
+    #[test]
+    fn valid_guard_metadata_survives_parameter_and_return_tag_attachment() {
+        for docs in [
+            "---@[valid_guard]\n---@param value any\n---@return boolean",
+            "---@param value any\n---@[valid_guard]\n---@return boolean",
+            "---@param value any\n---@return boolean\n---@[valid_guard]",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            let file = ws.def_file(
+                "annotations/valid_guard_placement.lua",
+                &format!("---@attribute valid_guard()\n\n{docs}\nfunction present(value) end"),
+            );
+            let db = ws.analysis.compilation.get_db();
+            let root = db
+                .get_vfs()
+                .get_syntax_tree(&file)
+                .unwrap()
+                .get_chunk_node();
+            let closure = root.descendants::<LuaClosureExpr>().next().unwrap();
+            let signature = LuaSignatureId::from_closure(file, &closure);
+            assert!(
+                signature_is_valid_guard_in_realm(db, signature, GmodRealm::Shared),
+                "{docs}"
+            );
+        }
     }
 }

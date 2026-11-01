@@ -4,40 +4,93 @@ mod module_node;
 mod test;
 mod workspace;
 
+use crate::db_index::cow_shards::{CowCell, CowShards};
 use glua_parser::LuaVersionCondition;
 pub use legacy_module_env::LegacyModuleEnv;
 use log::{error, info};
 pub use module_info::ModuleInfo;
 pub use module_node::{ModuleNode, ModuleNodeId};
 use regex::Regex;
-use rowan::TextSize;
-use rustc_hash::FxHashMap;
+use rowan::{TextRange, TextSize};
+use rustc_hash::{FxHashMap, FxHashSet};
+use smol_str::SmolStr;
+use std::collections::HashMap;
 pub(crate) use workspace::WorkspaceResolutionKey;
 pub use workspace::{Workspace, WorkspaceId, WorkspaceKind};
 
 use super::traits::LuaIndex;
-use crate::{Emmyrc, FileId};
+use crate::db_index::derivation::{self, FactKey, Fingerprint};
+use crate::{Emmyrc, FileId, LuaSemanticDeclId, LuaType};
 use std::{
-    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LuaModuleIndex {
-    module_patterns: Vec<Regex>,
+    module_patterns: CowCell<Vec<Regex>>,
     module_root_id: ModuleNodeId,
-    module_nodes: FxHashMap<ModuleNodeId, ModuleNode>,
-    file_module_map: FxHashMap<FileId, ModuleInfo>,
-    file_module_paths: FxHashMap<FileId, String>,
-    module_name_to_file_ids: FxHashMap<String, Vec<FileId>>,
-    legacy_module_envs: FxHashMap<FileId, Vec<LegacyModuleEnv>>,
-    workspaces: Vec<Workspace>,
-    workspace_kind_map: FxHashMap<WorkspaceId, WorkspaceKind>,
+    module_nodes: CowCell<FxHashMap<ModuleNodeId, ModuleNode>>,
+    file_module_map: CowShards<FileId, ModuleInfo>,
+    /// File -> the other files whose module export names a position in it.
+    export_refs: CowShards<FileId, FxHashSet<FileId>>,
+    /// The `(file, module name, workspace)` of every module in `file_module_map`.
+    module_files: derivation::SetFingerprint,
+    file_module_paths: CowCell<FxHashMap<FileId, String>>,
+    module_name_to_file_ids: CowCell<FxHashMap<String, Vec<FileId>>>,
+    legacy_module_envs: CowCell<FxHashMap<FileId, Vec<LegacyModuleEnv>>>,
+    workspaces: CowCell<Vec<Workspace>>,
+    workspace_kind_map: CowCell<FxHashMap<WorkspaceId, WorkspaceKind>>,
     id_counter: u32,
     fuzzy_search: bool,
-    module_replace_vec: Vec<(Regex, String)>,
+    module_replace_vec: CowCell<Vec<(Regex, String)>>,
     workspace_isolation_enabled: bool,
+}
+
+fn note_module_fact_write(file_id: FileId) {
+    derivation::note_write(|| FactKey::Module(file_id));
+    derivation::note_write(|| FactKey::ModuleMeta(file_id));
+}
+
+/// The first segment of a dotted module path: the namespace key.
+fn namespace_root(module_path: &str) -> SmolStr {
+    SmolStr::new(module_path.split('.').next().unwrap_or(module_path))
+}
+
+/// The last segment of a module path as lookups split it: the name key.
+fn lookup_name(module_path: &str) -> SmolStr {
+    SmolStr::new(
+        module_path
+            .rsplit(['.', '/', '\\'])
+            .next()
+            .unwrap_or(module_path),
+    )
+}
+
+/// Deterministic precedence of one declaration site for a shared `---`
+/// payload (alias origin, generic params, ...).
+///
+/// The ordering reuses the global module-resolution semantics: workspace kind
+/// (Main before Library before Std before Remote), then the workspace's
+/// registration order so earlier configured libraries win, then the
+/// normalized VFS path, then the declaration range inside the file. File id
+/// is only a totality tiebreak for two files sharing a path; arrival order
+/// never participates, so the winner is a function of the settled
+/// declaration set rather than ingestion order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LuaDeclSourceKey {
+    /// `workspace_kind_priority`: Main=0, Library=1, Std=2, Remote=3.
+    pub workspace_kind: u8,
+    /// Position of the file's workspace in registration order.
+    pub workspace_order: usize,
+    /// Tiebreak inside `workspace_order_priority` (`WorkspaceId::id`).
+    pub workspace_id: u32,
+    /// `Vfs::file_order_key` — normalized path, empty when unknown.
+    pub file_order_key: Arc<str>,
+    /// Totality tiebreak for files sharing an order key (`FileId::id`).
+    pub file_id: u32,
+    /// The declaration site's range inside its file.
+    pub range: (TextSize, TextSize),
 }
 
 impl Default for LuaModuleIndex {
@@ -46,21 +99,48 @@ impl Default for LuaModuleIndex {
     }
 }
 
+/// The files other than its own whose positions `info`'s export names.
+fn export_files(info: &ModuleInfo) -> FxHashSet<FileId> {
+    let mut files = info
+        .export_type
+        .as_ref()
+        .map(crate::db_index::r#type::type_referenced_files)
+        .unwrap_or_default();
+    files.extend(
+        info.semantic_id
+            .as_ref()
+            .and_then(LuaSemanticDeclId::get_file_id),
+    );
+    files.remove(&info.file_id);
+    files
+}
+
+/// One module's contribution to [`FactKey::ModuleFiles`].
+fn module_files_entry(info: &ModuleInfo) -> (FileId, &str, WorkspaceId) {
+    (
+        info.file_id,
+        info.full_module_name.as_str(),
+        info.workspace_id,
+    )
+}
+
 impl LuaModuleIndex {
     pub fn new() -> Self {
         let mut index = Self {
-            module_patterns: Vec::new(),
+            module_patterns: Default::default(),
             module_root_id: ModuleNodeId { id: 0 },
-            module_nodes: FxHashMap::default(),
-            file_module_map: FxHashMap::default(),
-            file_module_paths: FxHashMap::default(),
-            module_name_to_file_ids: FxHashMap::default(),
-            legacy_module_envs: FxHashMap::default(),
-            workspaces: Vec::new(),
-            workspace_kind_map: FxHashMap::default(),
+            module_nodes: Default::default(),
+            file_module_map: Default::default(),
+            export_refs: Default::default(),
+            module_files: derivation::SetFingerprint::default(),
+            file_module_paths: Default::default(),
+            module_name_to_file_ids: Default::default(),
+            legacy_module_envs: Default::default(),
+            workspaces: Default::default(),
+            workspace_kind_map: Default::default(),
             id_counter: 1,
             fuzzy_search: false,
-            module_replace_vec: Vec::new(),
+            module_replace_vec: Default::default(),
             workspace_isolation_enabled: true,
         };
 
@@ -119,15 +199,24 @@ impl LuaModuleIndex {
         }
 
         let normalized_path = path.replace('\\', "/");
-        let (module_path, workspace_id) = self.extract_module_path(&normalized_path)?;
-        let mut module_path = module_path.replace(['\\', '/'], ".");
-        if !self.module_replace_vec.is_empty() {
-            module_path = self.replace_module_path(&module_path);
-        }
+        let (module_path, workspace_id) = self.module_path_at(&normalized_path)?;
 
         self.add_module_by_module_path(file_id, module_path, workspace_id);
         self.file_module_paths.insert(file_id, normalized_path);
+        note_module_fact_write(file_id);
         Some(workspace_id)
+    }
+
+    /// The dotted module path, and workspace, a file at `path` registers as.
+    pub fn module_path_at(&self, path: &str) -> Option<(String, WorkspaceId)> {
+        let (module_path, workspace_id) = self.extract_module_path(path)?;
+        let module_path = module_path.replace(['\\', '/'], ".");
+        let module_path = if self.module_replace_vec.is_empty() {
+            module_path
+        } else {
+            self.replace_module_path(&module_path)
+        };
+        Some((module_path, workspace_id))
     }
 
     pub fn add_module_by_module_path(
@@ -165,7 +254,7 @@ impl LuaModuleIndex {
             if let std::collections::hash_map::Entry::Vacant(e) = self.module_nodes.entry(child_id)
             {
                 let new_node = ModuleNode {
-                    children: HashMap::new(),
+                    children: HashMap::default(),
                     file_ids: Vec::new(),
                     parent: Some(parent_node_id),
                 };
@@ -194,32 +283,299 @@ impl LuaModuleIndex {
             is_meta: false,
         };
 
+        self.module_files.insert(&module_files_entry(&module_info));
         self.file_module_map.insert(file_id, module_info);
-        if self.fuzzy_search {
-            self.module_name_to_file_ids
-                .entry(module_name)
-                .or_default()
-                .push(file_id);
-        }
+        derivation::note_write(|| FactKey::ModuleFiles);
+        self.module_name_to_file_ids
+            .entry(module_name)
+            .or_default()
+            .push(file_id);
+        self.note_lookup_keys(file_id);
 
         Some(())
     }
 
-    pub fn get_module(&self, file_id: FileId) -> Option<&ModuleInfo> {
-        self.file_module_map.get(&file_id)
+    /// The path `file_id`'s module was registered from, `/`-separated.
+    pub fn registered_path(&self, file_id: FileId) -> Option<&str> {
+        self.file_module_paths.get(&file_id).map(String::as_str)
     }
 
-    pub fn get_module_mut(&mut self, file_id: FileId) -> Option<&mut ModuleInfo> {
-        self.file_module_map.get_mut(&file_id)
+    /// Whether `file_id` at `path` belongs where it does now: a module in the
+    /// same workspace, or no module. Its module path may differ.
+    pub(crate) fn belongs_alike_at(&self, file_id: FileId, path: &str) -> bool {
+        let workspace_id = self
+            .extract_module_path(&path.replace('\\', "/"))
+            .map(|(_, workspace_id)| workspace_id);
+        workspace_id
+            == self
+                .file_module_map
+                .get(&file_id)
+                .map(|info| info.workspace_id)
+    }
+
+    /// Re-files `file_id`'s module, registered from its path, under `path`,
+    /// keeping what its source and module return declared of it. A module a
+    /// `---@module` annotation names stays as it is.
+    pub(crate) fn repath_module(&mut self, file_id: FileId, path: &str) {
+        if !self.file_module_paths.contains_key(&file_id) {
+            return;
+        }
+        let Some(declared) = self.file_module_map.get(&file_id).cloned() else {
+            return;
+        };
+        let legacy_envs = self.legacy_module_envs.get(&file_id).cloned();
+        self.add_module_by_path(file_id, path);
+        if let Some(info) = self.file_module_map.get_mut(&file_id) {
+            info.visible = declared.visible;
+            info.version_conds = declared.version_conds;
+            info.is_meta = declared.is_meta;
+            info.export_type = declared.export_type;
+            info.semantic_id = declared.semantic_id;
+        }
+        self.relink_export(file_id, FxHashSet::default());
+        if let Some(envs) = legacy_envs {
+            self.legacy_module_envs.insert(file_id, envs);
+        }
+        self.note_lookup_keys(file_id);
+    }
+
+    pub fn get_module(&self, file_id: FileId) -> Option<&ModuleInfo> {
+        derivation::note_read(|| FactKey::Module(file_id));
+        let module = self.file_module_map.get(&file_id)?;
+        Some(module)
+    }
+
+    /// Records a module-export change. Callers note only when the write
+    /// added a novel fact.
+    pub(crate) fn note_module_write(&mut self, file_id: FileId) {
+        note_module_fact_write(file_id);
+    }
+
+    /// Clears the export a file's module return derived, back to what the
+    /// source layer registered: none.
+    pub(crate) fn reset_export(&mut self, file_id: FileId) {
+        if let Some(info) = self.file_module_map.get_mut(&file_id) {
+            let linked = export_files(info);
+            info.export_type = None;
+            info.semantic_id = None;
+            note_module_fact_write(file_id);
+            self.relink_export(file_id, linked);
+        }
+    }
+
+    /// Sets `file_id`'s module export. Returns whether it changed, or `None`
+    /// when the file has no module.
+    pub fn set_export(
+        &mut self,
+        file_id: FileId,
+        export_type: LuaType,
+        semantic_id: Option<LuaSemanticDeclId>,
+    ) -> Option<bool> {
+        derivation::note_read(|| FactKey::Module(file_id));
+        self.note_lookup_keys(file_id);
+        let info = self.file_module_map.get_mut(&file_id)?;
+        if info.export_type.as_ref() == Some(&export_type) && info.semantic_id == semantic_id {
+            return Some(false);
+        }
+        let linked = export_files(info);
+        info.export_type = Some(export_type);
+        info.semantic_id = semantic_id;
+        self.relink_export(file_id, linked);
+        Some(true)
+    }
+
+    /// Re-files `file_id` under the files its export names now, given those
+    /// `linked` it named before.
+    fn relink_export(&mut self, file_id: FileId, linked: FxHashSet<FileId>) {
+        let named = self
+            .file_module_map
+            .get(&file_id)
+            .map(export_files)
+            .unwrap_or_default();
+        for named_file in linked.difference(&named) {
+            if let Some(files) = self.export_refs.get_mut(named_file) {
+                files.remove(&file_id);
+                if files.is_empty() {
+                    self.export_refs.remove(named_file);
+                }
+            }
+        }
+        for named_file in named.difference(&linked) {
+            self.export_refs
+                .entry(*named_file)
+                .or_default()
+                .insert(file_id);
+        }
+    }
+
+    /// Rewrites the exports of other files' modules that name positions of
+    /// `remap.file_id`. Returns the modules whose export named a position the
+    /// edit destroyed: they are computed again instead.
+    pub fn remap_file_exports(&mut self, remap: &crate::FileRemap) -> Vec<crate::LostFact> {
+        let mut lost = Vec::new();
+        let mut file_ids = self
+            .export_refs
+            .get(&remap.file_id)
+            .map(|files| files.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        file_ids.sort_unstable();
+        for file_id in &file_ids {
+            let Some(info) = self.file_module_map.get_mut(file_id) else {
+                continue;
+            };
+            let export = info
+                .export_type
+                .as_ref()
+                .map(|typ| crate::remap_identities_in_type(typ, remap));
+            let semantic_id = info
+                .semantic_id
+                .as_ref()
+                .map(|id| remap.semantic_decl_id(id));
+            if export.as_ref().is_some_and(|export| export.lost)
+                || semantic_id.as_ref().is_some_and(crate::Remap::is_lost)
+            {
+                lost.push(crate::LostFact::new(*file_id, FactKey::Module(*file_id)));
+                continue;
+            }
+            let mut moved = false;
+            if let Some(typ) = export.and_then(|export| export.typ) {
+                info.export_type = Some(typ);
+                moved = true;
+            }
+            if let Some(crate::Remap::Moved(id)) = semantic_id
+                && info.semantic_id.as_ref() != Some(&id)
+            {
+                info.semantic_id = Some(id);
+                moved = true;
+            }
+            if moved {
+                note_module_fact_write(*file_id);
+            }
+        }
+        lost
+    }
+
+    /// What module lookups (`find_module*`, module nodes, workspace file
+    /// lists, legacy namespaces) observe of one file; `ABSENT` when the file
+    /// contributes nothing.
+    /// Notes a change to what lookups by `file_id`'s module name and legacy
+    /// namespaces observe.
+    fn note_lookup_keys(&self, file_id: FileId) {
+        if !derivation::recording() {
+            return;
+        }
+        note_module_fact_write(file_id);
+        if let Some(info) = self.file_module_map.get(&file_id) {
+            derivation::note_write(|| FactKey::ModuleName(SmolStr::new(&info.name)));
+            derivation::note_write(|| FactKey::ModulePath(SmolStr::new(&info.full_module_name)));
+        }
+        for env in self.legacy_module_envs.get(&file_id).into_iter().flatten() {
+            derivation::note_write(|| FactKey::ModuleNamespace(namespace_root(&env.module_path)));
+        }
+    }
+
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        match key {
+            FactKey::Module(file_id) => {
+                let module_info = self.file_module_map.get(file_id);
+                let legacy_envs = self.legacy_module_envs.get(file_id);
+                if module_info.is_none() && legacy_envs.is_none() {
+                    return derivation::ABSENT;
+                }
+                derivation::fingerprint_of(&(
+                    module_info.map(|info| {
+                        (
+                            info.full_module_name.as_str(),
+                            info.name.as_str(),
+                            info.visible,
+                            &info.export_type,
+                            &info.version_conds,
+                            info.workspace_id,
+                            &info.semantic_id,
+                            info.is_meta,
+                        )
+                    }),
+                    self.file_module_paths.get(file_id),
+                    legacy_envs,
+                ))
+            }
+            FactKey::ModuleMeta(file_id) => {
+                let module_info = self.file_module_map.get(file_id);
+                let legacy_envs = self.legacy_module_envs.get(file_id);
+                if module_info.is_none() && legacy_envs.is_none() {
+                    return derivation::ABSENT;
+                }
+                derivation::fingerprint_of(&(
+                    module_info.map(|info| (info.workspace_id, info.is_meta)),
+                    legacy_envs,
+                ))
+            }
+            FactKey::ModuleName(name) => self.named_modules_fingerprint(name, |_| true),
+            FactKey::ModulePath(path) => self
+                .named_modules_fingerprint(&lookup_name(path), |info| {
+                    info.full_module_name == path.as_str()
+                }),
+            FactKey::ModuleFiles => self.module_files.get(),
+            FactKey::ModuleNamespace(root) => {
+                let mut envs = self
+                    .legacy_module_envs
+                    .iter()
+                    .flat_map(|(file_id, envs)| envs.iter().map(move |env| (*file_id, env)))
+                    .filter(|(_, env)| namespace_root(&env.module_path) == *root)
+                    .map(|(file_id, env)| (file_id, env.module_path.as_str()))
+                    .collect::<Vec<_>>();
+                if envs.is_empty() {
+                    return derivation::ABSENT;
+                }
+                envs.sort();
+                derivation::fingerprint_of(&envs)
+            }
+            _ => {
+                debug_assert!(false, "{key:?} is not a module fact");
+                derivation::ABSENT
+            }
+        }
+    }
+
+    /// The fingerprint of the modules named `name` that `filter` keeps.
+    fn named_modules_fingerprint(
+        &self,
+        name: &str,
+        filter: impl Fn(&ModuleInfo) -> bool,
+    ) -> Fingerprint {
+        let Some(file_ids) = self.module_name_to_file_ids.get(name) else {
+            return derivation::ABSENT;
+        };
+        let mut modules = file_ids
+            .iter()
+            .filter_map(|file_id| self.file_module_map.get(file_id))
+            .filter(|info| filter(info))
+            .map(|info| {
+                (
+                    info.file_id,
+                    info.full_module_name.as_str(),
+                    info.visible,
+                    info.workspace_id,
+                    &info.version_conds,
+                )
+            })
+            .collect::<Vec<_>>();
+        if modules.is_empty() {
+            return derivation::ABSENT;
+        }
+        modules.sort_by_key(|module| module.0);
+        derivation::fingerprint_of(&modules)
     }
 
     pub fn set_legacy_module_env(&mut self, file_id: FileId, env: LegacyModuleEnv) {
         let envs = self.legacy_module_envs.entry(file_id).or_default();
         envs.push(env);
         envs.sort_by_key(|env| env.activation_position);
+        self.note_lookup_keys(file_id);
     }
 
     pub fn get_legacy_module_env(&self, file_id: FileId) -> Option<&LegacyModuleEnv> {
+        derivation::note_file_fact_read(derivation::FileFact::ModuleMeta, file_id);
         self.legacy_module_envs.get(&file_id)?.last()
     }
 
@@ -228,6 +584,7 @@ impl LuaModuleIndex {
         file_id: FileId,
         position: TextSize,
     ) -> Option<&LegacyModuleEnv> {
+        derivation::note_file_fact_read(derivation::FileFact::ModuleMeta, file_id);
         self.legacy_module_envs
             .get(&file_id)?
             .iter()
@@ -236,6 +593,7 @@ impl LuaModuleIndex {
     }
 
     pub fn has_legacy_module_namespace(&self, name: &str) -> bool {
+        derivation::note_read(|| FactKey::ModuleNamespace(namespace_root(name)));
         self.legacy_module_envs.values().flatten().any(|env| {
             env.module_path == name
                 || env
@@ -246,6 +604,7 @@ impl LuaModuleIndex {
     }
 
     pub fn has_legacy_module_namespace_for_file(&self, file_id: FileId, name: &str) -> bool {
+        derivation::note_read(|| FactKey::ModuleNamespace(namespace_root(name)));
         let Some(current_workspace_id) = self.get_workspace_id(file_id) else {
             return self.has_legacy_module_namespace(name);
         };
@@ -271,6 +630,7 @@ impl LuaModuleIndex {
     pub fn set_module_visibility(&mut self, file_id: FileId, visible: bool) {
         if let Some(module_info) = self.file_module_map.get_mut(&file_id) {
             module_info.visible = visible;
+            self.note_lookup_keys(file_id);
         }
     }
 
@@ -281,28 +641,12 @@ impl LuaModuleIndex {
     ) {
         if let Some(module_info) = self.file_module_map.get_mut(&file_id) {
             module_info.version_conds = Some(Box::new(version_conds));
+            self.note_lookup_keys(file_id);
         }
     }
 
     pub fn find_module(&self, module_path: &str) -> Option<&ModuleInfo> {
-        let module_path = module_path.replace(['\\', '/'], ".");
-        let module_parts: Vec<&str> = module_path.split('.').collect();
-        if module_parts.is_empty() {
-            return None;
-        }
-
-        let result = self.exact_find_module(&module_parts);
-        if result.is_some() {
-            return result;
-        }
-
-        if self.fuzzy_search {
-            let last_name = module_parts.last()?;
-
-            return self.fuzzy_find_module(&module_path, last_name);
-        }
-
-        None
+        self.lookup(module_path, None, true)
     }
 
     pub fn find_module_in_workspace(
@@ -310,23 +654,69 @@ impl LuaModuleIndex {
         module_path: &str,
         workspace_id: WorkspaceId,
     ) -> Option<&ModuleInfo> {
+        self.lookup(module_path, Some(workspace_id), true)
+    }
+
+    /// The file of the module [`Self::find_module_for_file`] finds, for a
+    /// reader that needs only which file it is: records the lookup, not the
+    /// module's contents.
+    pub fn find_module_file_for_file(&self, module_path: &str, file_id: FileId) -> Option<FileId> {
+        self.lookup(module_path, self.get_workspace_id(file_id), false)
+            .map(|module| module.file_id)
+    }
+
+    /// [`Self::find_module_file_for_file`] by a file path.
+    pub fn find_module_file_by_path_for_file(
+        &self,
+        path: &Path,
+        file_id: FileId,
+    ) -> Option<FileId> {
+        let (module_path, _) = self.extract_module_path(path.to_str()?)?;
+        self.find_module_file_for_file(&module_path, file_id)
+    }
+
+    /// Looks `module_path` up, within `workspace_id` when given, recording the
+    /// modules at its path or name and, when `contents` is set, the module
+    /// found.
+    fn lookup(
+        &self,
+        module_path: &str,
+        workspace_id: Option<WorkspaceId>,
+        contents: bool,
+    ) -> Option<&ModuleInfo> {
         let module_path = module_path.replace(['\\', '/'], ".");
         let module_parts: Vec<&str> = module_path.split('.').collect();
         if module_parts.is_empty() {
             return None;
         }
 
-        let result = self.exact_find_module_in_workspace(&module_parts, workspace_id);
-        if result.is_some() {
-            return result;
+        let exact = match workspace_id {
+            Some(workspace_id) => self.exact_find_module_in_workspace(&module_parts, workspace_id),
+            None => self.exact_find_module(&module_parts),
+        };
+        if let Some(module) = exact {
+            derivation::note_read(|| FactKey::ModulePath(SmolStr::new(&module_path)));
+            if contents {
+                derivation::note_read(|| FactKey::Module(module.file_id));
+            }
+            return Some(module);
         }
-
-        if self.fuzzy_search {
-            let last_name = module_parts.last()?;
-            return self.fuzzy_find_module_in_workspace(&module_path, last_name, workspace_id);
+        let result = if self.fuzzy_search {
+            let name = module_parts.last()?;
+            match workspace_id {
+                Some(workspace_id) => {
+                    self.fuzzy_find_module_in_workspace(&module_path, name, workspace_id)
+                }
+                None => self.fuzzy_find_module(&module_path, name),
+            }
+        } else {
+            None
+        };
+        derivation::note_read(|| FactKey::ModuleName(lookup_name(&module_path)));
+        if contents && let Some(module) = result {
+            derivation::note_read(|| FactKey::Module(module.file_id));
         }
-
-        None
+        result
     }
 
     pub fn find_module_by_path(&self, path: &Path) -> Option<&ModuleInfo> {
@@ -337,10 +727,10 @@ impl LuaModuleIndex {
 
     pub fn find_module_for_file(&self, module_path: &str, file_id: FileId) -> Option<&ModuleInfo> {
         if let Some(workspace_id) = self.get_workspace_id(file_id) {
-            return self.find_module_in_workspace(module_path, workspace_id);
+            self.find_module_in_workspace(module_path, workspace_id)
+        } else {
+            self.find_module(module_path)
         }
-
-        self.find_module(module_path)
     }
 
     pub fn find_module_by_path_in_workspace(
@@ -446,11 +836,16 @@ impl LuaModuleIndex {
         workspace_id: WorkspaceId,
     ) -> Option<&ModuleInfo> {
         let file_ids = self.module_name_to_file_ids.get(last_name)?;
+        let suffix_with_boundary = format!(".{module_path}");
         let mut best: Option<(&ModuleInfo, u8)> = None;
 
         for file_id in file_ids {
-            let module_info = self.file_module_map.get(file_id)?;
-            if !module_info.full_module_name.ends_with(module_path) {
+            let Some(module_info) = self.file_module_map.get(file_id) else {
+                continue;
+            };
+            let full_module_name = module_info.full_module_name.as_str();
+            if full_module_name != module_path && !full_module_name.ends_with(&suffix_with_boundary)
+            {
                 continue;
             }
 
@@ -597,6 +992,27 @@ impl LuaModuleIndex {
         )
     }
 
+    /// The precedence key one declaration site carries for a shared `---`
+    /// payload. See [`LuaDeclSourceKey`]; a file with no module info is
+    /// treated as a main-workspace file, matching the loose-file default.
+    pub(crate) fn decl_source_key(
+        &self,
+        file_id: FileId,
+        file_order_key: Arc<str>,
+        range: TextRange,
+    ) -> LuaDeclSourceKey {
+        let workspace_id = self.get_workspace_id(file_id).unwrap_or(WorkspaceId::MAIN);
+        let (workspace_order, _) = self.workspace_order_priority(workspace_id);
+        LuaDeclSourceKey {
+            workspace_kind: self.workspace_kind_priority(workspace_id),
+            workspace_order,
+            workspace_id: workspace_id.id,
+            file_order_key,
+            file_id: file_id.id,
+            range: (range.start(), range.end()),
+        }
+    }
+
     fn workspace_kind_priority(&self, workspace_id: WorkspaceId) -> u8 {
         match self.get_workspace_kind(workspace_id) {
             WorkspaceKind::Main => 0,
@@ -616,6 +1032,7 @@ impl LuaModuleIndex {
     /// The module path is a string separated by dots.
     /// For example, "a.b.c" represents the module "c" in the module "b" in the module "a".
     pub fn find_module_node(&self, module_path: &str) -> Option<&ModuleNode> {
+        derivation::note_read(|| FactKey::ModuleFiles);
         if module_path.is_empty() {
             return self.module_nodes.get(&self.module_root_id);
         }
@@ -637,13 +1054,20 @@ impl LuaModuleIndex {
     }
 
     pub fn get_module_node(&self, module_id: &ModuleNodeId) -> Option<&ModuleNode> {
+        derivation::note_read(|| FactKey::ModuleFiles);
         self.module_nodes.get(module_id)
     }
 
     /// Sorted by file id: the result reaches completion output, so hash order
     /// would let two runs of the same workspace disagree.
     pub fn get_module_infos(&self) -> Vec<&ModuleInfo> {
+        derivation::note_read(|| FactKey::ModuleFiles);
         let mut module_infos: Vec<&ModuleInfo> = self.file_module_map.values().collect();
+        if derivation::recording() {
+            for module_info in &module_infos {
+                derivation::note_read(|| FactKey::Module(module_info.file_id));
+            }
+        }
         module_infos.sort_unstable_by_key(|module_info| module_info.file_id);
         module_infos
     }
@@ -872,7 +1296,7 @@ impl LuaModuleIndex {
     }
 
     pub fn next_main_workspace_id(&self) -> u32 {
-        let used: HashSet<u32> = self.workspaces.iter().map(|w| w.id.id).collect();
+        let used: FxHashSet<u32> = self.workspaces.iter().map(|w| w.id.id).collect();
         let mut candidate = WorkspaceId::MAIN.id;
         while candidate == WorkspaceId::REMOTE.id || used.contains(&candidate) {
             candidate += 1;
@@ -881,7 +1305,7 @@ impl LuaModuleIndex {
     }
 
     pub fn next_library_workspace_id(&self) -> u32 {
-        let used: HashSet<u32> = self.workspaces.iter().map(|w| w.id.id).collect();
+        let used: FxHashSet<u32> = self.workspaces.iter().map(|w| w.id.id).collect();
         let mut candidate = WorkspaceId::REMOTE.id + 1;
         while used.contains(&candidate) {
             candidate += 1;
@@ -889,9 +1313,18 @@ impl LuaModuleIndex {
         candidate
     }
 
-    #[allow(unused)]
-    pub fn remove_workspace_root(&mut self, root: &Path) {
-        self.workspaces.retain(|r| r.root != root);
+    /// Every workspace root, with its id and kind.
+    pub fn workspaces(&self) -> &[Workspace] {
+        &self.workspaces
+    }
+
+    /// Unregisters every main and library workspace root.
+    pub fn remove_main_and_library_workspaces(&mut self) {
+        let user_root =
+            |kind: &WorkspaceKind| matches!(kind, WorkspaceKind::Main | WorkspaceKind::Library);
+        self.workspaces
+            .retain(|workspace| !user_root(&workspace.kind));
+        self.workspace_kind_map.retain(|_, kind| !user_root(kind));
     }
 
     pub fn update_config(&mut self, config: Arc<Emmyrc>) {
@@ -942,6 +1375,7 @@ impl LuaModuleIndex {
     }
 
     pub fn get_std_file_ids(&self) -> Vec<FileId> {
+        derivation::note_read(|| FactKey::ModuleFiles);
         let mut file_ids = Vec::new();
         for module_info in self.file_module_map.values() {
             if self.is_std_workspace_id(module_info.workspace_id) {
@@ -954,6 +1388,7 @@ impl LuaModuleIndex {
     }
 
     pub fn is_main(&self, file_id: &FileId) -> bool {
+        derivation::note_file_fact_read(derivation::FileFact::ModuleMeta, *file_id);
         if let Some(module_info) = self.file_module_map.get(file_id) {
             return self.is_main_workspace_id(module_info.workspace_id);
         }
@@ -962,6 +1397,7 @@ impl LuaModuleIndex {
     }
 
     pub fn is_std(&self, file_id: &FileId) -> bool {
+        derivation::note_file_fact_read(derivation::FileFact::ModuleMeta, *file_id);
         if let Some(module_info) = self.file_module_map.get(file_id) {
             return self.is_std_workspace_id(module_info.workspace_id);
         }
@@ -970,6 +1406,7 @@ impl LuaModuleIndex {
     }
 
     pub fn is_library(&self, file_id: &FileId) -> bool {
+        derivation::note_file_fact_read(derivation::FileFact::ModuleMeta, *file_id);
         if let Some(module_info) = self.file_module_map.get(file_id) {
             return self.is_library_workspace_id(module_info.workspace_id);
         }
@@ -978,6 +1415,7 @@ impl LuaModuleIndex {
     }
 
     pub fn get_main_workspace_file_ids(&self) -> Vec<FileId> {
+        derivation::note_read(|| FactKey::ModuleFiles);
         let mut file_ids = Vec::new();
         for module_info in self.file_module_map.values() {
             if self.is_main_workspace_id(module_info.workspace_id) {
@@ -990,6 +1428,7 @@ impl LuaModuleIndex {
     }
 
     pub fn get_lib_file_ids(&self) -> Vec<FileId> {
+        derivation::note_read(|| FactKey::ModuleFiles);
         let mut file_ids = Vec::new();
         for module_info in self.file_module_map.values() {
             if self.is_library_workspace_id(module_info.workspace_id) {
@@ -1004,10 +1443,12 @@ impl LuaModuleIndex {
     pub fn set_meta(&mut self, file_id: FileId) {
         if let Some(module_info) = self.file_module_map.get_mut(&file_id) {
             module_info.is_meta = true;
+            note_module_fact_write(file_id);
         }
     }
 
     pub fn is_meta_file(&self, file_id: &FileId) -> bool {
+        derivation::note_file_fact_read(derivation::FileFact::ModuleMeta, *file_id);
         if let Some(module_info) = self.file_module_map.get(file_id) {
             return module_info.is_meta;
         }
@@ -1016,6 +1457,7 @@ impl LuaModuleIndex {
     }
 
     pub fn get_workspace_id(&self, file_id: FileId) -> Option<WorkspaceId> {
+        derivation::note_file_fact_read(derivation::FileFact::ModuleMeta, file_id);
         if let Some(module_info) = self.file_module_map.get(&file_id) {
             return Some(module_info.workspace_id);
         }
@@ -1041,18 +1483,39 @@ impl LuaModuleIndex {
 
 impl LuaIndex for LuaModuleIndex {
     fn remove(&mut self, file_id: FileId) {
+        // Dropping the export is a novel fact for export readers, mirroring
+        // the signature index's removal tombstones.
+        if self.file_module_map.contains_key(&file_id) {
+            self.note_module_write(file_id);
+            derivation::note_write(|| FactKey::ModuleFiles);
+        }
+        self.note_lookup_keys(file_id);
+        if let Some(name) = self
+            .file_module_map
+            .get(&file_id)
+            .map(|info| info.name.clone())
+            && let Some(file_ids) = self.module_name_to_file_ids.get_mut(&name)
+        {
+            file_ids.retain(|id| *id != file_id);
+            if file_ids.is_empty() {
+                self.module_name_to_file_ids.remove(&name);
+            }
+        }
         let (mut parent_id, mut child_id) =
             if let Some(module_info) = self.file_module_map.remove(&file_id) {
+                self.relink_export(file_id, export_files(&module_info));
+                self.module_files.remove(&module_files_entry(&module_info));
                 let module_id = module_info.module_id;
-                let node = match self.module_nodes.get_mut(&module_id) {
-                    Some(node) => node,
-                    None => return,
-                };
-                node.file_ids.retain(|id| *id != file_id);
-                if node.file_ids.is_empty() && node.children.is_empty() {
-                    (node.parent, Some(module_id))
-                } else {
-                    (None, None)
+                match self.module_nodes.get_mut(&module_id) {
+                    Some(node) => {
+                        node.file_ids.retain(|id| *id != file_id);
+                        if node.file_ids.is_empty() && node.children.is_empty() {
+                            (node.parent, Some(module_id))
+                        } else {
+                            (None, None)
+                        }
+                    }
+                    None => (None, None),
                 }
             } else {
                 (None, None)
@@ -1089,33 +1552,21 @@ impl LuaIndex for LuaModuleIndex {
                 break;
             }
         }
-
-        if !self.module_name_to_file_ids.is_empty() {
-            let mut module_name = String::new();
-            for (name, file_ids) in &self.module_name_to_file_ids {
-                if file_ids.contains(&file_id) {
-                    module_name = name.clone();
-                    break;
-                }
-            }
-
-            if !module_name.is_empty() {
-                let file_ids = match self.module_name_to_file_ids.get_mut(&module_name) {
-                    Some(ids) => ids,
-                    None => return,
-                };
-
-                file_ids.retain(|id| *id != file_id);
-                if file_ids.is_empty() {
-                    self.module_name_to_file_ids.remove(&module_name);
-                }
-            }
-        }
     }
 
     fn clear(&mut self) {
+        for file_id in self
+            .file_module_map
+            .keys()
+            .chain(self.legacy_module_envs.keys())
+        {
+            self.note_lookup_keys(*file_id);
+        }
+        derivation::note_write(|| FactKey::ModuleFiles);
         self.module_nodes.clear();
         self.file_module_map.clear();
+        self.export_refs.clear();
+        self.module_files = derivation::SetFingerprint::default();
         self.file_module_paths.clear();
         self.module_name_to_file_ids.clear();
         self.legacy_module_envs.clear();
@@ -1124,3 +1575,21 @@ impl LuaIndex for LuaModuleIndex {
         self.module_nodes.insert(self.module_root_id, root_node);
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(LuaModuleIndex {
+    module_patterns,
+    module_root_id,
+    module_nodes,
+    file_module_map,
+    export_refs => crate::db_index::cow_shards::merge_set,
+    module_files,
+    file_module_paths,
+    module_name_to_file_ids,
+    legacy_module_envs,
+    workspaces,
+    workspace_kind_map,
+    id_counter,
+    fuzzy_search,
+    module_replace_vec,
+    workspace_isolation_enabled,
+});

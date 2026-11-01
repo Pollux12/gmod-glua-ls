@@ -1,13 +1,13 @@
 mod infer_binary_and;
 mod infer_binary_or;
 
-use glua_parser::{BinaryOperator, LuaBinaryExpr};
+use glua_parser::{BinaryOperator, LuaAstNode, LuaBinaryExpr, LuaExpr, LuaIndexKey, LuaNameExpr};
 use infer_binary_and::{infer_binary_expr_and, special_and_rule};
 use infer_binary_or::{infer_binary_expr_or, special_or_rule};
 use smol_str::SmolStr;
 
 use crate::{
-    LuaInferCache, TypeOps, check_type_compact,
+    FileId, LuaInferCache, TypeOps, check_type_compact,
     db_index::{DbIndex, LuaOperatorMetaMethod, LuaType},
     get_real_type,
 };
@@ -22,6 +22,43 @@ pub fn infer_binary_expr(
     let op = expr.get_op_token().ok_or(InferFailReason::None)?.get_op();
     let (left, right) = expr.get_exprs().ok_or(InferFailReason::None)?;
 
+    // A field self-bootstrap `X.y = X.y or {}` always answers with the fresh
+    // table: the left read is the slot being defined, so it cannot inform its
+    // own definition (see `special_or_rule`, which discards it unconditionally
+    // for this shape). Inferring it first would merge every writer the slot
+    // holds so far — and walk the flow chain behind it — on every write, only
+    // to throw the answer away, so N same-slot bootstraps cost O(N^2). The
+    // table literal alone is the same answer `special_or_rule` returns below.
+    //
+    // Bare names are excluded: `is_self_referential_bootstrap` now resolves name
+    // targets (local/param/declared-global gate), so the unresolved-global arms
+    // ahead of the bootstrap check keep precedence for them and the narrow
+    // idiom keeps its cheap left read. An index read is never an unresolved
+    // global, so those checks are provably inert for it and skipping them
+    // changes nothing.
+    //
+    // Computed keys are excluded too: only an `Expr`-keyed member read bumps
+    // the sibling-merge counter the walk uses to queue settled re-derivation,
+    // so inferring one has an observable side effect this must preserve.
+    if op == BinaryOperator::OpOr
+        && matches!(
+            &left,
+            LuaExpr::IndexExpr(index) if matches!(
+                index.get_index_key(),
+                Some(
+                    LuaIndexKey::Name(_)
+                        | LuaIndexKey::String(_)
+                        | LuaIndexKey::Integer(_)
+                        | LuaIndexKey::Idx(_)
+                )
+            )
+        )
+        && matches!(&right, LuaExpr::TableExpr(table) if table.is_empty())
+        && infer_binary_or::is_self_referential_bootstrap(db, cache, &left)
+    {
+        return infer_expr(db, cache, right);
+    }
+
     let left_type = match infer_expr(db, cache, left.clone()) {
         Ok(ty) => ty,
         Err(err) => {
@@ -35,6 +72,16 @@ pub fn infer_binary_expr(
         }
     };
     let right_type = infer_expr(db, cache, right.clone())?;
+    let (left_type, right_type) = if folds_constants(op)
+        && !(is_constant_expr(db, cache, &left) && is_constant_expr(db, cache, &right))
+    {
+        (
+            crate::db_index::widen_literal_type_for_assignment(&left_type),
+            crate::db_index::widen_literal_type_for_assignment(&right_type),
+        )
+    } else {
+        (left_type, right_type)
+    };
     let real_left_type = get_real_type(db, &left_type);
     let real_right_type = get_real_type(db, &right_type);
     let left_type_ref = real_left_type.unwrap_or(&left_type);
@@ -70,6 +117,94 @@ pub fn infer_binary_expr(
     infer_binary_expr_type(db, left_ty, right_ty, op)
 }
 
+fn folds_constants(op: BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::OpAdd
+            | BinaryOperator::OpSub
+            | BinaryOperator::OpMul
+            | BinaryOperator::OpDiv
+            | BinaryOperator::OpIDiv
+            | BinaryOperator::OpMod
+            | BinaryOperator::OpPow
+            | BinaryOperator::OpConcat
+    )
+}
+
+/// Whether `expr` has the same value every time it runs: literals and
+/// operators over them, read directly or through a local only its initializer
+/// assigns. Only such operands fold to a constant. A constant read from a
+/// variable or field is the value one run left there, and folding it would let
+/// a value computed from its own previous value count up without end.
+fn is_constant_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: &LuaExpr) -> bool {
+    if matches!(expr, LuaExpr::LiteralExpr(_)) {
+        return true;
+    }
+    let syntax_id = expr.get_syntax_id();
+    if let Some(constant) = cache.tracked_get(|cache| &mut cache.constant_expr_cache, &syntax_id) {
+        return constant;
+    }
+    #[cfg(test)]
+    CONSTANT_EXPR_CLASSIFICATIONS.with(|count| count.set(count.get() + 1));
+    let frame = crate::db_index::derivation::open_frame();
+    let constant = match expr {
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| is_constant_expr(db, cache, &inner)),
+        LuaExpr::UnaryExpr(unary) => unary
+            .get_expr()
+            .is_some_and(|inner| is_constant_expr(db, cache, &inner)),
+        LuaExpr::BinaryExpr(binary) => binary.get_exprs().is_some_and(|(left, right)| {
+            is_constant_expr(db, cache, &left) && is_constant_expr(db, cache, &right)
+        }),
+        LuaExpr::NameExpr(name) => constant_local_initializer(db, cache.get_file_id(), name)
+            .is_some_and(|initializer| is_constant_expr(db, cache, &initializer)),
+        _ => false,
+    };
+    cache.tracked_insert(
+        |cache| &mut cache.constant_expr_cache,
+        syntax_id,
+        constant,
+        frame,
+    );
+    constant
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Constant-expression classifications that missed the memo, on this
+    /// thread: a count, so the guard against re-walking shared initializers
+    /// does not depend on how loaded the machine is.
+    pub(crate) static CONSTANT_EXPR_CLASSIFICATIONS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The initializer of the local `name` reads, when nothing else assigns it.
+fn constant_local_initializer(
+    db: &DbIndex,
+    file_id: FileId,
+    name: &LuaNameExpr,
+) -> Option<LuaExpr> {
+    let decl = db
+        .get_decl_index()
+        .get_decl_tree(&file_id)?
+        .find_local_decl(&name.get_name_text()?, name.get_position())?;
+    if !decl.is_local()
+        || db
+            .get_reference_index()
+            .get_decl_references(&file_id, &decl.get_id())
+            .is_some_and(|references| references.is_written_after_declaration(decl.get_position()))
+    {
+        return None;
+    }
+    let root = name.syntax().ancestors().last()?;
+    LuaExpr::cast(
+        decl.get_initializer()?
+            .get_expr_syntax_id()
+            .to_node_from_root(&root)?,
+    )
+}
+
 fn infer_union_binary_expr(
     db: &DbIndex,
     op: BinaryOperator,
@@ -84,20 +219,53 @@ fn infer_union_binary_expr(
         return None;
     };
 
-    // 只在实际调用时才 clone，而不是预先 clone
+    // A `nil` arm makes arithmetic or concatenation raise rather than yield a value,
+    // unless the other operand's metamethod takes `nil`.
+    let raises_on_nil = folds_constants(op) && !has_operator_taking_nil(db, other, op);
+    // Only clone on an actual call instead of cloning up front
     let inferred = u
         .types()
+        .filter(|ty| !(raises_on_nil && ty.is_nil()))
         .filter_map(|ty| {
-            if is_left_union {
-                infer_binary_expr_type(db, ty.clone(), other.clone(), op)
+            let (left, right) = if is_left_union {
+                (ty.clone(), other.clone())
             } else {
-                infer_binary_expr_type(db, other.clone(), ty.clone(), op)
-            }
-            .ok()
+                (other.clone(), ty.clone())
+            };
+            // The other operand may be a union too: each pair of arms is its own operation.
+            infer_union_binary_expr(db, op, &left, &right)
+                .map(Ok)
+                .unwrap_or_else(|| infer_binary_expr_type(db, left, right, op))
+                .ok()
         })
         .reduce(|left, right| TypeOps::Union.apply(db, &left, &right));
     // Every member failed: pin the escape value instead of returning the seed.
     Some(inferred.unwrap_or(LuaType::Unknown))
+}
+
+fn has_operator_taking_nil(db: &DbIndex, operand: &LuaType, op: BinaryOperator) -> bool {
+    let meta_method = match op {
+        BinaryOperator::OpAdd => LuaOperatorMetaMethod::Add,
+        BinaryOperator::OpSub => LuaOperatorMetaMethod::Sub,
+        BinaryOperator::OpMul => LuaOperatorMetaMethod::Mul,
+        BinaryOperator::OpDiv => LuaOperatorMetaMethod::Div,
+        BinaryOperator::OpMod => LuaOperatorMetaMethod::Mod,
+        BinaryOperator::OpPow => LuaOperatorMetaMethod::Pow,
+        BinaryOperator::OpConcat => LuaOperatorMetaMethod::Concat,
+        _ => return false,
+    };
+    let arms = match operand {
+        LuaType::Union(union) => union.types().cloned().collect::<Vec<_>>(),
+        _ => vec![operand.clone()],
+    };
+    arms.into_iter().any(|arm| {
+        arm.is_custom_type()
+            && get_custom_type_operator(db, arm, meta_method).is_some_and(|operators| {
+                operators.iter().any(|operator| {
+                    check_type_compact(db, &operator.get_operand(db), &LuaType::Nil).is_ok()
+                })
+            })
+    })
 }
 
 fn infer_binary_expr_type(
@@ -132,8 +300,10 @@ fn infer_binary_custom_operator(
     right: &LuaType,
     op: LuaOperatorMetaMethod,
 ) -> InferResult {
-    // 先检查 left 是否是自定义类型，避免不必要的 clone
+    // An operand we could not resolve matches every overload, so it picks none.
+    // Check whether left is a custom type first to avoid unnecessary clones
     if left.is_custom_type()
+        && !right.is_unknown()
         && let Some(operators) = get_custom_type_operator(db, left.clone(), op)
     {
         for operator in operators {
@@ -144,8 +314,9 @@ fn infer_binary_custom_operator(
         }
     }
 
-    // 再检查 right 是否是自定义类型，只在需要时 clone
+    // Then check whether right is a custom type, cloning only when needed
     if right.is_custom_type()
+        && !left.is_unknown()
         && let Some(operators) = get_custom_type_operator(db, right.clone(), op)
     {
         for operator in operators {
@@ -220,12 +391,17 @@ fn infer_binary_expr_add(db: &DbIndex, left: LuaType, right: LuaType) -> InferRe
         };
     }
 
+    // A value we know nothing about takes the other operand's type, unless that
+    // operand's own `__add` is what runs for a `nil`.
+    let nil_has_operator = |nil_side: &LuaType, other: &LuaType| {
+        nil_side.is_nil() && has_operator_taking_nil(db, other, BinaryOperator::OpAdd)
+    };
     match (
         left.is_nil() || left.is_any() || left.is_unknown(),
         right.is_nil() || right.is_any() || right.is_unknown(),
     ) {
-        (true, false) => return Ok(right),
-        (false, true) => return Ok(left),
+        (true, false) if !nil_has_operator(&left, &right) => return Ok(right),
+        (false, true) if !nil_has_operator(&right, &left) => return Ok(left),
         _ => {}
     }
 

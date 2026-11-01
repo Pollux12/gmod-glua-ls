@@ -28,15 +28,21 @@ pub struct ClientProxy {
 
 #[derive(Default)]
 struct RefreshRequestGates {
-    workspace_diagnostics: Option<RequestId>,
-    semantic_tokens: Option<RequestId>,
-    inlay_hints: Option<RequestId>,
-    code_lens: Option<RequestId>,
+    semantic_tokens: RefreshGate,
+    inlay_hints: RefreshGate,
+    code_lens: RefreshGate,
+}
+
+/// One kind of refresh: at most one request in flight, and whether another
+/// was wanted while it was, which is sent once it is answered.
+#[derive(Default)]
+struct RefreshGate {
+    in_flight: Option<RequestId>,
+    wanted_again: bool,
 }
 
 #[derive(Clone, Copy)]
 enum RefreshRequestKind {
-    WorkspaceDiagnostics,
     SemanticTokens,
     InlayHints,
     CodeLens,
@@ -45,16 +51,16 @@ enum RefreshRequestKind {
 impl RefreshRequestKind {
     const fn method(self) -> &'static str {
         match self {
-            Self::WorkspaceDiagnostics => "workspace/diagnostic/refresh",
             Self::SemanticTokens => "workspace/semanticTokens/refresh",
             Self::InlayHints => "workspace/inlayHint/refresh",
             Self::CodeLens => "workspace/codeLens/refresh",
         }
     }
 
-    fn gate(self, gates: &mut RefreshRequestGates) -> &mut Option<RequestId> {
+    const ALL: [Self; 3] = [Self::SemanticTokens, Self::InlayHints, Self::CodeLens];
+
+    fn gate(self, gates: &mut RefreshRequestGates) -> &mut RefreshGate {
         match self {
-            Self::WorkspaceDiagnostics => &mut gates.workspace_diagnostics,
             Self::SemanticTokens => &mut gates.semantic_tokens,
             Self::InlayHints => &mut gates.inlay_hints,
             Self::CodeLens => &mut gates.code_lens,
@@ -88,6 +94,8 @@ impl ClientProxy {
         }));
     }
 
+    /// Sends a request and waits for its response, or for `cancel_token`; a
+    /// request whose token is already cancelled is never sent.
     pub async fn send_request(
         &self,
         id: RequestId,
@@ -95,6 +103,9 @@ impl ClientProxy {
         params: impl serde::Serialize,
         cancel_token: CancellationToken,
     ) -> Option<Response> {
+        if cancel_token.is_cancelled() {
+            return None;
+        }
         let (sender, receiver) = oneshot::channel();
         self.response_manager
             .lock()
@@ -155,12 +166,13 @@ impl ClientProxy {
         };
 
         let gate = kind.gate(&mut gates);
-        if gate.is_some() {
+        if gate.in_flight.is_some() {
+            gate.wanted_again = true;
             return;
         }
 
         let request_id = self.next_id();
-        *gate = Some(request_id.clone());
+        gate.in_flight = Some(request_id.clone());
         drop(gates);
 
         let params = match serde_json::to_value(()) {
@@ -197,50 +209,30 @@ impl ClientProxy {
         };
 
         let gate = kind.gate(&mut gates);
-        if gate
-            .as_ref()
-            .is_some_and(|in_flight| in_flight == request_id)
-        {
-            *gate = None;
+        if gate.in_flight.as_ref() == Some(request_id) {
+            *gate = RefreshGate::default();
         }
     }
 
+    /// Opens the gate `request_id` held, sending the refresh again when one
+    /// was wanted meanwhile.
     fn clear_completed_refresh_request(&self, request_id: &RequestId) {
-        let Ok(mut gates) = self.refresh_request_gates.lock() else {
-            log::error!("Failed to lock refresh request gates for response cleanup");
-            return;
+        let again = {
+            let Ok(mut gates) = self.refresh_request_gates.lock() else {
+                log::error!("Failed to lock refresh request gates for response cleanup");
+                return;
+            };
+            RefreshRequestKind::ALL.into_iter().find(|kind| {
+                let gate = kind.gate(&mut gates);
+                if gate.in_flight.as_ref() != Some(request_id) {
+                    return false;
+                }
+                gate.in_flight = None;
+                std::mem::take(&mut gate.wanted_again)
+            })
         };
-
-        if gates
-            .workspace_diagnostics
-            .as_ref()
-            .is_some_and(|in_flight| in_flight == request_id)
-        {
-            gates.workspace_diagnostics = None;
-        }
-
-        if gates
-            .semantic_tokens
-            .as_ref()
-            .is_some_and(|in_flight| in_flight == request_id)
-        {
-            gates.semantic_tokens = None;
-        }
-
-        if gates
-            .inlay_hints
-            .as_ref()
-            .is_some_and(|in_flight| in_flight == request_id)
-        {
-            gates.inlay_hints = None;
-        }
-
-        if gates
-            .code_lens
-            .as_ref()
-            .is_some_and(|in_flight| in_flight == request_id)
-        {
-            gates.code_lens = None;
+        if let Some(kind) = again {
+            self.send_deduped_refresh_request(kind);
         }
     }
 
@@ -328,10 +320,6 @@ impl ClientProxy {
         self.send_request_no_wait(request_id, method, params);
     }
 
-    pub fn refresh_workspace_diagnostics(&self) {
-        self.send_deduped_refresh_request(RefreshRequestKind::WorkspaceDiagnostics);
-    }
-
     pub fn refresh_semantic_tokens(&self) {
         self.send_deduped_refresh_request(RefreshRequestKind::SemanticTokens);
     }
@@ -371,33 +359,30 @@ mod tests {
         request
     }
 
+    /// A request made once its token is cancelled, as at shutdown, never
+    /// reaches the client.
     #[gtest]
-    fn refresh_workspace_diagnostics_dedupes_while_request_is_in_flight() -> Result<()> {
+    fn a_request_with_a_cancelled_token_is_not_sent() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         let (client, peer) = create_client_proxy();
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
 
-        client.refresh_workspace_diagnostics();
-        client.refresh_workspace_diagnostics();
+        let response = runtime.block_on(client.apply_edit(
+            lsp_types::ApplyWorkspaceEditParams {
+                label: None,
+                edit: lsp_types::WorkspaceEdit::default(),
+            },
+            cancelled,
+        ));
 
-        let request = recv_request(&peer);
-        verify_that!(request.method.as_str(), eq("workspace/diagnostic/refresh"))?;
-        verify_that!(peer.receiver.try_recv().is_err(), eq(true))?;
-
-        runtime.block_on(client.on_response(Response {
-            id: request.id.clone(),
-            result: Some(serde_json::Value::Null),
-            error: None,
-        }));
-
-        client.refresh_workspace_diagnostics();
-
-        let second_request = recv_request(&peer);
+        verify_that!(response, none())?;
         verify_that!(
-            second_request.method.as_str(),
-            eq("workspace/diagnostic/refresh")
-        )?;
-        assert_ne!(second_request.id, request.id);
-        Ok(())
+            peer.receiver
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            eq(true)
+        )
     }
 
     #[gtest]
@@ -491,10 +476,50 @@ mod tests {
     }
 
     #[gtest]
+    fn a_refresh_wanted_while_one_is_in_flight_is_sent_once_it_is_answered() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (client, peer) = create_client_proxy();
+
+        client.refresh_semantic_tokens();
+        let request = recv_request(&peer);
+        client.refresh_semantic_tokens();
+        client.refresh_semantic_tokens();
+
+        runtime.block_on(client.on_response(Response {
+            id: request.id.clone(),
+            result: Some(serde_json::Value::Null),
+            error: None,
+        }));
+
+        let again = recv_request(&peer);
+        verify_that!(
+            again.method.as_str(),
+            eq("workspace/semanticTokens/refresh")
+        )?;
+        assert_ne!(again.id, request.id);
+        verify_that!(peer.receiver.try_recv().is_err(), eq(true))
+    }
+
+    #[gtest]
+    fn an_answered_refresh_nothing_else_wanted_is_not_sent_again() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (client, peer) = create_client_proxy();
+
+        client.refresh_code_lens();
+        let request = recv_request(&peer);
+        runtime.block_on(client.on_response(Response {
+            id: request.id,
+            result: Some(serde_json::Value::Null),
+            error: None,
+        }));
+
+        verify_that!(peer.receiver.try_recv().is_err(), eq(true))
+    }
+
+    #[gtest]
     fn different_refresh_requests_keep_separate_gates() -> Result<()> {
         let (client, peer) = create_client_proxy();
 
-        client.refresh_workspace_diagnostics();
         client.refresh_semantic_tokens();
         client.refresh_inlay_hints();
         client.refresh_code_lens();
@@ -502,12 +527,10 @@ mod tests {
         let first_request = recv_request(&peer);
         let second_request = recv_request(&peer);
         let third_request = recv_request(&peer);
-        let fourth_request = recv_request(&peer);
         let mut methods = [
             first_request.method,
             second_request.method,
             third_request.method,
-            fourth_request.method,
         ];
         methods.sort();
 
@@ -515,7 +538,6 @@ mod tests {
             methods,
             [
                 "workspace/codeLens/refresh".to_string(),
-                "workspace/diagnostic/refresh".to_string(),
                 "workspace/inlayHint/refresh".to_string(),
                 "workspace/semanticTokens/refresh".to_string()
             ]

@@ -363,17 +363,17 @@ mod tests {
             .get_member_index()
             .get_current_owner_members_for_key(&owner, &key);
         assert_eq!(history.len(), 2);
-        let latest_member_id = history
+        let mut history_ids = history
             .iter()
             .map(|member| member.get_id())
-            .max_by_key(|member_id| member_id.get_position())
-            .expect("registered class history must contain the latest write");
+            .collect::<Vec<_>>();
+        history_ids.sort_by_key(|member_id| crate::db_index::member_id_sort_key(*member_id));
         let current_member_ids = db
             .get_member_index()
             .get_member_item(&owner, &key)
             .expect("registered class member must exist")
             .get_member_ids();
-        assert_eq!(current_member_ids, vec![latest_member_id]);
+        assert_eq!(current_member_ids, history_ids);
     }
 
     #[test]
@@ -1854,6 +1854,7 @@ mod tests {
                     .to_string(),
                 ),
             )
+            .map(|(id, _)| id)
             .expect("target file must be created");
         ws.def_file(
             "lua/autorun/incremental_edit_consumer.lua",
@@ -1886,19 +1887,21 @@ mod tests {
             before_receiver_slot
         ));
 
-        ws.analysis.update_file_by_uri(
-            &target_uri,
-            Some(
-                r#"
+        ws.analysis
+            .update_file_by_uri(
+                &target_uri,
+                Some(
+                    r#"
                 local MIXIN = {}
                 function MIXIN:After()
                     self:OnlyOnReceiver()
                 end
                 return MIXIN
                 "#
-                .to_string(),
-            ),
-        );
+                    .to_string(),
+                ),
+            )
+            .map(|(id, _)| id);
 
         assert!(!has_inferred_param(
             &ws,
@@ -1924,6 +1927,7 @@ mod tests {
         let target_file_id = ws
             .analysis
             .update_file_by_uri(&target_uri, Some(target_content.to_string()))
+            .map(|(id, _)| id)
             .expect("target file must be created");
         ws.def_file(
             "lua/autorun/incremental_reopen_consumer.lua",
@@ -1954,12 +1958,14 @@ mod tests {
 
         ws.analysis
             .remove_file_by_uri(&target_uri)
+            .0
             .expect("target file must be removed");
         assert!(!has_inferred_param(&ws, original_signature, receiver_slot));
 
         let reopened_file_id = ws
             .analysis
             .update_file_by_uri(&target_uri, Some(target_content.to_string()))
+            .map(|(id, _)| id)
             .expect("target file must reopen");
         assert!(has_inferred_receiver(&ws, reopened_file_id, "MIXIN.Run"));
     }
@@ -1980,6 +1986,7 @@ mod tests {
         let target_file_id = ws
             .analysis
             .update_file_by_uri(&target_uri, Some(target_content.to_string()))
+            .map(|(id, _)| id)
             .expect("target file must be created");
         ws.def_file(
             "lua/autorun/compilefile_reopen_consumer.lua",
@@ -2010,12 +2017,14 @@ mod tests {
 
         ws.analysis
             .remove_file_by_uri(&target_uri)
+            .0
             .expect("target file must be removed");
         assert!(!has_inferred_param(&ws, original_signature, receiver_slot));
 
         let reopened_file_id = ws
             .analysis
             .update_file_by_uri(&target_uri, Some(target_content.to_string()))
+            .map(|(id, _)| id)
             .expect("target file must reopen");
         assert!(has_inferred_receiver(&ws, reopened_file_id, "MIXIN.Run"));
     }

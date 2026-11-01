@@ -13,6 +13,8 @@
 //                             [--edit code|comment]
 //                             [--edit-find TEXT --edit-replace TEXT]
 //                             [--completion-find TEXT]
+//                             [--other relative/path.lua]
+//                             [--quiet-ms 5000]
 //
 // --edit-find/--edit-replace swap one snippet back and forth on every edit, so
 // a specific real change to real code can be reproduced. --completion-find puts
@@ -25,21 +27,36 @@
 // isolating offset-shift cost, but an optimisation that only helps this case
 // has not made real typing any faster.
 //
+// --other opens a second document and hovers it every 25 ms while each edit
+// of the target settles, keeping the slowest answer: no request should wait
+// long on an edit to another file, however far that edit's ripple goes.
+//
+// A server that advertises `diagnosticProvider` is pulled, as VS Code pulls
+// it. One that does not delivers diagnostics only by `publishDiagnostics`:
+// quiet then means no publish for --quiet-ms (after the server's
+// `startupComplete` status), "edit -> fresh answer" is the time to the edited
+// document's first publish at or past the edit's version, and "edit -> all
+// work done" the time to the last publish before the stream goes quiet.
+// Measurements and checks that only exist for pulls are reported as null
+// (`n/a (push)` in the table).
+//
 // LSP_SERVER overrides the binary (default: target/dist/glua_ls[.exe] if built,
-// else target/release/glua_ls[.exe] — see defaultServerPath, and prefer `dist`).
+// unless target/release/glua_ls[.exe] is newer — see defaultServerPath).
 // LSP_SERVER_ARGS passes extra space-separated arguments to the server, e.g.
 //   LSP_SERVER_ARGS='--log-level debug' to profile a slow path.
 // --file defaults to the largest .lua file in the workspace, which is the
 // pessimistic case and keeps runs comparable without naming a file per repo.
 //
 // Exits non-zero on a correctness check, not on a latency number: a cancelled
-// diagnostic pull answered with an empty full report, or a mid-edit completion
-// that disagrees with the settled one.
+// diagnostic pull answered with a report thinner than the settled one (pull
+// servers only), or a mid-edit completion that disagrees with the settled one.
 'use strict';
 
-const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const {
+    sleep, defaultServerPath, requireDir, fileUri, startServer, contentChanges,
+} = require('./lsp_client');
 
 // LSP ContentModified. The client is expected to re-send rather than wait.
 const CONTENT_MODIFIED = -32801;
@@ -49,7 +66,8 @@ const CONTENT_MODIFIED = -32801;
 function parseArgs(argv) {
     const opts = {
         json: false, runs: 5, file: null, edit: 'code',
-        editFind: null, editReplace: null, completionFind: null,
+        editFind: null, editReplace: null, completionFind: null, other: null,
+        quietMs: 5000,
     };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
@@ -60,6 +78,8 @@ function parseArgs(argv) {
         else if (a === '--edit-find') opts.editFind = argv[++i];
         else if (a === '--edit-replace') opts.editReplace = argv[++i];
         else if (a === '--completion-find') opts.completionFind = argv[++i];
+        else if (a === '--other') opts.other = argv[++i];
+        else if (a === '--quiet-ms') opts.quietMs = Number(argv[++i]);
         else throw new Error(`unknown argument: ${a}`);
     }
     if (opts.edit !== 'code' && opts.edit !== 'comment') {
@@ -72,25 +92,10 @@ function parseArgs(argv) {
     if (!Number.isFinite(opts.runs) || opts.runs < 1) {
         throw new Error('--runs must be a positive integer');
     }
+    if (!Number.isFinite(opts.quietMs) || opts.quietMs <= 0) {
+        throw new Error('--quiet-ms must be a positive number');
+    }
     return opts;
-}
-
-/**
- * Prefers the `dist` profile, which is what ships. `release` lacks its thin LTO
- * and single codegen unit, so measuring it reports numbers no user experiences —
- * an easy mistake to make for a whole session before noticing.
- */
-function defaultServerPath() {
-    const exe = process.platform === 'win32' ? 'glua_ls.exe' : 'glua_ls';
-    const dist = path.resolve(__dirname, '..', 'target', 'dist', exe);
-    if (fs.existsSync(dist)) return dist;
-    return path.resolve(__dirname, '..', 'target', 'release', exe);
-}
-
-function requireDir(value, name) {
-    if (!value) throw new Error(`${name} is required`);
-    if (!fs.existsSync(value)) throw new Error(`${name} does not exist: ${value}`);
-    return path.resolve(value);
 }
 
 function largestLuaFile(root) {
@@ -113,149 +118,17 @@ function largestLuaFile(root) {
     return best.path;
 }
 
-function fileUri(p) {
-    const resolved = path.resolve(p).replace(/\\/g, '/');
-    const withSlash = resolved.startsWith('/') ? resolved : `/${resolved}`;
-    return `file://${encodeURI(withSlash).replace(/#/g, '%23').replace(/\?/g, '%3F')}`;
-}
-
-// ------------------------------------------------------------ lsp client ---
-
-class LspClient {
-    constructor(proc) {
-        this.proc = proc;
-        this.buffer = Buffer.alloc(0);
-        this.nextId = 1;
-        this.pending = new Map();
-        this.onNotification = null;
-        this.serverRequests = new Set();
-        proc.stdout.on('data', (chunk) => this._receive(chunk));
-        // The server's phase profiler writes to stderr, so LSP_SERVER_STDERR
-        // makes those numbers reachable instead of dropping them on the floor.
-        const stderrPath = process.env.LSP_SERVER_STDERR;
-        if (stderrPath) fs.writeFileSync(stderrPath, '');
-        proc.stderr.on('data', (chunk) => {
-            if (stderrPath) fs.appendFileSync(stderrPath, chunk);
-        });
-    }
-
-    _receive(chunk) {
-        this.buffer = Buffer.concat([this.buffer, chunk]);
-        for (;;) {
-            const headerEnd = this.buffer.indexOf('\r\n\r\n');
-            if (headerEnd < 0) return;
-            const header = this.buffer.slice(0, headerEnd).toString('ascii');
-            const match = /Content-Length: (\d+)/i.exec(header);
-            if (!match) return;
-            const length = Number(match[1]);
-            const bodyStart = headerEnd + 4;
-            if (this.buffer.length < bodyStart + length) return;
-            const body = this.buffer.slice(bodyStart, bodyStart + length).toString('utf8');
-            this.buffer = this.buffer.slice(bodyStart + length);
-            try { this._dispatch(JSON.parse(body)); } catch { /* ignore malformed frame */ }
-        }
-    }
-
-    _dispatch(message) {
-        if (message.id !== undefined && message.method) {
-            // Server-initiated request. Record it and answer so the server is
-            // never left waiting on us. `workspace/configuration` has to come
-            // back as one entry per requested item; null is not a valid result
-            // and would have the server fall back to something a real client
-            // never makes it use.
-            this.serverRequests.add(message.method);
-            const result = message.method === 'workspace/configuration'
-                ? ((message.params && message.params.items) || []).map(() => ({}))
-                : null;
-            this._write({ jsonrpc: '2.0', id: message.id, result });
-            return;
-        }
-        if (message.id !== undefined) {
-            const resolve = this.pending.get(message.id);
-            if (resolve) { this.pending.delete(message.id); resolve(message); }
-            return;
-        }
-        if (this.onNotification) this.onNotification(message);
-    }
-
-    _write(payload) {
-        const body = Buffer.from(JSON.stringify(payload), 'utf8');
-        this.proc.stdin.write(`Content-Length: ${body.length}\r\n\r\n`);
-        this.proc.stdin.write(body);
-    }
-
-    notify(method, params) {
-        this._write({ jsonrpc: '2.0', method, params });
-    }
-
-    /** Returns a promise carrying the response, the elapsed ms, and its id. */
-    request(method, params) {
-        const id = this.nextId++;
-        const startedAt = Date.now();
-        const promise = new Promise((resolve) => {
-            this.pending.set(id, (message) =>
-                resolve({ message, ms: Date.now() - startedAt, id }));
-        });
-        this._write({ jsonrpc: '2.0', id, method, params });
-        return Object.assign(promise, { id });
-    }
-
-    cancel(id) {
-        this.notify('$/cancelRequest', { id });
-    }
-}
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/**
- * The subset of VS Code's capabilities that changes server behaviour on the
- * paths this tool measures. Keep in step with vscode-languageclient: the point
- * is to exercise what the real client exercises.
- */
-function clientCapabilities() {
-    return {
-        general: {
-            staleRequestSupport: {
-                cancel: true,
-                retryOnContentModified: [
-                    'textDocument/semanticTokens/full',
-                    'textDocument/semanticTokens/range',
-                    'textDocument/semanticTokens/full/delta',
-                ],
-            },
-        },
-        window: { workDoneProgress: true },
-        workspace: {
-            applyEdit: true,
-            configuration: true,
-            workspaceFolders: true,
-            diagnostics: { refreshSupport: true },
-            semanticTokens: { refreshSupport: true },
-            inlayHint: { refreshSupport: true },
-            codeLens: { refreshSupport: true },
-            didChangeWatchedFiles: { dynamicRegistration: true },
-        },
-        textDocument: {
-            synchronization: { didSave: true },
-            diagnostic: { dynamicRegistration: true, relatedDocumentSupport: true },
-            completion: { completionItem: { tagSupport: { valueSet: [1] } } },
-            hover: {},
-            definition: {},
-            semanticTokens: {
-                requests: { full: true },
-                tokenTypes: [], tokenModifiers: [], formats: ['relative'],
-            },
-        },
-    };
-}
-
 // ------------------------------------------------------------- reporting ---
 
 function summarise(samples) {
     if (samples.length === 0) return null;
     const sorted = [...samples].sort((a, b) => a - b);
     const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
-    return { runs: sorted.length, min: sorted[0], median: at(0.5), max: sorted[sorted.length - 1] };
+    const nearestRank = (q) => sorted[Math.max(0, Math.ceil(q * sorted.length) - 1)];
+    return {
+        runs: sorted.length, min: sorted[0], median: at(0.5), p95: nearestRank(0.95), max: sorted[sorted.length - 1],
+        samples: [...samples],
+    };
 }
 
 function describeReport(result) {
@@ -273,9 +146,10 @@ function describeReport(result) {
  *
  * `self.` is preferred because resolving it exercises the class/type indexes
  * rather than a module table, which is where a stale index shows up first.
+ * Comments and strings are skipped: completion there is rightly empty.
  */
 function memberAccessPosition(text) {
-    const lines = text.split('\n');
+    const lines = codeLines(text);
     const find = (pattern) => {
         for (let line = 0; line < lines.length; line++) {
             const match = pattern.exec(lines[line]);
@@ -290,6 +164,53 @@ function memberAccessPosition(text) {
         || { line: 0, character: 0 };
 }
 
+/** `text`'s lines with comments and string contents blanked, columns kept. */
+function codeLines(text) {
+    const longBracket = /\[(=*)\[/y;
+    const longAt = (at) => {
+        longBracket.lastIndex = at;
+        return longBracket.exec(text);
+    };
+    let code = '';
+    let at = 0;
+    const blankTo = (end) => {
+        code += text.slice(at, end).replace(/[^\r\n]/g, ' ');
+        at = end;
+    };
+    const blankLong = (open, from) => {
+        const close = text.indexOf(`]${open[1]}]`, from + open[0].length);
+        blankTo(close < 0 ? text.length : close + open[1].length + 2);
+    };
+    while (at < text.length) {
+        const ch = text[at];
+        if (ch === '-' && text[at + 1] === '-') {
+            const open = longAt(at + 2);
+            if (open) {
+                blankLong(open, at + 2);
+            } else {
+                const lineEnd = text.indexOf('\n', at);
+                blankTo(lineEnd < 0 ? text.length : lineEnd);
+            }
+        } else if (ch === '[' && longAt(at)) {
+            blankLong(longAt(at), at);
+        } else if (ch === '"' || ch === "'") {
+            let end = at + 1;
+            while (end < text.length && text[end] !== ch && text[end] !== '\n') {
+                if (text[end] !== '\\') {
+                    end += 1;
+                } else {
+                    end += text.startsWith('\r\n', end + 1) ? 3 : 2;
+                }
+            }
+            blankTo(Math.min(end + 1, text.length));
+        } else {
+            code += ch;
+            at += 1;
+        }
+    }
+    return code.split('\n');
+}
+
 async function main() {
     const opts = parseArgs(process.argv);
     const codebase = requireDir(process.env.LSP_CODEBASE, 'LSP_CODEBASE');
@@ -301,49 +222,18 @@ async function main() {
     const target = opts.file ? path.resolve(codebase, opts.file) : largestLuaFile(codebase);
     if (!fs.existsSync(target)) throw new Error(`target file not found: ${target}`);
 
-    const extraArgs = (process.env.LSP_SERVER_ARGS || '').split(' ').filter(Boolean);
-    const proc = spawn(server, [
-        '--communication', 'stdio',
-        '--gmod-annotations-path', annotations,
-        ...extraArgs,
-    ], { stdio: ['pipe', 'pipe', 'pipe'] });
-
-    const client = new LspClient(proc);
+    const { proc, client, loadMs, push, incremental } = await startServer(server, codebase, annotations);
     const report = {
         workspace: codebase,
         file: path.relative(codebase, target),
         server,
         runs: opts.runs,
+        diagnosticDelivery: push ? 'push' : 'pull',
+        textSync: incremental ? 'incremental' : 'full',
         measurements: {},
         checks: {},
     };
-
-    let workspaceLoadedAt = null;
-    client.onNotification = (message) => {
-        if (message.method === 'gluals/serverStatus'
-            && message.params && message.params.state === 'workspaceLoaded') {
-            workspaceLoadedAt = Date.now();
-        }
-    };
-
-    const startedAt = Date.now();
-    await client.request('initialize', {
-        processId: process.pid,
-        rootUri: fileUri(codebase),
-        workspaceFolders: [{ uri: fileUri(codebase), name: path.basename(codebase) }],
-        capabilities: clientCapabilities(),
-        initializationOptions: {},
-        clientInfo: { name: 'Visual Studio Code', version: '1.95.0' },
-    });
-    client.notify('initialized', {});
-
-    const loadDeadline = Date.now() + 300000;
-    while (!workspaceLoadedAt && Date.now() < loadDeadline) await sleep(100);
-    if (!workspaceLoadedAt) {
-        proc.kill();
-        throw new Error('workspace never finished loading (5 minute timeout)');
-    }
-    report.measurements.workspaceLoad = { runs: 1, min: workspaceLoadedAt - startedAt, median: workspaceLoadedAt - startedAt, max: workspaceLoadedAt - startedAt };
+    report.measurements.workspaceLoad = summarise([loadMs]);
 
     const uri = fileUri(target);
     const original = fs.readFileSync(target, 'utf8');
@@ -352,6 +242,18 @@ async function main() {
     client.notify('textDocument/didOpen', {
         textDocument: { uri, languageId: 'lua', version, text },
     });
+
+    let other = null;
+    if (opts.other !== null) {
+        const otherPath = path.resolve(codebase, opts.other);
+        if (!fs.existsSync(otherPath)) throw new Error(`--other file not found: ${otherPath}`);
+        const otherText = fs.readFileSync(otherPath, 'utf8');
+        other = { uri: fileUri(otherPath), position: memberAccessPosition(otherText) };
+        client.notify('textDocument/didOpen', {
+            textDocument: { uri: other.uri, languageId: 'lua', version: 1, text: otherText },
+        });
+        report.otherFile = path.relative(codebase, otherPath);
+    }
     await sleep(1500);
 
     // `--completion-find` puts the cursor immediately after a given snippet, so
@@ -378,7 +280,10 @@ async function main() {
     const editToFresh = [];
     const cancelledPulls = [];
     const completionDrift = [];
+    const otherHoverWhileSettling = [];
+    let editsWithoutFreshPublish = 0;
     let previousResultId;
+    let lastEditAt = -Infinity;
 
     const labelsOf = (items) =>
         (Array.isArray(items) ? items : []).map((item) => item.label);
@@ -395,6 +300,7 @@ async function main() {
     const editDocument = () => {
         version += 1;
         editSerial += 1;
+        lastEditAt = Date.now();
 
         // `--edit-find`/`--edit-replace` reproduce one specific edit, swapping
         // back and forth so every keystroke is a real change to real code. Use
@@ -406,10 +312,11 @@ async function main() {
             if (!text.includes(from)) {
                 throw new Error(`--edit-find text not present in document: ${JSON.stringify(from)}`);
             }
+            const before = text;
             text = text.replace(from, to);
             client.notify('textDocument/didChange', {
                 textDocument: { uri, version },
-                contentChanges: [{ text }],
+                contentChanges: contentChanges(before, text, incremental),
             });
             return;
         }
@@ -422,21 +329,37 @@ async function main() {
         const inserted = opts.edit === 'comment'
             ? '-- perf\n'
             : `function _PerfProbe${editSerial}(a) return a end\n`;
+        const before = text;
         text = text.slice(0, editOffset) + inserted + text.slice(editOffset);
         client.notify('textDocument/didChange', {
             textDocument: { uri, version },
-            contentChanges: [{ text }],
+            contentChanges: contentChanges(before, text, incremental),
         });
     };
 
     // A settled measurement is only meaningful once nothing is pending. An
     // uncancelled diagnostic pull returns exactly when the analysis is fresh,
-    // so it is the cheapest way to wait for quiescence without guessing.
+    // so it is the cheapest way to wait for quiescence without guessing. A
+    // push server has nothing to pull: it is quiet once no publish has
+    // arrived for --quiet-ms since the last edit.
     const waitUntilQuiet = async () => {
+        if (push) {
+            await client.waitForPublishQuiet(opts.quietMs, lastEditAt);
+            return;
+        }
         await client.request('textDocument/diagnostic', {
             textDocument: { uri }, previousResultId,
         });
     };
+
+    // The edited document's first publish that reflects the edit: one at or
+    // past the edit's version, or any later one when the server sends none.
+    const freshPublish = (editVersion) => client.nextPublish(uri,
+        (entry) => entry.version === undefined || entry.version === null || entry.version >= editVersion,
+        opts.quietMs);
+
+    // The startup fill is still publishing until the server says it is done.
+    if (push) await client.waitForStatus('startupComplete', 300000);
 
     for (let run = 0; run < opts.runs; run++) {
         await waitUntilQuiet();
@@ -449,13 +372,18 @@ async function main() {
             : [];
         report.checks.completionItemCount = Array.isArray(items) ? items.length : 0;
 
-        const diagnostic = await client.request('textDocument/diagnostic', {
-            textDocument: { uri }, previousResultId,
-        });
-        settledDiagnostic.push(diagnostic.ms);
-        const described = describeReport(diagnostic.message.result);
-        if (described.resultId) previousResultId = described.resultId;
-        report.checks.diagnosticCount = described.count ?? report.checks.diagnosticCount;
+        if (push) {
+            const published = client.publishes.get(uri);
+            report.checks.diagnosticCount = published ? published.diagnostics.length : 0;
+        } else {
+            const diagnostic = await client.request('textDocument/diagnostic', {
+                textDocument: { uri }, previousResultId,
+            });
+            settledDiagnostic.push(diagnostic.ms);
+            const described = describeReport(diagnostic.message.result);
+            if (described.resultId) previousResultId = described.resultId;
+            report.checks.diagnosticCount = described.count ?? report.checks.diagnosticCount;
+        }
 
         // While typing: the request the user actually waits on. Its result is
         // compared against the settled one, because the whole risk of answering
@@ -506,15 +434,53 @@ async function main() {
         highlightAfterEdit.push(Date.now() - highlightStarted);
         highlightRetries.push(highlightRetried);
 
+        // Another document while an edit settles: hover it every 25 ms from
+        // the keystroke until every request the edit owes is answered (for a
+        // push server, until its publishes go quiet), and keep the slowest.
+        if (other) {
+            await waitUntilQuiet();
+            editDocument();
+            const settled = push
+                ? client.waitForPublishQuiet(opts.quietMs, lastEditAt)
+                : client.request('workspace/diagnostic', { previousResultIds: [] });
+            let done = false;
+            settled.then(() => { done = true; });
+            let worst = 0;
+            const until = Date.now() + 5000;
+            while (!done && Date.now() < until) {
+                const hovered = await client.request('textDocument/hover', {
+                    textDocument: { uri: other.uri }, position: other.position,
+                });
+                worst = Math.max(worst, hovered.ms);
+                await sleep(25);
+            }
+            await settled;
+            otherHoverWhileSettling.push(worst);
+        }
+
         // Keystroke to the first answer any index-reading handler can give.
+        // A push server answers with a publish; an edit that leaves the file's
+        // diagnostics unchanged may publish nothing, which is counted rather
+        // than timed. Cancelled pulls only exist for a pull server.
         editDocument();
+        if (push) {
+            const editAt = lastEditAt;
+            const published = await freshPublish(version);
+            if (published) editToFresh.push(published.at - editAt);
+            else editsWithoutFreshPublish += 1;
+            continue;
+        }
         const fresh = await client.request('textDocument/diagnostic', {
             textDocument: { uri }, previousResultId,
         });
         editToFresh.push(fresh.ms);
 
-        // A pull cancelled mid-flight must never come back as an empty full
-        // report — that is what clears the file's diagnostics in VS Code.
+        // A pull cancelled mid-flight must never come back thinner than the
+        // settled answer — a full report short of what the file really has is
+        // what drops diagnostics in VS Code, and an empty one clears the file.
+        // Stated against the settled count rather than against zero, so a file
+        // that legitimately has no diagnostics does not read as a failure: on a
+        // clean file the correct report is empty too.
         editDocument();
         const doomed = client.request('textDocument/diagnostic', {
             textDocument: { uri }, previousResultId,
@@ -524,9 +490,74 @@ async function main() {
         const cancelled = await doomed;
         const shape = describeReport(cancelled.message.result);
         cancelledPulls.push({
-            emptyFullReport: shape.kind === 'full' && shape.count === 0,
+            thinFullReport: shape.kind === 'full'
+                && shape.count < report.checks.diagnosticCount,
             errorCode: cancelled.message.error && cancelled.message.error.code,
         });
+    }
+
+    // Edit -> all related work done. One last isolated edit, then wait out the
+    // server's own pipeline: debounce, self-index, ripple quiet, ripple, the
+    // idle arm that raises the workspace-diagnostic level, the refresh request,
+    // and the workspace pull itself. Nothing here is optional — until the pull
+    // resolves, diagnostics and every freshness-gated feature lag the edit.
+    //
+    // An edit that moves nothing any other file reads owes no downstream work:
+    // the server then sends no refresh, and all related work ends when the
+    // edited file itself goes fresh. Both shapes are real; measure whichever
+    // this edit produces.
+    //
+    // A push server has no sweep or refresh: all related work is done at the
+    // last publish before the stream goes quiet.
+    const waitRefresh = (ms) =>
+        client.waitForServerRequest('workspace/diagnostic/refresh', ms).catch(() => null);
+    await waitUntilQuiet();
+    if (push) {
+        editDocument();
+        const allWorkEditAt = lastEditAt;
+        await client.waitForPublishQuiet(opts.quietMs, allWorkEditAt);
+        report.measurements.editToAllWorkDone = client.lastPublishAt > allWorkEditAt
+            ? summarise([client.lastPublishAt - allWorkEditAt])
+            : null;
+        report.measurements.workspaceSweep = null;
+    } else {
+        // Consume the sweep the workspace load armed: the pending level is what the
+        // next pull claims, and a Slow claim sweeps every file regardless of the
+        // scoped set. Until it drains, a post-edit pull measures the initial sweep,
+        // not the edit's own.
+        await client.request('workspace/diagnostic', { previousResultIds: [] });
+        // The run loop's last edits may have armed a refresh that fires ~3s later;
+        // drain it so the refresh awaited below is unambiguously caused by this edit.
+        await waitRefresh(15000);
+        const allWorkEditAt = Date.now();
+        editDocument();
+        const refreshWait = waitRefresh(15000);
+        // The file going fresh is the last owed work when the edit moves nothing
+        // another file reads; the sweep, when owed, supersedes it.
+        const fresh = client.request('textDocument/diagnostic', {
+            textDocument: { uri }, previousResultId,
+        });
+        await fresh;
+        const freshDoneAt = Date.now();
+        const refresh = await refreshWait;
+        if (refresh) {
+            const workspacePull = await client.request('workspace/diagnostic', {
+                previousResultIds: [],
+            });
+            if (workspacePull.message.error) {
+                throw new Error(`workspace/diagnostic pull failed: ${JSON.stringify(workspacePull.message.error)}`);
+            }
+            report.measurements.editToAllWorkDone = summarise([Date.now() - allWorkEditAt]);
+            report.measurements.workspaceSweep = summarise([workspacePull.ms]);
+            const workspaceItems = (workspacePull.message.result && workspacePull.message.result.items) || [];
+            report.checks.workspaceSweepItems = workspaceItems.length;
+            report.checks.workspaceSweepUnchanged =
+                workspaceItems.filter((item) => item.kind === 'unchanged').length;
+        } else {
+            // No refresh ever came: the edit owed no downstream work, so all
+            // related work ended when the edited file answered fresh.
+            report.measurements.editToAllWorkDone = summarise([freshDoneAt - allWorkEditAt]);
+        }
     }
 
     report.measurements.completionSettled = summarise(settledCompletion);
@@ -537,14 +568,22 @@ async function main() {
     report.measurements.highlightAfterEdit = summarise(highlightAfterEdit);
     report.checks.highlightRetries = highlightRetries.reduce((a, b) => a + b, 0);
     report.measurements.editToFreshAnswer = summarise(editToFresh);
-    report.checks.emptyFullReportsOnCancel =
-        cancelledPulls.filter((p) => p.emptyFullReport).length;
+    if (otherHoverWhileSettling.length > 0) {
+        report.measurements.otherHoverWhileSettling = summarise(otherHoverWhileSettling);
+    }
+    report.checks.thinReportsOnCancel = push
+        ? null
+        : cancelledPulls.filter((p) => p.thinFullReport).length;
+    if (push) report.checks.editsWithoutFreshPublish = editsWithoutFreshPublish;
     // A mid-edit completion that differs from the settled one is a correctness
     // regression, however fast it came back.
     report.checks.completionDriftWhileTyping = {
         worstMissing: Math.max(0, ...completionDrift.map((d) => d.missing)),
         worstExtra: Math.max(0, ...completionDrift.map((d) => d.extra)),
         sampleMissing: (completionDrift.find((d) => d.missing > 0) || {}).sampleMissing || [],
+        // A --edit-find rename *should* change completions mid-edit; drift is
+        // only a defect when the edit was meant to be inert at this position.
+        expectedToDrift: opts.editFind !== null,
     };
     report.checks.serverInitiatedRequests = [...client.serverRequests].sort();
 
@@ -555,30 +594,52 @@ async function main() {
         return failedChecks(report);
     }
 
+    // The third entry marks rows that only exist for a pull server.
     const rows = [
         ['workspace load', report.measurements.workspaceLoad],
         ['completion (settled)', report.measurements.completionSettled],
         ['completion (while typing)', report.measurements.completionWhileTyping],
-        ['diagnostic (settled)', report.measurements.diagnosticSettled],
+        ['diagnostic (settled)', report.measurements.diagnosticSettled, true],
         ['hover (while typing)', report.measurements.hoverWhileTyping],
         ['completion (concurrent)', report.measurements.completionWhileTypingConcurrent],
         ['highlight after edit', report.measurements.highlightAfterEdit],
         ['edit -> fresh answer', report.measurements.editToFreshAnswer],
+        ['other doc hover (worst)', report.measurements.otherHoverWhileSettling],
+        ['edit -> all work done', report.measurements.editToAllWorkDone],
+        ['workspace sweep', report.measurements.workspaceSweep, true],
     ];
     console.log(`workspace : ${report.workspace}`);
     console.log(`file      : ${report.file}`);
     console.log(`server    : ${report.server}`);
-    console.log(`runs      : ${report.runs}\n`);
-    console.log('                             min      median       max');
-    for (const [label, stats] of rows) {
+    console.log(`runs      : ${report.runs}`);
+    console.log(`delivery  : ${report.diagnosticDelivery}\n`);
+    console.log('                             min      median       p95       max');
+    for (const [label, stats, pullOnly] of rows) {
+        if (push && pullOnly) {
+            console.log(`${label.padEnd(28)}${'n/a (push)'.padStart(10)}`);
+            continue;
+        }
         if (!stats) continue;
         const fmt = (n) => `${n}ms`.padStart(10);
-        console.log(`${label.padEnd(28)}${fmt(stats.min)}${fmt(stats.median)}${fmt(stats.max)}`);
+        console.log(`${label.padEnd(28)}${fmt(stats.min)}${fmt(stats.median)}${fmt(stats.p95)}${fmt(stats.max)}`);
     }
     console.log(`\ncompletion items          : ${report.checks.completionItemCount}`);
     console.log(`diagnostics               : ${report.checks.diagnosticCount}`);
-    console.log(`empty reports on cancel   : ${report.checks.emptyFullReportsOnCancel}`
-        + (report.checks.emptyFullReportsOnCancel === 0 ? '  (good)' : '  (BAD: clears the file)'));
+    if (push) {
+        console.log('workspace sweep items     : n/a (push)');
+    } else if (report.checks.workspaceSweepItems !== undefined) {
+        console.log(`workspace sweep items     : ${report.checks.workspaceSweepItems}`
+            + ` (${report.checks.workspaceSweepUnchanged} unchanged)`);
+    } else {
+        console.log('workspace sweep items     : (edit owed no downstream work)');
+    }
+    if (push) {
+        console.log('thin reports on cancel    : n/a (push)');
+        console.log(`no fresh publish on edit  : ${report.checks.editsWithoutFreshPublish}`);
+    } else {
+        console.log(`thin reports on cancel    : ${report.checks.thinReportsOnCancel}`
+            + (report.checks.thinReportsOnCancel === 0 ? '  (good)' : '  (BAD: drops diagnostics)'));
+    }
     const drift = report.checks.completionDriftWhileTyping;
     const driftOk = drift.worstMissing === 0 && drift.worstExtra === 0;
     console.log(`completion drift mid-edit : -${drift.worstMissing} / +${drift.worstExtra}`
@@ -591,12 +652,15 @@ async function main() {
 // comparison and never fail; these two are defects whatever the latency was.
 function failedChecks(report) {
     const failures = [];
-    if (report.checks.emptyFullReportsOnCancel > 0) {
-        failures.push(`${report.checks.emptyFullReportsOnCancel} cancelled diagnostic pull(s) `
-            + 'came back as an empty full report, which clears the file in the editor');
+    if (report.checks.completionItemCount === 0) {
+        failures.push('completion probe returned no items; select a real member access with --completion-find');
+    }
+    if (report.checks.thinReportsOnCancel > 0) {
+        failures.push(`${report.checks.thinReportsOnCancel} cancelled diagnostic pull(s) came `
+            + 'back thinner than the settled report, which drops diagnostics in the editor');
     }
     const drift = report.checks.completionDriftWhileTyping;
-    if (drift.worstMissing > 0 || drift.worstExtra > 0) {
+    if ((drift.worstMissing > 0 || drift.worstExtra > 0) && !drift.expectedToDrift) {
         failures.push(`completion mid-edit differed from settled by -${drift.worstMissing}`
             + ` / +${drift.worstExtra} items`);
     }

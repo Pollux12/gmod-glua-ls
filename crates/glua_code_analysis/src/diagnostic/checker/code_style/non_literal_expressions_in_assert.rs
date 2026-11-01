@@ -11,8 +11,10 @@ impl Checker for NonLiteralExpressionsInAssertChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::NonLiteralExpressionsInAssert];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        for call_expr in root.descendants::<LuaCallExpr>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for call_expr in buckets.call_exprs.iter().cloned() {
             if call_expr.is_assert() {
                 check_assert_rule(context, semantic_model, call_expr);
             }

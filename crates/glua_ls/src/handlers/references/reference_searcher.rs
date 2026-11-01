@@ -139,7 +139,7 @@ pub fn search_decl_references_with_token(
         result,
         cancel_token,
     );
-    // 如果不等于当前文件, 那么我们可能是引用了其他文件的导出
+    // If it is not the current file, we may be referencing an export from another file
     if ret.is_none()
         && previous_result == result.len()
         && decl_id.file_id != semantic_model.get_file_id()
@@ -229,7 +229,7 @@ fn search_decl_references_with_ctx<'a>(
             .get_reference_index()
             .get_decl_references(&decl_id.file_id, &decl_id)?;
         let document = semantic_model.get_document();
-        // 加入自己 (only for the starting symbol when include_declaration is true,
+        // Add itself (only for the starting symbol when include_declaration is true,
         // or for secondary symbols when write/reference locations are requested)
         if ctx.include_declaration || (!ctx.is_starting_symbol && ctx.include_write_references) {
             if let Some(location) = document.to_lsp_location(decl.get_range()) {
@@ -511,7 +511,7 @@ fn search_vgui_panel_string_references(
     for (file_id, call) in semantic_model
         .get_db()
         .get_gmod_class_metadata_index()
-        .find_vgui_panel_definitions(&context.name)
+        .find_vgui_panel_definitions(semantic_model.get_db().get_vfs(), &context.name)
     {
         let definition_range = call.define_arg_range(GmodScriptedClassCallKind::VguiRegister);
         let Some(document) = semantic_model.get_document_by_file_id(file_id) else {
@@ -670,7 +670,7 @@ fn search_derma_skin_string_references(
     for (file_id, call) in semantic_model
         .get_db()
         .get_gmod_class_metadata_index()
-        .find_derma_skin_definitions(&context.name)
+        .find_derma_skin_definitions(semantic_model.get_db().get_vfs(), &context.name)
     {
         let definition_range = call.define_arg_range(GmodScriptedClassCallKind::DermaDefineSkin);
         let Some(document) = semantic_model.get_document_by_file_id(file_id) else {
@@ -978,7 +978,7 @@ fn enqueue_value_alias_references(
     Some(())
 }
 
-/// 如果是模块导出, 那么我们需要找到所有引用了这个模块的变量
+/// For a module export, find all variables that reference this module
 fn extend_module_return_value_references<'a>(
     ctx: &mut ReferenceSearchContext,
     semantic_model: &SemanticModel<'a>,

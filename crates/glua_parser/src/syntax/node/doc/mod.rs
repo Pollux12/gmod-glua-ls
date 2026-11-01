@@ -11,7 +11,8 @@ use super::{
     LuaAst, LuaBinaryOpToken, LuaLiteralToken, LuaNameToken, LuaNumberToken, LuaStringToken,
 };
 use crate::{
-    LuaAstChildren, LuaAstToken, LuaAstTokenChildren, LuaKind, LuaLiteralExpr, LuaSyntaxNode,
+    LuaAstChildren, LuaAstToken, LuaAstTokenChildren, LuaClosureExpr, LuaKind, LuaLiteralExpr,
+    LuaSyntaxNode,
     kind::{LuaSyntaxKind, LuaTokenKind},
     syntax::traits::LuaAstNode,
 };
@@ -68,6 +69,14 @@ impl LuaComment {
             LuaAst::cast(attached_node)
         } else {
             None
+        }
+    }
+
+    pub fn get_owner_closure(&self) -> Option<LuaClosureExpr> {
+        match self.get_owner()? {
+            LuaAst::LuaFuncStat(func) => func.get_closure(),
+            LuaAst::LuaLocalFuncStat(local_func) => local_func.get_closure(),
+            owner => owner.descendants::<LuaClosureExpr>().next(),
         }
     }
 

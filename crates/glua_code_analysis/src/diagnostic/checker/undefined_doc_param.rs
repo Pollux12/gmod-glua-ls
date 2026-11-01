@@ -10,9 +10,11 @@ impl Checker for UndefinedDocParamChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::UndefinedDocParam];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        for closure_expr in root.descendants::<LuaClosureExpr>() {
-            check_doc_param(context, semantic_model, &closure_expr);
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for closure_expr in buckets.closure_exprs.iter() {
+            check_doc_param(context, semantic_model, closure_expr);
         }
     }
 }

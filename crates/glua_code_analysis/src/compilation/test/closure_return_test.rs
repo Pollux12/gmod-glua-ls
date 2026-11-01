@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use glua_parser::{LuaAstNode, LuaClosureExpr, LuaNameExpr};
+    use glua_parser::{LuaAstNode, LuaAstToken, LuaClosureExpr, LuaNameExpr};
     use tokio_util::sync::CancellationToken;
 
     use crate::{DiagnosticCode, LuaSignatureId, LuaType, VirtualWorkspace};
@@ -25,6 +25,61 @@ mod test {
             .expect("semantic info")
             .display_typ()
             .clone()
+    }
+
+    /// The callback's return binds the method's generic from its body, with
+    /// the parameter typed by the call. Resolving the parameter writes the
+    /// closure's signature mid-evaluation; the body inference after it must
+    /// not reuse what was inferred before that write.
+    #[test]
+    fn test_generic_callback_return_uses_its_contextual_param() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Observable<T>
+            local Observable
+
+            ---@generic R
+            ---@param selector fun(value: T, index?: integer): R
+            ---@return R
+            function Observable:select(selector) end
+
+            ---@type Observable<integer>
+            source = {}
+
+            result = source:select(function(value)
+                return value
+            end)
+            "#,
+        );
+        assert_eq!(ws.expr_ty("result"), LuaType::Integer);
+    }
+
+    /// A branch returning `any` sits beside the others as one more arm, the
+    /// same whether or not another branch may be nil: a branch that learns it
+    /// can be nil must not take the rest of the return with it.
+    #[test]
+    fn an_any_branch_keeps_a_nullable_branch_beside_it() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@type string?
+            local name
+
+            ---@return any
+            local function anything() end
+
+            function Pick(flag)
+                if flag then
+                    return name
+                end
+                return anything()
+            end
+            "#,
+        );
+
+        let picked = ws.expr_ty("Pick(true)");
+        assert_eq!(ws.humanize_type(picked), "(any|string)?");
     }
 
     #[test]
@@ -143,6 +198,7 @@ mod test {
         assert_eq!(initial, ws.ty("unknown"));
         ws.analysis
             .update_file_by_uri(&consumer_uri, Some(format!("{consumer}\n")))
+            .map(|(id, _)| id)
             .expect("edited consumer");
         let incremental = local_name_type(&ws, consumer_file_id, "instance");
 
@@ -201,6 +257,7 @@ mod test {
             .unwrap_or_default();
         ws.analysis
             .update_file_by_uri(&consumer_uri, Some(format!("{consumer}\n")))
+            .map(|(id, _)| id)
             .expect("edited consumer");
         let after = ws
             .analysis
@@ -246,5 +303,69 @@ mod test {
             .expect("callback signature");
 
         assert_eq!(signature.get_return_type(), LuaType::Nil);
+    }
+
+    /// `analyze_return` derives a closure's return before its own body
+    /// statements have bound the global's declaration cache. The `DeclPosition`
+    /// fallback then substitutes the raw initializer literal (`integerconst(0)`)
+    /// where the settled declaration — a mutable global written more than once —
+    /// holds the widened `integer`. The provisional answer is re-derived later,
+    /// but a consumer that bound it in between keeps the stale arm.
+    #[test]
+    fn mutable_global_return_consumer_is_stable_across_reindex() {
+        let mut ws = VirtualWorkspace::new();
+        let file_ids = ws.def_files(vec![
+            (
+                "a.lua",
+                r#"
+                g = function(flag)
+                    local t = flag
+                    gx = 0
+                    if flag then
+                        gx = strfn()
+                    end
+                    return gx
+                end
+                local v = g()
+                "#,
+            ),
+            (
+                "b.lua",
+                r#"
+                function strfn()
+                    return "s"
+                end
+                "#,
+            ),
+        ]);
+        let consumer = file_ids[0];
+
+        let cold = local_decl_type(&mut ws, consumer, "v");
+        ws.analysis.reindex_files(vec![consumer]);
+        let warm = local_decl_type(&mut ws, consumer, "v");
+        assert_eq!(cold, warm, "cold {cold:?} vs warm {warm:?}");
+    }
+
+    fn local_decl_type(ws: &mut VirtualWorkspace, file_id: crate::FileId, name: &str) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let local_name = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaLocalName>()
+            .find(|local_name| {
+                local_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == name)
+            })
+            .expect("local name");
+        let token = local_name.get_name_token().expect("name token");
+        semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .expect("semantic info")
+            .display_typ()
+            .clone()
     }
 }

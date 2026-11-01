@@ -1,13 +1,15 @@
 use crate::FileId;
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::db_index::cow_shards::CowShards;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::VecDeque;
 
 #[derive(Debug)]
 pub struct FileDependencyRelation<'a> {
-    dependencies: &'a HashMap<FileId, HashSet<FileId>>,
+    dependencies: &'a CowShards<FileId, HashSet<FileId>>,
 }
 
 impl<'a> FileDependencyRelation<'a> {
-    pub fn new(dependencies: &'a HashMap<FileId, HashSet<FileId>>) -> Self {
+    pub(crate) fn new(dependencies: &'a CowShards<FileId, HashSet<FileId>>) -> Self {
         Self { dependencies }
     }
 
@@ -56,12 +58,12 @@ impl<'a> FileDependencyRelation<'a> {
         let mut queue = VecDeque::with_capacity(n);
         let mut popped = 0usize;
 
-        // 入度为0的节点，按优先级排序：meta文件优先，然后按FileId排序
+        // Nodes with in-degree 0, sorted by priority: meta files first, then by FileId
         let mut zero_in_degree: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
         zero_in_degree.sort_by(|&a, &b| {
             let a_is_meta = metas.contains(&file_ids[a]);
             let b_is_meta = metas.contains(&file_ids[b]);
-            // meta文件优先（true > false，所以反过来比较）
+            // meta files first (true > false, so compare in reverse)
             match (b_is_meta, a_is_meta) {
                 (true, false) => std::cmp::Ordering::Greater,
                 (false, true) => std::cmp::Ordering::Less,
@@ -81,7 +83,7 @@ impl<'a> FileDependencyRelation<'a> {
             levels[level].push(file_ids[idx]);
             popped += 1;
 
-            // 收集新的入度为0的节点
+            // Collect new nodes with in-degree 0
             let mut new_zero: Vec<usize> = Vec::new();
             for &neighbor in &adjacency[idx] {
                 in_degree[neighbor] -= 1;
@@ -92,7 +94,7 @@ impl<'a> FileDependencyRelation<'a> {
                 }
             }
 
-            // 同样按优先级排序后加入队列
+            // Sort by priority as well before adding to the queue
             if new_zero.len() > 1 {
                 new_zero.sort_by(|&a, &b| {
                     let a_is_meta = metas.contains(&file_ids[a]);
@@ -109,7 +111,7 @@ impl<'a> FileDependencyRelation<'a> {
             }
         }
 
-        // 处理循环依赖
+        // Handle circular dependencies
         if popped < n {
             for (idx, &deg) in in_degree.iter().enumerate() {
                 if deg > 0 {
@@ -124,13 +126,13 @@ impl<'a> FileDependencyRelation<'a> {
 
     /// Get all direct and indirect dependencies for the file list
     pub fn collect_file_dependents(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
-        let mut reverse_map: HashMap<FileId, Vec<FileId>> = HashMap::new();
+        let mut reverse_map: HashMap<FileId, Vec<FileId>> = HashMap::default();
         for (&fid, deps) in self.dependencies.iter() {
             for &dep in deps {
                 reverse_map.entry(dep).or_default().push(fid);
             }
         }
-        let mut result = HashSet::new();
+        let mut result = HashSet::default();
         let mut queue = VecDeque::new();
         for file_id in file_ids {
             queue.push_back(file_id);
@@ -154,67 +156,70 @@ mod tests {
 
     #[test]
     fn test_best_analysis_order() {
-        let mut map = HashMap::new();
-        // 文件1依赖文件2
+        let mut map = HashMap::default();
+        // File 1 depends on file 2
         map.insert(FileId::new(1), {
-            let mut s = HashSet::new();
+            let mut s = HashSet::default();
             s.insert(FileId::new(2));
             s
         });
-        // 文件2没有依赖
-        map.insert(FileId::new(2), HashSet::new());
+        // File 2 has no dependencies
+        map.insert(FileId::new(2), HashSet::default());
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
         let result =
             rel.get_best_analysis_order(&[FileId::new(1), FileId::new(2)], &HashSet::default());
-        // 文件2没有依赖，应该在前；文件1依赖文件2，在后
+        // File 2 has no dependencies so it comes first; file 1 depends on file 2 so it comes after
         assert_eq!(result, vec![FileId::new(2), FileId::new(1)]);
     }
 
     #[test]
     fn test_best_analysis_order2() {
-        let mut map = HashMap::new();
-        // 文件1依赖文件2和文件3
+        let mut map = HashMap::default();
+        // File 1 depends on files 2 and 3
         map.insert(1.into(), {
-            let mut s = HashSet::new();
+            let mut s = HashSet::default();
             s.insert(2.into());
             s.insert(3.into());
             s
         });
-        // 文件2依赖文件3
+        // File 2 depends on file 3
         map.insert(2.into(), {
-            let mut s = HashSet::new();
+            let mut s = HashSet::default();
             s.insert(3.into());
             s
         });
-        // 文件3没有依赖
-        map.insert(3.into(), HashSet::new());
+        // File 3 has no dependencies
+        map.insert(3.into(), HashSet::default());
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
         let result =
             rel.get_best_analysis_order(&[1.into(), 2.into(), 3.into()], &HashSet::default());
-        // 文件3没有依赖，应该在最前面；然后是2，最后是1
+        // File 3 has no dependencies so it comes first, then 2, and 1 last
         assert_eq!(result, vec![3.into(), 2.into(), 1.into()]);
     }
 
     #[test]
     fn test_no_deps_files_first() {
-        let mut map = HashMap::new();
-        // 文件1依赖文件2
+        let mut map = HashMap::default();
+        // File 1 depends on file 2
         map.insert(FileId::new(1), {
-            let mut s = HashSet::new();
+            let mut s = HashSet::default();
             s.insert(FileId::new(2));
             s
         });
-        // 文件2依赖文件1（循环依赖）
+        // File 2 depends on file 1 (circular dependency)
         map.insert(FileId::new(2), {
-            let mut s = HashSet::new();
+            let mut s = HashSet::default();
             s.insert(FileId::new(1));
             s
         });
-        // 文件3没有依赖
-        map.insert(FileId::new(3), HashSet::new());
-        // 文件4没有依赖
-        map.insert(FileId::new(4), HashSet::new());
+        // File 3 has no dependencies
+        map.insert(FileId::new(3), HashSet::default());
+        // File 4 has no dependencies
+        map.insert(FileId::new(4), HashSet::default());
 
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
         let result = rel.get_best_analysis_order(
             &[
@@ -226,22 +231,23 @@ mod tests {
             &HashSet::default(),
         );
 
-        // 文件3和4没有依赖，应该在前面
+        // Files 3 and 4 have no dependencies so they come first
         assert_eq!(result[0], FileId::new(3));
         assert_eq!(result[1], FileId::new(4));
-        // 文件1和2有循环依赖，在后面
+        // Files 1 and 2 have a circular dependency so they come last
         assert!(result.contains(&FileId::new(1)));
         assert!(result.contains(&FileId::new(2)));
     }
 
     #[test]
     fn the_analysis_order_places_every_dependency_before_its_dependents() {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         map.insert(1.into(), [2.into(), 3.into()].into_iter().collect());
         map.insert(2.into(), [3.into()].into_iter().collect());
-        map.insert(3.into(), HashSet::new());
+        map.insert(3.into(), HashSet::default());
         map.insert(4.into(), [1.into()].into_iter().collect());
-        map.insert(5.into(), HashSet::new());
+        map.insert(5.into(), HashSet::default());
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
         let files: Vec<FileId> = (1..=5).map(FileId::new).collect();
         let metas = HashSet::from_iter([FileId::new(5)]);
@@ -266,12 +272,13 @@ mod tests {
 
     #[test]
     fn a_level_never_contains_a_file_depending_on_a_sibling() {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         map.insert(1.into(), [2.into(), 3.into()].into_iter().collect());
         map.insert(2.into(), [3.into()].into_iter().collect());
-        map.insert(3.into(), HashSet::new());
+        map.insert(3.into(), HashSet::default());
         map.insert(4.into(), [1.into()].into_iter().collect());
-        map.insert(5.into(), HashSet::new());
+        map.insert(5.into(), HashSet::default());
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
         let files: Vec<FileId> = (1..=5).map(FileId::new).collect();
 
@@ -290,10 +297,11 @@ mod tests {
 
     #[test]
     fn cyclic_files_each_get_their_own_level() {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         map.insert(1.into(), [2.into()].into_iter().collect());
         map.insert(2.into(), [1.into()].into_iter().collect());
-        map.insert(3.into(), HashSet::new());
+        map.insert(3.into(), HashSet::default());
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
         let files: Vec<FileId> = (1..=3).map(FileId::new).collect();
 
@@ -306,15 +314,16 @@ mod tests {
 
     #[test]
     fn test_collect_file_dependents() {
-        let mut deps = HashMap::new();
+        let mut deps = HashMap::default();
         deps.insert(
             FileId::new(1),
             [FileId::new(2), FileId::new(3)].iter().cloned().collect(),
         );
         deps.insert(FileId::new(2), [FileId::new(3)].iter().cloned().collect());
-        deps.insert(FileId::new(3), HashSet::new());
+        deps.insert(FileId::new(3), HashSet::default());
         deps.insert(FileId::new(4), [FileId::new(3)].iter().cloned().collect());
 
+        let deps = CowShards::from(deps);
         let rel = FileDependencyRelation::new(&deps);
         let mut result = rel.collect_file_dependents(vec![FileId::new(3)]);
         result.sort();
@@ -323,17 +332,18 @@ mod tests {
 
     #[test]
     fn test_meta_files_first() {
-        let mut map = HashMap::new();
-        // 所有文件都没有依赖
-        map.insert(FileId::new(1), HashSet::new());
-        map.insert(FileId::new(2), HashSet::new());
-        map.insert(FileId::new(3), HashSet::new());
-        map.insert(FileId::new(4), HashSet::new());
+        let mut map = HashMap::default();
+        // No file has dependencies
+        map.insert(FileId::new(1), HashSet::default());
+        map.insert(FileId::new(2), HashSet::default());
+        map.insert(FileId::new(3), HashSet::default());
+        map.insert(FileId::new(4), HashSet::default());
 
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
 
-        // 文件2和4是meta文件
-        let mut metas = HashSet::new();
+        // Files 2 and 4 are meta files
+        let mut metas = HashSet::default();
         metas.insert(FileId::new(2));
         metas.insert(FileId::new(4));
 
@@ -347,30 +357,43 @@ mod tests {
             &metas,
         );
 
-        // meta文件应该在前面（2和4），非meta文件在后面（1和3）
-        assert!(metas.contains(&result[0]), "第一个应该是meta文件");
-        assert!(metas.contains(&result[1]), "第二个应该是meta文件");
-        assert!(!metas.contains(&result[2]), "第三个应该是非meta文件");
-        assert!(!metas.contains(&result[3]), "第四个应该是非meta文件");
+        // meta files should come first (2 and 4), non-meta files last (1 and 3)
+        assert!(
+            metas.contains(&result[0]),
+            "the first should be a meta file"
+        );
+        assert!(
+            metas.contains(&result[1]),
+            "the second should be a meta file"
+        );
+        assert!(
+            !metas.contains(&result[2]),
+            "the third should be a non-meta file"
+        );
+        assert!(
+            !metas.contains(&result[3]),
+            "the fourth should be a non-meta file"
+        );
     }
 
     #[test]
     fn test_meta_with_dependencies() {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         // File 1 depends on file 2 (meta)
         map.insert(FileId::new(1), {
-            let mut s = HashSet::new();
+            let mut s = HashSet::default();
             s.insert(FileId::new(2));
             s
         });
         // File 2 (meta) has no dependencies
-        map.insert(FileId::new(2), HashSet::new());
+        map.insert(FileId::new(2), HashSet::default());
         // File 3 has no dependencies
-        map.insert(FileId::new(3), HashSet::new());
+        map.insert(FileId::new(3), HashSet::default());
 
+        let map = CowShards::from(map);
         let rel = FileDependencyRelation::new(&map);
 
-        let mut metas = HashSet::new();
+        let mut metas = HashSet::default();
         metas.insert(FileId::new(2));
 
         let result =

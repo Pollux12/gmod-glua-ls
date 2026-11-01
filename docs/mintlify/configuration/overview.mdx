@@ -1,109 +1,81 @@
 ---
-title: Configuration overview
-description: Configure GLuaLS with the settings panel or a .gluarc.json file.
+title: Configuration
+description: Change GLuaLS settings with the settings panel or a .gluarc.json file.
 ---
 
-import ConfigTip from "/snippets/config-tip.mdx"
+GLuaLS works without any configuration. Change settings only when you need to, such as turning off a warning or picking a formatting style.
 
-## Overview
+Project settings are stored in a `.gluarc.json` file in your project folder. Commit it so everyone working on the project gets the same results.
 
-Configure language server behavior in a `.gluarc.json` file at your workspace root. The file has full JSON schema support, so your editor validates settings and provides completions.
+## Settings panel
 
-Use the VS Code settings panel to edit `.gluarc.json` without writing JSON, or edit the file directly. Both update the same configuration.
+The settings panel edits `.gluarc.json` for you, so you never have to write JSON.
 
----
+<Frame>
+  <img src="/images/showcase/settings-panel.png" alt="The GLua Settings panel with the Format category open" />
+</Frame>
 
-## Settings panel (recommended)
+Open it in any of these ways:
 
-The GLua Settings panel lets you configure GLuaLS without touching JSON. Changes write directly to `.gluarc.json`.
+- Click **GLuaLS** in the status bar and choose **Open GLuaLS Settings**
+- Run **GLuaLS: Open GLuaLS Settings** from the Command Palette (`Ctrl+Shift+P`)
+- Right-click a `.gluarc.json` file in the Explorer
 
-### Opening the panel
+In a multi-root workspace, you choose which folder to configure. Click **Save** to write your changes, or turn on **Auto-save settings** at the top of the panel.
 
-Open **GLuaLS: Open GLuaLS Settings** from the Command Palette (`Ctrl+Shift+P`), click the GLuaLS status item, or right-click a `.gluarc.json` file in the Explorer. In a multi-root workspace, choose the folder to configure.
+## Edit `.gluarc.json` directly
 
-The panel groups settings by the same top-level sections as `.gluarc.json`. Click **Save** to write your changes, or enable **Auto-save settings** in the panel header.
-
-<Tip>
-If you want to inspect the generated JSON, open `.gluarc.json` directly. You can edit both the settings panel and the JSON file, and they stay in sync.
-</Tip>
-
-### Auto-save behavior
-
-Auto-save is off by default. Click **Save** after editing.
-
-To change auto-save behavior, toggle **Auto-save settings** in the panel header or set `gluals.gmod.settingsAutoSave` in your VS Code settings.
-
----
-
-## Manual configuration (.gluarc.json)
-
-### Creating your config
-
-Create a `.gluarc.json` file at the root of your workspace:
-
-<ConfigTip />
+You can also edit the file by hand. Add only the settings you want to change and leave everything else out, so you keep the defaults:
 
 ```json .gluarc.json
 {
-  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/crates/glua_code_analysis/resources/schema.json"
+  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/crates/glua_code_analysis/resources/schema.json",
+  "diagnostics": {
+    "disable": ["unused"]
+  },
+  "format": {
+    "preset": "cfc"
+  }
 }
 ```
 
-The `$schema` property enables IDE validation and autocomplete for the file itself.
+The `$schema` line gives you completion and descriptions for every setting while you type. To create the file, right-click your project folder and choose **Create GLuaLS Settings**.
 
-The settings panel can also create the file for you. Run **GLuaLS: Create GLuaLS Settings** from the Command Palette.
+<Note>
+If a project has `.gluarc.json`, GLuaLS uses only that file. Without it, GLuaLS reads `.luarc.json`, `.emmyrc.json` or `.emmyrc.lua`, in that order, so existing configs from other Lua tools keep working.
+</Note>
 
-Most projects do not need a starter config. Add only the settings you want to change so new defaults can apply automatically.
-
-### Config file priority
-
-When a workspace has multiple config files, GLuaLS uses this priority order (highest first):
-
-1. `.gluarc.json`
-2. `.luarc.json`
-3. `.emmyrc.json`
-4. `.emmyrc.lua`
-
-`.gluarc.json` is exclusive. If it exists, GLuaLS ignores all other config files.
-
----
-
-## Configuration reference
-
-The config file is split into top-level sections. Each page lists the available `.gluarc.json` options and related VS Code settings:
+## Settings by section
 
 <CardGroup cols={2}>
-  <Card title="Garry's Mod settings" icon="gamepad-2" href="/configuration/gmod">
-    Realm analysis, network checks, scripted classes, hooks, and VGUI
+  <Card title="Garry's Mod" icon="gamepad-2" href="/configuration/gmod">
+    Realms, scripted classes, hooks, net messages and VGUI
   </Card>
   <Card title="Diagnostics" icon="triangle-alert" href="/configuration/diagnostics">
-    Enable, disable, and tune severity of all diagnostic codes
-  </Card>
-  <Card title="Completion" icon="square-code" href="/configuration/completion">
-    Autocomplete behavior, call snippets, postfix trigger, auto-require
+    Turn warnings on or off and change how they show
   </Card>
   <Card title="Formatting" icon="align-left" href="/configuration/formatting">
-    Built-in presets, style overrides, external formatter configuration
+    Presets, style options and external formatters
   </Card>
   <Card title="Workspace" icon="folder" href="/configuration/workspace">
-    Library paths, ignore patterns, module map, encoding
+    Libraries, ignored files and multi-root projects
   </Card>
-  <Card title="Hints & Hover" icon="lightbulb" href="/configuration/hints-and-hover">
-    Inlay hints, inline values, hover, semantic tokens, signature help
+  <Card title="Completion" icon="square-code" href="/configuration/completion">
+    Snippets and automatic `require` lines
   </Card>
-  <Card title="Runtime & Strict" icon="settings" href="/configuration/runtime">
-    Non-standard symbols, strict type checking, special functions
+  <Card title="Hints and hover" icon="lightbulb" href="/configuration/hints-and-hover">
+    Inlay hints, hover, code lens and highlighting
   </Card>
-  <Card title="Annotations management" icon="arrows-rotate" href="/configuration/annotations-management">
-    Auto-download Garry's Mod wiki annotations, custom annotation paths
+  <Card title="Runtime and strict mode" icon="settings" href="/configuration/runtime">
+    Syntax, `require` handling and stricter type checks
+  </Card>
+  <Card title="Garry's Mod annotations" icon="arrows-rotate" href="/configuration/annotations-management">
+    How the Garry's Mod annotations are downloaded
   </Card>
 </CardGroup>
 
----
+## VS Code settings
 
-## VS Code extension settings
+A few options only exist as VS Code settings, such as the debugger and annotation download options. Open VS Code **Settings** and search for `gluals` to see them.
 
-Extension settings control the debugger, AI integration, UI preferences, and annotation downloads. Open VS Code **Settings** and search for `gluals` to find them.
-
-Use `.gluarc.json` for analysis behavior. Its settings take precedence over matching VS Code workspace settings.
-
+Many `.gluarc.json` options also have a matching `gluals.*` VS Code setting. These are handy for personal preferences, such as turning off inlay hints. When both are set, the VS Code setting wins. Use `.gluarc.json` for anything the whole project should share.

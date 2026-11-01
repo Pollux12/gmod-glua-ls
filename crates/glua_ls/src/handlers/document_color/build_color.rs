@@ -1,4 +1,5 @@
 use glua_code_analysis::{LuaDocument, SemanticModel};
+use glua_parser::LuaSyntaxNodeExt;
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaExpr, LuaLiteralToken, LuaSyntaxNode, LuaSyntaxToken, LuaTokenKind,
     NumberResult,
@@ -53,7 +54,7 @@ pub fn build_colors(
     }
 
     // Scan for GMod Color(r, g, b[, a]) constructor calls or tuple arguments.
-    for call_expr in root.descendants().filter_map(LuaCallExpr::cast) {
+    for call_expr in root.descendants_of::<LuaCallExpr>() {
         if try_build_gmod_color_call(call_expr.clone(), document, &mut result).is_some() {
             continue;
         }
@@ -531,7 +532,7 @@ mod tests {
             ---@param b number
             ---@param a? number
             function surface.SetDrawColor(r, g, b, a) end
-            
+
             surface.SetDrawColor(255, 0, 0)
             surface.SetDrawColor(255, 0, 0, 255)
             "#,
@@ -632,7 +633,7 @@ mod tests {
             ---@param b number
             ---@param a? number
             function Color(r, g, b, a) end
-            
+
             local c = Color(255, 0, 0)
             "#,
         );
@@ -688,7 +689,7 @@ mod tests {
             ---@param y number
             ---@param z number
             function SetPos(x, y, z) end
-            
+
             SetPos(255, 0, 0)
             "#,
         );

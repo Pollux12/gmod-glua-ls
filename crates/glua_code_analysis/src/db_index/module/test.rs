@@ -5,10 +5,78 @@ mod tests {
         sync::Arc,
     };
 
+    use rowan::{TextRange, TextSize};
+    use rustc_hash::{FxHashMap, FxHashSet};
+
     use crate::{
-        Emmyrc, FileId, WorkspaceId,
-        db_index::{WorkspaceKind, module::LuaModuleIndex, traits::LuaIndex},
+        Emmyrc, FileId, FileRemap, InFiled, LuaSemanticDeclId, LuaSignatureId, LuaType,
+        PositionMap, WorkspaceId,
+        db_index::{
+            WorkspaceKind,
+            module::{LuaModuleIndex, export_files},
+            traits::LuaIndex,
+        },
     };
+
+    /// `export_refs` names exactly the modules a scan of every export finds.
+    fn assert_export_refs_match_a_scan(m: &LuaModuleIndex) {
+        let mut expected: FxHashMap<FileId, FxHashSet<FileId>> = FxHashMap::default();
+        for info in m.file_module_map.values() {
+            for file_id in export_files(info) {
+                expected.entry(file_id).or_default().insert(info.file_id);
+            }
+        }
+        let indexed: FxHashMap<_, _> = m
+            .export_refs
+            .iter()
+            .map(|(file_id, files)| (*file_id, files.clone()))
+            .collect();
+        assert_eq!(indexed, expected);
+    }
+
+    #[test]
+    fn export_refs_follow_sets_resets_remaps_and_removals() {
+        let mut m = create_module();
+        let (exporter, literal_file, other) = (FileId::new(1), FileId::new(2), FileId::new(3));
+        m.add_module_by_module_path(exporter, "exporter".into(), WorkspaceId::MAIN);
+        m.add_module_by_module_path(literal_file, "literal".into(), WorkspaceId::MAIN);
+        m.add_module_by_module_path(other, "other".into(), WorkspaceId::MAIN);
+        let literal = |start: u32| {
+            LuaType::TableConst(InFiled::new(
+                literal_file,
+                TextRange::new(TextSize::new(start), TextSize::new(start + 2)),
+            ))
+        };
+        assert_eq!(m.set_export(exporter, literal(4), None), Some(true));
+        assert_eq!(m.set_export(exporter, literal(4), None), Some(false));
+        m.set_export(literal_file, literal(0), None);
+        m.set_export(
+            other,
+            LuaType::Any,
+            Some(LuaSemanticDeclId::Signature(LuaSignatureId::new(
+                literal_file,
+                TextSize::new(0),
+            ))),
+        );
+        assert_export_refs_match_a_scan(&m);
+
+        let lost = m.remap_file_exports(&FileRemap::unvalidated(
+            literal_file,
+            PositionMap::new("abc", "\nabc"),
+        ));
+        assert!(lost.is_empty());
+        assert_eq!(
+            m.get_module(exporter)
+                .and_then(|info| info.export_type.clone()),
+            Some(literal(5))
+        );
+        assert_export_refs_match_a_scan(&m);
+
+        m.reset_export(other);
+        assert_export_refs_match_a_scan(&m);
+        m.remove(exporter);
+        assert!(m.export_refs.is_empty());
+    }
 
     fn create_module() -> LuaModuleIndex {
         let mut m = LuaModuleIndex::new();
@@ -333,6 +401,30 @@ mod tests {
         assert!(m.find_module("pckr.event").is_none());
         let module_info = m.find_module("event").unwrap();
         assert_eq!(module_info.full_module_name, "nvim-cmp.lua.cmp.utils.event");
+    }
+
+    /// A require looked up from a workspace matches whole trailing segments,
+    /// as a lookup from nowhere does.
+    #[test]
+    fn test_require_fuzzy_match_in_a_workspace_honors_segment_boundaries() {
+        let mut m = LuaModuleIndex::new();
+        m.update_config(Arc::new(Emmyrc::default()));
+        m.add_workspace_root(
+            Path::new("C:/Users/username/Documents").into(),
+            WorkspaceId::MAIN,
+        );
+
+        let file_id = FileId { id: 1 };
+        m.add_module_by_path(file_id, "C:/Users/username/Documents/a/foobar/new.lua");
+
+        assert!(
+            m.find_module_in_workspace("bar.new", WorkspaceId::MAIN)
+                .is_none()
+        );
+        let module_info = m
+            .find_module_in_workspace("foobar.new", WorkspaceId::MAIN)
+            .unwrap();
+        assert_eq!(module_info.file_id, file_id);
     }
 
     #[test]

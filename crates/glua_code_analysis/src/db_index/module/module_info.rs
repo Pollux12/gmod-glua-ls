@@ -4,7 +4,7 @@ use crate::{DbIndex, FileId, LuaExport, LuaSemanticDeclId, db_index::LuaType};
 
 use super::{module_node::ModuleNodeId, workspace::WorkspaceId};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModuleInfo {
     pub file_id: FileId,
     pub full_module_name: String,

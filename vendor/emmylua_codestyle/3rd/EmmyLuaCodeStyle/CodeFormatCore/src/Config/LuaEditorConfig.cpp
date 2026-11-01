@@ -1,4 +1,4 @@
-﻿
+
 #include "CodeFormatCore/Config/LuaEditorConfig.h"
 
 #include <fstream>

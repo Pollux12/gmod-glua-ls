@@ -1,7 +1,9 @@
 mod client;
 mod client_id;
 mod debounced_analysis;
+pub(crate) mod diagnostic_store;
 mod did_change_coalescer;
+mod editor_documents;
 mod file_diagnostic;
 mod lsp_features;
 mod snapshot;
@@ -10,8 +12,12 @@ mod workspace_manager;
 
 pub use client::ClientProxy;
 pub use client_id::{ClientId, get_client_id};
-pub use debounced_analysis::{DebouncedAnalysis, InFlightChangeGuard};
+#[cfg(test)]
+pub(crate) use debounced_analysis::expedites_debounce;
+pub use debounced_analysis::{DebouncedAnalysis, Freshness, InFlightChangeGuard};
+pub use diagnostic_store::DiagnosticStore;
 pub use did_change_coalescer::DidChangeCoalescer;
+pub use editor_documents::{EditorDocuments, SyncError};
 pub use file_diagnostic::FileDiagnostic;
 use glua_code_analysis::EmmyLuaAnalysis;
 pub use lsp_features::LspFeatures;
@@ -25,17 +31,21 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 pub use workspace_manager::*;
 
-use crate::context::snapshot::ServerContextInner;
+use crate::context::snapshot::{DocumentVersions, ServerContextInner};
 
-// LOCK ORDER (acquire low → high; never a lower lock while holding a higher):
-// 1. diagnostic_tokens  2. workspace_diagnostic_token  3. cached_file_diagnostics
-// 4. update_token  5. analysis(read)  6. workspace_manager(read)
-// 7. workspace_manager(write)  8. analysis(write)
+// LOCK ORDER (take top to bottom; never one above while holding one below):
+// 1. `WorkspaceManager::config_apply`, held across a whole config reload.
+// 2. workspace_manager (read or write).
+// 3. analysis (read or write).
 // Within `DebouncedAnalysis`: pending_files before reindexing_files, and both
 // are released before anything above is taken.
-// Leaf: document_versions — a synchronous lock, so it can never be held across
-// an `.await`. Never upgrade read→write in place; avoid holding any lock across
-// `.await`. Atomics are exempt.
+// Leaves, taking nothing while held: workspace_diagnostic_token,
+// `WorkspaceManager`'s recheck_token and config_token (taken under
+// workspace_manager), document_versions, renamed_uris, the diagnostic store's
+// publishing then state, and `DebouncedAnalysis::in_flight_documents`. The
+// synchronous ones are never held across an `.await`. Never upgrade
+// read→write in place; avoid holding any lock across `.await`. Atomics are
+// exempt.
 
 /// Panics the debounce supervisor will restart before it stops trying.
 const DEBOUNCE_RESTART_LIMIT: u32 = 5;
@@ -71,38 +81,42 @@ struct InFlightRequest {
 
 // Methods answered with their computed result on cancel instead of an error,
 // so the client keeps its current UI state.
-// - semantic tokens excluded: relative offsets make a stale set wrong.
-// - workspace/diagnostic included: vscode-languageclient permanently stops
-//   workspace pulls after 6 non-cancellation errors.
-// - textDocument/diagnostic excluded: the client rewrites a cancelled pull's
-//   result to an empty full report; an error reschedules instead.
+// Semantic tokens are excluded: relative offsets make a stale set wrong.
 fn keep_stale_editor_data_on_cancel(method: &str) -> bool {
     matches!(
         method,
-        "textDocument/codeLens"
-            | "textDocument/inlayHint"
-            | "gluals/annotator"
-            | "workspace/diagnostic"
+        "textDocument/codeLens" | "textDocument/inlayHint" | "gluals/annotator"
     )
 }
 
 /// The error code — and any `data` payload — for a cancelled request.
 fn cancel_error(features: &LspFeatures, method: &str) -> (ErrorCode, Option<serde_json::Value>) {
-    // The client only retriggers when `data` is present; it ignores the
-    // spec's default-when-absent.
-    if matches!(method, "textDocument/diagnostic" | "workspace/diagnostic") {
-        return (
-            ErrorCode::ServerCancelled,
-            Some(serde_json::json!({ "retriggerRequest": true })),
-        );
-    }
-
     // ContentModified only for methods the client declares it re-sends;
     // others read it as "no result" and clear the feature's UI.
     if features.retries_on_content_modified(method) {
         (ErrorCode::ContentModified, None)
     } else {
         (ErrorCode::RequestCanceled, None)
+    }
+}
+
+/// The answer to `id`, a `method` request the server gave up on, in the form
+/// the client re-sends it on.
+pub(crate) fn cancelled_response(
+    features: &LspFeatures,
+    id: RequestId,
+    method: &str,
+    message: &str,
+) -> Response {
+    let (code, data) = cancel_error(features, method);
+    Response {
+        id,
+        result: None,
+        error: Some(lsp_server::ResponseError {
+            code: code as i32,
+            message: message.to_string(),
+            data,
+        }),
     }
 }
 
@@ -130,16 +144,34 @@ pub struct ServerContext {
     debounced_shutdown: CancellationToken,
     inner: Arc<ServerContextInner>,
     did_change_coalescer: DidChangeCoalescer,
+    editor_documents: EditorDocuments,
 }
 
 impl ServerContext {
     pub fn new(conn: Connection, client_capabilities: ClientCapabilities) -> Self {
+        Self::build(conn, client_capabilities, true)
+    }
+
+    /// A context that starts no background task, so what it stages stays
+    /// staged until the test takes it.
+    #[cfg(test)]
+    pub(crate) fn new_idle(conn: Connection, client_capabilities: ClientCapabilities) -> Self {
+        Self::build(conn, client_capabilities, false)
+    }
+
+    fn build(
+        conn: Connection,
+        client_capabilities: ClientCapabilities,
+        background_tasks: bool,
+    ) -> Self {
         let client = Arc::new(ClientProxy::new(Connection {
             sender: conn.sender.clone(),
             receiver: conn.receiver.clone(),
         }));
 
-        let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
+        let mut analysis = EmmyLuaAnalysis::new();
+        analysis.compilation.set_detached_tasks(true);
+        let analysis = Arc::new(RwLock::new(analysis));
         let lsp_features = Arc::new(LspFeatures::new(client_capabilities));
         let status_bar = Arc::new(StatusBar::new(
             client.clone(),
@@ -150,29 +182,36 @@ impl ServerContext {
             status_bar.clone(),
             client.clone(),
         ));
-        let workspace_manager_inner = WorkspaceManager::new(
-            analysis.clone(),
-            client.clone(),
-            status_bar.clone(),
-            file_diagnostic.clone(),
-            lsp_features.clone(),
-        );
-        let workspace_diagnostic_level = workspace_manager_inner.workspace_diagnostic_level_arc();
-        let workspace_manager = Arc::new(RwLock::new(workspace_manager_inner));
         let debounced_shutdown = CancellationToken::new();
         let debounced_analysis = Arc::new(DebouncedAnalysis::new(
             analysis.clone(),
             200,
             debounced_shutdown.clone(),
             client.clone(),
-            file_diagnostic.shared_diagnostic_data_cache(),
-            workspace_diagnostic_level,
+            file_diagnostic.clone(),
             lsp_features.clone(),
         ));
+        let workspace_manager_inner = WorkspaceManager::new(
+            analysis.clone(),
+            client.clone(),
+            status_bar.clone(),
+            file_diagnostic.clone(),
+            lsp_features.clone(),
+            debounced_analysis.clone(),
+        );
+        let workspace_manager = Arc::new(RwLock::new(workspace_manager_inner));
+
+        if background_tasks {
+            file_diagnostic.store().start(
+                file_diagnostic::workspace_diagnostic_parallelism(),
+                debounced_analysis.clone(),
+            );
+        }
 
         // Supervise the debounce loop: freshness waiters park on it with no
-        // deadline, so if it dies the whole server silently goes quiet.
-        {
+        // deadline, so if it dies the waiters fail fast via the alive flag
+        // instead of the whole server silently going quiet.
+        if background_tasks {
             let da = debounced_analysis.clone();
             let shutdown = debounced_shutdown.clone();
             tokio::spawn(async move {
@@ -189,10 +228,11 @@ impl ServerContext {
                             restarts += 1;
                             if restarts > DEBOUNCE_RESTART_LIMIT {
                                 log::error!(
-                                    "LS_DEBOUNCE_LOOP_DEAD debounced analysis loop panicked {} times; giving up, so edits stop being re-indexed and freshness waits park until their request is cancelled: {}",
+                                    "LS_DEBOUNCE_LOOP_DEAD debounced analysis loop panicked {} times; giving up, so edits stop being re-indexed and freshness waits fail fast: {}",
                                     restarts,
                                     err
                                 );
+                                da.note_debounce_loop_dead();
                                 return;
                             }
                             log::error!(
@@ -220,8 +260,9 @@ impl ServerContext {
             status_bar,
             lsp_features,
             debounced_analysis,
-            document_versions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            document_versions: Arc::new(std::sync::Mutex::new(DocumentVersions::default())),
             document_version_notify: Arc::new(Notify::new()),
+            renamed_uris: Default::default(),
         });
 
         // Create the didChange coalescer with a snapshot of the inner state
@@ -234,7 +275,13 @@ impl ServerContext {
             debounced_shutdown,
             inner,
             did_change_coalescer,
+            editor_documents: EditorDocuments::default(),
         }
+    }
+
+    /// The answer to a request refused while the workspace initializes.
+    pub fn refused_during_init(&self, id: RequestId, method: &str) -> Response {
+        cancelled_response(&self.inner.lsp_features, id, method, "server initializing")
     }
 
     pub fn snapshot(&self) -> ServerContextSnapshot {
@@ -243,6 +290,10 @@ impl ServerContext {
 
     pub fn did_change_coalescer(&self) -> &DidChangeCoalescer {
         &self.did_change_coalescer
+    }
+
+    pub fn editor_documents(&mut self) -> &mut EditorDocuments {
+        &mut self.editor_documents
     }
 
     pub fn send(&self, response: Response) {
@@ -293,16 +344,12 @@ impl ServerContext {
                 {
                     let _ = sender.send(Message::Response(response.clone()));
                 } else {
-                    let (code, data) = cancel_error(&lsp_features, &request_method);
-                    let response = Response {
-                        id: req_id.clone(),
-                        result: None,
-                        error: Some(lsp_server::ResponseError {
-                            code: code as i32,
-                            message: "cancel".to_string(),
-                            data,
-                        }),
-                    };
+                    let response = cancelled_response(
+                        &lsp_features,
+                        req_id.clone(),
+                        &request_method,
+                        "cancel",
+                    );
                     let _ = sender.send(Message::Response(response));
                 }
             } else if res.is_none() {
@@ -328,28 +375,16 @@ impl ServerContext {
         }
     }
 
-    pub async fn cancel_all_requests_except(&self, excluded_methods: &[&str]) {
+    /// Cancels the in-flight requests aimed at `uri`, except those of
+    /// `excluded_methods`.
+    ///
+    /// Request URIs and `uri` both come from the client's own params, so they
+    /// are spelled alike and compare as they are.
+    pub async fn cancel_requests_for_uri(&self, uri: &Uri, excluded_methods: &[&str]) {
         let requests = self.requests.lock().await;
         for request in requests.values() {
-            if excluded_methods
-                .iter()
-                .any(|method| request.metadata.method == *method)
-            {
-                continue;
-            }
-
-            request.cancel_token.cancel();
-        }
-    }
-
-    pub async fn cancel_text_requests_for_uri(&self, uri: &Uri) {
-        let requests = self.requests.lock().await;
-        for request in requests.values() {
-            if request
-                .metadata
-                .uri
-                .as_ref()
-                .is_some_and(|request_uri| request_uri == uri)
+            if request.metadata.uri.as_ref() == Some(uri)
+                && !excluded_methods.contains(&request.metadata.method.as_str())
             {
                 request.cancel_token.cancel();
             }
@@ -358,6 +393,7 @@ impl ServerContext {
 
     pub async fn close(&self) {
         self.debounced_shutdown.cancel();
+        self.inner.file_diagnostic.store().stop();
         let mut workspace_manager = self.inner.workspace_manager.write().await;
         workspace_manager.watcher = None;
     }
@@ -371,13 +407,14 @@ impl ServerContext {
 mod tests {
     use super::{
         DEBOUNCE_RESTART_BACKOFF_MAX, LspFeatures, RequestTaskMetadata, ServerContext,
-        WorkspaceDiagnosticLevel, cancel_error, debounce_restart_backoff,
-        keep_stale_editor_data_on_cancel, should_send_stale_response_on_cancel,
+        cancel_error, debounce_restart_backoff, keep_stale_editor_data_on_cancel,
+        should_send_stale_response_on_cancel,
     };
     use googletest::prelude::*;
-    use lsp_server::{Connection, ErrorCode, RequestId, Response};
-    use lsp_types::ClientCapabilities;
+    use lsp_server::{ErrorCode, RequestId, Response};
+    use lsp_types::{ClientCapabilities, Uri};
     use serde_json::json;
+    use std::str::FromStr;
     use std::time::Duration;
 
     #[test]
@@ -464,169 +501,63 @@ mod tests {
         Ok(())
     }
 
+    /// A document change supersedes only that document's requests: other
+    /// documents' requests, and those aimed at none, keep running, as do the
+    /// exempted methods.
     #[gtest]
-    fn a_cancelled_workspace_sweep_restores_the_level_it_claimed() -> Result<()> {
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-        let (connection, _peer) = Connection::memory();
-
-        runtime.block_on(async {
-            let context = ServerContext::new(connection, ClientCapabilities::default());
-            let workspace = context.snapshot().workspace_manager_arc();
-            let workspace = workspace.read().await;
-
-            workspace.update_workspace_version(WorkspaceDiagnosticLevel::Slow, false);
-            workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, false);
-            verify_that!(
-                workspace.claim_workspace_diagnostic_level(),
-                eq(WorkspaceDiagnosticLevel::Slow)
-            )?;
-
-            workspace.update_workspace_version(WorkspaceDiagnosticLevel::Slow, false);
-
-            // Claiming empties it, so a second pull finds nothing to do.
-            verify_that!(
-                workspace.claim_workspace_diagnostic_level(),
-                eq(WorkspaceDiagnosticLevel::Slow)
-            )?;
-            verify_that!(
-                workspace.claim_workspace_diagnostic_level(),
-                eq(WorkspaceDiagnosticLevel::None)
-            )?;
-
-            // A `Fast` request arriving mid-sweep must not survive as the
-            // restored value in place of the interrupted `Slow`.
-            workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, false);
-            workspace.restore_workspace_diagnostic_level(WorkspaceDiagnosticLevel::Slow);
-            verify_that!(
-                workspace.claim_workspace_diagnostic_level(),
-                eq(WorkspaceDiagnosticLevel::Slow)
-            )?;
-
-            // And restoring never lowers an already-higher pending level.
-            workspace.update_workspace_version(WorkspaceDiagnosticLevel::Slow, false);
-            workspace.restore_workspace_diagnostic_level(WorkspaceDiagnosticLevel::Fast);
-            verify_that!(
-                workspace.claim_workspace_diagnostic_level(),
-                eq(WorkspaceDiagnosticLevel::Slow)
-            )?;
-            Ok(())
-        })
-    }
-
-    /// See `keep_stale_editor_data_on_cancel`: cancelled document pulls must
-    /// answer with an error, workspace pulls with a success.
-    #[gtest]
-    fn cancelled_document_diagnostics_answer_with_an_error() -> Result<()> {
-        verify_that!(
-            keep_stale_editor_data_on_cancel("textDocument/diagnostic"),
-            eq(false)
-        )?;
-        verify_that!(
-            keep_stale_editor_data_on_cancel("workspace/diagnostic"),
-            eq(true)
-        )?;
-
-        let features = LspFeatures::new(ClientCapabilities::default());
-        for method in ["textDocument/diagnostic", "workspace/diagnostic"] {
-            let (code, data) = cancel_error(&features, method);
-            verify_that!(code as i32, eq(ErrorCode::ServerCancelled as i32))?;
-            verify_that!(data, eq(&Some(json!({ "retriggerRequest": true }))))?;
-        }
-        Ok(())
-    }
-
-    #[gtest]
-    fn cancel_all_requests_except_preserves_inlay_and_code_lens_requests() -> Result<()> {
+    fn cancelling_a_documents_requests_leaves_other_documents_alone() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         runtime.block_on(async {
             let (conn, _peer) = lsp_server::Connection::memory();
             let context = ServerContext::new(conn, ClientCapabilities::default());
+            let edited = Uri::from_str("file:///workspace/edited.lua").expect("uri should parse");
+            let other = Uri::from_str("file:///workspace/other.lua").expect("uri should parse");
 
-            let inlay_id: RequestId = 1.into();
-            context
-                .task(
-                    inlay_id.clone(),
-                    RequestTaskMetadata::new("textDocument/inlayHint", None),
-                    |_cancel_token| async move {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        Some(Response::new_ok(inlay_id, json!([{"label": ": number"}])))
-                    },
-                )
-                .await;
-
-            let hover_id: RequestId = 2.into();
-            context
-                .task(
-                    hover_id.clone(),
-                    RequestTaskMetadata::new("textDocument/hover", None),
-                    |_cancel_token| async move {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        Some(Response::new_ok(hover_id, serde_json::Value::Null))
-                    },
-                )
-                .await;
-
-            let code_lens_id: RequestId = 3.into();
-            context
-                .task(
-                    code_lens_id.clone(),
-                    RequestTaskMetadata::new("textDocument/codeLens", None),
-                    |_cancel_token| async move {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        Some(Response::new_ok(code_lens_id, json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "command": {"title": "test", "command": "test"}}])))
-                    },
-                )
-                .await;
-
-            let diag_id: RequestId = 4.into();
-            context
-                .task(
-                    diag_id.clone(),
-                    RequestTaskMetadata::new("textDocument/diagnostic", None),
-                    |_cancel_token| async move {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        Some(Response::new_ok(diag_id, json!({"kind": "unChanged", "resultId": "abc"})))
-                    },
-                )
-                .await;
-
-            let (inlay_token, code_lens_token, hover_token, diag_token) = {
+            let requests = [
+                ("textDocument/inlayHint", Some(edited.clone())),
+                ("textDocument/codeLens", Some(edited.clone())),
+                ("textDocument/hover", Some(edited.clone())),
+                ("textDocument/hover", Some(other)),
+                ("workspace/symbol", None),
+            ];
+            for (id, (method, uri)) in requests.into_iter().enumerate() {
+                let request_id = RequestId::from(id as i32);
+                context
+                    .task(
+                        request_id.clone(),
+                        RequestTaskMetadata::new(method, uri),
+                        |_cancel_token| async move {
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            Some(Response::new_ok(request_id, serde_json::Value::Null))
+                        },
+                    )
+                    .await;
+            }
+            let tokens = {
                 let requests = context.requests.lock().await;
-                let inlay = requests
-                    .get(&RequestId::from(1))
-                    .expect("inlay request should exist")
-                    .cancel_token
-                    .clone();
-                let code_lens = requests
-                    .get(&RequestId::from(3))
-                    .expect("code lens request should exist")
-                    .cancel_token
-                    .clone();
-                let hover = requests
-                    .get(&RequestId::from(2))
-                    .expect("hover request should exist")
-                    .cancel_token
-                    .clone();
-                let diag = requests
-                    .get(&RequestId::from(4))
-                    .expect("diagnostic request should exist")
-                    .cancel_token
-                    .clone();
-                (inlay, code_lens, hover, diag)
+                (0..5)
+                    .map(|id| {
+                        requests
+                            .get(&RequestId::from(id))
+                            .expect("request should be in flight")
+                            .cancel_token
+                            .clone()
+                    })
+                    .collect::<Vec<_>>()
             };
 
             context
-                .cancel_all_requests_except(&[
-                    "textDocument/inlayHint",
-                    "textDocument/codeLens",
-                ])
+                .cancel_requests_for_uri(
+                    &edited,
+                    &["textDocument/inlayHint", "textDocument/codeLens"],
+                )
                 .await;
 
-            verify_that!(inlay_token.is_cancelled(), eq(false))?;
-            verify_that!(code_lens_token.is_cancelled(), eq(false))?;
-            verify_that!(diag_token.is_cancelled(), eq(true))?;
-            verify_that!(hover_token.is_cancelled(), eq(true))?;
-            Ok(())
+            let cancelled = tokens
+                .iter()
+                .map(|token| token.is_cancelled())
+                .collect::<Vec<_>>();
+            verify_that!(cancelled, eq(&vec![false, false, true, false, false]))
         })
     }
 }

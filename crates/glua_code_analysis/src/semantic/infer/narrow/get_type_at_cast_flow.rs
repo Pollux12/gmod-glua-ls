@@ -1,10 +1,8 @@
-use glua_parser::{
-    BinaryOperator, LuaAstNode, LuaCallExpr, LuaChunk, LuaDocOpType, LuaDocTagCast, LuaExpr,
-};
+use glua_parser::{LuaAstNode, LuaCallExpr, LuaChunk, LuaDocOpType, LuaDocTagCast, LuaExpr};
 
 use crate::{
     DbIndex, FileId, FlowId, FlowNode, FlowNodeKind, FlowTree, InFiled, InferFailReason,
-    LuaInferCache, LuaType, LuaTypeOwner, TypeOps,
+    LuaCastAction, LuaCastOp, LuaCastTarget, LuaInferCache, LuaType, LuaTypeOwner, TypeOps,
     semantic::infer::{
         VarRefId,
         narrow::{
@@ -67,13 +65,12 @@ fn get_type_at_cast_expr(
         policy,
     )?;
     for cast_op_type in tag_cast.get_op_types() {
-        antecedent_type = cast_type(
+        antecedent_type = apply_cast(
             db,
-            cache.get_file_id(),
-            cast_op_type,
+            &doc_cast_op(db, cache.get_file_id(), &cast_op_type),
             antecedent_type,
             InferConditionFlow::TrueCondition,
-        )?;
+        );
     }
     Ok(ResultTypeOrContinue::Result(antecedent_type))
 }
@@ -99,13 +96,12 @@ fn get_type_at_inline_cast(
         policy,
     )?;
     for cast_op_type in tag_cast.get_op_types() {
-        antecedent_type = cast_type(
+        antecedent_type = apply_cast(
             db,
-            cache.get_file_id(),
-            cast_op_type,
+            &doc_cast_op(db, cache.get_file_id(), &cast_op_type),
             antecedent_type,
             InferConditionFlow::TrueCondition,
-        )?;
+        );
     }
     Ok(ResultTypeOrContinue::Result(antecedent_type))
 }
@@ -125,96 +121,95 @@ pub fn get_type_at_call_expr_inline_cast(
 
     let root = LuaChunk::cast(call_expr.get_root())?;
     let tag_cast = tag_cast_ptr.to_node(&root)?;
+    if tag_cast.get_key_expr().is_some() {
+        return None;
+    }
 
     for cast_op_type in tag_cast.get_op_types() {
-        return_type = match cast_type(
+        return_type = apply_cast(
             db,
-            cache.get_file_id(),
-            cast_op_type,
+            &doc_cast_op(db, cache.get_file_id(), &cast_op_type),
             return_type,
             InferConditionFlow::TrueCondition,
-        ) {
-            Ok(typ) => typ,
-            Err(_) => return None,
-        };
+        );
     }
 
     Some(return_type)
 }
 
-enum CastAction {
-    Add,
-    Remove,
-    Force,
-}
-
-impl CastAction {
-    fn get_negative(&self) -> Self {
-        match self {
-            CastAction::Add => CastAction::Remove,
-            CastAction::Remove => CastAction::Add,
-            CastAction::Force => CastAction::Remove,
-        }
-    }
-}
-
-pub fn cast_type(
+/// Applies `op` to `source_type`; a false condition applies it negated.
+pub fn apply_cast(
     db: &DbIndex,
-    file_id: FileId,
-    cast_op_type: LuaDocOpType,
-    mut source_type: LuaType,
+    op: &LuaCastOp,
+    source_type: LuaType,
     condition_flow: InferConditionFlow,
-) -> Result<LuaType, InferFailReason> {
-    let mut action = match cast_op_type.get_op() {
-        Some(op) => {
-            if op.get_op() == BinaryOperator::OpAdd {
-                CastAction::Add
-            } else {
-                CastAction::Remove
-            }
-        }
-        None => CastAction::Force,
+) -> LuaType {
+    let action = if condition_flow.is_false() {
+        op.action.negated()
+    } else {
+        op.action
     };
-
-    if condition_flow.is_false() {
-        action = action.get_negative();
-    }
-
-    if cast_op_type.is_nullable() {
-        match action {
-            CastAction::Add => {
-                source_type = TypeOps::Union.apply(db, &source_type, &LuaType::Nil);
-            }
-            CastAction::Remove => {
-                source_type = TypeOps::Remove.apply(db, &source_type, &LuaType::Nil);
-            }
-            _ => {}
+    let target = match &op.target {
+        Some(LuaCastTarget::Nil) => {
+            return match action {
+                LuaCastAction::Add => TypeOps::Union.apply(db, &source_type, &LuaType::Nil),
+                LuaCastAction::Remove => TypeOps::Remove.apply(db, &source_type, &LuaType::Nil),
+                LuaCastAction::Force => source_type,
+            };
         }
-    } else if let Some(doc_type) = cast_op_type.get_type() {
-        let type_owner = LuaTypeOwner::SyntaxId(InFiled {
-            file_id,
-            value: doc_type.get_syntax_id(),
-        });
-        let typ = match db.get_type_index().get_type_cache(&type_owner) {
-            Some(type_cache) => type_cache.as_type().clone(),
-            None => return Ok(source_type),
-        };
-        match action {
-            CastAction::Add => {
-                source_type = TypeOps::Union.apply(db, &source_type, &typ);
-            }
-            CastAction::Remove => {
-                let original_type = source_type.clone();
-                source_type = TypeOps::Remove.apply(db, &source_type, &typ);
-                if source_type == original_type && original_type == typ {
-                    source_type = LuaType::Never;
-                }
-            }
-            CastAction::Force => {
-                source_type = typ;
+        Some(LuaCastTarget::Type(typ)) => typ,
+        None => return source_type,
+    };
+    match action {
+        // A predicate that removes `target` when true leaves possible when false only
+        // the parts of it the value could have held.
+        LuaCastAction::Add if condition_flow.is_false() => {
+            let held = arms(crate::get_real_type(db, target).unwrap_or(target))
+                .filter(|part| arms(&source_type).any(|arm| arm_can_hold(db, arm, part)))
+                .cloned()
+                .collect::<Vec<_>>();
+            if held.is_empty() {
+                source_type
+            } else {
+                TypeOps::Union.apply(db, &source_type, &LuaType::from_vec(held))
             }
         }
+        LuaCastAction::Add => TypeOps::Union.apply(db, &source_type, target),
+        LuaCastAction::Remove => {
+            let removed = TypeOps::Remove.apply(db, &source_type, target);
+            if removed == source_type && source_type == *target {
+                LuaType::Never
+            } else {
+                removed
+            }
+        }
+        LuaCastAction::Force => target.clone(),
     }
+}
 
-    Ok(source_type)
+fn arms(typ: &LuaType) -> Box<dyn Iterator<Item = &LuaType> + '_> {
+    match typ {
+        LuaType::Union(union) => Box::new(union.types()),
+        _ => Box::new(std::iter::once(typ)),
+    }
+}
+
+fn arm_can_hold(db: &DbIndex, arm: &LuaType, part: &LuaType) -> bool {
+    !arm.is_unknown()
+        && !arm.is_any()
+        && crate::semantic::type_check::check_type_compact(db, arm, part).is_ok()
+}
+
+/// The operation a `---@cast` in `file_id` writes, with the type the doc
+/// analyzer bound to its doc type.
+pub fn doc_cast_op(db: &DbIndex, file_id: FileId, op_type: &LuaDocOpType) -> LuaCastOp {
+    let typ = op_type.get_type().and_then(|doc_type| {
+        db.get_type_index()
+            .get_type_cache(&LuaTypeOwner::SyntaxId(InFiled::new(
+                file_id,
+                doc_type.get_syntax_id(),
+            )))
+            .map(|cache| cache.as_type().clone())
+    });
+    LuaCastOp::new(op_type, typ)
 }

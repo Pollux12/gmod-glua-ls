@@ -8,11 +8,7 @@ mod tests {
         CompletionItemKind, CompletionItemTag, CompletionResponse, CompletionTriggerKind,
         Documentation, InsertTextFormat, MarkupContent,
     };
-    use std::{
-        fs,
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{collections::HashMap, fs, path::PathBuf};
     use tokio_util::sync::CancellationToken;
 
     use crate::handlers::completion::{completion, completion_with_deprecated_tag_support};
@@ -69,7 +65,7 @@ mod tests {
             ],
         ));
 
-        // 主动触发补全
+        // Explicitly triggered completion
         check!(ws.check_completion(
             r#"
                 ---@overload fun(event: "AAA", callback: fun(trg: string, data: number)): number
@@ -97,7 +93,7 @@ mod tests {
             ],
         ));
 
-        // 被动触发补全
+        // Passively triggered completion
         check!(ws.check_completion_with_kind(
             r#"
                 ---@overload fun(event: "AAA", callback: fun(trg: string, data: number)): number
@@ -126,7 +122,7 @@ mod tests {
     #[gtest]
     fn test_3() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
-        // 被动触发补全
+        // Passively triggered completion
         check!(ws.check_completion_with_kind(
             r#"
                 ---@class Test
@@ -150,7 +146,7 @@ mod tests {
             CompletionTriggerKind::TRIGGER_CHARACTER,
         ));
 
-        // 主动触发补全
+        // Explicitly triggered completion
         check!(ws.check_completion(
             r#"
                 ---@class Test1
@@ -518,6 +514,40 @@ mod tests {
         )?;
 
         Ok(())
+    }
+
+    #[gtest]
+    fn test_member_access_on_unknown_receiver_offers_no_keywords() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut labels_at = |source: &str| -> Result<Vec<String>> {
+            let (content, position) = ProviderVirtualWorkspace::handle_file_content(source)?;
+            let file_id = ws.def(&content);
+            let items = match completion(
+                &ws.analysis,
+                file_id,
+                position,
+                CompletionTriggerKind::INVOKED,
+                CancellationToken::new(),
+            ) {
+                Some(CompletionResponse::Array(items)) => items,
+                Some(CompletionResponse::List(list)) => list.items,
+                None => Vec::new(),
+            };
+            Ok(items.into_iter().map(|item| item.label).collect())
+        };
+
+        verify_that!(
+            labels_at("local function f(client)\n    client:Re<??>\nend\n")?,
+            not(contains(eq("repeat")))
+        )?;
+        verify_that!(
+            labels_at("local function f(client)\n    client.Re<??>\nend\n")?,
+            not(contains(eq("repeat")))
+        )?;
+        verify_that!(
+            labels_at("local function f(client)\n    re<??>\nend\n")?,
+            contains(eq("repeat"))
+        )
     }
 
     #[gtest]
@@ -1181,6 +1211,69 @@ mod tests {
     }
 
     #[gtest]
+    fn test_function_type_field_detail_spaces_its_return_arrow() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class C1
+                ---@field get_force fun(self: C1): number
+            "#,
+        );
+        check!(ws.check_completion_with_kind(
+            r#"
+                ---@type C1
+                local c1
+                c1:<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "get_force".to_string(),
+                kind: CompletionItemKind::METHOD,
+                label_detail: Some("() -> number".to_string()),
+            }],
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+        ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_colon_call_overload_detail_omits_explicit_self() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class C1
+                local C1 = {}
+
+                ---@overload fun(self: C1, key: string): number
+                ---@param key string
+                ---@param fallback number
+                ---@return number
+                function C1:get_value(key, fallback) end
+            "#,
+        );
+        check!(ws.check_completion_with_kind(
+            r#"
+                ---@type C1
+                local c1
+                c1:<??>
+            "#,
+            vec![
+                VirtualCompletionItem {
+                    label: "get_value".to_string(),
+                    kind: CompletionItemKind::METHOD,
+                    label_detail: Some("(key, fallback) -> number".to_string()),
+                },
+                VirtualCompletionItem {
+                    label: "get_value".to_string(),
+                    kind: CompletionItemKind::METHOD,
+                    label_detail: Some("(key) -> number".to_string()),
+                },
+            ],
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_class_function_3() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         ws.def(
@@ -1398,7 +1491,7 @@ mod tests {
     #[gtest]
     fn test_auto_require_field_1() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
-        // 没有 export 标记, 不允许子字段自动导入
+        // No export tag, so child fields are not allowed to be auto-imported
         ws.def_file(
             "AAA.lua",
             r#"
@@ -1474,6 +1567,189 @@ mod tests {
         Ok(())
     }
 
+    /// A global slot written by a plain top-level assignment in one file and
+    /// a conditional-branch writer in another resolves like the settled slot:
+    /// the plain write supersedes the conditional writer, so the key is
+    /// offered once.
+    #[gtest]
+    fn test_completion_plain_write_supersedes_cross_file_conditional_writer() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "a.lua",
+            r#"
+                cfg = cfg or {}
+                cfg.mode = "plain"
+            "#,
+        );
+        ws.def_file(
+            "b.lua",
+            r#"
+                cfg = cfg or {}
+                if cfg.mode then
+                    cfg.mode = "conditional"
+                end
+            "#,
+        );
+        check!(ws.check_completion(
+            r#"
+                cfg.<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "mode".to_string(),
+                kind: CompletionItemKind::FIELD,
+                ..Default::default()
+            }],
+        ));
+        Ok(())
+    }
+
+    /// A function that runs more than once — every GMod hook — has already
+    /// executed the assignments below the cursor on its later calls, so the
+    /// fields they define stay listed inside it. Only a file's top-level
+    /// statements are a strict sequence. The name is offered even though a read
+    /// at that position is not yet given its type.
+    #[gtest]
+    fn test_completion_offers_dynamic_field_defined_later_in_the_same_function() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        check!(ws.check_completion(
+            r#"
+                ---@class DynLater.Entity
+
+                ---@type DynLater.Entity
+                local ent
+
+                function ENT:Think()
+                    ent.<??>
+                    local now = 1
+                    ent.cooldown = now
+                end
+            "#,
+            vec![VirtualCompletionItem {
+                label: "cooldown".to_string(),
+                kind: CompletionItemKind::VARIABLE,
+                label_detail: None,
+            }],
+        ));
+        Ok(())
+    }
+
+    /// A branch write is dropped beside an unconditional write of its kind;
+    /// a method a branch defines can still be what a `:` call reaches past a
+    /// plain value, so it stays.
+    #[gtest]
+    fn test_completion_branch_method_stays_beside_a_plain_value() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "a.lua",
+            r#"
+                cfg = {}
+                cfg.run = false
+            "#,
+        );
+        ws.def_file(
+            "b.lua",
+            r#"
+                if enabled then
+                    function cfg:run() end
+                end
+            "#,
+        );
+        check!(ws.check_completion(
+            r#"
+                cfg:<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "run".to_string(),
+                kind: CompletionItemKind::METHOD,
+                label_detail: Some("()".to_string()),
+            }],
+        ));
+        Ok(())
+    }
+
+    /// A branch write is dropped beside an unconditional one whatever form the
+    /// unconditional one takes — a guarded bootstrap included, since it runs on
+    /// every load of its file.
+    #[gtest]
+    fn test_completion_branch_write_drops_beside_guarded_bootstrap_sibling() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "a.lua",
+            r#"
+                cfg = cfg or {}
+                cfg.alpha = cfg.alpha or {}
+            "#,
+        );
+        ws.def_file(
+            "b.lua",
+            r#"
+                cfg = cfg or {}
+                if cfg.alpha then
+                    cfg.alpha = 2
+                end
+            "#,
+        );
+        check!(ws.check_completion(
+            r#"
+                cfg.<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "alpha".to_string(),
+                kind: CompletionItemKind::FIELD,
+                label_detail: None,
+            }],
+        ));
+        Ok(())
+    }
+
+    /// Guarded bootstrap writers of a slot coexist: the completion must not
+    /// collapse them the way it collapses superseded writers.
+    #[gtest]
+    fn test_completion_keeps_guarded_bootstrap_sibling_writers() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "a.lua",
+            r#"
+                cfg = cfg or { alpha = {} }
+            "#,
+        );
+        ws.def_file(
+            "b.lua",
+            r#"
+                cfg = cfg or {}
+                cfg.alpha = cfg.alpha or {}
+            "#,
+        );
+        check!(ws.check_completion(
+            r#"
+                cfg.<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "alpha".to_string(),
+                kind: CompletionItemKind::INTERFACE,
+                ..Default::default()
+            }],
+        ));
+        Ok(())
+    }
+
     #[gtest]
     fn test_issue_572() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
@@ -1535,7 +1811,7 @@ mod tests {
                 A = {}
             "#,
         );
-        // 测试索引成员别名语法
+        // Test the index member alias syntax
         check!(ws.check_completion(
             r#"
                 A.<??>
@@ -2889,6 +3165,65 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_net_read_completion_skips_a_sender_whose_payload_is_opaque() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.network.completion.smart_read_suggestions = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "addons/test/lua/autorun/server/send.lua",
+            r#"
+            function SendWith(writer)
+                net.Start("MyMsg")
+                net.WriteString("hello")
+                writer()
+                net.Broadcast()
+            end
+            "#,
+        );
+
+        let (receive_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            net.Receive("MyMsg", function()
+                local x = net.<??>
+            end)
+            "#,
+        )?;
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/client/receive.lua",
+            receive_content.as_str(),
+        );
+
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        verify_that!(
+            items.iter().any(|item| {
+                item.sort_text
+                    .as_deref()
+                    .is_some_and(|sort_text| sort_text.starts_with("000_gmod_net_read"))
+            }),
+            eq(false)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_net_read_completion_rejects_unrelated_named_prefix() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -3073,6 +3408,87 @@ mod tests {
         Ok(())
     }
 
+    /// The text each net read completion inserts at `read` inside a receiver
+    /// of a `WriteString` then `WriteUInt(id, 8)` send, keyed by label.
+    fn net_read_insertions(read: &str, call_snippet: bool) -> Result<HashMap<String, String>> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.network.completion.smart_read_suggestions = true;
+        emmyrc.completion.call_snippet = call_snippet;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "addons/test/lua/autorun/server/send.lua",
+            r#"
+            net.Start("MyMsg")
+            net.WriteString(name)
+            net.WriteUInt(id, 8)
+            net.Broadcast()
+            "#,
+        );
+
+        let (receive_content, position) = ProviderVirtualWorkspace::handle_file_content(&format!(
+            r#"
+            net.Receive("MyMsg", function()
+                local name = {read}
+            end)
+            "#
+        ))?;
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/client/receive.lua",
+            receive_content.as_str(),
+        );
+
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        Ok(items
+            .into_iter()
+            .filter_map(|item| match item.text_edit {
+                Some(lsp_types::CompletionTextEdit::Edit(edit)) => {
+                    Some((item.label, edit.new_text))
+                }
+                _ => None,
+            })
+            .collect())
+    }
+
+    #[gtest]
+    fn test_gmod_net_read_completion_inserts_a_call() -> Result<()> {
+        let inserted = net_read_insertions("net.<??>", true)?;
+
+        verify_that!(inserted.get("net.ReadString"), some(eq("net.ReadString()")))?;
+        verify_that!(inserted.get("net.ReadUInt"), some(eq("net.ReadUInt(8)")))?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_net_read_completion_keeps_the_existing_call() -> Result<()> {
+        let inserted = net_read_insertions("net.R<??>()", true)?;
+
+        verify_that!(inserted.get("net.ReadString"), some(eq("net.ReadString")))
+    }
+
+    #[gtest]
+    fn test_gmod_net_read_completion_inserts_no_call_without_call_snippets() -> Result<()> {
+        let inserted = net_read_insertions("net.<??>", false)?;
+
+        verify_that!(inserted.get("net.ReadUInt"), some(eq("net.ReadUInt")))
+    }
+
     #[gtest]
     fn test_gmod_net_read_completion_uses_reader_bits_metadata() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
@@ -3146,7 +3562,7 @@ mod tests {
         };
 
         verify_eq!(item.kind, Some(CompletionItemKind::FUNCTION))?;
-        verify_that!(text_edit.new_text.as_str(), eq("MyNet.ReadAsymmetric"))?;
+        verify_that!(text_edit.new_text.as_str(), eq("MyNet.ReadAsymmetric()"))?;
         verify_that!(
             item.insert_text_format,
             eq(Some(InsertTextFormat::PLAIN_TEXT))
@@ -3387,6 +3803,44 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_hook_and_net_completion_skip_the_name_being_typed() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+        ws.def(
+            r#"
+            function GM:PlayerSpawn(ply, transition) end
+            util.AddNetworkString("known_message")
+            "#,
+        );
+
+        check!(ws.check_completion(
+            r#"
+            hook.Add("PlayerSp<??>", "id", function() end)
+            "#,
+            vec![VirtualCompletionItem {
+                label: "PlayerSpawn".to_string(),
+                kind: CompletionItemKind::EVENT,
+                label_detail: Some("(1 method; args: ply, transition)".to_string()),
+            }],
+        ));
+        check!(ws.check_completion(
+            r#"
+            net.Receive("known_mes<??>", function() end)
+            "#,
+            vec![VirtualCompletionItem {
+                label: "known_message".to_string(),
+                kind: CompletionItemKind::EVENT,
+                label_detail: Some("(1 registration, 0 receivers)".to_string()),
+            }],
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_hook_completion_requires_annotated_call_arg_role() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -3602,6 +4056,58 @@ mod tests {
                 .map(|command| command.command.as_str()),
             eq(Some("editor.action.triggerSuggest"))
         )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_string_completion_range_excludes_quotes_even_when_unclosed() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+        ws.def(
+            r#"
+            util.AddNetworkString("known_message")
+            "#,
+        );
+
+        for source in [
+            "\n            net.Start(\"<??>",
+            "\n            net.Start(\"<??>\")\n",
+        ] {
+            let (content, position) = ProviderVirtualWorkspace::handle_file_content(source)?;
+            let file_id = ws.def(content.as_str());
+            let result = completion(
+                &ws.analysis,
+                file_id,
+                position,
+                CompletionTriggerKind::INVOKED,
+                CancellationToken::new(),
+            )
+            .ok_or("failed to get completion")
+            .or_fail()?;
+            let items = match result {
+                CompletionResponse::Array(items) => items,
+                CompletionResponse::List(list) => list.items,
+            };
+
+            let item = items
+                .iter()
+                .find(|item| item.label == "known_message")
+                .ok_or("missing known_message completion")
+                .or_fail()?;
+            let Some(lsp_types::CompletionTextEdit::Edit(text_edit)) = item.text_edit.as_ref()
+            else {
+                return fail!("expected text edit for net.Start string completion");
+            };
+
+            verify_that!(text_edit.range.start.line, eq(1))?;
+            verify_that!(text_edit.range.start.character, eq(23))?;
+            verify_that!(text_edit.range.end.line, eq(1))?;
+            verify_that!(text_edit.range.end.character, eq(23))?;
+        }
 
         Ok(())
     }
@@ -4402,6 +4908,54 @@ mod tests {
         Ok(())
     }
 
+    /// A gamemode class based on `GM` is offered the hooks `GM` falls back to,
+    /// as `GM` itself is.
+    #[gtest]
+    fn a_class_based_on_gm_completes_the_sandbox_hooks() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            ---@class GM
+            GM = GM or {}
+
+            ---@class SANDBOX
+            SANDBOX = SANDBOX or {}
+
+            function SANDBOX:ZzzSandboxHook(player, class_name) end
+
+            ---@class MYGM : GM
+            local MYGM = {}
+            function MYGM:<??>()
+            end
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let description = items
+            .into_iter()
+            .find(|it| it.label == "ZzzSandboxHook")
+            .and_then(|item| item.label_details)
+            .and_then(|details| details.description);
+        verify_eq!(description, Some("from SANDBOX".to_string()))
+    }
+
     #[gtest]
     fn test_gmod_plugin_function_decl_completion_uses_gm_fallback_with_param_detail() -> Result<()>
     {
@@ -4457,6 +5011,151 @@ mod tests {
             .and_then(|details| details.description.clone());
         verify_eq!(item_description, Some("from GM".to_string()))?;
 
+        Ok(())
+    }
+
+    /// The hooks `function <prefix>:` offers in a plugin of a Helix schema at
+    /// `root` ([`ProviderVirtualWorkspace::def_helix_schema`]).
+    fn derived_gamemode_hook_completions(
+        root: &str,
+        prefix: &str,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+
+        ws.def_helix_schema(root);
+        let (content, position) =
+            ProviderVirtualWorkspace::handle_file_content(&format!("function {prefix}:<??>\n"))?;
+        let file_id = ws.def_file(&format!("{root}plugins/writing/sv_hooks.lua"), &content);
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let mut hooks = items
+            .into_iter()
+            .filter(|item| item.label == "PlayerSpawn" || item.label == "CanPlayerTakeItem")
+            .map(|item| {
+                let description = item.label_details.and_then(|details| details.description);
+                (item.label, description)
+            })
+            .collect::<Vec<_>>();
+        hooks.sort();
+        Ok(hooks)
+    }
+
+    /// A function returning several values without `---@return` docs shows
+    /// the first of them, as documented multiple returns are shown.
+    #[gtest]
+    fn test_inferred_multiple_returns_show_the_first_value() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def_file(
+            "lua/lib/sh_chat.lua",
+            "lib = lib or {}\nfunction lib.Parse(message)\n    return \"ic\", message, false\nend\n",
+        );
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content("lib.<??>\n")?;
+        let file_id = ws.def_file("lua/autorun/sh_use.lua", &content);
+        let items = match completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?
+        {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let detail = items
+            .into_iter()
+            .find(|item| item.label == "Parse")
+            .and_then(|item| item.label_details)
+            .and_then(|details| details.detail);
+
+        verify_eq!(detail, Some("(message) -> \"ic\" ...".to_string()))
+    }
+
+    /// A library table bootstrapped in several files is one entry, while
+    /// definitions of one key that render differently each stay listed.
+    #[gtest]
+    fn test_member_written_in_several_files_is_listed_once() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def_file(
+            "lua/lib/sh_lib.lua",
+            "lib = lib or {}\nlib.net = lib.net or {}\nfunction lib.Send(name) end\n",
+        );
+        ws.def_file(
+            "lua/lib/sh_networking.lua",
+            "lib.net = lib.net or {}\nfunction lib.Send(name, target) end\n",
+        );
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content("lib.<??>\n")?;
+        let file_id = ws.def_file("lua/autorun/sh_use.lua", &content);
+        let items = match completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?
+        {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let count = |label: &str| items.iter().filter(|item| item.label == label).count();
+
+        verify_eq!((count("net"), count("Send")), (1, 2))
+    }
+
+    #[gtest]
+    fn test_gmod_plugin_completion_offers_derived_gamemode_hooks_in_schema_workspace() -> Result<()>
+    {
+        verify_eq!(
+            derived_gamemode_hook_completions("", "PLUGIN")?,
+            vec![
+                ("CanPlayerTakeItem".to_string(), Some("from GM".to_string())),
+                ("PlayerSpawn".to_string(), Some("from GM".to_string())),
+            ]
+        )
+    }
+
+    #[gtest]
+    fn test_gmod_plugin_completion_offers_derived_gamemode_hooks_in_game_root_workspace()
+    -> Result<()> {
+        verify_eq!(
+            derived_gamemode_hook_completions("gamemodes/ixhl2rp/", "PLUGIN")?,
+            vec![
+                ("CanPlayerTakeItem".to_string(), Some("from GM".to_string())),
+                ("PlayerSpawn".to_string(), Some("from GM".to_string())),
+            ]
+        )
+    }
+
+    #[gtest]
+    fn test_gmod_gamemode_completion_in_plugin_offers_derived_gamemode_hooks() -> Result<()> {
+        for root in ["", "gamemodes/ixhl2rp/"] {
+            let labels = derived_gamemode_hook_completions(root, "GAMEMODE")?
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect::<Vec<_>>();
+            verify_eq!(
+                labels,
+                vec!["CanPlayerTakeItem".to_string(), "PlayerSpawn".to_string()]
+            )?;
+        }
         Ok(())
     }
 
@@ -5180,11 +5879,11 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
-        let root = create_path_completion_root("gmod_include_path")?;
+        let root = crate::util::TempDir::new("glua_ls_gmod_include_path");
         fs::create_dir_all(root.join("lua/includes")).or_fail()?;
         fs::write(root.join("lua/includes/init.lua"), "").or_fail()?;
         fs::write(root.join("lua/includes/icon.png"), "").or_fail()?;
-        ws.analysis.add_main_workspace(root.clone());
+        ws.analysis.add_main_workspace(root.to_path_buf());
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
             r#"
@@ -5213,11 +5912,11 @@ mod tests {
     #[gtest]
     fn test_member_named_include_uses_annotation_path_kind() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
-        let root = create_path_completion_root("member_include_path")?;
+        let root = crate::util::TempDir::new("glua_ls_member_include_path");
         fs::create_dir_all(root.join("materials/icons")).or_fail()?;
         fs::write(root.join("materials/icons/icon.png"), "").or_fail()?;
         fs::write(root.join("materials/icons/cl_init.lua"), "").or_fail()?;
-        ws.analysis.add_main_workspace(root.clone());
+        ws.analysis.add_main_workspace(root.to_path_buf());
         ws.def(
             r#"
             ---@class Loader
@@ -5254,16 +5953,6 @@ mod tests {
         )
     }
 
-    fn create_path_completion_root(name: &str) -> Result<PathBuf> {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .or_fail()?
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("glua_ls_{name}_{nonce}"));
-        fs::create_dir_all(&root).or_fail()?;
-        Ok(root)
-    }
-
     fn define_disk_file(
         ws: &mut ProviderVirtualWorkspace,
         path: PathBuf,
@@ -5277,6 +5966,38 @@ mod tests {
             .or_fail()?;
         ws.analysis
             .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id)
             .or_fail()
+    }
+
+    /// `T["a.b"]` and `T.a.b` are two fields, so neither offers the other's
+    /// members.
+    #[gtest]
+    fn a_dotted_string_key_completes_only_its_own_members() -> Result<()> {
+        let tables = r#"
+            T = {
+                ["a.b"] = { own = 1 },
+                a = { b = { nested = 2 } },
+            }
+        "#;
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_completion(
+            &format!("{tables}local v = T[\"a.b\"].<??>"),
+            vec![VirtualCompletionItem {
+                label: "own".to_string(),
+                kind: CompletionItemKind::FIELD,
+                label_detail: Some(" = 1".to_string()),
+            }],
+        ));
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_completion(
+            &format!("{tables}local v = T.a.b.<??>"),
+            vec![VirtualCompletionItem {
+                label: "nested".to_string(),
+                kind: CompletionItemKind::FIELD,
+                label_detail: Some(" = 2".to_string()),
+            }],
+        ));
+        Ok(())
     }
 }

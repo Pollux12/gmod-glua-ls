@@ -13,26 +13,70 @@ use super::{
 use crate::GenericParam;
 use crate::compilation::analyzer::doc::tags::report_orphan_tag;
 use crate::{
-    LuaTypeCache, LuaTypeDeclId,
+    InFiled, LuaAliasSource, LuaTypeCache, LuaTypeDeclId,
     compilation::analyzer::common::bind_type,
     db_index::{
         LuaDeclId, LuaGenericParamInfo, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey,
-        LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType,
+        LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeExtra,
     },
 };
 use std::sync::Arc;
 use std::vec;
 
+/// Files the members of the global path this class is annotated on under the
+/// class.
+///
+/// `---@class C` above `X = {}` or `X.k = X.k or {}` gives one table two
+/// names, and every reader of the annotated type looks the members up on the
+/// class. Recorded here, from the tag, because documentation analysis runs for
+/// every file before any file resolves: reading it back off the type cache
+/// instead would hand the binding to whichever file inference reached first.
+fn bind_annotated_global_path_class(
+    analyzer: &mut DocAnalyzer,
+    class_decl_id: &LuaTypeDeclId,
+) -> Option<()> {
+    let LuaAst::LuaAssignStat(assign) = analyzer.comment.get_owner()? else {
+        return None;
+    };
+    let file_id = analyzer.file_id;
+    let path = match assign.child::<LuaVarExpr>()? {
+        LuaVarExpr::NameExpr(name_expr) => {
+            let decl_id = LuaDeclId::new(file_id, name_expr.get_position());
+            let decl = analyzer.db.get_decl_index().get_decl(&decl_id)?;
+            if !decl.is_global() {
+                return None;
+            }
+            crate::GlobalId::new(decl.get_name())
+        }
+        LuaVarExpr::IndexExpr(index_expr) => {
+            let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
+            analyzer
+                .db
+                .get_member_index()
+                .get_member(&member_id)?
+                .get_global_id()?
+                .clone()
+        }
+    };
+    analyzer
+        .db
+        .get_member_index_mut()
+        .set_global_path_class(path, class_decl_id.clone(), file_id);
+    Some(())
+}
+
 pub fn analyze_class(analyzer: &mut DocAnalyzer, tag: LuaDocTagClass) -> Option<()> {
     let file_id = analyzer.file_id;
-    let name = tag.get_name_token()?.get_name_text().to_string();
+    let name_token = tag.get_name_token()?;
+    let site_range = name_token.syntax().text_range();
 
     let class_decl = analyzer
         .db
         .get_type_index_mut()
-        .find_type_decl(file_id, &name)?;
+        .find_type_decl_by_site(file_id, site_range)?;
 
     let class_decl_id = class_decl.get_id();
+    bind_annotated_global_path_class(analyzer, &class_decl_id);
     analyzer.current_type_id = Some(class_decl_id.clone());
     if let Some(generic_params) = tag.get_generic_decl() {
         let generic_params = get_generic_params(analyzer, generic_params);
@@ -96,13 +140,14 @@ fn add_description_for_type_decl(
 
 pub fn analyze_enum(analyzer: &mut DocAnalyzer, tag: LuaDocTagEnum) -> Option<()> {
     let file_id = analyzer.file_id;
-    let name = tag.get_name_token()?.get_name_text().to_string();
+    let name_token = tag.get_name_token()?;
+    let site_range = name_token.syntax().text_range();
 
     let enum_decl_id = {
         let enum_decl = analyzer
             .db
             .get_type_index()
-            .find_type_decl(file_id, &name)?;
+            .find_type_decl_by_site(file_id, site_range)?;
         if !enum_decl.is_enum() {
             return None;
         }
@@ -111,22 +156,29 @@ pub fn analyze_enum(analyzer: &mut DocAnalyzer, tag: LuaDocTagEnum) -> Option<()
 
     analyzer.current_type_id = Some(enum_decl_id.clone());
 
-    if let Some(base_type) = tag.get_base_type() {
-        let base_type = infer_type(analyzer, base_type);
-        if base_type.is_unknown() {
-            return None;
+    let base = match tag.get_base_type() {
+        Some(base_type) => {
+            let base_type = infer_type(analyzer, base_type);
+            if base_type.is_unknown() {
+                return None;
+            }
+            Some(base_type)
         }
-
-        let enum_decl = analyzer
-            .db
-            .get_type_index_mut()
-            .get_type_decl_mut(&enum_decl_id)?;
-        enum_decl.add_enum_base(base_type);
-    }
+        None => None,
+    };
 
     add_description_for_type_decl(analyzer, &enum_decl_id, tag.get_descriptions());
 
     let is_flat = analyze_enum_fields(analyzer, &enum_decl_id, &tag);
+    publish_extra_source(
+        analyzer,
+        &enum_decl_id,
+        site_range,
+        LuaTypeExtra::Enum {
+            base,
+            flat: is_flat,
+        },
+    );
 
     // A flat enum has no runtime table to bind to; binding would attach the enum
     // type to whatever statement happens to follow the annotation block.
@@ -192,16 +244,27 @@ fn analyze_enum_fields(
         registered = true;
     }
 
-    if registered
-        && let Some(enum_decl) = analyzer
-            .db
-            .get_type_index_mut()
-            .get_type_decl_mut(enum_decl_id)
-    {
-        enum_decl.mark_flat_enum();
-    }
-
     registered
+}
+
+fn publish_extra_source(
+    analyzer: &mut DocAnalyzer,
+    decl_id: &LuaTypeDeclId,
+    site_range: TextRange,
+    extra: LuaTypeExtra,
+) {
+    let file_id = analyzer.file_id;
+    let order_key = analyzer.db.get_module_index().decl_source_key(
+        file_id,
+        analyzer.db.get_vfs().file_order_key(&file_id),
+        site_range,
+    );
+    analyzer.db.get_type_index_mut().set_extra_source(
+        decl_id.clone(),
+        InFiled::new(file_id, site_range),
+        order_key,
+        extra,
+    );
 }
 
 fn comment_has_explicit_owner_type(comment: &LuaComment) -> bool {
@@ -219,13 +282,13 @@ fn comment_has_explicit_owner_type(comment: &LuaComment) -> bool {
 
 pub fn analyze_alias(analyzer: &mut DocAnalyzer, tag: LuaDocTagAlias) -> Option<()> {
     let file_id = analyzer.file_id;
-    let name = tag.get_name_token()?.get_name_text().to_string();
-
+    let name_token = tag.get_name_token()?;
+    let site = InFiled::new(file_id, name_token.syntax().text_range());
     let alias_decl_id = {
         let alias_decl = analyzer
             .db
             .get_type_index()
-            .find_type_decl(file_id, &name)?;
+            .find_type_decl_by_site(file_id, site.value)?;
         if !alias_decl.is_alias() {
             return None;
         }
@@ -233,55 +296,68 @@ pub fn analyze_alias(analyzer: &mut DocAnalyzer, tag: LuaDocTagAlias) -> Option<
         alias_decl.get_id()
     };
 
-    if let Some(generic_params) = tag.get_generic_decl_list() {
-        let generic_params = get_generic_params(analyzer, generic_params);
-
-        analyzer
-            .db
-            .get_type_index_mut()
-            .add_generic_params(alias_decl_id.clone(), generic_params.clone());
-        let range = analyzer.comment.get_range();
-        let scope_id = analyzer.generic_index.add_generic_scope(vec![range], false);
+    // The alias's own generic params scope only this declaration's origin
+    // inference; they publish with the origin as one contribution instead of
+    // overwriting the shared decl slot before the origin is known.
+    let generic_params = tag
+        .get_generic_decl_list()
+        .map(|decl_list| get_generic_params(analyzer, decl_list));
+    if let Some(generic_params) = &generic_params {
+        let scope_id = analyzer
+            .generic_index
+            .add_generic_scope(vec![tag.get_range()], false);
         analyzer
             .generic_index
-            .append_generic_params(scope_id, generic_params);
+            .append_generic_params(scope_id, generic_params.clone());
     }
 
     let origin_type = infer_type(analyzer, tag.get_type()?);
 
-    let alias = analyzer
-        .db
-        .get_type_index_mut()
-        .get_type_decl_mut(&alias_decl_id)?;
-
-    alias.add_alias_origin(origin_type);
+    let order_key = analyzer.db.get_module_index().decl_source_key(
+        file_id,
+        analyzer.db.get_vfs().file_order_key(&file_id),
+        site.value,
+    );
+    analyzer.db.get_type_index_mut().set_alias_source(
+        alias_decl_id.clone(),
+        LuaAliasSource {
+            site,
+            origin: origin_type,
+            generic_params,
+            order_key,
+        },
+    );
 
     add_description_for_type_decl(analyzer, &alias_decl_id, tag.get_descriptions());
 
     Some(())
 }
 
-/// 分析属性定义
+/// Analyzes an attribute definition
 pub fn analyze_attribute(analyzer: &mut DocAnalyzer, tag: LuaDocTagAttribute) -> Option<()> {
     let file_id = analyzer.file_id;
-    let name = tag.get_name_token()?.get_name_text().to_string();
+    let name_token = tag.get_name_token()?;
+    let site_range = name_token.syntax().text_range();
 
     let decl_id = {
         let decl = analyzer
             .db
             .get_type_index()
-            .find_type_decl(file_id, &name)?;
+            .find_type_decl_by_site(file_id, site_range)?;
         if !decl.is_attribute() {
             return None;
         }
         decl.get_id()
     };
     let attribute_type = infer_type(analyzer, tag.get_type()?);
-    let attribute_decl = analyzer
-        .db
-        .get_type_index_mut()
-        .get_type_decl_mut(&decl_id)?;
-    attribute_decl.add_attribute_type(attribute_type);
+    publish_extra_source(
+        analyzer,
+        &decl_id,
+        site_range,
+        LuaTypeExtra::Attribute {
+            typ: Some(attribute_type),
+        },
+    );
 
     add_description_for_type_decl(analyzer, &decl_id, tag.get_descriptions());
     Some(())

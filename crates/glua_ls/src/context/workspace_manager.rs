@@ -1,17 +1,20 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use super::{ClientProxy, FileDiagnostic, StatusBar};
-use crate::codestyle::{apply_editorconfig_file, apply_workspace_code_style};
+use super::{ClientProxy, DebouncedAnalysis, FileDiagnostic, StatusBar};
+use crate::codestyle::apply_workspace_code_style_off_workers;
+use crate::context::ServerContextSnapshot;
 use crate::context::lsp_features::LspFeatures;
-use crate::handlers::{ClientConfig, init_analysis};
+use crate::handlers::{
+    ClientConfig, apply_file_system_changes, apply_workspace_diagnostic_configs, init_analysis,
+    refresh_open_document_features,
+};
 use crate::util::{LongRunningWatchdogStatus, spawn_long_running_watchdog};
 use glua_code_analysis::uri_to_file_path;
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, LuaDiagnosticConfig, WorkspaceFolder, WorkspaceImport,
+    EmmyLuaAnalysis, Emmyrc, EmmyrcChange, LuaDiagnosticConfig, WorkspaceFolder, WorkspaceImport,
     calculate_include_and_exclude, load_configs,
 };
 use log::{debug, info};
@@ -25,9 +28,16 @@ pub struct WorkspaceManager {
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
     client: Arc<ClientProxy>,
     status_bar: Arc<StatusBar>,
-    update_token: Arc<Mutex<Option<Arc<ReindexToken>>>>,
+    /// The workspace recheck still waiting for edits to pause.
+    recheck_token: Arc<Mutex<Option<Arc<QuietPeriod>>>>,
+    /// The config reload still waiting out its delay.
+    config_token: Arc<Mutex<Option<Arc<QuietPeriod>>>>,
+    /// Held while a config reload compares and applies, so reloads apply in
+    /// the order they load.
+    config_apply: Arc<Mutex<()>>,
     file_diagnostic: Arc<FileDiagnostic>,
     lsp_features: Arc<LspFeatures>,
+    debounced_analysis: Arc<DebouncedAnalysis>,
     pub client_config: ClientConfig,
     pub workspace_folders: Vec<WorkspaceFolder>,
     pub watcher: Option<notify::RecommendedWatcher>,
@@ -39,8 +49,8 @@ pub struct WorkspaceManager {
     /// matcher for the first workspace root that is a prefix of the file path,
     /// so each root's `useDefaultIgnores` / `ignoreDirDefaults` stays isolated.
     pub per_root_matchers: HashMap<PathBuf, WorkspaceFileMatcher>,
-    workspace_diagnostic_level: Arc<AtomicU8>,
-    workspace_version: Arc<AtomicI64>,
+    /// The config the analysis was last loaded with.
+    pub loaded_config: Option<LoadedConfig>,
 }
 
 impl WorkspaceManager {
@@ -50,6 +60,7 @@ impl WorkspaceManager {
         status_bar: Arc<StatusBar>,
         file_diagnostic: Arc<FileDiagnostic>,
         lsp_features: Arc<LspFeatures>,
+        debounced_analysis: Arc<DebouncedAnalysis>,
     ) -> Self {
         Self {
             analysis,
@@ -57,246 +68,235 @@ impl WorkspaceManager {
             status_bar,
             client_config: ClientConfig::default(),
             workspace_folders: Vec::new(),
-            update_token: Arc::new(Mutex::new(None)),
+            recheck_token: Arc::new(Mutex::new(None)),
+            config_token: Arc::new(Mutex::new(None)),
+            config_apply: Arc::new(Mutex::new(())),
             file_diagnostic,
             lsp_features,
+            debounced_analysis,
             watcher: None,
             current_open_files: HashSet::new(),
             match_file_pattern: WorkspaceFileMatcher::default(),
             per_root_matchers: HashMap::new(),
-            workspace_diagnostic_level: Arc::new(AtomicU8::new(
-                WorkspaceDiagnosticLevel::Fast.to_u8(),
-            )),
-            workspace_version: Arc::new(AtomicI64::new(0)),
+            loaded_config: None,
         }
     }
 
-    pub fn workspace_diagnostic_level_arc(&self) -> Arc<AtomicU8> {
-        self.workspace_diagnostic_level.clone()
-    }
-
-    /// Take the pending diagnostic level and reset it to `None` in one atomic
-    /// step; a separate load+store pair races with concurrent writers.
-    pub fn claim_workspace_diagnostic_level(&self) -> WorkspaceDiagnosticLevel {
-        let previous = self
-            .workspace_diagnostic_level
-            .swap(WorkspaceDiagnosticLevel::None.to_u8(), Ordering::AcqRel);
-        WorkspaceDiagnosticLevel::from_u8(previous)
-    }
-
-    /// Put a claimed level back after a sweep failed to finish; keeps the
-    /// higher of it and anything requested since.
-    pub fn restore_workspace_diagnostic_level(&self, level: WorkspaceDiagnosticLevel) {
-        self.workspace_diagnostic_level
-            .fetch_max(level.to_u8(), Ordering::AcqRel);
-    }
-
-    /// Request at least `level` of workspace diagnostics. A max, not a store:
-    /// a concurrent request must never downgrade a pending `Slow` sweep.
-    pub fn update_workspace_version(&self, level: WorkspaceDiagnosticLevel, add_version: bool) {
-        self.workspace_diagnostic_level
-            .fetch_max(level.to_u8(), Ordering::AcqRel);
-        if add_version {
-            self.workspace_version.fetch_add(1, Ordering::AcqRel);
-        }
-    }
-
-    pub async fn add_update_emmyrc_task(
+    /// After `delay`, loads the config again and applies what changed; a call
+    /// made while an earlier one still waits replaces it.
+    pub async fn schedule_config_reload(
         &self,
-        file_dir: PathBuf,
+        delay: Duration,
         workspace_manager: Arc<RwLock<WorkspaceManager>>,
     ) {
-        let mut update_token = self.update_token.lock().await;
-        if let Some(token) = update_token.as_ref() {
+        let mut config_token = self.config_token.lock().await;
+        if let Some(token) = config_token.as_ref() {
             token.cancel();
-            debug!("cancel update config: {:?}", file_dir);
+            debug!("cancel pending config reload");
+        }
+        let token = Arc::new(QuietPeriod::new(delay));
+        config_token.replace(token.clone());
+        drop(config_token);
+
+        let pending = self.config_token.clone();
+        tokio::spawn(async move {
+            token.wait().await;
+            if token.is_cancelled() {
+                return;
+            }
+            {
+                let mut pending = pending.lock().await;
+                if pending
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &token))
+                {
+                    pending.take();
+                }
+            }
+            Self::reload_config(workspace_manager).await;
+        });
+    }
+
+    /// Loads the config again and applies it with only the work its change
+    /// from the loaded config needs, returning that change.
+    pub async fn reload_config(workspace_manager: Arc<RwLock<WorkspaceManager>>) -> EmmyrcChange {
+        let config_apply = workspace_manager.read().await.config_apply.clone();
+        let _applying = config_apply.lock().await;
+        let (analysis, client, status_bar, file_diagnostic, lsp_features, debounced_analysis) = {
+            let manager = workspace_manager.read().await;
+            (
+                manager.analysis.clone(),
+                manager.client.clone(),
+                manager.status_bar.clone(),
+                manager.file_diagnostic.clone(),
+                manager.lsp_features.clone(),
+                manager.debounced_analysis.clone(),
+            )
+        };
+        let (workspace_folders, client_config) = {
+            let manager = workspace_manager.read().await;
+            (
+                manager.workspace_folders.clone(),
+                manager.client_config.clone(),
+            )
+        };
+
+        let watchdog_status = LongRunningWatchdogStatus::new("Reloading GLuaLS configuration");
+        let _watchdog =
+            spawn_long_running_watchdog("workspace config reload", watchdog_status.clone());
+        let loaded =
+            load_emmy_config_off_workers(collect_config_roots(&workspace_folders), client_config)
+                .await;
+        let (change, open_files) = {
+            let mut manager = workspace_manager.write().await;
+            let change = manager
+                .loaded_config
+                .as_ref()
+                .map_or(EmmyrcChange::Workspace, |previous| {
+                    loaded.change_from(previous)
+                });
+            if change != EmmyrcChange::Unchanged {
+                manager.per_root_matchers = loaded.workspace_matchers.clone();
+                let (include, exclude, exclude_dir) = calculate_include_and_exclude(&loaded.emmyrc);
+                manager.match_file_pattern =
+                    WorkspaceFileMatcher::new(include, exclude, exclude_dir);
+                manager.loaded_config = Some(loaded.clone());
+            }
+            (change, manager.open_workspace_files())
+        };
+        info!("config reload: {change:?}");
+
+        match change {
+            EmmyrcChange::Unchanged => {}
+            EmmyrcChange::Workspace => {
+                apply_workspace_code_style_off_workers(
+                    workspace_folders.clone(),
+                    loaded.emmyrc.clone(),
+                )
+                .await;
+                init_analysis(
+                    &analysis,
+                    &client,
+                    &status_bar,
+                    &file_diagnostic,
+                    &lsp_features,
+                    workspace_folders,
+                    loaded,
+                    open_files,
+                    watchdog_status,
+                )
+                .await;
+            }
+            EmmyrcChange::Editor | EmmyrcChange::Diagnostics | EmmyrcChange::Analysis => {
+                if change >= EmmyrcChange::Diagnostics {
+                    apply_workspace_code_style_off_workers(
+                        workspace_folders.clone(),
+                        loaded.emmyrc.clone(),
+                    )
+                    .await;
+                }
+                let affects_index = {
+                    let mut analysis = analysis.write().await;
+                    let applied = analysis.apply_config(loaded.emmyrc.clone());
+                    apply_workspace_diagnostic_configs(
+                        &mut analysis,
+                        &loaded.workspace_diagnostic_configs,
+                    );
+                    applied.affects_index()
+                };
+                if affects_index {
+                    // The rebuild re-diagnoses every file and refreshes the
+                    // open documents' views once it settles.
+                    debounced_analysis.request_rebuild();
+                } else {
+                    if change != EmmyrcChange::Diagnostics {
+                        refresh_open_document_features(&client, &lsp_features);
+                    }
+                    if change >= EmmyrcChange::Diagnostics {
+                        file_diagnostic
+                            .add_workspace_diagnostic_task(0, false)
+                            .await;
+                    }
+                }
+            }
+        }
+        change
+    }
+
+    pub async fn extend_recheck_delay(&self) -> Option<()> {
+        let recheck_token = self.recheck_token.lock().await;
+        if let Some(token) = recheck_token.as_ref() {
+            token.extend().await;
         }
 
-        let cancel_token = Arc::new(ReindexToken::new(Duration::from_secs(2)));
-        update_token.replace(cancel_token.clone());
-        drop(update_token);
+        Some(())
+    }
 
-        let analysis = self.analysis.clone();
-        let workspace_folders = self.workspace_folders.clone();
-        let config_update_token = self.update_token.clone();
-        let client_config = self.client_config.clone();
-        let status_bar = self.status_bar.clone();
+    /// Once edits pause for `delay`, removes the files deleted from disk
+    /// behind the editor's back and computes every file's diagnostics again,
+    /// publishing those that changed.
+    pub async fn recheck_workspace(&self, delay: Duration, context: ServerContextSnapshot) {
+        log::info!("recheck workspace with delay: {:?}", delay);
+        let mut recheck_token = self.recheck_token.lock().await;
+        if let Some(token) = recheck_token.as_ref() {
+            token.cancel();
+            log::info!("cancel pending workspace recheck");
+        }
+
+        let token = Arc::new(QuietPeriod::new(delay));
+        recheck_token.replace(token.clone());
+        drop(recheck_token);
         let file_diagnostic = self.file_diagnostic.clone();
         let lsp_features = self.lsp_features.clone();
         let client = self.client.clone();
-        let workspace_diagnostic_level = self.workspace_diagnostic_level.clone();
         tokio::spawn(async move {
-            cancel_token.wait_for_reindex().await;
-            if cancel_token.is_cancelled() {
+            token.wait().await;
+            if token.is_cancelled() {
                 return;
             }
 
-            let config_roots = collect_config_roots(&workspace_folders, Some(file_dir.clone()));
-            let watchdog_status = LongRunningWatchdogStatus::new("Reloading GLuaLS configuration");
-            let _watchdog =
-                spawn_long_running_watchdog("workspace config reload", watchdog_status.clone());
-            let loaded = load_emmy_config(config_roots, client_config);
-            apply_workspace_code_style(&workspace_folders, loaded.emmyrc.as_ref());
-
-            // Refresh per-root matchers before re-indexing so that
-            // `is_workspace_file` is consistent with the new config.
-            {
-                let mut wm = workspace_manager.write().await;
-                wm.per_root_matchers = loaded.workspace_matchers.clone();
-                let (include, exclude, exclude_dir) = calculate_include_and_exclude(&loaded.emmyrc);
-                wm.match_file_pattern = WorkspaceFileMatcher::new(include, exclude, exclude_dir);
+            // The paths are read under the lock, the disk off it.
+            let paths = context.analysis().read().await.local_file_paths();
+            let deleted = tokio::task::spawn_blocking(move || {
+                paths
+                    .into_iter()
+                    .filter(|(_, path)| !path.exists())
+                    .map(|(uri, _)| (uri, None))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            if !deleted.is_empty() {
+                log::info!("recheck removes {} files deleted from disk", deleted.len());
             }
+            apply_file_system_changes(&context, deleted).await;
 
-            init_analysis(
-                &analysis,
-                &client,
-                &status_bar,
-                &file_diagnostic,
-                &lsp_features,
-                workspace_folders,
-                loaded.emmyrc,
-                loaded.workspace_diagnostic_configs,
-                loaded.workspace_emmyrcs,
-                watchdog_status,
-                workspace_diagnostic_level,
-            )
-            .await;
-            if lsp_features.supports_refresh_diagnostic() {
-                client.refresh_workspace_diagnostics();
-            }
-            // After completion, remove from HashMap
-            let mut tokens = config_update_token.lock().await;
-            tokens.take();
+            file_diagnostic.forget_missing().await;
+            file_diagnostic.add_workspace_diagnostic_task(0, true).await;
+            refresh_open_document_features(&client, &lsp_features);
         });
     }
 
-    pub fn update_editorconfig(&self, path: PathBuf) {
-        log::info!("update code style: {:?}", path);
-        let _ = apply_editorconfig_file(&path);
+    /// The open documents the workspace admits, as it would on their opening.
+    pub fn open_workspace_files(&self) -> HashSet<Uri> {
+        self.current_open_files
+            .iter()
+            .filter(|uri| self.is_workspace_file(uri))
+            .cloned()
+            .collect()
     }
 
-    pub fn add_reload_workspace_task(
-        &self,
-        workspace_manager: Arc<RwLock<WorkspaceManager>>,
-    ) -> Option<()> {
-        let config_roots = collect_config_roots(&self.workspace_folders, None);
-        let loaded = load_emmy_config(config_roots, self.client_config.clone());
-        let analysis = self.analysis.clone();
-        let workspace_folders = self.workspace_folders.clone();
-        let status_bar = self.status_bar.clone();
-        let file_diagnostic = self.file_diagnostic.clone();
-        let lsp_features = self.lsp_features.clone();
-        let client = self.client.clone();
-        let workspace_diagnostic_status = self.workspace_diagnostic_level.clone();
-        tokio::spawn(async move {
-            let watchdog_status = LongRunningWatchdogStatus::new("Reloading workspace");
-            let _watchdog =
-                spawn_long_running_watchdog("workspace reload", watchdog_status.clone());
-            apply_workspace_code_style(&workspace_folders, loaded.emmyrc.as_ref());
-
-            // Refresh per-root matchers before re-indexing.
-            {
-                let mut wm = workspace_manager.write().await;
-                wm.per_root_matchers = loaded.workspace_matchers.clone();
-                let (include, exclude, exclude_dir) = calculate_include_and_exclude(&loaded.emmyrc);
-                wm.match_file_pattern = WorkspaceFileMatcher::new(include, exclude, exclude_dir);
-            }
-
-            // Perform reindex with minimal lock holding time
-            init_analysis(
-                &analysis,
-                &client,
-                &status_bar,
-                &file_diagnostic,
-                &lsp_features,
-                workspace_folders,
-                loaded.emmyrc,
-                loaded.workspace_diagnostic_configs,
-                loaded.workspace_emmyrcs,
-                watchdog_status,
-                workspace_diagnostic_status.clone(),
-            )
-            .await;
-
-            // Cancel diagnostics and update status without holding analysis lock
-            file_diagnostic.cancel_workspace_diagnostic().await;
-            // Raise, never lower — a pending `Slow` request must survive.
-            workspace_diagnostic_status
-                .fetch_max(WorkspaceDiagnosticLevel::Fast.to_u8(), Ordering::AcqRel);
-
-            if lsp_features.supports_refresh_diagnostic() {
-                client.refresh_workspace_diagnostics();
-            } else {
-                file_diagnostic
-                    .add_workspace_diagnostic_task(500, true)
-                    .await;
-            }
-        });
-
-        Some(())
-    }
-
-    pub async fn extend_reindex_delay(&self) -> Option<()> {
-        let update_token = self.update_token.lock().await;
-        if let Some(token) = update_token.as_ref() {
-            token.set_resleep().await;
-        }
-
-        Some(())
-    }
-
-    pub async fn reindex_workspace(&self, delay: Duration) -> Option<()> {
-        log::info!("refresh workspace with delay: {:?}", delay);
-        let mut update_token = self.update_token.lock().await;
-        if let Some(token) = update_token.as_ref() {
-            token.cancel();
-            log::info!("cancel reindex workspace");
-        }
-
-        let cancel_token = Arc::new(ReindexToken::new(delay));
-        update_token.replace(cancel_token.clone());
-        drop(update_token);
-        let analysis = self.analysis.clone();
-        let file_diagnostic = self.file_diagnostic.clone();
-        let lsp_features = self.lsp_features.clone();
-        let client = self.client.clone();
-        let workspace_diagnostic_status = self.workspace_diagnostic_level.clone();
-        tokio::spawn(async move {
-            cancel_token.wait_for_reindex().await;
-            if cancel_token.is_cancelled() {
-                return;
-            }
-
-            // Perform reindex with minimal lock holding time
-            {
-                let mut analysis = analysis.write().await;
-                // 在重新索引之前清理不存在的文件
-                analysis.cleanup_nonexistent_files();
-                file_diagnostic.invalidate_shared_diagnostic_data();
-                // Release lock immediately after cleanup
-            }
-
-            // Cancel diagnostics and update status without holding analysis lock
-            file_diagnostic.cancel_workspace_diagnostic().await;
-            workspace_diagnostic_status
-                .fetch_max(WorkspaceDiagnosticLevel::Fast.to_u8(), Ordering::AcqRel);
-
-            if lsp_features.supports_semantic_tokens_refresh() {
-                client.refresh_semantic_tokens();
-            }
-            if lsp_features.supports_inlay_hint_refresh() {
-                client.refresh_inlay_hints();
-            }
-            if lsp_features.supports_refresh_diagnostic() {
-                client.refresh_workspace_diagnostics();
-            } else {
-                file_diagnostic
-                    .add_workspace_diagnostic_task(500, true)
-                    .await;
-            }
-        });
-
-        Some(())
+    /// Whether `uri` is where the workspace loads config from: directly in a
+    /// workspace root.
+    pub fn is_workspace_config_file(&self, uri: &Uri) -> bool {
+        uri_to_file_path(uri)
+            .as_deref()
+            .and_then(Path::parent)
+            .is_some_and(|dir| {
+                self.workspace_folders
+                    .iter()
+                    .any(|workspace| workspace.root == dir)
+            })
     }
 
     pub fn is_workspace_file(&self, uri: &Uri) -> bool {
@@ -367,21 +367,13 @@ fn is_workspace_file_inner(
     matcher.is_match(&file_path, &relative)
 }
 
-fn collect_config_roots(
-    workspace_folders: &[WorkspaceFolder],
-    preferred_root: Option<PathBuf>,
-) -> Vec<PathBuf> {
-    let mut config_roots = Vec::new();
-    if let Some(preferred_root) = preferred_root {
-        config_roots.push(preferred_root);
-    }
-
-    config_roots.extend(
+fn collect_config_roots(workspace_folders: &[WorkspaceFolder]) -> Vec<PathBuf> {
+    dedup_paths(
         workspace_folders
             .iter()
-            .map(|workspace| workspace.root.clone()),
-    );
-    dedup_paths(config_roots)
+            .map(|workspace| workspace.root.clone())
+            .collect(),
+    )
 }
 
 fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -396,7 +388,10 @@ fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     deduped
 }
 
+#[derive(Clone, Default)]
 pub struct LoadedConfig {
+    /// The workspace roots the config was loaded for.
+    pub roots: Vec<PathBuf>,
     pub emmyrc: Arc<Emmyrc>,
     pub workspace_diagnostic_configs: HashMap<PathBuf, LuaDiagnosticConfig>,
     pub workspace_emmyrcs: HashMap<PathBuf, Arc<Emmyrc>>,
@@ -404,6 +399,35 @@ pub struct LoadedConfig {
     /// Used by `WorkspaceManager::is_workspace_file` to avoid cross-root leakage
     /// of `useDefaultIgnores` / `ignoreDirDefaults` settings.
     pub workspace_matchers: HashMap<PathBuf, WorkspaceFileMatcher>,
+}
+
+impl LoadedConfig {
+    /// How far moving from `previous` to this config reaches, across the
+    /// merged config and every root's own.
+    pub fn change_from(&self, previous: &LoadedConfig) -> EmmyrcChange {
+        if self.roots != previous.roots {
+            return EmmyrcChange::Workspace;
+        }
+        self.roots
+            .iter()
+            .map(|root| previous.root_emmyrc(root).change_to(self.root_emmyrc(root)))
+            .fold(previous.emmyrc.change_to(&self.emmyrc), Ord::max)
+    }
+
+    /// The config `root` is collected and diagnosed with.
+    fn root_emmyrc(&self, root: &Path) -> &Emmyrc {
+        self.workspace_emmyrcs.get(root).unwrap_or(&self.emmyrc)
+    }
+}
+
+/// [`load_emmy_config`] on a blocking thread: it reads every config file.
+pub async fn load_emmy_config_off_workers(
+    config_roots: Vec<PathBuf>,
+    client_config: ClientConfig,
+) -> LoadedConfig {
+    tokio::task::spawn_blocking(move || load_emmy_config(config_roots, client_config))
+        .await
+        .unwrap_or_else(|err| std::panic::resume_unwind(err.into_panic()))
 }
 
 pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig) -> LoadedConfig {
@@ -488,6 +512,7 @@ pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig)
     log::info!("loaded emmyrc complete");
     let workspace_matchers = build_workspace_matchers(&workspace_emmyrcs);
     LoadedConfig {
+        roots: config_roots,
         emmyrc: emmyrc.into(),
         workspace_diagnostic_configs,
         workspace_emmyrcs,
@@ -1052,31 +1077,32 @@ fn inject_gamemode_base_libraries(
     }
 }
 
+/// A wait for a quiet period: each [`Self::extend`] while it runs waits one
+/// period more.
 #[derive(Debug)]
-pub struct ReindexToken {
+pub struct QuietPeriod {
     cancel_token: CancellationToken,
-    time_sleep: Duration,
-    need_re_sleep: Mutex<bool>,
+    period: Duration,
+    extended: Mutex<bool>,
 }
 
-impl ReindexToken {
-    pub fn new(time_sleep: Duration) -> Self {
+impl QuietPeriod {
+    pub fn new(period: Duration) -> Self {
         Self {
             cancel_token: CancellationToken::new(),
-            time_sleep,
-            need_re_sleep: Mutex::new(false),
+            period,
+            extended: Mutex::new(false),
         }
     }
 
-    pub async fn wait_for_reindex(&self) {
+    /// Waits until a whole period passes without an extension, or until
+    /// cancelled.
+    pub async fn wait(&self) {
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(self.time_sleep) => {
-                    // 获取锁来安全地访问和修改 need_re_sleep
-                    let mut need_re_sleep = self.need_re_sleep.lock().await;
-                    if *need_re_sleep {
-                        *need_re_sleep = false;
-                    } else {
+                _ = tokio::time::sleep(self.period) => {
+                    let mut extended = self.extended.lock().await;
+                    if !std::mem::replace(&mut *extended, false) {
                         break;
                     }
                 }
@@ -1095,51 +1121,57 @@ impl ReindexToken {
         self.cancel_token.is_cancelled()
     }
 
-    pub async fn set_resleep(&self) {
-        // 获取锁来安全地修改 need_re_sleep
-        let mut need_re_sleep = self.need_re_sleep.lock().await;
-        *need_re_sleep = true;
+    pub async fn extend(&self) {
+        *self.extended.lock().await = true;
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceFileMatcher {
-    include: Vec<String>,
-    exclude: Vec<String>,
+    /// `None` when a pattern is invalid: every file is included.
+    include: Option<wax::Any<'static>>,
+    /// `None` when a pattern is invalid: no file is excluded.
+    exclude: Option<wax::Any<'static>>,
     exclude_dir: Vec<PathBuf>,
 }
 
 impl WorkspaceFileMatcher {
     pub fn new(include: Vec<String>, exclude: Vec<String>, exclude_dir: Vec<PathBuf>) -> Self {
         Self {
-            include,
-            exclude,
+            include: compile_globs(&include, "include"),
+            exclude: compile_globs(&exclude, "exclude"),
             exclude_dir,
         }
     }
+
     pub fn is_match(&self, path: &Path, relative_path: &Path) -> bool {
         if self.exclude_dir.iter().any(|dir| path.starts_with(dir)) {
             return false;
         }
-
-        // let path_str = path.to_string_lossy().to_string().replace("\\", "/");
-        let exclude_matcher = wax::any(self.exclude.iter().map(|s| s.as_str()));
-        if let Ok(exclude_set) = exclude_matcher {
-            if exclude_set.is_match(relative_path) {
-                return false;
-            }
-        } else {
-            log::error!("Invalid exclude pattern");
+        if self
+            .exclude
+            .as_ref()
+            .is_some_and(|exclude| exclude.is_match(relative_path))
+        {
+            return false;
         }
+        self.include
+            .as_ref()
+            .is_none_or(|include| include.is_match(relative_path))
+    }
+}
 
-        let include_matcher = wax::any(self.include.iter().map(|s| s.as_str()));
-        if let Ok(include_set) = include_matcher {
-            return include_set.is_match(relative_path);
-        } else {
-            log::error!("Invalid include pattern");
+fn compile_globs(patterns: &[String], kind: &str) -> Option<wax::Any<'static>> {
+    let globs = patterns
+        .iter()
+        .map(|pattern| wax::Glob::new(pattern).map(wax::Glob::into_owned))
+        .collect::<Result<Vec<_>, _>>();
+    match globs.and_then(wax::any) {
+        Ok(globs) => Some(globs),
+        Err(err) => {
+            log::error!("Invalid {kind} pattern: {err}");
+            None
         }
-
-        true
     }
 }
 
@@ -1150,34 +1182,13 @@ impl Default for WorkspaceFileMatcher {
     }
 }
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkspaceDiagnosticLevel {
-    None = 0,
-    Fast = 1,
-    Slow = 2,
-}
-
-impl WorkspaceDiagnosticLevel {
-    pub fn from_u8(value: u8) -> Self {
-        match value {
-            1 => Self::Fast,
-            2 => Self::Slow,
-            _ => Self::None,
-        }
-    }
-
-    pub fn to_u8(self) -> u8 {
-        self as u8
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
         str::FromStr,
+        sync::atomic::{AtomicUsize, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1193,11 +1204,16 @@ mod tests {
     };
 
     fn create_temp_dir() -> PathBuf {
-        let unique = SystemTime::now()
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let started = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should be valid")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("glua_ls_config_test_{unique}"));
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "glua_ls_config_test_{started}_{}_{unique}",
+            std::process::id()
+        ));
         fs::create_dir_all(&dir).expect("failed to create temp test dir");
         dir
     }
@@ -1266,15 +1282,19 @@ mod tests {
         assert_eq!(deduped, vec![path_a, path_b]);
     }
 
+    /// A reload reads the roots in workspace order, as the first load does,
+    /// whichever root's config changed.
     #[test]
-    fn test_collect_config_roots_prefers_changed_dir_and_dedups() {
+    fn test_collect_config_roots_keeps_workspace_order_and_dedups() {
         let workspace_a = WorkspaceFolder::new(PathBuf::from("/workspace/a"), false);
         let workspace_b = WorkspaceFolder::new(PathBuf::from("/workspace/b"), false);
-        let preferred = PathBuf::from("/workspace/b");
 
-        let roots = collect_config_roots(&[workspace_a, workspace_b], Some(preferred.clone()));
+        let roots = collect_config_roots(&[workspace_a.clone(), workspace_b, workspace_a]);
 
-        assert_eq!(roots, vec![preferred, PathBuf::from("/workspace/a")]);
+        assert_eq!(
+            roots,
+            vec![PathBuf::from("/workspace/a"), PathBuf::from("/workspace/b")]
+        );
     }
 
     #[test]
@@ -2280,7 +2300,7 @@ mod tests {
     /// whether the file still exists on disk (i.e. after deletion).
     /// This verifies the helper returns `Some(WatchedFileType::Emmyrc)` for all
     /// recognised config file names, which is the precondition for the DELETE
-    /// branch in `on_did_change_watched_files` to push to `emmyrc_dirs`.
+    /// branch in `on_did_change_watched_files` to schedule a config reload.
     ///
     /// We test the pure `get_file_type` helper directly since the async handler
     /// requires a full server context.
@@ -2716,5 +2736,359 @@ mod tests {
         fs::write(dir.join("a.txt"), "").expect("write txt");
         assert!(!directory_contains_lua_file(&dir));
         let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    use glua_code_analysis::{
+        DiagnosticCode, EmmyrcChange, Workspace, WorkspaceFolder, WorkspaceId, file_path_to_uri,
+    };
+    use lsp_server::{Connection, Message};
+    use lsp_types::{ClientCapabilities, NumberOrString, PublishDiagnosticsParams, Uri};
+    use tokio_util::sync::CancellationToken;
+
+    use crate::context::{ServerContext, ServerContextSnapshot};
+
+    use super::WorkspaceManager;
+
+    const SOURCE: &str = "lua/autorun/sh_source.lua";
+    const LATE: &str = "lua/autorun/sh_late.lua";
+
+    /// A workspace whose one source file reports an unused local, with
+    /// `config` as its `.gluarc.json`.
+    fn workspace(name: &str, config: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("glua_ls_reload_{name}_{unique}"));
+        fs::create_dir_all(root.join("lua/autorun")).expect("create workspace");
+        fs::write(root.join(SOURCE), "local unused_value = 1\n").expect("write source");
+        fs::write(root.join(".gluarc.json"), config).expect("write config");
+        root
+    }
+
+    fn uri(root: &Path, relative: &str) -> Uri {
+        file_path_to_uri(&root.join(relative)).expect("file URI should parse")
+    }
+
+    /// A server loaded from `root` as on startup.
+    fn start(runtime: &tokio::runtime::Runtime, root: &Path) -> (ServerContext, Connection) {
+        let (connection, peer) = Connection::memory();
+        let context = runtime.block_on(async {
+            let context = ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            snapshot.workspace_manager().write().await.workspace_folders =
+                vec![WorkspaceFolder::new(root.to_path_buf(), false)];
+            let change = WorkspaceManager::reload_config(snapshot.workspace_manager_arc()).await;
+            assert_eq!(change, EmmyrcChange::Workspace);
+            context
+        });
+        (context, peer)
+    }
+
+    /// Waits for `uri`'s published diagnostics to report `unused` or not.
+    fn wait_for_unused(peer: &Connection, uri: &Uri, reported: bool) {
+        let unused = Some(NumberOrString::String(
+            DiagnosticCode::Unused.get_name().to_string(),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            let Ok(Message::Notification(notification)) = peer.receiver.recv_timeout(remaining)
+            else {
+                continue;
+            };
+            if notification.method != "textDocument/publishDiagnostics" {
+                continue;
+            }
+            let params: PublishDiagnosticsParams =
+                serde_json::from_value(notification.params).expect("publish params");
+            if params.uri == *uri
+                && params
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == unused)
+                    == reported
+            {
+                return;
+            }
+        }
+        panic!("no publish with unused reported = {reported} for {uri:?}");
+    }
+
+    /// Reloads after writing `config`, with a file added on disk that only a
+    /// walk of the workspace finds; returns the change, the analysis batches
+    /// the reload ran and whether the added file was loaded.
+    fn reload_with(
+        runtime: &tokio::runtime::Runtime,
+        snapshot: &ServerContextSnapshot,
+        root: &Path,
+        config: &str,
+    ) -> (EmmyrcChange, usize, bool) {
+        fs::write(root.join(LATE), "return 1\n").expect("write late file");
+        fs::write(root.join(".gluarc.json"), config).expect("write config");
+        runtime.block_on(async {
+            snapshot
+                .analysis()
+                .write()
+                .await
+                .compilation
+                .start_batch_log();
+            let change = WorkspaceManager::reload_config(snapshot.workspace_manager_arc()).await;
+            let mut analysis = snapshot.analysis().write().await;
+            let batches = analysis.compilation.take_batch_log().len();
+            let late_loaded = analysis.get_file_id(&uri(root, LATE)).is_some();
+            (change, batches, late_loaded)
+        })
+    }
+
+    #[test]
+    fn a_diagnostics_only_change_rediagnoses_without_a_walk_or_reindex() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let root = workspace("diagnostics", "{}");
+        let (context, peer) = start(&runtime, &root);
+        let source = uri(&root, SOURCE);
+        wait_for_unused(&peer, &source, true);
+
+        let reload = reload_with(
+            &runtime,
+            &context.snapshot(),
+            &root,
+            r#"{ "diagnostics": { "disable": ["unused"] } }"#,
+        );
+
+        assert_eq!(reload, (EmmyrcChange::Diagnostics, 0, false));
+        wait_for_unused(&peer, &source, false);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_workspace_shape_change_walks_the_workspace() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let root = workspace("shape", "{}");
+        let (context, _peer) = start(&runtime, &root);
+
+        let (change, _, late_loaded) = reload_with(
+            &runtime,
+            &context.snapshot(),
+            &root,
+            r#"{ "workspace": { "ignoreGlobs": ["**/ignored/**"] } }"#,
+        );
+
+        assert_eq!((change, late_loaded), (EmmyrcChange::Workspace, true));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rewriting_the_config_with_equal_content_does_nothing() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let config = r#"{ "diagnostics": { "globals": ["Extra"] } }"#;
+        let root = workspace("equal", config);
+        let (context, _peer) = start(&runtime, &root);
+
+        let reload = reload_with(&runtime, &context.snapshot(), &root, config);
+
+        assert_eq!(reload, (EmmyrcChange::Unchanged, 0, false));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Every workspace file's diagnostics, keyed by path relative to `root`.
+    fn workspace_diagnostics(
+        runtime: &tokio::runtime::Runtime,
+        snapshot: &ServerContextSnapshot,
+        root: &Path,
+    ) -> BTreeMap<String, Vec<String>> {
+        runtime.block_on(async {
+            let analysis = snapshot.analysis().read().await;
+            analysis
+                .get_main_workspace_file_ids_for_diagnostics()
+                .into_iter()
+                .map(|file_id| {
+                    let path = analysis
+                        .compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_file_path(&file_id)
+                        .expect("file path")
+                        .strip_prefix(root)
+                        .expect("file under the root")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let mut diagnostics = analysis
+                        .diagnose_file(file_id, CancellationToken::new())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|diagnostic| format!("{:?} {}", diagnostic.code, diagnostic.message))
+                        .collect::<Vec<_>>();
+                    diagnostics.sort();
+                    (path, diagnostics)
+                })
+                .collect()
+        })
+    }
+
+    /// A file a workspace-shape change stops collecting leaves the index and
+    /// the client, and its readers end as a cold load of the new config
+    /// leaves them.
+    #[test]
+    fn a_file_the_new_config_stops_collecting_is_removed() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let root = workspace("uncollected", "{}");
+        let ignored = "lua/ignored/sh_ignored.lua";
+        fs::create_dir_all(root.join("lua/ignored")).expect("create ignored dir");
+        fs::write(
+            root.join(ignored),
+            "local unused_value = 1\nfunction IgnoredApi() end\n",
+        )
+        .expect("write ignored file");
+        fs::write(root.join(SOURCE), "IgnoredApi()\n").expect("write source");
+        let (warm, peer) = start(&runtime, &root);
+        let ignored_uri = uri(&root, ignored);
+        wait_for_unused(&peer, &ignored_uri, true);
+
+        let (change, _, _) = reload_with(
+            &runtime,
+            &warm.snapshot(),
+            &root,
+            r#"{ "workspace": { "ignoreGlobs": ["**/ignored/**"] } }"#,
+        );
+
+        assert_eq!(change, EmmyrcChange::Workspace);
+        wait_for_unused(&peer, &ignored_uri, false);
+        let still_loaded = runtime.block_on(async {
+            warm.snapshot()
+                .analysis()
+                .read()
+                .await
+                .get_file_id(&ignored_uri)
+                .is_some()
+        });
+        assert!(!still_loaded);
+        let (cold, _cold_peer) = start(&runtime, &root);
+        let warm_diagnostics = workspace_diagnostics(&runtime, &warm.snapshot(), &root);
+        assert!(!warm_diagnostics.contains_key(ignored));
+        assert_ne!(warm_diagnostics.get(SOURCE), Some(&Vec::new()));
+        assert_eq!(
+            warm_diagnostics,
+            workspace_diagnostics(&runtime, &cold.snapshot(), &root)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The registered workspace roots, and every loaded file outside std
+    /// with its module path and workspace.
+    fn roots_and_modules(
+        runtime: &tokio::runtime::Runtime,
+        snapshot: &ServerContextSnapshot,
+    ) -> (Vec<Workspace>, BTreeMap<PathBuf, (String, WorkspaceId)>) {
+        runtime.block_on(async {
+            let analysis = snapshot.analysis().read().await;
+            let db = analysis.compilation.get_db();
+            let module_index = db.get_module_index();
+            let modules = db
+                .get_vfs()
+                .get_all_local_file_ids()
+                .into_iter()
+                .filter(|file_id| !module_index.is_std(file_id))
+                .map(|file_id| {
+                    let module = module_index.get_module(file_id).expect("module info");
+                    (
+                        db.get_vfs()
+                            .get_file_path(&file_id)
+                            .expect("file path")
+                            .clone(),
+                        (module.full_module_name.clone(), module.workspace_id),
+                    )
+                })
+                .collect();
+            (module_index.workspaces().to_vec(), modules)
+        })
+    }
+
+    /// A library dropped from the config leaves the registered roots, and the
+    /// libraries after it take the ids, module paths and diagnostics a cold
+    /// load of the new config gives them.
+    #[test]
+    fn a_library_dropped_from_the_config_leaves_the_roots() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let libraries = ["dropped", "kept"].map(|name| {
+            let library = workspace(&format!("library_{name}"), "{}");
+            fs::write(
+                library.join(format!("lua/autorun/sh_{name}.lua")),
+                format!("function {name}_api() end\n"),
+            )
+            .expect("write library file");
+            library
+        });
+        let library_config = |libraries: &[&PathBuf]| {
+            let paths = libraries
+                .iter()
+                .map(|path| format!("\"{}\"", path.to_string_lossy().replace('\\', "/")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(r#"{{ "workspace": {{ "library": [{paths}] }} }}"#)
+        };
+        let root = workspace(
+            "libraries",
+            &library_config(&[&libraries[0], &libraries[1]]),
+        );
+        fs::write(root.join(SOURCE), "dropped_api()\nkept_api()\n").expect("write source");
+        let (warm, _peer) = start(&runtime, &root);
+
+        let (change, _, _) = reload_with(
+            &runtime,
+            &warm.snapshot(),
+            &root,
+            &library_config(&[&libraries[1]]),
+        );
+
+        assert_eq!(change, EmmyrcChange::Workspace);
+        let (cold, _cold_peer) = start(&runtime, &root);
+        let (warm_roots, warm_modules) = roots_and_modules(&runtime, &warm.snapshot());
+        assert!(
+            !warm_roots
+                .iter()
+                .any(|workspace| workspace.root.starts_with(&libraries[0]))
+        );
+        assert_eq!(
+            (warm_roots, warm_modules),
+            roots_and_modules(&runtime, &cold.snapshot())
+        );
+        assert_eq!(
+            workspace_diagnostics(&runtime, &warm.snapshot(), &root),
+            workspace_diagnostics(&runtime, &cold.snapshot(), &root)
+        );
+        let _ = fs::remove_dir_all(root);
+        for library in libraries {
+            let _ = fs::remove_dir_all(library);
+        }
+    }
+
+    #[test]
+    fn only_config_files_directly_in_a_workspace_root_are_loaded() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let root = crate::util::unique_temp_dir("glua_ls_reload_config_location");
+        let (connection, _peer) = Connection::memory();
+        runtime.block_on(async {
+            let context = ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let mut manager = snapshot.workspace_manager().write().await;
+            manager.workspace_folders = vec![WorkspaceFolder::new(root.clone(), false)];
+
+            assert!(manager.is_workspace_config_file(&uri(&root, ".gluarc.json")));
+            assert!(!manager.is_workspace_config_file(&uri(&root, "lua/.luarc.json")));
+            assert!(!manager.is_workspace_config_file(&uri(
+                &crate::util::unique_temp_dir("glua_ls_reload_elsewhere"),
+                ".emmyrc.json"
+            )));
+        });
     }
 }

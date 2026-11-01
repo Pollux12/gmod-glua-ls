@@ -17,6 +17,20 @@ pub use super::{
 pub use comment_trait::*;
 pub use description_trait::*;
 
+/// Typed walks from a syntax node.
+pub trait LuaSyntaxNodeExt {
+    /// The descendants of type `N`, this node included, in preorder. Only
+    /// they and their ancestors get syntax nodes of their own.
+    fn descendants_of<N: LuaAstNode>(&self) -> impl Iterator<Item = N>;
+}
+
+impl LuaSyntaxNodeExt for LuaSyntaxNode {
+    fn descendants_of<N: LuaAstNode>(&self) -> impl Iterator<Item = N> {
+        self.descendants_matching(|kind| N::can_cast(kind.into()))
+            .filter_map(N::cast)
+    }
+}
+
 pub trait LuaAstNode {
     fn syntax(&self) -> &LuaSyntaxNode;
 
@@ -57,7 +71,7 @@ pub trait LuaAstNode {
     }
 
     fn descendants<N: LuaAstNode>(&self) -> impl Iterator<Item = N> {
-        self.syntax().descendants().filter_map(N::cast)
+        self.syntax().descendants_of()
     }
 
     fn walk_descendants<N: LuaAstNode>(&self) -> impl Iterator<Item = WalkEvent<N>> {
@@ -214,5 +228,103 @@ impl<N: LuaAstToken> Iterator for LuaAstTokenChildren<N> {
 
     fn next(&mut self) -> Option<N> {
         self.inner.find_map(|it| it.into_token().and_then(N::cast))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{LuaParser, ParserConfig};
+
+    const SAMPLE: &str = r#"
+---@class Shop
+---@field price integer
+local Shop = {}
+
+---@param count integer
+---@return integer
+function Shop:Buy(count)
+    local total = self.price * count
+    for i = 1, count do
+        if i % 2 == 0 then
+            total = total + helper(i, { a = 1, [i] = function() return i end })
+        elseif i > 3 then
+            break
+        else
+            repeat total = total - 1 until total < 0
+        end
+    end
+    for _, v in pairs(self.items or {}) do
+        while v.next do v = v.next end
+    end
+    return setmetatable({ total = total }, { __index = Shop })
+end
+
+local function helper(a, b) return a + #b end
+Config = Config or {}
+Config.Money = helper(1, "text") .. tostring(nil)
+"#;
+
+    /// The nodes of type `N` under `node`, as the plain preorder walk and the
+    /// green-guided walk each find them.
+    fn both<N: LuaAstNode>(node: &LuaSyntaxNode) -> (Vec<LuaSyntaxNode>, Vec<LuaSyntaxNode>) {
+        let plain = node
+            .descendants()
+            .filter_map(N::cast)
+            .map(|it| it.syntax().clone())
+            .collect();
+        let guided = node
+            .descendants_matching(|kind| N::can_cast(kind.into()))
+            .filter_map(N::cast)
+            .map(|it| it.syntax().clone())
+            .collect();
+        (plain, guided)
+    }
+
+    fn assert_same<N: LuaAstNode>(node: &LuaSyntaxNode) {
+        let (plain, guided) = both::<N>(node);
+        assert!(
+            !plain.is_empty(),
+            "the sample has a {}",
+            std::any::type_name::<N>()
+        );
+        assert_eq!(guided, plain, "{}", std::any::type_name::<N>());
+        for (guided, plain) in guided.iter().zip(&plain) {
+            assert_eq!(
+                (guided.parent(), guided.index(), guided.text_range()),
+                (plain.parent(), plain.index(), plain.text_range())
+            );
+        }
+    }
+
+    #[test]
+    fn the_green_guided_walk_finds_what_the_preorder_walk_finds() {
+        let root = LuaParser::parse(SAMPLE, ParserConfig::default()).get_red_root();
+        assert_same::<LuaAst>(&root);
+        assert_same::<LuaStat>(&root);
+        assert_same::<LuaExpr>(&root);
+        assert_same::<LuaCallExpr>(&root);
+        assert_same::<LuaIndexExpr>(&root);
+        assert_same::<LuaNameExpr>(&root);
+        assert_same::<LuaTableExpr>(&root);
+        assert_same::<LuaClosureExpr>(&root);
+        assert_same::<LuaFuncStat>(&root);
+        assert_same::<LuaLoopStat>(&root);
+        assert_same::<LuaVarExpr>(&root);
+        assert_same::<LuaDocTag>(&root);
+        assert_same::<LuaDocType>(&root);
+        assert_same::<LuaComment>(&root);
+    }
+
+    #[test]
+    fn the_green_guided_walk_starts_at_an_inner_node() {
+        let root = LuaParser::parse(SAMPLE, ParserConfig::default()).get_red_root();
+        let func_stat = root
+            .descendants()
+            .find_map(LuaFuncStat::cast)
+            .expect("the sample has a method");
+        assert_same::<LuaFuncStat>(func_stat.syntax());
+        assert_same::<LuaCallExpr>(func_stat.syntax());
+        assert_same::<LuaExpr>(func_stat.syntax());
     }
 }

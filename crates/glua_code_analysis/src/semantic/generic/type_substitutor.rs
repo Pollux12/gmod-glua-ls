@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use super::tpl_pattern::constant_decay;
 use crate::{GenericTplId, LuaType, LuaTypeDeclId};
@@ -19,14 +19,14 @@ impl Default for TypeSubstitutor {
 impl TypeSubstitutor {
     pub fn new() -> Self {
         Self {
-            tpl_replace_map: HashMap::new(),
-            alias_type_ids: HashSet::new(),
+            tpl_replace_map: HashMap::default(),
+            alias_type_ids: HashSet::default(),
             self_type: None,
         }
     }
 
     pub fn from_type_array(type_array: Vec<LuaType>) -> Self {
-        let mut tpl_replace_map = HashMap::new();
+        let mut tpl_replace_map = HashMap::default();
         for (i, ty) in type_array.into_iter().enumerate() {
             tpl_replace_map.insert(
                 GenericTplId::Type(i as u32),
@@ -35,7 +35,7 @@ impl TypeSubstitutor {
         }
         Self {
             tpl_replace_map,
-            alias_type_ids: HashSet::new(),
+            alias_type_ids: HashSet::default(),
             self_type: None,
         }
     }
@@ -49,7 +49,7 @@ impl TypeSubstitutor {
         alias_type_id: LuaTypeDeclId,
         parent: Option<&TypeSubstitutor>,
     ) -> Self {
-        let mut tpl_replace_map = HashMap::new();
+        let mut tpl_replace_map = HashMap::default();
         for (i, ty) in type_array.into_iter().enumerate() {
             tpl_replace_map.insert(
                 GenericTplId::Type(i as u32),
@@ -97,6 +97,50 @@ impl TypeSubstitutor {
 
         self.tpl_replace_map
             .insert(tpl_id, SubstitutorValue::Type(value));
+    }
+
+    /// Takes the bindings each union arm made in its own copy of `self`: a
+    /// template the arms bind alike takes that binding, a type they bind
+    /// differently takes the union of those types, and parameter or result
+    /// lists they bind differently stay unbound, since no one instantiation
+    /// stands for every arm. An arm that leaves a list unbound bound it empty.
+    pub fn merge_union_arm_bindings(&mut self, arms: Vec<TypeSubstitutor>) {
+        let arm_count = arms.len();
+        let mut bound: HashMap<GenericTplId, Vec<SubstitutorValue>> = HashMap::default();
+        for arm in arms {
+            for (tpl_id, value) in arm.tpl_replace_map {
+                if !value.is_none() && self.can_insert_type(tpl_id) {
+                    bound.entry(tpl_id).or_default().push(value);
+                }
+            }
+        }
+        for (tpl_id, values) in bound {
+            let first = &values[0];
+            let is_list = !matches!(first, SubstitutorValue::Type(_));
+            if is_list && values.len() < arm_count {
+                continue;
+            }
+            if values.iter().all(|value| value == first) {
+                self.tpl_replace_map.insert(tpl_id, first.clone());
+                continue;
+            }
+            let types = values
+                .iter()
+                .map(|value| match value {
+                    SubstitutorValue::Type(value) => Some(value),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(types) = types {
+                let raw = LuaType::from_vec(types.iter().map(|value| value.raw.clone()).collect());
+                let default =
+                    LuaType::from_vec(types.iter().map(|value| value.default.clone()).collect());
+                self.tpl_replace_map.insert(
+                    tpl_id,
+                    SubstitutorValue::Type(SubstitutorTypeValue { raw, default }),
+                );
+            }
+        }
     }
 
     fn can_insert_type(&self, tpl_id: GenericTplId) -> bool {
@@ -163,7 +207,7 @@ impl TypeSubstitutor {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SubstitutorTypeValue {
     raw: LuaType,
     default: LuaType,
@@ -189,7 +233,7 @@ impl SubstitutorTypeValue {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SubstitutorValue {
     None,
     Type(SubstitutorTypeValue),

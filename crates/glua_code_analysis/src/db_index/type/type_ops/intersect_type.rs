@@ -1,6 +1,6 @@
 use std::ops::Deref;
 
-use crate::{DbIndex, LuaType, get_real_type};
+use crate::{DbIndex, LuaType, get_real_type, semantic::is_sub_type_of};
 
 pub fn intersect_type(db: &DbIndex, source: LuaType, target: LuaType) -> LuaType {
     let real_type = get_real_type(db, &source).unwrap_or(&source);
@@ -49,10 +49,12 @@ pub fn intersect_type(db: &DbIndex, source: LuaType, target: LuaType) -> LuaType
         // TODO: Intersecting two non-identical function types currently falls back to `never`.
         // Consider implementing a proper intersection (or overload-set semantics) for function
         // signatures instead of treating it as incompatible.
-        // class references
+        // class references: a value of both classes is one of the narrower
         (LuaType::Ref(id1), LuaType::Ref(id2)) => {
-            if id1 == id2 {
+            if is_sub_type_of(db, id1, id2) {
                 source.clone()
+            } else if is_sub_type_of(db, id2, id1) {
+                target
             } else {
                 LuaType::Never
             }

@@ -33,6 +33,26 @@ impl LspFeatures {
             .unwrap_or(false)
     }
 
+    /// Whether the client asks for the edits of a rename before making it.
+    pub fn supports_will_rename_files(&self) -> bool {
+        self.client_capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.file_operations.as_ref())
+            .and_then(|file_operations| file_operations.will_rename)
+            .unwrap_or(false)
+    }
+
+    /// Whether a workspace edit can name the document version it was made for.
+    pub fn supports_document_changes(&self) -> bool {
+        self.client_capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.workspace_edit.as_ref())
+            .and_then(|workspace_edit| workspace_edit.document_changes)
+            .unwrap_or(false)
+    }
+
     /// Gates `workspace/applyEdit`.
     pub fn supports_apply_edit(&self) -> bool {
         self.client_capabilities
@@ -51,11 +71,14 @@ impl LspFeatures {
         false
     }
 
-    pub fn supports_pull_diagnostic(&self) -> bool {
-        if let Some(text_document) = &self.client_capabilities.text_document {
-            return text_document.diagnostic.is_some();
-        }
-        false
+    /// Gates registering `workspace/didChangeConfiguration` with the client.
+    pub fn supports_did_change_configuration_registration(&self) -> bool {
+        self.client_capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.did_change_configuration.as_ref())
+            .and_then(|capability| capability.dynamic_registration)
+            .unwrap_or(false)
     }
 
     pub fn supports_completion_item_deprecated_tags(&self) -> bool {
@@ -71,21 +94,6 @@ impl LspFeatures {
                         .value_set
                         .contains(&lsp_types::CompletionItemTag::DEPRECATED)
             })
-    }
-
-    pub fn supports_workspace_diagnostic(&self) -> bool {
-        self.supports_pull_diagnostic()
-    }
-
-    pub fn supports_refresh_diagnostic(&self) -> bool {
-        if let Some(workspace) = &self.client_capabilities.workspace {
-            if let Some(diagnostic) = &workspace.diagnostics {
-                if let Some(supports) = diagnostic.refresh_support {
-                    return supports;
-                }
-            }
-        }
-        false
     }
 
     pub fn supports_semantic_tokens_refresh(&self) -> bool {

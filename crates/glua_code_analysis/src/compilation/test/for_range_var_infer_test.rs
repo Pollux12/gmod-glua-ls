@@ -3,7 +3,12 @@ mod test {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use crate::{LuaType, LuaUnionType, VirtualWorkspace};
+    use smol_str::SmolStr;
+
+    use crate::{
+        GlobalId, LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType, VirtualWorkspace,
+        get_member_map,
+    };
 
     #[test]
     fn test_closure_param_infer() {
@@ -570,5 +575,838 @@ mod test {
         assert_eq!(ws.humanize_type(def_ty.clone()), "{ a: string }");
         assert_eq!(ws.humanize_type(alias_ty.clone()), "{ a: string }");
         assert_eq!(def_ty, alias_ty);
+    }
+
+    fn registry_files(reg: &str, source: &str) -> Vec<(String, String)> {
+        vec![
+            (
+                format!("lua/autorun/sh_{reg}_registry.lua"),
+                format!(
+                    r#"
+                    {reg} = {{}}
+                    {reg}.alpha = {{}}
+                    {reg}.beta = {{}}
+                    {reg}.gamma = {{}}
+                    "#
+                ),
+            ),
+            (
+                format!("lua/autorun/sh_{reg}_write.lua"),
+                format!(
+                    r#"
+                    function {reg}_Write(keys)
+                        for _, entry in pairs({source}) do
+                            for _, key in pairs(keys) do
+                                entry[key] = {{ door = 1 }}
+                            end
+                        end
+                    end
+                    "#
+                ),
+            ),
+            (
+                format!("lua/autorun/sh_{reg}_read.lua"),
+                format!(
+                    r#"
+                    function {reg}_Read(name, key)
+                        return {reg}[name][key]
+                    end
+
+                    function {reg}_ReadThroughIterVar(key)
+                        for _, entry in pairs({reg}) do
+                            return entry[key]
+                        end
+                    end
+                    "#
+                ),
+            ),
+        ]
+    }
+
+    fn load_registry(reg: &str, source: &str, reverse: bool) -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut files = registry_files(reg, source);
+        if reverse {
+            files.reverse();
+        }
+        ws.def_files(
+            files
+                .iter()
+                .map(|(path, source)| (path.as_str(), source.as_str()))
+                .collect(),
+        );
+        ws
+    }
+
+    fn wildcard_bucket_keys(ws: &VirtualWorkspace, reg: &str) -> Vec<String> {
+        let owner = LuaMemberOwner::GlobalPath(GlobalId::new(&format!("{reg}.[]")));
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_members(&owner)
+            .unwrap_or_default()
+            .iter()
+            .map(|member| format!("{:?}", member.get_key()))
+            .collect()
+    }
+
+    #[test]
+    fn pairs_value_var_write_files_onto_the_registry_wildcard_bucket() {
+        let ws = load_registry("REGWRITE", "REGWRITE", false);
+        assert_eq!(
+            wildcard_bucket_keys(&ws, "REGWRITE"),
+            vec!["ExprType(Unknown)".to_string()]
+        );
+    }
+
+    /// Without the wildcard bucket this read answers `any?`, which is what the
+    /// `may be nil` reports on such registries come from.
+    #[test]
+    fn pairs_value_var_write_is_read_back_through_the_registry_path() {
+        let mut ws = load_registry("REGREAD", "REGREAD", false);
+        let ty = ws.expr_ty("REGREAD_Read('alpha', 'door')");
+        assert_eq!(ws.humanize_type(ty), "table");
+    }
+
+    /// Same member, reached through a second loop's value variable. Nullable
+    /// here because the write is in another file, where a computed-key write is
+    /// evidence about the values a registry holds, not that this key is one.
+    #[test]
+    fn pairs_value_var_write_is_read_back_through_another_iter_var() {
+        let mut ws = load_registry("REGITER", "REGITER", false);
+        let ty = ws.expr_ty("REGITER_ReadThroughIterVar('door')");
+        assert_eq!(ws.humanize_type(ty), "table?");
+    }
+
+    #[test]
+    fn registry_wildcard_bucket_does_not_depend_on_file_order() {
+        let forward = load_registry("REGORDER", "REGORDER", false);
+        let reverse = load_registry("REGORDER", "REGORDER", true);
+        assert_eq!(
+            wildcard_bucket_keys(&forward, "REGORDER"),
+            wildcard_bucket_keys(&reverse, "REGORDER")
+        );
+        assert_eq!(
+            wildcard_bucket_keys(&reverse, "REGORDER"),
+            vec!["ExprType(Unknown)".to_string()]
+        );
+    }
+
+    #[test]
+    fn pairs_over_a_call_result_files_nothing() {
+        let ws = load_registry("REGCALL", "GetRegistry()", false);
+        assert_eq!(wildcard_bucket_keys(&ws, "REGCALL"), Vec::<String>::new());
+        assert_eq!(
+            wildcard_bucket_keys(&ws, "GetRegistry"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn pairs_over_a_local_registry_files_nothing() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/autorun/sh_local_registry.lua",
+            r#"
+            local reg = {}
+            reg.alpha = {}
+
+            function LocalRegistryWrite(keys)
+                for _, entry in pairs(reg) do
+                    for _, key in pairs(keys) do
+                        entry[key] = { door = 1 }
+                    end
+                end
+            end
+            "#,
+        );
+        assert_eq!(wildcard_bucket_keys(&ws, "reg"), Vec::<String>::new());
+    }
+
+    /// A mutable local assigned from a loop variable must settle with it. The
+    /// loop enumerates a value nothing determines (`keys` is never called), so
+    /// the loop variable holds a raw template placeholder through the walk and
+    /// the unresolve waves, and only the settled tail falls it back to `any`.
+    /// The assignment was bound (then floored) before that, so without a
+    /// settled replay the local keeps the placeholder-era answer while the
+    /// loop variable it copies has moved on.
+    #[test]
+    fn settled_loop_var_move_rederives_mutable_local_assignment() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_ids = ws.def_files(vec![(
+            "lua/autorun/a_settled_assign_use.lua",
+            r#"
+            local selected
+            local function f(keys)
+                for key in pairs(keys) do
+                    selected = key
+                end
+            end
+            "#,
+        )]);
+
+        // Read the cold-build decl caches directly: a global copy of `selected`
+        // can answer from flow facts, which would mask a stale lifetime type
+        // on the declaration itself.
+        let loop_file = file_ids[0];
+        let db = ws.get_db_mut();
+        let decl_tree = db
+            .get_decl_index()
+            .get_decl_tree(&loop_file)
+            .expect("loop file decl tree");
+        let decl_id_by_name = |name: &str| {
+            decl_tree
+                .get_decls()
+                .values()
+                .filter(|decl| decl.get_name() == name)
+                .map(|decl| decl.get_id())
+                .next()
+                .unwrap_or_else(|| panic!("{name} decl"))
+        };
+        let cached_ty = |db: &crate::DbIndex, decl_id: crate::LuaDeclId| {
+            db.get_type_index()
+                .get_type_cache(&decl_id.into())
+                .map(|cache| cache.as_type().clone())
+        };
+        let key_ty = cached_ty(db, decl_id_by_name("key")).expect("key cache");
+        let selected_ty = cached_ty(db, decl_id_by_name("selected"));
+        let _ = db;
+
+        // Guards against passing vacuously: `any` is the deliberate settled
+        // answer for a loop nothing determines (a loop over an `any` value
+        // answers the same way), not an unresolved placeholder.
+        assert_eq!(key_ty, crate::LuaType::Any);
+        assert_eq!(selected_ty, Some(key_ty));
+    }
+
+    /// Reads the cold-build lifetime type cached on a declaration directly. A
+    /// global copy of the local could answer from flow facts, which would mask
+    /// a stale lifetime type on the declaration itself.
+    fn settled_assign_decl_cached_ty(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+    ) -> Option<LuaType> {
+        let db = ws.get_db_mut();
+        let decl_tree = db
+            .get_decl_index()
+            .get_decl_tree(&file_id)
+            .expect("decl tree");
+        let decl_id = decl_tree
+            .get_decls()
+            .values()
+            .filter(|decl| decl.get_name() == name)
+            .map(|decl| decl.get_id())
+            .next()
+            .unwrap_or_else(|| panic!("{name} decl"));
+        db.get_type_index()
+            .get_type_cache(&decl_id.into())
+            .map(|cache| cache.as_type().clone())
+    }
+
+    /// A widening replay must commit: `selected` is seeded with `string` up
+    /// front, so the settled tail cannot take the loop's grown key union
+    /// through the placeholder rules — only the structural widening gate (the
+    /// settled union holding every cached arm) admits it. A supersedes-only
+    /// gate keeps the stale `string` forever.
+    #[test]
+    fn settled_assign_replay_commits_union_widening() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![(
+            "lua/autorun/a_settled_assign_widen.lua",
+            r#"
+            local tb = { s = "b" }
+            local selected = "init"
+            local function f()
+                for kb in pairs(tb) do
+                    selected = kb
+                end
+            end
+            tb[true] = 1
+            "#,
+        )]);
+        let loop_file = file_ids[0];
+        let kb_ty = settled_assign_decl_cached_ty(&mut ws, loop_file, "kb").expect("kb cache");
+        let selected_ty =
+            settled_assign_decl_cached_ty(&mut ws, loop_file, "selected").expect("selected cache");
+        assert_eq!(selected_ty, kb_ty);
+        let LuaType::Union(union) = selected_ty else {
+            panic!("expected widened key union, got {:?}", kb_ty);
+        };
+        let arms = union.into_set();
+        assert!(arms.contains(&LuaType::String), "string arm in {arms:?}");
+        assert!(
+            arms.iter()
+                .any(|arm| matches!(arm, LuaType::BooleanConst(_))),
+            "boolean arm in {arms:?}"
+        );
+    }
+
+    /// The claim holder's sideways replace follows a multi-declaration global
+    /// merge. The reader file walks between the two backing writes (batches
+    /// walk in URI order), so `m` is bound from the first backing table only;
+    /// the settled multi-decl pass force-completes it to the merged backing
+    /// tables, a shape structurally unrelated to the subset. Only the holder
+    /// — the `selected = m` write that owns the declaration — may replace its
+    /// own contribution with it; `supersedes` never relates two informative
+    /// tables.
+    #[test]
+    fn settled_assign_replay_holder_sideways_multi_decl_merge() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![
+            ("lua/autorun/smd_a_first.lua", "SMD_MERGE = { k = \"s\" }\n"),
+            (
+                "lua/autorun/smd_m_reader.lua",
+                "local m = SMD_MERGE\nlocal selected\nselected = m\n",
+            ),
+            ("lua/autorun/smd_z_second.lua", "SMD_MERGE = { j = 1 }\n"),
+        ]);
+        let reader_file = file_ids[1];
+        let m_ty = settled_assign_decl_cached_ty(&mut ws, reader_file, "m").expect("m cache");
+        let selected_ty = settled_assign_decl_cached_ty(&mut ws, reader_file, "selected")
+            .expect("selected cache");
+        assert_eq!(selected_ty, m_ty);
+        // Both backing tables are visible in the merged global: a walk-time
+        // subset could never answer both members, so `m` must have moved in
+        // the settled tail and `selected` must have tracked it there.
+        assert!(matches!(ws.expr_ty("SMD_MERGE.k"), LuaType::StringConst(_)));
+        assert!(matches!(
+            ws.expr_ty("SMD_MERGE.j"),
+            LuaType::IntegerConst(_)
+        ));
+    }
+
+    /// Source order elects the winner between two moved right-hand sides. The
+    /// initializer seeds `string` and never moves, so the holder is not even
+    /// queued; both loop writes widen it, and exactly one — the earliest —
+    /// may commit per round. A second replace of the same cache within the
+    /// round would leave the later union behind instead.
+    #[test]
+    fn settled_assign_replay_source_order_winner_over_two_moved_rhs() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![(
+            "lua/autorun/a_settled_assign_order.lua",
+            r#"
+            local ta = { s = "a" }
+            local tb = { s = "b" }
+            local selected = "init"
+            local function f()
+                for ka in pairs(ta) do
+                    selected = ka
+                end
+                for kb in pairs(tb) do
+                    selected = kb
+                end
+            end
+            ta[false] = true
+            tb[true] = 1
+            "#,
+        )]);
+        let loop_file = file_ids[0];
+        let ka_ty = settled_assign_decl_cached_ty(&mut ws, loop_file, "ka").expect("ka cache");
+        let kb_ty = settled_assign_decl_cached_ty(&mut ws, loop_file, "kb").expect("kb cache");
+        let selected_ty =
+            settled_assign_decl_cached_ty(&mut ws, loop_file, "selected").expect("selected cache");
+        assert_ne!(ka_ty, kb_ty);
+        assert_eq!(selected_ty, ka_ty);
+    }
+
+    /// A trailing variadic right-hand side supplies one slot per extra target:
+    /// `first, second = echo(key)` queues both, and the replay selects each
+    /// target's own slot out of the settled answer. The generic call fails
+    /// while the loop variable still holds its template placeholder, so the
+    /// walk defers both targets and the force wave floors them to `unknown`;
+    /// only the settled replay — the extra target solely through its
+    /// `ret_idx = 1` queue entry — can complete them to the settled answer.
+    /// Without the multi-target queue the second target keeps `unknown`: it
+    /// reads no cache of its own, so no other pass re-derives it.
+    #[test]
+    fn settled_assign_replay_derives_all_multi_targets() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![(
+            "lua/autorun/a_settled_assign_multi.lua",
+            r#"
+            ---@generic T
+            ---@param x T
+            ---@return T, T
+            local function echo(x) return x, x end
+
+            local first
+            local second
+            local function f(keys)
+                for key in pairs(keys) do
+                    first, second = echo(key)
+                end
+            end
+            "#,
+        )]);
+        let loop_file = file_ids[0];
+        let key_ty = settled_assign_decl_cached_ty(&mut ws, loop_file, "key").expect("key cache");
+        let first_ty =
+            settled_assign_decl_cached_ty(&mut ws, loop_file, "first").expect("first cache");
+        let second_ty =
+            settled_assign_decl_cached_ty(&mut ws, loop_file, "second").expect("second cache");
+        // Guards against passing vacuously, as in the single-target repro:
+        // `any` is the deliberate settled answer for this loop.
+        assert_eq!(key_ty, crate::LuaType::Any);
+        assert_eq!(first_ty, key_ty);
+        assert_eq!(second_ty, key_ty);
+    }
+
+    /// The force wave and the settled replay share one target and must agree:
+    /// the call write floors while its callee is still unresolved, the loop
+    /// write replays once its variable settles, and the tail terminates on
+    /// the completed value instead of alternating the two contributions.
+    #[test]
+    fn settled_assign_replay_converges_with_force_on_shared_target() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![(
+            "lua/autorun/a_settled_assign_force.lua",
+            r#"
+            local selected
+            local function f(keys, mk)
+                for key in pairs(keys) do
+                    selected = key
+                end
+                selected = mk()
+            end
+            "#,
+        )]);
+        let loop_file = file_ids[0];
+        let key_ty = settled_assign_decl_cached_ty(&mut ws, loop_file, "key").expect("key cache");
+        let selected_ty =
+            settled_assign_decl_cached_ty(&mut ws, loop_file, "selected").expect("selected cache");
+        assert_eq!(key_ty, crate::LuaType::Any);
+        assert_eq!(selected_ty, key_ty);
+    }
+
+    /// The settled tail advances several independent parts of the boundary
+    /// across successive rounds — a widening union, a multi-declaration merge
+    /// tracked through the holder-sideways clause, a deferred multi-target,
+    /// and a member map that must be rekeyed before its loop re-derives. No
+    /// part may observe a partially settled loop break: every part must
+    /// converge to its settled answer.
+    ///
+    /// The recurrence-vs-advance distinction itself — the same net delta
+    /// recurring while another part advances must not confirm a cycle — is
+    /// pinned at the fuse predicate level (`FixpointFuse` tests), where it is
+    /// directly constructible: with monotone commit gates an end-to-end run
+    /// cannot move an owner back to a previous answer, so a recurring net
+    /// delta is unconstructible from Lua. This test pins the other half of
+    /// the contract: multi-part advancement always runs to convergence.
+    #[test]
+    fn settled_tail_multi_part_boundary_converges_without_early_break() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        // `def_files` returns ids in URI-sorted order, so the numeric prefixes
+        // below are the indexing: the reader still walks between the two
+        // backing writes, as in the single-purpose merge test.
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/autorun/mp_1_widen.lua",
+                r#"
+                local tb = { s = "b" }
+                local keyed = {}
+                local selected = "init"
+                local function f()
+                    for kb in pairs(tb) do
+                        selected = kb
+                        keyed[kb] = true
+                    end
+                    for observed in pairs(keyed) do
+                        mp_key_out = observed
+                    end
+                end
+                tb[true] = 1
+                "#,
+            ),
+            (
+                "lua/autorun/mp_2_smd_a_first.lua",
+                "MP_MERGE = { k = \"s\" }\n",
+            ),
+            (
+                "lua/autorun/mp_3_smd_m_reader.lua",
+                "local m = MP_MERGE\nlocal selected\nselected = m\n",
+            ),
+            (
+                "lua/autorun/mp_4_smd_z_second.lua",
+                "MP_MERGE = { j = 1 }\n",
+            ),
+            (
+                "lua/autorun/mp_5_multi.lua",
+                r#"
+                ---@generic T
+                ---@param x T
+                ---@return T, T
+                local function echo(x) return x, x end
+
+                local first
+                local second
+                local function f(keys)
+                    for key in pairs(keys) do
+                        first, second = echo(key)
+                    end
+                end
+                "#,
+            ),
+        ]);
+
+        let widen_file = file_ids[0];
+        let kb_ty = settled_assign_decl_cached_ty(&mut ws, widen_file, "kb").expect("kb cache");
+        let widened_ty =
+            settled_assign_decl_cached_ty(&mut ws, widen_file, "selected").expect("selected cache");
+        assert_eq!(widened_ty, kb_ty);
+        let LuaType::Union(union) = widened_ty else {
+            panic!("expected widened key union, got {:?}", kb_ty);
+        };
+        let arms = union.into_set();
+        assert!(arms.contains(&LuaType::String), "string arm in {arms:?}");
+        assert!(
+            arms.iter()
+                .any(|arm| matches!(arm, LuaType::BooleanConst(_))),
+            "boolean arm in {arms:?}"
+        );
+
+        let reader_file = file_ids[2];
+        let m_ty = settled_assign_decl_cached_ty(&mut ws, reader_file, "m").expect("m cache");
+        let tracked_ty = settled_assign_decl_cached_ty(&mut ws, reader_file, "selected")
+            .expect("selected cache");
+        assert_eq!(tracked_ty, m_ty);
+        assert!(matches!(ws.expr_ty("MP_MERGE.k"), LuaType::StringConst(_)));
+        assert!(matches!(ws.expr_ty("MP_MERGE.j"), LuaType::IntegerConst(_)));
+
+        let multi_file = file_ids[4];
+        let key_ty = settled_assign_decl_cached_ty(&mut ws, multi_file, "key").expect("key cache");
+        let first_ty =
+            settled_assign_decl_cached_ty(&mut ws, multi_file, "first").expect("first cache");
+        let second_ty =
+            settled_assign_decl_cached_ty(&mut ws, multi_file, "second").expect("second cache");
+        assert_eq!(key_ty, crate::LuaType::Any);
+        assert_eq!(first_ty, key_ty);
+        assert_eq!(second_ty, key_ty);
+
+        // The computed-key target is written with the widening loop key
+        // before `tb[true]` widens it, then iterated into a global: the
+        // member key must move after `kb` settles, forcing the unfiltered
+        // round that rederives the second loop.
+        assert_eq!(ws.expr_ty("mp_key_out"), kb_ty);
+    }
+
+    /// `T[k] = v` inside `pairs(T)` writes the iterated table back through its
+    /// own loop key. The write's member key is minted while `k` is still a
+    /// settling iter var, so it lands as `ExprType(Unknown)`; the loop's retry
+    /// then enumerates that placeholder as a sampled dynamic key and the exact
+    /// `a|b` domain degrades to `string|unknown`. The self-write is feedback,
+    /// not evidence: the key domain must stay exactly the member names.
+    ///
+    /// The copies are read through the declaration caches — a global copy
+    /// could answer from flow facts and mask a stale lifetime type.
+    #[test]
+    fn pairs_self_write_key_feedback_keeps_exact_key_domain() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![(
+            "lua/autorun/a_pairs_self_write.lua",
+            r#"
+            local T = { a = "x", b = "y" }
+            for k, v in pairs(T) do
+                T[k] = v
+                local observed_key = k
+                local observed_value = v
+            end
+            "#,
+        )]);
+        let loop_file = file_ids[0];
+
+        let expected_keys: HashSet<_> = vec![
+            LuaType::StringConst(SmolStr::new("a").into()),
+            LuaType::StringConst(SmolStr::new("b").into()),
+        ]
+        .into_iter()
+        .collect();
+        let assert_domain = |ws: &mut VirtualWorkspace| {
+            let key_ty = settled_assign_decl_cached_ty(ws, loop_file, "observed_key")
+                .expect("observed_key cache");
+            let LuaType::Union(key_union) = &key_ty else {
+                panic!("expected exact key domain union, got {key_ty:?}");
+            };
+            assert_eq!(key_union.into_set(), expected_keys);
+
+            let k_ty = settled_assign_decl_cached_ty(ws, loop_file, "k").expect("k cache");
+            assert_eq!(k_ty, key_ty);
+
+            let value_ty = settled_assign_decl_cached_ty(ws, loop_file, "observed_value")
+                .expect("observed_value cache");
+            let concrete_strings = match &value_ty {
+                LuaType::String => true,
+                LuaType::Union(union) => union
+                    .types()
+                    .all(|arm| matches!(arm, LuaType::StringConst(_))),
+                _ => false,
+            };
+            assert!(
+                concrete_strings,
+                "expected concrete string values, got {value_ty:?}"
+            );
+        };
+
+        assert_domain(&mut ws);
+        ws.analysis.reindex_files(vec![loop_file]);
+        assert_domain(&mut ws);
+    }
+
+    /// A write-back through any loop over the same table is feedback, not
+    /// just one through the loop deriving the domain: two files each writing
+    /// `radios[k] = …` inside their own `for k in pairs(radios)` must not feed
+    /// each other's key domain.
+    #[test]
+    fn pairs_self_writes_in_two_files_keep_the_key_domain_they_write_back() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let set_radio = |name: &str| {
+            format!(
+                "function {name}(radio, station)
+    for k, v in pairs(radios) do
+        if radio == v.RadioEnt then
+            radios[k] = {{ station = station, RadioEnt = radio }}
+        end
+    end
+    radios[RadioNum] = {{ station = station, RadioEnt = radio }}
+    RadioNum = RadioNum + 1
+end
+"
+            )
+        };
+        let admin = format!(
+            "radios = {{}}
+RadioNum = 0
+{}",
+            set_radio("AdminRadioSet")
+        );
+        let plugin = set_radio("PluginRadioSet");
+        let file_ids = ws.def_files(vec![
+            ("lua/autorun/server/sv_radioadmin.lua", admin.as_str()),
+            ("lua/autorun/server/sv_radio.lua", plugin.as_str()),
+        ]);
+
+        let key_types = file_ids
+            .iter()
+            .map(|file_id| settled_assign_decl_cached_ty(&mut ws, *file_id, "k"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            key_types,
+            vec![Some(LuaType::Integer), Some(LuaType::Integer)]
+        );
+    }
+
+    /// The same feedback written through another name for the iterated table:
+    /// `A` is `T`, so `A[k] = v` mints its key from the very domain the loop
+    /// derives, and the domain stays exactly the member names.
+    #[test]
+    fn pairs_write_back_through_an_alias_keeps_exact_key_domain() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![(
+            "lua/autorun/a_pairs_alias_write.lua",
+            r#"
+            local T = { a = "x", b = "y" }
+            local A = T
+            for k, v in pairs(T) do
+                A[k] = v
+                local observed_key = k
+            end
+            "#,
+        )]);
+
+        let key_ty = settled_assign_decl_cached_ty(&mut ws, file_ids[0], "observed_key")
+            .expect("observed_key cache");
+        let expected_keys: HashSet<_> = vec![
+            LuaType::StringConst(SmolStr::new("a").into()),
+            LuaType::StringConst(SmolStr::new("b").into()),
+        ]
+        .into_iter()
+        .collect();
+        let LuaType::Union(key_union) = &key_ty else {
+            panic!("expected exact key domain union, got {key_ty:?}");
+        };
+        assert_eq!(key_union.into_set(), expected_keys);
+    }
+
+    /// The same write is genuine evidence when the key is unknowable on its
+    /// own: `k` reassigned from an untyped call result before `T[k] = v` must
+    /// still file an `ExprType(Unknown)` member on `T`. Filtering
+    /// `ExprType(Unknown)` member keys outright — the tempting fix for the
+    /// self-write — would drop this evidence. The loop key's own settled
+    /// answer is not asserted here: a reassigned loop variable is a separate
+    /// behavior, and the before-assignment copy reads whatever the walk had
+    /// derived at that point.
+    #[test]
+    fn pairs_self_write_with_unknowable_key_keeps_unknown_member() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![(
+            "lua/autorun/a_pairs_self_write_unknown.lua",
+            r#"
+            local T = { a = "x", b = "y" }
+            local function f(mk)
+                for k, v in pairs(T) do
+                    k = mk()
+                    T[k] = v
+                end
+            end
+            "#,
+        )]);
+        let loop_file = file_ids[0];
+
+        let t_ty = settled_assign_decl_cached_ty(&mut ws, loop_file, "T").expect("T cache");
+        let db = ws.get_db_mut();
+        let t_members = get_member_map(db, &t_ty).expect("T member map");
+        assert!(
+            t_members
+                .keys()
+                .any(|key| matches!(key, LuaMemberKey::ExprType(LuaType::Unknown))),
+            "expected computed-key member on T, got {:?}",
+            t_members.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// An independent `ExprType(Unknown)` write sharing the member key the
+    /// self-write mints must survive: removing the placeholder contribution
+    /// may not take `T[mk()] = 1`'s evidence with it. The loop key stays
+    /// `string|unknown` because the dynamic write is real.
+    #[test]
+    fn pairs_self_write_does_not_remove_independent_unknown_key() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![(
+            "lua/autorun/a_pairs_self_write_shared.lua",
+            r#"
+            local T = { a = "x", b = "y" }
+            local function f(mk)
+                T[mk()] = 1
+                for k, v in pairs(T) do
+                    T[k] = v
+                    local observed_key = k
+                end
+            end
+            "#,
+        )]);
+        let loop_file = file_ids[0];
+
+        let key_ty = settled_assign_decl_cached_ty(&mut ws, loop_file, "observed_key")
+            .expect("observed_key cache");
+        let LuaType::Union(key_union) = &key_ty else {
+            panic!("expected sampled key union, got {key_ty:?}");
+        };
+        let key_set = key_union.into_set();
+        assert!(
+            key_set.contains(&LuaType::Unknown),
+            "unknown arm in {key_set:?}"
+        );
+        assert!(
+            key_set.contains(&LuaType::String),
+            "string arm in {key_set:?}"
+        );
+    }
+
+    /// `U[k] = v` writes a different table through the settling key: the
+    /// dynamic member lands on `U`, never on `T`, so `T`'s domain is exactly
+    /// its own members — including `other`, contributed by a sibling write
+    /// outside the literal — while `U` holds the computed-key member.
+    #[test]
+    fn pairs_iter_var_write_to_sibling_table_stays_off_the_iterated_domain() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_ids = ws.def_files(vec![(
+            "lua/autorun/a_pairs_sibling_write.lua",
+            r#"
+            local T = { a = "x", b = "y" }
+            local U = {}
+            for k, v in pairs(T) do
+                U[k] = v
+                local observed_key = k
+            end
+            T.other = "z"
+            "#,
+        )]);
+        let loop_file = file_ids[0];
+
+        let key_ty = settled_assign_decl_cached_ty(&mut ws, loop_file, "observed_key")
+            .expect("observed_key cache");
+        let LuaType::Union(key_union) = &key_ty else {
+            panic!("expected exact key domain union, got {key_ty:?}");
+        };
+        let expected_keys: HashSet<_> = vec![
+            LuaType::StringConst(SmolStr::new("a").into()),
+            LuaType::StringConst(SmolStr::new("b").into()),
+            LuaType::StringConst(SmolStr::new("other").into()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(key_union.into_set(), expected_keys);
+
+        let u_ty = settled_assign_decl_cached_ty(&mut ws, loop_file, "U").expect("U cache");
+        let db = ws.get_db_mut();
+        let u_members = get_member_map(db, &u_ty).expect("U member map");
+        assert!(
+            u_members
+                .keys()
+                .any(|key| matches!(key, LuaMemberKey::ExprType(_))),
+            "expected computed-key member on U, got {:?}",
+            u_members.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Writing a loop's own value back (`T[k] = v` inside `for k, v in
+    /// pairs(T)`) puts back an element `T` already holds, so its value is
+    /// feedback like its key: an element type a later file settles must not
+    /// stay mixed with what the write-back carried before.
+    #[test]
+    fn a_loop_value_written_back_keeps_no_earlier_element_type() {
+        const CONFIGURATION: (&str, &str) = (
+            "gamemodes/cityrp/gamemode/core/sh_configuration.lua",
+            r#"cityrp = cityrp or {}
+cityrp.configuration = cityrp.configuration or {}
+cityrp.configuration.passes = {
+    green = {
+        name = "Visitor",
+        color = MakeColor(),
+    },
+    custom = {
+        title = "Custom",
+        color = MakeColor(),
+        presOnly = true,
+    },
+}
+for key, data in pairs(cityrp.configuration.passes) do
+    if not data.title and data.name then
+        data.title = data.name
+        cityrp.configuration.passes[key] = data
+    end
+end
+"#,
+        );
+        // `MakeColor` resolves to the first of its declarations by path, so a
+        // file created later but sorting first changes what the literal holds.
+        const LATER_MAKER: (&str, &str) = (
+            "gamemodes/cityrp/gamemode/core/a_color.lua",
+            "---@return string\nfunction MakeColor() end\n",
+        );
+        const EARLIER_MAKER: (&str, &str) = (
+            "gamemodes/cityrp/gamemode/core/z_color.lua",
+            "---@return integer\nfunction MakeColor() end\n",
+        );
+        const CONSUMER: (&str, &str) = (
+            "gamemodes/cityrp/plugins/contextmenu/contexts/sh_government.lua",
+            "for _, pass in pairs(cityrp.configuration.passes) do\n    passColor = pass.color\nend\n",
+        );
+        let pass_color = |batches: &[&[(&str, &str)]]| {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            for batch in batches {
+                ws.def_files(batch.to_vec());
+            }
+            let ty = ws.expr_ty("passColor");
+            ws.humanize_type(ty)
+        };
+        assert_eq!(
+            pass_color(&[&[EARLIER_MAKER, CONFIGURATION, CONSUMER], &[LATER_MAKER]]),
+            pass_color(&[&[EARLIER_MAKER, LATER_MAKER, CONFIGURATION, CONSUMER]])
+        );
     }
 }

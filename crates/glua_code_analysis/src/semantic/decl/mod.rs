@@ -1,4 +1,6 @@
-use std::collections::HashSet;
+pub(crate) mod value;
+
+use rustc_hash::FxHashSet;
 
 use glua_parser::{LuaAstNode, LuaCallExpr, LuaIndexExpr, LuaSyntaxKind};
 use rowan::NodeOrToken;
@@ -45,13 +47,13 @@ pub fn enum_variable_is_param(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclGuard {
-    decl_set: HashSet<LuaDeclId>,
+    decl_set: FxHashSet<LuaDeclId>,
 }
 
 impl DeclGuard {
     pub fn new() -> Self {
         Self {
-            decl_set: HashSet::new(),
+            decl_set: FxHashSet::default(),
         }
     }
 
@@ -72,14 +74,13 @@ fn find_enum_origin(
     decl_guard: &mut DeclGuard,
 ) -> Option<LuaDeclId> {
     decl_guard.check(decl_id)?;
-    let syntax_tree = db.get_vfs().get_syntax_tree(&decl_id.file_id)?;
-    let root = syntax_tree.get_red_root();
-
-    let node = db
+    let value_syntax_id = db
         .get_decl_index()
         .get_decl(&decl_id)?
-        .get_value_syntax_id()?
-        .to_node_from_root(&root)?;
+        .get_value_syntax_id()?;
+    let node = db
+        .get_vfs()
+        .syntax_node_around(&decl_id.file_id, value_syntax_id)?;
 
     let semantic_decl = match node.into() {
         NodeOrToken::Node(node) => {
@@ -104,7 +105,7 @@ fn find_enum_origin(
     }
 }
 
-/// 解析 require 调用表达式并获取模块信息
+/// Parses a require call expression and gets the module info
 pub fn parse_require_module_info<'a>(
     semantic_model: &'a SemanticModel,
     decl: &LuaDecl,
@@ -117,16 +118,7 @@ pub fn parse_require_module_info<'a>(
     let node = semantic_model
         .get_db()
         .get_vfs()
-        .get_syntax_tree(&decl.get_file_id())
-        .and_then(|tree| {
-            let root = tree.get_red_root();
-            semantic_model
-                .get_db()
-                .get_decl_index()
-                .get_decl(&decl.get_id())
-                .and_then(|decl| decl.get_value_syntax_id())
-                .and_then(|syntax_id| syntax_id.to_node_from_root(&root))
-        })?;
+        .syntax_node_around(&decl.get_file_id(), value_syntax_id)?;
 
     let call_expr = LuaCallExpr::cast(node)?;
     let arg_list = call_expr.get_args_list()?;

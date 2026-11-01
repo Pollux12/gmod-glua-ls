@@ -76,7 +76,7 @@ fn get_member_name_token_lsp_range(
         return document.to_lsp_range(token.get_range());
     }
 
-    // 此时可能是 [] 访问
+    // This may be a [] access
     if node.token::<LuaIndexToken>().is_some() {
         match node {
             LuaAst::LuaDocTagField(tag) => {

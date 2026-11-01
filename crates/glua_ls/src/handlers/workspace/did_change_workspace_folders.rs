@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use glua_code_analysis::{WorkspaceFolder, uri_to_file_path};
 use lsp_types::DidChangeWorkspaceFoldersParams;
@@ -59,11 +59,66 @@ pub async fn on_did_change_workspace_folders(
         )
     };
 
-    let client_config = get_client_config(&context, client_id, supports_config_request).await;
+    let mut client_config = get_client_config(&context, client_id, supports_config_request).await;
 
     let mut workspace_manager = context.workspace_manager().write().await;
+    client_config.keep_session_options(&workspace_manager.client_config);
     workspace_manager.client_config = client_config;
-    workspace_manager.add_reload_workspace_task(context.workspace_manager_arc());
+    workspace_manager
+        .schedule_config_reload(Duration::ZERO, context.workspace_manager_arc())
+        .await;
 
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use lsp_server::Connection;
+    use lsp_types::{
+        ClientCapabilities, DidChangeWorkspaceFoldersParams, WorkspaceFolder,
+        WorkspaceFoldersChangeEvent,
+    };
+
+    use crate::context::ServerContext;
+
+    /// Adding a folder reads the client's settings again, which do not carry
+    /// what the command line and the initialization options set.
+    #[test]
+    fn a_folder_change_keeps_the_options_set_at_initialization() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let folder = crate::util::TempDir::new("gmod_glua_ls_folder_change");
+        let kept = runtime.block_on(async {
+            let (connection, _peer) = Connection::memory();
+            let context = ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            {
+                let mut manager = snapshot.workspace_manager().write().await;
+                manager.client_config.gmod_annotations_path = Some("annotations".to_string());
+                manager.client_config.gamemode_base_libraries = vec!["sandbox".to_string()];
+            }
+            super::on_did_change_workspace_folders(
+                snapshot.clone(),
+                DidChangeWorkspaceFoldersParams {
+                    event: WorkspaceFoldersChangeEvent {
+                        added: vec![WorkspaceFolder {
+                            uri: glua_code_analysis::file_path_to_uri(&folder.to_path_buf())
+                                .expect("folder URI"),
+                            name: "added".to_string(),
+                        }],
+                        removed: Vec::new(),
+                    },
+                },
+            )
+            .await;
+            let manager = snapshot.workspace_manager().read().await;
+            (
+                manager.client_config.gmod_annotations_path.clone(),
+                manager.client_config.gamemode_base_libraries.clone(),
+            )
+        });
+        assert_eq!(
+            kept,
+            (Some("annotations".to_string()), vec!["sandbox".to_string()])
+        );
+    }
 }

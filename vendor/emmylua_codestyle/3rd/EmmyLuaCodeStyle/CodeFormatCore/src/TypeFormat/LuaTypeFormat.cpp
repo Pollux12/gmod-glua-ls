@@ -1,4 +1,4 @@
-﻿#include "CodeFormatCore/TypeFormat/LuaTypeFormat.h"
+#include "CodeFormatCore/TypeFormat/LuaTypeFormat.h"
 #include "CodeFormatCore/RangeFormat/RangeFormatBuilder.h"
 #include "LuaParser/Lexer/LuaTokenTypeDetail.h"
 #include "Util/StringUtil.h"

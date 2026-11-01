@@ -1,3 +1,7 @@
+pub mod cpu;
+pub mod memory;
+pub mod work;
+
 use log::info;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -13,6 +17,20 @@ use std::time::{Duration, Instant};
 /// "is this phase allocation-bound?" a measurement rather than a guess.
 pub static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Estimated heap bytes of a hash table with `capacity` entries of
+/// `entry_size` bytes: its buckets and their control bytes.
+pub(crate) fn hash_table_bytes(capacity: usize, entry_size: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = (capacity * 8 / 7).next_power_of_two();
+    buckets * (entry_size + 1)
+}
+
+pub(crate) fn megabytes(bytes: usize) -> usize {
+    bytes / 1_048_576
+}
 
 /// True while a `Profile` whose name matches `GLUALS_PROFILE_SAMPLE` is alive.
 /// An allocation sampler can gate on this to profile one phase instead of the
@@ -50,8 +68,9 @@ fn alloc_snapshot() -> (u64, u64) {
     )
 }
 
-/// Named sub-phase accumulator, gated on `GLUALS_PROFILE_PHASE`.
-fn phase_enabled() -> bool {
+/// Named sub-phase accumulator, gated on `GLUALS_PROFILE_PHASE`. Per-file
+/// detail prints are gated on it too, so `GLUALS_PROFILE` stays per-run.
+pub(crate) fn phase_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_PROFILE_PHASE").is_some())
 }
@@ -105,22 +124,26 @@ impl Drop for PhaseGuard {
         let Some((start, allocs_before)) = self.start else {
             return;
         };
-        let elapsed = start.elapsed();
         let allocs = ALLOC_COUNT
             .load(Ordering::Relaxed)
             .saturating_sub(allocs_before);
-        let mut phases = PHASES.lock().unwrap_or_else(|poison| poison.into_inner());
-        match phases
-            .iter_mut()
-            .find(|(phase, _, _, _)| *phase == self.name)
-        {
-            Some((_, total, count, total_allocs)) => {
-                *total += elapsed;
-                *count += 1;
-                *total_allocs += allocs;
-            }
-            None => phases.push((self.name, elapsed, 1, allocs)),
+        add_phase(self.name, start.elapsed(), allocs);
+    }
+}
+
+/// Accumulates `elapsed` and `allocs` under `name`, as one call.
+pub fn add_phase(name: &'static str, elapsed: Duration, allocs: u64) {
+    if !phase_enabled() {
+        return;
+    }
+    let mut phases = PHASES.lock().unwrap_or_else(|poison| poison.into_inner());
+    match phases.iter_mut().find(|(phase, _, _, _)| *phase == name) {
+        Some((_, total, count, total_allocs)) => {
+            *total += elapsed;
+            *count += 1;
+            *total_allocs += allocs;
         }
+        None => phases.push((name, elapsed, 1, allocs)),
     }
 }
 
@@ -149,9 +172,16 @@ pub struct Profile<'a> {
 /// When `GLUALS_PROFILE` is set, phase-level `Profile` timers print to stderr
 /// even without Info-level logging. This gives clean per-phase numbers without
 /// the per-node instrumentation overhead that distorts Info-level runs.
-fn phase_profile_enabled() -> bool {
+pub fn profiling() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_PROFILE").is_some())
+}
+
+/// When `GLUALS_TRACE_EVALUATIONS` is set, the engine prints every derivation
+/// it evaluates with the key that queued it and the reads that moved.
+pub fn tracing_evaluations() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_TRACE_EVALUATIONS").is_some())
 }
 
 #[allow(unused)]
@@ -168,7 +198,7 @@ impl<'a> Profile<'a> {
     }
 
     pub fn cond_new(name: &'a str, cond: bool) -> Option<Self> {
-        if (cond && log::log_enabled!(log::Level::Info)) || phase_profile_enabled() {
+        if cond && (log::log_enabled!(log::Level::Info) || profiling()) {
             Some(Self::new(name))
         } else {
             None
@@ -185,7 +215,7 @@ impl<'a> Drop for Profile<'a> {
         if log::log_enabled!(log::Level::Info) {
             info!("{}: cost {:?}", self.name, duration);
         }
-        if phase_profile_enabled() {
+        if profiling() {
             let (count, bytes) = alloc_snapshot();
             let allocs = count.saturating_sub(self.allocs.0);
             if allocs == 0 {

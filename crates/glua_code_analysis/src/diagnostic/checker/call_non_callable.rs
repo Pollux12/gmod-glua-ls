@@ -1,6 +1,7 @@
 use glua_parser::{LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr};
 use std::collections::BTreeSet;
 
+use crate::semantic::{infer_expr, semantic_decl_value};
 use crate::{
     DbIndex, DiagnosticCode, InferFailReason, InferGuard, LuaInferCache, LuaSemanticDeclId,
     LuaType, RenderLevel, SemanticDeclLevel, SemanticModel,
@@ -16,7 +17,10 @@ impl Checker for CallNonCallableChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::CallNonCallable];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        for call_expr in semantic_model.get_root().descendants::<LuaCallExpr>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for call_expr in buckets.call_exprs.iter().cloned() {
             check_call_expr(context, semantic_model, call_expr);
         }
     }
@@ -129,15 +133,13 @@ fn infer_call_target_type(
             Some(decl.get_id())
         })?;
 
-    let decl = db.get_decl_index().get_decl(&decl_id)?;
-    let value_syntax_id = decl.get_value_syntax_id()?;
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&decl_id.file_id)?
-        .get_red_root();
-    let node = value_syntax_id.to_node_from_root(&root)?;
-    let expr = LuaExpr::cast(node)?;
-    semantic_model.infer_expr(expr).ok()
+    let (value_file_id, expr) = semantic_decl_value(db, LuaSemanticDeclId::LuaDecl(decl_id))?;
+    if value_file_id == file_id {
+        return semantic_model.infer_expr(expr).ok();
+    }
+    let config = semantic_model.get_cache().borrow_mut().get_config().clone();
+    let mut value_cache = LuaInferCache::new(value_file_id, config);
+    infer_expr(db, &mut value_cache, expr).ok()
 }
 
 fn has_non_callable_member(db: &DbIndex, typ: &LuaType) -> bool {

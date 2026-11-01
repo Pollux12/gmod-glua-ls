@@ -1,4 +1,598 @@
 #[cfg(test)]
+mod nominal_false_edge_tests {
+    use crate::{DiagnosticCode, FileId, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaCallExpr};
+    use tokio_util::sync::CancellationToken;
+
+    const PREDICATE_PATH: &str = "lua/includes/predicates.lua";
+    const PREDICATE: &str =
+        "local classify = type\nfunction isvector(value) return classify(value) == 'Vector' end\n";
+    const SOURCE: &str = r#"
+---@param box ResidualVectorBox
+local function inspect(box)
+    local col = box.value
+    if isvector(box.value) then col = box.value:ToColor() end
+    need_color(col)
+    if not isvector(box.value) then need_color(box.value) end
+    need_color(box.value)
+end
+"#;
+
+    fn workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "annotations/residual_geometry.lua",
+            r#"
+---@meta
+---@class Vector
+local VECTOR = {}
+---@class Color
+local COLOR = {}
+---@return Color
+function VECTOR:ToColor() end
+---@class ResidualVectorBox
+---@field value Color|Vector
+local HOLDER = {}
+---@param value Color
+function need_color(value) end
+"#,
+        );
+        ws
+    }
+
+    fn diagnostics(ws: &mut VirtualWorkspace, file: FileId) -> Vec<(lsp_types::Range, String)> {
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::ParamTypeMismatch);
+        let mut diagnostics = ws
+            .analysis
+            .diagnose_file(file, CancellationToken::new())
+            .unwrap()
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range, diagnostic.message))
+            .collect::<Vec<_>>();
+        diagnostics.sort_by_key(|(range, _)| (range.start.line, range.start.character));
+        diagnostics
+    }
+
+    fn expected(
+        ws: &VirtualWorkspace,
+        file: FileId,
+        guarded: bool,
+    ) -> Vec<(lsp_types::Range, String)> {
+        let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
+        let calls = model
+            .get_root()
+            .descendants::<LuaCallExpr>()
+            .filter(|call| {
+                call.get_prefix_expr()
+                    .is_some_and(|prefix| prefix.syntax().text() == "need_color")
+            })
+            .collect::<Vec<_>>();
+        calls
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !guarded || *index == 2)
+            .map(|(_, call)| {
+                (
+                    model
+                        .get_document()
+                        .to_lsp_range(
+                            call.get_args_list()
+                                .unwrap()
+                                .get_args()
+                                .next()
+                                .unwrap()
+                                .get_range(),
+                        )
+                        .unwrap(),
+                    "expected `Color` but found `(Color|Vector)`. ".to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_variadic_arg_narrowed_inside_loop_is_not_nil() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param ... number
+            local function smallest(...) end
+
+            local function scan()
+                local best
+                for i = 1, 3 do
+                    if not best then
+                        best = i
+                    else
+                        smallest(best, i)
+                    end
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn nominal_false_edge_narrows_a_field_and_its_prebranch_alias() {
+        let mut ws = workspace();
+        ws.def_file(PREDICATE_PATH, PREDICATE);
+        let file = ws.def_file("lua/vgui/prop_vectorcolor.lua", SOURCE);
+        let expected = expected(&ws, file, true);
+        assert_eq!(diagnostics(&mut ws, file), expected);
+    }
+
+    #[test]
+    fn nominal_false_edge_predicate_edits_delete_reopen_and_revert_match_cold() {
+        let mut warm = workspace();
+        let predicate = warm.def_file(PREDICATE_PATH, PREDICATE);
+        let uri = warm.analysis.get_uri(predicate).unwrap();
+        let path = "lua/vgui/prop_vectorcolor.lua";
+        let file = warm.def_file(path, SOURCE);
+        for text in [
+            Some(PREDICATE),
+            Some("function isvector(value) return true end"),
+            None,
+            Some(PREDICATE),
+        ] {
+            if let Some(text) = text {
+                warm.analysis
+                    .update_file_by_uri(&uri, Some(text.to_string()));
+            } else {
+                warm.analysis.remove_file_by_uri(&uri).0.unwrap();
+            }
+            let mut cold = workspace();
+            if let Some(text) = text {
+                cold.def_file(PREDICATE_PATH, text);
+            }
+            let cold_file = cold.def_file(path, SOURCE);
+            let expected = expected(&cold, cold_file, text == Some(PREDICATE));
+            assert_eq!(diagnostics(&mut cold, cold_file), expected, "cold {text:?}");
+            assert_eq!(diagnostics(&mut warm, file), expected, "warm {text:?}");
+        }
+    }
+
+    const EXACT_NAME_CLASSES: &str = r#"
+---@class F1Parent
+local PARENT = {}
+function PARENT:ParentOnly() end
+---@class F1Other
+local OTHER = {}
+function OTHER:OtherOnly() end
+"#;
+    const EXACT_NAME_CHILD: &str =
+        "---@class F1Child: F1Parent\nlocal CHILD = {}\nfunction CHILD:ChildOnly() end\n";
+
+    fn exact_name_workspace(child: bool) -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file("lua/includes/nominal_classes.lua", EXACT_NAME_CLASSES);
+        if child {
+            ws.def_file("lua/includes/nominal_child.lua", EXACT_NAME_CHILD);
+        }
+        ws
+    }
+
+    fn exact_name_diagnostics(
+        ws: &mut VirtualWorkspace,
+        file: FileId,
+    ) -> Vec<(Option<lsp_types::NumberOrString>, lsp_types::Range, String)> {
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::InferUnguardedChild);
+        let mut diagnostics = ws
+            .analysis
+            .diagnose_file(file, CancellationToken::new())
+            .unwrap()
+            .into_iter()
+            .map(|diagnostic| (diagnostic.code, diagnostic.range, diagnostic.message))
+            .collect::<Vec<_>>();
+        diagnostics.sort_by_key(|(_, range, _)| (range.start.line, range.start.character));
+        diagnostics
+    }
+
+    fn exact_name_expected(
+        ws: &VirtualWorkspace,
+        file: FileId,
+        receiver: &str,
+    ) -> Vec<(Option<lsp_types::NumberOrString>, lsp_types::Range, String)> {
+        let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
+        let union = if receiver == "F1Parent" {
+            "F1Other|F1Parent"
+        } else {
+            "F1Child|F1Other"
+        };
+        model.get_root().descendants::<LuaCallExpr>()
+            .filter_map(|call| call.get_prefix_expr())
+            .filter(|prefix| prefix.syntax().text() == "value:OtherOnly")
+            .map(|prefix| (
+                Some(lsp_types::NumberOrString::String("infer-unguarded-child".to_string())),
+                model.get_document().to_lsp_range(prefix.get_range()).unwrap(),
+                format!("`OtherOnly` is only defined on `F1Other`, but the value is `({union})`. Add a guard that narrows it to `F1Other`."),
+            )).collect()
+    }
+
+    #[test]
+    fn negative_exact_nominal_names_keep_declared_parent_and_child_arms() {
+        for predicate in [
+            "local classify = type\n---@param value F1Parent|F1Other\nlocal function notparent(value) return classify(value) ~= 'F1Parent' end",
+            "---@param value F1Parent|F1Other\nlocal function notparent(value) if type(value) == 'F1Parent' then return false end return true end",
+            "local function isparent(value) return type(value) == 'F1Parent' end\nlocal function notparent(value) return not isparent(value) end",
+        ] {
+            let mut ws = exact_name_workspace(true);
+            let source = format!(
+                "{predicate}\n---@param value F1Child|F1Other\nlocal function inspect(value) if notparent(value) then value:OtherOnly() end end\n"
+            );
+            let file = ws.def_file("lua/autorun/server/sv_nominal_negative.lua", &source);
+            let expected = exact_name_expected(&ws, file, "F1Child");
+            assert_eq!(
+                exact_name_diagnostics(&mut ws, file),
+                expected,
+                "{predicate}"
+            );
+        }
+        for condition in ["type(value) ~= 'F1Parent'", "classify(value) ~= 'F1Parent'"] {
+            let mut ws = exact_name_workspace(true);
+            let source = format!(
+                "local classify = type\n---@param value F1Parent|F1Other\nlocal function inspect(value) if {condition} then value:OtherOnly() end end\n"
+            );
+            let file = ws.def_file("lua/autorun/server/sv_nominal_direct.lua", &source);
+            let expected = exact_name_expected(&ws, file, "F1Parent");
+            assert_eq!(
+                exact_name_diagnostics(&mut ws, file),
+                expected,
+                "{condition}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_nominal_name_leaf_false_and_parent_true_edges_still_narrow() {
+        let mut ws = exact_name_workspace(false);
+        let file = ws.def_file(
+            "lua/autorun/server/sv_nominal_controls.lua",
+            r#"
+---@param value F1Parent|F1Other
+local function notparent(value) return type(value) ~= 'F1Parent' end
+---@param value F1Parent|F1Other
+local function inspect(value)
+    if type(value) ~= 'F1Parent' then value:OtherOnly() end
+    if notparent(value) then value:OtherOnly() end
+    if type(value) == 'F1Parent' then value:ParentOnly() end
+end
+"#,
+        );
+        assert_eq!(exact_name_diagnostics(&mut ws, file), Vec::new());
+        ws.def_file("lua/includes/nominal_child.lua", EXACT_NAME_CHILD);
+        let file = ws.def_file(
+            "lua/autorun/server/sv_nominal_positive.lua",
+            r#"
+---@param value F1Parent|F1Other
+local function inspect(value)
+    if type(value) == 'F1Parent' then value:ParentOnly() end
+end
+"#,
+        );
+        assert_eq!(exact_name_diagnostics(&mut ws, file), Vec::new());
+        let file = ws.def_file(
+            "lua/autorun/server/sv_nominal_typeguard.lua",
+            r#"
+---@param value F1Parent|F1Other
+---@return TypeGuard<F1Parent>
+local function isparent(value) end
+---@param value F1Child|F1Other
+local function inspect(value)
+    if not isparent(value) then value:OtherOnly() end
+end
+"#,
+        );
+        let expected = exact_name_expected(&ws, file, "F1Child");
+        assert_eq!(exact_name_diagnostics(&mut ws, file), expected);
+    }
+
+    const TYPE_TEST_CLASSES: &str = r#"
+---@meta
+---@class Entity
+local ENTITY = {}
+---@class Player: Entity
+local PLAYER = {}
+---@class NULL: Entity
+local NULL_ENTITY = {}
+---@class Color
+local COLOR = {}
+---@class DerivedColor: Color
+local DERIVED_COLOR = {}
+---@param value string
+function need_string(value) end
+"#;
+    const ENTITY_TYPE_TEST: &str = "---@meta\n---@param value any\n---@return TypeGuard<Entity>\n---@[exhaustive_type_guard]\nfunction isentity(value) end\n";
+    const TYPE_TEST_PATH: &str = "annotations/entity_guard.lua";
+
+    fn type_test_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file("annotations/type_test_classes.lua", TYPE_TEST_CLASSES);
+        ws
+    }
+
+    fn string_call_expected(
+        ws: &VirtualWorkspace,
+        file: FileId,
+        mismatches: &[(usize, &str)],
+    ) -> Vec<(lsp_types::Range, String)> {
+        let model = ws.analysis.compilation.get_semantic_model(file).unwrap();
+        let calls = model
+            .get_root()
+            .descendants::<LuaCallExpr>()
+            .filter(|call| {
+                call.get_prefix_expr()
+                    .is_some_and(|prefix| prefix.syntax().text() == "need_string")
+            })
+            .collect::<Vec<_>>();
+        mismatches
+            .iter()
+            .map(|(index, found)| {
+                (
+                    model
+                        .get_document()
+                        .to_lsp_range(
+                            calls[*index]
+                                .get_args_list()
+                                .unwrap()
+                                .get_args()
+                                .next()
+                                .unwrap()
+                                .get_range(),
+                        )
+                        .unwrap(),
+                    format!("expected `string` but found `{found}`. "),
+                )
+            })
+            .collect()
+    }
+
+    fn type_test_source(typ: &str, predicate: &str) -> String {
+        format!(
+            "---@param value {typ}\nlocal function inspect(value)\n    if not {predicate}(value) then need_string(value) end\n    need_string(value)\nend\n"
+        )
+    }
+
+    #[test]
+    fn exhaustive_type_guard_false_edge_removes_player_and_null() {
+        for typ in ["Player|string", "NULL|string"] {
+            let mut ws = type_test_workspace();
+            ws.def_file(TYPE_TEST_PATH, ENTITY_TYPE_TEST);
+            let file = ws.def_file(
+                "lua/autorun/server/sv_entity_guard.lua",
+                &type_test_source(typ, "isentity"),
+            );
+            let found = format!("({typ})");
+            let expected = string_call_expected(&ws, file, &[(1, &found)]);
+            assert_eq!(diagnostics(&mut ws, file), expected, "{typ}");
+        }
+    }
+
+    #[test]
+    fn nonexhaustive_type_guard_false_edge_keeps_player_and_null() {
+        for typ in ["Player|string", "NULL|string"] {
+            let mut ws = type_test_workspace();
+            ws.def_file(
+                TYPE_TEST_PATH,
+                &ENTITY_TYPE_TEST.replace("---@[exhaustive_type_guard]\n", ""),
+            );
+            let file = ws.def_file(
+                "lua/autorun/server/sv_entity_subset.lua",
+                &type_test_source(typ, "isentity"),
+            );
+            let found = format!("({typ})");
+            let expected = string_call_expected(&ws, file, &[(0, &found), (1, &found)]);
+            assert_eq!(diagnostics(&mut ws, file), expected, "{typ}");
+        }
+    }
+
+    #[test]
+    fn exact_metatable_type_guard_false_edge_keeps_color_subclasses() {
+        let mut ws = type_test_workspace();
+        ws.def_file(
+            "annotations/color_guard.lua",
+            r#"
+---@meta
+---@param var any
+---@return TypeGuard<Color> isColor
+function IsColor(var) end
+"#,
+        );
+        let file = ws.def_file(
+            "lua/autorun/client/cl_color_guard.lua",
+            &type_test_source("DerivedColor|string", "IsColor"),
+        );
+        let expected = string_call_expected(
+            &ws,
+            file,
+            &[(0, "(DerivedColor|string)"), (1, "(DerivedColor|string)")],
+        );
+        assert_eq!(diagnostics(&mut ws, file), expected);
+    }
+
+    #[test]
+    fn validity_type_guard_false_edge_keeps_null() {
+        let mut ws = type_test_workspace();
+        ws.def_file(
+            "annotations/validity_guard.lua",
+            r#"
+---@meta
+---@param value any
+---@return TypeGuard<any>
+---@return_cast value -NULL
+---@[valid_guard]
+function IsValid(value) end
+---@param value any
+---@return TypeGuard<Entity>
+---@[valid_guard]
+function live_entity(value) return IsValid(value) and isentity(value) end
+"#,
+        );
+        ws.def_file(TYPE_TEST_PATH, ENTITY_TYPE_TEST);
+        for predicate in ["IsValid", "live_entity"] {
+            let file = ws.def_file(
+                "lua/autorun/server/sv_validity_guard.lua",
+                &type_test_source("NULL|string", predicate),
+            );
+            let expected =
+                string_call_expected(&ws, file, &[(0, "(NULL|string)"), (1, "(NULL|string)")]);
+            assert_eq!(diagnostics(&mut ws, file), expected, "{predicate}");
+        }
+    }
+
+    #[test]
+    fn exhaustive_type_guard_is_ingested_on_the_signature() {
+        let attached = ENTITY_TYPE_TEST.replace(
+            "---@return TypeGuard<Entity>
+---@[exhaustive_type_guard]",
+            "---@[exhaustive_type_guard]
+---@return TypeGuard<Entity>",
+        );
+        for text in [ENTITY_TYPE_TEST, attached.as_str()] {
+            let mut ws = type_test_workspace();
+            ws.def_file(TYPE_TEST_PATH, text);
+            let db = ws.analysis.compilation.get_db();
+            let marked = db
+                .get_signature_index()
+                .iter()
+                .filter(|(id, _)| crate::signature_is_exhaustive_type_guard(db, **id))
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            assert_eq!(marked.len(), 1);
+            let uses = crate::signature_attribute_uses(db, marked[0]).unwrap();
+            assert_eq!(
+                uses.iter()
+                    .map(|attribute| attribute.id.get_name())
+                    .collect::<Vec<_>>(),
+                vec![crate::GMOD_ATTR_EXHAUSTIVE_TYPE_GUARD]
+            );
+        }
+    }
+
+    #[test]
+    fn exhaustive_type_guard_attribute_edit_remove_and_revert_match_cold() {
+        let mut warm = type_test_workspace();
+        let predicate = warm.def_file(TYPE_TEST_PATH, ENTITY_TYPE_TEST);
+        let uri = warm.analysis.get_uri(predicate).unwrap();
+        let source = type_test_source("Player|string", "isentity");
+        let path = "lua/autorun/server/sv_type_test_lifecycle.lua";
+        let file = warm.def_file(path, &source);
+        let unmarked = ENTITY_TYPE_TEST.replace("---@[exhaustive_type_guard]\n", "");
+        for text in [
+            Some(ENTITY_TYPE_TEST),
+            Some(unmarked.as_str()),
+            Some(ENTITY_TYPE_TEST),
+            None,
+            Some(ENTITY_TYPE_TEST),
+        ] {
+            if let Some(text) = text {
+                warm.analysis
+                    .update_file_by_uri(&uri, Some(text.to_string()));
+            } else {
+                warm.analysis.remove_file_by_uri(&uri).0.unwrap();
+            }
+            let mut cold = type_test_workspace();
+            if let Some(text) = text {
+                cold.def_file(TYPE_TEST_PATH, text);
+            }
+            let cold_file = cold.def_file(path, &source);
+            let mismatches = if text == Some(ENTITY_TYPE_TEST) {
+                vec![(1, "(Player|string)")]
+            } else {
+                vec![(0, "(Player|string)"), (1, "(Player|string)")]
+            };
+            let expected = string_call_expected(&cold, cold_file, &mismatches);
+            assert_eq!(diagnostics(&mut cold, cold_file), expected, "cold {text:?}");
+            assert_eq!(diagnostics(&mut warm, file), expected, "warm {text:?}");
+        }
+    }
+
+    #[test]
+    fn negative_exact_nominal_names_track_subclass_add_delete_and_reopen() {
+        let source = r#"
+---@param value F1Parent|F1Other
+local function notparent(value) return type(value) ~= 'F1Parent' end
+---@param value F1Parent|F1Other
+local function multireturn(value)
+    if type(value) == 'F1Parent' then return false end
+    return true
+end
+---@param value F1Parent|F1Other
+local function direct(value) if type(value) ~= 'F1Parent' then value:OtherOnly() end end
+---@param value F1Parent|F1Other
+local function helper(value) if notparent(value) then value:OtherOnly() end end
+---@param value F1Parent|F1Other
+local function multi(value) if multireturn(value) then value:OtherOnly() end end
+"#;
+        let path = "lua/autorun/server/sv_nominal_lifecycle.lua";
+        let mut warm = exact_name_workspace(false);
+        let file = warm.def_file(path, source);
+        let mut subclass_uri = None;
+        for present in [false, true, false, true] {
+            if present {
+                let child = warm.def_file("lua/includes/nominal_child.lua", EXACT_NAME_CHILD);
+                subclass_uri = Some(warm.analysis.get_uri(child).unwrap());
+            } else if let Some(uri) = &subclass_uri {
+                warm.analysis.remove_file_by_uri(uri).0.unwrap();
+            }
+            let mut cold = exact_name_workspace(present);
+            let cold_file = cold.def_file(path, source);
+            let expected = if present {
+                exact_name_expected(&cold, cold_file, "F1Parent")
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                exact_name_diagnostics(&mut cold, cold_file),
+                expected,
+                "cold {present}"
+            );
+            assert_eq!(
+                exact_name_diagnostics(&mut warm, file),
+                expected,
+                "warm {present}"
+            );
+        }
+    }
+
+    #[test]
+    fn nominal_false_edge_retracts_when_a_subclass_with_another_runtime_name_is_added() {
+        let mut warm = workspace();
+        warm.def_file(PREDICATE_PATH, PREDICATE);
+        let path = "lua/vgui/prop_vectorcolor.lua";
+        let file = warm.def_file(path, SOURCE);
+        let subclass_path = "lua/includes/custom_vector.lua";
+        let subclass = "---@class CustomVector: Vector\n";
+        let mut subclass_uri = None;
+        for present in [false, true, false, true] {
+            if present {
+                let subclass_file = warm.def_file(subclass_path, subclass);
+                subclass_uri = Some(warm.analysis.get_uri(subclass_file).unwrap());
+            } else if let Some(uri) = &subclass_uri {
+                warm.analysis.remove_file_by_uri(uri).0.unwrap();
+            }
+            let mut cold = workspace();
+            cold.def_file(PREDICATE_PATH, PREDICATE);
+            if present {
+                cold.def_file(subclass_path, subclass);
+            }
+            let cold_file = cold.def_file(path, SOURCE);
+            let expected = expected(&cold, cold_file, !present);
+            assert_eq!(
+                diagnostics(&mut cold, cold_file),
+                expected,
+                "cold {present}"
+            );
+            assert_eq!(diagnostics(&mut warm, file), expected, "warm {present}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod test {
     use std::{ops::Deref, sync::Arc};
 
@@ -7,6 +601,152 @@ mod test {
     use tokio_util::sync::CancellationToken;
 
     use crate::{DiagnosticCode, Emmyrc, LuaMemberId, LuaType, LuaTypeCache, VirtualWorkspace};
+
+    /// Calling a module whose `__call` metamethod takes the module first
+    /// passes the arguments after it: the module is not the first argument.
+    #[test]
+    fn a_callable_module_checks_its_arguments_against_the_call_operator() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Buffer
+
+            ---@class BufferModule
+            ---@operator call(string|table): Buffer
+            local BufferModule = {}
+            setmetatable(BufferModule, {
+                __call = function(_, data, little_endian) return {} end,
+            })
+
+            ---@type boolean?
+            local little_endian
+            local buffer = BufferModule("data", little_endian)
+        "#
+        ));
+    }
+
+    /// `---@operator call: T` lists no parameters: the call's arguments are
+    /// unconstrained, not absent.
+    #[test]
+    fn a_call_operator_without_a_parameter_list_accepts_any_arguments() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+            ---@class Delta
+
+            ---@class DeltaModule
+            ---@operator call: Delta
+            local DeltaModule = {}
+
+            local delta = DeltaModule(5)
+        "#
+        ));
+    }
+
+    /// `icon` reaches the call either truthy or through the `anywayicon` arm,
+    /// where it is still the whole unknown parameter: never a proven `nil`.
+    #[test]
+    fn a_compound_condition_on_an_unknown_argument_leaves_it_unknown() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class IMaterial
+            ---@class ConVar
+            ---@return integer
+            function ConVar:GetInt() end
+
+            ---@param name string
+            ---@return ConVar
+            function GetConVar(name) end
+
+            ---@param name string
+            ---@return IMaterial
+            function Material(name) end
+
+            local M = {}
+            function M.DrawBar(icon, anywayicon)
+                if (icon and GetConVar("cl_icons"):GetInt() == 1 or anywayicon == true) then
+                    local material = Material(icon)
+                end
+            end
+        "#
+        ));
+    }
+
+    /// Each fallback assigns an `any` value, so past the `if` `amount` is that
+    /// value or the truthy original: never the `nil|false` the branch began with.
+    #[test]
+    fn a_fallback_assigned_from_an_any_value_is_not_nil_or_false() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value number
+            ---@param decimals? number
+            ---@return number
+            function math.Round(value, decimals) end
+
+            ---@param x any
+            local function T1(x, amount)
+                if not amount then
+                    amount = x
+                end
+                return math.Round(amount)
+            end
+
+            ---@param x any
+            local function T2(x, amount)
+                if not amount then
+                    amount = x or 1
+                end
+                return math.Round(amount)
+            end
+
+            ---@param x any
+            local function T3(x, amount)
+                if not amount then
+                    amount = x and x or 1
+                end
+                return math.Round(amount)
+            end
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_union_containing_any_is_not_a_param_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param armor number
+            local function SetArmor(armor) end
+
+            ---@type any|boolean|table
+            local stored
+            SetArmor(stored)
+        "#
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param armor number
+            local function SetArmor(armor) end
+
+            ---@type boolean|table
+            local stored
+            SetArmor(stored)
+        "#
+        ));
+    }
 
     #[test]
     fn test_issue_216() {
@@ -2541,7 +3281,7 @@ mod test {
             "#
         ));
 
-        // 测试泛型
+        // Test generics
         assert!(ws.check_code_for(
             DiagnosticCode::ParamTypeMismatch,
             r#"
@@ -2896,6 +3636,44 @@ mod test {
             end
             "#,
         ));
+    }
+
+    #[test]
+    fn explicit_dot_call_to_colon_method_names_receiver_class_in_message() {
+        let mut ws = VirtualWorkspace::new();
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        let file_id = ws.def(
+            r#"
+            ---@class receiver_base
+            local BASE = {}
+            function BASE:Run() end
+
+            ---@class unrelated_receiver
+            local OTHER = {}
+            function OTHER:Dispatch()
+                BASE.Run(self)
+            end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == code)
+            .map(|diag| diag.message.clone())
+            .collect();
+
+        assert_eq!(messages.len(), 1, "{}", messages.join(" || "));
+        assert!(
+            messages[0].contains("expected `receiver_base`"),
+            "{}",
+            messages[0]
+        );
     }
 
     #[test]
@@ -3263,6 +4041,583 @@ mod test {
                 local groupId = ...
                 local actions = inputGroups[groupId]
                 SortedPairs(actions)
+            "#
+        ));
+    }
+
+    #[test]
+    fn a_table_whose_metatable_indexes_through_a_function_fills_a_class_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class SkinColours
+            ---@field Label table
+
+            ---@class Skin
+            ---@field Colours SkinColours?
+
+            ---@param skin Skin
+            local function DefineSkin(skin) end
+
+            local function makeProxy(o)
+                return setmetatable({}, {
+                    __index = function(t, key)
+                        local v = o[key]
+                        rawset(t, key, v)
+                        return v
+                    end,
+                })
+            end
+
+            local SKIN = {}
+            SKIN.Colours = makeProxy({})
+            DefineSkin(SKIN)
+            "#
+        ));
+    }
+
+    /// A class with a required `foo: string`, a consumer of it, and `setup`,
+    /// which builds the value passed to it.
+    fn metatable_backed_value(setup: &str) -> String {
+        format!(
+            r#"
+            ---@class MetaRequired
+            ---@field foo string
+
+            ---@param value MetaRequired
+            local function consume(value) end
+
+            {setup}
+            "#
+        )
+    }
+
+    /// Whether passing the value each setup builds reports a mismatch.
+    fn reports_param_mismatch(setups: &[&str]) -> Vec<bool> {
+        setups
+            .iter()
+            .map(|setup| {
+                let mut ws = VirtualWorkspace::new_with_init_std_lib();
+                !ws.check_code_for(
+                    DiagnosticCode::ParamTypeMismatch,
+                    &metatable_backed_value(setup),
+                )
+            })
+            .collect()
+    }
+
+    /// A field the table lacks is read through its metatable's `__index`
+    /// table: it fills the class field when its type fits, and is wrong or
+    /// missing otherwise, set up inline or apart, returned or not.
+    #[test]
+    fn a_field_read_through_an_index_table_is_checked_against_the_class() {
+        let setups = [
+            r#"
+            local function factory()
+                local value = {}
+                setmetatable(value, { __index = { foo = "yes" } })
+                return value
+            end
+            consume(factory())
+            "#,
+            r#"
+            local function factory()
+                local value = {}
+                setmetatable(value, { __index = { foo = 123 } })
+                return value
+            end
+            consume(factory())
+            "#,
+            r#"
+            local function factory()
+                local value = {}
+                setmetatable(value, { __index = { bar = "yes" } })
+                return value
+            end
+            consume(factory())
+            "#,
+            r#"
+            local value = {}
+            setmetatable(value, { __index = { foo = 123 } })
+            consume(value)
+            "#,
+            r#"
+            local value = setmetatable({}, { __index = { foo = 123 } })
+            consume(value)
+            "#,
+            r#"
+            local value = {}
+            setmetatable(value, { __index = false })
+            consume(value)
+            "#,
+        ];
+
+        assert_eq!(
+            reports_param_mismatch(&setups),
+            [false, true, true, true, true, true]
+        );
+    }
+
+    /// An `__index` function answers every key its key parameter takes, with
+    /// what it returns.
+    #[test]
+    fn a_field_read_through_an_index_function_is_checked_against_its_result() {
+        let setups = [
+            r#"
+            local value = {}
+            setmetatable(value, {
+                ---@return string
+                __index = function(t, key) return "yes" end,
+            })
+            consume(value)
+            "#,
+            r#"
+            local value = {}
+            setmetatable(value, {
+                ---@return integer
+                __index = function(t, key) return 1 end,
+            })
+            consume(value)
+            "#,
+        ];
+
+        assert_eq!(reports_param_mismatch(&setups), [false, true]);
+    }
+
+    /// An index table answers every key its index signature admits, with the
+    /// value type the signature gives.
+    #[test]
+    fn a_field_read_through_an_index_signature_is_checked_against_the_class() {
+        let setups = [
+            r#"
+            ---@type table<string, string>
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@type { [string]: string }
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@type table<string, integer>
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@type table<integer, string>
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@type table<string, string>
+            local fallback = {}
+            local value = setmetatable({}, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@type table<string, integer>
+            local fallback = {}
+            local value = setmetatable({}, { __index = fallback })
+            consume(value)
+            "#,
+        ];
+
+        assert_eq!(
+            reports_param_mismatch(&setups),
+            [false, false, true, true, false, true]
+        );
+    }
+
+    /// An `__index` value read as a read through it resolves: every
+    /// alternative of a union or alias answers, a generic instantiated to a
+    /// constant key answers that key, and a table backed by a function
+    /// without a declared result says nothing of one key.
+    #[test]
+    fn a_field_read_through_an_index_value_answers_as_a_read_would() {
+        let setups = [
+            r#"
+            ---@alias IndexEither table<string, string>|table<string, integer>
+            ---@type IndexEither
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@alias IndexSame table<string, string>|{ foo: string }
+            ---@type IndexSame
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@generic K
+            ---@param key std.ConstTpl<K>
+            ---@return table<K, string>
+            local function make_fallback(key)
+                return {}
+            end
+            local value = {}
+            setmetatable(value, { __index = make_fallback("foo") })
+            consume(value)
+            "#,
+            r#"
+            local fallback = {}
+            setmetatable(fallback, {
+                __index = function(t, key)
+                    if key == "foo" then return "yes" end
+                    return 123
+                end
+            })
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+        ];
+
+        assert_eq!(reports_param_mismatch(&setups), [true, false, false, false]);
+    }
+
+    /// A table given a metatable answers with its own fields, then its
+    /// `__index`; a class answers through its index signatures; and an alias
+    /// that names itself says nothing rather than recursing forever.
+    #[test]
+    fn a_field_read_through_an_instance_class_or_recursive_alias() {
+        let setups = [
+            r#"
+            local fallback = setmetatable({ bar = true }, { __index = { foo = 123 } })
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            local fallback = setmetatable({ bar = true }, { __index = { foo = "yes" } })
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@class LookupStrings
+            ---@field [string] string
+            ---@type LookupStrings
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@class LookupIntegers
+            ---@field [string] integer
+            ---@type LookupIntegers
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            ---@alias RecursiveIndex RecursiveIndex|table<string, string>
+            ---@type RecursiveIndex
+            local fallback = {}
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+        ];
+
+        assert_eq!(
+            reports_param_mismatch(&setups),
+            [true, false, false, true, false]
+        );
+    }
+
+    /// Branches of a union that share an index table each find the field
+    /// through it: a table reached twice is not a cycle.
+    #[test]
+    fn a_shared_index_table_answers_every_branch_that_reaches_it() {
+        let setup = metatable_backed_value(
+            r#"
+            local shared = {}
+            setmetatable(shared, { __index = { foo = "yes" } })
+            local left, right = {}, {}
+            setmetatable(left, { __index = shared })
+            setmetatable(right, { __index = shared })
+            local fallback = math.random() > 0.5 and left or right
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+        );
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.strict.allow_nullable_as_non_nullable = false;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_code_for(DiagnosticCode::ParamTypeMismatch, &setup));
+    }
+
+    /// Index tables shared level after level are each looked through once:
+    /// a lookup that went down every branch again would take 2^24 steps here.
+    #[test]
+    fn layered_shared_index_tables_are_each_looked_through_once() {
+        let mut setup = String::from(
+            "local fallback0 = {}\nsetmetatable(fallback0, { __index = { foo = \"yes\" } })\n",
+        );
+        for level in 1..=24 {
+            let previous = level - 1;
+            setup.push_str(&format!(
+                "local left{level}, right{level} = {{}}, {{}}\n\
+                 setmetatable(left{level}, {{ __index = fallback{previous} }})\n\
+                 setmetatable(right{level}, {{ __index = fallback{previous} }})\n\
+                 local fallback{level} = math.random() > 0.5 and left{level} or right{level}\n"
+            ));
+        }
+        setup.push_str(
+            "local value = {}\nsetmetatable(value, { __index = fallback24 })\nconsume(value)\n",
+        );
+
+        assert_eq!(reports_param_mismatch(&[setup.as_str()]), [false]);
+    }
+
+    /// A lookup through layered shared index tables that loop back to the top,
+    /// or through layered shared aliases, also looks through each one once.
+    #[test]
+    fn cyclic_layers_and_alias_layers_are_each_looked_through_once() {
+        let mut cyclic = String::from("local fallback0 = {}\n");
+        let mut aliases = String::from("---@alias Layer0 table<string, string>\n");
+        for level in 1..=24 {
+            let previous = level - 1;
+            cyclic.push_str(&format!(
+                "local left{level}, right{level} = {{}}, {{}}\n\
+                 setmetatable(left{level}, {{ __index = fallback{previous} }})\n\
+                 setmetatable(right{level}, {{ __index = fallback{previous} }})\n\
+                 local fallback{level} = math.random() > 0.5 and left{level} or right{level}\n"
+            ));
+            aliases.push_str(&format!(
+                "---@alias Left{level} Layer{previous}\n\
+                 ---@alias Right{level} Layer{previous}\n\
+                 ---@alias Layer{level} Left{level}|Right{level}\n"
+            ));
+        }
+        cyclic.push_str(
+            "setmetatable(fallback0, { __index = fallback24 })\n\
+             local value = {}\nsetmetatable(value, { __index = fallback24 })\nconsume(value)\n",
+        );
+        aliases.push_str(
+            "---@type Layer24\nlocal fallback = {}\n\
+             local value = {}\nsetmetatable(value, { __index = fallback })\nconsume(value)\n",
+        );
+
+        assert_eq!(
+            reports_param_mismatch(&[cyclic.as_str(), aliases.as_str()]),
+            [true, false]
+        );
+    }
+
+    /// A table made by `setmetatable` answers with its own fields first, then
+    /// through its metatable, an `__index` function answering with its
+    /// declared result.
+    #[test]
+    fn a_field_read_through_an_instance_follows_its_metatable() {
+        let setups = [
+            r#"
+            ---@return integer
+            local function index(t, key) return 123 end
+            local fallback = setmetatable({ bar = true }, { __index = index })
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+            r#"
+            local fallback = setmetatable({ foo = "yes" }, { __index = { foo = 123 } })
+            local value = {}
+            setmetatable(value, { __index = fallback })
+            consume(value)
+            "#,
+        ];
+
+        assert_eq!(reports_param_mismatch(&setups), [true, false]);
+    }
+
+    /// An `__index` that may be nil may leave the field nil, which only a
+    /// nullable-tolerant check accepts in a non-nullable field.
+    #[test]
+    fn a_field_read_through_a_nullable_index_value_may_be_nil() {
+        let setup = metatable_backed_value(
+            r#"
+            ---@return table<string, string>?
+            local function make_fallback() end
+            local value = {}
+            setmetatable(value, { __index = make_fallback() })
+            consume(value)
+            "#,
+        );
+        let reports = [true, false].map(|allow_nullable| {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let mut emmyrc = ws.get_emmyrc();
+            emmyrc.strict.allow_nullable_as_non_nullable = allow_nullable;
+            ws.update_emmyrc(emmyrc);
+            !ws.check_code_for(DiagnosticCode::ParamTypeMismatch, &setup)
+        });
+
+        assert_eq!(reports, [false, true]);
+    }
+
+    /// A generic table meets a class field by field: a field whose key its
+    /// key type admits holds its value type, and any other must be optional.
+    #[test]
+    fn a_generic_table_meets_a_class_field_by_field() {
+        let setups = [
+            "---@type table<string, string>\nlocal t = {}\nconsume(t)\n",
+            "---@type table<string, integer>\nlocal t = {}\nconsume(t)\n",
+            "---@type table<integer, string>\nlocal t = {}\nconsume(t)\n",
+            "---@type table<any, any>\nlocal t = {}\nconsume(t)\n",
+            "---@type table<string, any>\nlocal t = {}\nconsume(t)\n",
+        ];
+
+        assert_eq!(
+            reports_param_mismatch(&setups),
+            [false, true, true, false, false]
+        );
+    }
+
+    /// A field the index table lacks is read through that table's own
+    /// metatable in turn, as a class inheriting from a base reads it.
+    #[test]
+    fn a_field_read_through_a_chain_of_index_tables_is_checked_against_the_class() {
+        let chained = |base_foo: &str| {
+            format!(
+                r#"
+            local Base = {{ foo = {base_foo} }}
+            local Class = setmetatable({{}}, {{ __index = Base }})
+            local function new()
+                local value = {{}}
+                setmetatable(value, {{ __index = Class }})
+                return value
+            end
+            consume(new())
+            "#
+            )
+        };
+        let good = chained(r#""yes""#);
+        let wrong = chained("123");
+
+        assert_eq!(reports_param_mismatch(&[&good, &wrong]), [false, true]);
+    }
+
+    /// An `__index` function without a declared result returns one inferred
+    /// type for every key, which says nothing of one field: a recursive
+    /// copy-on-write proxy, inferred to return the proxy itself, fills the
+    /// class.
+    #[test]
+    fn an_index_function_without_a_declared_result_fills_a_class_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class ProxyState
+            ---@field Normal string
+
+            ---@class ProxyColours
+            ---@field Button ProxyState
+
+            ---@class ProxySkin
+            ---@field Colours ProxyColours?
+
+            ---@param skin ProxySkin
+            local function DefineSkin(skin) end
+
+            local function makeRecursiveCOW(o)
+                return setmetatable({}, {
+                    __index = function(t, key)
+                        local v = o[key]
+                        if type(v) == "table" then
+                            v = makeRecursiveCOW(v)
+                        end
+                        rawset(t, key, v)
+                        return v
+                    end,
+                })
+            end
+
+            local SKIN = {}
+            SKIN.Colours = makeRecursiveCOW({})
+            DefineSkin(SKIN)
+            "#
+        ));
+    }
+
+    #[test]
+    fn pcall_accepts_functions_returning_different_numbers_of_values() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local ops = {}
+
+            ---@param a number
+            ---@return boolean?, boolean, boolean
+            function ops.button(a) return nil, true, true end
+
+            ---@param a number
+            function ops.rect(a) end
+
+            ---@param op string
+            local function run(op)
+                local fn = ops[op]
+                if not fn then return end
+                local r, e = pcall(fn, 1)
+            end
+            "#
+        ));
+    }
+
+    #[test]
+    fn a_table_or_unknown_argument_takes_the_table_signature_over_a_nil_overload() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@generic T : table
+            ---@overload fun(originalTable: nil): nil
+            ---@param originalTable T?
+            ---@param lookupTable? table<any, any>
+            ---@return T?
+            local function copy(originalTable, lookupTable) end
+
+            local function adjust(fresh, u)
+                local data = fresh and {} or u
+                local copied = copy(data)
+            end
+            "#
+        ));
+    }
+
+    #[test]
+    fn pcall_accepts_a_union_of_functions() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class MyPlug
+            local Plug = {}
+
+            ---@param cache table<MyPlug, (fun(self: MyPlug, value: any, global: boolean?))|(fun(self: MyPlug): string)|(fun(self: MyPlug): integer)>
+            local function SafeRun(cache, ...)
+                for k, v in pairs(cache) do
+                    local ok = pcall(v, k, ...)
+                end
+            end
             "#
         ));
     }
@@ -4055,6 +5410,85 @@ mod test {
         ));
     }
 
+    /// LuaJIT's `tonumber` reads a `0b` prefix as binary digits, any fraction all zeros.
+    #[test]
+    fn a_number_param_accepts_a_binary_literal_tonumber_converts() {
+        for (literal, converts) in [
+            ("\"0b101\"", true),
+            ("\"-0B11\"", true),
+            ("\" 0b0 \"", true),
+            ("\"0b1.\"", true),
+            ("\"0b10.00\"", true),
+            ("\"0b0.0\"", true),
+            (format!("\"0b000{}\"", "1".repeat(64)).as_str(), true),
+            (format!("\"0b{}\"", "1".repeat(65)).as_str(), false),
+            ("\"0b\"", false),
+            ("\"0b.\"", false),
+            ("\"0b102\"", false),
+            ("\"0b1.1\"", false),
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert_eq!(
+                ws.check_code_for(
+                    DiagnosticCode::ParamTypeMismatch,
+                    &format!(
+                        r#"
+            ---@param n number
+            local function calc(n) end
+            calc({literal})
+        "#
+                    )
+                ),
+                converts,
+                "{literal}"
+            );
+        }
+    }
+
+    /// A literal `tonumber` reads as a number passes, whitespace and hex included.
+    #[test]
+    fn a_number_param_accepts_a_literal_tonumber_converts() {
+        for literal in [
+            "\" 5 \"",
+            "\"0x1F\"",
+            "\"-2.5e3\"",
+            "\"0x1.8p1\"",
+            "\"-0x.8\"",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            assert!(
+                ws.check_code_for(
+                    DiagnosticCode::ParamTypeMismatch,
+                    &format!(
+                        r#"
+            ---@param n number
+            local function calc(n) end
+            calc({literal})
+        "#
+                    )
+                ),
+                "{literal}"
+            );
+        }
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number
+            local function calc(n) end
+            calc("0x")
+        "#
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number
+            local function calc(n) end
+            calc("0x1p")
+        "#
+        ));
+    }
+
     /// A bare `string` type must be rejected for `number` params.
     #[test]
     fn test_number_param_rejects_bare_string_type() {
@@ -4241,24 +5675,6 @@ mod test {
         ));
     }
 
-    /// `(any|string)` passed to `number` param SHOULD still mismatch.
-    /// The `string` arm remains incompatible with `number`.
-    #[test]
-    fn test_any_string_union_to_number_param_still_mismatches() {
-        let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
-            DiagnosticCode::ParamTypeMismatch,
-            r#"
-            ---@param n number
-            local function f(n) end
-
-            ---@type any|string
-            local val
-            f(val)
-        "#
-        ));
-    }
-
     /// `any|string|nil` should satisfy `string?` through nullable string coercion.
     #[test]
     fn test_any_string_nil_to_string_nullable_passes() {
@@ -4276,11 +5692,11 @@ mod test {
         ));
     }
 
-    /// `any|string|nil` should still mismatch `number?` because `string` is incompatible.
+    /// `any|string|nil` may be `any`, so it satisfies `number?` as well.
     #[test]
-    fn test_any_string_nil_to_number_nullable_mismatches() {
+    fn test_any_string_nil_to_number_nullable_passes() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
+        assert!(ws.check_code_for(
             DiagnosticCode::ParamTypeMismatch,
             r#"
             ---@param n number?
@@ -4527,4 +5943,143 @@ mod test {
             "inferred dynamic key field values should respect inferred mismatch diagnostics policy: {diagnostics:?}"
         );
     }
+
+    /// The same runtime write also reached table compatibility, which reported
+    /// the literal as missing a member the class never declared.
+    #[test]
+    fn undeclared_field_written_to_a_container_element_is_not_expected_of_a_literal() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Fires
+            ---@field ID string
+
+            ---@type table<string, Fires>
+            local storeF = {}
+
+            ---@param t Fires
+            local function makeF(t) return t.ID end
+
+            makeF({ ID = "a" })
+            for _, v in pairs(storeF) do v.X = 5 end
+            "#,
+        ));
+    }
+    /// An unannotated recursive function reaches its return type through its
+    /// base case, so `((1,2)|unknown)` must not leave the first value typed as
+    /// the whole union when it spreads into an argument list.
+    #[test]
+    fn recursive_multi_return_spreads_into_an_argument_list() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param x number
+            ---@param y number
+            local function takesTwo(x, y) end
+
+            local function r2(n)
+                if n and n > 0 then return r2(n - 1) end
+                return 1, 2
+            end
+
+            takesTwo(r2(5))
+            "#,
+        ));
+    }
+
+    /// `if a.x ~= nil` on an untyped container narrows the field to `never`,
+    /// because the flow antecedent for a field it cannot resolve is `nil`. The
+    /// branch is not actually unreachable, so nothing may be reported against a
+    /// value inside it - and a runtime `TypeGuard` cannot recover one either,
+    /// since `never & T` is `never`.
+    #[test]
+    fn neq_nil_on_an_untyped_container_field_reports_nothing() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local function base(a)
+                if a.x ~= nil then math.max(0, a.x) end
+            end
+            "#,
+        ));
+    }
+
+    /// A `never` *member* is a declared shape contradicting itself
+    /// (`integer & string`), which is a real defect and keeps reporting.
+    #[test]
+    fn contradictory_intersection_member_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@class NevA
+            ---@field y integer
+
+            ---@class NevB
+            ---@field y string
+
+            local c ---@type NevA & NevB
+
+            ---@class NevC
+            ---@field y integer
+
+            ---@type NevC
+            _ = c
+            "#
+        ));
+    }
+}
+
+/// A scripted-class global alias (`Schema` -> `SCHEMA`) yields `Def(SCHEMA)`
+/// while annotated params reference `Ref(SCHEMA)`. When no schema file exists
+/// the class decl is dangling; `check_ref_type_compact` must still recognize
+/// `Def(id)`/`Ref(id)` identity instead of erroring with "type SCHEMA not
+/// found" on every call site. Regression: CityRP `sh_plugin.lua`'s
+/// `pcall(Schema[name], Schema, ...)` flagged `expected SCHEMA but found
+/// SCHEMA`.
+#[test]
+fn dangling_scoped_class_ref_matches_its_own_def() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    ws.def_file(
+        "gamemode/init.lua",
+        r#"
+            hook.Add("PlayerSpawn", "x", function(client) end)
+        "#,
+    );
+    let file_id = ws.def_file(
+        "gamemode/core/libraries/sh_plugin.lua",
+        r#"
+            local function SafeRun(name, gm, ...)
+                if (Schema and Schema[name]) then
+                    local bSuccess, a, b = pcall(Schema[name], Schema, ...)
+                end
+            end
+            SafeRun("PlayerSpawn", nil, 1)
+        "#,
+    );
+    let diags: Vec<_> = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    crate::DiagnosticCode::ParamTypeMismatch
+                        .get_name()
+                        .to_string(),
+                ))
+        })
+        .collect();
+    assert!(
+        diags.is_empty(),
+        "a value of a dangling scripted-class ref must satisfy its own type: {diags:#?}"
+    );
 }

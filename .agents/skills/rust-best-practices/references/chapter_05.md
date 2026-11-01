@@ -14,12 +14,12 @@ In Rust, as in many other languages, tests often show how the functions are mean
 > In the unit test name we should see the following:
 > * `unit_of_work`: which *function* we are calling. The **action** that will be executed. This is often be the name of the the test `mod` where the function is being tested.
 ```rust
-#[cfg(test)] 
-mod test { 
-    mod function_name { 
-        #[test] 
-        fn returns_y_when_x() { ... } 
-    } 
+#[cfg(test)]
+mod test {
+    mod function_name {
+        #[test]
+        fn returns_y_when_x() { ... }
+    }
 }
 ```
 > * `expected_behavior`: the set of **assertions** that we need to verify that the test works.
@@ -83,9 +83,9 @@ mod test { // IDEs will provide a ▶️ button here
             let a = setup_a_to_be_xyz();
             let b = Some(-5);
             let expected = MyError::Xyz;
-            
+
             let result = process(a, b).unwrap_err();
-            
+
             assert_eq!(result, expected);
         }
 
@@ -124,8 +124,8 @@ mod test_thing_parser {
     fn lowercase_letters_are_valid() {
         assert!(
             Thing::parse("abcd").is_ok(),
-            // Works like `eprintln, format and println` macros 
-            "Thing parse error: {:?}", 
+            // Works like `eprintln, format and println` macros
+            "Thing parse error: {:?}",
             Thing::parse("abcd").unwrap_err()
         );
     }
@@ -141,7 +141,7 @@ mod test_thing_parser {
 
 ### Use very few, ideally one, assertion per test
 
-When there are multiple assertions per test, it's both harder to understand the intended behavior and 
+When there are multiple assertions per test, it's both harder to understand the intended behavior and
 often requires many iterations to fix a broken test, as you work through assertions one by one.
 
 ❌ Don't include many assertions in one test:
@@ -185,19 +185,19 @@ We will deep dive into docs at a later stage, so in this section we will just br
 
 ```rust
 /// Helper function that adds any two numeric values together.
-/// This functions reasons about which would be the correct type to parse based on the type 
+/// This functions reasons about which would be the correct type to parse based on the type
 /// and the size of the numeric value.
-/// 
+///
 /// # Examples
-/// 
+///
 /// ```rust
 /// # use crate_name::generic_add;
 /// use num::numeric;
-/// 
+///
 /// # assert_eq!(
 /// generic_add(5.2, 4) // => 9.2
 /// # , 9.2)
-/// 
+///
 /// # assert_eq!(
 /// generic_add(2, 2.0) // => 4
 /// # , 4)
@@ -243,7 +243,7 @@ mod unit_of_work_tests {
 
 ### Integration Tests
 
-Tests that go under the `tests/` directory, they are entirely external to your library and use the same code as any other code would use, not have access to private and crate level functions, which means they can **only test** functions on your **public API**. 
+Tests that go under the `tests/` directory, they are entirely external to your library and use the same code as any other code would use, not have access to private and crate level functions, which means they can **only test** functions on your **public API**.
 
 > Their purpose is to test whether many parts of the code work together correctly, units of code that work correctly on their own could have problems when integrated.
 
@@ -252,14 +252,14 @@ Tests that go under the `tests/` directory, they are entirely external to your l
 * if testing binaries, try to break **executable** and **functions** into `src/main.rs` and `src/lib.rs`, respectively.
 
 ```
-├── Cargo.lock 
-├── Cargo.toml 
-├── src 
-│   └── lib.rs 
-└── tests 
-    ├── mod.rs 
-    ├── common 
-    │   └── mod.rs 
+├── Cargo.lock
+├── Cargo.toml
+├── src
+│   └── lib.rs
+└── tests
+    ├── mod.rs
+    ├── common
+    │   └── mod.rs
     └── integration_test.rs
 ```
 
@@ -341,7 +341,7 @@ Snapshot testing compares your output (text, Json, HTML, YAML, etc) against a sa
 assert_snapshot!("this_is_a_named_snapshot", output);
 ```
 
-* Keep snapshots small and clear. 
+* Keep snapshots small and clear.
 ```rust
 // ✅ Best case:
 assert_snapshot!("app_config/http", whole_app_config.http);
@@ -350,7 +350,7 @@ assert_snapshot!("app_config/http", whole_app_config.http);
 assert_snapshot!("app_config", whole_app_config); // Huge object
 ```
 
-> #### 🚨 Avoid snapshotting huge objects 
+> #### 🚨 Avoid snapshotting huge objects
 > Huge objects become hard to review and reason about.
 
 * Avoid snapshotting simple types (primitives, flat enums, small structs):

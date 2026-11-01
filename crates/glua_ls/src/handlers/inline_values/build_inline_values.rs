@@ -10,7 +10,7 @@ pub fn build_inline_values(
     let mut result = Vec::new();
     let root = semantic_model.get_root();
     let document = semantic_model.get_document();
-    let offset = document.get_offset(position.line as usize, position.character as usize)?;
+    let offset = document.to_offset(position);
     let token = match root.syntax().token_at_offset(offset) {
         TokenAtOffset::Between(left, _) => left,
         TokenAtOffset::Single(token) => token,

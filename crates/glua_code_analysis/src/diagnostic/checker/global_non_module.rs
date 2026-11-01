@@ -10,8 +10,10 @@ impl Checker for GlobalInNonModuleChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::GlobalInNonModule];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        for assign_stat in root.descendants::<LuaAssignStat>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for assign_stat in buckets.assign_stats.iter().cloned() {
             check_assign_stat(context, semantic_model, assign_stat);
         }
     }

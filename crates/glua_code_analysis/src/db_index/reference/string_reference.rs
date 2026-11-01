@@ -1,16 +1,16 @@
 use rowan::TextRange;
+use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
-use std::collections::HashMap;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StringReference {
-    string_references: HashMap<SmolStr, Vec<TextRange>>,
+    string_references: FxHashMap<SmolStr, Vec<TextRange>>,
 }
 
 impl StringReference {
     pub fn new() -> Self {
         Self {
-            string_references: HashMap::new(),
+            string_references: FxHashMap::default(),
         }
     }
 
@@ -26,5 +26,12 @@ impl StringReference {
             .get(string)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Every indexed string literal and its reference ranges, borrowed.
+    pub fn iter_string_references(&self) -> impl Iterator<Item = (&str, &[TextRange])> {
+        self.string_references
+            .iter()
+            .map(|(string, ranges)| (string.as_str(), ranges.as_slice()))
     }
 }

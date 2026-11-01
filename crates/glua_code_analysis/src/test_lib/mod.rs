@@ -52,6 +52,8 @@ concommand = concommand or {}
 vgui = vgui or {}
 derma = derma or {}
 file = file or {}
+scripted_ents = scripted_ents or {}
+weapons = weapons or {}
 
 Entity = Entity or {}
 
@@ -374,6 +376,13 @@ function Panel:Add(className) end
 ---@param parent Panel
 function Panel:SetParent(parent) end
 
+---@[call_arg("gmod.vgui_panel", "own_class")]
+---@param class string
+---@param dpropertysheet any
+---@param width number
+---@param height number
+function Panel:GenerateExample(class, dpropertysheet, width, height) end
+
 ---@class DDragBase: Panel
 ---@field GetParent fun(self: DDragBase): Panel
 ---@class DHorizontalScroller: Panel
@@ -400,6 +409,18 @@ function vgui.CreateFromTable(metatable, parent, name) end
 ---@[call_arg("gmod.vgui_panel", "base")]
 ---@param base string
 function vgui.Register(name, panel, base) end
+
+---@[call_arg("gmod.scripted_class", "entity_table")]
+---@param ENT table
+---@[call_arg("gmod.scripted_class", "define")]
+---@param classname string
+function scripted_ents.Register(ENT, classname) end
+
+---@[call_arg("gmod.scripted_class", "weapon_table")]
+---@param SWEP table
+---@[call_arg("gmod.scripted_class", "define")]
+---@param classname string
+function weapons.Register(SWEP, classname) end
 
 ---@generic T: table
 ---@[call_arg("gmod.vgui_panel", "register_table")]
@@ -444,6 +465,19 @@ function Panel:SetSkin(skinName) end
 function Entity:NetworkVar(type, slot, name, extended) end
 
 ---@[overload_call_arg(0, "gmod.network_var", "type")]
+---@[overload_call_arg(1, "gmod.network_var", "define_slot")]
+---@overload fun(type: string, name: string)
+---@[overload_call_arg(0, "gmod.network_var", "type")]
+---@[overload_call_arg(2, "gmod.network_var", "define_slot")]
+---@overload fun(type: string, slot: nil, name: string)
+---@[call_arg("gmod.network_var", "type")]
+---@param type string
+---@param slot number
+---@[call_arg("gmod.network_var", "define_slot")]
+---@param name string
+function Entity:DTVar(type, slot, name) end
+
+---@[overload_call_arg(0, "gmod.network_var", "type")]
 ---@[overload_call_arg(2, "gmod.network_var", "define_element")]
 ---@overload fun(type: string, element: string, name: string, extended?: table)
 ---@[call_arg("gmod.network_var", "type")]
@@ -454,6 +488,13 @@ function Entity:NetworkVar(type, slot, name, extended) end
 ---@param name string
 ---@param extended? table
 function Entity:NetworkVarElement(type, slot, element, name, extended) end
+
+---@accessorfunc 3
+---@param tab table
+---@param key any
+---@param name string
+---@param force? number
+function _G.AccessorFunc(tab, key, name, force) end
 "#;
 
 #[cfg(test)]
@@ -552,6 +593,7 @@ impl VirtualWorkspace {
 
         self.analysis
             .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id)
             .expect("File ID must be present")
     }
 
@@ -638,11 +680,12 @@ impl VirtualWorkspace {
 
         self.analysis
             .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id)
             .expect("File ID must be present")
     }
 
     pub fn def_files(&mut self, files: Vec<(&str, &str)>) -> Vec<FileId> {
-        let file_infos = files
+        let file_infos: Vec<_> = files
             .iter()
             .map(|(file_name, content)| {
                 let uri = self.virtual_url_generator.new_uri(file_name);
@@ -650,7 +693,15 @@ impl VirtualWorkspace {
             })
             .collect();
 
-        let mut file_ids = self.analysis.update_files_by_uri_sorted(file_infos);
+        let uris = file_infos
+            .iter()
+            .map(|(uri, _)| uri.clone())
+            .collect::<Vec<_>>();
+        self.analysis.update_files_by_uri(file_infos);
+        let mut file_ids = uris
+            .iter()
+            .map(|uri| self.analysis.get_file_id(uri).expect("defined file id"))
+            .collect::<Vec<_>>();
         file_ids.sort();
 
         file_ids
@@ -710,6 +761,30 @@ impl VirtualWorkspace {
         info.display_typ().clone()
     }
 
+    /// The type of the local `name` declared in `file_id`.
+    pub fn local_ty(&self, file_id: FileId, name: &str) -> LuaType {
+        let semantic_model = self
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Model must exist");
+        let local_name = semantic_model
+            .get_root()
+            .descendants::<LuaLocalName>()
+            .find(|local_name| {
+                local_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == name)
+            })
+            .expect("Local must exist");
+        let token = local_name.get_name_token().expect("Name token must exist");
+        semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .expect("Semantic info must exist")
+            .display_typ()
+            .clone()
+    }
+
     pub fn check_type(&self, source: &LuaType, compact_type: &LuaType) -> bool {
         let db = &self.analysis.compilation.get_db();
         check_type_compact(db, source, compact_type).is_ok()
@@ -721,9 +796,9 @@ impl VirtualWorkspace {
         self.analysis.diagnostic.update_config(Arc::new(emmyrc));
     }
 
-    /// 只执行对应诊断代码的检查, 必须要在对应的`Checker`中为`const CODES`添加对应的诊断代码
+    /// Only runs the checks of the given diagnostic code; the code must be added to `const CODES` in the corresponding `Checker`
     pub fn check_code_for(&mut self, diagnostic_code: DiagnosticCode, block_str: &str) -> bool {
-        // 只启用对应的诊断
+        // Only enable the given diagnostic
         self.analysis.diagnostic.enable_only(diagnostic_code);
         let file_id = self.def(block_str);
         let result = self
@@ -856,6 +931,205 @@ impl VirtualWorkspace {
 
         diagnostics_to_snapshot_set(normalized_file, diagnostics)
     }
+
+    /// Every main-workspace file's name/index expression types and
+    /// diagnostics, in path order.
+    #[cfg(test)]
+    pub fn semantic_digest(&self) -> Vec<String> {
+        use glua_parser::LuaExpr;
+
+        let db = self.analysis.compilation.get_db();
+        let mut files = db
+            .get_module_index()
+            .get_main_workspace_file_ids()
+            .into_iter()
+            .map(|file_id| {
+                let path = db
+                    .get_vfs()
+                    .get_file_path(&file_id)
+                    .map(|path| normalize_snapshot_file(&self.virtual_url_generator.base, path))
+                    .unwrap_or_default();
+                (path, file_id)
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+
+        let mut digest = Vec::new();
+        for (path, file_id) in files {
+            let model = self
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("semantic model");
+            for expr in model.get_root().descendants::<LuaExpr>() {
+                if !matches!(expr, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)) {
+                    continue;
+                }
+                let typ = model
+                    .get_semantic_info(expr.syntax().clone().into())
+                    .map(|info| self.humanize_type(info.display_typ().clone()))
+                    .unwrap_or_default();
+                let range = expr.syntax().text_range();
+                digest.push(format!(
+                    "{path}@{:?}: {} = {typ}",
+                    range,
+                    expr.syntax().text()
+                ));
+            }
+            let diagnostics = self
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default();
+            digest.extend(
+                diagnostics_to_snapshot_set(path, diagnostics)
+                    .into_iter()
+                    .map(|snapshot| format!("{snapshot:?}")),
+            );
+        }
+        digest
+    }
+
+    /// The derivations a read of which no longer holds: after an update the
+    /// engine must leave none.
+    #[cfg(test)]
+    pub fn stale_derivations(&self) -> Vec<crate::db_index::derivation::DerivationId> {
+        use crate::db_index::derivation::DerivationKind;
+        let db = self.analysis.compilation.get_db();
+        let mut graph = db.reader_graph().clone();
+        graph.forget_fingerprints();
+        let mut stale = graph
+            .derivations()
+            .filter(|id| id.kind != DerivationKind::Diagnostics)
+            .filter(|id| graph.is_stale(*id, |key| db.fact_fingerprint(key), |_, _| false))
+            .collect::<Vec<_>>();
+        stale.sort();
+        stale
+    }
+
+    /// The derivations of a file that name no node of its current text.
+    #[cfg(test)]
+    pub fn phantom_derivations(&self) -> Vec<crate::db_index::derivation::DerivationId> {
+        use crate::db_index::derivation::DerivationKind;
+        let db = self.analysis.compilation.get_db();
+        let mut phantoms = db
+            .reader_graph()
+            .derivations()
+            .filter(|id| id.file_id != FileId::VIRTUAL && id.kind != DerivationKind::Diagnostics)
+            .filter(|id| {
+                if id.kind.is_query() {
+                    let signature_id =
+                        crate::LuaSignatureId::new(id.file_id, id.syntax_id().get_range().start());
+                    return db.get_signature_index().get(&signature_id).is_none();
+                }
+                db.get_vfs()
+                    .get_syntax_tree(&id.file_id)
+                    .is_none_or(|tree| {
+                        id.syntax_id()
+                            .to_node_from_root(&tree.get_red_root())
+                            .is_none()
+                    })
+            })
+            .collect::<Vec<_>>();
+        phantoms.sort();
+        phantoms
+    }
+
+    /// Every type cache, type declaration, dynamic field, net flow and the
+    /// semantic digest, as sorted text.
+    #[cfg(test)]
+    pub fn settled_digest(&self) -> Vec<String> {
+        let db = self.analysis.compilation.get_db();
+        let mut settled = db
+            .get_type_index()
+            .iter_type_caches()
+            .map(|(owner, cache)| format!("{owner:?} = {:?}", cache.as_type()))
+            .chain(
+                db.get_dynamic_field_index()
+                    .iter_all_field_definitions()
+                    .flat_map(|(owner, fields)| {
+                        fields
+                            .keys()
+                            .map(move |field| format!("{owner:?} has {field}"))
+                    }),
+            )
+            .collect::<Vec<_>>();
+        settled.extend(db.get_type_index().iter_type_decls().map(|decl| {
+            let mut locations = decl
+                .get_locations()
+                .iter()
+                .map(|location| format!("{location:?}"))
+                .collect::<Vec<_>>();
+            locations.sort();
+            format!("{:?} at {locations:?}", decl.get_id())
+        }));
+        settled.extend(db.get_type_index().iter_type_decls().filter_map(|decl| {
+            let owner = crate::LuaMemberOwner::Type(decl.get_id());
+            let mut members = db
+                .get_member_index()
+                .get_members(&owner)?
+                .into_iter()
+                .map(|member| format!("{:?}", member.get_id()))
+                .collect::<Vec<_>>();
+            members.sort();
+            Some(format!("{:?} members {members:?}", decl.get_id()))
+        }));
+        let network = db.get_gmod_network_index();
+        settled.extend(
+            network
+                .iter_send_flows()
+                .map(|(file_id, _, flow)| format!("{file_id:?} sends {flow:?}")),
+        );
+        settled.extend(
+            network
+                .iter_receive_flows()
+                .map(|(file_id, flow)| format!("{file_id:?} receives {flow:?}")),
+        );
+        settled.extend(self.semantic_digest());
+        settled.sort();
+        settled
+    }
+
+    /// Applies `edits` one at a time to a workspace holding `files`, builds a
+    /// fresh workspace from the final texts, and asserts both digests match.
+    /// `setup` configures each workspace before any file is added. Returns
+    /// the incrementally edited workspace.
+    #[cfg(test)]
+    pub fn assert_warm_matches_cold(
+        setup: impl Fn(&mut VirtualWorkspace),
+        files: &[(&str, &str)],
+        edits: &[(&str, &str)],
+    ) -> VirtualWorkspace {
+        let mut warm = VirtualWorkspace::new();
+        setup(&mut warm);
+        warm.def_files(files.to_vec());
+        for (path, text) in edits {
+            warm.def_file(path, text);
+        }
+
+        let mut final_files = files.to_vec();
+        for (path, text) in edits {
+            match final_files
+                .iter_mut()
+                .find(|(existing, _)| existing == path)
+            {
+                Some(entry) => entry.1 = text,
+                None => final_files.push((path, text)),
+            }
+        }
+        let mut cold = VirtualWorkspace::new();
+        setup(&mut cold);
+        cold.def_files(final_files);
+
+        assert_eq!(warm.semantic_digest(), cold.semantic_digest());
+        warm
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{}-{id}", std::process::id()))
 }
 
 #[cfg(test)]

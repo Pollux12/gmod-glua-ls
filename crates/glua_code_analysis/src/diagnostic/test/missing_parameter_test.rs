@@ -9,6 +9,239 @@ mod test {
     }
 
     #[test]
+    fn calling_a_gamemode_hook_with_fewer_arguments_is_not_missing_parameters() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "lua/aaa_annotations/sandbox.lua",
+            r#"
+            ---@class SANDBOX
+            SANDBOX = {}
+
+            ---@hook CanTool
+            ---@param ply table
+            ---@param trace table
+            ---@param mode string
+            ---@param tool table
+            ---@param button number
+            ---@return boolean
+            function SANDBOX:CanTool(ply, trace, mode, tool, button) end
+
+            ---@class ToolRules
+            ToolRules = {}
+
+            ---@param ply table
+            ---@param trace table
+            ---@param mode string
+            ---@param tool table
+            ---@param button number
+            ---@return boolean
+            function ToolRules:CanTool(ply, trace, mode, tool, button) end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingParameter,
+            r#"
+            ---@param base SANDBOX
+            local function CanTool(base, ply, trace, mode)
+                return base:CanTool(ply, trace, mode)
+            end
+            "#
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingParameter,
+            r#"
+            ---@param rules ToolRules
+            local function CanTool(rules, ply, trace, mode)
+                return rules:CanTool(ply, trace, mode)
+            end
+            "#
+        ));
+    }
+
+    #[test]
+    fn only_a_gamemode_method_overriding_a_hook_may_be_called_with_fewer_arguments() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "lua/aaa_annotations/gm.lua",
+            r#"
+            ---@class GM
+            GM = {}
+
+            ---@hook PlayerSpawn
+            ---@param ply table
+            ---@param transition boolean
+            function GM:PlayerSpawn(ply, transition) end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "gamemodes/sample/gamemode/init.lua",
+            r#"
+            function GM:PlayerSpawn(ply, transition) end
+
+            ---@param amount number
+            function GM:ChargeAccount(amount) return amount end
+
+            function GM:Respawn(ply)
+                self:PlayerSpawn(ply)
+                self:ChargeAccount()
+                GM.PlayerSpawn()
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::MissingParameter);
+        let lines = ws
+            .analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|diagnostic| diagnostic.range.start.line)
+            .collect::<Vec<_>>();
+        assert_eq!(lines, vec![8, 9]);
+    }
+
+    #[test]
+    fn untagging_the_hook_a_method_overrides_reports_its_short_calls_again() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        let base_path = "lua/aaa_annotations/rules.lua";
+        let tagged = r#"
+            ---@class Rules
+            Rules = {}
+            ---@hook Pulse
+            ---@param n number
+            function Rules:Pulse(n) end
+            "#;
+        ws.def_file(base_path, tagged);
+        let file_id = ws.def_file(
+            "lua/autorun/rules_child.lua",
+            r#"
+            function Rules:Pulse(n) end
+            Rules:Pulse()
+            "#,
+        );
+        let missing = |ws: &mut VirtualWorkspace| {
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::MissingParameter);
+            ws.analysis
+                .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+                .unwrap_or_default()
+                .len()
+        };
+        assert_eq!(missing(&mut ws), 0);
+
+        ws.def_file(
+            base_path,
+            &tagged.replace("---@hook Pulse", "---@noop Pulse"),
+        );
+        assert_eq!(missing(&mut ws), 1);
+
+        ws.def_file(base_path, tagged);
+        assert_eq!(missing(&mut ws), 0);
+    }
+
+    #[test]
+    fn a_hook_of_the_other_realm_does_not_excuse_a_short_call() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "lua/autorun/sh_rules.lua",
+            r#"
+            ---@class Rules
+            Rules = {}
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/server/sv_rules.lua",
+            r#"
+            ---@hook Pulse
+            ---@param n number
+            function Rules:Pulse(n) end
+            "#,
+        );
+        assert!(!ws.check_file_for(
+            DiagnosticCode::MissingParameter,
+            "lua/autorun/client/cl_rules.lua",
+            r#"
+            ---@param n number
+            function Rules:Pulse(n) end
+            Rules:Pulse()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_hook_tag_is_recognised_in_any_case() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "lua/aaa_annotations/rules_case.lua",
+            r#"
+            ---@class RulesCase
+            RulesCase = {}
+            ---@Hook Pulse
+            ---@param n number
+            function RulesCase:Pulse(n) end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingParameter,
+            r#"
+            RulesCase:Pulse()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn calling_a_panel_hook_with_fewer_arguments_is_not_missing_parameters() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "lua/aaa_annotations/panel.lua",
+            r#"
+            ---@class Panel
+            local Panel = {}
+
+            ---@hook PaintOver
+            ---@param width number
+            ---@param height number
+            ---@return boolean?
+            function Panel:PaintOver(width, height) end
+
+            ---@param width number
+            ---@param height number
+            function Panel:SetSize(width, height) end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingParameter,
+            r#"
+            ---@param pnl Panel
+            local function DrawOver(pnl)
+                pnl.m_OldPaintOver = pnl.PaintOver
+                pnl:m_OldPaintOver()
+            end
+            "#
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingParameter,
+            r#"
+            ---@param pnl Panel
+            local function Resize(pnl)
+                pnl:SetSize(10)
+            end
+            "#
+        ));
+    }
+
+    #[test]
     fn test_issue_276() {
         let mut ws = VirtualWorkspace::new();
 
@@ -334,6 +567,30 @@ mod test {
 
             pick()
         "#
+        ));
+    }
+
+    /// The `unknown` arm of an unannotated recursive function's return must not
+    /// make its arity look like 1: the base case returns two values, so the
+    /// spread fills both parameters.
+    #[test]
+    fn recursive_multi_return_fills_every_parameter() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingParameter,
+            r#"
+            ---@param x number
+            ---@param y number
+            local function takesTwo(x, y) end
+
+            local function r2(n)
+                if n and n > 0 then return r2(n - 1) end
+                return 1, 2
+            end
+
+            takesTwo(r2(5))
+            "#
         ));
     }
 }

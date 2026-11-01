@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "CodeFormatCore/Config/NameStyleRule.h"
 #include "LuaParser/Ast/LuaSyntaxTree.h"

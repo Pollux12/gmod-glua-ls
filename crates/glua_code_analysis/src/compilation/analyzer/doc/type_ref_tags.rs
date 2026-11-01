@@ -1,9 +1,9 @@
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaClosureExpr,
-    LuaDocDescriptionOwner, LuaDocTagAs, LuaDocTagCast, LuaDocTagModule, LuaDocTagOther,
-    LuaDocTagOutparam, LuaDocTagOverload, LuaDocTagParam, LuaDocTagReturn, LuaDocTagReturnCast,
-    LuaDocTagSchema, LuaDocTagSee, LuaDocTagType, LuaDocTypeFlag, LuaExpr, LuaFuncStat,
-    LuaIndexExpr, LuaIndexKey, LuaLocalName, LuaTokenKind, LuaVarExpr,
+    LuaDocDescriptionOwner, LuaDocOpType, LuaDocTagAs, LuaDocTagCast, LuaDocTagModule,
+    LuaDocTagOther, LuaDocTagOutparam, LuaDocTagOverload, LuaDocTagParam, LuaDocTagReturn,
+    LuaDocTagReturnCast, LuaDocTagSchema, LuaDocTagSee, LuaDocTagType, LuaDocTypeFlag, LuaExpr,
+    LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalName, LuaNameExpr, LuaTokenKind, LuaVarExpr,
 };
 use std::sync::Arc;
 
@@ -21,13 +21,14 @@ use crate::{
     },
 };
 use crate::{
-    InFiled, JsonSchemaFile, LuaCallArgRole, LuaOperatorMetaMethod, LuaTypeCache, LuaTypeOwner,
-    OVERLOAD_CALL_ARG_ATTRIBUTE, OperatorFunction, ReturnTypeKind, SignatureReturnStatus,
+    InFiled, JsonSchemaFile, LuaCallArgRole, LuaCastOp, LuaOperatorMetaMethod, LuaSignatureCast,
+    LuaTypeCache, LuaTypeOwner, OVERLOAD_CALL_ARG_ATTRIBUTE, OperatorFunction, ReturnTypeKind,
+    SignatureReturnStatus,
     compilation::analyzer::common::{TypeCacheWriteMode, bind_type, write_type_cache},
     db_index::{
-        AccessorFuncAnnotation, LuaDeclId, LuaDocParamInfo, LuaDocReturnInfo, LuaInstanceType,
-        LuaMemberId, LuaOperator, LuaOutParamInfo, LuaOutParamRoot, LuaSemanticDeclId,
-        LuaSignatureId, LuaType,
+        AccessorFuncAnnotation, AccessorOwner, AccessorPrefix, AccessorTemplate, LuaDeclId,
+        LuaDocParamInfo, LuaDocReturnInfo, LuaInstanceType, LuaMemberId, LuaOperator,
+        LuaOutParamInfo, LuaOutParamRoot, LuaSemanticDeclId, LuaSignatureId, LuaType,
     },
 };
 
@@ -221,7 +222,7 @@ pub fn analyze_param(analyzer: &mut DocAnalyzer, tag: LuaDocTagParam) -> Option<
     // bind type ref to signature and param
     if let Some(closure) = find_owner_closure(analyzer) {
         let id = LuaSignatureId::from_closure(analyzer.file_id, &closure);
-        // 绑定`attribute`标记
+        // Bind the `attribute` tag
         let attributes =
             find_attach_attribute(LuaAst::LuaDocTagParam(tag)).and_then(|tag_attribute_uses| {
                 let result: Vec<LuaAttributeUse> = tag_attribute_uses
@@ -260,7 +261,7 @@ pub fn analyze_param(analyzer: &mut DocAnalyzer, tag: LuaDocTagParam) -> Option<
             );
         }
     } else if let Some(LuaAst::LuaForRangeStat(for_range)) = analyzer.comment.get_owner() {
-        // for in 支持 @param 语法
+        // `for in` supports the @param syntax
         for it_name_token in for_range.get_var_name_list() {
             let it_name = it_name_token.get_name_text();
             if it_name == name {
@@ -307,9 +308,7 @@ pub fn analyze_outparam(analyzer: &mut DocAnalyzer, tag: LuaDocTagOutparam) -> O
         .db
         .get_signature_index_mut()
         .get_or_create(signature_id);
-    let root = if param_name == "self"
-        && (signature.is_colon_define || closure_is_colon_define(&closure))
-    {
+    let root = if param_name == "self" && signature.is_colon_define {
         LuaOutParamRoot::SelfReceiver
     } else {
         let Some(param_idx) = signature.find_param_idx(&param_name) else {
@@ -345,18 +344,6 @@ pub fn analyze_outparam(analyzer: &mut DocAnalyzer, tag: LuaDocTagOutparam) -> O
             .add_receiver_out_param_member_name(analyzer.file_id, member_name);
     }
     Some(())
-}
-
-fn closure_is_colon_define(closure: &LuaClosureExpr) -> bool {
-    let Some(func_stat) = closure.get_parent::<LuaFuncStat>() else {
-        return false;
-    };
-    let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
-        return false;
-    };
-    index_expr
-        .get_index_token()
-        .is_some_and(|token| token.is_colon())
 }
 
 fn receiver_member_name_for_closure(closure: &LuaClosureExpr) -> Option<String> {
@@ -463,43 +450,37 @@ pub fn analyze_return(analyzer: &mut DocAnalyzer, tag: LuaDocTagReturn) -> Optio
     Some(())
 }
 
+/// Resolves one cast operation, binding its doc type's type as for any doc type.
+fn resolve_cast_op(analyzer: &mut DocAnalyzer, op_type: &LuaDocOpType) -> LuaCastOp {
+    let typ = op_type.get_type().map(|node_type| {
+        let typ = infer_type(analyzer, node_type.clone());
+        let type_owner =
+            LuaTypeOwner::SyntaxId(InFiled::new(analyzer.file_id, node_type.get_syntax_id()));
+        bind_type(analyzer.db, type_owner, LuaTypeCache::DocType(typ.clone()));
+        typ
+    });
+    LuaCastOp::new(op_type, typ)
+}
+
 pub fn analyze_return_cast(analyzer: &mut DocAnalyzer, tag: LuaDocTagReturnCast) -> Option<()> {
     if let Some(LuaSemanticDeclId::Signature(signature_id)) = get_owner_id(analyzer, None, false) {
         let name_token = tag.get_name_token()?;
         let name = name_token.get_name_text();
 
-        let op_types: Vec<_> = tag.get_op_types().collect();
-        let cast_op_type = op_types.first()?;
-
-        // Bind the true condition type
-        if let Some(node_type) = cast_op_type.get_type() {
-            let typ = infer_type(analyzer, node_type.clone());
-            let infiled_syntax_id = InFiled::new(analyzer.file_id, node_type.get_syntax_id());
-            let type_owner = LuaTypeOwner::SyntaxId(infiled_syntax_id);
-            bind_type(analyzer.db, type_owner, LuaTypeCache::DocType(typ));
-        };
-
-        // Bind the false condition type if present
-        let fallback_cast = if op_types.len() > 1 {
-            let fallback_op_type = &op_types[1];
-            if let Some(node_type) = fallback_op_type.get_type() {
-                let typ = infer_type(analyzer, node_type.clone());
-                let infiled_syntax_id = InFiled::new(analyzer.file_id, node_type.get_syntax_id());
-                let type_owner = LuaTypeOwner::SyntaxId(infiled_syntax_id);
-                bind_type(analyzer.db, type_owner, LuaTypeCache::DocType(typ));
-            }
-            Some(fallback_op_type.to_ptr())
-        } else {
-            None
-        };
-
-        analyzer.db.get_flow_index_mut().add_signature_cast(
-            analyzer.file_id,
-            signature_id,
-            name.to_string(),
-            cast_op_type.to_ptr(),
+        let mut ops = tag
+            .get_op_types()
+            .map(|op_type| resolve_cast_op(analyzer, &op_type));
+        let cast = ops.next()?;
+        let fallback_cast = ops.next();
+        analyzer
+            .db
+            .get_signature_index_mut()
+            .get_or_create(signature_id)
+            .return_cast = Some(LuaSignatureCast {
+            name: name.to_string(),
+            cast,
             fallback_cast,
-        );
+        });
     } else {
         report_orphan_tag(analyzer, &tag);
     }
@@ -518,7 +499,7 @@ pub fn analyze_overload(analyzer: &mut DocAnalyzer, tag: LuaDocTagOverload) -> O
                 tag.get_range(),
                 OperatorFunction::Func(func.clone()),
             );
-            analyzer.db.get_operator_index_mut().add_operator(operator);
+            analyzer.db.add_operator(operator);
         }
     } else if let Some(closure) = find_owner_closure_or_report(analyzer, &tag) {
         let type_ref = infer_type(analyzer, tag.get_type()?);
@@ -725,12 +706,23 @@ pub fn analyze_other(analyzer: &mut DocAnalyzer, other: LuaDocTagOther) -> Optio
         && let Some(name) = extract_func_name_from_ast(&owner_ast)
     {
         let name_param_index = parse_accessorfunc_param_index(&description);
+        let closure = match &owner_ast {
+            LuaAst::LuaFuncStat(func) => func.get_closure(),
+            LuaAst::LuaLocalFuncStat(func) => func.get_closure(),
+            _ => None,
+        };
+        let file_order_key = analyzer.db.get_vfs().file_order_key(&analyzer.file_id);
         analyzer.db.get_accessor_func_index_mut().register(
             name.into(),
             AccessorFuncAnnotation {
                 name_param_index,
                 file_id: analyzer.file_id,
+                accessors: AccessorTemplate::receiver_get_set_pair(),
+                signature_id: closure
+                    .map(|closure| LuaSignatureId::from_closure(analyzer.file_id, &closure)),
+                inferred: false,
             },
+            file_order_key,
         );
     }
 
@@ -759,6 +751,561 @@ fn extract_func_name_from_ast(ast: &LuaAst) -> Option<String> {
             .get_local_name()?
             .get_name_token()
             .map(|token| token.get_name_text().to_string()),
+        _ => None,
+    }
+}
+
+/// The prefixes a generator's own literals may put before an accessor's name.
+const ACCESSOR_PREFIXES: [&str; 4] = ["Get", "Set", "Is", "Has"];
+
+/// The file whose generators are being read.
+struct GeneratorScan<'a> {
+    db: &'a crate::DbIndex,
+    file_id: crate::FileId,
+}
+
+/// A function of a file that may make accessors from a name it is given.
+struct GeneratorCandidate {
+    name: String,
+    closure: LuaClosureExpr,
+    is_method: bool,
+    /// Where the name that holds the function is declared: a local function's name, or
+    /// the plain global name of `function Name()`.
+    decl_position: Option<rowan::TextSize>,
+}
+
+/// The accessors a function makes, each with the parameter it is named after.
+type AccessorPairs = std::collections::BTreeSet<(usize, AccessorTemplate)>;
+
+/// Registers each function of `root` that makes methods on a table from a name,
+/// `tbl["Get" .. name] = function ... end`, as an accessor generator, as
+/// `@accessorfunc` marks one, together with each function that passes its name on
+/// to one of them.
+pub(crate) fn register_inferred_accessor_generators(
+    scan_db: &mut crate::DbIndex,
+    file_id: crate::FileId,
+    root: &glua_parser::LuaChunk,
+) {
+    let db = &*scan_db;
+    let candidates = root
+        .descendants::<LuaAst>()
+        .filter_map(|ast| generator_candidate(&ast))
+        .collect::<Vec<_>>();
+    let scan = GeneratorScan { db, file_id };
+    // Forwarding only adds pairs, of which a file's functions can name finitely many,
+    // so this reaches the least fixed point whatever order the functions come in.
+    let mut made = candidates
+        .iter()
+        .map(|candidate| direct_accessor_pairs(&scan, candidate))
+        .collect::<Vec<_>>();
+    loop {
+        let mut changed = false;
+        for index in 0..candidates.len() {
+            let forwarded = forwarded_accessor_pairs(&scan, &candidates, &made, &candidates[index]);
+            for pair in forwarded {
+                changed |= made[index].insert(pair);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (candidate, pairs) in candidates.iter().zip(made) {
+        // One name argument describes a generator only when every accessor is named
+        // after the same parameter.
+        let mut name_params = pairs.iter().map(|(name_param, _)| *name_param);
+        let Some(name_param_index) = name_params.next() else {
+            continue;
+        };
+        if name_params.any(|name_param| name_param != name_param_index) {
+            continue;
+        }
+        let file_order_key = scan_db.get_vfs().file_order_key(&file_id);
+        scan_db.get_accessor_func_index_mut().register(
+            candidate.name.as_str().into(),
+            AccessorFuncAnnotation {
+                name_param_index,
+                file_id,
+                accessors: pairs.into_iter().map(|(_, template)| template).collect(),
+                signature_id: Some(LuaSignatureId::from_closure(file_id, &candidate.closure)),
+                inferred: true,
+            },
+            file_order_key,
+        );
+    }
+}
+
+fn generator_candidate(ast: &LuaAst) -> Option<GeneratorCandidate> {
+    let (closure, is_method, decl_position) = match ast {
+        LuaAst::LuaFuncStat(func) => (
+            func.get_closure()?,
+            matches!(func.get_func_name(), Some(LuaVarExpr::IndexExpr(index))
+                if index.get_index_token().is_some_and(|token| token.is_colon())),
+            match func.get_func_name() {
+                Some(LuaVarExpr::NameExpr(name)) => Some(name.get_position()),
+                _ => None,
+            },
+        ),
+        LuaAst::LuaLocalFuncStat(func) => (
+            func.get_closure()?,
+            false,
+            Some(func.get_local_name()?.get_position()),
+        ),
+        _ => return None,
+    };
+    Some(GeneratorCandidate {
+        name: extract_func_name_from_ast(ast)?,
+        closure,
+        is_method,
+        decl_position,
+    })
+}
+
+/// The accessors a function makes by assigning a function to `owner[prefix .. name]`,
+/// through locals, where the owner is `self` for a method, the first parameter
+/// otherwise, or a local holding a call that names a class.
+fn direct_accessor_pairs(scan: &GeneratorScan, candidate: &GeneratorCandidate) -> AccessorPairs {
+    let mut pairs = AccessorPairs::new();
+    for assign in candidate.closure.descendants::<LuaAssignStat>() {
+        if !in_own_body(assign.syntax(), &candidate.closure) {
+            continue;
+        }
+        let (vars, values) = assign.get_var_and_expr_list();
+        for (var, value) in vars.iter().zip(values.iter()) {
+            let (LuaVarExpr::IndexExpr(index), LuaExpr::ClosureExpr(_)) = (var, value) else {
+                continue;
+            };
+            let Some(LuaExpr::NameExpr(owner_expr)) = index.get_prefix_expr() else {
+                continue;
+            };
+            let Some(owner) = accessor_owner(scan, candidate, &owner_expr) else {
+                continue;
+            };
+            let Some(LuaIndexKey::Expr(key)) = index.get_index_key() else {
+                continue;
+            };
+            let Some((prefix, name, capitalized)) = accessor_key(scan, candidate, key) else {
+                continue;
+            };
+            pairs.extend(accessor_pair(candidate, owner, prefix, name, capitalized));
+        }
+    }
+    pairs
+}
+
+/// The accessors a function makes by passing one of its parameters as the name to a
+/// function of `candidates` that makes the accessors `made` holds for it.
+fn forwarded_accessor_pairs(
+    scan: &GeneratorScan,
+    candidates: &[GeneratorCandidate],
+    made: &[AccessorPairs],
+    candidate: &GeneratorCandidate,
+) -> AccessorPairs {
+    let mut pairs = AccessorPairs::new();
+    for call in candidate.closure.descendants::<glua_parser::LuaCallExpr>() {
+        if !in_own_body(call.syntax(), &candidate.closure) {
+            continue;
+        }
+        let Some(LuaExpr::NameExpr(callee)) = call.get_prefix_expr() else {
+            continue;
+        };
+        let Some(callee_name) = callee.get_name_text() else {
+            continue;
+        };
+        // The callee is the function a local name declares, or the global one when
+        // no local binds the name.
+        let callee_decl = match read_decl(scan, &callee) {
+            Some((decl_id, decl)) if !decl.is_global() => {
+                if !never_reassigned(scan, decl_id) {
+                    continue;
+                }
+                Some(decl_id)
+            }
+            _ => {
+                let Some([decl_id]) = scan
+                    .db
+                    .get_global_index()
+                    .get_global_decl_ids(&callee_name)
+                    .map(Vec::as_slice)
+                else {
+                    continue;
+                };
+                if !never_reassigned(scan, *decl_id) {
+                    continue;
+                }
+                Some(*decl_id)
+            }
+        };
+        let Some(callee_pairs) = candidates
+            .iter()
+            .position(|other| {
+                callee_decl.is_some_and(|decl_id| {
+                    decl_id.file_id == scan.file_id && other.decl_position == Some(decl_id.position)
+                })
+            })
+            .map(|callee_index| &made[callee_index])
+        else {
+            continue;
+        };
+        let args = call
+            .get_args_list()
+            .map(|args| args.get_args().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for (callee_name_param, template) in callee_pairs {
+            let Some(name) = args
+                .get(*callee_name_param)
+                .and_then(|arg| passed_param(scan, candidate, arg))
+            else {
+                continue;
+            };
+            let owner = match &template.owner {
+                AccessorOwner::Receiver => {
+                    let Some(LuaExpr::NameExpr(receiver)) = args.first() else {
+                        continue;
+                    };
+                    let Some(owner) = accessor_owner(scan, candidate, receiver) else {
+                        continue;
+                    };
+                    owner
+                }
+                named_class => named_class.clone(),
+            };
+            let prefix = match &template.prefix {
+                AccessorPrefix::Literal(prefix) => AccessorPrefix::Literal(prefix.clone()),
+                AccessorPrefix::ParamOr(index, default) => match args.get(*index) {
+                    None => AccessorPrefix::Literal(default.clone()),
+                    Some(arg) if crate::compilation::analyzer::is_falsy_literal_expr(arg) => {
+                        AccessorPrefix::Literal(default.clone())
+                    }
+                    Some(arg) => {
+                        if let Some(param) = passed_param(scan, candidate, arg) {
+                            AccessorPrefix::ParamOr(param, default.clone())
+                        } else if let Some(prefix) = string_literal(arg) {
+                            AccessorPrefix::Literal(prefix.into())
+                        } else {
+                            continue;
+                        }
+                    }
+                },
+            };
+            pairs.extend(accessor_pair(
+                candidate,
+                owner,
+                prefix,
+                name,
+                template.capitalized,
+            ));
+        }
+    }
+    pairs
+}
+
+/// The accessor named after parameter `name`; none when the owner is the receiver a
+/// plain function takes first, which cannot also be the name.
+fn accessor_pair(
+    candidate: &GeneratorCandidate,
+    owner: AccessorOwner,
+    prefix: AccessorPrefix,
+    name: usize,
+    capitalized: bool,
+) -> Option<(usize, AccessorTemplate)> {
+    (owner != AccessorOwner::Receiver || candidate.is_method || name != 0).then_some((
+        name,
+        AccessorTemplate {
+            owner,
+            prefix,
+            capitalized,
+        },
+    ))
+}
+
+fn accessor_owner(
+    scan: &GeneratorScan,
+    candidate: &GeneratorCandidate,
+    owner: &LuaNameExpr,
+) -> Option<AccessorOwner> {
+    let (decl_id, decl) = read_decl(scan, owner)?;
+    match &decl.extra {
+        crate::LuaDeclExtra::ImplicitSelf { .. }
+            if candidate.is_method && never_reassigned(scan, decl_id) =>
+        {
+            return Some(AccessorOwner::Receiver);
+        }
+        crate::LuaDeclExtra::Param { idx: 0, .. }
+            if !candidate.is_method
+                && passed_param_decl(scan, candidate, decl_id, decl).is_some() =>
+        {
+            return Some(AccessorOwner::Receiver);
+        }
+        crate::LuaDeclExtra::Local { .. } => {
+            if let Some(table) = closed_over_table(scan, candidate, decl_id, decl) {
+                return Some(AccessorOwner::Table(table));
+            }
+        }
+        _ => {}
+    }
+    let LuaExpr::CallExpr(call) = local_value(scan, candidate, owner)? else {
+        return None;
+    };
+    let Some(LuaExpr::NameExpr(callee)) = call.get_prefix_expr() else {
+        return None;
+    };
+    if read_decl(scan, &callee).is_some_and(|(_, decl)| !decl.is_global()) {
+        return None;
+    }
+    let class_name = string_literal(&call.get_args_list()?.get_args().next()?)?;
+    Some(AccessorOwner::NamedClass {
+        callee: callee.get_name_text()?,
+        class_name: class_name.into(),
+    })
+}
+
+/// The table literal a never reassigned local declared outside `candidate` holds.
+fn closed_over_table(
+    scan: &GeneratorScan,
+    candidate: &GeneratorCandidate,
+    decl_id: LuaDeclId,
+    decl: &crate::LuaDecl,
+) -> Option<crate::InFiled<rowan::TextRange>> {
+    if !never_reassigned(scan, decl_id) {
+        return None;
+    }
+    let root = candidate.closure.syntax().ancestors().last()?;
+    let value = LuaExpr::cast(decl.get_value_syntax_id()?.to_node_from_root(&root)?)?;
+    if candidate
+        .closure
+        .syntax()
+        .text_range()
+        .contains_range(value.syntax().text_range())
+    {
+        return None;
+    }
+    crate::semantic::table_backing_range_from_expr(scan.file_id, &value)
+}
+
+/// The prefix and name parameter of an accessor key `prefix .. name`, and whether the
+/// name is capitalised, read through the local the key is held in; the prefix is a
+/// literal or `(param or literal)`.
+fn accessor_key(
+    scan: &GeneratorScan,
+    candidate: &GeneratorCandidate,
+    key: LuaExpr,
+) -> Option<(AccessorPrefix, usize, bool)> {
+    let key = match key {
+        LuaExpr::NameExpr(local) => local_value(scan, candidate, &local)?,
+        key => key,
+    };
+    let LuaExpr::BinaryExpr(concat) = unparenthesized(key) else {
+        return None;
+    };
+    if concat.get_op_token()?.get_op() != glua_parser::BinaryOperator::OpConcat {
+        return None;
+    }
+    let (prefix, name) = concat.get_exprs()?;
+    let (name, capitalized) = accessor_name_param(scan, candidate, &name)?;
+    let accessor_prefix = |expr: &LuaExpr| {
+        string_literal(expr).filter(|prefix| ACCESSOR_PREFIXES.contains(&prefix.as_str()))
+    };
+    let prefix = match unparenthesized(prefix) {
+        LuaExpr::BinaryExpr(or)
+            if or.get_op_token()?.get_op() == glua_parser::BinaryOperator::OpOr =>
+        {
+            let (param, default) = or.get_exprs()?;
+            AccessorPrefix::ParamOr(
+                passed_param(scan, candidate, &param)?,
+                accessor_prefix(&default)?.into(),
+            )
+        }
+        prefix => AccessorPrefix::Literal(accessor_prefix(&prefix)?.into()),
+    };
+    Some((prefix, name, capitalized))
+}
+
+/// The parameter an accessor's name is, and whether it is capitalised first, read
+/// through the local the name is held in.
+fn accessor_name_param(
+    scan: &GeneratorScan,
+    candidate: &GeneratorCandidate,
+    name: &LuaExpr,
+) -> Option<(usize, bool)> {
+    if let Some(param) = passed_param(scan, candidate, name) {
+        return Some((param, false));
+    }
+    let name = match name {
+        LuaExpr::NameExpr(local) => local_value(scan, candidate, local)?,
+        name => name.clone(),
+    };
+    capitalized_param(scan, candidate, name).map(|param| (param, true))
+}
+
+/// The parameter `expr` capitalises, as `p:sub(1, 1):upper() .. p:sub(2)` does, or
+/// the same through `string.upper` and `string.sub`.
+fn capitalized_param(
+    scan: &GeneratorScan,
+    candidate: &GeneratorCandidate,
+    expr: LuaExpr,
+) -> Option<usize> {
+    let LuaExpr::BinaryExpr(concat) = unparenthesized(expr) else {
+        return None;
+    };
+    if concat.get_op_token()?.get_op() != glua_parser::BinaryOperator::OpConcat {
+        return None;
+    }
+    let (first, rest) = concat.get_exprs()?;
+    let (upper_subject, upper_args) = string_call(scan, first, "upper")?;
+    let (first_subject, first_args) = string_call(scan, upper_subject, "sub")?;
+    let (rest_subject, rest_args) = string_call(scan, rest, "sub")?;
+    if !upper_args.is_empty()
+        || !int_literals(&first_args, &[1, 1])
+        || !int_literals(&rest_args, &[2])
+    {
+        return None;
+    }
+    let param = passed_param(scan, candidate, &first_subject)?;
+    (passed_param(scan, candidate, &rest_subject)? == param).then_some(param)
+}
+
+/// The string `expr` calls the string library's `method` on, as `s:method(...)` or
+/// `string.method(s, ...)`, with the arguments after it.
+fn string_call(
+    scan: &GeneratorScan,
+    expr: LuaExpr,
+    method: &str,
+) -> Option<(LuaExpr, Vec<LuaExpr>)> {
+    let LuaExpr::CallExpr(call) = unparenthesized(expr) else {
+        return None;
+    };
+    let Some(LuaExpr::IndexExpr(callee)) = call.get_prefix_expr() else {
+        return None;
+    };
+    let Some(LuaIndexKey::Name(key)) = callee.get_index_key() else {
+        return None;
+    };
+    if key.get_name_text() != method {
+        return None;
+    }
+    let mut args = call.get_args_list()?.get_args().collect::<Vec<_>>();
+    if call.is_colon_call() {
+        return Some((callee.get_prefix_expr()?, args));
+    }
+    let Some(LuaExpr::NameExpr(library)) = callee.get_prefix_expr() else {
+        return None;
+    };
+    if library.get_name_text()? != "string"
+        || read_decl(scan, &library).is_some_and(|(_, decl)| !decl.is_global())
+        || args.is_empty()
+    {
+        return None;
+    }
+    let subject = args.remove(0);
+    Some((subject, args))
+}
+
+fn int_literals(args: &[LuaExpr], expected: &[i64]) -> bool {
+    args.len() == expected.len()
+        && args.iter().zip(expected).all(|(arg, expected)| {
+            let LuaExpr::LiteralExpr(literal) = arg else {
+                return false;
+            };
+            matches!(
+                literal.get_literal(),
+                Some(glua_parser::LuaLiteralToken::Number(number))
+                    if number.get_number_value() == glua_parser::NumberResult::Int(*expected)
+            )
+        })
+}
+
+/// The declaration `name_expr` reads.
+fn read_decl<'a>(
+    scan: &GeneratorScan<'a>,
+    name_expr: &LuaNameExpr,
+) -> Option<(LuaDeclId, &'a crate::LuaDecl)> {
+    let decl_id = scan
+        .db
+        .get_reference_index()
+        .get_var_reference_decl(&scan.file_id, name_expr.get_range())?;
+    Some((decl_id, scan.db.get_decl_index().get_decl(&decl_id)?))
+}
+
+/// Whether nothing assigns the declaration after it takes its value.
+fn never_reassigned(scan: &GeneratorScan, decl_id: LuaDeclId) -> bool {
+    !scan
+        .db
+        .get_reference_index()
+        .get_decl_references(&scan.file_id, &decl_id)
+        .is_some_and(|references| references.mutable)
+}
+
+/// The parameter of `candidate` that `expr` passes unchanged: one of its own that
+/// nothing reassigns.
+fn passed_param(
+    scan: &GeneratorScan,
+    candidate: &GeneratorCandidate,
+    expr: &LuaExpr,
+) -> Option<usize> {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return None;
+    };
+    let (decl_id, decl) = read_decl(scan, name_expr)?;
+    passed_param_decl(scan, candidate, decl_id, decl)
+}
+
+fn passed_param_decl(
+    scan: &GeneratorScan,
+    candidate: &GeneratorCandidate,
+    decl_id: LuaDeclId,
+    decl: &crate::LuaDecl,
+) -> Option<usize> {
+    let crate::LuaDeclExtra::Param {
+        idx, signature_id, ..
+    } = &decl.extra
+    else {
+        return None;
+    };
+    (*signature_id == LuaSignatureId::from_closure(scan.file_id, &candidate.closure)
+        && never_reassigned(scan, decl_id))
+    .then_some(*idx)
+}
+
+/// The value of the never reassigned local, declared in `candidate`'s own body, that
+/// `name_expr` reads.
+fn local_value(
+    scan: &GeneratorScan,
+    candidate: &GeneratorCandidate,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaExpr> {
+    let (decl_id, decl) = read_decl(scan, name_expr)?;
+    if !matches!(decl.extra, crate::LuaDeclExtra::Local { .. }) || !never_reassigned(scan, decl_id)
+    {
+        return None;
+    }
+    let root = candidate.closure.syntax().ancestors().last()?;
+    let value = LuaExpr::cast(decl.get_value_syntax_id()?.to_node_from_root(&root)?)?;
+    in_own_body(value.syntax(), &candidate.closure).then_some(value)
+}
+
+fn in_own_body(node: &glua_parser::LuaSyntaxNode, closure: &LuaClosureExpr) -> bool {
+    node.ancestors()
+        .find_map(LuaClosureExpr::cast)
+        .is_some_and(|enclosing| enclosing.syntax() == closure.syntax())
+}
+
+fn unparenthesized(expr: LuaExpr) -> LuaExpr {
+    match expr {
+        LuaExpr::ParenExpr(paren) => match paren.get_expr() {
+            Some(inner) => unparenthesized(inner),
+            None => LuaExpr::ParenExpr(paren),
+        },
+        expr => expr,
+    }
+}
+
+fn string_literal(expr: &LuaExpr) -> Option<String> {
+    let LuaExpr::LiteralExpr(literal) = expr else {
+        return None;
+    };
+    match literal.get_literal()? {
+        glua_parser::LuaLiteralToken::String(string) => Some(string.get_value()),
         _ => None,
     }
 }
@@ -801,6 +1348,7 @@ pub fn analyze_doc_tag_schema(analyzer: &mut DocAnalyzer, tag: LuaDocTagSchema) 
     };
 
     let schema_index = analyzer.db.get_json_schema_index_mut();
+    schema_index.add_user(&url, analyzer.file_id);
     if let Some(schema_file) = schema_index.get_schema_file(&url) {
         if let JsonSchemaFile::Resolved(type_id) = schema_file {
             let types = vec![LuaType::Ref(type_id.clone())];

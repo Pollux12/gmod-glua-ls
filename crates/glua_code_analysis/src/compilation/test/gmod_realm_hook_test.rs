@@ -89,6 +89,191 @@ mod test {
         );
     }
 
+    #[test]
+    fn test_files_under_lua_menu_are_in_the_menu_realm() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let files = [
+            ws.def_file("lua/menu/mainmenu.lua", "return {}"),
+            ws.def_file("lua/menu/mount/vgui/workshop.lua", "return {}"),
+            ws.def_file("addons/tool/lua/menu/plugin.lua", "return {}"),
+        ];
+        let not_menu = ws.def_file("lua/menuhelpers/sh_util.lua", "return {}");
+
+        let infer_index = ws.get_db_mut().get_gmod_infer_index();
+        let realm_of = |file_id| {
+            infer_index
+                .get_realm_file_metadata(&file_id)
+                .map(|metadata| metadata.inferred_realm)
+        };
+        for file_id in files {
+            assert_eq!(realm_of(file_id), Some(GmodRealm::Menu));
+        }
+        assert_eq!(realm_of(not_menu), Some(GmodRealm::Shared));
+    }
+
+    #[test]
+    fn test_explicit_realm_names_under_lua_menu_keep_their_realm() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let files = [
+            (
+                ws.def_file("lua/menu/cl_named.lua", "return {}"),
+                GmodRealm::Client,
+            ),
+            (
+                ws.def_file("lua/menu/sv_named.lua", "return {}"),
+                GmodRealm::Server,
+            ),
+            (
+                ws.def_file("lua/menu/sh_named.lua", "return {}"),
+                GmodRealm::Shared,
+            ),
+            (
+                ws.def_file("lua/menu/client/plain.lua", "return {}"),
+                GmodRealm::Client,
+            ),
+            (
+                ws.def_file("lua/menu/server/plain.lua", "return {}"),
+                GmodRealm::Server,
+            ),
+        ];
+
+        let infer_index = ws.get_db_mut().get_gmod_infer_index();
+        for (file_id, expected) in files {
+            let realm = infer_index
+                .get_realm_file_metadata(&file_id)
+                .map(|metadata| metadata.inferred_realm);
+            assert_eq!(realm, Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_a_prefixed_menu_file_without_a_load_path_includes_on_its_own_realm() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let source = ws.def_file(
+            "addons/tool/lua/menu/cl_partial.lua",
+            r#"include("support/helper.lua")"#,
+        );
+        let helper = ws.def_file("addons/tool/lua/support/helper.lua", "return {}");
+
+        let infer_index = ws.get_db_mut().get_gmod_infer_index();
+        for file_id in [source, helper] {
+            let realm = infer_index
+                .get_realm_file_metadata(&file_id)
+                .map(|metadata| metadata.inferred_realm);
+            assert_eq!(realm, Some(GmodRealm::Client));
+        }
+    }
+
+    #[test]
+    fn test_an_unloaded_menu_shared_file_seeds_no_execution_state_for_its_includes() {
+        for source_path in [
+            "addons/tool/lua/menu/shared.lua",
+            "addons/tool/lua/menu/entities/example/shared.lua",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            set_gmod_enabled(&mut ws);
+            let source = ws.def_file(source_path, r#"include("support/helper.lua")"#);
+            let helper = ws.def_file("addons/tool/lua/support/helper.lua", "return {}");
+
+            let db = ws.get_db_mut();
+            let realm = db
+                .get_gmod_infer_index()
+                .get_realm_file_metadata(&source)
+                .map(|metadata| metadata.inferred_realm);
+            assert_eq!(realm, Some(GmodRealm::Menu), "{source_path}");
+            let helper_info = db
+                .get_gmod_load_index()
+                .get_file_info(&helper)
+                .map(|info| (info.state_mask, info.status));
+            assert_eq!(
+                helper_info,
+                Some((GmodStateMask::empty(), GmodLoadStatus::NoKnownLoadPath)),
+                "{source_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_server_include_of_an_addon_menu_file_runs_it_on_the_server() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "addons/tool/lua/autorun/server/sv_boot.lua",
+            r#"include("menu/widget.lua")"#,
+        );
+        let widget = ws.def_file("addons/tool/lua/menu/widget.lua", "return {}");
+
+        let db = ws.get_db_mut();
+        let state_mask = db
+            .get_gmod_load_index()
+            .get_file_info(&widget)
+            .map(|info| info.state_mask);
+        assert_eq!(state_mask, Some(GmodStateMask::SERVER));
+        let realm = db
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&widget)
+            .map(|metadata| metadata.inferred_realm);
+        assert_eq!(realm, Some(GmodRealm::Server));
+    }
+
+    #[test]
+    fn test_a_client_chain_through_an_addon_menu_file_keeps_only_the_client_state() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "addons/tool/lua/autorun/client/cl_boot.lua",
+            r#"include("zz/bridge.lua")"#,
+        );
+        ws.def_file(
+            "addons/tool/lua/zz/bridge.lua",
+            r#"include("menu/widget.lua")"#,
+        );
+        let widget = ws.def_file(
+            "addons/tool/lua/menu/widget.lua",
+            r#"include("support/helper.lua")"#,
+        );
+        let helper = ws.def_file("addons/tool/lua/support/helper.lua", "return {}");
+
+        let db = ws.get_db_mut();
+        for file_id in [widget, helper] {
+            let state_mask = db
+                .get_gmod_load_index()
+                .get_file_info(&file_id)
+                .map(|info| info.state_mask);
+            assert_eq!(state_mask, Some(GmodStateMask::CLIENT));
+            let realm = db
+                .get_gmod_infer_index()
+                .get_realm_file_metadata(&file_id)
+                .map(|metadata| metadata.inferred_realm);
+            assert_eq!(realm, Some(GmodRealm::Client));
+        }
+    }
+
+    #[test]
+    fn test_a_client_include_of_an_addon_menu_file_runs_it_on_the_client() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "addons/tool/lua/autorun/client/cl_boot.lua",
+            r#"include("menu/widget.lua")"#,
+        );
+        let widget = ws.def_file("addons/tool/lua/menu/widget.lua", "return {}");
+
+        let db = ws.get_db_mut();
+        let state_mask = db
+            .get_gmod_load_index()
+            .get_file_info(&widget)
+            .map(|info| info.state_mask);
+        assert_eq!(state_mask, Some(GmodStateMask::CLIENT));
+        let realm = db
+            .get_gmod_infer_index()
+            .get_realm_file_metadata(&widget)
+            .map(|metadata| metadata.inferred_realm);
+        assert_eq!(realm, Some(GmodRealm::Client));
+    }
     #[gtest]
     fn test_realm_inference_with_filename_and_dependency_hints() {
         let mut ws = VirtualWorkspace::new();
@@ -915,6 +1100,69 @@ mod test {
     }
 
     #[gtest]
+    fn test_mapped_emitter_call_is_collected_without_hook_text() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .hook_mappings
+            .emitter_to_hook
+            .insert("bus.Fire".to_string(), "*".to_string());
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def(r#"bus.Fire("MappedFire")"#);
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_hook_file_metadata(&file_id)
+            .cloned()
+            .expect("expected hook metadata");
+
+        assert!(metadata.sites.iter().any(|site| {
+            site.kind == GmodHookKind::Emit && site.hook_name.as_deref() == Some("MappedFire")
+        }));
+    }
+
+    #[gtest]
+    fn test_mapped_emitter_prefers_the_most_specific_path() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        for (path, hook) in [
+            ("Fire", "Short"),
+            ("bus.Fire", "Specific"),
+            ("us.Fire", "Middle"),
+            ("s.Fire", "Tiny"),
+        ] {
+            emmyrc
+                .gmod
+                .hook_mappings
+                .emitter_to_hook
+                .insert(path.to_string(), hook.to_string());
+        }
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def(r#"bus.Fire("x")"#);
+
+        let metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_hook_file_metadata(&file_id)
+            .cloned()
+            .expect("expected hook metadata");
+
+        assert_eq!(
+            metadata
+                .sites
+                .iter()
+                .filter(|site| site.kind == GmodHookKind::Emit)
+                .map(|site| site.hook_name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("Specific")]
+        );
+    }
+
+    #[gtest]
     fn test_hook_detection_respects_hook_mappings() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -1255,6 +1503,37 @@ mod test {
                 .any(|r| r.realm == GmodRealm::Client),
             "Expected Client realm range from if CLIENT block"
         );
+    }
+
+    #[gtest]
+    fn test_state_mask_intersects_every_containing_branch() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let text = r#"
+            if SERVER then
+                if CLIENT then
+                    print("dead")
+                end
+                if SERVER then
+                    print("live")
+                end
+            end
+            if CLIENT then
+                if SERVER then
+                    print("dead up")
+                end
+            end
+        "#;
+        let file_id = ws.def_file("lua/autorun/sh_nested_masks.lua", text);
+        let infer_index = ws.get_db_mut().get_gmod_infer_index();
+        let mask_at = |needle: &str| {
+            let offset = rowan::TextSize::new(text.find(needle).expect("needle") as u32);
+            infer_index.get_state_mask_at_offset(&file_id, offset)
+        };
+
+        assert_eq!(mask_at("print(\"dead\")"), GmodStateMask::EMPTY);
+        assert_eq!(mask_at("print(\"live\")"), GmodStateMask::SERVER);
+        assert_eq!(mask_at("print(\"dead up\")"), GmodStateMask::EMPTY);
     }
 
     #[gtest]
@@ -1676,6 +1955,35 @@ mod test {
                 .any(|r| r.realm == GmodRealm::Server),
             "Expected Server realm range from `if CLIENT then return end` early-return guard"
         );
+    }
+
+    /// Code appended after an early-return guard is in the guard's realm,
+    /// though the edit re-runs no load fold.
+    #[gtest]
+    fn test_code_appended_after_an_early_return_guard_takes_its_realm() {
+        const PATH: &str = "lua/sh_append_after_guard.lua";
+        const TEXT: &str = "print(\"shared\")
+if CLIENT then return end
+print(\"server-only\")
+";
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(PATH, TEXT);
+
+        let file_id = ws.def_file(
+            PATH,
+            &format!(
+                "{TEXT}print(\"appended\")
+"
+            ),
+        );
+
+        let appended = rowan::TextSize::from((TEXT.len() + 1) as u32);
+        let realm = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_realm_at_offset(&file_id, appended);
+        expect_that!(realm, eq(GmodRealm::Server));
     }
 
     #[gtest]
@@ -2878,6 +3186,44 @@ mod test {
         );
     }
 
+    /// A dynamic loader whose file settles its realm over several fixpoint
+    /// rounds records its edge once, with the states its file settled on.
+    #[gtest]
+    fn test_load_index_dynamic_loader_reached_late_records_one_settled_edge() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let part_id = ws.def_file("lua/myaddon/parts/part.lua", "return true");
+        ws.def_file(
+            "lua/myaddon/sh_loader.lua",
+            r#"
+            local files = file.Find("myaddon/parts/*.lua", "LUA")
+            for _, file_name in ipairs(files) do
+                include("myaddon/parts/" .. file_name)
+            end
+            "#,
+        );
+        ws.def_file("lua/aaa/mid.lua", r#"include("myaddon/sh_loader.lua")"#);
+        ws.def_file(
+            "lua/autorun/server/sv_boot.lua",
+            r#"include("aaa/mid.lua")"#,
+        );
+
+        let db = ws.get_db_mut();
+        let dynamic_edges = db
+            .get_gmod_load_index()
+            .get_file_info(&part_id)
+            .map(|info| {
+                info.incoming_edges
+                    .iter()
+                    .filter(|edge| edge.original_expr.as_deref() == Some("gmod.file_find"))
+                    .map(|edge| edge.states)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert_eq!(dynamic_edges, vec![GmodStateMask::SERVER]);
+    }
+
     #[gtest]
     fn test_load_index_dynamic_file_find_prefix_dispatch_loader() {
         let mut ws = VirtualWorkspace::new();
@@ -2951,6 +3297,47 @@ mod test {
                 .map(|m| m.inferred_realm),
             Some(GmodRealm::Shared),
         );
+    }
+
+    /// An annotated load wrapper one file defines and another calls loads the
+    /// file it is given, and the load fold settles in one run: the wrapper's
+    /// role comes from what its signature declares, not from what inference
+    /// resolves for it.
+    #[gtest]
+    fn test_load_wrapper_from_another_file_loads_its_target_in_one_fold_run() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_gmod_call_arg_builtins();
+        let target = ws.def_file("lua/myaddon/sv_store.lua", "return true");
+        ws.def_files(vec![
+            (
+                "lua/autorun/sh_lib.lua",
+                "MyLib = {}
+---@[call_arg(\"gmod.load\", \"include\")]
+---@param path string
+function MyLib.Include(path)
+    include(path)
+end
+",
+            ),
+            (
+                "lua/autorun/server/sv_loader.lua",
+                "MyLib.Include(\"myaddon/sv_store.lua\")
+",
+            ),
+        ]);
+
+        let runs = ws
+            .analysis
+            .compilation
+            .last_stats()
+            .evaluations(crate::db_index::derivation::DerivationKind::GmodLoad);
+        let loaded = ws
+            .get_db_mut()
+            .get_gmod_load_index()
+            .get_file_info(&target)
+            .is_some_and(|info| info.state_mask == GmodStateMask::SERVER);
+        expect_that!((runs, loaded), eq((1, true)));
     }
 
     #[gtest]
@@ -3643,6 +4030,7 @@ mod test {
         let old_target_id = ws
             .analysis
             .update_file_by_uri(&target_uri, Some("return true".to_string()))
+            .map(|(id, _)| id)
             .expect("target file id must be present");
         ws.def_file(
             "lua/autorun/server/sv_loader.lua",
@@ -3651,10 +4039,12 @@ mod test {
 
         ws.analysis
             .remove_file_by_uri(&target_uri)
+            .0
             .expect("target should be removed");
         let new_target_id = ws
             .analysis
             .update_file_by_uri(&target_uri, Some("return true".to_string()))
+            .map(|(id, _)| id)
             .expect("recreated target file id must be present");
         assert_ne!(old_target_id, new_target_id);
 
@@ -3666,6 +4056,55 @@ mod test {
             .expect("recreated target should have load info");
         assert_that!(
             new_target_info.state_mask.contains(GmodStateMask::SERVER),
+            eq(true)
+        );
+    }
+
+    /// Every load site contributes exactly one incoming edge, carrying the converged state
+    /// mask, and the edges are ordered by the normalized path of the including file. Before
+    /// the sites were sorted and the edges recorded after convergence, a site visited ahead of
+    /// its source's realm also left an edge stamped with the empty mask.
+    #[gtest]
+    fn test_load_index_incoming_edges_are_one_per_site_in_source_path_order() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let target_id = ws.def_file("lua/myaddon/target.lua", "return true");
+        let b_id = ws.def_file(
+            "lua/myaddon/b_middle.lua",
+            r#"include("myaddon/target.lua")"#,
+        );
+        let a_id = ws.def_file(
+            "lua/myaddon/a_middle.lua",
+            r#"include("myaddon/target.lua")"#,
+        );
+        ws.def_file(
+            "lua/autorun/server/sv_boot.lua",
+            r#"
+            include("myaddon/b_middle.lua")
+            include("myaddon/a_middle.lua")
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let target_info = db
+            .get_gmod_load_index()
+            .get_file_info(&target_id)
+            .expect("target should have load info");
+
+        assert_eq!(
+            target_info
+                .incoming_edges
+                .iter()
+                .map(|edge| edge.source_file_id)
+                .collect::<Vec<_>>(),
+            vec![a_id, b_id],
+        );
+        assert_that!(
+            target_info
+                .incoming_edges
+                .iter()
+                .all(|edge| edge.states == GmodStateMask::SERVER),
             eq(true)
         );
     }

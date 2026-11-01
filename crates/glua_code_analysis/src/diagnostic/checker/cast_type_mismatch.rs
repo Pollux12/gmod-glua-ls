@@ -1,5 +1,6 @@
 use glua_parser::{LuaAst, LuaAstNode, LuaDocTagCast};
 use rowan::TextRange;
+use rustc_hash::FxHashSet;
 use std::collections::HashSet;
 
 use crate::{
@@ -15,7 +16,10 @@ impl Checker for CastTypeMismatchChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::CastTypeMismatch];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        for node in semantic_model.get_root().descendants::<LuaAst>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for node in buckets.all_nodes.iter().cloned() {
             if let LuaAst::LuaDocTagCast(cast_tag) = node {
                 check_cast_tag(context, semantic_model, &cast_tag);
             }
@@ -36,9 +40,9 @@ fn check_cast_tag(
 
     let doc_ctx = DocTypeInferContext::new(semantic_model.get_db(), semantic_model.get_file_id());
 
-    // 检查每个 cast 操作类型
+    // Check each cast operation type
     for op_type in cast_tag.get_op_types() {
-        // 如果具有操作符, 则不检查
+        // No check if it has an operator
         if op_type.get_op().is_some() {
             continue;
         }
@@ -71,11 +75,11 @@ fn check_cast_compatibility(
         return Some(());
     }
 
-    // 检查是否可以从原始类型转换为目标类型, 允许父类转为子类
+    // Check whether the original type can be converted to the target type, allowing a parent class to be cast to a child class
     let result = match origin_type {
         LuaType::Union(union_type) => {
             for member_type in union_type.types() {
-                // 不检查 nil 类型
+                // Do not check the nil type
                 if member_type.is_nil() {
                     continue;
                 }
@@ -138,7 +142,7 @@ fn add_cast_type_mismatch_diagnostic(
     }
 }
 
-/// 允许父类转为子类
+/// Allows a parent class to be cast to a child class
 fn cast_type_check(
     semantic_model: &SemanticModel,
     origin_type: &LuaType,
@@ -154,7 +158,7 @@ fn cast_type_check(
         return Ok(());
     }
 
-    // cast 规则非常宽松
+    // The cast rules are very loose
     match (origin_type, target_type) {
         (LuaType::Any | LuaType::Nil, _) => Ok(()),
         (LuaType::Number, LuaType::Integer) => Ok(()),
@@ -164,7 +168,7 @@ fn cast_type_check(
             Ok(())
         }
         (_, LuaType::Union(union)) => {
-            // 通常来说这个的原始类型为 alias / enum-field 的集合
+            // Usually the original type here is a set of alias / enum-field
             for member_type in union.types() {
                 match cast_type_check(
                     semantic_model,
@@ -211,23 +215,23 @@ fn cast_type_check(
 }
 
 fn expand_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
-    let mut visited = HashSet::new();
+    let mut visited = FxHashSet::default();
     expand_type_recursive(db, typ, &mut visited)
 }
 
 fn expand_type_recursive(
     db: &DbIndex,
     typ: &LuaType,
-    visited: &mut HashSet<LuaType>,
+    visited: &mut FxHashSet<LuaType>,
 ) -> Option<LuaType> {
-    // TODO: 优化性能
-    // 防止无限递归, 性能很有问题, 但 @cast 使用频率不高, 这是可以接受的
+    // TODO: optimize performance
+    // Prevents infinite recursion; performance is poor, but @cast is rarely used so this is acceptable
     if visited.contains(typ) {
         return Some(typ.clone());
     }
     visited.insert(typ.clone());
 
-    // 展开类型, 如果具有多种类型将尽量返回 union
+    // Expand the type; if it has several types, return a union where possible
     match get_real_type(db, typ).unwrap_or(typ) {
         LuaType::Ref(id) | LuaType::Def(id) => {
             let type_decl = db.get_type_index().get_type_decl(id)?;
@@ -246,8 +250,8 @@ fn expand_type_recursive(
             return expand_type_recursive(db, &union, visited);
         }
         LuaType::Union(union_type) => {
-            // 递归展开 union 中的每个类型
-            let mut expanded_types = HashSet::new();
+            // Recursively expand each type in the union
+            let mut expanded_types = HashSet::default();
             let mut has_nil = false;
             for inner_type in union_type.types() {
                 if inner_type.is_nil() {
@@ -257,7 +261,7 @@ fn expand_type_recursive(
                 if let Some(expanded) = expand_type_recursive(db, inner_type, visited) {
                     match expanded {
                         LuaType::Union(inner_union) => {
-                            // 如果展开后还是 union，则将其成员类型添加到结果中
+                            // If the expansion is still a union, add its member types to the result
                             expanded_types.extend(inner_union.types().cloned());
                         }
                         _ => {

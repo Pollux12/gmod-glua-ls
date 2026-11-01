@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use glua_parser::{LuaAstNode, LuaAstToken, LuaDocTagClass};
 use rowan::TextRange;
@@ -12,15 +12,17 @@ pub struct CircleDocClassChecker;
 impl Checker for CircleDocClassChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::CircleDocClass];
 
-    /// 检查循环继承的类
+    /// Checks classes with circular inheritance
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
 
-        for expr in root.descendants::<LuaDocTagClass>() {
+        for expr in buckets.doc_tag_classes.iter() {
             if context.is_cancelled() {
                 return;
             }
-            check_doc_tag_class(context, semantic_model, &expr);
+            check_doc_tag_class(context, semantic_model, expr);
         }
     }
 }
@@ -36,19 +38,19 @@ fn check_doc_tag_class(
 
     let type_index = context.db.get_type_index();
 
-    let class_decl =
-        type_index.find_type_decl(context.file_id, tag.get_name_token()?.get_name_text())?;
+    let class_decl = type_index
+        .find_type_decl_by_site(context.file_id, tag.get_name_token()?.syntax().text_range())?;
 
     if !class_decl.is_class() {
         return Some(());
     }
 
-    let name = class_decl.get_full_name();
+    let class_id = class_decl.get_id();
 
     let mut queue = Vec::new();
-    let mut visited = HashSet::new();
+    let mut visited = FxHashSet::default();
 
-    queue.push(class_decl.get_id());
+    queue.push(class_id.clone());
     while let Some(current_id) = queue.pop() {
         if context.is_cancelled() {
             return Some(());
@@ -64,7 +66,7 @@ fn check_doc_tag_class(
                     return Some(());
                 }
                 if let LuaType::Ref(super_type_id) = &super_type {
-                    if super_type_id.get_name() == name {
+                    if *super_type_id == class_id {
                         context.add_diagnostic(
                             DiagnosticCode::CircleDocClass,
                             get_lint_range(tag).unwrap_or(tag.get_range()),

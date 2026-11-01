@@ -12,7 +12,7 @@ use glua_parser::{
 use lsp_types::{
     Command, CompletionItem, CompletionTextEdit, InsertTextFormat, InsertTextMode, TextEdit,
 };
-use rowan::TextSize;
+use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 
 use crate::handlers::completion::add_completions::CompletionTriggerStatus;
@@ -281,6 +281,9 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
         return false;
     }
 
+    let inserts_call =
+        builder.semantic_model.get_emmyrc().completion.call_snippet && !is_called(&index_expr);
+
     let mismatch_marker = if builder
         .semantic_model
         .get_emmyrc()
@@ -330,10 +333,11 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
         // `bits` alone cannot separate the first two from the third, because it
         // is `None` both when there is no bit parameter and when the writer
         // passed a variable.
-        let (insert_text, is_snippet) = match (has_bits_param, bits) {
-            (true, Some(bits)) => (format!("{read_name}({bits})"), false),
-            (true, None) => (format!("{read_name}(${{1:bits}})"), true),
-            (false, _) => (read_name.clone(), false),
+        let (insert_text, is_snippet) = match (inserts_call, has_bits_param, bits) {
+            (false, _, _) => (read_name.clone(), false),
+            (true, true, Some(bits)) => (format!("{read_name}({bits})"), false),
+            (true, true, None) => (format!("{read_name}(${{1:bits}})"), true),
+            (true, false, _) => (format!("{read_name}()"), false),
         };
 
         let _ = builder.add_completion_item(CompletionItem {
@@ -362,6 +366,15 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
     true
 }
 
+/// Whether `index_expr` is already the callee of a call, whose arguments a
+/// completion replacing only `index_expr` keeps.
+fn is_called(index_expr: &LuaIndexExpr) -> bool {
+    index_expr
+        .get_parent::<LuaCallExpr>()
+        .and_then(|call_expr| call_expr.get_prefix_expr())
+        .is_some_and(|prefix_expr| prefix_expr.syntax() == index_expr.syntax())
+}
+
 fn choose_preferred_send_flow<'a>(
     send_flows: Vec<(FileId, &'a NetSendFlow)>,
     infer_index: &glua_code_analysis::GmodInferIndex,
@@ -369,7 +382,7 @@ fn choose_preferred_send_flow<'a>(
 ) -> Option<(FileId, &'a NetSendFlow)> {
     send_flows
         .into_iter()
-        .filter(|(_, flow)| !flow.writes.is_empty())
+        .filter(|(_, flow)| flow.payload_known() && !flow.writes.is_empty())
         .max_by_key(|(send_file_id, flow)| {
             let sender_realm =
                 infer_index.get_realm_at_offset(send_file_id, flow.start_range.start());
@@ -653,16 +666,22 @@ fn count_label(count: usize, singular: &str, plural: &str) -> String {
 fn collect_net_message_stats(builder: &CompletionBuilder) -> Vec<(String, (usize, usize))> {
     let infer_index = builder.semantic_model.get_db().get_gmod_infer_index();
     let mut net_name_stats: HashMap<String, (usize, usize)> = HashMap::new();
-    for (_, metadata) in infer_index.iter_system_file_metadata() {
+    for (file_id, metadata) in infer_index.iter_system_file_metadata() {
         if builder.is_cancelled() {
             return Vec::new();
         }
         for net_registration in &metadata.net_add_string_calls {
+            if is_name_being_completed(builder, file_id, net_registration.name_range) {
+                continue;
+            }
             if let Some(name) = normalize_name(net_registration.name.as_deref()) {
                 net_name_stats.entry(name.to_string()).or_default().0 += 1;
             }
         }
         for net_receive in &metadata.net_receive_calls {
+            if is_name_being_completed(builder, file_id, net_receive.name_range) {
+                continue;
+            }
             if let Some(name) = normalize_name(net_receive.message_name.as_deref()) {
                 net_name_stats.entry(name.to_string()).or_default().1 += 1;
             }
@@ -690,6 +709,9 @@ fn collect_hook_completion_entries(
             return Vec::new();
         }
         for hook_site in &metadata.sites {
+            if is_name_being_completed(builder, file_id, hook_site.name_range) {
+                continue;
+            }
             if should_filter_realm {
                 let hook_realm =
                     resolve_hook_site_realm(&builder.semantic_model, file_id, hook_site);
@@ -746,6 +768,15 @@ fn collect_hook_completion_entries(
             (name, stats, data)
         })
         .collect()
+}
+
+fn is_name_being_completed(
+    builder: &CompletionBuilder,
+    file_id: &FileId,
+    name_range: Option<TextRange>,
+) -> bool {
+    *file_id == builder.semantic_model.get_file_id()
+        && name_range.is_some_and(|range| range.contains_inclusive(builder.position_offset))
 }
 
 fn literal_arg_index(call_expr: &LuaCallExpr, literal_expr: &LuaLiteralExpr) -> Option<usize> {

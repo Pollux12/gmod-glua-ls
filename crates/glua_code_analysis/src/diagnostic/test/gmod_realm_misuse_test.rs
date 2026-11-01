@@ -284,6 +284,48 @@ mod tests {
     }
 
     #[gtest]
+    fn test_risky_mismatch_message_names_the_evidence_for_each_side() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
+
+        ws.def_file(
+            "lua/myaddon/api.lua",
+            r#"
+                ---@realm server
+                function ServerOnlyApi()
+                    return true
+                end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/myaddon/cl_hud.lua",
+            r#"
+                ServerOnlyApi()
+            "#,
+        );
+
+        let messages = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            messages,
+            elements_are![eq(
+                "Possible realm mismatch: `ServerOnlyApi` is called in client realm (inferred from the file path) but declaration is server (from a @realm annotation)."
+            )]
+        );
+    }
+
+    #[gtest]
     fn test_does_not_report_unknown_realm_when_callsite_has_default_menu_realm() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -1484,5 +1526,138 @@ mod tests {
             }),
             "Expected inherited shared Think to suppress the client override mismatch, got: {diagnostics:?}"
         );
+    }
+    /// Realm reports for a client `source` beside a server `ENT:ServerPos` and `ServerOnlyApi`.
+    fn guarded_call_realm_reports(source: &str) -> Vec<lsp_types::Diagnostic> {
+        let mut ws = VirtualWorkspace::new();
+        enable_only_realm_mismatch_diagnostics(&mut ws);
+        ws.def_file(
+            "lua/entities/realm_guard_entity/init.lua",
+            "function ENT:ServerPos() return 1 end\n",
+        );
+        ws.def_file(
+            "lua/autorun/server/sv_api.lua",
+            "function ServerOnlyApi() return true end\n",
+        );
+        let file_id = ws.def_file("lua/entities/realm_guard_entity/cl_init.lua", source);
+        let codes = [
+            DiagnosticCode::GmodRealmMismatch,
+            DiagnosticCode::GmodRealmMismatchHeuristic,
+        ]
+        .map(|code| Some(NumberOrString::String(code.get_name().to_string())));
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| codes.contains(&diagnostic.code))
+            .collect()
+    }
+
+    /// A call made only once its callee is proven present never runs where it is missing.
+    #[gtest]
+    fn a_presence_guarded_call_is_not_a_realm_mismatch() {
+        for body in [
+            "if self.ServerPos then self:ServerPos() end",
+            "local pos = self.ServerPos and self:ServerPos()",
+            "if not self.ServerPos then return end\n    self:ServerPos()",
+            "if self.ServerPos == nil then return end\n    for i = 1, 2 do self:ServerPos() end",
+            "if self.ServerPos ~= nil then self:ServerPos() end",
+            "if (self.ServerPos) == nil then return end\n    self:ServerPos()",
+            "for i = 1, 2 do\n        if not self.ServerPos then break end\n        self:ServerPos()\n    end",
+            "if ServerOnlyApi then ServerOnlyApi() end",
+            "local ok = ServerOnlyApi and ServerOnlyApi()",
+            "if not ServerOnlyApi then return end\n    ServerOnlyApi()",
+        ] {
+            let source = format!("function ENT:Draw()\n    {body}\nend\n");
+            let reports = guarded_call_realm_reports(&source);
+            assert!(reports.is_empty(), "{body}: {reports:?}");
+        }
+    }
+
+    /// A guard on another member, or one that does not exit, leaves the call reachable.
+    #[gtest]
+    fn a_call_its_guard_does_not_cover_is_a_realm_mismatch() {
+        for body in [
+            "self:ServerPos()",
+            "if self.Other then self:ServerPos() end",
+            "if self.ServerPos then print(1) end\n    self:ServerPos()",
+            "if not self.ServerPos then print(1) end\n    self:ServerPos()",
+            "if not self.ServerPos then goto call end\n    ::call::\n    self:ServerPos()",
+            "if not self.ServerPos then\n        if Other then goto call end\n        return\n    end\n    ::call::\n    self:ServerPos()",
+            "if Other then goto call end\n    if not self.ServerPos then return end\n    ::call::\n    self:ServerPos()",
+            "local ent, other = self, self\n    if not ent.ServerPos then return else ent = other end\n    ent:ServerPos()",
+            "if Other then ServerOnlyApi() end",
+        ] {
+            let source = format!("function ENT:Draw()\n    {body}\nend\n");
+            let reports = guarded_call_realm_reports(&source);
+            assert_eq!(reports.len(), 1, "{body}: {reports:?}");
+        }
+    }
+    /// A name guard does not cover a local that shadows the tested global.
+    #[gtest]
+    fn a_name_guard_does_not_cover_a_local_that_shadows_it() {
+        let local_call = "local ServerOnlyApi = ServerOnlyApi\n        ServerOnlyApi()";
+        let unguarded =
+            format!("function ENT:Draw()\n    do\n        {local_call}\n    end\nend\n");
+        assert_eq!(guarded_call_realm_reports(&unguarded).len(), 1);
+        let guarded = format!(
+            "function ENT:Draw()\n    if ServerOnlyApi then\n        {local_call}\n    end\nend\n"
+        );
+        let reports = guarded_call_realm_reports(&guarded);
+        assert_eq!(reports.len(), 1, "{reports:?}");
+    }
+    const SERVER_DECLARED_TOOL: &str = r#"
+        local TOOL = {}
+        if SERVER then
+            function TOOL:SendFunc() end
+        else
+            function TOOL:Spawn()
+                self.SendFunc()
+            end
+        end
+        return TOOL
+    "#;
+
+    fn realm_reports_in_tool(with_proxy_includer: bool) -> usize {
+        let mut ws = VirtualWorkspace::new();
+        enable_only_realm_mismatch_diagnostics(&mut ws);
+        ws.def_gmod_call_arg_builtins();
+        if with_proxy_includer {
+            ws.def_file(
+                "lua/weapons/sf2_tool/shared.lua",
+                r#"
+                local t_meta = {}
+                t_meta.__index = function(self, key)
+                    return self._swep[key]
+                end
+                local tool = include("weapons/sf2_tool/settings/light_editor.lua")
+                setmetatable(tool, t_meta)
+                "#,
+            );
+            ws.def_file("lua/weapons/sf2_tool/init.lua", "include(\"shared.lua\")");
+        }
+        let file_id = ws.def_file(
+            "lua/weapons/sf2_tool/settings/light_editor.lua",
+            SERVER_DECLARED_TOOL,
+        );
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::GmodRealmMismatch.get_name().to_string(),
+        ));
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .count()
+    }
+
+    #[gtest]
+    fn a_member_declared_only_in_another_realm_is_a_mismatch_on_a_closed_table() {
+        assert_eq!(realm_reports_in_tool(false), 1);
+    }
+
+    #[gtest]
+    fn a_member_declared_only_in_another_realm_may_come_from_a_function_index() {
+        assert_eq!(realm_reports_in_tool(true), 0);
     }
 }

@@ -13,8 +13,10 @@ impl Checker for EnumValueMismatchChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::EnumValueMismatch];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
-        for node in root.descendants::<LuaAst>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for node in buckets.all_nodes.iter().cloned() {
             let condition_expr = match node {
                 LuaAst::LuaIfStat(if_stat) => if_stat.get_condition_expr(),
                 LuaAst::LuaElseIfClauseStat(elseif_stat) => elseif_stat.get_condition_expr(),
@@ -83,11 +85,14 @@ fn check_enum_value_pair(
     let constant_type = get_constant_type(value_type)?;
     let enum_value_types = get_enum_value_types(context, enum_decl_id)?;
 
-    if !enum_value_types.contains(constant_type) {
-        let constant_value_str = humanize_lint_type(context.db, constant_type);
+    if !enum_value_types
+        .iter()
+        .any(|value| same_constant(value, constant_type))
+    {
+        let constant_value_str = humanize_constant(context, constant_type);
         let enum_values_str: Vec<String> = enum_value_types
             .iter()
-            .map(|typ| humanize_lint_type(context.db, typ))
+            .map(|typ| humanize_constant(context, typ))
             .collect();
         context.add_diagnostic(
             DiagnosticCode::EnumValueMismatch,
@@ -169,5 +174,33 @@ fn get_constant_type(typ: &LuaType) -> Option<&LuaType> {
         | LuaType::DocBooleanConst(_)
         | LuaType::TableConst(_) => Some(typ),
         _ => None,
+    }
+}
+
+fn same_constant(a: &LuaType, b: &LuaType) -> bool {
+    match (a, b) {
+        (
+            LuaType::StringConst(a) | LuaType::DocStringConst(a),
+            LuaType::StringConst(b) | LuaType::DocStringConst(b),
+        ) => a == b,
+        (
+            LuaType::IntegerConst(a) | LuaType::DocIntegerConst(a),
+            LuaType::IntegerConst(b) | LuaType::DocIntegerConst(b),
+        ) => a == b,
+        (
+            LuaType::BooleanConst(a) | LuaType::DocBooleanConst(a),
+            LuaType::BooleanConst(b) | LuaType::DocBooleanConst(b),
+        ) => a == b,
+        _ => a == b,
+    }
+}
+
+fn humanize_constant(context: &DiagnosticContext, typ: &LuaType) -> String {
+    match typ {
+        LuaType::StringConst(value) | LuaType::DocStringConst(value) => format!("\"{value}\""),
+        LuaType::IntegerConst(value) | LuaType::DocIntegerConst(value) => value.to_string(),
+        LuaType::BooleanConst(value) | LuaType::DocBooleanConst(value) => value.to_string(),
+        LuaType::FloatConst(value) => value.to_string(),
+        _ => humanize_lint_type(context.db, typ),
     }
 }

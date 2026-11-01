@@ -49,4 +49,3 @@ public:
     ResultType Type;
     T Data;
 };
-

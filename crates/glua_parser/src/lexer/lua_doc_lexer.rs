@@ -645,10 +645,11 @@ impl LuaDocLexer<'_> {
                 reader.bump();
                 reader.eat_while(is_name_continue);
                 let text = reader.current_text();
-                if text == "nil" {
-                    LuaTokenKind::TkNil
-                } else {
-                    LuaTokenKind::TkName
+                match text {
+                    "nil" => LuaTokenKind::TkNil,
+                    "true" => LuaTokenKind::TkTrue,
+                    "false" => LuaTokenKind::TkFalse,
+                    _ => LuaTokenKind::TkName,
                 }
             }
             _ => {

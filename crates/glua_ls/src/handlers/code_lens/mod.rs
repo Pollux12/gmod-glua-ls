@@ -10,7 +10,7 @@ use resolve_code_lens::resolve_code_lens;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::context::ServerContextSnapshot;
+use crate::context::{Freshness, ServerContextSnapshot};
 
 use super::RegisterCapabilities;
 
@@ -32,12 +32,14 @@ pub async fn on_code_lens_handler(
         return None;
     }
 
-    // Wait for pending reindex work so VS Code keeps the current lenses visible
-    // instead of clearing them during the dirty window, which causes layout flicker.
-    if !context
+    // Wait until this document's entries match its text so VS Code keeps the
+    // current lenses visible instead of clearing them during the dirty window,
+    // which causes layout flicker.
+    if context
         .debounced_analysis()
-        .wait_until_fresh_for(&cancel_token, "textDocument/codeLens")
+        .wait_until_file_fresh_for(&cancel_token, "textDocument/codeLens", &uri)
         .await
+        != Freshness::Fresh
     {
         return None;
     }

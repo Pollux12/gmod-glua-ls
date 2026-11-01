@@ -4,7 +4,7 @@ pub enum PropertyDeclFeature {
     ReadOnly = 1 << 0,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeclFeatureFlag(u32);
 
 impl DeclFeatureFlag {
@@ -18,5 +18,9 @@ impl DeclFeatureFlag {
 
     pub fn has_feature(&self, feature: PropertyDeclFeature) -> bool {
         (self.0 & (feature as u32)) != 0
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
 }

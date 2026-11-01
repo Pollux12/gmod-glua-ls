@@ -34,7 +34,7 @@ pub async fn on_document_selection_range_handle(
     let root = semantic_model.get_root();
     let mut result = Vec::new();
     for pos in position {
-        let offset = document.get_offset(pos.line as usize, pos.character as usize)?;
+        let offset = document.to_offset(pos);
         let token = match root.syntax().token_at_offset(offset) {
             TokenAtOffset::Single(token) => token,
             TokenAtOffset::Between(_, right) => right,

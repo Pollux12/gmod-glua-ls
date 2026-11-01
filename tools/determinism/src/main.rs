@@ -1,487 +1,110 @@
-//! Workspace diagnostic determinism harness.
+//! Determinism of settled language-server workspace updates.
 //!
-//! Answers one question: does re-analysing a workspace produce the same
-//! diagnostics as building it from scratch? It indexes a workspace exactly like
-//! `init_analysis` does, then re-analyses it in various ways and diffs both the
-//! diagnostic sets and the derived indexes they are read from.
+//! Every stage runs production update paths on a copy-on-write fork of one
+//! cold base build and compares the settled index, and the diagnostics the
+//! language server shows, with a cold build of the same final input (the
+//! oracle, or answer key). The base is the oracle of every stage that ends on
+//! the text it started from.
 //!
-//! The stages are ordered by how much they re-analyse, which is what makes a
-//! divergence diagnosable: if `allreindex` matches cold but `mainreindex` does
-//! not, re-analysis itself is sound and the gap is in which files a partial
-//! re-index covers; if `allreindex` diverges too, per-file removal is leaving
-//! state behind. `mainexpand` is the production path — it is the one that has to
-//! be identical.
+//! Shown diagnostics: a warm run starts from the base's diagnostics and, after
+//! each settled re-analysis, re-diagnoses the files it reported affected, as
+//! the server does; a deleted file's are dropped. A file whose diagnostics
+//! changed but were never re-diagnosed therefore differs from the oracle; the
+//! `STALE` line names those files.
 //!
-//! # Release gates vs bisect stages
+//! Answer keys are built ahead of the stages by worker threads. `DET_JOBS`
+//! (default 2) caps the analyses alive at once, the kept base included, which
+//! bounds memory: about 2.7 GB each on CityRP. Each is kept as its snapshot
+//! until its last use.
 //!
-//! Only some stages are pass/fail. The gates are `repeat`, `noopedit`,
-//! `realedit`, `mainexpand`, `allreindex`, `reindex`, `order` and `fresh`: each
-//! of these runs a path the language server actually takes (or a ground-truth
-//! rebuild), so any divergence one of them reports is a defect that ships.
+//! Stages (`DET_STAGES`, comma list; default `schedule,edit,revert,noop`):
+//! - `edit`: each target's edit, settled at once.
+//! - `revert`: the edit, then the original text; the oracle is the base.
+//! - `typing`: the edit typed one character at a time as the language server
+//!   takes it, through every invalid text in between: each keystroke is
+//!   taken into the re-analysis still settling from the one before, after 16
+//!   or 256 of its evaluations, and every third keystroke and the last settle
+//!   first, as after a pause. Slices alternate threads, and each first puts
+//!   the next of the target's readers ahead, as a waiting diagnostics pull
+//!   does. Shares the edit's oracle.
+//! - `gate`: on one fork, the `typing` stage's keystrokes, the original text
+//!   back, then the file deleted and re-created through watched-file events,
+//!   each settled in slices, as the language-server drift gate drives the
+//!   server; between slices the file is put ahead while it settles, then
+//!   diagnosed once mid re-analysis, as its diagnostics task does (the revert, delete and re-create in slices of `DET_SLICE`,
+//!   default 16); its oracle is the `recreate` stage's kind.
+//! - `burst`: three edits of every target before one re-analysis, ending on
+//!   the edited text.
+//! - `noop`: re-index each target with unchanged text; the oracle is the base.
+//!   Any evaluated file outside the targets is a locality divergence.
+//! - `reload`: the settled analysis reloaded as the server reloads its
+//!   configuration, to the configuration `reconfigure` makes (an analysis
+//!   setting and a parse setting changed), compared with a cold build of it,
+//!   then back (`reload+back`), compared with the base.
+//! - `exact`: remove and re-add exactly the targets in one batch (a bisect
+//!   aid).
+//! - `schedule`: cold build taking files in reverse order within each rank,
+//!   compared with the base; `schedule:SEED` takes them in an order fixed by
+//!   the seed; `schedule:deferred` takes them in order but makes every reader
+//!   an evaluation queues wait for the next round. The settled result must
+//!   not depend on the order derivations run in.
+//! - `split:N`: cold build in N batches, compared with the base.
+//! - `rewrite`, `unrewrite`: sweeps of document edits an agent makes:
+//!   three globals defined at the top of every swept file and a parameter
+//!   added to each of its first three functions, settled at once; `unrewrite`
+//!   then puts the original text back and settles again, its oracle the base.
+//! - `touch`, `shift`, `delete`, `recreate`, `rename`: sweeps through
+//!   watched-file events (delete, recreate, rename) or document edits (touch
+//!   appends a comment, shift prepends a newline; any evaluated file outside
+//!   the swept files is a locality divergence). The swept files are the
+//!   `DET_HUBS` main files the most other files read from, with the files
+//!   named in `DET_ONLY`, or else every `DET_STRIDE`-th (default 25) main file
+//!   from `DET_STRIDE_OFFSET`. They form one batch with one oracle; with
+//!   `DET_EACH=1` each file is its own run and oracle, labelled
+//!   `stage[path]`, which a batch cannot mask by re-indexing a reader another
+//!   file left stale. `DET_SLICE=N` settles each watched-file batch in slices
+//!   of N evaluations, every other slice on a fresh thread, as the language
+//!   server settles one; with `DET_FOCUS_AFTER=K` each boundary from the K-th
+//!   on puts the batch's files ahead, as a diagnostics task waiting on them
+//!   does.
 //!
-//! `noopedit` and `realedit` gate different halves of editing. `noopedit`
-//! verifies that the semantic no-op gate skips the re-index and that skipping
-//! preserves state — it cannot verify re-analysis, because its edit pair is
-//! exactly what that gate rejects as meaningless. `realedit` is the gate for
-//! re-analysis itself: its edit changes what the file means, so the incremental
-//! result has to land where a cold build of the edited source lands. It does
-//! not reach zero today — see AGENTS.md for the known divergence and its cause
-//! — so measure it before and after a change and treat any *growth* as yours.
+//! Targets: `DET_EDITS` names a file of `path<TAB>find<TAB>replace` lines
+//! (`\n`, `\t` and `\` escaped), one edit per target; or `DET_TARGETS`
+//! lists paths relative to `DET_CODEBASE`, each edited `DET_EDIT_FIND` ->
+//! `DET_EDIT_REPLACE`.
 //!
-//! `mainreindex`, `exact`, `editmid` and `split:N` are **bisect stages** — diagnostic
-//! instruments, not gates, and they are expected to diverge. Both `mainreindex`
-//! and `exact` go through `reindex_files_without_expansion`, which deliberately
-//! skips three convergence passes that production's `reindex_files` performs
-//! (`refresh_file_source_dependencies`,
-//! `reindex_changed_inferred_guard_references` and
-//! `reindex_changed_inferred_param_consumers`). They are "production minus its
-//! fixpoint": a divergence there localises which file's re-analysis perturbs a
-//! fact, and is only a defect if `mainexpand` diverges too. `split:N` likewise
-//! only answers whether a fact depends on batch composition.
+//! Every warm stage prints its reach (files evaluated and reported affected)
+//! and a `[waste]` line counting the files whose diagnostics or stored types
+//! changed (needed) against those it evaluated and reported affected.
 //!
-//! `restabilize` is its own thing: it is a demonstration that re-running does
-//! not converge, not a stage anything is expected to pass.
+//! `DET_REPLAY=1` also replays the warm run's `update_index` batch log onto a
+//! fork of the oracle and compares again: drift that disappears depends on
+//! batch composition, drift that survives is an incremental-path bug.
 //!
-//! `expandwhy` and `faithful` are measurements, not comparisons: they report
-//! numbers rather than diff two snapshots, so they pass or fail nothing.
-//!
-//! Example:
-//!   DET_CODEBASE=/path/to/addon DET_ANNOTATIONS=/path/to/annotations/output \
-//!     DET_STAGES=repeat,noopedit,mainexpand DET_TARGETS=lua/autorun/init.lua \
-//!     cargo run --release -p determinism
-//!
-//! Env vars:
-//!   DET_CODEBASE    (required) workspace root
-//!   DET_ANNOTATIONS (required) GMod annotations root (library workspace)
-//!   DET_TARGETS     comma separated workspace-relative paths to no-op edit
-//!   DET_STAGES      comma separated subset of:
-//!                     repeat    re-collect diagnostics with no change at all
-//!                     noopedit  EOF-newline edit pair on each DET_TARGETS
-//!                               entry, through the same `update_file_by_uri`
-//!                               path the LSP uses. The pair is semantically
-//!                               unchanged, which is precisely what this stage
-//!                               gates: the no-op gate must SKIP the re-index
-//!                               and skipping must preserve state. It does not
-//!                               exercise re-analysis — `realedit` gates that,
-//!                               and `editmid` bisects it.
-//!                     indexrepeat
-//!                               re-index each DET_TARGETS entry with its text
-//!                               untouched and require the INDEX to come back
-//!                               identical. The diagnostic gates cannot see
-//!                               this: re-analysing a file can attach different
-//!                               members, or settle a decl's type differently
-//!                               from the cold build, and still produce the same
-//!                               diagnostics — `repeat` and `noopedit` both
-//!                               report IDENTICAL while the index underneath has
-//!                               drifted. That drift is why no incremental work
-//!                               can be skipped: every "did this actually
-//!                               change?" test answers yes. Does **not** pass
-//!                               today (CityRP: 82 type caches, 3 signatures and
-//!                               11 class members change), and it is a real
-//!                               defect rather than a harness artefact, so treat
-//!                               any *growth* in those counts as yours. Listed
-//!                               last in the default set because it re-indexes
-//!                               in place and leaves that warm state behind, so
-//!                               an in-place stage after it inherits it.
-//!                     editmid   offset-shifting no-op edit pair (newline at the
-//!                               front of the file, then removed): the semantic
-//!                               no-op gate cannot fire, so both edits run the
-//!                               full re-index expansion. Bisect stage for the
-//!                               batch-composition convergence gap; expected to
-//!                               diverge until re-analysis is confluent. Run it
-//!                               ALONE (or last): it leaves diverged warm state
-//!                               behind, so any in-place stage listed after it
-//!                               inherits that state and its diff is
-//!                               meaningless. Honours DET_INDEX_DIFF (cold index
-//!                               snapshot vs the state each target leaves behind).
-//!                     editrevert
-//!                               apply a real edit through the single-file
-//!                               update path and then take it back out. The
-//!                               source ends where it started, so the INDEX and
-//!                               the diagnostics have to as well — a difference
-//!                               is drift the edit path introduced, not a fact
-//!                               about the code. Needs DET_EDIT_FIND; without it
-//!                               the stage skips. Runs before `realedit`, which
-//!                               leaves the edited file re-indexed behind it.
-//!                               Covers what the other stages cannot:
-//!                               `indexrepeat` re-indexes with the text
-//!                               untouched and so never exercises an edit's
-//!                               invalidation, and `noopedit`'s pair is
-//!                               semantically neutral, so the update path skips
-//!                               the re-index outright.
-//!                     realedit  apply a real edit (DET_EDIT_FIND replaced by
-//!                               DET_EDIT_REPLACE) to each DET_TARGETS entry and
-//!                               compare the incremental result against a cold
-//!                               build of the same edited source. The only stage
-//!                               whose edit changes what the file means, so it is
-//!                               the only one that measures how much of the index
-//!                               an edit actually moves — which bounds what a
-//!                               cheaper re-index mechanism has to reproduce.
-//!                               Always diffs the index, DET_INDEX_DIFF or not.
-//!                               Needs DET_EDIT_FIND; without it the stage
-//!                               skips loudly instead of gating anything.
-//!                     burst     three edits per DET_TARGETS entry, each one
-//!                               self-indexed on its own, then ONE ripple over
-//!                               the union of the three separately-captured
-//!                               expansions — the sequence a debounce that
-//!                               defers the ripple behind a longer idle timer
-//!                               produces. Gates that union against a cold build
-//!                               of the final text. An expansion recomputed
-//!                               after a self-index under-expands badly (739
-//!                               files collapsed to 8), so union is the only
-//!                               shape that can work; this measures whether it
-//!                               does. Needs DET_EDIT_FIND; without it the stage
-//!                               skips loudly instead of gating anything.
-//!                     exact     reindex DET_TARGETS with no text change and no
-//!                               dependency expansion (bisects which file's
-//!                               re-analysis perturbs a fact)
-//!                     perfile   remove and re-add every file ON ITS OWN, so
-//!                               each one is re-derived against the complete
-//!                               settled workspace instead of the prefix the
-//!                               cold walk had built when it reached that file.
-//!                               Says whether the cold answer is simply one
-//!                               computed from an incomplete view. It is, and it
-//!                               converges: on CityRP round 1 moves 4277 type
-//!                               caches away from cold and round 2 moves
-//!                               nothing. Honours DET_PERFILE_ROUNDS (default
-//!                               2). Slow -- ~830s a round -- because every file
-//!                               pays the whole pipeline.
-//!                     reindex   full clear + rebuild, the ground truth
-//!                     order     rebuild with the file list reversed
-//!                     split:N   rebuild in N batches instead of one
-//!                     mainreindex  re-analyse every main-workspace file at
-//!                               once, deliberately *without* the dependency
-//!                               expansion
-//!                     mainexpand   same set, but through `reindex_files`, i.e.
-//!                               the expansion the LSP actually applies
-//!                     allreindex   re-analyse every file, library included,
-//!                               via per-file removal rather than `clear_index`
-//!                     restabilize  re-run analysis over every file *without*
-//!                               removing anything first, three times. This is
-//!                               the only stage that gives a full build the same
-//!                               retained state a partial re-index inherits. It
-//!                               diverges wildly and does not converge, which is
-//!                               why "just run it again" is not a fix
-//!                     expandwhy attribute the reindex expansion of each
-//!                               DET_TARGETS entry to the dependent source that
-//!                               contributed each file, per fixpoint round
-//!                     faithful  re-infer every member initializer in isolation
-//!                               and report how often it reproduces the cached
-//!                               type, split by single- vs multi-writer members
-//!                     fresh     build a second analysis in-process
-//!   DET_INDEX_DIFF  also diff type caches, members, signatures, class members,
-//!                   super types, net flows and inferred params
-//!   DET_DUMP_INDEX  directory to write each index snapshot to as `<label>.idx`.
-//!                   The stage diffs only compare snapshots *within* one process;
-//!                   this writes them out so two runs of the same binary on the
-//!                   same input can be diffed against each other, which is the
-//!                   only way to see a per-process divergence (hash seeds,
-//!                   allocation addresses) rather than an ordering one.
-//!   DET_SHOW_EXPANSION  print the reindex expansion set for each edit
-//!   DET_DUMP        write the cold diagnostic set to this path
-//!   DET_DUMP_FILE_IDS   print the main-workspace file id table
-//!   DET_DUMP_EXPANSION  list every file `indexrepeat` re-indexes, so a drifting
-//!                   entry can be told apart from one merely near the batch:
-//!                   whether the writer of a fact sits inside or outside it is
-//!                   what decides whether the reader saw it settled
-//!   DET_DUMP_CLASS  print the member list of this class at each snapshot
-//!   DET_LIMIT       max diff lines printed per bucket (default 40)
-//!   DET_FILTER      substring an index-diff entry line must contain to be
-//!                   printed. Bucket headers still print in full. Setting it
-//!                   lifts DET_LIMIT: the filter is the limit, so a match never
-//!                   hides behind the first 40 unrelated entries.
+//! Environment: `DET_CODEBASE`, `DET_ANNOTATIONS` (required);
+//! `DET_DUMP_INDEX_DETAIL` (index names or `all`, keeps entry text for
+//! per-entry diffs); `DET_DUMP_INDEX` (directory for full snapshots);
+//! `DET_DUMP` (base diagnostics file); `DET_FILTER`, `DET_LIMIT`. Any
+//! divergence exits 1. The run prints its peak memory.
 
 use mimalloc::MiMalloc;
-use std::alloc::{GlobalAlloc, Layout};
-
-/// mimalloc, plus a count of every allocation it hands out.
-///
-/// A sampling profiler blames the allocator, never the code that asked for the
-/// memory, so it cannot answer "is this phase allocation-bound?". Counting can:
-/// `GLUALS_PROFILE=1` prints allocations alongside each phase's cost, and
-/// dividing by the phase's unit of work gives allocations-per-step directly.
-struct CountingMiMalloc;
-
-/// Sample one in every `DET_ALLOC_SAMPLE` allocations and record where it came
-/// from. This is a poor-man's allocation profiler: it attributes allocations to
-/// source locations, which a CPU sampling profiler cannot do (it blames the
-/// allocator) — and it works even where external profilers fail to read the PDB.
-mod alloc_sample {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-
-    const MAX_FRAMES: usize = 64;
-
-    // Documented in WinBase.h; returns the number of frames written.
-    #[cfg(windows)]
-    unsafe extern "system" {
-        fn RtlCaptureStackBackTrace(
-            frames_to_skip: u32,
-            frames_to_capture: u32,
-            back_trace: *mut *mut std::ffi::c_void,
-            back_trace_hash: *mut u32,
-        ) -> u16;
-    }
-
-    /// Raw instruction pointers for the current stack, innermost first. Returns
-    /// how many of `buffer` were filled.
-    ///
-    /// `backtrace::trace` goes through dbghelp's StackWalkEx on Windows, which
-    /// takes a process-wide lock and costs milliseconds per capture: a full run
-    /// never finished. `RtlCaptureStackBackTrace` unwinds via the x64 unwind
-    /// tables instead and costs microseconds. Elsewhere the crate's own unwinder
-    /// is already cheap enough.
-    #[cfg(windows)]
-    fn capture(buffer: &mut [*mut std::ffi::c_void]) -> usize {
-        let captured = unsafe {
-            RtlCaptureStackBackTrace(
-                1,
-                buffer.len() as u32,
-                buffer.as_mut_ptr(),
-                std::ptr::null_mut(),
-            )
-        };
-        captured as usize
-    }
-
-    #[cfg(not(windows))]
-    fn capture(buffer: &mut [*mut std::ffi::c_void]) -> usize {
-        let mut filled = 0;
-        backtrace::trace(|frame| {
-            if filled >= buffer.len() {
-                return false;
-            }
-            buffer[filled] = frame.ip();
-            filled += 1;
-            true
-        });
-        filled
-    }
-
-    static SAMPLE_RATE: AtomicUsize = AtomicUsize::new(0);
-    static PHASE_SCOPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    static TICK: AtomicU64 = AtomicU64::new(0);
-    /// Frame address -> number of sampled allocations whose stack contained it.
-    /// Addresses are resolved to names once, at report time.
-    static FRAMES: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
-    /// Ordered stacks (innermost first) -> count. Kept alongside FRAMES because
-    /// "which of our functions asked for this memory" needs frame order, which
-    /// the flat per-frame tally throws away.
-    type StackCounts = HashMap<Box<[usize]>, u64>;
-    static STACKS: Mutex<Option<StackCounts>> = Mutex::new(None);
-
-    thread_local! {
-        /// Capturing a backtrace allocates; without this guard the sampler
-        /// would recurse into itself.
-        static SAMPLING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-
-    pub fn init() {
-        let rate = std::env::var("DET_ALLOC_SAMPLE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
-        SAMPLE_RATE.store(rate, Ordering::Relaxed);
-        PHASE_SCOPED.store(
-            std::env::var_os("GLUALS_PROFILE_SAMPLE").is_some(),
-            Ordering::Relaxed,
-        );
-    }
-
-    #[inline]
-    pub fn maybe_sample() {
-        let rate = SAMPLE_RATE.load(Ordering::Relaxed);
-        if rate == 0 {
-            return;
-        }
-        // Sample one phase only (GLUALS_PROFILE_SAMPLE), when asked to.
-        if PHASE_SCOPED.load(Ordering::Relaxed)
-            && !glua_code_analysis::profile::sample_phase_active()
-        {
-            return;
-        }
-        if !TICK
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(rate as u64)
-        {
-            return;
-        }
-        SAMPLING.with(|sampling| {
-            if sampling.get() {
-                return;
-            }
-            sampling.set(true);
-            // Raw instruction pointers only — no symbol resolution here.
-            let mut buffer = [std::ptr::null_mut::<std::ffi::c_void>(); MAX_FRAMES];
-            let captured = capture(&mut buffer);
-            let mut ips: Vec<usize> = buffer[..captured].iter().map(|&ip| ip as usize).collect();
-            {
-                let mut stacks = STACKS.lock().unwrap_or_else(|p| p.into_inner());
-                *stacks
-                    .get_or_insert_with(HashMap::new)
-                    .entry(ips.as_slice().into())
-                    .or_insert(0) += 1;
-            }
-            let mut frames = FRAMES.lock().unwrap_or_else(|p| p.into_inner());
-            let frames = frames.get_or_insert_with(HashMap::new);
-            // Count each frame once per sample, so the number reads as "share of
-            // sampled allocations made underneath this function".
-            ips.sort_unstable();
-            ips.dedup();
-            for ip in ips {
-                *frames.entry(ip).or_insert(0) += 1;
-            }
-            sampling.set(false);
-        });
-    }
-
-    /// Attribute each sampled allocation to the innermost frame belonging to our
-    /// own crates. The inclusive tally says an allocation happened *somewhere*
-    /// under a function; this says which of our functions actually asked for the
-    /// memory, which is the line you can go and change.
-    fn nearest_caller_report(top: usize) {
-        let stacks = STACKS.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(stacks) = stacks.as_ref() else {
-            return;
-        };
-        let total: u64 = stacks.values().sum();
-        if total == 0 {
-            return;
-        }
-
-        let mut names: HashMap<usize, Option<String>> = HashMap::new();
-        let mut resolve = |ip: usize| -> Option<String> {
-            names
-                .entry(ip)
-                .or_insert_with(|| {
-                    let mut found = None;
-                    backtrace::resolve(ip as *mut _, |symbol| {
-                        if found.is_none() {
-                            found = symbol.name().map(|name| name.to_string());
-                        }
-                    });
-                    found
-                })
-                .clone()
-        };
-
-        let mut by_caller: HashMap<String, u64> = HashMap::new();
-        for (stack, count) in stacks {
-            let owner = stack.iter().find_map(|&ip| {
-                let name = resolve(ip)?;
-                (name.starts_with("glua_") && !name.contains("::profile::")).then_some(name)
-            });
-            let owner = owner.unwrap_or_else(|| "<no glua frame>".to_string());
-            let owner = owner
-                .rsplit_once("::h")
-                .filter(|(_, hash)| hash.len() == 16)
-                .map_or(owner.as_str(), |(head, _)| head)
-                .to_string();
-            *by_caller.entry(owner).or_insert(0) += count;
-        }
-
-        let mut rows: Vec<_> = by_caller.into_iter().collect();
-        rows.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
-        eprintln!("\n=== allocations by nearest owning function ({total} samples) ===");
-        for (name, count) in rows.into_iter().take(top) {
-            eprintln!("{:>6.2}%  {name}", (count as f64 / total as f64) * 100.0);
-        }
-    }
-
-    /// Print the functions that appear most often across sampled allocations.
-    pub fn report(top: usize) {
-        // Symbol resolution allocates, so a sample taken while reporting would
-        // re-enter and block on a lock this thread already holds.
-        SAMPLE_RATE.store(0, Ordering::Relaxed);
-
-        let frames = FRAMES.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(frames) = frames.as_ref() else {
-            return;
-        };
-        // Samples, not frame hits: the most-hit frame is the allocator entry,
-        // which every sample passes through.
-        let total = frames.values().copied().max().unwrap_or(0);
-        if total == 0 {
-            return;
-        }
-
-        // Resolve once, then fold the per-address counts into per-function ones
-        // (a function inlined or spread over several addresses is one entry).
-        let mut by_name: HashMap<String, u64> = HashMap::new();
-        for (&ip, &count) in frames {
-            backtrace::resolve(ip as *mut _, |symbol| {
-                let Some(name) = symbol.name() else { return };
-                let name = name.to_string();
-                // Strip the trailing hash rustc appends to monomorphized names.
-                let name = name
-                    .rsplit_once("::h")
-                    .filter(|(_, hash)| hash.len() == 16)
-                    .map_or(name.as_str(), |(head, _)| head)
-                    .to_string();
-                *by_name.entry(name).or_insert(0) += count;
-            });
-        }
-
-        nearest_caller_report(top);
-
-        let mut rows: Vec<_> = by_name
-            .into_iter()
-            .filter(|(name, _)| {
-                !name.starts_with("core::")
-                    && !name.starts_with("alloc::")
-                    && !name.starts_with("std::")
-                    && !name.contains("hashbrown")
-                    && !name.contains("mi_")
-                    && !name.contains("CountingMiMalloc")
-                    && !name.contains("alloc_sample")
-            })
-            .collect();
-        rows.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
-        eprintln!("\n=== sampled allocation frames ({total} samples) ===");
-        eprintln!("share of sampled allocations made underneath each function:");
-        for (name, count) in rows.into_iter().take(top) {
-            eprintln!("{:>6.2}%  {name}", (count as f64 / total as f64) * 100.0);
-        }
-    }
-}
-
-// SAFETY: every method forwards to MiMalloc with the same arguments; the
-// counters are plain relaxed atomics and do not affect allocation behavior.
-unsafe impl GlobalAlloc for CountingMiMalloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        glua_code_analysis::profile::record_alloc(layout.size());
-        alloc_sample::maybe_sample();
-        unsafe { MiMalloc.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { MiMalloc.dealloc(ptr, layout) }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        glua_code_analysis::profile::record_alloc(layout.size());
-        unsafe { MiMalloc.alloc_zeroed(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        glua_code_analysis::profile::record_alloc(new_size);
-        unsafe { MiMalloc.realloc(ptr, layout, new_size) }
-    }
-}
 
 #[global_allocator]
-static GLOBAL: CountingMiMalloc = CountingMiMalloc;
-
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+static GLOBAL: MiMalloc = MiMalloc;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, FileId, WorkspaceFolder, collect_workspace_files, load_configs,
+    EmmyLuaAnalysis, Emmyrc, EmmyrcNonStdSymbol, FileId, Schedule, Slice, UpdateProgress,
+    WorkspaceFolder, collect_workspace_files, load_configs,
 };
+use glua_parser::{LineIndex, LuaParser};
 use lsp_types::{DiagnosticSeverity, NumberOrString};
+use rayon::prelude::*;
+use rowan::NodeCache;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -532,30 +155,35 @@ fn discover_config_files(root: &Path) -> Vec<PathBuf> {
     .collect()
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Order {
-    Natural,
-    Reverse,
-}
-
-fn build_analysis(codebase: &Path, annotations: &Path) -> EmmyLuaAnalysis {
-    build_analysis_with(codebase, annotations, Order::Natural, 1, &[])
-}
-
-/// Comparison key for a workspace file path. The override list is written by
-/// hand from `DET_TARGETS`, so it has to match what the loader collected
-/// regardless of separator or case.
+/// Comparison key for a workspace file path. `DET_TARGETS` is written by hand,
+/// so it has to match the loader's paths regardless of separator or case.
 fn path_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
-fn build_analysis_with(
-    codebase: &Path,
-    annotations: &Path,
-    order: Order,
-    batches: usize,
-    overrides: &[(PathBuf, String)],
-) -> EmmyLuaAnalysis {
+fn file_uri(path: &Path) -> lsp_types::Uri {
+    glua_code_analysis::file_path_to_uri(&path.to_path_buf())
+        .unwrap_or_else(|| panic!("cannot build URI for {}", path.display()))
+}
+
+/// The final input of a cold build: the collected workspace with `overrides`
+/// replacing file text and `removed` never present. `created` files get new
+/// ids after every collected file's id is reserved, as the watcher path
+/// assigns them.
+#[derive(Clone, Default, Eq, Hash, PartialEq)]
+struct ColdInput {
+    overrides: Vec<(PathBuf, String)>,
+    removed: Vec<PathBuf>,
+    created: Vec<(PathBuf, String)>,
+    /// Files moved from the first path to the second with their text, each
+    /// keeping its id as the server's move does.
+    moved: Vec<(PathBuf, PathBuf, String)>,
+    /// Whether the configuration is the one [`reconfigure`] makes.
+    reconfigured: bool,
+}
+
+/// The codebase's configuration, as the server loads it.
+fn workspace_config(codebase: &Path) -> Emmyrc {
     let config_files = discover_config_files(codebase);
     let mut emmyrc = if config_files.is_empty() {
         Emmyrc::default()
@@ -564,10 +192,27 @@ fn build_analysis_with(
     };
     emmyrc.gmod.enabled = true;
     emmyrc.pre_process_emmyrc(codebase);
+    emmyrc
+}
 
-    let mut analysis = EmmyLuaAnalysis::new();
-    analysis.update_config(Arc::new(emmyrc.clone()));
-    analysis.init_std_lib();
+/// The configuration the `reload` stage moves to: one setting that changes
+/// what the index derives and one that changes how every file parses.
+fn reconfigure(emmyrc: &mut Emmyrc) {
+    emmyrc.strict.array_index = !emmyrc.strict.array_index;
+    emmyrc
+        .runtime
+        .nonstandard_symbol
+        .retain(|symbol| *symbol != EmmyrcNonStdSymbol::Continue);
+}
+
+/// Adds the annotations, the codebase and the configured libraries as
+/// workspaces, and returns every file to index.
+fn add_workspaces(
+    analysis: &mut EmmyLuaAnalysis,
+    codebase: &Path,
+    annotations: &Path,
+    emmyrc: &Emmyrc,
+) -> Vec<(PathBuf, Option<String>)> {
     analysis.add_library_workspace(annotations.to_path_buf());
     analysis.add_main_workspace(codebase.to_path_buf());
 
@@ -583,79 +228,118 @@ fn build_analysis_with(
         }
     }
 
-    let mut files = collect_workspace_files(&workspace_folders, &analysis.emmyrc, None, None)
+    collect_workspace_files(&workspace_folders, &analysis.emmyrc, None, None)
         .into_iter()
         .filter(|file| !file.path.ends_with(".editorconfig"))
         .map(|file| file.into_tuple())
-        .collect::<Vec<_>>();
-    if order == Order::Reverse {
-        files.reverse();
+        .collect()
+}
+
+fn build_cold(
+    codebase: &Path,
+    annotations: &Path,
+    input: &ColdInput,
+    batches: usize,
+    schedule: Schedule,
+) -> EmmyLuaAnalysis {
+    let mut emmyrc = workspace_config(codebase);
+    if input.reconfigured {
+        reconfigure(&mut emmyrc);
     }
-    if !overrides.is_empty() {
-        let mut applied = 0;
-        for (path, content) in overrides {
-            let want = path_key(path);
-            for file in files.iter_mut() {
-                if path_key(&file.0) == want {
-                    file.1 = Some(content.clone());
-                    applied += 1;
-                }
-            }
+    let mut analysis = EmmyLuaAnalysis::new();
+    analysis.compilation.set_schedule(schedule);
+    analysis.update_config(Arc::new(emmyrc.clone()));
+    analysis.init_std_lib();
+    let mut files = add_workspaces(&mut analysis, codebase, annotations, &emmyrc);
+    for (path, content) in &input.overrides {
+        let want = path_key(path);
+        let mut matched = 0;
+        for file in files.iter_mut().filter(|file| path_key(&file.0) == want) {
+            file.1 = Some(content.clone());
+            matched += 1;
         }
         // A silently unapplied override would make this build a copy of the
         // baseline, and every diff taken against it would read as "identical".
+        assert_eq!(matched, 1, "override did not match one workspace file");
+    }
+    if !input.removed.is_empty() || !input.created.is_empty() || !input.moved.is_empty() {
+        let vfs = analysis.compilation.get_db().get_vfs();
+        files.sort_by_cached_key(|(path, _)| vfs.order_key_for_path(path));
+        let vfs = analysis.compilation.get_db_mut().get_vfs_mut();
+        for (path, _) in &files {
+            vfs.set_file_content(&file_uri(path), None);
+        }
+        let removed = input
+            .removed
+            .iter()
+            .map(|path| path_key(path))
+            .collect::<BTreeSet<_>>();
+        let before = files.len();
+        files.retain(|(path, _)| !removed.contains(&path_key(path)));
         assert_eq!(
-            applied,
-            overrides.len(),
-            "content override did not match a collected workspace file"
+            before - files.len(),
+            removed.len(),
+            "removed path did not match one workspace file"
         );
-        eprintln!("[setup] applied {applied} content override(s)");
+        for path in &input.removed {
+            vfs.remove_file(&file_uri(path));
+        }
+        for (from, to, text) in &input.moved {
+            vfs.move_file(&file_uri(from), &file_uri(to), text.clone())
+                .expect("a moved path names one workspace file");
+            let file = files
+                .iter_mut()
+                .find(|(path, _)| path_key(path) == path_key(from))
+                .expect("a moved path names one workspace file");
+            *file = (to.clone(), Some(text.clone()));
+        }
+        let mut created = input.created.clone();
+        created.sort_by_cached_key(|(path, _)| vfs.order_key_for_path(path));
+        for (path, text) in created {
+            vfs.set_file_content(&file_uri(&path), None);
+            files.push((path, Some(text)));
+        }
+    }
+    let t = Instant::now();
+    for group in files.chunks(files.len().div_ceil(batches)) {
+        analysis.update_files_by_path(group.to_vec());
     }
     eprintln!(
-        "[setup] collected {} files (order={} batches={batches})",
-        files.len(),
-        if order == Order::Reverse {
-            "reverse"
-        } else {
-            "natural"
-        }
+        "[setup] cold build indexed in {:.2}s",
+        t.elapsed().as_secs_f64()
     );
-
-    let t = Instant::now();
-    if batches <= 1 {
-        analysis.update_files_by_path(files);
-    } else {
-        let chunk = files.len().div_ceil(batches);
-        for group in files.chunks(chunk) {
-            analysis.update_files_by_path(group.to_vec());
-        }
-    }
-    eprintln!("[setup] indexed in {:.2}s", t.elapsed().as_secs_f64());
-    if std::env::var_os("DET_DUMP_FILE_IDS").is_some() {
-        for file_id in analysis.get_main_workspace_file_ids_for_diagnostics() {
-            eprintln!("[fileid] {} {}", file_id.id, file_label(&analysis, file_id));
-        }
-    }
     analysis
 }
 
-fn collect(analysis: &EmmyLuaAnalysis, label: &str) -> BTreeSet<Snapshot> {
+/// The diagnostics of the main workspace, sorted, each one as often as the
+/// server would show it.
+fn collect(analysis: &EmmyLuaAnalysis, label: &str) -> Vec<Snapshot> {
     let t = Instant::now();
+    let mut out = diagnose(
+        analysis,
+        analysis.get_main_workspace_file_ids_for_diagnostics(),
+    );
+    out.sort_unstable();
+    let (errors, warnings) = counts(&out);
+    eprintln!(
+        "[{label}] total={} errors={errors} warnings={warnings} ({:.2}s)",
+        out.len(),
+        t.elapsed().as_secs_f64()
+    );
+    out
+}
+
+/// The diagnostics of `file_ids`, as the language server reports them.
+fn diagnose(analysis: &EmmyLuaAnalysis, file_ids: Vec<FileId>) -> Vec<Snapshot> {
     let shared = analysis.precompute_diagnostic_shared_data();
-    let file_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
-    let mut out = BTreeSet::new();
-    for file_id in file_ids {
-        let Some(diagnostics) =
-            analysis.diagnose_file_with_shared(file_id, CancellationToken::new(), shared.clone())
-        else {
-            continue;
-        };
-        if diagnostics.is_empty() {
-            continue;
-        }
-        let file = file_label(analysis, file_id);
-        for diagnostic in diagnostics {
-            out.insert(Snapshot {
+    file_ids
+        .into_par_iter()
+        .flat_map_iter(|file_id| {
+            let diagnostics = analysis
+                .diagnose_file_with_shared(file_id, CancellationToken::new(), shared.clone())
+                .unwrap_or_default();
+            let file = file_label(analysis, file_id);
+            diagnostics.into_iter().map(move |diagnostic| Snapshot {
                 file: file.clone(),
                 code: match &diagnostic.code {
                     Some(NumberOrString::String(code)) => code.clone(),
@@ -673,53 +357,224 @@ fn collect(analysis: &EmmyLuaAnalysis, label: &str) -> BTreeSet<Snapshot> {
                 end_line: diagnostic.range.end.line,
                 end_character: diagnostic.range.end.character,
                 message: diagnostic.message,
-            });
-        }
-    }
-    let (errors, warnings) = counts(&out);
-    eprintln!(
-        "[{label}] total={} errors={errors} warnings={warnings} ({:.2}s)",
-        out.len(),
-        t.elapsed().as_secs_f64()
-    );
-    out
+            })
+        })
+        .collect()
 }
 
 /// Snapshot of the derived index state that diagnostics read from.
 struct IndexSnapshot {
     type_caches: BTreeMap<String, String>,
-    /// How each cached type was reached, under `DET_PROVENANCE`. Diffed apart
-    /// from the type so a value that stayed put while the reasoning behind it
-    /// moved is still visible.
+    /// How each cached type was reached. Diffed apart from the type, so a
+    /// value that stayed put while its reasoning moved is still visible.
     type_facts: BTreeMap<String, String>,
-    /// The assignment-contribution store, under `DET_PROVENANCE`: which writers
-    /// each owner/key group merges. A member's type is a function of this, so a
-    /// group that gains or loses a writer explains a drifting type directly.
-    contribution_groups: BTreeMap<String, String>,
-    /// Where each member is currently homed, under `DET_PROVENANCE`. Class
-    /// member lists and contribution groups are both keyed off this.
+    /// Where each member is currently homed. Class member lists are keyed off
+    /// this.
     member_owners: BTreeMap<String, String>,
     members: BTreeSet<String>,
     net_flows: Vec<String>,
     inferred_params: BTreeMap<String, String>,
-    /// Class hierarchy. A `---@class A : B` link that survives a cold build but
-    /// not a partial re-index silently breaks inherited-member lookup, which
-    /// then falls back to a by-name search and can land on a sibling class.
+    /// Class hierarchy. A dropped `---@class A : B` link breaks inherited-member
+    /// lookup, which falls back to a by-name search and can land on a sibling.
     super_types: BTreeMap<String, String>,
     class_members: BTreeMap<String, String>,
+    /// Each global path's table literals, sorted. Member ownership is derived
+    /// from this, so a site list that moves between two runs is drift the
+    /// member set can hide.
+    definition_sites: BTreeMap<String, String>,
     signatures: BTreeMap<String, String>,
+    flow_trees: BTreeMap<String, String>,
+    signature_casts: BTreeMap<String, String>,
+    special_call_effects: BTreeMap<String, String>,
+    special_call_facts: BTreeMap<String, String>,
+    accessor_func_annotations: HashDumpResult,
+    accessor_func_annotation_files: HashDumpResult,
+    numeric_range_file_populations: HashDumpResult,
+    numeric_range_global_populations: HashDumpResult,
+    decls: HashDumpResult,
+    /// Complete effective `LuaTypeDecl` payload per decl id: name, kind,
+    /// canonically ordered locations (file path, range, flags), alias origin,
+    /// enum base/flatness and attribute type. `decls` covers syntax decls;
+    /// this covers the merged type-level declaration state they feed.
+    type_decl_states: HashDumpResult,
+    /// Every stored alias contribution (site, origin, generic params,
+    /// precedence), not just the effective winner `type_decl_states` shows.
+    alias_contributions: HashDumpResult,
+    /// Declared generic parameter list per decl id. Order is meaningful
+    /// (`fun<T, U>` vs `fun<U, T>`), so the rendered list keeps it.
+    type_decl_generic_params: HashDumpResult,
+    decl_references: HashDumpResult,
+    /// Expression range → decl it refers to: the inverse view of
+    /// `decl_references`, which keys the same cells by decl.
+    reference_ranges: HashDumpResult,
+    /// Member-key reference sites: key → file → syntax ids.
+    index_references: HashDumpResult,
+    /// Global-name reference sites: name → file → syntax ids.
+    global_references: HashDumpResult,
+    /// Per-file string literal reference sites.
+    string_references: HashDumpResult,
+    /// Doc type-name reference sites: file → type decl → ranges.
+    type_references: HashDumpResult,
+    /// First reassignment position of each local: file → decl → position.
+    local_reassignments: HashDumpResult,
+    modules: HashDumpResult,
+    globals: HashDumpResult,
+    diagnostics: HashDumpResult,
+    diagnostic_actions: HashDumpResult,
+    operators: HashDumpResult,
+    dependency_sites: HashDumpResult,
+    gmod_load_files: HashDumpResult,
+    gmod_load_unresolved_edges: HashDumpResult,
+    gmod_hook_files: HashDumpResult,
+    gmod_system_files: HashDumpResult,
+    gmod_gm_method_realm_annotations: HashDumpResult,
+    gmod_realm_files: HashDumpResult,
+    gmod_scoped_class_info: HashDumpResult,
+    gmod_network_wire_coverage: HashDumpResult,
+    gmod_class_file_metadata: HashDumpResult,
+    dynamic_field_wildcards: HashDumpResult,
+    dynamic_fields: HashDumpResult,
+    accessor_func_calls: HashDumpResult,
+    properties: HashDumpResult,
+    metatables: HashDumpResult,
+    metatable_factory_bindings: HashDumpResult,
+    /// Observed call-site param evidence contributed by calls in each file.
+    call_site_contributions: HashDumpResult,
+    /// Each file's stored helper scan, load scan, net helpers and function
+    /// summaries, by the fingerprint they were stored with.
+    stored_facts: HashDumpResult,
+    /// Schema URL → resolution state.
+    schema_files: HashDumpResult,
+}
+
+/// Accumulates one index's entries as sorted hashes rather than owned
+/// strings, so a bulky index (every decl, every diagnostic, every dependency
+/// site) costs 8 bytes per entry during the in-process diff instead of two
+/// full rendered strings. `+N/-N` then comes from a sorted-merge of the two
+/// hash vectors: a changed entry is a drop of its old hash plus a gain of its
+/// new one, same as the existing members/net_flows set-diffs.
+///
+/// `DET_DUMP_INDEX_DETAIL=<name>` (matching the `name` passed to `diff_map`
+/// in `diff_index`) additionally retains the full text for that one index, so
+/// it can still be inspected entry-by-entry while every other index stays
+/// hash-only.
+struct HashDump {
+    hashes: Vec<u64>,
+    detail: Option<BTreeMap<String, String>>,
+}
+
+struct HashDumpResult {
+    hashes: Vec<u64>,
+    detail: Option<BTreeMap<String, String>>,
+}
+
+impl HashDump {
+    fn new(name: &str) -> Self {
+        let want_detail = std::env::var("DET_DUMP_INDEX_DETAIL")
+            .is_ok_and(|want| want.split(',').any(|want| want == name || want == "all"));
+        Self {
+            hashes: Vec::new(),
+            detail: want_detail.then(BTreeMap::new),
+        }
+    }
+
+    fn insert(&mut self, key: String, value: String) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        value.hash(&mut hasher);
+        self.hashes.push(hasher.finish());
+        if let Some(detail) = &mut self.detail {
+            detail.insert(key, value);
+        }
+    }
+
+    fn finish(mut self) -> HashDumpResult {
+        self.hashes.sort_unstable();
+        HashDumpResult {
+            hashes: self.hashes,
+            detail: self.detail,
+        }
+    }
+}
+
+static DIVERGENCES: AtomicUsize = AtomicUsize::new(0);
+
+fn record_divergence() {
+    DIVERGENCES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Sorted-merge diff of two hash vectors: counts only, since a hash carries
+/// no text to print a dropped/gained line from.
+fn diff_sorted_hashes(base: &[u64], other: &[u64]) -> (usize, usize) {
+    let mut dropped = 0;
+    let mut gained = 0;
+    let mut i = 0;
+    let mut j = 0;
+    while i < base.len() && j < other.len() {
+        match base[i].cmp(&other[j]) {
+            std::cmp::Ordering::Less => {
+                dropped += 1;
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                gained += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    dropped += base.len() - i;
+    gained += other.len() - j;
+    (dropped, gained)
+}
+
+/// One hash-based bucket: full per-entry diff when `DET_DUMP_INDEX_DETAIL`
+/// retained text for this index, otherwise a dropped/gained count from the
+/// hash vectors alone.
+#[allow(clippy::too_many_arguments)]
+fn diff_hash_dump(
+    base_label: &str,
+    label: &str,
+    name: &str,
+    prefix: &str,
+    base: &HashDumpResult,
+    other: &HashDumpResult,
+    limit: usize,
+    emit: &impl Fn(String),
+) {
+    if let (Some(base_detail), Some(other_detail)) = (&base.detail, &other.detail) {
+        diff_map(
+            base_label,
+            label,
+            name,
+            prefix,
+            base_detail,
+            other_detail,
+            limit,
+            emit,
+        );
+        return;
+    }
+    let (dropped, gained) = diff_sorted_hashes(&base.hashes, &other.hashes);
+    if dropped > 0 || gained > 0 {
+        record_divergence();
+        println!("INDEX {base_label} -> {label}: {name} dropped={dropped} gained={gained}");
+    }
 }
 
 fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
+    let t = Instant::now();
     let db = analysis.compilation.get_db();
     let type_index = db.get_type_index();
     let mut type_caches = BTreeMap::new();
     let mut type_facts: BTreeMap<String, String> = BTreeMap::new();
-    // `DET_PROVENANCE=1` records how each cached type was reached, not just what
-    // it is. Drift entries then carry the pass that produced them on both sides,
-    // so the whole set can be grouped by cause in one run rather than traced one
-    // at a time.
-    let with_provenance = std::env::var_os("DET_PROVENANCE").is_some();
+    // Provenance records how each cached type was reached, so drift entries
+    // carry the producing pass on both sides and can be grouped by cause.
+    let with_provenance = true;
     for (owner, cache) in type_index.iter_type_caches() {
         let value = format!("{:?}", cache.as_type());
         if with_provenance {
@@ -737,21 +592,18 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
                 None => ("-".into(), "-".into(), String::new()),
             };
             let doc = if cache.is_doc() { "doc" } else { "infer" };
-            // How many writers this member's value is merged from, and whether
-            // any of them contributed an unsettled type. If drift tracks these
-            // rather than the individual site, the cause is the merge, not the
-            // sites.
+            // How many writers share this member's slot. Drift tracking these
+            // rather than the individual site points at the merge.
             let writers = match owner {
                 glua_code_analysis::LuaTypeOwner::Member(member_id) => {
                     let member_index = db.get_member_index();
                     member_index
                         .get_member(member_id)
                         .zip(member_index.get_member_owner(member_id))
-                        .and_then(|(member, member_owner)| {
+                        .map(|(member, member_owner)| {
                             member_index
-                                .member_assignment_contributions()
-                                .contributions(&(member_owner.clone(), member.get_key().clone()))
-                                .map(|group| group.len())
+                                .get_current_owner_members_for_key(member_owner, member.get_key())
+                                .len()
                         })
                         .map(|len| format!("w{len}"))
                         .unwrap_or_else(|| "w-".into())
@@ -777,7 +629,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         for member in member_index.get_file_members(file_id) {
             let member_id = member.get_id();
             members.insert(format!(
-                "{file}|{:?}|owner={:?}",
+                "{file}|{:?}|owner={:?}|member={member:?}",
                 member.get_key(),
                 member_index.get_member_owner(&member_id),
             ));
@@ -786,8 +638,8 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
             }
         }
     }
-    // Net flows are stored per file; the index yields them in canonical file
-    // order so ordering differences (not just membership) show up in the diff.
+    // Net flows are stored per file; sorted so the dump is canonical across
+    // processes and membership differences show up in the diff.
     let network = db.get_gmod_network_index();
     let mut net_flows = Vec::new();
     for (file_id, _, flow) in network.iter_send_flows() {
@@ -796,56 +648,139 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     for (file_id, flow) in network.iter_receive_flows() {
         net_flows.push(format!("recv {}|{flow:?}", file_label(analysis, file_id)));
     }
+    net_flows.sort_unstable();
 
     let mut super_types = BTreeMap::new();
+    // Complete effective declaration payload: kind, every location (sorted by
+    // file path/range/flags rather than merge-arrival order), alias origin,
+    // enum base/flatness, attribute type. `members`/`super_types` snapshot the
+    // decl's edges; this snapshots the decl itself.
+    let mut type_decl_states = HashDump::new("type_decl_states");
+    // Declared generic parameter list per decl. Parameter order is semantic,
+    // so the rendered list preserves it instead of sorting.
+    let mut type_decl_generic_params = HashDump::new("type_decl_generic_params");
     // Ordered member list per class. Two members can share a key (a doc `@field`
-    // and a file define, or two partial-class contributions); which one wins is
-    // decided by this order, so drift here silently changes overload selection
-    // without changing the member set at all.
+    // and a file define, or two partial-class contributions) and this order picks
+    // the winner, so drift changes overload selection without changing the set.
     let mut class_members = BTreeMap::new();
     for type_decl in type_index.get_all_types() {
         let decl_id = type_decl.get_id();
         if let Some(supers) = type_index.get_super_types(&decl_id) {
             super_types.insert(format!("{decl_id:?}"), format!("{supers:?}"));
         }
+        let kind = match () {
+            _ if type_decl.is_class() => "class",
+            _ if type_decl.is_enum() => "enum",
+            _ if type_decl.is_alias() => "alias",
+            _ if type_decl.is_attribute() => "attribute",
+            _ => "unknown",
+        };
+        let mut locations = type_decl
+            .get_locations()
+            .iter()
+            .map(|location| {
+                (
+                    file_label(analysis, location.file_id),
+                    u32::from(location.range.start()),
+                    u32::from(location.range.end()),
+                    location.flag.bits(),
+                    format!("{location:?}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        locations.sort_unstable();
+        let locations = locations
+            .into_iter()
+            .map(|(file, start, end, _, debug)| format!("{file}@{start}..{end} {debug}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        type_decl_states.insert(
+            format!("{decl_id:?}"),
+            format!(
+                "name={}|kind={kind}|locations=[{locations}]|alias_origin={:?}|enum_base={:?}|flat_enum={}|attribute_type={:?}",
+                type_decl.get_name(),
+                type_decl.get_alias_ref(),
+                type_decl.get_enum_base(),
+                type_decl.is_flat_enum(),
+                type_decl.get_attribute_type(),
+            ),
+        );
+        if let Some(params) = type_index.get_generic_params(&decl_id) {
+            type_decl_generic_params.insert(
+                format!("{decl_id:?}"),
+                params
+                    .iter()
+                    .map(|param| format!("{param:?}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
         let owner = glua_code_analysis::LuaMemberOwner::Type(decl_id.clone());
         if let Some(members) = db.get_member_index().get_members(&owner) {
-            let ordered = members
+            let mut ordered = members
                 .iter()
-                .map(|member| format!("{:?}@{:?}", member.get_key(), member.get_id()))
+                .map(|member| format!("{:?}@{:?}|{member:?}", member.get_key(), member.get_id()))
                 .collect::<Vec<_>>();
-            if let Ok(want) = std::env::var("DET_DUMP_CLASS")
-                && decl_id.get_simple_name() == want
-            {
-                for member in &members {
-                    println!(
-                        "  [{label}] {want}.{:?} from {} id={:?}",
-                        member.get_key(),
-                        file_label(analysis, member.get_file_id()),
-                        member.get_id()
-                    );
-                }
-            }
+            ordered.sort_unstable();
             class_members.insert(format!("{decl_id:?}"), ordered.join(","));
         }
     }
 
-    // Same visible-item view for *non-type* owners (table constants, element
-    // owners, global paths). Those decide member lookup on anonymous tables,
-    // and drift there is invisible to `class_members`.
+    // Every stored alias contribution, not just the winning origin the
+    // `type_decl_states` bucket shows: a losing site's origin/generic params
+    // still decide what a removal re-selects. Sorted by site path/range so
+    // the dump is canonical across processes.
+    let mut alias_contributions = HashDump::new("alias_contributions");
+    let mut alias_entries = type_index
+        .iter_alias_sources()
+        .map(|(decl_id, source)| {
+            (
+                file_label(analysis, source.site.file_id),
+                u32::from(source.site.value.start()),
+                u32::from(source.site.value.end()),
+                format!("{decl_id:?}"),
+                format!("{source:?}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    alias_entries.sort_unstable();
+    for (file, start, end, decl_id, source) in alias_entries {
+        alias_contributions.insert(format!("{file}@{start}..{end}|decl={decl_id}"), source);
+    }
+
+    // The same visible-item view for non-type owners (table constants, element
+    // owners, global paths), which decide member lookup on anonymous tables.
     for (key, owner) in &all_owners {
         if let Some(members) = db.get_member_index().get_members(owner) {
-            let ordered = members
+            let mut ordered = members
                 .iter()
-                .map(|member| format!("{:?}@{:?}", member.get_key(), member.get_id()))
+                .map(|member| format!("{:?}@{:?}|{member:?}", member.get_key(), member.get_id()))
                 .collect::<Vec<_>>();
+            ordered.sort_unstable();
             class_members.insert(format!("OWNER {key}"), ordered.join(","));
         }
     }
 
-    // Resolved signature shapes. `inferred_params` only covers call-site-derived
-    // facts; the signature's own param and return types are a separate index and
-    // drift there changes overload selection without moving a single member.
+    let mut definition_sites = BTreeMap::new();
+    for (path, sites) in db.get_member_index().sorted_definition_sites() {
+        definition_sites.insert(
+            path.get_name().to_string(),
+            sites
+                .iter()
+                .map(|site| {
+                    format!(
+                        "{}@{:?}",
+                        file_label(analysis, site.file_id),
+                        (u32::from(site.value.start()), u32::from(site.value.end()))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+
+    // Resolved signature shapes. `inferred_params` covers only call-site-derived
+    // facts; a signature's own param and return types are a separate index.
     let mut signatures = BTreeMap::new();
     for (signature_id, signature) in db.get_signature_index().iter() {
         signatures.insert(
@@ -854,13 +789,49 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
                 file_label(analysis, signature_id.get_file_id())
             ),
             format!(
-                "{:?} -> {:?}",
+                "params={:?} return={:?} optional={:?} sig={}",
                 signature.get_type_params(),
-                signature.get_return_type()
+                signature.get_return_type(),
+                signature.get_param_optional_flags(),
+                canonical_signature(signature)
             ),
         );
     }
 
+    let flow = db.get_flow_index();
+    let mut flow_trees = BTreeMap::new();
+    // Compared by content: the trees hold hash sets whose printed order
+    // differs between two builds of the same text.
+    for (file_id, tree) in flow.flow_trees() {
+        flow_trees.insert(
+            file_label(analysis, *file_id),
+            format!("{:016x}", tree.content_fingerprint()),
+        );
+    }
+    let mut signature_casts = BTreeMap::new();
+    for (signature_id, signature) in db.get_signature_index().iter() {
+        if let Some(cast) = &signature.return_cast {
+            signature_casts.insert(
+                format!(
+                    "{}|{signature_id:?}",
+                    file_label(analysis, signature_id.get_file_id())
+                ),
+                format!("{cast:?}"),
+            );
+        }
+    }
+    let mut special_call_effects = BTreeMap::new();
+    for (file_id, position, effect) in flow.special_call_effects() {
+        special_call_effects.insert(
+            format!("{}|{position:?}|{effect:?}", file_label(analysis, *file_id)),
+            format!("{effect:?}"),
+        );
+    }
+    let mut special_call_facts = BTreeMap::new();
+    for fact in flow.settled_special_call_facts() {
+        let text = format!("{fact:?}");
+        special_call_facts.insert(text.clone(), text);
+    }
     let mut inferred_params = BTreeMap::new();
     for (signature_id, param_idx, fact) in db.get_call_site_param_index().iter_inferred_params() {
         inferred_params.insert(
@@ -872,15 +843,8 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         );
     }
 
-    eprintln!(
-        "[{label}] index type_caches={} members={} net_flows={}",
-        type_caches.len(),
-        members.len(),
-        net_flows.len()
-    );
     // Where every member ended up. Contribution groups and class member lists
-    // are both keyed off this, so a member homed differently explains drift in
-    // either without having to trace them apart.
+    // are both keyed off this.
     let mut member_owners = BTreeMap::new();
     if with_provenance {
         for file_id in db.get_vfs().get_all_file_ids() {
@@ -898,46 +862,453 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         }
     }
 
-    // Every assignment-contribution group, so a writer that landed under the
-    // wrong owner is visible as a group that moved rather than as a member
-    // whose type merely changed.
-    let mut contribution_groups = BTreeMap::new();
-    if with_provenance {
-        let all_files = db.get_vfs().get_all_file_ids().into_iter().collect();
-        let store = member_index.member_assignment_contributions();
-        for group_key in store.keys_for_files(&all_files) {
-            let Some(group) = store.contributions(&group_key) else {
-                continue;
-            };
-            let mut ids = group
-                .keys()
-                .map(|member_id| {
-                    format!(
-                        "{}:{:?}",
-                        member_id.file_id.id,
-                        u32::from(member_id.get_position())
-                    )
-                })
+    // Every index not already covered above, dumped through whatever public
+    // iteration each one exposes. Per-file maps key on `file_label`; indexes
+    // with no per-file getter but a global iterator key on their own item.
+    let all_files = db.get_vfs().get_all_file_ids();
+
+    let decl_index = db.get_decl_index();
+    let mut decls = HashDump::new("decls");
+    let mut decl_references = HashDump::new("decl_references");
+    for &file_id in &all_files {
+        let file = file_label(analysis, file_id);
+        if let Some(tree) = decl_index.get_decl_tree(&file_id) {
+            for (decl_id, decl) in tree.get_decls() {
+                decls.insert(format!("{file}|{decl_id:?}"), format!("{decl:?}"));
+            }
+        }
+        if let Some(reference) = db.get_reference_index().get_local_reference(&file_id) {
+            for (decl_id, decl_reference) in reference.get_decl_references_map() {
+                decl_references
+                    .insert(format!("{file}|{decl_id:?}"), format!("{decl_reference:?}"));
+            }
+        }
+    }
+
+    // The rest of the reference index: the inverse range→decl map, the
+    // member/global/string/type site maps, and per-local first-reassignment
+    // positions. `file_revision`/`next_revision` are raw epochs and stay out.
+    // Hash-set values render sorted so two processes agree on the text.
+    let reference_index = db.get_reference_index();
+    let mut reference_ranges = HashDump::new("reference_ranges");
+    for (file_id, range, decl_id) in reference_index.iter_reference_ranges() {
+        reference_ranges.insert(
+            format!("{}|{range:?}", file_label(analysis, file_id)),
+            format!("{decl_id:?}"),
+        );
+    }
+    let mut index_references = HashDump::new("index_references");
+    for (key, by_file) in reference_index.iter_index_references() {
+        for (file_id, syntax_ids) in by_file {
+            let mut sites = syntax_ids
+                .iter()
+                .map(|syntax_id| format!("{syntax_id:?}"))
                 .collect::<Vec<_>>();
-            ids.sort();
-            contribution_groups.insert(
-                format!("{:?}|{:?}", group_key.0, group_key.1),
-                ids.join(","),
+            sites.sort_unstable();
+            index_references.insert(
+                format!("{key:?}|{}", file_label(analysis, *file_id)),
+                format!("{sites:?}"),
+            );
+        }
+    }
+    let mut global_references = HashDump::new("global_references");
+    for (name, by_file) in reference_index.iter_global_references() {
+        for (file_id, syntax_ids) in by_file {
+            let mut sites = syntax_ids
+                .iter()
+                .map(|syntax_id| format!("{syntax_id:?}"))
+                .collect::<Vec<_>>();
+            sites.sort_unstable();
+            global_references.insert(
+                format!("{name}|{}", file_label(analysis, *file_id)),
+                format!("{sites:?}"),
+            );
+        }
+    }
+    let mut string_references = HashDump::new("string_references");
+    for (file_id, string_reference) in reference_index.iter_string_references() {
+        let file = file_label(analysis, *file_id);
+        for (string, ranges) in string_reference.iter_string_references() {
+            string_references.insert(format!("{file}|{string}"), format!("{ranges:?}"));
+        }
+    }
+    let mut type_references = HashDump::new("type_references");
+    for (file_id, by_decl) in reference_index.iter_type_references() {
+        let file = file_label(analysis, *file_id);
+        for (type_decl_id, ranges) in by_decl {
+            let mut sites = ranges
+                .iter()
+                .map(|range| format!("{range:?}"))
+                .collect::<Vec<_>>();
+            sites.sort_unstable();
+            type_references.insert(format!("{file}|{type_decl_id:?}"), format!("{sites:?}"));
+        }
+    }
+    let mut local_reassignments = HashDump::new("local_reassignments");
+    for (file_id, positions) in reference_index.iter_local_reassignments() {
+        let file = file_label(analysis, *file_id);
+        for (decl_id, position) in positions {
+            local_reassignments.insert(
+                format!("{file}|{decl_id:?}"),
+                format!("{}", u32::from(*position)),
             );
         }
     }
 
+    // `module_id` is an arena index assigned in tree-build order, not a
+    // function of content -- it legitimately differs between a full walk and
+    // a partial re-index of the same files, so it is left out here.
+    let mut modules = HashDump::new("modules");
+    for info in db.get_module_index().get_module_infos() {
+        modules.insert(
+            file_label(analysis, info.file_id),
+            format!(
+                "full_module_name={:?} name={:?} visible={:?} export_type={:?} version_conds={:?} workspace_id={:?} semantic_id={:?} is_meta={:?}",
+                info.full_module_name,
+                info.name,
+                info.visible,
+                info.export_type,
+                info.version_conds,
+                info.workspace_id,
+                info.semantic_id,
+                info.is_meta
+            ),
+        );
+    }
+
+    let mut globals = HashDump::new("globals");
+    for decl_id in db.get_global_index().get_all_global_decl_ids() {
+        globals.insert(format!("{decl_id:?}"), format!("{decl_id:?}"));
+    }
+
+    let mut diagnostics = HashDump::new("diagnostics_index");
+    let mut diagnostic_actions = HashDump::new("diagnostic_actions");
+    let mut operators = HashDump::new("operators");
+    for &file_id in &all_files {
+        let file = file_label(analysis, file_id);
+        if let Some(errors) = db.get_diagnostic_index().get_diagnostics(&file_id) {
+            diagnostics.insert(file.clone(), format!("{errors:?}"));
+        }
+        if let Some(actions) = db.get_diagnostic_index().get_diagnostics_actions(file_id) {
+            diagnostic_actions.insert(file.clone(), format!("{actions:?}"));
+        }
+        let ops = db.get_operator_index().operators_in_file(file_id);
+        if !ops.is_empty() {
+            operators.insert(file, format!("{ops:?}"));
+        }
+    }
+
+    let mut dependency_sites = HashDump::new("dependency_sites");
+    for file_id in db.get_vfs().get_all_file_ids() {
+        if let Some(sites) = db
+            .get_file_dependencies_index()
+            .get_dependency_sites(&file_id)
+        {
+            dependency_sites.insert(file_label(analysis, file_id), format!("{sites:?}"));
+        }
+    }
+
+    let mut gmod_load_files = HashDump::new("gmod_load_files");
+    for (file_id, info) in db.get_gmod_load_index().iter_file_infos() {
+        gmod_load_files.insert(file_label(analysis, *file_id), format!("{info:?}"));
+    }
+    // Self-keyed rather than positional: an edge has no stable id, and a
+    // positional key would turn one inserted/removed entry into a cascade of
+    // false "changed" hits for every entry after it.
+    let mut gmod_load_unresolved_edges = HashDump::new("gmod_load_unresolved_edges");
+    for edge in db.get_gmod_load_index().unresolved_edges() {
+        let text = format!("{edge:?}");
+        gmod_load_unresolved_edges.insert(text.clone(), text);
+    }
+
+    let gmod_infer_index = db.get_gmod_infer_index();
+    let mut gmod_hook_files = HashDump::new("gmod_hook_files");
+    for (file_id, metadata) in gmod_infer_index.iter_hook_file_metadata() {
+        gmod_hook_files.insert(file_label(analysis, *file_id), format!("{metadata:?}"));
+    }
+    let mut gmod_system_files = HashDump::new("gmod_system_files");
+    for (file_id, metadata) in gmod_infer_index.iter_system_file_metadata() {
+        gmod_system_files.insert(file_label(analysis, *file_id), format!("{metadata:?}"));
+    }
+    let mut gmod_gm_method_realm_annotations = HashDump::new("gmod_gm_method_realm_annotations");
+    for (file_id, annotations) in gmod_infer_index.iter_gm_method_realm_annotations() {
+        gmod_gm_method_realm_annotations
+            .insert(file_label(analysis, *file_id), format!("{annotations:?}"));
+    }
+    let mut gmod_realm_files = HashDump::new("gmod_realm_files");
+    let mut gmod_scoped_class_info = HashDump::new("gmod_scoped_class_info");
+    for &file_id in &all_files {
+        let file = file_label(analysis, file_id);
+        if let Some(metadata) = gmod_infer_index.get_realm_file_metadata(&file_id) {
+            gmod_realm_files.insert(file.clone(), format!("{metadata:?}"));
+        }
+        if let Some(info) = gmod_infer_index.get_scoped_class_info(&file_id) {
+            gmod_scoped_class_info.insert(file, format!("{info:?}"));
+        }
+    }
+
+    let mut gmod_network_wire_coverage = HashDump::new("gmod_network_wire_coverage");
+    for (wire_format, coverage) in network.wire_format_coverage() {
+        gmod_network_wire_coverage.insert(format!("{wire_format:?}"), format!("{coverage:?}"));
+    }
+
+    let mut gmod_class_file_metadata = HashDump::new("gmod_class_file_metadata");
+    for (file_id, metadata) in db.get_gmod_class_metadata_index().iter_file_metadata() {
+        gmod_class_file_metadata.insert(file_label(analysis, *file_id), format!("{metadata:?}"));
+    }
+
+    let mut dynamic_field_wildcards = HashDump::new("dynamic_field_wildcards");
+    for entry in db.get_dynamic_field_index().get_all_wildcard_definitions() {
+        dynamic_field_wildcards.insert(format!("{entry:?}"), format!("{entry:?}"));
+    }
+
+    // The named-field maps, unattributed names and finite members the wildcard
+    // bucket does not cover. Hash-set values render sorted so two processes
+    // agree on the text.
+    let mut dynamic_fields = HashDump::new("dynamic_fields");
+    let dynamic_field_index = db.get_dynamic_field_index();
+    for (owner, fields) in dynamic_field_index.iter_all_owner_fields() {
+        for (field_name, files) in fields {
+            let mut files = files.iter().map(|f| f.id).collect::<Vec<_>>();
+            files.sort_unstable();
+            dynamic_fields.insert(
+                format!("OWNERFIELD {owner:?}|{field_name}"),
+                format!("{files:?}"),
+            );
+        }
+    }
+    for (owner, fields) in dynamic_field_index.iter_all_field_definitions() {
+        for (field_name, definitions) in fields {
+            let mut definitions = definitions
+                .iter()
+                .map(|d| format!("{d:?}"))
+                .collect::<Vec<_>>();
+            definitions.sort_unstable();
+            dynamic_fields.insert(
+                format!("FIELDDEF {owner:?}|{field_name}"),
+                format!("{definitions:?}"),
+            );
+        }
+    }
+    for (owner, fields) in dynamic_field_index.iter_all_direct_field_definitions() {
+        for (field_name, definitions) in fields {
+            let mut definitions = definitions
+                .iter()
+                .map(|d| format!("{d:?}"))
+                .collect::<Vec<_>>();
+            definitions.sort_unstable();
+            dynamic_fields.insert(
+                format!("DIRECTFIELDDEF {owner:?}|{field_name}"),
+                format!("{definitions:?}"),
+            );
+        }
+    }
+    for (field_name, sites) in dynamic_field_index.iter_all_unattributed_fields() {
+        // Every site keeps its full identity — file id plus the index-key
+        // range's numeric bounds — so same-file sites stay distinct records.
+        let mut sites = sites
+            .iter()
+            .map(|site| {
+                (
+                    site.file_id.id,
+                    u32::from(site.value.start()),
+                    u32::from(site.value.end()),
+                )
+            })
+            .collect::<Vec<_>>();
+        sites.sort_unstable();
+        dynamic_fields.insert(format!("UNATTRIBUTED {field_name}"), format!("{sites:?}"));
+    }
+    for (owner, member_ids) in dynamic_field_index.iter_all_finite_named_members() {
+        let mut member_ids = member_ids
+            .iter()
+            .map(|m| format!("{m:?}"))
+            .collect::<Vec<_>>();
+        member_ids.sort_unstable();
+        dynamic_fields.insert(format!("FINITE {owner:?}"), format!("{member_ids:?}"));
+    }
+
+    let mut accessor_func_annotations = HashDump::new("accessor_func_annotations");
+    for (name, annotations) in db.get_accessor_func_index().annotation_entries() {
+        let mut entries = annotations
+            .iter()
+            .map(|annotation| format!("{annotation:?}"))
+            .collect::<Vec<_>>();
+        entries.sort_unstable();
+        accessor_func_annotations.insert(name.to_string(), format!("{entries:?}"));
+    }
+    let mut accessor_func_annotation_files = HashDump::new("accessor_func_annotation_files");
+    for (file_id, names) in db.get_accessor_func_index().annotation_files() {
+        let mut names = names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        accessor_func_annotation_files.insert(file_label(analysis, *file_id), format!("{names:?}"));
+    }
+    let mut numeric_range_file_populations = HashDump::new("numeric_range_file_populations");
+    let mut numeric_range_global_populations = HashDump::new("numeric_range_global_populations");
+    for (file_id, populations) in db
+        .get_numeric_range_population_index()
+        .populations_by_file()
+    {
+        let mut entries = populations
+            .iter()
+            .map(|population| format!("{population:?}"))
+            .collect::<Vec<_>>();
+        entries.sort_unstable();
+        numeric_range_file_populations
+            .insert(file_label(analysis, *file_id), format!("{entries:?}"));
+    }
+    for (global, populations) in db
+        .get_numeric_range_population_index()
+        .populations_by_global()
+    {
+        let mut entries = populations
+            .iter()
+            .map(|population| format!("{population:?}"))
+            .collect::<Vec<_>>();
+        entries.sort_unstable();
+        numeric_range_global_populations.insert(global.clone(), format!("{entries:?}"));
+    }
+    let mut accessor_func_calls = HashDump::new("accessor_func_calls");
+    for (file_id, calls) in db.get_accessor_func_call_index().iter() {
+        accessor_func_calls.insert(file_label(analysis, *file_id), format!("{calls:?}"));
+    }
+
+    let mut properties = HashDump::new("properties");
+    for (owner_id, property) in db.get_property_index().iter_owner_properties() {
+        properties.insert(format!("{owner_id:?}"), format!("{property:?}"));
+    }
+    // Source-owned contributions, normalized across the sole/multi storage
+    // split: the merged `properties` view alone cannot show a hidden
+    // contribution that lost the merge but still decides what a deletion
+    // re-selects.
+    for contribution in db.get_property_index().iter_source_contributions() {
+        properties.insert(
+            format!(
+                "PROPERTYCONTRIB {:?}|{}",
+                contribution.owner_id,
+                file_label(analysis, contribution.file_id)
+            ),
+            format!(
+                "rank={}|path={}|{:?}",
+                contribution.workspace_rank, contribution.normalized_path, contribution.property
+            ),
+        );
+    }
+
+    let mut metatables = HashDump::new("metatables");
+    for (table, binding) in db.get_metatable_index().iter_bindings() {
+        metatables.insert(
+            format!("{table:?} <- {:?}", binding.writer_file_id),
+            format!("{:?}", binding.metatable),
+        );
+    }
+    let mut metatable_factory_bindings = HashDump::new("metatable_factory_bindings");
+    for &file_id in &all_files {
+        if let Some(bindings) = db.get_metatable_index().factory_bindings_for_file(file_id)
+            && !bindings.is_empty()
+        {
+            metatable_factory_bindings
+                .insert(file_label(analysis, file_id), format!("{bindings:?}"));
+        }
+    }
+
+    // The call-site param index's persisted relation: each file's evidence.
+    // The folded params are dumped with the inferred params above.
+    let call_site = db.get_call_site_param_index();
+    let mut call_site_contributions = HashDump::new("call_site_contributions");
+    for (file_id, contributions) in call_site.iter_file_contributions() {
+        call_site_contributions
+            .insert(file_label(analysis, *file_id), format!("{contributions:?}"));
+    }
+
+    let mut stored_facts = HashDump::new("stored_facts");
+    for (kind, file_id, fingerprint) in db.stored_fact_fingerprints() {
+        stored_facts.insert(
+            format!("{kind} {}", file_label(analysis, file_id)),
+            fingerprint.to_string(),
+        );
+    }
+
+    let mut schema_files = HashDump::new("schema_files");
+    for (url, schema_file) in db.get_json_schema_index().iter_schema_files() {
+        schema_files.insert(url.as_str().to_string(), format!("{schema_file:?}"));
+    }
+
+    eprintln!(
+        "[{label}] index type_caches={} members={} net_flows={} flow_trees={} signature_casts={} special_call_effects={} special_call_facts={} accessor_annotations={} accessor_annotation_files={} numeric_range_files={} numeric_range_globals={} type_decl_states={} type_decl_generic_params={} ({:.2}s)",
+        type_caches.len(),
+        members.len(),
+        net_flows.len(),
+        flow_trees.len(),
+        signature_casts.len(),
+        special_call_effects.len(),
+        special_call_facts.len(),
+        accessor_func_annotations.hashes.len(),
+        accessor_func_annotation_files.hashes.len(),
+        numeric_range_file_populations.hashes.len(),
+        numeric_range_global_populations.hashes.len(),
+        type_decl_states.hashes.len(),
+        type_decl_generic_params.hashes.len(),
+        t.elapsed().as_secs_f64()
+    );
+
     let snapshot = IndexSnapshot {
         type_caches,
         type_facts,
-        contribution_groups,
         member_owners,
         members,
         net_flows,
         inferred_params,
         super_types,
         class_members,
+        definition_sites,
         signatures,
+        flow_trees,
+        signature_casts,
+        special_call_effects,
+        special_call_facts,
+        accessor_func_annotations: accessor_func_annotations.finish(),
+        accessor_func_annotation_files: accessor_func_annotation_files.finish(),
+        numeric_range_file_populations: numeric_range_file_populations.finish(),
+        numeric_range_global_populations: numeric_range_global_populations.finish(),
+        decls: decls.finish(),
+        type_decl_states: type_decl_states.finish(),
+        type_decl_generic_params: type_decl_generic_params.finish(),
+        alias_contributions: alias_contributions.finish(),
+        decl_references: decl_references.finish(),
+        reference_ranges: reference_ranges.finish(),
+        index_references: index_references.finish(),
+        global_references: global_references.finish(),
+        string_references: string_references.finish(),
+        type_references: type_references.finish(),
+        local_reassignments: local_reassignments.finish(),
+        modules: modules.finish(),
+        globals: globals.finish(),
+        diagnostics: diagnostics.finish(),
+        diagnostic_actions: diagnostic_actions.finish(),
+        operators: operators.finish(),
+        dependency_sites: dependency_sites.finish(),
+        gmod_load_files: gmod_load_files.finish(),
+        gmod_load_unresolved_edges: gmod_load_unresolved_edges.finish(),
+        gmod_hook_files: gmod_hook_files.finish(),
+        gmod_system_files: gmod_system_files.finish(),
+        gmod_gm_method_realm_annotations: gmod_gm_method_realm_annotations.finish(),
+        gmod_realm_files: gmod_realm_files.finish(),
+        gmod_scoped_class_info: gmod_scoped_class_info.finish(),
+        gmod_network_wire_coverage: gmod_network_wire_coverage.finish(),
+        gmod_class_file_metadata: gmod_class_file_metadata.finish(),
+        dynamic_field_wildcards: dynamic_field_wildcards.finish(),
+        dynamic_fields: dynamic_fields.finish(),
+        accessor_func_calls: accessor_func_calls.finish(),
+        properties: properties.finish(),
+        metatables: metatables.finish(),
+        metatable_factory_bindings: metatable_factory_bindings.finish(),
+        call_site_contributions: call_site_contributions.finish(),
+        stored_facts: stored_facts.finish(),
+        schema_files: schema_files.finish(),
     };
 
     // Cross-process comparison: write the whole snapshot so two runs of the same
@@ -946,10 +1317,17 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         let mut out = String::new();
         for (tag, map) in [
             ("TC", &snapshot.type_caches),
+            ("TF", &snapshot.type_facts),
+            ("MO", &snapshot.member_owners),
             ("PARAM", &snapshot.inferred_params),
             ("SUPER", &snapshot.super_types),
             ("CLSMEM", &snapshot.class_members),
+            ("DEFSITE", &snapshot.definition_sites),
             ("SIG", &snapshot.signatures),
+            ("FLOW", &snapshot.flow_trees),
+            ("CAST", &snapshot.signature_casts),
+            ("SCEFFECT", &snapshot.special_call_effects),
+            ("SCFACT", &snapshot.special_call_facts),
         ] {
             for (key, value) in map {
                 out.push_str(&format!("{tag} {key} = {value}\n"));
@@ -961,6 +1339,60 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         for entry in &snapshot.net_flows {
             out.push_str(&format!("NET {entry}\n"));
         }
+        // Hash-only unless `DET_DUMP_INDEX_DETAIL` named this index: write its
+        // retained text, otherwise write just the sorted hashes so a
+        // cross-process compare still has *something* to diff.
+        for (tag, dump) in [
+            ("DECL", &snapshot.decls),
+            ("TDECL", &snapshot.type_decl_states),
+            ("TGEN", &snapshot.type_decl_generic_params),
+            ("ALIASCONTRIB", &snapshot.alias_contributions),
+            ("DREF", &snapshot.decl_references),
+            ("REFRANGE", &snapshot.reference_ranges),
+            ("IDXREF", &snapshot.index_references),
+            ("GLOBREF", &snapshot.global_references),
+            ("STRREF", &snapshot.string_references),
+            ("TYPEREF", &snapshot.type_references),
+            ("LOCALREASSIGN", &snapshot.local_reassignments),
+            ("MOD", &snapshot.modules),
+            ("GLOBAL", &snapshot.globals),
+            ("DIAG", &snapshot.diagnostics),
+            ("DIAGACT", &snapshot.diagnostic_actions),
+            ("OP", &snapshot.operators),
+            ("DEP", &snapshot.dependency_sites),
+            ("GLOAD", &snapshot.gmod_load_files),
+            ("GLOADEDGE", &snapshot.gmod_load_unresolved_edges),
+            ("GHOOK", &snapshot.gmod_hook_files),
+            ("GSYS", &snapshot.gmod_system_files),
+            ("GMETHREALM", &snapshot.gmod_gm_method_realm_annotations),
+            ("GREALM", &snapshot.gmod_realm_files),
+            ("GSCOPED", &snapshot.gmod_scoped_class_info),
+            ("GWIRE", &snapshot.gmod_network_wire_coverage),
+            ("GCLASS", &snapshot.gmod_class_file_metadata),
+            ("DYNWILD", &snapshot.dynamic_field_wildcards),
+            ("DYNFIELD", &snapshot.dynamic_fields),
+            ("ACCANN", &snapshot.accessor_func_annotations),
+            ("ACCFILES", &snapshot.accessor_func_annotation_files),
+            ("NUMFILE", &snapshot.numeric_range_file_populations),
+            ("NUMGLOBAL", &snapshot.numeric_range_global_populations),
+            ("ACCCALL", &snapshot.accessor_func_calls),
+            ("PROP", &snapshot.properties),
+            ("METATBL", &snapshot.metatables),
+            ("METAFACT", &snapshot.metatable_factory_bindings),
+            ("CSCONTRIB", &snapshot.call_site_contributions),
+            ("STORED", &snapshot.stored_facts),
+            ("SCHEMA", &snapshot.schema_files),
+        ] {
+            if let Some(detail) = &dump.detail {
+                for (key, value) in detail {
+                    out.push_str(&format!("{tag} {key} = {value}\n"));
+                }
+            } else {
+                for hash in &dump.hashes {
+                    out.push_str(&format!("{tag}_HASH {hash:016x}\n"));
+                }
+            }
+        }
         let file_name = label
             .chars()
             .map(|c| if c.is_alphanumeric() { c } else { '_' })
@@ -969,6 +1401,49 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     }
 
     snapshot
+}
+
+/// Canonical serialization of one signature for the index snapshot.
+///
+/// `LuaSignature`'s derived `Debug` renders `param_docs` — a
+/// `std::collections::HashMap` re-seeded per signature — in randomized order,
+/// so two identical builds can produce different strings for the same
+/// signature. Every field is serialized explicitly instead: `param_docs`
+/// sorted by parameter index, private fields through their getters.
+fn canonical_signature(signature: &glua_code_analysis::LuaSignature) -> String {
+    let mut param_docs = signature
+        .param_docs
+        .iter()
+        .map(|(idx, info)| format!("{idx}:{info:?}"))
+        .collect::<Vec<_>>();
+    param_docs.sort_unstable();
+    format!(
+        "generic_params={:?} overloads={:?} param_docs={param_docs:?} out_params={:?} params={:?} \
+         return_docs={:?} resolve_return={:?} is_colon_define={:?} async_state={:?} nodiscard={:?} \
+         is_vararg={:?} params_filled_from_slot={:?} return_filled_from_slot={:?} \
+         require_guard_param={:?} nil_return_guard_params={:?} return_correlations={:?} \
+         direct_param_return_alias={:?} class_name_param_return_alias={:?} \
+         falsy_param_nil_free_return_slots={:?} falsy_param_return_aliases={:?}",
+        signature.generic_params,
+        signature.overloads,
+        signature.out_params,
+        signature.params,
+        signature.return_docs,
+        signature.resolve_return,
+        signature.is_colon_define,
+        signature.async_state,
+        signature.nodiscard,
+        signature.is_vararg,
+        signature.params_filled_from_slot,
+        signature.return_filled_from_slot,
+        signature.require_guard_param(),
+        signature.nil_return_guard_params(),
+        signature.return_correlations(),
+        signature.direct_param_return_alias(),
+        signature.class_name_param_return_alias(),
+        signature.falsy_param_nil_free_return_slots(),
+        signature.falsy_param_return_aliases(),
+    )
 }
 
 /// Max diff lines printed per bucket.
@@ -1000,12 +1475,15 @@ fn diff_map(
         .intersection(&other_keys)
         .filter(|key| base.get(**key) != other.get(**key))
         .collect::<Vec<_>>();
-    println!(
-        "INDEX {base_label} -> {label}: {name} dropped={} gained={} changed={}",
-        dropped.len(),
-        gained.len(),
-        changed.len()
-    );
+    if !dropped.is_empty() || !gained.is_empty() || !changed.is_empty() {
+        record_divergence();
+        println!(
+            "INDEX {base_label} -> {label}: {name} dropped={} gained={} changed={}",
+            dropped.len(),
+            gained.len(),
+            changed.len()
+        );
+    }
     for key in dropped.iter().take(limit) {
         emit(format!("  {prefix}_DROPPED {key} = {:?}", base.get(**key)));
     }
@@ -1041,12 +1519,6 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
         ("type_caches", "TC", &base.type_caches, &other.type_caches),
         ("type_facts", "TF", &base.type_facts, &other.type_facts),
         (
-            "contribution_groups",
-            "CG",
-            &base.contribution_groups,
-            &other.contribution_groups,
-        ),
-        (
             "member_owners",
             "MO",
             &base.member_owners,
@@ -1059,11 +1531,36 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
             &other.super_types,
         ),
         ("signatures", "SIG", &base.signatures, &other.signatures),
+        ("flow_trees", "FLOW", &base.flow_trees, &other.flow_trees),
+        (
+            "signature_casts",
+            "CAST",
+            &base.signature_casts,
+            &other.signature_casts,
+        ),
+        (
+            "special_call_effects",
+            "SCEFFECT",
+            &base.special_call_effects,
+            &other.special_call_effects,
+        ),
+        (
+            "special_call_facts",
+            "SCFACT",
+            &base.special_call_facts,
+            &other.special_call_facts,
+        ),
         (
             "class_members",
             "CM",
             &base.class_members,
             &other.class_members,
+        ),
+        (
+            "definition_sites",
+            "DEFSITE",
+            &base.definition_sites,
+            &other.definition_sites,
         ),
         (
             "inferred_params",
@@ -1077,13 +1574,230 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
         );
     }
 
+    // Bulky per-file/per-decl indexes: diffed as sorted hash vectors (see
+    // `HashDump`) instead of owned-string maps, so a whole-workspace snapshot
+    // does not multiply the harness's peak memory.
+    for (name, prefix, base_hash, other_hash) in [
+        ("decls", "DECL", &base.decls, &other.decls),
+        (
+            "type_decl_states",
+            "TDECL",
+            &base.type_decl_states,
+            &other.type_decl_states,
+        ),
+        (
+            "type_decl_generic_params",
+            "TGEN",
+            &base.type_decl_generic_params,
+            &other.type_decl_generic_params,
+        ),
+        (
+            "alias_contributions",
+            "ALIASCONTRIB",
+            &base.alias_contributions,
+            &other.alias_contributions,
+        ),
+        (
+            "decl_references",
+            "DREF",
+            &base.decl_references,
+            &other.decl_references,
+        ),
+        (
+            "reference_ranges",
+            "REFRANGE",
+            &base.reference_ranges,
+            &other.reference_ranges,
+        ),
+        (
+            "index_references",
+            "IDXREF",
+            &base.index_references,
+            &other.index_references,
+        ),
+        (
+            "global_references",
+            "GLOBREF",
+            &base.global_references,
+            &other.global_references,
+        ),
+        (
+            "string_references",
+            "STRREF",
+            &base.string_references,
+            &other.string_references,
+        ),
+        (
+            "type_references",
+            "TYPEREF",
+            &base.type_references,
+            &other.type_references,
+        ),
+        (
+            "local_reassignments",
+            "LOCALREASSIGN",
+            &base.local_reassignments,
+            &other.local_reassignments,
+        ),
+        ("modules", "MOD", &base.modules, &other.modules),
+        ("globals", "GLOBAL", &base.globals, &other.globals),
+        (
+            "diagnostics_index",
+            "DIAG",
+            &base.diagnostics,
+            &other.diagnostics,
+        ),
+        (
+            "diagnostic_actions",
+            "DIAGACT",
+            &base.diagnostic_actions,
+            &other.diagnostic_actions,
+        ),
+        ("operators", "OP", &base.operators, &other.operators),
+        (
+            "dependency_sites",
+            "DEP",
+            &base.dependency_sites,
+            &other.dependency_sites,
+        ),
+        (
+            "gmod_load_files",
+            "GLOAD",
+            &base.gmod_load_files,
+            &other.gmod_load_files,
+        ),
+        (
+            "gmod_load_unresolved_edges",
+            "GLOADEDGE",
+            &base.gmod_load_unresolved_edges,
+            &other.gmod_load_unresolved_edges,
+        ),
+        (
+            "gmod_hook_files",
+            "GHOOK",
+            &base.gmod_hook_files,
+            &other.gmod_hook_files,
+        ),
+        (
+            "gmod_system_files",
+            "GSYS",
+            &base.gmod_system_files,
+            &other.gmod_system_files,
+        ),
+        (
+            "gmod_gm_method_realm_annotations",
+            "GMETHREALM",
+            &base.gmod_gm_method_realm_annotations,
+            &other.gmod_gm_method_realm_annotations,
+        ),
+        (
+            "gmod_realm_files",
+            "GREALM",
+            &base.gmod_realm_files,
+            &other.gmod_realm_files,
+        ),
+        (
+            "gmod_scoped_class_info",
+            "GSCOPED",
+            &base.gmod_scoped_class_info,
+            &other.gmod_scoped_class_info,
+        ),
+        (
+            "gmod_network_wire_coverage",
+            "GWIRE",
+            &base.gmod_network_wire_coverage,
+            &other.gmod_network_wire_coverage,
+        ),
+        (
+            "gmod_class_file_metadata",
+            "GCLASS",
+            &base.gmod_class_file_metadata,
+            &other.gmod_class_file_metadata,
+        ),
+        (
+            "dynamic_field_wildcards",
+            "DYNWILD",
+            &base.dynamic_field_wildcards,
+            &other.dynamic_field_wildcards,
+        ),
+        (
+            "dynamic_fields",
+            "DYNFIELD",
+            &base.dynamic_fields,
+            &other.dynamic_fields,
+        ),
+        (
+            "accessor_func_annotations",
+            "ACCANN",
+            &base.accessor_func_annotations,
+            &other.accessor_func_annotations,
+        ),
+        (
+            "accessor_func_annotation_files",
+            "ACCFILES",
+            &base.accessor_func_annotation_files,
+            &other.accessor_func_annotation_files,
+        ),
+        (
+            "numeric_range_file_populations",
+            "NUMFILE",
+            &base.numeric_range_file_populations,
+            &other.numeric_range_file_populations,
+        ),
+        (
+            "numeric_range_global_populations",
+            "NUMGLOBAL",
+            &base.numeric_range_global_populations,
+            &other.numeric_range_global_populations,
+        ),
+        (
+            "accessor_func_calls",
+            "ACCCALL",
+            &base.accessor_func_calls,
+            &other.accessor_func_calls,
+        ),
+        ("properties", "PROP", &base.properties, &other.properties),
+        ("metatables", "METATBL", &base.metatables, &other.metatables),
+        (
+            "metatable_factory_bindings",
+            "METAFACT",
+            &base.metatable_factory_bindings,
+            &other.metatable_factory_bindings,
+        ),
+        (
+            "call_site_contributions",
+            "CSCONTRIB",
+            &base.call_site_contributions,
+            &other.call_site_contributions,
+        ),
+        (
+            "stored_facts",
+            "STORED",
+            &base.stored_facts,
+            &other.stored_facts,
+        ),
+        (
+            "schema_files",
+            "SCHEMA",
+            &base.schema_files,
+            &other.schema_files,
+        ),
+    ] {
+        diff_hash_dump(
+            base_label, label, name, prefix, base_hash, other_hash, limit, &emit,
+        );
+    }
+
     let member_dropped = base.members.difference(&other.members).collect::<Vec<_>>();
     let member_gained = other.members.difference(&base.members).collect::<Vec<_>>();
-    println!(
-        "INDEX {base_label} -> {label}: members dropped={} gained={}",
-        member_dropped.len(),
-        member_gained.len()
-    );
+    if !member_dropped.is_empty() || !member_gained.is_empty() {
+        record_divergence();
+        println!(
+            "INDEX {base_label} -> {label}: members dropped={} gained={}",
+            member_dropped.len(),
+            member_gained.len()
+        );
+    }
     for entry in member_dropped.iter().take(limit) {
         emit(format!("  MEM_DROPPED {entry}"));
     }
@@ -1095,12 +1809,14 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
     let other_net = other.net_flows.iter().collect::<BTreeSet<_>>();
     let net_dropped = base_net.difference(&other_net).collect::<Vec<_>>();
     let net_gained = other_net.difference(&base_net).collect::<Vec<_>>();
-    let net_reordered = base.net_flows != other.net_flows;
-    println!(
-        "INDEX {base_label} -> {label}: net_flows dropped={} gained={} reordered={net_reordered}",
-        net_dropped.len(),
-        net_gained.len()
-    );
+    if !net_dropped.is_empty() || !net_gained.is_empty() {
+        record_divergence();
+        println!(
+            "INDEX {base_label} -> {label}: net_flows dropped={} gained={}",
+            net_dropped.len(),
+            net_gained.len()
+        );
+    }
     for entry in net_dropped.iter().take(limit) {
         emit(format!("  NET_DROPPED {}", clip(entry, 400)));
     }
@@ -1115,7 +1831,7 @@ fn clip(text: &str, chars: usize) -> String {
     text.chars().take(chars).collect()
 }
 
-fn counts(set: &BTreeSet<Snapshot>) -> (usize, usize) {
+fn counts(set: &[Snapshot]) -> (usize, usize) {
     let errors = set.iter().filter(|s| s.severity == 1).count();
     let warnings = set.iter().filter(|s| s.severity == 2).count();
     (errors, warnings)
@@ -1131,9 +1847,21 @@ fn file_label(analysis: &EmmyLuaAnalysis, file_id: FileId) -> String {
         .unwrap_or_else(|| format!("{file_id:?}"))
 }
 
-fn diff(base_label: &str, base: &BTreeSet<Snapshot>, label: &str, other: &BTreeSet<Snapshot>) {
-    let removed = base.difference(other).collect::<Vec<_>>();
-    let added = other.difference(base).collect::<Vec<_>>();
+/// The entries of sorted `of` left once each entry of sorted `without`
+/// cancels one equal entry, so a repeated diagnostic counts every time.
+fn sorted_difference<'a>(of: &'a [Snapshot], without: &[Snapshot]) -> Vec<&'a Snapshot> {
+    let mut without = without.iter().peekable();
+    of.iter()
+        .filter(|entry| {
+            while without.next_if(|other| other < entry).is_some() {}
+            without.next_if(|other| other == entry).is_none()
+        })
+        .collect()
+}
+
+fn diff(base_label: &str, base: &[Snapshot], label: &str, other: &[Snapshot]) {
+    let removed = sorted_difference(base, other);
+    let added = sorted_difference(other, base);
     if removed.is_empty() && added.is_empty() {
         println!(
             "DIFF {base_label} -> {label}: IDENTICAL ({} entries)",
@@ -1146,6 +1874,7 @@ fn diff(base_label: &str, base: &BTreeSet<Snapshot>, label: &str, other: &BTreeS
         removed.len(),
         added.len()
     );
+    record_divergence();
 
     let limit = diff_limit();
 
@@ -1174,703 +1903,1597 @@ fn diff(base_label: &str, base: &BTreeSet<Snapshot>, label: &str, other: &BTreeS
     }
 }
 
-/// Re-index the targets without touching their text and require the index to
-/// come back byte-identical.
-///
-/// The diagnostic gates cannot see this: re-analysing a file can attach members
-/// or settle a decl's type differently from the cold build and still produce the
-/// same diagnostics, so `repeat` and `noopedit` both report IDENTICAL while the
-/// index underneath has drifted. That drift is what makes incremental work
-/// impossible to skip — every "did this actually change?" test reports yes — so
-/// it needs a gate of its own.
-///
-/// Like `editrevert` it builds its own analysis, for the same reason: sharing
-/// one with the other index gate lets whichever runs second measure against an
-/// already-converged index and report a clean 0.
-fn run_index_repeat(codebase: &Path, annotations: &Path, targets: &[String]) {
-    let analysis = &mut build_analysis(codebase, annotations);
-    for target in targets {
-        let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
-            eprintln!("[indexrepeat] cannot build uri for {}", path.display());
-            continue;
-        };
-        let Some(file_id) = analysis.get_file_id(&uri) else {
-            eprintln!("[indexrepeat] file not indexed: {}", path.display());
-            continue;
-        };
-
-        let expanded = analysis.expand_reindex_file_ids(vec![file_id]);
-        eprintln!(
-            "[indexrepeat] {} re-indexes {} files with no text change",
-            target,
-            expanded.len()
-        );
-        if std::env::var_os("DET_DUMP_EXPANSION").is_some() {
-            for id in &expanded {
-                if let Some(path) = analysis.compilation.get_db().get_vfs().get_file_path(id) {
-                    eprintln!("[expansion] {}", path.display());
-                }
-            }
-        }
-
-        // Re-indexing the same unchanged file again asks whether the index is
-        // converging on a fixed point or just oscillating. Round 1 measures the
-        // cold build against a re-index; every later round measures a re-index
-        // against the one before it, so a shrinking count means the cold build
-        // had simply not settled, while a steady one means each pass invents a
-        // fresh answer.
-        let rounds = std::env::var("DET_INDEXREPEAT_ROUNDS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .unwrap_or(1);
-        let mut before = collect_index(analysis, "before_indexrepeat");
-        for round in 1..=rounds {
-            analysis.reindex_files(vec![file_id]);
-            let label = format!("after_indexrepeat[{target}]#{round}");
-            let after = collect_index(analysis, &label);
-            diff_index(
-                &format!("before_indexrepeat#{round}"),
-                &before,
-                &label,
-                &after,
-            );
-            before = after;
-        }
-    }
-}
-
-/// Applies a semantically-neutral edit pair and lets the analysis settle.
-///
-/// `at_front` decides which kind: appending a trailing newline is a semantic
-/// no-op the update gate can skip outright, while inserting one at the front
-/// shifts every offset in the file, so the gate cannot fire and the full
-/// re-index expansion runs.
-fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path, at_front: bool) -> bool {
-    let tag = if at_front { "editmid" } else { "noopedit" };
-    let Some(uri) = glua_code_analysis::file_path_to_uri(&target.to_path_buf()) else {
-        eprintln!("[{tag}] cannot build uri for {}", target.display());
-        return false;
-    };
-    let Some(file_id) = analysis.get_file_id(&uri) else {
-        eprintln!("[{tag}] file not indexed: {}", target.display());
-        return false;
-    };
-    let Some(original) = analysis
+fn target(
+    analysis: &EmmyLuaAnalysis,
+    codebase: &Path,
+    relative: &str,
+) -> (PathBuf, lsp_types::Uri, FileId, String) {
+    let path = codebase.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let uri = file_uri(&path);
+    let file_id = analysis
+        .get_file_id(&uri)
+        .unwrap_or_else(|| panic!("target is not indexed: {}", path.display()));
+    let text = analysis
         .compilation
         .get_db()
         .get_vfs()
         .get_file_content(&file_id)
-        .cloned()
-    else {
-        eprintln!("[{tag}] no content for {}", target.display());
-        return false;
-    };
+        .unwrap_or_else(|| panic!("target has no indexed text: {}", path.display()))
+        .clone();
+    (path, uri, file_id, text)
+}
 
-    let expanded = analysis.expand_reindex_file_ids(vec![file_id]);
-    eprintln!(
-        "[{tag}] {} expands to {} files{}",
-        target.display(),
-        expanded.len(),
-        if at_front {
-            ""
-        } else {
-            " (the re-index the semantic no-op gate must skip, not run)"
-        }
+/// The texts typing `find` into `replace` passes through: the part of `find`
+/// that differs deleted at once, then the part of `replace` that differs typed
+/// one character at a time. The last is [`edited`]'s text.
+fn typed_texts(text: &str, find: &str, replace: &str) -> Vec<String> {
+    let prefix: usize = find
+        .chars()
+        .zip(replace.chars())
+        .take_while(|(from, to)| from == to)
+        .map(|(from, _)| from.len_utf8())
+        .sum();
+    let suffix: usize = find[prefix..]
+        .chars()
+        .rev()
+        .zip(replace[prefix..].chars().rev())
+        .take_while(|(from, to)| from == to)
+        .map(|(from, _)| from.len_utf8())
+        .sum();
+    let head = &replace[..prefix];
+    let tail = &replace[replace.len() - suffix..];
+    let typed = &replace[prefix..replace.len() - suffix];
+    let mut texts = Vec::new();
+    if find.len() - suffix > prefix || typed.is_empty() {
+        texts.push(edited(text, find, &format!("{head}{tail}")));
+    }
+    let ends = typed
+        .char_indices()
+        .map(|(at, _)| at)
+        .skip(1)
+        .chain(std::iter::once(typed.len()));
+    for end in ends.filter(|end| *end > 0) {
+        texts.push(edited(
+            text,
+            find,
+            &format!("{head}{}{tail}", &typed[..end]),
+        ));
+    }
+    texts
+}
+
+fn edited(text: &str, find: &str, replace: &str) -> String {
+    assert!(
+        text.contains(find),
+        "DET_EDIT_FIND does not occur in target"
     );
-    if std::env::var_os("DET_SHOW_EXPANSION").is_some() {
-        for expanded_id in &expanded {
-            eprintln!("[{tag}]   {}", file_label(analysis, *expanded_id));
-        }
-    }
-
-    let t = Instant::now();
-    let edited = if at_front {
-        format!(
-            "
-{original}"
-        )
-    } else {
-        format!(
-            "{original}
-"
-        )
-    };
-    analysis.update_file_by_uri(&uri, Some(edited));
-    analysis.update_file_by_uri(&uri, Some(original));
-    eprintln!(
-        "[{tag}] no-op newline edit pair on {} ({:.2}s)",
-        target.display(),
-        t.elapsed().as_secs_f64()
-    );
-    true
+    let result = text.replace(find, replace);
+    assert_ne!(result, text, "edit must change the target text");
+    result
 }
 
-/// Reports whether re-inferring a member's initializer in isolation reproduces
-/// the type the full pipeline settled on, split by single- vs multi-writer
-/// members.
-///
-/// A member with several writers holds the merge of those writes, so
-/// re-inferring one initializer answers a different question and is expected to
-/// disagree.
-fn refresh_faithfulness(analysis: &EmmyLuaAnalysis) {
-    let db = analysis.compilation.get_db();
-    let member_index = db.get_member_index();
-    let mut stats = [Faithfulness::default(); 2];
-    let mut samples = Vec::new();
-    let t = Instant::now();
-
-    for file_id in db.get_vfs().get_all_file_ids() {
-        let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
-            continue;
-        };
-        let root = tree.get_red_root();
-        let Some(model) = analysis.compilation.get_semantic_model(file_id) else {
-            continue;
-        };
-        for member in member_index.get_file_members(file_id) {
-            let member_id = member.get_id();
-            let Some(current) = db.get_type_index().get_type_cache(&member_id.into()) else {
-                continue;
-            };
-            // Annotated caches were never derived from the initializer, so
-            // re-inferring one is not the same question.
-            if current.is_doc() {
-                continue;
-            }
-            let Some(expr) = member_initializer_expr(&root, member_id) else {
-                continue;
-            };
-            let writers = member_index
-                .get_member_owner(&member_id)
-                .and_then(|owner| {
-                    member_index
-                        .member_assignment_contributions()
-                        .contributions(&(owner.clone(), member.get_key().clone()))
-                        .map(|group| group.len())
-                })
-                .unwrap_or(1);
-            let stat = &mut stats[usize::from(writers > 1)];
-            stat.derivable += 1;
-            match model.infer_expr(expr).map(first_result_type) {
-                Ok(inferred) if &inferred == current.as_type() => stat.agree += 1,
-                Ok(inferred) => {
-                    stat.mismatched += 1;
-                    if writers <= 1 && samples.len() < 15 {
-                        samples.push(format!(
-                            "  DISAGREE(1 writer) {}|{member_id:?}\n      cached     = {:?}\n      reinferred = {inferred:?}",
-                            file_label(analysis, file_id),
-                            current.as_type()
-                        ));
-                    }
-                }
-                Err(_) => stat.infer_failed += 1,
-            }
-        }
-    }
-
-    for (label, stat) in [("single_writer", &stats[0]), ("multi_writer", &stats[1])] {
-        println!(
-            "REFRESH faithfulness {label}: derivable={} agree={} mismatched={} infer_failed={}",
-            stat.derivable, stat.agree, stat.mismatched, stat.infer_failed
-        );
-    }
-    println!(
-        "REFRESH faithfulness took {:.2}s",
-        t.elapsed().as_secs_f64()
-    );
-    for sample in &samples {
-        println!("{sample}");
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-struct Faithfulness {
-    derivable: usize,
-    agree: usize,
-    mismatched: usize,
-    infer_failed: usize,
-}
-
-/// A single-value assignment takes the first result of a multi-return call, the
-/// way the analyzer's `select_result_fact` does.
-fn first_result_type(typ: glua_code_analysis::LuaType) -> glua_code_analysis::LuaType {
-    match &typ {
-        glua_code_analysis::LuaType::Variadic(variadic) => variadic
-            .get_type(0)
-            .cloned()
-            .unwrap_or(glua_code_analysis::LuaType::Nil),
-        _ => typ,
-    }
-}
-
-/// The expression a member's cached type was derived from, for the
-/// `t.k = <expr>` shape. Mirrors the analyzer's own initializer lookup.
-fn member_initializer_expr(
-    root: &glua_parser::LuaSyntaxNode,
-    member_id: glua_code_analysis::LuaMemberId,
-) -> Option<glua_parser::LuaExpr> {
-    use glua_parser::{LuaAstNode, LuaIndexExpr};
-
-    let node = member_id.get_syntax_id().to_node_from_root(root)?;
-    let index_expr = LuaIndexExpr::cast(node)?;
-    let assign_stat = index_expr.get_parent::<glua_parser::LuaAssignStat>()?;
-    let (vars, exprs) = assign_stat.get_var_and_expr_list();
-    let value_idx = vars
-        .iter()
-        .position(|var| var.syntax().text_range() == index_expr.get_range())?;
-    exprs.get(value_idx).cloned()
-}
-
-/// Attributes the re-index expansion to the source that produced each file.
-///
-/// `expand_reindex_file_ids` unions the dependent sets to a fixpoint and returns
-/// only the total. This mirrors that loop and reports, per round, how many files
-/// each source contributed that no earlier source already had.
-fn expand_why(analysis: &EmmyLuaAnalysis, codebase: &Path, targets: &[String]) {
-    for target in targets {
-        let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
-            continue;
-        };
-        let Some(file_id) = analysis.get_file_id(&uri) else {
-            eprintln!("[expandwhy] not indexed: {}", path.display());
-            continue;
-        };
-
-        let db = analysis.compilation.get_db();
-        let mut expanded = HashSet::from([file_id]);
-        let mut round = 0;
-        loop {
-            round += 1;
-            let seed = expanded.iter().copied().collect::<Vec<_>>();
-            let sources: [(&str, Vec<FileId>); 5] = [
-                (
-                    "include/require dependents",
-                    db.get_file_dependencies_index()
-                        .get_file_dependencies()
-                        .collect_file_dependents(seed.clone()),
-                ),
-                (
-                    "type-cache references",
-                    db.get_type_index()
-                        .files_with_type_caches_referencing_files(&expanded)
-                        .into_iter()
-                        .collect(),
-                ),
-                (
-                    "inference support",
-                    db.get_type_index()
-                        .files_depending_on_inference_support(&expanded)
-                        .into_iter()
-                        .collect(),
-                ),
-                (
-                    "callback source",
-                    db.get_call_site_param_index()
-                        .collect_source_dependents(&expanded),
-                ),
-                (
-                    "callback source path",
-                    db.get_call_site_param_index()
-                        .collect_source_path_dependents(
-                            expanded
-                                .iter()
-                                .filter_map(|id| db.get_vfs().get_file_path(id))
-                                .collect::<Vec<_>>(),
-                        ),
-                ),
-            ];
-
-            let mut added_this_round = 0;
-            for (name, files) in sources {
-                let fresh = files
-                    .into_iter()
-                    .filter(|id| !expanded.contains(id))
-                    .collect::<HashSet<_>>();
-                if !fresh.is_empty() {
-                    println!(
-                        "EXPAND {target} round {round}: {name} added {}",
-                        fresh.len()
-                    );
-                    if round == 1 || std::env::var_os("DET_SHOW_EXPANSION").is_some() {
-                        let mut labels = fresh
-                            .iter()
-                            .map(|id| file_label(analysis, *id))
-                            .collect::<Vec<_>>();
-                        labels.sort();
-                        for label in labels {
-                            println!("    {label}");
-                        }
-                    }
-                    added_this_round += fresh.len();
-                    expanded.extend(fresh);
-                }
-            }
-            if added_this_round == 0 {
-                break;
-            }
-        }
-        println!(
-            "EXPAND {target}: total {} files after {round} round(s)",
-            expanded.len()
-        );
-    }
-}
-
-/// Edit a file through the single-file update path, then put it back.
-///
-/// The source ends up exactly as it started, so the index has to as well. Any
-/// difference is drift the edit path introduced rather than a fact about the
-/// code: state the edit added and the revert did not take away, or state the
-/// edit dropped and the revert did not restore.
-///
-/// This is the update-path counterpart of `indexrepeat`. That stage re-indexes
-/// with the text untouched, so it never exercises the invalidation an edit
-/// triggers; this one does, and unlike `realedit` it needs no ground-truth
-/// build, because the pre-edit index *is* the truth. `noopedit` does not cover
-/// it either: its edit pair is semantically neutral, so the update path skips
-/// the re-index outright and nothing is invalidated.
-///
-/// It builds its own analysis rather than sharing the caller's. Both index
-/// gates re-index in place and leave a converged index behind, so whichever ran
-/// second would measure drift against the other's converged state instead of
-/// against a cold build and report a clean 0 — the drift does not go away, it
-/// stops being visible.
-fn edit_revert(codebase: &Path, annotations: &Path, targets: &[String]) {
-    let Ok(find) = std::env::var("DET_EDIT_FIND") else {
-        eprintln!("[editrevert] SKIPPED: DET_EDIT_FIND is not set, so no drift gate ran");
-        return;
-    };
-    let replace = std::env::var("DET_EDIT_REPLACE").unwrap_or_default();
-    let analysis = &mut build_analysis(codebase, annotations);
-
-    for target in targets {
-        let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
-            continue;
-        };
-        let Some(file_id) = analysis.get_file_id(&uri) else {
-            eprintln!("[editrevert] file not indexed: {}", path.display());
-            continue;
-        };
-        let Some(original) = analysis
-            .compilation
-            .get_db()
-            .get_vfs()
-            .get_file_content(&file_id)
-            .cloned()
-        else {
-            continue;
-        };
-        if !original.contains(find.as_str()) {
-            eprintln!("[editrevert] {find:?} not present in {}", path.display());
-            continue;
-        }
-        let edited = original.replace(find.as_str(), replace.as_str());
-
-        let before_index = collect_index(analysis, "before_editrevert");
-        let before = collect(analysis, "before_editrevert");
-
-        let t = Instant::now();
-        analysis.update_file_by_uri(&uri, Some(edited));
-        analysis.update_file_by_uri(&uri, Some(original));
-        eprintln!(
-            "[editrevert] {target} edited and reverted ({:.2}s)",
-            t.elapsed().as_secs_f64()
-        );
-
-        let label = format!("after_editrevert[{target}]");
-        let after_index = collect_index(analysis, &label);
-        let after = collect(analysis, &label);
-        diff_index("before_editrevert", &before_index, &label, &after_index);
-        diff("before_editrevert", &before, &label, &after);
-    }
-}
-
-/// Applies a **real** edit and compares the incremental result against a cold
-/// build of the same edited source.
-///
-/// Every other edit stage perturbs a file without changing what it means, so
-/// they answer "does re-analysis preserve state". This one answers the question
-/// the others cannot: when an edit genuinely changes a published fact, does the
-/// incremental path land where a full build of the edited workspace lands, and
-/// how much of the index does that edit actually move? The second number bounds
-/// what any cheaper re-index mechanism has to reproduce.
-fn real_edit(
+fn apply_text(
     analysis: &mut EmmyLuaAnalysis,
-    codebase: &Path,
-    annotations: &Path,
-    targets: &[String],
-    cold: &BTreeSet<Snapshot>,
+    uri: &lsp_types::Uri,
+    file_id: FileId,
+    text: String,
+    version: i32,
 ) {
-    // In the default stage set, so a missing edit spec must skip loudly rather
-    // than abort the run and lose every stage after it.
-    let Ok(find) = std::env::var("DET_EDIT_FIND") else {
-        eprintln!("[realedit] SKIPPED: DET_EDIT_FIND is not set, so no edit gate ran");
-        return;
-    };
-    let replace = std::env::var("DET_EDIT_REPLACE").unwrap_or_default();
-    let cold_index = collect_index(analysis, "cold");
+    let mut cache = NodeCache::default();
+    let config = analysis.get_emmyrc();
+    let line_index = LineIndex::parse(&text);
+    let tree = LuaParser::parse(&text, config.get_parse_config(&mut cache));
+    let (updated, old) = analysis
+        .update_file_preparsed_deferred(uri.clone(), Some(text), tree, line_index, Some(version))
+        .expect("document update must apply");
+    assert_eq!(updated, file_id);
+    drop(old);
+}
 
-    for target in targets {
-        let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
-            continue;
-        };
-        let Some(file_id) = analysis.get_file_id(&uri) else {
-            eprintln!("[realedit] file not indexed: {}", path.display());
-            continue;
-        };
-        let Some(original) = analysis
-            .compilation
-            .get_db()
-            .get_vfs()
-            .get_file_content(&file_id)
-            .cloned()
-        else {
-            continue;
-        };
-        let matches = original.matches(find.as_str()).count();
-        if matches == 0 {
-            eprintln!("[realedit] {find:?} not present in {}", path.display());
-            continue;
+/// The files a warm run's re-analyses evaluated and the files whose
+/// diagnostics they reported affected.
+#[derive(Default)]
+struct Reach {
+    evaluated: Vec<FileId>,
+    affected: Vec<FileId>,
+}
+
+impl Reach {
+    fn extend(&mut self, other: Reach) {
+        self.evaluated.extend(other.evaluated);
+        self.affected.extend(other.affected);
+    }
+
+    fn of(analysis: &EmmyLuaAnalysis, affected: Vec<FileId>) -> Self {
+        Self {
+            evaluated: analysis.compilation.last_evaluated_files().to_vec(),
+            affected,
         }
-        let edited = original.replace(find.as_str(), replace.as_str());
-
-        let expanded = analysis.expand_reindex_file_ids(vec![file_id]);
-        let t = Instant::now();
-        analysis.update_file_by_uri(&uri, Some(edited.clone()));
-        eprintln!(
-            "[realedit] {} ({matches} site(s)) expands to {} files ({:.2}s)",
-            target,
-            expanded.len(),
-            t.elapsed().as_secs_f64()
-        );
-
-        let warm_index = collect_index(analysis, "warm");
-        let warm = collect(analysis, "warm");
-
-        let ground_truth = build_analysis_with(
-            codebase,
-            annotations,
-            Order::Natural,
-            1,
-            &[(path.clone(), edited)],
-        );
-        let truth_index = collect_index(&ground_truth, "cold_edited");
-        let truth = collect(&ground_truth, "cold_edited");
-
-        // What the edit genuinely moves: the work any mechanism must reproduce.
-        diff_index("cold", &cold_index, "cold_edited", &truth_index);
-        diff("cold", cold, "cold_edited", &truth);
-        // What today's incremental path gets wrong about it.
-        diff_index("cold_edited", &truth_index, "warm", &warm_index);
-        diff("cold_edited", &truth, "warm", &warm);
-
-        analysis.update_file_by_uri(&uri, Some(original));
     }
 }
 
-/// Gate the deferred ripple: several self-indexes, then one re-index over the
-/// union of their separately-captured expansions.
-///
-/// The LSP debounce runs the edited file's own re-index on a short timer and
-/// owes the dependency ripple afterwards. Deferring that ripple behind a longer
-/// idle timer means a typing burst produces several self-indexes before one
-/// ripple, so the ripple has to run against a *union* of expansions each
-/// captured at a different point.
-///
-/// That union is the whole risk. An expansion recomputed after a self-index is
-/// known to under-expand badly — 739 files collapsed to 8 — which is why the
-/// production path captures before self-indexing. Union survives that, because
-/// a collapsed later capture only ever adds files and the burst's first capture
-/// is taken before any self-index, exactly as today. What it cannot rule out by
-/// argument is a dependent present in *no* capture, and that is what this
-/// stage measures: the burst's result against a cold build of the final text.
-fn burst_edit(
-    analysis: &mut EmmyLuaAnalysis,
-    codebase: &Path,
-    annotations: &Path,
-    targets: &[String],
-    cold: &BTreeSet<Snapshot>,
-) {
-    let Ok(find) = std::env::var("DET_EDIT_FIND") else {
-        eprintln!("[burst] SKIPPED: DET_EDIT_FIND is not set, so no burst gate ran");
-        return;
-    };
-    let replace = std::env::var("DET_EDIT_REPLACE").unwrap_or_default();
-    let cold_index = collect_index(analysis, "cold");
+/// A fork of the base updated as the language server updates it, with the
+/// diagnostics the server shows: the base's, a file's replaced each time a
+/// settled re-analysis reports it affected, and a deleted file's dropped.
+struct Warm {
+    analysis: EmmyLuaAnalysis,
+    shown: BTreeMap<String, Vec<Snapshot>>,
+}
 
-    struct Target {
-        path: std::path::PathBuf,
-        uri: lsp_types::Uri,
-        file_id: FileId,
-        original: String,
+impl std::ops::Deref for Warm {
+    type Target = EmmyLuaAnalysis;
+
+    fn deref(&self) -> &EmmyLuaAnalysis {
+        &self.analysis
     }
+}
 
-    let mut resolved = Vec::new();
-    for target in targets {
-        let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
-            continue;
-        };
-        let Some(file_id) = analysis.get_file_id(&uri) else {
-            eprintln!("[burst] file not indexed: {}", path.display());
-            continue;
-        };
-        let Some(original) = analysis
-            .compilation
-            .get_db()
-            .get_vfs()
-            .get_file_content(&file_id)
-            .cloned()
-        else {
-            continue;
-        };
-        if !original.contains(find.as_str()) {
-            eprintln!("[burst] {find:?} not present in {}", path.display());
-            continue;
+impl std::ops::DerefMut for Warm {
+    fn deref_mut(&mut self) -> &mut EmmyLuaAnalysis {
+        &mut self.analysis
+    }
+}
+
+impl Warm {
+    /// Takes in a settled re-analysis that reported `affected` as the server
+    /// does, and returns its reach.
+    fn settled(&mut self, affected: Vec<FileId>) -> Reach {
+        let live = self
+            .analysis
+            .get_main_workspace_file_ids_for_diagnostics()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let live_files = live
+            .iter()
+            .map(|file_id| file_label(&self.analysis, *file_id))
+            .collect::<BTreeSet<_>>();
+        self.shown.retain(|file, _| live_files.contains(file));
+        let rediagnosed = affected
+            .iter()
+            .filter(|file_id| live.contains(file_id))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for file_id in &rediagnosed {
+            self.shown.remove(&file_label(&self.analysis, *file_id));
         }
-        resolved.push(Target {
-            path,
-            uri,
-            file_id,
-            original,
-        });
-    }
-
-    if resolved.is_empty() {
-        eprintln!("[burst] SKIPPED: no target matched, so no burst gate ran");
-        return;
-    }
-
-    // Three keystroke groups, chosen to cover what a burst can do that a single
-    // edit cannot: change meaning, shift offsets only, and introduce a class
-    // definition partway through — the case where reusing the first capture
-    // would miss the new dependents outright.
-    let step_text = |target: &Target, step: usize| -> String {
-        let mut text = target.original.replace(find.as_str(), replace.as_str());
-        if step >= 1 {
-            text.push_str("\n-- burst\n");
+        for diagnostic in diagnose(&self.analysis, rediagnosed.into_iter().collect()) {
+            self.shown
+                .entry(diagnostic.file.clone())
+                .or_default()
+                .push(diagnostic);
         }
-        if step >= 2 {
-            text.push_str("\n---@class DetBurstClass\nlocal DetBurst = {}\n");
-        }
-        text
-    };
-
-    let mut owed_files: BTreeSet<FileId> = BTreeSet::new();
-    let mut owed_expansion: BTreeSet<FileId> = BTreeSet::new();
-
-    let t = Instant::now();
-    for step in 0..3 {
-        for target in &resolved {
-            // Production order: didChange installs the text, then phase A
-            // captures the expansion and self-indexes under one lock.
-            analysis.update_file_text_only(&target.uri, step_text(target, step));
-            let expansion = analysis.expand_reindex_file_ids(vec![target.file_id]);
-            analysis.self_index_files(vec![target.file_id]);
-            owed_files.insert(target.file_id);
-            owed_expansion.extend(expansion);
-        }
+        Reach::of(&self.analysis, affected)
     }
 
-    let self_indexed = t.elapsed();
-    let t = Instant::now();
-    analysis.reindex_expanded_files(
-        owed_files.iter().copied().collect(),
-        owed_expansion.iter().copied().collect(),
-    );
-    eprintln!(
-        "[burst] {} file(s) x 3 edits: {} self-index(es) in {:.2}s, then one ripple over {} files ({:.2}s)",
-        resolved.len(),
-        resolved.len() * 3,
-        self_indexed.as_secs_f64(),
-        owed_expansion.len(),
-        t.elapsed().as_secs_f64()
-    );
-
-    let warm_index = collect_index(analysis, "warm");
-    let warm = collect(analysis, "warm");
-
-    // The control: the same three edits through today's path, one ripple each.
-    // Deferral is only a regression if it drifts further than this does — the
-    // incremental path already drifts from cold on its own, so comparing the
-    // burst against cold alone would charge it for drift it did not cause.
-    for target in &resolved {
-        analysis.update_file_by_uri(&target.uri, Some(target.original.clone()));
+    /// The diagnostics the server shows now.
+    fn shown(&self) -> Vec<Snapshot> {
+        let mut shown = self.shown.values().flatten().cloned().collect::<Vec<_>>();
+        shown.sort_unstable();
+        shown
     }
-    let t = Instant::now();
-    for step in 0..3 {
-        for target in &resolved {
-            analysis.update_file_by_uri(&target.uri, Some(step_text(target, step)));
-        }
-    }
-    eprintln!(
-        "[burst] control: same edits through {} separate ripples ({:.2}s)",
-        resolved.len() * 3,
-        t.elapsed().as_secs_f64()
-    );
-    let control_index = collect_index(analysis, "control");
-    let control = collect(analysis, "control");
+}
 
-    let overrides = resolved
-        .iter()
-        .map(|target| (target.path.clone(), step_text(target, 2)))
+/// The cold input the `reload` stage compares with before reloading back.
+fn reload_input() -> ColdInput {
+    ColdInput {
+        reconfigured: true,
+        ..ColdInput::default()
+    }
+}
+
+/// Reloads `warm` with `emmyrc` as the server reloads its configuration: the
+/// configuration applied, the workspaces added again and the collected files
+/// submitted, in one rebuild when the change reaches the index; then every
+/// file diagnosed again.
+fn reload_with(warm: &mut Warm, codebase: &Path, annotations: &Path, emmyrc: Emmyrc) -> Reach {
+    let rebuild = warm.apply_config(Arc::new(emmyrc.clone())).affects_index();
+    let changes = add_workspaces(warm, codebase, annotations, &emmyrc)
+        .into_iter()
+        .map(|(path, text)| (file_uri(&path), text))
         .collect::<Vec<_>>();
-    let ground_truth = build_analysis_with(codebase, annotations, Order::Natural, 1, &overrides);
-    let truth_index = collect_index(&ground_truth, "cold_burst");
-    let truth = collect(&ground_truth, "cold_burst");
-
-    // What the burst genuinely moves, so a reader can tell a real miss from a
-    // change the edits were always going to make.
-    diff_index("cold", &cold_index, "cold_burst", &truth_index);
-    diff("cold", cold, "cold_burst", &truth);
-    // What today's path already gets wrong about it.
-    diff_index("cold_burst", &truth_index, "control", &control_index);
-    diff("cold_burst", &truth, "control", &control);
-    // The gate: deferring the ripple must not get more wrong than the control.
-    diff_index("cold_burst", &truth_index, "warm", &warm_index);
-    diff("cold_burst", &truth, "warm", &warm);
-
-    for target in &resolved {
-        analysis.update_file_by_uri(&target.uri, Some(target.original.clone()));
+    if rebuild {
+        warm.stage_file_system_changes(changes);
+        warm.begin_full_reindex();
+        warm.advance_reindex(Slice::Whole);
+    } else {
+        warm.update_files_by_uri(changes);
     }
+    let every_file = warm.get_main_workspace_file_ids_for_diagnostics();
+    warm.settled(every_file)
 }
 
-fn reindex_exact(analysis: &mut EmmyLuaAnalysis, codebase: &Path, relatives: &[String]) -> bool {
-    let mut file_ids = Vec::new();
-    for relative in relatives {
-        let path = codebase.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
-            continue;
+fn settle(
+    warm: &mut Warm,
+    uri: &lsp_types::Uri,
+    file_id: FileId,
+    text: String,
+    version: i32,
+) -> Reach {
+    apply_text(warm, uri, file_id, text, version);
+    let affected = warm.reindex_files(vec![file_id]);
+    warm.settled(affected)
+}
+
+/// Settles the re-analysis in progress in slices of `evaluations`, every
+/// other slice on a fresh thread, calling `between` after each slice that
+/// left work. Returns the files it reported affected.
+fn settle_in_slices(
+    analysis: &mut EmmyLuaAnalysis,
+    evaluations: usize,
+    mut between: impl FnMut(&mut EmmyLuaAnalysis),
+) -> Vec<FileId> {
+    for slice in 0.. {
+        let progress = if slice % 2 == 0 {
+            analysis.advance_reindex(Slice::Evaluations(evaluations))
+        } else {
+            std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .stack_size(glua_code_analysis::ANALYSIS_STACK_SIZE)
+                    .spawn_scoped(scope, || {
+                        analysis.advance_reindex(Slice::Evaluations(evaluations))
+                    })
+                    .expect("slice thread should spawn")
+                    .join()
+                    .expect("slice thread should not panic")
+            })
         };
-        let Some(file_id) = analysis.get_file_id(&uri) else {
-            eprintln!("[exact] not indexed: {}", path.display());
-            continue;
+        match progress {
+            UpdateProgress::Settled(affected) => return affected,
+            UpdateProgress::Settling => between(analysis),
+            UpdateProgress::TextChanged => panic!("a slice found text it had not taken"),
+        }
+    }
+    unreachable!("slices go on until the re-analysis settles")
+}
+
+/// Evaluations per slice when a stage settles a re-analysis in slices.
+const SLICE_EVALUATIONS: usize = 16;
+
+/// Between two slices, what a diagnostics task waiting on `file_ids` does:
+/// puts them ahead while they settle, then diagnoses the live ones once,
+/// recording their reads mid re-analysis.
+fn pull_when_settled(analysis: &mut EmmyLuaAnalysis, file_ids: &[FileId], pulled: &mut bool) {
+    if *pulled {
+        return;
+    }
+    if file_ids
+        .iter()
+        .any(|file_id| analysis.compilation.is_settling(*file_id))
+    {
+        analysis.compilation.prioritise_update(file_ids);
+        return;
+    }
+    *pulled = true;
+    let live = file_ids
+        .iter()
+        .copied()
+        .filter(|file_id| analysis.get_uri(*file_id).is_some())
+        .collect::<Vec<_>>();
+    diagnose(analysis, live);
+}
+
+/// What typing an edit into a warm fork reached.
+struct Typed {
+    reach: Reach,
+    most_evaluated: usize,
+    most_affected: usize,
+    taken_mid: usize,
+    /// The document version the last keystroke took.
+    version: i32,
+}
+
+/// Types `edit` into `file_id` one character at a time as the language server
+/// takes it, every keystroke into the re-analysis still settling from the one
+/// before; see the module docs.
+fn type_edit(
+    warm: &mut Warm,
+    uri: &lsp_types::Uri,
+    file_id: FileId,
+    original: &str,
+    edit: &Edit,
+    readers: &[FileId],
+) -> Typed {
+    let mut next_reader = readers.iter().cycle();
+    let mut typed = Typed {
+        reach: Reach::default(),
+        most_evaluated: 0,
+        most_affected: 0,
+        taken_mid: 0,
+        version: 0,
+    };
+    let texts = typed_texts(original, &edit.find, &edit.replace);
+    let keystrokes = texts.len();
+    for (version, text) in (1..).zip(texts) {
+        typed.version = version;
+        apply_text(warm, uri, file_id, text, version);
+        warm.begin_reindex(vec![file_id]);
+        let pause = version % 3 == 0 || version as usize == keystrokes;
+        let affected = if pause {
+            Some(settle_in_slices(warm, SLICE_EVALUATIONS, |warm| {
+                if let Some(reader) = next_reader.next() {
+                    warm.compilation.prioritise_update(&[*reader]);
+                }
+            }))
+        } else {
+            let evaluations = if version % 3 == 1 { 16 } else { 256 };
+            match warm.advance_reindex(Slice::Evaluations(evaluations)) {
+                UpdateProgress::Settled(affected) => Some(affected),
+                UpdateProgress::Settling => {
+                    typed.taken_mid += 1;
+                    None
+                }
+                UpdateProgress::TextChanged => panic!("a slice found text it had not taken"),
+            }
         };
-        file_ids.push(file_id);
+        if let Some(mut affected) = affected {
+            affected.push(file_id);
+            let step = warm.settled(affected);
+            typed.most_evaluated = typed.most_evaluated.max(step.evaluated.len());
+            typed.most_affected = typed.most_affected.max(step.affected.len());
+            typed.reach.extend(step);
+        }
     }
-    if file_ids.is_empty() {
-        return false;
-    }
-    let t = Instant::now();
-    analysis.reindex_files_without_expansion(file_ids.clone());
-    eprintln!(
-        "[exact] reindexed {} files ({:.2}s)",
-        file_ids.len(),
-        t.elapsed().as_secs_f64()
+    typed
+}
+
+/// Prints how far a warm run reached. With `strict`, any evaluated file
+/// outside `edited` is a locality divergence.
+fn report_reach(
+    analysis: &EmmyLuaAnalysis,
+    label: &str,
+    edited: &[FileId],
+    reach: &Reach,
+    strict: bool,
+) {
+    let evaluated = reach.evaluated.iter().collect::<BTreeSet<_>>();
+    let affected = reach.affected.iter().collect::<BTreeSet<_>>();
+    let beyond = evaluated
+        .iter()
+        .filter(|file_id| !edited.contains(file_id))
+        .collect::<BTreeSet<_>>();
+    println!(
+        "[reach {label}] evaluated={} affected={} beyond_edited={}",
+        evaluated.len(),
+        affected.len(),
+        beyond.len()
     );
-    true
+    if strict && !beyond.is_empty() {
+        record_divergence();
+        println!(
+            "LOCALITY {label}: {} file(s) beyond the edited set",
+            beyond.len()
+        );
+        for file_id in beyond.iter().take(diff_limit()) {
+            println!("  BEYOND {}", file_label(analysis, ***file_id));
+        }
+    }
 }
 
-/// Analysis recurses over deeply nested syntax. The server does that work on
-/// spawned threads, which get a far larger stack than a process main thread does
-/// on Windows, so the tools have to ask for one explicitly.
+/// A warm run's reach by file label: the files it edited, evaluated and
+/// reported affected.
+struct Reached {
+    edited: BTreeSet<String>,
+    evaluated: BTreeSet<String>,
+    affected: BTreeSet<String>,
+}
+
+impl Reached {
+    /// Labels each file by its path in the base and in the warm run: a file
+    /// the run moved keeps its id and goes by both.
+    fn of(
+        base: &EmmyLuaAnalysis,
+        warm: &EmmyLuaAnalysis,
+        edited: &[FileId],
+        reach: &Reach,
+    ) -> Self {
+        let labels = |file_ids: &[FileId]| {
+            file_ids
+                .iter()
+                .flat_map(|file_id| {
+                    let paths = [base, warm]
+                        .into_iter()
+                        .filter_map(|analysis| {
+                            analysis
+                                .compilation
+                                .get_db()
+                                .get_vfs()
+                                .get_file_path(file_id)
+                                .map(|path| path.display().to_string().replace('\\', "/"))
+                        })
+                        .collect::<Vec<_>>();
+                    if paths.is_empty() {
+                        vec![format!("{file_id:?}")]
+                    } else {
+                        paths
+                    }
+                })
+                .collect()
+        };
+        Self {
+            edited: labels(edited),
+            evaluated: labels(&reach.evaluated),
+            affected: labels(&reach.affected),
+        }
+    }
+}
+
+/// Checks a warm run's reach against what its edit changed between the base
+/// and the oracle, and names the files the language server would leave
+/// stale: their diagnostics changed, but the run neither edited them nor
+/// reported them affected. The diagnostics comparison already counts those
+/// files as differing; this says why. Also reports the files evaluated or
+/// reported affected with nothing of theirs changing, and the files whose
+/// facts changed without being evaluated.
+fn check_reach(label: &str, base: &Snap, expected: &Snap, reached: &Reached) {
+    let diagnostics_changed =
+        files_with_changed_diagnostics(&base.diagnostics, &expected.diagnostics);
+    let stale = diagnostics_changed
+        .iter()
+        .filter(|file| !reached.edited.contains(*file) && !reached.affected.contains(*file))
+        .collect::<Vec<_>>();
+    let beyond_edited = |files: &BTreeSet<String>| {
+        files
+            .iter()
+            .filter(|file| !reached.edited.contains(*file))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    };
+    let mut needed = files_with_changed_types(&base.index, &expected.index);
+    needed.extend(diagnostics_changed.iter().cloned());
+    let needed = beyond_edited(&needed);
+    let evaluated = beyond_edited(&reached.evaluated);
+    let diagnostics_changed = beyond_edited(&diagnostics_changed);
+    let affected = beyond_edited(&reached.affected);
+    println!(
+        "[waste {label}] needed={} evaluated={} wasted={} missed={}; diagnostics changed={} affected={} wasted={}",
+        needed.len(),
+        evaluated.len(),
+        evaluated.difference(&needed).count(),
+        needed.difference(&evaluated).count(),
+        diagnostics_changed.len(),
+        affected.len(),
+        affected.difference(&diagnostics_changed).count(),
+    );
+    for file in needed.difference(&evaluated).take(diff_limit()) {
+        println!("  missed {file}");
+    }
+    if !stale.is_empty() {
+        println!(
+            "STALE {label}: {} file(s) whose diagnostics changed were not reported affected",
+            stale.len()
+        );
+        for file in stale.iter().take(diff_limit()) {
+            println!("  STALE {file}");
+        }
+    }
+}
+
+/// The files whose diagnostics differ between `before` and `after`.
+fn files_with_changed_diagnostics(before: &[Snapshot], after: &[Snapshot]) -> BTreeSet<String> {
+    let by_file = |diagnostics: &[Snapshot]| {
+        let mut by_file = BTreeMap::<String, Vec<Snapshot>>::new();
+        for diagnostic in diagnostics {
+            by_file
+                .entry(diagnostic.file.clone())
+                .or_default()
+                .push(diagnostic.clone());
+        }
+        by_file
+    };
+    let (before, after) = (by_file(before), by_file(after));
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|file| before.get(*file) != after.get(*file))
+        .cloned()
+        .collect()
+}
+
+/// The files whose stored types differ between `before` and `after`, from
+/// the type caches and type facts keyed `file|owner`. A type fact's trailing
+/// `/wN` counts the writers sharing the member's slot across the workspace,
+/// which is no fact of the file itself.
+fn files_with_changed_types(before: &IndexSnapshot, after: &IndexSnapshot) -> BTreeSet<String> {
+    let mut files = BTreeSet::new();
+    for (before, after, counts_writers) in [
+        (&before.type_caches, &after.type_caches, false),
+        (&before.type_facts, &after.type_facts, true),
+    ] {
+        let own = |value: &String| {
+            if counts_writers {
+                value
+                    .rsplit_once("/w")
+                    .map_or(value.as_str(), |(fact, _)| fact)
+            } else {
+                value.as_str()
+            }
+            .to_string()
+        };
+        for key in before.keys().chain(after.keys()) {
+            if before.get(key).map(own) != after.get(key).map(own)
+                && let Some((file, _)) = key.split_once('|')
+            {
+                files.insert(file.to_string());
+            }
+        }
+    }
+    files
+}
+
+fn replay(analysis: &mut EmmyLuaAnalysis, log: &[Vec<FileId>]) {
+    for batch in log {
+        analysis.compilation.remove_index(batch.clone());
+        analysis.compilation.update_index(batch.clone());
+    }
+}
+
+/// Index and diagnostics of one analysis.
+struct Snap {
+    index: IndexSnapshot,
+    diagnostics: Vec<Snapshot>,
+}
+
+fn snapshot(analysis: &EmmyLuaAnalysis, label: &str) -> Snap {
+    let (index, diagnostics) = rayon::join(
+        || collect_index(analysis, label),
+        || collect(analysis, label),
+    );
+    Snap { index, diagnostics }
+}
+
+fn compare(expected_label: &str, expected: &Snap, label: &str, actual: &Snap) {
+    let before = DIVERGENCES.load(Ordering::Relaxed);
+    diff_index(expected_label, &expected.index, label, &actual.index);
+    diff(
+        expected_label,
+        &expected.diagnostics,
+        label,
+        &actual.diagnostics,
+    );
+    if DIVERGENCES.load(Ordering::Relaxed) == before {
+        println!("[{label}] +0 index, +0 diagnostics");
+    }
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+/// One `apply_file_system_changes` batch: each URI with its new text, or
+/// `None` for a deletion.
+type WatchEvents = Vec<(lsp_types::Uri, Option<String>)>;
+
+/// A sweep file: its path, URI, id and base text.
+type SweepFile = (PathBuf, lsp_types::Uri, FileId, String);
+
+/// A target file and the edit the edit stages make to it.
+struct Target {
+    relative: String,
+    edit: Option<Edit>,
+}
+
+/// Replaces `find`, which must occur, with `replace`.
+struct Edit {
+    find: String,
+    replace: String,
+}
+
+impl Target {
+    fn edit(&self) -> &Edit {
+        self.edit
+            .as_ref()
+            .unwrap_or_else(|| panic!("no edit is given for {}", self.relative))
+    }
+}
+
+/// The targets and their edits: each line of the `DET_EDITS` file is
+/// `path<TAB>find<TAB>replace`, with `\n`, `\t` and `\\` escaped; or the
+/// `DET_TARGETS` files, each with the `DET_EDIT_FIND` -> `DET_EDIT_REPLACE`
+/// edit when both are set.
+fn targets_from_env() -> Vec<Target> {
+    let unescape = |text: &str| {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            match (c, c == '\\') {
+                (_, true) => match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some(other) => out.push(other),
+                    None => out.push('\\'),
+                },
+                (c, false) => out.push(c),
+            }
+        }
+        out
+    };
+    if let Ok(path) = std::env::var("DET_EDITS") {
+        let text = std::fs::read_to_string(&path).expect("DET_EDITS should be readable");
+        return text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let mut fields = line.split('\t');
+                let (Some(relative), Some(find), Some(replace)) =
+                    (fields.next(), fields.next(), fields.next())
+                else {
+                    panic!("DET_EDITS line is not path<TAB>find<TAB>replace: {line}");
+                };
+                Target {
+                    relative: relative.trim().to_string(),
+                    edit: Some(Edit {
+                        find: unescape(find),
+                        replace: unescape(replace),
+                    }),
+                }
+            })
+            .collect();
+    }
+    let edit = match (
+        std::env::var("DET_EDIT_FIND"),
+        std::env::var("DET_EDIT_REPLACE"),
+    ) {
+        (Ok(find), Ok(replace)) => Some((find, replace)),
+        _ => None,
+    };
+    std::env::var("DET_TARGETS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|relative| !relative.is_empty())
+        .map(|relative| Target {
+            relative: relative.to_string(),
+            edit: edit.as_ref().map(|(find, replace)| Edit {
+                find: find.clone(),
+                replace: replace.clone(),
+            }),
+        })
+        .collect()
+}
+
+/// The order a cold build takes files in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Order {
+    Canonical,
+    Reversed,
+    Shuffled(u64),
+    Deferred,
+}
+
+impl Order {
+    fn schedule(self) -> Schedule {
+        match self {
+            Self::Canonical => Schedule::Canonical,
+            Self::Reversed => Schedule::Reversed,
+            Self::Shuffled(seed) => Schedule::Shuffled(seed),
+            Self::Deferred => Schedule::Deferred,
+        }
+    }
+}
+
+/// A cold build to compare with: its final input, how many batches it is
+/// fed in, and the order it takes files in.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ColdKey {
+    input: ColdInput,
+    batches: usize,
+    order: Order,
+}
+
+impl ColdKey {
+    /// The cold build of `input`, as the oracle of a warm run.
+    fn oracle(input: ColdInput) -> Self {
+        Self {
+            input,
+            batches: 1,
+            order: Order::Canonical,
+        }
+    }
+
+    fn label(&self) -> String {
+        match (self.order, self.batches) {
+            (Order::Canonical, 1) => "oracle".into(),
+            (Order::Canonical, batches) => format!("split:{batches}"),
+            (Order::Reversed, _) => "schedule".into(),
+            (Order::Shuffled(seed), _) => format!("schedule:{seed}"),
+            (Order::Deferred, _) => "schedule:deferred".into(),
+        }
+    }
+}
+
+/// A built answer key, or why its build failed.
+type Built = Result<Arc<Snap>, String>;
+
+/// Cold builds to compare with, made by worker threads ahead of the stages
+/// that need them. At most `limit` analyses are alive at once, the kept base
+/// included, which bounds memory. Each build is kept as its snapshot until
+/// its last planned use.
+struct AnswerKeys {
+    state: std::sync::Mutex<Keys>,
+    changed: std::sync::Condvar,
+    limit: usize,
+}
+
+#[derive(Default)]
+struct Keys {
+    queued: std::collections::VecDeque<ColdKey>,
+    building: std::collections::HashSet<ColdKey>,
+    /// Analyses alive: builds in progress and the kept base.
+    builds: usize,
+    built: HashMap<ColdKey, Built>,
+    /// Planned uses still to come.
+    uses: HashMap<ColdKey, usize>,
+    closed: bool,
+}
+
+impl AnswerKeys {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::default(),
+            changed: std::sync::Condvar::new(),
+            limit,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Keys> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn wait<'a>(&self, state: std::sync::MutexGuard<'a, Keys>) -> std::sync::MutexGuard<'a, Keys> {
+        self.changed
+            .wait(state)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Queues `keys` in the order the stages use them, counting each use.
+    fn plan(&self, keys: impl IntoIterator<Item = ColdKey>) {
+        let mut state = self.lock();
+        for key in keys {
+            let uses = state.uses.entry(key.clone()).or_default();
+            *uses += 1;
+            if *uses == 1 {
+                state.queued.push_back(key);
+            }
+        }
+        self.changed.notify_all();
+    }
+
+    /// Runs `build`, a cold build made outside the workers, counted against
+    /// the limit while it runs.
+    fn building<T>(&self, build: impl FnOnce() -> T) -> T {
+        let built = self.keeping(build);
+        self.lock().builds -= 1;
+        self.changed.notify_all();
+        built
+    }
+
+    /// Runs `build` for an analysis kept alive from then on, the base,
+    /// counted against the limit for as long as the workers run.
+    fn keeping<T>(&self, build: impl FnOnce() -> T) -> T {
+        let mut state = self.lock();
+        while state.builds >= self.limit {
+            state = self.wait(state);
+        }
+        state.builds += 1;
+        drop(state);
+        build()
+    }
+
+    /// Builds queued keys until the plan is closed and none is left.
+    fn work(&self, build: &(dyn Fn(&ColdKey) -> Snap + Sync)) {
+        let mut state = self.lock();
+        loop {
+            if state.builds < self.limit
+                && let Some(key) = state.queued.pop_front()
+            {
+                state.builds += 1;
+                state.building.insert(key.clone());
+                drop(state);
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&key)))
+                    .map(Arc::new)
+                    .map_err(|panic| {
+                        panic
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+                            .unwrap_or_else(|| "build panicked".to_owned())
+                    });
+                state = self.lock();
+                state.builds -= 1;
+                state.building.remove(&key);
+                state.built.insert(key, built);
+                self.changed.notify_all();
+                continue;
+            }
+            if state.closed && state.queued.is_empty() {
+                return;
+            }
+            state = self.wait(state);
+        }
+    }
+
+    /// Waits for `key`'s snapshot, queuing it first if it was not planned,
+    /// and lets it go after its last planned use.
+    fn take(&self, key: &ColdKey) -> Arc<Snap> {
+        let mut state = self.lock();
+        let planned = state.uses.contains_key(key);
+        if !planned && !state.building.contains(key) && !state.built.contains_key(key) {
+            state.queued.push_front(key.clone());
+            self.changed.notify_all();
+        }
+        loop {
+            if let Some(built) = state.built.get(key) {
+                let built = built.clone();
+                let left = state.uses.get_mut(key).map(|uses| {
+                    *uses -= 1;
+                    *uses
+                });
+                if left.unwrap_or(0) == 0 {
+                    state.built.remove(key);
+                    state.uses.remove(key);
+                }
+                return built
+                    .unwrap_or_else(|reason| panic!("{} build failed: {reason}", key.label()));
+            }
+            state = self.wait(state);
+        }
+    }
+
+    /// Drops the builds not yet started and lets the workers finish.
+    fn close(&self) {
+        let mut state = self.lock();
+        state.closed = true;
+        state.queued.clear();
+        drop(state);
+        self.changed.notify_all();
+    }
+}
+
+/// Closes the answer keys when dropped, a stage's panic included, so the
+/// workers stop instead of waiting for work.
+struct CloseOnDrop<'a>(&'a AnswerKeys);
+
+impl Drop for CloseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+struct Harness<'k> {
+    codebase: PathBuf,
+    annotations: PathBuf,
+    replay: bool,
+    /// Cold build of the unmodified workspace; every warm run starts as a
+    /// fork of it.
+    base: EmmyLuaAnalysis,
+    /// The base's snapshot, the oracle of every run that ends on the text it
+    /// started from.
+    base_snap: Arc<Snap>,
+    /// The base's diagnostics by file, where every warm run's shown
+    /// diagnostics start.
+    base_shown: BTreeMap<String, Vec<Snapshot>>,
+    keys: &'k AnswerKeys,
+    /// The most recent non-base oracle, kept only for replay.
+    oracle: Option<(ColdInput, EmmyLuaAnalysis)>,
+    sweep: std::cell::OnceCell<Vec<SweepFile>>,
+    warm_started: Instant,
+}
+
+impl Harness<'_> {
+    /// A fork of the base that records its `update_index` batches.
+    fn warm(&mut self) -> Warm {
+        self.warm_started = Instant::now();
+        let mut analysis = self.base.fork();
+        analysis.compilation.start_batch_log();
+        Warm {
+            analysis,
+            shown: self.base_shown.clone(),
+        }
+    }
+
+    fn oracle_analysis(&mut self, input: &ColdInput) -> &EmmyLuaAnalysis {
+        if *input == ColdInput::default() {
+            return &self.base;
+        }
+        if self.oracle.as_ref().is_none_or(|(kept, _)| kept != input) {
+            self.oracle = None;
+            let built = self.keys.building(|| {
+                build_cold(
+                    &self.codebase,
+                    &self.annotations,
+                    input,
+                    1,
+                    Schedule::Canonical,
+                )
+            });
+            self.oracle = Some((input.clone(), built));
+        }
+        &self.oracle.as_ref().expect("oracle was just built").1
+    }
+
+    fn expected(&self, input: &ColdInput) -> Arc<Snap> {
+        if *input == ColdInput::default() {
+            return Arc::clone(&self.base_snap);
+        }
+        self.keys.take(&ColdKey::oracle(input.clone()))
+    }
+
+    /// Reports how far the warm run reached and returns its batch log.
+    fn observe(
+        &self,
+        label: &str,
+        warm: &mut Warm,
+        edited: &[FileId],
+        reach: &Reach,
+        strict: bool,
+    ) -> Vec<Vec<FileId>> {
+        eprintln!(
+            "[{label}] warm run {:.2}s",
+            self.warm_started.elapsed().as_secs_f64()
+        );
+        let log = warm.compilation.take_batch_log();
+        report_reach(warm, label, edited, reach, strict);
+        log
+    }
+
+    /// Compares the warm run, its index and the diagnostics the server shows,
+    /// with the cold oracle of `input` and, with replay, with that oracle
+    /// after replaying the warm run's batch log. Then checks the run's reach
+    /// against what the edit changed; see [`check_reach`].
+    fn check(
+        &mut self,
+        label: &str,
+        warm: Warm,
+        log: &[Vec<FileId>],
+        input: &ColdInput,
+        edited: &[FileId],
+        reach: &Reach,
+    ) {
+        let reached = Reached::of(&self.base, &warm, edited, reach);
+        let actual = Snap {
+            index: collect_index(&warm, label),
+            diagnostics: warm.shown(),
+        };
+        drop(warm);
+        let expected = self.expected(input);
+        compare("expected", &expected, label, &actual);
+        check_reach(label, &self.base_snap, &expected, &reached);
+        if self.replay {
+            let mut replayed = self.oracle_analysis(input).fork();
+            replay(&mut replayed, log);
+            let replay_label = format!("{label}+replay");
+            let expected = snapshot(&replayed, &format!("expected_{replay_label}"));
+            drop(replayed);
+            compare("replayed", &expected, &replay_label, &actual);
+        }
+    }
+
+    /// [`Self::observe`], then [`Self::check`].
+    fn finish(
+        &mut self,
+        label: &str,
+        mut warm: Warm,
+        edited: &[FileId],
+        reach: &Reach,
+        strict: bool,
+        input: &ColdInput,
+    ) {
+        let log = self.observe(label, &mut warm, edited, reach, strict);
+        self.check(label, warm, &log, input, edited, reach);
+    }
+
+    /// The cold input with each of `targets` edited.
+    /// The cold input a `gate` run of `target_file` ends on: the file removed
+    /// and created again with its original text.
+    fn recreated_input(&self, target_file: &Target) -> ColdInput {
+        let (path, _, _, original) = target(&self.base, &self.codebase, &target_file.relative);
+        ColdInput {
+            removed: vec![path.clone()],
+            created: vec![(path, original)],
+            ..ColdInput::default()
+        }
+    }
+
+    fn edit_input(&self, targets: &[Target]) -> ColdInput {
+        ColdInput {
+            overrides: targets
+                .iter()
+                .map(|target_file| {
+                    let (path, _, _, original) =
+                        target(&self.base, &self.codebase, &target_file.relative);
+                    let edit = target_file.edit();
+                    (path, edited(&original, &edit.find, &edit.replace))
+                })
+                .collect(),
+            ..ColdInput::default()
+        }
+    }
+
+    /// The oracles the stages compare with, other than the base, in the
+    /// order they use them. Orders and splits are planned before the base.
+    fn plan(&self, stages: &[&str], targets: &[Target]) -> Vec<ColdKey> {
+        let mut inputs = Vec::new();
+        for stage in stages {
+            match *stage {
+                "edit" | "typing" => inputs.extend(
+                    targets
+                        .iter()
+                        .map(|target_file| self.edit_input(std::slice::from_ref(target_file))),
+                ),
+                "burst" => inputs.push(self.edit_input(targets)),
+                "reload" => inputs.push(reload_input()),
+                "gate" => inputs.extend(
+                    targets
+                        .iter()
+                        .map(|target_file| self.recreated_input(target_file)),
+                ),
+                "touch" | "shift" | "rewrite" | "unrewrite" | "delete" | "recreate" | "rename" => {
+                    inputs.extend(
+                        self.sweep_batches(stage)
+                            .iter()
+                            .map(|(_, files)| sweep_input(stage, files)),
+                    )
+                }
+                _ => {}
+            }
+        }
+        inputs
+            .into_iter()
+            .filter(|input| *input != ColdInput::default())
+            .map(ColdKey::oracle)
+            .collect()
+    }
+
+    fn edit(&mut self, targets: &[Target]) {
+        for target_file in targets {
+            let relative = &target_file.relative;
+            let edit = target_file.edit();
+            let (_, uri, file_id, original) = target(&self.base, &self.codebase, relative);
+            let mut warm = self.warm();
+            let changed = edited(&original, &edit.find, &edit.replace);
+            let reach = settle(&mut warm, &uri, file_id, changed, 1);
+            let input = self.edit_input(std::slice::from_ref(target_file));
+            self.finish(
+                &format!("edit[{relative}]"),
+                warm,
+                &[file_id],
+                &reach,
+                false,
+                &input,
+            );
+        }
+    }
+
+    fn revert(&mut self, targets: &[Target]) {
+        for target_file in targets {
+            let relative = &target_file.relative;
+            let edit = target_file.edit();
+            let (_, uri, file_id, original) = target(&self.base, &self.codebase, relative);
+            let mut warm = self.warm();
+            let changed = edited(&original, &edit.find, &edit.replace);
+            let mut reach = settle(&mut warm, &uri, file_id, changed, 1);
+            reach.extend(settle(&mut warm, &uri, file_id, original, 2));
+            self.finish(
+                &format!("revert[{relative}]"),
+                warm,
+                &[file_id],
+                &reach,
+                false,
+                &ColdInput::default(),
+            );
+        }
+    }
+
+    fn burst(&mut self, targets: &[Target]) {
+        let resolved = targets
+            .iter()
+            .map(|target_file| {
+                (
+                    target(&self.base, &self.codebase, &target_file.relative),
+                    target_file.edit(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut warm = self.warm();
+        for step in 0..3 {
+            for ((_, uri, file_id, original), edit) in &resolved {
+                let text = match step {
+                    0 => original.replace(&edit.find, ""),
+                    1 => format!("\n{}", edited(original, &edit.find, &edit.replace)),
+                    _ => edited(original, &edit.find, &edit.replace),
+                };
+                apply_text(&mut warm, uri, *file_id, text, step + 1);
+            }
+        }
+        let ids = resolved
+            .iter()
+            .map(|((_, _, id, _), _)| *id)
+            .collect::<Vec<_>>();
+        let affected = warm.reindex_files(ids.clone());
+        let reach = warm.settled(affected);
+        let input = self.edit_input(targets);
+        self.finish("burst", warm, &ids, &reach, false, &input);
+    }
+
+    /// Reloads the settled workspace as the server does when its
+    /// configuration changes, to the configuration [`reconfigure`] makes and
+    /// back. The oracles are a cold build of that configuration, then the
+    /// base.
+    fn reload(&mut self) {
+        let emmyrc = workspace_config(&self.codebase);
+        let mut reconfigured = emmyrc.clone();
+        reconfigure(&mut reconfigured);
+        assert!(
+            emmyrc.change_to(&reconfigured).affects_index(),
+            "the reload stage's configuration change should reach the index"
+        );
+        let mut warm = self.warm();
+        let reach = reload_with(&mut warm, &self.codebase, &self.annotations, reconfigured);
+        let mut back = Warm {
+            analysis: warm.fork(),
+            shown: warm.shown.clone(),
+        };
+        back.compilation.start_batch_log();
+        self.finish("reload", warm, &[], &reach, false, &reload_input());
+        self.warm_started = Instant::now();
+        let reach = reload_with(&mut back, &self.codebase, &self.annotations, emmyrc);
+        self.finish(
+            "reload+back",
+            back,
+            &[],
+            &reach,
+            false,
+            &ColdInput::default(),
+        );
+    }
+
+    /// Types the edit into each target as the language server takes it; see
+    /// the module docs.
+    fn typing(&mut self, targets: &[Target]) {
+        let dependents = self.base.dependent_files();
+        for target_file in targets {
+            let relative = &target_file.relative;
+            let (_, uri, file_id, original) = target(&self.base, &self.codebase, relative);
+            let readers = dependents.get(&file_id).cloned().unwrap_or_default();
+            let mut warm = self.warm();
+            let typed = type_edit(
+                &mut warm,
+                &uri,
+                file_id,
+                &original,
+                target_file.edit(),
+                &readers,
+            );
+            println!(
+                "[reach typing[{relative}] per settle] evaluated<={} affected<={}; {} keystroke(s) taken mid re-analysis",
+                typed.most_evaluated, typed.most_affected, typed.taken_mid
+            );
+            let input = self.edit_input(std::slice::from_ref(target_file));
+            self.finish(
+                &format!("typing[{relative}]"),
+                warm,
+                &[file_id],
+                &typed.reach,
+                false,
+                &input,
+            );
+        }
+    }
+
+    /// Drives each target as the language-server drift gate does, on one
+    /// fork: the edit typed, the original text back, then the file deleted
+    /// and re-created through watched-file events, each settled in slices.
+    fn gate(&mut self, targets: &[Target]) {
+        let dependents = self.base.dependent_files();
+        let slice = env_usize("DET_SLICE", SLICE_EVALUATIONS);
+        for target_file in targets {
+            let relative = &target_file.relative;
+            let (_, uri, file_id, original) = target(&self.base, &self.codebase, relative);
+            let readers = dependents.get(&file_id).cloned().unwrap_or_default();
+            let mut warm = self.warm();
+            let typed = type_edit(
+                &mut warm,
+                &uri,
+                file_id,
+                &original,
+                target_file.edit(),
+                &readers,
+            );
+            let mut reach = typed.reach;
+            apply_text(
+                &mut warm,
+                &uri,
+                file_id,
+                original.clone(),
+                typed.version + 1,
+            );
+            warm.begin_reindex(vec![file_id]);
+            let mut pulled = false;
+            let mut affected = settle_in_slices(&mut warm, slice, |analysis| {
+                pull_when_settled(analysis, &[file_id], &mut pulled)
+            });
+            affected.push(file_id);
+            reach.extend(warm.settled(affected));
+            for text in [None, Some(original.clone())] {
+                let changed = warm.stage_file_system_changes(vec![(uri.clone(), text)]);
+                warm.begin_reindex(changed.clone());
+                let mut pulled = false;
+                let mut affected = settle_in_slices(&mut warm, slice, |analysis| {
+                    pull_when_settled(analysis, &changed, &mut pulled)
+                });
+                affected.extend(changed);
+                reach.extend(warm.settled(affected));
+            }
+            let input = self.recreated_input(target_file);
+            self.finish(
+                &format!("gate[{relative}]"),
+                warm,
+                &[file_id],
+                &reach,
+                false,
+                &input,
+            );
+        }
+    }
+
+    /// Applies watched-file event batches in order to a warm fork.
+    fn watched(
+        &mut self,
+        label: &str,
+        steps: Vec<WatchEvents>,
+        edited: &[FileId],
+        input: &ColdInput,
+    ) {
+        let mut warm = self.warm();
+        let mut reach = Reach::default();
+        let slice = env_usize("DET_SLICE", 0);
+        for events in steps {
+            let affected = if slice == 0 {
+                warm.apply_file_system_changes(events)
+            } else {
+                let changed = warm.stage_file_system_changes(events);
+                if changed.is_empty() {
+                    Vec::new()
+                } else {
+                    warm.begin_reindex(changed.clone());
+                    let focus_after = std::env::var("DET_FOCUS_AFTER")
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok());
+                    let mut boundaries = 0;
+                    let mut affected = settle_in_slices(&mut warm, slice, |analysis| {
+                        if focus_after.is_some_and(|after| boundaries >= after) {
+                            analysis.compilation.prioritise_update(&changed);
+                        }
+                        boundaries += 1;
+                    });
+                    affected.extend(changed);
+                    affected
+                }
+            };
+            reach.extend(warm.settled(affected));
+        }
+        self.finish(label, warm, edited, &reach, false, input);
+    }
+
+    fn noop(&mut self, targets: &[Target]) {
+        for relative in targets.iter().map(|target_file| &target_file.relative) {
+            let (_, _, file_id, _) = target(&self.base, &self.codebase, relative);
+            let mut warm = self.warm();
+            let affected = warm.reindex_files(vec![file_id]);
+            let reach = warm.settled(affected);
+            self.finish(
+                &format!("noop[{relative}]"),
+                warm,
+                &[file_id],
+                &reach,
+                true,
+                &ColdInput::default(),
+            );
+        }
+    }
+
+    fn exact(&mut self, targets: &[Target]) {
+        let ids = targets
+            .iter()
+            .map(|target_file| target(&self.base, &self.codebase, &target_file.relative).2)
+            .collect::<Vec<_>>();
+        let mut warm = self.warm();
+        let affected = warm.reindex_files(ids.clone());
+        let reach = warm.settled(affected);
+        self.finish("exact", warm, &ids, &reach, false, &ColdInput::default());
+    }
+
+    /// Compares the cold build of the unmodified workspace taken in `order`
+    /// or fed in `batches` with the base.
+    fn cold_order(&mut self, label: &str, batches: usize, order: Order) {
+        let actual = self.keys.take(&ColdKey {
+            input: ColdInput::default(),
+            batches,
+            order,
+        });
+        compare("base", &self.base_snap, label, &actual);
+    }
+
+    /// `path` relative to the codebase, with forward slashes.
+    fn relative(&self, path: &Path) -> String {
+        path.strip_prefix(&self.codebase)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// The `DET_HUBS` main files the most other files read from, printed with
+    /// their dependent counts.
+    fn hubs(&self) -> Vec<FileId> {
+        let count = env_usize("DET_HUBS", 0);
+        if count == 0 {
+            return Vec::new();
+        }
+        let dependents = self.base.dependent_files();
+        let vfs = self.base.compilation.get_db().get_vfs();
+        let mut ranked = self
+            .base
+            .get_main_workspace_file_ids_for_diagnostics()
+            .into_iter()
+            .filter_map(|file_id| {
+                let relative = self.relative(vfs.get_file_path(&file_id)?);
+                Some((
+                    dependents.get(&file_id).map_or(0, Vec::len),
+                    relative,
+                    file_id,
+                ))
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        ranked.truncate(count);
+        for (dependents, relative, _) in &ranked {
+            eprintln!("[hubs] {dependents:5} dependents  {relative}");
+        }
+        ranked.into_iter().map(|(.., file_id)| file_id).collect()
+    }
+
+    /// The sweep's files: every `DET_STRIDE`-th main file from
+    /// `DET_STRIDE_OFFSET`, or the `DET_HUBS` hubs together with the files
+    /// whose path ends with an entry of `DET_ONLY`.
+    fn sweep_files(&self) -> &[SweepFile] {
+        self.sweep.get_or_init(|| {
+            let stride = env_usize("DET_STRIDE", 25);
+            let offset = env_usize("DET_STRIDE_OFFSET", 0);
+            let only = std::env::var("DET_ONLY").ok().map(|value| {
+                value
+                    .split(',')
+                    .map(|entry| entry.trim().replace('\\', "/").to_lowercase())
+                    .filter(|entry| !entry.is_empty())
+                    .collect::<Vec<_>>()
+            });
+            let hubs = self.hubs();
+            let vfs = self.base.compilation.get_db().get_vfs();
+            let mut ids = self.base.get_main_workspace_file_ids_for_diagnostics();
+            ids.sort_unstable();
+            let files = ids
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, file_id)| {
+                    let path = vfs.get_file_path(&file_id)?;
+                    let selected = if only.is_none() && hubs.is_empty() {
+                        i % stride == offset
+                    } else {
+                        hubs.contains(&file_id)
+                            || only
+                                .iter()
+                                .flatten()
+                                .any(|entry| path_key(path).ends_with(entry.as_str()))
+                    };
+                    selected.then(|| {
+                        let text = vfs.get_file_content(&file_id)?.clone();
+                        Some((path.clone(), file_uri(path), file_id, text))
+                    })?
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !files.is_empty(),
+                "the sweep selected no file (DET_ONLY={:?}, DET_HUBS={}, DET_STRIDE={stride}, DET_STRIDE_OFFSET={offset})",
+                std::env::var("DET_ONLY").unwrap_or_default(),
+                hubs.len(),
+            );
+            eprintln!("[sweep] {} file(s)", files.len());
+            files
+        })
+    }
+
+    /// The sweep's batches with their labels: one batch of every sweep file,
+    /// or each file alone with `DET_EACH=1`, so no edited file re-indexes the
+    /// readers another edited file left stale.
+    fn sweep_batches(&self, stage: &str) -> Vec<(String, Vec<SweepFile>)> {
+        let files = self.sweep_files().to_vec();
+        if !std::env::var("DET_EACH").is_ok_and(|value| value == "1") {
+            return vec![(stage.to_owned(), files)];
+        }
+        files
+            .into_iter()
+            .map(|file| (format!("{stage}[{}]", self.relative(&file.0)), vec![file]))
+            .collect()
+    }
+
+    /// Edits each batch's files as `stage` does and settles them together.
+    fn sweep_edit(&mut self, stage: &str) {
+        for (label, files) in self.sweep_batches(stage) {
+            let mut warm = self.warm();
+            for (_, uri, file_id, text) in &files {
+                apply_text(&mut warm, uri, *file_id, sweep_edited(stage, text), 1);
+            }
+            let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+            let mut affected = warm.reindex_files(ids.clone());
+            if stage == "unrewrite" {
+                for (_, uri, file_id, text) in &files {
+                    apply_text(&mut warm, uri, *file_id, text.clone(), 2);
+                }
+                affected.extend(warm.reindex_files(ids.clone()));
+            }
+            let reach = warm.settled(affected);
+            // A rewrite changes what the files export, so its readers run.
+            let strict = matches!(stage, "touch" | "shift");
+            self.finish(
+                &label,
+                warm,
+                &ids,
+                &reach,
+                strict,
+                &sweep_input(stage, &files),
+            );
+        }
+    }
+
+    fn sweep_delete(&mut self) {
+        for (label, files) in self.sweep_batches("delete") {
+            let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+            let input = sweep_input("delete", &files);
+            let events = files.into_iter().map(|(_, uri, ..)| (uri, None)).collect();
+            self.watched(&label, vec![events], &ids, &input);
+        }
+    }
+
+    fn sweep_recreate(&mut self) {
+        for (label, files) in self.sweep_batches("recreate") {
+            let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+            let input = sweep_input("recreate", &files);
+            let deletes = files
+                .iter()
+                .map(|(_, uri, ..)| (uri.clone(), None))
+                .collect();
+            let creates = files
+                .into_iter()
+                .map(|(_, uri, _, text)| (uri, Some(text)))
+                .collect();
+            self.watched(&label, vec![deletes, creates], &ids, &input);
+        }
+    }
+
+    fn sweep_rename(&mut self) {
+        for (label, files) in self.sweep_batches("rename") {
+            let ids = files.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+            let input = sweep_input("rename", &files);
+            let mut events = files
+                .iter()
+                .map(|(_, uri, ..)| (uri.clone(), None))
+                .collect::<Vec<_>>();
+            events.extend(
+                input
+                    .moved
+                    .iter()
+                    .map(|(_, path, text)| (file_uri(path), Some(text.clone()))),
+            );
+            self.watched(&label, vec![events], &ids, &input);
+        }
+    }
+}
+
+/// A sweep file's text after the `touch`, `shift` or `rewrite` edit.
+fn sweep_edited(stage: &str, text: &str) -> String {
+    match stage {
+        "touch" => format!("{text}\n-- touch\n"),
+        "shift" => format!("\n{text}"),
+        "rewrite" | "unrewrite" => agent_rewrite(text),
+        _ => unreachable!("{stage} edits no text"),
+    }
+}
+
+/// What an agent's light rewrite of a file does in the language-server
+/// scenarios: three globals defined at the top, and a parameter added to each
+/// of the first three `function name(...)` lines that take a fixed list.
+fn agent_rewrite(text: &str) -> String {
+    let mut added = 0;
+    let mut body = String::with_capacity(text.len() + 64);
+    for line in text.split_inclusive('\n') {
+        let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+        let signature = line[indent..]
+            .strip_prefix("function")
+            .filter(|after| after.starts_with([' ', '\t']))
+            .and_then(|after| {
+                let name = after.trim_start_matches([' ', '\t']);
+                let open = name.find('(')?;
+                let valid = name[..open].trim_end().split(['.', ':']).all(|part| {
+                    part.chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                        && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                });
+                let close = name[open..].find(')')? + open;
+                let at = line.len() - name.len();
+                valid.then_some((at + open, at + close))
+            });
+        match signature {
+            Some((open, close))
+                if added < 3 && !line[open + 1..close].trim_end().ends_with("...") =>
+            {
+                added += 1;
+                let params = if line[open + 1..close].trim().is_empty() {
+                    "_scn".to_string()
+                } else {
+                    format!("{}, _scn", &line[open + 1..close])
+                };
+                body.push_str(&line[..open + 1]);
+                body.push_str(&params);
+                body.push_str(&line[close..]);
+            }
+            _ => body.push_str(line),
+        }
+    }
+    format!(
+        "function ScnA_det(a, b) return a + b end\nfunction ScnB_det(self, n) local r = {{}} for i = 1, n do r[i] = i end return r end\nScnV_det = {{ name = \"scn\", count = 3 }}\n{body}"
+    )
+}
+
+/// The cold input a sweep `stage` ends on for `files`.
+fn sweep_input(stage: &str, files: &[SweepFile]) -> ColdInput {
+    let removed = || files.iter().map(|(path, ..)| path.clone()).collect();
+    match stage {
+        "unrewrite" => ColdInput::default(),
+        "touch" | "shift" | "rewrite" => ColdInput {
+            overrides: files
+                .iter()
+                .map(|(path, _, _, text)| (path.clone(), sweep_edited(stage, text)))
+                .collect(),
+            ..ColdInput::default()
+        },
+        "delete" => ColdInput {
+            removed: removed(),
+            ..ColdInput::default()
+        },
+        "recreate" => ColdInput {
+            removed: removed(),
+            created: files
+                .iter()
+                .map(|(path, _, _, text)| (path.clone(), text.clone()))
+                .collect(),
+            ..ColdInput::default()
+        },
+        "rename" => ColdInput {
+            moved: files
+                .iter()
+                .map(|(path, _, _, text)| {
+                    let stem = path
+                        .file_stem()
+                        .expect("workspace file has a name")
+                        .to_string_lossy();
+                    let renamed = path.with_file_name(format!("{stem}_rn.lua"));
+                    (path.clone(), renamed, text.clone())
+                })
+                .collect(),
+            ..ColdInput::default()
+        },
+        _ => unreachable!("{stage} is not a sweep"),
+    }
+}
+
 fn main() {
     std::thread::Builder::new()
-        .stack_size(256 * 1024 * 1024)
+        .stack_size(glua_code_analysis::ANALYSIS_STACK_SIZE)
         .spawn(run)
         .expect("determinism worker thread should spawn")
         .join()
@@ -1878,294 +3501,189 @@ fn main() {
 }
 
 fn run() {
-    alloc_sample::init();
-    let codebase =
-        PathBuf::from(std::env::var("DET_CODEBASE").expect("DET_CODEBASE env var is required"));
-    let annotations = PathBuf::from(
-        std::env::var("DET_ANNOTATIONS").expect("DET_ANNOTATIONS env var is required"),
-    );
-    let stages = std::env::var("DET_STAGES")
-        .unwrap_or_else(|_| "repeat,noopedit,editrevert,realedit,indexrepeat".to_string())
+    let codebase = PathBuf::from(std::env::var("DET_CODEBASE").expect("DET_CODEBASE is required"));
+    let annotations =
+        PathBuf::from(std::env::var("DET_ANNOTATIONS").expect("DET_ANNOTATIONS is required"));
+    let stages = std::env::var("DET_STAGES").unwrap_or_else(|_| "schedule,edit,revert,noop".into());
+    let stages: Vec<_> = stages
         .split(',')
-        .map(|s| s.trim().to_string())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
-    let targets = std::env::var("DET_TARGETS")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
-
-    let mut analysis = build_analysis(&codebase, &annotations);
-    let cold = collect(&analysis, "cold");
-
-    if let Ok(dump_path) = std::env::var("DET_DUMP") {
-        let rendered = cold
-            .iter()
-            .map(Snapshot::render)
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(&dump_path, rendered).expect("dump write should succeed");
-        eprintln!("[cold] dumped to {dump_path}");
-    }
-
-    // A cross-process comparison needs the cold snapshot even when no stage runs
-    // that would otherwise collect one.
-    if std::env::var_os("DET_DUMP_INDEX").is_some() && std::env::var_os("DET_INDEX_DIFF").is_none()
-    {
-        collect_index(&analysis, "cold");
-    }
-
-    if stages.iter().any(|s| s == "repeat") {
-        let again = collect(&analysis, "repeat");
-        diff("cold", &cold, "repeat", &again);
-    }
-
-    if stages.iter().any(|s| s == "noopedit") {
-        let mut previous = cold.clone();
-        let mut previous_label = "cold".to_string();
-        let cold_index =
-            std::env::var_os("DET_INDEX_DIFF").map(|_| collect_index(&analysis, "cold"));
-        for target in &targets {
-            let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
-            if !noop_edit(&mut analysis, &path, false) {
-                continue;
-            }
-            let label = format!("after_noopedit[{target}]");
-            if let Some(cold_index) = &cold_index {
-                let after_index = collect_index(&analysis, &label);
-                diff_index("cold", cold_index, &label, &after_index);
-            }
-            let after = collect(&analysis, &label);
-            diff("cold", &cold, &label, &after);
-            if previous_label != "cold" {
-                diff(&previous_label, &previous, &label, &after);
-            }
-            previous = after;
-            previous_label = label;
-        }
-    }
-
-    if stages.iter().any(|s| s == "editmid") {
-        let cold_index =
-            std::env::var_os("DET_INDEX_DIFF").map(|_| collect_index(&analysis, "cold"));
-        for target in &targets {
-            let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
-            if !noop_edit(&mut analysis, &path, true) {
-                continue;
-            }
-            let label = format!("after_editmid[{target}]");
-            if let Some(cold_index) = &cold_index {
-                let after_index = collect_index(&analysis, &label);
-                diff_index("cold", cold_index, &label, &after_index);
-            }
-            let after = collect(&analysis, &label);
-            diff("cold", &cold, &label, &after);
-        }
-    }
-
-    if stages.iter().any(|s| s == "exact") {
-        let cold_index = collect_index(&analysis, "cold");
-        if reindex_exact(&mut analysis, &codebase, &targets) {
-            let after_index = collect_index(&analysis, "after_exact");
-            diff_index("cold", &cold_index, "after_exact", &after_index);
-            let after = collect(&analysis, "after_exact");
-            diff("cold", &cold, "after_exact", &after);
-        }
-    }
-
-    // Re-run the pipeline over every main-workspace file with the full DB
-    // already populated. Tests whether the cold build under-resolved because
-    // library/std workspace groups were analysed before main-workspace files
-    // existed in the index.
-    if stages.iter().any(|s| s == "mainreindex") {
-        let cold_index = collect_index(&analysis, "cold");
-        let main_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
-        let t = Instant::now();
-        analysis.reindex_files_without_expansion(main_ids.clone());
-        eprintln!(
-            "[mainreindex] reindexed {} main files ({:.2}s)",
-            main_ids.len(),
-            t.elapsed().as_secs_f64()
-        );
-        let after_index = collect_index(&analysis, "after_mainreindex");
-        diff_index("cold", &cold_index, "after_mainreindex", &after_index);
-        let after = collect(&analysis, "after_mainreindex");
-        diff("cold", &cold, "after_mainreindex", &after);
-
-        let t = Instant::now();
-        analysis.reindex_files_without_expansion(main_ids);
-        eprintln!(
-            "[mainreindex] second pass ({:.2}s)",
-            t.elapsed().as_secs_f64()
-        );
-        let second = collect(&analysis, "after_mainreindex_2");
-        diff("after_mainreindex", &after, "after_mainreindex_2", &second);
-    }
-
-    // Remove and re-add *every* file, without clearing the index first. Cold and
-    // this stage then analyse exactly the same file set from exactly the same
-    // (empty, for those files) starting point, so any difference isolates state
-    // that `remove_index` fails to drop — as opposed to `mainreindex`, which
-    // legitimately leaves the library workspace resolved.
-    if stages.iter().any(|s| s == "allreindex") {
-        let cold_index = collect_index(&analysis, "cold");
-        let all_ids = analysis.compilation.get_db().get_vfs().get_all_file_ids();
-        let t = Instant::now();
-        let file_count = all_ids.len();
-        analysis.reindex_files_without_expansion(all_ids);
-        eprintln!(
-            "[allreindex] reindexed {file_count} files ({:.2}s)",
-            t.elapsed().as_secs_f64()
-        );
-        let after_index = collect_index(&analysis, "after_allreindex");
-        diff_index("cold", &cold_index, "after_allreindex", &after_index);
-        let after = collect(&analysis, "after_allreindex");
-        diff("cold", &cold, "after_allreindex", &after);
-    }
-
-    // Re-run analysis over every file *without* removing anything first, so each
-    // file re-infers against the settled index while every existing fact is
-    // retained. This is the only stage that gives a full build the same
-    // advantage a partial re-index gets from the state it inherits, so it says
-    // whether the cold answer is simply under-converged.
-    if stages.iter().any(|s| s == "restabilize") {
-        let all_ids = analysis.compilation.get_db().get_vfs().get_all_file_ids();
-        for round in 0..3 {
-            let t = Instant::now();
-            analysis.compilation.update_index(all_ids.clone());
-            let label = format!("after_restabilize_{round}");
-            eprintln!(
-                "[restabilize] round {round} over {} files ({:.2}s)",
-                all_ids.len(),
-                t.elapsed().as_secs_f64()
-            );
-            let after = collect(&analysis, &label);
-            diff("cold", &cold, &label, &after);
-        }
-    }
-
-    // Remove and re-add each file ON ITS OWN, so every file is re-derived
-    // against the complete settled workspace rather than against the prefix the
-    // cold walk had built when it reached that file. This is the "fully
-    // informed" fixed point: if the index converges here, the cold answer is
-    // simply one computed from an incomplete view, and a subset re-index — which
-    // also sees a settled workspace — is agreeing with the informed answer
-    // rather than drifting.
-    if stages.iter().any(|s| s == "perfile") {
-        let all_ids = analysis.compilation.get_db().get_vfs().get_all_file_ids();
-        let rounds = std::env::var("DET_PERFILE_ROUNDS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .unwrap_or(2);
-        let mut previous_index = collect_index(&analysis, "cold");
-        let mut previous_diagnostics = cold.clone();
-        let mut previous_label = "cold".to_string();
-        for round in 1..=rounds {
-            let t = Instant::now();
-            for file_id in &all_ids {
-                analysis.reindex_files_without_expansion(vec![*file_id]);
-            }
-            let label = format!("after_perfile_{round}");
-            eprintln!(
-                "[perfile] round {round} over {} files ({:.2}s)",
-                all_ids.len(),
-                t.elapsed().as_secs_f64()
-            );
-            let after_index = collect_index(&analysis, &label);
-            diff_index(&previous_label, &previous_index, &label, &after_index);
-            let after = collect(&analysis, &label);
-            diff(&previous_label, &previous_diagnostics, &label, &after);
-            previous_index = after_index;
-            previous_diagnostics = after;
-            previous_label = label;
-        }
-    }
-
-    // The production incremental path: `reindex_files` runs the same re-analysis
-    // as `mainreindex` but first widens the set through `expand_reindex_file_ids`.
-    // Comparing the two says whether the expansion is what closes the gap, i.e.
-    // whether `mainreindex`'s divergence is a real defect or an artefact of the
-    // harness bypassing the safety net.
-    if stages.iter().any(|s| s == "mainexpand") {
-        let cold_index = collect_index(&analysis, "cold");
-        let main_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
-        let t = Instant::now();
-        analysis.reindex_files(main_ids.clone());
-        eprintln!(
-            "[mainexpand] reindexed {} main files through the production expansion ({:.2}s)",
-            main_ids.len(),
-            t.elapsed().as_secs_f64()
-        );
-        let after_index = collect_index(&analysis, "after_mainexpand");
-        diff_index("cold", &cold_index, "after_mainexpand", &after_index);
-        let after = collect(&analysis, "after_mainexpand");
-        diff("cold", &cold, "after_mainexpand", &after);
-    }
-
-    if stages.iter().any(|s| s == "reindex") {
-        let t = Instant::now();
-        analysis.reindex();
-        eprintln!("[reindex] full reindex {:.2}s", t.elapsed().as_secs_f64());
-        let after = collect(&analysis, "after_full_reindex");
-        diff("cold", &cold, "after_full_reindex", &after);
-    }
-
-    if stages.iter().any(|s| s == "expandwhy") {
-        expand_why(&analysis, &codebase, &targets);
-    }
-
-    if stages.iter().any(|s| s == "faithful") {
-        refresh_faithfulness(&analysis);
-    }
-
-    if stages.iter().any(|s| s == "editrevert") {
-        edit_revert(&codebase, &annotations, &targets);
-    }
-
-    if stages.iter().any(|s| s == "realedit") {
-        real_edit(&mut analysis, &codebase, &annotations, &targets, &cold);
-    }
-
-    if stages.iter().any(|s| s == "burst") {
-        burst_edit(&mut analysis, &codebase, &annotations, &targets, &cold);
-    }
-
-    if stages.iter().any(|s| s == "indexrepeat") {
-        run_index_repeat(&codebase, &annotations, &targets);
-    }
-
-    if stages.iter().any(|s| s == "fresh") {
-        let fresh_analysis = build_analysis(&codebase, &annotations);
-        let fresh = collect(&fresh_analysis, "fresh_process");
-        diff("cold", &cold, "fresh_process", &fresh);
-    }
-
-    if stages.iter().any(|s| s == "order") {
-        let reversed_analysis =
-            build_analysis_with(&codebase, &annotations, Order::Reverse, 1, &[]);
-        let reversed = collect(&reversed_analysis, "reverse_order");
-        diff("cold", &cold, "reverse_order", &reversed);
-    }
-
-    if let Some(batches) = stages.iter().find_map(|s| s.strip_prefix("split:")) {
-        let batches = batches.parse::<usize>().unwrap_or(2);
-        let split_analysis =
-            build_analysis_with(&codebase, &annotations, Order::Natural, batches, &[]);
-        if std::env::var_os("DET_INDEX_DIFF").is_some() {
-            let cold_index = collect_index(&analysis, "cold");
-            let split_index = collect_index(&split_analysis, "split_batches");
-            diff_index("cold", &cold_index, "split_batches", &split_index);
-        }
-        let split = collect(&split_analysis, "split_batches");
-        diff("cold", &cold, "split_batches", &split);
-    }
-
-    alloc_sample::report(
-        std::env::var("DET_ALLOC_TOP")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30),
+        .collect();
+    assert!(
+        !stages.is_empty(),
+        "DET_STAGES must select at least one check"
     );
+    let order_of = |stage: &str| -> Option<(usize, Order)> {
+        if let Some(batches) = stage
+            .strip_prefix("split:")
+            .and_then(|n| n.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+        {
+            return Some((batches, Order::Canonical));
+        }
+        match stage {
+            "schedule" => Some((1, Order::Reversed)),
+            "schedule:deferred" => Some((1, Order::Deferred)),
+            _ => stage
+                .strip_prefix("schedule:")
+                .and_then(|seed| seed.parse::<u64>().ok())
+                .map(|seed| (1, Order::Shuffled(seed))),
+        }
+    };
+    for stage in &stages {
+        assert!(
+            order_of(stage).is_some()
+                || matches!(
+                    *stage,
+                    "edit"
+                        | "revert"
+                        | "burst"
+                        | "typing"
+                        | "gate"
+                        | "noop"
+                        | "reload"
+                        | "exact"
+                        | "touch"
+                        | "shift"
+                        | "rewrite"
+                        | "unrewrite"
+                        | "delete"
+                        | "recreate"
+                        | "rename"
+                ),
+            "unknown check: {stage}"
+        );
+    }
+    let needs_targets = stages.iter().any(|s| {
+        matches!(
+            *s,
+            "edit" | "revert" | "burst" | "typing" | "gate" | "noop" | "exact"
+        )
+    });
+    let targets = targets_from_env();
+    assert!(
+        !needs_targets || !targets.is_empty(),
+        "DET_TARGETS or DET_EDITS must name indexed files"
+    );
+    let needs_edit = stages
+        .iter()
+        .any(|s| matches!(*s, "edit" | "revert" | "burst" | "typing"));
+    assert!(
+        !needs_edit
+            || targets.iter().all(|target_file| target_file
+                .edit
+                .as_ref()
+                .is_some_and(|edit| !edit.find.is_empty())),
+        "the edit stages need a nonempty edit for every target (DET_EDIT_FIND/DET_EDIT_REPLACE or DET_EDITS)"
+    );
+
+    let started = Instant::now();
+    let jobs = env_usize("DET_JOBS", 2).max(1);
+    // Every other stage compares with a cold build other than the base.
+    let base_only = |stage: &str| matches!(stage, "revert" | "noop" | "exact" | "unrewrite");
+    assert!(
+        jobs >= 2 || stages.iter().all(|stage| base_only(stage)),
+        "a cold-build comparison stage needs DET_JOBS of at least 2: its cold build waits for a slot the live base holds"
+    );
+    let keys = AnswerKeys::new(jobs);
+    let build_key = |key: &ColdKey| {
+        let built = build_cold(
+            &codebase,
+            &annotations,
+            &key.input,
+            key.batches,
+            key.order.schedule(),
+        );
+        snapshot(&built, &key.label())
+    };
+    let divergences = std::thread::scope(|scope| {
+        let _close = CloseOnDrop(&keys);
+        for _ in 0..keys.limit {
+            std::thread::Builder::new()
+                .stack_size(glua_code_analysis::ANALYSIS_STACK_SIZE)
+                .spawn_scoped(scope, || keys.work(&build_key))
+                .expect("answer key worker should spawn");
+        }
+        keys.plan(stages.iter().filter_map(|stage| {
+            let (batches, order) = order_of(stage)?;
+            Some(ColdKey {
+                input: ColdInput::default(),
+                batches,
+                order,
+            })
+        }));
+        let base = keys.keeping(|| {
+            build_cold(
+                &codebase,
+                &annotations,
+                &ColdInput::default(),
+                1,
+                Schedule::Canonical,
+            )
+        });
+        // Diagnosing the base records what each file's diagnostics read, so
+        // every warm run reports affected files from the same starting point.
+        let base_snap = Arc::new(snapshot(&base, "base"));
+        let mut base_shown = BTreeMap::<String, Vec<Snapshot>>::new();
+        for diagnostic in &base_snap.diagnostics {
+            base_shown
+                .entry(diagnostic.file.clone())
+                .or_default()
+                .push(diagnostic.clone());
+        }
+        let mut harness = Harness {
+            replay: std::env::var("DET_REPLAY").is_ok_and(|value| value == "1"),
+            codebase: codebase.clone(),
+            annotations: annotations.clone(),
+            base,
+            base_snap,
+            base_shown,
+            keys: &keys,
+            oracle: None,
+            sweep: std::cell::OnceCell::new(),
+            warm_started: Instant::now(),
+        };
+        keys.plan(harness.plan(&stages, &targets));
+        println!("[time] setup {:.1}s", started.elapsed().as_secs_f64());
+        if let Ok(dump_path) = std::env::var("DET_DUMP") {
+            let rendered = harness
+                .base_snap
+                .diagnostics
+                .iter()
+                .map(Snapshot::render)
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(dump_path, rendered).expect("diagnostic dump should succeed");
+        }
+        for stage in &stages {
+            let t = Instant::now();
+            match *stage {
+                "edit" => harness.edit(&targets),
+                "revert" => harness.revert(&targets),
+                "burst" => harness.burst(&targets),
+                "typing" => harness.typing(&targets),
+                "gate" => harness.gate(&targets),
+                "noop" => harness.noop(&targets),
+                "reload" => harness.reload(),
+                "exact" => harness.exact(&targets),
+                "touch" | "shift" | "rewrite" | "unrewrite" => harness.sweep_edit(stage),
+                "delete" => harness.sweep_delete(),
+                "recreate" => harness.sweep_recreate(),
+                "rename" => harness.sweep_rename(),
+                _ => {
+                    let (batches, order) = order_of(stage).expect("validated above");
+                    harness.cold_order(stage, batches, order);
+                }
+            }
+            println!("[time] {stage} {:.1}s", t.elapsed().as_secs_f64());
+        }
+        DIVERGENCES.load(Ordering::Relaxed)
+    });
+    println!("[time] total {:.1}s", started.elapsed().as_secs_f64());
+    glua_code_analysis::profile::memory::report_peak();
+    if divergences != 0 {
+        eprintln!("[determinism] {divergences} comparison(s) differed");
+        std::process::exit(1);
+    }
 }

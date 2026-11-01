@@ -13,14 +13,14 @@ pub fn build_need_check_nil(
     _data: &Option<serde_json::Value>,
 ) -> Option<()> {
     let document = semantic_model.get_document();
-    let offset = document.get_offset(range.end.line as usize, range.end.character as usize)?;
+    let offset = document.to_offset(range.end);
     let root = semantic_model.get_root();
     let token = match root.syntax().token_at_offset(offset) {
         TokenAtOffset::Single(token) => token,
         TokenAtOffset::Between(_, token) => token,
         _ => return None,
     };
-    // 取上一个token的父节点
+    // Take the parent node of the previous token
     let node_or_token = token.prev_sibling_or_token()?;
     if let NodeOrToken::Node(expr_node) = node_or_token
         && LuaExpr::can_cast(expr_node.kind().into())
@@ -28,7 +28,7 @@ pub fn build_need_check_nil(
         let expr = LuaExpr::cast(expr_node)?;
         let range = expr.syntax().text_range();
         let mut lsp_range = document.to_lsp_range(range)?;
-        // 将范围缩小到最尾部的字符
+        // Narrow the range to the last character
         lsp_range.start.line = lsp_range.end.line;
         lsp_range.start.character = lsp_range.end.character;
 

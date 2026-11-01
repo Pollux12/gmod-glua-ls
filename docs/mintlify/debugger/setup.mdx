@@ -1,205 +1,111 @@
 ---
-title: Setup & installation
-description: Install gm_rdb on your SRCDS server and configure VS Code to connect for debugging.
+title: Set up the debugger
+description: Install the debugger module and connect VS Code to your local server.
 ---
 
-import ConfigTip from "/snippets/config-tip.mdx"
-
-## Automatic setup
-
-`gm_rdb` is a binary module that runs inside SRCDS and exposes Lua state for debugging.
-
-### Using the setup wizard (recommended)
-
-Use the built-in setup wizard. The walkthrough should appear when you install the extension for the first time. You can also start it yourself:
-
-1. Open the Command Palette (`Ctrl+Shift+P`)
-2. Run **GLua: Setup Debugger**
-3. Follow the wizard steps. It will download the correct `gm_rdb` binary for your server's OS and architecture, then guide you through placing the files
-
-You can also click **GLuaLS** in the status bar to start the setup wizard.
-
-## Manual installation
+The debugger connects VS Code to a running Garry's Mod dedicated server (SRCDS) through a small binary module called `gm_rdb`. It is meant for local development servers.
 
 <Warning>
-The VS Code extension can set up the debugger for you. Use manual setup only if the extension setup fails.
+Do not install `gm_rdb` on a public or production server. It lets a connected debugger run any Lua on the server.
 </Warning>
 
-### Step 1: Download and install gm_rdb
+## Set up with the wizard
 
-Download the correct binary for your server from the [GitHub releases page](https://github.com/Pollux12/gmod-glua-ls/releases):
+<Steps>
+  <Step title="Start the wizard">
+    Click **GLuaLS** in the status bar and choose **Setup Debugger**, or run **GLuaLS: Configure Debugger** from the Command Palette (`Ctrl+Shift+P`).
+  </Step>
+  <Step title="Answer the prompts">
+    The wizard asks for your SRCDS folder (it usually finds it for you), the server's platform, and how your project maps to the server's files. It then:
 
-| Platform | File |
+    - Installs `gm_rdb` into `garrysmod/lua/bin/`
+    - Adds `garrysmod/lua/autorun/debug.lua`, which starts the debugger when the server loads
+    - Adds a **[SERVER] Attach to SRCDS** entry to `.vscode/launch.json`
+  </Step>
+  <Step title="Restart the server">
+    Restart SRCDS so it loads the module.
+  </Step>
+  <Step title="Connect">
+    Open **Run and Debug** (`Ctrl+Shift+D`), pick **[SERVER] Attach to SRCDS** and press `F5`.
+  </Step>
+</Steps>
+
+The extension keeps `gm_rdb` and `debug.lua` up to date and asks before installing an update.
+
+## Debug the client
+
+The wizard can also install the client module (`rdb_client`) into your own Garry's Mod install. It then adds a **[CLIENT] Attach to Gmod** entry to `launch.json`.
+
+Join your server with that game install, then start **[CLIENT] Attach to Gmod**. The client part of `debug.lua` comes from the server, so the server needs to be set up first.
+
+<Warning>
+With the client module installed, any server you join that runs a matching `debug.lua` could start the debugger in your game. Remove the module when you are not using it.
+</Warning>
+
+## launch.json options
+
+The wizard writes these for you. You only need to edit them if your layout changes.
+
+| Option | Default | Description |
+|---|---|---|
+| `host` | `"127.0.0.1"` | Address of the server |
+| `port` | `21111` | Debugger port. The client uses `21112` |
+| `sourceRoot` | `${workspaceFolder}` | Folder that server paths are resolved from |
+| `sourceFileMap` | `{}` | Maps folders on your machine to paths on the server, such as `"${workspaceFolder}": "addons/my-addon"` |
+| `stopOnEntry` | `true` | Pause as soon as the debugger connects. The wizard sets this to `false` for the server |
+| `stopOnError` | `false` | Pause when a Lua error happens. This includes errors in other addons |
+| `realm` | `"server"` | Where **Run Lua** commands run by default: `"server"`, `"client"` or `"shared"` |
+
+If breakpoints never hit, `sourceFileMap` is usually wrong. Each entry should map your project folder to the same folder as seen from `garrysmod/`.
+
+## Manual setup
+
+Use this only if the wizard fails.
+
+1. Download the module for your server from the [GitHub releases](https://github.com/Pollux12/gmod-glua-ls/releases): `gmsv_rdb_win64.dll`, `gmsv_rdb_win32.dll`, `gmsv_rdb_linux64.dll` or `gmsv_rdb_linux.dll`.
+2. Put it in `garrysmod/lua/bin/` on the server. Create the folder if it does not exist.
+3. Create `garrysmod/lua/autorun/debug.lua`:
+
+   ```lua garrysmod/lua/autorun/debug.lua
+   if SERVER then
+       require("rdb")
+       rdb.activate(21111)
+   end
+   ```
+
+4. Add an attach entry to `.vscode/launch.json`:
+
+   ```json .vscode/launch.json
+   {
+     "version": "0.2.0",
+     "configurations": [
+       {
+         "type": "gluals_gmod",
+         "request": "attach",
+         "name": "[SERVER] Attach to SRCDS",
+         "host": "127.0.0.1",
+         "port": 21111,
+         "sourceRoot": "${workspaceFolder}/../..",
+         "sourceFileMap": {
+           "${workspaceFolder}": "addons/my-addon"
+         },
+         "stopOnEntry": false
+       }
+     ]
+   }
+   ```
+
+This minimal `debug.lua` is enough for breakpoints and stepping. **Run Lua** on the client and **Refresh GLua File** need the full file the wizard writes.
+
+## Server launch options
+
+Add these to the SRCDS command line only if you need them:
+
+| Option | Effect |
 |---|---|
-| Windows 64-bit | `gmsv_rdb_win64.dll` |
-| Windows 32-bit | `gmsv_rdb_win32.dll` |
-| Linux 64-bit | `gmsv_rdb_linux64.dll` |
-| Linux 32-bit | `gmsv_rdb_linux.dll` |
+| `-rdb_allow_remote` | Accept debugger connections from other machines. By default only the same machine can connect |
+| `-rdb_pause_on_activate [seconds]` | Pause the server when the debugger module starts, so you can debug startup code. It resumes after the timeout, 60 seconds by default, or `0` to wait forever |
 
-Place the binary in `garrysmod/lua/bin/` on your server. Create the `bin` folder if it does not exist. The final path should be `garrysmod/lua/bin/gmsv_rdb_*.dll`.
-
-Create `garrysmod/lua/autorun/debug.lua`:
-
-```lua garrysmod/lua/autorun/debug.lua
-if SERVER then
-    require("rdb")
-    rdb.activate(21111)
-end
-```
-
-This is enough to attach to and debug the server. Use the setup wizard when you also need its current client-execution and file-refresh helpers.
-
-### Runtime launch flags
-
-`gm_rdb` reads these command-line flags when the module loads. You can skip them unless you need the listed behavior.
-
-| Flag | Effect | Default without flag |
-|---|---|---|
-| `-rdb_allow_remote` | Accept debugger connections from non-loopback addresses | Only localhost or loopback connections are allowed |
-| `-rdb_pause_on_activate [seconds]` | Pause on the next event after `rdb.activate(...)` runs. Optional timeout in seconds; use `0` to wait indefinitely. | `activate` does not pause |
-
-Add these CLI flags to your Garry's Mod or SRCDS launch options.
-
----
-
-## Step 2: Configure VS Code
-
-Create a `launch.json` in your `.vscode/` folder (or use the VS Code **Run & Debug** panel → **Create a launch.json file**):
-
-### Attach to a running server
-
-Use **attach** when the server is already running. Most addon development uses this option.
-
-<ConfigTip />
-```json .vscode/launch.json
-{
-    "version": "0.2.0",
-    "configurations": [
-        {
-            "type": "gluals_gmod",
-            "request": "attach",
-            "name": "GMod Attach (SRCDS)",
-            "host": "127.0.0.1",
-            "port": 21111,
-            "sourceRoot": "${workspaceFolder}/../..",
-            "sourceFileMap": {
-                "${workspaceFolder}/../../addons": "addons",
-                "${workspaceFolder}/../../lua": "lua",
-                "${workspaceFolder}/../../gamemodes/base": "gamemodes/base",
-                "${workspaceFolder}/../../gamemodes/sandbox": "gamemodes/sandbox"
-            },
-            "stopOnEntry": false,
-            "stopOnError": false,
-            "realm": "server"
-        }
-    ]
-}
-```
--  "sourceRoot": should point to your garrysmod folder (one level up from scrds)
--  "sourceFileMap" should map workspace folders to their corresponding paths, going from the sourceRoot folder.
-
-Edit the configuration above to match your workspace structure. Most setups only need one new line in `sourceFileMap`.
-
-Addon example:
-```
-"${workspaceFolder}": "addons/your-addon-folder"
-```
-
-Gamemode example:
-```
-"${workspaceFolder}": "gamemodes/your-addon-folder"
-```
-
-This example covers common addon and gamemode layouts. You can use hardcoded paths, but other developers will need to edit them before using your config.
-
-
-### Launch a server
-
-<Warning>The `launch` option is unsupported and may not work on all systems. Use `attach` instead.</Warning>
-
----
-
-## Step 3: Start debugging
-
-1. Start your SRCDS server
-2. In VS Code, open the **Run & Debug** panel (`Ctrl+Shift+D`)
-3. Select your launch configuration from the dropdown
-4. Press **F5** (or click the green play button)
-
-When VS Code connects, the debug toolbar appears at the top of the screen. The Debug Console opens in the bottom panel.
-
----
-
-## Configuration reference
-
-### Attach configuration
-
-| Property | Type | Description |
-|---|---|---|
-| `host` | `string` | Server hostname or IP. Default: `"127.0.0.1"` |
-| `port` | `number` | Port `gm_rdb` is listening on. Default: `21111` |
-| `sourceRoot` | `string` | Workspace path to map server files to. Default: `${workspaceFolder}` |
-| `sourceFileMap` | `object` | Map server paths to workspace paths manually |
-| `stopOnEntry` | `boolean` | Pause at first line when connecting. Default: `true` |
-| `stopOnError` | `boolean` | Pause when a Lua error is thrown. Default: `false` |
-| `realm` | `string` | Default realm for code execution (`"server"` or `"client"`) |
-
-### Launch configuration (server process)
-
-<Warning>The `launch` option is unsupported and may not work on all systems. Use `attach` instead.</Warning>
-
-Includes the above, plus:
-
-| Property | Type | Description |
-|---|---|---|
-| `program` | `string` | Path to `srcds.exe` or `srcds_run` |
-| `args` | `string[]` | Additional server command-line arguments |
-| `cwd` | `string` | Working directory for the server process |
-
----
-
-## Changing the default port
-
-To make `gm_rdb` listen on a different port, change this line in `debug.lua`:
-
-```lua garrysmod/lua/autorun/debug.lua
-rdb.activate(<PORT_NUMBER>)
-```
-
-Update `"port"` in your `launch.json` to match.
-
----
-
-## Remote debugging
-
-<Warning>Do not use the debugger on untrusted or public networks. Use remote debugging only if you understand and accept the risk.</Warning>
-
-If debugging a remote server, start SRCDS with `-rdb_allow_remote`, open the `gm_rdb` port (default `21111`) in your server's firewall, and set `host` in your `launch.json` to the server's reachable address.
-
-Without `-rdb_allow_remote`, `gm_rdb` only accepts loopback connections, so remote attach fails.
-
-<Danger>Do not enable this option unless you understand and accept the risk. If you enable this option on the client and expose your local port, any server could activate the debugger through clientside Lua.</Danger>
-
----
-
-## Pause on activation
-
-<Warning>Do not use the debugger on untrusted or public networks. This option pauses execution once loaded (usually during startup/initial join). If no timeout is provided, execution resumes automatically after 60 seconds if no debugger connects.</Warning>
-
-`rdb.activate(...)` does not pause execution by default. The debugger may miss the server or client startup sequence unless you connect fast.
-
-To pause on the next hook event after `rdb.activate(...)` runs, add `-rdb_pause_on_activate` to the server startup arguments or client Steam launch options. You can provide a timeout in seconds.
-
-```txt
--rdb_pause_on_activate
--rdb_pause_on_activate 120
--rdb_pause_on_activate 0
-```
-
-- `-rdb_pause_on_activate` pauses on activation and resumes after 60 seconds if no debugger connects.
-- `-rdb_pause_on_activate 120` pauses on activation with a 120-second timeout.
-- `-rdb_pause_on_activate 0` pauses until a debugger connects.
-
-Use this when you need to capture the server or client startup sequence.
-
-<Danger>If you enable this option on the client, any server could activate the debugger and freeze your game.</Danger>
+<Warning>
+Only use `-rdb_allow_remote` on a network you trust, and open the debugger port in the firewall only for your own machine.
+</Warning>

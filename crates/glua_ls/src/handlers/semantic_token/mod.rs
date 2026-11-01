@@ -151,11 +151,12 @@ mod tests {
                 .analysis()
                 .write()
                 .await
-                .update_file_by_uri(&uri, Some("local greeting = 1".to_string()));
+                .update_file_by_uri(&uri, Some("local greeting = 1".to_string()))
+                .map(|(id, _)| id);
 
             // Seen but not yet applied: exactly the window between a didChange
             // notification and the coalescer applying its preparsed tree.
-            snapshot.note_document_seen_version(&uri, 2);
+            let session = snapshot.note_document_opened(&uri, 2);
 
             let handler_snapshot = snapshot.clone();
             let params = SemanticTokensParams {
@@ -170,7 +171,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             verify_that!(handler.is_finished(), eq(false))?;
 
-            snapshot.note_document_applied_version(&uri, 2);
+            snapshot.note_document_applied_version(&uri, session, 2);
 
             tokio::time::timeout(Duration::from_secs(1), handler)
                 .await

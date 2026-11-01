@@ -1,8 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+use crate::db_index::cow_shards::CowCell;
 use rowan::TextRange;
 
-use crate::{FileId, LuaDeclId};
+use crate::{
+    FileId, LuaDeclId,
+    db_index::derivation::{self, FactKey, Fingerprint},
+};
 
 use super::{GmodRealm, LuaDependencyKind, LuaIndex};
 
@@ -181,7 +185,7 @@ impl From<LuaDependencyKind> for GmodLoadEdgeKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodLoadRoot {
     pub kind: GmodLoadRootKind,
     pub states: GmodStateMask,
@@ -199,7 +203,29 @@ pub struct GmodLoadEdge {
     pub range: Option<TextRange>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl std::hash::Hash for GmodLoadEdge {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        use crate::db_index::derivation::FilePosition;
+        let Self {
+            source_file_id,
+            target_file_id,
+            kind,
+            states,
+            path,
+            original_expr,
+            range,
+        } = self;
+        source_file_id.hash(state);
+        target_file_id.hash(state);
+        kind.hash(state);
+        states.hash(state);
+        path.hash(state);
+        original_expr.hash(state);
+        range.hash_in_file(*source_file_id, state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodFileLoadInfo {
     pub status: GmodLoadStatus,
     pub realm: GmodRealm,
@@ -272,6 +298,31 @@ impl GmodExecutionEnvironmentFileFlow {
     pub(crate) fn is_empty(&self) -> bool {
         self.edges.is_empty() && self.seeds.is_empty() && self.sites.is_empty()
     }
+
+    /// Content fingerprint; `edges` and each site's `fields` are hashed
+    /// independently of their hash order.
+    pub(crate) fn fingerprint(&self) -> Fingerprint {
+        let edges = self
+            .edges
+            .iter()
+            .fold(0, |sum: Fingerprint, (decl_id, targets)| {
+                sum.wrapping_add(derivation::fingerprint_of(&(decl_id, targets)))
+            });
+        let sites = self
+            .sites
+            .iter()
+            .map(|site| {
+                let mut fields = site.fields.iter().collect::<Vec<_>>();
+                fields.sort_unstable();
+                let source = match &site.source {
+                    GmodExecutionEnvironmentSource::Decl(decl_id) => (Some(*decl_id), None),
+                    GmodExecutionEnvironmentSource::Path(path) => (None, Some(path)),
+                };
+                (source, fields)
+            })
+            .collect::<Vec<_>>();
+        derivation::fingerprint_of(&(edges, &self.seeds, sites))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -286,43 +337,82 @@ pub(crate) enum GmodExecutionEnvironmentSource {
     Path(String),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GmodLoadIndex {
-    file_infos: HashMap<FileId, GmodFileLoadInfo>,
-    unresolved_edges: Vec<GmodLoadEdge>,
-    execution_environments: HashMap<FileId, HashSet<String>>,
-    execution_environment_sites: HashMap<FileId, HashMap<FileId, HashSet<String>>>,
-    execution_environment_file_flows: HashMap<FileId, GmodExecutionEnvironmentFileFlow>,
-    execution_environment_role_sources: HashSet<FileId>,
-    execution_environment_roles_dirty: bool,
+    file_infos: CowCell<HashMap<FileId, GmodFileLoadInfo>>,
+    unresolved_edges: CowCell<Vec<GmodLoadEdge>>,
+    /// Source file -> the files, sorted, whose incoming edges it holds the
+    /// call of.
+    edge_targets_by_source: CowCell<HashMap<FileId, Vec<FileId>>>,
+    /// Source file -> where its edges sit in `unresolved_edges`.
+    unresolved_by_source: CowCell<HashMap<FileId, Vec<usize>>>,
+    execution_environments: CowCell<HashMap<FileId, HashSet<String>>>,
+    execution_environment_sites: CowCell<HashMap<FileId, HashMap<FileId, HashSet<String>>>>,
 }
 
 impl GmodLoadIndex {
     pub fn new() -> Self {
         Self {
-            file_infos: HashMap::new(),
-            unresolved_edges: Vec::new(),
-            execution_environments: HashMap::new(),
-            execution_environment_sites: HashMap::new(),
-            execution_environment_file_flows: HashMap::new(),
-            execution_environment_role_sources: HashSet::new(),
-            execution_environment_roles_dirty: false,
+            file_infos: Default::default(),
+            unresolved_edges: Default::default(),
+            edge_targets_by_source: Default::default(),
+            unresolved_by_source: Default::default(),
+            execution_environments: Default::default(),
+            execution_environment_sites: Default::default(),
+        }
+    }
+
+    pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
+        let FactKey::GmodLoadFile(file_id) = key else {
+            debug_assert!(false, "{key:?} is not a gmod load fact");
+            return derivation::ABSENT;
+        };
+        let info = self.file_infos.get(file_id);
+        let environment = self.execution_environments.get(file_id).map(|fields| {
+            let mut fields = fields.iter().collect::<Vec<_>>();
+            fields.sort_unstable();
+            fields
+        });
+        if info.is_none() && environment.is_none() {
+            return derivation::ABSENT;
+        }
+        derivation::fingerprint_of(&(info, environment))
+    }
+
+    /// Notes a write of every file key this index currently holds.
+    fn note_all_file_writes(&self) {
+        if !derivation::recording() {
+            return;
+        }
+        for file_id in self
+            .file_infos
+            .keys()
+            .chain(self.execution_environments.keys())
+        {
+            derivation::note_write(|| FactKey::GmodLoadFile(*file_id));
         }
     }
 
     pub fn get_file_info(&self, file_id: &FileId) -> Option<&GmodFileLoadInfo> {
+        derivation::note_read(|| FactKey::GmodLoadFile(*file_id));
         self.file_infos.get(file_id)
     }
 
     pub fn iter_file_infos(&self) -> impl Iterator<Item = (&FileId, &GmodFileLoadInfo)> {
-        self.file_infos.iter()
+        self.file_infos
+            .iter()
+            .inspect(|(file_id, _)| derivation::note_read(|| FactKey::GmodLoadFile(**file_id)))
     }
 
     pub fn unresolved_edges(&self) -> &[GmodLoadEdge] {
+        for edge in &self.unresolved_edges {
+            derivation::note_read(|| FactKey::GmodLoadFile(edge.source_file_id));
+        }
         &self.unresolved_edges
     }
 
     pub fn execution_environment_contains(&self, file_id: FileId, name: &str) -> bool {
+        derivation::note_read(|| FactKey::GmodLoadFile(file_id));
         self.execution_environments
             .get(&file_id)
             .is_some_and(|fields| fields.contains(name))
@@ -332,46 +422,10 @@ impl GmodLoadIndex {
         &mut self,
         execution_environment_sites: HashMap<FileId, HashMap<FileId, HashSet<String>>>,
     ) {
-        self.execution_environment_sites = execution_environment_sites;
+        self.note_all_file_writes();
+        self.execution_environment_sites = execution_environment_sites.into();
         self.rebuild_execution_environments();
-    }
-
-    pub(crate) fn set_execution_environment_file_flow(
-        &mut self,
-        file_id: FileId,
-        flow: GmodExecutionEnvironmentFileFlow,
-    ) {
-        if flow.is_empty() {
-            self.execution_environment_file_flows.remove(&file_id);
-        } else {
-            self.execution_environment_file_flows.insert(file_id, flow);
-        }
-    }
-
-    pub(crate) fn iter_execution_environment_file_flows(
-        &self,
-    ) -> impl Iterator<Item = (FileId, &GmodExecutionEnvironmentFileFlow)> {
-        self.execution_environment_file_flows
-            .iter()
-            .map(|(file_id, flow)| (*file_id, flow))
-    }
-
-    pub(crate) fn execution_environment_roles_changed(
-        &self,
-        current_role_sources: &HashSet<FileId>,
-        analyzed_file_ids: &HashSet<FileId>,
-    ) -> bool {
-        self.execution_environment_roles_dirty
-            || self.execution_environment_role_sources != *current_role_sources
-            || analyzed_file_ids.iter().any(|file_id| {
-                self.execution_environment_role_sources.contains(file_id)
-                    || current_role_sources.contains(file_id)
-            })
-    }
-
-    pub(crate) fn set_execution_environment_role_sources(&mut self, role_sources: HashSet<FileId>) {
-        self.execution_environment_role_sources = role_sources;
-        self.execution_environment_roles_dirty = false;
+        self.note_all_file_writes();
     }
 
     fn rebuild_execution_environments(&mut self) {
@@ -394,6 +448,8 @@ impl GmodLoadIndex {
         left: FileId,
         right: FileId,
     ) -> bool {
+        derivation::note_read(|| FactKey::GmodLoadFile(left));
+        derivation::note_read(|| FactKey::GmodLoadFile(right));
         let Some(left_info) = self.file_infos.get(&left) else {
             return false;
         };
@@ -412,6 +468,7 @@ impl GmodLoadIndex {
             .file_infos
             .iter()
             .flat_map(|(file_id, info)| {
+                derivation::note_read(|| FactKey::GmodLoadFile(*file_id));
                 info.roots.iter().filter_map(|root| {
                     if !root.states.intersects(state) {
                         return None;
@@ -449,8 +506,32 @@ impl GmodLoadIndex {
         file_infos: HashMap<FileId, GmodFileLoadInfo>,
         unresolved_edges: Vec<GmodLoadEdge>,
     ) {
-        self.file_infos = file_infos;
-        self.unresolved_edges = unresolved_edges;
+        self.note_all_file_writes();
+        let mut edge_targets_by_source: HashMap<FileId, Vec<FileId>> = HashMap::default();
+        for (target, info) in &file_infos {
+            for edge in &info.incoming_edges {
+                edge_targets_by_source
+                    .entry(edge.source_file_id)
+                    .or_default()
+                    .push(*target);
+            }
+        }
+        for targets in edge_targets_by_source.values_mut() {
+            targets.sort_unstable();
+            targets.dedup();
+        }
+        let mut unresolved_by_source: HashMap<FileId, Vec<usize>> = HashMap::default();
+        for (at, edge) in unresolved_edges.iter().enumerate() {
+            unresolved_by_source
+                .entry(edge.source_file_id)
+                .or_default()
+                .push(at);
+        }
+        self.file_infos = file_infos.into();
+        self.unresolved_edges = unresolved_edges.into();
+        self.edge_targets_by_source = edge_targets_by_source.into();
+        self.unresolved_by_source = unresolved_by_source.into();
+        self.note_all_file_writes();
     }
 }
 
@@ -546,89 +627,68 @@ fn is_base_gamemode_path(path_sort_key: &str) -> bool {
     path_sort_key.starts_with("gamemodes/base/gamemode/")
 }
 
-impl LuaIndex for GmodLoadIndex {
-    fn remove(&mut self, file_id: FileId) {
-        self.file_infos.remove(&file_id);
-        self.execution_environment_file_flows.remove(&file_id);
-        if self.execution_environment_role_sources.remove(&file_id) {
-            self.execution_environment_roles_dirty = true;
-            self.execution_environment_file_flows.clear();
-            self.execution_environment_sites.clear();
-            self.execution_environments.clear();
-        }
-        self.execution_environments.remove(&file_id);
-        self.execution_environment_sites.remove(&file_id);
-        for targets in self.execution_environment_sites.values_mut() {
-            targets.remove(&file_id);
-        }
-        self.rebuild_execution_environments();
-        self.unresolved_edges
-            .retain(|edge| edge.source_file_id != file_id && edge.target_file_id != Some(file_id));
-        for info in self.file_infos.values_mut() {
-            info.incoming_edges.retain(|edge| {
-                edge.source_file_id != file_id && edge.target_file_id != Some(file_id)
-            });
-            if info.shadowed_by == Some(file_id) {
-                info.shadowed_by = None;
+impl GmodLoadIndex {
+    /// Moves the call sites of the load edges `remap`'s file holds to their
+    /// new place. A call the edit destroyed changes the file's load scan, so
+    /// the load fold runs again and replaces the edges.
+    pub(crate) fn remap_edge_positions(&mut self, remap: &crate::FileRemap) {
+        let remap_edge = |edge: &mut GmodLoadEdge| {
+            if edge.source_file_id != remap.file_id {
+                return false;
+            }
+            let Some(range) = edge.range else {
+                return false;
+            };
+            let moved = remap.map.map_range(range);
+            let changed = moved != Some(range);
+            edge.range = moved;
+            changed
+        };
+        let mut changed = Vec::new();
+        let targets = self
+            .edge_targets_by_source
+            .get(&remap.file_id)
+            .cloned()
+            .unwrap_or_default();
+        for file_id in targets {
+            let Some(info) = self.file_infos.get_mut(&file_id) else {
+                continue;
+            };
+            let mut moved = false;
+            for edge in &mut info.incoming_edges {
+                moved |= remap_edge(edge);
+            }
+            if moved {
+                changed.push(file_id);
             }
         }
+        let unresolved = self
+            .unresolved_by_source
+            .get(&remap.file_id)
+            .cloned()
+            .unwrap_or_default();
+        for at in unresolved {
+            remap_edge(&mut self.unresolved_edges[at]);
+        }
+        for file_id in changed {
+            derivation::note_write(|| FactKey::GmodLoadFile(file_id));
+        }
     }
+}
 
-    fn remove_files(&mut self, file_ids: &[FileId]) {
-        let removed_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
-        self.file_infos
-            .retain(|file_id, _| !removed_file_ids.contains(file_id));
-        self.execution_environment_file_flows
-            .retain(|file_id, _| !removed_file_ids.contains(file_id));
-        let previous_role_source_count = self.execution_environment_role_sources.len();
-        self.execution_environment_role_sources
-            .retain(|file_id| !removed_file_ids.contains(file_id));
-        let removed_role_source =
-            previous_role_source_count != self.execution_environment_role_sources.len();
-        self.execution_environment_roles_dirty |= removed_role_source;
-        if removed_role_source {
-            self.execution_environment_file_flows.clear();
-            self.execution_environment_sites.clear();
-            self.execution_environments.clear();
-        }
-        self.execution_environments
-            .retain(|file_id, _| !removed_file_ids.contains(file_id));
-        self.execution_environment_sites
-            .retain(|source, _| !removed_file_ids.contains(source));
-        for targets in self.execution_environment_sites.values_mut() {
-            targets.retain(|target, _| !removed_file_ids.contains(target));
-        }
-        self.rebuild_execution_environments();
-        self.unresolved_edges.retain(|edge| {
-            !removed_file_ids.contains(&edge.source_file_id)
-                && !edge
-                    .target_file_id
-                    .is_some_and(|target_file_id| removed_file_ids.contains(&target_file_id))
-        });
-        for info in self.file_infos.values_mut() {
-            info.incoming_edges.retain(|edge| {
-                !removed_file_ids.contains(&edge.source_file_id)
-                    && !edge
-                        .target_file_id
-                        .is_some_and(|target_file_id| removed_file_ids.contains(&target_file_id))
-            });
-            if info
-                .shadowed_by
-                .is_some_and(|file_id| removed_file_ids.contains(&file_id))
-            {
-                info.shadowed_by = None;
-            }
-        }
-    }
+/// The load fold's output only: it replaces all of it when it runs, so a
+/// removed file's entries stay until then.
+impl LuaIndex for GmodLoadIndex {
+    fn remove(&mut self, _file_id: FileId) {}
 
     fn clear(&mut self) {
+        self.note_all_file_writes();
         self.file_infos.clear();
         self.unresolved_edges.clear();
+        self.edge_targets_by_source.clear();
+        self.unresolved_by_source.clear();
         self.execution_environments.clear();
         self.execution_environment_sites.clear();
-        self.execution_environment_file_flows.clear();
-        self.execution_environment_role_sources.clear();
-        self.execution_environment_roles_dirty = false;
     }
 }
 
@@ -646,56 +706,88 @@ fn status_rank(status: GmodLoadStatus) -> u8 {
 mod tests {
     use std::collections::{HashMap, HashSet};
 
-    use super::{GmodFileLoadInfo, GmodLoadEdge, GmodLoadEdgeKind, GmodLoadIndex, GmodStateMask};
-    use crate::{FileId, db_index::LuaIndex};
+    use rowan::TextRange;
 
-    #[test]
-    fn batch_removal_keeps_only_surviving_load_edges() {
-        let removed = FileId::new(1);
-        let other_removed = FileId::new(2);
-        let surviving = FileId::new(3);
-        let external = FileId::new(4);
-        let edge = |source_file_id, target_file_id| GmodLoadEdge {
+    use super::{GmodFileLoadInfo, GmodLoadEdge, GmodLoadEdgeKind, GmodLoadIndex, GmodStateMask};
+    use crate::{FileId, FileRemap, PositionMap, db_index::LuaIndex};
+
+    fn include_edge(source_file_id: FileId, target_file_id: FileId) -> GmodLoadEdge {
+        GmodLoadEdge {
             source_file_id,
-            target_file_id,
+            target_file_id: Some(target_file_id),
             kind: GmodLoadEdgeKind::Include,
             states: GmodStateMask::SHARED,
             path: None,
             original_expr: None,
-            range: None,
-        };
-        let mut index = GmodLoadIndex::new();
-        let mut info = GmodFileLoadInfo::fallback_shared();
-        info.incoming_edges.push(edge(external, Some(surviving)));
-        info.incoming_edges.push(edge(removed, Some(surviving)));
-        info.shadowed_by = Some(removed);
-        index.file_infos.insert(surviving, info);
-        index.unresolved_edges.extend([
-            edge(surviving, Some(external)),
-            edge(surviving, Some(removed)),
-        ]);
-
-        index.remove_files(&[other_removed, removed, other_removed]);
-
-        let info = index.get_file_info(&surviving).unwrap();
-        assert_eq!(info.incoming_edges, vec![edge(external, Some(surviving))]);
-        assert_eq!(info.shadowed_by, None);
-        assert_eq!(index.unresolved_edges(), &[edge(surviving, Some(external))]);
+            range: Some(TextRange::new(2.into(), 6.into())),
+        }
     }
 
+    /// The load fold replaces this index whole when it runs, so a re-indexed
+    /// file's edges stay for it to keep or replace.
     #[test]
-    fn removing_environment_source_drops_its_target_fields() {
-        let source = FileId::new(1);
-        let target = FileId::new(2);
+    fn removing_a_file_keeps_its_load_edges_for_the_fold() {
+        let (source, target) = (FileId::new(1), FileId::new(2));
         let mut index = GmodLoadIndex::new();
-        index.set_execution_environment_sites(HashMap::from([(
-            source,
-            HashMap::from([(target, HashSet::from(["simple".to_string()]))]),
-        )]));
+        let mut info = GmodFileLoadInfo::fallback_shared();
+        info.incoming_edges.push(include_edge(source, target));
+        index.file_infos.insert(target, info);
 
         index.remove(source);
 
-        assert!(!index.execution_environment_contains(target, "simple"));
+        let info = index
+            .get_file_info(&target)
+            .expect("the target's info is kept");
+        assert_eq!(info.incoming_edges, vec![include_edge(source, target)]);
+    }
+
+    /// An edit above a kept edge's call moves the call's range with it.
+    #[test]
+    fn an_edit_moves_a_kept_edge_to_its_call() {
+        let (source, target) = (FileId::new(1), FileId::new(2));
+        let mut index = GmodLoadIndex::new();
+        let mut info = GmodFileLoadInfo::fallback_shared();
+        info.incoming_edges.push(include_edge(source, target));
+        index.set_all_file_infos(
+            rustc_hash::FxHashMap::from_iter([(target, info)]),
+            Vec::new(),
+        );
+
+        index.remap_edge_positions(&FileRemap::unvalidated(
+            source,
+            PositionMap::new(
+                "abcdefgh",
+                "
+abcdefgh",
+            ),
+        ));
+
+        let range = index
+            .get_file_info(&target)
+            .expect("the target's info is kept")
+            .incoming_edges[0]
+            .range;
+        assert_eq!(range, Some(TextRange::new(3.into(), 7.into())));
+    }
+
+    /// An edit above an unresolved edge's call moves its range too.
+    #[test]
+    fn an_edit_moves_an_unresolved_edge_to_its_call() {
+        let source = FileId::new(1);
+        let mut edge = include_edge(source, FileId::new(2));
+        edge.target_file_id = None;
+        let mut index = GmodLoadIndex::new();
+        index.set_all_file_infos(rustc_hash::FxHashMap::default(), vec![edge]);
+
+        index.remap_edge_positions(&FileRemap::unvalidated(
+            source,
+            PositionMap::new("abcdefgh", "\nabcdefgh"),
+        ));
+
+        assert_eq!(
+            index.unresolved_edges()[0].range,
+            Some(TextRange::new(3.into(), 7.into()))
+        );
     }
 
     #[test]
@@ -703,9 +795,9 @@ mod tests {
         let source = FileId::new(1);
         let target = FileId::new(2);
         let mut index = GmodLoadIndex::new();
-        index.set_execution_environment_sites(HashMap::from([(
+        index.set_execution_environment_sites(HashMap::from_iter([(
             source,
-            HashMap::from([(target, HashSet::from(["simple".to_string()]))]),
+            HashMap::from_iter([(target, HashSet::from_iter(["simple".to_string()]))]),
         )]));
 
         index.clear();
@@ -713,3 +805,12 @@ mod tests {
         assert!(!index.execution_environment_contains(target, "simple"));
     }
 }
+
+crate::db_index::cow_shards::task_fork_fields!(GmodLoadIndex {
+    file_infos,
+    unresolved_edges,
+    edge_targets_by_source,
+    unresolved_by_source,
+    execution_environments,
+    execution_environment_sites,
+});

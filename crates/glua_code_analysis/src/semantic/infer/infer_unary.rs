@@ -1,7 +1,7 @@
 use glua_parser::{LuaUnaryExpr, UnaryOperator};
 
 use crate::{
-    LuaInferCache,
+    LuaInferCache, TypeOps,
     db_index::{DbIndex, LuaOperatorMetaMethod, LuaType},
 };
 
@@ -72,6 +72,12 @@ fn infer_unary_expr_unm(db: &DbIndex, inner_type: LuaType) -> InferResult {
         LuaType::DocIntegerConst(i) => Ok(LuaType::DocIntegerConst(-i)),
         LuaType::FloatConst(f) => Ok(LuaType::FloatConst(-f)),
         LuaType::Integer => Ok(LuaType::Integer),
+        LuaType::Union(union) => union
+            .types()
+            .map(|member| infer_unary_expr_unm(db, member.clone()))
+            .try_fold(LuaType::Never, |result, member| {
+                Ok(TypeOps::Union.apply(db, &result, &member?))
+            }),
         _ => infer_unary_custom_operator(db, &inner_type, LuaOperatorMetaMethod::Unm),
     }
 }

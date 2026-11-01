@@ -59,7 +59,7 @@ impl CommandSpec for AutoRequireCommand {
             }
         );
         let document = semantic_model.get_document();
-        let offset = document.get_offset(position.line as usize, position.character as usize)?;
+        let offset = document.to_offset(position);
         let root_block = semantic_model.get_root().get_block()?;
         let mut last_require_stat: Option<LuaStat> = None;
         for stat in root_block.get_stats() {
@@ -197,8 +197,8 @@ pub fn make_auto_require(
     add_to: FileId,
     need_require_file_id: FileId,
     position: Position,
-    local_name: String,          // 导入时使用的名称
-    member_name: Option<String>, // 导入的成员名, 不要包含前缀`.`号, 它将拼接到 `require` 后面. 例如 require("a").member
+    local_name: String,          // Name used on import
+    member_name: Option<String>, // Imported member name, without the leading `.`; it is appended after `require`. For example require("a").member
 ) -> Command {
     let args = vec![
         serde_json::to_value(add_to).unwrap(),

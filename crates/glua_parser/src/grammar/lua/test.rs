@@ -1224,4 +1224,209 @@ local y = 2
             );
         }
     }
+
+    // Regression test: deep call nesting must degrade to a parse error,
+    // never abort the process with a stack overflow. Depth exceeds the
+    // release-frame trip point (~4173 on 2 MB) with margin; debug frames
+    // are fatter and trip even earlier.
+    #[test]
+    fn deeply_nested_calls_parse_to_error_not_abort() {
+        let depth = 20000;
+        let mut body = String::from("local function f(x) return x end\nlocal v = ");
+        for _ in 0..depth {
+            body.push_str("f(");
+        }
+        body.push('1');
+        for _ in 0..depth {
+            body.push(')');
+        }
+        body.push('\n');
+        let tree = LuaParser::parse(&body, ParserConfig::default());
+        assert!(
+            !tree.get_errors().is_empty(),
+            "{depth}-deep nesting must degrade to parse errors, not abort"
+        );
+    }
+
+    // Regression test: `not` chains recurse through `parse_sub_expr` itself,
+    // bypassing any guard placed only on `parse_expr`. They must bail to
+    // errors (resuming chunk by chunk as the stack unwinds), never abort.
+    #[test]
+    fn deeply_nested_unary_exprs_parse_to_error_not_abort() {
+        let depth = 30000;
+        let mut body = String::from("local v = ");
+        for _ in 0..depth {
+            body.push_str("not ");
+        }
+        body.push_str("x\n");
+        let tree = LuaParser::parse(&body, ParserConfig::default());
+        assert!(
+            !tree.get_errors().is_empty(),
+            "{depth}-deep unary nesting must degrade to parse errors, not abort"
+        );
+    }
+
+    // Regression test: right-associative operators (`^`, `..`) recurse through
+    // `parse_sub_expr` for every level, bypassing any guard placed only on
+    // `parse_expr`. They must bail to errors, never abort.
+    #[test]
+    fn deeply_nested_right_assoc_chain_parses_to_error_not_abort() {
+        let depth = 20000;
+        let mut body = String::from("local v = 1");
+        for _ in 0..depth {
+            body.push_str("^1");
+        }
+        body.push('\n');
+        let tree = LuaParser::parse(&body, ParserConfig::default());
+        assert!(
+            !tree.get_errors().is_empty(),
+            "{depth}-deep right-associative nesting must degrade to parse errors, not abort"
+        );
+    }
+
+    // Regression test: a stack-reserve bail consumes nothing, so when the
+    // innermost token is a statement start the recovery loop used to retry the
+    // same token at the same depth forever. `parse_stats` now breaks on
+    // no-progress instead. The watchdog turns a regression into a failure
+    // rather than a hung suite. Depth exceeds the release-frame trip point
+    // (~3755 on 2 MB) with margin; debug frames are fatter and trip earlier.
+    #[test]
+    fn deeply_nested_blocks_with_statement_start_terminates() {
+        let depth = 20000;
+        let mut body = String::new();
+        for _ in 0..depth {
+            body.push_str("do ");
+        }
+        body.push('x');
+        for _ in 0..depth {
+            body.push_str(" end");
+        }
+        body.push('\n');
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let tree = LuaParser::parse(&body, ParserConfig::default());
+            let errors = tree.get_errors();
+            let report = (
+                errors.len(),
+                errors
+                    .iter()
+                    .any(|error| error.message.contains("too deeply nested")),
+            );
+            let _ = tx.send(report);
+        });
+        let (error_count, tripped) = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("deeply nested blocks must terminate with errors, not hang");
+        worker.join().expect("worker must not overflow its stack");
+        assert!(
+            tripped,
+            "{depth}-deep blocks must trip the stack reserve guard"
+        );
+        assert!(
+            error_count > 0,
+            "{depth}-deep blocks must degrade to parse errors"
+        );
+    }
+
+    // Regression: a guard-tripped block tree must also drop safely on a
+    // production-sized (2 MB) thread. The parse bails via the reserve guard,
+    // but the resulting deep green tree previously aborted the process
+    // in recursive `GreenNode` destruction. Rowan now frees green nodes
+    // iteratively, so the ordinary drop below is O(1) stack; join-based like
+    // the existing 2 MB tests. Depth exceeds the release-frame trip point
+    // (~3755 on 2 MB) with margin; debug frames are fatter and trip earlier.
+    #[test]
+    fn deeply_nested_blocks_drop_safely_on_small_stack() {
+        let depth = 20000;
+        let mut body = String::new();
+        for _ in 0..depth {
+            body.push_str("do ");
+        }
+        body.push('x');
+        for _ in 0..depth {
+            body.push_str(" end");
+        }
+        body.push('\n');
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let tree = LuaParser::parse(&body, ParserConfig::default());
+                assert!(
+                    !tree.get_errors().is_empty(),
+                    "{depth}-deep blocks must degrade to parse errors, not abort"
+                );
+                assert!(
+                    tree.get_errors()
+                        .iter()
+                        .any(|error| error.message.contains("too deeply nested")),
+                    "{depth}-deep blocks must trip the stack reserve guard"
+                );
+            })
+            .expect("worker thread should spawn")
+            .join()
+            .expect("production-sized worker must not overflow when dropping its tree");
+    }
+
+    // A failed statement that consumes nothing while sitting on a statement
+    // start must not spin `parse_stats` forever, even far from any stack
+    // limit: recovery without progress breaks out and lets `parse_chunk`
+    // consume the token.
+    #[test]
+    fn statement_start_without_progress_terminates() {
+        let tree = LuaParser::parse("foo bar", ParserConfig::default());
+        assert!(
+            !tree.get_errors().is_empty(),
+            "unconsumed statement start must degrade to parse errors, not hang"
+        );
+    }
+
+    // Regression: a red root cloned from a guard-tripped tree must also drop
+    // safely on a production-sized (2 MB) thread, even when it outlives its
+    // `LuaSyntaxTree`. `get_red_root` clones the green root, so dropping the
+    // tree releases only one reference; the final release happens wherever the
+    // last red dies (memo eviction, thread-local teardown, caches) —
+    // previously a recursive `GreenNode` free that aborted small-stack threads
+    // mid-suite. Rowan now frees green nodes iteratively, so the red drop, the
+    // tree drop, and the memo teardown below are all safe on this 2 MB stack;
+    // join-based like the existing 2 MB tests.
+    #[test]
+    fn deeply_nested_blocks_red_root_outlives_tree_drops_safely_on_small_stack() {
+        // Depth exceeds the release-frame trip point (~3755 on 2 MB) with
+        // margin; debug frames are fatter and trip earlier.
+        let depth = 20000;
+        let mut body = String::new();
+        for _ in 0..depth {
+            body.push_str("do ");
+        }
+        body.push('x');
+        for _ in 0..depth {
+            body.push_str(" end");
+        }
+        body.push('\n');
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let tree = LuaParser::parse(&body, ParserConfig::default());
+                assert!(
+                    tree.get_errors()
+                        .iter()
+                        .any(|error| error.message.contains("too deeply nested")),
+                    "{depth}-deep blocks must trip the stack reserve guard"
+                );
+                // Retain a red root past the tree and soil the per-thread node
+                // memo with it; the memo pins the green until thread teardown.
+                let red = tree.get_red_root();
+                let id = crate::LuaSyntaxId::from_node(&red);
+                assert!(
+                    id.to_node_from_root(&red).is_some(),
+                    "memoized resolve of the deep root must succeed"
+                );
+                drop(tree);
+                assert_eq!(red.text_range().len(), body.len().try_into().unwrap());
+                drop(red);
+            })
+            .expect("worker thread should spawn")
+            .join()
+            .expect("production-sized worker must not overflow when a retained red root drops");
+    }
 }

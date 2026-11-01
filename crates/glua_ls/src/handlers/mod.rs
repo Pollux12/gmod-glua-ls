@@ -5,8 +5,6 @@ mod command;
 mod completion;
 mod configuration;
 mod definition;
-mod diagnostic;
-mod doc_search;
 mod document_color;
 mod document_formatting;
 mod document_highlight;
@@ -42,12 +40,18 @@ mod test;
 #[cfg(test)]
 mod test_lib;
 
-pub use initialized::{ClientConfig, init_analysis, initialized_handler};
+pub use initialized::{
+    ClientConfig, apply_workspace_diagnostic_configs, init_analysis, initialized_handler,
+    refresh_open_document_features,
+};
 use lsp_types::{ClientCapabilities, ServerCapabilities};
 pub use notification_handler::on_notification_handler;
 pub use request_handler::on_request_handler;
 pub use response_handler::on_response_handler;
+pub(crate) use text_document::apply_file_system_changes;
 pub use text_document::on_did_change_text_document;
+#[cfg(test)]
+pub(crate) use text_document::on_did_close_document;
 
 pub trait RegisterCapabilities {
     fn register_capabilities(
@@ -101,5 +105,4 @@ capabilities!(modules: {
     configuration => ConfigurationCapabilities,
     call_hierarchy => CallHierarchyCapabilities,
     workspace => WorkspaceCapabilities,
-    diagnostic => DiagnosticCapabilities,
 });

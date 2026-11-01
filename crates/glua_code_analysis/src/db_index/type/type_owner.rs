@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use glua_parser::LuaSyntaxId;
 use rowan::TextSize;
 
@@ -46,9 +48,47 @@ impl LuaTypeOwner {
             LuaTypeOwner::SyntaxId(id) => id.value.get_range().start(),
         }
     }
+
+    /// Total order over owners, so index writes ordered by it do not depend on
+    /// hash-map iteration order. Mirrors the field order `Debug` prints, but
+    /// through real keys rather than a formatted string.
+    pub fn stable_cmp(&self, other: &Self) -> Ordering {
+        let tag = |owner: &Self| match owner {
+            LuaTypeOwner::Decl(_) => 0,
+            LuaTypeOwner::Member(_) => 1,
+            LuaTypeOwner::SyntaxId(_) => 2,
+        };
+
+        tag(self)
+            .cmp(&tag(other))
+            .then_with(|| match (self, other) {
+                (LuaTypeOwner::Decl(left), LuaTypeOwner::Decl(right)) => left
+                    .file_id
+                    .cmp(&right.file_id)
+                    .then_with(|| left.position.cmp(&right.position)),
+                (LuaTypeOwner::Member(left), LuaTypeOwner::Member(right)) => left
+                    .file_id
+                    .cmp(&right.file_id)
+                    .then_with(|| syntax_id_cmp(left.get_syntax_id(), right.get_syntax_id()))
+                    .then_with(|| left.get_slot().cmp(&right.get_slot())),
+                (LuaTypeOwner::SyntaxId(left), LuaTypeOwner::SyntaxId(right)) => left
+                    .file_id
+                    .cmp(&right.file_id)
+                    .then_with(|| syntax_id_cmp(&left.value, &right.value)),
+                _ => Ordering::Equal,
+            })
+    }
 }
 
-#[derive(Debug, Clone)]
+fn syntax_id_cmp(left: &LuaSyntaxId, right: &LuaSyntaxId) -> Ordering {
+    left.get_range()
+        .start()
+        .cmp(&right.get_range().start())
+        .then_with(|| left.get_range().end().cmp(&right.get_range().end()))
+        .then_with(|| (left.get_kind() as u16).cmp(&(right.get_kind() as u16)))
+}
+
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum LuaTypeCache {
     DocType(LuaType),
     InferType(LuaType),
@@ -109,6 +149,7 @@ impl LuaTypeCache {
 }
 
 const NIL_RANK: u8 = 1;
+const UNKNOWN_RANK: u8 = 2;
 
 /// Rank within the "carries no type information" band, ordered by how much
 /// the value could be: `never` (nothing) through `any` (anything). `None`
@@ -118,7 +159,7 @@ pub(crate) fn uninformative_rank(typ: &LuaType) -> Option<u8> {
     match typ {
         LuaType::Never => Some(0),
         LuaType::Nil => Some(NIL_RANK),
-        LuaType::Unknown => Some(2),
+        LuaType::Unknown => Some(UNKNOWN_RANK),
         LuaType::Any => Some(3),
         LuaType::Union(union) => union
             .types()
@@ -132,6 +173,40 @@ pub(crate) fn uninformative_rank(typ: &LuaType) -> Option<u8> {
     }
 }
 
+/// Whether `typ` carries a template parameter in value position — on its own or
+/// as a union arm.
+///
+/// Such a parameter is not a type: it records that the generic call it came out
+/// of was never instantiated, so an answer carrying one is a placeholder rather
+/// than an inference. Deliberately kept out of [`is_informative_type`], which
+/// the checkers read — the arms beside the leak are real, so narrowing and
+/// nil-checking against them stay sound.
+///
+/// Only value positions are checked, containers' elements among them: a
+/// function type that is generic *over* a parameter is a real type, but a
+/// table of an uninstantiated parameter (`V[]`) is still a placeholder.
+pub fn leaks_unsubstituted_tpl(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::TplRef(_) | LuaType::StrTplRef(_) | LuaType::ConstTplRef(_) => true,
+        LuaType::Union(union) => union.types().any(leaks_unsubstituted_tpl),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .any(|(typ, _)| leaks_unsubstituted_tpl(typ)),
+        LuaType::Array(array) => leaks_unsubstituted_tpl(array.get_base()),
+        LuaType::Tuple(tuple) => tuple.get_types().iter().any(leaks_unsubstituted_tpl),
+        LuaType::TableGeneric(params) => params.iter().any(leaks_unsubstituted_tpl),
+        LuaType::Generic(generic) => generic.get_params().iter().any(leaks_unsubstituted_tpl),
+        LuaType::Object(object) => {
+            object.get_fields().values().any(leaks_unsubstituted_tpl)
+                || object.get_index_access().iter().any(|(key, value)| {
+                    leaks_unsubstituted_tpl(key) || leaks_unsubstituted_tpl(value)
+                })
+        }
+        _ => false,
+    }
+}
+
 /// Total order over the "carries no type information" band:
 /// [`uninformative_rank`] first, then the nullable variant ahead of the
 /// bare one.
@@ -139,8 +214,10 @@ fn uninformative_key(typ: &LuaType) -> Option<(u8, u8)> {
     Some((uninformative_rank(typ)?, typ.is_nullable() as u8))
 }
 
-/// Whether `wider` is the widened primitive of the literal `narrower`.
-fn widens_primitive(wider: &LuaType, narrower: &LuaType) -> bool {
+/// Whether `wider` is the widened primitive of `narrower` — a literal folding
+/// into its primitive, or a narrower primitive folding into its supertype
+/// (`integer` into `number`).
+pub(crate) fn widens_primitive(wider: &LuaType, narrower: &LuaType) -> bool {
     matches!(
         (wider, narrower),
         (
@@ -151,7 +228,10 @@ fn widens_primitive(wider: &LuaType, narrower: &LuaType) -> bool {
             LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_)
         ) | (
             LuaType::Number,
-            LuaType::FloatConst(_) | LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_)
+            LuaType::Integer
+                | LuaType::FloatConst(_)
+                | LuaType::IntegerConst(_)
+                | LuaType::DocIntegerConst(_)
         ) | (
             LuaType::Boolean,
             LuaType::BooleanConst(_) | LuaType::DocBooleanConst(_)
@@ -163,6 +243,18 @@ fn widens_primitive(wider: &LuaType, narrower: &LuaType) -> bool {
 /// "no value was found" rather than "any value is allowed".
 pub(crate) fn is_bottom_type(typ: &LuaType) -> bool {
     uninformative_rank(typ).is_some_and(|rank| rank <= NIL_RANK)
+}
+
+/// Whether `typ` is a value inference could not resolve — `unknown`, alone or
+/// beside `nil` — rather than a known absence of value or `any`.
+pub(crate) fn is_unresolved_type(typ: &LuaType) -> bool {
+    uninformative_rank(typ) == Some(UNKNOWN_RANK)
+}
+
+/// Whether `typ` records that no value could be determined — `never`, `nil` or
+/// `unknown` — as opposed to `any`, which states that any value is allowed.
+pub(crate) fn is_undetermined_type(typ: &LuaType) -> bool {
+    uninformative_rank(typ).is_some_and(|rank| rank <= UNKNOWN_RANK)
 }
 
 /// Whether `typ` says anything about the value. The single authoritative
@@ -184,6 +276,22 @@ impl std::ops::Deref for LuaTypeCache {
 mod tests {
     use super::*;
     use crate::LuaUnionType;
+
+    /// The members one node makes in different slots are different owners, so a
+    /// sort by this order groups each one's writes together.
+    #[test]
+    fn stable_cmp_tells_apart_the_slots_of_one_node() {
+        let call = LuaSyntaxId::new(
+            glua_parser::LuaSyntaxKind::CallExpr.into(),
+            rowan::TextRange::new(0.into(), 6.into()),
+        );
+        let member = |slot| {
+            LuaTypeOwner::Member(crate::LuaMemberId::new_in_slot(call, FileId::new(1), slot))
+        };
+        let mut owners = vec![member(0), member(1), member(0)];
+        owners.sort_by(LuaTypeOwner::stable_cmp);
+        assert_eq!(owners, vec![member(0), member(0), member(1)]);
+    }
 
     fn union(types: Vec<LuaType>) -> LuaType {
         LuaType::from_vec(types)

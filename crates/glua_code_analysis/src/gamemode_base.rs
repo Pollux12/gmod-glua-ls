@@ -1,23 +1,24 @@
 //! Server-side detection of GMod gamemode base libraries.
 //!
 //! Garry's Mod gamemodes live under `<gameroot>/gamemodes/<name>/` and carry a
-//! `<name>.txt` KeyValues metadata file describing the gamemode. That file may
+//! `.txt` KeyValues metadata file describing the gamemode. That file may
 //! contain a `"base"` field naming a parent gamemode whose folder name is
 //! `<base>`. At runtime, gmod loads the parent's code first via
 //! `DeriveGamemode("<base>")`, so for accurate static analysis we must resolve
 //! the inheritance chain and add each ancestor's gamemode folder as a library.
 //!
 //! This module:
-//!   * scans a workspace root for any `gamemodes/<name>/<name>.txt`,
+//!   * scans gamemode folders for top-level `.txt` manifests,
 //!   * parses just enough of the KeyValues format to extract the `"base"` field,
 //!   * follows the `base` chain (e.g. `darkrp` -> `sandbox` -> `base`),
 //!   * returns the absolute folder paths of all ancestor gamemodes that exist
-//!     on disk and are not the workspace itself.
+//!     on disk and are not the workspace itself, stopping at `base` and
+//!     `sandbox`, which the GMod annotations declare.
 //!
 //! The detector is intentionally tolerant: malformed KV files are skipped,
 //! cycles are broken, and nothing is added when no metadata is found.
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::path::{Path, PathBuf};
 
 /// Validate that `name` is a plausible gamemode folder name.
@@ -35,6 +36,16 @@ fn is_valid_gamemode_name(name: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// Gamemodes the GMod annotations declare. Loading their source as well would
+/// define everything they provide twice, so a base chain ends where it reaches one.
+const ANNOTATED_GAMEMODES: [&str; 2] = ["base", "sandbox"];
+
+fn is_annotated_gamemode(name: &str) -> bool {
+    ANNOTATED_GAMEMODES
+        .iter()
+        .any(|annotated| annotated.eq_ignore_ascii_case(name))
+}
+
 /// Extract the `"base"` value from a gamemode `.txt` KeyValues file.
 ///
 /// Returns `None` when the file is missing, unreadable, malformed, or has an
@@ -50,18 +61,19 @@ pub fn read_gamemode_base(txt_path: &Path) -> Option<String> {
 ///
 /// The detector handles two layouts:
 ///   1. **Game install root** (e.g. `.../garrysmod/`): scans `gamemodes/*` for
-///      every gamemode that has a `<name>/<name>.txt` and follows each chain.
+///      every gamemode and follows each manifest's base chain.
 ///   2. **Single gamemode root** (e.g. `.../gamemodes/darkrp/`): if the root
-///      itself contains `<basename>/<basename>.txt`, follows that chain.
+///      itself contains a manifest, follows that chain.
 ///
 /// Returned paths:
 ///   * are absolute,
 ///   * point at the ancestor gamemode folder (e.g. `.../gamemodes/sandbox`),
 ///   * exclude the workspace root itself (avoid self-library),
+///   * exclude the gamemodes the annotations declare (`base`, `sandbox`),
 ///   * are deduplicated while preserving discovery order.
 pub fn detect_gamemode_base_libraries(workspace_root: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut seen: FxHashSet<PathBuf> = FxHashSet::default();
     let workspace_root_canon = canonicalize_or(workspace_root);
 
     // Layout 2: workspace root *is* a gamemode folder.
@@ -70,7 +82,6 @@ pub fn detect_gamemode_base_libraries(workspace_root: &Path) -> Vec<PathBuf> {
     // as gamemodes.
     if let Some(name) = workspace_root.file_name().and_then(|s| s.to_str())
         && is_valid_gamemode_name(name)
-        && workspace_root.join(format!("{name}.txt")).is_file()
         && let Some(parent) = workspace_root.parent()
         && parent
             .file_name()
@@ -105,9 +116,6 @@ pub fn detect_gamemode_base_libraries(workspace_root: &Path) -> Vec<PathBuf> {
                 if !is_valid_gamemode_name(name) {
                     continue;
                 }
-                if !gm_folder.join(format!("{name}.txt")).is_file() {
-                    continue;
-                }
                 walk_chain(
                     &gm_folder,
                     &gamemodes_dir,
@@ -130,31 +138,20 @@ fn walk_chain(
     gamemodes_dir: &Path,
     workspace_root_canon: &Path,
     out: &mut Vec<PathBuf>,
-    seen: &mut HashSet<PathBuf>,
+    seen: &mut FxHashSet<PathBuf>,
 ) {
     let mut current = start_folder.to_path_buf();
-    let mut visited_names: HashSet<String> = HashSet::new();
+    let mut visited_names: FxHashSet<String> = FxHashSet::default();
     if let Some(name) = current.file_name().and_then(|s| s.to_str()) {
         visited_names.insert(name.to_string());
     }
 
     loop {
-        let Some(name) = current
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-        else {
+        let Some(base) = read_gamemode_folder_base(&current) else {
             return;
         };
-        let txt = current.join(format!("{name}.txt"));
-        let Some(base) = read_gamemode_base(&txt) else {
-            return;
-        };
-        if base.is_empty() {
-            return;
-        }
         // Reject path-traversal / weird names before joining.
-        if !is_valid_gamemode_name(&base) {
+        if !is_valid_gamemode_name(&base) || is_annotated_gamemode(&base) {
             return;
         }
         if !visited_names.insert(base.clone()) {
@@ -174,6 +171,29 @@ fn walk_chain(
 
         current = parent_folder;
     }
+}
+
+fn read_gamemode_folder_base(folder: &Path) -> Option<String> {
+    let name = folder.file_name()?.to_str()?;
+    let preferred = folder.join(format!("{name}.txt"));
+    if preferred.is_file() {
+        return read_gamemode_base(&preferred);
+    }
+
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(folder)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+        })
+        .collect();
+    candidates.sort();
+    candidates.iter().find_map(|path| read_gamemode_base(path))
 }
 
 fn canonicalize_or(p: &Path) -> PathBuf {
@@ -438,21 +458,135 @@ sandbox
         assert_eq!(parse_base_field("not even close"), None);
     }
 
+    fn rename_manifest(root: &Path, name: &str, manifest: &str) {
+        let folder = root.join("gamemodes").join(name);
+        fs::rename(folder.join(format!("{name}.txt")), folder.join(manifest))
+            .expect("rename gamemode manifest");
+    }
+
     #[test]
-    fn detect_walks_full_chain() {
+    fn manifest_mismatched_name_resolves_base() {
+        let root = temp_dir();
+        write_gamemode(&root, "helix", None);
+        write_gamemode(&root, "helix-hl2rp", Some("helix"));
+        rename_manifest(&root, "helix-hl2rp", "ixhl2rp.txt");
+        assert_eq!(
+            detect_gamemode_base_libraries(&root.join("gamemodes/helix-hl2rp")),
+            vec![root.join("gamemodes/helix")]
+        );
+    }
+
+    #[test]
+    fn manifest_preferred_name_wins() {
+        let root = temp_dir();
+        write_gamemode(&root, "ancestor", None);
+        write_gamemode(&root, "helix", Some("ancestor"));
+        rename_manifest(&root, "helix", "framework.txt");
+        write_gamemode(&root, "other", None);
+        write_gamemode(&root, "helix-hl2rp", Some("helix"));
+        fs::write(
+            root.join("gamemodes/helix-hl2rp/a.txt"),
+            "other { base other }",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_gamemode_base_libraries(&root.join("gamemodes/helix-hl2rp")),
+            vec![
+                root.join("gamemodes/helix"),
+                root.join("gamemodes/ancestor")
+            ]
+        );
+    }
+
+    #[test]
+    fn manifest_skips_text_without_base() {
+        let root = temp_dir();
+        write_gamemode(&root, "helix", None);
+        write_gamemode(&root, "helix-hl2rp", Some("helix"));
+        rename_manifest(&root, "helix-hl2rp", "ixhl2rp.txt");
+        fs::write(
+            root.join("gamemodes/helix-hl2rp/a_readme.txt"),
+            "readme { title documentation }",
+        )
+        .unwrap();
+        fs::write(
+            root.join("gamemodes/helix-hl2rp/b_empty.txt"),
+            "empty { base \"\" }",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_gamemode_base_libraries(&root.join("gamemodes/helix-hl2rp")),
+            vec![root.join("gamemodes/helix")]
+        );
+    }
+
+    #[test]
+    fn manifest_follows_mismatched_ancestor() {
+        let root = temp_dir();
+        write_gamemode(&root, "ancestor", None);
+        write_gamemode(&root, "helix", Some("ancestor"));
+        rename_manifest(&root, "helix", "framework.txt");
+        write_gamemode(&root, "helix-hl2rp", Some("helix"));
+        assert_eq!(
+            detect_gamemode_base_libraries(&root.join("gamemodes/helix-hl2rp")),
+            vec![
+                root.join("gamemodes/helix"),
+                root.join("gamemodes/ancestor")
+            ]
+        );
+    }
+
+    #[test]
+    fn manifest_fallback_is_sorted() {
+        let root = temp_dir();
+        write_gamemode(&root, "helix", None);
+        write_gamemode(&root, "other", None);
+        write_gamemode(&root, "helix-hl2rp", Some("other"));
+        rename_manifest(&root, "helix-hl2rp", "z.txt");
+        fs::write(
+            root.join("gamemodes/helix-hl2rp/a.TXT"),
+            "ixhl2rp { base helix }",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_gamemode_base_libraries(&root.join("gamemodes/helix-hl2rp")),
+            vec![root.join("gamemodes/helix")]
+        );
+    }
+
+    #[test]
+    fn manifest_game_root_discovers_mismatched_name() {
+        let root = temp_dir();
+        write_gamemode(&root, "helix", None);
+        write_gamemode(&root, "helix-hl2rp", Some("helix"));
+        rename_manifest(&root, "helix-hl2rp", "ixhl2rp.txt");
+        assert_eq!(
+            detect_gamemode_base_libraries(&root),
+            vec![root.join("gamemodes/helix")]
+        );
+    }
+
+    #[test]
+    fn detect_leaves_annotated_gamemodes_to_the_annotations() {
         let root = temp_dir();
         write_gamemode(&root, "base", Some(""));
         write_gamemode(&root, "sandbox", Some("base"));
         write_gamemode(&root, "darkrp", Some("sandbox"));
+        write_gamemode(&root, "helix", Some("sandbox"));
+        write_gamemode(&root, "ixhl2rp", Some("helix"));
 
-        let mut libs = detect_gamemode_base_libraries(&root);
-        libs.sort();
-        let mut expected = vec![
-            root.join("gamemodes").join("base"),
-            root.join("gamemodes").join("sandbox"),
-        ];
-        expected.sort();
-        assert_eq!(libs, expected);
+        assert_eq!(
+            detect_gamemode_base_libraries(&root.join("gamemodes").join("darkrp")),
+            Vec::<PathBuf>::new()
+        );
+        assert_eq!(
+            detect_gamemode_base_libraries(&root.join("gamemodes").join("ixhl2rp")),
+            vec![root.join("gamemodes").join("helix")]
+        );
+        assert_eq!(
+            detect_gamemode_base_libraries(&root),
+            vec![root.join("gamemodes").join("helix")]
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -460,8 +594,8 @@ sandbox
     #[test]
     fn detect_skips_missing_parent_folder() {
         let root = temp_dir();
-        // darkrp claims base sandbox but sandbox folder doesn't exist
-        write_gamemode(&root, "darkrp", Some("sandbox"));
+        // darkrp claims base framework but the framework folder doesn't exist
+        write_gamemode(&root, "darkrp", Some("framework"));
         let libs = detect_gamemode_base_libraries(&root);
         assert!(libs.is_empty(), "expected no libs, got {libs:?}");
         let _ = fs::remove_dir_all(root);
@@ -470,21 +604,20 @@ sandbox
     #[test]
     fn detect_handles_workspace_root_being_gamemode() {
         let root = temp_dir();
-        // Set up: `<root>/gamemodes/{base,sandbox}` and treat
+        // Set up: `<root>/gamemodes/{ancestor,framework}` and treat
         // `<root>/gamemodes/darkrp` as the workspace.
-        write_gamemode(&root, "base", Some(""));
-        write_gamemode(&root, "sandbox", Some("base"));
-        write_gamemode(&root, "darkrp", Some("sandbox"));
+        write_gamemode(&root, "ancestor", Some(""));
+        write_gamemode(&root, "framework", Some("ancestor"));
+        write_gamemode(&root, "darkrp", Some("framework"));
 
         let darkrp_root = root.join("gamemodes").join("darkrp");
-        let mut libs = detect_gamemode_base_libraries(&darkrp_root);
-        libs.sort();
-        let mut expected = vec![
-            root.join("gamemodes").join("base"),
-            root.join("gamemodes").join("sandbox"),
-        ];
-        expected.sort();
-        assert_eq!(libs, expected);
+        assert_eq!(
+            detect_gamemode_base_libraries(&darkrp_root),
+            vec![
+                root.join("gamemodes").join("framework"),
+                root.join("gamemodes").join("ancestor"),
+            ]
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -621,22 +754,22 @@ sandbox
         let root = temp_dir();
         let parent = root.join("Gamemodes");
         let gm = parent.join("darkrp");
-        let sb = parent.join("sandbox");
+        let base = parent.join("framework");
         fs::create_dir_all(&gm).unwrap();
-        fs::create_dir_all(&sb).unwrap();
+        fs::create_dir_all(&base).unwrap();
         fs::write(
             gm.join("darkrp.txt"),
-            "\"darkrp\"\n{\n\t\"base\"\t\"sandbox\"\n}\n",
+            "\"darkrp\"\n{\n\t\"base\"\t\"framework\"\n}\n",
         )
         .unwrap();
         fs::write(
-            sb.join("sandbox.txt"),
-            "\"sandbox\"\n{\n\t\"title\"\t\"Sandbox\"\n}\n",
+            base.join("framework.txt"),
+            "\"framework\"\n{\n\t\"title\"\t\"Framework\"\n}\n",
         )
         .unwrap();
 
         let libs = detect_gamemode_base_libraries(&gm);
-        assert_eq!(libs, vec![sb]);
+        assert_eq!(libs, vec![base]);
 
         let _ = fs::remove_dir_all(root);
     }

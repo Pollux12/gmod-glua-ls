@@ -1,69 +1,50 @@
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::time::Duration;
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr,
-    LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIndexKey, LuaLiteralToken, LuaSyntaxKind,
-    LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIndexKey, LuaLiteralToken, LuaSyntaxId,
+    LuaSyntaxKind, LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use rowan::TextSize;
 use smol_str::SmolStr;
 
 use crate::{
-    InFiled, LuaDeclId, LuaInferredGuardOwner, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType,
+    InFiled, LuaDeclId, LuaInstanceKind, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType,
     LuaTypeOwner, VarRefId,
     db_index::{DbIndex, DynamicFieldOwner, LuaMemberOwner, LuaSemanticDeclId, WorkspaceKind},
     find_signature_attribute_use,
-    profile::Profile,
     semantic::{
-        find_members_with_key, get_var_expr_var_ref_id, infer_expr, unwrap_paren_to_name_expr,
+        contains_gmod_null_type, declaring_for_range, find_members_with_key,
+        get_var_expr_var_ref_id, infer_expr, raw_get_access_path,
+        try_infer_enclosing_for_range_iter_type, unwrap_paren_to_name_expr,
     },
 };
 
-use super::{AnalysisPipeline, AnalyzeContext};
-
-/// Cache key for prefix type inference in dynamic field analysis.
-/// Uses VarRefId when available (same variable at different positions hits cache),
-/// falls back to TextRange for unnamable expressions (table constructors, etc.).
+/// The reference a write's prefix names: its variable when it names one
+/// (the same variable at different positions is one reference), else the
+/// prefix expression itself.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-enum PrefixCacheKey {
+enum PrefixKey {
     Var(VarRefId),
     Range(rowan::TextRange),
 }
 
-impl PrefixCacheKey {
+impl PrefixKey {
     fn from_expr(db: &DbIndex, cache: &mut crate::LuaInferCache, expr: &LuaExpr) -> Self {
         match get_var_expr_var_ref_id(db, cache, expr.clone()) {
-            Some(var_ref_id) => PrefixCacheKey::Var(var_ref_id),
-            None => PrefixCacheKey::Range(expr.syntax().text_range()),
+            Some(var_ref_id) => PrefixKey::Var(var_ref_id),
+            None => PrefixKey::Range(expr.syntax().text_range()),
         }
     }
 }
 
-pub struct DynamicFieldAnalysisPipeline;
-
-impl AnalysisPipeline for DynamicFieldAnalysisPipeline {
-    fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
-        analyze_dynamic_fields(db, context, DynamicFieldAnalysisMode::Full);
-    }
-}
-
-pub struct EarlyDynamicFieldAnalysisPipeline;
-
-impl AnalysisPipeline for EarlyDynamicFieldAnalysisPipeline {
-    fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
-        analyze_dynamic_fields(db, context, DynamicFieldAnalysisMode::Early);
-    }
-}
-
 #[derive(Clone, Copy)]
-enum DynamicFieldAnalysisMode {
-    Early,
+pub(super) enum DynamicFieldAnalysisMode {
     Full,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FieldSetterHelper {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct FieldSetterHelper {
     table_param_index: usize,
     key_param_index: usize,
 }
@@ -90,72 +71,15 @@ type FiniteNamedMemberEvidence = (
     bool,
 );
 
-#[derive(Default, Clone)]
-struct FieldSetterHelperCache {
-    complete_helper_registry: bool,
-    helpers: FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
-    non_helpers: FxHashSet<LuaSignatureId>,
-    member_names: FxHashSet<SmolStr>,
-}
-
-impl FieldSetterHelperCache {
-    fn from_tree_list(
-        tree_list: &[InFiled<glua_parser::LuaChunk>],
-        enable_member_name_prefilter: bool,
-    ) -> Self {
-        let (helpers, mut member_names) = collect_field_setter_helpers(tree_list);
-        if !enable_member_name_prefilter {
-            member_names.clear();
-        }
-        Self {
-            complete_helper_registry: enable_member_name_prefilter,
-            helpers,
-            non_helpers: FxHashSet::default(),
-            member_names,
-        }
-    }
-
-    fn definitely_has_no_helpers(&self) -> bool {
-        self.complete_helper_registry && self.helpers.is_empty()
-    }
-
-    fn patterns_for_signature(
-        &mut self,
-        db: &DbIndex,
-        signature_id: LuaSignatureId,
-    ) -> Vec<FieldSetterHelper> {
-        if let Some(patterns) = self.helpers.get(&signature_id) {
-            return patterns.clone();
-        }
-
-        if self.non_helpers.contains(&signature_id) {
-            return Vec::new();
-        }
-
-        let patterns = collect_field_setter_helpers_for_signature(db, signature_id);
-        if patterns.is_empty() {
-            self.non_helpers.insert(signature_id);
-        } else {
-            self.helpers.insert(signature_id, patterns.clone());
-        }
-
-        patterns
-    }
-
-    fn definitely_not_member_helper_call(&self, prefix_expr: &LuaExpr) -> bool {
-        if self.member_names.is_empty() {
-            return false;
-        }
-
-        let LuaExpr::IndexExpr(index_expr) = prefix_expr else {
-            return false;
-        };
-        let Some(member_name) = simple_index_key_name(index_expr) else {
-            return false;
-        };
-
-        !self.member_names.contains(&member_name)
-    }
+fn patterns_for_signature(db: &DbIndex, signature_id: LuaSignatureId) -> Vec<FieldSetterHelper> {
+    super::function_summary::function_summaries(db, signature_id.get_file_id())
+        .and_then(|summaries| {
+            summaries
+                .field_setter_helpers
+                .get(&signature_id.get_position())
+                .cloned()
+        })
+        .unwrap_or_default()
 }
 
 impl DynamicFieldAnalysisMode {
@@ -187,509 +111,647 @@ impl DynamicFieldAnalysisMode {
     }
 }
 
-/// The field-definition sites a statement contributes, as `(indexed target,
-/// assigned value)` pairs.
-fn field_definition_sites(
-    db: &DbIndex,
-    file_id: crate::FileId,
-    node: &LuaSyntaxNode,
-) -> Vec<(glua_parser::LuaIndexExpr, Option<LuaExpr>)> {
+/// Whether a node is a statement that can define fields.
+fn defines_fields(kind: glua_parser::LuaKind) -> bool {
+    matches!(
+        kind.into(),
+        LuaSyntaxKind::AssignStat | LuaSyntaxKind::FuncStat
+    )
+}
+
+/// A statement's indexed targets, each with its position among the
+/// statement's assigned variables: what its syntax alone says can define a
+/// field.
+fn indexed_targets(node: &LuaSyntaxNode) -> Vec<(usize, glua_parser::LuaIndexExpr)> {
     if let Some(assign) = LuaAssignStat::cast(node.clone()) {
-        let (vars, exprs) = assign.get_var_and_expr_list();
-        return vars
-            .iter()
+        return assign
+            .get_var_and_expr_list()
+            .0
+            .into_iter()
             .enumerate()
-            .filter_map(|(idx, var)| match var {
-                LuaVarExpr::IndexExpr(index_expr) => {
-                    Some((index_expr.clone(), exprs.get(idx).cloned()))
-                }
+            .filter_map(|(var, target)| match target {
+                LuaVarExpr::IndexExpr(index_expr) => Some((var, index_expr)),
                 _ => None,
             })
             .collect();
     }
-
     if let Some(func_stat) = LuaFuncStat::cast(node.clone())
         && let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name()
-        && index_expr
-            .get_index_token()
-            .is_some_and(|token| !token.is_colon())
-        && db
-            .get_member_index()
-            .get_current_owner(&LuaMemberId::new(index_expr.get_syntax_id(), file_id))
-            .is_none()
     {
-        return vec![(index_expr, None)];
+        return vec![(0, index_expr)];
     }
-
     Vec::new()
 }
 
-/// Per-file dynamic-field collection. Reads only immutable `&DbIndex` state
-/// (lua/unresolve analysis is complete) plus the file's own AST, and writes
-/// nothing to the db — all results are returned for sequential merge. Uses a
-/// fresh per-file infer cache (the db is immutable during this pass, so a cold
-/// cache yields identical inference results) and a local clone of the workspace
-/// field-setter-helper registry (a deterministic memoization cache). This makes
-/// the collection safe to run concurrently across files.
-fn collect_dynamic_fields_for_file(
+/// The field-definition sites a statement contributes, as `(position among
+/// its assigned variables, indexed target, assigned value)`. A function
+/// statement defines a field where its dotted name is no member yet, and,
+/// where no class owns it, on the table a name holds when that table is a
+/// call's result, as an assignment to the same target does.
+fn field_definition_sites(
     db: &DbIndex,
     file_id: crate::FileId,
+    node: &LuaSyntaxNode,
+) -> Vec<(usize, glua_parser::LuaIndexExpr, Option<LuaExpr>)> {
+    if let Some(assign) = LuaAssignStat::cast(node.clone()) {
+        let exprs = assign.get_var_and_expr_list().1;
+        return indexed_targets(node)
+            .into_iter()
+            .map(|(var, index_expr)| (var, index_expr, exprs.get(var).cloned()))
+            .collect();
+    }
+    indexed_targets(node)
+        .into_iter()
+        .filter(|(_, index_expr)| {
+            let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
+            let owner = db.get_member_index().get_current_owner(&member_id);
+            let dotted = index_expr
+                .get_index_token()
+                .is_some_and(|token| !token.is_colon());
+            match owner {
+                None if dotted => true,
+                Some(owner) if extends_prototype_class(db, owner, member_id) => true,
+                Some(crate::LuaMemberOwner::Type(_)) => false,
+                _ => prefix_holds_call_result(db, file_id, index_expr),
+            }
+        })
+        .map(|(var, index_expr)| (var, index_expr, None))
+        .collect()
+}
+
+/// Whether a method is written through an instance of a prototype class, one
+/// whose table is its own `__index`: the tables built from such a class are
+/// ordinary tables each carrying the methods written on it, so a method one
+/// carries is one the class's instances may carry.
+fn extends_prototype_class(
+    db: &DbIndex,
+    owner: &crate::LuaMemberOwner,
+    member_id: LuaMemberId,
+) -> bool {
+    let crate::LuaMemberOwner::Type(type_id) = owner else {
+        return false;
+    };
+    db.get_member_index().is_member_owner_only(&member_id)
+        && db
+            .get_member_index()
+            .get_current_owner_members_for_key(owner, &LuaMemberKey::Name("__index".into()))
+            .into_iter()
+            .any(|member| {
+                db.get_type_index()
+                    .get_type_cache(&member.get_id().into())
+                    .is_some_and(|cache| {
+                        matches!(cache.as_type(), LuaType::Def(id) | LuaType::Ref(id) if id == type_id)
+                    })
+            })
+}
+
+/// Whether the prefix of `index_expr` is a name every declaration of which
+/// takes a call's result: a table made elsewhere, such as a factory's.
+fn prefix_holds_call_result(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    index_expr: &glua_parser::LuaIndexExpr,
+) -> bool {
+    let Some(LuaExpr::NameExpr(name_expr)) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let decl_index = db.get_decl_index();
+    let takes_call_result = |decl_id: &LuaDeclId| {
+        decl_index.get_decl(decl_id).is_some_and(|decl| {
+            decl.get_value_syntax_id()
+                .is_some_and(|value| value.get_kind() == LuaSyntaxKind::CallExpr)
+        })
+    };
+    if let Some(decl_id) = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, name_expr.get_range())
+    {
+        return takes_call_result(&decl_id);
+    }
+    name_expr.get_name_text().is_some_and(|name| {
+        db.get_global_index()
+            .get_global_decl_ids(&name)
+            .is_some_and(|decl_ids| !decl_ids.is_empty() && decl_ids.iter().all(takes_call_result))
+    })
+}
+
+/// Whether a node is a write site of its own: a statement with an indexed
+/// target, or a call with two or more arguments, which can set fields
+/// through `setmetatable` or a setter helper.
+pub(super) fn is_write_site(node: &LuaSyntaxNode) -> bool {
+    if let Some(call) = LuaCallExpr::cast(node.clone()) {
+        return call
+            .get_args_list()
+            .is_some_and(|args| args.get_args().nth(1).is_some());
+    }
+    defines_fields(node.kind()) && !indexed_targets(node).is_empty()
+}
+
+/// One file's indexed write targets and setmetatable calls, read off its
+/// syntax once per analysis pass: a pass rebuilds no source layer, so the
+/// file's syntax, declarations and local references hold for all of it.
+#[derive(Default)]
+pub(crate) struct FileWriteSites {
+    /// Every indexed target of an assignment or function statement, in the
+    /// order a walk of the file meets them.
+    targets: Vec<WriteTarget>,
+    /// The setmetatable calls of each binding scope, in tree order.
+    setmetatables: FxHashMap<LuaSyntaxId, Vec<LuaSyntaxId>>,
+    /// The positions each local of the file is reassigned at, sorted.
+    reassignments: std::sync::OnceLock<FxHashMap<LuaDeclId, Vec<TextSize>>>,
+}
+
+/// An indexed target of an assignment or function statement.
+struct WriteTarget {
+    statement: LuaSyntaxId,
+    /// The target's position among the statement's assigned variables.
+    var: usize,
+    /// The class of the target's prefix: two prefixes can name the same
+    /// variable only within one class. `None` for a prefix that names none.
+    prefix: Option<u32>,
+}
+
+impl FileWriteSites {
+    pub(crate) fn new(root: &glua_parser::LuaChunk) -> Self {
+        let mut classes = FxHashMap::<String, u32>::default();
+        let mut targets = Vec::new();
+        for node in root.syntax().descendants_matching(defines_fields) {
+            let statement = LuaSyntaxId::from_node(&node);
+            for (var, index_expr) in indexed_targets(&node) {
+                let prefix = index_expr
+                    .get_prefix_expr()
+                    .as_ref()
+                    .and_then(prefix_class)
+                    .map(|class| {
+                        let next = classes.len() as u32;
+                        *classes.entry(class).or_insert(next)
+                    });
+                targets.push(WriteTarget {
+                    statement,
+                    var,
+                    prefix,
+                });
+            }
+        }
+        let mut setmetatables = FxHashMap::<LuaSyntaxId, Vec<LuaSyntaxId>>::default();
+        for call in root.descendants::<LuaCallExpr>() {
+            if !call.is_setmetatable() {
+                continue;
+            }
+            if let Some(scope) = nearest_dynamic_field_binding_scope(call.syntax()) {
+                setmetatables
+                    .entry(LuaSyntaxId::from_node(&scope))
+                    .or_default()
+                    .push(call.get_syntax_id());
+            }
+        }
+        Self {
+            targets,
+            setmetatables,
+            reassignments: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Where the target at position `var` of `statement` is among the
+    /// targets.
+    fn target_at(&self, statement: LuaSyntaxId, var: usize) -> Option<usize> {
+        let order = |target: &WriteTarget| (target.statement.get_range().start(), target.var);
+        let key = (statement.get_range().start(), var);
+        let at = self.targets.partition_point(|target| order(target) < key);
+        self.targets
+            .get(at)
+            .is_some_and(|target| target.statement == statement && target.var == var)
+            .then_some(at)
+    }
+
+    fn reassignments(
+        &self,
+        db: &DbIndex,
+        file_id: crate::FileId,
+        root: &glua_parser::LuaChunk,
+    ) -> &FxHashMap<LuaDeclId, Vec<TextSize>> {
+        self.reassignments
+            .get_or_init(|| collect_local_reassignment_positions(db, file_id, root))
+    }
+}
+
+/// What a prefix's text says of the variable it names: a name, or an access
+/// path. Two prefixes that name the same variable have the same class; `None`
+/// for a prefix that names no variable.
+fn prefix_class(prefix: &LuaExpr) -> Option<String> {
+    match prefix {
+        LuaExpr::NameExpr(name_expr) => Some(format!("name {}", name_expr.get_name_text()?)),
+        LuaExpr::IndexExpr(index_expr) => Some(format!("path {}", index_expr.get_access_path()?)),
+        LuaExpr::CallExpr(call_expr) => Some(format!("path {}", raw_get_access_path(call_expr)?)),
+        _ => None,
+    }
+}
+
+/// A target the pass collects from: what it read of the target before
+/// inferring its prefix.
+struct ReachedTarget {
+    prefix_expr: LuaExpr,
+    definition_range: rowan::TextRange,
+    field_names: ResolvedDynamicFieldNames,
+    collect_finite_direct_assignment: bool,
+    should_collect_wildcard: bool,
+}
+
+/// The target `index_expr`, assigned `value_expr`, when the pass collects
+/// from it: it names fields, or writes through a key that may name any.
+fn reach_target(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
     root: &glua_parser::LuaChunk,
+    sites: &FileWriteSites,
     mode: DynamicFieldAnalysisMode,
-    field_setter_helpers: &FieldSetterHelperCache,
-) -> (
-    Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
-    Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
-    Vec<FiniteNamedMemberEvidence>,
-    std::collections::HashSet<LuaInferredGuardOwner>,
-    Vec<SmolStr>,
-) {
-    let mut collected_unattributed: Vec<SmolStr> = Vec::new();
-    let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
-        Vec::new();
-    let mut collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)> =
-        Vec::new();
-    let mut collected_finite_members = Vec::new();
-    let mut field_setter_helpers = field_setter_helpers.clone();
-    let mut cache = crate::LuaInferCache::new(
-        file_id,
-        crate::CacheOptions {
-            analysis_phase: crate::LuaAnalysisPhase::Force,
-            dynamic_fields_visible: true,
-            building_dynamic_field_index: true,
-        },
-    );
-    let cache = &mut cache;
-    let mut prefix_type_cache: FxHashMap<PrefixCacheKey, Option<LuaType>> = FxHashMap::default();
-    let mut local_reassignment_positions = None;
-    for node in root.syntax().descendants() {
-        for (index_expr, value_expr) in field_definition_sites(db, file_id, &node) {
-            let value_expr = value_expr.as_ref();
-            let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+    index_expr: &glua_parser::LuaIndexExpr,
+    value_expr: Option<&LuaExpr>,
+) -> Option<ReachedTarget> {
+    let prefix_expr = index_expr.get_prefix_expr()?;
+    let definition_range = index_expr.get_index_key().and_then(|k| k.get_range())?;
+    let copies_own_shape = value_expr
+        .is_some_and(|value_expr| copies_table_into_itself(db, cache, index_expr, value_expr));
+    if copies_own_shape
+        && let Some(LuaExpr::NameExpr(value)) = value_expr
+        && let Some(source) = for_range_pairs_source_for_var(db, cache.get_file_id(), value, 1)
+        && let Some(target) = get_var_expr_var_ref_id(db, cache, prefix_expr.clone())
+        && get_var_expr_var_ref_id(db, cache, source.source_expr).as_ref() == Some(&target)
+    {
+        return None;
+    }
+    let field_names = if copies_own_shape {
+        ResolvedDynamicFieldNames {
+            names: Vec::new(),
+            may_have_other_string_names: true,
+        }
+    } else {
+        get_field_names(db, cache, root, sites, index_expr)
+    };
+    let collect_finite_direct_assignment = mode.collect_finite_direct_assignments()
+        && is_dynamic_index_key(index_expr)
+        && !field_names.names.is_empty();
+    if mode.collects_only_declared_member_table_fields()
+        && !matches!(value_expr, Some(LuaExpr::TableExpr(_)))
+        && !collect_finite_direct_assignment
+    {
+        return None;
+    }
+    let should_collect_wildcard = mode.collect_direct_assignments()
+        && is_dynamic_index_key(index_expr)
+        && field_names.may_have_other_string_names;
+    if field_names.names.is_empty() && !should_collect_wildcard {
+        return None;
+    }
+    Some(ReachedTarget {
+        prefix_expr,
+        definition_range,
+        field_names,
+        collect_finite_direct_assignment,
+        should_collect_wildcard,
+    })
+}
+
+/// The type every write through `key` takes its prefix to have: the type
+/// inferred at the first target in tree order the pass collects from whose
+/// prefix names that reference, the target at `at` included, unless that type
+/// says nothing about the value, when this write's own prefix type is used. A
+/// prefix that names no variable is a reference of its own.
+fn shared_prefix_type(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    root: &glua_parser::LuaChunk,
+    sites: &FileWriteSites,
+    mode: DynamicFieldAnalysisMode,
+    at: Option<usize>,
+    key: &PrefixKey,
+    prefix_expr: &LuaExpr,
+) -> Option<LuaType> {
+    let file_id = cache.get_file_id();
+    if let (PrefixKey::Var(_), Some(at)) = (key, at)
+        && let Some(class) = sites.targets[at].prefix
+    {
+        for earlier in sites.targets[..at]
+            .iter()
+            .filter(|target| target.prefix == Some(class))
+        {
+            let Some(node) = earlier.statement.to_node_from_root(root.syntax()) else {
                 continue;
             };
-
-            let Some(definition_range) = index_expr.get_index_key().and_then(|k| k.get_range())
+            let Some((_, index_expr, value_expr)) = field_definition_sites(db, file_id, &node)
+                .into_iter()
+                .find(|(var, _, _)| *var == earlier.var)
             else {
                 continue;
             };
-
-            let field_names = get_field_names(
+            let Some(reached) = reach_target(
                 db,
                 cache,
                 root,
-                &mut local_reassignment_positions,
+                sites,
+                mode,
                 &index_expr,
-            );
-            let collect_finite_direct_assignment = mode.collect_finite_direct_assignments()
-                && is_dynamic_index_key(&index_expr)
-                && !field_names.names.is_empty();
-            if mode.collects_only_declared_member_table_fields()
-                && !matches!(value_expr, Some(LuaExpr::TableExpr(_)))
-                && !collect_finite_direct_assignment
-            {
-                continue;
-            }
-            let should_collect_wildcard = mode.collect_direct_assignments()
-                && is_dynamic_index_key(&index_expr)
-                && field_names.may_have_other_string_names;
-            if field_names.names.is_empty() && !should_collect_wildcard {
-                continue;
-            }
-
-            let cache_key = PrefixCacheKey::from_expr(db, cache, &prefix_expr);
-            let prefix_type = if let Some(cached_type) = prefix_type_cache.get(&cache_key) {
-                match cached_type {
-                    Some(prefix_type) => prefix_type.clone(),
-                    None => continue,
-                }
-            } else {
-                let inferred = infer_expr(db, cache, prefix_expr.clone()).ok();
-                prefix_type_cache.insert(cache_key, inferred.clone());
-                let Some(prefix_type) = inferred else {
-                    continue;
-                };
-                prefix_type
-            };
-
-            let effective_type = if let Some(metatable_type) =
-                infer_setmetatable_target_type(db, cache, &prefix_expr, index_expr.get_range())
-            {
-                metatable_type
-            } else {
-                prefix_type
-            };
-            if should_collect_wildcard {
-                collect_wildcard_for_type(
-                    &effective_type,
-                    file_id,
-                    definition_range,
-                    &mut collected_wildcards,
-                );
-            }
-
-            if is_dynamic_index_key(&index_expr) && !field_names.names.is_empty() {
-                collect_finite_member_for_type(
-                    &effective_type,
-                    LuaMemberId::new(index_expr.get_syntax_id(), file_id),
-                    file_id,
-                    definition_range,
-                    !field_names.may_have_other_string_names,
-                    &mut collected_finite_members,
-                );
-            }
-
-            if field_names.names.is_empty() {
+                value_expr.as_ref(),
+            ) else {
                 continue;
             };
-
-            for field_name in field_names.names {
-                if mode.collect_declared_member_table_fields()
-                    && let Some(value_expr) = value_expr
-                {
-                    let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
-                    collect_assigned_table_fields_for_declared_member(
-                        db,
-                        cache,
-                        &effective_type,
-                        &field_name,
-                        member_id,
-                        value_expr,
-                        file_id,
-                        &mut collected,
-                        &mut collected_finite_members,
-                    );
-                }
-                if mode.collect_direct_assignments() || collect_finite_direct_assignment {
-                    let before = collected.len();
-                    collect_for_type(
-                        &effective_type,
-                        &field_name,
-                        file_id,
-                        definition_range,
-                        &mut collected,
-                    );
-                    // The write is real but landed on no owner the index can
-                    // name, so record that the field exists somewhere even
-                    // though no table claims it.
-                    if collected.len() == before {
-                        collected_unattributed.push(field_name.clone());
-                    }
-                }
+            if PrefixKey::from_expr(db, cache, &reached.prefix_expr) == *key {
+                return infer_expr(db, cache, reached.prefix_expr)
+                    .ok()
+                    .filter(crate::db_index::is_informative_type)
+                    .or_else(|| infer_expr(db, cache, prefix_expr.clone()).ok());
             }
         }
     }
-    if mode.collect_setmetatable_tables() {
-        for call_expr in root.descendants::<LuaCallExpr>() {
-            collect_field_setter_helper_call_fields(
-                db,
-                cache,
-                &call_expr,
-                file_id,
-                &mut field_setter_helpers,
-                &mut collected,
-            );
-            collect_setmetatable_table_fields(
-                db,
-                cache,
-                &call_expr,
-                file_id,
-                &mut collected,
-                &mut collected_finite_members,
-            );
-        }
-    }
-    (
-        collected,
-        collected_wildcards,
-        collected_finite_members,
-        cache.take_inferred_guard_dependencies(),
-        collected_unattributed,
-    )
+    infer_expr(db, cache, prefix_expr.clone()).ok()
 }
 
-fn analyze_dynamic_fields(
-    db: &mut DbIndex,
-    context: &mut AnalyzeContext,
-    mode: DynamicFieldAnalysisMode,
-) {
-    let _p = Profile::cond_new("dynamic field analyze", context.tree_list.len() > 1);
-    let tree_list = context.tree_list.clone();
-    let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
-        Vec::new();
-    let mut collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)> =
-        Vec::new();
-    let mut collected_finite_members = Vec::new();
-    let stderr_profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
-    let profile_enabled = log::log_enabled!(log::Level::Info) || stderr_profile_enabled;
-    let mut profile = profile_enabled.then(DynamicFieldProfile::default);
-    let helper_start = profile_enabled.then(std::time::Instant::now);
-    let field_setter_helpers = if mode.collect_direct_assignments() {
-        let context_covers_workspace = context_covers_workspace(&*db, context, &tree_list);
-        FieldSetterHelperCache::from_tree_list(&tree_list, context_covers_workspace)
-    } else {
-        FieldSetterHelperCache::default()
-    };
-    if let (Some(profile), Some(helper_start)) = (profile.as_mut(), helper_start) {
-        profile.helper_cache_time += helper_start.elapsed();
-    }
-
-    // Collection is read-only against an immutable `&DbIndex` and writes only to
-    // per-file local buffers, so it runs concurrently across files. Results are
-    // concatenated in deterministic file order and merged into the db below.
-    let file_ids: Vec<crate::FileId> = tree_list.iter().map(|t| t.file_id).collect();
-    let collection_start = profile_enabled.then(std::time::Instant::now);
-    let per_file = super::parallel::map_files_collect(&*db, &file_ids, |db, file_id| {
-        let Some(root) = db
-            .get_vfs()
-            .get_syntax_tree(&file_id)
-            .map(|tree| tree.get_chunk_node())
-        else {
-            return (
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Default::default(),
-                Vec::new(),
-            );
-        };
-        collect_dynamic_fields_for_file(db, file_id, &root, mode, &field_setter_helpers)
-    });
-    if let (Some(profile), Some(collection_start)) = (profile.as_mut(), collection_start) {
-        profile.collection_time += collection_start.elapsed();
-    }
-    let merge_start = profile_enabled.then(std::time::Instant::now);
-    let mut collected_unattributed: Vec<(SmolStr, crate::FileId)> = Vec::new();
-    for (
-        (file_collected, file_wildcards, file_finite_members, dependencies, file_unattributed),
-        file_id,
-    ) in per_file.into_iter().zip(file_ids)
-    {
-        collected.extend(file_collected);
-        collected_wildcards.extend(file_wildcards);
-        collected_finite_members.extend(file_finite_members);
-        collected_unattributed.extend(
-            file_unattributed
-                .into_iter()
-                .map(|field_name| (field_name, file_id)),
-        );
-        context.add_inferred_guard_dependencies(file_id, dependencies);
-    }
-    if let (Some(profile), Some(merge_start)) = (profile.as_mut(), merge_start) {
-        profile.collection_merge_time += merge_start.elapsed();
-    }
-
-    let propagate_start = profile_enabled.then(std::time::Instant::now);
-    // Propagate dynamic fields to parent types so that e.g. a field assigned
-    // on `base_glide` (which extends `Entity`) is also visible when the variable
-    // is typed as `Entity`.  This avoids false-positive `undefined-field` when
-    // user code accesses entity fields through a base-class reference.
-    let mut propagated: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
-        Vec::new();
-    if mode.propagate_to_super_types() {
-        // The authoring globals of scripted-class scopes (`ENT`, `SWEP`,
-        // `TOOL`, `GM`, and their aliases) are supers of *every* per-file
-        // scoped class, so propagating there pools each file's fields onto
-        // one table the whole workspace writes. Those scopes are per-file
-        // by design: a `---@type SWEP` read is a read of the generic
-        // authoring table, not of any one weapon, so it should see the
-        // annotated `SWEP` fields and not every weapon's private ones.
-        let scoped_globals: FxHashSet<&str> = db
-            .get_emmyrc()
-            .gmod
-            .scripted_class_scopes
-            .resolved_definitions_slice()
-            .iter()
-            .flat_map(|definition| {
-                std::iter::once(definition.class_global.as_str())
-                    .chain(definition.aliases.iter().map(String::as_str))
-            })
-            .collect();
-        for (owner, field_name, file_id, range) in &collected {
-            let DynamicFieldOwner::Type(type_id) = owner else {
-                continue;
-            };
-            let mut super_types = Vec::new();
-            type_id.collect_super_types(&*db, &mut super_types);
-            for super_type in super_types {
-                if let LuaType::Ref(super_id) = &super_type
-                    && !scoped_globals.contains(super_id.get_name())
-                {
-                    propagated.push((
-                        DynamicFieldOwner::Type(super_id.clone()),
-                        field_name.clone(),
-                        *file_id,
-                        *range,
-                    ));
-                }
-            }
-        }
-    }
-    if let (Some(profile), Some(propagate_start)) = (profile.as_mut(), propagate_start) {
-        profile.propagation_time += propagate_start.elapsed();
-    }
-
-    let insert_start = profile_enabled.then(std::time::Instant::now);
-    let index = db.get_dynamic_field_index_mut();
-    for (field_name, file_id) in collected_unattributed {
-        index.add_unattributed_field(field_name, file_id);
-    }
-    for (owner, field_name, file_id, range) in &collected {
-        index.add_field(owner.clone(), field_name.clone(), *file_id, *range);
-    }
-    for (owner, field_name, file_id, range) in &propagated {
-        index.add_propagated_field(owner.clone(), field_name.clone(), *file_id, *range);
-    }
-    for (owner, file_id, range) in &collected_wildcards {
-        index.add_wildcard_definition(owner.clone(), *file_id, *range);
-    }
-    let wildcard_definitions = collected_wildcards.into_iter().collect::<FxHashSet<_>>();
-    for (owner, member_id, file_id, range, has_finite_domain) in collected_finite_members {
-        if has_finite_domain && !wildcard_definitions.contains(&(owner.clone(), file_id, range)) {
-            index.add_finite_named_member(owner, member_id);
-        } else {
-            index.remove_finite_named_member(&owner, member_id);
-        }
-    }
-    if let (Some(profile), Some(insert_start)) = (profile.as_mut(), insert_start) {
-        profile.insertion_time += insert_start.elapsed();
-    }
-    if let Some(profile) = profile {
-        profile.log(tree_list.len(), collected.len(), propagated.len());
-        if stderr_profile_enabled {
-            profile.print(tree_list.len(), collected.len(), propagated.len());
-        }
-    }
+/// What one write site files: the fields it writes on each owner, those
+/// propagated to the owners' super types, its wildcard definitions, its
+/// finite-member evidence and the names it writes on no owner.
+#[derive(Default)]
+pub(super) struct SiteDynamicFields {
+    named: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    propagated: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
+    finite: Vec<FiniteNamedMemberEvidence>,
+    unattributed: Vec<(SmolStr, rowan::TextRange)>,
 }
 
-fn collect_field_setter_helpers(
-    tree_list: &[InFiled<glua_parser::LuaChunk>],
-) -> (
-    FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>>,
-    FxHashSet<SmolStr>,
-) {
-    let mut helpers: FxHashMap<LuaSignatureId, Vec<FieldSetterHelper>> = FxHashMap::default();
-    let mut member_names = FxHashSet::default();
-
-    for in_filed_tree in tree_list {
-        let file_id = in_filed_tree.file_id;
-        let root = in_filed_tree.value.clone();
-        for closure in root.descendants::<LuaClosureExpr>() {
-            let signature_id = LuaSignatureId::from_closure(file_id, &closure);
-            let patterns = collect_field_setter_helpers_in_closure(&closure);
-            if !patterns.is_empty() {
-                helpers.insert(signature_id, patterns);
-                collect_helper_member_names_for_closure(&closure, &mut member_names);
-            }
-        }
-    }
-
-    (helpers, member_names)
-}
-
-fn context_covers_workspace(
+/// The fields one statement's targets write. Reads only immutable
+/// `&DbIndex` state plus the file's own AST, and writes nothing to the db.
+/// Infers through `cache` under [`collecting_view`]; memos it holds from
+/// other views are reused only where they consulted none of that view's
+/// gates.
+fn collect_statement_fields(
     db: &DbIndex,
-    context: &AnalyzeContext,
-    tree_list: &[InFiled<glua_parser::LuaChunk>],
-) -> bool {
-    let Some(workspace_id) = context.workspace_id else {
-        return false;
-    };
-
-    let tree_file_ids = tree_list
-        .iter()
-        .map(|in_filed_tree| in_filed_tree.file_id)
-        .collect::<FxHashSet<_>>();
-    let mut found_workspace_file = false;
-    for file_id in db.get_vfs().get_all_file_ids() {
-        if db.get_vfs().get_syntax_tree(&file_id).is_none() {
-            continue;
-        }
-
-        if db.get_module_index().get_workspace_id(file_id) != Some(workspace_id) {
-            continue;
-        }
-
-        found_workspace_file = true;
-        if !tree_file_ids.contains(&file_id) {
-            return false;
-        }
-    }
-
-    found_workspace_file
-}
-
-fn collect_helper_member_names_for_closure(
-    closure: &LuaClosureExpr,
-    member_names: &mut FxHashSet<SmolStr>,
+    cache: &mut crate::LuaInferCache,
+    root: &glua_parser::LuaChunk,
+    sites: &FileWriteSites,
+    mode: DynamicFieldAnalysisMode,
+    node: &LuaSyntaxNode,
+    fields: &mut SiteDynamicFields,
 ) {
-    for ancestor in closure.syntax().ancestors().skip(1) {
-        if let Some(func_stat) = LuaFuncStat::cast(ancestor.clone()) {
-            if let Some(func_name) = func_stat.get_func_name() {
-                collect_helper_member_name_from_var(&func_name, member_names);
-            }
-            return;
+    let file_id = cache.get_file_id();
+    let statement = LuaSyntaxId::from_node(node);
+    // The records are what this pass is building. A cold build has none yet,
+    // and a re-index of some sites has the rest of the workspace's, with the
+    // re-indexed sites' contributions removed: a partial record that names a
+    // different table than the complete one will. Neither is read here, so
+    // both builds decide the same way.
+    for (var, index_expr, value_expr) in field_definition_sites(db, file_id, node) {
+        let value_expr = value_expr.as_ref();
+        let Some(ReachedTarget {
+            prefix_expr,
+            definition_range,
+            field_names,
+            collect_finite_direct_assignment,
+            should_collect_wildcard,
+        }) = reach_target(db, cache, root, sites, mode, &index_expr, value_expr)
+        else {
+            continue;
+        };
+
+        let key = PrefixKey::from_expr(db, cache, &prefix_expr);
+        let at = sites.target_at(statement, var);
+        let Some(prefix_type) =
+            shared_prefix_type(db, cache, root, sites, mode, at, &key, &prefix_expr)
+        else {
+            continue;
+        };
+
+        let effective_type = if let Some(metatable_type) = infer_setmetatable_target_type(
+            db,
+            cache,
+            root,
+            sites,
+            &prefix_expr,
+            index_expr.get_range(),
+        ) {
+            metatable_type
+        } else {
+            prefix_type
+        };
+        // A method defined on a call's result reaches the table a factory made,
+        // not a class instance whose other instances lack it.
+        let made_table = match &effective_type {
+            LuaType::Instance(instance) => instance.get_base(),
+            typ => typ,
+        };
+        let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
+        let owner = db.get_member_index().get_current_owner(&member_id);
+        if value_expr.is_none()
+            && LuaFuncStat::cast(node.clone()).is_some()
+            && !matches!(made_table, LuaType::TableConst(_))
+            && owner.is_some_and(|owner| !extends_prototype_class(db, owner, member_id))
+        {
+            continue;
+        }
+        if should_collect_wildcard {
+            collect_wildcard_for_type(
+                db,
+                &effective_type,
+                file_id,
+                definition_range,
+                &mut fields.wildcards,
+            );
         }
 
-        if let Some(assign) = LuaAssignStat::cast(ancestor.clone()) {
-            let (vars, exprs) = assign.get_var_and_expr_list();
-            for (var, expr) in vars.iter().zip(exprs.iter()) {
-                if expr.syntax() == closure.syntax() {
-                    collect_helper_member_name_from_var(var, member_names);
-                }
-            }
-            return;
+        if is_dynamic_index_key(&index_expr) && !field_names.names.is_empty() {
+            collect_finite_member_for_type(
+                db,
+                &effective_type,
+                LuaMemberId::new(index_expr.get_syntax_id(), file_id),
+                file_id,
+                definition_range,
+                !field_names.may_have_other_string_names,
+                &mut fields.finite,
+            );
         }
 
-        if LuaTableField::can_cast(ancestor.kind().into()) {
-            if let Some(field) = LuaTableField::cast(ancestor) {
-                if let Some(field_key) = field.get_field_key() {
-                    collect_helper_member_name_from_key(&field_key, member_names);
+        if field_names.names.is_empty() {
+            continue;
+        };
+
+        // Target-local buffers: super-type propagation runs per target.
+        let mut target_named: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
+            Vec::new();
+        let mut per_call_bases: Vec<CollectedField> = Vec::new();
+        for field_name in field_names.names {
+            if mode.collect_declared_member_table_fields()
+                && let Some(value_expr) = value_expr
+            {
+                let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
+                collect_assigned_table_fields_for_declared_member(
+                    db,
+                    cache,
+                    &effective_type,
+                    &field_name,
+                    member_id,
+                    value_expr,
+                    file_id,
+                    &mut target_named,
+                    &mut fields.finite,
+                );
+            }
+            if mode.collect_direct_assignments() || collect_finite_direct_assignment {
+                let before = target_named.len();
+                collect_for_written_type(
+                    db,
+                    &effective_type,
+                    &field_name,
+                    file_id,
+                    definition_range,
+                    &mut target_named,
+                    &mut per_call_bases,
+                );
+                // The write is real but landed on no owner the index can
+                // name, so record that the field exists somewhere even
+                // though no table claims it.
+                if target_named.len() == before {
+                    fields
+                        .unattributed
+                        .push((field_name.clone(), definition_range));
                 }
             }
-            return;
         }
+        if mode.propagate_to_super_types() {
+            fields
+                .propagated
+                .extend(propagate_dynamic_fields_to_super_types(db, &target_named));
+            fields
+                .propagated
+                .extend(propagate_dynamic_fields_to_super_types(db, &per_call_bases));
+        }
+        fields.propagated.extend(per_call_bases);
+        fields.named.extend(target_named);
     }
 }
 
-fn collect_helper_member_name_from_var(var: &LuaVarExpr, member_names: &mut FxHashSet<SmolStr>) {
-    let LuaVarExpr::IndexExpr(index_expr) = var else {
+/// The fields one call sets through a setter helper or `setmetatable`.
+fn collect_call_fields(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    mode: DynamicFieldAnalysisMode,
+    call_expr: &LuaCallExpr,
+    fields: &mut SiteDynamicFields,
+) {
+    if !mode.collect_setmetatable_tables() {
         return;
-    };
-    if let Some(member_name) = simple_index_key_name(index_expr) {
-        member_names.insert(member_name);
+    }
+    let file_id = cache.get_file_id();
+    collect_field_setter_helper_call_fields(db, cache, call_expr, file_id, &mut fields.named);
+    collect_setmetatable_table_fields(
+        db,
+        cache,
+        call_expr,
+        file_id,
+        &mut fields.named,
+        &mut fields.finite,
+    );
+    if mode.propagate_to_super_types() {
+        fields.propagated = propagate_dynamic_fields_to_super_types(db, &fields.named);
     }
 }
 
-fn collect_helper_member_name_from_key(key: &LuaIndexKey, member_names: &mut FxHashSet<SmolStr>) {
-    if let Some(member_name) = simple_key_name(key) {
-        member_names.insert(member_name);
+/// The view dynamic fields are collected under: the records this pass builds
+/// are not read while building them.
+fn collecting_view() -> crate::CacheOptions {
+    crate::CacheOptions {
+        analysis_phase: crate::LuaAnalysisPhase::Force,
+        dynamic_fields_visible: false,
+        call_site_params_visible: false,
     }
 }
 
-fn collect_field_setter_helpers_in_closure(closure: &LuaClosureExpr) -> Vec<FieldSetterHelper> {
-    let Some(params_list) = closure.get_params_list() else {
-        return Vec::new();
+/// The fields the write site `site` of the cache's file writes, inferred
+/// through `cache` (its memo) under [`collecting_view`]; the cache's own view
+/// is restored afterwards.
+pub(super) fn compute_site_dynamic_fields(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    sites: &FileWriteSites,
+    site: LuaSyntaxId,
+) -> SiteDynamicFields {
+    let mut fields = SiteDynamicFields::default();
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&cache.get_file_id())
+        .map(|tree| tree.get_chunk_node())
+    else {
+        return fields;
     };
-    let param_names = params_list
-        .get_params()
-        .filter_map(|param| {
-            param
-                .get_name_token()
-                .map(|token| token.get_name_text().to_string())
-        })
-        .collect::<Vec<_>>();
-    if param_names.len() < 2 {
-        return Vec::new();
+    let Some(node) = site.to_node_from_root(root.syntax()) else {
+        return fields;
+    };
+    let view = std::mem::replace(cache.config_mut(), collecting_view());
+    let mode = DynamicFieldAnalysisMode::Full;
+    match LuaCallExpr::cast(node.clone()) {
+        Some(call_expr) => collect_call_fields(db, cache, mode, &call_expr, &mut fields),
+        None => collect_statement_fields(db, cache, &root, sites, mode, &node, &mut fields),
     }
+    *cache.config_mut() = view;
+    fields
+}
 
-    let Some(block) = closure.get_block() else {
-        return Vec::new();
-    };
+/// Stores the fields a write site found, filed under the site.
+pub(super) fn apply_site_dynamic_fields(
+    db: &mut DbIndex,
+    site: &InFiled<rowan::TextRange>,
+    fields: SiteDynamicFields,
+) {
+    let SiteDynamicFields {
+        named,
+        propagated,
+        wildcards,
+        finite,
+        unattributed,
+    } = fields;
+    // Owners were canonicalized at push, and super-type propagation ran per
+    // target.
+    let index = db.get_dynamic_field_index_mut();
+    for (field_name, range) in unattributed {
+        index.add_unattributed_field(site, field_name, range);
+    }
+    for (owner, field_name, _, range) in named {
+        index.add_field(site, owner, field_name, range);
+    }
+    for (owner, field_name, _, range) in propagated {
+        index.add_propagated_field(site, owner, field_name, range);
+    }
+    let wildcard_definitions = wildcards.iter().cloned().collect::<FxHashSet<_>>();
+    for (owner, _, range) in wildcards {
+        index.add_wildcard_definition(site, owner, range);
+    }
+    for (owner, member_id, file_id, range, has_finite_domain) in finite {
+        if has_finite_domain && !wildcard_definitions.contains(&(owner.clone(), file_id, range)) {
+            index.add_finite_named_member(site, owner, member_id);
+        } else {
+            index.remove_finite_named_member(site, &owner, member_id);
+        }
+    }
+}
 
-    let mut helpers = Vec::new();
-    for assign in block.descendants::<LuaAssignStat>() {
-        if assign.ancestors::<LuaClosureExpr>().next().as_ref() != Some(closure) {
+pub(super) fn collect_field_setter_helpers(
+    root: &glua_parser::LuaChunk,
+) -> FxHashMap<TextSize, Vec<FieldSetterHelper>> {
+    let mut helpers: FxHashMap<TextSize, Vec<FieldSetterHelper>> = FxHashMap::default();
+    for assign in root.descendants::<LuaAssignStat>() {
+        let Some(closure) = assign.ancestors::<LuaClosureExpr>().next() else {
+            continue;
+        };
+        let Some(params_list) = closure.get_params_list() else {
+            continue;
+        };
+        let param_names = params_list
+            .get_params()
+            .filter_map(|param| {
+                param
+                    .get_name_token()
+                    .map(|token| token.get_name_text().to_string())
+            })
+            .collect::<Vec<_>>();
+        if param_names.len() < 2 {
             continue;
         }
 
@@ -711,10 +773,13 @@ fn collect_field_setter_helpers_in_closure(closure: &LuaClosureExpr) -> Vec<Fiel
                 continue;
             };
 
-            helpers.push(FieldSetterHelper {
-                table_param_index,
-                key_param_index,
-            });
+            helpers
+                .entry(closure.get_position())
+                .or_default()
+                .push(FieldSetterHelper {
+                    table_param_index,
+                    key_param_index,
+                });
         }
     }
 
@@ -726,7 +791,6 @@ fn collect_field_setter_helper_call_fields(
     cache: &mut crate::LuaInferCache,
     call_expr: &LuaCallExpr,
     file_id: crate::FileId,
-    helpers: &mut FieldSetterHelperCache,
     collected: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
 ) {
     let Some(args_list) = call_expr.get_args_list() else {
@@ -743,7 +807,7 @@ fn collect_field_setter_helper_call_fields(
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return;
     };
-    let helper_patterns = helper_patterns_for_call(db, cache, &prefix_expr, helpers);
+    let helper_patterns = helper_patterns_for_call(db, cache, &prefix_expr);
     if helper_patterns.is_empty() {
         return;
     };
@@ -769,6 +833,7 @@ fn collect_field_setter_helper_call_fields(
 
         for field_name in field_names {
             collect_for_type(
+                db,
                 &table_type,
                 &field_name,
                 file_id,
@@ -797,56 +862,45 @@ fn helper_patterns_for_call(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     prefix_expr: &LuaExpr,
-    helpers: &mut FieldSetterHelperCache,
 ) -> Vec<FieldSetterHelper> {
     if let LuaExpr::NameExpr(name_expr) = prefix_expr
         && let Some(signature_id) = direct_name_expr_signature_id(db, cache, name_expr)
     {
-        return helpers.patterns_for_signature(db, signature_id);
+        return patterns_for_signature(db, signature_id);
     }
 
-    if helpers.definitely_has_no_helpers() {
-        return Vec::new();
-    }
-
-    helper_patterns_for_call_fallback(db, cache, prefix_expr, helpers)
+    helper_patterns_for_call_fallback(db, cache, prefix_expr)
 }
 
 fn helper_patterns_for_call_fallback(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     prefix_expr: &LuaExpr,
-    helpers: &mut FieldSetterHelperCache,
 ) -> Vec<FieldSetterHelper> {
-    if helpers.definitely_not_member_helper_call(prefix_expr) {
-        return Vec::new();
-    }
-
     let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
         return Vec::new();
     };
 
     let mut result = Vec::new();
-    collect_helper_patterns_from_type(db, &prefix_type, helpers, &mut result);
+    collect_helper_patterns_from_type(db, &prefix_type, &mut result);
     result
 }
 
 fn collect_helper_patterns_from_type(
     db: &DbIndex,
     typ: &LuaType,
-    helpers: &mut FieldSetterHelperCache,
     result: &mut Vec<FieldSetterHelper>,
 ) {
     match typ {
         LuaType::Signature(signature_id) => {
-            result.extend(helpers.patterns_for_signature(db, *signature_id));
+            result.extend(patterns_for_signature(db, *signature_id));
         }
         LuaType::Union(union_type) => {
             for typ in union_type.types() {
-                collect_helper_patterns_from_type(db, typ, helpers, result);
+                collect_helper_patterns_from_type(db, typ, result);
             }
         }
-        LuaType::TypeGuard(inner) => collect_helper_patterns_from_type(db, inner, helpers, result),
+        LuaType::TypeGuard(inner) => collect_helper_patterns_from_type(db, inner, result),
         _ => {}
     }
 }
@@ -861,40 +915,8 @@ fn direct_name_expr_signature_id(
         .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())?;
     let decl = db.get_decl_index().get_decl(&decl_id)?;
     let value_syntax_id = decl.get_value_syntax_id()?;
-    let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
-    let value_expr = LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)?;
-    let LuaExpr::ClosureExpr(closure) = value_expr else {
-        return None;
-    };
-
-    Some(LuaSignatureId::from_closure(decl.get_file_id(), &closure))
-}
-
-fn simple_index_key_name(index_expr: &glua_parser::LuaIndexExpr) -> Option<SmolStr> {
-    simple_key_name(&index_expr.get_index_key()?)
-}
-
-fn simple_key_name(key: &LuaIndexKey) -> Option<SmolStr> {
-    match key {
-        LuaIndexKey::Name(name) => Some(name.get_name_text().into()),
-        LuaIndexKey::String(string) => Some(string.get_value().into()),
-        _ => None,
-    }
-}
-
-fn collect_field_setter_helpers_for_signature(
-    db: &DbIndex,
-    signature_id: LuaSignatureId,
-) -> Vec<FieldSetterHelper> {
-    let Some(tree) = db.get_vfs().get_syntax_tree(&signature_id.get_file_id()) else {
-        return Vec::new();
-    };
-
-    tree.get_chunk_node()
-        .descendants::<LuaClosureExpr>()
-        .find(|closure| closure.get_position() == signature_id.get_position())
-        .map(|closure| collect_field_setter_helpers_in_closure(&closure))
-        .unwrap_or_default()
+    (value_syntax_id.get_kind() == LuaSyntaxKind::ClosureExpr)
+        .then(|| LuaSignatureId::new(decl.get_file_id(), value_syntax_id.get_range().start()))
 }
 
 fn param_index_key_index(key: &LuaIndexKey, param_names: &[String]) -> Option<usize> {
@@ -912,57 +934,6 @@ fn param_expr_index(expr: &LuaExpr, param_names: &[String]) -> Option<usize> {
     param_names
         .iter()
         .position(|param_name| *param_name == name)
-}
-
-#[derive(Default)]
-struct DynamicFieldProfile {
-    assignments_scanned: usize,
-    vars_scanned: usize,
-    index_candidates: usize,
-    no_field_name_skips: usize,
-    calls_scanned: usize,
-    fields_collected: usize,
-    owner_cache_hits: usize,
-    owner_cache_misses: usize,
-    owner_infer_time: Duration,
-    helper_cache_time: Duration,
-    collection_time: Duration,
-    collection_merge_time: Duration,
-    propagation_time: Duration,
-    insertion_time: Duration,
-}
-
-impl DynamicFieldProfile {
-    fn summary(&self, file_count: usize, collected: usize, propagated: usize) -> String {
-        format!(
-            "dynamic field profile: files={} assignments={} vars={} index_candidates={} no_field_name_skips={} calls={} fields_collected={} collected_entries={} propagated={} owner_cache_hits={} owner_cache_misses={} owner_infer_time={:?} helper_cache_time={:?} collection_time={:?} collection_merge_time={:?} propagation_time={:?} insertion_time={:?}",
-            file_count,
-            self.assignments_scanned,
-            self.vars_scanned,
-            self.index_candidates,
-            self.no_field_name_skips,
-            self.calls_scanned,
-            self.fields_collected,
-            collected,
-            propagated,
-            self.owner_cache_hits,
-            self.owner_cache_misses,
-            self.owner_infer_time,
-            self.helper_cache_time,
-            self.collection_time,
-            self.collection_merge_time,
-            self.propagation_time,
-            self.insertion_time,
-        )
-    }
-
-    fn log(&self, file_count: usize, collected: usize, propagated: usize) {
-        log::info!("{}", self.summary(file_count, collected, propagated));
-    }
-
-    fn print(&self, file_count: usize, collected: usize, propagated: usize) {
-        eprintln!("{}", self.summary(file_count, collected, propagated));
-    }
 }
 
 fn collect_setmetatable_table_fields(
@@ -1037,6 +1008,7 @@ fn collect_nested_table_field(
 
     if is_expression_key {
         collect_finite_member_for_type(
+            db,
             owner_type,
             LuaMemberId::new(field.get_syntax_id(), file_id),
             file_id,
@@ -1048,6 +1020,7 @@ fn collect_nested_table_field(
 
     for field_name in field_names {
         collect_for_type(
+            db,
             owner_type,
             &field_name,
             file_id,
@@ -1160,83 +1133,44 @@ fn find_declared_member_types_for_dynamic_field(
     current_member_type.map(|(_, member_type)| vec![member_type])
 }
 
+/// The `__index` type of the last `setmetatable` in the prefix's binding
+/// scope that ends before the assignment and binds the prefix's variable.
 fn infer_setmetatable_target_type(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
+    root: &glua_parser::LuaChunk,
+    sites: &FileWriteSites,
     prefix_expr: &LuaExpr,
     assignment_range: rowan::TextRange,
 ) -> Option<LuaType> {
     let prefix_var_ref_id = get_var_expr_var_ref_id(db, cache, prefix_expr.clone())?;
     let scope = nearest_dynamic_field_binding_scope(prefix_expr.syntax())?;
-    let scope_range = scope.text_range();
-    if !cache
-        .dynamic_field_scope_metatable_cache
-        .contains_key(&scope_range)
-    {
-        let bindings = collect_setmetatable_bindings_by_var_in_scope(db, cache, &scope);
-        cache
-            .dynamic_field_scope_metatable_cache
-            .insert(scope_range, bindings);
-    }
-
-    cache
-        .dynamic_field_scope_metatable_cache
-        .get(&scope_range)?
-        .get(&prefix_var_ref_id)?
+    sites
+        .setmetatables
+        .get(&LuaSyntaxId::from_node(&scope))?
         .iter()
-        .take_while(|(range, _)| range.end() <= assignment_range.start())
-        .last()
-        .map(|(_, target_type)| target_type.clone())
+        .rev()
+        .filter(|call| call.get_range().end() <= assignment_range.start())
+        .filter_map(|call| LuaCallExpr::cast(call.to_node_from_root(root.syntax())?))
+        .find_map(|call_expr| setmetatable_binding(db, cache, &call_expr, &prefix_var_ref_id))
 }
 
-fn collect_setmetatable_bindings_by_var_in_scope(
+/// The `__index` type a two-argument `setmetatable` call gives `var` when its
+/// first argument is that variable.
+fn setmetatable_binding(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
-    scope: &LuaSyntaxNode,
-) -> FxHashMap<VarRefId, Vec<(rowan::TextRange, LuaType)>> {
-    let mut bindings_by_var: FxHashMap<VarRefId, Vec<(rowan::TextRange, LuaType)>> =
-        FxHashMap::default();
-    for node in scope.descendants() {
-        let Some(call_expr) = LuaCallExpr::cast(node) else {
-            continue;
-        };
-        let Some(call_scope) = nearest_dynamic_field_binding_scope(call_expr.syntax()) else {
-            continue;
-        };
-        if call_scope != scope.clone() {
-            continue;
-        }
-
-        if !call_expr.is_setmetatable() {
-            continue;
-        }
-
-        let Some(arg_list) = call_expr.get_args_list() else {
-            continue;
-        };
-        let args = arg_list.get_args().collect::<Vec<_>>();
-        if args.len() != 2 {
-            continue;
-        }
-
-        let Some(target_var_ref_id) = get_var_expr_var_ref_id(db, cache, args[0].clone()) else {
-            continue;
-        };
-
-        if let Some(target_type) = infer_metatable_index_type_for_dynamic_field(db, cache, &args[1])
-        {
-            bindings_by_var
-                .entry(target_var_ref_id)
-                .or_default()
-                .push((call_expr.get_range(), target_type));
-        }
+    call_expr: &LuaCallExpr,
+    var: &VarRefId,
+) -> Option<LuaType> {
+    let args = call_expr.get_args_list()?.get_args().collect::<Vec<_>>();
+    if args.len() != 2 {
+        return None;
     }
-
-    for bindings in bindings_by_var.values_mut() {
-        bindings.sort_by_key(|(range, _)| range.start());
+    if get_var_expr_var_ref_id(db, cache, args[0].clone())? != *var {
+        return None;
     }
-
-    bindings_by_var
+    infer_metatable_index_type_for_dynamic_field(db, cache, &args[1])
 }
 
 fn nearest_dynamic_field_binding_scope(node: &LuaSyntaxNode) -> Option<LuaSyntaxNode> {
@@ -1345,7 +1279,7 @@ fn get_field_names(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     root: &glua_parser::LuaChunk,
-    local_reassignment_positions: &mut Option<FxHashMap<LuaDeclId, Vec<TextSize>>>,
+    sites: &FileWriteSites,
     index_expr: &glua_parser::LuaIndexExpr,
 ) -> ResolvedDynamicFieldNames {
     let Some(key) = index_expr.get_index_key() else {
@@ -1361,13 +1295,10 @@ fn get_field_names(
             may_have_other_string_names: false,
         },
         LuaIndexKey::Expr(expr) => {
-            let for_range_names =
-                field_names_from_for_range_pairs_key(db, cache.get_file_id(), expr.clone());
+            let for_range_names = field_names_from_for_range_pairs_key(db, cache, expr.clone());
             if let Some(for_range_names) = for_range_names {
                 let local_reassignment_positions =
-                    local_reassignment_positions.get_or_insert_with(|| {
-                        collect_local_reassignment_positions(db, cache.get_file_id(), root)
-                    });
+                    sites.reassignments(db, cache.get_file_id(), root);
                 let key_position = index_expr
                     .get_index_key()
                     .and_then(|key| key.get_range())
@@ -1384,7 +1315,7 @@ fn get_field_names(
                 };
             }
 
-            let names = string_const_names(&infer_expr(db, cache, expr.clone()).ok());
+            let names = string_const_names(&computed_key_type(db, cache, &expr));
             if !names.is_empty() {
                 return ResolvedDynamicFieldNames {
                     names,
@@ -1405,6 +1336,28 @@ fn get_field_names(
         }
         _ => ResolvedDynamicFieldNames::default(),
     }
+}
+
+/// A computed key's type as this pass may read it. A loop variable's stored
+/// type was settled with the fields this pass builds visible: read back, a
+/// field it named would name itself again after whatever first gave it was
+/// gone. So its type is inferred from its loop's iterator, under this pass's
+/// view.
+fn computed_key_type(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    expr: &LuaExpr,
+) -> Option<LuaType> {
+    if let LuaExpr::NameExpr(name_expr) = expr
+        && let Some(decl_id) = db
+            .get_reference_index()
+            .get_local_reference(&cache.get_file_id())
+            .and_then(|references| references.get_decl_id(&name_expr.get_range()))
+        && declaring_for_range(name_expr.syntax(), decl_id).is_some()
+    {
+        return try_infer_enclosing_for_range_iter_type(db, cache, name_expr.syntax(), decl_id);
+    }
+    infer_expr(db, cache, expr.clone()).ok()
 }
 
 fn collect_local_reassignment_positions(
@@ -1470,7 +1423,7 @@ fn finite_dynamic_key_strings(
     expr: &LuaExpr,
     visiting: &mut FxHashSet<LuaDeclId>,
 ) -> Vec<SmolStr> {
-    let inferred = string_const_names(&infer_expr(db, cache, expr.clone()).ok());
+    let inferred = string_const_names(&computed_key_type(db, cache, expr));
     if !inferred.is_empty() {
         return inferred;
     }
@@ -1521,16 +1474,10 @@ fn finite_dynamic_key_strings(
 }
 
 fn local_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<LuaExpr> {
-    let decl = db.get_decl_index().get_decl(&decl_id)?;
-    let initializer = decl.get_initializer()?;
-    if initializer.get_ret_idx() != 0 {
-        return None;
+    match crate::semantic::local_initializer_expr(db, decl_id)? {
+        (0, initializer) => Some(initializer),
+        _ => None,
     }
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&decl_id.file_id)?
-        .get_red_root();
-    LuaExpr::cast(initializer.get_expr_syntax_id().to_node_from_root(&root)?)
 }
 
 fn concatenate_finite_strings(left: &[SmolStr], right: &[SmolStr]) -> Vec<SmolStr> {
@@ -1659,32 +1606,32 @@ fn infer_integer_const(
     }
 }
 
-fn field_names_from_for_range_pairs_key(
+/// The single argument of the `pairs(..)` a `for ... in` loop iterates, when
+/// `name_expr` names that loop's `var_index`-th variable.
+pub(crate) struct ForRangePairsSource {
+    pub(crate) iter_decl_id: LuaDeclId,
+    pub(crate) source_expr: LuaExpr,
+}
+
+pub(crate) fn for_range_pairs_source_for_var(
     db: &DbIndex,
     file_id: crate::FileId,
-    key_expr: LuaExpr,
-) -> Option<ForRangePairsFieldNames> {
-    let LuaExpr::NameExpr(name_expr) = key_expr else {
-        return None;
-    };
-    let name_text = name_expr.get_name_text()?;
-    let for_range = name_expr
-        .syntax()
-        .ancestors()
-        .find_map(LuaForRangeStat::cast)?;
-
-    let iter_name = for_range.get_var_name_list().next()?;
-    if iter_name.get_name_text() != name_text {
-        return None;
-    }
-    let iter_decl_id = LuaDeclId::new(file_id, iter_name.get_position());
-    let key_decl_id = db
+    name_expr: &glua_parser::LuaNameExpr,
+    var_index: usize,
+) -> Option<ForRangePairsSource> {
+    let name_decl_id = db
         .get_reference_index()
         .get_local_reference(&file_id)?
         .get_decl_id(&name_expr.get_range())?;
-    if key_decl_id != iter_decl_id {
-        return None;
-    }
+    let (for_range, iter_decl_id) = name_expr
+        .syntax()
+        .ancestors()
+        .filter_map(LuaForRangeStat::cast)
+        .find_map(|for_range| {
+            let iter_name = for_range.get_var_name_list().nth(var_index)?;
+            let iter_decl_id = LuaDeclId::new(file_id, iter_name.get_position());
+            (iter_decl_id == name_decl_id).then_some((for_range, iter_decl_id))
+        })?;
 
     let mut iter_exprs = for_range.get_expr_list();
     let Some(LuaExpr::CallExpr(call_expr)) = iter_exprs.next() else {
@@ -1695,24 +1642,117 @@ fn field_names_from_for_range_pairs_key(
     }
 
     let args_list = call_expr.get_args_list()?;
-    let table_expr = if args_list.is_single_arg_no_parens() {
+    let source_expr = if args_list.is_single_arg_no_parens() {
         match args_list.get_single_arg_expr()? {
-            glua_parser::LuaSingleArgExpr::TableExpr(table_expr) => table_expr,
-            glua_parser::LuaSingleArgExpr::LiteralExpr(_) => return None,
+            glua_parser::LuaSingleArgExpr::TableExpr(table_expr) => LuaExpr::TableExpr(table_expr),
+            glua_parser::LuaSingleArgExpr::LiteralExpr(literal) => LuaExpr::LiteralExpr(literal),
         }
     } else {
         let mut args = args_list.get_args();
-        let Some(LuaExpr::TableExpr(table_expr)) = args.next() else {
-            return None;
-        };
+        let source_expr = args.next()?;
         if args.next().is_some() {
             return None;
         }
-        table_expr
+        source_expr
     };
 
-    let (mut names, may_have_other_string_names) =
-        field_names_from_pairs_table_expr_keys(&table_expr);
+    Some(ForRangePairsSource {
+        iter_decl_id,
+        source_expr,
+    })
+}
+
+/// The `pairs` loop a write `t[k]` takes its key from, when `k` is that
+/// loop's key variable, not reassigned before the write, and every table the
+/// loop can iterate is `t`: each key the write names is one `t` already has.
+pub(crate) fn writes_own_pairs_key(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    index_expr: &glua_parser::LuaIndexExpr,
+) -> Option<ForRangePairsSource> {
+    let file_id = cache.get_file_id();
+    let Some(LuaIndexKey::Expr(LuaExpr::NameExpr(key_name))) = index_expr.get_index_key() else {
+        return None;
+    };
+    let key = for_range_pairs_source_for_var(db, file_id, &key_name, 0)?;
+    if !unreassigned_before(db, file_id, &key.iter_decl_id, index_expr) {
+        return None;
+    }
+    let member_index = db.get_member_index();
+    let target = member_index
+        .get_member_owner(&LuaMemberId::new(index_expr.get_syntax_id(), file_id))
+        .cloned()?;
+    let target = member_index.canonical_owner(target);
+    let source_type = infer_expr(db, cache, key.source_expr.clone()).ok()?;
+    let mut sources = Vec::new();
+    (collect_pairs_source_owners(&source_type, &mut sources)
+        && !sources.is_empty()
+        && sources
+            .into_iter()
+            .all(|source| member_index.canonical_owner(source) == target))
+    .then_some(key)
+}
+
+/// Whether a write `t[k] = v` copies `t` into itself: `k` and `v` are the key
+/// and value variables of one builtin `pairs` loop, neither reassigned before
+/// the write, and every table that loop can iterate is `t`. Each field is
+/// written back onto itself, so the copy gives no field a value it does not
+/// already hold.
+pub(crate) fn copies_table_into_itself(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    index_expr: &glua_parser::LuaIndexExpr,
+    value_expr: &LuaExpr,
+) -> bool {
+    let file_id = cache.get_file_id();
+    let LuaExpr::NameExpr(value_name) = value_expr else {
+        return false;
+    };
+    let Some(value) = for_range_pairs_source_for_var(db, file_id, value_name, 1) else {
+        return false;
+    };
+    unreassigned_before(db, file_id, &value.iter_decl_id, index_expr)
+        && writes_own_pairs_key(db, cache, index_expr)
+            .is_some_and(|key| key.source_expr.get_range() == value.source_expr.get_range())
+}
+
+/// Whether the local `decl_id` is not reassigned before `index_expr`.
+fn unreassigned_before(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    decl_id: &LuaDeclId,
+    index_expr: &glua_parser::LuaIndexExpr,
+) -> bool {
+    db.get_reference_index()
+        .first_local_reassignment(file_id, decl_id)
+        .is_none_or(|position| position >= index_expr.get_position())
+}
+
+fn field_names_from_for_range_pairs_key(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    key_expr: LuaExpr,
+) -> Option<ForRangePairsFieldNames> {
+    let LuaExpr::NameExpr(name_expr) = key_expr else {
+        return None;
+    };
+    let ForRangePairsSource {
+        iter_decl_id,
+        source_expr,
+    } = for_range_pairs_source_for_var(db, cache.get_file_id(), &name_expr, 0)?;
+
+    let (mut names, may_have_other_string_names) = match source_expr {
+        LuaExpr::TableExpr(table_expr) => field_names_from_pairs_table_expr_keys(&table_expr),
+        // The keys a table was written with are read off its members, not
+        // off the loop variable's type: that type is the union of those keys
+        // only until a computed-key write joins the table, when it collapses
+        // to `string` and names nothing -- and whether that write has joined
+        // yet is a property of how far the batch has settled.
+        source_expr => {
+            let source_type = infer_expr(db, cache, source_expr).ok()?;
+            field_names_from_member_keys(db, &source_type)?
+        }
+    };
     names.sort();
     names.dedup();
     Some(ForRangePairsFieldNames {
@@ -1722,22 +1762,136 @@ fn field_names_from_for_range_pairs_key(
     })
 }
 
-fn is_provably_builtin_pairs_call(
+/// The names a table's members were written with, read off the syntax of
+/// each write, plus whether any member was written through a computed key.
+///
+/// A member minted under the name a computed key happened to resolve to does
+/// not count as a name the source states: it is one of the "other" names.
+fn field_names_from_member_keys(
+    db: &DbIndex,
+    source_type: &LuaType,
+) -> Option<(Vec<SmolStr>, bool)> {
+    let mut owners = Vec::new();
+    if !collect_pairs_source_owners(source_type, &mut owners) {
+        return None;
+    }
+    let member_index = db.get_member_index();
+    let mut names = Vec::new();
+    let mut may_have_other_string_names = false;
+    for owner in owners {
+        let Some(members) = member_index.get_members(&owner) else {
+            may_have_other_string_names = true;
+            continue;
+        };
+        for member in members {
+            match member.get_key() {
+                LuaMemberKey::Name(name) if member_key_is_written_literally(db, member) => {
+                    names.push(SmolStr::from(name.as_str()));
+                }
+                LuaMemberKey::Name(_) | LuaMemberKey::ExprType(_) => {
+                    may_have_other_string_names = true;
+                }
+                LuaMemberKey::Integer(_) | LuaMemberKey::None => {}
+            }
+        }
+    }
+    Some((names, may_have_other_string_names))
+}
+
+/// The owners whose members a `pairs` loop over `typ` enumerates, or `false`
+/// when an arm names no table the index holds.
+fn collect_pairs_source_owners(typ: &LuaType, owners: &mut Vec<LuaMemberOwner>) -> bool {
+    match typ {
+        LuaType::TableConst(range) => {
+            owners.push(LuaMemberOwner::Element(range.clone()));
+            true
+        }
+        LuaType::Instance(instance) => {
+            owners.push(LuaMemberOwner::Element(instance.get_range().clone()));
+            true
+        }
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => {
+            owners.push(LuaMemberOwner::Type(type_id.clone()));
+            true
+        }
+        LuaType::MergedTable(merged) => merged
+            .get_types()
+            .iter()
+            .all(|arm| collect_pairs_source_owners(arm, owners)),
+        LuaType::Union(union) => union
+            .types()
+            .filter(|arm| !arm.is_nil())
+            .all(|arm| collect_pairs_source_owners(arm, owners)),
+        _ => false,
+    }
+}
+
+/// Whether a member's key is spelled literally at its write.
+fn member_key_is_written_literally(db: &DbIndex, member: &crate::LuaMember) -> bool {
+    let Some(root) = db
+        .get_vfs()
+        .syntax_tree_around(&member.get_file_id(), member.get_syntax_id().get_range())
+        .map(|tree| tree.get_red_root())
+    else {
+        return false;
+    };
+    let Some(node) = member.get_syntax_id().to_node_from_root(&root) else {
+        return false;
+    };
+    let key = if let Some(index_expr) = glua_parser::LuaIndexExpr::cast(node.clone()) {
+        index_expr.get_index_key()
+    } else if let Some(field) = glua_parser::LuaTableField::cast(node) {
+        field.get_field_key()
+    } else {
+        // Declared in an annotation or synthesized: the name is the source's.
+        return true;
+    };
+    match key {
+        Some(LuaIndexKey::Name(_) | LuaIndexKey::String(_)) => true,
+        Some(LuaIndexKey::Expr(LuaExpr::LiteralExpr(literal))) => {
+            matches!(literal.get_literal(), Some(LuaLiteralToken::String(_)))
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn is_provably_builtin_pairs_call(
     db: &DbIndex,
     file_id: crate::FileId,
     call_expr: &LuaCallExpr,
 ) -> bool {
-    if call_expr.get_access_path().as_deref() != Some("pairs") {
+    is_provably_builtin_global_call(db, file_id, call_expr, "pairs")
+}
+
+/// [`is_provably_builtin_pairs_call`] proved for the other builtin iterator
+/// whose generic bindings the for-range path retrieves (`ipairs`).
+pub(crate) fn is_provably_builtin_iterator_call(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    ["pairs", "ipairs"]
+        .into_iter()
+        .any(|builtin_name| is_provably_builtin_global_call(db, file_id, call_expr, builtin_name))
+}
+
+fn is_provably_builtin_global_call(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    call_expr: &LuaCallExpr,
+    builtin_name: &str,
+) -> bool {
+    if call_expr.get_access_path().as_deref() != Some(builtin_name) {
         return false;
     }
-    let Some(LuaExpr::NameExpr(pairs_name)) = call_expr.get_prefix_expr() else {
+    let Some(LuaExpr::NameExpr(call_name)) = call_expr.get_prefix_expr() else {
         return false;
     };
-    if db
+    if let Some(decl_id) = db
         .get_reference_index()
         .get_local_reference(&file_id)
-        .and_then(|references| references.get_decl_id(&pairs_name.get_range()))
-        .is_some()
+        .and_then(|references| references.get_decl_id(&call_name.get_range()))
+        && !aliases_global(db, file_id, decl_id, builtin_name)
     {
         return false;
     }
@@ -1747,7 +1901,7 @@ fn is_provably_builtin_pairs_call(
         return false;
     };
     let Some(priority_tiers) = db.get_global_index().get_global_decl_id_priority_tiers(
-        "pairs",
+        builtin_name,
         module_index,
         current_workspace_id,
     ) else {
@@ -1766,8 +1920,26 @@ fn is_provably_builtin_pairs_call(
             .is_some_and(|workspace_id| {
                 module_index.get_workspace_kind(workspace_id) == WorkspaceKind::Std
             })
-            || decl_preserves_builtin_semantics(db, *decl_id, "pairs")
+            || decl_preserves_builtin_semantics(db, *decl_id, builtin_name)
     })
+}
+
+/// Whether the local `decl_id` is `local name = name` for the global `name`,
+/// never reassigned: it names the global wherever it is read.
+fn aliases_global(db: &DbIndex, file_id: crate::FileId, decl_id: LuaDeclId, name: &str) -> bool {
+    let Some(LuaExpr::NameExpr(initializer)) = local_initializer_expr(db, decl_id) else {
+        return false;
+    };
+    initializer.get_name_text().as_deref() == Some(name)
+        && db
+            .get_reference_index()
+            .get_local_reference(&file_id)
+            .and_then(|references| references.get_decl_id(&initializer.get_range()))
+            .is_none()
+        && db
+            .get_reference_index()
+            .first_local_reassignment(file_id, &decl_id)
+            .is_none()
 }
 
 fn decl_preserves_builtin_semantics(db: &DbIndex, decl_id: LuaDeclId, builtin_name: &str) -> bool {
@@ -1846,47 +2018,227 @@ fn collect_string_const_names(typ: &LuaType, names: &mut Vec<SmolStr>) {
     }
 }
 
+/// Propagates collected dynamic fields to the super types of their owners so
+/// that e.g. a field assigned on `base_glide` (which extends `Entity`) is also
+/// visible when the variable is typed as `Entity`.  This avoids false-positive
+/// `undefined-field` when user code accesses entity fields through a
+/// base-class reference.  Shared by the initial pass and the settled
+/// re-derivation so both file the same propagated field set.
+fn propagate_dynamic_fields_to_super_types(
+    db: &DbIndex,
+    collected: &[(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)],
+) -> Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> {
+    // The authoring globals of scripted-class scopes (`ENT`, `SWEP`,
+    // `TOOL`, `GM`, and their aliases) are supers of *every* per-file
+    // scoped class, so propagating there pools each file's fields onto
+    // one table the whole workspace writes. Those scopes are per-file
+    // by design: a `---@type SWEP` read is a read of the generic
+    // authoring table, not of any one weapon, so it should see the
+    // annotated `SWEP` fields and not every weapon's private ones.
+    let scoped_globals: FxHashSet<&str> = db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .resolved_definitions_slice()
+        .iter()
+        .flat_map(|definition| {
+            std::iter::once(definition.class_global.as_str())
+                .chain(definition.aliases.iter().map(String::as_str))
+        })
+        .collect();
+    let mut propagated = Vec::new();
+    for (owner, field_name, file_id, range) in collected {
+        if let DynamicFieldOwner::Table(table) = owner {
+            if let Some(prototype) = metatable_index_owner(db, table)
+                && !owner_has_member(db, &prototype, field_name)
+            {
+                propagated.push((prototype, field_name.clone(), *file_id, *range));
+            }
+            continue;
+        }
+        let DynamicFieldOwner::Type(type_id) = owner else {
+            continue;
+        };
+        let mut super_types = Vec::new();
+        type_id.collect_super_types(db, &mut super_types);
+        for super_type in super_types {
+            if let LuaType::Ref(super_id) = &super_type
+                && !scoped_globals.contains(super_id.get_name())
+            {
+                propagated.push((
+                    DynamicFieldOwner::Type(super_id.clone()),
+                    field_name.clone(),
+                    *file_id,
+                    *range,
+                ));
+            }
+        }
+    }
+    propagated
+}
+
+/// The table a literal's metatable `__index` names: the prototype whose methods
+/// run with the literal as `self`, so a field the literal holds is one `self` may.
+fn metatable_index_owner(
+    db: &DbIndex,
+    table: &InFiled<rowan::TextRange>,
+) -> Option<DynamicFieldOwner> {
+    let metatable = db.get_metatable_index().get(table)?.clone();
+    match infer_index_type_from_metatable_type(db, &LuaType::TableConst(metatable))? {
+        LuaType::TableConst(prototype) if prototype != *table => Some(
+            crate::canonical_dynamic_field_owner(db, DynamicFieldOwner::Table(prototype)),
+        ),
+        _ => None,
+    }
+}
+
+/// Whether `owner` already declares `name`, so a propagated field would only blur its type.
+fn owner_has_member(db: &DbIndex, owner: &DynamicFieldOwner, name: &SmolStr) -> bool {
+    let member_owner = match owner {
+        DynamicFieldOwner::Type(id) => LuaMemberOwner::Type(id.clone()),
+        DynamicFieldOwner::Table(range) => LuaMemberOwner::Element(range.clone()),
+        DynamicFieldOwner::GlobalPath(path) => LuaMemberOwner::GlobalPath(path.clone()),
+    };
+    !db.get_member_index()
+        .get_current_owner_members_for_key(&member_owner, &LuaMemberKey::Name(name.clone()))
+        .is_empty()
+}
+
 fn collect_wildcard_for_type(
+    db: &DbIndex,
     typ: &LuaType,
     file_id: crate::FileId,
     range: rowan::TextRange,
     result: &mut Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
 ) {
+    let mut visited = rustc_hash::FxHashSet::default();
+    collect_wildcard_for_type_inner(db, typ, file_id, range, result, &mut visited);
+}
+
+fn collect_wildcard_for_type_inner(
+    db: &DbIndex,
+    typ: &LuaType,
+    file_id: crate::FileId,
+    range: rowan::TextRange,
+    result: &mut Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
+    visited: &mut rustc_hash::FxHashSet<LuaType>,
+) {
+    if !visited.insert(typ.clone()) {
+        return;
+    }
     match typ {
-        LuaType::Ref(id) | LuaType::Def(id) => {
+        // `NULL` holds no fields: a write through it errors at runtime.
+        LuaType::Ref(id) | LuaType::Def(id) if !contains_gmod_null_type(db, typ) => {
             result.push((DynamicFieldOwner::Type(id.clone()), file_id, range));
         }
+        // Canonicalized at push, like `collect_for_type`: the
+        // `definition_site_owner` read is noted during collection so a
+        // late literal→path binding re-derives it.
         LuaType::TableConst(table_range) => {
             result.push((
-                DynamicFieldOwner::Table(table_range.clone()),
+                crate::canonical_dynamic_field_owner(
+                    db,
+                    DynamicFieldOwner::Table(table_range.clone()),
+                ),
                 file_id,
                 range,
             ));
         }
         LuaType::Instance(instance) => {
-            collect_wildcard_for_type(instance.get_base(), file_id, range, result);
+            collect_wildcard_for_type_inner(
+                db,
+                instance.get_base(),
+                file_id,
+                range,
+                result,
+                visited,
+            );
         }
         LuaType::TableOf(inner) => {
-            collect_wildcard_for_type(inner, file_id, range, result);
+            collect_wildcard_for_type_inner(db, inner, file_id, range, result, visited);
         }
         LuaType::Union(union_type) => {
             for t in union_type.types() {
-                collect_wildcard_for_type(t, file_id, range, result);
+                collect_wildcard_for_type_inner(db, t, file_id, range, result, visited);
+            }
+        }
+        // See `collect_for_type`: a merged table stands for its backing
+        // literals.
+        LuaType::MergedTable(merged) => {
+            for t in merged.get_types() {
+                collect_wildcard_for_type_inner(db, t, file_id, range, result, visited);
             }
         }
         _ => {}
     }
 }
 
+type CollectedField = (DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange);
+
 fn collect_for_type(
+    db: &DbIndex,
     typ: &LuaType,
     field_name: &SmolStr,
     file_id: crate::FileId,
     range: rowan::TextRange,
-    result: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    result: &mut Vec<CollectedField>,
 ) {
+    let mut visited = rustc_hash::FxHashSet::default();
+    collect_for_type_inner(
+        db,
+        typ,
+        field_name,
+        file_id,
+        range,
+        result,
+        None,
+        &mut visited,
+    );
+}
+
+/// [`collect_for_type`] for a write through an expression: a field written on
+/// a table one call made, or on a copy of one, is the field of that table
+/// alone. A table a function builds also stands for every table that
+/// constructor builds, whose code runs with any of them as `self`, so its
+/// owners are filed in `propagated`.
+fn collect_for_written_type(
+    db: &DbIndex,
+    typ: &LuaType,
+    field_name: &SmolStr,
+    file_id: crate::FileId,
+    range: rowan::TextRange,
+    result: &mut Vec<CollectedField>,
+    propagated: &mut Vec<CollectedField>,
+) {
+    let mut visited = rustc_hash::FxHashSet::default();
+    collect_for_type_inner(
+        db,
+        typ,
+        field_name,
+        file_id,
+        range,
+        result,
+        Some(propagated),
+        &mut visited,
+    );
+}
+
+fn collect_for_type_inner(
+    db: &DbIndex,
+    typ: &LuaType,
+    field_name: &SmolStr,
+    file_id: crate::FileId,
+    range: rowan::TextRange,
+    result: &mut Vec<CollectedField>,
+    mut per_call: Option<&mut Vec<CollectedField>>,
+    visited: &mut rustc_hash::FxHashSet<LuaType>,
+) {
+    if !visited.insert(typ.clone()) {
+        return;
+    }
     match typ {
-        LuaType::Ref(id) | LuaType::Def(id) => {
+        // `NULL` holds no fields: a write through it errors at runtime.
+        LuaType::Ref(id) | LuaType::Def(id) if !contains_gmod_null_type(db, typ) => {
             result.push((
                 DynamicFieldOwner::Type(id.clone()),
                 field_name.clone(),
@@ -1894,23 +2246,98 @@ fn collect_for_type(
                 range,
             ));
         }
+        // The owner is canonicalized here, during the site's collection
+        // scope: a literal that initializes a global path belongs to the
+        // path, and the `definition_site_owner` read that decides it is what
+        // re-derives this site when the binding lands after collection.
+        // Canonicalizing at merge instead would file the same owner but
+        // record the read nowhere, leaving the site frozen at the literal.
         LuaType::TableConst(table_range) => {
             result.push((
-                DynamicFieldOwner::Table(table_range.clone()),
+                crate::canonical_dynamic_field_owner(
+                    db,
+                    DynamicFieldOwner::Table(table_range.clone()),
+                ),
                 field_name.clone(),
                 file_id,
                 range,
             ));
         }
         LuaType::Instance(instance) => {
-            collect_for_type(instance.get_base(), field_name, file_id, range, result);
+            let kind = instance.get_kind();
+            if let Some(propagated) = per_call.as_deref_mut()
+                && kind != LuaInstanceKind::Shared
+            {
+                result.push((
+                    crate::canonical_dynamic_field_owner(
+                        db,
+                        DynamicFieldOwner::Table(instance.get_range().clone()),
+                    ),
+                    field_name.clone(),
+                    file_id,
+                    range,
+                ));
+                if kind == LuaInstanceKind::Made {
+                    let mut base_propagated = Vec::new();
+                    collect_for_type_inner(
+                        db,
+                        instance.get_base(),
+                        field_name,
+                        file_id,
+                        range,
+                        propagated,
+                        Some(&mut base_propagated),
+                        visited,
+                    );
+                    propagated.extend(base_propagated);
+                }
+            } else {
+                collect_for_type_inner(
+                    db,
+                    instance.get_base(),
+                    field_name,
+                    file_id,
+                    range,
+                    result,
+                    per_call,
+                    visited,
+                );
+            }
         }
         LuaType::TableOf(inner) => {
-            collect_for_type(inner, field_name, file_id, range, result);
+            collect_for_type_inner(
+                db, inner, field_name, file_id, range, result, per_call, visited,
+            );
         }
         LuaType::Union(union_type) => {
             for t in union_type.types() {
-                collect_for_type(t, field_name, file_id, range, result);
+                collect_for_type_inner(
+                    db,
+                    t,
+                    field_name,
+                    file_id,
+                    range,
+                    result,
+                    per_call.as_deref_mut(),
+                    visited,
+                );
+            }
+        }
+        // A merged table is the same runtime table seen through several
+        // backing literals; the write belongs to each of them, exactly as it
+        // does when inference answers with the literals unmerged.
+        LuaType::MergedTable(merged) => {
+            for t in merged.get_types() {
+                collect_for_type_inner(
+                    db,
+                    t,
+                    field_name,
+                    file_id,
+                    range,
+                    result,
+                    per_call.as_deref_mut(),
+                    visited,
+                );
             }
         }
         _ => {}
@@ -1918,6 +2345,7 @@ fn collect_for_type(
 }
 
 fn collect_finite_member_for_type(
+    db: &DbIndex,
     typ: &LuaType,
     member_id: LuaMemberId,
     file_id: crate::FileId,
@@ -1925,6 +2353,32 @@ fn collect_finite_member_for_type(
     has_finite_domain: bool,
     result: &mut Vec<FiniteNamedMemberEvidence>,
 ) {
+    let mut visited = rustc_hash::FxHashSet::default();
+    collect_finite_member_for_type_inner(
+        db,
+        typ,
+        member_id,
+        file_id,
+        range,
+        has_finite_domain,
+        result,
+        &mut visited,
+    );
+}
+
+fn collect_finite_member_for_type_inner(
+    db: &DbIndex,
+    typ: &LuaType,
+    member_id: LuaMemberId,
+    file_id: crate::FileId,
+    range: rowan::TextRange,
+    has_finite_domain: bool,
+    result: &mut Vec<FiniteNamedMemberEvidence>,
+    visited: &mut rustc_hash::FxHashSet<LuaType>,
+) {
+    if !visited.insert(typ.clone()) {
+        return;
+    }
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => {
             result.push((
@@ -1935,9 +2389,16 @@ fn collect_finite_member_for_type(
                 has_finite_domain,
             ));
         }
+        // Canonicalized at push, like `collect_for_type`: the mark must land
+        // on the owner readers consult, and the `definition_site_owner` read
+        // is noted during collection so a late literal→path binding
+        // re-derives it.
         LuaType::TableConst(table_range) => {
             result.push((
-                DynamicFieldOwner::Table(table_range.clone()),
+                crate::canonical_dynamic_field_owner(
+                    db,
+                    DynamicFieldOwner::Table(table_range.clone()),
+                ),
                 member_id,
                 file_id,
                 range,
@@ -1945,34 +2406,56 @@ fn collect_finite_member_for_type(
             ));
         }
         LuaType::Instance(instance) => {
-            collect_finite_member_for_type(
+            collect_finite_member_for_type_inner(
+                db,
                 instance.get_base(),
                 member_id,
                 file_id,
                 range,
                 has_finite_domain,
                 result,
+                visited,
             );
         }
         LuaType::TableOf(inner) => {
-            collect_finite_member_for_type(
+            collect_finite_member_for_type_inner(
+                db,
                 inner,
                 member_id,
                 file_id,
                 range,
                 has_finite_domain,
                 result,
+                visited,
             );
         }
         LuaType::Union(union_type) => {
             for typ in union_type.types() {
-                collect_finite_member_for_type(
+                collect_finite_member_for_type_inner(
+                    db,
                     typ,
                     member_id,
                     file_id,
                     range,
                     has_finite_domain,
                     result,
+                    visited,
+                );
+            }
+        }
+        // See `collect_for_type`: a merged table stands for its backing
+        // literals.
+        LuaType::MergedTable(merged) => {
+            for typ in merged.get_types() {
+                collect_finite_member_for_type_inner(
+                    db,
+                    typ,
+                    member_id,
+                    file_id,
+                    range,
+                    has_finite_domain,
+                    result,
+                    visited,
                 );
             }
         }

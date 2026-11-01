@@ -56,7 +56,7 @@ pub fn references(
     let root = semantic_model.get_root();
     let position_offset = {
         let document = semantic_model.get_document();
-        document.get_offset(position.line as usize, position.character as usize)?
+        document.to_offset(position)
     };
 
     if position_offset > root.syntax().text_range().end() {

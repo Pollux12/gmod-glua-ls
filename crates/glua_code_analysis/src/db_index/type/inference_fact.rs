@@ -26,7 +26,7 @@ pub enum LuaInferenceProvenanceKind {
     UnresolvedVguiParent,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LuaDefinitionId {
     Declaration(LuaDeclId),
     Assignment {
@@ -161,7 +161,7 @@ pub struct LuaInferenceStep {
     pub found_type: Option<Arc<LuaType>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaTypeFact {
     typ: LuaType,
     confidence: LuaInferenceConfidence,
@@ -225,55 +225,6 @@ impl LuaTypeFact {
         self.provenance.iter().map(|step| &step.event)
     }
 
-    pub(crate) fn has_independently_stronger_authority_than(
-        &self,
-        other: &Self,
-        target: &LuaInferenceNodeId,
-    ) -> bool {
-        self.authority_rank() > other.authority_rank()
-            && !other.is_unguarded_child_refinement_of(&self.typ, target)
-            && self.provenance.iter().all(|step| {
-                !same_fact_target(&step.event.node, target)
-                    && !step
-                        .support
-                        .iter()
-                        .any(|support| same_fact_target(support, target))
-            })
-    }
-
-    fn is_unguarded_child_refinement_of(
-        &self,
-        base_type: &LuaType,
-        target: &LuaInferenceNodeId,
-    ) -> bool {
-        self.provenance.iter().any(|step| {
-            step.event.kind == LuaInferenceProvenanceKind::UnguardedChild
-                && same_fact_target(&step.event.node, target)
-                && step.found_type.as_deref() == Some(base_type)
-        })
-    }
-
-    fn authority_rank(&self) -> u8 {
-        if self.base_provenance_kind == Some(LuaInferenceProvenanceKind::ExplicitAnnotation) {
-            return 4;
-        }
-        if self.confidence == LuaInferenceConfidence::Certain {
-            return 3;
-        }
-        if self.confidence == LuaInferenceConfidence::Anchored
-            || self
-                .provenance
-                .iter()
-                .any(|step| step.event.kind == LuaInferenceProvenanceKind::ContextualUnknown)
-        {
-            return 2;
-        }
-        if self.confidence == LuaInferenceConfidence::Heuristic {
-            return 1;
-        }
-        0
-    }
-
     pub(crate) fn from_normalized_parts(
         typ: LuaType,
         confidence: LuaInferenceConfidence,
@@ -289,25 +240,7 @@ impl LuaTypeFact {
     }
 }
 
-fn same_fact_target(left: &LuaInferenceNodeId, right: &LuaInferenceNodeId) -> bool {
-    if left == right {
-        return true;
-    }
-
-    match (left, right) {
-        (
-            LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(left)),
-            LuaInferenceNodeId::TypeOwner(LuaTypeOwner::Decl(right)),
-        )
-        | (
-            LuaInferenceNodeId::TypeOwner(LuaTypeOwner::Decl(right)),
-            LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(left)),
-        ) => left == right,
-        _ => false,
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaTypeFactMetadata {
     pub confidence: LuaInferenceConfidence,
     pub base_provenance_kind: Option<LuaInferenceProvenanceKind>,
@@ -350,29 +283,7 @@ fn normalize_provenance(provenance: Arc<[LuaInferenceStep]>) -> Arc<[LuaInferenc
 }
 
 fn type_owner_cmp(left: &LuaTypeOwner, right: &LuaTypeOwner) -> Ordering {
-    let tag = |owner: &LuaTypeOwner| match owner {
-        LuaTypeOwner::Decl(_) => 0,
-        LuaTypeOwner::Member(_) => 1,
-        LuaTypeOwner::SyntaxId(_) => 2,
-    };
-
-    tag(left)
-        .cmp(&tag(right))
-        .then_with(|| match (left, right) {
-            (LuaTypeOwner::Decl(left), LuaTypeOwner::Decl(right)) => left
-                .file_id
-                .cmp(&right.file_id)
-                .then_with(|| left.position.cmp(&right.position)),
-            (LuaTypeOwner::Member(left), LuaTypeOwner::Member(right)) => left
-                .file_id
-                .cmp(&right.file_id)
-                .then_with(|| syntax_id_cmp(left.get_syntax_id(), right.get_syntax_id())),
-            (LuaTypeOwner::SyntaxId(left), LuaTypeOwner::SyntaxId(right)) => left
-                .file_id
-                .cmp(&right.file_id)
-                .then_with(|| syntax_id_cmp(&left.value, &right.value)),
-            _ => Ordering::Equal,
-        })
+    left.stable_cmp(right)
 }
 
 fn syntax_id_cmp(left: &LuaSyntaxId, right: &LuaSyntaxId) -> Ordering {

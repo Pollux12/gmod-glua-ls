@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn test_4() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        // TODO 该测试被`setmetatable`强行覆盖, 未正常诊断`debug.setmetatable`
+        // TODO: this test is forcibly overridden by `setmetatable`, so `debug.setmetatable` is not diagnosed properly
         assert!(ws.check_code_for(
             DiagnosticCode::ReturnTypeMismatch,
             r#"
@@ -519,5 +519,68 @@ mod tests {
                 end
             "#
         ));
+    }
+
+    /// A union arm that is an unbounded variadic answers *every* slot, so the
+    /// spread has to bound itself. Checking a `@return` asks for the value list
+    /// with no arity to fill, and taking the unbounded arm's arity literally
+    /// looped to `usize::MAX` pushing a type per iteration, which ate the
+    /// machine on a ten-line file.
+    #[test]
+    fn unbounded_variadic_union_arm_spreads_without_an_arity_to_fill() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def_file(
+            "lua/forward.lua",
+            r#"
+            ---@vararg integer
+            local function forward(n, ...)
+                if n > 0 then return forward(n - 1, ...) end
+                return ...
+            end
+
+            ---@return integer
+            local function outer(...)
+                return forward(3, ...)
+            end
+
+            print(outer(1))
+            "#,
+        );
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::ReturnTypeMismatch);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        // The point is that this terminates at all, and the type it settles
+        // on is what proves it: an unbounded arm taken literally cannot
+        // produce a finite union. `outer` forwards its `...` into `forward`,
+        // so `forward`'s vararg stays `integer` and `integer ...` satisfies
+        // `@return integer`.
+        assert!(
+            diagnostics.is_empty(),
+            "forwarded varargs contribute their element types, not the pack: {diagnostics:#?}"
+        );
+        use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr};
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let outer_call = semantic_model
+            .get_root()
+            .descendants::<LuaCallExpr>()
+            .find(|call| call.syntax().text() == "outer(1)")
+            .expect("outer(1) call");
+        let outer_result = semantic_model
+            .infer_expr(LuaExpr::CallExpr(outer_call))
+            .unwrap_or(crate::LuaType::Unknown);
+        assert_eq!(
+            ws.humanize_type(outer_result),
+            "integer",
+            "an unbounded spread arm must not explode into a per-slot union"
+        );
     }
 }

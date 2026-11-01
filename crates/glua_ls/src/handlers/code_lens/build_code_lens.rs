@@ -270,7 +270,7 @@ fn find_gmod_class_from_type_id(
     if let Some(base_name) = semantic_model
         .get_db()
         .get_gmod_class_metadata_index()
-        .get_vgui_panel_base(&type_name)
+        .get_vgui_panel_base(semantic_model.get_db().get_vfs(), &type_name)
     {
         return Some(GmodClassInfo {
             class_name: type_name,

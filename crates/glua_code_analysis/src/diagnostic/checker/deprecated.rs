@@ -18,13 +18,15 @@ impl Checker for DeprecatedChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::Unused, DiagnosticCode::Deprecated];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let root = semantic_model.get_root().clone();
         let candidates = DeprecatedCandidates::new(context, semantic_model.get_db());
         if candidates.is_empty() {
             return;
         }
 
-        for node in root.descendants::<LuaAst>() {
+        let Some(buckets) = context.file_buckets() else {
+            return;
+        };
+        for node in buckets.all_nodes.iter().cloned() {
             match node {
                 LuaAst::LuaNameExpr(name_expr) => {
                     check_name_expr(context, semantic_model, name_expr, &candidates);
@@ -149,7 +151,7 @@ fn check_deprecated(
 
         context.add_diagnostic(DiagnosticCode::Deprecated, range, deprecated_message, None);
     }
-    // 检查特性
+    // Check attributes
     if let Some(attribute_uses) = property.attribute_uses() {
         for attribute_use in attribute_uses.iter() {
             if attribute_use.id.get_name() == "deprecated" {

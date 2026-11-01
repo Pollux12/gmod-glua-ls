@@ -340,6 +340,77 @@ mod test {
     }
 
     #[test]
+    fn test_helix_character_keeps_meta_methods_through_return_and_map() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "annotations/core.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@class Player : Entity
+
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return (definition) T
+            function FindMetaTable(metaName) end
+
+            ---@return any
+            function Entity:GetNetVar(key) end
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/helix/gamemode/core/meta/sh_character.lua",
+            r#"
+            ix = ix or {}
+            ix.meta = ix.meta or {}
+            ix.char = ix.char or {}
+            ix.char.loaded = ix.char.loaded or {}
+
+            local CHAR = ix.meta.character or {}
+            CHAR.__index = CHAR
+            ---@return integer
+            function CHAR:GetID() return self.id end
+            ---@return string
+            function CHAR:GetInventory() return self.inv end
+            ix.meta.character = CHAR
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/helix/gamemode/core/libs/sh_character.lua",
+            r#"
+            function ix.char.New(data, id)
+                local character = setmetatable({vars = {}}, ix.meta.character)
+                character.id = id
+                return character
+            end
+
+            function ix.char.Load(data, id)
+                ix.char.loaded[id] = ix.char.New(data, id)
+            end
+
+            do
+                local playerMeta = FindMetaTable("Player")
+                function playerMeta:GetCharacter()
+                    return ix.char.loaded[self:GetNetVar("char")]
+                end
+            end
+            "#,
+        );
+        let probe = ws.def_file(
+            "gamemodes/ixhl2rp/schema/sh_probe.lua",
+            r#"
+            ---@type Player
+            local p
+            local returned_id = ix.char.New({}, 1):GetID()
+            local mapped_inventory = p:GetCharacter():GetInventory()
+            "#,
+        );
+
+        assert_eq!(ws.local_ty(probe, "returned_id"), LuaType::Integer);
+        assert_eq!(ws.local_ty(probe, "mapped_inventory"), LuaType::String);
+    }
+
+    #[test]
     fn test_mutual_anonymous_metatable_index_cycle_does_not_overflow() {
         let mut ws = VirtualWorkspace::new();
         ws.enable_check(DiagnosticCode::UndefinedField);
@@ -834,10 +905,9 @@ mod test {
     }
 
     #[test]
-    fn test_colon_receiver_contribution_requires_leading_self_name() {
+    fn test_colon_receiver_contribution_requires_leading_self_name_leaves_methods_open() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedMethod,
+        let file_id = ws.def(
             r#"
             local Class = {
                 __index = {
@@ -855,15 +925,16 @@ mod test {
             setmetatable(Class, Class)
 
             Class():create():makeDirty()
+            local probe = Class():create().makeDirty
             "#,
-        ));
+        );
+        assert!(!is_function_type(&ws.local_ty(file_id, "probe")));
     }
 
     #[test]
-    fn test_colon_receiver_contribution_rejects_nonleading_self() {
+    fn test_colon_receiver_contribution_rejects_nonleading_self_leaves_methods_open() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedMethod,
+        let file_id = ws.def(
             r#"
             local Class = {
                 __index = {
@@ -881,15 +952,16 @@ mod test {
             setmetatable(Class, Class)
 
             Class():create(nil):makeDirty()
+            local probe = Class():create(nil).makeDirty
             "#,
-        ));
+        );
+        assert!(!is_function_type(&ws.local_ty(file_id, "probe")));
     }
 
     #[test]
-    fn test_colon_receiver_contribution_rejects_mutated_self() {
+    fn test_colon_receiver_contribution_rejects_mutated_self_leaves_methods_open() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedMethod,
+        let file_id = ws.def(
             r#"
             local Class = {
                 __index = {
@@ -908,8 +980,10 @@ mod test {
             setmetatable(Class, Class)
 
             Class():create():makeDirty()
+            local probe = Class():create().makeDirty
             "#,
-        ));
+        );
+        assert!(!is_function_type(&ws.local_ty(file_id, "probe")));
     }
 
     #[test]
@@ -1003,10 +1077,9 @@ mod test {
     }
 
     #[test]
-    fn test_callable_table_nonreceiver_parameter_is_not_used_as_instance_metatable() {
+    fn test_callable_table_nonreceiver_parameter_leaves_instance_methods_open_but_unattributed() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedMethod,
+        let file_id = ws.def(
             r#"
             local Setting = {
                 __index = {
@@ -1015,12 +1088,14 @@ mod test {
                 __call = function(class, metatable)
                     local self = setmetatable({}, metatable)
                     self:known()
+                    local probe = self.known
                 end,
             }
 
             setmetatable(Setting, Setting)
             "#,
-        ));
+        );
+        assert!(!is_function_type(&ws.local_ty(file_id, "probe")));
     }
 
     #[test]
@@ -1119,10 +1194,9 @@ mod test {
     }
 
     #[test]
-    fn test_arbitrary_factory_parameter_is_not_treated_as_metatable_owner() {
+    fn test_arbitrary_factory_parameter_leaves_instance_methods_open_but_unattributed() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedMethod,
+        let file_id = ws.def(
             r#"
             local Class = {}
             Class.__index = Class
@@ -1133,8 +1207,10 @@ mod test {
             end
 
             make(Class):known()
+            local probe = make(Class).known
             "#,
-        ));
+        );
+        assert!(!is_function_type(&ws.local_ty(file_id, "probe")));
     }
 
     #[test]
@@ -1228,9 +1304,9 @@ mod test {
     }
 
     #[test]
-    fn test_literal_index_later_function_overwrite_rejects_factory_recovery() {
+    fn test_literal_index_later_function_overwrite_leaves_methods_open() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
+        assert!(ws.check_code_for(
             DiagnosticCode::UndefinedMethod,
             r#"
             local Class = {}
@@ -1404,12 +1480,10 @@ mod test {
             value:known()
         "#;
         let unsupported_content = r#"
+            local Other = {}
             local Class = {}
             function Class:known() end
-            local Meta = { __index = Class }
-            Meta.__index = function(_, key)
-                return rawget(Class, key)
-            end
+            local Meta = { __index = Other }
             local value = setmetatable({}, Meta)
             value:known()
         "#;
@@ -1427,27 +1501,32 @@ mod test {
         let initial_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(unsupported_content.to_string()))
+            .map(|(id, _)| id)
             .expect("literal metatable lifecycle file must be created");
         assert!(has_undefined_method(&ws, initial_file_id));
 
         let edited_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(supported_content.to_string()))
+            .map(|(id, _)| id)
             .expect("literal metatable lifecycle file must be updated");
         assert!(!has_undefined_method(&ws, edited_file_id));
 
         ws.analysis
             .remove_file_by_uri(&uri)
+            .0
             .expect("literal metatable lifecycle file must be removed");
         let reopened_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(unsupported_content.to_string()))
+            .map(|(id, _)| id)
             .expect("literal metatable lifecycle file must reopen");
         assert!(has_undefined_method(&ws, reopened_file_id));
 
         let restored_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(supported_content.to_string()))
+            .map(|(id, _)| id)
             .expect("literal metatable lifecycle file must be restored");
         assert!(!has_undefined_method(&ws, restored_file_id));
     }
@@ -1494,27 +1573,32 @@ mod test {
         let initial_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(self_index_content.to_string()))
+            .map(|(id, _)| id)
             .expect("metatable lifecycle file must be created");
         assert!(!has_undefined_method(&ws, initial_file_id));
 
         let edited_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(other_index_content.to_string()))
+            .map(|(id, _)| id)
             .expect("metatable lifecycle file must be updated");
         assert!(has_undefined_method(&ws, edited_file_id));
 
         ws.analysis
             .remove_file_by_uri(&uri)
+            .0
             .expect("metatable lifecycle file must be removed");
         let reopened_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(other_index_content.to_string()))
+            .map(|(id, _)| id)
             .expect("metatable lifecycle file must reopen");
         assert!(has_undefined_method(&ws, reopened_file_id));
 
         let restored_file_id = ws
             .analysis
             .update_file_by_uri(&uri, Some(self_index_content.to_string()))
+            .map(|(id, _)| id)
             .expect("metatable lifecycle file must be restored");
         assert!(!has_undefined_method(&ws, restored_file_id));
     }
@@ -1645,7 +1729,7 @@ mod test {
                 return setmetatable({}, self)
             end
 
-            Class:new():known()
+            Class:new():missing()
             "#,
         ));
     }
@@ -1684,5 +1768,348 @@ mod test {
             Class:new():known()
             "#,
         ));
+    }
+
+    #[test]
+    fn concrete_inferred_returns_follow_late_member_types_to_a_fixpoint() {
+        let mut ws = VirtualWorkspace::new();
+        let player_path = "lua/a_player.lua";
+        let player_source = r#"
+            Player = Player or {}
+
+            function Player:GetGender()
+                return self._Gender or GENDER_NEUTRAL
+            end
+
+            local genders = Config.gender
+            function Player:GetTitle()
+                return genders[self:GetGender()].title
+            end
+
+            function Player:GetLabel()
+                return self:GetTitle()
+            end
+        "#;
+        ws.def_files(vec![
+            (player_path, player_source),
+            ("lua/b_male_write.lua", "Player._Gender = GENDER_MALE"),
+            ("lua/c_female_write.lua", "Player._Gender = GENDER_FEMALE"),
+            (
+                "lua/d_config.lua",
+                r#"
+                Config = { gender = {
+                    [GENDER_NEUTRAL] = { title = "neutral" },
+                    [GENDER_MALE] = { title = "male" },
+                    [GENDER_FEMALE] = { title = "female" },
+                } }
+                "#,
+            ),
+            (
+                "lua/e_enums.lua",
+                "GENDER_NEUTRAL = \"Neutral\"\nGENDER_MALE = \"Male\"\nGENDER_FEMALE = \"Female\"",
+            ),
+        ]);
+
+        let player_uri = ws.virtual_url_generator.new_uri(player_path);
+        let player_file = ws
+            .analysis
+            .get_file_id(&player_uri)
+            .expect("expected player file");
+        let title_return = signature_return_type(&ws, player_file, "GetTitle");
+        let label_return = signature_return_type(&ws, player_file, "GetLabel");
+        let cold = (
+            ws.humanize_type_detailed(title_return),
+            ws.humanize_type_detailed(label_return),
+        );
+        let expected = (
+            "(\"female\"|\"male\"|\"neutral\")".to_string(),
+            "(\"female\"|\"male\"|\"neutral\")".to_string(),
+        );
+        assert_eq!(cold, expected);
+
+        ws.analysis
+            .update_file_text_only(&player_uri, format!("{player_source}\n"));
+        ws.analysis.reindex_files(vec![player_file]);
+
+        let title_return = signature_return_type(&ws, player_file, "GetTitle");
+        let label_return = signature_return_type(&ws, player_file, "GetLabel");
+        let warm = (
+            ws.humanize_type_detailed(title_return),
+            ws.humanize_type_detailed(label_return),
+        );
+        assert_eq!(warm, expected);
+    }
+
+    #[test]
+    fn inferred_returns_follow_late_settled_dynamic_fields_to_a_fixpoint() {
+        // The writer's `Ranks[rank]` prefix only resolves once the
+        // `pairs(Ranks)` loop variables settle, so `iconMat` lands after the
+        // returner's `.iconMat` read was taken. Sorting the returner first
+        // forces that late publication on a cold build.
+        let mut ws = VirtualWorkspace::new();
+        let returner_path = "lua/a_returner.lua";
+        let returner_source = r#"
+            ---@class IMaterial
+            ---@return IMaterial
+            function Material(path) end
+
+            function GetRankData(rank)
+                return Ranks[rank]
+            end
+
+            function GetRankIconMaterial(rank)
+                return GetRankData(rank).iconMat
+            end
+
+            function GetRankMissing(rank)
+                return GetRankData(rank).nope
+            end
+        "#;
+        ws.def_files(vec![
+            (returner_path, returner_source),
+            (
+                "lua/b_ranks.lua",
+                r#"
+                Ranks = {
+                    admin = { title = "Admin" },
+                    user = { title = "User" },
+                }
+
+                for rank, data in pairs(Ranks) do
+                    Ranks[rank].iconMat = Material("icon.vmt")
+                end
+                "#,
+            ),
+        ]);
+
+        let returner_uri = ws.virtual_url_generator.new_uri(returner_path);
+        let returner_file = ws
+            .analysis
+            .get_file_id(&returner_uri)
+            .expect("expected returner file");
+        let cold_icon = ws.humanize_type_detailed(signature_return_type(
+            &ws,
+            returner_file,
+            "GetRankIconMaterial",
+        ));
+        let cold_missing =
+            ws.humanize_type_detailed(signature_return_type(&ws, returner_file, "GetRankMissing"));
+        assert_eq!(cold_icon, "IMaterial");
+        assert_eq!(cold_missing, "nil");
+
+        ws.analysis
+            .update_file_text_only(&returner_uri, format!("{returner_source}\n"));
+        ws.analysis.reindex_files(vec![returner_file]);
+
+        let warm_icon = ws.humanize_type_detailed(signature_return_type(
+            &ws,
+            returner_file,
+            "GetRankIconMaterial",
+        ));
+        let warm_missing =
+            ws.humanize_type_detailed(signature_return_type(&ws, returner_file, "GetRankMissing"));
+        assert_eq!(warm_icon, "IMaterial");
+        assert_eq!(warm_missing, "nil");
+    }
+
+    #[test]
+    fn test_class_annotated_metatable_keeps_methods_after_in_place_setmetatable() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local settings = {}
+
+            ---@class Convar
+            local meta = {}
+            meta.__index = meta
+
+            function meta:GetValue()
+                return self.value
+            end
+
+            local function Add(name)
+                local t = {}
+                setmetatable(t, meta)
+                t:GetValue()
+                settings[name] = t
+                return t
+            end
+
+            local obj = settings["a"]
+            obj:GetValue()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_accessor_func_on_unannotated_metatable_table_keeps_accessors() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local meta = {}
+            meta.__index = meta
+            AccessorFunc(meta, "iMat", "Material")
+
+            local function Create()
+                local t = {}
+                setmetatable(t, meta)
+                t:SetMaterial("a")
+                return t:GetMaterial()
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_class_annotated_metatable_factory_fields_are_class_fields() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@class Weather
+            local meta = {}
+            meta.__index = meta
+
+            ---@return Weather
+            function Create(name)
+                local t = {}
+                t.Name = name
+                setmetatable(t, meta)
+                return t
+            end
+
+            local w = Create("rain")
+            print(w.Name)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_metatable_factory_constructor_fields_are_instance_fields() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local meta = {}
+            meta.__index = meta
+
+            function meta:Describe()
+                return self.name, self[1]
+            end
+
+            local function create(name, first)
+                local t = { first, name = name }
+                setmetatable(t, meta)
+                return t
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_metatable_factory_positional_constructor_fields_are_instance_fields() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local meta = {}
+            meta.__index = meta
+
+            function meta:First()
+                return self[1], self[2]
+            end
+
+            local function create(ent, center)
+                local t = { ent, center }
+                setmetatable(t, meta)
+                return t
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_metatable_factory_positional_constructor_does_not_open_other_indices() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local meta = {}
+            meta.__index = meta
+
+            function meta:Third()
+                return self[3]
+            end
+
+            local function create(ent, center)
+                local t = { ent, center }
+                setmetatable(t, meta)
+                return t
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_metatable_index_taken_from_a_function_defined_elsewhere_leaves_methods_open() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local methods = {}
+            function methods:Known() end
+
+            local shared = {
+                __index = function(_, key)
+                    return methods[key]
+                end,
+            }
+
+            local object = setmetatable({}, { __index = shared.__index })
+            object:Known()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_named_metatable_index_taken_from_a_function_defined_elsewhere_leaves_methods_open() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local methods = {}
+            function methods:Known() end
+
+            local shared = {
+                __index = function(_, key)
+                    return methods[key]
+                end,
+            }
+
+            local metatable = { __index = shared.__index }
+            local object = setmetatable({}, metatable)
+            object:Known()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_metatable_without_index_still_reports_undefined_methods() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local shared = { __call = function() end }
+            local object = setmetatable({}, { __call = shared.__call })
+            object:Known()
+            "#,
+        ));
+    }
+
+    fn is_function_type(typ: &LuaType) -> bool {
+        matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }
 }

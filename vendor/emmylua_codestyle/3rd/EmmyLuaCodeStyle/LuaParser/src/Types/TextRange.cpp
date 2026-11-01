@@ -1,4 +1,4 @@
-﻿#include "LuaParser/Types/TextRange.h"
+#include "LuaParser/Types/TextRange.h"
 
 TextRange::TextRange()
     : TextRange(0, 0) {

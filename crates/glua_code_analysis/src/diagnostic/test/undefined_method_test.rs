@@ -5,6 +5,146 @@ mod tests {
     use lsp_types::{DiagnosticSeverity, NumberOrString};
     use tokio_util::sync::CancellationToken;
 
+    #[test]
+    fn metatable_index_resolves_methods_through_each_table_alternative() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "lua/includes/modules/drivers.lua",
+            r#"
+            local first = {}
+            function first:Init() return 1 end
+            local second = {}
+            function second:Init() return 2 end
+            ---@param choose boolean
+            local function build(choose)
+                local base = choose and first or second
+                local method = {}
+                setmetatable(method, { __index = base })
+                method:Init()
+            end
+            build(true)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn methods_installed_on_a_metatable_parameter_belong_to_its_class() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/annotations/meta.lua",
+            "---@meta\n---@class Panel\n---@generic T : table\n---@param metaName `T`\n---@return (definition) T\nfunction FindMetaTable(metaName) end\n",
+        );
+        let installer_path = "gamemodes/helix/gamemode/core/libs/sh_animation.lua";
+        let installer = r#"
+            ix = ix or {}
+            ix.util = ix.util or {}
+            function ix.util.InstallAnimationMethods(meta)
+                function meta:CreateAnimation(length, data) end
+            end
+            local panelMeta = FindMetaTable("Panel")
+            ix.util.InstallAnimationMethods(panelMeta)
+        "#;
+        let user_path = "gamemodes/helix/gamemode/core/derma/cl_notice.lua";
+        let user =
+            "---@param panel Panel\nlocal function Show(panel) panel:CreateAnimation(1, {}) end\n";
+        ws.def_file(installer_path, installer);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, user_path, user));
+        let uri = ws.virtual_url_generator.new_uri(installer_path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert!(!ws.check_file_for(DiagnosticCode::UndefinedMethod, user_path, user));
+        ws.def_file(installer_path, installer);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, user_path, user));
+    }
+
+    #[test]
+    fn plugin_files_inherit_methods_from_the_table_the_loader_publishes() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let loader_path = "gamemode/core/libs/sh_plugin.lua";
+        let loader = r#"
+            ix = ix or {}
+            ix.plugin = ix.plugin or {}
+            function ix.plugin.Load(uniqueID, path, isSingleFile, variable)
+                variable = variable or "PLUGIN"
+                if (uniqueID == "schema") then
+                    variable = "Schema"
+                end
+                local PLUGIN = {
+                    folder = path,
+                    uniqueID = uniqueID,
+                }
+                _G[variable] = PLUGIN
+                function PLUGIN:SetData(value, global, ignoreMap) end
+            end
+        "#;
+        let plugin_path = "plugins/3dpanel.lua";
+        let plugin = "local PLUGIN = PLUGIN
+function PLUGIN:SavePanels()
+    self:SetData(self.list)
+end
+";
+        ws.def_file(loader_path, loader);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, plugin_path, plugin));
+        let uri = ws.virtual_url_generator.new_uri(loader_path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert!(!ws.check_file_for(DiagnosticCode::UndefinedMethod, plugin_path, plugin));
+        ws.def_file(loader_path, loader);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, plugin_path, plugin));
+    }
+
+    #[test]
+    fn metatable_index_without_the_method_reports_it_undefined() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "lua/includes/modules/drivers.lua",
+            r#"
+            local method = {}
+            setmetatable(method, { __index = { Other = function() end } })
+            method:Init()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn metatable_index_table_alternatives_refresh_after_edit_delete_reopen() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let path = "lua/includes/modules/drivers.lua";
+        let definitions = r#"
+            local first = {}
+            function first:Init() return 1 end
+            local second = {}
+            function second:Init() return 2 end
+            return { first = first, second = second }
+        "#;
+        let reader_path = "lua/includes/modules/drive_reader.lua";
+        let reader = r#"
+            local drivers = require("drivers")
+            ---@param choose boolean
+            local function build(choose)
+                local base = choose and drivers.first or drivers.second
+                local method = {}
+                setmetatable(method, { __index = base })
+                method:Init()
+            end
+            build(true)
+        "#;
+        ws.def_file(path, definitions);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, reader_path, reader));
+        ws.def_file(path, &definitions.replace("Init", "Other"));
+        assert!(!ws.check_file_for(DiagnosticCode::UndefinedMethod, reader_path, reader));
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        ws.def_file(path, definitions);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, reader_path, reader));
+    }
+
     fn diagnostics(ws: &mut VirtualWorkspace, source: &str) -> Vec<lsp_types::Diagnostic> {
         let file_id = ws.def(source);
         ws.analysis
@@ -27,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn gmod_name_fallback_method_reports_undefined_field_warning() {
+    fn gmod_name_fallback_method_reports_an_inferred_type_advisory() {
         let diagnostics = gmod_diagnostics(
             r#"
             ---@class Panel
@@ -37,16 +177,11 @@ mod tests {
             "#,
         );
 
-        let diagnostic = diagnostics
-            .iter()
-            .find(|diagnostic| {
-                diagnostic.code
-                    == Some(NumberOrString::String(
-                        DiagnosticCode::UndefinedField.get_name().to_string(),
-                    ))
-            })
-            .unwrap_or_else(|| panic!("undefined-field diagnostic: {diagnostics:#?}"));
-        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+        assert!(
+            has_code(&diagnostics, DiagnosticCode::InferUnknown),
+            "infer-unknown diagnostic: {diagnostics:#?}"
+        );
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedField));
         assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
     }
 
@@ -54,6 +189,9 @@ mod tests {
     fn explicit_parameter_type_keeps_undefined_method_error() {
         let diagnostics = gmod_diagnostics(
             r#"
+            ---@class Panel
+            local Panel = {}
+
             ---@param panel Panel
             local function update_panel(panel)
                 panel:MissingMethod()
@@ -712,6 +850,181 @@ mod tests {
         assert_eq!(undefined_fields, ["Undefined field `DefinitelyMissing`. "]);
     }
 
+    /// Undefined methods reported when `PopulateFromList` is called as `callers` call it.
+    fn installed_tree_method_reports(callers: &str) -> Vec<String> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/annotations/meta.lua",
+            "---@meta
+---@class Panel
+---@class DTree: Panel
+---@class SpawnmenuContentPanel: Panel
+",
+        );
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/content.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:PopulateFromList(listName, tree, options)
+                tree.Categories = {}
+                tree.RefreshContent = function(self, item, spawnname) end
+            end
+            vgui.Register("SpawnmenuContentPanel", PANEL, "Panel")
+            "#,
+        );
+        let file_id = ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/contenttypes/weapons.lua",
+            &format!(
+                r#"
+            {callers}
+
+            ---@type DTree
+            local navTree
+            navTree:RefreshContent({{}}, "weapon_crowbar")
+            "#
+            ),
+        );
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect()
+    }
+
+    #[test]
+    fn a_panel_method_installs_a_field_on_the_panel_its_callers_pass() {
+        assert_eq!(
+            installed_tree_method_reports(
+                r#"
+            ---@param pnlContent SpawnmenuContentPanel
+            ---@param tree DTree
+            local function populate(pnlContent, tree)
+                pnlContent:PopulateFromList("Weapon", tree, {})
+            end
+            "#
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A forwarded vararg names no value, so the tree stays untyped.
+    #[test]
+    fn a_forwarded_vararg_leaves_an_installed_parameter_untyped() {
+        assert_eq!(
+            installed_tree_method_reports(
+                r#"
+            ---@param pnlContent SpawnmenuContentPanel
+            ---@param tree DTree
+            local function populate(pnlContent, tree)
+                pnlContent:PopulateFromList("Weapon", tree, {})
+            end
+
+            ---@param pnlContent SpawnmenuContentPanel
+            local function forward(pnlContent, ...)
+                pnlContent:PopulateFromList("Weapon", ...)
+            end
+            "#
+            ),
+            ["Undefined method `RefreshContent`. "]
+        );
+    }
+
+    /// A call through a value holding either handler types neither handler's parameter.
+    #[test]
+    fn a_pooled_handler_call_does_not_type_an_installed_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        assert!(!ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "lua/autorun/handlers.lua",
+            r#"
+            ---@class DTree
+
+            local Handlers = {}
+            function Handlers.Mark(key, target)
+                target.Marked = function() end
+            end
+            function Handlers.Other(key, target) end
+
+            ---@param self DTree
+            ---@param marks boolean
+            local function run(self, marks)
+                local handler = marks and Handlers.Mark or Handlers.Other
+                handler("key", self)
+            end
+
+            ---@type DTree
+            local tree
+            tree:Marked()
+            "#,
+        ));
+    }
+
+    /// A call through a value holding one function types the parameter it installs on.
+    #[test]
+    fn an_aliased_installer_call_types_its_installed_parameter() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        assert!(ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "lua/autorun/handlers.lua",
+            r#"
+            ---@class DTree
+
+            local Handlers = {}
+            function Handlers.Install(key, target)
+                target.Marked = function() end
+            end
+
+            ---@param self DTree
+            local function run(self)
+                local handler = Handlers.Install
+                handler("key", self)
+            end
+
+            ---@type DTree
+            local tree
+            tree:Marked()
+            "#,
+        ));
+    }
+
+    /// A named table passed to an installer gets the members it installs.
+    #[test]
+    fn a_named_table_passed_to_an_installer_gets_its_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        assert!(ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "lua/autorun/install.lua",
+            r#"
+            function Install(target)
+                function target:Marked() end
+            end
+            local tree = {}
+            Install(tree)
+            tree:Marked()
+            "#,
+        ));
+    }
+
     #[test]
     fn vgui_parent_chain_resolves_add_panel_canvas_to_owner() {
         let mut ws = VirtualWorkspace::new();
@@ -763,6 +1076,67 @@ mod tests {
                     crate::LuaTypeDeclId::global("DDragBase"),
                     crate::LuaTypeDeclId::global("DHorizontalScroller"),
                     crate::LuaTypeDeclId::global("StreamEditor"),
+                ]
+                .as_slice()
+            )
+        );
+
+        let undefined_methods = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert_eq!(undefined_methods, ["Undefined method `Missing`. "]);
+    }
+
+    #[test]
+    fn vgui_parent_call_through_member_receiver_is_collected_on_a_cold_build() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class DScrollPanel: Panel
+            local PANEL = {}
+            function PANEL:CardMethod() end
+            function PANEL:Init()
+                self.infoPanel = self:Add("DScrollPanel")
+                local row = self.infoPanel:Add("cityrpListRow")
+            end
+            vgui.Register("cityrp_character_card", PANEL, "Panel")
+
+            local ROW = {}
+            function ROW:Think()
+                self:GetParent():GetParent():CardMethod()
+                self:GetParent():GetParent():Missing()
+            end
+            vgui.Register("cityrpListRow", ROW, "Panel")
+            "#,
+        );
+
+        let metadata = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index();
+        assert_eq!(
+            metadata.get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("cityrpListRow")),
+            Some(
+                [
+                    crate::LuaTypeDeclId::global("DScrollPanel"),
+                    crate::LuaTypeDeclId::global("cityrp_character_card"),
                 ]
                 .as_slice()
             )
@@ -1039,23 +1413,163 @@ mod tests {
         let content_container_uri = ws.virtual_url_generator.new_uri(content_container_path);
         ws.analysis
             .update_file_by_uri(&content_container_uri, None)
+            .map(|(id, _)| id)
             .expect("forwarding helper file should exist");
-        let metadata = ws
+        let parent_chains = |ws: &VirtualWorkspace| {
+            ["ContentHeader", "ContentIcon"].map(|name| {
+                ws.analysis
+                    .compilation
+                    .get_db()
+                    .get_gmod_class_metadata_index()
+                    .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global(name))
+                    .map(|chain| chain.to_vec())
+            })
+        };
+        let after_deletion = parent_chains(&ws);
+        for chain in &after_deletion {
+            assert_eq!(
+                chain.as_deref(),
+                Some([crate::LuaTypeDeclId::global("ContentContainer")].as_slice()),
+                "the inherited Panel:Add replaces the deleted forwarding override"
+            );
+        }
+        ws.analysis.reindex();
+        assert_eq!(parent_chains(&ws), after_deletion);
+    }
+
+    #[test]
+    fn vgui_forwarding_uses_indexed_callers_across_edits_delete_and_reopen() {
+        use crate::db_index::derivation::{DerivationId, DerivationKind, FactKey};
+
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/vgui.lua",
+            "---@class Panel
+---@class DTileLayout: Panel
+---@class Child: Panel
+---@class OtherChild: Panel",
+        );
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/cl_container.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Init()
+                self.Body = vgui.Create("DTileLayout")
+            end
+            function PANEL:Relay(pnl)
+                self.Body:Add(pnl)
+            end
+            vgui.Register("Container", PANEL, "Panel")
+            "#,
+        );
+        let unrelated = ws.def_file(
+            "gamemodes/sandbox/gamemode/cl_unrelated.lua",
+            "local marker = 'Relay'",
+        );
+        let caller_path = "gamemodes/sandbox/gamemode/cl_caller.lua";
+        let caller = r#"
+            local container = vgui.Create("Container")
+            local child = vgui.Create("Child")
+            local second = vgui.Create("OtherChild")
+            container : Relay(child)
+        "#;
+        let child_id = crate::LuaTypeDeclId::global("Child");
+        let chain = |ws: &VirtualWorkspace| {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_gmod_class_metadata_index()
+                .get_vgui_panel_parent_chain(&child_id)
+                .map(|chain| chain.to_vec())
+        };
+        assert_eq!(chain(&ws), None);
+        ws.def_file(caller_path, caller);
+        assert_eq!(
+            chain(&ws),
+            Some(vec![crate::LuaTypeDeclId::global("DTileLayout")])
+        );
+        let reads = ws
             .analysis
             .compilation
             .get_db()
-            .get_gmod_class_metadata_index();
+            .reader_graph()
+            .reads_of(DerivationId::workspace(DerivationKind::VguiChains))
+            .map(|key| key.key())
+            .collect::<Vec<_>>();
         assert!(
-            metadata
-                .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("ContentHeader"))
-                .is_none(),
-            "forwarded parent metadata must be invalidated when the helper is deleted"
+            !reads
+                .iter()
+                .any(|key| matches!(key, FactKey::FileText(file_id) if *file_id == unrelated))
+        );
+        assert!(reads.contains(&&FactKey::IndexReferenceFiles("Relay".into())));
+        assert!(!reads.contains(&&FactKey::ReferencesByName("Relay".into())));
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/cl_unrelated.lua",
+            "local marker = 'Other'",
+        );
+        assert_eq!(
+            chain(&ws),
+            Some(vec![crate::LuaTypeDeclId::global("DTileLayout")])
+        );
+        assert_eq!(
+            ws.analysis
+                .compilation
+                .last_stats()
+                .evaluations(DerivationKind::VguiChains),
+            0
+        );
+        let reference_files_key = FactKey::IndexReferenceFiles("Relay".into());
+        let membership = ws
+            .analysis
+            .compilation
+            .get_db()
+            .fact_fingerprint(&reference_files_key);
+        ws.def_file(
+            caller_path,
+            &caller.replace("Relay(child)", "Relay(second)"),
+        );
+        assert_eq!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .fact_fingerprint(&reference_files_key),
+            membership
         );
         assert!(
-            metadata
-                .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("ContentIcon"))
-                .is_none()
+            ws.analysis
+                .compilation
+                .last_stats()
+                .evaluations(DerivationKind::VguiChains)
+                > 0
         );
+        assert_eq!(chain(&ws), None);
+        assert_eq!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_gmod_class_metadata_index()
+                .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("OtherChild")),
+            Some([crate::LuaTypeDeclId::global("DTileLayout")].as_slice())
+        );
+        ws.def_file(caller_path, "local marker = 'Relay'");
+        assert_eq!(chain(&ws), None);
+        ws.def_file(caller_path, caller);
+        assert_eq!(
+            chain(&ws),
+            Some(vec![crate::LuaTypeDeclId::global("DTileLayout")])
+        );
+        let uri = ws.virtual_url_generator.new_uri(caller_path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert_eq!(chain(&ws), None);
+        ws.def_file(caller_path, caller);
+        let reopened = chain(&ws);
+        assert_eq!(
+            reopened,
+            Some(vec![crate::LuaTypeDeclId::global("DTileLayout")])
+        );
+        ws.analysis.reindex();
+        assert_eq!(chain(&ws), reopened);
     }
 
     #[test]
@@ -1541,5 +2055,433 @@ mod tests {
         );
 
         assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    /// A table a function fills fields into is that caller's input, not the parameter's type.
+    #[test]
+    fn a_registered_table_does_not_close_the_input_it_fills() {
+        for table in ["CLASS", "{ format = \"x\" }", "self"] {
+            let mut ws = VirtualWorkspace::new();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+            assert!(
+                ws.check_file_for(
+                    DiagnosticCode::UndefinedField,
+                    "lua/autorun/register.lua",
+                    &format!(
+                        r#"
+            function Register(name, data)
+                data.uniqueID = name
+                return {{ bNoIndicator = data.bNoIndicator }}
+            end
+            local CLASS = {{}}
+            local self = {{}}
+            Register("chat", {table})
+            "#
+                    ),
+                ),
+                "{table}"
+            );
+        }
+    }
+
+    const CLASS_NAME_ANNOTATIONS: &str = r#"
+        ---@meta
+        ---@class Entity
+        local Entity = {}
+        ---@return string
+        function Entity:GetClass() end
+        ---@class farmplot : Entity
+        local farmplot = {}
+        function farmplot:GetPlotSize() end
+        ---@class composter : Entity
+        local composter = {}
+        function composter:GetComposting() end
+        ---@class plant : Entity
+        local plant = {}
+        function plant:GetGrowth() end
+        ---@class ground_plant : plant
+        local ground_plant = {}
+        ---@class TraceResult
+        ---@field Entity Entity
+        local TraceResult = {}
+    "#;
+
+    fn class_name_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file("lua/annotations/entity.lua", CLASS_NAME_ANNOTATIONS);
+        ws
+    }
+
+    /// `local class = ent:GetClass()` compared with a class name narrows `ent` as the call itself would.
+    #[test]
+    fn a_class_name_local_narrows_the_entity_it_was_read_from() {
+        let source = r#"
+            ---@param trace TraceResult
+            local function draw(trace)
+                local class = trace.Entity:GetClass()
+                if class == "farmplot" then
+                    print(trace.Entity:GetPlotSize())
+                elseif "composter" == class then
+                    print(trace.Entity:GetComposting())
+                elseif (class == "plant" or class == "ground_plant") then
+                    print(trace.Entity:GetGrowth())
+                end
+            end
+            print(draw)
+        "#;
+        for code in [
+            DiagnosticCode::UndefinedMethod,
+            DiagnosticCode::InferUnguardedChild,
+        ] {
+            let mut ws = class_name_workspace();
+            assert!(
+                ws.check_file_for(code, "lua/autorun/client/cl_draw.lua", source),
+                "{code:?}"
+            );
+        }
+    }
+
+    /// The class name a local holds stops describing the entity once either is reassigned, and
+    /// says nothing inside a closure that may run later.
+    #[test]
+    fn a_class_name_local_does_not_narrow_past_a_write_or_into_a_closure() {
+        for body in [
+            "local class = trace.Entity:GetClass()\ntrace.Entity = other\nif class == \"composter\" then print(trace.Entity:GetComposting()) end",
+            "local class = trace.Entity:GetClass()\ntrace = { Entity = other }\nif class == \"composter\" then print(trace.Entity:GetComposting()) end",
+            "local class = trace.Entity:GetClass()\nclass = other:GetClass()\nif class == \"composter\" then print(trace.Entity:GetComposting()) end",
+            "local class = trace.Entity:GetClass()\nlocal function later() if class == \"composter\" then print(trace.Entity:GetComposting()) end end\nlater()",
+        ] {
+            let mut ws = class_name_workspace();
+            let source = format!(
+                "---@param trace TraceResult\n---@param other Entity\nlocal function draw(trace, other)\n{body}\nend\nprint(draw)\n"
+            );
+            assert!(
+                !ws.check_file_for(
+                    DiagnosticCode::InferUnguardedChild,
+                    "lua/autorun/client/cl_draw.lua",
+                    &source,
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    /// A missing method a test reads for presence may be installed at run time, so the read is
+    /// unknown rather than nil; a plain read of it stays nil.
+    #[test]
+    fn a_presence_tested_missing_method_reads_as_unknown() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let file = ws.def_file(
+            "lua/autorun/server/sv_car.lua",
+            r#"
+            ---@class Car
+            local Car = {}
+            ---@param hasPhoton boolean
+            function Car:OnSeatInput(hasPhoton)
+                local controller = hasPhoton and self.GetPhotonController and self:GetPhotonController()
+                local plain = self.GetPhotonController
+                print(controller, plain)
+            end
+            "#,
+        );
+        let controller = ws.humanize_type(ws.local_ty(file, "controller"));
+        assert!(
+            controller.contains("unknown") && !controller.contains("nil"),
+            "{controller}"
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file, "plain")), "nil");
+    }
+
+    /// Methods a caller defines on the table a factory returns are members of that table,
+    /// which the factory's own methods may call; a class instance's other instances
+    /// do not gain them.
+    #[test]
+    fn a_method_defined_on_a_factory_result_belongs_to_the_table_it_made() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let factory_path = "lua/includes/util/workshop_files.lua";
+        let factory = r#"
+            function WorkshopFileBase(namespace)
+                local ret = {}
+                function ret:Fetch(kind)
+                    if kind == "local" then return self:FetchLocal(1) end
+                    if kind == "dot" then return self.FetchDot() end
+                    return self:FetchOther()
+                end
+                return ret
+            end
+        "#;
+        let consumer_path = "lua/menu/menu_save.lua";
+        let consumer = r#"
+            ws_save = WorkshopFileBase("save")
+            function ws_save:FetchLocal(offset) return offset end
+            function ws_save.FetchDot() return 1 end
+            local ws_dupe = WorkshopFileBase("dupe")
+            function ws_dupe:FetchOther() return 2 end
+        "#;
+        ws.def_file(consumer_path, consumer);
+        for code in [
+            DiagnosticCode::UndefinedMethod,
+            DiagnosticCode::UndefinedField,
+        ] {
+            assert!(ws.check_file_for(code, factory_path, factory), "{code:?}");
+        }
+
+        let uri = ws.virtual_url_generator.new_uri(consumer_path);
+        ws.analysis.update_file_by_uri(&uri, None);
+        assert!(!ws.check_file_for(DiagnosticCode::UndefinedMethod, factory_path, factory));
+        ws.def_file(consumer_path, consumer);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, factory_path, factory));
+
+        ws.def_file(
+            "lua/annotations/panel.lua",
+            "---@meta\n---@class Panel\nlocal Panel = {}\n---@return Panel\nfunction CreatePanel() end\n",
+        );
+        assert!(!ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "lua/autorun/client/cl_panel.lua",
+            "local a = CreatePanel()\nfunction a:Custom() end\n---@param b Panel\nlocal function Use(b) b:Custom() end\nprint(Use)\n",
+        ));
+    }
+
+    #[test]
+    fn method_on_a_class_that_does_not_exist_is_left_to_type_not_found() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            ---@return Missing
+            local function get() end
+
+            get():Update()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn methods_installed_on_a_created_panel_reach_the_callers_of_its_factory() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            local function Make(parent)
+                local p = vgui.Create("DPanel", parent)
+                function p:SetVal(n) self.val = n end
+                return p
+            end
+
+            local function Use()
+                local p = Make()
+                p:SetVal(1)
+                p:Missing()
+            end
+            "#,
+        );
+
+        let undefined_methods = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(undefined_methods, ["Undefined method `Missing`. "]);
+    }
+
+    #[test]
+    fn methods_of_an_instance_whose_metatable_is_not_a_table_literal_are_not_undefined() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            local function GetClass(name)
+                return _G[name]
+            end
+
+            local function create(name)
+                local part = setmetatable({}, GetClass(name))
+                part:SetUniqueID(1)
+                return part
+            end
+            "#,
+        );
+
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
+    fn methods_of_a_local_table_given_an_unresolved_metatable_are_not_undefined() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            local function GetClass(name)
+                return _G[name]
+            end
+
+            local function create(name)
+                local t = {}
+                setmetatable(t, GetClass(name))
+                t:GetNorm()
+                return t
+            end
+            "#,
+        );
+
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
+    fn methods_of_a_table_whose_metatable_index_is_a_function_are_not_undefined() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            local proxy = {}
+            proxy.__index = function(self, key)
+                return rawget(self, "_target")[key]
+            end
+
+            local function create()
+                local t = setmetatable({}, proxy)
+                t:EmitSound()
+                return t
+            end
+            "#,
+        );
+
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    fn proxy_tool_workspace(include_expr: &str) -> (VirtualWorkspace, &'static str) {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/weapons/sf2_tool/shared.lua",
+            &format!(
+                r#"
+                local t_meta = {{}}
+                t_meta.__index = function(self, key)
+                    return self._swep[key]
+                end
+
+                SWEP.Tool = {{}}
+                local files = file.Find("weapons/sf2_tool/settings/*.lua", "LUA")
+                for _, fil in ipairs(files) do
+                    local tool = ({include_expr})
+                    setmetatable(tool, t_meta)
+                    table.insert(SWEP.Tool, tool)
+                end
+                "#
+            ),
+        );
+        ws.def_file("lua/weapons/sf2_tool/init.lua", "include(\"shared.lua\")");
+        (ws, "lua/weapons/sf2_tool/settings/light_editor.lua")
+    }
+
+    const PROXY_TOOL: &str = r#"
+        local TOOL = {}
+        function TOOL:Use()
+            self:EmitSound("beep")
+        end
+        return TOOL
+    "#;
+
+    #[test]
+    fn methods_of_a_file_whose_includer_gives_its_table_a_function_index_are_not_undefined() {
+        let (mut ws, tool_path) =
+            proxy_tool_workspace(r#"include("weapons/sf2_tool/settings/light_editor.lua")"#);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, tool_path, PROXY_TOOL));
+    }
+
+    #[test]
+    fn methods_of_a_file_a_computed_include_path_loads_are_not_undefined() {
+        let (mut ws, tool_path) =
+            proxy_tool_workspace(r#"include("weapons/sf2_tool/settings/" .. fil)"#);
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, tool_path, PROXY_TOOL));
+    }
+
+    #[test]
+    fn methods_of_a_file_nothing_includes_stay_undefined() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        assert!(!ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "lua/weapons/sf2_tool/settings/light_editor.lua",
+            PROXY_TOOL,
+        ));
+    }
+
+    #[test]
+    fn methods_missing_from_an_instance_whose_metatable_is_a_table_literal_are_undefined() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            local META = {}
+            META.__index = META
+            function META:Known() end
+
+            local function create()
+                local part = setmetatable({}, META)
+                part:Known()
+                part:Missing()
+                return part
+            end
+            "#,
+        );
+
+        let undefined_methods = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(undefined_methods, ["Undefined method `Missing`. "]);
+    }
+
+    #[test]
+    fn instance_methods_resolve_through_a_metatable_a_function_returns() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            local methods = {}
+            function methods:Known() end
+
+            local function GetClass()
+                return { __index = methods }
+            end
+
+            local function create()
+                local t = {}
+                setmetatable(t, GetClass())
+                t:Known()
+                t:Missing()
+            end
+            "#,
+        );
+
+        let undefined_methods = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(undefined_methods, ["Undefined method `Missing`. "]);
     }
 }

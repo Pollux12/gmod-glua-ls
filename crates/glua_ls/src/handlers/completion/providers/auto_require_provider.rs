@@ -77,7 +77,7 @@ fn add_module_completion_item(
 
     let completion_name = module_name_convert(module_info, file_conversion);
     if !completion_name.to_lowercase().starts_with(prefix) {
-        // 如果模块名不匹配, 则根据导出类型添加完成项
+        // If the module name does not match, add completion items according to the export type
         add_completion_item_by_type(
             builder,
             prefix,
@@ -134,7 +134,7 @@ fn add_completion_item_by_type(
     position: Position,
     completions: &mut Vec<CompletionItem>,
 ) -> Option<()> {
-    // 模块必须要有 export 标记
+    // The module must have an export tag
     module_info.get_export(builder.semantic_model.get_db())?;
 
     if let Some(export_type) = &module_info.export_type {
@@ -165,7 +165,7 @@ fn add_completion_item_by_type(
                             else {
                                 continue;
                             };
-                            // 允许标记有 export 标记的引用成员被自动导入捕获
+                            // Allow referenced members with an export tag to be captured by auto-import
                             if property.export().is_none() {
                                 continue;
                             }
