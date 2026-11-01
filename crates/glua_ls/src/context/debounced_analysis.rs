@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use super::{ClientProxy, FileDiagnostic};
+use crate::handlers::refresh_open_document_features;
 
 const FRESHNESS_STUCK_WARN_AFTER: Duration = Duration::from_secs(5);
 
@@ -990,12 +991,7 @@ impl DebouncedAnalysis {
 
     /// Has the client request its derived views of open documents again.
     fn refresh_views(&self) {
-        if self.lsp_features.supports_semantic_tokens_refresh() {
-            self.client.refresh_semantic_tokens();
-        }
-        if self.lsp_features.supports_inlay_hint_refresh() {
-            self.client.refresh_inlay_hints();
-        }
+        refresh_open_document_features(&self.client, &self.lsp_features);
     }
 
     /// Background loop: waits for edits, debounces them, takes them into the
@@ -2758,6 +2754,7 @@ mod tests {
                     "workspace": {
                         "semanticTokens": { "refreshSupport": true },
                         "inlayHint": { "refreshSupport": true },
+                        "codeLens": { "refreshSupport": true },
                     }
                 }))
                 .expect("capabilities should deserialize"),
@@ -2798,6 +2795,7 @@ mod tests {
             verify_that!(
                 refreshes(),
                 eq(&vec![
+                    "workspace/codeLens/refresh".to_string(),
                     "workspace/inlayHint/refresh".to_string(),
                     "workspace/semanticTokens/refresh".to_string(),
                 ])

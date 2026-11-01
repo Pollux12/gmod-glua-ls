@@ -273,12 +273,7 @@ impl WorkspaceManager {
 
             file_diagnostic.forget_missing().await;
             file_diagnostic.add_workspace_diagnostic_task(0, true).await;
-            if lsp_features.supports_semantic_tokens_refresh() {
-                client.refresh_semantic_tokens();
-            }
-            if lsp_features.supports_inlay_hint_refresh() {
-                client.refresh_inlay_hints();
-            }
+            refresh_open_document_features(&client, &lsp_features);
         });
     }
 
