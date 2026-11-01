@@ -55,6 +55,17 @@ pub fn build_semantic_info_hover(
     let typ = assignment_type.unwrap_or_else(|| semantic_info.display_typ().clone());
     let type_label = HoverTypeLabel::from_semantic_origin(semantic_info.origin);
     let Some(semantic_decl) = semantic_info.semantic_decl else {
+        if let Some(hover) = build_subtype_member_hover(
+            compilation,
+            semantic_model,
+            db,
+            document,
+            &token,
+            range,
+            render_level,
+        ) {
+            return Some(hover);
+        }
         return build_hover_without_property(db, semantic_model, document, token, typ, type_label);
     };
     let typ = other_realm_member_type(semantic_model, &token, &semantic_decl, typ);
@@ -82,6 +93,54 @@ pub fn build_semantic_info_hover(
     } else {
         None
     }
+}
+
+/// The hover for a member its receiver's class lacks but subtypes define:
+/// the first subtype's member, with the classes that define it.
+fn build_subtype_member_hover(
+    compilation: &LuaCompilation,
+    semantic_model: &SemanticModel,
+    db: &DbIndex,
+    document: &LuaDocument,
+    token: &LuaSyntaxToken,
+    range: TextRange,
+    render_level: Option<RenderLevel>,
+) -> Option<Hover> {
+    let index_expr = token.parent().and_then(LuaIndexExpr::cast)?;
+    if index_expr.get_index_name_token()?.text_range() != token.text_range() {
+        return None;
+    }
+    let (LuaType::Ref(type_id) | LuaType::Def(type_id)) = semantic_model
+        .infer_expr(index_expr.get_prefix_expr()?)
+        .ok()?
+    else {
+        return None;
+    };
+    let key = LuaMemberKey::Name(token.text().into());
+    let members = semantic_model.get_subtype_members_for_key(&type_id, &key);
+    let (_, member_id) = members.first()?;
+    let mut hover_builder = build_hover_content(
+        compilation,
+        semantic_model,
+        db,
+        Some(semantic_model.get_type((*member_id).into())),
+        LuaSemanticDeclId::Member(*member_id),
+        false,
+        Some(token.clone()),
+        render_level,
+        HoverTypeLabel::Plain,
+    )?;
+    let owners = members
+        .iter()
+        .map(|(owner, _)| format!("`{}`", owner.get_name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    hover_builder.add_annotation_description(format!(
+        "`{}` is not defined on `{}`. Defined on {owners}.",
+        token.text(),
+        type_id.get_name()
+    ));
+    hover_builder.build_hover_result(document.to_lsp_range(range))
 }
 
 /// The type to show for a member access that reads `typ`. An access whose

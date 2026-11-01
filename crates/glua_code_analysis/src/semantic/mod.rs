@@ -772,6 +772,39 @@ impl<'a> SemanticModel<'a> {
         is_sub_type_of(self.db, sub_type_ref_id, super_type_ref_id)
     }
 
+    /// The members named `key` that subtypes of `type_id` define, one per
+    /// subtype, ordered by subtype name.
+    pub fn get_subtype_members_for_key(
+        &self,
+        type_id: &LuaTypeDeclId,
+        key: &LuaMemberKey,
+    ) -> Vec<(LuaTypeDeclId, LuaMemberId)> {
+        let member_index = self.db.get_member_index();
+        let mut owners = member_index
+            .get_current_members_for_key(key)
+            .into_iter()
+            .filter_map(
+                |member| match member_index.get_current_owner(&member.get_id())? {
+                    LuaMemberOwner::Type(owner) if owner != type_id => Some(owner.clone()),
+                    _ => None,
+                },
+            )
+            .filter(|owner| is_sub_type_of(self.db, owner, type_id))
+            .collect::<Vec<_>>();
+        owners.sort_by(|a, b| a.get_name().cmp(b.get_name()));
+        owners.dedup();
+        owners
+            .into_iter()
+            .filter_map(|owner| {
+                let member = member_index
+                    .get_current_owner_members_for_key(&LuaMemberOwner::Type(owner.clone()), key)
+                    .into_iter()
+                    .next()?;
+                Some((owner, member.get_id()))
+            })
+            .collect()
+    }
+
     pub fn get_emmyrc(&self) -> &Emmyrc {
         &self.emmyrc
     }

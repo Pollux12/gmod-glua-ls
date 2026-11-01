@@ -1804,6 +1804,50 @@ local EscapeStringMap: {
     }
 
     #[gtest]
+    fn test_hover_member_only_subtypes_define_shows_their_member() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@class gmod_balloon: Entity
+                local gmod_balloon = {}
+
+                ---@return number
+                function gmod_balloon:GetForce() end
+            "#,
+        );
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                ---@type Entity
+                local ent
+                print(ent:GetFo<??>rce())
+            "#,
+        )?;
+        let file_id = ws.def_file("report.lua", &content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .ok_or("expected hover")
+            .or_fail()?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        verify_that!(
+            markup.value.as_str(),
+            contains_substring("gmod_balloon:GetForce()")
+        )?;
+        verify_that!(
+            markup.value.as_str(),
+            contains_substring("`GetForce` is not defined on `Entity`. Defined on `gmod_balloon`.")
+        )?;
+        verify_that!(
+            markup.value.as_str(),
+            not(contains_substring("GetForce: nil"))
+        )
+    }
+
+    #[gtest]
     fn test_hover_badge_prefers_annotation_realm_over_inferred_realm() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
