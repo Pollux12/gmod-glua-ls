@@ -5,13 +5,13 @@ use crate::{
     vfs::loader::normalize_path_for_ordering,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum WorkspaceImport {
     All,
     SubPaths(Vec<PathBuf>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WorkspaceFolder {
     pub root: PathBuf,
     pub import: WorkspaceImport,
@@ -43,7 +43,7 @@ impl WorkspaceFolder {
 pub fn workspace_collection_folders(
     workspace: Option<WorkspaceFolder>,
     emmyrc: &Emmyrc,
-    configured: &mut HashSet<PathBuf>,
+    configured: &mut HashSet<WorkspaceFolder>,
 ) -> Vec<WorkspaceFolder> {
     let mut own = workspace.is_some();
     let mut workspaces = Vec::from_iter(workspace);
@@ -109,7 +109,7 @@ pub fn workspace_collection_folders(
         }
     }
 
-    workspaces.retain(|folder| std::mem::take(&mut own) || configured.insert(folder.root.clone()));
+    workspaces.retain(|folder| std::mem::take(&mut own) || configured.insert(folder.clone()));
     workspaces
 }
 
@@ -352,8 +352,38 @@ fn find_library_exclude(library: &WorkspaceFolder, emmyrc: &Emmyrc) -> (Vec<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkspaceFileCandidate, dedupe_workspace_files_deterministic};
-    use crate::LuaFileInfo;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    use super::{
+        WorkspaceFileCandidate, WorkspaceFolder, dedupe_workspace_files_deterministic,
+        workspace_collection_folders,
+    };
+    use crate::{Emmyrc, LuaFileInfo};
+
+    #[test]
+    fn package_dirs_sharing_a_parent_are_each_collected() {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.workspace.package_dirs = vec!["/deps/alpha".to_string(), "/deps/beta".to_string()];
+
+        let folders = workspace_collection_folders(None, &emmyrc, &mut HashSet::new());
+
+        assert_eq!(
+            folders,
+            vec![
+                WorkspaceFolder::with_sub_paths(
+                    PathBuf::from("/deps"),
+                    vec![PathBuf::from("alpha")],
+                    true
+                ),
+                WorkspaceFolder::with_sub_paths(
+                    PathBuf::from("/deps"),
+                    vec![PathBuf::from("beta")],
+                    true
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn vfs_collect_dedupe_is_deterministic_with_workspace_priority() {
