@@ -51,7 +51,9 @@ pub use response_handler::on_response_handler;
 pub(crate) use text_document::apply_file_system_changes;
 pub use text_document::on_did_change_text_document;
 #[cfg(test)]
-pub(crate) use text_document::{on_did_close_document, on_did_open_text_document};
+pub(crate) use text_document::{
+    on_did_change_watched_files, on_did_close_document, on_did_open_text_document,
+};
 
 pub trait RegisterCapabilities {
     fn register_capabilities(

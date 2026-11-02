@@ -576,4 +576,62 @@ mod tests {
             let _ = fs::remove_dir_all(root.parent().expect("temp dir"));
         }
     }
+
+    /// Waits until `root`'s loaded files, as [`loaded`] lists them, include
+    /// `relative` (or leave it out, when not `present`), as a scheduled
+    /// reload settles.
+    fn wait_until_loaded(
+        runtime: &tokio::runtime::Runtime,
+        snapshot: &ServerContextSnapshot,
+        root: &Path,
+        relative: &str,
+        present: bool,
+    ) -> BTreeMap<String, Vec<String>> {
+        for _ in 0..300 {
+            let loaded = loaded(runtime, snapshot, root);
+            if loaded.contains_key(relative) == present {
+                return loaded;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("{relative} never became loaded: {present}");
+    }
+
+    #[test]
+    fn an_addon_created_on_disk_loads() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let root = install("new_addon", "{}");
+        let (context, _peer) = start(&runtime, &root);
+        let snapshot = context.snapshot();
+        write(
+            &root,
+            "addons/extra/lua/autorun/sh_extra.lua",
+            "EXTRA = 1\n",
+        );
+
+        runtime.block_on(crate::handlers::on_did_change_watched_files(
+            snapshot.clone(),
+            lsp_types::DidChangeWatchedFilesParams {
+                changes: vec![lsp_types::FileEvent {
+                    uri: uri(&root, "addons/extra"),
+                    typ: lsp_types::FileChangeType::CREATED,
+                }],
+            },
+        ));
+
+        assert_eq!(
+            paths(&wait_until_loaded(
+                &runtime,
+                &snapshot,
+                &root,
+                "addons/extra/lua/autorun/sh_extra.lua",
+                true
+            )),
+            vec![
+                "addons/extra/lua/autorun/sh_extra.lua",
+                "addons/tools/lua/autorun/sh_tools.lua",
+            ]
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("temp dir"));
+    }
 }

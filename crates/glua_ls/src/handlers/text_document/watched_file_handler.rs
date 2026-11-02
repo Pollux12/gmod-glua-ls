@@ -8,7 +8,7 @@ use walkdir::WalkDir;
 
 use crate::{
     codestyle::{apply_editorconfig_file, should_apply_editorconfig_updates},
-    context::ServerContextSnapshot,
+    context::{ServerContextSnapshot, rescope_open_files},
 };
 
 pub async fn on_did_change_watched_files(
@@ -60,11 +60,16 @@ pub async fn on_did_change_watched_files(
     let mut lua_events: Vec<(Uri, FileChangeType)> = Vec::new();
     let mut editorconfig_paths: Vec<PathBuf> = Vec::new();
     let mut config_changed = false;
+    // A file created or deleted in a whole Garry's Mod folder may add or
+    // remove one of its addons or gamemodes.
+    let mut gmod_layout_changed = false;
 
     {
         let workspace = context.workspace_manager().read().await;
 
         for file_event in changes {
+            gmod_layout_changed |= file_event.typ != FileChangeType::CHANGED
+                && workspace.in_scoped_folder(&file_event.uri);
             let file_type = get_file_type(&file_event.uri);
             match file_type {
                 // The editor owns an open document's text, deleted on disk
@@ -107,6 +112,9 @@ pub async fn on_did_change_watched_files(
     stage("renames", &mut at);
     let files = lua_batch.len();
     apply_file_system_changes(&context, lua_batch).await;
+    if gmod_layout_changed {
+        rescope_open_files(&context).await;
+    }
     stage("apply", &mut at);
     crate::util::ls_profile::emit_ls_watched(files, &stages);
 
