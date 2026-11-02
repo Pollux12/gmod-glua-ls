@@ -12,18 +12,28 @@ use crate::{
 
 use super::RegisterCapabilities;
 
-/// Pulls the client's settings again, since the notification's payload is
-/// client-specific, and applies whatever the effective config changed.
+/// How long settings changes must pause before they are read, so a client
+/// writing several settings in a row reloads the config once, with all of them.
+const SETTINGS_QUIET_PERIOD: Duration = Duration::from_millis(300);
+
+/// Pulls the client's settings again once changes pause, since the
+/// notification's payload is client-specific, and applies whatever the
+/// effective config changed.
 pub async fn on_did_change_configuration(
     context: ServerContextSnapshot,
     _params: DidChangeConfigurationParams,
 ) -> Option<()> {
-    let client_id = context
-        .workspace_manager()
-        .read()
-        .await
-        .client_config
-        .client_id;
+    let (settled, client_id) = {
+        let manager = context.workspace_manager().read().await;
+        (
+            manager.begin_settings_change(SETTINGS_QUIET_PERIOD).await,
+            manager.client_config.client_id,
+        )
+    };
+    settled.wait().await;
+    if settled.is_cancelled() {
+        return Some(());
+    }
     let supports_config_request = context.lsp_features().supports_config_request();
     log::info!("change config client_id: {:?}", client_id);
 
@@ -148,5 +158,39 @@ mod tests {
             manager.client_config.gmod_annotations_path.clone()
         });
         verify_that!(kept, eq(&Some("annotations".to_string())))
+    }
+
+    /// Settings that change several times in a row, as when the client writes
+    /// two settings for one gamemode pick, are read once, after the last change.
+    #[gtest]
+    fn a_burst_of_settings_changes_reads_the_settings_once() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, peer) = Connection::memory();
+        let capabilities = serde_json::from_value::<ClientCapabilities>(serde_json::json!({
+            "workspace": { "configuration": true }
+        }))
+        .expect("capabilities should deserialize");
+        runtime.block_on(async {
+            let context = crate::context::ServerContext::new(connection, capabilities);
+            let snapshot = context.snapshot();
+            for _ in 0..2 {
+                tokio::spawn(super::on_did_change_configuration(
+                    snapshot.clone(),
+                    lsp_types::DidChangeConfigurationParams {
+                        settings: serde_json::Value::Null,
+                    },
+                ));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(super::SETTINGS_QUIET_PERIOD + Duration::from_millis(500)).await;
+        });
+        let reads = peer
+            .receiver
+            .try_iter()
+            .filter(|message| {
+                matches!(message, Message::Request(request) if request.method == "workspace/configuration")
+            })
+            .count();
+        verify_that!(reads, eq(1))
     }
 }

@@ -32,6 +32,8 @@ pub struct WorkspaceManager {
     recheck_token: Arc<Mutex<Option<Arc<QuietPeriod>>>>,
     /// The config reload still waiting out its delay.
     config_token: Arc<Mutex<Option<Arc<QuietPeriod>>>>,
+    /// The client settings change still waiting for its burst to end.
+    settings_token: Arc<Mutex<Option<Arc<QuietPeriod>>>>,
     /// Held while a config reload compares and applies, so reloads apply in
     /// the order they load.
     config_apply: Arc<Mutex<()>>,
@@ -76,6 +78,7 @@ impl WorkspaceManager {
             scoped_folders: Vec::new(),
             recheck_token: Arc::new(Mutex::new(None)),
             config_token: Arc::new(Mutex::new(None)),
+            settings_token: Arc::new(Mutex::new(None)),
             config_apply: Arc::new(Mutex::new(())),
             file_diagnostic,
             lsp_features,
@@ -121,6 +124,16 @@ impl WorkspaceManager {
             }
             Self::reload_config(workspace_manager).await;
         });
+    }
+
+    /// The quiet period a client settings change waits out before the settings
+    /// are read; a change made while an earlier one still waits cancels it.
+    pub async fn begin_settings_change(&self, quiet: Duration) -> Arc<QuietPeriod> {
+        let token = Arc::new(QuietPeriod::new(quiet));
+        if let Some(waiting) = self.settings_token.lock().await.replace(token.clone()) {
+            waiting.cancel();
+        }
+        token
     }
 
     /// Loads the config again and applies it with only the work its change
