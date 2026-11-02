@@ -6,8 +6,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use glua_code_analysis::{
-    ALL_CUSTOM_GAMEMODES, GmodTopology, WorkspaceFolder, WorkspaceImport, collect_workspace_files,
-    file_path_to_uri,
+    ALL_CUSTOM_GAMEMODES, GmodTopology, NO_GAMEMODE, WorkspaceFolder, WorkspaceImport,
+    collect_workspace_files, file_path_to_uri,
 };
 use lsp_types::Uri;
 use serde::Serialize;
@@ -211,7 +211,7 @@ pub fn projects(
                     .collect()
             };
             let picked = match gmod.active_gamemode.as_deref() {
-                Some(ALL_CUSTOM_GAMEMODES) => true,
+                Some(ALL_CUSTOM_GAMEMODES | NO_GAMEMODE) => true,
                 Some(name) => topology.gamemode(name).is_some(),
                 None => false,
             };
@@ -531,6 +531,9 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         let unpicked = install("unpicked", "{}");
         let picked = install("projects", r#"{ "gmod": { "activeGamemode": "beta" } }"#);
+        let addons_only = install("addons_only", r#"{ "gmod": { "activeGamemode": "" } }"#);
+        let all_custom = install("all_custom", r#"{ "gmod": { "activeGamemode": "*" } }"#);
+        let everything = install("everything", r#"{ "gmod": { "loadEverything": true } }"#);
         let summary = |root: &Path| {
             let (context, _peer) = start(&runtime, root);
             runtime.block_on(async {
@@ -554,10 +557,23 @@ mod tests {
         };
 
         assert_eq!(
-            (summary(&unpicked), summary(&picked)),
-            ((true, 1, 5), (false, 3, 5))
+            [
+                summary(&unpicked),
+                summary(&picked),
+                summary(&addons_only),
+                summary(&all_custom),
+                summary(&everything),
+            ],
+            [
+                (true, 1, 5),
+                (false, 3, 5),
+                (false, 1, 5),
+                (false, 4, 5),
+                (false, 6, 5),
+            ]
         );
-        let _ = fs::remove_dir_all(unpicked.parent().expect("temp dir"));
-        let _ = fs::remove_dir_all(picked.parent().expect("temp dir"));
+        for root in [unpicked, picked, addons_only, all_custom, everything] {
+            let _ = fs::remove_dir_all(root.parent().expect("temp dir"));
+        }
     }
 }

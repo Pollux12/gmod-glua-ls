@@ -106,9 +106,9 @@ pub struct EmmyrcGmod {
     pub auto_detect_gamemode_base: Option<bool>,
     /// The gamemode a Garry's Mod folder (named `garrysmod`, or holding `addons/`
     /// and `gamemodes/`) loads with its addons, together with the custom
-    /// gamemodes it derives from. `"*"` loads every custom gamemode. Unset, a
-    /// sole custom gamemode loads; with several, each loads while a file in it
-    /// is open.
+    /// gamemodes it derives from. `"*"` loads every custom gamemode and `""`
+    /// none, for working on addons. Unset, a sole custom gamemode loads; with
+    /// several, each loads while a file in it is open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_gamemode: Option<String>,
     /// Load a whole Garry's Mod folder, `lua/` and the built-in gamemodes

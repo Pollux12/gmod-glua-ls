@@ -31,8 +31,8 @@ pub use gamemode_base::detect_gamemode_base_libraries;
 pub use glua_codestyle::*;
 use glua_parser::{LineIndex, LuaCallExpr, LuaSyntaxTree};
 pub use gmod_workspace::{
-    ALL_CUSTOM_GAMEMODES, BUILTIN_GAMEMODES, Gamemode, GmodTopology, UnpickedGamemodes,
-    scope_workspace_folder,
+    ALL_CUSTOM_GAMEMODES, BUILTIN_GAMEMODES, Gamemode, GmodTopology, NO_GAMEMODE,
+    UnpickedGamemodes, scope_workspace_folder,
 };
 pub use library_collision::LibraryDefinitionCollision;
 use lsp_types::Uri;

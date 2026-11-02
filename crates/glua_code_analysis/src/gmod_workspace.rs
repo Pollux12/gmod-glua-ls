@@ -16,6 +16,9 @@ pub const BUILTIN_GAMEMODES: [&str; 3] = ["base", "sandbox", "terrortown"];
 /// The `gmod.activeGamemode` value that picks every custom gamemode.
 pub const ALL_CUSTOM_GAMEMODES: &str = "*";
 
+/// The `gmod.activeGamemode` value that picks no gamemode, for working on addons.
+pub const NO_GAMEMODE: &str = "";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gamemode {
     pub name: String,
@@ -107,9 +110,9 @@ impl GmodTopology {
     }
 
     /// The gamemodes loaded whatever is open: the pick (`"*"` for every custom
-    /// gamemode) with its chain, or with none the sole custom gamemode's
-    /// chain, or with several what `unpicked` says. A pick that names no
-    /// gamemode counts as none.
+    /// gamemode, `""` for none) with its chain, or with none the sole custom
+    /// gamemode's chain, or with several what `unpicked` says. A pick that
+    /// names no gamemode counts as none.
     pub fn picked_gamemodes(
         &self,
         pick: Option<&str>,
@@ -117,6 +120,7 @@ impl GmodTopology {
     ) -> Vec<&Gamemode> {
         match pick {
             Some(ALL_CUSTOM_GAMEMODES) => return self.custom_gamemodes().collect(),
+            Some(NO_GAMEMODE) => return Vec::new(),
             Some(name) if self.gamemode(name).is_some() => return self.chain(name),
             Some(name) => log::warn!(
                 "gmod.activeGamemode names no gamemode in {:?}: {name}",
@@ -398,6 +402,7 @@ mod tests {
                 picked(Some("helix-hl2rp"), UnpickedGamemodes::None),
                 picked(Some("sandbox"), UnpickedGamemodes::None),
                 picked(Some("*"), UnpickedGamemodes::None),
+                picked(Some(""), UnpickedGamemodes::AllCustom),
                 picked(Some("missing"), UnpickedGamemodes::None),
                 picked(None, UnpickedGamemodes::None),
                 picked(None, UnpickedGamemodes::AllCustom),
@@ -406,6 +411,7 @@ mod tests {
                 vec!["helix-hl2rp".to_string(), "helix".to_string()],
                 vec!["sandbox".to_string()],
                 vec!["helix".to_string(), "helix-hl2rp".to_string()],
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 vec!["helix".to_string(), "helix-hl2rp".to_string()],
