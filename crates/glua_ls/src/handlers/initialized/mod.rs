@@ -22,9 +22,8 @@ use crate::{
 };
 pub use client_config::{ClientConfig, client_config_sections, get_client_config};
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, FileId, LuaDiagnosticConfig, Slice, WorkspaceFolder,
-    calculate_include_and_exclude, collect_workspace_files, fetch_schema_urls, file_path_to_uri,
-    uri_to_file_path,
+    EmmyLuaAnalysis, Emmyrc, FileId, Slice, WorkspaceFolder, calculate_include_and_exclude,
+    collect_workspace_files, fetch_schema_urls, file_path_to_uri, uri_to_file_path,
 };
 use lsp_types::{InitializeParams, MessageType, ShowMessageParams, Uri};
 use tokio::sync::RwLock;
@@ -222,31 +221,22 @@ pub async fn init_analysis(
     );
     log::info!("preparing workspace folders for initial indexing");
 
-    let mut workspace_collection_groups: Vec<(Arc<Emmyrc>, Vec<WorkspaceFolder>)> = Vec::new();
-    if workspace_folders.is_empty() {
-        workspace_collection_groups.push((
+    let workspace_collection_groups = if workspace_folders.is_empty() {
+        vec![(
             emmyrc.clone(),
             glua_code_analysis::workspace_collection_folders(
                 None,
                 emmyrc.as_ref(),
                 &mut HashSet::new(),
             ),
-        ));
+        )]
     } else {
-        let mut configured = HashSet::new();
-        for workspace in workspace_folders {
-            let workspace_config = workspace_emmyrcs
-                .get(&workspace.root)
-                .cloned()
-                .unwrap_or_else(|| emmyrc.clone());
-            let group = glua_code_analysis::workspace_collection_folders(
-                Some(workspace),
-                workspace_config.as_ref(),
-                &mut configured,
-            );
-            workspace_collection_groups.push((workspace_config, group));
-        }
-    }
+        glua_code_analysis::workspace_collection_groups(
+            workspace_folders,
+            &emmyrc,
+            &workspace_emmyrcs,
+        )
+    };
 
     watchdog_status.set_phase("Collecting Lua files");
     status_bar.update_startup_phase(
@@ -312,7 +302,7 @@ pub async fn init_analysis(
     );
     let rebuild = mut_analysis.apply_config(emmyrc.clone()).affects_index() || roots_moved;
 
-    apply_workspace_diagnostic_configs(&mut mut_analysis, &workspace_diagnostic_configs);
+    mut_analysis.set_root_diagnostic_configs(&workspace_diagnostic_configs);
 
     // The editor owns an open document's text: disk text would replace the
     // unsaved edits it holds.
@@ -455,23 +445,6 @@ fn uncollected_files(
 }
 
 /// Gives each workspace root that has its own diagnostic config that config.
-pub fn apply_workspace_diagnostic_configs(
-    analysis: &mut EmmyLuaAnalysis,
-    workspace_diagnostic_configs: &HashMap<PathBuf, LuaDiagnosticConfig>,
-) {
-    let configs = workspace_diagnostic_configs
-        .iter()
-        .filter_map(|(root, config)| {
-            let workspace_id = analysis.get_workspace_id_for_root(root)?;
-            log::info!("setting per-workspace diagnostic config for {root:?} ({workspace_id:?})");
-            Some((workspace_id, Arc::new(config.clone())))
-        })
-        .collect::<HashMap<_, _>>();
-    if !configs.is_empty() {
-        analysis.set_workspace_diagnostic_configs(configs);
-    }
-}
-
 /// Asks the client to request again the open documents' semantic tokens,
 /// inlay hints and code lenses.
 pub fn refresh_open_document_features(

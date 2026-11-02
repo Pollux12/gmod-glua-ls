@@ -766,6 +766,27 @@ impl EmmyLuaAnalysis {
         self.diagnostic.set_workspace_configs(configs);
     }
 
+    /// Diagnoses the files of each registered root in `configs` with its
+    /// diagnostic config.
+    pub fn set_root_diagnostic_configs(
+        &mut self,
+        configs: &HashMap<std::path::PathBuf, LuaDiagnosticConfig>,
+    ) {
+        let configs = configs
+            .iter()
+            .filter_map(|(root, config)| {
+                let workspace_id = self.get_workspace_id_for_root(root)?;
+                log::info!(
+                    "setting per-workspace diagnostic config for {root:?} ({workspace_id:?})"
+                );
+                Some((workspace_id, Arc::new(config.clone())))
+            })
+            .collect::<HashMap<_, _>>();
+        if !configs.is_empty() {
+            self.set_workspace_diagnostic_configs(configs);
+        }
+    }
+
     pub fn get_workspace_id_for_root(&self, root: &Path) -> Option<WorkspaceId> {
         self.compilation
             .get_db()

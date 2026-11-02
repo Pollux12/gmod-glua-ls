@@ -41,8 +41,7 @@ mod test;
 mod test_lib;
 
 pub use initialized::{
-    ClientConfig, apply_workspace_diagnostic_configs, init_analysis, initialized_handler,
-    refresh_open_document_features,
+    ClientConfig, init_analysis, initialized_handler, refresh_open_document_features,
 };
 use lsp_types::{ClientCapabilities, ServerCapabilities};
 pub use notification_handler::on_notification_handler;
