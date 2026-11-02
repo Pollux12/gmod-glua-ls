@@ -9,6 +9,9 @@ use crate::{
 pub enum WorkspaceImport {
     All,
     SubPaths(Vec<PathBuf>),
+    /// Registered as a root for its module paths and config, loading none of
+    /// its files and none of its extra roots, libraries or package directories.
+    None,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -39,12 +42,19 @@ impl WorkspaceFolder {
 /// The folders `workspace` loads under `emmyrc`, in registration order: the
 /// workspace, its extra roots, its libraries, then its package directories.
 /// An extra root, library or package directory already in `configured` is left
-/// to the workspace that configured it first.
+/// to the workspace that configured it first, and a workspace that imports
+/// nothing brings none of them.
 pub fn workspace_collection_folders(
     workspace: Option<WorkspaceFolder>,
     emmyrc: &Emmyrc,
     configured: &mut HashSet<WorkspaceFolder>,
 ) -> Vec<WorkspaceFolder> {
+    if let Some(workspace) = workspace
+        .as_ref()
+        .filter(|workspace| workspace.import == WorkspaceImport::None)
+    {
+        return vec![workspace.clone()];
+    }
     let mut own = workspace.is_some();
     let mut workspaces = Vec::from_iter(workspace);
 
@@ -278,6 +288,7 @@ pub fn collect_workspace_files(
                     }
                 }
             }
+            WorkspaceImport::None => {}
         }
     }
     let files = dedupe_workspace_files_deterministic(candidates);

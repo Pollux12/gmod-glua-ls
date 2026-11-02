@@ -402,6 +402,7 @@ fn is_workspace_file_inner(
     let inside_import = match &workspace.import {
         WorkspaceImport::All => true,
         WorkspaceImport::SubPaths(paths) => paths.iter().any(|p| relative.starts_with(p)),
+        WorkspaceImport::None => false,
     };
 
     if !inside_import {
@@ -450,6 +451,8 @@ pub struct LoadedConfig {
     /// Used by `WorkspaceManager::is_workspace_file` to avoid cross-root leakage
     /// of `useDefaultIgnores` / `ignoreDirDefaults` settings.
     pub workspace_matchers: HashMap<PathBuf, WorkspaceFileMatcher>,
+    /// The roots with a config file of their own.
+    pub local_config_roots: HashSet<PathBuf>,
 }
 
 impl LoadedConfig {
@@ -493,8 +496,12 @@ pub fn load_scoped_config(
     client_config: ClientConfig,
 ) -> (Vec<WorkspaceFolder>, LoadedConfig) {
     let config_roots = collect_config_roots(folders);
-    let loaded =
-        load_config_for_roots(config_roots.clone(), &HashSet::new(), client_config.clone());
+    let loaded = load_config_for_roots(
+        config_roots.clone(),
+        &HashSet::new(),
+        &HashSet::new(),
+        client_config.clone(),
+    );
     let mut scoped_folders = Vec::new();
     let mut scoped_roots = HashSet::new();
     for (folder, scoped) in folders.iter().zip(scope_each(folders, &loaded, open)) {
@@ -510,7 +517,12 @@ pub fn load_scoped_config(
         .into_iter()
         .chain(scoped_folders.iter().map(|folder| folder.root.clone()))
         .collect();
-    let loaded = load_config_for_roots(config_roots, &scoped_roots, client_config);
+    let unloaded_roots = scoped_folders
+        .iter()
+        .filter(|folder| folder.import == WorkspaceImport::None)
+        .map(|folder| folder.root.clone())
+        .collect();
+    let loaded = load_config_for_roots(config_roots, &scoped_roots, &unloaded_roots, client_config);
     (scoped_folders, loaded)
 }
 
@@ -544,16 +556,23 @@ fn scope_each(
 
 #[cfg(test)]
 pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig) -> LoadedConfig {
-    load_config_for_roots(config_roots, &HashSet::new(), client_config)
+    load_config_for_roots(
+        config_roots,
+        &HashSet::new(),
+        &HashSet::new(),
+        client_config,
+    )
 }
 
 /// The config of `config_roots`, merged, and each root's own. A root in
 /// `scoped_roots` belongs to a scoped Garry's Mod folder, so no gamemode base
 /// is detected from it: the folder loads its custom gamemodes itself and the
-/// annotations cover the built-in ones.
+/// annotations cover the built-in ones. A root in `unloaded_roots` loads none
+/// of its files, so its config is its own and stays out of the merged one.
 fn load_config_for_roots(
     config_roots: Vec<PathBuf>,
     scoped_roots: &HashSet<PathBuf>,
+    unloaded_roots: &HashSet<PathBuf>,
     client_config: ClientConfig,
 ) -> LoadedConfig {
     // Config load priority.
@@ -619,16 +638,18 @@ fn load_config_for_roots(
     // Inject GMod annotations path if provided and not explicitly disabled
     inject_gmod_annotations(&client_config, &mut emmyrc);
 
-    let (workspace_diagnostic_configs, workspace_emmyrcs) = pre_process_emmyrc_for_all_roots(
-        &mut emmyrc,
-        &config_roots,
-        scoped_roots,
-        &global_config_files,
-        &client_config,
-        luarc_file,
-        emmyrc_file,
-        emmyrc_lua_file,
-    );
+    let (workspace_diagnostic_configs, workspace_emmyrcs, local_config_roots) =
+        pre_process_emmyrc_for_all_roots(
+            &mut emmyrc,
+            &config_roots,
+            scoped_roots,
+            unloaded_roots,
+            &global_config_files,
+            &client_config,
+            luarc_file,
+            emmyrc_file,
+            emmyrc_lua_file,
+        );
 
     log::info!("loaded emmyrc complete");
     let workspace_matchers = build_workspace_matchers(&workspace_emmyrcs);
@@ -638,6 +659,7 @@ fn load_config_for_roots(
         workspace_diagnostic_configs,
         workspace_emmyrcs,
         workspace_matchers,
+        local_config_roots,
     }
 }
 
@@ -645,6 +667,7 @@ fn pre_process_emmyrc_for_all_roots(
     emmyrc: &mut Emmyrc,
     config_roots: &[PathBuf],
     scoped_roots: &HashSet<PathBuf>,
+    unloaded_roots: &HashSet<PathBuf>,
     global_config_files: &[PathBuf],
     client_config: &ClientConfig,
     luarc_file: &str,
@@ -653,12 +676,18 @@ fn pre_process_emmyrc_for_all_roots(
 ) -> (
     HashMap<PathBuf, LuaDiagnosticConfig>,
     HashMap<PathBuf, Arc<Emmyrc>>,
+    HashSet<PathBuf>,
 ) {
     let mut workspace_diagnostic_configs = HashMap::new();
     let mut workspace_emmyrcs = HashMap::new();
+    let mut local_config_roots = HashSet::new();
 
     if config_roots.is_empty() {
-        return (workspace_diagnostic_configs, workspace_emmyrcs);
+        return (
+            workspace_diagnostic_configs,
+            workspace_emmyrcs,
+            local_config_roots,
+        );
     }
 
     let mut workspace_configs = Vec::new();
@@ -667,6 +696,9 @@ fn pre_process_emmyrc_for_all_roots(
         let local_config_files =
             collect_config_files_from_dir(workspace_root, luarc_file, emmyrc_file, emmyrc_lua_file);
         let has_local_config = !local_config_files.is_empty();
+        if has_local_config {
+            local_config_roots.insert(workspace_root.clone());
+        }
 
         let mut workspace_config_files = global_config_files.to_vec();
         workspace_config_files.extend(local_config_files);
@@ -687,6 +719,7 @@ fn pre_process_emmyrc_for_all_roots(
     // Isolation can only stay enabled if all workspace configs keep it enabled.
     let isolation_enabled = workspace_configs
         .iter()
+        .filter(|(workspace_root, _, _)| !unloaded_roots.contains(workspace_root))
         .all(|(_, workspace_emmyrc, _)| workspace_emmyrc.workspace.enable_isolation);
 
     if isolation_enabled {
@@ -698,6 +731,9 @@ fn pre_process_emmyrc_for_all_roots(
             );
             workspace_emmyrcs.insert(workspace_root.clone(), Arc::new(workspace_emmyrc.clone()));
 
+            if unloaded_roots.contains(workspace_root) {
+                continue;
+            }
             if let Some(merged) = merged_emmyrc.as_mut() {
                 merge_isolated_workspace_fields(merged, workspace_emmyrc);
             } else {
@@ -709,14 +745,20 @@ fn pre_process_emmyrc_for_all_roots(
             *emmyrc = merged_emmyrc;
         }
 
-        return (workspace_diagnostic_configs, workspace_emmyrcs);
+        return (
+            workspace_diagnostic_configs,
+            workspace_emmyrcs,
+            local_config_roots,
+        );
     }
 
     // isolation disabled: build one global merged config while keeping
     // local workspace configs as optional overrides only where present.
     let baseline_index = workspace_configs
         .iter()
-        .position(|(_, _, has_local)| *has_local)
+        .position(|(workspace_root, _, has_local)| {
+            *has_local && !unloaded_roots.contains(workspace_root)
+        })
         .unwrap_or(0);
 
     let mut merged_emmyrc = workspace_configs
@@ -735,7 +777,7 @@ fn pre_process_emmyrc_for_all_roots(
             workspace_emmyrcs.insert(workspace_root.clone(), Arc::new(workspace_emmyrc.clone()));
         }
 
-        if index == baseline_index {
+        if index == baseline_index || unloaded_roots.contains(&workspace_root) {
             continue;
         }
 
@@ -747,7 +789,11 @@ fn pre_process_emmyrc_for_all_roots(
 
     *emmyrc = merged_emmyrc;
 
-    (workspace_diagnostic_configs, workspace_emmyrcs)
+    (
+        workspace_diagnostic_configs,
+        workspace_emmyrcs,
+        local_config_roots,
+    )
 }
 
 fn merge_isolated_workspace_fields(merged: &mut Emmyrc, workspace_emmyrc: &Emmyrc) {

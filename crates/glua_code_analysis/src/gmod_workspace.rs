@@ -147,8 +147,9 @@ impl GmodTopology {
     /// The workspace folders the root loads with `picked` and the files in
     /// `open`: every addon and gamemode registered as its own root, each
     /// loaded addon and gamemode whole (a gamemode with an open file and its
-    /// chain among them), then the opened folder with only the open files
-    /// outside them. The roots are the same whatever is picked or open.
+    /// chain among them) and the others importing nothing, then the opened
+    /// folder with only the open files outside them. The roots are the same
+    /// whatever is picked or open.
     pub fn scoped_folders(&self, picked: &[&Gamemode], open: &[PathBuf]) -> Vec<WorkspaceFolder> {
         let mut loaded = picked
             .iter()
@@ -183,7 +184,11 @@ impl GmodTopology {
             if loaded.contains(&gamemode.name.as_str()) {
                 WorkspaceFolder::new(gamemode.dir.clone(), false)
             } else {
-                WorkspaceFolder::with_sub_paths(gamemode.dir.clone(), Vec::new(), false)
+                WorkspaceFolder {
+                    root: gamemode.dir.clone(),
+                    import: WorkspaceImport::None,
+                    is_library: false,
+                }
             }
         });
         addons
