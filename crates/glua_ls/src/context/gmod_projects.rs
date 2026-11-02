@@ -56,14 +56,10 @@ pub async fn rescope_open_files(context: &ServerContextSnapshot) -> HashSet<Uri>
         .filter(|(now, was)| now.import != was.import)
         .map(|(now, was)| (now.clone(), was.clone()))
         .collect::<Vec<_>>();
-    if changed.iter().any(|(now, was)| {
+    let reconfigures = changed.iter().any(|(now, was)| {
         (now.import == WorkspaceImport::None || was.import == WorkspaceImport::None)
             && loaded.local_config_roots.contains(&now.root)
-    }) {
-        log::info!("a Garry's Mod gamemode with its own config loaded or unloaded; reloading");
-        schedule_reload(context).await;
-        return HashSet::new();
-    }
+    });
     let local = context.analysis().read().await.local_file_paths();
     let unloaded = {
         let mut manager = context.workspace_manager().write().await;
@@ -98,6 +94,10 @@ pub async fn rescope_open_files(context: &ServerContextSnapshot) -> HashSet<Uri>
     );
     apply_file_system_changes(context, batch).await;
     send_projects_changed(context.client(), folders, loaded, scoped).await;
+    if reconfigures {
+        log::info!("a Garry's Mod gamemode with its own config loaded or unloaded; reloading");
+        schedule_reload(context).await;
+    }
     unloaded
 }
 
@@ -645,6 +645,55 @@ mod tests {
                 "addons/extra/lua/autorun/sh_extra.lua",
                 "addons/tools/lua/autorun/sh_tools.lua",
             ]
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("temp dir"));
+    }
+
+    #[test]
+    fn a_gamemode_with_its_own_config_loads_and_keeps_its_open_document() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let root = install("gamemode_config", "{}");
+        write(&root, "gamemodes/gamma/.gluarc.json", "{}");
+        write(
+            &root,
+            "gamemodes/gamma/gamemode/shared.lua",
+            "GAMMA_SHARED = 1\n",
+        );
+        let (context, _peer) = start(&runtime, &root);
+        let snapshot = context.snapshot();
+        let before = loaded(&runtime, &snapshot, &root);
+
+        toggle(
+            &runtime,
+            &snapshot,
+            &root,
+            "gamemodes/gamma/gamemode/init.lua",
+            true,
+        );
+        let opened = loaded(&runtime, &snapshot, &root);
+        let edits_reach_the_server = snapshot
+            .note_document_seen_version(&uri(&root, "gamemodes/gamma/gamemode/init.lua"), 2)
+            .is_some();
+        toggle(
+            &runtime,
+            &snapshot,
+            &root,
+            "gamemodes/gamma/gamemode/init.lua",
+            false,
+        );
+        let closed = loaded(&runtime, &snapshot, &root);
+
+        assert_eq!(
+            (paths(&opened), edits_reach_the_server, &closed),
+            (
+                vec![
+                    "addons/tools/lua/autorun/sh_tools.lua",
+                    "gamemodes/gamma/gamemode/init.lua",
+                    "gamemodes/gamma/gamemode/shared.lua",
+                ],
+                true,
+                &before
+            )
         );
         let _ = fs::remove_dir_all(root.parent().expect("temp dir"));
     }
