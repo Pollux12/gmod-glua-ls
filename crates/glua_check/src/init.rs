@@ -1,8 +1,9 @@
 use fern::Dispatch;
 use glua_code_analysis::{
-    EmmyLibraryItem, EmmyLuaAnalysis, Emmyrc, GmodTopology, UnpickedGamemodes, WorkspaceFolder,
-    collect_workspace_files, detect_gamemode_base_libraries, load_configs, scope_workspace_folder,
-    update_code_style, workspace_collection_folders,
+    ConfigSources, EmmyLibraryItem, EmmyLuaAnalysis, Emmyrc, GmodTopology, UnpickedGamemodes,
+    WorkspaceConfigs, WorkspaceFolder, collect_workspace_files, detect_gamemode_base_libraries,
+    load_configs, load_scoped_workspace_configs, scope_folders, update_code_style,
+    workspace_collection_groups,
 };
 use log::LevelFilter;
 use std::collections::HashSet;
@@ -68,71 +69,79 @@ pub async fn load_workspace(
     ignore: Option<Vec<String>>,
     gmod_annotations: Option<PathBuf>,
 ) -> Option<EmmyLuaAnalysis> {
-    let (config_files, config_root): (Vec<PathBuf>, PathBuf) =
-        if let Some(config_paths) = config_paths {
-            (
-                config_paths.clone(),
-                root_from_configs(&config_paths, &main_path),
-            )
-        } else {
-            (
-                discover_config_files_in_order(&main_path),
-                main_path.clone(),
-            )
-        };
-
-    let mut emmyrc = load_configs(config_files, None);
-    log::info!(
-        "Pre processing configurations using root: \"{}\"",
-        config_root.display()
-    );
-
-    apply_gamemode_base_detection(&mut emmyrc, &cmd_workspace_folders, &main_path);
-
-    emmyrc.pre_process_emmyrc(&config_root);
-
-    if let Some(annotations_path) = gmod_annotations {
+    let annotations = gmod_annotations.and_then(|annotations_path| {
         if annotations_path.is_dir() {
             log::info!(
                 "Adding GMod annotations from: {}",
                 annotations_path.display()
             );
-            emmyrc.prioritize_gmod_annotations_library(
-                annotations_path.to_string_lossy().into_owned(),
-            );
+            Some(annotations_path.to_string_lossy().into_owned())
         } else {
             log::warn!(
                 "GMod annotations path is not an existing directory: {}",
                 annotations_path.display()
             );
+            None
         }
-    }
+    });
+    let prepare = |emmyrc: &mut Emmyrc| {
+        if let Some(annotations) = &annotations {
+            emmyrc.prioritize_gmod_annotations_library(annotations.clone());
+        }
+    };
+    let folders = cmd_workspace_folders
+        .iter()
+        .map(|root| WorkspaceFolder::new(root.clone(), false))
+        .collect::<Vec<_>>();
+
+    // Loaded as the server loads them, so each folder, addon and gamemode
+    // reads its own config, and load order and library precedence match.
+    let (workspace_folders, configs) = match config_paths {
+        Some(config_paths) => {
+            let config_root = root_from_configs(&config_paths, &main_path);
+            let mut emmyrc = load_configs(config_paths, None);
+            log::info!(
+                "Pre processing configurations using root: \"{}\"",
+                config_root.display()
+            );
+            apply_gamemode_base_detection(&mut emmyrc, &cmd_workspace_folders, &main_path);
+            emmyrc.pre_process_emmyrc(&config_root);
+            prepare(&mut emmyrc);
+            let configs = WorkspaceConfigs {
+                emmyrc: emmyrc.into(),
+                ..WorkspaceConfigs::default()
+            };
+            let scoped = scope_folders(&folders, &[], UnpickedGamemodes::AllCustom, |_| {
+                configs.emmyrc.as_ref()
+            });
+            (scoped, configs)
+        }
+        None => load_scoped_workspace_configs(
+            &folders,
+            &[],
+            UnpickedGamemodes::AllCustom,
+            &ConfigSources {
+                global_files: Vec::new(),
+                partial_emmyrcs: None,
+                prepare: &prepare,
+            },
+        ),
+    };
 
     let mut analysis = EmmyLuaAnalysis::new();
-    analysis.update_config(emmyrc.clone().into());
+    analysis.update_config(configs.emmyrc.clone());
     analysis.init_std_lib();
 
-    // Registered as the server registers them, so load order and library
-    // precedence match.
-    let mut configured = HashSet::new();
-    let workspace_folders = cmd_workspace_folders
-        .iter()
-        .flat_map(|root| {
-            scope_workspace_folder(
-                &WorkspaceFolder::new(root.clone(), false),
-                &emmyrc.gmod,
-                UnpickedGamemodes::AllCustom,
-                &[],
-            )
-        })
-        .flat_map(|folder| workspace_collection_folders(Some(folder), &emmyrc, &mut configured))
-        .collect::<Vec<WorkspaceFolder>>();
-    analysis.set_workspace_roots(&workspace_folders);
+    let groups =
+        workspace_collection_groups(workspace_folders, &configs.emmyrc, &configs.root_emmyrcs);
+    analysis.set_workspace_roots(groups.iter().flat_map(|(_, group)| group));
+    analysis.set_root_diagnostic_configs(&configs.diagnostic_configs);
 
-    let file_infos = collect_workspace_files(&workspace_folders, &analysis.emmyrc, None, ignore);
+    let file_infos = groups
+        .iter()
+        .flat_map(|(config, group)| collect_workspace_files(group, config, None, ignore.clone()));
     let mut loaded_paths = HashSet::new();
     let files = file_infos
-        .into_iter()
         .filter(|file| loaded_paths.insert(file.path.clone()))
         .filter_map(|file| {
             if file.path.ends_with(".editorconfig") {
@@ -159,22 +168,6 @@ pub async fn load_workspace(
     }
 
     Some(analysis)
-}
-
-fn discover_config_files_in_order(root: &Path) -> Vec<PathBuf> {
-    // .gluarc.json is the GMod-specific config — if present, it takes exclusive priority.
-    let gluarc = root.join(".gluarc.json");
-    if gluarc.exists() {
-        return vec![gluarc];
-    }
-    [
-        root.join(".luarc.json"),
-        root.join(".emmyrc.json"),
-        root.join(".emmyrc.lua"),
-    ]
-    .into_iter()
-    .filter(|path| path.exists())
-    .collect()
 }
 
 /// Auto-detect GMod gamemode base libraries from `<gamemodes>/<name>/<name>.txt`
@@ -477,5 +470,34 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(packages);
+    }
+
+    /// Each addon of a whole Garry's Mod folder is collected with its own
+    /// config, as the server collects it.
+    #[tokio::test]
+    async fn collects_each_addon_of_a_gmod_folder_with_its_own_config() {
+        let root = make_workspace();
+        let file = |addon: &str| root.join(format!("addons/{addon}/lua/extras/sh_extra.lua"));
+        for addon in ["configured", "plain"] {
+            fs::create_dir_all(file(addon).parent().unwrap()).unwrap();
+            fs::write(file(addon), "EXTRA = {}\n").unwrap();
+        }
+        fs::create_dir_all(root.join("gamemodes")).unwrap();
+        fs::write(
+            root.join("addons/configured/.gluarc.json"),
+            r#"{"workspace":{"ignoreDir":["lua/extras/"]}}"#,
+        )
+        .unwrap();
+
+        let analysis = load_workspace(root.clone(), vec![root.clone()], None, None, None)
+            .await
+            .expect("workspace should load");
+        let loaded = |addon: &str| {
+            let uri = glua_code_analysis::file_path_to_uri(&file(addon)).expect("URI should parse");
+            analysis.get_file_id(&uri).is_some()
+        };
+
+        assert_eq!((loaded("configured"), loaded("plain")), (false, true));
+        let _ = fs::remove_dir_all(root);
     }
 }
