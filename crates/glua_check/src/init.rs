@@ -69,21 +69,7 @@ pub async fn load_workspace(
     ignore: Option<Vec<String>>,
     gmod_annotations: Option<PathBuf>,
 ) -> Option<EmmyLuaAnalysis> {
-    let annotations = gmod_annotations.and_then(|annotations_path| {
-        if annotations_path.is_dir() {
-            log::info!(
-                "Adding GMod annotations from: {}",
-                annotations_path.display()
-            );
-            Some(annotations_path.to_string_lossy().into_owned())
-        } else {
-            log::warn!(
-                "GMod annotations path is not an existing directory: {}",
-                annotations_path.display()
-            );
-            None
-        }
-    });
+    let annotations = gmod_annotations.and_then(annotations_library);
     let prepare = |emmyrc: &mut Emmyrc| {
         if let Some(annotations) = &annotations {
             emmyrc.prioritize_gmod_annotations_library(annotations.clone());
@@ -168,6 +154,25 @@ pub async fn load_workspace(
     }
 
     Some(analysis)
+}
+
+/// The annotations library at `annotations_path`, made absolute against the
+/// current directory so no workspace root's config resolves it, or `None`
+/// when it is not an existing directory.
+fn annotations_library(annotations_path: PathBuf) -> Option<String> {
+    if !annotations_path.is_dir() {
+        log::warn!(
+            "GMod annotations path is not an existing directory: {}",
+            annotations_path.display()
+        );
+        return None;
+    }
+    let annotations_path = std::path::absolute(&annotations_path).unwrap_or(annotations_path);
+    log::info!(
+        "Adding GMod annotations from: {}",
+        annotations_path.display()
+    );
+    Some(annotations_path.to_string_lossy().into_owned())
 }
 
 /// Auto-detect GMod gamemode base libraries from `<gamemodes>/<name>/<name>.txt`
@@ -470,6 +475,18 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(packages);
+    }
+
+    /// A relative annotations path names a folder under the current
+    /// directory, not under each workspace root.
+    #[test]
+    fn a_relative_annotations_path_resolves_against_the_current_directory() {
+        let current = std::env::current_dir().unwrap();
+
+        assert_eq!(
+            annotations_library(PathBuf::from("src")).map(PathBuf::from),
+            Some(current.join("src"))
+        );
     }
 
     /// Each addon of a whole Garry's Mod folder is collected with its own
