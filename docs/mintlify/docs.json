@@ -40,7 +40,8 @@
             "group": "Debugger",
             "pages": [
               "debugger/setup",
-              "debugger/usage"
+              "debugger/usage",
+              "debugger/ai-agents"
             ]
           },
           {
