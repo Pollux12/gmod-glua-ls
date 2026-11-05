@@ -69,7 +69,7 @@ tool_timeout_sec = 120
 |---|---|
 | `server_run_lua` | Run Lua on the server. Returns the return values, printed output, and errors with a traceback. Can include a workspace file, or evaluate inside a paused stack frame. |
 | `server_console` | Read the server console, filtered by text or regex, or wait for new lines. Can also run a console command and return its output. |
-| `server_errors` | Unique Lua errors with counts and stack traces, including errors from before the debugger attached. Can clear them and wait for new ones. |
+| `server_errors` | Unique Lua errors with counts and stack traces, including errors from before the debugger attached. Notes when GMod removed a timer because it errored. Can clear them and wait for new ones. |
 | `diagnostics` | GLuaLS errors and warnings for files the agent edited, or the whole workspace. |
 | `breakpoints` | Breakpoints, conditional breakpoints, logpoints and function traces. Breakpoints and logpoints show up in your editor. |
 | `debugger` | Status, attach, wait for a breakpoint, continue, step, and pause. Shows the paused line with source, stack, locals and upvalues. Detach removes everything the agent set, resumes the server, and disconnects if the agent attached the debugger. A debug session you started stays attached. |
