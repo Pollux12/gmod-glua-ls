@@ -513,6 +513,7 @@ pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig)
         config_roots,
         &HashSet::new(),
         &HashSet::new(),
+        &HashMap::new(),
         &config_sources(&client_config, &prepare),
     ))
 }

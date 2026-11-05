@@ -58,10 +58,12 @@ pub fn load_scoped_workspace_configs(
         config_roots.clone(),
         &HashSet::new(),
         &HashSet::new(),
+        &HashMap::new(),
         sources,
     );
     let mut scoped_folders = Vec::new();
     let mut scoped_roots = HashSet::new();
+    let mut parents = HashMap::new();
     let mut changed_scope = false;
     for folder in folders {
         let scoped = scope_workspace_folder(
@@ -76,6 +78,11 @@ pub fn load_scoped_workspace_configs(
             // folders of a multi-root workspace do.
             if !is_addons_folder(&folder.root) {
                 scoped_roots.extend(scoped.iter().map(|scoped| scoped.root.clone()));
+            }
+            for scoped in &scoped {
+                parents
+                    .entry(scoped.root.clone())
+                    .or_insert_with(|| folder.root.clone());
             }
             changed_scope = true;
         }
@@ -93,7 +100,13 @@ pub fn load_scoped_workspace_configs(
         .filter(|folder| folder.import == WorkspaceImport::None)
         .map(|folder| folder.root.clone())
         .collect();
-    let configs = load_workspace_configs(config_roots, &scoped_roots, &unloaded_roots, sources);
+    let configs = load_workspace_configs(
+        config_roots,
+        &scoped_roots,
+        &unloaded_roots,
+        &parents,
+        sources,
+    );
     (scoped_folders, configs)
 }
 
@@ -133,10 +146,15 @@ fn other_folder_roots(folders: &[WorkspaceFolder], folder: &WorkspaceFolder) -> 
 /// is detected from it: the folder loads its custom gamemodes itself and the
 /// annotations cover the built-in ones. A root in `unloaded_roots` loads none
 /// of its files, so its config is its own and stays out of the merged one.
+/// A root in `parents` without a config file of its own, an addon or gamemode
+/// of an opened Garry's Mod or `addons` folder, or that folder itself, is
+/// configured as that folder is, so one addon's config never applies to
+/// another's files.
 pub fn load_workspace_configs(
     config_roots: Vec<PathBuf>,
     scoped_roots: &HashSet<PathBuf>,
     unloaded_roots: &HashSet<PathBuf>,
+    parents: &HashMap<PathBuf, PathBuf>,
     sources: &ConfigSources,
 ) -> WorkspaceConfigs {
     let config_roots = dedup_paths(config_roots);
@@ -154,12 +172,23 @@ pub fn load_workspace_configs(
         return configs;
     }
 
-    let mut workspace_configs = Vec::new();
+    let mut workspace_configs: Vec<(PathBuf, Emmyrc, bool, bool)> = Vec::new();
     for workspace_root in &configs.roots {
         let local_config_files = config_files_in(workspace_root);
         let has_local_config = !local_config_files.is_empty();
         if has_local_config {
             configs.local_config_roots.insert(workspace_root.clone());
+        }
+        let parent = parents.get(workspace_root);
+        if !has_local_config
+            && let Some(parent) = parent.filter(|parent| *parent != workspace_root)
+            && let Some((_, parent_emmyrc, _, _)) = workspace_configs
+                .iter()
+                .find(|(root, _, _, _)| root == parent)
+        {
+            let inherited = parent_emmyrc.clone();
+            workspace_configs.push((workspace_root.clone(), inherited, false, true));
+            continue;
         }
 
         let mut workspace_config_files = sources.global_files.clone();
@@ -171,18 +200,24 @@ pub fn load_workspace_configs(
             add_gamemode_base_libraries(&mut workspace_emmyrc, workspace_root);
         }
         workspace_emmyrc.pre_process_emmyrc(workspace_root);
-        workspace_configs.push((workspace_root.clone(), workspace_emmyrc, has_local_config));
+        let keeps_own = has_local_config || parent.is_some();
+        workspace_configs.push((
+            workspace_root.clone(),
+            workspace_emmyrc,
+            has_local_config,
+            keeps_own,
+        ));
     }
 
     // Isolation can only stay enabled if all workspace configs keep it enabled.
     let isolation_enabled = workspace_configs
         .iter()
-        .filter(|(workspace_root, _, _)| !unloaded_roots.contains(workspace_root))
-        .all(|(_, workspace_emmyrc, _)| workspace_emmyrc.workspace.enable_isolation);
+        .filter(|(workspace_root, _, _, _)| !unloaded_roots.contains(workspace_root))
+        .all(|(_, workspace_emmyrc, _, _)| workspace_emmyrc.workspace.enable_isolation);
 
     if isolation_enabled {
         let mut merged_emmyrc: Option<Emmyrc> = None;
-        for (workspace_root, workspace_emmyrc, _) in &workspace_configs {
+        for (workspace_root, workspace_emmyrc, _, _) in &workspace_configs {
             configs.diagnostic_configs.insert(
                 workspace_root.clone(),
                 LuaDiagnosticConfig::new(workspace_emmyrc),
@@ -207,22 +242,34 @@ pub fn load_workspace_configs(
 
     // isolation disabled: build one global merged config while keeping
     // local workspace configs as optional overrides only where present.
+    // The baseline is a workspace folder's config, never an addon's or
+    // gamemode's of an opened folder, whose config is its own.
+    let in_opened_folder = |root: &PathBuf| parents.get(root).is_some_and(|parent| parent != root);
     let baseline_index = workspace_configs
         .iter()
-        .position(|(workspace_root, _, has_local)| {
-            *has_local && !unloaded_roots.contains(workspace_root)
+        .position(|(workspace_root, _, has_local, _)| {
+            *has_local
+                && !unloaded_roots.contains(workspace_root)
+                && !in_opened_folder(workspace_root)
+        })
+        .or_else(|| {
+            workspace_configs
+                .iter()
+                .position(|(workspace_root, _, _, _)| {
+                    !unloaded_roots.contains(workspace_root) && !in_opened_folder(workspace_root)
+                })
         })
         .unwrap_or(0);
 
     let mut merged_emmyrc = workspace_configs
         .get(baseline_index)
-        .map(|(_, cfg, _)| cfg.clone())
+        .map(|(_, cfg, _, _)| cfg.clone())
         .unwrap_or(emmyrc);
 
-    for (index, (workspace_root, workspace_emmyrc, has_local_config)) in
+    for (index, (workspace_root, workspace_emmyrc, _, keeps_own)) in
         workspace_configs.into_iter().enumerate()
     {
-        if has_local_config {
+        if keeps_own {
             configs.diagnostic_configs.insert(
                 workspace_root.clone(),
                 LuaDiagnosticConfig::new(&workspace_emmyrc),
@@ -236,6 +283,12 @@ pub fn load_workspace_configs(
             continue;
         }
 
+        // An addon or gamemode of an opened folder adds only what every root
+        // is analysed with, such as its libraries, never its diagnostics.
+        if in_opened_folder(&workspace_root) {
+            merge_isolated_workspace_fields(&mut merged_emmyrc, &workspace_emmyrc);
+            continue;
+        }
         merge_emmyrc_prefer_existing_with_array_union(&mut merged_emmyrc, &workspace_emmyrc);
     }
 
@@ -485,6 +538,111 @@ mod tests {
             vec![luarc_json, emmyrc_json, emmyrc_lua]
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// An addon's own config applies to that addon only: the addons and
+    /// gamemodes of a whole Garry's Mod folder without a config of their own
+    /// use the folder's, and another workspace folder without one uses the
+    /// merged config, which takes no addon's diagnostics.
+    #[test]
+    fn an_addon_config_applies_to_that_addon_only() {
+        let gmod = create_temp_dir().join("garrysmod");
+        let other = gmod.parent().unwrap().join("other");
+        fs::create_dir_all(&other).unwrap();
+        for addon in ["ulx", "wire"] {
+            fs::create_dir_all(gmod.join("addons").join(addon).join("lua")).unwrap();
+        }
+        fs::create_dir_all(gmod.join("gamemodes")).unwrap();
+        fs::write(
+            gmod.join(".gluarc.json"),
+            r#"{ "diagnostics": { "disable": ["unused"] } }"#,
+        )
+        .unwrap();
+        fs::write(
+            gmod.join("addons/wire/.gluarc.json"),
+            r#"{ "diagnostics": { "disable": ["undefined-global"] } }"#,
+        )
+        .unwrap();
+        let prepare = |_: &mut crate::Emmyrc| {};
+        let sources = super::ConfigSources {
+            global_files: Vec::new(),
+            partial_emmyrcs: None,
+            prepare: &prepare,
+        };
+
+        let (_, configs) = super::load_scoped_workspace_configs(
+            &[
+                crate::WorkspaceFolder::new(gmod.clone(), false),
+                crate::WorkspaceFolder::new(other.clone(), false),
+            ],
+            &[],
+            crate::UnpickedGamemodes::None,
+            &sources,
+        );
+        let disabled = |root: &Path| {
+            configs
+                .root_emmyrc(root)
+                .diagnostics
+                .disable
+                .iter()
+                .map(|code| format!("{code:?}"))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            (
+                disabled(&gmod),
+                disabled(&gmod.join("addons/ulx")),
+                disabled(&gmod.join("addons/wire")),
+                disabled(&other),
+            ),
+            (
+                vec!["Unused".to_string()],
+                vec!["Unused".to_string()],
+                vec!["UndefinedGlobal".to_string()],
+                vec!["Unused".to_string()],
+            )
+        );
+        let _ = fs::remove_dir_all(gmod.parent().unwrap());
+    }
+
+    /// With no config in the opened folders, an addon's own config is not
+    /// what the other folders use either.
+    #[test]
+    fn an_addon_config_stays_out_of_folders_without_one() {
+        let base = create_temp_dir();
+        let gamemode = base.join("ixhl2rp");
+        let addons = base.join("addons");
+        fs::create_dir_all(&gamemode).unwrap();
+        fs::create_dir_all(addons.join("wire/lua")).unwrap();
+        fs::write(
+            addons.join("wire/.gluarc.json"),
+            r#"{ "diagnostics": { "disable": ["undefined-global"] } }"#,
+        )
+        .unwrap();
+        let prepare = |_: &mut crate::Emmyrc| {};
+        let sources = super::ConfigSources {
+            global_files: Vec::new(),
+            partial_emmyrcs: None,
+            prepare: &prepare,
+        };
+
+        let (_, configs) = super::load_scoped_workspace_configs(
+            &[
+                crate::WorkspaceFolder::new(gamemode.clone(), false),
+                crate::WorkspaceFolder::new(addons.clone(), false),
+            ],
+            &[],
+            crate::UnpickedGamemodes::None,
+            &sources,
+        );
+        let disabled = |root: &Path| configs.root_emmyrc(root).diagnostics.disable.len();
+
+        assert_eq!(
+            (disabled(&gamemode), disabled(&addons.join("wire"))),
+            (0, 1)
+        );
+        let _ = fs::remove_dir_all(base);
     }
 
     /// A reload reads the roots in workspace order, as the first load does,

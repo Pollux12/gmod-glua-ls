@@ -40,7 +40,7 @@ See [Garry's Mod annotations](/configuration/annotations-management) for downloa
 
 When you open a whole Garry's Mod folder (named `garrysmod`, holding both `addons/` and `gamemodes/`, or holding a `garrysmod/` folder), GLuaLS treats it like a multi-root workspace of its addons and the gamemode you work on. Each addon and gamemode keeps its own module paths and its own `.gluarc.json`.
 
-As in a multi-root workspace, an addon or gamemode with its own config file (`.gluarc.json`, `.luarc.json`, `.emmyrc.json` or `.emmyrc.lua`) uses that config instead of the Garry's Mod folder's. The others use the workspace's merged config, which starts from the Garry's Mod folder's. `workspace.enableIsolation` stays on only when every one of these configs turns it on.
+As in a multi-root workspace, an addon or gamemode with its own config file (`.gluarc.json`, `.luarc.json`, `.emmyrc.json` or `.emmyrc.lua`) uses that config instead of the Garry's Mod folder's. The others use the Garry's Mod folder's config, so one addon's config never applies to another's files. `workspace.enableIsolation` stays on only when every one of these configs turns it on.
 
 - Every addon loads.
 - The active gamemode loads with the gamemodes it derives from, up to `base` or `sandbox`, which the annotations describe. The gamemodes that ship with Garry's Mod (`base`, `sandbox` and `terrortown`) otherwise load only when picked or while one of their files is open; `terrortown` also loads with a gamemode that derives from it.
