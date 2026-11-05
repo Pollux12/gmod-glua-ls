@@ -60,7 +60,7 @@ tool_timeout_sec = 120
 |---|---|---|
 | `gluals.mcp.enabled` | `false` | Runs the MCP server. |
 | `gluals.mcp.port` | `21120` | Port the MCP server listens on. |
-| `gluals.mcp.allowCodeExecution` | `true` | Lets agents run Lua and console commands. When off, they can still read and debug. |
+| `gluals.mcp.allowCodeExecution` | `true` | Lets agents run Lua and console commands. Breakpoint conditions, logpoints and traces also run Lua, so they need it too. When off, agents can still read the console and errors and use plain breakpoints. |
 | `gluals.mcp.autoAttach` | `true` | Connects the debugger automatically when an agent needs it, without pausing the game. |
 
 ## Tools
