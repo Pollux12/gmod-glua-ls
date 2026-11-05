@@ -111,7 +111,7 @@ impl GmodTopology {
     }
 
     /// The gamemodes loaded whatever is open: the pick (`"*"` for every custom
-    /// gamemode, `""` for none) with its chain, or with none the sole custom
+    /// gamemode, `""` for none) with its chain or chains, or with none the sole custom
     /// gamemode's chain, or with several what `unpicked` says. A pick that
     /// names no gamemode counts as none.
     pub fn picked_gamemodes(
@@ -120,7 +120,7 @@ impl GmodTopology {
         unpicked: UnpickedGamemodes,
     ) -> Vec<&Gamemode> {
         match pick {
-            Some(ALL_CUSTOM_GAMEMODES) => return self.custom_gamemodes().collect(),
+            Some(ALL_CUSTOM_GAMEMODES) => return self.custom_chains(),
             Some(NO_GAMEMODE) => return Vec::new(),
             Some(name) if self.gamemode(name).is_some() => return self.chain(name),
             Some(name) => log::warn!(
@@ -134,8 +134,22 @@ impl GmodTopology {
             (None, _, _) => Vec::new(),
             (Some(only), None, _) => self.chain(&only.name),
             (Some(_), Some(_), UnpickedGamemodes::None) => Vec::new(),
-            (Some(_), Some(_), UnpickedGamemodes::AllCustom) => self.custom_gamemodes().collect(),
+            (Some(_), Some(_), UnpickedGamemodes::AllCustom) => self.custom_chains(),
         }
+    }
+
+    /// Every custom gamemode with its chain, each once.
+    fn custom_chains(&self) -> Vec<&Gamemode> {
+        let mut gamemodes = Vec::new();
+        for gamemode in self
+            .custom_gamemodes()
+            .flat_map(|gamemode| self.chain(&gamemode.name))
+        {
+            if !gamemodes.contains(&gamemode) {
+                gamemodes.push(gamemode);
+            }
+        }
+        gamemodes
     }
 
     /// The gamemode whose folder holds `path`.
@@ -475,6 +489,29 @@ mod tests {
                 vec!["ttt_custom".to_string(), "terrortown".to_string()],
                 vec!["terrortown".to_string()]
             )
+        );
+    }
+
+    /// Picking every custom gamemode, or the command-line tools loading them
+    /// all, brings each one's chain, `terrortown` included.
+    #[test]
+    fn every_custom_gamemode_loads_with_its_chain() {
+        let root = install("all_custom_chain");
+        gamemode(&root, "ttt_custom", "ttt_custom", Some("terrortown"));
+        let topology = GmodTopology::discover(&root).expect("gmod root");
+        let picked = |pick, unpicked| {
+            let mut names = names(&topology.picked_gamemodes(pick, unpicked));
+            names.sort();
+            names
+        };
+        let expected = ["helix", "helix-hl2rp", "terrortown", "ttt_custom"].map(String::from);
+
+        assert_eq!(
+            (
+                picked(Some("*"), UnpickedGamemodes::None),
+                picked(None, UnpickedGamemodes::AllCustom)
+            ),
+            (expected.to_vec(), expected.to_vec())
         );
     }
 
