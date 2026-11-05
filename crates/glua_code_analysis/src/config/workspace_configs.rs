@@ -172,8 +172,16 @@ pub fn load_workspace_configs(
         return configs;
     }
 
-    let mut workspace_configs: Vec<(PathBuf, Emmyrc, bool, bool)> = Vec::new();
-    for workspace_root in &configs.roots {
+    // An addon or gamemode of an opened folder, configured after every
+    // opened folder whatever the workspace order, so it finds its folder's.
+    let in_opened_folder = |root: &PathBuf| parents.get(root).is_some_and(|parent| parent != root);
+    let config_order = configs
+        .roots
+        .iter()
+        .filter(|root| !in_opened_folder(root))
+        .chain(configs.roots.iter().filter(|root| in_opened_folder(root)));
+    let mut root_configs: HashMap<PathBuf, (Emmyrc, bool, bool)> = HashMap::new();
+    for workspace_root in config_order {
         let local_config_files = config_files_in(workspace_root);
         let has_local_config = !local_config_files.is_empty();
         if has_local_config {
@@ -182,12 +190,10 @@ pub fn load_workspace_configs(
         let parent = parents.get(workspace_root);
         if !has_local_config
             && let Some(parent) = parent.filter(|parent| *parent != workspace_root)
-            && let Some((_, parent_emmyrc, _, _)) = workspace_configs
-                .iter()
-                .find(|(root, _, _, _)| root == parent)
+            && let Some((parent_emmyrc, _, _)) = root_configs.get(parent)
         {
             let inherited = parent_emmyrc.clone();
-            workspace_configs.push((workspace_root.clone(), inherited, false, true));
+            root_configs.insert(workspace_root.clone(), (inherited, false, true));
             continue;
         }
 
@@ -201,13 +207,19 @@ pub fn load_workspace_configs(
         }
         workspace_emmyrc.pre_process_emmyrc(workspace_root);
         let keeps_own = has_local_config || parent.is_some();
-        workspace_configs.push((
+        root_configs.insert(
             workspace_root.clone(),
-            workspace_emmyrc,
-            has_local_config,
-            keeps_own,
-        ));
+            (workspace_emmyrc, has_local_config, keeps_own),
+        );
     }
+    let workspace_configs = configs
+        .roots
+        .iter()
+        .filter_map(|root| {
+            let (emmyrc, has_local, keeps_own) = root_configs.remove(root)?;
+            Some((root.clone(), emmyrc, has_local, keeps_own))
+        })
+        .collect::<Vec<_>>();
 
     // Isolation can only stay enabled if all workspace configs keep it enabled.
     let isolation_enabled = workspace_configs
@@ -244,7 +256,6 @@ pub fn load_workspace_configs(
     // local workspace configs as optional overrides only where present.
     // The baseline is a workspace folder's config, never an addon's or
     // gamemode's of an opened folder, whose config is its own.
-    let in_opened_folder = |root: &PathBuf| parents.get(root).is_some_and(|parent| parent != root);
     let baseline_index = workspace_configs
         .iter()
         .position(|(workspace_root, _, has_local, _)| {
@@ -283,10 +294,13 @@ pub fn load_workspace_configs(
             continue;
         }
 
-        // An addon or gamemode of an opened folder adds only what every root
-        // is analysed with, such as its libraries, never its diagnostics.
+        // An addon or gamemode of an opened folder adds what every root is
+        // parsed and analysed with, such as its libraries and loaders, but
+        // never its diagnostics, which stay with its own files.
         if in_opened_folder(&workspace_root) {
-            merge_isolated_workspace_fields(&mut merged_emmyrc, &workspace_emmyrc);
+            let mut shared = workspace_emmyrc;
+            shared.diagnostics = merged_emmyrc.diagnostics.clone();
+            merge_emmyrc_prefer_existing_with_array_union(&mut merged_emmyrc, &shared);
             continue;
         }
         merge_emmyrc_prefer_existing_with_array_union(&mut merged_emmyrc, &workspace_emmyrc);
@@ -643,6 +657,88 @@ mod tests {
             (0, 1)
         );
         let _ = fs::remove_dir_all(base);
+    }
+
+    /// An addon's config still adds what every file is parsed and analysed
+    /// with, such as its require-like loaders, to the shared config.
+    #[test]
+    fn an_addon_config_still_shares_its_runtime_settings() {
+        let gmod = create_temp_dir().join("garrysmod");
+        fs::create_dir_all(gmod.join("addons/wire/lua")).unwrap();
+        fs::create_dir_all(gmod.join("gamemodes")).unwrap();
+        fs::write(
+            gmod.join("addons/wire/.gluarc.json"),
+            r#"{ "runtime": { "requireLikeFunction": ["wire_require"] }, "diagnostics": { "disable": ["undefined-global"] } }"#,
+        )
+        .unwrap();
+        let prepare = |_: &mut crate::Emmyrc| {};
+        let sources = super::ConfigSources {
+            global_files: Vec::new(),
+            partial_emmyrcs: None,
+            prepare: &prepare,
+        };
+
+        let (_, configs) = super::load_scoped_workspace_configs(
+            &[crate::WorkspaceFolder::new(gmod.clone(), false)],
+            &[],
+            crate::UnpickedGamemodes::None,
+            &sources,
+        );
+
+        assert_eq!(
+            (
+                configs.emmyrc.runtime.require_like_function.clone(),
+                configs.emmyrc.diagnostics.disable.len()
+            ),
+            (vec!["wire_require".to_string()], 0)
+        );
+        let _ = fs::remove_dir_all(gmod.parent().unwrap());
+    }
+
+    /// A gamemode opened before its whole Garry's Mod folder is configured as
+    /// it is when opened after it.
+    #[test]
+    fn a_gamemode_opened_before_its_gmod_folder_uses_the_folder_config() {
+        let gmod = create_temp_dir().join("garrysmod");
+        let helix = gmod.join("gamemodes/helix");
+        fs::create_dir_all(&helix).unwrap();
+        fs::write(
+            helix.join("helix.txt"),
+            "\"helix\"\n{\n\t\"base\"\t\"sandbox\"\n}\n",
+        )
+        .unwrap();
+        fs::create_dir_all(gmod.join("addons")).unwrap();
+        fs::write(
+            gmod.join(".gluarc.json"),
+            r#"{ "diagnostics": { "disable": ["unused"] } }"#,
+        )
+        .unwrap();
+        let prepare = |_: &mut crate::Emmyrc| {};
+        let sources = super::ConfigSources {
+            global_files: Vec::new(),
+            partial_emmyrcs: None,
+            prepare: &prepare,
+        };
+        let disabled = |folders: &[crate::WorkspaceFolder]| {
+            let (_, configs) = super::load_scoped_workspace_configs(
+                folders,
+                &[],
+                crate::UnpickedGamemodes::None,
+                &sources,
+            );
+            configs.root_emmyrc(&helix).diagnostics.disable.len()
+        };
+        let gamemode = crate::WorkspaceFolder::new(helix.clone(), false);
+        let whole = crate::WorkspaceFolder::new(gmod.clone(), false);
+
+        assert_eq!(
+            (
+                disabled(&[gamemode.clone(), whole.clone()]),
+                disabled(&[whole, gamemode])
+            ),
+            (1, 1)
+        );
+        let _ = fs::remove_dir_all(gmod.parent().unwrap());
     }
 
     /// A reload reads the roots in workspace order, as the first load does,
