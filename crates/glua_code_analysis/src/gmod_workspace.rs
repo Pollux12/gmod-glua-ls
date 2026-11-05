@@ -49,18 +49,17 @@ pub enum UnpickedGamemodes {
 }
 
 impl GmodTopology {
-    /// The topology of `folder` when it is a GMod root: named `garrysmod`,
-    /// holding both `addons/` and `gamemodes/`, or holding a `garrysmod/`
-    /// child that is one.
+    /// The topology of `folder` when it is a GMod root: holding a `garrysmod/`
+    /// child, which is then the root (Steam's `GarrysMod/garrysmod`), or
+    /// itself named `garrysmod` or holding both `addons/` and `gamemodes/`.
     pub fn discover(folder: &Path) -> Option<Self> {
-        let root = if is_gmod_root(folder) {
+        let child = folder.join("garrysmod");
+        let root = if child.is_dir() {
+            child
+        } else if is_gmod_root(folder) {
             folder.to_path_buf()
         } else {
-            let child = folder.join("garrysmod");
-            if !child.is_dir() {
-                return None;
-            }
-            child
+            return None;
         };
         Some(Self {
             folder: folder.to_path_buf(),
@@ -346,6 +345,28 @@ mod tests {
                 Some(both.clone()),
                 None
             ]
+        );
+    }
+
+    /// Steam installs to `GarrysMod/garrysmod`; the outer folder's name
+    /// matches `garrysmod` but its addons and gamemodes are in the inner one.
+    #[test]
+    fn steams_garrysmod_folder_is_scoped_to_its_garrysmod_child() {
+        let steam = temp_dir("steam").join("GarrysMod");
+        let root = steam.join("garrysmod");
+        fs::create_dir_all(root.join("addons").join("ulx")).expect("addon");
+        gamemode(&root, "helix", "helix", Some("sandbox"));
+
+        let topology = GmodTopology::discover(&steam).expect("gmod root");
+
+        assert_eq!(
+            (
+                &topology.folder,
+                &topology.root,
+                topology.addons.len(),
+                names(&topology.gamemodes.iter().collect::<Vec<_>>())
+            ),
+            (&steam, &root, 1, vec!["helix".to_string()])
         );
     }
 
