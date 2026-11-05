@@ -72,8 +72,8 @@ tool_timeout_sec = 120
 | `server_errors` | Unique Lua errors with counts and stack traces. Can clear them and wait for new ones. |
 | `diagnostics` | GLuaLS errors and warnings for files the agent edited, or the whole workspace. |
 | `breakpoints` | Set, list, remove and clear breakpoints, conditional breakpoints and logpoints. They show up in your editor. |
-| `debugger` | Status, attach, wait for a breakpoint, continue, step, and pause. Shows the paused line with source, stack, locals and upvalues. |
-| `code_lookup` | Hover docs, definition and references for a symbol, using the language server. |
+| `debugger` | Status, attach, detach, wait for a breakpoint, continue, step, and pause. Shows the paused line with source, stack, locals and upvalues. |
+| `code_lookup` | Hover docs, definition and references for a workspace or GMod API symbol, such as `MyAddon.Config` or `Player:Nick`. |
 
 Code run with `server_run_lua` runs on the next server tick, so breakpoints and logpoints inside it work. When it stops at a breakpoint, the agent gets the paused location straight away and the code's result after it continues.
 
