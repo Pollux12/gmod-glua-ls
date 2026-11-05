@@ -68,11 +68,11 @@ tool_timeout_sec = 120
 | Tool | What the agent uses it for |
 |---|---|
 | `server_run_lua` | Run Lua on the server. Returns the return values, printed output, and errors with a traceback. Can include a workspace file, or evaluate inside a paused stack frame. |
-| `server_console` | Read the server console, filtered by text or regex, or run a console command and get its output. |
-| `server_errors` | Unique Lua errors with counts and stack traces. Can clear them and wait for new ones. |
+| `server_console` | Read the server console, filtered by text or regex, or wait for new lines. Can also run a console command and return its output. |
+| `server_errors` | Unique Lua errors with counts and stack traces, including errors from before the debugger attached. Can clear them and wait for new ones. |
 | `diagnostics` | GLuaLS errors and warnings for files the agent edited, or the whole workspace. |
 | `breakpoints` | Breakpoints, conditional breakpoints, logpoints and function traces. Breakpoints and logpoints show up in your editor. |
-| `debugger` | Status, attach, wait for a breakpoint, continue, step, and pause. Shows the paused line with source, stack, locals and upvalues. Detach removes everything the agent set and disconnects. |
+| `debugger` | Status, attach, wait for a breakpoint, continue, step, and pause. Shows the paused line with source, stack, locals and upvalues. Detach removes everything the agent set, resumes the server, and disconnects if the agent attached the debugger. A debug session you started stays attached. |
 | `code_lookup` | Hover docs, definition and references for a workspace or GMod API symbol, such as `MyAddon.Config` or `Player:Nick`. |
 
 Code run with `server_run_lua` runs on the next server tick, so breakpoints and logpoints inside it work. When it stops at a breakpoint, the agent gets the paused location straight away and the code's result after it continues.
@@ -87,7 +87,7 @@ Logpoints are the better choice while a person or a client MCP is playing, becau
 
 ### Function traces
 
-A trace logs every call of one function, such as `MyAddon.Score` or `Player:Nick`, without pausing: its arguments, what it returned and how long it took. A call that raises an error is reported as not returning. A trace stops by itself after 20 calls or two minutes unless the agent asks for other limits, and the function goes back to how it was.
+A trace logs every call of one function, such as `MyAddon.Score` or `Player:Nick`, without pausing: its arguments, what it returned and how long it took. A call that raises an error is reported as not returning on the next tick, and `server_errors` has the error with its stack. A trace stops by itself after 20 calls or two minutes unless the agent asks for other limits, and the function goes back to how it was.
 
 ```
 [trace MyAddon.Score] #1 called (name = "a", kills = 3, deaths = 1)
