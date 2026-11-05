@@ -1033,4 +1033,116 @@ mod tests {
         );
         let _ = fs::remove_dir_all(base);
     }
+
+    /// Each gamemode option loads exactly the addons and gamemodes it names:
+    /// a pick with the gamemodes it derives from up to the annotated ones,
+    /// and the addons with every option.
+    #[test]
+    fn each_gamemode_option_loads_its_gamemodes_and_the_addons() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let addon = "addons/tools/lua/autorun/sh_tools.lua";
+        let alpha = "gamemodes/alpha/gamemode/shared.lua";
+        let beta = "gamemodes/beta/gamemode/init.lua";
+        let gamma = "gamemodes/gamma/gamemode/init.lua";
+        let sandbox = "gamemodes/sandbox/gamemode/init.lua";
+        let loose = "lua/autorun/sh_loose.lua";
+        let cases: [(&str, &str, Vec<&str>); 8] = [
+            (
+                "beta",
+                r#"{ "gmod": { "activeGamemode": "beta" } }"#,
+                vec![addon, alpha, beta],
+            ),
+            (
+                "gamma",
+                r#"{ "gmod": { "activeGamemode": "gamma" } }"#,
+                vec![addon, gamma],
+            ),
+            (
+                "builtin",
+                r#"{ "gmod": { "activeGamemode": "sandbox" } }"#,
+                vec![addon, sandbox],
+            ),
+            (
+                "addons_only",
+                r#"{ "gmod": { "activeGamemode": "" } }"#,
+                vec![addon],
+            ),
+            (
+                "all_custom",
+                r#"{ "gmod": { "activeGamemode": "*" } }"#,
+                vec![addon, alpha, beta, gamma],
+            ),
+            (
+                "everything",
+                r#"{ "gmod": { "loadEverything": true } }"#,
+                vec![addon, alpha, beta, gamma, sandbox, loose],
+            ),
+            ("unpicked", "{}", vec![addon]),
+            (
+                "missing",
+                r#"{ "gmod": { "activeGamemode": "nope" } }"#,
+                vec![addon],
+            ),
+        ];
+
+        for (name, config, expected) in cases {
+            let root = install(&format!("option_{name}"), config);
+            let (context, _peer) = start(&runtime, &root);
+            assert_eq!(
+                paths(&loaded(&runtime, &context.snapshot(), &root)),
+                expected,
+                "option {name}"
+            );
+            let _ = fs::remove_dir_all(root.parent().expect("temp dir"));
+        }
+    }
+
+    /// Changing the pick in `.gluarc.json` while the server runs loads the
+    /// new gamemode's chain and unloads the old one's.
+    #[test]
+    fn switching_the_pick_loads_the_new_gamemode_instead() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let root = install("switch", r#"{ "gmod": { "activeGamemode": "beta" } }"#);
+        let (context, _peer) = start(&runtime, &root);
+        let snapshot = context.snapshot();
+        let before = loaded(&runtime, &snapshot, &root);
+
+        write(
+            &root,
+            ".gluarc.json",
+            r#"{ "gmod": { "activeGamemode": "gamma" } }"#,
+        );
+        runtime.block_on(crate::handlers::on_did_change_watched_files(
+            snapshot.clone(),
+            lsp_types::DidChangeWatchedFilesParams {
+                changes: vec![lsp_types::FileEvent {
+                    uri: uri(&root, ".gluarc.json"),
+                    typ: lsp_types::FileChangeType::CHANGED,
+                }],
+            },
+        ));
+        let after = wait_until_loaded(
+            &runtime,
+            &snapshot,
+            &root,
+            "gamemodes/alpha/gamemode/shared.lua",
+            false,
+        );
+
+        assert_eq!(
+            (paths(&before), paths(&after)),
+            (
+                vec![
+                    "addons/tools/lua/autorun/sh_tools.lua",
+                    "gamemodes/alpha/gamemode/shared.lua",
+                    "gamemodes/beta/gamemode/init.lua",
+                ],
+                vec![
+                    "addons/tools/lua/autorun/sh_tools.lua",
+                    "gamemodes/gamma/gamemode/init.lua",
+                ]
+            )
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("temp dir"));
+    }
 }
