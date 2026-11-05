@@ -98,8 +98,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, EmmyrcNonStdSymbol, FileId, Schedule, Slice, UpdateProgress,
-    WorkspaceFolder, collect_workspace_files, load_configs,
+    EmmyLuaAnalysis, Emmyrc, EmmyrcNonStdSymbol, FileId, Schedule, Slice, UnpickedGamemodes,
+    UpdateProgress, WorkspaceFolder, collect_workspace_files, load_configs, scope_workspace_folder,
 };
 use glua_parser::{LineIndex, LuaParser};
 use lsp_types::{DiagnosticSeverity, NumberOrString};
@@ -214,12 +214,19 @@ fn add_workspaces(
     emmyrc: &Emmyrc,
 ) -> Vec<(PathBuf, Option<String>)> {
     analysis.add_library_workspace(annotations.to_path_buf());
-    analysis.add_main_workspace(codebase.to_path_buf());
+    let main_folders = scope_workspace_folder(
+        &WorkspaceFolder::new(codebase.to_path_buf(), false),
+        &emmyrc.gmod,
+        UnpickedGamemodes::AllCustom,
+        &[],
+        &[],
+    );
+    for folder in &main_folders {
+        analysis.add_main_workspace(folder.root.clone());
+    }
 
-    let mut workspace_folders = vec![
-        WorkspaceFolder::new(annotations.to_path_buf(), true),
-        WorkspaceFolder::new(codebase.to_path_buf(), false),
-    ];
+    let mut workspace_folders = vec![WorkspaceFolder::new(annotations.to_path_buf(), true)];
+    workspace_folders.extend(main_folders);
     for lib in &emmyrc.workspace.library {
         let path = PathBuf::from(lib.get_path().clone());
         if path != annotations {

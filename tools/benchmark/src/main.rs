@@ -96,8 +96,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, FileId, WorkspaceFolder, collect_workspace_files, load_configs,
-    update_code_style,
+    EmmyLuaAnalysis, Emmyrc, FileId, UnpickedGamemodes, WorkspaceFolder, collect_workspace_files,
+    load_configs, scope_workspace_folder, update_code_style,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -705,7 +705,16 @@ async fn run() {
     }
 
     // Add main workspace
-    analysis.add_main_workspace(large_path.clone());
+    let main_folders = scope_workspace_folder(
+        &WorkspaceFolder::new(large_path.clone(), false),
+        &emmyrc.gmod,
+        UnpickedGamemodes::AllCustom,
+        &[],
+        &[],
+    );
+    for folder in &main_folders {
+        analysis.add_main_workspace(folder.root.clone());
+    }
     results.push(BenchmarkResult {
         phase: "workspace setup".into(),
         duration: t.elapsed(),
@@ -719,7 +728,7 @@ async fn run() {
             .iter()
             .map(|library| WorkspaceFolder::new(library.clone(), true)),
     );
-    workspace_folders.push(WorkspaceFolder::new(large_path.clone(), false));
+    workspace_folders.extend(main_folders);
 
     // Add library paths from config
     for lib in &emmyrc.workspace.library {

@@ -258,6 +258,7 @@ fn collect_workspace_editorconfigs(workspace_folders: &[WorkspaceFolder]) -> Vec
                     collect_editorconfigs(&workspace.root.join(sub), &mut editorconfig_files);
                 }
             }
+            WorkspaceImport::None => {}
         }
     }
 
@@ -274,6 +275,7 @@ fn collect_workspace_style_roots(workspace_folders: &[WorkspaceFolder]) -> Vec<P
                     roots.push(workspace.root.join(sub));
                 }
             }
+            WorkspaceImport::None => {}
         }
     }
     roots

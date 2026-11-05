@@ -14,6 +14,7 @@ mod config;
 mod db_index;
 mod diagnostic;
 mod gamemode_base;
+mod gmod_workspace;
 mod library_collision;
 pub mod profile;
 pub mod progress;
@@ -29,6 +30,10 @@ pub use diagnostic::*;
 pub use gamemode_base::detect_gamemode_base_libraries;
 pub use glua_codestyle::*;
 use glua_parser::{LineIndex, LuaCallExpr, LuaSyntaxTree};
+pub use gmod_workspace::{
+    ALL_CUSTOM_GAMEMODES, BUILTIN_GAMEMODES, Gamemode, GmodTopology, NO_GAMEMODE,
+    UnpickedGamemodes, is_addons_folder, scope_workspace_folder,
+};
 pub use library_collision::LibraryDefinitionCollision;
 use lsp_types::Uri;
 pub use profile::Profile;
@@ -759,6 +764,27 @@ impl EmmyLuaAnalysis {
         configs: std::collections::HashMap<WorkspaceId, Arc<LuaDiagnosticConfig>>,
     ) {
         self.diagnostic.set_workspace_configs(configs);
+    }
+
+    /// Diagnoses the files of each registered root in `configs` with its
+    /// diagnostic config.
+    pub fn set_root_diagnostic_configs(
+        &mut self,
+        configs: &HashMap<std::path::PathBuf, LuaDiagnosticConfig>,
+    ) {
+        let configs = configs
+            .iter()
+            .filter_map(|(root, config)| {
+                let workspace_id = self.get_workspace_id_for_root(root)?;
+                log::info!(
+                    "setting per-workspace diagnostic config for {root:?} ({workspace_id:?})"
+                );
+                Some((workspace_id, Arc::new(config.clone())))
+            })
+            .collect::<HashMap<_, _>>();
+        if !configs.is_empty() {
+            self.set_workspace_diagnostic_configs(configs);
+        }
     }
 
     pub fn get_workspace_id_for_root(&self, root: &Path) -> Option<WorkspaceId> {

@@ -5,13 +5,16 @@ use crate::{
     vfs::loader::normalize_path_for_ordering,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum WorkspaceImport {
     All,
     SubPaths(Vec<PathBuf>),
+    /// Registered as a root for its module paths and config, loading none of
+    /// its files and none of its extra roots, libraries or package directories.
+    None,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WorkspaceFolder {
     pub root: PathBuf,
     pub import: WorkspaceImport,
@@ -36,18 +39,24 @@ impl WorkspaceFolder {
     }
 }
 
-/// The folders a workspace rooted at `workspace_root` loads under `emmyrc`,
-/// in registration order: the root, its extra roots, its libraries, then its
-/// package directories.
+/// The folders `workspace` loads under `emmyrc`, in registration order: the
+/// workspace, its extra roots, its libraries, then its package directories.
+/// An extra root, library or package directory already in `configured` is left
+/// to the workspace that configured it first, and a workspace that imports
+/// nothing brings none of them.
 pub fn workspace_collection_folders(
-    workspace_root: Option<PathBuf>,
+    workspace: Option<WorkspaceFolder>,
     emmyrc: &Emmyrc,
+    configured: &mut HashSet<WorkspaceFolder>,
 ) -> Vec<WorkspaceFolder> {
-    let mut workspaces = Vec::new();
-
-    if let Some(workspace_root) = workspace_root {
-        workspaces.push(WorkspaceFolder::new(workspace_root, false));
+    if let Some(workspace) = workspace
+        .as_ref()
+        .filter(|workspace| workspace.import == WorkspaceImport::None)
+    {
+        return vec![workspace.clone()];
     }
+    let mut own = workspace.is_some();
+    let mut workspaces = Vec::from_iter(workspace);
 
     for extra_root in &emmyrc.workspace.workspace_roots {
         workspaces.push(WorkspaceFolder::new(PathBuf::from(extra_root), false));
@@ -110,6 +119,7 @@ pub fn workspace_collection_folders(
         }
     }
 
+    workspaces.retain(|folder| std::mem::take(&mut own) || configured.insert(folder.clone()));
     workspaces
 }
 
@@ -278,6 +288,7 @@ pub fn collect_workspace_files(
                     }
                 }
             }
+            WorkspaceImport::None => {}
         }
     }
     let files = dedupe_workspace_files_deterministic(candidates);
@@ -352,8 +363,38 @@ fn find_library_exclude(library: &WorkspaceFolder, emmyrc: &Emmyrc) -> (Vec<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkspaceFileCandidate, dedupe_workspace_files_deterministic};
-    use crate::LuaFileInfo;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    use super::{
+        WorkspaceFileCandidate, WorkspaceFolder, dedupe_workspace_files_deterministic,
+        workspace_collection_folders,
+    };
+    use crate::{Emmyrc, LuaFileInfo};
+
+    #[test]
+    fn package_dirs_sharing_a_parent_are_each_collected() {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.workspace.package_dirs = vec!["/deps/alpha".to_string(), "/deps/beta".to_string()];
+
+        let folders = workspace_collection_folders(None, &emmyrc, &mut HashSet::new());
+
+        assert_eq!(
+            folders,
+            vec![
+                WorkspaceFolder::with_sub_paths(
+                    PathBuf::from("/deps"),
+                    vec![PathBuf::from("alpha")],
+                    true
+                ),
+                WorkspaceFolder::with_sub_paths(
+                    PathBuf::from("/deps"),
+                    vec![PathBuf::from("beta")],
+                    true
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn vfs_collect_dedupe_is_deterministic_with_workspace_priority() {

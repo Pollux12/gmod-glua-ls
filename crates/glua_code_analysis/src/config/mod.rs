@@ -6,6 +6,7 @@ mod lua_loader;
 mod pre_process;
 #[cfg(test)]
 mod test;
+mod workspace_configs;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,6 +31,10 @@ use glua_parser::{LuaLanguageLevel, LuaNonStdSymbolSet, ParserConfig, SpecialFun
 use rowan::NodeCache;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+pub use workspace_configs::{
+    ConfigSources, WorkspaceConfigs, config_files_in, load_scoped_workspace_configs,
+    load_workspace_configs, scope_folders, workspace_collection_groups,
+};
 
 use crate::config::pre_process::PreProcessContext;
 
