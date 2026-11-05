@@ -486,6 +486,49 @@ mod tests {
         let _ = fs::remove_dir_all(root.parent().expect("temp dir"));
     }
 
+    /// A config reload that reads the open documents after one opened and
+    /// before its handler scoped the workspace leaves loading its gamemode
+    /// to that handler.
+    #[test]
+    fn a_reload_racing_an_open_document_still_loads_its_gamemode() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let root = install("reload_race", "{}");
+        write(
+            &root,
+            "gamemodes/gamma/gamemode/shared.lua",
+            "GAMMA_SHARED = 1\n",
+        );
+        let (context, _peer) = start(&runtime, &root);
+        let snapshot = context.snapshot();
+        runtime.block_on(async {
+            snapshot
+                .workspace_manager()
+                .write()
+                .await
+                .current_open_files
+                .insert(uri(&root, "gamemodes/gamma/gamemode/init.lua"));
+            WorkspaceManager::reload_config(snapshot.workspace_manager_arc()).await;
+        });
+
+        toggle(
+            &runtime,
+            &snapshot,
+            &root,
+            "gamemodes/gamma/gamemode/init.lua",
+            true,
+        );
+
+        assert_eq!(
+            paths(&loaded(&runtime, &snapshot, &root)),
+            vec![
+                "addons/tools/lua/autorun/sh_tools.lua",
+                "gamemodes/gamma/gamemode/init.lua",
+                "gamemodes/gamma/gamemode/shared.lua",
+            ]
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("temp dir"));
+    }
+
     #[test]
     fn an_opened_gamemode_settles_as_a_cold_load_that_picks_it() {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");

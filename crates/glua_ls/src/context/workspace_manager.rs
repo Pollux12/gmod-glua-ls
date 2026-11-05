@@ -167,13 +167,18 @@ impl WorkspaceManager {
                 .await;
         let (change, open_files) = {
             let mut manager = workspace_manager.write().await;
-            manager.scoped_folders = scoped_folders.clone();
             let change = manager
                 .loaded_config
                 .as_ref()
                 .map_or(EmmyrcChange::Workspace, |previous| {
                     loaded.change_from(previous)
                 });
+            // Only a workspace change loads the scope it read. Any other
+            // change keeps the scope the loaded files match, so the documents
+            // opened or closed since it was applied still scope it again.
+            if change == EmmyrcChange::Workspace {
+                manager.scoped_folders = scoped_folders.clone();
+            }
             if change != EmmyrcChange::Unchanged {
                 manager.per_root_matchers = loaded.workspace_matchers.clone();
                 let (include, exclude, exclude_dir) = calculate_include_and_exclude(&loaded.emmyrc);
