@@ -53,6 +53,8 @@ pub use text_document::on_did_change_text_document;
 pub(crate) use text_document::{
     on_did_change_watched_files, on_did_close_document, on_did_open_text_document,
 };
+#[cfg(test)]
+pub(crate) use workspace::on_did_change_workspace_folders;
 
 pub trait RegisterCapabilities {
     fn register_capabilities(

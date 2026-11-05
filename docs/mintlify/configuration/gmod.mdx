@@ -47,7 +47,9 @@ As in a multi-root workspace, an addon or gamemode with its own config file (`.g
 - With no active gamemode, a sole custom gamemode loads. With several, each loads while one of its files is open in the editor; `glua_check` loads them all.
 - Files outside the addons and gamemodes, such as `lua/`, are analysed while open.
 
-Any other folder, such as one gamemode or the `addons/` folder, loads everything.
+An `addons/` folder opened on its own loads the same way: each addon is its own root with its own config, and files directly in `addons/` are analysed while open. Any other folder, such as one gamemode, loads everything.
+
+When a workspace also has a folder inside one of the Garry's Mod folder's gamemodes, such as the gamemode itself, that gamemode loads with the gamemodes it derives from, as if picked.
 
 In VS Code, when the folder has several custom gamemodes and none is picked, GLuaLS asks which to load: **Addons only** (`""`), one gamemode, **Load all custom** (`"*"`), or **Load all** (`loadEverything`). For addon work, pick **Addons only**: the annotations already describe `base` and `sandbox`, and picking one of them loads its source on top. Run **GLuaLS: Select Gamemode** or click the status bar item to change it later. The pick is saved to `.gluarc.json` when the folder is in a git repository and has a `.gluarc.json` or no other config file, and otherwise to the workspace folder's settings.
 

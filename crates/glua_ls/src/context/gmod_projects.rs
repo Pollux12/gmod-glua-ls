@@ -837,4 +837,200 @@ mod tests {
         );
         let _ = fs::remove_dir_all(root.parent().expect("temp dir"));
     }
+
+    /// Each loaded file outside std with its module path and the root of its
+    /// workspace, as paths relative to `base`.
+    fn modules(
+        runtime: &tokio::runtime::Runtime,
+        snapshot: &ServerContextSnapshot,
+        base: &Path,
+    ) -> Vec<(String, String, String)> {
+        let relative = |path: &Path| {
+            path.strip_prefix(base)
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default()
+        };
+        runtime.block_on(async {
+            let analysis = snapshot.analysis().read().await;
+            let module_index = analysis.compilation.get_db().get_module_index();
+            let mut modules = analysis
+                .local_file_paths()
+                .into_iter()
+                .filter(|(_, path)| path.starts_with(base))
+                .filter_map(|(uri, path)| {
+                    let module = module_index.get_module(analysis.get_file_id(&uri)?)?;
+                    let root = module_index
+                        .workspaces()
+                        .iter()
+                        .find(|workspace| workspace.id == module.workspace_id)?;
+                    Some((
+                        relative(&path),
+                        module.full_module_name.clone(),
+                        relative(&root.root),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            modules.sort();
+            modules
+        })
+    }
+
+    /// [`modules`] once a scheduled reload has settled: unchanged for a second.
+    fn settled_modules(
+        runtime: &tokio::runtime::Runtime,
+        snapshot: &ServerContextSnapshot,
+        base: &Path,
+    ) -> Vec<(String, String, String)> {
+        let mut last = modules(runtime, snapshot, base);
+        let mut unchanged = 0;
+        for _ in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let now = modules(runtime, snapshot, base);
+            if now == last {
+                unchanged += 1;
+                if unchanged == 10 {
+                    break;
+                }
+            } else {
+                unchanged = 0;
+                last = now;
+            }
+        }
+        last
+    }
+
+    /// Adds and removes workspace folders as the client's notification does.
+    fn change_folders(
+        runtime: &tokio::runtime::Runtime,
+        snapshot: &ServerContextSnapshot,
+        added: &[PathBuf],
+        removed: &[PathBuf],
+    ) {
+        let folders = |paths: &[PathBuf]| {
+            paths
+                .iter()
+                .map(|path| lsp_types::WorkspaceFolder {
+                    uri: file_path_to_uri(path).expect("file URI should parse"),
+                    name: "folder".to_string(),
+                })
+                .collect()
+        };
+        runtime.block_on(crate::handlers::on_did_change_workspace_folders(
+            snapshot.clone(),
+            lsp_types::DidChangeWorkspaceFoldersParams {
+                event: lsp_types::WorkspaceFoldersChangeEvent {
+                    added: folders(added),
+                    removed: folders(removed),
+                },
+            },
+        ));
+    }
+
+    fn module(path: &str, module: &str, root: &str) -> (String, String, String) {
+        (path.to_string(), module.to_string(), root.to_string())
+    }
+
+    /// An `addons` folder added beside an open gamemode loads as the
+    /// multi-root workspace of its addons, each with its own config, and
+    /// removing it leaves the gamemode as it was.
+    #[test]
+    fn an_addons_folder_added_beside_a_gamemode_registers_each_addon() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let root = install("addons_beside_gamemode", "{}");
+        write(
+            &root,
+            "addons/tools/.gluarc.json",
+            r#"{ "diagnostics": { "disable": ["unused"] } }"#,
+        );
+        write(&root, "addons/wire/lua/autorun/sh_wire.lua", "WIRE = 1\n");
+        let base = root.parent().expect("temp dir").to_path_buf();
+        let (context, _peer) = start(&runtime, &root.join("gamemodes/beta"));
+        let snapshot = context.snapshot();
+        let gamemode = settled_modules(&runtime, &snapshot, &base);
+
+        change_folders(&runtime, &snapshot, &[root.join("addons")], &[]);
+        let added = settled_modules(&runtime, &snapshot, &base);
+        let tools_config = runtime.block_on(async {
+            let manager = snapshot.workspace_manager().read().await;
+            let loaded = manager.loaded_config.as_ref().expect("loaded config");
+            loaded
+                .workspace_emmyrcs
+                .get(&root.join("addons/tools"))
+                .map(|emmyrc| format!("{:?}", emmyrc.diagnostics.disable))
+        });
+        change_folders(&runtime, &snapshot, &[], &[root.join("addons")]);
+        let removed = settled_modules(&runtime, &snapshot, &base);
+
+        let beta = [
+            module(
+                "garrysmod/gamemodes/alpha/gamemode/shared.lua",
+                "gamemode.shared",
+                "garrysmod/gamemodes/alpha",
+            ),
+            module(
+                "garrysmod/gamemodes/beta/gamemode/init.lua",
+                "gamemode",
+                "garrysmod/gamemodes/beta",
+            ),
+        ];
+        assert_eq!(
+            (&gamemode, &added, tools_config.as_deref(), &removed),
+            (
+                &beta.to_vec(),
+                &vec![
+                    module(
+                        "garrysmod/addons/tools/lua/autorun/sh_tools.lua",
+                        "lua.autorun.sh_tools",
+                        "garrysmod/addons/tools",
+                    ),
+                    module(
+                        "garrysmod/addons/wire/lua/autorun/sh_wire.lua",
+                        "lua.autorun.sh_wire",
+                        "garrysmod/addons/wire",
+                    ),
+                    beta[0].clone(),
+                    beta[1].clone(),
+                ],
+                Some("[Unused]"),
+                &beta.to_vec(),
+            )
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// A whole Garry's Mod folder added beside one of its gamemodes keeps
+    /// that gamemode loaded with the gamemodes it derives from, though the
+    /// folder picks none.
+    #[test]
+    fn a_gmod_folder_added_beside_its_gamemode_keeps_the_gamemode_chain() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let root = install("gmod_beside_gamemode", "{}");
+        let base = root.parent().expect("temp dir").to_path_buf();
+        let (context, _peer) = start(&runtime, &root.join("gamemodes/beta"));
+        let snapshot = context.snapshot();
+
+        change_folders(&runtime, &snapshot, std::slice::from_ref(&root), &[]);
+
+        assert_eq!(
+            settled_modules(&runtime, &snapshot, &base),
+            vec![
+                module(
+                    "garrysmod/addons/tools/lua/autorun/sh_tools.lua",
+                    "lua.autorun.sh_tools",
+                    "garrysmod/addons/tools",
+                ),
+                module(
+                    "garrysmod/gamemodes/alpha/gamemode/shared.lua",
+                    "gamemode.shared",
+                    "garrysmod/gamemodes/alpha",
+                ),
+                module(
+                    "garrysmod/gamemodes/beta/gamemode/init.lua",
+                    "gamemode",
+                    "garrysmod/gamemodes/beta",
+                ),
+            ]
+        );
+        let _ = fs::remove_dir_all(base);
+    }
 }

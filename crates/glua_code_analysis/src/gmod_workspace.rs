@@ -204,24 +204,71 @@ impl GmodTopology {
 }
 
 /// The folders `folder` loads: a GMod root's addons and gamemodes, each its
-/// own root, scoped by `gmod` and the files in `open`; any other folder, a
-/// library, or a GMod root under `gmod.loadEverything`, as it is.
+/// own root, scoped by `gmod`, the files in `open` and the other workspace
+/// folders in `others` (a gamemode, or a folder in one, loads as if picked);
+/// an `addons` folder's addons, each its own root; any other folder, a
+/// library, or either under `gmod.loadEverything`, as it is.
 pub fn scope_workspace_folder(
     folder: &WorkspaceFolder,
     gmod: &EmmyrcGmod,
     unpicked: UnpickedGamemodes,
     open: &[PathBuf],
+    others: &[PathBuf],
 ) -> Vec<WorkspaceFolder> {
     if folder.is_library || gmod.load_everything || folder.import != WorkspaceImport::All {
         return vec![folder.clone()];
     }
+    if is_addons_folder(&folder.root) {
+        return addons_folder_scope(&folder.root, open);
+    }
     match GmodTopology::discover(&folder.root) {
-        Some(topology) => topology.scoped_folders(
-            &topology.picked_gamemodes(gmod.active_gamemode.as_deref(), unpicked),
-            open,
-        ),
+        Some(topology) => {
+            let mut picked = topology.picked_gamemodes(gmod.active_gamemode.as_deref(), unpicked);
+            for gamemode in others
+                .iter()
+                .filter_map(|other| topology.gamemode_of(other))
+                .flat_map(|gamemode| topology.chain(&gamemode.name))
+            {
+                if !picked.contains(&gamemode) {
+                    picked.push(gamemode);
+                }
+            }
+            topology.scoped_folders(&picked, open)
+        }
         None => vec![folder.clone()],
     }
+}
+
+/// Whether `dir` is a folder of addons, `addons`, whose folders are each an
+/// addon's root.
+pub fn is_addons_folder(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("addons"))
+        && dir.is_dir()
+}
+
+/// An `addons` folder as the multi-root workspace of its addons, then itself
+/// with only the files in `open` outside them.
+fn addons_folder_scope(folder: &Path, open: &[PathBuf]) -> Vec<WorkspaceFolder> {
+    let addons = sorted_dirs(folder);
+    let mut loose = open
+        .iter()
+        .filter(|path| !addons.iter().any(|addon| path.starts_with(addon)))
+        .filter_map(|path| path.strip_prefix(folder).ok())
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    loose.sort();
+    loose.dedup();
+    addons
+        .into_iter()
+        .map(|addon| WorkspaceFolder::new(addon, false))
+        .chain(std::iter::once(WorkspaceFolder::with_sub_paths(
+            folder.to_path_buf(),
+            loose,
+            false,
+        )))
+        .collect()
 }
 
 fn is_gmod_root(dir: &Path) -> bool {
@@ -586,7 +633,7 @@ mod tests {
             ..EmmyrcGmod::default()
         };
         let scope = |folder: &WorkspaceFolder, gmod: &EmmyrcGmod| {
-            scope_workspace_folder(folder, gmod, UnpickedGamemodes::None, &[])
+            scope_workspace_folder(folder, gmod, UnpickedGamemodes::None, &[], &[])
         };
 
         assert_eq!(
@@ -596,6 +643,44 @@ mod tests {
                 scope(&whole, &EmmyrcGmod::default()).len(),
             ),
             (vec![gamemode.clone()], vec![whole.clone()], 2 + 5 + 1)
+        );
+    }
+
+    /// An `addons` folder loads as the multi-root workspace of its addons,
+    /// with the files directly in it only while open, unless it loads
+    /// everything.
+    #[test]
+    fn an_addons_folder_registers_each_addon_as_its_own_root() {
+        let root = install("addons_folder");
+        let addons = root.join("addons");
+        let loose = addons.join("readme.lua");
+        fs::write(&loose, "").expect("write loose file");
+        let folder = WorkspaceFolder::new(addons.clone(), false);
+        let everything = EmmyrcGmod {
+            load_everything: true,
+            ..EmmyrcGmod::default()
+        };
+        let scope = |gmod: &EmmyrcGmod, open: &[PathBuf]| {
+            scope_workspace_folder(&folder, gmod, UnpickedGamemodes::None, open, &[])
+        };
+
+        assert_eq!(
+            (
+                scope(&EmmyrcGmod::default(), std::slice::from_ref(&loose)),
+                scope(&everything, &[])
+            ),
+            (
+                vec![
+                    WorkspaceFolder::new(addons.join("ulx"), false),
+                    WorkspaceFolder::new(addons.join("wiremod"), false),
+                    WorkspaceFolder::with_sub_paths(
+                        addons.clone(),
+                        vec![PathBuf::from("readme.lua")],
+                        false
+                    ),
+                ],
+                vec![folder.clone()]
+            )
         );
     }
 

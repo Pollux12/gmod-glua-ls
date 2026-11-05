@@ -10,8 +10,8 @@ use serde_json::Value;
 
 use crate::{
     EmmyLibraryItem, Emmyrc, LuaDiagnosticConfig, UnpickedGamemodes, WorkspaceFolder,
-    WorkspaceImport, detect_gamemode_base_libraries, load_configs, scope_workspace_folder,
-    workspace_collection_folders,
+    WorkspaceImport, detect_gamemode_base_libraries, is_addons_folder, load_configs,
+    scope_workspace_folder, workspace_collection_folders,
 };
 
 /// What every root's config is read with besides its own config files.
@@ -62,19 +62,26 @@ pub fn load_scoped_workspace_configs(
     );
     let mut scoped_folders = Vec::new();
     let mut scoped_roots = HashSet::new();
+    let mut changed_scope = false;
     for folder in folders {
         let scoped = scope_workspace_folder(
             folder,
             &configs.root_emmyrc(&folder.root).gmod,
             unpicked,
             open,
+            &other_folder_roots(folders, folder),
         );
         if scoped.as_slice() != std::slice::from_ref(folder) {
-            scoped_roots.extend(scoped.iter().map(|scoped| scoped.root.clone()));
+            // An `addons` folder's addons detect their gamemode bases as the
+            // folders of a multi-root workspace do.
+            if !is_addons_folder(&folder.root) {
+                scoped_roots.extend(scoped.iter().map(|scoped| scoped.root.clone()));
+            }
+            changed_scope = true;
         }
         scoped_folders.extend(scoped);
     }
-    if scoped_roots.is_empty() {
+    if !changed_scope {
         return (scoped_folders, configs);
     }
     let config_roots = config_roots
@@ -101,8 +108,23 @@ pub fn scope_folders<'a>(
     folders
         .iter()
         .flat_map(|folder| {
-            scope_workspace_folder(folder, &root_emmyrc(&folder.root).gmod, unpicked, open)
+            scope_workspace_folder(
+                folder,
+                &root_emmyrc(&folder.root).gmod,
+                unpicked,
+                open,
+                &other_folder_roots(folders, folder),
+            )
         })
+        .collect()
+}
+
+/// The roots of the workspace folders besides `folder`, libraries left out.
+fn other_folder_roots(folders: &[WorkspaceFolder], folder: &WorkspaceFolder) -> Vec<PathBuf> {
+    folders
+        .iter()
+        .filter(|other| !other.is_library && other.root != folder.root)
+        .map(|other| other.root.clone())
         .collect()
 }
 

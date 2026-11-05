@@ -116,6 +116,11 @@ pub fn load_workspace(
                 &emmyrc.gmod,
                 UnpickedGamemodes::AllCustom,
                 &[],
+                &cmd_workspace_folders
+                    .iter()
+                    .filter(|other| *other != path)
+                    .cloned()
+                    .collect::<Vec<_>>(),
             )
         })
         .collect::<Vec<WorkspaceFolder>>();

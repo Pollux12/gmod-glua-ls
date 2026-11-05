@@ -710,6 +710,7 @@ async fn run() {
         &emmyrc.gmod,
         UnpickedGamemodes::AllCustom,
         &[],
+        &[],
     );
     for folder in &main_folders {
         analysis.add_main_workspace(folder.root.clone());
