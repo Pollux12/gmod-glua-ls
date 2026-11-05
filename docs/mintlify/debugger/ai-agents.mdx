@@ -71,19 +71,30 @@ tool_timeout_sec = 120
 | `server_console` | Read the server console, filtered by text or regex, or run a console command and get its output. |
 | `server_errors` | Unique Lua errors with counts and stack traces. Can clear them and wait for new ones. |
 | `diagnostics` | GLuaLS errors and warnings for files the agent edited, or the whole workspace. |
-| `breakpoints` | Set, list, remove and clear breakpoints, conditional breakpoints and logpoints. They show up in your editor. |
-| `debugger` | Status, attach, detach, wait for a breakpoint, continue, step, and pause. Shows the paused line with source, stack, locals and upvalues. |
+| `breakpoints` | Breakpoints, conditional breakpoints, logpoints and function traces. Breakpoints and logpoints show up in your editor. |
+| `debugger` | Status, attach, wait for a breakpoint, continue, step, and pause. Shows the paused line with source, stack, locals and upvalues. Detach removes everything the agent set and disconnects. |
 | `code_lookup` | Hover docs, definition and references for a workspace or GMod API symbol, such as `MyAddon.Config` or `Player:Nick`. |
 
 Code run with `server_run_lua` runs on the next server tick, so breakpoints and logpoints inside it work. When it stops at a breakpoint, the agent gets the paused location straight away and the code's result after it continues.
 
-Breakpoints the agent sets appear in VS Code like your own. Its **clear** action only removes the agent's breakpoints, and when the server stops, the agent is told whether it stopped on its own breakpoint or yours.
+Breakpoints the agent sets appear in VS Code like your own. Its **clear** action, and **detach**, only remove what the agent set, and when the server stops, the agent is told whether it stopped on its own breakpoint or yours.
 
 ### Logpoints
 
-A logpoint prints a message when a line runs, without pausing. Messages can include Lua in braces, such as `hp={ply:Health()} wep={ply:GetActiveWeapon()}`. Lines appear in the console as `[logpoint addons/myaddon/lua/file.lua:12] ...`.
+A logpoint prints a message when a line runs, without pausing. Messages can include Lua in braces, such as `hp={ply:Health()} wep={ply:GetActiveWeapon()}`. Lines appear in the console as `[logpoint autorun/server/file.lua:12] ...`. Agents can make a logpoint remove itself after a number of hits or seconds, and a hit condition such as `% 10` logs every tenth hit.
 
 Logpoints are the better choice while a person or a client MCP is playing, because a breakpoint freezes the whole server. You can also add them yourself: right-click the gutter and choose **Add Logpoint**.
+
+### Function traces
+
+A trace logs every call of one function, such as `MyAddon.Score` or `Player:Nick`, without pausing: its arguments, what it returned and how long it took. A call that raises an error is reported as not returning. A trace stops by itself after 20 calls or two minutes unless the agent asks for other limits, and the function goes back to how it was.
+
+```
+[trace MyAddon.Score] #1 called (name = "a", kills = 3, deaths = 1)
+[trace MyAddon.Score] #1 returned 300 (0.02 ms)
+```
+
+Calls through a saved copy of the function, such as `local f = MyAddon.Score` or a timer callback, are not traced. Hooks added with `hook.Add` are.
 
 ## Pausing a server freezes every player
 
