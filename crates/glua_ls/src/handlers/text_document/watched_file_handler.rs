@@ -61,16 +61,18 @@ pub async fn on_did_change_watched_files(
     let mut editorconfig_paths: Vec<PathBuf> = Vec::new();
     let mut config_changed = false;
     // A file created or deleted in a whole Garry's Mod folder may add or
-    // remove one of its addons or gamemodes.
+    // remove one of its addons or gamemodes, and a gamemode manifest names
+    // the gamemode it derives from.
     let mut gmod_layout_changed = false;
 
     {
         let workspace = context.workspace_manager().read().await;
 
         for file_event in changes {
-            gmod_layout_changed |= file_event.typ != FileChangeType::CHANGED
-                && workspace.in_scoped_folder(&file_event.uri);
             let file_type = get_file_type(&file_event.uri);
+            gmod_layout_changed |= (file_event.typ != FileChangeType::CHANGED
+                || matches!(file_type, Some(WatchedFileType::GamemodeManifest)))
+                && workspace.in_scoped_folder(&file_event.uri);
             match file_type {
                 // The editor owns an open document's text, deleted on disk
                 // or not: closing it reads the disk again. Library files
@@ -95,7 +97,7 @@ pub async fn on_did_change_watched_files(
                     // takes its place.
                     config_changed |= workspace.is_workspace_config_file(&file_event.uri);
                 }
-                None => {}
+                Some(WatchedFileType::GamemodeManifest) | None => {}
             }
         }
     } // workspace read lock released here, before any write lock
@@ -305,6 +307,7 @@ enum WatchedFileType {
     Lua,
     Editorconfig,
     Emmyrc,
+    GamemodeManifest,
 }
 
 /// The documents a batch of watched-file changes can change: its own Lua
@@ -322,6 +325,18 @@ pub(crate) fn watched_change_scope(params: &DidChangeWatchedFilesParams) -> Opti
         .collect()
 }
 
+/// Whether `path` is a `.txt` file directly in a gamemode folder, where a
+/// gamemode's manifest is: `gamemodes/<name>/<file>.txt`.
+pub(crate) fn is_gamemode_manifest(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("txt"))
+        && path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name.eq_ignore_ascii_case("gamemodes"))
+}
+
 fn get_file_type(uri: &Uri) -> Option<WatchedFileType> {
     let path = uri_to_file_path(uri)?;
     let file_name = path.file_name()?.to_str()?;
@@ -330,6 +345,7 @@ fn get_file_type(uri: &Uri) -> Option<WatchedFileType> {
         ".emmyrc.json" | ".luarc.json" | ".emmyrc.lua" | ".gluarc.json" => {
             Some(WatchedFileType::Emmyrc)
         }
+        _ if is_gamemode_manifest(&path) => Some(WatchedFileType::GamemodeManifest),
         _ => Some(WatchedFileType::Lua),
     }
 }

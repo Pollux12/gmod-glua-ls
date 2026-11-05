@@ -13,7 +13,7 @@ use std::{path::PathBuf, time::Duration};
 
 use crate::{
     context::{ClientProxy, ServerContextSnapshot},
-    handlers::text_document::on_did_change_watched_files,
+    handlers::text_document::{is_gamemode_manifest, on_did_change_watched_files},
 };
 
 pub async fn register_files_watch(
@@ -64,6 +64,11 @@ fn register_files_watch_use_lsp_client(client: &ClientProxy) {
             },
             FileSystemWatcher {
                 glob_pattern: GlobPattern::String("**/.gluarc.json".into()),
+                kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+            },
+            // A gamemode's manifest names the gamemode it derives from.
+            FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/gamemodes/*/*.txt".into()),
                 kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
             },
         ],
@@ -148,8 +153,9 @@ async fn register_files_watch_use_fsnotify(context: ServerContextSnapshot) -> Op
             let file_events = path_changes(&event)
                 .into_iter()
                 .filter(|(path, _)| {
-                    let path = path.as_os_str().to_string_lossy();
-                    WATCH_FILE_EXTENSIONS.iter().any(|ext| path.ends_with(ext))
+                    let text = path.as_os_str().to_string_lossy();
+                    WATCH_FILE_EXTENSIONS.iter().any(|ext| text.ends_with(ext))
+                        || is_gamemode_manifest(path)
                 })
                 .filter_map(|(path, typ)| {
                     Some(FileEvent {

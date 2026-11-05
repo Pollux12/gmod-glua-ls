@@ -693,6 +693,44 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_naming_another_base_loads_that_base_instead() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let root = install(
+            "manifest_base",
+            r#"{ "gmod": { "activeGamemode": "beta" } }"#,
+        );
+        let (context, _peer) = start(&runtime, &root);
+        let snapshot = context.snapshot();
+        gamemode(&root, "beta", "gamma");
+
+        runtime.block_on(crate::handlers::on_did_change_watched_files(
+            snapshot.clone(),
+            lsp_types::DidChangeWatchedFilesParams {
+                changes: vec![lsp_types::FileEvent {
+                    uri: uri(&root, "gamemodes/beta/beta.txt"),
+                    typ: lsp_types::FileChangeType::CHANGED,
+                }],
+            },
+        ));
+
+        assert_eq!(
+            paths(&wait_until_loaded(
+                &runtime,
+                &snapshot,
+                &root,
+                "gamemodes/alpha/gamemode/shared.lua",
+                false
+            )),
+            vec![
+                "addons/tools/lua/autorun/sh_tools.lua",
+                "gamemodes/beta/gamemode/init.lua",
+                "gamemodes/gamma/gamemode/init.lua",
+            ]
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("temp dir"));
+    }
+
+    #[test]
     fn a_gamemode_with_its_own_config_loads_and_keeps_its_open_document() {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
         let root = install("gamemode_config", "{}");

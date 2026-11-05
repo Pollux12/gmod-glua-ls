@@ -14,7 +14,9 @@ pub use text_document_handler::{
     on_did_save_text_document,
 };
 pub use watched_file_handler::on_did_change_watched_files;
-pub(crate) use watched_file_handler::{apply_file_system_changes, watched_change_scope};
+pub(crate) use watched_file_handler::{
+    apply_file_system_changes, is_gamemode_manifest, watched_change_scope,
+};
 
 use super::RegisterCapabilities;
 
