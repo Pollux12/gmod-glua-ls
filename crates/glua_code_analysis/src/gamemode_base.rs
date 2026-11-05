@@ -40,7 +40,7 @@ pub(crate) fn is_valid_gamemode_name(name: &str) -> bool {
 /// define everything they provide twice, so a base chain ends where it reaches one.
 const ANNOTATED_GAMEMODES: [&str; 2] = ["base", "sandbox"];
 
-fn is_annotated_gamemode(name: &str) -> bool {
+pub(crate) fn is_annotated_gamemode(name: &str) -> bool {
     ANNOTATED_GAMEMODES
         .iter()
         .any(|annotated| annotated.eq_ignore_ascii_case(name))

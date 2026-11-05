@@ -41,7 +41,7 @@ See [Garry's Mod annotations](/configuration/annotations-management) for downloa
 When you open a whole Garry's Mod folder (named `garrysmod`, holding both `addons/` and `gamemodes/`, or holding a `garrysmod/` folder), GLuaLS treats it like a multi-root workspace of its addons and the gamemode you work on. Each addon and gamemode keeps its own module paths and its own `.gluarc.json`.
 
 - Every addon loads.
-- The active gamemode loads with the custom gamemodes it derives from. The gamemodes that ship with Garry's Mod (`base`, `sandbox` and `terrortown`) load only when picked or while one of their files is open.
+- The active gamemode loads with the gamemodes it derives from, up to `base` or `sandbox`, which the annotations describe. The gamemodes that ship with Garry's Mod (`base`, `sandbox` and `terrortown`) otherwise load only when picked or while one of their files is open; `terrortown` also loads with a gamemode that derives from it.
 - With no active gamemode, a sole custom gamemode loads. With several, each loads while one of its files is open in the editor; `glua_check` loads them all.
 - Files outside the addons and gamemodes, such as `lua/`, are analysed while open.
 

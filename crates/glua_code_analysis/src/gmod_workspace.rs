@@ -6,7 +6,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::gamemode_base::{
-    find_gamemode_manifest, is_valid_gamemode_name, read_gamemode_folder_base,
+    find_gamemode_manifest, is_annotated_gamemode, is_valid_gamemode_name,
+    read_gamemode_folder_base,
 };
 use crate::{EmmyrcGmod, WorkspaceFolder, WorkspaceImport};
 
@@ -87,8 +88,9 @@ impl GmodTopology {
         self.gamemodes.iter().filter(|gamemode| !gamemode.builtin)
     }
 
-    /// `name` and the custom gamemodes it derives from, in order; the walk
-    /// stops at a built-in, a missing gamemode or a cycle.
+    /// `name` and the gamemodes it derives from, in order; the walk stops at
+    /// a gamemode the annotations declare (`base`, `sandbox`), a missing
+    /// gamemode or a cycle, so a gamemode deriving from `terrortown` brings it.
     pub fn chain(&self, name: &str) -> Vec<&Gamemode> {
         let Some(start) = self.gamemode(name) else {
             return Vec::new();
@@ -99,7 +101,7 @@ impl GmodTopology {
             let Some(next) = self.gamemode(base) else {
                 break;
             };
-            if next.builtin || chain.contains(&next) {
+            if is_annotated_gamemode(&next.name) || chain.contains(&next) {
                 break;
             }
             chain.push(next);
@@ -404,6 +406,27 @@ mod tests {
             (
                 vec!["helix-hl2rp".to_string(), "helix".to_string()],
                 vec!["sandbox".to_string()]
+            )
+        );
+    }
+
+    /// The annotations declare `base` and `sandbox` but not `terrortown`, so
+    /// a gamemode deriving from `terrortown` loads it too, as the base
+    /// detection of a single gamemode folder does.
+    #[test]
+    fn a_chain_brings_terrortown_which_the_annotations_do_not_declare() {
+        let root = install("terrortown_chain");
+        gamemode(&root, "ttt_custom", "ttt_custom", Some("terrortown"));
+        let topology = GmodTopology::discover(&root).expect("gmod root");
+
+        assert_eq!(
+            (
+                names(&topology.chain("ttt_custom")),
+                names(&topology.chain("terrortown"))
+            ),
+            (
+                vec!["ttt_custom".to_string(), "terrortown".to_string()],
+                vec!["terrortown".to_string()]
             )
         );
     }
