@@ -81,7 +81,7 @@ Breakpoints the agent sets appear in VS Code like your own. Its **clear** action
 
 ### Logpoints
 
-A logpoint prints a message when a line runs, without pausing. Messages can include Lua in braces, such as `hp={ply:Health()} wep={ply:GetActiveWeapon()}`. Lines appear in the console as `[logpoint autorun/server/file.lua:12] ...`. Agents can make a logpoint remove itself after a number of hits or seconds, and a hit condition such as `% 10` logs every tenth hit.
+A logpoint prints a message when a line runs, without pausing. Messages can include Lua in braces, such as `hp={ply:Health()} wep={ply:GetActiveWeapon()}`. Lines appear in the console as `[logpoint autorun/server/file.lua:12] ...`. Agents can make a logpoint remove itself after a number of hits or seconds, and a hit condition such as `% 10` logs every tenth hit. If an expression in the message fails, for example because a variable is nil, the logpoint prints the error and the server keeps running.
 
 Logpoints are the better choice while a person or a client MCP is playing, because a breakpoint freezes the whole server. You can also add them yourself: right-click the gutter and choose **Add Logpoint**.
 
