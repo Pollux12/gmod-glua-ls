@@ -59,9 +59,9 @@ tool_timeout_sec = 120
 | Setting | Default | What it does |
 |---|---|---|
 | `gluals.mcp.enabled` | `false` | Runs the MCP server. |
-| `gluals.mcp.port` | `21120` | Port on `127.0.0.1`. Each VS Code window running the MCP server needs its own port. |
-| `gluals.mcp.allowCodeExecution` | `true` | Allows running Lua, console commands and paused-frame evaluation. Turn off for read-only tools. |
-| `gluals.mcp.autoAttach` | `true` | Attaches the debugger when an agent first uses a server tool. It never stops on entry, so the game keeps running. |
+| `gluals.mcp.port` | `21120` | Port the MCP server listens on. |
+| `gluals.mcp.allowCodeExecution` | `true` | Lets agents run Lua and console commands. When off, they can still read and debug. |
+| `gluals.mcp.autoAttach` | `true` | Connects the debugger automatically when an agent needs it, without pausing the game. |
 
 ## Tools
 
@@ -103,7 +103,7 @@ The server stays paused until someone continues, either the agent or you with **
 
 **`server_run_lua` says the server returned no result.** The server is still running the older debugger bridge. Restart the map or server so it loads the updated `lua/autorun/debug.lua`, and update `gm_rdb` with **GMod Debugger: Check for Updates**.
 
-**The port is already in use.** Another VS Code window is running the MCP server. Set `gluals.mcp.port` to a different port in this workspace, then run the setup again so the agent's config uses the new port.
+**The port is already in use.** Choose another in `gluals.mcp.port`, then run the setup again so the agent uses the new port.
 
 **A breakpoint never hits.** Server breakpoints only hit in code the server runs. Files such as `cl_init.lua` or `lua/autorun/client/` only run on clients.
 
