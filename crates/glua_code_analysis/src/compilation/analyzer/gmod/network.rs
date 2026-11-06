@@ -896,7 +896,7 @@ fn summarize_helper_call(
             callback_idx,
         }) => {
             call.literal_receive =
-                extract_static_string_arg_value(call_expr, message_idx).is_some();
+                !extract_static_string_arg_values(call_expr, message_idx).is_empty();
             if !call.literal_receive {
                 call.receive_reads = receive_reads(site, owner, call_expr, callback_idx);
             }
@@ -947,20 +947,17 @@ fn helper_sends(
             let mut stat_items = Vec::new();
             let mut send = None;
             for next_stat in stats.iter().skip(index + 1) {
-                if let Some(next_call) = call_expr_from_stat(next_stat) {
-                    match site.role(&next_call) {
-                        Some(NetCallRole::Start { .. }) => break,
-                        Some(NetCallRole::Send(send_kind)) => {
-                            send =
-                                Some((send_kind, extract_send_target_text(&next_call, send_kind)));
-                            break;
-                        }
-                        _ => {}
-                    }
+                let end = transaction_end(next_stat, |call| direct_transaction_end(site, call));
+                if matches!(end, Some(TransactionEnd::Start)) {
+                    break;
                 }
                 let mut items = Vec::new();
                 op_items(site, owner, &block, next_stat.syntax(), &mut items);
                 stat_items.push(items);
+                if let Some(TransactionEnd::Send { answer, .. }) = end {
+                    send = Some(answer);
+                    break;
+                }
             }
             sends.push(HelperSend {
                 start_range: start_call.get_range(),
@@ -1001,6 +998,12 @@ fn op_items(
     };
     if is_call_expr_in_nested_closure(block, &call_expr) {
         return;
+    }
+    // Lua evaluates the called expression before the arguments, so an op that
+    // produces the callee or receiver (`f(net.ReadString())()`,
+    // `net.ReadEntity():Remove()`) comes first.
+    if let Some(prefix_expr) = call_expr.get_prefix_expr() {
+        op_items(site, owner, block, prefix_expr.syntax(), out);
     }
     if let Some(args) = call_expr.get_args_list() {
         for arg in args.get_args() {
@@ -1371,8 +1374,9 @@ fn collect_call_flows(ctx: &mut NetCollectCtx<'_>, call_expr: &LuaCallExpr) -> C
     let mut flows = CallFlows::default();
     let candidate = ctx.site.call(call_expr).is_some_and(|fact| fact.candidate);
     if candidate {
-        if let Some(receive_flow) = collect_net_receive_flow(ctx, call_expr) {
-            flows.receive_flows.push(receive_flow);
+        let receive_flows = collect_net_receive_flows(ctx, call_expr);
+        if !receive_flows.is_empty() {
+            flows.receive_flows.extend(receive_flows);
         } else if call_has_literal_string_arg(call_expr) {
             collect_receive_flows_from_helper_call(ctx, call_expr, &mut flows.receive_flows);
         }
@@ -1381,8 +1385,10 @@ fn collect_call_flows(ctx: &mut NetCollectCtx<'_>, call_expr: &LuaCallExpr) -> C
     if call_has_literal_string_arg(call_expr)
         && let Some((block, stat)) = call_stat_in_block(call_expr)
     {
-        send_flows.extend(collect_net_send_flow(ctx, &block, &stat, call_expr));
-        send_flows.extend(collect_wrapped_net_send_flow(ctx, &block, &stat, call_expr));
+        send_flows.extend(collect_net_send_flows(ctx, &block, &stat, call_expr));
+        send_flows.extend(collect_wrapped_net_send_flows(
+            ctx, &block, &stat, call_expr,
+        ));
     }
     if candidate {
         send_flows.extend(collect_unannotated_net_wrapper_send_flows(ctx, call_expr));
@@ -1534,19 +1540,24 @@ struct HelperMemo {
 /// The transaction written at `call_expr`, a statement of `block`: the
 /// `net.Start` or helper call, the payload statements after it, and the send
 /// that ends it.
-fn collect_net_send_flow(
+fn collect_net_send_flows(
     ctx: &mut NetCollectCtx<'_>,
     block: &LuaBlock,
     stat: &LuaStat,
     call_expr: &LuaCallExpr,
-) -> Option<NetSendFlow> {
-    let message_name = match ctx.site.role(call_expr) {
+) -> Vec<NetSendFlow> {
+    let message_names = match ctx.site.role(call_expr) {
         Some(NetCallRole::Start { message_idx }) => {
-            extract_static_string_arg_value(call_expr, message_idx)
+            extract_static_string_arg_values(call_expr, message_idx)
         }
-        Some(_) => None,
-        None => resolve_helper_start_message(ctx, call_expr),
-    }?;
+        Some(_) => Vec::new(),
+        None => resolve_helper_start_message(ctx, call_expr)
+            .into_iter()
+            .collect(),
+    };
+    if message_names.is_empty() {
+        return Vec::new();
+    }
 
     let mut writes = Vec::new();
     // A start or send helper's own writes, around the start or send it makes,
@@ -1555,56 +1566,136 @@ fn collect_net_send_flow(
     let mut send = None;
 
     for next_stat in stats_after(stat) {
-        if let Some(next_call_expr) = call_expr_from_stat(&next_stat) {
-            match ctx.site.role(&next_call_expr) {
-                Some(NetCallRole::Start { .. }) => break,
-                Some(NetCallRole::Send(send_kind)) => {
-                    let target = extract_send_target_text(&next_call_expr, send_kind);
-                    send = Some((
-                        next_call_expr.get_range(),
-                        send_kind,
-                        target,
-                        call_display_name(&next_call_expr),
-                    ));
-                    break;
+        match transaction_end(&next_stat, |call| helper_transaction_end(ctx, call)) {
+            Some(TransactionEnd::Start) => break,
+            Some(TransactionEnd::Send { call, answer }) => {
+                // A send helper's own writes are not composed: one that can
+                // write leaves the payload unknown.
+                if is_whole_stat(&next_stat, &call) {
+                    writes_opaque |= helper_writes(ctx, &call);
+                } else {
+                    collect_net_write_ops_from_stat(
+                        ctx,
+                        block,
+                        &next_stat,
+                        &mut writes,
+                        &mut writes_opaque,
+                    );
                 }
-                Some(_) => {}
-                None => {
-                    if resolve_helper_start_message(ctx, &next_call_expr).is_some() {
-                        break;
-                    }
-                    if let Some((send_kind, send_target)) =
-                        resolve_helper_send(ctx, &next_call_expr)
-                    {
-                        writes_opaque |= helper_writes(ctx, &next_call_expr);
-                        send = Some((
-                            next_call_expr.get_range(),
-                            send_kind,
-                            send_target,
-                            call_display_name(&next_call_expr),
-                        ));
-                        break;
-                    }
-                }
+                let (send_kind, send_target) = answer;
+                send = Some((
+                    call.get_range(),
+                    send_kind,
+                    send_target,
+                    call_display_name(&call),
+                ));
+                break;
             }
+            None => {}
         }
 
         collect_net_write_ops_from_stat(ctx, block, &next_stat, &mut writes, &mut writes_opaque);
     }
 
-    let (send_range, send_kind, send_target, send_display_name) = send?;
-    Some(NetSendFlow {
-        message_name,
-        start_range: call_expr.get_range(),
-        writes,
-        send_range,
-        send_kind,
-        send_display_name,
-        send_target,
-        is_wrapped: false,
-        writes_opaque,
-        materialized_from: None,
+    let Some((send_range, send_kind, send_target, send_display_name)) = send else {
+        return Vec::new();
+    };
+    send_flow_per_name(
+        message_names,
+        NetSendFlow {
+            message_name: String::new(),
+            start_range: call_expr.get_range(),
+            writes,
+            send_range,
+            send_kind,
+            send_display_name,
+            send_target,
+            is_wrapped: false,
+            writes_opaque,
+            materialized_from: None,
+        },
+    )
+}
+
+/// `flow` once for each name its start can send.
+fn send_flow_per_name(message_names: Vec<String>, flow: NetSendFlow) -> Vec<NetSendFlow> {
+    message_names
+        .into_iter()
+        .map(|message_name| NetSendFlow {
+            message_name,
+            ..flow.clone()
+        })
+        .collect()
+}
+
+/// What ends a `net.Start` transaction in a statement that follows it.
+enum TransactionEnd {
+    /// Another message starts first: the transaction ends unsent.
+    Start,
+    /// `call` sends the message.
+    Send {
+        call: LuaCallExpr,
+        answer: HelperSendAnswer,
+    },
+}
+
+/// The first call of `stat` that ends a transaction, in document order and
+/// at any depth, so a send chosen in an `if`/`else` ends it as a send
+/// statement does. Calls in closures `stat` defines run later and are skipped.
+fn transaction_end(
+    stat: &LuaStat,
+    mut classify: impl FnMut(&LuaCallExpr) -> Option<TransactionEnd>,
+) -> Option<TransactionEnd> {
+    let mut nodes = stat.syntax().preorder();
+    while let Some(event) = nodes.next() {
+        let rowan::WalkEvent::Enter(node) = event else {
+            continue;
+        };
+        if LuaClosureExpr::can_cast(node.kind().into()) {
+            nodes.skip_subtree();
+            continue;
+        }
+        if let Some(call) = LuaCallExpr::cast(node)
+            && let Some(end) = classify(&call)
+        {
+            return Some(end);
+        }
+    }
+    None
+}
+
+/// How a call ends a transaction through its own net role.
+fn direct_transaction_end(site: &NetFileSite<'_>, call: &LuaCallExpr) -> Option<TransactionEnd> {
+    match site.role(call)? {
+        NetCallRole::Start { .. } => Some(TransactionEnd::Start),
+        NetCallRole::Send(send_kind) => Some(TransactionEnd::Send {
+            call: call.clone(),
+            answer: (send_kind, extract_send_target_text(call, send_kind)),
+        }),
+        _ => None,
+    }
+}
+
+/// How a call ends a transaction through its role or the helper it calls.
+fn helper_transaction_end(
+    ctx: &mut NetCollectCtx<'_>,
+    call: &LuaCallExpr,
+) -> Option<TransactionEnd> {
+    if ctx.site.role(call).is_some() {
+        return direct_transaction_end(&ctx.site, call);
+    }
+    if resolve_helper_start_message(ctx, call).is_some() {
+        return Some(TransactionEnd::Start);
+    }
+    resolve_helper_send(ctx, call).map(|answer| TransactionEnd::Send {
+        call: call.clone(),
+        answer,
     })
+}
+
+/// Whether `call` is the whole of `stat`, rather than a call inside it.
+fn is_whole_stat(stat: &LuaStat, call: &LuaCallExpr) -> bool {
+    call_expr_from_stat(stat).is_some_and(|stat_call| stat_call.syntax() == call.syntax())
 }
 
 /// Whether `call_expr` calls a helper whose expansion can write a payload.
@@ -1722,90 +1813,109 @@ fn resolve_helper_send(
 /// inside an anonymous callback (e.g. a `net.Receive` receiver) have no named
 /// owner and are skipped. A block nested inside another named function is
 /// visited under that inner owner.
-fn collect_wrapped_net_send_flow(
+fn collect_wrapped_net_send_flows(
     ctx: &mut NetCollectCtx<'_>,
     block: &LuaBlock,
     stat: &LuaStat,
     call_expr: &LuaCallExpr,
-) -> Option<NetSendFlow> {
-    let owner = block
+) -> Vec<NetSendFlow> {
+    let Some(owner) = block
         .syntax()
         .ancestors()
         .find_map(LuaClosureExpr::cast)
-        .and_then(|closure| closure.get_block())?;
+        .and_then(|closure| closure.get_block())
+    else {
+        return Vec::new();
+    };
     if !ctx
         .site
         .syntax
         .named_blocks
         .contains(&owner.syntax().text_range())
     {
-        return None;
+        return Vec::new();
     }
 
     let Some(NetCallRole::Start { message_idx }) = ctx.site.role(call_expr) else {
-        return None;
+        return Vec::new();
     };
-    let message_name = extract_static_string_arg_value(call_expr, message_idx)?;
+    let message_names = extract_static_string_arg_values(call_expr, message_idx);
+    if message_names.is_empty() {
+        return Vec::new();
+    }
 
     let mut writes = Vec::new();
     let mut writes_opaque = false;
     let mut send = None;
 
     for next_stat in stats_after(stat) {
-        if let Some(next_call_expr) = call_expr_from_stat(&next_stat) {
-            match ctx.site.role(&next_call_expr) {
-                Some(NetCallRole::Start { .. }) => break,
-                Some(NetCallRole::Send(send_kind)) => {
-                    let target = extract_send_target_text(&next_call_expr, send_kind);
-                    send = Some((
-                        next_call_expr.get_range(),
-                        send_kind,
-                        target,
-                        call_display_name(&next_call_expr),
-                    ));
-                    break;
-                }
-                _ => {}
+        let end = transaction_end(&next_stat, |call| direct_transaction_end(&ctx.site, call));
+        if matches!(end, Some(TransactionEnd::Start)) {
+            break;
+        }
+        if let Some(TransactionEnd::Send { call, answer }) = end {
+            if !is_whole_stat(&next_stat, &call) {
+                collect_net_write_ops_from_stat(
+                    ctx,
+                    block,
+                    &next_stat,
+                    &mut writes,
+                    &mut writes_opaque,
+                );
             }
+            let (send_kind, send_target) = answer;
+            send = Some((
+                call.get_range(),
+                send_kind,
+                send_target,
+                call_display_name(&call),
+            ));
+            break;
         }
 
         collect_net_write_ops_from_stat(ctx, block, &next_stat, &mut writes, &mut writes_opaque);
     }
 
     if let Some((send_range, send_kind, send_target, send_display_name)) = send {
-        return Some(NetSendFlow {
-            message_name,
-            start_range: call_expr.get_range(),
-            writes,
-            send_range,
-            send_kind,
-            send_display_name,
-            send_target,
-            is_wrapped: true,
-            writes_opaque,
-            materialized_from: None,
-        });
+        return send_flow_per_name(
+            message_names,
+            NetSendFlow {
+                message_name: String::new(),
+                start_range: call_expr.get_range(),
+                writes,
+                send_range,
+                send_kind,
+                send_display_name,
+                send_target,
+                is_wrapped: true,
+                writes_opaque,
+                materialized_from: None,
+            },
+        );
     }
 
     // Wrapped helper flows can start a net message in one function and send at call-site.
     // Keep a conservative stub so counterpart diagnostics can still resolve by message name.
     // The realm is a placeholder: `is_wrapped` flows are used for counterpart
     // presence only and are skipped by every realm-sensitive check.
-    Some(NetSendFlow {
-        message_name,
-        start_range: call_expr.get_range(),
-        writes: Vec::new(),
-        send_range: call_expr.get_range(),
-        send_kind: NetSendKind {
-            receiver_realm: GmodRealm::Client,
-            target_arg_idx: None,
+    send_flow_per_name(
+        message_names,
+        NetSendFlow {
+            message_name: String::new(),
+            start_range: call_expr.get_range(),
+            writes: Vec::new(),
+            send_range: call_expr.get_range(),
+            send_kind: NetSendKind {
+                receiver_realm: GmodRealm::Client,
+                target_arg_idx: None,
+            },
+            send_display_name: call_display_name(call_expr),
+            send_target: None,
+            is_wrapped: true,
+            writes_opaque: false,
+            materialized_from: None,
         },
-        send_display_name: call_display_name(call_expr),
-        send_target: None,
-        is_wrapped: true,
-        writes_opaque: false,
-        materialized_from: None,
-    })
+    )
 }
 
 /// Collect complete send flows performed by an ordinary, unannotated helper
@@ -1957,12 +2067,12 @@ fn helper_send_body(
     (bodies, low)
 }
 
-fn collect_net_receive_flow(
+fn collect_net_receive_flows(
     ctx: &mut NetCollectCtx<'_>,
     call_expr: &LuaCallExpr,
-) -> Option<NetReceiveFlow> {
+) -> Vec<NetReceiveFlow> {
     if !call_has_literal_string_arg(call_expr) {
-        return None;
+        return Vec::new();
     }
 
     let Some(NetCallRole::Receive {
@@ -1970,17 +2080,23 @@ fn collect_net_receive_flow(
         callback_idx,
     }) = ctx.site.role(call_expr)
     else {
-        return None;
+        return Vec::new();
     };
-    let message_name = extract_static_string_arg_value(call_expr, message_idx)?;
+    let message_names = extract_static_string_arg_values(call_expr, message_idx);
+    if message_names.is_empty() {
+        return Vec::new();
+    }
     let reads = receive_reads(&ctx.site, None, call_expr, callback_idx);
     let (reads, reads_opaque) = compose_receive_reads(ctx, &reads, &[]);
-    Some(NetReceiveFlow {
-        message_name,
-        receive_range: call_expr.get_range(),
-        reads,
-        reads_opaque,
-    })
+    message_names
+        .into_iter()
+        .map(|message_name| NetReceiveFlow {
+            message_name,
+            receive_range: call_expr.get_range(),
+            reads: reads.clone(),
+            reads_opaque,
+        })
+        .collect()
 }
 
 /// The reads of a receive callback, each call of the walked function's

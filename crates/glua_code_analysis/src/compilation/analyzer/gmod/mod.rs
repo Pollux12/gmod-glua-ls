@@ -8,9 +8,9 @@ use std::{
 };
 
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr,
-    LuaChunk, LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag,
-    LuaDocTagFileparam, LuaDocTagRealm, LuaElseClauseStat, LuaElseIfClauseStat, LuaExpr,
+    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBinaryExpr, LuaBlock,
+    LuaCallExpr, LuaChunk, LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner,
+    LuaDocTag, LuaDocTagFileparam, LuaDocTagRealm, LuaElseClauseStat, LuaElseIfClauseStat, LuaExpr,
     LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken,
     LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaNameExpr, LuaParamName, LuaRepeatStat,
     LuaStat, LuaSyntaxId, LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, LuaWhileStat,
@@ -1636,18 +1636,38 @@ fn collect_gm_method_realm_annotation(func_stat: &LuaFuncStat) -> Option<(String
 }
 
 fn is_call_expr_in_dynamic_control_flow(block: &LuaBlock, call_expr: &LuaCallExpr) -> bool {
-    call_expr
+    let mut child = call_expr.syntax().clone();
+    for node in call_expr
         .syntax()
         .ancestors()
+        .skip(1)
         .take_while(|node| node != block.syntax())
-        .any(|node| {
-            let kind = node.kind().into();
-            LuaIfStat::can_cast(kind)
-                || LuaWhileStat::can_cast(kind)
-                || LuaForStat::can_cast(kind)
-                || LuaForRangeStat::can_cast(kind)
-                || LuaRepeatStat::can_cast(kind)
-        })
+    {
+        let kind = node.kind().into();
+        if LuaIfStat::can_cast(kind)
+            || LuaWhileStat::can_cast(kind)
+            || LuaForStat::can_cast(kind)
+            || LuaForRangeStat::can_cast(kind)
+            || LuaRepeatStat::can_cast(kind)
+            || short_circuit_guard(&node, &child).is_some()
+        {
+            return true;
+        }
+        child = node;
+    }
+    false
+}
+
+/// The `and`/`or` expression `node` is when `child` is its right operand,
+/// which runs only when the left operand lets it, as an `if` body does.
+fn short_circuit_guard(node: &LuaSyntaxNode, child: &LuaSyntaxNode) -> Option<LuaBinaryExpr> {
+    let binary_expr = LuaBinaryExpr::cast(node.clone())?;
+    let op = binary_expr.get_op_token()?.get_op();
+    if !matches!(op, BinaryOperator::OpAnd | BinaryOperator::OpOr) {
+        return None;
+    }
+    let (_, right) = binary_expr.get_exprs()?;
+    (right.syntax() == child).then_some(binary_expr)
 }
 
 /// Walks ancestors from `call_expr` up to (but not including) `block`,
@@ -1674,12 +1694,25 @@ fn extract_flow_path(
     // an elseif/else clause we just captured) should be skipped so we don't
     // double-count the if-chain.
     let mut skip_parent_if = false;
+    let mut child = call_expr.syntax().clone();
     for node in call_expr
         .syntax()
         .ancestors()
         .take_while(|node| node != block.syntax())
     {
         let kind = node.kind().into();
+        let guard = short_circuit_guard(&node, &child);
+        child = node.clone();
+
+        if let Some(binary_expr) = guard {
+            frames.push(NetFlowFrame {
+                kind: NetFlowKind::If,
+                header: extract_short_circuit_header(&binary_expr),
+                id: u32::from(node.text_range().start()),
+                file_id,
+            });
+            continue;
+        }
 
         if skip_parent_if && LuaIfStat::can_cast(kind) {
             skip_parent_if = false;
@@ -1764,6 +1797,26 @@ fn first_line_text(node: &LuaSyntaxNode) -> String {
         }
     }
     line
+}
+
+/// The guard of a short-circuited operand as a header, `cond and` or
+/// `cond or`, when its left operand fits on one short line.
+fn extract_short_circuit_header(binary_expr: &LuaBinaryExpr) -> Option<String> {
+    const MAX_HEADER_LEN: usize = 80;
+    let (left, _) = binary_expr.get_exprs()?;
+    let op = match binary_expr.get_op_token()?.get_op() {
+        BinaryOperator::OpAnd => "and",
+        _ => "or",
+    };
+    let left_text = left.syntax().text().to_string();
+    if left_text.contains('\n') {
+        return None;
+    }
+    let header = format!(
+        "{} {op}",
+        left_text.split_whitespace().collect::<Vec<_>>().join(" ")
+    );
+    (header.len() <= MAX_HEADER_LEN).then_some(header)
 }
 
 /// Pulls the header text for an `elseif cond then` clause from source.
@@ -1945,13 +1998,52 @@ fn extract_bit_width_arg(call_expr: &LuaCallExpr, bits_arg_idx: usize) -> Option
     Some(value as u32)
 }
 
-fn extract_static_string_arg_value(call_expr: &LuaCallExpr, arg_idx: usize) -> Option<String> {
-    crate::ast_util::literal_string_arg_value(call_expr, arg_idx)
+/// The message names argument `arg_idx` can hold: a literal, or literals
+/// chosen with `and`/`or`. Empty when it can hold a name that is not static.
+fn extract_static_string_arg_values(call_expr: &LuaCallExpr, arg_idx: usize) -> Vec<String> {
+    call_expr
+        .get_args_list()
+        .and_then(|args| args.get_args().nth(arg_idx))
+        .and_then(|arg| static_string_values(&arg))
+        .unwrap_or_default()
+}
+
+/// The strings `expr` can evaluate to, `None` when one of them is not static.
+/// `a and b` yields a string only through `b`, since a string is never falsy;
+/// `a or b` yields either side.
+fn static_string_values(expr: &LuaExpr) -> Option<Vec<String>> {
+    match expr {
+        LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal()? {
+            LuaLiteralToken::String(string) => Some(vec![string.get_value()]),
+            LuaLiteralToken::Nil(_) | LuaLiteralToken::Bool(_) | LuaLiteralToken::Number(_) => {
+                Some(Vec::new())
+            }
+            _ => None,
+        },
+        LuaExpr::ParenExpr(paren_expr) => static_string_values(&paren_expr.get_expr()?),
+        LuaExpr::BinaryExpr(binary_expr) => {
+            let (left, right) = binary_expr.get_exprs()?;
+            match binary_expr.get_op_token()?.get_op() {
+                BinaryOperator::OpAnd => static_string_values(&right),
+                BinaryOperator::OpOr => {
+                    let mut values = static_string_values(&left)?;
+                    for value in static_string_values(&right)? {
+                        if !values.contains(&value) {
+                            values.push(value);
+                        }
+                    }
+                    Some(values)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Cheap syntactic gate for the flow collectors, which run over every
 /// statement-level call in a candidate file. A tracked flow always names its
-/// message with a literal string, so a call carrying none can never start or
+/// message with string literals, so a call carrying none can never start or
 /// receive one, and is rejected here before the far more expensive signature
 /// resolution runs.
 ///
@@ -1962,12 +2054,9 @@ fn call_has_literal_string_arg(call_expr: &LuaCallExpr) -> bool {
     let Some(args_list) = call_expr.get_args_list() else {
         return false;
     };
-    args_list.get_args().any(|arg| match arg {
-        LuaExpr::LiteralExpr(literal_expr) => {
-            matches!(literal_expr.get_literal(), Some(LuaLiteralToken::String(_)))
-        }
-        _ => false,
-    })
+    args_list
+        .get_args()
+        .any(|arg| static_string_values(&arg).is_some_and(|values| !values.is_empty()))
 }
 
 /// Captures the recipient argument of a send terminator as a single-line snippet

@@ -4481,4 +4481,211 @@ mod tests {
         let diagnostics = file_diagnostics(&mut ws, server_file_id);
         expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
     }
+
+    #[gtest]
+    fn test_read_guarded_by_and_or_is_optional() {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(
+            "lua/autorun/client/send.lua",
+            r#"
+            net.Start("Stage")
+            net.WriteUInt(1, 2)
+            net.SendToServer()
+            "#,
+        );
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/receive.lua",
+            r#"
+            util.AddNetworkString("Stage")
+            net.Receive("Stage", function(_, ply)
+                local stage = net.ReadUInt(2)
+                local secret = stage == 2 and net.ReadString() or "NO DATA"
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_read_inside_called_call_result_is_counted() {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("Code")
+            net.Start("Code")
+            net.WriteString("print(1)")
+            net.Broadcast()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("Code", function()
+                CompileString(net.ReadString(), "code")()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        assert_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_read_whose_result_is_a_method_receiver_is_counted() {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("Remove")
+            net.Start("Remove")
+            net.WriteEntity(NULL)
+            net.Broadcast()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("Remove", function()
+                net.ReadEntity():Remove()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        assert_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_and_or_message_name_sends_each_literal() {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("PickA")
+            util.AddNetworkString("PickB")
+            local function sendOne(isB)
+                net.Start(isB and "PickB" or "PickA")
+                net.Broadcast()
+            end
+            sendOne(true)
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("PickA", function() end)
+            net.Receive("PickB", function() end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        assert_that!(
+            count_diagnostic(
+                &diagnostics,
+                DiagnosticCode::GmodNetMissingNetworkCounterpart
+            ),
+            eq(0usize)
+        );
+    }
+
+    #[gtest]
+    fn test_and_or_message_name_payload_is_checked_per_name() {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("PickA")
+            util.AddNetworkString("PickB")
+            local function sendOne(isB)
+                net.Start(isB and "PickB" or "PickA")
+                net.WriteString("x")
+                net.Broadcast()
+            end
+            sendOne(true)
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("PickA", function() local x = net.ReadString() end)
+            net.Receive("PickB", function() local x = net.ReadEntity() end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        assert_that!(
+            count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteTypeMismatch),
+            eq(1usize)
+        );
+    }
+
+    const WRAPPED_NET_START: &str = r#"
+        net._Start = net._Start or net.Start
+        function net.Start(name, unreliable)
+            net._Start(name, unreliable)
+        end
+    "#;
+
+    fn branch_send_receiver_diagnostics(wrapper: Option<&str>, sender: &str) -> Vec<Diagnostic> {
+        let mut ws = new_gmod_workspace();
+        if let Some(wrapper) = wrapper {
+            ws.def_file("lua/autorun/sh_netwrap.lua", wrapper);
+        }
+        ws.def_file("lua/autorun/server/send.lua", sender);
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("Branch", function()
+                local x = net.ReadString()
+            end)
+            "#,
+        );
+        file_diagnostics(&mut ws, client_file_id)
+    }
+
+    const BRANCH_SEND: &str = r#"
+        util.AddNetworkString("Branch")
+        local function networkBranch(ply)
+            net.Start("Branch")
+            net.WriteString("x")
+            if IsValid(ply) then
+                net.Send(ply)
+            else
+                net.Broadcast()
+            end
+        end
+        networkBranch(NULL)
+    "#;
+
+    #[gtest]
+    fn test_send_in_if_else_with_wrapped_net_start_finds_counterpart() {
+        let diagnostics = branch_send_receiver_diagnostics(Some(WRAPPED_NET_START), BRANCH_SEND);
+        assert_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_send_in_if_else_checks_payload_count() {
+        let diagnostics = branch_send_receiver_diagnostics(
+            None,
+            r#"
+            util.AddNetworkString("Branch")
+            local function networkBranch(ply)
+                net.Start("Branch")
+                if IsValid(ply) then
+                    net.Send(ply)
+                else
+                    net.Broadcast()
+                end
+            end
+            networkBranch(NULL)
+            "#,
+        );
+        assert_that!(
+            count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteOrderMismatch),
+            eq(1usize)
+        );
+    }
 }
