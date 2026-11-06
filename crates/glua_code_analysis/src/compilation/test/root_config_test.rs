@@ -1,6 +1,10 @@
 #[cfg(test)]
 mod test {
-    use std::{collections::HashMap, path::PathBuf, sync::Arc};
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     use crate::{DiagnosticCode, Emmyrc, EmmyrcChange, FileId, VirtualWorkspace};
 
@@ -23,7 +27,7 @@ mod test {
         ws.humanize_type(ws.local_ty(file_id, "seen"))
     }
 
-    fn define_dhtml(ws: &mut VirtualWorkspace, root: &PathBuf) {
+    fn define_dhtml(ws: &mut VirtualWorkspace, root: &Path) {
         ws.def_file_in(root, "dhtml.lua", "---@class DHTML");
     }
 
