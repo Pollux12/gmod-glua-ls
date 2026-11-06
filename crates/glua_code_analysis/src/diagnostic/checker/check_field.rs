@@ -383,7 +383,7 @@ fn check_index_expr(
         return Some(());
     }
 
-    if is_dynamic_field(db, &prefix_typ, &field_name) {
+    if is_dynamic_field(db, semantic_model.get_emmyrc(), &prefix_typ, &field_name) {
         if let Some(profile) = profile.as_mut() {
             profile.dynamic_field_skips += 1;
         }
@@ -2804,8 +2804,12 @@ fn is_shapeless_table_const(db: &DbIndex, typ: &LuaType) -> bool {
             .is_none_or(|fields| fields.is_empty())
 }
 
-fn is_dynamic_field(db: &DbIndex, prefix_typ: &LuaType, field_name: &SmolStr) -> bool {
-    let emmyrc = db.get_emmyrc();
+fn is_dynamic_field(
+    db: &DbIndex,
+    emmyrc: &crate::Emmyrc,
+    prefix_typ: &LuaType,
+    field_name: &SmolStr,
+) -> bool {
     if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
         return false;
     }

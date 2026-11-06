@@ -12,9 +12,9 @@ use crate::handlers::{
 use crate::util::{LongRunningWatchdogStatus, spawn_long_running_watchdog};
 use glua_code_analysis::uri_to_file_path;
 use glua_code_analysis::{
-    ConfigSources, EmmyLuaAnalysis, Emmyrc, EmmyrcChange, LuaDiagnosticConfig, UnpickedGamemodes,
-    WorkspaceConfigs, WorkspaceFolder, WorkspaceImport, calculate_include_and_exclude,
-    config_files_in, load_scoped_workspace_configs,
+    ConfigSources, EmmyLuaAnalysis, Emmyrc, EmmyrcChange, UnpickedGamemodes, WorkspaceConfigs,
+    WorkspaceFolder, WorkspaceImport, calculate_include_and_exclude, config_files_in,
+    load_scoped_workspace_configs,
 };
 use log::{debug, info};
 use lsp_types::Uri;
@@ -220,16 +220,18 @@ impl WorkspaceManager {
                     )
                     .await;
                 }
-                let affects_index = {
-                    let mut analysis = analysis.write().await;
-                    let applied = analysis.apply_config(loaded.emmyrc.clone());
-                    analysis.set_root_diagnostic_configs(&loaded.workspace_diagnostic_configs);
-                    applied.affects_index()
-                };
-                if affects_index {
+                let applied = analysis
+                    .write()
+                    .await
+                    .apply_configs(loaded.emmyrc.clone(), &loaded.workspace_emmyrcs);
+                if applied.shared.affects_index() {
                     // The rebuild re-diagnoses every file and refreshes the
                     // open documents' views once it settles.
                     debounced_analysis.request_rebuild();
+                } else if !applied.files.is_empty() {
+                    // Only the roots whose own config reaches the index are
+                    // analysed again, and their files diagnosed.
+                    debounced_analysis.request_rebuild_files(applied.files);
                 } else {
                     if change != EmmyrcChange::Diagnostics {
                         refresh_open_document_features(&client, &lsp_features);
@@ -424,7 +426,6 @@ pub struct LoadedConfig {
     /// The workspace roots the config was loaded for.
     pub roots: Vec<PathBuf>,
     pub emmyrc: Arc<Emmyrc>,
-    pub workspace_diagnostic_configs: HashMap<PathBuf, LuaDiagnosticConfig>,
     pub workspace_emmyrcs: HashMap<PathBuf, Arc<Emmyrc>>,
     /// Per-workspace-root file matchers built from each root's individual config.
     /// Used by `WorkspaceManager::is_workspace_file` to avoid cross-root leakage
@@ -441,7 +442,6 @@ impl LoadedConfig {
             workspace_matchers: build_workspace_matchers(&configs.root_emmyrcs),
             roots: configs.roots,
             emmyrc: configs.emmyrc,
-            workspace_diagnostic_configs: configs.diagnostic_configs,
             workspace_emmyrcs: configs.root_emmyrcs,
             local_config_roots: configs.local_config_roots,
         }
@@ -456,7 +456,7 @@ impl LoadedConfig {
         self.roots
             .iter()
             .map(|root| previous.root_emmyrc(root).change_to(self.root_emmyrc(root)))
-            .fold(previous.emmyrc.change_to(&self.emmyrc), Ord::max)
+            .fold(previous.emmyrc.shared_change_to(&self.emmyrc), Ord::max)
     }
 
     /// The config `root` is collected and diagnosed with.
@@ -886,7 +886,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use glua_code_analysis::{DiagnosticCode, Emmyrc, WorkspaceFolder, collect_workspace_files};
+    use glua_code_analysis::{
+        DiagnosticCode, Emmyrc, LuaDiagnosticConfig, WorkspaceFolder, collect_workspace_files,
+    };
 
     use crate::handlers::ClientConfig;
 
@@ -1290,14 +1292,8 @@ mod tests {
             ClientConfig::default(),
         );
 
-        let config_a = loaded
-            .workspace_diagnostic_configs
-            .get(&workspace_a)
-            .expect("workspace_a config should be present");
-        let config_b = loaded
-            .workspace_diagnostic_configs
-            .get(&workspace_b)
-            .expect("workspace_b config should be present");
+        let config_a = LuaDiagnosticConfig::new(loaded.root_emmyrc(&workspace_a));
+        let config_b = LuaDiagnosticConfig::new(loaded.root_emmyrc(&workspace_b));
 
         assert_eq!(
             config_a
@@ -1535,7 +1531,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_root_merge_unions_diagnostic_globals_when_isolation_disabled() {
+    fn test_multi_root_configs_do_not_merge_diagnostic_globals() {
         let workspace_a = create_temp_dir();
         let workspace_b = create_temp_dir();
 
@@ -1555,19 +1551,13 @@ mod tests {
             ClientConfig::default(),
         );
 
-        assert!(
-            loaded
-                .emmyrc
-                .diagnostics
-                .globals
-                .contains(&"A_ONLY".to_string())
+        assert_eq!(
+            loaded.root_emmyrc(&workspace_a).diagnostics.globals,
+            vec!["A_ONLY".to_string()]
         );
-        assert!(
-            loaded
-                .emmyrc
-                .diagnostics
-                .globals
-                .contains(&"B_ONLY".to_string())
+        assert_eq!(
+            loaded.root_emmyrc(&workspace_b).diagnostics.globals,
+            vec!["B_ONLY".to_string()]
         );
 
         let _ = fs::remove_dir_all(workspace_a);
@@ -1596,27 +1586,13 @@ mod tests {
         );
 
         assert!(!loaded.emmyrc.workspace.enable_isolation);
-        assert!(
-            loaded
-                .emmyrc
-                .diagnostics
-                .globals
-                .contains(&"A_ONLY".to_string())
-        );
-        assert!(
-            loaded
-                .emmyrc
-                .diagnostics
-                .globals
-                .contains(&"B_ONLY".to_string())
-        );
 
         let _ = fs::remove_dir_all(workspace_a);
         let _ = fs::remove_dir_all(workspace_b);
     }
 
     #[test]
-    fn test_isolation_disabled_only_registers_workspace_overrides_with_local_configs() {
+    fn test_every_root_has_its_own_config_and_matcher() {
         let workspace_a = create_temp_dir();
         let workspace_b = create_temp_dir();
 
@@ -1631,20 +1607,17 @@ mod tests {
             ClientConfig::default(),
         );
 
+        assert!(loaded.workspace_emmyrcs.contains_key(&workspace_a));
+        assert!(loaded.workspace_emmyrcs.contains_key(&workspace_b));
+        assert!(loaded.workspace_matchers.contains_key(&workspace_a));
+        assert!(loaded.workspace_matchers.contains_key(&workspace_b));
         assert!(
             loaded
-                .workspace_diagnostic_configs
-                .contains_key(&workspace_a)
+                .root_emmyrc(&workspace_b)
+                .diagnostics
+                .severity
+                .is_empty()
         );
-        assert!(
-            !loaded
-                .workspace_diagnostic_configs
-                .contains_key(&workspace_b)
-        );
-        assert!(loaded.workspace_emmyrcs.contains_key(&workspace_a));
-        assert!(!loaded.workspace_emmyrcs.contains_key(&workspace_b));
-        assert!(loaded.workspace_matchers.contains_key(&workspace_a));
-        assert!(!loaded.workspace_matchers.contains_key(&workspace_b));
 
         let _ = fs::remove_dir_all(workspace_a);
         let _ = fs::remove_dir_all(workspace_b);

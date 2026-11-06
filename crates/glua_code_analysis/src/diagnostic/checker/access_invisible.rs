@@ -20,7 +20,7 @@ impl Checker for AccessInvisibleChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::AccessInvisible];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let candidates = AccessInvisibleCandidates::new(context, semantic_model.get_db());
+        let candidates = AccessInvisibleCandidates::new(context, semantic_model);
         if candidates.is_empty() {
             return;
         }
@@ -108,13 +108,14 @@ struct AccessInvisibleCandidates {
 }
 
 impl AccessInvisibleCandidates {
-    fn new(context: &DiagnosticContext, db: &crate::DbIndex) -> Self {
+    fn new(context: &DiagnosticContext, semantic_model: &SemanticModel) -> Self {
+        let db = semantic_model.get_db();
         Self {
             candidates: context
                 .get_shared_data_arc()
                 .map(|shared_data| shared_data.property_name_candidates.clone())
                 .unwrap_or_else(|| Arc::new(precompute_property_name_candidates(db))),
-            private_name_patterns: db.get_emmyrc().doc.private_name.clone(),
+            private_name_patterns: semantic_model.get_emmyrc().doc.private_name.clone(),
         }
     }
 

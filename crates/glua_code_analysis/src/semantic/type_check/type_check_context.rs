@@ -1,6 +1,8 @@
 use rustc_hash::FxHashMap;
 
-use crate::{DbIndex, InferFailReason, LuaMemberId, LuaMemberIndexItem, LuaType, LuaTypeFact};
+use crate::{
+    DbIndex, Emmyrc, FileId, InferFailReason, LuaMemberId, LuaMemberIndexItem, LuaType, LuaTypeFact,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeCheckCheckLevel {
@@ -12,6 +14,9 @@ pub enum TypeCheckCheckLevel {
 pub struct TypeCheckContext<'db> {
     pub detail: bool,
     pub db: &'db DbIndex,
+    /// The config the check reads its strictness from: the checked file's, or
+    /// else the shared one.
+    pub emmyrc: &'db Emmyrc,
     pub level: TypeCheckCheckLevel,
     member_facts: FxHashMap<LuaMemberId, LuaTypeFact>,
 }
@@ -21,9 +26,16 @@ impl<'db> TypeCheckContext<'db> {
         Self {
             detail,
             db,
+            emmyrc: db.get_emmyrc(),
             level,
             member_facts: FxHashMap::default(),
         }
+    }
+
+    /// Checks with the config of `file_id`.
+    pub fn in_file(mut self, file_id: FileId) -> Self {
+        self.emmyrc = self.db.get_file_emmyrc(file_id);
+        self
     }
 
     pub fn with_member_facts(mut self, member_facts: FxHashMap<LuaMemberId, LuaTypeFact>) -> Self {

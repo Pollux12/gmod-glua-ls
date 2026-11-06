@@ -20,11 +20,12 @@ pub struct EmmyrcWorkspace {
     #[serde(default = "use_default_ignores_default")]
     #[schemars(extend("x-vscode-setting" = true))]
     pub use_default_ignores: bool,
-    /// Whether multi-root workspaces should remain isolated.
+    /// Whether the folders of a multi-root workspace stay isolated.
     ///
-    /// When false, workspace configs are merged into one global baseline
-    /// (first workspace config wins scalar conflicts, arrays are unioned), while
-    /// local workspace configs can still override file-scoped behavior.
+    /// When true, a folder sees only its own code and libraries. When false,
+    /// folders can use each other's functions and classes. Each folder is
+    /// always analysed with its own settings, and the setting stays on only
+    /// when every folder turns it on.
     #[serde(default = "enable_isolation_default")]
     #[schemars(extend("x-vscode-setting" = true))]
     pub enable_isolation: bool,

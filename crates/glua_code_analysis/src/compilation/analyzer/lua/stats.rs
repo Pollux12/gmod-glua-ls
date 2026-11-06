@@ -338,7 +338,11 @@ fn should_defer_nil_gmod_index_alias(
 ) -> bool {
     expr_type.is_nil()
         && analyzer.gmod_enabled
-        && analyzer.db.get_emmyrc().gmod.infer_dynamic_fields
+        && analyzer
+            .db
+            .get_file_emmyrc(analyzer.file_id)
+            .gmod
+            .infer_dynamic_fields
         && matches!(expr, LuaExpr::IndexExpr(_))
 }
 
@@ -350,7 +354,11 @@ fn should_defer_weak_gmod_member_index_assignment(
 ) -> bool {
     matches!(expr_type, LuaType::Any | LuaType::Unknown)
         && analyzer.gmod_enabled
-        && analyzer.db.get_emmyrc().gmod.infer_dynamic_fields
+        && analyzer
+            .db
+            .get_file_emmyrc(analyzer.file_id)
+            .gmod
+            .infer_dynamic_fields
         && matches!(expr, LuaExpr::IndexExpr(_))
         && matches!(type_owner, LuaTypeOwner::Member(_))
 }
@@ -361,7 +369,11 @@ fn should_defer_weak_gmod_dynamic_index_alias(
     expr_type: &LuaType,
 ) -> bool {
     analyzer.gmod_enabled
-        && analyzer.db.get_emmyrc().gmod.infer_dynamic_fields
+        && analyzer
+            .db
+            .get_file_emmyrc(analyzer.file_id)
+            .gmod
+            .infer_dynamic_fields
         && matches!(expr, LuaExpr::IndexExpr(index_expr) if matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_))))
         && is_weak_dynamic_index_alias_type(expr_type)
 }

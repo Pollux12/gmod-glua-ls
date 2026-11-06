@@ -109,6 +109,7 @@ pub use crate::semantic::member::{
 };
 use crate::semantic::type_check::{
     check_type_compact_detail, check_type_compact_detail_with_member_facts,
+    check_type_compact_for_file,
 };
 use crate::{
     Emmyrc, LuaDocument, LuaInferenceConfidence, LuaInferenceProvenanceKind, LuaMemberOwner,
@@ -553,11 +554,11 @@ impl<'a> SemanticModel<'a> {
     }
 
     pub fn type_check(&self, source: &LuaType, compact_type: &LuaType) -> TypeCheckResult {
-        check_type_compact(self.db, source, compact_type)
+        check_type_compact_for_file(self.db, self.file_id, source, compact_type)
     }
 
     pub fn type_check_detail(&self, source: &LuaType, compact_type: &LuaType) -> TypeCheckResult {
-        check_type_compact_detail(self.db, source, compact_type)
+        check_type_compact_detail(self.db, self.file_id, source, compact_type)
     }
 
     pub fn type_check_expr_detail(
@@ -580,6 +581,7 @@ impl<'a> SemanticModel<'a> {
         let runtime_compact_type = self.infer_closure_body_type_for_check(compact_expr);
         check_type_compact_detail_with_member_facts(
             self.db,
+            self.file_id,
             source,
             runtime_compact_type.as_ref().unwrap_or(compact_type),
             member_facts,

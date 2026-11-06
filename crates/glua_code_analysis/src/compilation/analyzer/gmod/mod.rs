@@ -134,7 +134,7 @@ fn scan_gmod_keywords(
     let has_load_annotation = content.contains("gmod.load");
     let annotated_candidates = annotated_global_call_roles.candidate_presence(db, file_id);
     let calls_configured_emitter = db
-        .get_emmyrc()
+        .get_file_emmyrc(file_id)
         .gmod
         .hook_mappings
         .emitter_to_hook
@@ -178,19 +178,13 @@ fn collect_numeric_range_table_populations(db: &mut DbIndex, context: &AnalyzeCo
 
 /// Hook method prefixes, pre-formatted once to avoid a per-file
 /// `format!("{prefix}:")` allocation in the call-site scan.
-fn formatted_hook_prefixes(db: &DbIndex) -> Vec<String> {
-    db.get_emmyrc()
-        .gmod
-        .hook_mappings
+fn formatted_hook_prefixes(db: &DbIndex, file_id: FileId) -> Vec<String> {
+    let gmod = &db.get_file_emmyrc(file_id).gmod;
+    gmod.hook_mappings
         .method_prefixes
         .iter()
         .cloned()
-        .chain(
-            db.get_emmyrc()
-                .gmod
-                .scripted_class_scopes
-                .hook_owner_globals(),
-        )
+        .chain(gmod.scripted_class_scopes.hook_owner_globals())
         .map(|prefix| format!("{prefix}:"))
         .collect()
 }
@@ -239,7 +233,6 @@ impl crate::db_index::derivation::DerivedFact for GmodFileLoadScan {
 fn collect_annotated_call_sites_with(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
-    formatted_hook_prefixes: &[String],
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
     include_load: bool,
     include_class_calls: bool,
@@ -253,7 +246,6 @@ fn collect_annotated_call_sites_with(
         file_annotated_call_sites(
             db,
             file_id,
-            formatted_hook_prefixes,
             annotated_global_call_roles,
             include_load,
             include_class_calls,
@@ -275,26 +267,18 @@ pub(crate) fn compute_annotated_call_sites(
     if !db.get_emmyrc().gmod.enabled {
         return Vec::new();
     }
-    let prefixes = formatted_hook_prefixes(db);
     let roles = derive::call_role_entries(db);
-    file_annotated_call_sites(
-        db,
-        file_id,
-        &prefixes,
-        &roles.roles,
-        include_load,
-        include_class_calls,
-    )
+    file_annotated_call_sites(db, file_id, &roles.roles, include_load, include_class_calls)
 }
 
 fn file_annotated_call_sites(
     db: &DbIndex,
     file_id: FileId,
-    formatted_hook_prefixes: &[String],
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
     include_load: bool,
     include_class_calls: bool,
 ) -> Vec<PendingCallSite> {
+    let formatted_hook_prefixes = &formatted_hook_prefixes(db, file_id);
     let mut pending = Vec::new();
     if include_load {
         pending.push(PendingCallSite::LoadScan(GmodFileLoadScan {
@@ -1399,7 +1383,7 @@ fn collect_published_scope_bases(
         return Vec::new();
     };
     let definitions = db
-        .get_emmyrc()
+        .get_file_emmyrc(file_id)
         .gmod
         .scripted_class_scopes
         .resolved_definitions_slice();
@@ -1596,7 +1580,7 @@ fn collect_hook_metadata(
         }
 
         if let Some(func_stat) = LuaFuncStat::cast(node) {
-            if let Some(site) = collect_hook_method_site(db, func_stat.clone()) {
+            if let Some(site) = collect_hook_method_site(db, file_id, func_stat.clone()) {
                 hook_sites.push(site);
             }
 
@@ -2124,6 +2108,7 @@ pub(crate) fn bind_published_scope_bases(
     file_id: FileId,
     published_bases: &[(LuaDeclId, String)],
 ) {
+    let emmyrc = db.get_file_emmyrc(file_id).clone();
     // Decided before any is typed: the loop types each table it publishes,
     // which is not an annotation of it.
     let annotated = published_bases
@@ -2146,8 +2131,7 @@ pub(crate) fn bind_published_scope_bases(
         else {
             continue;
         };
-        let configured_super_types = db
-            .get_emmyrc()
+        let configured_super_types = emmyrc
             .gmod
             .scripted_class_scopes
             .resolved_definitions_slice()
@@ -7337,7 +7321,7 @@ fn resolve_networkvar_type(type_name: &str) -> LuaType {
 fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodScopedClassMatch> {
     let file_path = db.get_vfs().get_file_path(&file_id)?;
     if let Some(scope_match) = db
-        .get_emmyrc()
+        .get_file_emmyrc(file_id)
         .gmod
         .scripted_class_scopes
         .detect_class_for_path(file_path)
@@ -7387,7 +7371,7 @@ pub(crate) fn detect_file_gamemode_scope(
                 .windows(3)
                 .rposition(|window| window[0].eq_ignore_ascii_case("gamemodes"))?;
             let folder = root.join(parts[..at + 2].iter().collect::<PathBuf>());
-            gamemode_folder_scope(db, &folder)
+            gamemode_folder_scope(db, db.get_workspace_emmyrc(workspace_id), &folder)
         });
     folder_scope.or_else(|| root_gamemode_scope(db, workspace_id))
 }
@@ -7412,12 +7396,16 @@ pub(crate) fn root_gamemode_scope(
         return None;
     }
     let root = db.get_module_index().get_workspace_root(workspace_id)?;
-    gamemode_folder_scope(db, &root)
+    gamemode_folder_scope(db, db.get_workspace_emmyrc(workspace_id), &root)
 }
 
 /// The scope match of the gamemode folder `folder` when an entry file sits in
 /// its `gamemode/` directory, with that directory.
-fn gamemode_folder_scope(db: &DbIndex, folder: &Path) -> Option<(PathBuf, GmodScopedClassMatch)> {
+fn gamemode_folder_scope(
+    db: &DbIndex,
+    emmyrc: &crate::Emmyrc,
+    folder: &Path,
+) -> Option<(PathBuf, GmodScopedClassMatch)> {
     let gamemode_dir = folder.join("gamemode");
     let has_entry = ["init.lua", "shared.lua", "cl_init.lua"]
         .iter()
@@ -7438,8 +7426,7 @@ fn gamemode_folder_scope(db: &DbIndex, folder: &Path) -> Option<(PathBuf, GmodSc
         return None;
     }
 
-    let definition = db
-        .get_emmyrc()
+    let definition = emmyrc
         .gmod
         .scripted_class_scopes
         .resolved_definitions_slice()
@@ -9967,7 +9954,7 @@ fn collect_hook_call_site(
     let mapped_hook = if has_shadowing_local_root {
         None
     } else {
-        mapped_hook_for_emitter_call(db, &call_path, call_expr.clone())
+        mapped_hook_for_emitter_call(db, file_id, &call_path, call_expr.clone())
     };
     let (kind, name_arg_idx, callback_arg_idx, mapped_hook_data) =
         if let Some((kind, name_arg_idx, callback_arg_idx)) = annotated_hook {
@@ -10006,6 +9993,7 @@ fn collect_hook_call_site(
 
 fn mapped_hook_for_emitter_call(
     db: &DbIndex,
+    file_id: FileId,
     call_path: &str,
     call_expr: LuaCallExpr,
 ) -> Option<(
@@ -10014,7 +10002,7 @@ fn mapped_hook_for_emitter_call(
     Option<GmodHookNameIssue>,
 )> {
     let (_, mapped_hook) = db
-        .get_emmyrc()
+        .get_file_emmyrc(file_id)
         .gmod
         .hook_mappings
         .emitter_to_hook
@@ -10040,7 +10028,11 @@ fn mapped_hook_for_emitter_call(
     })
 }
 
-fn collect_hook_method_site(db: &DbIndex, func_stat: LuaFuncStat) -> Option<GmodHookSiteMetadata> {
+fn collect_hook_method_site(
+    db: &DbIndex,
+    file_id: FileId,
+    func_stat: LuaFuncStat,
+) -> Option<GmodHookSiteMetadata> {
     let LuaVarExpr::IndexExpr(index_expr) = func_stat.get_func_name()? else {
         return None;
     };
@@ -10067,6 +10059,7 @@ fn collect_hook_method_site(db: &DbIndex, func_stat: LuaFuncStat) -> Option<Gmod
 
     let mapped_method_hook = method_mapped_hook_name(
         db,
+        file_id,
         &prefix_name,
         separator,
         method_name.as_deref().unwrap_or_default(),
@@ -10080,7 +10073,7 @@ fn collect_hook_method_site(db: &DbIndex, func_stat: LuaFuncStat) -> Option<Gmod
         (hook_name, name_issue)
     } else if let Some(annotation_hook) = annotation
         && (is_builtin_method_hook_prefix(&prefix_name)
-            || is_configured_method_hook_prefix(db, &prefix_name))
+            || is_configured_method_hook_prefix(db, file_id, &prefix_name))
     {
         let hook_name = annotation_hook.hook_name.or_else(|| {
             (!trimmed_method_name.is_empty()).then_some(trimmed_method_name.to_string())
@@ -10094,7 +10087,7 @@ fn collect_hook_method_site(db: &DbIndex, func_stat: LuaFuncStat) -> Option<Gmod
     } else {
         if !is_colon
             || (!is_builtin_method_hook_prefix(&prefix_name)
-                && !is_configured_method_hook_prefix(db, &prefix_name))
+                && !is_configured_method_hook_prefix(db, file_id, &prefix_name))
         {
             return None;
         }
@@ -10187,8 +10180,8 @@ fn is_builtin_method_hook_prefix(prefix_name: &str) -> bool {
     crate::BUILTIN_HOOK_OWNERS.contains(&prefix_name)
 }
 
-fn is_configured_method_hook_prefix(db: &DbIndex, prefix_name: &str) -> bool {
-    let gmod = &db.get_emmyrc().gmod;
+fn is_configured_method_hook_prefix(db: &DbIndex, file_id: FileId, prefix_name: &str) -> bool {
+    let gmod = &db.get_file_emmyrc(file_id).gmod;
     gmod.hook_mappings
         .method_prefixes
         .iter()
@@ -10254,11 +10247,16 @@ fn hook_annotation_from_doc(func_stat: &LuaFuncStat) -> Option<HookAnnotationMet
 
 fn method_mapped_hook_name(
     db: &DbIndex,
+    file_id: FileId,
     prefix_name: &str,
     separator: &str,
     method_name: &str,
 ) -> Option<(Option<String>, Option<GmodHookNameIssue>)> {
-    let mappings = &db.get_emmyrc().gmod.hook_mappings.method_to_hook;
+    let mappings = &db
+        .get_file_emmyrc(file_id)
+        .gmod
+        .hook_mappings
+        .method_to_hook;
     let method_name = method_name.trim();
     let mut candidates = vec![format!("{prefix_name}{separator}{method_name}")];
     if separator == ":" {
@@ -13730,13 +13728,6 @@ fn rebuild_realm_metadata(
             })
             .collect()
     };
-    let default_realm = gmod_config_default_realm(db);
-    let detect_filename = db
-        .get_emmyrc()
-        .gmod
-        .detect_realm_from_filename
-        .unwrap_or(true);
-    let detect_calls = db.get_emmyrc().gmod.detect_realm_from_calls.unwrap_or(true);
     let analyzed_file_ids: HashSet<FileId> = analyzed_file_ids.iter().copied().collect();
     let previous_realm_metadata: HashMap<FileId, GmodRealmFileMetadata> = file_ids
         .iter()
@@ -13773,39 +13764,6 @@ fn rebuild_realm_metadata(
             .and_then(|metadata| metadata.annotation_realm)
     };
 
-    if !detect_filename && !detect_calls {
-        let realm_metadata: rustc_hash::FxHashMap<FileId, GmodRealmFileMetadata> = file_ids
-            .into_iter()
-            .map(|file_id| {
-                let ranges = if meta_file_ids.contains(&file_id) {
-                    Vec::new()
-                } else {
-                    resolve_branch_ranges(&file_id)
-                };
-                let annotation_realm = resolve_annotation_realm(&file_id);
-                let is_meta_file = meta_file_ids.contains(&file_id);
-                let is_library_file = library_file_ids.contains(&file_id);
-                let realm = if is_meta_file || is_library_file {
-                    annotation_realm.unwrap_or(GmodRealm::Shared)
-                } else {
-                    annotation_realm.unwrap_or(default_realm)
-                };
-                (
-                    file_id,
-                    GmodRealmFileMetadata {
-                        inferred_realm: realm,
-                        annotation_realm,
-                        branch_realm_ranges: ranges,
-                        ..Default::default()
-                    },
-                )
-            })
-            .collect();
-        db.get_gmod_infer_index_mut()
-            .set_all_realm_file_metadata(realm_metadata);
-        return;
-    }
-
     let mut realm_metadata = rustc_hash::FxHashMap::default();
     for file_id in file_ids {
         let ranges = if meta_file_ids.contains(&file_id) {
@@ -13816,6 +13774,27 @@ fn rebuild_realm_metadata(
 
         let annotation_realm = resolve_annotation_realm(&file_id);
         let is_meta_file = meta_file_ids.contains(&file_id);
+        let gmod = &db.get_file_emmyrc(file_id).gmod;
+        let default_realm = gmod_config_default_realm(&gmod.default_realm);
+        let detect_filename = gmod.detect_realm_from_filename.unwrap_or(true);
+        let detect_calls = gmod.detect_realm_from_calls.unwrap_or(true);
+        if !detect_filename && !detect_calls {
+            let realm = if is_meta_file || library_file_ids.contains(&file_id) {
+                annotation_realm.unwrap_or(GmodRealm::Shared)
+            } else {
+                annotation_realm.unwrap_or(default_realm)
+            };
+            realm_metadata.insert(
+                file_id,
+                GmodRealmFileMetadata {
+                    inferred_realm: realm,
+                    annotation_realm,
+                    branch_realm_ranges: ranges,
+                    ..Default::default()
+                },
+            );
+            continue;
+        }
         let load_info = db.get_gmod_load_index().get_file_info(&file_id);
         let load_realm = load_info.map(|info| info.realm);
         let load_status = load_info.map(|info| info.status);
@@ -13899,8 +13878,8 @@ fn rebuild_realm_metadata(
         .set_all_realm_file_metadata(realm_metadata);
 }
 
-fn gmod_config_default_realm(db: &DbIndex) -> GmodRealm {
-    match db.get_emmyrc().gmod.default_realm {
+fn gmod_config_default_realm(realm: &EmmyrcGmodRealm) -> GmodRealm {
+    match realm {
         EmmyrcGmodRealm::Client => GmodRealm::Client,
         EmmyrcGmodRealm::Server => GmodRealm::Server,
         EmmyrcGmodRealm::Shared => GmodRealm::Shared,

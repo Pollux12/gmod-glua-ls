@@ -49,6 +49,7 @@ mod pcall_test;
 mod query_test;
 mod retraction_test;
 mod return_unwrap_test;
+mod root_config_test;
 mod schedule_order_test;
 mod self_nesting_cycle_test;
 mod self_support_test;

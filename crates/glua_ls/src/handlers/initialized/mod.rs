@@ -202,7 +202,6 @@ pub async fn init_analysis(
 ) {
     let LoadedConfig {
         emmyrc,
-        workspace_diagnostic_configs,
         workspace_emmyrcs,
         ..
     } = loaded;
@@ -300,9 +299,8 @@ pub async fn init_analysis(
             .iter()
             .flat_map(|(_, workspace_group)| workspace_group),
     );
-    let rebuild = mut_analysis.apply_config(emmyrc.clone()).affects_index() || roots_moved;
-
-    mut_analysis.set_root_diagnostic_configs(&workspace_diagnostic_configs);
+    let applied = mut_analysis.apply_configs(emmyrc.clone(), &workspace_emmyrcs);
+    let rebuild = applied.shared.affects_index() || !applied.files.is_empty() || roots_moved;
 
     // The editor owns an open document's text: disk text would replace the
     // unsaved edits it holds.

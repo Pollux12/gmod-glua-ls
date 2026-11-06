@@ -121,7 +121,7 @@ pub async fn load_workspace(
     let groups =
         workspace_collection_groups(workspace_folders, &configs.emmyrc, &configs.root_emmyrcs);
     analysis.set_workspace_roots(groups.iter().flat_map(|(_, group)| group));
-    analysis.set_root_diagnostic_configs(&configs.diagnostic_configs);
+    analysis.set_root_configs(&configs.root_emmyrcs);
 
     let file_infos = groups
         .iter()

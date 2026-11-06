@@ -21,7 +21,7 @@ pub use type_check_fail_reason::TypeCheckFailReason;
 use type_check_guard::TypeCheckGuard;
 
 use crate::{
-    LuaMemberFeature, LuaMemberId, LuaSemanticDeclId, LuaTypeFact, LuaUnionType,
+    FileId, LuaMemberFeature, LuaMemberId, LuaSemanticDeclId, LuaTypeFact, LuaUnionType,
     db_index::{DbIndex, LuaType},
     semantic::type_check::type_check_context::TypeCheckContext,
 };
@@ -93,24 +93,38 @@ pub fn check_type_compact(
     check_general_type_compact(&mut context, source, compact_type, TypeCheckGuard::new())
 }
 
+pub fn check_type_compact_for_file(
+    db: &DbIndex,
+    file_id: FileId,
+    source: &LuaType,
+    compact_type: &LuaType,
+) -> TypeCheckResult {
+    let mut context =
+        TypeCheckContext::new(db, false, TypeCheckCheckLevel::Normal).in_file(file_id);
+    check_general_type_compact(&mut context, source, compact_type, TypeCheckGuard::new())
+}
+
 pub fn check_type_compact_detail(
     db: &DbIndex,
+    file_id: FileId,
     source: &LuaType,
     compact_type: &LuaType,
 ) -> TypeCheckResult {
     let guard = TypeCheckGuard::new();
-    let mut context = TypeCheckContext::new(db, true, TypeCheckCheckLevel::Normal);
+    let mut context = TypeCheckContext::new(db, true, TypeCheckCheckLevel::Normal).in_file(file_id);
     check_general_type_compact(&mut context, source, compact_type, guard)
 }
 
 pub fn check_type_compact_detail_with_member_facts(
     db: &DbIndex,
+    file_id: FileId,
     source: &LuaType,
     compact_type: &LuaType,
     member_facts: HashMap<LuaMemberId, LuaTypeFact>,
 ) -> TypeCheckResult {
     let guard = TypeCheckGuard::new();
     let mut context = TypeCheckContext::new(db, true, TypeCheckCheckLevel::Normal)
+        .in_file(file_id)
         .with_member_facts(member_facts);
     check_general_type_compact(&mut context, source, compact_type, guard)
 }
@@ -173,11 +187,7 @@ fn check_general_type_compact(
         return check_general_type_compact(context, source, inner, check_guard.next_level()?);
     }
 
-    if context
-        .db
-        .get_emmyrc()
-        .strict
-        .allow_nullable_as_non_nullable
+    if context.emmyrc.strict.allow_nullable_as_non_nullable
         && let LuaType::Union(union_type) = compact_type
     {
         match union_type.nullable_inner() {

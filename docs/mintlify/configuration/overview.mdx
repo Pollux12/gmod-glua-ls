@@ -45,6 +45,12 @@ The `$schema` line gives you completion and descriptions for every setting while
 If a project has `.gluarc.json`, GLuaLS uses only that file. Without it, GLuaLS reads `.luarc.json`, `.emmyrc.json` or `.emmyrc.lua`, in that order, so existing configs from other Lua tools keep working.
 </Note>
 
+## Settings in several folders
+
+In a multi-root workspace, each folder is analysed with its own settings. They start from the defaults and change only the keys the folder's own config file sets, so a folder with no config file uses the defaults, and one folder's config never reaches another folder's files. This holds for every setting, including [Garry's Mod settings](/configuration/gmod) such as `gmod.fileParamDefaults`, whichever order the folders come in. The Garry's Mod folder's addons and gamemodes layer on the folder's config the same way (see [Opening a whole Garry's Mod folder](/configuration/gmod#opening-a-whole-garrys-mod-folder)).
+
+A few settings are read once for the whole workspace, so they add up across the folders: the file extensions, `require` patterns, `require`-like functions and non-standard symbols under `runtime`, and the libraries, ignores and roots under `workspace` and `resource`.
+
 ## Settings by section
 
 <CardGroup cols={2}>

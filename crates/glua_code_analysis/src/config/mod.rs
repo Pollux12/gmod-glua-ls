@@ -12,7 +12,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub use change::EmmyrcChange;
-pub use config_loader::{ConfigLoadError, load_configs, load_configs_raw, try_load_configs};
+pub use config_loader::{
+    ConfigFile, ConfigLoadError, load_configs, load_configs_raw, load_layered_configs,
+    try_load_configs,
+};
 pub use configs::{
     DiagnosticSeveritySetting, DocSyntax, EmmyLibraryConfig, EmmyLibraryItem, EmmyrcCodeAction,
     EmmyrcCodeLens, EmmyrcCompletion, EmmyrcDiagnostic, EmmyrcDoc, EmmyrcDocumentColor,

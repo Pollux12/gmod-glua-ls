@@ -101,7 +101,7 @@ impl LuaCompilation {
             file_id,
             &self.db,
             cache,
-            self.emmyrc.clone(),
+            self.db.get_file_emmyrc(file_id).clone(),
             tree.get_chunk_node(),
         ))
     }
@@ -129,7 +129,7 @@ impl LuaCompilation {
             file_id,
             &self.db,
             cache,
-            self.emmyrc.clone(),
+            self.db.get_file_emmyrc(file_id).clone(),
             tree.get_chunk_node(),
         ))
     }
@@ -625,6 +625,12 @@ impl LuaCompilation {
     /// the other that neither has written since.
     pub fn index_revision(&self) -> u64 {
         self.index_revision
+    }
+
+    /// Drops the scripted-class scopes held, for the next re-analysis to scan
+    /// again: a root's config decides them.
+    pub fn reset_scopes(&mut self) {
+        self.scopes = analyzer::ScopesCache::default();
     }
 
     /// Applies `config`; `affects_index` says whether facts derived under the

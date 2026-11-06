@@ -2035,19 +2035,32 @@ fn propagate_dynamic_fields_to_super_types(
     // by design: a `---@type SWEP` read is a read of the generic
     // authoring table, not of any one weapon, so it should see the
     // annotated `SWEP` fields and not every weapon's private ones.
-    let scoped_globals: FxHashSet<&str> = db
-        .get_emmyrc()
-        .gmod
-        .scripted_class_scopes
-        .resolved_definitions_slice()
-        .iter()
-        .flat_map(|definition| {
-            std::iter::once(definition.class_global.as_str())
-                .chain(definition.aliases.iter().map(String::as_str))
-        })
-        .collect();
+    let mut scoped_globals_by_config: Vec<(&std::sync::Arc<crate::Emmyrc>, FxHashSet<&str>)> =
+        Vec::new();
     let mut propagated = Vec::new();
     for (owner, field_name, file_id, range) in collected {
+        let config = db.get_file_emmyrc(*file_id);
+        let position = match scoped_globals_by_config
+            .iter()
+            .position(|(group, _)| std::sync::Arc::ptr_eq(group, config))
+        {
+            Some(position) => position,
+            None => {
+                let scoped_globals = config
+                    .gmod
+                    .scripted_class_scopes
+                    .resolved_definitions_slice()
+                    .iter()
+                    .flat_map(|definition| {
+                        std::iter::once(definition.class_global.as_str())
+                            .chain(definition.aliases.iter().map(String::as_str))
+                    })
+                    .collect();
+                scoped_globals_by_config.push((config, scoped_globals));
+                scoped_globals_by_config.len() - 1
+            }
+        };
+        let scoped_globals = &scoped_globals_by_config[position].1;
         if let DynamicFieldOwner::Table(table) = owner {
             if let Some(prototype) = metatable_index_owner(db, table)
                 && !owner_has_member(db, &prototype, field_name)

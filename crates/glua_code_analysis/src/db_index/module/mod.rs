@@ -1465,6 +1465,14 @@ impl LuaModuleIndex {
         None
     }
 
+    /// [`Self::get_workspace_id`] without recording a read: for what a
+    /// configuration change, not an edit, re-analyses.
+    pub fn get_untracked_workspace_id(&self, file_id: FileId) -> Option<WorkspaceId> {
+        self.file_module_map
+            .get(&file_id)
+            .map(|module_info| module_info.workspace_id)
+    }
+
     pub fn get_workspace_id_for_root(&self, root: &Path) -> Option<WorkspaceId> {
         self.workspaces
             .iter()

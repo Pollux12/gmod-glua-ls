@@ -57,17 +57,47 @@ const PATH_CHANGES: &[(&str, EmmyrcChange)] = &[
     ("gmod.loadEverything", EmmyrcChange::Workspace),
 ];
 
+/// The sections whose settings a file is analysed with from its own root's
+/// config, so a change there reaches that root's files and no other root's.
+const PER_ROOT_ANALYSIS_PATHS: &[&str] = &["strict", "gmod", "references", "doc"];
+
+/// Whose files a change reaches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Every file the config applies to.
+    Config,
+    /// Every root's files: what is read from the config the roots share.
+    SharedByRoots,
+}
+
 impl Emmyrc {
     /// How far moving from this configuration to `new` reaches.
     pub fn change_to(&self, new: &Emmyrc) -> EmmyrcChange {
+        self.change_with_reach(new, Reach::Config)
+    }
+
+    /// [`Self::change_to`] for the config the roots share, leaving out what
+    /// each root's files are analysed with from the root's own config.
+    pub fn shared_change_to(&self, new: &Emmyrc) -> EmmyrcChange {
+        self.change_with_reach(new, Reach::SharedByRoots)
+    }
+
+    fn change_with_reach(&self, new: &Emmyrc, reach: Reach) -> EmmyrcChange {
         match (serde_json::to_value(self), serde_json::to_value(new)) {
-            (Ok(Value::Object(old)), Ok(Value::Object(new))) => object_change("", &old, &new),
+            (Ok(Value::Object(old)), Ok(Value::Object(new))) => {
+                object_change("", &old, &new, reach)
+            }
             _ => EmmyrcChange::Workspace,
         }
     }
 }
 
-fn object_change(prefix: &str, old: &Map<String, Value>, new: &Map<String, Value>) -> EmmyrcChange {
+fn object_change(
+    prefix: &str,
+    old: &Map<String, Value>,
+    new: &Map<String, Value>,
+    reach: Reach,
+) -> EmmyrcChange {
     old.keys()
         .chain(new.keys().filter(|key| !old.contains_key(*key)))
         .map(|key| {
@@ -76,22 +106,27 @@ fn object_change(prefix: &str, old: &Map<String, Value>, new: &Map<String, Value
             } else {
                 format!("{prefix}.{key}")
             };
-            value_change(&path, old.get(key), new.get(key))
+            value_change(&path, old.get(key), new.get(key), reach)
         })
         .max()
         .unwrap_or(EmmyrcChange::Unchanged)
 }
 
-fn value_change(path: &str, old: Option<&Value>, new: Option<&Value>) -> EmmyrcChange {
+fn value_change(
+    path: &str,
+    old: Option<&Value>,
+    new: Option<&Value>,
+    reach: Reach,
+) -> EmmyrcChange {
     if old == new {
         return EmmyrcChange::Unchanged;
     }
     if let (Some(Value::Object(old)), Some(Value::Object(new))) = (old, new)
         && has_listed_descendant(path)
     {
-        return object_change(path, old, new);
+        return object_change(path, old, new, reach);
     }
-    listed_change(path)
+    listed_change(path, reach)
 }
 
 fn has_listed_descendant(path: &str) -> bool {
@@ -102,7 +137,7 @@ fn has_listed_descendant(path: &str) -> bool {
     })
 }
 
-fn listed_change(path: &str) -> EmmyrcChange {
+fn listed_change(path: &str, reach: Reach) -> EmmyrcChange {
     let mut current = path;
     loop {
         if let Some((_, change)) = PATH_CHANGES.iter().find(|(listed, _)| *listed == current) {
@@ -110,9 +145,17 @@ fn listed_change(path: &str) -> EmmyrcChange {
         }
         match current.rsplit_once('.') {
             Some((parent, _)) => current = parent,
+            None if reach == Reach::SharedByRoots && is_per_root_analysis_path(path) => {
+                return EmmyrcChange::Unchanged;
+            }
             None => return EmmyrcChange::Analysis,
         }
     }
+}
+
+fn is_per_root_analysis_path(path: &str) -> bool {
+    let section = path.split_once('.').map_or(path, |(section, _)| section);
+    PER_ROOT_ANALYSIS_PATHS.contains(&section)
 }
 
 #[cfg(test)]
@@ -213,6 +256,46 @@ mod tests {
         verify_that!(
             change(|config| config.gmod.load_everything = true),
             eq(EmmyrcChange::Workspace)
+        )
+    }
+
+    fn shared_change(edit: impl FnOnce(&mut Emmyrc)) -> EmmyrcChange {
+        let old = Emmyrc::default();
+        let mut new = old.clone();
+        edit(&mut new);
+        old.shared_change_to(&new)
+    }
+
+    #[gtest]
+    fn a_roots_own_settings_stay_out_of_the_shared_change() -> Result<()> {
+        verify_that!(
+            shared_change(|config| config.strict.array_index = !config.strict.array_index),
+            eq(EmmyrcChange::Unchanged)
+        )?;
+        verify_that!(
+            shared_change(|config| {
+                config
+                    .gmod
+                    .file_param_defaults
+                    .insert("panel".to_string(), "DHTML".to_string());
+            }),
+            eq(EmmyrcChange::Unchanged)
+        )
+    }
+
+    #[gtest]
+    fn what_the_roots_share_stays_in_the_shared_change() -> Result<()> {
+        verify_that!(
+            shared_change(|config| config.runtime.require_pattern.push("?.lua".to_string())),
+            eq(EmmyrcChange::Analysis)
+        )?;
+        verify_that!(
+            shared_change(|config| config.gmod.active_gamemode = Some("helix".to_string())),
+            eq(EmmyrcChange::Workspace)
+        )?;
+        verify_that!(
+            shared_change(|config| config.diagnostics.disable.push(DiagnosticCode::Unused)),
+            eq(EmmyrcChange::Diagnostics)
         )
     }
 

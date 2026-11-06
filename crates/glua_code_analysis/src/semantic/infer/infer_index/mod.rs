@@ -1029,7 +1029,7 @@ fn infer_table_member_owner(
             member_type
         };
         let finite_named_dynamic = is_literal_table_field_access(&index_key)
-            && owner_has_finite_named_dynamic_assignment(db, &owner);
+            && owner_has_finite_named_dynamic_assignment(db, cache.get_file_id(), &owner);
         if literal_key
             && !finite_named_dynamic
             && crate::db_index::is_informative_type(&member_type)
@@ -1115,10 +1115,8 @@ fn infer_table_member_owner(
         return Ok(member_type);
     }
 
-    if db.get_emmyrc().gmod.enabled
-        && db.get_emmyrc().gmod.infer_dynamic_fields
-        && is_literal_table_field_access(&index_key)
-    {
+    let gmod = &db.get_file_emmyrc(cache.get_file_id()).gmod;
+    if gmod.enabled && gmod.infer_dynamic_fields && is_literal_table_field_access(&index_key) {
         if let Some(dynamic_field) = resolve_dynamic_field_member(
             db,
             cache,
@@ -1451,7 +1449,7 @@ fn infer_table_dynamic_key_member_type(
             continue;
         }
         if is_literal_member_key(key)
-            && member_is_finite_named_dynamic_assignment(db, owner, member)
+            && member_is_finite_named_dynamic_assignment(db, caller_file_id, owner, member)
         {
             continue;
         }
@@ -1533,7 +1531,8 @@ fn infer_gmod_same_file_expr_key_member_type(
     access_position: TextSize,
     source_min_position: Option<&InFiled<TextSize>>,
 ) -> Option<LuaType> {
-    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
+    let gmod = &db.get_file_emmyrc(access_file_id).gmod;
+    if !gmod.enabled || !gmod.infer_dynamic_fields {
         return None;
     }
 
@@ -1551,7 +1550,7 @@ fn infer_gmod_same_file_expr_key_member_type(
             continue;
         }
         if is_literal_member_key(key)
-            && member_is_finite_named_dynamic_assignment(db, owner, member)
+            && member_is_finite_named_dynamic_assignment(db, access_file_id, owner, member)
         {
             continue;
         }
@@ -1842,10 +1841,8 @@ fn infer_cross_file_matching_expr_key_member_type(
     access_file_id: FileId,
     access_position: TextSize,
 ) -> Result<Option<LuaType>, InferFailReason> {
-    if !db.get_emmyrc().gmod.enabled
-        || !db.get_emmyrc().gmod.infer_dynamic_fields
-        || !db.get_emmyrc().gmod.dynamic_fields_global
-    {
+    let gmod = &db.get_file_emmyrc(access_file_id).gmod;
+    if !gmod.enabled || !gmod.infer_dynamic_fields || !gmod.dynamic_fields_global {
         return Ok(None);
     }
 
@@ -1881,7 +1878,7 @@ fn infer_cross_file_matching_expr_key_member_type(
             continue;
         }
         if is_literal_member_key(key)
-            && member_is_finite_named_dynamic_assignment(db, owner, member)
+            && member_is_finite_named_dynamic_assignment(db, access_file_id, owner, member)
         {
             continue;
         }
@@ -1938,7 +1935,11 @@ fn table_has_cross_file_matching_expr_key_member(
     key: &LuaMemberKey,
     access_file_id: FileId,
 ) -> bool {
-    if !db.get_emmyrc().gmod.dynamic_fields_global {
+    if !db
+        .get_file_emmyrc(access_file_id)
+        .gmod
+        .dynamic_fields_global
+    {
         return false;
     }
 
@@ -1957,7 +1958,12 @@ fn table_has_cross_file_matching_expr_key_member(
             members.iter().any(|member| {
                 member.get_file_id() != access_file_id
                     && (!is_literal_member_key(key)
-                        || !member_is_finite_named_dynamic_assignment(db, owner, member))
+                        || !member_is_finite_named_dynamic_assignment(
+                            db,
+                            access_file_id,
+                            owner,
+                            member,
+                        ))
                     && is_dynamic_field_fallback_realm_compatible(
                         db,
                         access_realm,
@@ -1975,10 +1981,12 @@ fn is_literal_member_key(key: &LuaMemberKey) -> bool {
 
 fn member_is_finite_named_dynamic_assignment(
     db: &DbIndex,
+    access_file_id: FileId,
     owner: &LuaMemberOwner,
     member: &LuaMember,
 ) -> bool {
-    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
+    let gmod = &db.get_file_emmyrc(access_file_id).gmod;
+    if !gmod.enabled || !gmod.infer_dynamic_fields {
         return false;
     }
 
@@ -1988,8 +1996,13 @@ fn member_is_finite_named_dynamic_assignment(
     })
 }
 
-fn owner_has_finite_named_dynamic_assignment(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
-    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
+fn owner_has_finite_named_dynamic_assignment(
+    db: &DbIndex,
+    access_file_id: FileId,
+    owner: &LuaMemberOwner,
+) -> bool {
+    let gmod = &db.get_file_emmyrc(access_file_id).gmod;
+    if !gmod.enabled || !gmod.infer_dynamic_fields {
         return false;
     }
 
@@ -2195,7 +2208,8 @@ fn infer_gmod_plain_table_dynamic_field(
     cache: &mut LuaInferCache,
     index_expr: &LuaIndexMemberExpr,
 ) -> Option<LuaType> {
-    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
+    let gmod = &db.get_file_emmyrc(cache.get_file_id()).gmod;
+    if !gmod.enabled || !gmod.infer_dynamic_fields {
         return None;
     }
 
@@ -3567,7 +3581,12 @@ fn infer_member_by_index_table(
 
                 if saw_match {
                     let mut result_type = TypeOps::union_all(db, member_types);
-                    if table_index_result_may_be_nil(db, &key_type, matched_inferred_index_key) {
+                    if table_index_result_may_be_nil(
+                        db,
+                        cache.get_file_id(),
+                        &key_type,
+                        matched_inferred_index_key,
+                    ) {
                         result_type = TypeOps::Union.apply(db, &result_type, &LuaType::Nil);
                     }
 
@@ -3582,13 +3601,14 @@ fn infer_member_by_index_table(
 
 fn table_index_result_may_be_nil(
     db: &DbIndex,
+    file_id: FileId,
     key_type: &LuaType,
     matched_inferred_index_key: bool,
 ) -> bool {
     matches!(
         key_type,
         LuaType::String | LuaType::Number | LuaType::Integer
-    ) || (db.get_emmyrc().strict.array_index
+    ) || (db.get_file_emmyrc(file_id).strict.array_index
         && matched_inferred_index_key
         && is_numeric_access_key_type(key_type))
 }
@@ -3755,7 +3775,7 @@ fn infer_member_by_index_array(
     index_expr: LuaIndexMemberExpr,
 ) -> InferResult {
     let member_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
-    let expression_type = if db.get_emmyrc().strict.array_index {
+    let expression_type = if db.get_file_emmyrc(cache.get_file_id()).strict.array_index {
         TypeOps::Union.apply(db, base, &LuaType::Nil)
     } else {
         base.clone()
