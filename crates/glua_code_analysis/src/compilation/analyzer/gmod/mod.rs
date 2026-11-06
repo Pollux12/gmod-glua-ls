@@ -6127,6 +6127,31 @@ fn synthesize_network_var_element(
     );
 }
 
+/// The base a vgui registration gives its table: the literal it passes, or
+/// `Panel` when it passes none, as GMod's `base or "Panel"` defaults it.
+fn registered_panel_base(
+    call: &GmodScriptedClassCallMetadata,
+    base_source: Option<&GmodClassCallArgSource>,
+) -> Option<String> {
+    let argument = base_source.and_then(|source| {
+        if source.is_derived() {
+            call.field_args
+                .iter()
+                .find(|arg| &arg.source == source)
+                .map(|arg| arg.value.as_ref())
+        } else {
+            call.args.get(source.arg_idx).map(|arg| arg.value.as_ref())
+        }
+    });
+    match argument {
+        None
+        | Some(Some(GmodClassCallLiteral::Nil))
+        | Some(Some(GmodClassCallLiteral::Boolean(false))) => Some("Panel".to_string()),
+        Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => Some(name.clone()),
+        Some(_) => None,
+    }
+}
+
 fn synthesize_vgui_register(
     db: &mut DbIndex,
     cache: &mut VguiSynthesisCache,
@@ -6148,13 +6173,7 @@ fn synthesize_vgui_register(
         _ => None,
     };
 
-    let base_panel = match base_source
-        .as_ref()
-        .and_then(|source| call.value_for_arg_source(source))
-    {
-        Some(GmodClassCallLiteral::String(name)) if !name.is_empty() => Some(name.clone()),
-        _ => None,
-    };
+    let base_panel = registered_panel_base(call, base_source.as_ref());
 
     synthesize_panel_class(
         db,
@@ -6192,13 +6211,7 @@ fn synthesize_derma_define_control(
         _ => None,
     };
 
-    let base_panel = match base_source
-        .as_ref()
-        .and_then(|source| call.value_for_arg_source(source))
-    {
-        Some(GmodClassCallLiteral::String(name)) if !name.is_empty() => Some(name.clone()),
-        _ => None,
-    };
+    let base_panel = registered_panel_base(call, base_source.as_ref());
 
     synthesize_panel_class(
         db,
@@ -6237,13 +6250,7 @@ fn synthesize_vgui_register_table(
         _ => None,
     };
 
-    let base_panel = match base_source
-        .as_ref()
-        .and_then(|source| call.value_for_arg_source(source))
-    {
-        Some(GmodClassCallLiteral::String(name)) if !name.is_empty() => Some(name.clone()),
-        _ => None,
-    };
+    let base_panel = registered_panel_base(call, base_source.as_ref());
 
     let class_decl_id = vgui_register_table_type_decl_id(file_id, call);
     synthesize_panel_class_with_id(
