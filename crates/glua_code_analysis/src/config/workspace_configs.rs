@@ -270,21 +270,37 @@ fn ancestor_config_files(root: &Path, parents: &HashMap<PathBuf, PathBuf>) -> Ve
 /// Each of `folders` with the folders it registers and the config its files
 /// are collected with, its own in `root_emmyrcs` or else `merged`, in
 /// registration order. An extra root, library or package directory is
-/// collected with the first folder that brings it.
+/// collected with the first folder that brings it. A folder that is open is
+/// collected as itself, never as another folder's library.
 pub fn workspace_collection_groups(
     folders: Vec<WorkspaceFolder>,
     merged: &Arc<Emmyrc>,
     root_emmyrcs: &HashMap<PathBuf, Arc<Emmyrc>>,
 ) -> Vec<(Arc<Emmyrc>, Vec<WorkspaceFolder>)> {
     let mut configured = HashSet::new();
+    let open_roots = folders
+        .iter()
+        .filter(|folder| !folder.is_library)
+        .map(|folder| canonical_or_same(&folder.root))
+        .collect::<HashSet<_>>();
     folders
         .into_iter()
         .map(|folder| {
             let config = root_emmyrcs.get(&folder.root).unwrap_or(merged).clone();
-            let group = workspace_collection_folders(Some(folder), &config, &mut configured);
+            let mut group = workspace_collection_folders(Some(folder), &config, &mut configured);
+            let own = group.first().map(|own| own.root.clone());
+            group.retain(|registered| {
+                !registered.is_library
+                    || Some(&registered.root) == own.as_ref()
+                    || !open_roots.contains(&canonical_or_same(&registered.root))
+            });
             (config, group)
         })
         .collect()
+}
+
+fn canonical_or_same(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The config files of `dir`, lowest priority first: `.gluarc.json` alone
@@ -822,6 +838,55 @@ mod tests {
 
         assert_eq!(libraries, vec![gmod.join("shared_libs")]);
         let _ = fs::remove_dir_all(gmod.parent().unwrap());
+    }
+
+    /// A folder that is open stays a main workspace when another open folder
+    /// lists it in `workspace.library`, whichever folder comes first.
+    #[test]
+    fn an_open_folder_listed_as_a_library_stays_main() {
+        let base = create_temp_dir();
+        let first = base.join("first");
+        let second = base.join("second");
+        write(
+            &first.join(".gluarc.json"),
+            r#"{ "workspace": { "library": ["../second"] } }"#,
+        );
+        write(&second.join("gamemode/cl_second.lua"), "");
+
+        for folders in [
+            [first.clone(), second.clone()],
+            [second.clone(), first.clone()],
+        ] {
+            let configs = load(&folders);
+            let groups = crate::workspace_collection_groups(
+                folders
+                    .iter()
+                    .map(|root| crate::WorkspaceFolder::new(root.clone(), false))
+                    .collect(),
+                &configs.emmyrc,
+                &configs.root_emmyrcs,
+            );
+            let mut analysis = crate::EmmyLuaAnalysis::new();
+            analysis.set_workspace_roots(groups.iter().flat_map(|(_, group)| group));
+            let is_main = |root: &Path| {
+                analysis
+                    .get_workspace_id_for_root(&crate::normalize_workspace_root(root.to_path_buf()))
+                    .map(|id| {
+                        analysis
+                            .compilation
+                            .get_db()
+                            .get_module_index()
+                            .is_main_workspace_id(id)
+                    })
+            };
+
+            assert_eq!(
+                (is_main(&first), is_main(&second)),
+                (Some(true), Some(true)),
+                "folders: {folders:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(base);
     }
 
     /// A reload reads the roots in workspace order, as the first load does,

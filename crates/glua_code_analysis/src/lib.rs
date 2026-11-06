@@ -341,8 +341,9 @@ impl EmmyLuaAnalysis {
         self.sync_file_order();
     }
 
-    /// Registers `folders` as the main and library workspace roots, in order,
-    /// as a first load registers them, unregistering every other one. Returns
+    /// Registers `folders` as the main and library workspace roots, every main
+    /// before any library so a folder that is open stays main whichever folder
+    /// lists it as a library, unregistering every other one. Returns
     /// whether the index must be rebuilt: the registration changed while
     /// files outside std, whose module paths derive from it, are loaded.
     pub fn set_workspace_roots<'a>(
@@ -359,12 +360,13 @@ impl EmmyLuaAnalysis {
             .get_db_mut()
             .get_module_index_mut()
             .remove_main_and_library_workspaces();
-        for folder in folders {
-            if folder.is_library {
-                self.add_library_workspace(folder.root.clone());
-            } else {
-                self.add_main_workspace(folder.root.clone());
-            }
+        let (libraries, mains): (Vec<_>, Vec<_>) =
+            folders.into_iter().partition(|folder| folder.is_library);
+        for folder in mains {
+            self.add_main_workspace(folder.root.clone());
+        }
+        for folder in libraries {
+            self.add_library_workspace(folder.root.clone());
         }
         self.sync_file_order();
         let db = self.compilation.get_db();
