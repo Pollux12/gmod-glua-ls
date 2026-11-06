@@ -27,7 +27,7 @@ pub use compilation::*;
 pub use config::*;
 pub use db_index::*;
 pub use diagnostic::*;
-pub use gamemode_base::detect_gamemode_base_libraries;
+pub use gamemode_base::{detect_gamemode_base_libraries, detect_gamemode_bases};
 pub use glua_codestyle::*;
 use glua_parser::{LineIndex, LuaCallExpr, LuaSyntaxTree};
 pub use gmod_workspace::{

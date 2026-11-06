@@ -97,7 +97,12 @@ pub async fn on_did_change_watched_files(
                     // takes its place.
                     config_changed |= workspace.is_workspace_config_file(&file_event.uri);
                 }
-                Some(WatchedFileType::GamemodeManifest) | None => {}
+                // The base a manifest names decides how the gamemode's class
+                // inherits, which the config carries.
+                Some(WatchedFileType::GamemodeManifest) => {
+                    config_changed |= workspace.in_workspace_folder(&file_event.uri);
+                }
+                None => {}
             }
         }
     } // workspace read lock released here, before any write lock

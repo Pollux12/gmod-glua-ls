@@ -352,6 +352,16 @@ impl WorkspaceManager {
             })
     }
 
+    /// Whether `uri` lies in a workspace folder or in one of the folders it loads.
+    pub fn in_workspace_folder(&self, uri: &Uri) -> bool {
+        uri_to_file_path(uri).is_some_and(|path| {
+            self.workspace_folders
+                .iter()
+                .chain(&self.scoped_folders)
+                .any(|workspace| path.starts_with(&workspace.root))
+        })
+    }
+
     pub fn is_workspace_file(&self, uri: &Uri) -> bool {
         is_workspace_file_inner(
             uri,

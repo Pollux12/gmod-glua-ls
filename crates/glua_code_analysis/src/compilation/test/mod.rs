@@ -23,6 +23,7 @@ mod flat_enum_test;
 mod flow;
 mod for_range_var_infer_test;
 mod fork_test;
+mod gamemode_base_link_test;
 mod generic_infer_test;
 mod generic_test;
 mod gmod_network_test;

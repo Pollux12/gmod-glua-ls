@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::hash::Hash;
@@ -116,6 +116,14 @@ pub struct EmmyrcGmod {
     /// included, instead of its addons and active gamemode.
     #[serde(default)]
     pub load_everything: bool,
+    /// Gamemode folder name to the gamemode its manifest derives from, read at load.
+    #[serde(
+        default,
+        skip_deserializing,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    #[schemars(skip)]
+    pub gamemode_bases: BTreeMap<String, String>,
 }
 
 /// Scripted class groups used for class analysis, the Class Explorer and scaffolding.
@@ -665,6 +673,7 @@ impl Default for EmmyrcGmod {
             auto_detect_gamemode_base: None,
             active_gamemode: None,
             load_everything: false,
+            gamemode_bases: BTreeMap::new(),
         }
     }
 }

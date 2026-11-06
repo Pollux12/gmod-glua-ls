@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::{
     ConfigFile, EmmyLibraryItem, Emmyrc, UnpickedGamemodes, WorkspaceFolder, WorkspaceImport,
-    detect_gamemode_base_libraries, is_addons_folder, load_configs, load_layered_configs,
+    detect_gamemode_bases, is_addons_folder, load_configs, load_layered_configs,
     scope_workspace_folder, workspace_collection_folders,
 };
 
@@ -334,7 +334,9 @@ fn add_gamemode_base_libraries(emmyrc: &mut Emmyrc, workspace_root: &Path) {
         return;
     }
 
-    for lib_path in detect_gamemode_base_libraries(workspace_root) {
+    let found = detect_gamemode_bases(workspace_root);
+    emmyrc.gmod.gamemode_bases = found.bases;
+    for lib_path in found.libraries {
         let lib_path = lib_path.to_string_lossy().into_owned();
         if emmyrc
             .workspace

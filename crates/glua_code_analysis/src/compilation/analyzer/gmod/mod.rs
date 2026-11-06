@@ -2098,7 +2098,40 @@ fn ensure_scoped_class_type_decl(
         db.get_type_index_mut()
             .add_super_type(class_decl_id.clone(), file_id, range, super_type);
     }
+    if let Some(base_class) =
+        manifest_base_class(db.get_file_emmyrc(file_id), global_name, class_name)
+    {
+        db.get_type_index_mut().add_super_type(
+            class_decl_id.clone(),
+            file_id,
+            range,
+            LuaType::Ref(get_scripted_class_type_decl_id(global_name, &base_class)),
+        );
+    }
     class_decl_id
+}
+
+/// The class of the gamemode the manifest of gamemode class `class_name`
+/// derives from, as `gamemode.Register` inherits it.
+fn manifest_base_class(
+    emmyrc: &crate::Emmyrc,
+    global_name: &str,
+    class_name: &str,
+) -> Option<String> {
+    if global_name != "GM" {
+        return None;
+    }
+    let prefix = emmyrc
+        .gmod
+        .scripted_class_scopes
+        .resolved_definitions_slice()
+        .iter()
+        .find(|definition| definition.id == "gamemodes")?
+        .class_name_prefix
+        .clone()?;
+    let child = class_name.strip_prefix(prefix.as_str())?;
+    let base = emmyrc.gmod.gamemode_bases.get(child)?;
+    Some(format!("{prefix}{base}"))
 }
 
 /// Declares the shared class of each scope whose global `file_id` publishes a local table
