@@ -2,7 +2,7 @@
 name = "schema_to_glua"
 version = "0.1.5"
 edition = "2024"
-authors = ["Pollux12", "CppCXY"]
+authors = ["Pollux12"]
 description = "Tooling for converting JSON Schema into GLua annotations."
 license = "MIT"
 repository = "https://github.com/Pollux12/gmod-glua-ls"
