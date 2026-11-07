@@ -4667,6 +4667,43 @@ mod tests {
     }
 
     #[gtest]
+    fn test_send_in_if_else_with_local_forwarding_wrapper_finds_counterpart() {
+        let diagnostics = branch_send_receiver_diagnostics(
+            Some(
+                r#"
+                local netStart = net.Start
+                function net.Start(name, unreliable)
+                    netStart(name, unreliable)
+                end
+                "#,
+            ),
+            BRANCH_SEND,
+        );
+        assert_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_plain_send_with_local_forwarding_wrapper_finds_counterpart() {
+        let diagnostics = branch_send_receiver_diagnostics(
+            Some(
+                r#"
+                local netStart = net.Start
+                function net.Start(name, unreliable)
+                    netStart(name, unreliable)
+                end
+                "#,
+            ),
+            r#"
+            util.AddNetworkString("Branch")
+            net.Start("Branch")
+            net.WriteString("x")
+            net.Broadcast()
+            "#,
+        );
+        assert_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
     fn test_send_in_if_else_checks_payload_count() {
         let diagnostics = branch_send_receiver_diagnostics(
             None,
