@@ -17,6 +17,8 @@ pub struct TypeCheckContext<'db> {
     /// The config the check reads its strictness from: the checked file's, or
     /// else the shared one.
     pub emmyrc: &'db Emmyrc,
+    /// The file the check is for, when known.
+    pub file_id: Option<FileId>,
     pub level: TypeCheckCheckLevel,
     member_facts: FxHashMap<LuaMemberId, LuaTypeFact>,
 }
@@ -27,6 +29,7 @@ impl<'db> TypeCheckContext<'db> {
             detail,
             db,
             emmyrc: db.get_emmyrc(),
+            file_id: None,
             level,
             member_facts: FxHashMap::default(),
         }
@@ -35,6 +38,7 @@ impl<'db> TypeCheckContext<'db> {
     /// Checks with the config of `file_id`.
     pub fn in_file(mut self, file_id: FileId) -> Self {
         self.emmyrc = self.db.get_file_emmyrc(file_id);
+        self.file_id = Some(file_id);
         self
     }
 

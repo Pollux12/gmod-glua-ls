@@ -162,4 +162,66 @@ mod test {
         assert_eq!(applied.shared, EmmyrcChange::Unchanged);
         assert_eq!(applied.files, vec![in_first]);
     }
+
+    const ARRAY_FILE: &str = r#"
+        ---@class Bag : string[]
+
+        ---@type string[]
+        local list = {}
+        ---@type Bag
+        local bag = {}
+
+        local from_list = list[1]
+        local from_bag = bag[1]
+
+        ---@generic V
+        ---@param t table<integer, V>
+        ---@return V
+        local function value_of(t) end
+        local from_generic = value_of(bag)
+    "#;
+
+    fn with_array_index(array_index: bool) -> Emmyrc {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.strict.array_index = array_index;
+        emmyrc
+    }
+
+    fn array_reads(ws: &VirtualWorkspace, file_id: FileId) -> Vec<String> {
+        ["from_list", "from_bag", "from_generic"]
+            .iter()
+            .map(|name| ws.humanize_type(ws.local_ty(file_id, name)))
+            .collect()
+    }
+
+    /// `strict.arrayIndex` of a root that is not the first one decides the
+    /// element reads of its own files, and an edit to it re-reads them.
+    #[test]
+    fn a_later_roots_array_index_setting_decides_its_element_reads() {
+        let (mut ws, roots) = VirtualWorkspace::new_with_roots(&["first", "second"]);
+        let (first, second) = (&roots[0], &roots[1]);
+        ws.set_root_emmyrcs(vec![
+            (first, with_array_index(false)),
+            (second, with_array_index(true)),
+        ]);
+        let in_first = ws.def_file_in(first, "cl_first.lua", ARRAY_FILE);
+        let in_second = ws.def_file_in(second, "cl_second.lua", ARRAY_FILE);
+        let strict = array_reads(&ws, in_first);
+        assert_eq!(strict, ["string", "string", "string"]);
+        let nilable = array_reads(&ws, in_second);
+        assert_eq!(nilable, ["string?", "string?", "string?"]);
+
+        let shared = ws.analysis.get_emmyrc();
+        let applied = ws.analysis.apply_configs(
+            shared,
+            &applied_roots(vec![
+                (first, with_array_index(false)),
+                (second, with_array_index(false)),
+            ]),
+        );
+        ws.analysis.reindex_files(applied.files.clone());
+
+        assert_eq!(applied.files, vec![in_second]);
+        assert_eq!(array_reads(&ws, in_second), strict);
+    }
 }

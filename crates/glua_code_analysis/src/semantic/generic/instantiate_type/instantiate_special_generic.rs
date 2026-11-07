@@ -308,7 +308,7 @@ fn instantiate_rawget_call(db: &DbIndex, owner: &LuaType, key: &LuaType) -> LuaT
         _ => return LuaType::Unknown,
     };
 
-    infer_raw_member_type(db, owner, &member_key).unwrap_or(LuaType::Unknown)
+    infer_raw_member_type(db, None, owner, &member_key).unwrap_or(LuaType::Unknown)
 }
 
 fn instantiate_index_call(db: &DbIndex, owner: &LuaType, key: &LuaType) -> LuaType {
@@ -326,7 +326,7 @@ fn instantiate_index_call(db: &DbIndex, owner: &LuaType, key: &LuaType) -> LuaTy
     }
 
     if let Some(member_key) = key_type_to_member_key(key) {
-        infer_raw_member_type(db, owner, &member_key).unwrap_or(LuaType::Never)
+        infer_raw_member_type(db, None, owner, &member_key).unwrap_or(LuaType::Never)
     } else {
         LuaType::Never
     }

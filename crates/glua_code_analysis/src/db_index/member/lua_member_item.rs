@@ -802,15 +802,20 @@ fn resolve_member_type(
                     db.get_member_index()
                         .is_non_overwriting_assignment_member(member.get_id())
                 });
-            if db.get_emmyrc().strict.meta_override_file_define {
-                for member in &members {
-                    let feature = member.get_feature();
-                    if feature.is_meta_decl() {
-                        resolve_state = MemberTypeResolveState::Meta;
-                        break;
-                    } else if feature.is_file_decl() && !member_is_placeholder_decl(db, member) {
-                        resolve_state = MemberTypeResolveState::FileDecl;
-                    }
+            for member in &members {
+                if !db
+                    .get_file_emmyrc(member.get_id().file_id)
+                    .strict
+                    .meta_override_file_define
+                {
+                    continue;
+                }
+                let feature = member.get_feature();
+                if feature.is_meta_decl() {
+                    resolve_state = MemberTypeResolveState::Meta;
+                    break;
+                } else if feature.is_file_decl() && !member_is_placeholder_decl(db, member) {
+                    resolve_state = MemberTypeResolveState::FileDecl;
                 }
             }
 

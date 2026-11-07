@@ -107,7 +107,7 @@ fn check_array_type_compact_ref_def(
     compact_type: &LuaType,
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
-    let Some(members) = find_index_operations(context.db, compact_type) else {
+    let Some(members) = find_index_operations(context.db, context.file_id, compact_type) else {
         return Err(TypeCheckFailReason::TypeNotMatch);
     };
 
