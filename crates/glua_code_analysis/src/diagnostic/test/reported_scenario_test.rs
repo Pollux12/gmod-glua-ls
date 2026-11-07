@@ -119,6 +119,7 @@ mod tests {
             end
             OverridePanel("DHTML", function()
                 function PANEL:PerformLayout()
+                    self:CenterVertical()
                     return self.SubMenuArrow
                 end
             end)
@@ -134,6 +135,10 @@ mod tests {
         );
         assert_eq!(
             messages(&mut ws, DiagnosticCode::UndefinedField, path, code),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            messages(&mut ws, DiagnosticCode::UndefinedMethod, path, code),
             Vec::<String>::new()
         );
     }
