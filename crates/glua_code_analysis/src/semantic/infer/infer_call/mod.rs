@@ -815,7 +815,11 @@ fn infer_doc_function(
         let instantiation =
             instantiate_func_generic_with_bindings(db, cache, func, call_expr.clone())?;
         cache.record_generic_call_bindings(call_expr.get_syntax_id(), instantiation.bindings);
-        return Ok(Arc::new(instantiation.function));
+        return Ok(Arc::new(declared_definition_return(
+            db,
+            prefix_signature_id,
+            instantiation.function,
+        )));
     }
 
     // Handle self-type substitution for functions with SelfInfer in return type
@@ -1111,6 +1115,11 @@ fn infer_signature_doc_function(
 
         let fake_doc_function =
             apply_signature_return_kinds_to_function(signature, &fake_doc_function);
+        let fake_doc_function = Arc::new(declared_definition_return(
+            db,
+            Some(signature_id),
+            fake_doc_function.as_ref().clone(),
+        ));
         let fake_doc_function = specialize_nil_guarded_return_for_call(
             db,
             cache,
@@ -2526,6 +2535,55 @@ fn apply_signature_return_kinds(signature: &LuaSignature, return_type: LuaType) 
             _ => apply_return_kind(signature.return_docs[0].return_kind, return_type),
         },
     }
+}
+
+/// `function` with a `(definition)` return that names declared classes made
+/// non-nil: the definition of a class the workspace declares exists, and only a
+/// name nothing declares may look up nothing.
+fn declared_definition_return(
+    db: &DbIndex,
+    signature_id: Option<LuaSignatureId>,
+    function: LuaFunctionType,
+) -> LuaFunctionType {
+    let is_definition_return = signature_id
+        .and_then(|signature_id| db.get_signature_index().get(&signature_id))
+        .is_some_and(|signature| {
+            signature.return_docs.len() == 1
+                && signature.return_docs[0].return_kind == ReturnTypeKind::Definition
+        });
+    let LuaType::Union(union) = function.get_ret() else {
+        return function;
+    };
+    if !is_definition_return {
+        return function;
+    }
+    let classes = union
+        .types()
+        .filter(|member| !member.is_nil())
+        .cloned()
+        .collect::<Vec<_>>();
+    let all_declared = !classes.is_empty()
+        && classes.iter().all(|member| match member {
+            LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+                db.get_type_index().get_type_decl(type_id).is_some()
+            }
+            _ => false,
+        });
+    if !all_declared {
+        return function;
+    }
+    let ret = match classes.as_slice() {
+        [single] => apply_definition_return_type(single.clone()),
+        _ => LuaType::Table,
+    };
+    LuaFunctionType::new(
+        function.get_async_state(),
+        function.is_colon_define(),
+        function.is_variadic(),
+        function.get_params().to_vec(),
+        ret,
+    )
+    .with_optional_params(function.get_optional_params().to_vec())
 }
 
 fn apply_return_kind(return_kind: ReturnTypeKind, return_type: LuaType) -> LuaType {
