@@ -1024,9 +1024,53 @@ fn infer_table_member_owner(
             }
         };
         let member_type = if dynamic_numeric_index_key(&key) {
-            nullable_if_needed(db, member_type)
+            // When a shaped sequential literal also has computed numeric writes
+            // (`t[i] = v`), a read under a computed index reaches either the
+            // literal's own elements or the written values, with nil added only
+            // when `strict.arrayIndex` is enabled. Non-array tables keep the
+            // sparse dynamic-index nullability.
+            match resolve_table_const_array_base(
+                db,
+                cache,
+                &owner,
+                index_expr.get_position(),
+                source_min_position.as_ref(),
+            ) {
+                Ok(Some(base)) => {
+                    let elements = TypeOps::Union.apply(db, &member_type, &base);
+                    if db.get_emmyrc().strict.array_index {
+                        nullable_if_needed(db, elements)
+                    } else {
+                        elements
+                    }
+                }
+                Ok(None) => nullable_if_needed(db, member_type),
+                Err(reason) => {
+                    cache.close_frame(frame);
+                    return Err(reason);
+                }
+            }
         } else {
             member_type
+        };
+        // A write through an integer-typed key (`t[i] = v`) may have replaced
+        // any element, so an element read by its index sees those values too.
+        let member_type = match (&key, crate::db_index::is_informative_type(&member_type)) {
+            (LuaMemberKey::Integer(_), true) => infer_table_dynamic_key_member_type(
+                db,
+                &owner,
+                &key,
+                cache.get_file_id(),
+                Some(index_expr.get_position()),
+                source_min_position.as_ref(),
+                true,
+            )
+            .filter(crate::db_index::is_informative_type)
+            .map_or(member_type.clone(), |written| {
+                let written = TypeOps::Remove.apply(db, &written, &LuaType::Nil);
+                TypeOps::Union.apply(db, &member_type, &written)
+            }),
+            _ => member_type,
         };
         let finite_named_dynamic = is_literal_table_field_access(&index_key)
             && owner_has_finite_named_dynamic_assignment(db, &owner);
