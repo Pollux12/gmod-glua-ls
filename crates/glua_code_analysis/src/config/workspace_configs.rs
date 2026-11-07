@@ -212,9 +212,7 @@ pub fn load_workspace_configs(
         config_files.extend(own_files.into_iter().map(ConfigFile::from));
         let mut emmyrc = load_layered_configs(config_files, sources.partial_emmyrcs.clone());
         (sources.prepare)(&mut emmyrc);
-        if !scoped_roots.contains(root) {
-            add_gamemode_base_libraries(&mut emmyrc, root);
-        }
+        add_gamemode_bases(&mut emmyrc, root, !scoped_roots.contains(root));
         emmyrc.pre_process_emmyrc(root);
         root_emmyrcs.insert(root.clone(), Arc::new(emmyrc));
     }
@@ -325,10 +323,11 @@ fn dedup_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Adds the gamemodes `workspace_root`'s gamemode derives from (its `.txt`
-/// `"base"` chain, e.g. cityrp from sandbox) as libraries, so references into
+/// Reads the `.txt` `"base"` chain of the gamemodes under `workspace_root`
+/// (e.g. cityrp from sandbox) into `gmod.gamemodeBases`, and adds the gamemodes
+/// they derive from as libraries when `load_libraries`, so references into
 /// them resolve, unless `gmod.autoDetectGamemodeBase` is `false`.
-fn add_gamemode_base_libraries(emmyrc: &mut Emmyrc, workspace_root: &Path) {
+fn add_gamemode_bases(emmyrc: &mut Emmyrc, workspace_root: &Path, load_libraries: bool) {
     if matches!(emmyrc.gmod.auto_detect_gamemode_base, Some(false)) {
         log::info!("Gamemode base auto-detection explicitly disabled in config");
         return;
@@ -336,6 +335,9 @@ fn add_gamemode_base_libraries(emmyrc: &mut Emmyrc, workspace_root: &Path) {
 
     let found = detect_gamemode_bases(workspace_root);
     emmyrc.gmod.gamemode_bases = found.bases;
+    if !load_libraries {
+        return;
+    }
     for lib_path in found.libraries {
         let lib_path = lib_path.to_string_lossy().into_owned();
         if emmyrc
@@ -666,6 +668,59 @@ mod tests {
                 disabled(&[whole, gamemode])
             ),
             (1, 1)
+        );
+        let _ = fs::remove_dir_all(gmod.parent().unwrap());
+    }
+
+    /// A gamemode of a whole Garry's Mod folder that has a config of its own
+    /// still knows the gamemode its manifest derives from.
+    #[test]
+    fn a_scoped_gamemode_with_its_own_config_knows_its_manifest_base() {
+        let gmod = create_temp_dir().join("garrysmod");
+        let gamemodes = gmod.join("gamemodes");
+        write(
+            &gamemodes.join("parent/parent.txt"),
+            "\"parent\"
+{
+	\"base\"	\"sandbox\"
+}
+",
+        );
+        write(
+            &gamemodes.join("child/child.txt"),
+            "\"child\"
+{
+	\"base\"	\"parent\"
+}
+",
+        );
+        write(&gamemodes.join("child/.gluarc.json"), "{}");
+        fs::create_dir_all(gmod.join("addons")).unwrap();
+        let child = gamemodes.join("child");
+        let prepare = |_: &mut crate::Emmyrc| {};
+        let sources = super::ConfigSources {
+            global_files: Vec::new(),
+            partial_emmyrcs: None,
+            prepare: &prepare,
+        };
+
+        let (folders, configs) = super::load_scoped_workspace_configs(
+            &[crate::WorkspaceFolder::new(gmod.clone(), false)],
+            &[child.join("gamemode/cl_init.lua")],
+            crate::UnpickedGamemodes::None,
+            &sources,
+        );
+
+        let loaded = folders.iter().map(|f| f.root.clone()).collect::<Vec<_>>();
+        assert!(loaded.contains(&child), "{loaded:?}");
+        assert_eq!(
+            configs
+                .root_emmyrc(&child)
+                .gmod
+                .gamemode_bases
+                .get("child")
+                .map(String::as_str),
+            Some("parent")
         );
         let _ = fs::remove_dir_all(gmod.parent().unwrap());
     }
