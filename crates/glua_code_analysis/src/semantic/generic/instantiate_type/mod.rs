@@ -411,14 +411,26 @@ fn instantiate_table_generic(
 }
 
 /// A returned `` `T` `` is the type its argument bound: the class a literal names,
-/// or the constraint for a name only known at runtime. A parameter of that shape
-/// keeps the string it is.
+/// or the constraint for a name only known at runtime, and the constraint (or
+/// unknown) when no argument binds it. A parameter of that shape keeps the
+/// string it is.
 fn instantiate_return_str_tpl(ty: &LuaType, substitutor: &TypeSubstitutor) -> LuaType {
     match ty {
         LuaType::StrTplRef(str_tpl) => match substitutor.get(str_tpl.get_tpl_id()) {
             Some(SubstitutorValue::Type(bound)) => bound.default().clone(),
-            _ => ty.clone(),
+            _ => str_tpl
+                .get_constraint()
+                .cloned()
+                .unwrap_or(LuaType::Unknown),
         },
+        LuaType::Instance(instance) => {
+            let base = instantiate_return_str_tpl(instance.get_base(), substitutor);
+            if &base == instance.get_base() {
+                ty.clone()
+            } else {
+                LuaType::Instance(instance.rebased(base).into())
+            }
+        }
         LuaType::Union(union) => {
             let members = union
                 .types()

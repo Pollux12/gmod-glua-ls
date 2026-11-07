@@ -387,4 +387,21 @@ mod tests {
         );
         assert_eq!(mismatches.len(), 1, "{mismatches:?}");
     }
+    #[test]
+    fn returned_string_template_never_leaks_as_a_raw_template() {
+        let mut ws = gmod_workspace(CONTROL_TABLE_API);
+        let file_id = ws.def_file(
+            "gamemodes/test/gamemode/cl_template.lua",
+            r#"
+            local name = GetName()
+            local literal = vgui.GetControlTable("DHTML")
+            local runtime = vgui.GetControlTable(name)
+            local unbound = vgui.GetControlTable()
+            "#,
+        );
+        for local in ["literal", "runtime", "unbound"] {
+            let typ = ws.local_ty(file_id, local);
+            assert!(!typ.contain_tpl(), "{local}: {typ:?}");
+        }
+    }
 }
