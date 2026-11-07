@@ -502,7 +502,8 @@ pub(super) fn collect_param_summaries(
     )
 }
 
-/// The parameters `closure`'s body installs named members on, and those of them it assigns fields to.
+/// The parameters `closure`'s body installs named members on, and those of them it
+/// only assigns fields to, defining no methods there.
 fn method_installer_params(
     db: &DbIndex,
     file_id: FileId,
@@ -538,20 +539,26 @@ fn method_installer_params(
             .find(|(_, param_decl_id)| *param_decl_id == decl_id)
             .map(|(idx, _)| *idx)
     };
+    let mut method_params = closure
+        .descendants::<LuaFuncStat>()
+        .filter_map(|func_stat| func_stat.get_func_name())
+        .filter_map(param_of)
+        .collect::<Vec<_>>();
+    method_params.sort_unstable();
+    method_params.dedup();
+    // A parameter the body defines methods on is a class the call registers,
+    // as `vgui.Register` does, so the fields it sets there extend that class too.
     let mut filled = closure
         .descendants::<LuaAssignStat>()
         .flat_map(|assign| assign.get_var_and_expr_list().0)
         .filter(writes_named_field)
         .filter_map(param_of)
+        .filter(|idx| method_params.binary_search(idx).is_err())
         .collect::<Vec<_>>();
     filled.sort_unstable();
     filled.dedup();
-    let mut installed = closure
-        .descendants::<LuaFuncStat>()
-        .filter_map(|func_stat| func_stat.get_func_name())
-        .filter_map(param_of)
-        .chain(filled.iter().copied())
-        .collect::<Vec<_>>();
+    let mut installed = method_params;
+    installed.extend(filled.iter().copied());
     installed.sort_unstable();
     installed.dedup();
     (installed, filled)
@@ -2335,10 +2342,15 @@ fn infer_supported_call_site_arg_type(
     fills_fields: bool,
 ) -> Option<(LuaType, LuaInferenceProvenanceKind)> {
     // A table a function fills fields into is only that caller's input, unless it is the
-    // caller's receiver, which those members extend.
+    // caller's receiver, which those members extend. An inline table literal cannot be
+    // referenced after the call, so members installed on the parameter never reach a caller
+    // through it.
     let is_receiver = is_receiver_self(db, file_id, &arg);
-    infer_call_site_arg_value(db, cache, scope, file_id, arg, calls_with_args)
-        .filter(|(typ, _)| is_receiver || !(fills_fields && holds_table_const(typ)))
+    let is_inline_table =
+        calls_with_args && matches!(unparenthesized(arg.clone()), LuaExpr::TableExpr(_));
+    infer_call_site_arg_value(db, cache, scope, file_id, arg, calls_with_args).filter(|(typ, _)| {
+        is_receiver || (!is_inline_table && !(fills_fields && holds_table_const(typ)))
+    })
 }
 
 /// Whether `expr` names its function's receiver: an implicit `self` or a leading `self` parameter.
