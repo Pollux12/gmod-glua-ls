@@ -38,6 +38,7 @@ mod param_type_check_test;
 mod readonly_check;
 mod redefined_local_test;
 mod redundant_parameter_test;
+mod reported_scenario_test;
 mod require_module_visibility_test;
 mod return_type_mismatch_test;
 mod syntax_error_test;
