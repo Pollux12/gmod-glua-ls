@@ -442,6 +442,18 @@ fn instantiate_return_str_tpl(ty: &LuaType, substitutor: &TypeSubstitutor) -> Lu
                 LuaType::from_vec(members)
             }
         }
+        LuaType::Variadic(variadic) => match variadic.deref() {
+            VariadicType::Multi(types) => {
+                let types = types
+                    .iter()
+                    .map(|member| instantiate_return_str_tpl(member, substitutor))
+                    .collect::<Vec<_>>();
+                LuaType::Variadic(VariadicType::Multi(types).into())
+            }
+            VariadicType::Base(base) => LuaType::Variadic(
+                VariadicType::Base(instantiate_return_str_tpl(base, substitutor)).into(),
+            ),
+        },
         _ => ty.clone(),
     }
 }

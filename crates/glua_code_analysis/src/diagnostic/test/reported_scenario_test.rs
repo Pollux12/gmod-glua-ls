@@ -409,4 +409,21 @@ mod tests {
             assert!(!typ.contain_tpl(), "{local}: {typ:?}");
         }
     }
+
+    #[test]
+    fn string_template_in_a_multiple_return_resolves() {
+        let mut ws = gmod_workspace(CONTROL_TABLE_API);
+        let file_id = ws.def_file(
+            "gamemodes/test/gamemode/cl_template_multi.lua",
+            r#"
+            ---@generic T: Panel
+            ---@param name `T`
+            ---@return `T`, boolean
+            local function find(name) end
+            local found, ok = find("DHTML")
+            "#,
+        );
+        let found = ws.local_ty(file_id, "found");
+        assert_eq!(ws.humanize_type(found), "DHTML");
+    }
 }
