@@ -22,8 +22,8 @@ mod test {
         assert!(resolved.contains(&"**/node_modules/**".to_string()));
         assert!(resolved.contains(&"**/gmod_wire_expression2/**".to_string()));
         assert!(resolved.contains(&"**/wire_expression*.lua".to_string()));
-        assert!(resolved.contains(&"**/tests/**".to_string()));
-        assert!(resolved.contains(&"**/test/**".to_string()));
+        assert!(resolved.contains(&"**/lua/tests/**".to_string()));
+        assert!(resolved.contains(&"**/gamemode/tests/**".to_string()));
     }
 
     #[test]
@@ -118,8 +118,8 @@ mod test {
             13,
             "should have 13 entries after disabling 'tests'"
         );
-        assert!(!resolved.contains(&"**/tests/**".to_string()));
-        assert!(resolved.contains(&"**/test/**".to_string()));
+        assert!(!resolved.contains(&"**/lua/tests/**".to_string()));
+        assert!(resolved.contains(&"**/gamemode/tests/**".to_string()));
         assert!(resolved.contains(&"**/gmod_wire_expression2/**".to_string()));
     }
 
@@ -128,7 +128,7 @@ mod test {
         let json = r#"{
             "workspace": {
                 "ignoreDirDefaults": [
-                    { "id": "test", "glob": "**/my_tests/**" }
+                    { "id": "gamemode-tests", "glob": "**/my_tests/**" }
                 ]
             }
         }"#;
@@ -137,7 +137,7 @@ mod test {
         let resolved = emmyrc.workspace.resolve_ignore_dir_defaults();
 
         assert_eq!(resolved.len(), 14);
-        assert!(!resolved.contains(&"**/test/**".to_string()));
+        assert!(!resolved.contains(&"**/gamemode/tests/**".to_string()));
         assert!(resolved.contains(&"**/my_tests/**".to_string()));
     }
 

@@ -2021,8 +2021,8 @@ mod tests {
     // -------------------------------------------------------------------------
 
     /// Root A has `useDefaultIgnores: false`; root B has `useDefaultIgnores: true`.
-    /// The built-in default patterns include `**/tests/**`.
-    /// Root A's matcher must NOT exclude `tests/sub/foo.lua`, while root B's must.
+    /// The built-in default patterns include `**/lua/tests/**`.
+    /// Root A's matcher must NOT exclude `lua/tests/sub/foo.lua`, while root B's must.
     #[test]
     fn test_per_root_matchers_isolate_use_default_ignores() {
         let workspace_a = create_temp_dir();
@@ -2053,22 +2053,52 @@ mod tests {
             .get(&workspace_b)
             .expect("workspace b should have a matcher");
 
-        // **/tests/** is a built-in default ignore pattern.
-        // Root A (useDefaultIgnores=false): tests/sub/foo.lua should pass.
-        let tests_rel = std::path::Path::new("tests/sub/foo.lua");
+        // **/lua/tests/** is a built-in default ignore pattern.
+        // Root A (useDefaultIgnores=false): lua/tests/sub/foo.lua should pass.
+        let tests_rel = std::path::Path::new("lua/tests/sub/foo.lua");
         assert!(
-            matcher_a.is_match(&workspace_a.join("tests/sub/foo.lua"), tests_rel),
-            "root A (useDefaultIgnores=false) should NOT exclude tests/sub/foo.lua"
+            matcher_a.is_match(&workspace_a.join(tests_rel), tests_rel),
+            "root A (useDefaultIgnores=false) should NOT exclude lua/tests/sub/foo.lua"
         );
 
-        // Root B (useDefaultIgnores=true): tests/sub/foo.lua should be excluded.
+        // Root B (useDefaultIgnores=true): lua/tests/sub/foo.lua should be excluded.
         assert!(
-            !matcher_b.is_match(&workspace_b.join("tests/sub/foo.lua"), tests_rel),
-            "root B (useDefaultIgnores=true) should exclude tests/sub/foo.lua via built-in **/tests/**"
+            !matcher_b.is_match(&workspace_b.join(tests_rel), tests_rel),
+            "root B (useDefaultIgnores=true) should exclude lua/tests/sub/foo.lua via built-in **/lua/tests/**"
         );
 
         let _ = fs::remove_dir_all(workspace_a);
         let _ = fs::remove_dir_all(workspace_b);
+    }
+
+    /// The default ignores skip the folders GLuaTest loads tests from, and
+    /// nothing else: a gamemode or addon named `test` or `tests` still loads.
+    #[test]
+    fn default_ignores_skip_gluatest_folders_but_not_folders_named_test() {
+        let workspace = create_temp_dir();
+        fs::write(workspace.join(".gluarc.json"), "{}").expect("failed to write workspace config");
+        let loaded = load_emmy_config(vec![workspace.clone()], ClientConfig::default());
+        let matcher = loaded
+            .workspace_matchers
+            .get(&workspace)
+            .expect("workspace should have a matcher");
+        let loads = |relative: &str| {
+            let relative = std::path::Path::new(relative);
+            matcher.is_match(&workspace.join(relative), relative)
+        };
+
+        assert!(!loads("addons/myaddon/lua/tests/myaddon/sh_spec.lua"));
+        assert!(!loads(
+            "gamemodes/mygamemode/gamemode/tests/mygamemode/sh_spec.lua"
+        ));
+        assert!(!loads("lua/tests/myaddon/sh_spec.lua"));
+        assert!(loads("gamemodes/test/gamemode/cl_init.lua"));
+        assert!(loads("gamemodes/tests/gamemode/cl_init.lua"));
+        assert!(loads("addons/test/lua/autorun/sh_test.lua"));
+        assert!(loads("addons/tests/lua/autorun/sh_test.lua"));
+        assert!(loads("addons/myaddon/lua/test/sh_helper.lua"));
+
+        let _ = fs::remove_dir_all(workspace);
     }
 
     /// Each root's `ignoreDirDefaults` is scoped to that root's matcher only.
@@ -2149,7 +2179,7 @@ mod tests {
     fn test_reload_path_produces_fresh_per_root_matchers() {
         let workspace = create_temp_dir();
 
-        // Initial config: default ignores disabled → tests/ files should be included
+        // Initial config: default ignores disabled → lua/tests/ files should be included
         fs::write(
             workspace.join(".emmyrc.json"),
             r#"{ "workspace": { "useDefaultIgnores": false } }"#,
@@ -2162,13 +2192,13 @@ mod tests {
             .workspace_matchers
             .get(&workspace)
             .expect("workspace should have a matcher");
-        // **/tests/** is a built-in pattern; with useDefaultIgnores=false it should be included
-        let tests_rel = std::path::Path::new("tests/sub/foo.lua");
-        let tests_abs = workspace.join("tests/sub/foo.lua");
+        // **/lua/tests/** is a built-in pattern; with useDefaultIgnores=false it should be included
+        let tests_rel = std::path::Path::new("lua/tests/sub/foo.lua");
+        let tests_abs = workspace.join(tests_rel);
 
         assert!(
             matcher_initial.is_match(&tests_abs, tests_rel),
-            "before reload: tests/sub/foo.lua should be included (useDefaultIgnores=false)"
+            "before reload: lua/tests/sub/foo.lua should be included (useDefaultIgnores=false)"
         );
 
         // Simulate user enabling default ignores (config change → reload)
@@ -2187,7 +2217,7 @@ mod tests {
 
         assert!(
             !matcher_reloaded.is_match(&tests_abs, tests_rel),
-            "after reload: tests/sub/foo.lua should be excluded (useDefaultIgnores=true, **/tests/**)"
+            "after reload: lua/tests/sub/foo.lua should be excluded (useDefaultIgnores=true, **/lua/tests/**)"
         );
 
         let _ = fs::remove_dir_all(workspace);
@@ -2202,10 +2232,10 @@ mod tests {
     /// for files that live under the inner root, not the outer root's matcher.
     ///
     /// Scenario:
-    ///   outer_root  → useDefaultIgnores: true  (excludes **/tests/**)
-    ///   inner_root  → useDefaultIgnores: false  (tests/ files are allowed)
+    ///   outer_root  → useDefaultIgnores: true  (excludes **/lua/tests/**)
+    ///   inner_root  → useDefaultIgnores: false  (lua/tests/ files are allowed)
     ///
-    /// A file at `inner_root/tests/foo.lua` must be accepted because the
+    /// A file at `inner_root/lua/tests/foo.lua` must be accepted because the
     /// inner root is the most specific match.
     #[test]
     fn test_is_workspace_file_inner_prefers_most_specific_nested_root() {
@@ -2247,10 +2277,10 @@ mod tests {
             ClientConfig::default(),
         );
 
-        // A file under the inner root in tests/ — should pass (inner has
+        // A file under the inner root in lua/tests/ — should pass (inner has
         // useDefaultIgnores=false) and must NOT be rejected by the outer
         // root's matcher.
-        let target_path = inner_root.join("tests").join("foo.lua");
+        let target_path = inner_root.join("lua").join("tests").join("foo.lua");
         let Some(target_uri) = file_path_to_uri(&target_path) else {
             panic!("failed to build URI for target path");
         };
@@ -2264,14 +2294,14 @@ mod tests {
 
         assert!(
             result,
-            "file under inner_root/tests/ should be accepted because the inner root \
+            "file under inner_root/lua/tests/ should be accepted because the inner root \
              (useDefaultIgnores=false) is the most specific match and must not be \
              rejected by the outer root's matcher"
         );
 
-        // A file under the outer root but NOT under the inner root in tests/
+        // A file under the outer root but NOT under the inner root in lua/tests/
         // — should be rejected by the outer root's matcher.
-        let outer_tests_path = outer_root.join("tests").join("other.lua");
+        let outer_tests_path = outer_root.join("lua").join("tests").join("other.lua");
         let Some(outer_tests_uri) = file_path_to_uri(&outer_tests_path) else {
             panic!("failed to build URI for outer tests path");
         };
@@ -2285,7 +2315,7 @@ mod tests {
 
         assert!(
             !outer_result,
-            "file under outer_root/tests/ (not inside inner_root) should be rejected \
+            "file under outer_root/lua/tests/ (not inside inner_root) should be rejected \
              by the outer root's matcher (useDefaultIgnores=true)"
         );
 
