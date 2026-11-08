@@ -1642,26 +1642,59 @@ enum TransactionEnd {
 /// The first call of `stat` that ends a transaction, in document order and
 /// at any depth, so a send chosen in an `if`/`else` ends it as a send
 /// statement does. Calls in closures `stat` defines run later and are skipped.
+/// A start in a branch or loop body ends the transaction only on the paths
+/// that run it, so the rest of that body belongs to the started message and
+/// the search goes on after it.
 fn transaction_end(
     stat: &LuaStat,
     mut classify: impl FnMut(&LuaCallExpr) -> Option<TransactionEnd>,
 ) -> Option<TransactionEnd> {
     let mut nodes = stat.syntax().preorder();
+    let mut skip_until = None;
     while let Some(event) = nodes.next() {
         let rowan::WalkEvent::Enter(node) = event else {
             continue;
         };
+        if skip_until.is_some_and(|end| node.text_range().end() <= end) {
+            nodes.skip_subtree();
+            continue;
+        }
         if LuaClosureExpr::can_cast(node.kind().into()) {
             nodes.skip_subtree();
             continue;
         }
-        if let Some(call) = LuaCallExpr::cast(node)
-            && let Some(end) = classify(&call)
-        {
-            return Some(end);
+        let Some(call) = LuaCallExpr::cast(node) else {
+            continue;
+        };
+        match classify(&call) {
+            Some(TransactionEnd::Start) => match conditional_body(stat, &call) {
+                Some(body) => skip_until = Some(body.syntax().text_range().end()),
+                None => return Some(TransactionEnd::Start),
+            },
+            Some(end) => return Some(end),
+            None => {}
         }
     }
     None
+}
+
+/// The innermost branch or loop body of `stat` that holds `call`, if any: a
+/// `do` block always runs, so it is not one.
+fn conditional_body(stat: &LuaStat, call: &LuaCallExpr) -> Option<LuaBlock> {
+    call.syntax()
+        .ancestors()
+        .filter_map(LuaBlock::cast)
+        .take_while(|block| {
+            stat.syntax()
+                .text_range()
+                .contains_range(block.syntax().text_range())
+        })
+        .find(|block| {
+            !block
+                .syntax()
+                .parent()
+                .is_some_and(|parent| glua_parser::LuaDoStat::can_cast(parent.kind().into()))
+        })
 }
 
 /// How a call ends a transaction through its own net role.

@@ -4704,6 +4704,59 @@ mod tests {
     }
 
     #[gtest]
+    fn test_start_in_a_branch_keeps_the_earlier_message_sent_on_other_paths() {
+        let diagnostics = branch_send_receiver_diagnostics(
+            None,
+            r#"
+            util.AddNetworkString("Branch")
+            util.AddNetworkString("Other")
+            net.Start("Branch")
+            if GetConVar("sv_other"):GetBool() then
+                net.Start("Other")
+            end
+            net.WriteString("x")
+            net.Broadcast()
+            "#,
+        );
+        assert_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_send_after_a_start_in_a_branch_belongs_to_the_started_message() {
+        let diagnostics = branch_send_receiver_diagnostics(
+            None,
+            r#"
+            util.AddNetworkString("Branch")
+            util.AddNetworkString("Other")
+            net.Start("Branch")
+            if GetConVar("sv_other"):GetBool() then
+                net.Start("Other")
+                net.Broadcast()
+            end
+            "#,
+        );
+        assert_that!(count_network_diagnostics(&diagnostics), eq(1usize));
+    }
+
+    #[gtest]
+    fn test_start_in_a_do_block_ends_the_earlier_message() {
+        let diagnostics = branch_send_receiver_diagnostics(
+            None,
+            r#"
+            util.AddNetworkString("Branch")
+            util.AddNetworkString("Other")
+            net.Start("Branch")
+            do
+                net.Start("Other")
+            end
+            net.WriteString("x")
+            net.Broadcast()
+            "#,
+        );
+        assert_that!(count_network_diagnostics(&diagnostics), eq(1usize));
+    }
+
+    #[gtest]
     fn test_send_in_if_else_checks_payload_count() {
         let diagnostics = branch_send_receiver_diagnostics(
             None,
