@@ -4739,6 +4739,63 @@ mod tests {
     }
 
     #[gtest]
+    fn test_writes_after_a_start_in_a_branch_belong_to_the_started_message() {
+        let diagnostics = branch_send_receiver_diagnostics(
+            None,
+            r#"
+            util.AddNetworkString("Branch")
+            util.AddNetworkString("Other")
+            net.Start("Branch")
+            if GetConVar("sv_other"):GetBool() then
+                net.Start("Other")
+                net.WriteString("x")
+            end
+            net.Broadcast()
+            "#,
+        );
+        assert_that!(
+            count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteOrderMismatch),
+            eq(1usize)
+        );
+    }
+
+    #[gtest]
+    fn test_writes_before_a_start_in_a_branch_belong_to_the_earlier_message() {
+        let diagnostics = branch_send_receiver_diagnostics(
+            None,
+            r#"
+            util.AddNetworkString("Branch")
+            util.AddNetworkString("Other")
+            net.Start("Branch")
+            if GetConVar("sv_other"):GetBool() then
+                net.WriteString("x")
+                net.Start("Other")
+            end
+            net.Broadcast()
+            "#,
+        );
+        assert_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_start_in_a_repeat_body_ends_the_earlier_message() {
+        let diagnostics = branch_send_receiver_diagnostics(
+            None,
+            r#"
+            util.AddNetworkString("Branch")
+            util.AddNetworkString("Other")
+            net.Start("Branch")
+            repeat
+                net.Start("Other")
+            until true
+            net.WriteString("x")
+            net.Broadcast()
+            "#,
+        );
+        assert_that!(count_network_diagnostics(&diagnostics), eq(1usize));
+    }
+
+    #[gtest]
     fn test_start_in_a_do_block_ends_the_earlier_message() {
         let diagnostics = branch_send_receiver_diagnostics(
             None,

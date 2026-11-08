@@ -947,12 +947,20 @@ fn helper_sends(
             let mut stat_items = Vec::new();
             let mut send = None;
             for next_stat in stats.iter().skip(index + 1) {
-                let end = transaction_end(next_stat, |call| direct_transaction_end(site, call));
+                let TransactionScan { end, replaced } =
+                    transaction_end(next_stat, |call| direct_transaction_end(site, call));
                 if matches!(end, Some(TransactionEnd::Start)) {
                     break;
                 }
                 let mut items = Vec::new();
-                op_items(site, owner, &block, next_stat.syntax(), &mut items);
+                op_items_outside(
+                    site,
+                    owner,
+                    &block,
+                    next_stat.syntax(),
+                    &replaced,
+                    &mut items,
+                );
                 stat_items.push(items);
                 if let Some(TransactionEnd::Send { answer, .. }) = end {
                     send = Some(answer);
@@ -1566,7 +1574,9 @@ fn collect_net_send_flows(
     let mut send = None;
 
     for next_stat in stats_after(stat) {
-        match transaction_end(&next_stat, |call| helper_transaction_end(ctx, call)) {
+        let TransactionScan { end, replaced } =
+            transaction_end(&next_stat, |call| helper_transaction_end(ctx, call));
+        match end {
             Some(TransactionEnd::Start) => break,
             Some(TransactionEnd::Send { call, answer }) => {
                 // A send helper's own writes are not composed: one that can
@@ -1578,6 +1588,7 @@ fn collect_net_send_flows(
                         ctx,
                         block,
                         &next_stat,
+                        &replaced,
                         &mut writes,
                         &mut writes_opaque,
                     );
@@ -1594,7 +1605,14 @@ fn collect_net_send_flows(
             None => {}
         }
 
-        collect_net_write_ops_from_stat(ctx, block, &next_stat, &mut writes, &mut writes_opaque);
+        collect_net_write_ops_from_stat(
+            ctx,
+            block,
+            &next_stat,
+            &replaced,
+            &mut writes,
+            &mut writes_opaque,
+        );
     }
 
     let Some((send_range, send_kind, send_target, send_display_name)) = send else {
@@ -1639,6 +1657,15 @@ enum TransactionEnd {
     },
 }
 
+/// How a statement after a `net.Start` bears on that transaction.
+struct TransactionScan {
+    /// The first call that ends the transaction, if any.
+    end: Option<TransactionEnd>,
+    /// The parts that belong to a message another start in a branch or loop
+    /// body begins, from that start to the end of its body.
+    replaced: Vec<TextRange>,
+}
+
 /// The first call of `stat` that ends a transaction, in document order and
 /// at any depth, so a send chosen in an `if`/`else` ends it as a send
 /// statement does. Calls in closures `stat` defines run later and are skipped.
@@ -1648,18 +1675,18 @@ enum TransactionEnd {
 fn transaction_end(
     stat: &LuaStat,
     mut classify: impl FnMut(&LuaCallExpr) -> Option<TransactionEnd>,
-) -> Option<TransactionEnd> {
+) -> TransactionScan {
     let mut nodes = stat.syntax().preorder();
-    let mut skip_until = None;
+    let mut replaced = Vec::<TextRange>::new();
     while let Some(event) = nodes.next() {
         let rowan::WalkEvent::Enter(node) = event else {
             continue;
         };
-        if skip_until.is_some_and(|end| node.text_range().end() <= end) {
-            nodes.skip_subtree();
-            continue;
-        }
-        if LuaClosureExpr::can_cast(node.kind().into()) {
+        if replaced
+            .last()
+            .is_some_and(|range| range.contains_range(node.text_range()))
+            || LuaClosureExpr::can_cast(node.kind().into())
+        {
             nodes.skip_subtree();
             continue;
         }
@@ -1668,18 +1695,29 @@ fn transaction_end(
         };
         match classify(&call) {
             Some(TransactionEnd::Start) => match conditional_body(stat, &call) {
-                Some(body) => skip_until = Some(body.syntax().text_range().end()),
-                None => return Some(TransactionEnd::Start),
+                Some(body) => replaced.push(TextRange::new(
+                    call.get_range().start(),
+                    body.syntax().text_range().end(),
+                )),
+                None => {
+                    return TransactionScan {
+                        end: Some(TransactionEnd::Start),
+                        replaced,
+                    };
+                }
             },
-            Some(end) => return Some(end),
+            end @ Some(_) => return TransactionScan { end, replaced },
             None => {}
         }
     }
-    None
+    TransactionScan {
+        end: None,
+        replaced,
+    }
 }
 
 /// The innermost branch or loop body of `stat` that holds `call`, if any: a
-/// `do` block always runs, so it is not one.
+/// `do` block and a `repeat` body always run, so neither is one.
 fn conditional_body(stat: &LuaStat, call: &LuaCallExpr) -> Option<LuaBlock> {
     call.syntax()
         .ancestors()
@@ -1690,11 +1728,39 @@ fn conditional_body(stat: &LuaStat, call: &LuaCallExpr) -> Option<LuaBlock> {
                 .contains_range(block.syntax().text_range())
         })
         .find(|block| {
-            !block
-                .syntax()
-                .parent()
-                .is_some_and(|parent| glua_parser::LuaDoStat::can_cast(parent.kind().into()))
+            !block.syntax().parent().is_some_and(|parent| {
+                let kind = parent.kind().into();
+                glua_parser::LuaDoStat::can_cast(kind) || glua_parser::LuaRepeatStat::can_cast(kind)
+            })
         })
+}
+
+/// [`op_items`] of `subtree` without the parts in `replaced`, which belong to
+/// another message. They never lie inside a call outside a closure, so walking
+/// down to them visits what `op_items` would.
+fn op_items_outside(
+    site: &NetFileSite<'_>,
+    owner: Option<LuaSignatureId>,
+    block: &LuaBlock,
+    subtree: &LuaSyntaxNode,
+    replaced: &[TextRange],
+    out: &mut Vec<NetOpItem>,
+) {
+    let range = subtree.text_range();
+    if replaced.iter().any(|part| part.contains_range(range)) {
+        return;
+    }
+    if !replaced.iter().any(|part| {
+        range
+            .intersect(*part)
+            .is_some_and(|shared| !shared.is_empty())
+    }) {
+        op_items(site, owner, block, subtree, out);
+        return;
+    }
+    for child in subtree.children() {
+        op_items_outside(site, owner, block, &child, replaced, out);
+    }
 }
 
 /// How a call ends a transaction through its own net role.
@@ -1882,7 +1948,8 @@ fn collect_wrapped_net_send_flows(
     let mut send = None;
 
     for next_stat in stats_after(stat) {
-        let end = transaction_end(&next_stat, |call| direct_transaction_end(&ctx.site, call));
+        let TransactionScan { end, replaced } =
+            transaction_end(&next_stat, |call| direct_transaction_end(&ctx.site, call));
         if matches!(end, Some(TransactionEnd::Start)) {
             break;
         }
@@ -1892,6 +1959,7 @@ fn collect_wrapped_net_send_flows(
                     ctx,
                     block,
                     &next_stat,
+                    &replaced,
                     &mut writes,
                     &mut writes_opaque,
                 );
@@ -1906,7 +1974,14 @@ fn collect_wrapped_net_send_flows(
             break;
         }
 
-        collect_net_write_ops_from_stat(ctx, block, &next_stat, &mut writes, &mut writes_opaque);
+        collect_net_write_ops_from_stat(
+            ctx,
+            block,
+            &next_stat,
+            &replaced,
+            &mut writes,
+            &mut writes_opaque,
+        );
     }
 
     if let Some((send_range, send_kind, send_target, send_display_name)) = send {
@@ -2267,17 +2342,18 @@ fn helper_receive_body(
     (bodies, low)
 }
 
-/// The writes of `stat`, setting `opaque` when it calls a function nothing
-/// binds.
+/// The writes of `stat` outside the parts `replaced` gives to another message,
+/// setting `opaque` when it calls a function nothing binds.
 fn collect_net_write_ops_from_stat(
     ctx: &mut NetCollectCtx<'_>,
     block: &LuaBlock,
     stat: &LuaStat,
+    replaced: &[TextRange],
     writes: &mut Vec<NetOpEntry>,
     opaque: &mut bool,
 ) {
     let mut items = Vec::new();
-    op_items(&ctx.site, None, block, stat.syntax(), &mut items);
+    op_items_outside(&ctx.site, None, block, stat.syntax(), replaced, &mut items);
     compose_ops(ctx, &items, NetOpDirection::Write, &[], writes, opaque);
 }
 
