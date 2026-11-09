@@ -274,7 +274,10 @@ pub fn instantiate_doc_function(
         }
     }
 
-    let mut inst_ret_type = instantiate_type_generic(db, tpl_ret, substitutor);
+    let mut inst_ret_type = instantiate_return_str_tpl(
+        &instantiate_type_generic(db, tpl_ret, substitutor),
+        substitutor,
+    );
     // For variadic returns, if the instantiation is a tuple, expand the tuple
     if let LuaType::Variadic(_) = &&tpl_ret
         && let LuaType::Tuple(tuple) = &inst_ret_type
@@ -405,6 +408,54 @@ fn instantiate_table_generic(
     }
 
     LuaType::TableGeneric(new_params.into())
+}
+
+/// A returned `` `T` `` is the type its argument bound: the class a literal names,
+/// or the constraint for a name only known at runtime, and the constraint (or
+/// unknown) when no argument binds it. A parameter of that shape keeps the
+/// string it is.
+fn instantiate_return_str_tpl(ty: &LuaType, substitutor: &TypeSubstitutor) -> LuaType {
+    match ty {
+        LuaType::StrTplRef(str_tpl) => match substitutor.get(str_tpl.get_tpl_id()) {
+            Some(SubstitutorValue::Type(bound)) => bound.default().clone(),
+            _ => str_tpl
+                .get_constraint()
+                .cloned()
+                .unwrap_or(LuaType::Unknown),
+        },
+        LuaType::Instance(instance) => {
+            let base = instantiate_return_str_tpl(instance.get_base(), substitutor);
+            if &base == instance.get_base() {
+                ty.clone()
+            } else {
+                LuaType::Instance(instance.rebased(base).into())
+            }
+        }
+        LuaType::Union(union) => {
+            let members = union
+                .types()
+                .map(|member| instantiate_return_str_tpl(member, substitutor))
+                .collect::<Vec<_>>();
+            if members.iter().eq(union.types()) {
+                ty.clone()
+            } else {
+                LuaType::from_vec(members)
+            }
+        }
+        LuaType::Variadic(variadic) => match variadic.deref() {
+            VariadicType::Multi(types) => {
+                let types = types
+                    .iter()
+                    .map(|member| instantiate_return_str_tpl(member, substitutor))
+                    .collect::<Vec<_>>();
+                LuaType::Variadic(VariadicType::Multi(types).into())
+            }
+            VariadicType::Base(base) => LuaType::Variadic(
+                VariadicType::Base(instantiate_return_str_tpl(base, substitutor)).into(),
+            ),
+        },
+        _ => ty.clone(),
+    }
 }
 
 fn instantiate_tpl_ref(_: &DbIndex, tpl: &GenericTpl, substitutor: &TypeSubstitutor) -> LuaType {

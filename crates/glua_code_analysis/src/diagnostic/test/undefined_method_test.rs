@@ -2484,4 +2484,106 @@ end
             .collect::<Vec<_>>();
         assert_eq!(undefined_methods, ["Undefined method `Missing`. "]);
     }
+
+    const PANEL_API: &str = r#"
+        ---@meta
+        ---@class Panel
+        ---@field SetSize fun(self: Panel, w: number, h: number)
+        ---@field SetWide fun(self: Panel, w: number)
+    "#;
+
+    fn vgui_registration_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file("lua/annotations/panel.lua", PANEL_API);
+        ws
+    }
+
+    #[test]
+    fn vgui_register_without_base_inherits_panel() {
+        let mut ws = vgui_registration_workspace();
+        assert!(ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "gamemodes/test/gamemode/cl_nobase.lua",
+            r#"
+            local NOBASE = {}
+            function NOBASE:Init()
+                self:SetSize(10, 10)
+            end
+            vgui.Register("TestNoBase", NOBASE)
+            local panel = vgui.Create("TestNoBase")
+            panel:SetWide(5)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn vgui_register_without_base_satisfies_panel_constraint() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/annotations/vgui.lua",
+            r#"
+            ---@meta
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+            ---@class Panel
+            vgui = {}
+            ---@generic T: Panel
+            ---@[call_arg("gmod.vgui_panel", "define")]
+            ---@param classname string
+            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@param panelTable T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param baseName? string
+            ---@return T
+            function vgui.Register(classname, panelTable, baseName) end
+            "#,
+        );
+        assert!(ws.check_file_for(
+            DiagnosticCode::GenericConstraintMismatch,
+            "gamemodes/test/gamemode/cl_nobase.lua",
+            r#"
+            local NOBASE = {}
+            function NOBASE:Init() end
+            vgui.Register("TestNoBase", NOBASE)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn vgui_register_table_without_base_inherits_panel() {
+        let mut ws = vgui_registration_workspace();
+        assert!(ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "gamemodes/test/gamemode/cl_nobase_table.lua",
+            r#"
+            local NOBASE = {}
+            function NOBASE:Init()
+                self:SetSize(10, 10)
+            end
+            vgui.RegisterTable(NOBASE)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn derma_define_control_without_base_inherits_panel() {
+        let mut ws = vgui_registration_workspace();
+        assert!(ws.check_file_for(
+            DiagnosticCode::UndefinedMethod,
+            "gamemodes/test/gamemode/cl_nobase_control.lua",
+            r#"
+            local NOBASE = {}
+            function NOBASE:Init()
+                self:SetSize(10, 10)
+            end
+            derma.DefineControl("TestNoBaseControl", "", NOBASE)
+            "#,
+        ));
+    }
 }

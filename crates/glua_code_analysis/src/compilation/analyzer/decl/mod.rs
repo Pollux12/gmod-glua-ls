@@ -160,16 +160,10 @@ fn walk_node_enter(analyzer: &mut DeclAnalyzer, node: LuaAst) {
             } else {
                 analyzer.create_scope(stat.get_range(), LuaScopeKind::FuncStat);
             }
-            analyzer
-                .ops
-                .push(DeclOp::FunctionScopeRange(stat.get_range()));
             stats::analyze_func_stat(analyzer, stat);
         }
         LuaAst::LuaLocalFuncStat(stat) => {
             analyzer.create_scope(stat.get_range(), LuaScopeKind::FuncStat);
-            analyzer
-                .ops
-                .push(DeclOp::FunctionScopeRange(stat.get_range()));
             stats::analyze_local_func_stat(analyzer, stat);
         }
         LuaAst::LuaRepeatStat(stat) => {
@@ -183,6 +177,8 @@ fn walk_node_enter(analyzer: &mut DeclAnalyzer, node: LuaAst) {
         }
         LuaAst::LuaClosureExpr(expr) => {
             analyzer.create_scope(expr.get_range(), LuaScopeKind::Normal);
+            // A function statement's name is assigned where the statement runs,
+            // so only its closure, not the whole statement, is a function scope.
             analyzer
                 .ops
                 .push(DeclOp::FunctionScopeRange(expr.get_range()));

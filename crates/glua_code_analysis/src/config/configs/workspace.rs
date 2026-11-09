@@ -218,7 +218,7 @@ pub enum IgnoreDirDefaultEntry {
 pub struct IgnoreDirDefaultDefinition {
     /// Stable identifier. Built-in ids: `"git"`, `"github"`, `"claude"`, `"agents"`,
     /// `"gemini"`, `"vscode"`, `"idea"`, `"svn"`, `"hg"`, `"node-modules"`,
-    /// `"wire-expression2"`, `"wire-expression-files"`, `"tests"`, `"test"`.
+    /// `"wire-expression2"`, `"wire-expression-files"`, `"tests"`, `"gamemode-tests"`.
     /// Custom ids can be any non-empty string.
     pub id: String,
     /// Optional human-readable label (informational only).
@@ -290,11 +290,11 @@ fn builtin_ignore_dir_defaults() -> Vec<BuiltinIgnoreDirDefault> {
         },
         BuiltinIgnoreDirDefault {
             id: "tests",
-            glob: "**/tests/**",
+            glob: "**/lua/tests/**",
         },
         BuiltinIgnoreDirDefault {
-            id: "test",
-            glob: "**/test/**",
+            id: "gamemode-tests",
+            glob: "**/gamemode/tests/**",
         },
     ]
 }

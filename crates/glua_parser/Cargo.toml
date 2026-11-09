@@ -2,7 +2,7 @@
 name = "glua_parser"
 version = "0.1.5"
 edition = "2024"
-authors = ["Pollux12", "CppCXY"]
+authors = ["Pollux12"]
 description = "Parser for Garry's Mod Lua, Lua 5.x, and LuaJIT source files."
 license = "MIT"
 repository = "https://github.com/Pollux12/gmod-glua-ls"

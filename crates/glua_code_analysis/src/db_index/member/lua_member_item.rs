@@ -12,7 +12,7 @@ use crate::{
 use glua_parser::{BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, LuaSyntaxNode, PathTrait};
 use rowan::TextSize;
 
-use super::{LuaMemberId, LuaMemberOwner};
+use super::{LuaMemberFeature, LuaMemberId, LuaMemberOwner};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LuaMemberIndexItem {
@@ -456,7 +456,44 @@ impl<'a> OffsetVisibilityQuery<'a> {
             }
         }
         drop_overwritten_writer_indices(db, member_ids, &mut visible);
+        self.drop_later_method_decl_indices(member_ids, &mut visible);
         visible
+    }
+
+    /// Drops the `function x.y()` definitions the caller's file makes after the
+    /// caller in the same execution region, which have not run yet there,
+    /// when another definition before or outside the caller remains to name
+    /// what the access reads.
+    fn drop_later_method_decl_indices(&self, member_ids: &[LuaMemberId], visible: &mut Vec<usize>) {
+        let db = self.db;
+        let site = self.site;
+        let member_index = db.get_member_index();
+        let not_yet_run = |member_id: &LuaMemberId| {
+            member_id.file_id == site.file_id
+                && member_index.get_member(member_id).is_some_and(|member| {
+                    matches!(member.get_feature(), LuaMemberFeature::FileMethodDecl)
+                        && member.get_range().start() > site.position()
+                })
+                && same_file_define_shares_execution_region(
+                    db,
+                    *member_id,
+                    &site.file_id,
+                    site.position(),
+                )
+        };
+        let at_site = |member_id: &LuaMemberId| {
+            member_id.file_id == site.file_id
+                && member_index
+                    .get_member(member_id)
+                    .is_some_and(|member| member.get_range().contains(site.position()))
+        };
+        let has_prior_or_external = visible.iter().any(|&index| {
+            let member_id = &member_ids[index];
+            !not_yet_run(member_id) && !at_site(member_id)
+        });
+        if has_prior_or_external {
+            visible.retain(|&index| !not_yet_run(&member_ids[index]));
+        }
     }
 
     /// Whether any visible member is a function-scoped assignment the caller

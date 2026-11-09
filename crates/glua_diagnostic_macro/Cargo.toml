@@ -2,7 +2,7 @@
 name = "glua_diagnostic_macro"
 version = "0.1.5"
 edition = "2024"
-authors = ["Pollux12", "CppCXY"]
+authors = ["Pollux12"]
 description = "Proc-macro crate for generating diagnostics in gmod-glua-ls."
 license = "MIT"
 repository = "https://github.com/Pollux12/gmod-glua-ls"

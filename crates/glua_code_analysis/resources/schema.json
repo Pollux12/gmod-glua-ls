@@ -2710,12 +2710,12 @@
               "id": "wire-expression-files"
             },
             {
-              "glob": "**/tests/**",
+              "glob": "**/lua/tests/**",
               "id": "tests"
             },
             {
-              "glob": "**/test/**",
-              "id": "test"
+              "glob": "**/gamemode/tests/**",
+              "id": "gamemode-tests"
             }
           ],
           "description": "Default directories/globs to ignore. Accepts strings (legacy, replaces built-ins) or\nobjects with `id`, optional `label`, `glob`, and `disabled`. Objects start from the\nbuilt-in list and apply overrides: `disabled: true` removes a built-in by id; a new id\nadds a custom default; an existing id with a `glob` changes the built-in's pattern.\nSet `useDefaultIgnores` to `false` to suppress all resolved defaults at runtime.",
@@ -2817,7 +2817,7 @@
           ]
         },
         "id": {
-          "description": "Stable identifier. Built-in ids: `\"git\"`, `\"github\"`, `\"claude\"`, `\"agents\"`,\n`\"gemini\"`, `\"vscode\"`, `\"idea\"`, `\"svn\"`, `\"hg\"`, `\"node-modules\"`,\n`\"wire-expression2\"`, `\"wire-expression-files\"`, `\"tests\"`, `\"test\"`.\nCustom ids can be any non-empty string.",
+          "description": "Stable identifier. Built-in ids: `\"git\"`, `\"github\"`, `\"claude\"`, `\"agents\"`,\n`\"gemini\"`, `\"vscode\"`, `\"idea\"`, `\"svn\"`, `\"hg\"`, `\"node-modules\"`,\n`\"wire-expression2\"`, `\"wire-expression-files\"`, `\"tests\"`, `\"gamemode-tests\"`.\nCustom ids can be any non-empty string.",
           "type": "string"
         },
         "label": {
@@ -3279,12 +3279,12 @@
             "id": "wire-expression-files"
           },
           {
-            "glob": "**/tests/**",
+            "glob": "**/lua/tests/**",
             "id": "tests"
           },
           {
-            "glob": "**/test/**",
-            "id": "test"
+            "glob": "**/gamemode/tests/**",
+            "id": "gamemode-tests"
           }
         ],
         "ignoreGlobs": [],

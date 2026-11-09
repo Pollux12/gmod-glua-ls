@@ -355,6 +355,7 @@ function timer.Create(identifier, delay, repetitions, func) end
 function timer.Simple(delay, func) end
 
 ---@generic T: Panel
+---@overload fun(classname: string, parent?: Panel, name?: string): Panel?
 ---@[call_arg("gmod.vgui_panel", "reference")]
 ---@param className `T`
 ---@[call_arg("gmod.vgui_panel", "parent")]
