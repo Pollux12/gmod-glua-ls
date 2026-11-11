@@ -1,7 +1,7 @@
 use fern::Dispatch;
 use glua_code_analysis::{
     ConfigSources, EmmyLibraryItem, EmmyLuaAnalysis, Emmyrc, GmodTopology, UnpickedGamemodes,
-    WorkspaceConfigs, WorkspaceFolder, collect_workspace_files, detect_gamemode_base_libraries,
+    WorkspaceConfigs, WorkspaceFolder, collect_workspace_files, detect_gamemode_bases,
     load_configs, load_scoped_workspace_configs, scope_folders, update_code_style,
     workspace_collection_groups,
 };
@@ -175,15 +175,16 @@ fn annotations_library(annotations_path: PathBuf) -> Option<String> {
     Some(annotations_path.to_string_lossy().into_owned())
 }
 
-/// Auto-detect GMod gamemode base libraries from `<gamemodes>/<name>/<name>.txt`
-/// unless explicitly disabled via `gmod.autoDetectGamemodeBase = false`.
+/// Auto-detect GMod gamemode bases from `<gamemodes>/<name>/<name>.txt` into
+/// `gmod.gamemodeBases`, and their folders as libraries, unless explicitly
+/// disabled via `gmod.autoDetectGamemodeBase = false`.
 ///
 /// Detection roots are the actual workspace folders (with `main_path` as a
-/// sensible fallback when none were given), except a whole Garry's Mod folder
-/// that is scoped to its addons and gamemodes, whose built-in gamemodes the
-/// annotations cover. `config_root` is intentionally
-/// NOT used as a detection root: when `--config` points outside the project
-/// it would scan the wrong directory.
+/// sensible fallback when none were given). A whole Garry's Mod folder that is
+/// scoped to its addons and gamemodes adds no libraries: it loads its custom
+/// gamemodes itself and the annotations cover the built-in ones. `config_root`
+/// is intentionally NOT used as a detection root: when `--config` points
+/// outside the project it would scan the wrong directory.
 ///
 /// Detected paths are appended to `emmyrc.workspace.library` as
 /// `EmmyLibraryItem::Path`, deduped against existing entries via canonical
@@ -206,7 +207,6 @@ pub(crate) fn apply_gamemode_base_detection(
     // Normalize: file path -> parent dir; dedupe by canonical path.
     let mut seen_canon: HashSet<PathBuf> = HashSet::new();
     let mut normalized: Vec<PathBuf> = Vec::new();
-    let scoped = |dir: &Path| !emmyrc.gmod.load_everything && GmodTopology::discover(dir).is_some();
     for root in raw_roots {
         let dir = if root.is_file() {
             match root.parent() {
@@ -216,9 +216,6 @@ pub(crate) fn apply_gamemode_base_detection(
         } else {
             root
         };
-        if scoped(&dir) {
-            continue;
-        }
         let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
         if seen_canon.insert(key) {
             normalized.push(dir);
@@ -226,7 +223,12 @@ pub(crate) fn apply_gamemode_base_detection(
     }
 
     for root in &normalized {
-        for detected in detect_gamemode_base_libraries(root) {
+        let found = detect_gamemode_bases(root);
+        emmyrc.gmod.gamemode_bases.extend(found.bases);
+        if !emmyrc.gmod.load_everything && GmodTopology::discover(root).is_some() {
+            continue;
+        }
+        for detected in found.libraries {
             let detected_str = detected.to_string_lossy().into_owned();
             let detected_canon = detected.canonicalize().unwrap_or_else(|_| detected.clone());
             let already_present = emmyrc.workspace.library.iter().any(|item| {
@@ -487,6 +489,64 @@ mod tests {
             annotations_library(PathBuf::from("src")).map(PathBuf::from),
             Some(current.join("src"))
         );
+    }
+
+    /// A gamemode's `self` and `GAMEMODE` know the `GM:` methods of the
+    /// gamemode its manifest derives from, with `--config` as without it.
+    #[tokio::test]
+    async fn a_base_gamemode_method_resolves_with_and_without_a_config_path() {
+        let root = make_workspace().join("garrysmod");
+        let annotations = make_workspace();
+        fs::write(
+            annotations.join("gm.lua"),
+            "---@meta\n---@class GM\nGM = {}\n\n---@type GM\nGAMEMODE = nil\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("addons")).unwrap();
+        write_gamemode(&root, "parent", Some("sandbox"));
+        write_gamemode(&root, "child", Some("parent"));
+        let gamemode_file = |name: &str| root.join(format!("gamemodes/{name}/gamemode/shared.lua"));
+        for (name, body) in [
+            ("parent", "function GM:ParentMethod() end\n"),
+            (
+                "child",
+                "function GM:ChildMethod()\n    return self:ParentMethod()\nend\n\nGAMEMODE:ParentMethod()\n",
+            ),
+        ] {
+            fs::create_dir_all(gamemode_file(name).parent().unwrap()).unwrap();
+            fs::write(gamemode_file(name), body).unwrap();
+        }
+        let config_path = root.join(".gluarc.json");
+        fs::write(&config_path, "{}").unwrap();
+
+        let mut undefined = Vec::new();
+        for config_paths in [None, Some(vec![config_path])] {
+            let analysis = load_workspace(
+                root.clone(),
+                vec![root.clone()],
+                config_paths,
+                None,
+                Some(annotations.clone()),
+            )
+            .await
+            .expect("workspace should load");
+            let uri = glua_code_analysis::file_path_to_uri(&gamemode_file("child"))
+                .expect("URI should parse");
+            let file_id = analysis.get_file_id(&uri).expect("child gamemode loads");
+            undefined.push(
+                analysis
+                    .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|diag| diag.message.contains("ParentMethod"))
+                    .map(|diag| diag.message)
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        assert_eq!(undefined, [Vec::<String>::new(), Vec::new()]);
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+        let _ = fs::remove_dir_all(annotations);
     }
 
     /// Each addon of a whole Garry's Mod folder is collected with its own
