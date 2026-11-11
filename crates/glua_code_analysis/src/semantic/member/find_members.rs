@@ -1162,7 +1162,7 @@ fn append_dynamic_fields_for_type(
     if !ctx.dynamic_fields || !crate::db_index::derivation::dynamic_fields_visible() {
         return false;
     }
-    let emmyrc = db.get_emmyrc();
+    let emmyrc = db.get_optional_file_emmyrc(ctx.file_id);
     if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
         return false;
     }
@@ -1256,7 +1256,7 @@ fn append_dynamic_fields_for_table(
     if !ctx.dynamic_fields || !crate::db_index::derivation::dynamic_fields_visible() {
         return false;
     }
-    let emmyrc = db.get_emmyrc();
+    let emmyrc = db.get_optional_file_emmyrc(ctx.file_id);
     if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
         return false;
     }

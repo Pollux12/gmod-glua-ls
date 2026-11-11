@@ -385,7 +385,12 @@ fn check_ref_type_compact_table_generic(
         {
             continue;
         }
-        match infer_raw_member_type(context.db, table_generic, &source_member.key) {
+        match infer_raw_member_type(
+            context.db,
+            context.file_id,
+            table_generic,
+            &source_member.key,
+        ) {
             Ok(read_type) => check_general_type_compact(
                 context,
                 &source_member.typ,

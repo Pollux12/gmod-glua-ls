@@ -55,9 +55,8 @@ pub(crate) fn evaluate_load_call_sites(db: &mut DbIndex, context: &mut AnalyzeCo
     if !db.get_emmyrc().gmod.enabled {
         return;
     }
-    let prefixes = formatted_hook_prefixes(db);
     let roles = call_role_entries(db);
-    collect_annotated_call_sites_with(db, context, &prefixes, &roles.roles, true, false);
+    collect_annotated_call_sites_with(db, context, &roles.roles, true, false);
 }
 
 /// One file's hook, system and realm metadata, read off the index; `None`
@@ -72,7 +71,7 @@ pub(crate) fn compute_pre(
         return None;
     }
     let roles = call_role_entries(db);
-    let prefixes = formatted_hook_prefixes(db);
+    let prefixes = formatted_hook_prefixes(db, file_id);
     let mut metadata = collect_file_gmod_metadata(db, file_id, &prefixes, &roles.roles);
     metadata.scope = collect_scoped_file_plan(db, file_id, &scopes.files);
     Some(metadata)
@@ -205,9 +204,8 @@ pub(crate) fn evaluate_class_call_sites(db: &mut DbIndex, context: &mut AnalyzeC
     if !db.get_emmyrc().gmod.enabled {
         return;
     }
-    let prefixes = formatted_hook_prefixes(db);
     let roles = call_role_entries(db);
-    collect_annotated_call_sites_with(db, context, &prefixes, &roles.roles, false, true);
+    collect_annotated_call_sites_with(db, context, &roles.roles, false, true);
 }
 
 /// One file's synthesized scripted-class members, registrations and numeric

@@ -24,7 +24,7 @@ pub fn infer_array_member(
 
     match key {
         LuaIndexKey::Integer(i) => {
-            if !db.get_emmyrc().strict.array_index {
+            if !db.get_file_emmyrc(cache.get_file_id()).strict.array_index {
                 return Ok(array_type.get_base().clone());
             }
 
@@ -71,7 +71,7 @@ pub fn infer_array_member(
                 let result_type = match &base_type {
                     LuaType::Any | LuaType::Unknown => base_type.clone(),
                     _ => {
-                        if db.get_emmyrc().strict.array_index {
+                        if db.get_file_emmyrc(cache.get_file_id()).strict.array_index {
                             TypeOps::Union.apply(db, base_type, &LuaType::Nil)
                         } else {
                             base_type.clone()

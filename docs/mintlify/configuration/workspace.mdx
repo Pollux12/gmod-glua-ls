@@ -14,7 +14,7 @@ These settings live under `workspace` in `.gluarc.json`. For the common cases, s
 | `workspace.ignoreGlobs` | `[]` | Glob patterns of files to skip |
 | `workspace.useDefaultIgnores` | `true` | Skip the built-in list of folders below |
 | `workspace.ignoreDirDefaults` | built-in list | Change the built-in list |
-| `workspace.enableIsolation` | `false` | In a multi-root workspace, analyze each folder on its own instead of together |
+| `workspace.enableIsolation` | `false` | In a multi-root workspace, keep each folder to its own code and libraries, so it cannot use another folder's functions and classes. It stays on only when every folder turns it on |
 | `workspace.workspaceRoots` | `[]` | Extra folders to treat as roots for `require` paths |
 | `workspace.packageDirs` | `[]` | Load only these folders from their parent library |
 | `workspace.moduleMap` | `[]` | Rewrite `require` paths with regex rules |

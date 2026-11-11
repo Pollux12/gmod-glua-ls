@@ -41,8 +41,7 @@ mod test;
 mod test_lib;
 
 pub use initialized::{
-    ClientConfig, apply_workspace_diagnostic_configs, init_analysis, initialized_handler,
-    refresh_open_document_features,
+    ClientConfig, init_analysis, initialized_handler, refresh_open_document_features,
 };
 use lsp_types::{ClientCapabilities, ServerCapabilities};
 pub use notification_handler::on_notification_handler;
@@ -51,7 +50,11 @@ pub use response_handler::on_response_handler;
 pub(crate) use text_document::apply_file_system_changes;
 pub use text_document::on_did_change_text_document;
 #[cfg(test)]
-pub(crate) use text_document::on_did_close_document;
+pub(crate) use text_document::{
+    on_did_change_watched_files, on_did_close_document, on_did_open_text_document,
+};
+#[cfg(test)]
+pub(crate) use workspace::on_did_change_workspace_folders;
 
 pub trait RegisterCapabilities {
     fn register_capabilities(

@@ -663,7 +663,7 @@ fn get_mutated_params(
                         _ => is_direct_closure,
                     }
                 } else if is_direct_closure {
-                    var_writes_param(db, &var, param_name)
+                    var_writes_param(db, file_id, &var, param_name)
                 } else {
                     false
                 };
@@ -813,7 +813,9 @@ fn collect_call_site_param_types(
                 let Some(param_name) = signature.params.get(param_idx) else {
                     continue;
                 };
-                if !has_gmod_param_name_hint(db, param_name) && !installs_on_arg {
+                if !has_gmod_param_name_hint(db, signature_id.get_file_id(), param_name)
+                    && !installs_on_arg
+                {
                     continue;
                 }
             }
@@ -1441,7 +1443,7 @@ fn signature_has_authoritative_receiver(db: &DbIndex, signature_id: LuaSignature
 }
 
 /// Whether `var` rebinds or writes into the parameter; a named field on an unhinted one installs instead.
-fn var_writes_param(db: &DbIndex, var: &LuaVarExpr, param_name: &str) -> bool {
+fn var_writes_param(db: &DbIndex, file_id: FileId, var: &LuaVarExpr, param_name: &str) -> bool {
     match var {
         LuaVarExpr::NameExpr(name_expr) => name_expr
             .get_name_text()
@@ -1450,7 +1452,7 @@ fn var_writes_param(db: &DbIndex, var: &LuaVarExpr, param_name: &str) -> bool {
             index_expr
                 .get_prefix_expr()
                 .is_some_and(|expr| expr_reads_param(&expr, param_name))
-                && (has_gmod_param_name_hint(db, param_name) || !writes_named_field(var))
+                && (has_gmod_param_name_hint(db, file_id, param_name) || !writes_named_field(var))
         }
     }
 }
@@ -1473,12 +1475,15 @@ fn expr_reads_param(expr: &LuaExpr, param_name: &str) -> bool {
     }
 }
 
-fn has_gmod_param_name_hint(db: &DbIndex, param_name: &str) -> bool {
-    if !db.get_emmyrc().gmod.enabled {
+/// Whether the config of `file_id`, the file declaring the parameter, names a
+/// type for `param_name`.
+fn has_gmod_param_name_hint(db: &DbIndex, file_id: FileId, param_name: &str) -> bool {
+    let emmyrc = db.get_file_emmyrc(file_id);
+    if !emmyrc.gmod.enabled {
         return false;
     }
 
-    let hints = &db.get_emmyrc().gmod.file_param_defaults;
+    let hints = &emmyrc.gmod.file_param_defaults;
     if hints.is_empty() {
         return false;
     }

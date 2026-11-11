@@ -13,7 +13,7 @@ pub fn check_array_type_compact(
     compact_type: &LuaType,
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
-    let source_base = if context.db.get_emmyrc().strict.array_index {
+    let source_base = if context.emmyrc.strict.array_index {
         TypeOps::Union.apply(context.db, source_base, &LuaType::Nil)
     } else {
         source_base.clone()
@@ -107,7 +107,7 @@ fn check_array_type_compact_ref_def(
     compact_type: &LuaType,
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
-    let Some(members) = find_index_operations(context.db, compact_type) else {
+    let Some(members) = find_index_operations(context.db, context.file_id, compact_type) else {
         return Err(TypeCheckFailReason::TypeNotMatch);
     };
 

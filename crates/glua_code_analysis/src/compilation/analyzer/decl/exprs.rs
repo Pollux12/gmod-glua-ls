@@ -371,7 +371,12 @@ pub fn analyze_literal_expr(analyzer: &mut DeclAnalyzer, expr: LuaLiteralExpr) -
 
     match literal {
         LuaLiteralToken::String(string_token) => {
-            if !analyzer.db.get_emmyrc().references.short_string_search {
+            if !analyzer
+                .db
+                .get_file_emmyrc(file_id)
+                .references
+                .short_string_search
+            {
                 return Some(());
             }
 
@@ -484,7 +489,11 @@ fn try_declare_define_baseclass_local(
 }
 
 fn try_analyze_legacy_module_call(analyzer: &mut DeclAnalyzer, expr: &LuaCallExpr) -> Option<()> {
-    let runtime_version = analyzer.db.get_emmyrc().runtime.version;
+    let runtime_version = analyzer
+        .db
+        .get_file_emmyrc(analyzer.get_file_id())
+        .runtime
+        .version;
     if !matches!(
         runtime_version,
         EmmyrcLuaVersion::Lua51 | EmmyrcLuaVersion::LuaJIT

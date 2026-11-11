@@ -113,6 +113,9 @@ pub struct DbIndex {
     /// The global paths each file's syntax names.
     role_mentions: CowShards<FileId, Arc<[smol_str::SmolStr]>>,
     emmyrc: Arc<Emmyrc>,
+    /// The config of each main workspace, which its files are analysed with
+    /// in place of `emmyrc`.
+    root_emmyrcs: Arc<FxHashMap<WorkspaceId, Arc<Emmyrc>>>,
     /// Each file's gmod helper scan with its fingerprint when stored.
     helper_scans: CowShards<FileId, (Arc<dyn derivation::DerivedFact>, derivation::Fingerprint)>,
     /// The set of files in `helper_scans`.
@@ -302,6 +305,7 @@ impl DbIndex {
             call_role_fingerprints: Default::default(),
             role_mentions: Default::default(),
             emmyrc: Arc::new(Emmyrc::default()),
+            root_emmyrcs: Arc::default(),
             helper_scans: Default::default(),
             helper_scan_files: derivation::SetFingerprint::default(),
             load_scans: Default::default(),
@@ -1411,10 +1415,45 @@ impl DbIndex {
         Arc::make_mut(&mut self.vfs).update_config(config.clone());
         Arc::make_mut(&mut self.modules_index).update_config(config.clone());
         self.emmyrc = config;
+        self.root_emmyrcs = Arc::default();
     }
 
+    /// The config shared by every workspace: what files are parsed and
+    /// indexed with together. Analysis reads [`Self::get_file_emmyrc`].
     pub fn get_emmyrc(&self) -> &Emmyrc {
         &self.emmyrc
+    }
+
+    /// The config of each workspace with one of its own.
+    pub fn get_root_emmyrcs(&self) -> &FxHashMap<WorkspaceId, Arc<Emmyrc>> {
+        &self.root_emmyrcs
+    }
+
+    /// Analyses the files of each main workspace in `configs` with its config.
+    pub fn set_root_emmyrcs(&mut self, configs: FxHashMap<WorkspaceId, Arc<Emmyrc>>) {
+        self.root_emmyrcs = Arc::new(configs);
+    }
+
+    /// The config the files of `workspace_id` are analysed with.
+    pub fn get_workspace_emmyrc(&self, workspace_id: WorkspaceId) -> &Arc<Emmyrc> {
+        self.root_emmyrcs.get(&workspace_id).unwrap_or(&self.emmyrc)
+    }
+
+    /// [`Self::get_file_emmyrc`] for a file that may not be known.
+    pub fn get_optional_file_emmyrc(&self, file_id: Option<FileId>) -> &Arc<Emmyrc> {
+        file_id.map_or(&self.emmyrc, |file_id| self.get_file_emmyrc(file_id))
+    }
+
+    /// The config `file_id` is analysed with: its workspace's, or else the
+    /// shared one.
+    pub fn get_file_emmyrc(&self, file_id: FileId) -> &Arc<Emmyrc> {
+        if self.root_emmyrcs.is_empty() {
+            return &self.emmyrc;
+        }
+        self.modules_index
+            .get_untracked_workspace_id(file_id)
+            .and_then(|workspace_id| self.root_emmyrcs.get(&workspace_id))
+            .unwrap_or(&self.emmyrc)
     }
 
     pub fn get_effective_resource_paths(&self) -> Vec<PathBuf> {
@@ -1470,6 +1509,7 @@ impl DbIndex {
             call_role_fingerprints: self.call_role_fingerprints.clone(),
             role_mentions: self.role_mentions.clone(),
             emmyrc: Arc::clone(&self.emmyrc),
+            root_emmyrcs: Arc::clone(&self.root_emmyrcs),
             helper_scans: self.helper_scans.clone(),
             helper_scan_files: self.helper_scan_files,
             load_scans: self.load_scans.clone(),
@@ -1503,6 +1543,7 @@ impl DbIndex {
                     $($field: cow_shards::TaskFork::task_fork(&self.$field),)*
                     vfs: Arc::clone(&self.vfs),
                     emmyrc: Arc::clone(&self.emmyrc),
+                    root_emmyrcs: Arc::clone(&self.root_emmyrcs),
                     derivations: Arc::clone(&self.derivations),
                     gmod_call_roles: self.gmod_call_roles.clone(),
                     type_structure_revision: self.type_structure_revision,

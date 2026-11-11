@@ -11,7 +11,7 @@ use crate::{
     codestyle::apply_workspace_code_style_off_workers,
     context::{
         FileDiagnostic, LoadedConfig, LspFeatures, ProgressTask, ServerContextSnapshot, StatusBar,
-        WorkspaceFileMatcher, get_client_id, load_emmy_config_off_workers,
+        WorkspaceFileMatcher, get_client_id, load_scoped_config_off_workers, send_projects_changed,
         validate_gmod_annotations_for_ls,
     },
     handlers::{
@@ -22,9 +22,8 @@ use crate::{
 };
 pub use client_config::{ClientConfig, client_config_sections, get_client_config};
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, FileId, LuaDiagnosticConfig, Slice, WorkspaceFolder,
-    calculate_include_and_exclude, collect_workspace_files, fetch_schema_urls, file_path_to_uri,
-    uri_to_file_path,
+    EmmyLuaAnalysis, Emmyrc, FileId, Slice, WorkspaceFolder, calculate_include_and_exclude,
+    collect_workspace_files, fetch_schema_urls, file_path_to_uri, uri_to_file_path,
 };
 use lsp_types::{InitializeParams, MessageType, ShowMessageParams, Uri};
 use tokio::sync::RwLock;
@@ -71,6 +70,7 @@ pub async fn initialized_handler(
         log::info!("set workspace folders: {:?}", workspace_folders);
         let mut workspace_manager = context.workspace_manager().write().await;
         workspace_manager.workspace_folders = workspace_folders.clone();
+        workspace_manager.scoped_folders = workspace_folders.clone();
         log::info!("workspace folders set");
     }
 
@@ -86,27 +86,6 @@ pub async fn initialized_handler(
                 // Only use VSCode path if CLI didn't provide one
                 if client_config.gmod_annotations_path.is_none() {
                     client_config.gmod_annotations_path = Some(path_str.to_string());
-                }
-            }
-        }
-
-        // Extract gamemode base libraries detected by the VSCode extension
-        if let Some(libraries) = init_options.get("gamemodeBaseLibraries") {
-            if let Some(arr) = libraries.as_array() {
-                for lib in arr {
-                    if let Some(lib_str) = lib.as_str() {
-                        if !lib_str.is_empty() {
-                            client_config
-                                .gamemode_base_libraries
-                                .push(lib_str.to_string());
-                        }
-                    }
-                }
-                if !client_config.gamemode_base_libraries.is_empty() {
-                    log::info!(
-                        "Received gamemode base libraries from VSCode: {:?}",
-                        client_config.gamemode_base_libraries
-                    );
                 }
             }
         }
@@ -131,11 +110,13 @@ pub async fn initialized_handler(
     // init config
     watchdog_status.set_phase("Loading GLuaLS configuration");
     log::info!("loading GLuaLS configuration");
-    let config_roots = workspace_folders
-        .iter()
-        .map(|workspace| workspace.root.clone())
-        .collect();
-    let loaded = load_emmy_config_off_workers(config_roots, client_config.clone()).await;
+    let open_paths = context.workspace_manager().read().await.open_file_paths();
+    let (scoped_folders, loaded) = load_scoped_config_off_workers(
+        workspace_folders.clone(),
+        open_paths,
+        client_config.clone(),
+    )
+    .await;
     let emmyrc = loaded.emmyrc.clone();
     apply_workspace_code_style_off_workers(workspace_folders.clone(), emmyrc.clone()).await;
     log::info!("configuration loaded");
@@ -178,6 +159,7 @@ pub async fn initialized_handler(
             WorkspaceFileMatcher::new(include, exclude, exclude_dir);
         workspace_manager.per_root_matchers = loaded.workspace_matchers.clone();
         workspace_manager.loaded_config = Some(loaded.clone());
+        workspace_manager.scoped_folders = scoped_folders.clone();
         log::info!("workspace manager updated with client config and watch file patterns");
         workspace_manager.open_workspace_files()
     };
@@ -188,12 +170,13 @@ pub async fn initialized_handler(
         context.status_bar(),
         context.file_diagnostic(),
         context.lsp_features(),
-        workspace_folders,
-        loaded,
+        scoped_folders.clone(),
+        loaded.clone(),
         open_files,
         watchdog_status.clone(),
     )
     .await;
+    send_projects_changed(context.client(), workspace_folders, loaded, scoped_folders).await;
 
     register_files_watch(context.clone(), &params.capabilities).await;
     register_did_change_configuration(context.client(), context.lsp_features(), client_id);
@@ -219,7 +202,6 @@ pub async fn init_analysis(
 ) {
     let LoadedConfig {
         emmyrc,
-        workspace_diagnostic_configs,
         workspace_emmyrcs,
         ..
     } = loaded;
@@ -238,32 +220,22 @@ pub async fn init_analysis(
     );
     log::info!("preparing workspace folders for initial indexing");
 
-    let workspace_roots = workspace_folders
-        .into_iter()
-        .map(|workspace| workspace.root)
-        .collect::<Vec<_>>();
-
-    let mut workspace_collection_groups: Vec<(Arc<Emmyrc>, Vec<WorkspaceFolder>)> = Vec::new();
-    if workspace_roots.is_empty() {
-        workspace_collection_groups.push((
+    let workspace_collection_groups = if workspace_folders.is_empty() {
+        vec![(
             emmyrc.clone(),
-            glua_code_analysis::workspace_collection_folders(None, emmyrc.as_ref()),
-        ));
+            glua_code_analysis::workspace_collection_folders(
+                None,
+                emmyrc.as_ref(),
+                &mut HashSet::new(),
+            ),
+        )]
     } else {
-        for workspace_root in workspace_roots {
-            let workspace_config = workspace_emmyrcs
-                .get(&workspace_root)
-                .cloned()
-                .unwrap_or_else(|| emmyrc.clone());
-            workspace_collection_groups.push((
-                workspace_config.clone(),
-                glua_code_analysis::workspace_collection_folders(
-                    Some(workspace_root),
-                    workspace_config.as_ref(),
-                ),
-            ));
-        }
-    }
+        glua_code_analysis::workspace_collection_groups(
+            workspace_folders,
+            &emmyrc,
+            &workspace_emmyrcs,
+        )
+    };
 
     watchdog_status.set_phase("Collecting Lua files");
     status_bar.update_startup_phase(
@@ -327,9 +299,8 @@ pub async fn init_analysis(
             .iter()
             .flat_map(|(_, workspace_group)| workspace_group),
     );
-    let rebuild = mut_analysis.apply_config(emmyrc.clone()).affects_index() || roots_moved;
-
-    apply_workspace_diagnostic_configs(&mut mut_analysis, &workspace_diagnostic_configs);
+    let applied = mut_analysis.apply_configs(emmyrc.clone(), &workspace_emmyrcs);
+    let rebuild = applied.shared.affects_index() || !applied.files.is_empty() || roots_moved;
 
     // The editor owns an open document's text: disk text would replace the
     // unsaved edits it holds.
@@ -472,23 +443,6 @@ fn uncollected_files(
 }
 
 /// Gives each workspace root that has its own diagnostic config that config.
-pub fn apply_workspace_diagnostic_configs(
-    analysis: &mut EmmyLuaAnalysis,
-    workspace_diagnostic_configs: &HashMap<PathBuf, LuaDiagnosticConfig>,
-) {
-    let configs = workspace_diagnostic_configs
-        .iter()
-        .filter_map(|(root, config)| {
-            let workspace_id = analysis.get_workspace_id_for_root(root)?;
-            log::info!("setting per-workspace diagnostic config for {root:?} ({workspace_id:?})");
-            Some((workspace_id, Arc::new(config.clone())))
-        })
-        .collect::<HashMap<_, _>>();
-    if !configs.is_empty() {
-        analysis.set_workspace_diagnostic_configs(configs);
-    }
-}
-
 /// Asks the client to request again the open documents' semantic tokens,
 /// inlay hints and code lenses.
 pub fn refresh_open_document_features(

@@ -111,7 +111,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum EmmyrcNonStdSymbol {
     #[serde(rename = "//")]
     DoubleSlash = 1, // "//"

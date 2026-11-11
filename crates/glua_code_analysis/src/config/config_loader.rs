@@ -1,8 +1,4 @@
-use std::{
-    error::Error,
-    fmt,
-    path::{Path, PathBuf},
-};
+use std::{error::Error, fmt, path::PathBuf};
 
 use serde::de::IntoDeserializer;
 use serde_json::Value;
@@ -10,7 +6,25 @@ use serde_path_to_error::{Path as SerdePath, Segment};
 
 use crate::{config::lua_loader::load_lua_config, read_file_with_encoding};
 
-use super::{Emmyrc, flatten_config::FlattenConfigObject};
+use super::{Emmyrc, flatten_config::FlattenConfigObject, pre_process::resolve_config_paths};
+
+/// A config file and the folder its relative paths resolve against, when that
+/// is not the root being configured: an ancestor's file resolves against the
+/// ancestor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigFile {
+    pub path: PathBuf,
+    pub resolve_against: Option<PathBuf>,
+}
+
+impl From<PathBuf> for ConfigFile {
+    fn from(path: PathBuf) -> Self {
+        Self {
+            path,
+            resolve_against: None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum ConfigLoadError {
@@ -66,7 +80,11 @@ struct ConfigLayer {
     source: Option<PathBuf>,
 }
 
-fn load_config_file(config_file: &Path) -> Result<Value, ConfigLoadError> {
+fn load_config_file(config_file: &ConfigFile) -> Result<Value, ConfigLoadError> {
+    let ConfigFile {
+        path: config_file,
+        resolve_against,
+    } = config_file;
     log::info!("Loading config file: {:?}", config_file);
     let config_content =
         read_file_with_encoding(config_file, "utf-8").ok_or_else(|| ConfigLoadError::Read {
@@ -85,11 +103,15 @@ fn load_config_file(config_file: &Path) -> Result<Value, ConfigLoadError> {
         })?
     };
 
-    Ok(normalize_to_emmyrc_json(config_value))
+    let mut config_value = normalize_to_emmyrc_json(config_value);
+    if let Some(folder) = resolve_against {
+        resolve_config_paths(&mut config_value, folder);
+    }
+    Ok(config_value)
 }
 
 fn load_config_layers_impl(
-    config_files: &[PathBuf],
+    config_files: &[ConfigFile],
     partial_emmyrcs: Option<Vec<Value>>,
     strict: bool,
 ) -> Result<Vec<ConfigLayer>, ConfigLoadError> {
@@ -99,7 +121,7 @@ fn load_config_layers_impl(
         match load_config_file(config_file) {
             Ok(value) => config_layers.push(ConfigLayer {
                 value,
-                source: Some(config_file.clone()),
+                source: Some(config_file.path.clone()),
             }),
             Err(error) if strict => return Err(error),
             Err(error) => log::error!("{error}"),
@@ -133,7 +155,7 @@ fn merge_config_layers(config_layers: Vec<ConfigLayer>) -> Value {
 }
 
 fn load_configs_raw_impl(
-    config_files: &[PathBuf],
+    config_files: &[ConfigFile],
     partial_emmyrcs: Option<Vec<Value>>,
     strict: bool,
 ) -> Result<Value, ConfigLoadError> {
@@ -141,22 +163,38 @@ fn load_configs_raw_impl(
     Ok(merge_config_layers(config_layers))
 }
 
+fn into_config_files(config_files: Vec<PathBuf>) -> Vec<ConfigFile> {
+    config_files.into_iter().map(ConfigFile::from).collect()
+}
+
 pub fn load_configs_raw(config_files: Vec<PathBuf>, partial_emmyrcs: Option<Vec<Value>>) -> Value {
-    load_configs_raw_impl(&config_files, partial_emmyrcs, false).unwrap_or_else(|error| {
-        log::error!("{error}");
-        Value::Object(Default::default())
-    })
+    load_configs_raw_impl(&into_config_files(config_files), partial_emmyrcs, false).unwrap_or_else(
+        |error| {
+            log::error!("{error}");
+            Value::Object(Default::default())
+        },
+    )
 }
 
 pub fn try_load_configs(
     config_files: Vec<PathBuf>,
     partial_emmyrcs: Option<Vec<Value>>,
 ) -> Result<Emmyrc, ConfigLoadError> {
-    let config_layers = load_config_layers_impl(&config_files, partial_emmyrcs, true)?;
+    let config_layers =
+        load_config_layers_impl(&into_config_files(config_files), partial_emmyrcs, true)?;
     deserialize_config_layers_ignoring_invalid_values(config_layers)
 }
 
 pub fn load_configs(config_files: Vec<PathBuf>, partial_emmyrcs: Option<Vec<Value>>) -> Emmyrc {
+    load_layered_configs(into_config_files(config_files), partial_emmyrcs)
+}
+
+/// The config `config_files` layer into, lowest priority first, then
+/// `partial_emmyrcs`. A layer overrides only the keys it sets.
+pub fn load_layered_configs(
+    config_files: Vec<ConfigFile>,
+    partial_emmyrcs: Option<Vec<Value>>,
+) -> Emmyrc {
     load_config_layers_impl(&config_files, partial_emmyrcs, false)
         .and_then(deserialize_config_layers_ignoring_invalid_values)
         .unwrap_or_else(|error| {

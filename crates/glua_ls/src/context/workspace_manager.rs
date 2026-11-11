@@ -1,25 +1,23 @@
 use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
 use std::path::Path;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use super::{ClientProxy, DebouncedAnalysis, FileDiagnostic, StatusBar};
 use crate::codestyle::apply_workspace_code_style_off_workers;
-use crate::context::ServerContextSnapshot;
 use crate::context::lsp_features::LspFeatures;
+use crate::context::{ServerContextSnapshot, send_projects_changed};
 use crate::handlers::{
-    ClientConfig, apply_file_system_changes, apply_workspace_diagnostic_configs, init_analysis,
-    refresh_open_document_features,
+    ClientConfig, apply_file_system_changes, init_analysis, refresh_open_document_features,
 };
 use crate::util::{LongRunningWatchdogStatus, spawn_long_running_watchdog};
 use glua_code_analysis::uri_to_file_path;
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, EmmyrcChange, LuaDiagnosticConfig, WorkspaceFolder, WorkspaceImport,
-    calculate_include_and_exclude, load_configs,
+    ConfigSources, EmmyLuaAnalysis, Emmyrc, EmmyrcChange, UnpickedGamemodes, WorkspaceConfigs,
+    WorkspaceFolder, WorkspaceImport, calculate_include_and_exclude, config_files_in,
+    load_scoped_workspace_configs,
 };
 use log::{debug, info};
 use lsp_types::Uri;
-use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use wax::Pattern;
@@ -32,6 +30,8 @@ pub struct WorkspaceManager {
     recheck_token: Arc<Mutex<Option<Arc<QuietPeriod>>>>,
     /// The config reload still waiting out its delay.
     config_token: Arc<Mutex<Option<Arc<QuietPeriod>>>>,
+    /// The client settings change still waiting for its burst to end.
+    settings_token: Arc<Mutex<Option<Arc<QuietPeriod>>>>,
     /// Held while a config reload compares and applies, so reloads apply in
     /// the order they load.
     config_apply: Arc<Mutex<()>>,
@@ -39,7 +39,12 @@ pub struct WorkspaceManager {
     lsp_features: Arc<LspFeatures>,
     debounced_analysis: Arc<DebouncedAnalysis>,
     pub client_config: ClientConfig,
+    /// The client's workspace folders.
     pub workspace_folders: Vec<WorkspaceFolder>,
+    /// The folders they load: a whole Garry's Mod folder as its addons and
+    /// gamemodes, each its own root, then itself for the open files outside
+    /// them; any other folder as it is.
+    pub scoped_folders: Vec<WorkspaceFolder>,
     pub watcher: Option<notify::RecommendedWatcher>,
     pub current_open_files: HashSet<Uri>,
     /// Fallback matcher used when no workspace-root-specific matcher applies
@@ -68,8 +73,10 @@ impl WorkspaceManager {
             status_bar,
             client_config: ClientConfig::default(),
             workspace_folders: Vec::new(),
+            scoped_folders: Vec::new(),
             recheck_token: Arc::new(Mutex::new(None)),
             config_token: Arc::new(Mutex::new(None)),
+            settings_token: Arc::new(Mutex::new(None)),
             config_apply: Arc::new(Mutex::new(())),
             file_diagnostic,
             lsp_features,
@@ -117,6 +124,16 @@ impl WorkspaceManager {
         });
     }
 
+    /// The quiet period a client settings change waits out before the settings
+    /// are read; a change made while an earlier one still waits cancels it.
+    pub async fn begin_settings_change(&self, quiet: Duration) -> Arc<QuietPeriod> {
+        let token = Arc::new(QuietPeriod::new(quiet));
+        if let Some(waiting) = self.settings_token.lock().await.replace(token.clone()) {
+            waiting.cancel();
+        }
+        token
+    }
+
     /// Loads the config again and applies it with only the work its change
     /// from the loaded config needs, returning that change.
     pub async fn reload_config(workspace_manager: Arc<RwLock<WorkspaceManager>>) -> EmmyrcChange {
@@ -133,19 +150,20 @@ impl WorkspaceManager {
                 manager.debounced_analysis.clone(),
             )
         };
-        let (workspace_folders, client_config) = {
+        let (workspace_folders, client_config, open_paths) = {
             let manager = workspace_manager.read().await;
             (
                 manager.workspace_folders.clone(),
                 manager.client_config.clone(),
+                manager.open_file_paths(),
             )
         };
 
         let watchdog_status = LongRunningWatchdogStatus::new("Reloading GLuaLS configuration");
         let _watchdog =
             spawn_long_running_watchdog("workspace config reload", watchdog_status.clone());
-        let loaded =
-            load_emmy_config_off_workers(collect_config_roots(&workspace_folders), client_config)
+        let (scoped_folders, loaded) =
+            load_scoped_config_off_workers(workspace_folders.clone(), open_paths, client_config)
                 .await;
         let (change, open_files) = {
             let mut manager = workspace_manager.write().await;
@@ -155,6 +173,12 @@ impl WorkspaceManager {
                 .map_or(EmmyrcChange::Workspace, |previous| {
                     loaded.change_from(previous)
                 });
+            // Only a workspace change loads the scope it read. Any other
+            // change keeps the scope the loaded files match, so the documents
+            // opened or closed since it was applied still scope it again.
+            if change == EmmyrcChange::Workspace {
+                manager.scoped_folders = scoped_folders.clone();
+            }
             if change != EmmyrcChange::Unchanged {
                 manager.per_root_matchers = loaded.workspace_matchers.clone();
                 let (include, exclude, exclude_dir) = calculate_include_and_exclude(&loaded.emmyrc);
@@ -180,12 +204,13 @@ impl WorkspaceManager {
                     &status_bar,
                     &file_diagnostic,
                     &lsp_features,
-                    workspace_folders,
-                    loaded,
+                    scoped_folders.clone(),
+                    loaded.clone(),
                     open_files,
                     watchdog_status,
                 )
                 .await;
+                send_projects_changed(&client, workspace_folders, loaded, scoped_folders).await;
             }
             EmmyrcChange::Editor | EmmyrcChange::Diagnostics | EmmyrcChange::Analysis => {
                 if change >= EmmyrcChange::Diagnostics {
@@ -195,19 +220,18 @@ impl WorkspaceManager {
                     )
                     .await;
                 }
-                let affects_index = {
-                    let mut analysis = analysis.write().await;
-                    let applied = analysis.apply_config(loaded.emmyrc.clone());
-                    apply_workspace_diagnostic_configs(
-                        &mut analysis,
-                        &loaded.workspace_diagnostic_configs,
-                    );
-                    applied.affects_index()
-                };
-                if affects_index {
+                let applied = analysis
+                    .write()
+                    .await
+                    .apply_configs(loaded.emmyrc.clone(), &loaded.workspace_emmyrcs);
+                if applied.shared.affects_index() {
                     // The rebuild re-diagnoses every file and refreshes the
                     // open documents' views once it settles.
                     debounced_analysis.request_rebuild();
+                } else if !applied.files.is_empty() {
+                    // Only the roots whose own config reaches the index are
+                    // analysed again, and their files diagnosed.
+                    debounced_analysis.request_rebuild_files(applied.files);
                 } else {
                     if change != EmmyrcChange::Diagnostics {
                         refresh_open_document_features(&client, &lsp_features);
@@ -277,6 +301,34 @@ impl WorkspaceManager {
         });
     }
 
+    /// Held while the workspace is scoped again, so a config reload and the
+    /// documents opening and closing scope it one at a time.
+    pub fn scope_lock(&self) -> Arc<Mutex<()>> {
+        self.config_apply.clone()
+    }
+
+    /// Whether `uri` lies in a workspace folder that loads only part of
+    /// itself: a whole Garry's Mod folder.
+    pub fn in_scoped_folder(&self, uri: &Uri) -> bool {
+        let Some(path) = uri_to_file_path(uri) else {
+            return false;
+        };
+        self.workspace_folders
+            .iter()
+            .any(|folder| path.starts_with(&folder.root) && !self.scoped_folders.contains(folder))
+    }
+
+    /// The paths of the open documents.
+    pub fn open_file_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self
+            .current_open_files
+            .iter()
+            .filter_map(uri_to_file_path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
     /// The open documents the workspace admits, as it would on their opening.
     pub fn open_workspace_files(&self) -> HashSet<Uri> {
         self.current_open_files
@@ -287,7 +339,7 @@ impl WorkspaceManager {
     }
 
     /// Whether `uri` is where the workspace loads config from: directly in a
-    /// workspace root.
+    /// workspace folder or in one of the folders it loads.
     pub fn is_workspace_config_file(&self, uri: &Uri) -> bool {
         uri_to_file_path(uri)
             .as_deref()
@@ -295,14 +347,25 @@ impl WorkspaceManager {
             .is_some_and(|dir| {
                 self.workspace_folders
                     .iter()
+                    .chain(&self.scoped_folders)
                     .any(|workspace| workspace.root == dir)
             })
+    }
+
+    /// Whether `uri` lies in a workspace folder or in one of the folders it loads.
+    pub fn in_workspace_folder(&self, uri: &Uri) -> bool {
+        uri_to_file_path(uri).is_some_and(|path| {
+            self.workspace_folders
+                .iter()
+                .chain(&self.scoped_folders)
+                .any(|workspace| path.starts_with(&workspace.root))
+        })
     }
 
     pub fn is_workspace_file(&self, uri: &Uri) -> bool {
         is_workspace_file_inner(
             uri,
-            &self.workspace_folders,
+            &self.scoped_folders,
             &self.per_root_matchers,
             &self.match_file_pattern,
         )
@@ -351,6 +414,7 @@ fn is_workspace_file_inner(
     let inside_import = match &workspace.import {
         WorkspaceImport::All => true,
         WorkspaceImport::SubPaths(paths) => paths.iter().any(|p| relative.starts_with(p)),
+        WorkspaceImport::None => false,
     };
 
     if !inside_import {
@@ -367,41 +431,32 @@ fn is_workspace_file_inner(
     matcher.is_match(&file_path, &relative)
 }
 
-fn collect_config_roots(workspace_folders: &[WorkspaceFolder]) -> Vec<PathBuf> {
-    dedup_paths(
-        workspace_folders
-            .iter()
-            .map(|workspace| workspace.root.clone())
-            .collect(),
-    )
-}
-
-fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
-    let mut deduped = Vec::new();
-    for path in paths {
-        if seen.insert(path.clone()) {
-            deduped.push(path);
-        }
-    }
-
-    deduped
-}
-
 #[derive(Clone, Default)]
 pub struct LoadedConfig {
     /// The workspace roots the config was loaded for.
     pub roots: Vec<PathBuf>,
     pub emmyrc: Arc<Emmyrc>,
-    pub workspace_diagnostic_configs: HashMap<PathBuf, LuaDiagnosticConfig>,
     pub workspace_emmyrcs: HashMap<PathBuf, Arc<Emmyrc>>,
     /// Per-workspace-root file matchers built from each root's individual config.
     /// Used by `WorkspaceManager::is_workspace_file` to avoid cross-root leakage
     /// of `useDefaultIgnores` / `ignoreDirDefaults` settings.
     pub workspace_matchers: HashMap<PathBuf, WorkspaceFileMatcher>,
+    /// The roots with a config file of their own.
+    pub local_config_roots: HashSet<PathBuf>,
 }
 
 impl LoadedConfig {
+    fn new(configs: WorkspaceConfigs) -> Self {
+        log::info!("loaded emmyrc complete");
+        LoadedConfig {
+            workspace_matchers: build_workspace_matchers(&configs.root_emmyrcs),
+            roots: configs.roots,
+            emmyrc: configs.emmyrc,
+            workspace_emmyrcs: configs.root_emmyrcs,
+            local_config_roots: configs.local_config_roots,
+        }
+    }
+
     /// How far moving from `previous` to this config reaches, across the
     /// merged config and every root's own.
     pub fn change_from(&self, previous: &LoadedConfig) -> EmmyrcChange {
@@ -411,316 +466,102 @@ impl LoadedConfig {
         self.roots
             .iter()
             .map(|root| previous.root_emmyrc(root).change_to(self.root_emmyrc(root)))
-            .fold(previous.emmyrc.change_to(&self.emmyrc), Ord::max)
+            .fold(previous.emmyrc.shared_change_to(&self.emmyrc), Ord::max)
     }
 
     /// The config `root` is collected and diagnosed with.
-    fn root_emmyrc(&self, root: &Path) -> &Emmyrc {
+    pub fn root_emmyrc(&self, root: &Path) -> &Emmyrc {
         self.workspace_emmyrcs.get(root).unwrap_or(&self.emmyrc)
     }
 }
 
-/// [`load_emmy_config`] on a blocking thread: it reads every config file.
-pub async fn load_emmy_config_off_workers(
-    config_roots: Vec<PathBuf>,
+/// [`load_scoped_config`] on a blocking thread: it reads every config file
+/// and the folders' layout.
+pub async fn load_scoped_config_off_workers(
+    folders: Vec<WorkspaceFolder>,
+    open: Vec<PathBuf>,
     client_config: ClientConfig,
-) -> LoadedConfig {
-    tokio::task::spawn_blocking(move || load_emmy_config(config_roots, client_config))
+) -> (Vec<WorkspaceFolder>, LoadedConfig) {
+    tokio::task::spawn_blocking(move || load_scoped_config(&folders, &open, client_config))
         .await
         .unwrap_or_else(|err| std::panic::resume_unwind(err.into_panic()))
 }
 
+/// The folders the client's `folders` load, scoped by their own config and
+/// the files in `open`, and the config they load with.
+pub fn load_scoped_config(
+    folders: &[WorkspaceFolder],
+    open: &[PathBuf],
+    client_config: ClientConfig,
+) -> (Vec<WorkspaceFolder>, LoadedConfig) {
+    let prepare = |emmyrc: &mut Emmyrc| prepare_client_config(&client_config, emmyrc);
+    let (scoped_folders, configs) = load_scoped_workspace_configs(
+        folders,
+        open,
+        UnpickedGamemodes::None,
+        &config_sources(&client_config, &prepare),
+    );
+    (scoped_folders, LoadedConfig::new(configs))
+}
+
+/// The folders the client's `folders` load with `loaded` and the files in
+/// `open`.
+pub fn scope_folders(
+    folders: &[WorkspaceFolder],
+    loaded: &LoadedConfig,
+    open: &[PathBuf],
+) -> Vec<WorkspaceFolder> {
+    glua_code_analysis::scope_folders(folders, open, UnpickedGamemodes::None, |root| {
+        loaded.root_emmyrc(root)
+    })
+}
+
+#[cfg(test)]
 pub fn load_emmy_config(config_roots: Vec<PathBuf>, client_config: ClientConfig) -> LoadedConfig {
-    // Config load priority.
-    // * Global `<os-specific home-dir>` config files.
-    // * Global `<os-specific config-dir>/glua_ls` config files.
-    // * Environment-specified config at the $EMMYLUALS_CONFIG path.
-    // * Local workspace config files.
-    //
-    // Merge order in one directory (low → high priority):
-    // `.luarc.json` → `.emmyrc.json` → `.emmyrc.lua`.
-    // This preserves LuaLS compatibility defaults while allowing Emmy configs to override.
-    let luarc_file = ".luarc.json";
-    let emmyrc_file = ".emmyrc.json";
-    let emmyrc_lua_file = ".emmyrc.lua";
-    let mut global_config_files = Vec::new();
-
-    let home_dir = dirs::home_dir();
-    if let Some(home_dir) = home_dir {
-        push_configs_from_dir(
-            &mut global_config_files,
-            &home_dir,
-            luarc_file,
-            emmyrc_file,
-            emmyrc_lua_file,
-        );
-    };
-
-    let emmylua_config_dir = "gluals";
-    let config_dir = dirs::config_dir().map(|path| path.join(emmylua_config_dir));
-    if let Some(config_dir) = config_dir {
-        push_configs_from_dir(
-            &mut global_config_files,
-            &config_dir,
-            luarc_file,
-            emmyrc_file,
-            emmyrc_lua_file,
-        );
-    };
-
-    std::env::var("GLUALS_CONFIG")
-        .inspect(|path| {
-            let config_path = std::path::PathBuf::from(path);
-            if config_path.exists() {
-                info!("load config from: {:?}", config_path);
-                global_config_files.push(config_path);
-            }
-        })
-        .ok();
-
-    let config_roots = dedup_paths(config_roots);
-    let mut config_files = global_config_files.clone();
-    push_configs_from_preferred_workspace_root(
-        &mut config_files,
-        &config_roots,
-        luarc_file,
-        emmyrc_file,
-        emmyrc_lua_file,
-    );
-
-    let mut emmyrc = load_configs(config_files, client_config.partial_emmyrcs.clone());
-    merge_client_config(&client_config, &mut emmyrc);
-
-    // Inject GMod annotations path if provided and not explicitly disabled
-    inject_gmod_annotations(&client_config, &mut emmyrc);
-
-    // Inject gamemode base libraries if detected and not explicitly disabled.
-    // For the global merged config we don't have a single workspace root, so
-    // pass `None`; per-root detection happens in `pre_process_emmyrc_for_all_roots`.
-    inject_gamemode_base_libraries(&client_config, &mut emmyrc, None);
-
-    let (workspace_diagnostic_configs, workspace_emmyrcs) = pre_process_emmyrc_for_all_roots(
-        &mut emmyrc,
-        &config_roots,
-        &global_config_files,
-        &client_config,
-        luarc_file,
-        emmyrc_file,
-        emmyrc_lua_file,
-    );
-
-    log::info!("loaded emmyrc complete");
-    let workspace_matchers = build_workspace_matchers(&workspace_emmyrcs);
-    LoadedConfig {
-        roots: config_roots,
-        emmyrc: emmyrc.into(),
-        workspace_diagnostic_configs,
-        workspace_emmyrcs,
-        workspace_matchers,
-    }
+    let prepare = |emmyrc: &mut Emmyrc| prepare_client_config(&client_config, emmyrc);
+    LoadedConfig::new(glua_code_analysis::load_workspace_configs(
+        config_roots,
+        &HashSet::new(),
+        &HashSet::new(),
+        &HashMap::new(),
+        &config_sources(&client_config, &prepare),
+    ))
 }
 
-fn pre_process_emmyrc_for_all_roots(
-    emmyrc: &mut Emmyrc,
-    config_roots: &[PathBuf],
-    global_config_files: &[PathBuf],
+/// Every root's config reads, lowest priority first, the config files in
+/// the home directory, in `<os-specific config-dir>/gluals` and at
+/// `$GLUALS_CONFIG`, then its own, then the client's settings.
+fn config_sources<'a>(
     client_config: &ClientConfig,
-    luarc_file: &str,
-    emmyrc_file: &str,
-    emmyrc_lua_file: &str,
-) -> (
-    HashMap<PathBuf, LuaDiagnosticConfig>,
-    HashMap<PathBuf, Arc<Emmyrc>>,
-) {
-    let mut workspace_diagnostic_configs = HashMap::new();
-    let mut workspace_emmyrcs = HashMap::new();
-
-    if config_roots.is_empty() {
-        return (workspace_diagnostic_configs, workspace_emmyrcs);
+    prepare: &'a dyn Fn(&mut Emmyrc),
+) -> ConfigSources<'a> {
+    let mut global_files = Vec::new();
+    if let Some(home_dir) = dirs::home_dir() {
+        global_files.extend(config_files_in(&home_dir));
     }
-
-    let mut workspace_configs = Vec::new();
-
-    for workspace_root in config_roots {
-        let local_config_files =
-            collect_config_files_from_dir(workspace_root, luarc_file, emmyrc_file, emmyrc_lua_file);
-        let has_local_config = !local_config_files.is_empty();
-
-        let mut workspace_config_files = global_config_files.to_vec();
-        workspace_config_files.extend(local_config_files);
-
-        let mut workspace_emmyrc = load_configs(
-            workspace_config_files,
-            client_config.partial_emmyrcs.clone(),
-        );
-        merge_client_config(client_config, &mut workspace_emmyrc);
-        inject_gmod_annotations(client_config, &mut workspace_emmyrc);
-        inject_gamemode_base_libraries(
-            client_config,
-            &mut workspace_emmyrc,
-            Some(workspace_root.as_path()),
-        );
-        workspace_emmyrc.pre_process_emmyrc(workspace_root);
-        workspace_configs.push((workspace_root.clone(), workspace_emmyrc, has_local_config));
+    if let Some(config_dir) = dirs::config_dir() {
+        global_files.extend(config_files_in(&config_dir.join("gluals")));
     }
-
-    // Isolation can only stay enabled if all workspace configs keep it enabled.
-    let isolation_enabled = workspace_configs
-        .iter()
-        .all(|(_, workspace_emmyrc, _)| workspace_emmyrc.workspace.enable_isolation);
-
-    if isolation_enabled {
-        let mut merged_emmyrc: Option<Emmyrc> = None;
-        for (workspace_root, workspace_emmyrc, _) in &workspace_configs {
-            workspace_diagnostic_configs.insert(
-                workspace_root.clone(),
-                LuaDiagnosticConfig::new(workspace_emmyrc),
-            );
-            workspace_emmyrcs.insert(workspace_root.clone(), Arc::new(workspace_emmyrc.clone()));
-
-            if let Some(merged) = merged_emmyrc.as_mut() {
-                merge_isolated_workspace_fields(merged, workspace_emmyrc);
-            } else {
-                merged_emmyrc = Some(workspace_emmyrc.clone());
-            }
+    if let Ok(path) = std::env::var("GLUALS_CONFIG") {
+        let config_path = PathBuf::from(path);
+        if config_path.exists() {
+            global_files.push(config_path);
         }
-
-        if let Some(merged_emmyrc) = merged_emmyrc {
-            *emmyrc = merged_emmyrc;
-        }
-
-        return (workspace_diagnostic_configs, workspace_emmyrcs);
     }
-
-    // isolation disabled: build one global merged config while keeping
-    // local workspace configs as optional overrides only where present.
-    let baseline_index = workspace_configs
-        .iter()
-        .position(|(_, _, has_local)| *has_local)
-        .unwrap_or(0);
-
-    let mut merged_emmyrc = workspace_configs
-        .get(baseline_index)
-        .map(|(_, cfg, _)| cfg.clone())
-        .unwrap_or_else(|| emmyrc.clone());
-
-    for (index, (workspace_root, workspace_emmyrc, has_local_config)) in
-        workspace_configs.into_iter().enumerate()
-    {
-        if has_local_config {
-            workspace_diagnostic_configs.insert(
-                workspace_root.clone(),
-                LuaDiagnosticConfig::new(&workspace_emmyrc),
-            );
-            workspace_emmyrcs.insert(workspace_root.clone(), Arc::new(workspace_emmyrc.clone()));
-        }
-
-        if index == baseline_index {
-            continue;
-        }
-
-        merge_emmyrc_prefer_existing_with_array_union(&mut merged_emmyrc, &workspace_emmyrc);
+    for file in &global_files {
+        info!("load config from: {:?}", file);
     }
-
-    // This branch is only entered when at least one workspace disabled isolation.
-    merged_emmyrc.workspace.enable_isolation = false;
-
-    *emmyrc = merged_emmyrc;
-
-    (workspace_diagnostic_configs, workspace_emmyrcs)
-}
-
-fn merge_isolated_workspace_fields(merged: &mut Emmyrc, workspace_emmyrc: &Emmyrc) {
-    extend_unique(
-        &mut merged.workspace.workspace_roots,
-        workspace_emmyrc.workspace.workspace_roots.clone(),
-    );
-    extend_unique(
-        &mut merged.workspace.library,
-        workspace_emmyrc.workspace.library.clone(),
-    );
-    extend_unique(
-        &mut merged.workspace.package_dirs,
-        workspace_emmyrc.workspace.package_dirs.clone(),
-    );
-    extend_unique(
-        &mut merged.workspace.ignore_dir,
-        workspace_emmyrc.workspace.ignore_dir.clone(),
-    );
-    extend_unique(
-        &mut merged.workspace.ignore_dir_defaults,
-        workspace_emmyrc.workspace.ignore_dir_defaults.clone(),
-    );
-    extend_unique(
-        &mut merged.workspace.ignore_globs,
-        workspace_emmyrc.workspace.ignore_globs.clone(),
-    );
-    merged.workspace.use_default_ignores =
-        merged.workspace.use_default_ignores || workspace_emmyrc.workspace.use_default_ignores;
-    merged.workspace.enable_isolation =
-        merged.workspace.enable_isolation && workspace_emmyrc.workspace.enable_isolation;
-    extend_unique(
-        &mut merged.runtime.extensions,
-        workspace_emmyrc.runtime.extensions.clone(),
-    );
-    extend_unique(
-        &mut merged.runtime.require_pattern,
-        workspace_emmyrc.runtime.require_pattern.clone(),
-    );
-    extend_unique(
-        &mut merged.resource.paths,
-        workspace_emmyrc.resource.paths.clone(),
-    );
-}
-
-fn merge_emmyrc_prefer_existing_with_array_union(merged: &mut Emmyrc, incoming: &Emmyrc) {
-    let Ok(mut merged_value) = serde_json::to_value(&*merged) else {
-        return;
-    };
-    let Ok(incoming_value) = serde_json::to_value(incoming) else {
-        return;
-    };
-
-    merge_value_prefer_existing_with_array_union(&mut merged_value, incoming_value);
-
-    if let Ok(new_merged) = serde_json::from_value::<Emmyrc>(merged_value) {
-        *merged = new_merged;
+    ConfigSources {
+        global_files,
+        partial_emmyrcs: client_config.partial_emmyrcs.clone(),
+        prepare,
     }
 }
 
-fn merge_value_prefer_existing_with_array_union(base: &mut Value, overlay: Value) {
-    match (base, overlay) {
-        (Value::Object(base_map), Value::Object(overlay_map)) => {
-            for (key, overlay_value) in overlay_map {
-                if let Some(base_value) = base_map.get_mut(&key) {
-                    merge_value_prefer_existing_with_array_union(base_value, overlay_value);
-                } else {
-                    base_map.insert(key, overlay_value);
-                }
-            }
-        }
-        (Value::Array(base_array), Value::Array(overlay_array)) => {
-            let mut seen = HashSet::new();
-            for item in base_array.iter() {
-                if let Ok(key) = serde_json::to_string(item) {
-                    seen.insert(key);
-                }
-            }
-
-            for item in overlay_array {
-                if let Ok(key) = serde_json::to_string(&item) {
-                    if seen.insert(key) {
-                        base_array.push(item);
-                    }
-                } else if !base_array.contains(&item) {
-                    base_array.push(item);
-                }
-            }
-        }
-        _ => {
-            // Keep existing scalar/object value on conflict.
-        }
-    }
+/// Applies the client's settings and its annotations to `emmyrc`.
+fn prepare_client_config(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
+    merge_client_config(client_config, emmyrc);
+    inject_gmod_annotations(client_config, emmyrc);
 }
 
 /// Build a per-workspace-root `WorkspaceFileMatcher` map from the per-root
@@ -742,78 +583,6 @@ fn build_workspace_matchers(
             )
         })
         .collect()
-}
-
-fn extend_unique<T>(target: &mut Vec<T>, incoming: Vec<T>)
-where
-    T: Eq + Hash + Clone,
-{
-    let mut seen: HashSet<T> = target.iter().cloned().collect();
-    for item in incoming {
-        if seen.insert(item.clone()) {
-            target.push(item);
-        }
-    }
-}
-
-fn push_configs_from_dir(
-    config_files: &mut Vec<PathBuf>,
-    dir: &Path,
-    luarc_file: &str,
-    emmyrc_file: &str,
-    emmyrc_lua_file: &str,
-) {
-    let dir_configs = collect_config_files_from_dir(dir, luarc_file, emmyrc_file, emmyrc_lua_file);
-    for config_file in dir_configs {
-        info!("load config from: {:?}", config_file);
-        config_files.push(config_file);
-    }
-}
-
-fn push_configs_from_preferred_workspace_root(
-    config_files: &mut Vec<PathBuf>,
-    config_roots: &[PathBuf],
-    luarc_file: &str,
-    emmyrc_file: &str,
-    emmyrc_lua_file: &str,
-) {
-    for config_root in config_roots {
-        let dir_configs =
-            collect_config_files_from_dir(config_root, luarc_file, emmyrc_file, emmyrc_lua_file);
-
-        if dir_configs.is_empty() {
-            continue;
-        }
-
-        info!("using preferred workspace config root: {:?}", config_root);
-        for config_file in dir_configs {
-            info!("load config from: {:?}", config_file);
-            config_files.push(config_file);
-        }
-        break;
-    }
-}
-
-fn collect_config_files_from_dir(
-    dir: &Path,
-    luarc_file: &str,
-    emmyrc_file: &str,
-    emmyrc_lua_file: &str,
-) -> Vec<PathBuf> {
-    // .gluarc.json is the GMod-specific config — if present, it takes exclusive priority
-    // and no other config files in this directory are considered.
-    let gluarc = dir.join(".gluarc.json");
-    if gluarc.exists() {
-        return vec![gluarc];
-    }
-    [
-        dir.join(luarc_file),
-        dir.join(emmyrc_file),
-        dir.join(emmyrc_lua_file),
-    ]
-    .into_iter()
-    .filter(|path| path.exists())
-    .collect()
 }
 
 fn merge_client_config(client_config: &ClientConfig, emmyrc: &mut Emmyrc) -> Option<()> {
@@ -1012,71 +781,6 @@ fn directory_contains_lua_file(dir: &Path) -> bool {
     false
 }
 
-/// Inject gamemode base libraries detected by the VSCode extension.
-///
-/// When a gamemode derives from a base gamemode (e.g., cityrp derives from
-/// sandbox), the base gamemode's folder is added as a library so that the
-/// language server can resolve references to code defined in the base.
-///
-/// This is controlled by `gmod.autoDetectGamemodeBase` — set to `false` to
-/// disable.
-///
-/// `workspace_root` is optional: when provided, the server will additionally
-/// scan that root for `gamemodes/<name>/<name>.txt` metadata files and follow
-/// the `"base"` chain to detect parent gamemode folders. This is editor-agnostic
-/// (works for `glua_check`, Neovim, etc.) and complements the VSCode extension's
-/// `gamemodeBaseLibraries` initialization option.
-fn inject_gamemode_base_libraries(
-    client_config: &ClientConfig,
-    emmyrc: &mut Emmyrc,
-    workspace_root: Option<&Path>,
-) {
-    // Check if explicitly disabled in config
-    if matches!(emmyrc.gmod.auto_detect_gamemode_base, Some(false)) {
-        log::info!("Gamemode base auto-detection explicitly disabled in config");
-        return;
-    }
-
-    let mut candidate_paths: Vec<String> = client_config.gamemode_base_libraries.to_vec();
-
-    if let Some(root) = workspace_root {
-        for path in glua_code_analysis::detect_gamemode_base_libraries(root) {
-            // Convert to lossy string for comparison/storage; library paths
-            // are stored as strings in `EmmyLibraryItem::Path`.
-            candidate_paths.push(path.to_string_lossy().into_owned());
-        }
-    }
-
-    if candidate_paths.is_empty() {
-        return;
-    }
-
-    use glua_code_analysis::EmmyLibraryItem;
-    for lib_path in &candidate_paths {
-        if emmyrc
-            .workspace
-            .library
-            .iter()
-            .any(|item| item.get_path() == lib_path)
-        {
-            log::info!(
-                "Gamemode base library already exists in workspace library: {}",
-                lib_path
-            );
-            continue;
-        }
-
-        emmyrc
-            .workspace
-            .library
-            .push(EmmyLibraryItem::Path(lib_path.clone()));
-        log::info!(
-            "Gamemode base library added to workspace library: {}",
-            lib_path
-        );
-    }
-}
-
 /// A wait for a quiet period: each [`Self::extend`] while it runs waits one
 /// period more.
 #[derive(Debug)]
@@ -1192,14 +896,15 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use glua_code_analysis::{DiagnosticCode, Emmyrc, WorkspaceFolder, collect_workspace_files};
+    use glua_code_analysis::{
+        DiagnosticCode, Emmyrc, LuaDiagnosticConfig, WorkspaceFolder, collect_workspace_files,
+    };
 
     use crate::handlers::ClientConfig;
 
     use super::{
-        WorkspaceFileMatcher, collect_config_files_from_dir, collect_config_roots, dedup_paths,
-        directory_contains_lua_file, inject_gmod_annotations, load_emmy_config,
-        push_configs_from_preferred_workspace_root, resolve_gmod_annotations_path,
+        WorkspaceFileMatcher, directory_contains_lua_file, inject_gmod_annotations,
+        load_emmy_config, load_scoped_config, resolve_gmod_annotations_path,
         validate_gmod_annotations_for_ls,
     };
 
@@ -1220,112 +925,6 @@ mod tests {
 
     fn touch(path: &Path) {
         fs::write(path, "{}").expect("failed to create temp config file");
-    }
-
-    #[test]
-    fn test_collect_config_files_from_dir_gluarc_json_takes_exclusive_priority() {
-        let dir = create_temp_dir();
-        let gluarc_json = dir.join(".gluarc.json");
-        let emmyrc_json = dir.join(".emmyrc.json");
-        let luarc_json = dir.join(".luarc.json");
-        touch(&gluarc_json);
-        touch(&emmyrc_json);
-        touch(&luarc_json);
-
-        let files =
-            collect_config_files_from_dir(&dir, ".luarc.json", ".emmyrc.json", ".emmyrc.lua");
-
-        assert_eq!(files, vec![gluarc_json]);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn test_collect_config_files_from_dir_orders_luarc_then_emmyrc_json() {
-        let dir = create_temp_dir();
-        let emmyrc_json = dir.join(".emmyrc.json");
-        let luarc_json = dir.join(".luarc.json");
-        touch(&emmyrc_json);
-        touch(&luarc_json);
-
-        let files =
-            collect_config_files_from_dir(&dir, ".luarc.json", ".emmyrc.json", ".emmyrc.lua");
-
-        assert_eq!(files, vec![luarc_json, emmyrc_json]);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn test_collect_config_files_from_dir_orders_emmyrc_lua_last() {
-        let dir = create_temp_dir();
-        let emmyrc_lua = dir.join(".emmyrc.lua");
-        let emmyrc_json = dir.join(".emmyrc.json");
-        let luarc_json = dir.join(".luarc.json");
-        touch(&emmyrc_lua);
-        touch(&emmyrc_json);
-        touch(&luarc_json);
-
-        let files =
-            collect_config_files_from_dir(&dir, ".luarc.json", ".emmyrc.json", ".emmyrc.lua");
-
-        assert_eq!(files, vec![luarc_json, emmyrc_json, emmyrc_lua]);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn test_dedup_paths_preserves_order() {
-        let path_a = PathBuf::from("/workspace/a");
-        let path_b = PathBuf::from("/workspace/b");
-        let paths = vec![path_a.clone(), path_b.clone(), path_a.clone()];
-
-        let deduped = dedup_paths(paths);
-
-        assert_eq!(deduped, vec![path_a, path_b]);
-    }
-
-    /// A reload reads the roots in workspace order, as the first load does,
-    /// whichever root's config changed.
-    #[test]
-    fn test_collect_config_roots_keeps_workspace_order_and_dedups() {
-        let workspace_a = WorkspaceFolder::new(PathBuf::from("/workspace/a"), false);
-        let workspace_b = WorkspaceFolder::new(PathBuf::from("/workspace/b"), false);
-
-        let roots = collect_config_roots(&[workspace_a.clone(), workspace_b, workspace_a]);
-
-        assert_eq!(
-            roots,
-            vec![PathBuf::from("/workspace/a"), PathBuf::from("/workspace/b")]
-        );
-    }
-
-    #[test]
-    fn test_push_configs_from_preferred_workspace_root_uses_first_root_with_config() {
-        let workspace_a = create_temp_dir();
-        let workspace_b = create_temp_dir();
-
-        fs::write(
-            workspace_a.join(".emmyrc.json"),
-            r#"{ "diagnostics": { "globals": ["A_ONLY"] } }"#,
-        )
-        .expect("failed to write workspace a config");
-        fs::write(
-            workspace_b.join(".emmyrc.json"),
-            r#"{ "diagnostics": { "globals": ["B_ONLY"] } }"#,
-        )
-        .expect("failed to write workspace b config");
-
-        let mut config_files = Vec::new();
-        push_configs_from_preferred_workspace_root(
-            &mut config_files,
-            &[workspace_a.clone(), workspace_b.clone()],
-            ".luarc.json",
-            ".emmyrc.json",
-            ".emmyrc.lua",
-        );
-
-        assert_eq!(config_files, vec![workspace_a.join(".emmyrc.json")]);
-
-        let _ = fs::remove_dir_all(workspace_a);
-        let _ = fs::remove_dir_all(workspace_b);
     }
 
     #[test]
@@ -1614,6 +1213,74 @@ mod tests {
         let _ = fs::remove_dir_all(workspace_b);
     }
 
+    fn write_gamemode(root: &Path, name: &str, base: &str) {
+        let dir = root.join("gamemodes").join(name);
+        fs::create_dir_all(dir.join("gamemode")).expect("create gamemode");
+        fs::write(
+            dir.join(format!("{name}.txt")),
+            format!("\"{name}\"\n{{\n\t\"base\"\t\"{base}\"\n}}\n"),
+        )
+        .expect("write manifest");
+    }
+
+    #[test]
+    fn a_whole_gmod_folder_loads_its_pick_with_each_folder_a_config_root() {
+        let root = create_temp_dir().join("garrysmod");
+        fs::create_dir_all(root.join("addons/ulx/lua")).expect("create addon");
+        write_gamemode(&root, "base", "");
+        write_gamemode(&root, "sandbox", "base");
+        write_gamemode(&root, "helix", "sandbox");
+        write_gamemode(&root, "cityrp", "helix");
+        write_gamemode(&root, "darkrp", "sandbox");
+        fs::write(
+            root.join(".gluarc.json"),
+            r#"{ "gmod": { "activeGamemode": "cityrp" } }"#,
+        )
+        .expect("write root config");
+        let cityrp = root.join("gamemodes/cityrp");
+        fs::write(
+            cityrp.join(".gluarc.json"),
+            r#"{ "diagnostics": { "disable": ["unused"] } }"#,
+        )
+        .expect("write gamemode config");
+
+        let (folders, loaded) = load_scoped_config(
+            &[WorkspaceFolder::new(root.clone(), false)],
+            &[],
+            ClientConfig::default(),
+        );
+
+        let whole = folders
+            .iter()
+            .filter(|folder| folder.import == glua_code_analysis::WorkspaceImport::All)
+            .map(|folder| folder.root.clone())
+            .collect::<Vec<_>>();
+        let libraries = loaded
+            .emmyrc
+            .workspace
+            .library
+            .iter()
+            .map(|library| library.get_path().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (
+                whole,
+                loaded.workspace_emmyrcs.contains_key(&cityrp),
+                libraries
+            ),
+            (
+                vec![
+                    root.join("addons/ulx"),
+                    root.join("gamemodes/cityrp"),
+                    root.join("gamemodes/helix"),
+                ],
+                true,
+                Vec::<String>::new()
+            )
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("temp dir"));
+    }
+
     #[test]
     fn test_load_emmy_config_returns_per_workspace_diagnostic_configs() {
         let workspace_a = create_temp_dir();
@@ -1635,14 +1302,8 @@ mod tests {
             ClientConfig::default(),
         );
 
-        let config_a = loaded
-            .workspace_diagnostic_configs
-            .get(&workspace_a)
-            .expect("workspace_a config should be present");
-        let config_b = loaded
-            .workspace_diagnostic_configs
-            .get(&workspace_b)
-            .expect("workspace_b config should be present");
+        let config_a = LuaDiagnosticConfig::new(loaded.root_emmyrc(&workspace_a));
+        let config_b = LuaDiagnosticConfig::new(loaded.root_emmyrc(&workspace_b));
 
         assert_eq!(
             config_a
@@ -1880,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_root_merge_unions_diagnostic_globals_when_isolation_disabled() {
+    fn test_multi_root_configs_do_not_merge_diagnostic_globals() {
         let workspace_a = create_temp_dir();
         let workspace_b = create_temp_dir();
 
@@ -1900,19 +1561,13 @@ mod tests {
             ClientConfig::default(),
         );
 
-        assert!(
-            loaded
-                .emmyrc
-                .diagnostics
-                .globals
-                .contains(&"A_ONLY".to_string())
+        assert_eq!(
+            loaded.root_emmyrc(&workspace_a).diagnostics.globals,
+            vec!["A_ONLY".to_string()]
         );
-        assert!(
-            loaded
-                .emmyrc
-                .diagnostics
-                .globals
-                .contains(&"B_ONLY".to_string())
+        assert_eq!(
+            loaded.root_emmyrc(&workspace_b).diagnostics.globals,
+            vec!["B_ONLY".to_string()]
         );
 
         let _ = fs::remove_dir_all(workspace_a);
@@ -1941,27 +1596,13 @@ mod tests {
         );
 
         assert!(!loaded.emmyrc.workspace.enable_isolation);
-        assert!(
-            loaded
-                .emmyrc
-                .diagnostics
-                .globals
-                .contains(&"A_ONLY".to_string())
-        );
-        assert!(
-            loaded
-                .emmyrc
-                .diagnostics
-                .globals
-                .contains(&"B_ONLY".to_string())
-        );
 
         let _ = fs::remove_dir_all(workspace_a);
         let _ = fs::remove_dir_all(workspace_b);
     }
 
     #[test]
-    fn test_isolation_disabled_only_registers_workspace_overrides_with_local_configs() {
+    fn test_every_root_has_its_own_config_and_matcher() {
         let workspace_a = create_temp_dir();
         let workspace_b = create_temp_dir();
 
@@ -1976,20 +1617,17 @@ mod tests {
             ClientConfig::default(),
         );
 
+        assert!(loaded.workspace_emmyrcs.contains_key(&workspace_a));
+        assert!(loaded.workspace_emmyrcs.contains_key(&workspace_b));
+        assert!(loaded.workspace_matchers.contains_key(&workspace_a));
+        assert!(loaded.workspace_matchers.contains_key(&workspace_b));
         assert!(
             loaded
-                .workspace_diagnostic_configs
-                .contains_key(&workspace_a)
+                .root_emmyrc(&workspace_b)
+                .diagnostics
+                .severity
+                .is_empty()
         );
-        assert!(
-            !loaded
-                .workspace_diagnostic_configs
-                .contains_key(&workspace_b)
-        );
-        assert!(loaded.workspace_emmyrcs.contains_key(&workspace_a));
-        assert!(!loaded.workspace_emmyrcs.contains_key(&workspace_b));
-        assert!(loaded.workspace_matchers.contains_key(&workspace_a));
-        assert!(!loaded.workspace_matchers.contains_key(&workspace_b));
 
         let _ = fs::remove_dir_all(workspace_a);
         let _ = fs::remove_dir_all(workspace_b);

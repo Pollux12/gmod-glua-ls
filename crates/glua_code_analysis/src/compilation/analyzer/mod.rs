@@ -148,7 +148,34 @@ fn scan_scopes(
     files: &[(FileId, Option<&Path>)],
     gamemodes: &[(PathBuf, GmodScopedClassInfo)],
 ) -> (HashSet<FileId>, HashMap<FileId, GmodScopedClassInfo>) {
-    let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
+    let mut by_config: Vec<(&Arc<crate::Emmyrc>, Vec<(FileId, Option<&Path>)>)> = Vec::new();
+    for file in files {
+        let config = db.get_file_emmyrc(file.0);
+        match by_config
+            .iter_mut()
+            .find(|(group, _)| Arc::ptr_eq(group, config))
+        {
+            Some((_, group)) => group.push(*file),
+            None => by_config.push((config, vec![*file])),
+        }
+    }
+    let mut scope_files = HashSet::default();
+    let mut infos = HashMap::default();
+    for (config, files) in by_config {
+        let (group_files, group_infos) =
+            scan_scopes_with(&config.gmod.scripted_class_scopes, &files, gamemodes);
+        scope_files.extend(group_files);
+        infos.extend(group_infos);
+    }
+    (scope_files, infos)
+}
+
+/// [`scan_scopes`] for files that share the config `scopes` belongs to.
+fn scan_scopes_with(
+    scopes: &crate::EmmyrcGmodScriptedClassScopes,
+    files: &[(FileId, Option<&Path>)],
+    gamemodes: &[(PathBuf, GmodScopedClassInfo)],
+) -> (HashSet<FileId>, HashMap<FileId, GmodScopedClassInfo>) {
     if scopes.resolved_definitions_slice().is_empty() {
         let files = files.iter().map(|(file_id, _)| *file_id).collect();
         return (files, HashMap::default());

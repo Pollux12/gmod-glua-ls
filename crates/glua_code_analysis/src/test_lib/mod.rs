@@ -676,6 +676,60 @@ impl VirtualWorkspace {
         )
     }
 
+    /// A workspace of the main roots `names`, siblings of the base folder,
+    /// registered in order, and their paths.
+    pub fn new_with_roots(names: &[&str]) -> (Self, Vec<std::path::PathBuf>) {
+        let paths = names
+            .iter()
+            .map(|name| format!("glua_test_roots_{name}"))
+            .collect::<Vec<_>>();
+        Self::new_with_root_paths(&paths.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+
+    /// A workspace of the main roots at `paths`, relative to the base
+    /// folder's parent, registered in order, and their paths.
+    pub fn new_with_root_paths(paths: &[&str]) -> (Self, Vec<std::path::PathBuf>) {
+        let generator = VirtualUrlGenerator::new();
+        let parent = generator.base.parent().expect("virtual workspace parent");
+        let roots = paths
+            .iter()
+            .map(|path| parent.join(path))
+            .collect::<Vec<_>>();
+        let mut analysis = EmmyLuaAnalysis::new();
+        for root in &roots {
+            analysis.add_main_workspace(root.clone());
+        }
+        let ws = VirtualWorkspace {
+            virtual_url_generator: generator,
+            analysis,
+            id_counter: 0,
+        };
+        (ws, roots)
+    }
+
+    /// Defines `file_name` under `root`.
+    pub fn def_file_in(
+        &mut self,
+        root: &std::path::Path,
+        file_name: &str,
+        content: &str,
+    ) -> FileId {
+        let uri = crate::file_path_to_uri(&root.join(file_name)).expect("a valid file URI");
+        self.analysis
+            .update_file_by_uri(&uri, Some(content.to_string()))
+            .map(|(id, _)| id)
+            .expect("File ID must be present")
+    }
+
+    /// Analyses the files of each root with its config.
+    pub fn set_root_emmyrcs(&mut self, configs: Vec<(&std::path::Path, Emmyrc)>) {
+        let configs = configs
+            .into_iter()
+            .map(|(root, emmyrc)| (root.to_path_buf(), Arc::new(emmyrc)))
+            .collect();
+        self.analysis.set_root_configs(&configs);
+    }
+
     pub fn def_file(&mut self, file_name: &str, content: &str) -> FileId {
         let uri = self.virtual_url_generator.new_uri(file_name);
 

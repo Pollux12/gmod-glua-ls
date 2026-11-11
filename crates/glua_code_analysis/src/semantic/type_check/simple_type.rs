@@ -176,12 +176,7 @@ pub fn check_simple_type_compact(
                 return Err(TypeCheckFailReason::TypeNotMatch);
             }
             LuaType::Integer => {
-                if context
-                    .db
-                    .get_emmyrc()
-                    .strict
-                    .doc_base_const_match_base_type
-                {
+                if context.emmyrc.strict.doc_base_const_match_base_type {
                     return Ok(());
                 }
                 return Err(TypeCheckFailReason::TypeNotMatch);
@@ -194,12 +189,7 @@ pub fn check_simple_type_compact(
                 return Err(TypeCheckFailReason::TypeNotMatch);
             }
             LuaType::Ref(_) => {
-                if context
-                    .db
-                    .get_emmyrc()
-                    .strict
-                    .doc_base_const_match_base_type
-                {
+                if context.emmyrc.strict.doc_base_const_match_base_type {
                     match check_base_type_for_ref_compact(
                         context,
                         source,
@@ -231,12 +221,7 @@ pub fn check_simple_type_compact(
                 return Err(TypeCheckFailReason::TypeNotMatch);
             }
             LuaType::Ref(_) => {
-                if context
-                    .db
-                    .get_emmyrc()
-                    .strict
-                    .doc_base_const_match_base_type
-                {
+                if context.emmyrc.strict.doc_base_const_match_base_type {
                     match check_base_type_for_ref_compact(
                         context,
                         source,

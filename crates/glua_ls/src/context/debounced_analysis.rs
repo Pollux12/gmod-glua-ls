@@ -106,6 +106,11 @@ pub struct DebouncedAnalysis {
     /// A change the index was derived under asks for every file to be
     /// analysed again; see [`DebouncedAnalysis::request_rebuild`].
     rebuild_requested: AtomicBool,
+    /// The rebuild requested is of every file, not just `rebuild_files`.
+    rebuild_all: AtomicBool,
+    /// The files a config change to their root asks to be analysed again;
+    /// see [`DebouncedAnalysis::request_rebuild_files`].
+    rebuild_files: std::sync::Mutex<Vec<FileId>>,
     notify: Notify,
     reindex_notify: Notify,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
@@ -238,6 +243,8 @@ impl DebouncedAnalysis {
             at_once: AtomicBool::new(false),
             failure_reported: AtomicBool::new(false),
             rebuild_requested: AtomicBool::new(false),
+            rebuild_all: AtomicBool::new(false),
+            rebuild_files: std::sync::Mutex::default(),
             notify: Notify::new(),
             reindex_notify: Notify::new(),
             analysis,
@@ -379,6 +386,21 @@ impl DebouncedAnalysis {
     /// in slices as an edit does: what a config change that reaches the index
     /// needs, without holding the analysis for the whole build.
     pub fn request_rebuild(&self) {
+        self.rebuild_all.store(true, Ordering::Release);
+        self.request_rebuild_of_pending();
+    }
+
+    /// [`Self::request_rebuild`] for `file_ids` alone: what a config change
+    /// to their root, and no other, needs.
+    pub fn request_rebuild_files(&self, file_ids: Vec<FileId>) {
+        self.rebuild_files
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .extend(file_ids);
+        self.request_rebuild_of_pending();
+    }
+
+    fn request_rebuild_of_pending(&self) {
         self.rebuild_requested.store(true, Ordering::Release);
         if let Some(interrupt) = self.interrupt.get() {
             interrupt.store(true, Ordering::Release);
@@ -921,7 +943,7 @@ impl DebouncedAnalysis {
                     .to_string(),
             });
         }
-        if *rebuild != Rebuild::Running && self.begin_rebuild().await {
+        if *rebuild != Rebuild::Running && self.begin_rebuild(None).await {
             log::error!("LS_REINDEX_REBUILD rebuilding the analysis of every file");
             *rebuild = Rebuild::Running;
         } else {
@@ -936,14 +958,23 @@ impl DebouncedAnalysis {
         self.reindex_notify.notify_waiters();
     }
 
-    /// Starts re-analysing every file from its text on a cleared index, and
-    /// marks every file's diagnostics dirty. Returns whether it started.
-    async fn begin_rebuild(&self) -> bool {
+    /// Starts re-analysing every file from its text on a cleared index, or
+    /// only `files` from theirs, and marks their diagnostics dirty. Returns
+    /// whether it started.
+    async fn begin_rebuild(&self, files: Option<Vec<FileId>>) -> bool {
         let analysis = self.analysis.clone();
         let rebuild = tokio::task::spawn_blocking(move || {
             let mut guard = analysis.blocking_write();
-            guard.begin_full_reindex();
-            guard.get_main_workspace_file_ids_for_diagnostics()
+            match files {
+                Some(files) => {
+                    guard.begin_reindex_files(files.clone());
+                    files
+                }
+                None => {
+                    guard.begin_full_reindex();
+                    guard.get_main_workspace_file_ids_for_diagnostics()
+                }
+            }
         });
         let file_ids = tokio::select! {
             _ = self.shutdown.cancelled() => return false,
@@ -1012,7 +1043,14 @@ impl DebouncedAnalysis {
             notified.as_mut().enable();
 
             if self.rebuild_requested.swap(false, Ordering::AcqRel) {
-                if self.begin_rebuild().await {
+                let files = std::mem::take(
+                    &mut *self
+                        .rebuild_files
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()),
+                );
+                let files = (!self.rebuild_all.swap(false, Ordering::AcqRel)).then_some(files);
+                if self.begin_rebuild(files).await {
                     rebuild = Rebuild::Running;
                 } else if self.shutdown.is_cancelled() {
                     return;

@@ -172,9 +172,10 @@ pub(crate) fn resolve_global_singleton_scripted_type_decl_id(
     cache: &mut LuaInferCache,
     name: &str,
 ) -> Option<LuaTypeDeclId> {
+    let file_id = cache.get_file_id();
     let singletons = cache
         .scripted_global_singleton_type_cache
-        .get_or_insert_with(|| scripted_singletons(db));
+        .get_or_insert_with(|| scripted_singletons(db, file_id));
     if singletons.gamemode_names.contains(name)
         && let Some(type_decl_id) = file_gamemode_class(db, cache)
     {
@@ -189,9 +190,9 @@ pub(crate) fn resolve_global_singleton_scripted_type_decl_id(
 }
 
 /// The global singleton names the config's scripted-class scopes bind.
-fn scripted_singletons(db: &DbIndex) -> ScriptedSingletons {
+fn scripted_singletons(db: &DbIndex, file_id: FileId) -> ScriptedSingletons {
     let mut singletons = ScriptedSingletons::default();
-    let emmyrc = db.get_emmyrc();
+    let emmyrc = db.get_file_emmyrc(file_id);
     if !emmyrc.gmod.enabled {
         return singletons;
     }
@@ -766,7 +767,8 @@ fn local_decl_type_cache_is_inferred(db: &DbIndex, decl_id: LuaDeclId) -> bool {
 }
 
 fn is_gmod_dynamic_initializer(db: &DbIndex, decl_id: LuaDeclId) -> bool {
-    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
+    let gmod = &db.get_file_emmyrc(decl_id.file_id).gmod;
+    if !gmod.enabled || !gmod.infer_dynamic_fields {
         return false;
     }
 
@@ -1236,7 +1238,8 @@ fn infer_param_inner(
 
     // A name is a guess for a param no evidence types, and call-site evidence
     // is only complete once the engine run has closed.
-    if let Some(param_hint_type) = infer_param_type_from_gmod_name_hint(db, decl.get_name())
+    if let Some(param_hint_type) =
+        infer_param_type_from_gmod_name_hint(db, decl.get_file_id(), decl.get_name())
         && db.stage_rule_holds(crate::db_index::derivation::StageRule::FloorUnsettled)
     {
         if let Some(cache) = cache.as_mut()
@@ -2283,8 +2286,14 @@ pub(crate) fn type_decl_is_vgui_panel(db: &DbIndex, type_id: &LuaTypeDeclId, dep
         })
 }
 
-fn infer_param_type_from_gmod_name_hint(db: &DbIndex, param_name: &str) -> Option<LuaType> {
-    let hints = &db.get_emmyrc().gmod.file_param_defaults;
+/// The type the config of `file_id`, the file declaring the parameter, names
+/// for `param_name`.
+fn infer_param_type_from_gmod_name_hint(
+    db: &DbIndex,
+    file_id: FileId,
+    param_name: &str,
+) -> Option<LuaType> {
+    let hints = &db.get_file_emmyrc(file_id).gmod.file_param_defaults;
     if hints.is_empty() {
         return None;
     }

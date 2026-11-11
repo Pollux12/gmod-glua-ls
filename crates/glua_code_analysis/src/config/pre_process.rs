@@ -1,5 +1,6 @@
 use regex::Regex;
-use std::{collections::HashSet, path::PathBuf, process::Command, sync::OnceLock};
+use serde_json::Value;
+use std::{collections::HashSet, path::Path, path::PathBuf, process::Command, sync::OnceLock};
 
 use crate::config::configs::{EmmyLibraryConfig, EmmyLibraryItem};
 
@@ -168,6 +169,40 @@ impl PreProcessContext {
         })
         .to_string()
     }
+}
+
+/// Resolves the paths a raw config sets against `workspace`, as
+/// [`crate::Emmyrc::pre_process_emmyrc`] does for a loaded one.
+pub(super) fn resolve_config_paths(config: &mut Value, workspace: &Path) {
+    let mut context = PreProcessContext::new(workspace.to_path_buf());
+    for path in [
+        &["workspace", "workspaceRoots"][..],
+        &["workspace", "packageDirs"],
+        &["workspace", "ignoreDir"],
+        &["resource", "paths"],
+    ] {
+        if let Some(Value::Array(items)) = value_at(config, path) {
+            for item in items.iter_mut() {
+                if let Value::String(text) = item {
+                    *text = context.pre_process_path(text);
+                }
+            }
+        }
+    }
+    if let Some(library) = value_at(config, &["workspace", "library"])
+        && let Ok(items) = serde_json::from_value::<Vec<EmmyLibraryItem>>(library.clone())
+        && let Ok(resolved) = serde_json::to_value(context.process_and_dedup_library(items.iter()))
+    {
+        *library = resolved;
+    }
+    if let Some(Value::String(path)) = value_at(config, &["gmod", "annotationsPath"]) {
+        *path = context.pre_process_path(path);
+    }
+}
+
+fn value_at<'a>(config: &'a mut Value, path: &[&str]) -> Option<&'a mut Value> {
+    path.iter()
+        .try_fold(config, |value, key| value.get_mut(*key))
 }
 
 fn get_luarocks_deploy_dir() -> &'static str {

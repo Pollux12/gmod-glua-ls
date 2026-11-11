@@ -654,7 +654,7 @@ fn table_generic_tpl_pattern_member_owner_match(
     }
 
     if keys.is_empty() {
-        find_index_operations(context.db, &owner_type)
+        find_index_operations(context.db, Some(context.cache.get_file_id()), &owner_type)
             .ok_or(InferFailReason::None)?
             .iter()
             .for_each(|m| {

@@ -1051,14 +1051,9 @@ pub(crate) fn resolve_dynamic_field_member(
     member_key: &LuaMemberKey,
     access_position: Option<TextSize>,
 ) -> Result<Option<DynamicFieldResolution>, InferFailReason> {
-    if !db.get_emmyrc().gmod.enabled
-        || !db.get_emmyrc().gmod.infer_dynamic_fields
-        || !cache.dynamic_fields_visible()
-    {
-        if db.get_emmyrc().gmod.enabled
-            && db.get_emmyrc().gmod.infer_dynamic_fields
-            && !cache.dynamic_fields_visible()
-        {
+    let gmod = &db.get_file_emmyrc(cache.get_file_id()).gmod;
+    if !gmod.enabled || !gmod.infer_dynamic_fields || !cache.dynamic_fields_visible() {
+        if gmod.enabled && gmod.infer_dynamic_fields && !cache.dynamic_fields_visible() {
             if let Some(field_name) = member_key.get_name() {
                 record_dynamic_field_read_for_prefix(db, prefix_type, field_name);
             }
@@ -1127,10 +1122,11 @@ pub(crate) fn dynamic_field_type_without(
     access_position: TextSize,
     skip: impl Fn(LuaMemberId) -> bool,
 ) -> Option<Option<LuaType>> {
-    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
+    let caller_file_id = cache.get_file_id();
+    let gmod = &db.get_file_emmyrc(caller_file_id).gmod;
+    if !gmod.enabled || !gmod.infer_dynamic_fields {
         return None;
     }
-    let caller_file_id = cache.get_file_id();
     let (skipped, kept): (Vec<_>, Vec<_>) = dynamic_field_definitions(
         db,
         cache,
@@ -1467,7 +1463,10 @@ fn dynamic_field_definitions_for_owner(
     source_min_position: Option<&InFiled<TextSize>>,
     direct_only: bool,
 ) -> Vec<VisibleDynamicFieldDefinition> {
-    let dynamic_fields_global = db.get_emmyrc().gmod.dynamic_fields_global;
+    let dynamic_fields_global = db
+        .get_file_emmyrc(caller_file_id)
+        .gmod
+        .dynamic_fields_global;
     let caller_mask = effective_dynamic_field_state_mask(db, caller_file_id, access_position);
     let access_function = access_position.and_then(|position| {
         db.get_member_index()

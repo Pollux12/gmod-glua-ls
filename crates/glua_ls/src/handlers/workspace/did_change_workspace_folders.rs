@@ -94,7 +94,6 @@ mod tests {
             {
                 let mut manager = snapshot.workspace_manager().write().await;
                 manager.client_config.gmod_annotations_path = Some("annotations".to_string());
-                manager.client_config.gamemode_base_libraries = vec!["sandbox".to_string()];
             }
             super::on_did_change_workspace_folders(
                 snapshot.clone(),
@@ -111,14 +110,8 @@ mod tests {
             )
             .await;
             let manager = snapshot.workspace_manager().read().await;
-            (
-                manager.client_config.gmod_annotations_path.clone(),
-                manager.client_config.gamemode_base_libraries.clone(),
-            )
+            manager.client_config.gmod_annotations_path.clone()
         });
-        assert_eq!(
-            kept,
-            (Some("annotations".to_string()), vec!["sandbox".to_string()])
-        );
+        assert_eq!(kept, Some("annotations".to_string()));
     }
 }

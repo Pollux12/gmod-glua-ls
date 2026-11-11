@@ -14,6 +14,7 @@ mod config;
 mod db_index;
 mod diagnostic;
 mod gamemode_base;
+mod gmod_workspace;
 mod library_collision;
 pub mod profile;
 pub mod progress;
@@ -26,9 +27,13 @@ pub use compilation::*;
 pub use config::*;
 pub use db_index::*;
 pub use diagnostic::*;
-pub use gamemode_base::detect_gamemode_base_libraries;
+pub use gamemode_base::{detect_gamemode_base_libraries, detect_gamemode_bases};
 pub use glua_codestyle::*;
 use glua_parser::{LineIndex, LuaCallExpr, LuaSyntaxTree};
+pub use gmod_workspace::{
+    ALL_CUSTOM_GAMEMODES, BUILTIN_GAMEMODES, Gamemode, GmodTopology, NO_GAMEMODE,
+    UnpickedGamemodes, is_addons_folder, scope_workspace_folder,
+};
 pub use library_collision::LibraryDefinitionCollision;
 use lsp_types::Uri;
 pub use profile::Profile;
@@ -225,6 +230,15 @@ fn lexically_normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+/// What applying the shared config and each root's own reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigApplied {
+    /// How far the change to the config the roots share reaches.
+    pub shared: EmmyrcChange,
+    /// The files of the roots whose own config reaches the index, sorted.
+    pub files: Vec<FileId>,
+}
+
 #[derive(Debug)]
 pub struct EmmyLuaAnalysis {
     pub compilation: LuaCompilation,
@@ -327,8 +341,9 @@ impl EmmyLuaAnalysis {
         self.sync_file_order();
     }
 
-    /// Registers `folders` as the main and library workspace roots, in order,
-    /// as a first load registers them, unregistering every other one. Returns
+    /// Registers `folders` as the main and library workspace roots, every main
+    /// before any library so a folder that is open stays main whichever folder
+    /// lists it as a library, unregistering every other one. Returns
     /// whether the index must be rebuilt: the registration changed while
     /// files outside std, whose module paths derive from it, are loaded.
     pub fn set_workspace_roots<'a>(
@@ -345,12 +360,13 @@ impl EmmyLuaAnalysis {
             .get_db_mut()
             .get_module_index_mut()
             .remove_main_and_library_workspaces();
-        for folder in folders {
-            if folder.is_library {
-                self.add_library_workspace(folder.root.clone());
-            } else {
-                self.add_main_workspace(folder.root.clone());
-            }
+        let (libraries, mains): (Vec<_>, Vec<_>) =
+            folders.into_iter().partition(|folder| folder.is_library);
+        for folder in mains {
+            self.add_main_workspace(folder.root.clone());
+        }
+        for folder in libraries {
+            self.add_library_workspace(folder.root.clone());
         }
         self.sync_file_order();
         let db = self.compilation.get_db();
@@ -737,6 +753,73 @@ impl EmmyLuaAnalysis {
         change
     }
 
+    /// Applies the config the roots share and each root's own, without
+    /// re-analysing. A change to the shared config that reaches the index
+    /// leaves every file to be rebuilt, as [`Self::begin_full_reindex`] does;
+    /// one to a root's own leaves only that root's files in
+    /// [`ConfigApplied::files`], for [`Self::begin_reindex_files`].
+    pub fn apply_configs(
+        &mut self,
+        shared: Arc<Emmyrc>,
+        roots: &HashMap<PathBuf, Arc<Emmyrc>>,
+    ) -> ConfigApplied {
+        let previous_roots = self.compilation.get_db().get_root_emmyrcs().clone();
+        let mut refreshed = (*shared).clone();
+        refreshed
+            .gmod
+            .scripted_class_scopes
+            .refresh_resolved_definitions();
+        let shared_change = if roots.is_empty() {
+            self.emmyrc.change_to(&refreshed)
+        } else {
+            self.emmyrc.shared_change_to(&refreshed)
+        };
+        let config = Arc::new(refreshed);
+        self.emmyrc = config.clone();
+        self.diagnostic.update_config(config.clone());
+        self.compilation
+            .update_config(config, shared_change.affects_index());
+        self.set_root_configs(roots);
+
+        let db = self.compilation.get_db();
+        let mut reanalysed = db
+            .get_root_emmyrcs()
+            .iter()
+            .filter(|(workspace_id, config)| {
+                previous_roots
+                    .get(workspace_id)
+                    .is_none_or(|previous| previous.change_to(config).affects_index())
+            })
+            .map(|(workspace_id, _)| *workspace_id)
+            .collect::<Vec<_>>();
+        reanalysed.sort_by_key(|workspace_id| workspace_id.id);
+        let module_index = db.get_module_index();
+        let mut files = db
+            .get_vfs()
+            .get_all_local_file_ids()
+            .into_iter()
+            .filter(|file_id| {
+                module_index
+                    .get_untracked_workspace_id(*file_id)
+                    .is_some_and(|workspace_id| reanalysed.contains(&workspace_id))
+            })
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        if !files.is_empty() && !shared_change.affects_index() {
+            self.compilation.reset_scopes();
+        }
+        ConfigApplied {
+            shared: shared_change,
+            files,
+        }
+    }
+
+    /// Starts re-analysing `file_ids` from the text the VFS holds for them,
+    /// whose config changed; see [`Self::advance_reindex`].
+    pub fn begin_reindex_files(&mut self, file_ids: Vec<FileId>) {
+        self.compilation.begin_update(file_ids);
+    }
+
     /// Applies `config` without re-analysing: a change that reaches the index
     /// leaves it to be rebuilt, as [`Self::begin_full_reindex`] does.
     pub fn apply_config(&mut self, config: Arc<Emmyrc>) -> EmmyrcChange {
@@ -754,11 +837,29 @@ impl EmmyLuaAnalysis {
         change
     }
 
-    pub fn set_workspace_diagnostic_configs(
-        &mut self,
-        configs: std::collections::HashMap<WorkspaceId, Arc<LuaDiagnosticConfig>>,
-    ) {
-        self.diagnostic.set_workspace_configs(configs);
+    /// Analyses and diagnoses the files of each registered root in `configs`
+    /// with its config.
+    pub fn set_root_configs(&mut self, configs: &HashMap<std::path::PathBuf, Arc<Emmyrc>>) {
+        let configs = configs
+            .iter()
+            .filter_map(|(root, config)| {
+                let workspace_id = self.get_workspace_id_for_root(root)?;
+                log::info!("setting per-workspace config for {root:?} ({workspace_id:?})");
+                Some((workspace_id, config.clone()))
+            })
+            .collect::<rustc_hash::FxHashMap<_, _>>();
+        if configs.is_empty() {
+            return;
+        }
+        self.diagnostic.set_workspace_configs(
+            configs
+                .iter()
+                .map(|(workspace_id, config)| {
+                    (*workspace_id, Arc::new(LuaDiagnosticConfig::new(config)))
+                })
+                .collect(),
+        );
+        self.compilation.get_db_mut().set_root_emmyrcs(configs);
     }
 
     pub fn get_workspace_id_for_root(&self, root: &Path) -> Option<WorkspaceId> {

@@ -6,12 +6,16 @@ mod lua_loader;
 mod pre_process;
 #[cfg(test)]
 mod test;
+mod workspace_configs;
 
 use std::collections::HashMap;
 use std::path::Path;
 
 pub use change::EmmyrcChange;
-pub use config_loader::{ConfigLoadError, load_configs, load_configs_raw, try_load_configs};
+pub use config_loader::{
+    ConfigFile, ConfigLoadError, load_configs, load_configs_raw, load_layered_configs,
+    try_load_configs,
+};
 pub use configs::{
     DiagnosticSeveritySetting, DocSyntax, EmmyLibraryConfig, EmmyLibraryItem, EmmyrcCodeAction,
     EmmyrcCodeLens, EmmyrcCompletion, EmmyrcDiagnostic, EmmyrcDoc, EmmyrcDocumentColor,
@@ -30,6 +34,10 @@ use glua_parser::{LuaLanguageLevel, LuaNonStdSymbolSet, ParserConfig, SpecialFun
 use rowan::NodeCache;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+pub use workspace_configs::{
+    ConfigSources, WorkspaceConfigs, config_files_in, load_scoped_workspace_configs,
+    load_workspace_configs, scope_folders, workspace_collection_groups,
+};
 
 use crate::config::pre_process::PreProcessContext;
 

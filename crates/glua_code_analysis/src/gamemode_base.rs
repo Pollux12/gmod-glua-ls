@@ -18,7 +18,9 @@
 //! The detector is intentionally tolerant: malformed KV files are skipped,
 //! cycles are broken, and nothing is added when no metadata is found.
 
+use crate::gmod_workspace::steam_garrysmod_child;
 use rustc_hash::FxHashSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Validate that `name` is a plausible gamemode folder name.
@@ -28,7 +30,7 @@ use std::path::{Path, PathBuf};
 /// segments, drive prefixes, whitespace — is rejected to prevent a malicious
 /// `"base"` value (e.g. `../../etc`) from steering the detector at folders
 /// outside `gamemodes/`.
-fn is_valid_gamemode_name(name: &str) -> bool {
+pub(crate) fn is_valid_gamemode_name(name: &str) -> bool {
     if name.is_empty() || name == "." || name == ".." {
         return false;
     }
@@ -40,7 +42,7 @@ fn is_valid_gamemode_name(name: &str) -> bool {
 /// define everything they provide twice, so a base chain ends where it reaches one.
 const ANNOTATED_GAMEMODES: [&str; 2] = ["base", "sandbox"];
 
-fn is_annotated_gamemode(name: &str) -> bool {
+pub(crate) fn is_annotated_gamemode(name: &str) -> bool {
     ANNOTATED_GAMEMODES
         .iter()
         .any(|annotated| annotated.eq_ignore_ascii_case(name))
@@ -57,11 +59,30 @@ pub fn read_gamemode_base(txt_path: &Path) -> Option<String> {
     parse_base_field(trimmed)
 }
 
+/// A gamemode folder's manifest: `<name>/<name>.txt`, or else the first `.txt`
+/// in it, by name, that holds a KeyValues block (`helix-hl2rp/ixhl2rp.txt`).
+pub(crate) fn find_gamemode_manifest(dir: &Path) -> Option<PathBuf> {
+    preferred_manifest(dir).or_else(|| {
+        fallback_manifests(dir).into_iter().find(|path| {
+            std::fs::read_to_string(path).is_ok_and(|content| {
+                is_keyvalues_block(content.strip_prefix('\u{FEFF}').unwrap_or(&content))
+            })
+        })
+    })
+}
+
+/// Whether `input` opens with a named KeyValues block.
+fn is_keyvalues_block(input: &str) -> bool {
+    let mut tokens = Tokenizer::new(input);
+    matches!(tokens.next_token(), Some(Token::Word(_))) && tokens.next_token() == Some(Token::Open)
+}
+
 /// Detect base gamemode library paths for a single workspace root.
 ///
 /// The detector handles two layouts:
-///   1. **Game install root** (e.g. `.../garrysmod/`): scans `gamemodes/*` for
-///      every gamemode and follows each manifest's base chain.
+///   1. **Game install root** (e.g. `.../garrysmod/`, or Steam's
+///      `.../GarrysMod/` above it): scans `gamemodes/*` for every gamemode and
+///      follows each manifest's base chain.
 ///   2. **Single gamemode root** (e.g. `.../gamemodes/darkrp/`): if the root
 ///      itself contains a manifest, follows that chain.
 ///
@@ -72,7 +93,24 @@ pub fn read_gamemode_base(txt_path: &Path) -> Option<String> {
 ///   * exclude the gamemodes the annotations declare (`base`, `sandbox`),
 ///   * are deduplicated while preserving discovery order.
 pub fn detect_gamemode_base_libraries(workspace_root: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
+    detect_gamemode_bases(workspace_root).libraries
+}
+
+/// What the manifests under a workspace root say about gamemode inheritance.
+#[derive(Default)]
+pub struct GamemodeBases {
+    /// The ancestor gamemode folders to load, see [`detect_gamemode_base_libraries`].
+    pub libraries: Vec<PathBuf>,
+    /// Each gamemode folder's name to the name of the gamemode it derives from,
+    /// for every link of every chain whose base folder exists.
+    pub bases: BTreeMap<String, String>,
+}
+
+/// The base libraries and the inheritance links below `workspace_root`.
+pub fn detect_gamemode_bases(workspace_root: &Path) -> GamemodeBases {
+    let mut found = GamemodeBases::default();
+    let out = &mut found.libraries;
+    let bases = &mut found.bases;
     let mut seen: FxHashSet<PathBuf> = FxHashSet::default();
     let workspace_root_canon = canonicalize_or(workspace_root);
 
@@ -92,13 +130,17 @@ pub fn detect_gamemode_base_libraries(workspace_root: &Path) -> Vec<PathBuf> {
             workspace_root,
             parent,
             &workspace_root_canon,
-            &mut out,
+            out,
+            bases,
             &mut seen,
         );
     }
 
-    // Layout 1: workspace root contains a `gamemodes/` directory.
-    let gamemodes_dir = workspace_root.join("gamemodes");
+    // Layout 1: workspace root, or Steam's `garrysmod` child of it, contains
+    // a `gamemodes/` directory.
+    let gamemodes_dir = steam_garrysmod_child(workspace_root)
+        .unwrap_or_else(|| workspace_root.to_path_buf())
+        .join("gamemodes");
     if gamemodes_dir.is_dir() {
         let entries = std::fs::read_dir(&gamemodes_dir).ok();
         if let Some(entries) = entries {
@@ -120,14 +162,15 @@ pub fn detect_gamemode_base_libraries(workspace_root: &Path) -> Vec<PathBuf> {
                     &gm_folder,
                     &gamemodes_dir,
                     &workspace_root_canon,
-                    &mut out,
+                    out,
+                    bases,
                     &mut seen,
                 );
             }
         }
     }
 
-    out
+    found
 }
 
 /// Walk the `base` chain starting from `start_folder`, pushing each *ancestor*
@@ -138,6 +181,7 @@ fn walk_chain(
     gamemodes_dir: &Path,
     workspace_root_canon: &Path,
     out: &mut Vec<PathBuf>,
+    bases: &mut BTreeMap<String, String>,
     seen: &mut FxHashSet<PathBuf>,
 ) {
     let mut current = start_folder.to_path_buf();
@@ -164,6 +208,9 @@ fn walk_chain(
             return;
         }
 
+        if let Some(child) = current.file_name().and_then(|s| s.to_str()) {
+            bases.insert(child.to_string(), base.clone());
+        }
         let parent_canon = canonicalize_or(&parent_folder);
         if parent_canon != *workspace_root_canon && seen.insert(parent_canon.clone()) {
             out.push(parent_folder.clone());
@@ -173,27 +220,39 @@ fn walk_chain(
     }
 }
 
-fn read_gamemode_folder_base(folder: &Path) -> Option<String> {
-    let name = folder.file_name()?.to_str()?;
-    let preferred = folder.join(format!("{name}.txt"));
-    if preferred.is_file() {
-        return read_gamemode_base(&preferred);
+/// The `"base"` of a gamemode folder: its `<name>.txt`, or else the first
+/// `.txt` in it, by name, that names one.
+pub(crate) fn read_gamemode_folder_base(folder: &Path) -> Option<String> {
+    match preferred_manifest(folder) {
+        Some(preferred) => read_gamemode_base(&preferred),
+        None => fallback_manifests(folder)
+            .iter()
+            .find_map(|path| read_gamemode_base(path)),
     }
+}
 
+fn preferred_manifest(folder: &Path) -> Option<PathBuf> {
+    let name = folder.file_name()?.to_str()?;
+    Some(folder.join(format!("{name}.txt"))).filter(|path| path.is_file())
+}
+
+fn fallback_manifests(folder: &Path) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(folder)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.is_file()
+                        && path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     candidates.sort();
-    candidates.iter().find_map(|path| read_gamemode_base(path))
+    candidates
 }
 
 fn canonicalize_or(p: &Path) -> PathBuf {
@@ -405,6 +464,26 @@ mod tests {
             None => format!("\"{name}\"\n{{\n\t\"title\"\t\"{name}\"\n}}\n"),
         };
         fs::write(folder.join(format!("{name}.txt")), body).expect("write gamemode txt");
+    }
+
+    #[test]
+    fn the_bases_name_each_link_of_the_chain_up_to_the_annotated_gamemodes() {
+        let root = temp_dir();
+        write_gamemode(&root, "child", Some("middle"));
+        write_gamemode(&root, "middle", Some("top"));
+        write_gamemode(&root, "top", Some("sandbox"));
+        write_gamemode(&root, "orphan", Some("missing"));
+
+        let found = detect_gamemode_bases(&root);
+
+        assert_eq!(
+            found.bases.into_iter().collect::<Vec<_>>(),
+            [
+                ("child".to_string(), "middle".to_string()),
+                ("middle".to_string(), "top".to_string()),
+            ]
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

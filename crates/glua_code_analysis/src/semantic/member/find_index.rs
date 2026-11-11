@@ -1,7 +1,7 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
-    DbIndex, InFiled, InferFailReason, InferGuardRef, LuaGenericType, LuaIntersectionType,
+    DbIndex, FileId, InFiled, InferFailReason, InferGuardRef, LuaGenericType, LuaIntersectionType,
     LuaMemberKey, LuaMemberOwner, LuaMergedTableType, LuaObjectType, LuaOperatorMetaMethod,
     LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, LuaUnionType, TypeOps,
     semantic::{
@@ -13,41 +13,47 @@ use crate::{
 use super::{FindMembersResult, LuaMemberInfo, intersect_member_types, member_key_as_type};
 use rowan::TextRange;
 
-pub fn find_index_operations(db: &DbIndex, prefix_type: &LuaType) -> FindMembersResult {
-    find_index_operations_guard(db, prefix_type, &InferGuard::new())
+/// The index operations of `prefix_type`, read by `file_id` when it is known.
+pub fn find_index_operations(
+    db: &DbIndex,
+    file_id: Option<FileId>,
+    prefix_type: &LuaType,
+) -> FindMembersResult {
+    find_index_operations_guard(db, prefix_type, file_id, &InferGuard::new())
 }
 
 pub fn find_index_operations_guard(
     db: &DbIndex,
     prefix_type: &LuaType,
+    file_id: Option<FileId>,
     infer_guard: &InferGuardRef,
 ) -> FindMembersResult {
     match &prefix_type {
         LuaType::TableConst(in_filed) => find_index_table(db, in_filed),
-        LuaType::Ref(decl_id) => find_index_custom_type(db, decl_id, infer_guard),
-        LuaType::Def(decl_id) => find_index_custom_type(db, decl_id, infer_guard),
-        LuaType::Array(array_type) => find_index_array(db, array_type.get_base()),
+        LuaType::Ref(decl_id) => find_index_custom_type(db, decl_id, file_id, infer_guard),
+        LuaType::Def(decl_id) => find_index_custom_type(db, decl_id, file_id, infer_guard),
+        LuaType::Array(array_type) => find_index_array(db, file_id, array_type.get_base()),
         LuaType::Object(object) => find_index_object(db, object),
-        LuaType::Union(union) => find_index_union(db, union, infer_guard),
+        LuaType::Union(union) => find_index_union(db, union, file_id, infer_guard),
         LuaType::MergedTable(merged_table) => {
-            find_index_merged_table(db, merged_table, infer_guard)
+            find_index_merged_table(db, merged_table, file_id, infer_guard)
         }
         LuaType::Intersection(intersection) => {
-            find_index_intersection(db, intersection, infer_guard)
+            find_index_intersection(db, intersection, file_id, infer_guard)
         }
-        LuaType::Generic(generic) => find_index_generic(db, generic, infer_guard),
+        LuaType::Generic(generic) => find_index_generic(db, generic, file_id, infer_guard),
         LuaType::TableGeneric(table_generic) => find_index_table_generic(db, table_generic),
         LuaType::Instance(inst) => {
             let base = inst.get_base();
-            find_index_operations_guard(db, base, infer_guard)
+            find_index_operations_guard(db, base, file_id, infer_guard)
         }
-        LuaType::TableOf(inner) => find_index_operations_guard(db, inner, infer_guard),
-        LuaType::ModuleRef(file_id) => {
-            let module_info = db.get_module_index().get_module(*file_id);
+        LuaType::TableOf(inner) => find_index_operations_guard(db, inner, file_id, infer_guard),
+        LuaType::ModuleRef(module_id) => {
+            let module_info = db.get_module_index().get_module(*module_id);
             if let Some(module_info) = module_info
                 && let Some(export_type) = &module_info.export_type
             {
-                return find_index_operations_guard(db, export_type, infer_guard);
+                return find_index_operations_guard(db, export_type, file_id, infer_guard);
             }
 
             None
@@ -118,6 +124,7 @@ fn find_index_table(db: &DbIndex, table_range: &InFiled<TextRange>) -> FindMembe
 fn find_index_custom_type(
     db: &DbIndex,
     prefix_type_id: &LuaTypeDeclId,
+    file_id: Option<FileId>,
     infer_guard: &InferGuardRef,
 ) -> FindMembersResult {
     infer_guard.check(prefix_type_id).ok()?;
@@ -126,7 +133,7 @@ fn find_index_custom_type(
 
     if type_decl.is_alias() {
         if let Some(origin_type) = type_decl.get_alias_origin(db, None) {
-            return find_index_operations_guard(db, &origin_type, infer_guard);
+            return find_index_operations_guard(db, &origin_type, file_id, infer_guard);
         }
         return None;
     }
@@ -159,7 +166,9 @@ fn find_index_custom_type(
         && let Some(super_types) = type_index.get_super_types(prefix_type_id)
     {
         for super_type in super_types {
-            if let Some(super_members) = find_index_operations_guard(db, &super_type, infer_guard) {
+            if let Some(super_members) =
+                find_index_operations_guard(db, &super_type, file_id, infer_guard)
+            {
                 members.extend(super_members);
             }
         }
@@ -172,10 +181,10 @@ fn find_index_custom_type(
     }
 }
 
-fn find_index_array(db: &DbIndex, base: &LuaType) -> FindMembersResult {
+fn find_index_array(db: &DbIndex, file_id: Option<FileId>, base: &LuaType) -> FindMembersResult {
     let mut members = Vec::new();
 
-    let expression_type = if db.get_emmyrc().strict.array_index {
+    let expression_type = if db.get_optional_file_emmyrc(file_id).strict.array_index {
         TypeOps::Union.apply(db, base, &LuaType::Nil)
     } else {
         base.clone()
@@ -227,12 +236,13 @@ fn find_index_object(db: &DbIndex, object: &LuaObjectType) -> FindMembersResult 
 fn find_index_union(
     db: &DbIndex,
     union: &LuaUnionType,
+    file_id: Option<FileId>,
     infer_guard: &InferGuardRef,
 ) -> FindMembersResult {
     let mut members = Vec::new();
 
     for member in union.types() {
-        if let Some(sub_members) = find_index_operations_guard(db, member, infer_guard) {
+        if let Some(sub_members) = find_index_operations_guard(db, member, file_id, infer_guard) {
             members.extend(sub_members);
         }
     }
@@ -247,12 +257,15 @@ fn find_index_union(
 fn find_index_merged_table(
     db: &DbIndex,
     merged_table: &LuaMergedTableType,
+    file_id: Option<FileId>,
     infer_guard: &InferGuardRef,
 ) -> FindMembersResult {
     let mut members = Vec::new();
 
     for component in merged_table.get_types() {
-        if let Some(component_members) = find_index_operations_guard(db, component, infer_guard) {
+        if let Some(component_members) =
+            find_index_operations_guard(db, component, file_id, infer_guard)
+        {
             members.extend(component_members);
         }
     }
@@ -267,13 +280,15 @@ fn find_index_merged_table(
 fn find_index_intersection(
     db: &DbIndex,
     intersection: &LuaIntersectionType,
+    file_id: Option<FileId>,
     infer_guard: &InferGuardRef,
 ) -> FindMembersResult {
     let mut order: Vec<LuaMemberKey> = Vec::new();
     let mut members: HashMap<LuaMemberKey, LuaType> = HashMap::default();
 
     for member in intersection.get_types() {
-        let Some(sub_members) = find_index_operations_guard(db, member, infer_guard) else {
+        let Some(sub_members) = find_index_operations_guard(db, member, file_id, infer_guard)
+        else {
             continue;
         };
 
@@ -322,6 +337,7 @@ fn find_index_intersection(
 fn find_index_generic(
     db: &DbIndex,
     generic: &LuaGenericType,
+    file_id: Option<FileId>,
     infer_guard: &InferGuardRef,
 ) -> FindMembersResult {
     let base_type = generic.get_base_type();
@@ -339,7 +355,7 @@ fn find_index_generic(
     if type_decl.is_alias() {
         if let Some(origin_type) = type_decl.get_alias_origin(db, Some(&substitutor)) {
             let instantiated_type = instantiate_type_generic(db, &origin_type, &substitutor);
-            return find_index_operations_guard(db, &instantiated_type, infer_guard);
+            return find_index_operations_guard(db, &instantiated_type, file_id, infer_guard);
         }
         return None;
     }
@@ -377,7 +393,7 @@ fn find_index_generic(
         for super_type in supers {
             let instantiated_super = instantiate_type_generic(db, &super_type, &substitutor);
             if let Some(super_members) =
-                find_index_operations_guard(db, &instantiated_super, infer_guard)
+                find_index_operations_guard(db, &instantiated_super, file_id, infer_guard)
             {
                 members.extend(super_members);
             }
@@ -438,6 +454,7 @@ pub(crate) fn find_metatable_index_field(
 ) -> MetatableIndexField {
     let mut lookup = IndexLookup {
         db,
+        file_id: Some(table.file_id),
         key,
         tables: HashSet::default(),
         aliases: HashSet::default(),
@@ -454,6 +471,7 @@ pub(crate) fn find_metatable_index_field(
 /// nothing, so each table and alias is looked through once, a cycle included.
 struct IndexLookup<'a> {
     db: &'a DbIndex,
+    file_id: Option<FileId>,
     key: &'a LuaMemberKey,
     tables: HashSet<InFiled<TextRange>>,
     aliases: HashSet<LuaTypeDeclId>,
@@ -534,7 +552,7 @@ impl IndexLookup<'_> {
                 }
             }
             LuaType::TableConst(table) => {
-                match super::infer_raw_member_type(db, index_type, self.key) {
+                match super::infer_raw_member_type(db, self.file_id, index_type, self.key) {
                     Ok(typ) => self.add(MetatableIndexField::Present(typ)),
                     Err(InferFailReason::FieldNotFound) => self.through_metatable(table),
                     Err(_) => self.add(MetatableIndexField::Unknown),
@@ -546,7 +564,7 @@ impl IndexLookup<'_> {
             LuaType::Instance(instance) => {
                 let range = instance.get_range();
                 let own = LuaType::TableConst(range.clone());
-                match super::infer_raw_member_type(db, &own, self.key) {
+                match super::infer_raw_member_type(db, self.file_id, &own, self.key) {
                     Ok(typ) => self.add(MetatableIndexField::Present(typ)),
                     Err(InferFailReason::FieldNotFound)
                         if db.get_metatable_index().get(range).is_some() =>
@@ -558,13 +576,14 @@ impl IndexLookup<'_> {
                 }
             }
             _ => {
-                let field = match super::infer_raw_member_type(db, index_type, self.key) {
-                    Ok(typ) => MetatableIndexField::Present(typ),
-                    Err(InferFailReason::FieldNotFound) => {
-                        index_signature_field(db, index_type, self.key)
-                    }
-                    Err(_) => MetatableIndexField::Unknown,
-                };
+                let field =
+                    match super::infer_raw_member_type(db, self.file_id, index_type, self.key) {
+                        Ok(typ) => MetatableIndexField::Present(typ),
+                        Err(InferFailReason::FieldNotFound) => {
+                            index_signature_field(db, self.file_id, index_type, self.key)
+                        }
+                        Err(_) => MetatableIndexField::Unknown,
+                    };
                 self.add(field);
             }
         }
@@ -606,14 +625,19 @@ fn index_operator_field(
 
 /// What the index signatures of `typ`, a class or an instantiated generic
 /// class, answer for a `key` none of its named members has.
-fn index_signature_field(db: &DbIndex, typ: &LuaType, key: &LuaMemberKey) -> MetatableIndexField {
+fn index_signature_field(
+    db: &DbIndex,
+    file_id: Option<FileId>,
+    typ: &LuaType,
+    key: &LuaMemberKey,
+) -> MetatableIndexField {
     if !matches!(typ, LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_)) {
         return MetatableIndexField::Absent;
     }
     let Some(key_type) = member_key_as_type(key) else {
         return MetatableIndexField::Unknown;
     };
-    find_index_operations(db, typ)
+    find_index_operations(db, file_id, typ)
         .into_iter()
         .flatten()
         .find(|operation| {

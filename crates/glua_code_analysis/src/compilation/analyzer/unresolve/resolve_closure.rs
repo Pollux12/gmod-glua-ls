@@ -349,7 +349,7 @@ pub fn resolve_gmod_hook_callback_doc_function(
     let member_key = LuaMemberKey::Name(hook_name.clone().into());
     let mut candidates = Vec::new();
     let mut seen_member_ids = FxHashSet::default();
-    for owner_name in iter_hook_owner_names(db) {
+    for owner_name in iter_hook_owner_names(db, call_file_id) {
         for owner in [
             LuaMemberOwner::Type(LuaTypeDeclId::global(&owner_name)),
             LuaMemberOwner::GlobalPath(GlobalId::new(&owner_name)),
@@ -409,14 +409,10 @@ pub fn resolve_gmod_hook_callback_doc_function(
     })
 }
 
-fn iter_hook_owner_names(db: &DbIndex) -> Vec<String> {
+fn iter_hook_owner_names(db: &DbIndex, file_id: crate::FileId) -> Vec<String> {
+    let gmod = &db.get_file_emmyrc(file_id).gmod;
     let mut names = crate::BUILTIN_HOOK_OWNERS.map(ToString::to_string).to_vec();
-    for scoped_hook_owner in db
-        .get_emmyrc()
-        .gmod
-        .scripted_class_scopes
-        .hook_owner_globals()
-    {
+    for scoped_hook_owner in gmod.scripted_class_scopes.hook_owner_globals() {
         if !names
             .iter()
             .any(|existing| existing.eq_ignore_ascii_case(&scoped_hook_owner))
@@ -424,7 +420,7 @@ fn iter_hook_owner_names(db: &DbIndex) -> Vec<String> {
             names.push(scoped_hook_owner);
         }
     }
-    for configured_prefix in &db.get_emmyrc().gmod.hook_mappings.method_prefixes {
+    for configured_prefix in &gmod.hook_mappings.method_prefixes {
         let normalized = configured_prefix
             .trim()
             .trim_end_matches([':', '.'])
