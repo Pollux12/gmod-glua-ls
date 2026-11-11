@@ -1,0 +1,121 @@
+---
+title: AI agents (MCP)
+description: Let Claude Code, Codex, GitHub Copilot, Cursor and other agents run Lua on your server, read its errors, and debug it with breakpoints.
+---
+
+The VS Code extension can run an [MCP](https://modelcontextprotocol.io) server that gives AI agents access to your Garry's Mod **server** through the debugger, plus the language server's diagnostics. An agent can then:
+
+- run Lua on the server and see what it returned and printed
+- read the server console and Lua errors, with stack traces pointing at your files
+- set breakpoints and logpoints, wait for a hit, read locals, and step through code
+- check your code with GLuaLS diagnostics and look up symbols
+
+It covers the server realm only. To drive the client (screenshots, input, clientside Lua), add a client MCP such as [gmcl_mcp](https://github.com/TomDotBat/gmcl_mcp) next to it. The two work well together: one plays the game, the other watches and debugs the server.
+
+<Warning>
+The MCP server can run any Lua on your server. Use it on development servers. It only listens on `127.0.0.1`, refuses requests from web pages, and only starts in trusted workspaces.
+</Warning>
+
+## Set it up
+
+1. Set up the [debugger](/debugger/setup) first and check that you can attach to your server.
+2. Open the Command Palette and run **GLuaLS: Set Up AI Agent (MCP)**. You can also use the **AI Agents (MCP)** card at the top of the GLuaLS settings panel.
+3. Choose **Enable the GLuaLS MCP server**, then pick your agent.
+
+| Agent | What setup does |
+|---|---|
+| GitHub Copilot (VS Code) | Nothing to do. The server appears as **GLuaLS (GMod server)** in VS Code's MCP servers list once enabled. |
+| Cursor | Nothing to do inside Cursor; the extension registers the server itself. |
+| Claude Code | Adds `gluals` to `.mcp.json` in your workspace (Claude Code asks you to approve it the first time), or copies a `claude mcp add` command. |
+| Codex | Adds `[mcp_servers.gluals]` to `~/.codex/config.toml`, with a longer tool timeout. |
+| Anything else | Copies a JSON snippet. The server speaks Streamable HTTP at `http://127.0.0.1:21120/mcp` with no authentication. |
+
+Restart the agent after adding the config. The server runs inside VS Code, so keep your workspace open in VS Code while the agent works. The extension starts when a Lua file is open, which VS Code restores for you after the first time.
+
+To set it up by hand:
+
+<CodeGroup>
+```bash Claude Code
+claude mcp add --transport http gluals http://127.0.0.1:21120/mcp
+```
+
+```toml Codex (~/.codex/config.toml)
+[mcp_servers.gluals]
+url = "http://127.0.0.1:21120/mcp"
+tool_timeout_sec = 120
+```
+
+```json Cursor (.cursor/mcp.json)
+{
+  "mcpServers": {
+    "gluals": { "url": "http://127.0.0.1:21120/mcp" }
+  }
+}
+```
+</CodeGroup>
+
+## Settings
+
+| Setting | Default | What it does |
+|---|---|---|
+| `gluals.mcp.enabled` | `false` | Runs the MCP server. |
+| `gluals.mcp.port` | `21120` | Port the MCP server listens on. |
+| `gluals.mcp.allowCodeExecution` | `true` | Lets agents run Lua and console commands. Breakpoint conditions, logpoints and traces also run Lua, so they need it too. When off, agents can still read the console and errors and use plain breakpoints. |
+| `gluals.mcp.autoAttach` | `true` | Connects the debugger automatically when an agent needs it, without pausing the game. |
+
+## Tools
+
+| Tool | What the agent uses it for |
+|---|---|
+| `server_run_lua` | Run Lua on the server. Returns the return values, printed output, and errors with a traceback. Can include a workspace file, or evaluate inside a paused stack frame. |
+| `server_console` | Read the server console, filtered by text or regex, or wait for new lines. Can also run a console command and return its output. |
+| `server_errors` | Unique Lua errors with counts and stack traces, including errors from before the debugger attached. Notes when GMod removed a timer because it errored. Can clear them and wait for new ones. |
+| `diagnostics` | GLuaLS errors and warnings for files the agent edited, or the whole workspace. |
+| `breakpoints` | Breakpoints, conditional breakpoints, logpoints and function traces. Breakpoints and logpoints show up in your editor. |
+| `debugger` | Status, attach, wait for a breakpoint, continue, step, and pause. Shows the paused line with source, stack, locals and upvalues. Detach removes everything the agent set, resumes the server, and disconnects if the agent attached the debugger. A debug session you started stays attached. |
+| `code_lookup` | Hover docs, definition and references for a workspace or GMod API symbol, such as `MyAddon.Config` or `Player:Nick`. |
+
+Code run with `server_run_lua` runs on the next server tick, so breakpoints and logpoints inside it work. When it stops at a breakpoint, the agent gets the paused location straight away and the code's result after it continues.
+
+Breakpoints the agent sets appear in VS Code like your own. Its **clear** action, and **detach**, only remove what the agent set, and when the server stops, the agent is told whether it stopped on its own breakpoint or yours.
+
+### Logpoints
+
+A logpoint prints a message when a line runs, without pausing. Messages can include Lua in braces, such as `hp={ply:Health()} wep={ply:GetActiveWeapon()}`. Lines appear in the console as `[logpoint autorun/server/file.lua:12] ...`. Agents can make a logpoint remove itself after a number of hits or seconds, and a hit condition such as `% 10` logs every tenth hit. If an expression in the message fails, for example because a variable is nil, the logpoint prints the error and the server keeps running.
+
+Logpoints are the better choice while a person or a client MCP is playing, because a breakpoint freezes the whole server. You can also add them yourself: right-click the gutter and choose **Add Logpoint**.
+
+### Function traces
+
+A trace logs every call of one function, such as `MyAddon.Score` or `Player:Nick`, without pausing: its arguments, what it returned and how long it took. A call that raises an error is reported as not returning on the next tick, and `server_errors` has the error with its stack. A trace stops by itself after 20 calls or two minutes unless the agent asks for other limits, and the function goes back to how it was.
+
+```
+[trace MyAddon.Score] #1 called (name = "a", kills = 3, deaths = 1)
+[trace MyAddon.Score] #1 returned 300 (0.02 ms)
+```
+
+Calls through a saved copy of the function, such as `local f = MyAddon.Score` or a timer callback, are not traced. Hooks added with `hook.Add` are.
+
+## Pausing a server freezes every player
+
+While the server is paused on a breakpoint, nothing runs on it, and every connected client sees the game freeze. After `cl_timeout` seconds (30 by default) clients disconnect. Agents can take longer than that to think between steps.
+
+If you or an agent use a client while debugging the server, raise the timeout on that client first:
+
+```
+cl_timeout 3600
+```
+
+The server stays paused until someone continues, either the agent or you with **Continue** (`F5`) in VS Code.
+
+## Troubleshooting
+
+**The agent says the debugger is not connected.** Check that the server is running with `gm_rdb` installed and that you can attach from **Run and Debug**. With `gluals.mcp.autoAttach` on, the agent uses the first `gluals_gmod` attach configuration in `launch.json`, or `127.0.0.1:21111`.
+
+**`server_run_lua` says the server returned no result.** The server is still running the older debugger bridge. Restart the map or server so it loads the updated `lua/autorun/debug.lua`, and update `gm_rdb` with **GMod Debugger: Check for Updates**.
+
+**The port is already in use.** Choose another in `gluals.mcp.port`, then run the setup again so the agent uses the new port.
+
+**A breakpoint never hits.** Server breakpoints only hit in code the server runs. Files such as `cl_init.lua` or `lua/autorun/client/` only run on clients.
+
+**A breakpoint pauses twice on the same line, or a logpoint prints twice.** That happens on lines that call a built-in function such as `math.max` with an older `gm_rdb`. Update it with **GMod Debugger: Check for Updates**.
