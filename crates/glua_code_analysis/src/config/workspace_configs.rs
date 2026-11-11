@@ -725,6 +725,38 @@ mod tests {
         let _ = fs::remove_dir_all(gmod.parent().unwrap());
     }
 
+    /// A gamemode of Steam's `GarrysMod` folder, opened above its `garrysmod`
+    /// child, knows the gamemode its manifest derives from without a config of
+    /// its own, as it does when `garrysmod` is opened.
+    #[test]
+    fn a_gamemode_of_steams_garrysmod_folder_knows_its_manifest_base() {
+        let steam = create_temp_dir().join("GarrysMod");
+        let gamemodes = steam.join("garrysmod/gamemodes");
+        write(
+            &gamemodes.join("parent/parent.txt"),
+            "\"parent\"\n{\n\t\"base\"\t\"sandbox\"\n}\n",
+        );
+        write(
+            &gamemodes.join("child/child.txt"),
+            "\"child\"\n{\n\t\"base\"\t\"parent\"\n}\n",
+        );
+        fs::create_dir_all(steam.join("garrysmod/addons")).unwrap();
+        let child = gamemodes.join("child");
+
+        let configs = load(std::slice::from_ref(&steam));
+
+        assert_eq!(
+            configs
+                .root_emmyrc(&child)
+                .gmod
+                .gamemode_bases
+                .get("child")
+                .map(String::as_str),
+            Some("parent")
+        );
+        let _ = fs::remove_dir_all(steam.parent().unwrap());
+    }
+
     fn load(folders: &[PathBuf]) -> super::WorkspaceConfigs {
         let prepare = |_: &mut crate::Emmyrc| {};
         let sources = super::ConfigSources {

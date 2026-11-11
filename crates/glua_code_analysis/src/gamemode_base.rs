@@ -18,6 +18,7 @@
 //! The detector is intentionally tolerant: malformed KV files are skipped,
 //! cycles are broken, and nothing is added when no metadata is found.
 
+use crate::gmod_workspace::steam_garrysmod_child;
 use rustc_hash::FxHashSet;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -79,8 +80,9 @@ fn is_keyvalues_block(input: &str) -> bool {
 /// Detect base gamemode library paths for a single workspace root.
 ///
 /// The detector handles two layouts:
-///   1. **Game install root** (e.g. `.../garrysmod/`): scans `gamemodes/*` for
-///      every gamemode and follows each manifest's base chain.
+///   1. **Game install root** (e.g. `.../garrysmod/`, or Steam's
+///      `.../GarrysMod/` above it): scans `gamemodes/*` for every gamemode and
+///      follows each manifest's base chain.
 ///   2. **Single gamemode root** (e.g. `.../gamemodes/darkrp/`): if the root
 ///      itself contains a manifest, follows that chain.
 ///
@@ -134,8 +136,11 @@ pub fn detect_gamemode_bases(workspace_root: &Path) -> GamemodeBases {
         );
     }
 
-    // Layout 1: workspace root contains a `gamemodes/` directory.
-    let gamemodes_dir = workspace_root.join("gamemodes");
+    // Layout 1: workspace root, or Steam's `garrysmod` child of it, contains
+    // a `gamemodes/` directory.
+    let gamemodes_dir = steam_garrysmod_child(workspace_root)
+        .unwrap_or_else(|| workspace_root.to_path_buf())
+        .join("gamemodes");
     if gamemodes_dir.is_dir() {
         let entries = std::fs::read_dir(&gamemodes_dir).ok();
         if let Some(entries) = entries {

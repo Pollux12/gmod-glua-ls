@@ -54,8 +54,7 @@ impl GmodTopology {
     /// child, which is then the root (Steam's `GarrysMod/garrysmod`), or
     /// itself named `garrysmod` or holding both `addons/` and `gamemodes/`.
     pub fn discover(folder: &Path) -> Option<Self> {
-        let child = folder.join("garrysmod");
-        let root = if child.is_dir() {
+        let root = if let Some(child) = steam_garrysmod_child(folder) {
             child
         } else if is_gmod_root(folder) {
             folder.to_path_buf()
@@ -283,6 +282,11 @@ fn addons_folder_scope(folder: &Path, open: &[PathBuf]) -> Vec<WorkspaceFolder> 
             false,
         )))
         .collect()
+}
+
+/// The `garrysmod` child of `folder`, as in Steam's `GarrysMod/garrysmod`.
+pub(crate) fn steam_garrysmod_child(folder: &Path) -> Option<PathBuf> {
+    Some(folder.join("garrysmod")).filter(|child| child.is_dir())
 }
 
 fn is_gmod_root(dir: &Path) -> bool {
