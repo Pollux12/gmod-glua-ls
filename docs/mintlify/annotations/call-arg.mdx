@@ -73,7 +73,15 @@ The first argument is the zero-based parameter index inside that overload.
 | `gmod.member_guard` | `function` | Member-name guard wrappers |
 | `gmod.color` | `r`, `g`, `b`, `a` | Color previews for custom color constructors |
 
-Guard metadata such as `valid_guard`, `self_guard`, and `self_call_valid` belongs on functions and callbacks, not parameters. Use [Guard metadata](/annotations/guard-metadata) for functions and callbacks that prove values are valid.
+A `gmod.member_guard` wrapper takes the name of the member it checks:
+
+```lua
+---@[call_arg("gmod.member_guard", "function")]
+---@param methodName string
+local function GuardMember(methodName) end
+```
+
+Validity checks go on the function or callback, not a parameter. See [`@valid_guard`](/annotations/valid-guard), [`@self_guard`](/annotations/self-guard) and [`@self_call_valid`](/annotations/self-call-valid).
 
 ---
 
@@ -249,4 +257,4 @@ Higher priority wins. You normally do not need this unless you are annotating a 
 
 ## See also
 
-- [Guard metadata](/annotations/guard-metadata): validity guards for nil and NULL checks
+- [`@valid_guard`](/annotations/valid-guard): validity checks for nil and NULL warnings

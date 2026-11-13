@@ -93,7 +93,9 @@
               "annotations/fileparam",
               "annotations/accessorfunc",
               "annotations/call-arg",
-              "annotations/guard-metadata"
+              "annotations/valid-guard",
+              "annotations/self-guard",
+              "annotations/self-call-valid"
             ]
           },
           {
@@ -155,6 +157,12 @@
       "view"
     ]
   },
+  "redirects": [
+    {
+      "source": "/annotations/guard-metadata",
+      "destination": "/annotations/valid-guard"
+    }
+  ],
   "footer": {
     "socials": {
       "github": "https://github.com/Pollux12/vscode-gmod-glua-ls"

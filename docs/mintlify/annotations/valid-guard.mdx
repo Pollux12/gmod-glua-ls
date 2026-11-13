@@ -1,0 +1,56 @@
+---
+title: "@valid_guard"
+description: Mark a check function that proves its argument is valid.
+---
+
+## Overview
+
+`valid_guard` marks a function such as `IsValid` that returns `true` only when its first argument is a valid object. After the check, GLuaLS treats the value as valid, so `need-check-nil` and `unchecked-nil-access` stop warning about it.
+
+Most addons do not need it. The official annotations already mark `IsValid` and similar Garry's Mod helpers.
+
+---
+
+## Syntax
+
+```lua
+---@return TypeGuard<T>
+---@[valid_guard]
+```
+
+Put it after the `@return` line. The function must return `TypeGuard<T>`.
+
+---
+
+## Example
+
+```lua
+---@param ent Entity?
+---@return TypeGuard<Entity>
+---@[valid_guard]
+function IsValidEntity(ent) end
+
+---@type Entity?
+local ent
+
+if IsValidEntity(ent) then
+    ent:GetClass() -- ent is valid here
+end
+```
+
+A value that already has a more specific type, such as `PhysObj` or `Panel`, keeps that type after the check.
+
+---
+
+## Keep it narrow
+
+Only use `valid_guard` on a function that really checks validity. Marking a function that does not hides real `nil` and `NULL` bugs.
+
+It applies only to calls of the annotated function. A local function with the same name is a separate function.
+
+---
+
+## See also
+
+- [`@self_guard`](/annotations/self-guard): a method that proves its receiver is valid
+- [`@self_call_valid`](/annotations/self-call-valid): a callback where a `self` method always returns a valid value

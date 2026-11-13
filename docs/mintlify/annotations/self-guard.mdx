@@ -1,0 +1,53 @@
+---
+title: "@self_guard"
+description: Mark a method that proves the object it is called on is valid.
+---
+
+## Overview
+
+`self_guard` marks a colon method such as `Entity:IsValid` that returns `true` only when the object it is called on is valid. After `if ent:IsValid() then`, GLuaLS treats `ent` as valid.
+
+Most addons do not need it. The official annotations already mark `IsValid` on entities, panels and other Garry's Mod objects.
+
+---
+
+## Syntax
+
+```lua
+---@return TypeGuard<T>
+---@[self_guard("domain")]
+```
+
+Put it after the `@return` or `@return_cast` line.
+
+---
+
+## Example
+
+```lua
+---@return TypeGuard<Entity>
+---@[self_guard("gmod.entity")]
+function Entity:IsValid() end
+```
+
+```lua
+---@type Entity?
+local ent
+
+if ent:IsValid() then
+    ent:GetClass() -- ent is valid here
+end
+```
+
+---
+
+## Keep it narrow
+
+It applies only to the annotated method. Only use it on a method that really checks validity, or it hides real `nil` and `NULL` bugs.
+
+---
+
+## See also
+
+- [`@valid_guard`](/annotations/valid-guard): a function that proves its argument is valid
+- [`@self_call_valid`](/annotations/self-call-valid): a callback where a `self` method always returns a valid value
