@@ -197,6 +197,16 @@
 --- - `return_self`: Whether the constructor is forced to return `self`, defaults to `true`
 ---@attribute constructor(name: string, root_class: string?, strip_self: boolean?, return_self: boolean?)
 
+---
+--- Marks a function parameter whose table gets a new field when the function is called.
+--- The field is added to the table the caller passes, so it is known after the call.
+--- Repeat the attribute to add several fields.
+---
+--- Parameters:
+--- - `name`: The name of the field.
+--- - `type`: The type of the field, such as `integer`, `string` or a class name. Add `?` for an optional field. Defaults to `any`.
+---@attribute adds_field(name: string, type: string?)
+
 --- Marks a function whose first return value is the exact value passed in one
 --- of its arguments. This is stronger than a generic parameter/return type
 --- correlation because it preserves runtime value identity.

@@ -8,7 +8,7 @@ use smol_str::SmolStr;
 
 use super::traits::LuaIndex;
 use crate::{
-    FileId, InFiled, LuaMemberOwner, LuaSignatureId,
+    FileId, InFiled, LuaMemberOwner, LuaSignatureId, LuaType,
     db_index::derivation::{self, FactKey, Fingerprint},
 };
 
@@ -285,7 +285,7 @@ impl std::hash::Hash for AccessorFuncCallMetadata {
     }
 }
 
-/// A method an accessor generator call makes, declared at `syntax_id` of the call in
+/// A member an accessor generator or `adds_field` call makes, declared at `syntax_id` of the call in
 /// `slot`, which tells apart the members one node declares.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccessorMember {
@@ -313,8 +313,8 @@ impl std::hash::Hash for AccessorMember {
     }
 }
 
-/// The callable shape of a synthesized accessor.
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+/// The shape of a synthesized member.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum AccessorSignature {
     /// `@accessorfunc`'s getter: no arguments, any value.
     Getter,
@@ -322,6 +322,8 @@ pub enum AccessorSignature {
     Setter,
     /// An inferred generator's function, whose branches may take any arguments.
     Any,
+    /// A field `adds_field` declares, holding a value of this type.
+    Field(LuaType),
 }
 
 #[derive(Debug, Default, Clone)]

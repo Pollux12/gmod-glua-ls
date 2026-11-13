@@ -2633,7 +2633,7 @@ fn str_tpl_selection_key(db: &DbIndex, str_tpl: &crate::LuaStringTplType) -> Str
     )
 }
 
-fn get_call_arg_expr(
+pub(crate) fn get_call_arg_expr(
     call_expr: &LuaCallExpr,
     param_idx: usize,
     is_colon_define: bool,

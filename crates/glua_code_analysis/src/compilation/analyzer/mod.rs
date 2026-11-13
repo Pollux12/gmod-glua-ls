@@ -1488,42 +1488,49 @@ fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
         let file_calls = db.get_accessor_func_call_index().calls_in(file_id).to_vec();
         for member in file_calls.into_iter().flat_map(|call| call.members) {
             let member_id = LuaMemberId::new_in_slot(member.syntax_id, file_id, member.slot);
-            let func = match member.signature {
-                crate::AccessorSignature::Setter => LuaFunctionType::new(
+            let (feature, typ) = match member.signature {
+                crate::AccessorSignature::Field(typ) => (LuaMemberFeature::FileFieldDecl, typ),
+                crate::AccessorSignature::Setter => accessor_method(LuaFunctionType::new(
                     AsyncState::None,
                     true,
                     false,
                     vec![("value".to_string(), Some(LuaType::Any))],
                     LuaType::Nil,
-                ),
-                crate::AccessorSignature::Getter => {
-                    LuaFunctionType::new(AsyncState::None, true, false, vec![], LuaType::Any)
-                }
-                crate::AccessorSignature::Any => LuaFunctionType::new(
+                )),
+                crate::AccessorSignature::Getter => accessor_method(LuaFunctionType::new(
+                    AsyncState::None,
+                    true,
+                    false,
+                    vec![],
+                    LuaType::Any,
+                )),
+                crate::AccessorSignature::Any => accessor_method(LuaFunctionType::new(
                     AsyncState::None,
                     true,
                     false,
                     vec![("...".to_string(), Some(LuaType::Any))],
                     LuaType::Any,
-                ),
+                )),
             };
             db.get_member_index_mut().add_member(
                 member.owner,
-                LuaMember::new(
-                    member_id,
-                    LuaMemberKey::Name(member.name),
-                    LuaMemberFeature::FileMethodDecl,
-                    None,
-                ),
+                LuaMember::new(member_id, LuaMemberKey::Name(member.name), feature, None),
             );
             write_type_cache(
                 db,
                 member_id.into(),
-                LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(func))),
+                LuaTypeCache::DocType(typ),
                 TypeCacheWriteMode::InsertOnly,
             );
         }
     }
+}
+
+fn accessor_method(func: LuaFunctionType) -> (LuaMemberFeature, LuaType) {
+    (
+        LuaMemberFeature::FileMethodDecl,
+        LuaType::DocFunction(Arc::new(func)),
+    )
 }
 
 trait AnalysisPipeline {

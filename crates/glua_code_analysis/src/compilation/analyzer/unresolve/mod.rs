@@ -14,8 +14,8 @@ use glua_parser::{LuaAssignStat, LuaAstNode, LuaCallExpr, LuaExpr, LuaFuncStat, 
 use resolve::{try_resolve_decl, try_resolve_module};
 use resolve_closure::{try_resolve_call_closure_params, try_resolve_closure_return};
 
-pub(crate) use resolve::get_wrapped_callable_target_expr;
 pub(crate) use resolve::iter_var_updates;
+pub(crate) use resolve::{get_call_arg_expr, get_wrapped_callable_target_expr};
 pub(crate) use resolve::{try_resolve_member, try_resolve_return_point};
 pub(crate) use resolve_closure::callback_contract_for_arg;
 pub use resolve_closure::extract_hook_name;

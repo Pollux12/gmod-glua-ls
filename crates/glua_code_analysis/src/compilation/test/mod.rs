@@ -1,4 +1,5 @@
 mod accessorfunc_test;
+mod adds_field_test;
 mod and_or_test;
 mod annotation_test;
 mod array_test;
