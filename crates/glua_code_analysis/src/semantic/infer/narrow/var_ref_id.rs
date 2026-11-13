@@ -3,7 +3,7 @@ use std::{
     ops::Deref,
 };
 
-use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaLiteralToken, PathTrait};
+use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaLiteralToken, LuaSyntaxKind, PathTrait};
 use internment::ArcIntern;
 use rowan::TextSize;
 use smol_str::SmolStr;
@@ -12,7 +12,8 @@ use crate::{
     DbIndex, LuaAliasCallKind, LuaDeclExtra, LuaDeclId, LuaDeclOrMemberId, LuaInferCache,
     LuaMemberId, LuaType, infer_expr,
     semantic::infer::{
-        infer_index::get_index_expr_var_ref_id, infer_name::get_name_expr_var_ref_id,
+        infer_index::{decl_rooted_index_ref, get_index_expr_var_ref_id},
+        infer_name::get_name_expr_var_ref_id,
     },
 };
 
@@ -37,6 +38,58 @@ pub(super) fn is_immutable_direct_lexical_decl(db: &DbIndex, var_ref_id: &VarRef
     db.get_reference_index()
         .get_decl_references(&decl_id.file_id, decl_id)
         .is_some_and(|references| !references.mutable)
+}
+
+/// The binding `decl_id` is another name for: a local that is never reassigned,
+/// carries no type annotation, and is declared as a bare name of a local or
+/// parameter that is never reassigned either (`local tr = trace`). Chains of
+/// such locals resolve to the first binding.
+fn local_alias_source(db: &DbIndex, decl_id: &LuaDeclId) -> Option<LuaDeclId> {
+    let mut source = None;
+    let mut current = *decl_id;
+    while let Some(next) = direct_local_alias_source(db, &current) {
+        source = Some(next);
+        current = next;
+    }
+    source
+}
+
+fn direct_local_alias_source(db: &DbIndex, decl_id: &LuaDeclId) -> Option<LuaDeclId> {
+    let decl = db.get_decl_index().get_decl(decl_id)?;
+    if !matches!(&decl.extra, LuaDeclExtra::Local { .. }) {
+        return None;
+    }
+    let initializer = decl.get_initializer()?;
+    let initializer_id = initializer.get_expr_syntax_id();
+    if initializer.get_ret_idx() != 0 || initializer_id.get_kind() != LuaSyntaxKind::NameExpr {
+        return None;
+    }
+    if db
+        .get_type_index()
+        .get_type_cache(&(*decl_id).into())
+        .is_some_and(|type_cache| type_cache.is_doc())
+    {
+        return None;
+    }
+    let source_id = db
+        .get_reference_index()
+        .get_local_reference(&decl_id.file_id)?
+        .get_decl_id(&initializer_id.get_range())?;
+    (is_immutable_direct_lexical_decl(db, &VarRefId::VarRef(*decl_id))
+        && is_immutable_direct_lexical_decl(db, &VarRefId::VarRef(source_id)))
+    .then_some(source_id)
+}
+
+/// The binding a narrowing reference rooted at `decl_id` is keyed by, so a
+/// path read through an alias and through its source narrow together.
+pub(crate) fn narrowing_root_decl(db: &DbIndex, decl_id: LuaDeclId) -> LuaDeclId {
+    local_alias_source(db, &decl_id).unwrap_or(decl_id)
+}
+
+/// `path` with its root spelled `root_name`, when it is written from another name.
+pub(crate) fn respell_path_root(path: &str, root_name: &str) -> Option<String> {
+    let root_end = path.find(['.', ':', '[']).unwrap_or(path.len());
+    (path[..root_end] != *root_name).then(|| format!("{root_name}{}", &path[root_end..]))
 }
 
 /// Returns true when a successfully-indexed `Unknown` prefix is authoritative
@@ -346,10 +399,11 @@ fn get_call_expr_var_ref_id(
             .get_name()?
             .get_name_text()
             .to_string();
-        return Some(VarRefId::IndexRef(
-            root,
-            crate::db_index::intern_smol_str(&format!("{path}.[:{name}()]")),
-        ));
+        let path = crate::db_index::intern_smol_str(&format!("{path}.[:{name}()]"));
+        return Some(match root {
+            VarRefRootId::Decl(decl_id) => decl_rooted_index_ref(db, decl_id, path),
+            root => VarRefId::IndexRef(root, path),
+        });
     }
 
     let ret = match maybe_func {

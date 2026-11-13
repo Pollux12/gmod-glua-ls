@@ -30,7 +30,9 @@ pub use narrow_type::{
 };
 pub(crate) use var_ref_id::call_var_ref_root;
 pub use var_ref_id::{SelfRefId, VarRefId, VarRefRootId, get_var_expr_var_ref_id};
-pub(crate) use var_ref_id::{getter_access_path, raw_get_access_path};
+pub(crate) use var_ref_id::{
+    getter_access_path, narrowing_root_decl, raw_get_access_path, respell_path_root,
+};
 
 const GMOD_NULL_TYPE_NAME: &str = "NULL";
 

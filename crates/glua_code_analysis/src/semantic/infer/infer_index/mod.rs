@@ -574,24 +574,45 @@ fn index_expr_var_ref_id_uncached(
             return None;
         };
         let path = super::narrow::getter_access_path(&LuaExpr::IndexExpr(index_expr.clone()))?;
-        return Some(VarRefId::IndexRef(
-            root,
-            crate::db_index::intern_smol_str(&path),
-        ));
+        let path = crate::db_index::intern_smol_str(&path);
+        return Some(match root {
+            VarRefRootId::Decl(decl_id) => decl_rooted_index_ref(db, decl_id, path),
+            root => VarRefId::IndexRef(root, path),
+        });
     }
 
     if let LuaExpr::NameExpr(name_expr) = prefix_expr {
-        let root = match get_name_expr_var_ref_id(db, cache, &name_expr) {
-            Some(VarRefId::SelfRef(self_ref_id)) => VarRefRootId::SelfRef(self_ref_id),
-            Some(VarRefId::VarRef(decl_id)) => VarRefRootId::Decl(decl_id),
-            _ => return None,
-        };
-
         let access_path = interned_access_path(cache.get_file_id(), syntax_id, index_expr)?;
-        return Some(VarRefId::IndexRef(root, access_path));
+        return match get_name_expr_var_ref_id(db, cache, &name_expr) {
+            Some(VarRefId::SelfRef(self_ref_id)) => Some(VarRefId::IndexRef(
+                VarRefRootId::SelfRef(self_ref_id),
+                access_path,
+            )),
+            Some(VarRefId::VarRef(decl_id)) => {
+                Some(decl_rooted_index_ref(db, decl_id, access_path))
+            }
+            _ => None,
+        };
     }
 
     None
+}
+
+/// The narrowing reference for `path` read from the binding `decl_id`, keyed by
+/// the binding it aliases, if any.
+pub(crate) fn decl_rooted_index_ref(
+    db: &DbIndex,
+    decl_id: crate::LuaDeclId,
+    path: internment::ArcIntern<smol_str::SmolStr>,
+) -> VarRefId {
+    let root_decl_id = super::narrow::narrowing_root_decl(db, decl_id);
+    let path = db
+        .get_decl_index()
+        .get_decl(&root_decl_id)
+        .and_then(|root_decl| super::narrow::respell_path_root(&path, root_decl.get_name()))
+        .map(|respelled| crate::db_index::intern_smol_str(&respelled))
+        .unwrap_or(path);
+    VarRefId::IndexRef(VarRefRootId::Decl(root_decl_id), path)
 }
 
 pub fn infer_member_by_member_key(

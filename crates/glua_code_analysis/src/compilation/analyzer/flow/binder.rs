@@ -1,6 +1,6 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use glua_parser::{LuaAstPtr, LuaExpr, LuaNameToken, LuaSyntaxId};
+use glua_parser::{LuaAstNode, LuaAstPtr, LuaExpr, LuaIndexExpr, LuaNameToken, LuaSyntaxId};
 use internment::ArcIntern;
 use rowan::TextSize;
 use smol_str::SmolStr;
@@ -363,9 +363,46 @@ impl<'a> FlowBinder<'a> {
         self.record_name(name, false);
     }
 
-    /// Record an index access path that can be narrowed.
-    pub fn record_narrowable_index_path(&mut self, path: &str) {
-        self.record_index_path(path, false);
+    /// Record the access path `index_expr` is written as, which can be narrowed.
+    pub fn record_narrowable_index_path(&mut self, index_expr: &LuaIndexExpr, path: &str) {
+        self.record_index_path_of(index_expr, path, false);
+    }
+
+    /// `path`, the access path of `index_expr`, spelled from the binding its
+    /// root aliases, when it is read through an alias: narrowing references
+    /// are keyed by that binding.
+    pub fn aliased_index_path(&self, index_expr: &LuaIndexExpr, path: &str) -> Option<String> {
+        let mut prefix = index_expr.get_prefix_expr()?;
+        let root = loop {
+            prefix = match prefix {
+                LuaExpr::IndexExpr(index_expr) => index_expr.get_prefix_expr()?,
+                LuaExpr::CallExpr(call_expr) => call_expr.get_prefix_expr()?,
+                LuaExpr::NameExpr(name_expr) => break name_expr,
+                _ => return None,
+            };
+        };
+        let decl_id = self
+            .db
+            .get_reference_index()
+            .get_var_reference_decl(&self.file_id, root.get_range())?;
+        let source_id = crate::semantic::narrowing_root_decl(self.db, decl_id);
+        if source_id == decl_id {
+            return None;
+        }
+        let source = self.db.get_decl_index().get_decl(&source_id)?;
+        crate::semantic::respell_path_root(path, source.get_name())
+    }
+
+    fn record_index_path_of(
+        &mut self,
+        index_expr: &LuaIndexExpr,
+        path: &str,
+        from_condition: bool,
+    ) {
+        if let Some(aliased) = self.aliased_index_path(index_expr, path) {
+            self.record_index_path(&aliased, from_condition);
+        }
+        self.record_index_path(path, from_condition);
     }
 
     pub fn mark_opaque_name_target(&mut self) {
@@ -468,8 +505,15 @@ impl<'a> FlowBinder<'a> {
                     call_locals.push(decl_id);
                 }
             } else if let Some(call) = LuaCallExpr::cast(node.clone()) {
-                if let Some(path) = crate::semantic::getter_access_path(&LuaExpr::CallExpr(call)) {
-                    self.record_index_path(&path, from_condition);
+                if let Some(path) =
+                    crate::semantic::getter_access_path(&LuaExpr::CallExpr(call.clone()))
+                {
+                    match call.get_prefix_expr() {
+                        Some(LuaExpr::IndexExpr(method)) => {
+                            self.record_index_path_of(&method, &path, from_condition)
+                        }
+                        _ => self.record_index_path(&path, from_condition),
+                    }
                 }
             } else if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
                 let dynamic = matches!(
@@ -481,7 +525,7 @@ impl<'a> FlowBinder<'a> {
                     .or_else(|| index_expr.get_access_path())
                 {
                     Some(path) if !dynamic => {
-                        self.record_index_path(&path, from_condition);
+                        self.record_index_path_of(&index_expr, &path, from_condition);
                     }
                     _ => {
                         self.record_opaque_index(from_condition);

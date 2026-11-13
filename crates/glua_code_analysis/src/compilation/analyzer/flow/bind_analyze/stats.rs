@@ -110,7 +110,7 @@ pub fn bind_assign_stat(
                 // sound.
                 match index_expr.get_access_path() {
                     Some(path) if !index_key_is_dynamic(index_expr) => {
-                        binder.record_narrowable_index_path(&path)
+                        binder.record_narrowable_index_path(index_expr, &path)
                     }
                     _ => binder.mark_opaque_index_target(),
                 }
@@ -165,7 +165,7 @@ fn collect_assignment_flow_info(binder: &FlowBinder, vars: &[LuaVarExpr]) -> Ass
         };
 
         match index_expr.get_access_path() {
-            Some(path) => push_assignment_index_path(&mut info, path),
+            Some(path) => push_assignment_index_path(binder, &mut info, index_expr, path),
             None => info.has_unknown_index_target = true,
         }
 
@@ -175,7 +175,7 @@ fn collect_assignment_flow_info(binder: &FlowBinder, vars: &[LuaVarExpr]) -> Ass
                 continue;
             };
             match expr_access_path(&prefix_expr) {
-                Some(path) => push_assignment_index_path(&mut info, path),
+                Some(path) => push_assignment_index_path(binder, &mut info, index_expr, path),
                 None => info.has_unknown_index_target = true,
             }
         }
@@ -183,10 +183,20 @@ fn collect_assignment_flow_info(binder: &FlowBinder, vars: &[LuaVarExpr]) -> Ass
     info
 }
 
-fn push_assignment_index_path(info: &mut AssignmentFlowInfo, path: smol_str::SmolStr) {
-    let path = crate::db_index::intern_smol_str(&path);
-    if !info.index_paths.contains(&path) {
-        info.index_paths.push(path);
+/// Adds the path `index_expr` writes, and its spelling from the binding its
+/// root aliases.
+fn push_assignment_index_path(
+    binder: &FlowBinder,
+    info: &mut AssignmentFlowInfo,
+    index_expr: &LuaIndexExpr,
+    path: smol_str::SmolStr,
+) {
+    let aliased = binder.aliased_index_path(index_expr, &path);
+    for path in std::iter::once(path.to_string()).chain(aliased) {
+        let path = crate::db_index::intern_smol_str(&path);
+        if !info.index_paths.contains(&path) {
+            info.index_paths.push(path);
+        }
     }
 }
 
@@ -686,7 +696,7 @@ pub fn bind_func_stat(binder: &mut FlowBinder, func_stat: LuaFuncStat, current: 
             None => binder.mark_opaque_name_target(),
         },
         LuaVarExpr::IndexExpr(index_expr) => match index_expr.get_access_path() {
-            Some(path) => binder.record_narrowable_index_path(&path),
+            Some(path) => binder.record_narrowable_index_path(index_expr, &path),
             None => binder.mark_opaque_index_target(),
         },
     }
