@@ -8,7 +8,10 @@ use crate::{
     LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
     compilation::analyzer::gmod::name_expr_resolves_to_scoped_authoring_table,
     semantic::{
-        member::{get_buildin_type_map_type_id, resolve_dynamic_field_member},
+        member::{
+            get_buildin_type_map_type_id, resolve_dynamic_field_member,
+            resolve_inherited_dynamic_field_member,
+        },
         semantic_info::resolve_global_decl_id,
     },
 };
@@ -574,7 +577,12 @@ fn infer_custom_type_member_semantic_decl(
     // type may still hold the answer. Remember the reason and report it only if
     // nothing is found, so a real hit stays a hit and a real miss stays retryable.
     let mut pending = None;
-    match resolve_dynamic_field_member(
+    let resolve_dynamic_field = if semantic_guard.is_inherited() {
+        resolve_inherited_dynamic_field_member
+    } else {
+        resolve_dynamic_field_member
+    };
+    match resolve_dynamic_field(
         db,
         cache,
         &LuaType::Ref(prefix_type_id.clone()),
@@ -591,7 +599,7 @@ fn infer_custom_type_member_semantic_decl(
             return pending.map_or(Ok(None), Err);
         };
         for super_type in super_types {
-            let Some(next_guard) = semantic_guard.next_level() else {
+            let Some(next_guard) = semantic_guard.next_super_level() else {
                 return pending.map_or(Ok(None), Err);
             };
             match infer_member_semantic_decl_by_member_key(

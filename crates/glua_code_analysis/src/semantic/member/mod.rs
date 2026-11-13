@@ -1051,6 +1051,30 @@ pub(crate) fn resolve_dynamic_field_member(
     member_key: &LuaMemberKey,
     access_position: Option<TextSize>,
 ) -> Result<Option<DynamicFieldResolution>, InferFailReason> {
+    resolve_dynamic_field_member_as(db, cache, prefix_type, member_key, access_position, false)
+}
+
+/// [`resolve_dynamic_field_member`] for a lookup that reached `prefix_type`
+/// from one of its subclasses: a class passes down only the fields written on
+/// it, not those its other subclasses' writes put there.
+pub(crate) fn resolve_inherited_dynamic_field_member(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    prefix_type: &LuaType,
+    member_key: &LuaMemberKey,
+    access_position: Option<TextSize>,
+) -> Result<Option<DynamicFieldResolution>, InferFailReason> {
+    resolve_dynamic_field_member_as(db, cache, prefix_type, member_key, access_position, true)
+}
+
+fn resolve_dynamic_field_member_as(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    prefix_type: &LuaType,
+    member_key: &LuaMemberKey,
+    access_position: Option<TextSize>,
+    inherited: bool,
+) -> Result<Option<DynamicFieldResolution>, InferFailReason> {
     let gmod = &db.get_file_emmyrc(cache.get_file_id()).gmod;
     if !gmod.enabled || !gmod.infer_dynamic_fields || !cache.dynamic_fields_visible() {
         if gmod.enabled && gmod.infer_dynamic_fields && !cache.dynamic_fields_visible() {
@@ -1061,7 +1085,12 @@ pub(crate) fn resolve_dynamic_field_member(
         return Ok(None);
     }
 
-    let cache_key = (prefix_type.clone(), member_key.clone(), access_position);
+    let cache_key = (
+        prefix_type.clone(),
+        member_key.clone(),
+        access_position,
+        inherited,
+    );
     if let Some(cached) = cache.tracked_get(
         |cache| &mut cache.dynamic_field_resolution_cache,
         &cache_key,
@@ -1073,8 +1102,14 @@ pub(crate) fn resolve_dynamic_field_member(
         return Ok(None);
     };
     let frame = crate::db_index::derivation::open_frame();
-    let resolved =
-        resolve_dynamic_field_uncached(db, cache, prefix_type, field_name, access_position);
+    let resolved = resolve_dynamic_field_uncached(
+        db,
+        cache,
+        prefix_type,
+        field_name,
+        access_position,
+        inherited,
+    );
     cache.tracked_insert(
         |cache| &mut cache.dynamic_field_resolution_cache,
         cache_key,
@@ -1090,16 +1125,31 @@ fn resolve_dynamic_field_uncached(
     prefix_type: &LuaType,
     field_name: &str,
     access_position: Option<TextSize>,
+    inherited: bool,
 ) -> Option<(LuaType, Option<LuaSemanticDeclId>)> {
     let caller_file_id = cache.get_file_id();
-    let definitions = dynamic_field_definitions(
-        db,
-        cache,
-        caller_file_id,
-        prefix_type,
-        field_name,
-        access_position,
-    );
+    let definitions = match prefix_type {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) if inherited => {
+            dynamic_field_definitions_for_owner(
+                db,
+                cache,
+                caller_file_id,
+                &crate::DynamicFieldOwner::Type(type_id.clone()),
+                field_name,
+                access_position,
+                None,
+                true,
+            )
+        }
+        _ => dynamic_field_definitions(
+            db,
+            cache,
+            caller_file_id,
+            prefix_type,
+            field_name,
+            access_position,
+        ),
+    };
     if definitions.is_empty() {
         return None;
     }
@@ -1197,14 +1247,17 @@ fn dynamic_field_definitions_type(
     (typ, semantic_decl)
 }
 
+/// `inherited` as for [`resolve_inherited_dynamic_field_member`].
 pub(crate) fn resolve_dynamic_field_member_for_file(
     db: &DbIndex,
     caller_file_id: FileId,
     prefix_type: &LuaType,
     member_key: &LuaMemberKey,
+    inherited: bool,
 ) -> Option<DynamicFieldResolution> {
     let mut cache = LuaInferCache::new(caller_file_id, Default::default());
-    resolve_dynamic_field_member(db, &mut cache, prefix_type, member_key, None).unwrap_or_default()
+    resolve_dynamic_field_member_as(db, &mut cache, prefix_type, member_key, None, inherited)
+        .unwrap_or_default()
 }
 
 fn dynamic_field_member_type(

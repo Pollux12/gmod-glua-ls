@@ -53,6 +53,7 @@ use crate::{
         member::member_key_matches_type,
         member::merge_open_table_types,
         member::resolve_dynamic_field_member,
+        member::resolve_inherited_dynamic_field_member,
         member::resolve_member_item_with_realm,
         member::source_survives_table_generation_cutoff,
         type_check::{self, check_type_compact},
@@ -65,12 +66,14 @@ use super::{
     infer_name::{contains_self_infer, infer_global_type},
 };
 
-/// The tables a member lookup is walking, and the per-call table whose base
-/// the lookup is reading through.
+/// The tables a member lookup is walking, the per-call table whose base
+/// the lookup is reading through, and whether it reached the current class
+/// from one of its subclasses.
 #[derive(Default)]
 struct TableMemberLookupGuard {
     tables: FxHashSet<InFiled<TextRange>>,
     instance: Option<Arc<LuaInstanceType>>,
+    inherited: bool,
 }
 
 impl TableMemberLookupGuard {
@@ -2581,7 +2584,12 @@ fn infer_custom_type_member(
         }
     }
 
-    let dynamic_field_result = resolve_dynamic_field_member(
+    let resolve_dynamic_field = if table_member_lookup_guard.inherited {
+        resolve_inherited_dynamic_field_member
+    } else {
+        resolve_dynamic_field_member
+    };
+    let dynamic_field_result = resolve_dynamic_field(
         db,
         cache,
         &LuaType::Ref(prefix_type_id.clone()),
@@ -2605,12 +2613,12 @@ fn infer_custom_type_member(
                 visible_super_types_for_index(db, cache, &prefix_type_id, &index_expr)
         {
             for super_type in super_types {
-                let result = infer_member_by_member_key_with_table_guard(
+                let result = infer_inherited_member(
                     db,
                     cache,
                     &super_type,
-                    index_expr.clone(),
-                    &infer_guard.fork(),
+                    &index_expr,
+                    infer_guard,
                     table_member_lookup_guard,
                 );
 
@@ -2673,12 +2681,12 @@ fn infer_custom_type_member(
             visible_super_types_for_index(db, cache, &prefix_type_id, &index_expr)
     {
         for super_type in super_types {
-            let result = infer_member_by_member_key_with_table_guard(
+            let result = infer_inherited_member(
                 db,
                 cache,
                 &super_type,
-                index_expr.clone(),
-                &infer_guard.fork(),
+                &index_expr,
+                infer_guard,
                 table_member_lookup_guard,
             );
 
@@ -2696,6 +2704,28 @@ fn infer_custom_type_member(
 
     cache.record_missed_member_read(db, owner, key);
     Err(InferFailReason::FieldNotFound)
+}
+
+/// `index_expr`'s member on `super_type` as a subclass inherits it.
+fn infer_inherited_member(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    super_type: &LuaType,
+    index_expr: &LuaIndexMemberExpr,
+    infer_guard: &InferGuardRef,
+    table_member_lookup_guard: &mut TableMemberLookupGuard,
+) -> InferResult {
+    let reached_from_subclass = std::mem::replace(&mut table_member_lookup_guard.inherited, true);
+    let result = infer_member_by_member_key_with_table_guard(
+        db,
+        cache,
+        super_type,
+        index_expr.clone(),
+        &infer_guard.fork(),
+        table_member_lookup_guard,
+    );
+    table_member_lookup_guard.inherited = reached_from_subclass;
+    result
 }
 
 /// Whether `typ` is a method: a function type, or a union of them. A dynamic
