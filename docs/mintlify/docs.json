@@ -80,6 +80,9 @@
               "annotations/return",
               "annotations/outparam",
               "annotations/adds-field",
+              "annotations/return-alias",
+              "annotations/copy-result",
+              "annotations/fresh-result",
               "annotations/overload",
               "annotations/async",
               "annotations/nodiscard"
@@ -95,7 +98,11 @@
               "annotations/call-arg",
               "annotations/valid-guard",
               "annotations/self-guard",
-              "annotations/self-call-valid"
+              "annotations/self-call-valid",
+              "annotations/exhaustive-type-guard",
+              "annotations/net-send",
+              "annotations/net-payload",
+              "annotations/writes-global"
             ]
           },
           {
@@ -108,7 +115,9 @@
               "annotations/module",
               "annotations/source",
               "annotations/version",
-              "annotations/see"
+              "annotations/see",
+              "annotations/lsp-optimization",
+              "annotations/builtin-alias"
             ]
           }
         ]

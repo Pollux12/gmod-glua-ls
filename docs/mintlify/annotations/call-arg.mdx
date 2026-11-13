@@ -52,6 +52,23 @@ local function AddVar(typeName, slot, name) end
 
 The first argument is the zero-based parameter index inside that overload.
 
+When the function reads the value from a field of a table argument, use `@call_arg_field` with the field's path:
+
+```lua
+---@[call_arg_field("gmod.vgui_panel", "base", "Base")]
+---@param panel table
+local function CreateFromTable(panel) end
+```
+
+Here `panel.Base` is treated as the panel's base class. Use dots for nested fields, such as `"Options.Base"`.
+
+`@overload_call_arg_field` does the same for a parameter inside the following `@overload`. It takes the zero-based parameter index first:
+
+```lua
+---@[overload_call_arg_field(0, "gmod.vgui_panel", "base", "Base")]
+---@overload fun(panel: table): Panel
+```
+
 ---
 
 ## Supported roles
@@ -61,13 +78,16 @@ The first argument is the zero-based parameter index inside that overload.
 | `gmod.net_message` | `define`, `start`, `receive`, `callback`, `reference` | Replacement network APIs or declarations provided without source code |
 | `gmod.hook` | `add`, `emit`, `callback`, `gamemode_table`, `remove`, `reference` | Hook registration, hook calls, callback inference, and hook name lookup |
 | `gmod.concommand` | `define`, `callback` | Console command registration and callback tracking |
-| `gmod.convar` | `define`, `define_server`, `define_client` | Server and client ConVar registration |
+| `gmod.net_payload` | `target`, `bits` | The recipient of a net send, and the bit count of a net read or write |
+| `gmod.convar` | `define`, `define_server`, `define_client`, `reference`, `exists` | ConVar registration, lookup by name, and `ConVarExists`-style checks |
 | `gmod.timer` | `define`, `callback`, `simple` | Timer creation and callback tracking |
-| `gmod.load` | `include`, `addcsluafile`, `add_cs_lua_file`, `includecs`, `include_cs`, `require` | File loading and realm detection for wrappers |
+| `gmod.load` | `include`, `addcsluafile`, `add_cs_lua_file`, `includecs`, `include_cs`, `require`, `compilefile` | File loading and realm detection for wrappers |
+| `gmod.environment` | `target`, `environment` | `setfenv`-style functions that give a function a new environment table |
 | `gmod.file_find` | `glob`, `search_path`, `path` | Files found by `file.Find` loader loops |
-| `gmod.vgui_panel` | `define`, `define_control`, `table`, `base`, `reference` | VGUI panel registration, inheritance, and panel name lookup |
+| `gmod.vgui_panel` | `define`, `define_control`, `table`, `base`, `reference`, `register_file`, `register_table`, `parent`, `child_self`, `parent_self`, `own_class` | VGUI panel registration, inheritance, parenting, and panel name lookup |
 | `gmod.derma_skin` | `define`, `reference` | Derma skin registration and skin name lookup |
-| `gmod.network_var` | `type`, `define`, `define_element` | Entity `NetworkVar` and `NetworkVarElement` accessor generation |
+| `gmod.scripted_class` | `define`, `entity_table`, `weapon_table`, `class_name`, `based_on` | Entity and weapon registration, and `IsBasedOn`-style checks |
+| `gmod.network_var` | `type`, `define`, `define_element`, `define_slot` | Entity `NetworkVar`, `NetworkVarElement` and `DTVar` accessor generation |
 | `gmod.class_base` | `reference` | Base class names passed to `DEFINE_BASECLASS` wrappers |
 | `gmod.gamemode` | `reference` | Parent gamemode names passed to `DeriveGamemode` wrappers |
 | `gmod.member_guard` | `function` | Member-name guard wrappers |
@@ -166,6 +186,29 @@ end
 
 When `FindLuaFiles("myaddon/*.lua", "LUA")` is used in a loop and the loop body calls annotated load wrappers, GLuaLS can infer which matching files are loaded server-side, sent to the client, or shared.
 
+Use `compilefile` for `CompileFile` wrappers, and `gmod.environment` for `setfenv` wrappers. When a compiled file is given an environment table, globals in that file are looked up in the table:
+
+```lua
+---@[call_arg("gmod.load", "compilefile")]
+---@param path string
+local function Compile(path)
+    return CompileFile(path)
+end
+
+---@[call_arg("gmod.environment", "target")]
+---@param fn function
+---@[call_arg("gmod.environment", "environment")]
+---@param env table
+local function SetEnv(fn, env)
+    setfenv(fn, env)
+end
+
+local chunk = Compile("myaddon/plugin.lua")
+SetEnv(chunk, { Config = {} }) -- Config is defined inside plugin.lua
+```
+
+Like `CompileFile`, the path is relative to `lua/`, not to the calling file.
+
 ---
 
 ## VGUI panels
@@ -185,6 +228,17 @@ end
 ```
 
 Use `define_control` instead of `define` for `derma.DefineControl` wrappers. Use `reference` for functions that create or look up panels by name.
+
+Other panel roles:
+
+- `register_file` marks a file path whose `PANEL` table is registered, like `vgui.RegisterFile`.
+- `register_table` marks a panel table that is created or registered without a name, like `vgui.CreateFromTable` and `vgui.RegisterTable`.
+- `parent` marks the parent panel argument, like the `parent` of `vgui.Create`.
+- `child_self` marks a method that sets the parent of the panel it is called on, like `Panel:SetParent`.
+- `parent_self` marks a method that parents its argument to the panel it is called on, like `Panel:Add`.
+- `own_class` marks a parameter that receives the panel's own class name, like the `class` of `PANEL:GenerateExample`.
+
+With the parent known, `self:GetParent()` in a child panel has the parent's type.
 
 ---
 
@@ -226,7 +280,23 @@ local function AddVar(name, typeName)
 end
 ```
 
-Use `define_element` for wrappers around `NetworkVarElement`, because element accessors always return numbers.
+Use `define_element` for wrappers around `NetworkVarElement`, because element accessors always return numbers. Use `define_slot` for `DTVar`-style functions that register a named data table slot.
+
+Use `gmod.scripted_class` for functions that register entities or weapons by name:
+
+```lua
+---@[call_arg("gmod.scripted_class", "entity_table")]
+---@param ENT table
+---@[call_arg("gmod.scripted_class", "define")]
+---@param className string
+local function RegisterEntity(ENT, className)
+    scripted_ents.Register(ENT, className)
+end
+```
+
+Use `weapon_table` instead of `entity_table` for weapons. The table then becomes the class named by `className`, with its base class's fields and methods.
+
+For `IsBasedOn`-style checks, mark the class name with `class_name` and the base with `based_on`. Inside `if IsBasedOn(ent:GetClass(), "base_class") then`, `ent` has the base class's type.
 
 For gamemode inheritance wrappers, mark the base-name parameter:
 

@@ -43,6 +43,9 @@ GLuaLS follows EmmyLua-style annotations and adds Garry's Mod Lua extensions for
 | [`@return`](/annotations/return) | Document a return value's type | `---@return boolean` |
 | [`@outparam`](/annotations/outparam) | Document a parameter table field modified by a function | `---@outparam cfg.output TraceResult` |
 | [`@adds_field`](/annotations/adds-field) | Declare a field a function adds to a table argument | `---@[adds_field("MetaID", "integer")]` |
+| [`@return_alias`](/annotations/return-alias) | Mark a function that returns one of its arguments unchanged | `---@[return_alias(0)]` |
+| [`@copy_result`](/annotations/copy-result) | Mark a function that returns a copy of its table argument | `---@[copy_result]` |
+| [`@fresh_result`](/annotations/fresh-result) | Mark a method that returns a new value on every call | `---@[fresh_result]` |
 | [`@overload`](/annotations/overload) | Define an alternate function signature | `---@overload fun(x: number): number` |
 | [`@async`](/annotations/async) | Mark a function as async/coroutine-based | `---@async` |
 | [`@nodiscard`](/annotations/nodiscard) | Warn if the return value is unused | `---@nodiscard` |
@@ -59,6 +62,10 @@ GLuaLS follows EmmyLua-style annotations and adds Garry's Mod Lua extensions for
 | [`@valid_guard`](/annotations/valid-guard) | Mark a function that proves its argument is valid | `---@[valid_guard]` |
 | [`@self_guard`](/annotations/self-guard) | Mark a method that proves its receiver is valid | `---@[self_guard("gmod.entity")]` |
 | [`@self_call_valid`](/annotations/self-call-valid) | Mark a callback where a `self` method returns a valid value | `---@[self_call_valid("GetOwner")]` |
+| [`@exhaustive_type_guard`](/annotations/exhaustive-type-guard) | Mark a type check that also rules out subclasses when it fails | `---@[exhaustive_type_guard]` |
+| [`@net_send`](/annotations/net-send) | Mark a function that sends the current net message | `---@[net_send("client")]` |
+| [`@net_payload`](/annotations/net-payload) | Mark a function that writes or reads a net message value | `---@[net_payload("write", "string")]` |
+| [`@writes_global`](/annotations/writes-global) | Declare the only globals a function changes | `---@[writes_global("ConVarCache")]` |
 
 ## Control and metadata annotations
 
@@ -72,6 +79,8 @@ GLuaLS follows EmmyLua-style annotations and adds Garry's Mod Lua extensions for
 | [`@see`](/annotations/see) | Add a cross-reference to another symbol | `---@see AnotherClass` |
 | [`@source`](/annotations/source) | Map a definition to its true source location | `---@source file:///path/file.lua#41:0` |
 | [`@version`](/annotations/version) | Restrict features to specific Lua versions | `---@version >5.1` |
+| [`@lsp_optimization`](/annotations/lsp-optimization) | Skip a check or delay a local's type | `---@[lsp_optimization("check_table_field")]` |
+| [`@builtin_alias`](/annotations/builtin-alias) | Keep a Lua built-in's handling on a replacement | `---@[builtin_alias("pairs")]` |
 
 ---
 

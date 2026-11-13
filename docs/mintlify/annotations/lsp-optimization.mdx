@@ -1,0 +1,50 @@
+---
+title: "@lsp_optimization"
+description: Turn off a check or change how GLuaLS types a local.
+---
+
+## Overview
+
+`lsp_optimization` goes on a `local` and changes how GLuaLS treats it. It takes one of two codes.
+
+---
+
+## Syntax
+
+```lua
+---@[lsp_optimization("check_table_field")]
+---@[lsp_optimization("delayed_definition")]
+```
+
+Put it directly above the `local`.
+
+---
+
+## `check_table_field`
+
+Skips the `assign-type-mismatch` check on the fields of a table. Use it on large configuration tables where the check is slow and not useful:
+
+```lua
+---@[lsp_optimization("check_table_field")]
+local Config = {
+    MaxPlayers = 32,
+    Spawns = { --[[ hundreds of entries ]] },
+}
+```
+
+---
+
+## `delayed_definition`
+
+For a `local` declared without a value. Its type comes from the first value assigned to it later, even in functions defined before that assignment:
+
+```lua
+---@[lsp_optimization("delayed_definition")]
+local config
+
+function GetConfig()
+    return config -- integer
+end
+
+config = 1
+```

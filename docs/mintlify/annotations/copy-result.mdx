@@ -1,0 +1,48 @@
+---
+title: "@copy_result"
+description: Mark a function that returns a copy of the table it is given.
+---
+
+## Overview
+
+`copy_result` marks a function such as `table.Copy` that returns a new table starting with the contents of its first argument.
+
+The copy keeps the original's fields and methods. Fields you add to the copy stay on the copy and never show on the original.
+
+---
+
+## Syntax
+
+```lua
+---@return T
+---@[copy_result]
+```
+
+Put it after the `@return` line.
+
+---
+
+## Example
+
+```lua
+---@generic T
+---@param originalTable T
+---@return T
+---@[copy_result]
+function table.Copy(originalTable) end
+```
+
+```lua
+local defaults = { Speed = 10 }
+local settings = table.Copy(defaults)
+settings.Extra = true
+
+print(settings.Speed) -- number
+print(defaults.Extra) -- undefined field
+```
+
+---
+
+## See also
+
+- [`@return_alias`](/annotations/return-alias): a function that returns its argument unchanged

@@ -1,0 +1,44 @@
+---
+title: "@net_payload"
+description: Mark a function that writes a value to, or reads one from, a net message.
+---
+
+## Overview
+
+`net_payload` marks a function like `net.WriteString` or `net.ReadUInt`. GLuaLS compares the writes in a message's sender with the reads in its receiver, and warns when they do not match in order or kind.
+
+Most addons do not need it. The official annotations already mark the `net` library, and wrappers that call it are detected automatically.
+
+---
+
+## Syntax
+
+```lua
+---@[net_payload("write", "format")]
+---@[net_payload("read", "format")]
+```
+
+- **Direction** is `write` or `read`.
+- **Format** names how the value is sent, such as `string`, `uint` or `entity`. A write matches a read with the same format.
+
+The format is separate from the Lua type on purpose. `net.ReadInt`, `net.ReadUInt` and `net.ReadFloat` all return `number`, so only the format tells them apart.
+
+Mark a bit-count parameter, if there is one, with [`@call_arg`](/annotations/call-arg) `gmod.net_payload` `bits`.
+
+---
+
+## Example
+
+```lua
+---@[call_arg("gmod.net_payload", "bits")]
+---@param bitCount number
+---@return number
+---@[net_payload("read", "int")]
+function net.ReadInt(bitCount) end
+```
+
+---
+
+## See also
+
+- [`@net_send`](/annotations/net-send): a function that sends the current net message

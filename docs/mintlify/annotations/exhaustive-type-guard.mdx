@@ -1,0 +1,47 @@
+---
+title: "@exhaustive_type_guard"
+description: Mark a type check that also rules out every subclass when it fails.
+---
+
+## Overview
+
+A type check such as `isentity(x)` returns `true` for an `Entity` and for every class built on it, such as `Player` and `Weapon`. So when it returns `false`, the value is none of them.
+
+`exhaustive_type_guard` tells GLuaLS this. In the `false` branch, the checked class and all its subclasses are removed from the value's type. Without it, only the exact class is removed.
+
+---
+
+## Syntax
+
+```lua
+---@return TypeGuard<T>
+---@[exhaustive_type_guard]
+```
+
+Put it after the `@return` line. The function must return `TypeGuard<T>`.
+
+---
+
+## Example
+
+```lua
+---@param var any
+---@return TypeGuard<Entity>
+---@[exhaustive_type_guard]
+function _G.isentity(var) end
+```
+
+```lua
+---@param target Player|string
+local function Describe(target)
+    if not isentity(target) then
+        print(target:upper()) -- target is string here
+    end
+end
+```
+
+---
+
+## See also
+
+- [`@valid_guard`](/annotations/valid-guard): a function that proves its argument is valid

@@ -1,0 +1,41 @@
+---
+title: "@writes_global"
+description: Declare the only global tables a function changes when called.
+---
+
+## Overview
+
+GLuaLS works out facts about global tables, such as which keys a table filled by a loop holds. A call to a function it cannot see into might change any global, so after that call those facts are dropped.
+
+`writes_global` says which globals a function changes. After a call, facts about those globals are dropped and facts about every other global are kept.
+
+Most addons do not need it. It is for functions with no source in your workspace, such as the official annotations.
+
+---
+
+## Syntax
+
+```lua
+---@[writes_global("GlobalName")]
+```
+
+Put it with the function's other annotations. Add one line per global.
+
+---
+
+## Example
+
+`GetConVar` only fills the `ConVarCache` global:
+
+```lua
+---@param name string
+---@return ConVar?
+---@[writes_global("ConVarCache")]
+function _G.GetConVar(name) end
+```
+
+```lua
+-- ROLE_COLORS is filled for every role in another file
+GetConVar("ttt_debug")
+local color = ROLE_COLORS[ROLE_TRAITOR] -- still known to be set
+```
