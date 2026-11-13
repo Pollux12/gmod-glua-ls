@@ -16,7 +16,8 @@ use crate::{
             narrow::{
                 ResultTypeOrContinue,
                 condition_flow::{
-                    InferConditionFlow, call_flow::get_type_at_call_expr,
+                    InferConditionFlow,
+                    call_flow::{class_name_call_receiver, get_type_at_call_expr},
                     get_condition_antecedent_type, get_type_at_condition_flow,
                 },
                 get_type_at_flow::FlowWalkPolicy,
@@ -1318,7 +1319,7 @@ fn maybe_type_name_literal_eq_narrow(
         return Ok(ResultTypeOrContinue::Continue);
     };
 
-    let Some(target_expr) = extract_type_name_guard_target_expr(&call_expr) else {
+    let Some(target_expr) = class_name_call_receiver(db, cache, &call_expr) else {
         return Ok(ResultTypeOrContinue::Continue);
     };
 
@@ -1526,23 +1527,6 @@ fn antecedent_excludes_target_class(
         | LuaType::Thread => true,
         _ => false,
     }
-}
-
-pub(super) fn extract_type_name_guard_target_expr(call_expr: &LuaCallExpr) -> Option<LuaExpr> {
-    if !call_expr.is_colon_call() {
-        return None;
-    }
-
-    let LuaExpr::IndexExpr(index_expr) = call_expr.get_prefix_expr()? else {
-        return None;
-    };
-
-    let args = call_expr.get_args_list()?;
-    if args.get_args().next().is_some() {
-        return None;
-    }
-
-    index_expr.get_prefix_expr()
 }
 
 fn const_type_eq(left_type: &LuaType, right_type: &LuaType) -> bool {

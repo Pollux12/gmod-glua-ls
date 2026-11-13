@@ -22,8 +22,7 @@ use crate::{
                 condition_flow::{
                     InferConditionFlow,
                     binary_flow::{
-                        can_narrow_type_guard_through_decl_alias,
-                        extract_type_name_guard_target_expr, narrow_by_class_test,
+                        can_narrow_type_guard_through_decl_alias, narrow_by_class_test,
                         resolve_class_name_target_type,
                     },
                     get_condition_antecedent_type,
@@ -37,6 +36,7 @@ use crate::{
         infer_expr_semantic_decl, known_signature_id, local_name_value, semantic_decl_value,
     },
     signature_is_exhaustive_type_guard, signature_is_valid_guard_or_base_runtime_isvalid_in_realm,
+    signature_returns_self_class_name,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -406,7 +406,7 @@ fn call_names_var(
     let class_name_receivers = args
         .iter()
         .filter_map(|arg| match arg {
-            LuaExpr::CallExpr(call) => extract_type_name_guard_target_expr(call),
+            LuaExpr::CallExpr(call) => class_name_call_receiver(db, cache, call),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -511,7 +511,7 @@ fn try_narrow_scripted_base_test(
     let LuaExpr::CallExpr(class_name_call) = class_name_arg else {
         return Ok(ResultTypeOrContinue::Continue);
     };
-    let Some(target_expr) = extract_type_name_guard_target_expr(&class_name_call) else {
+    let Some(target_expr) = class_name_call_receiver(db, cache, &class_name_call) else {
         return Ok(ResultTypeOrContinue::Continue);
     };
     let Some(target_ref_id) = get_var_expr_var_ref_id(db, cache, target_expr.clone()) else {
@@ -578,6 +578,51 @@ fn scripted_base_test_args(
         arg_with_role(GMOD_ROLE_SCRIPTED_CLASS_NAME)?,
         arg_with_role(GMOD_ROLE_SCRIPTED_BASED_ON)?,
     ))
+}
+
+/// The object whose own class name `call_expr` returns: the receiver of a
+/// no-argument method marked `self_class_name`, such as `ent` in
+/// `ent:GetClass()`. A receiver of unknown type has no method to resolve, so
+/// a marked member of the same name stands in for it.
+pub(super) fn class_name_call_receiver(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<LuaExpr> {
+    if !call_expr.is_colon_call() || call_expr.get_args_list()?.get_args().next().is_some() {
+        return None;
+    }
+    let LuaExpr::IndexExpr(index_expr) = call_expr.get_prefix_expr()? else {
+        return None;
+    };
+    let receiver = index_expr.get_prefix_expr()?;
+    let returns_receiver_class = match get_call_prefix_signature_id(db, cache, call_expr) {
+        Some(signature_id) => signature_returns_self_class_name(db, signature_id),
+        None => {
+            matches!(
+                infer_expr(db, cache, receiver.clone()),
+                Ok(LuaType::Any | LuaType::Unknown)
+            ) && any_member_returns_self_class_name(db, &index_expr)
+        }
+    };
+    returns_receiver_class.then_some(receiver)
+}
+
+fn any_member_returns_self_class_name(db: &DbIndex, index_expr: &LuaIndexExpr) -> bool {
+    let Some(name) = index_expr.get_index_name_token() else {
+        return false;
+    };
+    db.get_member_index()
+        .get_current_members_for_key(&LuaMemberKey::Name(name.text().into()))
+        .into_iter()
+        .any(|member| {
+            matches!(
+                db.get_type_index()
+                    .get_type_cache(&member.get_id().into())
+                    .map(|type_cache| type_cache.as_type()),
+                Some(LuaType::Signature(id)) if signature_returns_self_class_name(db, *id)
+            )
+        })
 }
 
 fn inferred_guard_target_expr(

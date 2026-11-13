@@ -157,6 +157,10 @@ pub const GMOD_ATTR_EXHAUSTIVE_TYPE_GUARD: &str = "exhaustive_type_guard";
 
 pub const GMOD_ATTR_FRESH_RESULT: &str = "fresh_result";
 
+/// Signature-level standalone attribute for no-argument methods returning the
+/// class name of their receiver, such as `Entity:GetClass`.
+pub const GMOD_ATTR_SELF_CLASS_NAME: &str = "self_class_name";
+
 /// Signature-level standalone attribute for functions returning a new table
 /// that starts as a copy of their first argument.
 pub const GMOD_ATTR_COPY_RESULT: &str = "copy_result";
@@ -595,6 +599,10 @@ pub fn signature_copies_result(db: &DbIndex, signature_id: LuaSignatureId) -> bo
 
 pub fn signature_has_fresh_result(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
     find_signature_attribute_use(db, signature_id, GMOD_ATTR_FRESH_RESULT).is_some()
+}
+
+pub fn signature_returns_self_class_name(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    find_signature_attribute_use(db, signature_id, GMOD_ATTR_SELF_CLASS_NAME).is_some()
 }
 
 fn signature_has_valid_guard_attribute(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
@@ -1226,6 +1234,41 @@ mod tests {
         let found = find_signature_attribute_use(db, *signature_id, "self_guard");
         let found = found.expect("find_signature_attribute_use locates the attribute");
         assert_eq!(found.id.get_name(), "self_guard");
+    }
+
+    #[test]
+    fn self_class_name_is_read_from_the_builtin_attribute() {
+        let source = r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@return string
+            ---@[self_class_name]
+            function Entity:GetClass() end
+
+            ---@return string
+            function Entity:GetOwnerClass() end
+            "#;
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(source);
+
+        let db = ws.analysis.compilation.get_db();
+        let marked_lines = db
+            .get_signature_index()
+            .iter()
+            .filter(|(id, _)| {
+                id.get_file_id() == file_id && signature_returns_self_class_name(db, **id)
+            })
+            .map(|(id, _)| {
+                let position = usize::from(id.get_position());
+                let line_start = source[..position].rfind('\n').map_or(0, |at| at + 1);
+                let line_end = source[position..]
+                    .find('\n')
+                    .map_or(source.len(), |at| position + at);
+                source[line_start..line_end].trim()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(marked_lines, ["function Entity:GetClass() end"]);
     }
 
     #[test]

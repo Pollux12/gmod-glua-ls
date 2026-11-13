@@ -299,7 +299,7 @@ end
 
 Use `weapon_table` instead of `entity_table` for weapons. The table then becomes the class named by `className`, with its base class's fields and methods.
 
-For `IsBasedOn`-style checks, mark the class name with `class_name` and the base with `based_on`. Inside `if IsBasedOn(ent:GetClass(), "base_class") then`, `ent` has the base class's type.
+For `IsBasedOn`-style checks, mark the class name with `class_name` and the base with `based_on`. Inside `if IsBasedOn(ent:GetClass(), "base_class") then`, `ent` has the base class's type. The class name has to come from a method marked with [`@self_class_name`](/annotations/self-class-name), such as `Entity:GetClass`.
 
 For gamemode inheritance wrappers, mark the base-name parameter:
 

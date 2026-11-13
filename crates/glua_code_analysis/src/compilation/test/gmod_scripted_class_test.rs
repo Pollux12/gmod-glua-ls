@@ -14931,8 +14931,6 @@ GM.TestValue = 1"#,
             r#"
             ---@class Entity
             ---@field Entity self
-            ---@return string
-            function Entity:GetClass() end
 
             ---@class ENTITY : Entity
             ENTITY = {}
@@ -15012,8 +15010,9 @@ GM.TestValue = 1"#,
             "lua/autorun/ent_lib.lua",
             r#"
             ---@class Entity
+
             ---@return string
-            function Entity:GetClass() end
+            function Entity:GetOwnerClass() end
 
             ---@class ENTITY : Entity
             ENTITY = {}
@@ -15123,6 +15122,73 @@ GM.TestValue = 1"#,
             file_id,
             DiagnosticCode::InferUnguardedChild
         ));
+    }
+
+    #[gtest]
+    fn test_is_based_on_an_unmarked_getter_leaves_the_entity_alone() {
+        let mut ws = base_test_workspace();
+        let file_id = ws.def_file(
+            "lua/test/owner.lua",
+            r#"
+            ---@param ent Entity
+            local function f(ent)
+                if scripted_ents.IsBasedOn(ent:GetOwnerClass(), "mech_base") then
+                    ent:Disposition()
+                end
+            end
+        "#,
+        );
+
+        assert!(file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::InferUnguardedChild
+        ));
+    }
+
+    #[gtest]
+    fn test_class_name_equality_with_an_unmarked_getter_leaves_the_entity_alone() {
+        let mut ws = base_test_workspace();
+        let file_id = ws.def_file(
+            "lua/test/owner.lua",
+            r#"
+            ---@param ent Entity
+            local function f(ent)
+                if ent:GetOwnerClass() == "mech_base" then
+                    ent:Disposition()
+                end
+            end
+        "#,
+        );
+
+        assert!(file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::InferUnguardedChild
+        ));
+    }
+
+    #[gtest]
+    fn test_class_name_equality_narrows_an_untyped_receiver_through_the_marked_getter() {
+        let mut ws = base_test_workspace();
+        let file_id = ws.def_file(
+            "lua/test/untyped.lua",
+            r#"
+            local function f(ent, other)
+                if ent:GetClass() == "mech_base" then
+                    Use(ent.Disposition)
+                end
+                if other:GetOwnerClass() == "mech_base" then
+                    Use(other.Disposition)
+                end
+            end
+        "#,
+        );
+
+        let narrowed = index_expr_type(&mut ws, file_id, "ent.Disposition");
+        assert_that!(ws.humanize_type(narrowed), contains_substring("fun"));
+        let untouched = index_expr_type(&mut ws, file_id, "other.Disposition");
+        assert_that!(ws.humanize_type(untouched), not(contains_substring("fun")));
     }
 
     #[gtest]

@@ -367,8 +367,12 @@ mod test {
             "annotations/entity.lua",
             r#"
             ---@meta
+            ---@attribute self_class_name()
             ---@class Entity
-            ---@field GetClass fun(self: Entity): string
+            local Entity = {}
+            ---@return string
+            ---@[self_class_name]
+            function Entity:GetClass() end
             ---@class prop_ragdoll : Entity
             "#,
         );

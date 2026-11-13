@@ -1,0 +1,64 @@
+---
+title: "@self_class_name"
+description: Mark a method that returns the class name of the object it is called on.
+---
+import AdvancedAnnotation from "/snippets/advanced-annotation.mdx"
+
+<AdvancedAnnotation />
+
+## Overview
+
+`self_class_name` marks a colon method such as `Entity:GetClass` that returns the class name of the object it is called on. When you compare that name with a class, or pass it to a base test such as `scripted_ents.IsBasedOn`, GLuaLS narrows the object to that class.
+
+Other methods that return a string, like `ent:GetOwnerClass()`, do not narrow the object.
+
+The official annotations already mark `Entity:GetClass`.
+
+---
+
+## Syntax
+
+```lua
+---@return string
+---@[self_class_name]
+```
+
+Put it after the `@return` line. The method must take no arguments.
+
+---
+
+## Example
+
+```lua
+---@return string
+---@[self_class_name]
+function Entity:GetClass() end
+```
+
+```lua
+---@param ent Entity
+local function Use(ent)
+    if ent:GetClass() == "mech_walker" then
+        ent:Stomp() -- ent is a mech_walker here
+    end
+
+    if scripted_ents.IsBasedOn(ent:GetClass(), "mech_base") then
+        ent:Disposition() -- ent is a mech_base here
+    end
+end
+```
+
+When GLuaLS cannot tell what type the object has, it narrows if any method with that name carries the attribute.
+
+---
+
+## Keep it narrow
+
+Only use it on a method that returns the object's own Lua class name. `Panel:GetClassName` returns the engine panel class, such as `Label`, not the Lua class, so it is not marked.
+
+---
+
+## See also
+
+- [`@call_arg`](/annotations/call-arg): marks the class name and base arguments of `IsBasedOn`
+- [`@self_guard`](/annotations/self-guard): a method that proves the object it is called on is valid

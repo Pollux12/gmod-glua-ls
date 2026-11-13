@@ -2088,9 +2088,11 @@ end
 
     const CLASS_NAME_ANNOTATIONS: &str = r#"
         ---@meta
+        ---@attribute self_class_name()
         ---@class Entity
         local Entity = {}
         ---@return string
+        ---@[self_class_name]
         function Entity:GetClass() end
         ---@class farmplot : Entity
         local farmplot = {}

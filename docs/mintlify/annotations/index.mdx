@@ -78,6 +78,7 @@ These annotations are intended for complex cases and are primarily designed to b
 | [`@valid_guard`](/annotations/valid-guard) | Mark a function that proves its argument is valid | `---@[valid_guard]` |
 | [`@self_guard`](/annotations/self-guard) | Mark a method that proves its receiver is valid | `---@[self_guard("gmod.entity")]` |
 | [`@self_call_valid`](/annotations/self-call-valid) | Mark a callback where a `self` method returns a valid value | `---@[self_call_valid("GetOwner")]` |
+| [`@self_class_name`](/annotations/self-class-name) | Mark a method that returns the class name of the object it is called on | `---@[self_class_name]` |
 | [`@exhaustive_type_guard`](/annotations/exhaustive-type-guard) | Mark a type check that also rules out subclasses when it fails | `---@[exhaustive_type_guard]` |
 | [`@return_alias`](/annotations/return-alias) | Mark a function that returns one of its arguments unchanged | `---@[return_alias(0)]` |
 | [`@copy_result`](/annotations/copy-result) | Mark a function that returns a copy of its table argument | `---@[copy_result]` |

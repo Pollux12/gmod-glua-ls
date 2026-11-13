@@ -33,8 +33,8 @@ pub use gmod_domains::{
     signature_has_net_op_metadata, signature_is_valid_guard_in_realm,
     signature_is_valid_guard_or_base_runtime_isvalid_in_realm, signature_net_bits_param_idx,
     signature_net_callback_param_idx, signature_net_payload, signature_net_send,
-    signature_owner_for, signature_writes_global_roots, store_valid_guard_signatures,
-    type_is_net_read_op,
+    signature_owner_for, signature_returns_self_class_name, signature_writes_global_roots,
+    store_valid_guard_signatures, type_is_net_read_op,
 };
 pub(crate) use signature::callee_signature_ids;
 pub use signature::{

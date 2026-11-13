@@ -296,6 +296,12 @@
 
 ---@attribute fresh_result()
 
+--- Marks a method that takes no arguments and returns the class name of the object it is
+--- called on, such as `Entity:GetClass`. Comparing the result with a class name, or passing it to
+--- a base test such as `scripted_ents.IsBasedOn`, narrows that object to the class. Results of
+--- other methods, such as `ent:GetOwnerClass()`, leave the object as it was.
+---@attribute self_class_name()
+
 --- Marks a function that returns a new table starting with the contents of its
 --- first argument, such as `table.Copy`. Writes to the copy never reach the
 --- original table, and the copy still has the original's members.
