@@ -1345,20 +1345,11 @@ impl LuaModuleIndex {
             extension_names.push("lua".to_string());
         }
 
-        let mut patterns = Vec::new();
-        for extension in &extension_names {
-            patterns.push(format!("?.{}", extension));
-        }
-
-        let require_pattern = config.runtime.require_pattern.clone();
-        if require_pattern.is_empty() {
-            // add default require pattern
-            for extension in &extension_names {
-                patterns.push(format!("?/init.{}", extension));
-            }
-        } else {
-            patterns.extend(require_pattern);
-        }
+        let mut patterns = extension_names
+            .iter()
+            .map(|extension| format!("?.{extension}"))
+            .collect::<Vec<_>>();
+        patterns.extend(config.runtime.require_pattern.iter().cloned());
 
         self.set_module_extract_patterns(patterns);
         self.set_module_replace_patterns(

@@ -307,24 +307,6 @@ mod test {
         );
     }
 
-    /// A `require` of a folder module, found through its `init.lua`, names the
-    /// folder's new name.
-    #[gtest]
-    fn a_folder_module_rename_rewrites_its_require() {
-        let mut ws = VirtualWorkspace::new();
-        ws.def_files(vec![
-            ("shop/init.lua", "return {}\n"),
-            ("loader.lua", "local shop = require(\"shop\")\n"),
-        ]);
-
-        let edits = rename_edits(&ws, &[("shop", "store")]);
-
-        assert_that!(
-            edits,
-            elements_are![eq(&edit("loader.lua", "shop", "store"))]
-        );
-    }
-
     /// A `require` names a module by the trailing segments of its path, in
     /// the caller's own separators, through the configured patterns.
     #[gtest]
