@@ -111,7 +111,7 @@ function GetSpawnPoint(data) end
 
 ## The field must already exist
 
-`@outparam` narrows the type of a field already on the table. It does not create missing fields. If the field is absent, it stays `nil` after the call:
+`@outparam` narrows the type of a field already on the table. It does not create missing fields. If the field is absent, it stays `nil` after the call. For a function that creates the field itself, use [`@adds_field`](/annotations/adds-field).
 
 ```lua
 local data = {}

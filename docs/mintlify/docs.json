@@ -79,6 +79,7 @@
               "annotations/param",
               "annotations/return",
               "annotations/outparam",
+              "annotations/adds-field",
               "annotations/overload",
               "annotations/async",
               "annotations/nodiscard"

@@ -41,6 +41,7 @@ GLuaLS follows EmmyLua-style annotations and adds Garry's Mod Lua extensions for
 |---|---|---|
 | [`@param`](/annotations/param) | Document a parameter's type | `---@param ply Player` |
 | [`@return`](/annotations/return) | Document a return value's type | `---@return boolean` |
+| [`@adds_field`](/annotations/adds-field) | Declare a field a function adds to a table argument | `---@[adds_field("MetaID", "integer")]` |
 | [`@overload`](/annotations/overload) | Define an alternate function signature | `---@overload fun(x: number): number` |
 | [`@async`](/annotations/async) | Mark a function as async/coroutine-based | `---@async` |
 | [`@nodiscard`](/annotations/nodiscard) | Warn if the return value is unused | `---@nodiscard` |
