@@ -16,6 +16,7 @@ use crate::{
 };
 
 pub const ADDS_FIELD_ATTRIBUTE: &str = "adds_field";
+pub const BASE_CLASS_ATTRIBUTE: &str = "base_class";
 pub const CALL_ARG_ATTRIBUTE: &str = "call_arg";
 pub const CALL_ARG_FIELD_ATTRIBUTE: &str = "call_arg_field";
 pub const OVERLOAD_CALL_ARG_ATTRIBUTE: &str = "overload_call_arg";
@@ -357,6 +358,9 @@ impl LuaSignature {
                 || param_info.get_attribute_by_name("constructor").is_some()
                 || param_info
                     .get_attribute_by_name(ADDS_FIELD_ATTRIBUTE)
+                    .is_some()
+                || param_info
+                    .get_attribute_by_name(BASE_CLASS_ATTRIBUTE)
                     .is_some()
         }) || !self.out_params.is_empty()
             || self.direct_param_return_alias().is_some()

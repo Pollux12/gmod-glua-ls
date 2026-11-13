@@ -207,6 +207,13 @@
 --- - `type`: The type of the field, such as `integer`, `string` or a class name. Add `?` for an optional field. Defaults to `any`.
 ---@attribute adds_field(name: string, type: string?)
 
+---
+--- Marks a parameter whose argument names the parent class of the class this call creates.
+--- The argument is wrapped in the same prefix and suffix as the function's string-template class
+--- parameter, so `CreateMetaTable("Walker", "Mech")` makes `battlemechs.Walker` inherit `battlemechs.Mech`.
+--- The parent must be a class that exists; otherwise only `root_class` applies.
+---@attribute base_class()
+
 --- Marks a function whose first return value is the exact value passed in one
 --- of its arguments. This is stronger than a generic parameter/return type
 --- correlation because it preserves runtime value identity.

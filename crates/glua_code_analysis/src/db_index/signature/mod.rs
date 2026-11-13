@@ -37,8 +37,8 @@ pub use gmod_domains::{
 };
 pub(crate) use signature::callee_signature_ids;
 pub use signature::{
-    ADDS_FIELD_ATTRIBUTE, CALL_ARG_ATTRIBUTE, CALL_ARG_FIELD_ATTRIBUTE, LuaCallArgRole,
-    LuaClassNameReturnAlias, LuaDocDefaultValue, LuaDocParamInfo, LuaDocReturnInfo,
+    ADDS_FIELD_ATTRIBUTE, BASE_CLASS_ATTRIBUTE, CALL_ARG_ATTRIBUTE, CALL_ARG_FIELD_ATTRIBUTE,
+    LuaCallArgRole, LuaClassNameReturnAlias, LuaDocDefaultValue, LuaDocParamInfo, LuaDocReturnInfo,
     LuaGenericParamInfo, LuaNoDiscard, LuaOutParamInfo, LuaOutParamRoot, LuaReturnCorrelation,
     LuaSignature, LuaSignatureId, OVERLOAD_CALL_ARG_ATTRIBUTE, OVERLOAD_CALL_ARG_FIELD_ATTRIBUTE,
     ReturnTypeKind, SignaturePayloadRemap, SignatureReturnStatus, find_call_arg_role_from_type,

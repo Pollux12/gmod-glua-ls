@@ -5,6 +5,7 @@ mod annotation_test;
 mod array_test;
 mod assign_widening_scaling_test;
 mod attribute_test;
+mod base_class_test;
 mod call_target_test;
 mod class_declaration_move_test;
 mod class_name_return_alias_test;

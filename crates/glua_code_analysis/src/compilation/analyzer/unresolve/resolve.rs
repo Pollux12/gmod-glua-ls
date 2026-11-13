@@ -31,8 +31,8 @@ use crate::{
         unresolve::UnResolveSpecialCall,
     },
     db_index::{
-        LuaFunctionType, LuaMemberFeature, LuaMemberOwner, LuaOutParamRoot, LuaSignature,
-        LuaSignatureId, SpecialCallFact, derivation::StageRule,
+        BASE_CLASS_ATTRIBUTE, LuaFunctionType, LuaMemberFeature, LuaMemberOwner, LuaOutParamRoot,
+        LuaSignature, LuaSignatureId, SpecialCallFact, derivation::StageRule,
     },
     find_members_with_key, humanize_type,
     semantic::{
@@ -828,8 +828,9 @@ pub fn try_resolve_special_call(
     }
 
     let is_colon_call = unresolve_special_call.call_expr.is_colon_call();
-    for param_info in callable_param_infos {
-        materialize_str_tpl_class_from_call(
+    let mut param_result = Ok(());
+    for param_info in &callable_param_infos {
+        param_result = materialize_str_tpl_class_from_call(
             db,
             cache,
             unresolve_special_call.file_id,
@@ -838,18 +839,35 @@ pub fn try_resolve_special_call(
             &param_info.param_type,
             param_info.is_colon_define,
             is_colon_call,
-        )?;
-
-        if param_info.is_constructor {
-            try_resolve_constructor_param(
-                db,
-                cache,
-                unresolve_special_call.file_id,
-                &unresolve_special_call.call_expr,
-                &param_info,
-            )?;
+        )
+        .and_then(|_| {
+            if param_info.is_constructor {
+                try_resolve_constructor_param(
+                    db,
+                    cache,
+                    unresolve_special_call.file_id,
+                    &unresolve_special_call.call_expr,
+                    param_info,
+                )
+            } else {
+                Ok(())
+            }
+        });
+        if param_result.is_err() {
+            break;
         }
     }
+
+    // A constructor lookup failure must not hide the parent link: the class
+    // already exists, only its constructor is missing.
+    try_resolve_base_class_params(
+        db,
+        cache,
+        unresolve_special_call.file_id,
+        &unresolve_special_call.call_expr,
+        &callable_param_infos,
+    );
+    param_result?;
 
     for out_param_info in callable_out_param_infos {
         apply_out_param_from_call(
@@ -870,6 +888,7 @@ struct SpecialCallParamInfo {
     param_idx: usize,
     param_type: LuaType,
     is_constructor: bool,
+    is_base_class: bool,
     is_colon_define: bool,
     signature_id: Option<LuaSignatureId>,
 }
@@ -1745,12 +1764,16 @@ fn collect_signature_special_call_params(
     let mut param_infos = Vec::new();
     for (idx, param_info) in &signature.param_docs {
         let is_constructor = param_info.get_attribute_by_name("constructor").is_some();
+        let is_base_class = param_info
+            .get_attribute_by_name(BASE_CLASS_ATTRIBUTE)
+            .is_some();
         let has_str_tpl = type_contains_str_tpl_ref(&param_info.type_ref);
-        if is_constructor || has_str_tpl {
+        if is_constructor || is_base_class || has_str_tpl {
             param_infos.push(SpecialCallParamInfo {
                 param_idx: *idx,
                 param_type: param_info.type_ref.clone(),
                 is_constructor,
+                is_base_class,
                 is_colon_define: signature.is_colon_define,
                 signature_id: Some(signature_id),
             });
@@ -1797,6 +1820,7 @@ fn collect_doc_function_special_call_params(func: &LuaFunctionType) -> Vec<Speci
                 param_idx: idx,
                 param_type: param_type.clone(),
                 is_constructor: false,
+                is_base_class: false,
                 is_colon_define: func.is_colon_define(),
                 signature_id: None,
             })
@@ -2445,26 +2469,14 @@ fn try_resolve_constructor_param(
             )
             .map(|arg| arg.get_range())
             .unwrap_or_else(|| call_expr.get_range());
-            let root_type = LuaType::Ref(root_type_id.clone());
-            if db.get_type_index_mut().add_super_type(
-                target_id.clone(),
+            add_call_super_edge(
+                db,
                 file_id,
+                call_expr,
+                &target_id,
+                root_type_id,
                 source_range,
-                root_type.clone(),
-            ) {
-                db.get_flow_index_mut().install_special_call_facts(
-                    file_id,
-                    call_expr.get_position(),
-                    [SpecialCallFact::super_edge(
-                        file_id,
-                        call_expr.get_position(),
-                        target_id.clone(),
-                        root_type,
-                        file_id,
-                        source_range,
-                    )],
-                );
-            }
+            );
         }
     }
 
@@ -2505,6 +2517,117 @@ fn try_resolve_constructor_param(
     .ok_or(InferFailReason::FieldNotFound)?;
 
     Ok(())
+}
+
+fn add_call_super_edge(
+    db: &mut DbIndex,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+    target_id: &LuaTypeDeclId,
+    parent_id: LuaTypeDeclId,
+    source_range: rowan::TextRange,
+) {
+    let parent_type = LuaType::Ref(parent_id);
+    if db.get_type_index_mut().add_super_type(
+        target_id.clone(),
+        file_id,
+        source_range,
+        parent_type.clone(),
+    ) {
+        db.get_flow_index_mut().install_special_call_facts(
+            file_id,
+            call_expr.get_position(),
+            [SpecialCallFact::super_edge(
+                file_id,
+                call_expr.get_position(),
+                target_id.clone(),
+                parent_type,
+                file_id,
+                source_range,
+            )],
+        );
+    }
+}
+
+/// Links the class this call creates to the class named by a `base_class` argument.
+/// Runs after every parameter has been settled so the target class already exists.
+fn try_resolve_base_class_params(
+    db: &mut DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+    param_infos: &[SpecialCallParamInfo],
+) {
+    let is_class_param = |info: &&SpecialCallParamInfo| {
+        !info.is_base_class && find_str_tpl_ref(db, &info.param_type).is_some()
+    };
+    let Some(class_param) = param_infos
+        .iter()
+        .filter(is_class_param)
+        .find(|info| info.is_constructor)
+        .or_else(|| param_infos.iter().find(is_class_param))
+        .cloned()
+    else {
+        return;
+    };
+    let Some(str_tpl) = find_str_tpl_ref(db, &class_param.param_type) else {
+        return;
+    };
+    let is_colon_call = call_expr.is_colon_call();
+    let Some(target_id) = get_constructor_target_type(
+        db,
+        cache,
+        &class_param.param_type,
+        call_expr.clone(),
+        class_param.param_idx,
+        class_param.is_colon_define,
+        is_colon_call,
+    ) else {
+        return;
+    };
+
+    for base_param in param_infos.iter().filter(|info| info.is_base_class) {
+        let Some(arg_expr) = get_call_arg_expr(
+            call_expr,
+            base_param.param_idx,
+            base_param.is_colon_define,
+            is_colon_call,
+        ) else {
+            continue;
+        };
+        let Some(name) = infer_string_const_arg(db, cache, &arg_expr) else {
+            continue;
+        };
+        let parent_id = LuaTypeDeclId::global(
+            format!("{}{}{}", str_tpl.get_prefix(), name, str_tpl.get_suffix()).as_str(),
+        );
+        if parent_id == target_id {
+            continue;
+        }
+        if !db
+            .get_type_index()
+            .get_type_decl(&parent_id)
+            .is_some_and(|decl| decl.is_class())
+        {
+            continue;
+        }
+        let mut parent_supers = Vec::new();
+        parent_id.collect_super_types(db, &mut parent_supers);
+        if parent_supers
+            .iter()
+            .any(|super_type| matches!(super_type, LuaType::Ref(id) if *id == target_id))
+        {
+            continue;
+        }
+        add_call_super_edge(
+            db,
+            file_id,
+            call_expr,
+            &target_id,
+            parent_id,
+            arg_expr.get_range(),
+        );
+    }
 }
 
 fn set_signature_to_default_call(
