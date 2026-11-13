@@ -62,7 +62,7 @@
             ]
           },
           {
-            "group": "Type system",
+            "group": "Types",
             "pages": [
               "annotations/class",
               "annotations/type",
@@ -80,46 +80,55 @@
             "pages": [
               "annotations/param",
               "annotations/return",
+              "annotations/overload",
               "annotations/outparam",
               "annotations/adds-field",
-              "annotations/return-alias",
-              "annotations/copy-result",
-              "annotations/fresh-result",
-              "annotations/overload",
               "annotations/async",
               "annotations/nodiscard"
             ]
           },
           {
-            "group": "Garry's Mod Lua",
+            "group": "Realms and hooks",
             "pages": [
               "annotations/realm",
               "annotations/hook",
               "annotations/fileparam",
-              "annotations/accessorfunc",
-              "annotations/call-arg",
+              "annotations/accessorfunc"
+            ]
+          },
+          {
+            "group": "Checks and narrowing",
+            "pages": [
+              "annotations/cast",
               "annotations/valid-guard",
               "annotations/self-guard",
               "annotations/self-call-valid",
-              "annotations/exhaustive-type-guard",
+              "annotations/exhaustive-type-guard"
+            ]
+          },
+          {
+            "group": "Wrappers and API behaviour",
+            "pages": [
+              "annotations/call-arg",
+              "annotations/return-alias",
+              "annotations/copy-result",
+              "annotations/fresh-result",
+              "annotations/writes-global",
               "annotations/net-send",
               "annotations/net-payload",
-              "annotations/writes-global"
+              "annotations/builtin-alias"
             ]
           },
           {
             "group": "Utilities",
             "pages": [
               "annotations/diagnostic",
-              "annotations/cast",
               "annotations/deprecated",
+              "annotations/see",
               "annotations/meta",
               "annotations/module",
               "annotations/source",
-              "annotations/version",
-              "annotations/see",
-              "annotations/lsp-optimization",
-              "annotations/builtin-alias"
+              "annotations/lsp-optimization"
             ]
           }
         ]
@@ -172,6 +181,10 @@
     {
       "source": "/annotations/guard-metadata",
       "destination": "/annotations/valid-guard"
+    },
+    {
+      "source": "/annotations/version",
+      "destination": "/annotations/index"
     }
   ],
   "footer": {
