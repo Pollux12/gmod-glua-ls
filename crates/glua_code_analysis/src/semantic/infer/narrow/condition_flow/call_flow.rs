@@ -2,14 +2,16 @@ use std::{ops::Deref, sync::Arc};
 
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr,
-    LuaTableExpr, LuaTableField,
+    LuaLiteralToken, LuaTableExpr, LuaTableField,
 };
 
 use crate::{
-    DbIndex, FileId, FlowNode, FlowTree, GMOD_ATTR_SELF_GUARD, InFiled, InferFailReason,
+    DbIndex, FileId, FlowNode, FlowTree, GMOD_ATTR_SELF_GUARD, GMOD_DOMAIN_SCRIPTED_CLASS,
+    GMOD_ROLE_SCRIPTED_BASED_ON, GMOD_ROLE_SCRIPTED_CLASS_NAME, InFiled, InferFailReason,
     InferGuard, LuaAliasCallKind, LuaAliasCallType, LuaFunctionType, LuaInferCache, LuaMemberKey,
     LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType, TypeOps,
-    check_type_compact, find_signature_attribute_use, infer_call_expr_func, infer_expr,
+    check_type_compact, find_best_direct_call_arg_role_for_param, find_signature_attribute_use,
+    infer_call_expr_func, infer_expr,
     semantic::{
         SemanticDeclGuard, SemanticDeclLevel,
         infer::{
@@ -18,7 +20,12 @@ use crate::{
             narrow::{
                 ResultTypeOrContinue, call_var_ref_root,
                 condition_flow::{
-                    InferConditionFlow, binary_flow::can_narrow_type_guard_through_decl_alias,
+                    InferConditionFlow,
+                    binary_flow::{
+                        can_narrow_type_guard_through_decl_alias,
+                        extract_type_name_guard_target_expr, narrow_by_class_test,
+                        resolve_class_name_target_type,
+                    },
                     get_condition_antecedent_type,
                 },
                 get_type_at_cast_flow::apply_cast,
@@ -72,6 +79,23 @@ pub fn get_type_at_call_expr(
             policy,
         ),
     };
+
+    if let Ok(ResultTypeOrContinue::Continue) = result {
+        let base_test = try_narrow_scripted_base_test(
+            db,
+            tree,
+            cache,
+            root,
+            var_ref_id,
+            flow_node,
+            &call_expr_ref,
+            condition_flow,
+            policy.clone(),
+        )?;
+        if let ResultTypeOrContinue::Result(narrowed) = base_test {
+            return Ok(ResultTypeOrContinue::Result(narrowed));
+        }
+    }
 
     // Fallback: check metadata-driven member-guard predicate patterns when
     // normal type-based narrowing didn't produce a result. The callee must
@@ -379,8 +403,16 @@ fn call_names_var(
         return true;
     }
     let first_arg_object = args.first().and_then(object_of);
+    let class_name_receivers = args
+        .iter()
+        .filter_map(|arg| match arg {
+            LuaExpr::CallExpr(call) => extract_type_name_guard_target_expr(call),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     object_of(prefix_expr)
         .into_iter()
+        .chain(class_name_receivers)
         .chain(first_arg_object)
         .chain(args.into_iter().skip(1))
         .any(|target| names_var(cache, target))
@@ -456,6 +488,96 @@ fn try_inferred_positive_guard(
             .false_removed_type
             .map(|removed| TypeOps::Remove.apply(db, &antecedent_type, &removed)),
     })
+}
+
+/// Narrows the object a scripted-class base test checks: the callee marks the
+/// argument holding the object's class name (`ent:GetClass()`) and the one
+/// naming the base, as `scripted_ents.IsBasedOn` does.
+#[allow(clippy::too_many_arguments)]
+fn try_narrow_scripted_base_test(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    call_expr: &LuaCallExpr,
+    condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
+) -> Result<ResultTypeOrContinue, InferFailReason> {
+    let Some((class_name_arg, base_arg)) = scripted_base_test_args(db, cache, call_expr) else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
+    let LuaExpr::CallExpr(class_name_call) = class_name_arg else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
+    let Some(target_expr) = extract_type_name_guard_target_expr(&class_name_call) else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
+    let Some(target_ref_id) = get_var_expr_var_ref_id(db, cache, target_expr.clone()) else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
+    if target_ref_id != *var_ref_id
+        && !can_narrow_type_guard_through_decl_alias(
+            db,
+            cache,
+            root,
+            var_ref_id,
+            &target_ref_id,
+            &target_expr,
+        )
+    {
+        return Ok(ResultTypeOrContinue::Continue);
+    }
+    let LuaExpr::LiteralExpr(base_literal) = base_arg else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
+    let Some(LuaLiteralToken::String(base_name)) = base_literal.get_literal() else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
+    let Some(target_type) = resolve_class_name_target_type(db, cache, &base_name.get_value())
+    else {
+        return Ok(ResultTypeOrContinue::Continue);
+    };
+
+    narrow_by_class_test(
+        db,
+        tree,
+        cache,
+        root,
+        var_ref_id,
+        flow_node,
+        &target_type,
+        condition_flow,
+        policy,
+    )
+}
+
+/// The class-name and base-name arguments of a call whose callee marks them
+/// with the scripted-class base-test roles.
+fn scripted_base_test_args(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<(LuaExpr, LuaExpr)> {
+    let signature_id = get_call_prefix_signature_id(db, cache, call_expr)?;
+    let signature = db.get_signature_index().get(&signature_id)?;
+    let arg_with_role = |role: &str| {
+        let param_idx = (0..signature.params.len()).find(|&param_idx| {
+            find_best_direct_call_arg_role_for_param(
+                signature,
+                param_idx,
+                GMOD_DOMAIN_SCRIPTED_CLASS,
+                &[role],
+            )
+            .is_some()
+        })?;
+        inferred_guard_target_expr(call_expr, signature, param_idx)
+    };
+    Some((
+        arg_with_role(GMOD_ROLE_SCRIPTED_CLASS_NAME)?,
+        arg_with_role(GMOD_ROLE_SCRIPTED_BASED_ON)?,
+    ))
 }
 
 fn inferred_guard_target_expr(

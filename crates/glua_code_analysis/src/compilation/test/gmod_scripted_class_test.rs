@@ -14998,6 +14998,133 @@ GM.TestValue = 1"#,
         );
     }
 
+    fn base_test_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/autorun/ent_lib.lua",
+            r#"
+            ---@class Entity
+            ---@return string
+            function Entity:GetClass() end
+
+            ---@class ENTITY : Entity
+            ENTITY = {}
+
+            ---@class ENT : ENTITY
+            ENT = {}
+
+            scripted_ents = {}
+
+            ---@[call_arg("gmod.scripted_class", "class_name")]
+            ---@param name string
+            ---@[call_arg("gmod.scripted_class", "based_on")]
+            ---@param base string
+            ---@return boolean
+            function scripted_ents.IsBasedOn(name, base) end
+
+            ---@param ent Entity
+            function Use(ent) end
+        "#,
+        );
+        ws.def_file(
+            "entities/entities/mech_base/shared.lua",
+            r#"
+            function ENT:Disposition() end
+        "#,
+        );
+        ws
+    }
+
+    fn file_has_diagnostic(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        code: DiagnosticCode,
+    ) -> bool {
+        ws.analysis.diagnostic.enable_only(code);
+        let name = Some(NumberOrString::String(code.get_name().to_string()));
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .iter()
+            .any(|diagnostic| diagnostic.code == name)
+    }
+
+    #[gtest]
+    fn test_is_based_on_class_name_test_narrows_the_entity_to_the_base() {
+        let mut ws = base_test_workspace();
+        let file_id = ws.def_file(
+            "lua/test/hooks.lua",
+            r#"
+            ---@param ent Entity
+            local function f(ent)
+                if scripted_ents.IsBasedOn(ent:GetClass(), "mech_base") then
+                    Use(ent.Disposition)
+                end
+            end
+        "#,
+        );
+
+        let ty = index_expr_type(&mut ws, file_id, "ent.Disposition");
+        assert_that!(ws.humanize_type(ty), contains_substring("fun"));
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::InferUnguardedChild
+        ));
+    }
+
+    #[gtest]
+    fn test_is_based_on_early_return_narrows_the_rest_of_the_block() {
+        let mut ws = base_test_workspace();
+        let file_id = ws.def_file(
+            "lua/test/skins.lua",
+            r#"
+            ---@param ent Entity
+            local function f(ent)
+                if not scripted_ents.IsBasedOn(ent:GetClass(), "mech_base") then return false end
+                ent:Disposition()
+            end
+        "#,
+        );
+
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::InferUnguardedChild
+        ));
+    }
+
+    #[gtest]
+    fn test_is_based_on_another_entity_class_leaves_the_entity_alone() {
+        let mut ws = base_test_workspace();
+        let file_id = ws.def_file(
+            "lua/test/other.lua",
+            r#"
+            ---@param ent Entity
+            ---@param other Entity
+            local function f(ent, other)
+                if scripted_ents.IsBasedOn(other:GetClass(), "mech_base") then
+                    ent:Disposition()
+                end
+            end
+        "#,
+        );
+
+        assert!(file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::InferUnguardedChild
+        ));
+    }
+
     #[gtest]
     fn test_vgui_create_field_keeps_created_class_when_registration_binds_after_statements() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();

@@ -103,6 +103,15 @@ pub const GMOD_ROLE_VGUI_PARENT_SELF: &str = "parent_self";
 /// `derma_controls` example UI fills with the registered name).
 pub const GMOD_ROLE_VGUI_OWN_CLASS: &str = "own_class";
 
+/// The class name a scripted-class base test checks, such as the
+/// `ent:GetClass()` passed to `scripted_ents.IsBasedOn`.
+pub const GMOD_ROLE_SCRIPTED_CLASS_NAME: &str = "class_name";
+
+/// The base class name a scripted-class base test checks against. A true
+/// result proves the object whose class name was tested is that class or
+/// one derived from it.
+pub const GMOD_ROLE_SCRIPTED_BASED_ON: &str = "based_on";
+
 // ---------------------------------------------------------------------------
 // Phase 1 reserved metadata names.
 // ---------------------------------------------------------------------------
