@@ -83,6 +83,58 @@ mod base_class_test {
         assert!(supers(&ws, "battlemechs.Walker").contains(&class_ref("battlemechs.Mech")));
     }
 
+    const OVERRIDES_BASE: &str = r#"
+        ---@type battlemechs.Base
+        local BASE
+        ---@type integer
+        BASE.Kind = 1
+        ---@return integer
+        function BASE:Describe() return 1 end
+    "#;
+
+    const OVERRIDES_MECH: &str = r#"
+        local MECH = CreateMetaTable("Mech")
+        ---@type string
+        MECH.Kind = "mech"
+        ---@return string
+        function MECH:Describe() return "mech" end
+    "#;
+
+    const OVERRIDES_WALKER: &str = r#"
+        local walker = CreateMetaTable("Walker", "Mech")
+        WalkerKind = walker.Kind
+        WalkerDescription = walker:Describe()
+    "#;
+
+    fn assert_walker_uses_mech_overrides(ws: &mut VirtualWorkspace) {
+        assert_eq!(
+            supers(ws, "battlemechs.Walker"),
+            vec![class_ref("battlemechs.Mech")]
+        );
+        let kind = ws.expr_ty("WalkerKind");
+        assert_eq!(ws.humanize_type(kind), "string");
+        let description = ws.expr_ty("WalkerDescription");
+        assert_eq!(ws.humanize_type(description), "string");
+    }
+
+    #[test]
+    fn the_named_parent_overrides_the_root_class_members() {
+        let mut ws = factory_workspace();
+        ws.def_file("base.lua", OVERRIDES_BASE);
+        ws.def_file("mech.lua", OVERRIDES_MECH);
+        ws.def_file("walker.lua", OVERRIDES_WALKER);
+        assert_walker_uses_mech_overrides(&mut ws);
+    }
+
+    #[test]
+    fn a_named_parent_from_a_later_file_overrides_the_root_class_members() {
+        let mut ws = factory_workspace();
+        ws.def_file("base.lua", OVERRIDES_BASE);
+        ws.def_file("walker.lua", OVERRIDES_WALKER);
+        ws.def_file("mech.lua", OVERRIDES_MECH);
+        assert_walker_uses_mech_overrides(&mut ws);
+    }
+
     #[test]
     fn a_base_passed_as_a_class_value_becomes_a_supertype() {
         let mut ws = factory_workspace();
