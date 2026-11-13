@@ -1971,11 +1971,11 @@ fn infer_cross_file_matching_expr_key_member_type(
         let key_match = if is_literal_member_key(key)
             && member_key_is_unknown_expr(member.get_key())
         {
-            is_precise_unknown_wildcard_value_type(&member_type)
+            allow_wildcard_expr_literal_match
+                || is_precise_unknown_wildcard_value_type(&member_type)
         } else if is_literal_member_key(key) && member_key_is_broad_wildcard_expr(member.get_key())
         {
             allow_wildcard_expr_literal_match
-                && is_precise_unknown_wildcard_value_type(&member_type)
         } else {
             member_key_matches_type(db, &access_key_type, member.get_key())
         };
