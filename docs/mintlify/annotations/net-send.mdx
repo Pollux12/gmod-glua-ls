@@ -2,12 +2,15 @@
 title: "@net_send"
 description: Mark a function that sends the current net message.
 ---
+import AdvancedAnnotation from "/snippets/advanced-annotation.mdx"
+
+<AdvancedAnnotation />
 
 ## Overview
 
 `net_send` marks a function that ends a net message and sends it, like `net.Send`, `net.Broadcast` and `net.SendToServer`. GLuaLS uses it to match each message's sender with its `net.Receive`, and to check that both sides read and write the same values.
 
-Most addons do not need it. The official annotations already mark the `net` library, and wrappers that call it are detected automatically.
+The official annotations already mark the `net` library, and wrappers that call it are detected automatically.
 
 ---
 

@@ -2,12 +2,15 @@
 title: "@self_guard"
 description: Mark a method that proves the object it is called on is valid.
 ---
+import AdvancedAnnotation from "/snippets/advanced-annotation.mdx"
+
+<AdvancedAnnotation />
 
 ## Overview
 
 `self_guard` marks a colon method such as `Entity:IsValid` that returns `true` only when the object it is called on is valid. After `if ent:IsValid() then`, GLuaLS treats `ent` as valid.
 
-Most addons do not need it. The official annotations already mark `IsValid` on entities, panels and other Garry's Mod objects.
+The official annotations already mark `IsValid` on entities, panels and other Garry's Mod objects.
 
 ---
 

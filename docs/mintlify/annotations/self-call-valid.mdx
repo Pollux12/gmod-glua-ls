@@ -2,6 +2,9 @@
 title: "@self_call_valid"
 description: Mark a callback where a method on self always returns a valid value.
 ---
+import AdvancedAnnotation from "/snippets/advanced-annotation.mdx"
+
+<AdvancedAnnotation />
 
 ## Overview
 
@@ -9,7 +12,7 @@ Some callbacks only run when a value is known to be valid. A weapon's `Think` on
 
 `self_call_valid` goes on the callback and names that method. Inside the callback, calls of it on `self` are treated as valid.
 
-Most addons do not need it. The official annotations already mark the weapon and entity callbacks where this holds.
+The official annotations already mark the weapon and entity callbacks where this holds.
 
 ---
 

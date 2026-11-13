@@ -2,12 +2,15 @@
 title: "@net_payload"
 description: Mark a function that writes a value to, or reads one from, a net message.
 ---
+import AdvancedAnnotation from "/snippets/advanced-annotation.mdx"
+
+<AdvancedAnnotation />
 
 ## Overview
 
 `net_payload` marks a function like `net.WriteString` or `net.ReadUInt`. GLuaLS compares the writes in a message's sender with the reads in its receiver, and warns when they do not match in order or kind.
 
-Most addons do not need it. The official annotations already mark the `net` library, and wrappers that call it are detected automatically.
+The official annotations already mark the `net` library, and wrappers that call it are detected automatically.
 
 ---
 

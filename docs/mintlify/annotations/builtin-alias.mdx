@@ -2,14 +2,15 @@
 title: "@builtin_alias"
 description: Keep a Lua built-in's special handling on a declaration that replaces it.
 ---
+import AdvancedAnnotation from "/snippets/advanced-annotation.mdx"
+
+<AdvancedAnnotation />
 
 ## Overview
 
 GLuaLS handles some Lua built-ins, such as `pairs`, specially. For example, it follows the keys a `pairs` loop visits.
 
 Annotation files redeclare those built-ins to add Garry's Mod details. `builtin_alias` names the built-in a declaration stands for, so the special handling carries over.
-
-Most addons do not need it. The official annotations already use it.
 
 ---
 

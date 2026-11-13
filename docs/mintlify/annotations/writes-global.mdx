@@ -2,6 +2,9 @@
 title: "@writes_global"
 description: Declare the only global tables a function changes when called.
 ---
+import AdvancedAnnotation from "/snippets/advanced-annotation.mdx"
+
+<AdvancedAnnotation />
 
 ## Overview
 
@@ -9,7 +12,7 @@ GLuaLS works out facts about global tables, such as which keys a table filled by
 
 `writes_global` says which globals a function changes. After a call, facts about those globals are dropped and facts about every other global are kept.
 
-Most addons do not need it. It is for functions with no source in your workspace, such as the official annotations.
+It is for functions with no source in your workspace, such as the official annotations.
 
 ---
 

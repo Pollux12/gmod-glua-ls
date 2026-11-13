@@ -2,12 +2,15 @@
 title: "@valid_guard"
 description: Mark a check function that proves its argument is valid.
 ---
+import AdvancedAnnotation from "/snippets/advanced-annotation.mdx"
+
+<AdvancedAnnotation />
 
 ## Overview
 
 `valid_guard` marks a function such as `IsValid` that returns `true` only when its first argument is a valid object. After the check, GLuaLS treats the value as valid, so `need-check-nil` and `unchecked-nil-access` stop warning about it.
 
-Most addons do not need it. The official annotations already mark `IsValid` and similar Garry's Mod helpers.
+The official annotations already mark `IsValid` and similar Garry's Mod helpers.
 
 ---
 

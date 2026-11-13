@@ -2,12 +2,15 @@
 title: "@call_arg"
 description: Tell GLuaLS what each parameter of a custom wrapper means.
 ---
+import AdvancedAnnotation from "/snippets/advanced-annotation.mdx"
+
+<AdvancedAnnotation />
 
 ## Overview
 
 Use `@call_arg` when your function wraps a Garry's Mod API. It lets completion, navigation, type checking, and other editor features treat the wrapper like the original function.
 
-Most addons do not need this annotation. The official annotations already apply it to built-in functions like `include`, `AddCSLuaFile`, `file.Find`, `util.AddNetworkString`, `net.Start`, `hook.Add`, `vgui.Register`, and `derma.DefineSkin`.
+The official annotations already apply it to built-in functions like `include`, `AddCSLuaFile`, `file.Find`, `util.AddNetworkString`, `net.Start`, `hook.Add`, `vgui.Register`, and `derma.DefineSkin`.
 
 Only add it when the wrapper has the same behavior as the API it represents.
 

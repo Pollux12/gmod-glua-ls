@@ -82,7 +82,6 @@
               "annotations/return",
               "annotations/overload",
               "annotations/outparam",
-              "annotations/adds-field",
               "annotations/async",
               "annotations/nodiscard"
             ]
@@ -97,38 +96,34 @@
             ]
           },
           {
-            "group": "Checks and narrowing",
+            "group": "Utilities",
             "pages": [
+              "annotations/diagnostic",
               "annotations/cast",
-              "annotations/valid-guard",
-              "annotations/self-guard",
-              "annotations/self-call-valid",
-              "annotations/exhaustive-type-guard"
+              "annotations/deprecated",
+              "annotations/see",
+              "annotations/lsp-optimization"
             ]
           },
           {
-            "group": "Wrappers and API behaviour",
+            "group": "Advanced",
             "pages": [
               "annotations/call-arg",
+              "annotations/adds-field",
+              "annotations/valid-guard",
+              "annotations/self-guard",
+              "annotations/self-call-valid",
+              "annotations/exhaustive-type-guard",
               "annotations/return-alias",
               "annotations/copy-result",
               "annotations/fresh-result",
               "annotations/writes-global",
               "annotations/net-send",
               "annotations/net-payload",
-              "annotations/builtin-alias"
-            ]
-          },
-          {
-            "group": "Utilities",
-            "pages": [
-              "annotations/diagnostic",
-              "annotations/deprecated",
-              "annotations/see",
+              "annotations/builtin-alias",
               "annotations/meta",
               "annotations/module",
-              "annotations/source",
-              "annotations/lsp-optimization"
+              "annotations/source"
             ]
           }
         ]
