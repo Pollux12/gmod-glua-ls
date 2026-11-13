@@ -53,9 +53,10 @@ pub fn dynamic_field_owner_of(db: &DbIndex, owner: &LuaMemberOwner) -> Option<Dy
     }
 }
 
-/// True when a wildcard (computed-key) assignment is the *only* thing known
-/// about `owner`: no named dynamic fields and no statically-known named
-/// members.
+/// True when a wildcard (computed-key) assignment decides which names `owner`
+/// holds: it has no named dynamic fields and no named members an annotation
+/// declares. Fields its own literal or assignments write leave it open, as the
+/// computed writes add names beside them.
 pub fn is_pure_wildcard_registry(db: &DbIndex, owner: &DynamicFieldOwner) -> bool {
     let index = db.get_dynamic_field_index();
     if !index.has_wildcard_definitions(owner) {
@@ -78,10 +79,11 @@ pub fn is_pure_wildcard_registry(db: &DbIndex, owner: &DynamicFieldOwner) -> boo
         .get_members(&member_owner)
         .is_none_or(|members| {
             !members.iter().any(|member| {
-                matches!(
-                    member.get_key(),
-                    LuaMemberKey::Name(_) | LuaMemberKey::Integer(_)
-                )
+                member.get_feature().is_decl()
+                    && matches!(
+                        member.get_key(),
+                        LuaMemberKey::Name(_) | LuaMemberKey::Integer(_)
+                    )
             })
         })
 }

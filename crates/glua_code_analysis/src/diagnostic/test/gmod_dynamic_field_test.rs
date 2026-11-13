@@ -1981,6 +1981,38 @@ function UnknownPosition() end"
         );
     }
 
+    /// A table literal's own fields are code, not a declared shape: the computed
+    /// writes beside them still add any name, read from any file.
+    #[gtest]
+    fn test_literal_registry_filled_by_computed_keys_accepts_names_from_other_files() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/mymod/core.lua",
+            r#"
+            module("mymod", package.seeall)
+            Meta = Meta or {Base = {}}
+            function Register(name)
+                local meta = {}
+                Meta[name] = meta
+                return meta
+            end
+            "#,
+        );
+        let user = ws.def_file(
+            "lua/mymod/user.lua",
+            r#"
+            module("mymod", package.seeall)
+            Register("Alpha")
+            print(Meta.Alpha, Meta.Base)
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, user, DiagnosticCode::UndefinedField),
+            Vec::<String>::new()
+        );
+    }
+
     /// One named write gives the table a shape again, so bogus names still report.
     #[gtest]
     fn test_mixed_computed_key_table_still_reports_undefined_field() {
