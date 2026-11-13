@@ -2236,6 +2236,62 @@ function UnknownPosition() end"
     }
 
     #[gtest]
+    fn entity_reads_field_written_on_an_instance_another_file_created() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/includes/extensions/ents.lua",
+            r#"
+            ---@class Entity
+            local Entity = {}
+            ---@class NULL : Entity
+            NULL = {}
+            ents = {}
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return (instance) T|NULL
+            function ents.Create(class) end
+            "#,
+        );
+        ws.def_file(
+            "lua/entities/base_chipbase/shared.lua",
+            r#"
+            ENT.Type = "anim"
+            "#,
+        );
+        let chip = ws.def_file(
+            "lua/entities/test_chip/init.lua",
+            r#"
+            ENT.Type = "anim"
+            ENT.Base = "base_chipbase"
+            function ENT:Initialize()
+                print(self._Owner)
+            end
+            function ENT:SetAmount(amount)
+                self.amount = amount
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/server/chip_spawner.lua",
+            r#"
+            local function spawn(ply)
+                local entity = ents.Create("test_chip")
+                if (entity.SetAmount) then
+                    entity:SetAmount(1)
+                    entity._Owner = ply
+                end
+            end
+            "#,
+        );
+
+        expect_that!(
+            diagnostic_messages_for_file(&mut ws, chip, DiagnosticCode::UndefinedField),
+            is_empty()
+        );
+    }
+
+    #[gtest]
     fn sibling_class_members_list_parent_dynamic_fields_but_not_sibling_ones() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def_file(
