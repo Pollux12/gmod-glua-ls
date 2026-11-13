@@ -67,6 +67,8 @@
               "annotations/class",
               "annotations/type",
               "annotations/field",
+              "annotations/index-alias",
+              "annotations/field-accessor",
               "annotations/alias",
               "annotations/enum",
               "annotations/generic",

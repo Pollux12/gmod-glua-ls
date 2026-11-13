@@ -1,0 +1,43 @@
+---
+title: "@index_alias"
+description: Give a numbered field a name in completion and hints.
+---
+
+## Overview
+
+A table field with a number key, like `[1]`, is hard to read at the call site. `index_alias` gives it a name. Completion lists the field under that name, and an inlay hint shows the name next to `t[1]`.
+
+The field keeps its number key. The name is only shown in the editor.
+
+---
+
+## Syntax
+
+```lua
+---@[index_alias("name")]
+```
+
+Put it above the numbered field, or after it on the same line.
+
+---
+
+## Example
+
+```lua
+local spawn = {
+    ---@[index_alias("pos")]
+    [1] = Vector(0, 0, 0),
+    ---@[index_alias("ang")]
+    [2] = Angle(0, 0, 0),
+}
+
+print(spawn[1]) -- hint shows: pos
+```
+
+It also works on numbered `@field` lines:
+
+```lua
+---@class SpawnPoint
+---@[index_alias("pos")]
+---@field [1] Vector
+```

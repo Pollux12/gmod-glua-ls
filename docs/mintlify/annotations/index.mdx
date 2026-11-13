@@ -29,6 +29,8 @@ GLuaLS follows EmmyLua-style annotations and adds Garry's Mod Lua extensions for
 |---|---|---|
 | [`@class`](/annotations/class) | Define a class with optional inheritance | `---@class Animal` |
 | [`@field`](/annotations/field) | Add a typed field to a class | `---@field health number` |
+| [`@index_alias`](/annotations/index-alias) | Name a numbered field in completion and hints | `---@[index_alias("pos")]` |
+| [`@field_accessor`](/annotations/field-accessor) | Link a field to its getter and setter methods | `---@[field_accessor("PascalCase")]` |
 | [`@type`](/annotations/type) | Declare the type of a variable | `---@type Player` |
 | [`@alias`](/annotations/alias) | Create a new type alias | `---@alias ID string \| number` |
 | [`@enum`](/annotations/enum) | Mark a table as an enumeration | `---@enum TEAM` |
