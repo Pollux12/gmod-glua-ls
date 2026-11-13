@@ -860,7 +860,7 @@ pub fn try_resolve_special_call(
 
     // A constructor lookup failure must not hide the parent link: the class
     // already exists, only its constructor is missing.
-    try_resolve_base_class_params(
+    let base_class_result = try_resolve_base_class_params(
         db,
         cache,
         unresolve_special_call.file_id,
@@ -868,6 +868,7 @@ pub fn try_resolve_special_call(
         &callable_param_infos,
     );
     param_result?;
+    base_class_result?;
 
     for out_param_info in callable_out_param_infos {
         apply_out_param_from_call(
@@ -2550,14 +2551,15 @@ fn add_call_super_edge(
 }
 
 /// Links the class this call creates to the class named by a `base_class` argument.
-/// Runs after every parameter has been settled so the target class already exists.
+/// Runs after every parameter has been settled so the target class already exists;
+/// an argument whose type is not settled yet retries the call.
 fn try_resolve_base_class_params(
     db: &mut DbIndex,
     cache: &mut LuaInferCache,
     file_id: FileId,
     call_expr: &LuaCallExpr,
     param_infos: &[SpecialCallParamInfo],
-) {
+) -> Result<(), InferFailReason> {
     let is_class_param = |info: &&SpecialCallParamInfo| {
         !info.is_base_class && find_str_tpl_ref(db, &info.param_type).is_some()
     };
@@ -2568,10 +2570,10 @@ fn try_resolve_base_class_params(
         .or_else(|| param_infos.iter().find(is_class_param))
         .cloned()
     else {
-        return;
+        return Ok(());
     };
     let Some(str_tpl) = find_str_tpl_ref(db, &class_param.param_type) else {
-        return;
+        return Ok(());
     };
     let is_colon_call = call_expr.is_colon_call();
     let Some(target_id) = get_constructor_target_type(
@@ -2583,7 +2585,7 @@ fn try_resolve_base_class_params(
         class_param.is_colon_define,
         is_colon_call,
     ) else {
-        return;
+        return Ok(());
     };
 
     for base_param in param_infos.iter().filter(|info| info.is_base_class) {
@@ -2595,12 +2597,9 @@ fn try_resolve_base_class_params(
         ) else {
             continue;
         };
-        let Some(name) = infer_string_const_arg(db, cache, &arg_expr) else {
+        let Some(parent_id) = base_class_arg_parent(db, cache, &arg_expr, &str_tpl)? else {
             continue;
         };
-        let parent_id = LuaTypeDeclId::global(
-            format!("{}{}{}", str_tpl.get_prefix(), name, str_tpl.get_suffix()).as_str(),
-        );
         if parent_id == target_id {
             continue;
         }
@@ -2628,6 +2627,7 @@ fn try_resolve_base_class_params(
             arg_expr.get_range(),
         );
     }
+    Ok(())
 }
 
 fn set_signature_to_default_call(
@@ -2779,6 +2779,32 @@ fn infer_string_const_arg(
         LuaType::StringConst(s) => Some(s.to_string()),
         _ => None,
     }
+}
+
+/// The class a `base_class` argument names: a string spelled as the factory
+/// spells its class names, or a value that is itself one of those classes.
+fn base_class_arg_parent(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    arg_expr: &LuaExpr,
+    str_tpl: &crate::LuaStringTplType,
+) -> Result<Option<LuaTypeDeclId>, InferFailReason> {
+    let arg_type = match infer_expr(db, cache, arg_expr.clone()) {
+        Ok(arg_type) => arg_type,
+        Err(reason) if reason.is_need_resolve() => return Err(reason),
+        Err(_) => return Ok(None),
+    };
+    Ok(match arg_type {
+        LuaType::StringConst(name) => Some(LuaTypeDeclId::global(
+            format!("{}{}{}", str_tpl.get_prefix(), name, str_tpl.get_suffix()).as_str(),
+        )),
+        LuaType::Ref(id) | LuaType::Def(id) => Some(id),
+        LuaType::Instance(instance) => match instance.get_base() {
+            LuaType::Ref(id) | LuaType::Def(id) => Some(id.clone()),
+            _ => None,
+        },
+        _ => None,
+    })
 }
 
 #[cfg(test)]

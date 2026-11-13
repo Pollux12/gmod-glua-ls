@@ -209,8 +209,9 @@
 
 ---
 --- Marks a parameter whose argument names the parent class of the class this call creates.
---- The argument is wrapped in the same prefix and suffix as the function's string-template class
+--- A string argument is wrapped in the same prefix and suffix as the function's string-template class
 --- parameter, so `CreateMetaTable("Walker", "Mech")` makes `battlemechs.Walker` inherit `battlemechs.Mech`.
+--- A class value, such as the table an earlier call returned, names its own class.
 --- The parent must be a class that exists; otherwise only `root_class` applies.
 ---@attribute base_class()
 

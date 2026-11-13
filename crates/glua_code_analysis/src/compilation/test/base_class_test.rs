@@ -10,7 +10,7 @@ mod base_class_test {
         ---@[constructor("Initialize", "battlemechs.Base", false)]
         ---@param name battlemechs.`T`
         ---@[base_class]
-        ---@param base string?
+        ---@param base (string|battlemechs.Base)?
         ---@return (definition) T
         function CreateMetaTable(name, base)
             ---@type (definition) battlemechs.Base
@@ -80,6 +80,39 @@ mod base_class_test {
             print(w:GetSpeed())
         "#;
         assert!(ws.check_file_for(DiagnosticCode::UndefinedField, "walker.lua", w_use));
+        assert!(supers(&ws, "battlemechs.Walker").contains(&class_ref("battlemechs.Mech")));
+    }
+
+    #[test]
+    fn a_base_passed_as_a_class_value_becomes_a_supertype() {
+        let mut ws = factory_workspace();
+        let w_use = r#"
+            local MECH = CreateMetaTable("Mech")
+            function MECH:GetSpeed() return 1 end
+
+            local w = CreateMetaTable("Walker", MECH)
+            print(w:GetSpeed())
+        "#;
+        assert!(ws.check_file_for(DiagnosticCode::UndefinedField, "walker.lua", w_use));
+        assert!(ws.check_file_for(DiagnosticCode::ParamTypeMismatch, "walker.lua", w_use));
+        assert!(supers(&ws, "battlemechs.Walker").contains(&class_ref("battlemechs.Mech")));
+    }
+
+    #[test]
+    fn a_class_value_base_from_a_later_file_becomes_a_supertype() {
+        let mut ws = factory_workspace();
+        ws.def_file(
+            "walker.lua",
+            r#"
+                local w = CreateMetaTable("Walker", battlemechs_mech)
+            "#,
+        );
+        ws.def_file(
+            "mech.lua",
+            r#"
+                battlemechs_mech = CreateMetaTable("Mech")
+            "#,
+        );
         assert!(supers(&ws, "battlemechs.Walker").contains(&class_ref("battlemechs.Mech")));
     }
 
