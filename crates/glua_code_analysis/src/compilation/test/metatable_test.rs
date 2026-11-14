@@ -2357,6 +2357,7 @@ mod test {
             meta = getmetatable(proxy)
             RegisterMetaTable(metaName, meta)
             meta.__index = meta
+            function meta:GetTable() return {} end
             return meta
         end
         "#,
@@ -2389,6 +2390,29 @@ mod test {
         let found = ws.local_ty(reader, "found");
         assert_eq!(ws.humanize_type(found), "Example.Bone");
         assert!(is_function_type(&ws.local_ty(reader, "name")));
+    }
+
+    /// What the factory puts on the table it returns, including the fields
+    /// the registration adds, belongs to every class a call makes.
+    #[test]
+    fn a_factory_made_class_has_what_the_factory_put_on_its_table() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![METATABLE_FACTORY]);
+        let bone = ws.def_file(
+            "lua/autorun/sh_bone.lua",
+            r#"
+            local BONE = CreateMetaTable("Bone")
+            function BONE:Name() return self:GetTable() end
+            local name = BONE.MetaName
+            local tab = BONE:Name()
+            "#,
+        );
+
+        let name = ws.local_ty(bone, "name");
+        assert_eq!(ws.humanize_type(name), "string");
+        let tab = ws.local_ty(bone, "tab");
+        assert_eq!(ws.humanize_type(tab), "table");
     }
 
     /// A function that returns what a factory call returns is a factory
@@ -2459,26 +2483,34 @@ mod test {
         assert_eq!(ws.humanize_type(panel), "MyPanel");
     }
 
-    /// Making the factory return something else, and back, leaves what a
+    /// Making the factory return something else or drop a method, and back, leaves what a
     /// fresh analysis of the final text has.
     #[test]
     fn editing_a_metatable_factory_matches_a_fresh_analysis() {
         let user = (
             "lua/autorun/sh_bone.lua",
-            "local BONE = CreateMetaTable(\"Bone\")\nfunction BONE:Name() return self end",
+            "local BONE = CreateMetaTable(\"Bone\")\nfunction BONE:Name() return self:GetTable() end",
         );
         let (head, tail) = METATABLE_FACTORY
             .1
             .rsplit_once("return meta")
             .expect("return");
         let not_returned = format!("{head}return proxy{tail}");
+        let no_method = METATABLE_FACTORY
+            .1
+            .replace("function meta:GetTable() return {} end", "");
         let setup = |ws: &mut VirtualWorkspace| {
             ws.def_gmod_call_arg_builtins();
         };
         VirtualWorkspace::assert_warm_matches_cold(
             setup,
             &[METATABLE_FACTORY, user],
-            &[(METATABLE_FACTORY.0, &not_returned), METATABLE_FACTORY],
+            &[
+                (METATABLE_FACTORY.0, &not_returned),
+                METATABLE_FACTORY,
+                (METATABLE_FACTORY.0, &no_method),
+                METATABLE_FACTORY,
+            ],
         );
     }
 

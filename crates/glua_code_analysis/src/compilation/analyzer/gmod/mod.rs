@@ -18,7 +18,8 @@ use glua_parser::{
 };
 
 use crate::semantic::{
-    getmetatable_call_metatable, local_initializer_expr, semantic_decl_closure_signature_id,
+    get_prefix_expr_signature_id, getmetatable_call_metatable, local_initializer_expr,
+    semantic_decl_closure_signature_id,
 };
 use crate::{
     EmmyrcGmodRealm, FileId, GlobalId, GmodClassCallArg, GmodClassCallArgSource,
@@ -7237,14 +7238,98 @@ fn synthesize_registered_class_with_id(
         {
             bind_panel_table_decl(db, decl_id, &LuaType::Def(class_decl_id.clone()));
         }
-    } else if bind
-        && call.class_registration_table_is_result()
-        && let Some(decl_id) = local_decl_for_call_result(db, file_id, call.syntax_id)
-        && !cached_decl_has_reassignment(cache, db, file_id, decl_id)
-    {
+    } else if bind && call.class_registration_table_is_result() {
+        // What the factory puts on the table it registers belongs to every
+        // class a call of it makes.
+        if let Some(factory_table) = factory_registered_table(db, file_id, call, &mut Vec::new()) {
+            db.get_type_index_mut().add_super_type(
+                class_decl_id.clone(),
+                file_id,
+                call.syntax_id.get_range(),
+                LuaType::TableConst(factory_table),
+            );
+        }
         // The local the call initialises holds the table the call registered.
-        bind_panel_table_decl(db, decl_id, &LuaType::Def(class_decl_id));
+        if let Some(decl_id) = local_decl_for_call_result(db, file_id, call.syntax_id)
+            && !cached_decl_has_reassignment(cache, db, file_id, decl_id)
+        {
+            bind_panel_table_decl(db, decl_id, &LuaType::Def(class_decl_id));
+        }
     }
+}
+
+/// The table the factory `call` calls registers in its own body.
+fn factory_registered_table(
+    db: &DbIndex,
+    file_id: FileId,
+    call: &GmodScriptedClassCallMetadata,
+    visited: &mut Vec<InFiled<TextRange>>,
+) -> Option<InFiled<TextRange>> {
+    let call_range = InFiled::new(file_id, call.syntax_id.get_range());
+    if visited.contains(&call_range) {
+        return None;
+    }
+    visited.push(call_range);
+    let root = db.get_vfs().get_syntax_tree(&file_id)?.get_red_root();
+    let call_expr = call
+        .syntax_id
+        .to_node_from_root(&root)
+        .and_then(LuaCallExpr::cast)?;
+    let mut infer_cache = LuaInferCache::new(file_id, super::call_target::pass_view());
+    let signature_id = get_prefix_expr_signature_id(db, &mut infer_cache, &call_expr)?;
+    let factory_file_id = signature_id.get_file_id();
+    let factory_root = db
+        .get_vfs()
+        .get_syntax_tree(&factory_file_id)?
+        .get_red_root();
+    let factory = factory_root
+        .token_at_offset(signature_id.get_position())
+        .right_biased()?
+        .parent_ancestors()
+        .find_map(LuaClosureExpr::cast)?;
+    let metadata = db
+        .get_gmod_class_metadata_index()
+        .get_file_metadata(&factory_file_id)?;
+    let mut registrations = [
+        (&metadata.vgui_register_calls, 1),
+        (&metadata.metatable_register_calls, 1),
+        (&metadata.derma_define_control_calls, 2),
+    ]
+    .into_iter()
+    .flat_map(|(calls, table_arg_idx)| calls.iter().map(move |call| (call, table_arg_idx)))
+    .filter(|(inner, _)| {
+        let inner_range = inner.syntax_id.get_range();
+        factory.get_range().contains_range(inner_range)
+            && LuaSyntaxId::to_node_from_root(&inner.syntax_id, &factory_root)
+                .and_then(|node| node.ancestors().find_map(LuaClosureExpr::cast))
+                .as_ref()
+                == Some(&factory)
+    })
+    .collect::<Vec<_>>();
+    registrations.sort_by_key(|(inner, _)| inner.syntax_id.get_range().start());
+    registrations
+        .into_iter()
+        .find_map(|(inner, table_arg_idx)| {
+            if inner.class_registration_table_is_result() {
+                return factory_registered_table(db, factory_file_id, inner, visited);
+            }
+            let table_source = inner.class_registration_table_arg_source(table_arg_idx)?;
+            match inner.value_for_arg_source(&table_source) {
+                Some(GmodClassCallLiteral::NameRef(table_var)) => {
+                    let (_, region_start) = resolve_local_registration_region(
+                        db,
+                        factory_file_id,
+                        table_var,
+                        inner.syntax_id.get_range().start(),
+                    )?;
+                    find_registered_table_expr_at_write_position(db, factory_file_id, region_start)
+                        .map(|table| InFiled::new(factory_file_id, table.get_range()))
+                        .or_else(|| registered_metatable(db, factory_file_id, region_start))
+                }
+                _ => find_table_expr_for_arg_source(db, factory_file_id, inner, &table_source)
+                    .map(|table| InFiled::new(factory_file_id, table.get_range())),
+            }
+        })
 }
 
 /// Types a panel table's declaration with the class registered from it.
