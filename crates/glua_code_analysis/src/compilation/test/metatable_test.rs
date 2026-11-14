@@ -2109,6 +2109,33 @@ mod test {
         ));
     }
 
+    /// `getmetatable` answers with the metatable `setmetatable` gave the
+    /// table, whether the table is the call's result or was passed to it.
+    #[test]
+    fn getmetatable_returns_the_metatable_the_table_was_given() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/cat.lua",
+            r#"
+            local CAT = {}
+            CAT.__index = CAT
+            function CAT:Meow() return "meow" end
+
+            local cat = setmetatable({}, CAT)
+            local from_result = getmetatable(cat).Meow
+
+            local dog = {}
+            setmetatable(dog, CAT)
+            local from_statement = getmetatable(dog).Meow
+            "#,
+        );
+
+        for name in ["from_result", "from_statement"] {
+            let typ = ws.local_ty(file_id, name);
+            assert!(is_function_type(&typ), "{name}: {}", ws.humanize_type(typ));
+        }
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }

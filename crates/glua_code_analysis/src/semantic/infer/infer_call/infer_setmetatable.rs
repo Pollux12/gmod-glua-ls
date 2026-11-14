@@ -83,6 +83,61 @@ pub fn infer_setmetatable_call(
     }
 }
 
+/// `getmetatable(t)` for a table `setmetatable` gave a metatable: that
+/// metatable. `None` for any other call, which then reads as declared.
+pub fn infer_getmetatable_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<LuaType> {
+    let LuaExpr::NameExpr(name) = call_expr.get_prefix_expr()? else {
+        return None;
+    };
+    if name.get_name_text()? != "getmetatable" {
+        return None;
+    }
+    let [table]: [LuaExpr; 1] = call_expr
+        .get_args_list()?
+        .get_args()
+        .collect::<Vec<_>>()
+        .try_into()
+        .ok()?;
+    let range = resolve_table_backing_range(db, cache, &table)
+        .or_else(|| setmetatable_target_range(db, cache, &table))?;
+    let metatable = db.get_metatable_index().get(&range)?;
+    Some(LuaType::TableConst(metatable.clone()))
+}
+
+/// The table literal a `setmetatable(t, mt)` call `expr` evaluates to, or is
+/// the value of: the call returns `t`.
+fn setmetatable_target_range(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> Option<InFiled<rowan::TextRange>> {
+    let (file_id, value) = match expr {
+        LuaExpr::CallExpr(_) => (cache.get_file_id(), expr.clone()),
+        _ => semantic_decl_value(
+            db,
+            infer_expr_semantic_decl(
+                db,
+                cache,
+                expr.clone(),
+                SemanticDeclGuard::default(),
+                SemanticDeclLevel::default(),
+            )?,
+        )?,
+    };
+    let LuaExpr::CallExpr(call) = value else {
+        return None;
+    };
+    if !call.is_setmetatable() {
+        return None;
+    }
+    let target = call.get_args_list()?.get_args().next()?;
+    table_backing_range_from_expr(file_id, &target)
+}
+
 fn resolve_table_backing_range(
     db: &DbIndex,
     cache: &mut LuaInferCache,
