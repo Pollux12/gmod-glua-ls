@@ -534,6 +534,34 @@ mod tests {
         VirtualWorkspace::assert_warm_matches_cold(|_| {}, &[(path, SOURCE)], &[(path, SOURCE)]);
     }
 
+    /// A read that several guessed assignments reach is reported once.
+    #[test]
+    fn a_read_of_several_guessed_assignments_is_reported_once() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_step.lua",
+            r#"
+            ---@param value number
+            local function takes_number(value) end
+            ---@return unknown
+            local function unknown_source() end
+
+            local fraction
+            if unknown_source() then
+                fraction = unknown_source()
+            elseif unknown_source() then
+                fraction = unknown_source()
+            else
+                fraction = unknown_source()
+            end
+            takes_number(fraction)
+            "#,
+        );
+
+        let found = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown);
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
     #[test]
     fn declared_overload_return_does_not_infer_from_usage_context() {
         let mut ws = VirtualWorkspace::new();
