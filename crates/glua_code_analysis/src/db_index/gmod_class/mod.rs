@@ -27,6 +27,7 @@ pub enum GmodScriptedClassCallKind {
     VguiRegisterTable,
     DermaDefineControl,
     DermaDefineSkin,
+    MetaTableRegister,
 }
 
 impl GmodScriptedClassCallKind {
@@ -323,6 +324,7 @@ pub struct GmodScriptedClassFileMetadata {
     pub vgui_register_table_calls: Vec<GmodScriptedClassCallMetadata>,
     pub derma_define_control_calls: Vec<GmodScriptedClassCallMetadata>,
     pub derma_define_skin_calls: Vec<GmodScriptedClassCallMetadata>,
+    pub metatable_register_calls: Vec<GmodScriptedClassCallMetadata>,
     pub vgui_parent_calls: Vec<GmodVguiParentCallMetadata>,
 }
 
@@ -426,6 +428,7 @@ impl GmodScriptedClassFileMetadata {
             GmodScriptedClassCallKind::VguiRegisterTable => &mut self.vgui_register_table_calls,
             GmodScriptedClassCallKind::DermaDefineControl => &mut self.derma_define_control_calls,
             GmodScriptedClassCallKind::DermaDefineSkin => &mut self.derma_define_skin_calls,
+            GmodScriptedClassCallKind::MetaTableRegister => &mut self.metatable_register_calls,
         }
     }
 }

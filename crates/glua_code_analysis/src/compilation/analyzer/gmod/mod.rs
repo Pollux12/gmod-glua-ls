@@ -4340,6 +4340,7 @@ fn synthesize_vgui_registrations(
                     || !m.vgui_register_table_calls.is_empty()
                     || !m.derma_define_control_calls.is_empty()
                     || !m.vgui_register_file_calls.is_empty()
+                    || !m.metatable_register_calls.is_empty()
             }
             None => continue,
         };
@@ -4352,7 +4353,17 @@ fn synthesize_vgui_registrations(
             .expect("metadata present (checked above)")
             .clone();
 
-        for call in &metadata.vgui_register_calls {
+        let named_registrations = metadata
+            .vgui_register_calls
+            .iter()
+            .map(|call| (GmodScriptedClassCallKind::VguiRegister, call))
+            .chain(
+                metadata
+                    .metatable_register_calls
+                    .iter()
+                    .map(|call| (GmodScriptedClassCallKind::MetaTableRegister, call)),
+            );
+        for (kind, call) in named_registrations {
             let register_position = call.syntax_id.get_range().start();
             let panel_source = call.class_registration_define_arg_source();
             let table_source = call.class_registration_table_arg_source(1);
@@ -4382,7 +4393,12 @@ fn synthesize_vgui_registrations(
                         region_end: register_position,
                     });
                 }
-                synthesize_vgui_register(
+                let synthesize = if kind == GmodScriptedClassCallKind::MetaTableRegister {
+                    synthesize_metatable_register
+                } else {
+                    synthesize_vgui_register
+                };
+                synthesize(
                     db,
                     &mut synthesis_cache,
                     file_id,
@@ -6281,7 +6297,7 @@ fn synthesize_vgui_register(
 
     let base_panel = registered_panel_base(call, base_source.as_ref());
 
-    synthesize_panel_class(
+    synthesize_registered_class(
         db,
         cache,
         file_id,
@@ -6289,6 +6305,36 @@ fn synthesize_vgui_register(
         table_var_name.as_deref(),
         base_panel.as_deref(),
         GmodScriptedClassCallKind::VguiRegister,
+        call,
+        resolved_registration,
+        phase,
+    );
+}
+
+/// `RegisterMetaTable(name, table)`: the table is the class of that name, with
+/// no base; GMod gives the userdata whose metatable it is the class's methods.
+fn synthesize_metatable_register(
+    db: &mut DbIndex,
+    cache: &mut VguiSynthesisCache,
+    file_id: FileId,
+    call: &GmodScriptedClassCallMetadata,
+    class_name: &str,
+    resolved_registration: Option<ResolvedVguiRegistrationRegion>,
+    phase: VguiSynthesisPhase,
+) {
+    let table_var_name =
+        match call.value_for_arg_source(&call.class_registration_table_arg_source(1)) {
+            Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
+            _ => None,
+        };
+    synthesize_registered_class(
+        db,
+        cache,
+        file_id,
+        class_name,
+        table_var_name.as_deref(),
+        None,
+        GmodScriptedClassCallKind::MetaTableRegister,
         call,
         resolved_registration,
         phase,
@@ -6319,7 +6365,7 @@ fn synthesize_derma_define_control(
 
     let base_panel = registered_panel_base(call, base_source.as_ref());
 
-    synthesize_panel_class(
+    synthesize_registered_class(
         db,
         cache,
         file_id,
@@ -6359,7 +6405,7 @@ fn synthesize_vgui_register_table(
     let base_panel = registered_panel_base(call, base_source.as_ref());
 
     let class_decl_id = vgui_register_table_type_decl_id(file_id, call);
-    synthesize_panel_class_with_id(
+    synthesize_registered_class_with_id(
         db,
         cache,
         file_id,
@@ -6777,7 +6823,7 @@ fn value_expr_as_table(expr: &LuaExpr) -> Option<LuaTableExpr> {
     }
 }
 
-fn synthesize_panel_class(
+fn synthesize_registered_class(
     db: &mut DbIndex,
     cache: &mut VguiSynthesisCache,
     file_id: FileId,
@@ -6790,7 +6836,7 @@ fn synthesize_panel_class(
     phase: VguiSynthesisPhase,
 ) {
     let class_decl_id = LuaTypeDeclId::global(panel_name);
-    synthesize_panel_class_with_id(
+    synthesize_registered_class_with_id(
         db,
         cache,
         file_id,
@@ -6804,7 +6850,7 @@ fn synthesize_panel_class(
     );
 }
 
-fn synthesize_panel_class_with_id(
+fn synthesize_registered_class_with_id(
     db: &mut DbIndex,
     cache: &mut VguiSynthesisCache,
     file_id: FileId,
@@ -7067,7 +7113,9 @@ fn find_inline_vgui_panel_table_expr(
     call: &GmodScriptedClassCallMetadata,
 ) -> Option<LuaTableExpr> {
     let table_source = match call_kind {
-        GmodScriptedClassCallKind::VguiRegister => call.class_registration_table_arg_source(1),
+        GmodScriptedClassCallKind::VguiRegister | GmodScriptedClassCallKind::MetaTableRegister => {
+            call.class_registration_table_arg_source(1)
+        }
         GmodScriptedClassCallKind::VguiRegisterTable => call.class_registration_table_arg_source(0),
         GmodScriptedClassCallKind::DermaDefineControl => {
             call.class_registration_table_arg_source(2)
@@ -7910,6 +7958,13 @@ impl AnnotatedGmodCallRoles {
             }
             ("gmod.derma_skin", "define") => {
                 self.derma_skin_define_roles.push(arg_role);
+            }
+            ("gmod.metatable", "define") => {
+                self.class_registration_kind = Some(GmodScriptedClassCallKind::MetaTableRegister);
+                self.class_registration_define_roles.push(arg_role);
+            }
+            ("gmod.metatable", "table") => {
+                self.class_registration_table_roles.push(arg_role);
             }
             ("gmod.scripted_class", "define") => {
                 self.scripted_class_define_roles.push(arg_role);

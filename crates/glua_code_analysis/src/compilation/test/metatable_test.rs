@@ -2136,6 +2136,93 @@ mod test {
         }
     }
 
+    const REGISTERED_COLOR: (&str, &str) = (
+        "lua/autorun/sh_color.lua",
+        r#"
+        local COLOR = {}
+        COLOR.__index = COLOR
+        function COLOR:Brighten() return self end
+        RegisterMetaTable("MyColor", COLOR)
+        local made = setmetatable({}, COLOR)
+        "#,
+    );
+
+    fn registered_color_workspace(reader: &str) -> (VirtualWorkspace, crate::FileId) {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![REGISTERED_COLOR]);
+        let reader = ws.def_file("lua/autorun/sh_reader.lua", reader);
+        (ws, reader)
+    }
+
+    /// `RegisterMetaTable(name, table)` is a class registration call.
+    #[test]
+    fn register_metatable_is_filed_as_a_class_registration() {
+        let (ws, _) = registered_color_workspace("");
+        let db = ws.analysis.compilation.get_db();
+        let uri = ws.virtual_url_generator.new_uri(REGISTERED_COLOR.0);
+        let file_id = ws.analysis.get_file_id(&uri).expect("file id");
+        let calls = db
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(&file_id)
+            .map(|metadata| metadata.metatable_register_calls.len());
+        assert_eq!(calls, Some(1));
+    }
+
+    /// A registered metatable is the class of that name: `FindMetaTable`
+    /// returns it, with its methods and the fields registration adds, and the
+    /// tables given it by `setmetatable` are its instances.
+    #[test]
+    fn a_registered_metatable_is_the_class_find_metatable_returns() {
+        let (ws, reader) = registered_color_workspace(
+            r#"
+            local meta = FindMetaTable("MyColor")
+            local brighten = meta.Brighten
+            local name = meta.MetaName
+            "#,
+        );
+
+        let meta = ws.local_ty(reader, "meta");
+        assert_eq!(ws.humanize_type(meta), "MyColor");
+        assert!(is_function_type(&ws.local_ty(reader, "brighten")));
+        let name = ws.local_ty(reader, "name");
+        assert_eq!(ws.humanize_type(name), "string");
+        let uri = ws.virtual_url_generator.new_uri(REGISTERED_COLOR.0);
+        let color_file = ws.analysis.get_file_id(&uri).expect("file id");
+        let made = ws.local_ty(color_file, "made");
+        assert_eq!(ws.humanize_type(made), "MyColor");
+    }
+
+    /// Renaming a registration, removing it and putting it back leaves what a
+    /// fresh analysis of the final text has.
+    #[test]
+    fn editing_a_metatable_registration_matches_a_fresh_analysis() {
+        let reader = (
+            "lua/autorun/sh_reader.lua",
+            "local meta = FindMetaTable(\"MyColor\")",
+        );
+        let renamed = REGISTERED_COLOR.1.replace("\"MyColor\"", "\"OtherColor\"");
+        let unregistered = REGISTERED_COLOR
+            .1
+            .replace("RegisterMetaTable(\"MyColor\", COLOR)", "");
+        let setup = |ws: &mut VirtualWorkspace| {
+            ws.def_gmod_call_arg_builtins();
+        };
+        VirtualWorkspace::assert_warm_matches_cold(
+            setup,
+            &[REGISTERED_COLOR, reader],
+            &[
+                (REGISTERED_COLOR.0, &renamed),
+                (REGISTERED_COLOR.0, &unregistered),
+            ],
+        );
+        VirtualWorkspace::assert_warm_matches_cold(
+            setup,
+            &[(REGISTERED_COLOR.0, &unregistered), reader],
+            &[REGISTERED_COLOR],
+        );
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }

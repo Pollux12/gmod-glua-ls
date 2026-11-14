@@ -441,6 +441,19 @@ function vgui.RegisterTable(panel, base) end
 ---@param base string
 function derma.DefineControl(class, description, panel, base) end
 
+---@[call_arg("gmod.metatable", "define")]
+---@param metaName string
+---@[call_arg("gmod.metatable", "table")]
+---@[adds_field("MetaID", "integer")]
+---@[adds_field("MetaName", "string")]
+---@param metaTable table
+function RegisterMetaTable(metaName, metaTable) end
+
+---@generic T : table
+---@param metaName `T`
+---@return (definition) T
+function FindMetaTable(metaName) end
+
 ---@[call_arg("gmod.derma_skin", "define")]
 ---@param name string
 function derma.DefineSkin(name, description, skin) end
