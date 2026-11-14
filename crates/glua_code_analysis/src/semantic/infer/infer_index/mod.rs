@@ -1242,7 +1242,7 @@ fn infer_table_member_owner(
             // a registry does not lose its nil just because the key-specific
             // lookup resolved to `unknown`.
             if !crate::db_index::is_informative_type(&typ)
-                && let Some(member_type) = infer_cross_file_matching_expr_key_member_type(
+                && let Some(member_type) = infer_written_expr_key_member_type(
                     db,
                     &owner,
                     &key,
@@ -1309,10 +1309,10 @@ fn infer_table_member_owner(
             }
 
             // Consulted last, after every key-specific source above: a
-            // computed write in another file is evidence about the *values* a
-            // table holds, never about this key being one of them. So it only
-            // answers when nothing better did, and it answers `V?`.
-            if let Some(member_type) = infer_cross_file_matching_expr_key_member_type(
+            // computed write is evidence about the *values* a table holds,
+            // never about this key being one of them. So it only answers when
+            // nothing better did, and it answers `V?`.
+            if let Some(member_type) = infer_written_expr_key_member_type(
                 db,
                 &owner,
                 &key,
@@ -1902,7 +1902,23 @@ fn nullable_if_needed(db: &DbIndex, typ: LuaType) -> LuaType {
     }
 }
 
-fn infer_cross_file_matching_expr_key_member_type(
+/// Whether a write in the reading file runs in a function that does not
+/// contain the read: it may have run any number of times before it, while a
+/// write in the read's own region is ordered against it by flow.
+fn same_file_write_may_run_first(
+    db: &DbIndex,
+    member: &LuaMember,
+    access_position: TextSize,
+) -> bool {
+    let member_index = db.get_member_index();
+    let file_id = member.get_file_id();
+    let write_function =
+        member_index.enclosing_function_scope_range(file_id, member.get_id().get_position());
+    write_function.is_some()
+        && write_function != member_index.enclosing_function_scope_range(file_id, access_position)
+}
+
+fn infer_written_expr_key_member_type(
     db: &DbIndex,
     owner: &LuaMemberOwner,
     key: &LuaMemberKey,
@@ -1935,7 +1951,8 @@ fn infer_cross_file_matching_expr_key_member_type(
     let mut pending_reason = None;
 
     for member in members {
-        if member.get_file_id() == access_file_id
+        if (member.get_file_id() == access_file_id
+            && !same_file_write_may_run_first(db, member, access_position))
             || !is_dynamic_field_fallback_realm_compatible(
                 db,
                 access_realm,

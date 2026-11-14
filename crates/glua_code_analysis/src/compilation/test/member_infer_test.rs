@@ -1301,7 +1301,7 @@ parser:parse()",
     }
 
     #[gtest]
-    fn test_unknown_dynamic_key_does_not_apply_to_unresolved_named_field_lookup() {
+    fn a_named_lookup_keeps_its_own_write_and_reads_computed_writes_otherwise() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -1329,7 +1329,7 @@ parser:parse()",
         );
 
         let unobserved_lookup_ty = ws.expr_ty("C");
-        assert_eq!(ws.humanize_type(unobserved_lookup_ty), "nil");
+        assert_eq!(ws.humanize_type(unobserved_lookup_ty), "true?");
     }
 
     /// A computed-key write whose key already settled to `string` files under
@@ -1910,6 +1910,33 @@ parser:parse()",
 
         let alpha = ws.local_ty(user, "alpha");
         assert_that!(ws.humanize_type(alpha), eq("1?"));
+    }
+
+    /// A function in the read's own file may run before the read, so what it
+    /// writes under a computed key is a possible value of the named read.
+    #[gtest]
+    fn named_read_of_a_registry_filled_by_computed_keys_in_the_same_file_uses_the_written_values() {
+        let mut ws = VirtualWorkspace::new();
+        let file = ws.def_file(
+            "lua/autorun/registry.lua",
+            r#"
+            local reg = {}
+            local function addLocal(name) reg[name] = 1 end
+            local r1 = reg.tom
+
+            Holder = {}
+            Holder.Map = {}
+            local function addField(name) Holder.Map[name] = 1 end
+            local r2 = Holder.Map.tom
+
+            local Box = { Map = {} }
+            local function addInner(name) Box.Map[name] = 1 end
+            local r3 = Box.Map.tom
+            "#,
+        );
+
+        let reads = ["r1", "r2", "r3"].map(|name| ws.humanize_type(ws.local_ty(file, name)));
+        assert_that!(reads, each(eq("1?")));
     }
 
     /// A field only ever written with what is read back from it holds the
