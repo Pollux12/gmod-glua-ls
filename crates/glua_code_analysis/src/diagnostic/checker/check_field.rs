@@ -1509,7 +1509,7 @@ fn is_unresolved_panel_registration_table(
     .flat_map(|(calls, default_table_arg_idx)| {
         calls.iter().map(move |call| {
             (
-                call.vgui_panel_table_arg_source(default_table_arg_idx),
+                call.class_registration_table_arg_source(default_table_arg_idx),
                 call,
             )
         })

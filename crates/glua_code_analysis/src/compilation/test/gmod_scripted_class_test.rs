@@ -6374,7 +6374,7 @@ end
             );
             for call in &metadata.vgui_register_table_calls {
                 let base_source = call
-                    .vgui_panel_base_arg_source(None)
+                    .class_registration_base_arg_source(None)
                     .expect("CreateFromTable metadata should use PANEL.Base as base source");
                 assert!(
                     matches!(

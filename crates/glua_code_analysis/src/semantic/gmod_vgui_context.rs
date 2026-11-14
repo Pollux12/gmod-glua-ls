@@ -194,7 +194,7 @@ pub(crate) fn registered_vgui_method_param_is_own_class(
 }
 
 fn registered_panel_name(call: &GmodScriptedClassCallMetadata) -> Option<String> {
-    let source = call.vgui_panel_define_arg_source();
+    let source = call.class_registration_define_arg_source();
     match call.value_for_arg_source(&source) {
         Some(crate::GmodClassCallLiteral::String(name)) if !name.is_empty() => Some(name.clone()),
         _ => None,
@@ -206,7 +206,7 @@ fn resolve_call_table_registration_region(
     file_id: FileId,
     call: &GmodScriptedClassCallMetadata,
 ) -> Option<(LuaDeclId, TextSize, TextSize)> {
-    let table_source = call.vgui_panel_roles.as_ref()?.table.as_ref()?;
+    let table_source = call.class_registration_roles.as_ref()?.table.as_ref()?;
     let arg = call.args.get(table_source.arg_idx)?;
     let range = arg.syntax_id.get_range();
     let register_position = call.syntax_id.get_range().start();

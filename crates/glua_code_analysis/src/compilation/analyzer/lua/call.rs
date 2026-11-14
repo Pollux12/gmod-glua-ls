@@ -1656,7 +1656,7 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
             field_args: Vec::new(),
             inheritance_roles: None,
             network_var_roles: None,
-            vgui_panel_roles: None,
+            class_registration_roles: None,
             derma_skin_roles: None,
             register_roles: None,
         }),

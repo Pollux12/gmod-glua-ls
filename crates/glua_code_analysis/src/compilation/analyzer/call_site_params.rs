@@ -375,7 +375,7 @@ fn vgui_named_callback_binding(
         let table_range = table_expr.get_range();
         let registration = metadata.vgui_register_table_calls.iter().find(|call| {
             call.args
-                .get(call.vgui_panel_table_arg_idx(0))
+                .get(call.class_registration_table_arg_idx(0))
                 .is_some_and(|arg| arg.syntax_id.get_range() == table_range)
         })?;
         if !is_vgui_register_table_call(db, file_id, registration) {

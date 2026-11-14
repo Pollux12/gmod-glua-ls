@@ -135,7 +135,7 @@ pub struct GmodScriptedClassCallMetadata {
     pub field_args: Vec<GmodClassCallFieldArg>,
     pub inheritance_roles: Option<GmodNamedStringCallRoles>,
     pub network_var_roles: Option<GmodNetworkVarCallRoles>,
-    pub vgui_panel_roles: Option<GmodVguiPanelCallRoles>,
+    pub class_registration_roles: Option<GmodClassRegistrationCallRoles>,
     pub derma_skin_roles: Option<GmodDermaSkinCallRoles>,
     pub register_roles: Option<GmodScriptedClassRegisterRoles>,
 }
@@ -149,7 +149,7 @@ impl Hash for GmodScriptedClassCallMetadata {
             field_args,
             inheritance_roles,
             network_var_roles,
-            vgui_panel_roles,
+            class_registration_roles,
             derma_skin_roles,
             register_roles,
         } = self;
@@ -159,7 +159,7 @@ impl Hash for GmodScriptedClassCallMetadata {
         field_args.hash(state);
         inheritance_roles.hash(state);
         network_var_roles.hash(state);
-        vgui_panel_roles.hash(state);
+        class_registration_roles.hash(state);
         derma_skin_roles.hash(state);
         register_roles.hash(state);
     }
@@ -178,7 +178,7 @@ pub struct GmodNetworkVarCallRoles {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct GmodVguiPanelCallRoles {
+pub struct GmodClassRegistrationCallRoles {
     pub define: GmodClassCallArgSource,
     pub table: Option<GmodClassCallArgSource>,
     pub base: Option<GmodClassCallArgSource>,
@@ -221,46 +221,49 @@ impl GmodScriptedClassCallMetadata {
         self.network_var_roles.map(|roles| roles.name_arg_idx)
     }
 
-    pub fn vgui_panel_define_arg_idx(&self) -> usize {
-        self.vgui_panel_roles
+    pub fn class_registration_define_arg_idx(&self) -> usize {
+        self.class_registration_roles
             .as_ref()
             .map(|roles| roles.define.arg_idx)
             .unwrap_or(0)
     }
 
-    pub fn vgui_panel_table_arg_idx(&self, default_arg_idx: usize) -> usize {
-        self.vgui_panel_roles
+    pub fn class_registration_table_arg_idx(&self, default_arg_idx: usize) -> usize {
+        self.class_registration_roles
             .as_ref()
             .and_then(|roles| roles.table.as_ref().map(|source| source.arg_idx))
             .unwrap_or(default_arg_idx)
     }
 
-    pub fn vgui_panel_base_arg_idx(&self, default_arg_idx: Option<usize>) -> Option<usize> {
-        self.vgui_panel_roles
+    pub fn class_registration_base_arg_idx(&self, default_arg_idx: Option<usize>) -> Option<usize> {
+        self.class_registration_roles
             .as_ref()
             .and_then(|roles| roles.base.as_ref().map(|source| source.arg_idx))
             .or(default_arg_idx)
     }
 
-    pub fn vgui_panel_define_arg_source(&self) -> GmodClassCallArgSource {
-        self.vgui_panel_roles
+    pub fn class_registration_define_arg_source(&self) -> GmodClassCallArgSource {
+        self.class_registration_roles
             .as_ref()
             .map(|roles| roles.define.clone())
             .unwrap_or_else(|| GmodClassCallArgSource::direct(0))
     }
 
-    pub fn vgui_panel_table_arg_source(&self, default_arg_idx: usize) -> GmodClassCallArgSource {
-        self.vgui_panel_roles
+    pub fn class_registration_table_arg_source(
+        &self,
+        default_arg_idx: usize,
+    ) -> GmodClassCallArgSource {
+        self.class_registration_roles
             .as_ref()
             .and_then(|roles| roles.table.clone())
             .unwrap_or_else(|| GmodClassCallArgSource::direct(default_arg_idx))
     }
 
-    pub fn vgui_panel_base_arg_source(
+    pub fn class_registration_base_arg_source(
         &self,
         default_arg_idx: Option<usize>,
     ) -> Option<GmodClassCallArgSource> {
-        self.vgui_panel_roles
+        self.class_registration_roles
             .as_ref()
             .and_then(|roles| roles.base.clone())
             .or_else(|| default_arg_idx.map(GmodClassCallArgSource::direct))
@@ -297,7 +300,7 @@ impl GmodScriptedClassCallMetadata {
             GmodScriptedClassCallKind::ScriptedEntRegister
             | GmodScriptedClassCallKind::ScriptedWeaponRegister => self.register_name_arg_idx(),
             GmodScriptedClassCallKind::DermaDefineSkin => self.derma_skin_define_arg_idx(),
-            _ => self.vgui_panel_define_arg_idx(),
+            _ => self.class_registration_define_arg_idx(),
         };
         self.args
             .get(arg_idx)
@@ -471,7 +474,7 @@ impl GmodClassMetadataIndex {
         let (define_arg_index, cached_name) = match kind {
             GmodScriptedClassCallKind::VguiRegister
             | GmodScriptedClassCallKind::DermaDefineControl => (
-                call.vgui_panel_define_arg_idx(),
+                call.class_registration_define_arg_idx(),
                 Self::maybe_extract_vgui_panel(kind, call).map(|(name, _)| name),
             ),
             GmodScriptedClassCallKind::DermaDefineSkin => (
@@ -640,8 +643,9 @@ impl GmodClassMetadataIndex {
             _ => None,
         };
 
-        let define_arg_index = call_metadata.vgui_panel_define_arg_idx();
-        let base_arg_source = call_metadata.vgui_panel_base_arg_source(default_base_arg_index);
+        let define_arg_index = call_metadata.class_registration_define_arg_idx();
+        let base_arg_source =
+            call_metadata.class_registration_base_arg_source(default_base_arg_index);
 
         let panel_name = Self::extract_non_empty_string_arg(call_metadata, define_arg_index)?;
         let base_name = base_arg_source
@@ -1002,7 +1006,7 @@ impl GmodClassMetadataIndex {
                 .iter()
                 .chain(file_metadata.derma_define_control_calls.iter())
             {
-                let define_arg_index = call.vgui_panel_define_arg_idx();
+                let define_arg_index = call.class_registration_define_arg_idx();
                 let Some(Some(GmodClassCallLiteral::String(panel_name))) =
                     call.literal_args.get(define_arg_index)
                 else {
@@ -1216,7 +1220,7 @@ mod tests {
             field_args: Vec::new(),
             inheritance_roles: None,
             network_var_roles: None,
-            vgui_panel_roles: None,
+            class_registration_roles: None,
             derma_skin_roles: None,
             register_roles: None,
         }

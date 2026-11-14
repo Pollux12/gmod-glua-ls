@@ -442,7 +442,7 @@ impl GmodCallRoles {
                         .and_then(|_| self.roles.roles_by_path.get(callee))
                 });
                 let Some(roles) =
-                    inner.and_then(|inner| inner.forwarded_vgui_panel_registration(forward))
+                    inner.and_then(|inner| inner.forwarded_class_registration(forward))
                 else {
                     continue;
                 };

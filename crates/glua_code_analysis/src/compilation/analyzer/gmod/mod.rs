@@ -20,9 +20,9 @@ use glua_parser::{
 use crate::semantic::{local_initializer_expr, semantic_decl_closure_signature_id};
 use crate::{
     EmmyrcGmodRealm, FileId, GlobalId, GmodClassCallArg, GmodClassCallArgSource,
-    GmodClassCallLiteral, GmodDermaSkinCallRoles, GmodNamedStringCallRoles,
-    GmodNetworkVarCallRoles, GmodScriptedClassCallKind, GmodScriptedClassCallMetadata,
-    GmodScriptedClassFileMetadata, GmodScriptedClassRegisterRoles, GmodVguiPanelCallRoles,
+    GmodClassCallLiteral, GmodClassRegistrationCallRoles, GmodDermaSkinCallRoles,
+    GmodNamedStringCallRoles, GmodNetworkVarCallRoles, GmodScriptedClassCallKind,
+    GmodScriptedClassCallMetadata, GmodScriptedClassFileMetadata, GmodScriptedClassRegisterRoles,
     GmodVguiParentCallMetadata, GmodVguiParentSource, InFiled, LuaCallArgRole, LuaDecl,
     LuaDeclExtra, LuaDeclId, LuaDeclTypeKind, LuaFunctionType, LuaInferCache, LuaMember,
     LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignature, LuaSignatureId, LuaType,
@@ -4354,8 +4354,8 @@ fn synthesize_vgui_registrations(
 
         for call in &metadata.vgui_register_calls {
             let register_position = call.syntax_id.get_range().start();
-            let panel_source = call.vgui_panel_define_arg_source();
-            let table_source = call.vgui_panel_table_arg_source(1);
+            let panel_source = call.class_registration_define_arg_source();
+            let table_source = call.class_registration_table_arg_source(1);
             let panel_name = resolve_vgui_registration_name(
                 db,
                 context.infer_manager.get_infer_cache(file_id),
@@ -4403,7 +4403,7 @@ fn synthesize_vgui_registrations(
 
         for call in &metadata.vgui_register_table_calls {
             let register_position = call.syntax_id.get_range().start();
-            let table_source = call.vgui_panel_table_arg_source(0);
+            let table_source = call.class_registration_table_arg_source(0);
             let is_actual_registration =
                 actual_register_table_positions.contains(&register_position);
             if !is_actual_registration
@@ -4472,8 +4472,8 @@ fn synthesize_vgui_registrations(
 
         for call in &metadata.derma_define_control_calls {
             let register_position = call.syntax_id.get_range().start();
-            let panel_source = call.vgui_panel_define_arg_source();
-            let table_source = call.vgui_panel_table_arg_source(2);
+            let panel_source = call.class_registration_define_arg_source();
+            let table_source = call.class_registration_table_arg_source(2);
             let panel_name = resolve_vgui_registration_name(
                 db,
                 context.infer_manager.get_infer_cache(file_id),
@@ -6271,8 +6271,8 @@ fn synthesize_vgui_register(
     // args[0] = panel name (string)
     // args[1] = table variable (name ref)
     // args[2] = base panel name (string)
-    let table_source = call.vgui_panel_table_arg_source(1);
-    let base_source = call.vgui_panel_base_arg_source(Some(2));
+    let table_source = call.class_registration_table_arg_source(1);
+    let base_source = call.class_registration_base_arg_source(Some(2));
 
     let table_var_name = match call.value_for_arg_source(&table_source) {
         Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
@@ -6309,8 +6309,8 @@ fn synthesize_derma_define_control(
     // args[1] = description (string, ignored)
     // args[2] = table variable (name ref)
     // args[3] = base panel name (string)
-    let table_source = call.vgui_panel_table_arg_source(2);
-    let base_source = call.vgui_panel_base_arg_source(Some(3));
+    let table_source = call.class_registration_table_arg_source(2);
+    let base_source = call.class_registration_base_arg_source(Some(3));
 
     let table_var_name = match call.value_for_arg_source(&table_source) {
         Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
@@ -6348,8 +6348,8 @@ fn synthesize_vgui_register_table(
     // vgui.RegisterTable(TABLE, "BasePanel")
     // args[0] = table variable (name ref)
     // args[1] = base panel name (string)
-    let table_source = call.vgui_panel_table_arg_source(0);
-    let base_source = call.vgui_panel_base_arg_source(Some(1));
+    let table_source = call.class_registration_table_arg_source(0);
+    let base_source = call.class_registration_base_arg_source(Some(1));
 
     let table_var_name = match call.value_for_arg_source(&table_source) {
         Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
@@ -6381,7 +6381,7 @@ fn synthesize_vgui_register_file_target(
     // vgui.RegisterFile("path/to/panel.lua") includes a file with a temporary
     // global PANEL table. The file itself is not a named VGUI class, but its
     // methods should still see PANEL.Base inheritance while it is being loaded.
-    let panel_source = call.vgui_panel_define_arg_source();
+    let panel_source = call.class_registration_define_arg_source();
     let GmodClassCallLiteral::String(path) = call.value_for_arg_source(&panel_source)? else {
         return None;
     };
@@ -7067,9 +7067,11 @@ fn find_inline_vgui_panel_table_expr(
     call: &GmodScriptedClassCallMetadata,
 ) -> Option<LuaTableExpr> {
     let table_source = match call_kind {
-        GmodScriptedClassCallKind::VguiRegister => call.vgui_panel_table_arg_source(1),
-        GmodScriptedClassCallKind::VguiRegisterTable => call.vgui_panel_table_arg_source(0),
-        GmodScriptedClassCallKind::DermaDefineControl => call.vgui_panel_table_arg_source(2),
+        GmodScriptedClassCallKind::VguiRegister => call.class_registration_table_arg_source(1),
+        GmodScriptedClassCallKind::VguiRegisterTable => call.class_registration_table_arg_source(0),
+        GmodScriptedClassCallKind::DermaDefineControl => {
+            call.class_registration_table_arg_source(2)
+        }
         _ => return None,
     };
 
@@ -7332,9 +7334,13 @@ fn synthesize_panel_baseclass_member(
     call: &GmodScriptedClassCallMetadata,
 ) {
     let base_arg_source = match call_kind {
-        GmodScriptedClassCallKind::VguiRegister => call.vgui_panel_base_arg_source(Some(2)),
-        GmodScriptedClassCallKind::VguiRegisterTable => call.vgui_panel_base_arg_source(Some(1)),
-        GmodScriptedClassCallKind::DermaDefineControl => call.vgui_panel_base_arg_source(Some(3)),
+        GmodScriptedClassCallKind::VguiRegister => call.class_registration_base_arg_source(Some(2)),
+        GmodScriptedClassCallKind::VguiRegisterTable => {
+            call.class_registration_base_arg_source(Some(1))
+        }
+        GmodScriptedClassCallKind::DermaDefineControl => {
+            call.class_registration_base_arg_source(Some(3))
+        }
         _ => return,
     };
 
@@ -7730,10 +7736,10 @@ struct AnnotatedGmodCallRoles {
     network_var_slot_only: bool,
     network_var_type_roles: Vec<AnnotatedGmodCallArgRole>,
     network_var_define_roles: Vec<AnnotatedGmodCallArgRole>,
-    vgui_panel_kind: Option<GmodScriptedClassCallKind>,
-    vgui_panel_define_roles: Vec<AnnotatedGmodCallArgRole>,
-    vgui_panel_table_roles: Vec<AnnotatedGmodCallArgRole>,
-    vgui_panel_base_roles: Vec<AnnotatedGmodCallArgRole>,
+    class_registration_kind: Option<GmodScriptedClassCallKind>,
+    class_registration_define_roles: Vec<AnnotatedGmodCallArgRole>,
+    class_registration_table_roles: Vec<AnnotatedGmodCallArgRole>,
+    class_registration_base_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_reference_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_child_self_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_parent_roles: Vec<AnnotatedGmodCallArgRole>,
@@ -7867,28 +7873,28 @@ impl AnnotatedGmodCallRoles {
                 self.network_var_define_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "define") => {
-                self.vgui_panel_kind = self
-                    .vgui_panel_kind
+                self.class_registration_kind = self
+                    .class_registration_kind
                     .or(Some(GmodScriptedClassCallKind::VguiRegister));
-                self.vgui_panel_define_roles.push(arg_role);
+                self.class_registration_define_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "define_control") => {
-                self.vgui_panel_kind = Some(GmodScriptedClassCallKind::DermaDefineControl);
-                self.vgui_panel_define_roles.push(arg_role);
+                self.class_registration_kind = Some(GmodScriptedClassCallKind::DermaDefineControl);
+                self.class_registration_define_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "register_file") => {
-                self.vgui_panel_kind = Some(GmodScriptedClassCallKind::VguiRegisterFile);
-                self.vgui_panel_define_roles.push(arg_role);
+                self.class_registration_kind = Some(GmodScriptedClassCallKind::VguiRegisterFile);
+                self.class_registration_define_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "register_table") => {
-                self.vgui_panel_kind = Some(GmodScriptedClassCallKind::VguiRegisterTable);
-                self.vgui_panel_table_roles.push(arg_role);
+                self.class_registration_kind = Some(GmodScriptedClassCallKind::VguiRegisterTable);
+                self.class_registration_table_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "table") => {
-                self.vgui_panel_table_roles.push(arg_role);
+                self.class_registration_table_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "base") => {
-                self.vgui_panel_base_roles.push(arg_role);
+                self.class_registration_base_roles.push(arg_role);
             }
             ("gmod.vgui_panel", crate::GMOD_ROLE_REFERENCE) => {
                 self.vgui_panel_reference_roles.push(arg_role);
@@ -7944,11 +7950,11 @@ impl AnnotatedGmodCallRoles {
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.network_var_define_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
-        self.vgui_panel_define_roles
+        self.class_registration_define_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
-        self.vgui_panel_table_roles
+        self.class_registration_table_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
-        self.vgui_panel_base_roles
+        self.class_registration_base_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.vgui_panel_reference_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
@@ -7979,7 +7985,7 @@ impl AnnotatedGmodCallRoles {
             || !self.file_find_search_path_roles.is_empty()
             || !self.inheritance_roles.is_empty()
             || !self.network_var_define_roles.is_empty()
-            || !self.vgui_panel_define_roles.is_empty()
+            || !self.class_registration_define_roles.is_empty()
             || (!self.vgui_panel_reference_roles.is_empty()
                 && (!self.vgui_panel_parent_roles.is_empty()
                     || !self.vgui_panel_parent_self_roles.is_empty()))
@@ -7987,7 +7993,7 @@ impl AnnotatedGmodCallRoles {
                 && (!self.vgui_panel_parent_roles.is_empty()
                     || !self.vgui_panel_parent_self_roles.is_empty()))
             || matches!(
-                self.vgui_panel_kind,
+                self.class_registration_kind,
                 Some(
                     GmodScriptedClassCallKind::VguiRegisterFile
                         | GmodScriptedClassCallKind::VguiRegisterTable
@@ -8107,7 +8113,7 @@ impl AnnotatedGmodCallRoles {
                 || !self.file_find_search_path_roles.is_empty(),
             has_scripted_class: !self.inheritance_roles.is_empty()
                 || !self.network_var_define_roles.is_empty()
-                || !self.vgui_panel_define_roles.is_empty()
+                || !self.class_registration_define_roles.is_empty()
                 || (!self.vgui_panel_reference_roles.is_empty()
                     && (!self.vgui_panel_parent_roles.is_empty()
                         || !self.vgui_panel_parent_self_roles.is_empty()))
@@ -8115,7 +8121,7 @@ impl AnnotatedGmodCallRoles {
                     && (!self.vgui_panel_parent_roles.is_empty()
                         || !self.vgui_panel_parent_self_roles.is_empty()))
                 || matches!(
-                    self.vgui_panel_kind,
+                    self.class_registration_kind,
                     Some(
                         GmodScriptedClassCallKind::VguiRegisterFile
                             | GmodScriptedClassCallKind::VguiRegisterTable
@@ -8223,10 +8229,10 @@ impl AnnotatedGmodCallRoles {
 
     /// The roles of a function that registers a panel by passing its
     /// parameters to a call with these roles.
-    fn forwarded_vgui_panel_registration(&self, forward: &ForwardedCall) -> Option<Self> {
-        let kind = self.vgui_panel_kind?;
+    fn forwarded_class_registration(&self, forward: &ForwardedCall) -> Option<Self> {
+        let kind = self.class_registration_kind?;
         if kind == GmodScriptedClassCallKind::VguiRegisterFile
-            || (self.vgui_panel_define_roles.is_empty()
+            || (self.class_registration_define_roles.is_empty()
                 && kind != GmodScriptedClassCallKind::VguiRegisterTable)
         {
             return None;
@@ -8239,39 +8245,39 @@ impl AnnotatedGmodCallRoles {
             )?;
             forward.args.get(arg_idx)?.forward_role(role)
         };
-        let table = forwarded(self.vgui_panel_table_roles.first()?).filter(|role| {
+        let table = forwarded(self.class_registration_table_roles.first()?).filter(|role| {
             role.field_path.is_empty() && role.prefix.is_empty() && role.suffix.is_empty()
         })?;
-        let define = match self.vgui_panel_define_roles.first() {
+        let define = match self.class_registration_define_roles.first() {
             Some(role) => vec![forwarded(role)?],
             None => Vec::new(),
         };
         let base = self
-            .vgui_panel_base_roles
+            .class_registration_base_roles
             .first()
             .and_then(forwarded)
             .into_iter()
             .collect();
         Some(Self {
-            vgui_panel_kind: self.vgui_panel_kind,
-            vgui_panel_define_roles: define,
-            vgui_panel_table_roles: vec![table],
-            vgui_panel_base_roles: base,
+            class_registration_kind: self.class_registration_kind,
+            class_registration_define_roles: define,
+            class_registration_table_roles: vec![table],
+            class_registration_base_roles: base,
             ..Self::default()
         })
     }
 
-    fn vgui_panel_call(
+    fn class_registration_call(
         &self,
         is_colon_call: bool,
-    ) -> Option<(GmodScriptedClassCallKind, GmodVguiPanelCallRoles)> {
+    ) -> Option<(GmodScriptedClassCallKind, GmodClassRegistrationCallRoles)> {
         let kind = self
-            .vgui_panel_kind
+            .class_registration_kind
             .unwrap_or(GmodScriptedClassCallKind::VguiRegister);
-        let define = if let Some(role) = self.vgui_panel_define_roles.first() {
+        let define = if let Some(role) = self.class_registration_define_roles.first() {
             role.to_arg_source(is_colon_call, self.is_colon_define)?
         } else if kind == GmodScriptedClassCallKind::VguiRegisterTable {
-            self.vgui_panel_table_roles
+            self.class_registration_table_roles
                 .first()?
                 .to_arg_source(is_colon_call, self.is_colon_define)?
         } else {
@@ -8280,14 +8286,14 @@ impl AnnotatedGmodCallRoles {
 
         Some((
             kind,
-            GmodVguiPanelCallRoles {
+            GmodClassRegistrationCallRoles {
                 define,
                 table: self
-                    .vgui_panel_table_roles
+                    .class_registration_table_roles
                     .first()
                     .and_then(|role| role.to_arg_source(is_colon_call, self.is_colon_define)),
                 base: self
-                    .vgui_panel_base_roles
+                    .class_registration_base_roles
                     .first()
                     .and_then(|role| role.to_arg_source(is_colon_call, self.is_colon_define)),
             },
@@ -8932,15 +8938,15 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             .and_then(|roles| roles.file_find_call(call_expr.is_colon_call()))
     }
 
-    fn vgui_panel_call(
+    fn class_registration_call(
         &self,
         db: &DbIndex,
         file_id: FileId,
         call_expr: &LuaCallExpr,
         call_path: &str,
-    ) -> Option<(GmodScriptedClassCallKind, GmodVguiPanelCallRoles)> {
+    ) -> Option<(GmodScriptedClassCallKind, GmodClassRegistrationCallRoles)> {
         self.roles_for_call(db, file_id, call_expr, call_path)
-            .and_then(|roles| roles.vgui_panel_call(call_expr.is_colon_call()))
+            .and_then(|roles| roles.class_registration_call(call_expr.is_colon_call()))
     }
 
     fn vgui_parent_call(
@@ -9528,7 +9534,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 field_args,
                 inheritance_roles: Some(inheritance_roles),
                 network_var_roles: None,
-                vgui_panel_roles: None,
+                class_registration_roles: None,
                 derma_skin_roles: None,
                 register_roles: None,
             }),
@@ -9550,7 +9556,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 field_args,
                 inheritance_roles: None,
                 network_var_roles: Some(network_var_roles),
-                vgui_panel_roles: None,
+                class_registration_roles: None,
                 derma_skin_roles: None,
                 register_roles: None,
             }),
@@ -9558,10 +9564,10 @@ fn collect_annotated_scripted_class_call_metadata(
         return Some(());
     }
 
-    if let Some((kind, vgui_panel_roles)) =
-        annotated_roles.vgui_panel_call(db, file_id, &call_expr, &call_path)
+    if let Some((kind, class_registration_roles)) =
+        annotated_roles.class_registration_call(db, file_id, &call_expr, &call_path)
     {
-        let field_sources = vgui_panel_field_sources(&vgui_panel_roles);
+        let field_sources = vgui_panel_field_sources(&class_registration_roles);
         let (literal_args, args, field_args) =
             extract_gmod_class_call_args(db, file_id, &call_expr, &field_sources);
         pending.push(PendingCallSite::ScriptedClass(
@@ -9573,7 +9579,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 field_args,
                 inheritance_roles: None,
                 network_var_roles: None,
-                vgui_panel_roles: Some(vgui_panel_roles),
+                class_registration_roles: Some(class_registration_roles),
                 derma_skin_roles: None,
                 register_roles: None,
             }),
@@ -9595,7 +9601,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 field_args,
                 inheritance_roles: None,
                 network_var_roles: None,
-                vgui_panel_roles: None,
+                class_registration_roles: None,
                 derma_skin_roles: None,
                 register_roles: Some(register_roles),
             }),
@@ -9617,7 +9623,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 field_args,
                 inheritance_roles: None,
                 network_var_roles: None,
-                vgui_panel_roles: None,
+                class_registration_roles: None,
                 derma_skin_roles: Some(derma_skin_roles),
                 register_roles: None,
             }),
@@ -9779,7 +9785,9 @@ fn extract_gmod_class_call_args(
     (literal_args, args, field_args)
 }
 
-fn vgui_panel_field_sources(roles: &GmodVguiPanelCallRoles) -> Vec<crate::GmodClassCallArgSource> {
+fn vgui_panel_field_sources(
+    roles: &GmodClassRegistrationCallRoles,
+) -> Vec<crate::GmodClassCallArgSource> {
     let mut sources = Vec::new();
     for source in std::iter::once(&roles.define)
         .chain(roles.table.as_ref())
