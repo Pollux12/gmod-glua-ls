@@ -2858,15 +2858,16 @@ fn has_dynamic_field_for_type_inner(
             if index.has_field(&owner, field_name) || owner_wildcard_covers_any_field(db, &owner) {
                 return true;
             }
-            // Walk parent types: dynamic fields registered on a parent class
-            // (e.g. base_glide_car) should also be visible on child classes
-            // (e.g. base_glide_motorcycle).
+            // Walk parent types: dynamic fields written on a parent class
+            // (e.g. base_glide_car) are visible on its child classes (e.g.
+            // base_glide_motorcycle), but not those its other children's writes
+            // put on it.
             let mut super_types = Vec::new();
             id.collect_super_types(db, &mut super_types);
             super_types.iter().any(|super_type| {
                 if let LuaType::Ref(super_id) | LuaType::Def(super_id) = super_type {
                     let owner = crate::DynamicFieldOwner::Type(super_id.clone());
-                    index.has_field(&owner, field_name)
+                    index.has_direct_field(&owner, field_name)
                         || owner_wildcard_covers_any_field(db, &owner)
                 } else {
                     false

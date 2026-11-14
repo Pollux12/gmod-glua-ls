@@ -1894,6 +1894,25 @@ parser:parse()",
     }
 
     #[gtest]
+    fn named_read_of_a_literal_registry_filled_by_computed_keys_uses_the_written_values() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/a_core.lua",
+            r#"
+            Meta = Meta or {Base = {}}
+            function Register(name)
+                Meta[name] = 1
+            end
+            "#,
+        );
+        ws.def_file("lua/b_alpha.lua", r#"Register("Alpha")"#);
+        let user = ws.def_file("lua/c_user.lua", "local alpha = Meta.Alpha\n");
+
+        let alpha = ws.local_ty(user, "alpha");
+        assert_that!(ws.humanize_type(alpha), eq("1?"));
+    }
+
+    #[gtest]
     fn computed_key_nil_delete_is_not_a_member_before_or_after_reindex() {
         let mut ws = VirtualWorkspace::new();
         let clear_path = "lua/a_clear.lua";

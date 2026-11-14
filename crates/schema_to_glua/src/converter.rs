@@ -106,10 +106,7 @@ impl SchemaConverter {
             }
         }
         // Has `anyOf` but is not object-like (union of types)
-        if schema.get("anyOf").is_some() && schema.get("properties").is_none() {
-            return true;
-        }
-        false
+        schema.get("anyOf").is_some() && schema.get("properties").is_none()
     }
 
     /// Emit a single definition (`$defs` entry).

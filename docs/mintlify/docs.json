@@ -62,11 +62,13 @@
             ]
           },
           {
-            "group": "Type system",
+            "group": "Types",
             "pages": [
               "annotations/class",
               "annotations/type",
               "annotations/field",
+              "annotations/index-alias",
+              "annotations/field-accessor",
               "annotations/alias",
               "annotations/enum",
               "annotations/generic",
@@ -78,21 +80,19 @@
             "pages": [
               "annotations/param",
               "annotations/return",
-              "annotations/outparam",
               "annotations/overload",
+              "annotations/outparam",
               "annotations/async",
               "annotations/nodiscard"
             ]
           },
           {
-            "group": "Garry's Mod Lua",
+            "group": "Realms and hooks",
             "pages": [
               "annotations/realm",
               "annotations/hook",
               "annotations/fileparam",
-              "annotations/accessorfunc",
-              "annotations/call-arg",
-              "annotations/guard-metadata"
+              "annotations/accessorfunc"
             ]
           },
           {
@@ -101,11 +101,30 @@
               "annotations/diagnostic",
               "annotations/cast",
               "annotations/deprecated",
+              "annotations/see",
+              "annotations/lsp-optimization"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "annotations/call-arg",
+              "annotations/adds-field",
+              "annotations/valid-guard",
+              "annotations/self-guard",
+              "annotations/self-call-valid",
+              "annotations/self-class-name",
+              "annotations/exhaustive-type-guard",
+              "annotations/return-alias",
+              "annotations/copy-result",
+              "annotations/fresh-result",
+              "annotations/writes-global",
+              "annotations/net-send",
+              "annotations/net-payload",
+              "annotations/builtin-alias",
               "annotations/meta",
               "annotations/module",
-              "annotations/source",
-              "annotations/version",
-              "annotations/see"
+              "annotations/source"
             ]
           }
         ]
@@ -154,6 +173,16 @@
       "view"
     ]
   },
+  "redirects": [
+    {
+      "source": "/annotations/guard-metadata",
+      "destination": "/annotations/valid-guard"
+    },
+    {
+      "source": "/annotations/version",
+      "destination": "/annotations/index"
+    }
+  ],
   "footer": {
     "socials": {
       "github": "https://github.com/Pollux12/vscode-gmod-glua-ls"

@@ -139,6 +139,35 @@ Common string-template forms:
 
 ---
 
+## Naming the parent class with `base_class`
+
+A factory can create a class from one string and take its parent in another argument. Put `base_class` on the parameter that holds the parent:
+
+```lua
+---@class battlemechs.Base
+
+---@generic T : battlemechs.Base
+---@[constructor("Initialize", "battlemechs.Base", false)]
+---@param name battlemechs.`T`
+---@[base_class]
+---@param base (string|battlemechs.Base)?
+---@return (definition) T
+function CreateMetaTable(name, base) end
+
+local MECH = CreateMetaTable("Mech")
+local walker = CreateMetaTable("Walker", "Mech") -- battlemechs.Walker inherits battlemechs.Mech
+local runner = CreateMetaTable("Runner", MECH)   -- battlemechs.Runner inherits battlemechs.Mech
+```
+
+The argument can name the parent in two ways:
+
+- **A string.** It gets the same prefix and suffix as the class parameter, so you write `"Mech"`, not `"battlemechs.Mech"`. Type the parameter as a plain string, not a string template, or a typo would create a new class.
+- **A class value**, such as the table an earlier call returned. Its class becomes the parent.
+
+GLuaLS adds the parent only when the argument names an existing class. Otherwise the class keeps the `root_class` from `constructor`, if there is one. `root_class` is the parent every class from the factory gets; `base_class` adds the one this call names. A class never inherits from itself or from one of its own subclasses.
+
+---
+
 ## Explicit generic call arguments
 
 When inference is unclear, pass generics at the call site:

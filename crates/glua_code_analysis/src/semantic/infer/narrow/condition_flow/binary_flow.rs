@@ -16,7 +16,8 @@ use crate::{
             narrow::{
                 ResultTypeOrContinue,
                 condition_flow::{
-                    InferConditionFlow, call_flow::get_type_at_call_expr,
+                    InferConditionFlow,
+                    call_flow::{class_name_call_receiver, get_type_at_call_expr},
                     get_condition_antecedent_type, get_type_at_condition_flow,
                 },
                 get_type_at_flow::FlowWalkPolicy,
@@ -1318,7 +1319,7 @@ fn maybe_type_name_literal_eq_narrow(
         return Ok(ResultTypeOrContinue::Continue);
     };
 
-    let Some(target_expr) = extract_type_name_guard_target_expr(&call_expr) else {
+    let Some(target_expr) = class_name_call_receiver(db, cache, &call_expr) else {
         return Ok(ResultTypeOrContinue::Continue);
     };
 
@@ -1342,12 +1343,39 @@ fn maybe_type_name_literal_eq_narrow(
         return Ok(ResultTypeOrContinue::Continue);
     }
 
-    let antecedent_type =
-        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
+    narrow_by_class_test(
+        db,
+        tree,
+        cache,
+        root,
+        var_ref_id,
+        flow_node,
+        &target_type,
+        condition_flow,
+        policy,
+    )
+}
 
-    let LuaType::Ref(target_type_id) = &target_type else {
+/// Narrows `var_ref_id` by a test of whether it is the class `target_type`
+/// names: the true branch holds that class, the false branch the rest.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn narrow_by_class_test(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    target_type: &LuaType,
+    condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
+) -> Result<ResultTypeOrContinue, InferFailReason> {
+    let LuaType::Ref(target_type_id) = target_type else {
         return Ok(ResultTypeOrContinue::Continue);
     };
+
+    let antecedent_type =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
 
     if !can_target_class_be_a_more_specific_narrowing(db, &antecedent_type, target_type_id) {
         return Ok(ResultTypeOrContinue::Continue);
@@ -1356,14 +1384,14 @@ fn maybe_type_name_literal_eq_narrow(
     let result_type = match condition_flow {
         InferConditionFlow::TrueCondition => target_type.clone(),
         InferConditionFlow::FalseCondition => {
-            TypeOps::Remove.apply(db, &antecedent_type, &target_type)
+            TypeOps::Remove.apply(db, &antecedent_type, target_type)
         }
     };
 
     Ok(ResultTypeOrContinue::Result(result_type))
 }
 
-fn resolve_class_name_target_type(
+pub(super) fn resolve_class_name_target_type(
     db: &DbIndex,
     cache: &LuaInferCache,
     class_name: &str,
@@ -1499,23 +1527,6 @@ fn antecedent_excludes_target_class(
         | LuaType::Thread => true,
         _ => false,
     }
-}
-
-fn extract_type_name_guard_target_expr(call_expr: &LuaCallExpr) -> Option<LuaExpr> {
-    if !call_expr.is_colon_call() {
-        return None;
-    }
-
-    let LuaExpr::IndexExpr(index_expr) = call_expr.get_prefix_expr()? else {
-        return None;
-    };
-
-    let args = call_expr.get_args_list()?;
-    if args.get_args().next().is_some() {
-        return None;
-    }
-
-    index_expr.get_prefix_expr()
 }
 
 fn const_type_eq(left_type: &LuaType, right_type: &LuaType) -> bool {

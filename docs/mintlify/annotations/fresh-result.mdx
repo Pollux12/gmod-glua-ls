@@ -1,0 +1,49 @@
+---
+title: "@fresh_result"
+description: Mark a method that returns a new value on every call.
+---
+import AdvancedAnnotation from "/snippets/advanced-annotation.mdx"
+
+<AdvancedAnnotation />
+
+## Overview
+
+GLuaLS normally treats repeated calls of a method with no arguments, like `ent:GetOwner()`, as the same value. A check on one call applies to the next:
+
+```lua
+if IsValid(self:GetOwner()) then
+    self:GetOwner():GetAimVector() -- no warning
+end
+```
+
+Some methods return a different value every time, such as `CNavArea:GetRandomPoint()`. `fresh_result` marks those, so a check on one call does not carry over to the next.
+
+---
+
+## Syntax
+
+```lua
+---@return T
+---@[fresh_result]
+```
+
+Put it after the `@return` line.
+
+---
+
+## Example
+
+```lua
+---@return Vector
+---@[fresh_result]
+function CNavArea:GetRandomPoint() end
+```
+
+```lua
+local point = area:GetRandomPoint()
+if point.z > 0 then
+    -- area:GetRandomPoint() here is a new point, not `point`
+end
+```
+
+Store the result in a local when you need the same value again.

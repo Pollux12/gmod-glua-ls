@@ -1981,6 +1981,38 @@ function UnknownPosition() end"
         );
     }
 
+    /// A table literal's own fields are code, not a declared shape: the computed
+    /// writes beside them still add any name, read from any file.
+    #[gtest]
+    fn test_literal_registry_filled_by_computed_keys_accepts_names_from_other_files() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/mymod/core.lua",
+            r#"
+            module("mymod", package.seeall)
+            Meta = Meta or {Base = {}}
+            function Register(name)
+                local meta = {}
+                Meta[name] = meta
+                return meta
+            end
+            "#,
+        );
+        let user = ws.def_file(
+            "lua/mymod/user.lua",
+            r#"
+            module("mymod", package.seeall)
+            Register("Alpha")
+            print(Meta.Alpha, Meta.Base)
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, user, DiagnosticCode::UndefinedField),
+            Vec::<String>::new()
+        );
+    }
+
     /// One named write gives the table a shape again, so bogus names still report.
     #[gtest]
     fn test_mixed_computed_key_table_still_reports_undefined_field() {
@@ -2188,5 +2220,373 @@ function UnknownPosition() end"
 
         ws.def_file(parser_path, parser);
         expect_that!(undefined(&mut ws), is_empty());
+    }
+
+    #[gtest]
+    fn subclass_dynamic_fields_do_not_leak_to_sibling_classes() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sibling_leak.lua",
+            r#"
+            ---@class LeakTest.Base
+            local Base = {}
+
+            ---@class LeakTest.Child1 : LeakTest.Base
+            local c1 = {}
+            c1.test = "hello"
+
+            ---@type LeakTest.Child1
+            local x
+            x.test2 = "hi"
+
+            ---@type LeakTest.Base
+            local b
+            local b_test = b.test
+            local b_test2 = b.test2
+            print(b.zzz)
+
+            ---@class LeakTest.Other : LeakTest.Base
+            local o
+            print(o.test, o.test2, o.zzz)
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            vec![
+                "Undefined field `zzz`. ",
+                "Undefined field `test`. ",
+                "Undefined field `test2`. ",
+                "Undefined field `zzz`. ",
+            ]
+        );
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "b_test")),
+            "\"hello\""
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "b_test2")), "\"hi\"");
+    }
+
+    #[gtest]
+    fn entity_reads_field_written_on_an_instance_another_file_created() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/includes/extensions/ents.lua",
+            r#"
+            ---@class Entity
+            local Entity = {}
+            ---@class NULL : Entity
+            NULL = {}
+            ents = {}
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return (instance) T|NULL
+            function ents.Create(class) end
+            "#,
+        );
+        ws.def_file(
+            "lua/entities/base_chipbase/shared.lua",
+            r#"
+            ENT.Type = "anim"
+            "#,
+        );
+        let chip = ws.def_file(
+            "lua/entities/test_chip/init.lua",
+            r#"
+            ENT.Type = "anim"
+            ENT.Base = "base_chipbase"
+            function ENT:Initialize()
+                print(self._Owner)
+            end
+            function ENT:SetAmount(amount)
+                self.amount = amount
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/server/chip_spawner.lua",
+            r#"
+            local function spawn(ply)
+                local entity = ents.Create("test_chip")
+                if (entity.SetAmount) then
+                    entity:SetAmount(1)
+                    entity._Owner = ply
+                end
+            end
+            "#,
+        );
+
+        expect_that!(
+            diagnostic_messages_for_file(&mut ws, chip, DiagnosticCode::UndefinedField),
+            is_empty()
+        );
+    }
+
+    #[gtest]
+    fn sibling_class_members_list_parent_dynamic_fields_but_not_sibling_ones() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sibling_members.lua",
+            r#"
+            ---@class ListLeak.Base
+            ---@class ListLeak.Child : ListLeak.Base
+            ---@class ListLeak.Other : ListLeak.Base
+
+            ---@type ListLeak.Base
+            local base
+            base.shared = 1
+
+            ---@type ListLeak.Child
+            local child
+            child.childOnly = "c"
+
+            ---@type ListLeak.Other
+            local other
+            "#,
+        );
+
+        let member_names = |local_name: &str| {
+            let ty = ws.local_ty(file_id, local_name);
+            let mut names = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("semantic model")
+                .get_member_infos(&ty)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|info| info.key.get_name().map(str::to_string))
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+
+        expect_that!(member_names("other"), elements_are![eq("shared")]);
+        expect_that!(
+            member_names("base"),
+            elements_are![eq("childOnly"), eq("shared")]
+        );
+    }
+
+    #[gtest]
+    fn base_entity_reads_subclass_dynamic_field_while_sibling_entity_rejects_it() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/annotations/entity.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@class other_ent : Entity
+            "#,
+        );
+        ws.def_file(
+            "lua/entities/base_glide/init.lua",
+            r#"
+            ---@class base_glide : Entity
+            local ENT = {}
+            function ENT:Initialize()
+                self.Speed = 1
+            end
+            "#,
+        );
+        let reader = ws.def_file(
+            "lua/autorun/glide_reader.lua",
+            r#"
+            ---@type Entity
+            local ent
+            local speed = ent.Speed
+
+            ---@type other_ent
+            local other
+            print(other.Speed)
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, reader, DiagnosticCode::UndefinedField),
+            vec!["Undefined field `Speed`. "]
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(reader, "speed")), "1");
+    }
+
+    #[gtest]
+    fn parent_read_of_dynamic_field_written_by_two_subclasses_unions_their_types() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/union_subclasses.lua",
+            r#"
+            ---@class UnionSub.Base
+            ---@class UnionSub.ChildA : UnionSub.Base
+            ---@class UnionSub.ChildB : UnionSub.Base
+
+            ---@type UnionSub.ChildA
+            local a
+            a.shared = "text"
+
+            ---@type UnionSub.ChildB
+            local b
+            b.shared = 42
+
+            ---@type UnionSub.Base
+            local base
+            local v = base.shared
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            Vec::<String>::new()
+        );
+        let ty = ws.humanize_type(ws.local_ty(file_id, "v"));
+        assert!(
+            ty.contains("\"text\"") && ty.contains("42"),
+            "expected union of subclass field types, got {ty}"
+        );
+    }
+
+    #[gtest]
+    fn parent_read_of_dynamic_field_includes_grandchild_writes() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/nearest_subclass.lua",
+            r#"
+            ---@class NearestSub.Base
+            ---@class NearestSub.Mid : NearestSub.Base
+            ---@class NearestSub.Leaf : NearestSub.Mid
+
+            ---@type NearestSub.Mid
+            local mid
+            mid.f = "alpha"
+
+            ---@type NearestSub.Leaf
+            local leaf
+            leaf.f = 42
+
+            ---@type NearestSub.Base
+            local base
+            local v = base.f
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "v")),
+            "(\"alpha\"|42)"
+        );
+    }
+
+    #[gtest]
+    fn battlemechs_create_meta_table_inherits_parent_fields_and_isolates_siblings() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "addons/battlemechs/lua/battlemechs/sh_core.lua",
+            r#"
+            ---@class battlemechs.Base
+            local META = {}
+
+            ---@generic T : battlemechs.Base
+            ---@[constructor("Initialize", "battlemechs.Base", false)]
+            ---@param name battlemechs.`T`
+            ---@[base_class]
+            ---@param base string?
+            ---@return (definition) T
+            local function CreateMetaTable(name, base)
+                ---@type (definition) battlemechs.Base
+                local meta = setmetatable({}, { __index = META })
+                return meta
+            end
+
+            local meow = CreateMetaTable("meow")
+            meow.test = "hello"
+
+            local woof = CreateMetaTable("woof", "meow")
+            print(woof.test)
+
+            local arf = CreateMetaTable("arf")
+            print(arf.test)
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            vec!["Undefined field `test`. "]
+        );
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            Vec::<String>::new()
+        );
+    }
+
+    #[gtest]
+    fn subclass_dynamic_field_edits_and_deletion_match_cold_analysis() {
+        let base_src = r#"
+            ---@class DynWarmCold.Base
+            ---@class DynWarmCold.Sibling : DynWarmCold.Base
+        "#;
+        let child_with_field = r#"
+            ---@class DynWarmCold.Child : DynWarmCold.Base
+            ---@type DynWarmCold.Child
+            local c
+            c.onlyChild = "v"
+        "#;
+        let child_without_field = r#"
+            ---@class DynWarmCold.Child : DynWarmCold.Base
+        "#;
+        let reader_src = r#"
+            ---@type DynWarmCold.Base
+            local b
+            print(b.onlyChild)
+
+            ---@type DynWarmCold.Sibling
+            local s
+            print(s.onlyChild)
+        "#;
+
+        let mut warm = VirtualWorkspace::new();
+        warm.def_file("lua/autorun/base.lua", base_src);
+        warm.def_file("lua/autorun/child.lua", child_with_field);
+        let reader = warm.def_file("lua/autorun/reader.lua", reader_src);
+        assert_eq!(
+            diagnostic_messages_for_file(&mut warm, reader, DiagnosticCode::UndefinedField),
+            vec!["Undefined field `onlyChild`. "]
+        );
+
+        // Edit child to remove the dynamic field write.
+        warm.def_file("lua/autorun/child.lua", child_without_field);
+        let mut cold1 = VirtualWorkspace::new();
+        cold1.def_file("lua/autorun/base.lua", base_src);
+        cold1.def_file("lua/autorun/child.lua", child_without_field);
+        let cold1_reader = cold1.def_file("lua/autorun/reader.lua", reader_src);
+        assert_eq!(
+            diagnostic_messages_for_file(&mut warm, reader, DiagnosticCode::UndefinedField),
+            diagnostic_messages_for_file(&mut cold1, cold1_reader, DiagnosticCode::UndefinedField)
+        );
+        assert_eq!(
+            diagnostic_messages_for_file(&mut warm, reader, DiagnosticCode::UndefinedField).len(),
+            2
+        );
+
+        // Restore child, then delete child file completely.
+        warm.def_file("lua/autorun/child.lua", child_with_field);
+        let child_uri = warm.virtual_url_generator.new_uri("lua/autorun/child.lua");
+        warm.analysis
+            .remove_file_by_uri(&child_uri)
+            .0
+            .expect("removed child.lua");
+        let mut cold2 = VirtualWorkspace::new();
+        cold2.def_file("lua/autorun/base.lua", base_src);
+        let cold2_reader = cold2.def_file("lua/autorun/reader.lua", reader_src);
+        assert_eq!(
+            diagnostic_messages_for_file(&mut warm, reader, DiagnosticCode::UndefinedField),
+            diagnostic_messages_for_file(&mut cold2, cold2_reader, DiagnosticCode::UndefinedField)
+        );
+        assert_eq!(
+            diagnostic_messages_for_file(&mut warm, reader, DiagnosticCode::UndefinedField).len(),
+            2
+        );
     }
 }

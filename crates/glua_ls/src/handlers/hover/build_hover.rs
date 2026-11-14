@@ -1176,9 +1176,8 @@ pub fn add_signature_ret_description(
 ) -> Option<()> {
     let signature = db.get_signature_index().get(&signature_id)?;
     let mut s = String::new();
-    for i in 0..signature.return_docs.len() {
-        let ret_info = &signature.return_docs[i];
-        if let Some(description) = ret_info.description.clone() {
+    for ret_info in &signature.return_docs {
+        if let Some(description) = &ret_info.description {
             s.push_str(&format!(
                 "@*return* {} — {}\n\n",
                 match &ret_info.name {

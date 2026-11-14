@@ -1,0 +1,50 @@
+---
+title: "@return_alias"
+description: Mark a function that returns one of its arguments unchanged.
+---
+import AdvancedAnnotation from "/snippets/advanced-annotation.mdx"
+
+<AdvancedAnnotation />
+
+## Overview
+
+`return_alias` marks a function whose first return value is the same value it was given in one argument, not a copy. `assert` is one: `assert(x)` returns `x` itself.
+
+GLuaLS then treats the result as the argument itself. Methods you add through the result go on the original.
+
+---
+
+## Syntax
+
+```lua
+---@[return_alias(index)]
+```
+
+Put it after the `@return` line. `index` is the zero-based position of the returned argument.
+
+---
+
+## Example
+
+The official annotations describe `assert` like this:
+
+```lua
+---@generic T, T1
+---@param expression T
+---@param ... T1
+---@return std.NotNull<T>, T1...
+---@[return_alias(0)]
+function _G.assert(expression, ...) end
+```
+
+```lua
+local PANEL = assert(FindMetaTable("Panel"))
+
+function PANEL:FadeIn() end -- added to every Panel
+```
+
+---
+
+## See also
+
+- [`@copy_result`](/annotations/copy-result): a function that returns a copy of its argument

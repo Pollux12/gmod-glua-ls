@@ -23,52 +23,73 @@ GLuaLS follows EmmyLua-style annotations and adds Garry's Mod Lua extensions for
 
 ---
 
-## Type system annotations
+## Types
 
 | Annotation | Description | Example |
 |---|---|---|
 | [`@class`](/annotations/class) | Define a class with optional inheritance | `---@class Animal` |
-| [`@field`](/annotations/field) | Add a typed field to a class | `---@field health number` |
 | [`@type`](/annotations/type) | Declare the type of a variable | `---@type Player` |
+| [`@field`](/annotations/field) | Add a typed field to a class | `---@field health number` |
+| [`@index_alias`](/annotations/index-alias) | Name a numbered field in completion and hints | `---@[index_alias("pos")]` |
+| [`@field_accessor`](/annotations/field-accessor) | Link a field to its getter and setter methods | `---@[field_accessor("PascalCase")]` |
 | [`@alias`](/annotations/alias) | Create a new type alias | `---@alias ID string \| number` |
 | [`@enum`](/annotations/enum) | Mark a table as an enumeration | `---@enum TEAM` |
 | [`@generic`](/annotations/generic) | Add generic type parameters to a function | `---@generic T` |
 | [`@operator`](/annotations/operator) | Document an operator overload | `---@operator add(Vector): Vector` |
 
-## Function annotations
+## Functions
 
 | Annotation | Description | Example |
 |---|---|---|
 | [`@param`](/annotations/param) | Document a parameter's type | `---@param ply Player` |
 | [`@return`](/annotations/return) | Document a return value's type | `---@return boolean` |
 | [`@overload`](/annotations/overload) | Define an alternate function signature | `---@overload fun(x: number): number` |
+| [`@outparam`](/annotations/outparam) | Document a parameter table field modified by a function | `---@outparam cfg.output TraceResult` |
 | [`@async`](/annotations/async) | Mark a function as async/coroutine-based | `---@async` |
 | [`@nodiscard`](/annotations/nodiscard) | Warn if the return value is unused | `---@nodiscard` |
 
-## Garry's Mod Lua annotations
+## Realms and hooks
 
 | Annotation | Description | Example |
 |---|---|---|
 | [`@realm`](/annotations/realm) | Declare which realm code runs in | `---@realm server` |
 | [`@hook`](/annotations/hook) | Mark a function or method as a hook handler | `---@hook PlayerSpawn` |
-| [`@outparam`](/annotations/outparam) | Document a parameter table field modified by a function | `---@outparam cfg.output TraceResult` |
 | [`@fileparam`](/annotations/fileparam) | Set a file-wide parameter type default | `---@fileparam ply Player` |
 | [`@accessorfunc`](/annotations/accessorfunc) | Mark a function as an accessor generator | `---@accessorfunc` |
-| [`@call_arg`](/annotations/call-arg) | Mark wrapper parameters as names, callbacks, files, or metadata | `---@[call_arg("gmod.hook", "add")]` |
-| [`Guard metadata`](/annotations/guard-metadata) | Mark functions and callbacks that prove values are valid | `---@[valid_guard]` |
 
-## Control and metadata annotations
+## Utilities
 
 | Annotation | Description | Example |
 |---|---|---|
 | [`@diagnostic`](/annotations/diagnostic) | Enable or disable specific diagnostics | `---@diagnostic disable-next-line` |
 | [`@cast`](/annotations/cast) | Cast a variable to a different type | `---@cast ply Player` |
 | [`@deprecated`](/annotations/deprecated) | Mark a symbol as deprecated | `---@deprecated Use NewFunc()` |
+| [`@see`](/annotations/see) | Add a cross-reference to another symbol | `---@see AnotherClass` |
+| [`@lsp_optimization`](/annotations/lsp-optimization) | Skip a check or delay a local's type | `---@[lsp_optimization("check_table_field")]` |
+
+## Advanced
+
+These annotations are intended for complex cases and are primarily designed to be used by the built-in annotations.
+
+| Annotation | Description | Example |
+|---|---|---|
+| [`@call_arg`](/annotations/call-arg) | Mark wrapper parameters as names, callbacks, files, or metadata | `---@[call_arg("gmod.hook", "add")]` |
+| [`@adds_field`](/annotations/adds-field) | Declare a field a function adds to a table argument | `---@[adds_field("MetaID", "integer")]` |
+| [`@valid_guard`](/annotations/valid-guard) | Mark a function that proves its argument is valid | `---@[valid_guard]` |
+| [`@self_guard`](/annotations/self-guard) | Mark a method that proves its receiver is valid | `---@[self_guard("gmod.entity")]` |
+| [`@self_call_valid`](/annotations/self-call-valid) | Mark a callback where a `self` method returns a valid value | `---@[self_call_valid("GetOwner")]` |
+| [`@self_class_name`](/annotations/self-class-name) | Mark a method that returns the class name of the object it is called on | `---@[self_class_name]` |
+| [`@exhaustive_type_guard`](/annotations/exhaustive-type-guard) | Mark a type check that also rules out subclasses when it fails | `---@[exhaustive_type_guard]` |
+| [`@return_alias`](/annotations/return-alias) | Mark a function that returns one of its arguments unchanged | `---@[return_alias(0)]` |
+| [`@copy_result`](/annotations/copy-result) | Mark a function that returns a copy of its table argument | `---@[copy_result]` |
+| [`@fresh_result`](/annotations/fresh-result) | Mark a method that returns a new value on every call | `---@[fresh_result]` |
+| [`@writes_global`](/annotations/writes-global) | Declare the only globals a function changes | `---@[writes_global("ConVarCache")]` |
+| [`@net_send`](/annotations/net-send) | Mark a function that sends the current net message | `---@[net_send("client")]` |
+| [`@net_payload`](/annotations/net-payload) | Mark a function that writes or reads a net message value | `---@[net_payload("write", "string")]` |
+| [`@builtin_alias`](/annotations/builtin-alias) | Keep a Lua built-in's handling on a replacement | `---@[builtin_alias("pairs")]` |
 | [`@meta`](/annotations/meta) | Mark a file as type-only (not runtime) | `---@meta` |
 | [`@module`](/annotations/module) | Declare a file as a named module | `---@module mymodule` |
-| [`@see`](/annotations/see) | Add a cross-reference to another symbol | `---@see AnotherClass` |
 | [`@source`](/annotations/source) | Map a definition to its true source location | `---@source file:///path/file.lua#41:0` |
-| [`@version`](/annotations/version) | Restrict features to specific Lua versions | `---@version >5.1` |
 
 ---
 

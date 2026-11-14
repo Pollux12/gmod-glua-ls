@@ -43,6 +43,7 @@ pub const GMOD_CALL_ARG_BUILTINS_FIXTURE: &str = r#"
 ---@attribute overload_call_arg_field(param: integer, domain: string, role: string, field_path: string, priority: integer?)
 ---@attribute net_send(receiver_realm: string)
 ---@attribute net_payload(direction: string, wire_format: string)
+---@attribute self_class_name()
 
 util = util or {}
 net = net or {}
@@ -489,6 +490,10 @@ function Entity:DTVar(type, slot, name) end
 ---@param name string
 ---@param extended? table
 function Entity:NetworkVarElement(type, slot, element, name, extended) end
+
+---@return string
+---@[self_class_name]
+function Entity:GetClass() end
 
 ---@accessorfunc 3
 ---@param tab table

@@ -53,6 +53,7 @@ use crate::{
         member::member_key_matches_type,
         member::merge_open_table_types,
         member::resolve_dynamic_field_member,
+        member::resolve_inherited_dynamic_field_member,
         member::resolve_member_item_with_realm,
         member::source_survives_table_generation_cutoff,
         type_check::{self, check_type_compact},
@@ -65,12 +66,14 @@ use super::{
     infer_name::{contains_self_infer, infer_global_type},
 };
 
-/// The tables a member lookup is walking, and the per-call table whose base
-/// the lookup is reading through.
+/// The tables a member lookup is walking, the per-call table whose base
+/// the lookup is reading through, and whether it reached the current class
+/// from one of its subclasses.
 #[derive(Default)]
 struct TableMemberLookupGuard {
     tables: FxHashSet<InFiled<TextRange>>,
     instance: Option<Arc<LuaInstanceType>>,
+    inherited: bool,
 }
 
 impl TableMemberLookupGuard {
@@ -571,24 +574,45 @@ fn index_expr_var_ref_id_uncached(
             return None;
         };
         let path = super::narrow::getter_access_path(&LuaExpr::IndexExpr(index_expr.clone()))?;
-        return Some(VarRefId::IndexRef(
-            root,
-            crate::db_index::intern_smol_str(&path),
-        ));
+        let path = crate::db_index::intern_smol_str(&path);
+        return Some(match root {
+            VarRefRootId::Decl(decl_id) => decl_rooted_index_ref(db, decl_id, path),
+            root => VarRefId::IndexRef(root, path),
+        });
     }
 
     if let LuaExpr::NameExpr(name_expr) = prefix_expr {
-        let root = match get_name_expr_var_ref_id(db, cache, &name_expr) {
-            Some(VarRefId::SelfRef(self_ref_id)) => VarRefRootId::SelfRef(self_ref_id),
-            Some(VarRefId::VarRef(decl_id)) => VarRefRootId::Decl(decl_id),
-            _ => return None,
-        };
-
         let access_path = interned_access_path(cache.get_file_id(), syntax_id, index_expr)?;
-        return Some(VarRefId::IndexRef(root, access_path));
+        return match get_name_expr_var_ref_id(db, cache, &name_expr) {
+            Some(VarRefId::SelfRef(self_ref_id)) => Some(VarRefId::IndexRef(
+                VarRefRootId::SelfRef(self_ref_id),
+                access_path,
+            )),
+            Some(VarRefId::VarRef(decl_id)) => {
+                Some(decl_rooted_index_ref(db, decl_id, access_path))
+            }
+            _ => None,
+        };
     }
 
     None
+}
+
+/// The narrowing reference for `path` read from the binding `decl_id`, keyed by
+/// the binding it aliases, if any.
+pub(crate) fn decl_rooted_index_ref(
+    db: &DbIndex,
+    decl_id: crate::LuaDeclId,
+    path: internment::ArcIntern<smol_str::SmolStr>,
+) -> VarRefId {
+    let root_decl_id = super::narrow::narrowing_root_decl(db, decl_id);
+    let path = db
+        .get_decl_index()
+        .get_decl(&root_decl_id)
+        .and_then(|root_decl| super::narrow::respell_path_root(&path, root_decl.get_name()))
+        .map(|respelled| crate::db_index::intern_smol_str(&respelled))
+        .unwrap_or(path);
+    VarRefId::IndexRef(VarRefRootId::Decl(root_decl_id), path)
 }
 
 pub fn infer_member_by_member_key(
@@ -1947,11 +1971,11 @@ fn infer_cross_file_matching_expr_key_member_type(
         let key_match = if is_literal_member_key(key)
             && member_key_is_unknown_expr(member.get_key())
         {
-            is_precise_unknown_wildcard_value_type(&member_type)
+            allow_wildcard_expr_literal_match
+                || is_precise_unknown_wildcard_value_type(&member_type)
         } else if is_literal_member_key(key) && member_key_is_broad_wildcard_expr(member.get_key())
         {
             allow_wildcard_expr_literal_match
-                && is_precise_unknown_wildcard_value_type(&member_type)
         } else {
             member_key_matches_type(db, &access_key_type, member.get_key())
         };
@@ -2581,7 +2605,12 @@ fn infer_custom_type_member(
         }
     }
 
-    let dynamic_field_result = resolve_dynamic_field_member(
+    let resolve_dynamic_field = if table_member_lookup_guard.inherited {
+        resolve_inherited_dynamic_field_member
+    } else {
+        resolve_dynamic_field_member
+    };
+    let dynamic_field_result = resolve_dynamic_field(
         db,
         cache,
         &LuaType::Ref(prefix_type_id.clone()),
@@ -2605,12 +2634,12 @@ fn infer_custom_type_member(
                 visible_super_types_for_index(db, cache, &prefix_type_id, &index_expr)
         {
             for super_type in super_types {
-                let result = infer_member_by_member_key_with_table_guard(
+                let result = infer_inherited_member(
                     db,
                     cache,
                     &super_type,
-                    index_expr.clone(),
-                    &infer_guard.fork(),
+                    &index_expr,
+                    infer_guard,
                     table_member_lookup_guard,
                 );
 
@@ -2673,12 +2702,12 @@ fn infer_custom_type_member(
             visible_super_types_for_index(db, cache, &prefix_type_id, &index_expr)
     {
         for super_type in super_types {
-            let result = infer_member_by_member_key_with_table_guard(
+            let result = infer_inherited_member(
                 db,
                 cache,
                 &super_type,
-                index_expr.clone(),
-                &infer_guard.fork(),
+                &index_expr,
+                infer_guard,
                 table_member_lookup_guard,
             );
 
@@ -2696,6 +2725,28 @@ fn infer_custom_type_member(
 
     cache.record_missed_member_read(db, owner, key);
     Err(InferFailReason::FieldNotFound)
+}
+
+/// `index_expr`'s member on `super_type` as a subclass inherits it.
+fn infer_inherited_member(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    super_type: &LuaType,
+    index_expr: &LuaIndexMemberExpr,
+    infer_guard: &InferGuardRef,
+    table_member_lookup_guard: &mut TableMemberLookupGuard,
+) -> InferResult {
+    let reached_from_subclass = std::mem::replace(&mut table_member_lookup_guard.inherited, true);
+    let result = infer_member_by_member_key_with_table_guard(
+        db,
+        cache,
+        super_type,
+        index_expr.clone(),
+        &infer_guard.fork(),
+        table_member_lookup_guard,
+    );
+    table_member_lookup_guard.inherited = reached_from_subclass;
+    result
 }
 
 /// Whether `typ` is a method: a function type, or a union of them. A dynamic

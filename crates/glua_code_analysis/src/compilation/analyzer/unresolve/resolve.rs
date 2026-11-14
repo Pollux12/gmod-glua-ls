@@ -31,8 +31,8 @@ use crate::{
         unresolve::UnResolveSpecialCall,
     },
     db_index::{
-        LuaFunctionType, LuaMemberFeature, LuaMemberOwner, LuaOutParamRoot, LuaSignature,
-        LuaSignatureId, SpecialCallFact, derivation::StageRule,
+        BASE_CLASS_ATTRIBUTE, LuaFunctionType, LuaMemberFeature, LuaMemberOwner, LuaOutParamRoot,
+        LuaSignature, LuaSignatureId, SpecialCallFact, derivation::StageRule,
     },
     find_members_with_key, humanize_type,
     semantic::{
@@ -828,8 +828,9 @@ pub fn try_resolve_special_call(
     }
 
     let is_colon_call = unresolve_special_call.call_expr.is_colon_call();
-    for param_info in callable_param_infos {
-        materialize_str_tpl_class_from_call(
+    let mut param_result = Ok(());
+    for param_info in &callable_param_infos {
+        param_result = materialize_str_tpl_class_from_call(
             db,
             cache,
             unresolve_special_call.file_id,
@@ -838,18 +839,38 @@ pub fn try_resolve_special_call(
             &param_info.param_type,
             param_info.is_colon_define,
             is_colon_call,
-        )?;
-
-        if param_info.is_constructor {
-            try_resolve_constructor_param(
-                db,
-                cache,
-                unresolve_special_call.file_id,
-                &unresolve_special_call.call_expr,
-                &param_info,
-            )?;
+            &callable_param_infos,
+        )
+        .and_then(|_| {
+            if param_info.is_constructor {
+                try_resolve_constructor_param(
+                    db,
+                    cache,
+                    unresolve_special_call.file_id,
+                    &unresolve_special_call.call_expr,
+                    param_info,
+                    &callable_param_infos,
+                )
+            } else {
+                Ok(())
+            }
+        });
+        if param_result.is_err() {
+            break;
         }
     }
+
+    // A constructor lookup failure must not hide the parent link: the class
+    // already exists, only its constructor is missing.
+    let base_class_result = try_resolve_base_class_params(
+        db,
+        cache,
+        unresolve_special_call.file_id,
+        &unresolve_special_call.call_expr,
+        &callable_param_infos,
+    );
+    param_result?;
+    base_class_result?;
 
     for out_param_info in callable_out_param_infos {
         apply_out_param_from_call(
@@ -870,6 +891,7 @@ struct SpecialCallParamInfo {
     param_idx: usize,
     param_type: LuaType,
     is_constructor: bool,
+    is_base_class: bool,
     is_colon_define: bool,
     signature_id: Option<LuaSignatureId>,
 }
@@ -1745,12 +1767,16 @@ fn collect_signature_special_call_params(
     let mut param_infos = Vec::new();
     for (idx, param_info) in &signature.param_docs {
         let is_constructor = param_info.get_attribute_by_name("constructor").is_some();
+        let is_base_class = param_info
+            .get_attribute_by_name(BASE_CLASS_ATTRIBUTE)
+            .is_some();
         let has_str_tpl = type_contains_str_tpl_ref(&param_info.type_ref);
-        if is_constructor || has_str_tpl {
+        if is_constructor || is_base_class || has_str_tpl {
             param_infos.push(SpecialCallParamInfo {
                 param_idx: *idx,
                 param_type: param_info.type_ref.clone(),
                 is_constructor,
+                is_base_class,
                 is_colon_define: signature.is_colon_define,
                 signature_id: Some(signature_id),
             });
@@ -1797,6 +1823,7 @@ fn collect_doc_function_special_call_params(func: &LuaFunctionType) -> Vec<Speci
                 param_idx: idx,
                 param_type: param_type.clone(),
                 is_constructor: false,
+                is_base_class: false,
                 is_colon_define: func.is_colon_define(),
                 signature_id: None,
             })
@@ -2212,6 +2239,7 @@ fn materialize_str_tpl_class_from_call(
     param_type: &LuaType,
     is_colon_define: bool,
     is_colon_call: bool,
+    param_infos: &[SpecialCallParamInfo],
 ) -> ResolveResult {
     let Some(str_tpl) = find_str_tpl_ref(db, param_type) else {
         return Ok(());
@@ -2261,15 +2289,37 @@ fn materialize_str_tpl_class_from_call(
     arg_names.sort_unstable();
     arg_names.dedup();
 
+    // Whether a declaration owns the name is only final once every
+    // registration has run: deciding earlier would leave a placeholder behind
+    // for a class a later registration declares.
+    if !db.stage_rule_holds(StageRule::FloorUnsettled) {
+        return Ok(());
+    }
     for arg_name in &arg_names {
+        let class_decl_id = str_tpl_class_id(&str_tpl, arg_name);
+        // A real declaration already owns this name (a `---@class` the author
+        // wrote, or a Register-synthesized one): the materialization must not
+        // add edges behind its back.
+        if db.get_type_index().has_non_auto_declaration(&class_decl_id) {
+            continue;
+        }
+        let inherit_constraint = !explicit_parent_reaches(
+            db,
+            cache,
+            call_expr,
+            param_infos,
+            param_type,
+            &class_decl_id,
+            &constraint,
+        )?;
         materialize_str_tpl_class(
             db,
             file_id,
             call_expr,
             &arg_expr,
-            &str_tpl,
+            class_decl_id,
             &constraint,
-            arg_name,
+            inherit_constraint,
             param_idx,
             is_colon_define,
             is_colon_call,
@@ -2278,38 +2328,28 @@ fn materialize_str_tpl_class_from_call(
     Ok(())
 }
 
+fn str_tpl_class_id(str_tpl: &crate::LuaStringTplType, name: &str) -> LuaTypeDeclId {
+    LuaTypeDeclId::global(&format!(
+        "{}{}{}",
+        str_tpl.get_prefix(),
+        name,
+        str_tpl.get_suffix()
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn materialize_str_tpl_class(
     db: &mut DbIndex,
     file_id: crate::FileId,
     call_expr: &LuaCallExpr,
     arg_expr: &LuaExpr,
-    str_tpl: &crate::LuaStringTplType,
+    class_decl_id: LuaTypeDeclId,
     constraint: &LuaTypeDeclId,
-    arg_name: &str,
+    inherit_constraint: bool,
     param_idx: usize,
     is_colon_define: bool,
     is_colon_call: bool,
 ) -> ResolveResult {
-    let class_name = format!(
-        "{}{}{}",
-        str_tpl.get_prefix(),
-        arg_name,
-        str_tpl.get_suffix()
-    );
-    let class_decl_id = LuaTypeDeclId::global(&class_name);
-    // Whether a declaration owns the name is only final once every
-    // registration has run: deciding earlier would leave a placeholder behind
-    // for a class a later registration declares.
-    if !db.stage_rule_holds(StageRule::FloorUnsettled) {
-        return Ok(());
-    }
-    // A real declaration already owns this name (a `---@class` the author
-    // wrote, or a Register-synthesized one): the materialization must not add
-    // edges behind its back.
-    if db.get_type_index().has_non_auto_declaration(&class_decl_id) {
-        return Ok(());
-    }
     // A re-settled call replays the same materialization: only a novel decl
     // or super edge may bump the special-call epoch. The facts carry their
     // full identity (call-site, class, constraint, source), so replaying them
@@ -2340,12 +2380,14 @@ fn materialize_str_tpl_class(
 
     let super_type = LuaType::Ref(constraint.clone());
     let source_range = arg_expr.get_range();
-    if db.get_type_index_mut().add_super_type(
-        class_decl_id.clone(),
-        file_id,
-        source_range,
-        super_type.clone(),
-    ) {
+    if inherit_constraint
+        && db.get_type_index_mut().add_super_type(
+            class_decl_id.clone(),
+            file_id,
+            source_range,
+            super_type.clone(),
+        )
+    {
         novel_facts.push(SpecialCallFact::super_edge(
             file_id,
             call_position,
@@ -2369,6 +2411,7 @@ fn try_resolve_constructor_param(
     file_id: crate::FileId,
     call_expr: &LuaCallExpr,
     param_info: &SpecialCallParamInfo,
+    param_infos: &[SpecialCallParamInfo],
 ) -> ResolveResult {
     let signature_id = param_info.signature_id.ok_or(InferFailReason::None)?;
     let (_, target_signature_name, root_class, strip_self, return_self) = {
@@ -2434,8 +2477,20 @@ fn try_resolve_constructor_param(
 
     if let Some(root_class) = root_class {
         let root_type_id = LuaTypeDeclId::global(&root_class);
-        if let Some(type_decl) = db.get_type_index().get_type_decl(&root_type_id)
-            && type_decl.is_class()
+        let root_is_class = db
+            .get_type_index()
+            .get_type_decl(&root_type_id)
+            .is_some_and(|decl| decl.is_class());
+        if root_is_class
+            && !explicit_parent_reaches(
+                db,
+                cache,
+                call_expr,
+                param_infos,
+                &param_info.param_type,
+                &target_id,
+                &root_type_id,
+            )?
         {
             let source_range = get_call_arg_expr(
                 call_expr,
@@ -2445,26 +2500,14 @@ fn try_resolve_constructor_param(
             )
             .map(|arg| arg.get_range())
             .unwrap_or_else(|| call_expr.get_range());
-            let root_type = LuaType::Ref(root_type_id.clone());
-            if db.get_type_index_mut().add_super_type(
-                target_id.clone(),
+            add_call_super_edge(
+                db,
                 file_id,
+                call_expr,
+                &target_id,
+                root_type_id,
                 source_range,
-                root_type.clone(),
-            ) {
-                db.get_flow_index_mut().install_special_call_facts(
-                    file_id,
-                    call_expr.get_position(),
-                    [SpecialCallFact::super_edge(
-                        file_id,
-                        call_expr.get_position(),
-                        target_id.clone(),
-                        root_type,
-                        file_id,
-                        source_range,
-                    )],
-                );
-            }
+            );
         }
     }
 
@@ -2505,6 +2548,156 @@ fn try_resolve_constructor_param(
     .ok_or(InferFailReason::FieldNotFound)?;
 
     Ok(())
+}
+
+fn add_call_super_edge(
+    db: &mut DbIndex,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+    target_id: &LuaTypeDeclId,
+    parent_id: LuaTypeDeclId,
+    source_range: rowan::TextRange,
+) {
+    let parent_type = LuaType::Ref(parent_id);
+    if db.get_type_index_mut().add_super_type(
+        target_id.clone(),
+        file_id,
+        source_range,
+        parent_type.clone(),
+    ) {
+        db.get_flow_index_mut().install_special_call_facts(
+            file_id,
+            call_expr.get_position(),
+            [SpecialCallFact::super_edge(
+                file_id,
+                call_expr.get_position(),
+                target_id.clone(),
+                parent_type,
+                file_id,
+                source_range,
+            )],
+        );
+    }
+}
+
+/// Links the class this call creates to the class named by a `base_class` argument.
+/// Runs after every parameter has been settled so the target class already exists;
+/// an argument whose type is not settled yet retries the call.
+fn try_resolve_base_class_params(
+    db: &mut DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+    param_infos: &[SpecialCallParamInfo],
+) -> Result<(), InferFailReason> {
+    let is_class_param = |info: &&SpecialCallParamInfo| {
+        !info.is_base_class && find_str_tpl_ref(db, &info.param_type).is_some()
+    };
+    let Some(class_param) = param_infos
+        .iter()
+        .filter(is_class_param)
+        .find(|info| info.is_constructor)
+        .or_else(|| param_infos.iter().find(is_class_param))
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let Some(target_id) = get_constructor_target_type(
+        db,
+        cache,
+        &class_param.param_type,
+        call_expr.clone(),
+        class_param.param_idx,
+        class_param.is_colon_define,
+        call_expr.is_colon_call(),
+    ) else {
+        return Ok(());
+    };
+
+    for (parent_id, source_range) in base_class_parents(
+        db,
+        cache,
+        call_expr,
+        param_infos,
+        &class_param.param_type,
+        &target_id,
+    )? {
+        add_call_super_edge(db, file_id, call_expr, &target_id, parent_id, source_range);
+    }
+    Ok(())
+}
+
+/// The classes this call's `base_class` arguments make parents of `target_id`,
+/// each with its argument's range. A parent must be an existing class that is
+/// neither `target_id` nor one of its subclasses.
+fn base_class_parents(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    param_infos: &[SpecialCallParamInfo],
+    class_param_type: &LuaType,
+    target_id: &LuaTypeDeclId,
+) -> Result<Vec<(LuaTypeDeclId, rowan::TextRange)>, InferFailReason> {
+    let Some(str_tpl) = find_str_tpl_ref(db, class_param_type) else {
+        return Ok(Vec::new());
+    };
+    let mut parents = Vec::new();
+    for base_param in param_infos.iter().filter(|info| info.is_base_class) {
+        let Some(arg_expr) = get_call_arg_expr(
+            call_expr,
+            base_param.param_idx,
+            base_param.is_colon_define,
+            call_expr.is_colon_call(),
+        ) else {
+            continue;
+        };
+        let Some(parent_id) = base_class_arg_parent(db, cache, &arg_expr, &str_tpl)? else {
+            continue;
+        };
+        if parent_id == *target_id
+            || !db
+                .get_type_index()
+                .get_type_decl(&parent_id)
+                .is_some_and(|decl| decl.is_class())
+            || class_inherits(db, &parent_id, target_id)
+        {
+            continue;
+        }
+        parents.push((parent_id, arg_expr.get_range()));
+    }
+    Ok(parents)
+}
+
+/// Whether a `base_class` parent of this call is `ancestor_id` or inherits it,
+/// so the class it creates reaches `ancestor_id` through that parent and an
+/// implicit edge to it would shadow the parent's overrides.
+fn explicit_parent_reaches(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    param_infos: &[SpecialCallParamInfo],
+    class_param_type: &LuaType,
+    target_id: &LuaTypeDeclId,
+    ancestor_id: &LuaTypeDeclId,
+) -> Result<bool, InferFailReason> {
+    Ok(base_class_parents(
+        db,
+        cache,
+        call_expr,
+        param_infos,
+        class_param_type,
+        target_id,
+    )?
+    .iter()
+    .any(|(parent_id, _)| parent_id == ancestor_id || class_inherits(db, parent_id, ancestor_id)))
+}
+
+fn class_inherits(db: &DbIndex, class_id: &LuaTypeDeclId, ancestor_id: &LuaTypeDeclId) -> bool {
+    let mut supers = Vec::new();
+    class_id.collect_super_types(db, &mut supers);
+    supers
+        .iter()
+        .any(|super_type| matches!(super_type, LuaType::Ref(id) if id == ancestor_id))
 }
 
 fn set_signature_to_default_call(
@@ -2633,7 +2826,7 @@ fn str_tpl_selection_key(db: &DbIndex, str_tpl: &crate::LuaStringTplType) -> Str
     )
 }
 
-fn get_call_arg_expr(
+pub(crate) fn get_call_arg_expr(
     call_expr: &LuaCallExpr,
     param_idx: usize,
     is_colon_define: bool,
@@ -2656,6 +2849,30 @@ fn infer_string_const_arg(
         LuaType::StringConst(s) => Some(s.to_string()),
         _ => None,
     }
+}
+
+/// The class a `base_class` argument names: a string spelled as the factory
+/// spells its class names, or a value that is itself one of those classes.
+fn base_class_arg_parent(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    arg_expr: &LuaExpr,
+    str_tpl: &crate::LuaStringTplType,
+) -> Result<Option<LuaTypeDeclId>, InferFailReason> {
+    let arg_type = match infer_expr(db, cache, arg_expr.clone()) {
+        Ok(arg_type) => arg_type,
+        Err(reason) if reason.is_need_resolve() => return Err(reason),
+        Err(_) => return Ok(None),
+    };
+    Ok(match arg_type {
+        LuaType::StringConst(name) => Some(str_tpl_class_id(str_tpl, &name)),
+        LuaType::Ref(id) | LuaType::Def(id) => Some(id),
+        LuaType::Instance(instance) => match instance.get_base() {
+            LuaType::Ref(id) | LuaType::Def(id) => Some(id.clone()),
+            _ => None,
+        },
+        _ => None,
+    })
 }
 
 #[cfg(test)]

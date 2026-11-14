@@ -1,0 +1,43 @@
+---
+title: "@net_send"
+description: Mark a function that sends the current net message.
+---
+import AdvancedAnnotation from "/snippets/advanced-annotation.mdx"
+
+<AdvancedAnnotation />
+
+## Overview
+
+`net_send` marks a function that ends a net message and sends it, like `net.Send`, `net.Broadcast` and `net.SendToServer`. GLuaLS uses it to match each message's sender with its `net.Receive`, and to check that both sides read and write the same values.
+
+The official annotations already mark the `net` library, and wrappers that call it are detected automatically.
+
+---
+
+## Syntax
+
+```lua
+---@[net_send("client")]
+---@[net_send("server")]
+```
+
+The argument is the realm the message arrives in: `client` for `net.Send` and `net.Broadcast`, `server` for `net.SendToServer`.
+
+Mark the recipient parameter, if there is one, with [`@call_arg`](/annotations/call-arg) `gmod.net_payload` `target`.
+
+---
+
+## Example
+
+```lua
+---@[call_arg("gmod.net_payload", "target")]
+---@param ply Player
+---@[net_send("client")]
+function net.Send(ply) end
+```
+
+---
+
+## See also
+
+- [`@net_payload`](/annotations/net-payload): a function that writes or reads a net message value

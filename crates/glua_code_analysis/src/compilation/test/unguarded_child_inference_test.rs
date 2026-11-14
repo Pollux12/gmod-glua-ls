@@ -5,7 +5,6 @@ mod property_callback_guard_test {
 
     const API: &str = r#"
         ---@class Entity
-        ---@field GetClass fun(self: Entity): string
         ---@class NULL: Entity
         ---@class Player: Entity
         ---@class ix_vendor: Entity
@@ -3842,6 +3841,7 @@ filter:SetUpdateOnType(true)
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         ws.def_gmod_type_predicates();
+        ws.def_gmod_call_arg_builtins();
         let source = format!(
             r#"
             ---@class Entity

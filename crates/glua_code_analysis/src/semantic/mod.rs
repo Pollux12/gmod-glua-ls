@@ -62,6 +62,7 @@ pub(crate) use infer::narrow::{
 pub(crate) use infer::pairs_iter_value_registry_path;
 pub(crate) use infer::presence_guard_target;
 pub(crate) use infer::resolve_decl_backed_global_path_member_type;
+pub(crate) use infer::resolve_type_text;
 pub(crate) use infer::table_backing_range_from_expr;
 pub(crate) use infer::{
     AccessPaths, keep_access_paths, restore_access_path_snapshot, stop_keeping_access_paths,
@@ -138,7 +139,7 @@ pub use infer::{SelfRefId, VarRefId, VarRefRootId};
 pub(crate) use infer::{
     condition_has_concrete_type_evidence, condition_nominal_type, contains_gmod_null_type,
     get_var_expr_var_ref_id, getter_access_path, is_gmod_null_entity_candidate,
-    raw_get_access_path,
+    narrowing_root_decl, raw_get_access_path, respell_path_root,
 };
 pub use infer::{infer_param, infer_param_with_cache};
 use overload_resolve::resolve_signature;

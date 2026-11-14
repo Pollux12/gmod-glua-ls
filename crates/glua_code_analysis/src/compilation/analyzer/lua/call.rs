@@ -10,15 +10,18 @@ use rowan::TextSize;
 use smol_str::SmolStr;
 
 use crate::{
-    AccessorFuncCallMetadata, AccessorMember, AccessorOwner, AccessorPrefix, AccessorSignature,
-    DbIndex, FileId, GmodClassCallArg, GmodClassCallLiteral, GmodScriptedClassCallKind,
-    GmodScriptedClassCallMetadata, InFiled, InferFailReason, LuaMemberKey, LuaMemberOwner,
-    LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId, LuaType, LuaTypeDeclId,
+    ADDS_FIELD_ATTRIBUTE, AccessorFuncCallMetadata, AccessorMember, AccessorOwner, AccessorPrefix,
+    AccessorSignature, DbIndex, FileId, GmodClassCallArg, GmodClassCallLiteral,
+    GmodScriptedClassCallKind, GmodScriptedClassCallMetadata, InFiled, InferFailReason,
+    LuaAttributeUse, LuaMemberKey, LuaMemberOwner, LuaOperatorMetaMethod, LuaOperatorOwner,
+    LuaSignatureId, LuaType, LuaTypeDeclId,
     compilation::analyzer::{
-        gmod::static_call_arg_string, lua::LuaAnalyzer, unresolve::UnResolveSpecialCall,
+        gmod::static_call_arg_string,
+        lua::LuaAnalyzer,
+        unresolve::{UnResolveSpecialCall, get_call_arg_expr},
     },
     get_member_value_expr,
-    semantic::find_members_with_key,
+    semantic::{find_members_with_key, get_prefix_expr_signature_id, resolve_type_text},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -264,6 +267,7 @@ pub(super) fn analyze_call(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) -
     collect_accessorfunc_annotated_call(analyzer, &call_expr);
 
     if special_call_followup(analyzer, &call_expr).is_some() {
+        collect_adds_field_call(analyzer, &call_expr);
         analyzer.context.add_unresolve(
             UnResolveSpecialCall {
                 file_id: analyzer.file_id,
@@ -1351,6 +1355,84 @@ fn collect_accessorfunc_annotated_call(
     });
 
     Some(())
+}
+
+/// The fields the callee's `adds_field` parameters add to the tables `call_expr` passes.
+fn collect_adds_field_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaCallExpr) -> Option<()> {
+    let db = analyzer.db;
+    let signature_id = {
+        let cache = analyzer
+            .context
+            .infer_manager
+            .get_infer_cache(analyzer.file_id);
+        get_prefix_expr_signature_id(db, cache, call_expr)?
+    };
+    let signature = db.get_signature_index().get(&signature_id)?;
+    let mut field_params = signature
+        .param_docs
+        .iter()
+        .filter_map(|(param_idx, param_info)| {
+            let fields = param_info
+                .iter_attributes_by_name(ADDS_FIELD_ATTRIBUTE)
+                .filter_map(|attribute| added_field(db, attribute))
+                .collect::<Vec<_>>();
+            (!fields.is_empty()).then_some((*param_idx, fields))
+        })
+        .collect::<Vec<_>>();
+    field_params.sort_by_key(|(param_idx, _)| *param_idx);
+
+    let mut members = Vec::new();
+    for (param_idx, fields) in field_params {
+        let Some(arg) = get_call_arg_expr(
+            call_expr,
+            param_idx,
+            signature.is_colon_define,
+            call_expr.is_colon_call(),
+        ) else {
+            continue;
+        };
+        let Some(owner) = find_owner_for_prefix(analyzer, &arg) else {
+            continue;
+        };
+        members.extend(
+            fields
+                .into_iter()
+                .zip(0..)
+                .map(|((name, typ), slot)| AccessorMember {
+                    owner: owner.clone(),
+                    name,
+                    signature: AccessorSignature::Field(typ),
+                    syntax_id: arg.get_syntax_id(),
+                    slot,
+                }),
+        );
+    }
+    if members.is_empty() {
+        return None;
+    }
+
+    analyzer.write(StatementWrite::AddAccessorFuncCall {
+        file_id: analyzer.file_id,
+        metadata: AccessorFuncCallMetadata {
+            syntax_id: call_expr.get_syntax_id(),
+            members,
+        },
+    });
+    Some(())
+}
+
+/// The name and type of the field one `adds_field` use declares.
+fn added_field(db: &DbIndex, attribute: &LuaAttributeUse) -> Option<(SmolStr, LuaType)> {
+    let LuaType::DocStringConst(name) = attribute.get_param_by_name("name")? else {
+        return None;
+    };
+    let typ = match attribute.get_param_by_name("type") {
+        Some(LuaType::DocStringConst(type_text)) => {
+            resolve_type_text(db, type_text).unwrap_or(LuaType::Any)
+        }
+        _ => LuaType::Any,
+    };
+    Some((SmolStr::new(name.as_str()), typ))
 }
 
 /// `name` with its first byte upper-cased, as `name:sub(1, 1):upper() .. name:sub(2)`

@@ -2307,7 +2307,7 @@ fn infer_param_type_from_gmod_name_hint(
         return None;
     }
 
-    resolve_param_hint_type(db, hint)
+    resolve_type_text(db, hint)
 }
 
 fn infer_param_type_from_file_hint(db: &DbIndex, decl: &LuaDecl) -> Option<LuaType> {
@@ -2315,10 +2315,10 @@ fn infer_param_type_from_file_hint(db: &DbIndex, decl: &LuaDecl) -> Option<LuaTy
     let type_text = db
         .get_gmod_infer_index()
         .get_file_param_type_text(&decl.get_file_id(), &target_name)?;
-    resolve_param_hint_type(db, type_text)
+    resolve_type_text(db, type_text)
 }
 
-fn resolve_param_hint_type(db: &DbIndex, hint: &str) -> Option<LuaType> {
+pub(crate) fn resolve_type_text(db: &DbIndex, hint: &str) -> Option<LuaType> {
     let normalized_hint = hint.trim();
     let (type_name, nullable) = if let Some(name) = normalized_hint.strip_suffix('?') {
         (name.trim(), true)

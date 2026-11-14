@@ -1,0 +1,43 @@
+---
+title: "@field_accessor"
+description: Link a field to its getter and setter methods.
+---
+
+## Overview
+
+`field_accessor` links a class field to the methods that read and write it. Go to definition on the field then lists the getter and setter too.
+
+It only affects navigation. The methods must be on the same class.
+
+---
+
+## Syntax
+
+```lua
+---@[field_accessor]
+---@[field_accessor("PascalCase")]
+---@[field_accessor(nil, "GetterName", "SetterName")]
+```
+
+Put it directly above the `@field` line.
+
+- **Convention** builds the method names from the field name: `camelCase` (`getAge`), `PascalCase` (`GetAge`) or `snake_case` (`get_age`). It defaults to `camelCase`.
+- **Getter** and **setter** name the methods directly and take precedence over the convention.
+
+---
+
+## Example
+
+Garry's Mod methods are usually `PascalCase`:
+
+```lua
+---@class Vehicle
+---@[field_accessor("PascalCase")]
+---@field Speed number
+local VEHICLE = {}
+
+function VEHICLE:GetSpeed() return self.Speed end
+function VEHICLE:SetSpeed(value) self.Speed = value end
+```
+
+Go to definition on `vehicle.Speed` now offers the field, `GetSpeed` and `SetSpeed`.

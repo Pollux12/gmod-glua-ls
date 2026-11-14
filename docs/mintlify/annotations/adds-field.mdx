@@ -1,0 +1,112 @@
+---
+title: "@adds_field"
+description: Tell GLuaLS that a function adds new fields to a table you pass it.
+---
+import AdvancedAnnotation from "/snippets/advanced-annotation.mdx"
+
+<AdvancedAnnotation />
+
+## Overview
+
+Some functions put new fields on the table you give them. `RegisterMetaTable` is one: after the call, the table has `MetaID` and `MetaName`. Nothing in your code assigns those fields, so without help GLuaLS reports them as undefined.
+
+`adds_field` goes on the function's parameter and names each field the function adds. Every call then gives the passed table those fields, typed and in autocomplete. Go to definition on a field jumps to the argument of the call that added it.
+
+You only annotate the function. Callers write nothing extra.
+
+---
+
+## Syntax
+
+```lua
+---@[adds_field("FieldName", "type")]
+---@param paramName type
+```
+
+Put it directly above the `@param` of the table that gets the field. Add one line per field.
+
+- **`FieldName`** is the name of the new field.
+- **`type`** is optional. It is a built-in type such as `integer`, `string` or `boolean`, or a class name. End it with `?` for a field that may be `nil`. Without it, the field is `any`.
+
+---
+
+## Example
+
+The official annotations describe `RegisterMetaTable` like this:
+
+```lua
+---@param metaName string
+---@[adds_field("MetaID", "integer")]
+---@[adds_field("MetaName", "string")]
+---@param metaTable table
+function _G.RegisterMetaTable(metaName, metaTable) end
+```
+
+Any table you register now has both fields:
+
+```lua
+---@class MyMeta
+local META = {}
+
+function META:Describe() end
+
+RegisterMetaTable("MyMeta", META)
+
+local id = META.MetaID      -- integer
+local name = META.MetaName  -- string
+META:Describe()             -- existing members stay as they were
+```
+
+---
+
+## Where the fields go
+
+The fields go on whatever the argument is:
+
+- A variable typed as a class (`---@class` or `---@type`) gives the field to that class. Every value of the class sees it, including classes that inherit from it.
+- A plain table such as `local t = {}` gets the field on that table only.
+
+That makes factories work without extra annotations. Here `CreateMetaTable` registers a `battlemechs.Base` table, so every class it makes inherits `MetaID`:
+
+```lua
+---@generic T : battlemechs.Base
+---@param name battlemechs.`T`
+---@return (definition) T
+function CreateMetaTable(name)
+    ---@type (definition) battlemechs.Base
+    local meta = getmetatable(newproxy(true))
+    RegisterMetaTable("Battlemechs." .. name, meta)
+    return meta
+end
+
+local walker = CreateMetaTable("Walker")
+local id = walker.MetaID  -- integer
+```
+
+---
+
+## Your own functions
+
+Any function can use it, not only built-in ones:
+
+```lua
+---@[adds_field("NetworkID", "integer")]
+---@[adds_field("Owner", "Player?")]
+---@param ent table
+function MyAddon.Track(ent) end
+```
+
+```lua
+local tracked = {}
+MyAddon.Track(tracked)
+print(tracked.NetworkID)  -- integer
+print(tracked.Owner)      -- Player?
+```
+
+---
+
+## adds_field vs @outparam
+
+Use `adds_field` when the function creates a field that is not on the table yet.
+
+Use [`@outparam`](/annotations/outparam) when the function writes a result into a field the caller already set up, like `util.TraceLine` filling in `output`.

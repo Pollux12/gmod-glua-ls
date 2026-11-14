@@ -311,6 +311,103 @@ mod test {
             .semantic_decl
     }
 
+    fn alias_narrowing_local(body: &str, local_name: &str) -> String {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(&format!(
+            r#"
+            ---@class AliasHolder
+            ---@field value string|number
+
+            ---@param holder AliasHolder
+            local function read(holder)
+                {body}
+            end
+            "#
+        ));
+        ws.humanize_type(ws.local_ty(file_id, local_name))
+    }
+
+    #[gtest]
+    fn a_condition_through_a_local_alias_narrows_the_source_path() {
+        expect_that!(
+            alias_narrowing_local(
+                r#"
+                local h = holder
+                if type(h.value) == "string" then
+                    local narrowed = holder.value
+                end
+                "#,
+                "narrowed",
+            ),
+            eq("string")
+        );
+    }
+
+    #[gtest]
+    fn a_condition_on_the_source_narrows_reads_through_its_alias() {
+        expect_that!(
+            alias_narrowing_local(
+                r#"
+                local h = holder
+                if type(holder.value) == "number" then
+                    local narrowed = h.value
+                end
+                "#,
+                "narrowed",
+            ),
+            eq("number")
+        );
+    }
+
+    #[gtest]
+    fn an_assignment_through_a_local_alias_narrows_the_source_path() {
+        expect_that!(
+            alias_narrowing_local(
+                r#"
+                local h = holder
+                h.value = "fixed"
+                local narrowed = holder.value
+                "#,
+                "narrowed",
+            ),
+            eq("\"fixed\"")
+        );
+    }
+
+    #[gtest]
+    fn a_reassigned_local_is_not_an_alias_for_narrowing() {
+        expect_that!(
+            alias_narrowing_local(
+                r#"
+                local h = holder
+                h = { value = 1 }
+                if type(h.value) == "string" then
+                    local unnarrowed = holder.value
+                end
+                "#,
+                "unnarrowed",
+            ),
+            eq("(number|string)")
+        );
+    }
+
+    #[gtest]
+    fn an_annotated_local_is_not_an_alias_for_narrowing() {
+        expect_that!(
+            alias_narrowing_local(
+                r#"
+                ---@type AliasHolder
+                local h = holder
+                if type(h.value) == "string" then
+                    local unnarrowed = holder.value
+                end
+                "#,
+                "unnarrowed",
+            ),
+            eq("(number|string)")
+        );
+    }
+
     #[test]
     fn test_closure_return() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();

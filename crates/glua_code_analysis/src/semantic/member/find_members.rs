@@ -167,6 +167,8 @@ struct FindMembersContext {
     file_id: Option<FileId>,
     caller_position: Option<TextSize>,
     dynamic_fields: bool,
+    /// Whether the lookup reached the current class from one of its subclasses.
+    inherited: bool,
 }
 
 impl FindMembersContext {
@@ -178,6 +180,7 @@ impl FindMembersContext {
             file_id: None,
             caller_position: None,
             dynamic_fields: true,
+            inherited: false,
         }
     }
 
@@ -193,6 +196,7 @@ impl FindMembersContext {
             file_id: Some(file_id),
             caller_position: None,
             dynamic_fields: true,
+            inherited: false,
         }
     }
 
@@ -209,6 +213,7 @@ impl FindMembersContext {
             file_id: Some(file_id),
             caller_position: Some(caller_position),
             dynamic_fields: true,
+            inherited: false,
         }
     }
 
@@ -220,6 +225,7 @@ impl FindMembersContext {
             file_id: self.file_id,
             caller_position: self.caller_position,
             dynamic_fields: self.dynamic_fields,
+            inherited: self.inherited,
         }
     }
 
@@ -231,6 +237,15 @@ impl FindMembersContext {
             file_id: self.file_id,
             caller_position: self.caller_position,
             dynamic_fields: self.dynamic_fields,
+            inherited: self.inherited,
+        }
+    }
+
+    /// This lookup as it continues into a class's supers.
+    fn inherited(&self) -> Self {
+        Self {
+            inherited: true,
+            ..self.clone()
         }
     }
 
@@ -501,9 +516,11 @@ fn find_super_type_members(
     filter: &FindMemberFilter,
 ) -> FindMembersResult {
     let mut members = Vec::new();
+    let super_ctx = ctx.inherited();
     for super_type in super_types_for_context(db, type_decl_id, ctx)? {
         let instantiated_super = ctx.instantiate_type(db, super_type);
-        if let Some(super_members) = find_members_guard(db, &instantiated_super, ctx, filter) {
+        if let Some(super_members) = find_members_guard(db, &instantiated_super, &super_ctx, filter)
+        {
             members.extend(super_members);
             if should_stop_collecting(members.len(), filter) {
                 break;
@@ -1181,21 +1198,56 @@ fn append_dynamic_fields_for_type(
         return should_stop;
     }
 
+    append_dynamic_field_names(
+        db,
+        ctx,
+        &owner,
+        &prefix_type,
+        members,
+        filter,
+        emmyrc.gmod.dynamic_fields_global,
+    )
+}
+
+/// Appends every dynamic field of `owner` this lookup sees, in name order.
+fn append_dynamic_field_names(
+    db: &DbIndex,
+    ctx: &FindMembersContext,
+    owner: &crate::DynamicFieldOwner,
+    prefix_type: &LuaType,
+    members: &mut Vec<LuaMemberInfo>,
+    filter: &FindMemberFilter,
+    dynamic_fields_global: bool,
+) -> bool {
+    let own_writes_only = reads_own_writes_only(ctx, owner);
+    let in_file = (!dynamic_fields_global).then(|| ctx.file_id()).flatten();
     let index = db.get_dynamic_field_index();
-    let mut field_names = if emmyrc.gmod.dynamic_fields_global {
+    let mut field_names = if own_writes_only {
         index
-            .get_fields(&owner)
-            .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
+            .get_direct_fields(owner)
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter(|(_, definitions)| {
+                        in_file.is_none_or(|file_id| {
+                            definitions
+                                .iter()
+                                .any(|definition| definition.file_id == file_id)
+                        })
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default()
-    } else if let Some(file_id) = ctx.file_id() {
+    } else if let Some(file_id) = in_file {
         index
-            .get_fields_in_file(&owner, file_id)
+            .get_fields_in_file(owner, file_id)
             .into_iter()
             .cloned()
             .collect::<Vec<_>>()
     } else {
         index
-            .get_fields(&owner)
+            .get_fields(owner)
             .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default()
     };
@@ -1219,13 +1271,19 @@ fn append_dynamic_fields_for_type(
         }
 
         if let Some(site) = &access_site
-            && !dynamic_field_visible_at_offset(db, &owner, &field_name, site)
+            && !dynamic_field_visible_at_offset(db, owner, &field_name, site, own_writes_only)
         {
             continue;
         }
 
         let resolved = ctx.file_id().and_then(|file_id| {
-            resolve_dynamic_field_member_for_file(db, file_id, &prefix_type, &member_key)
+            resolve_dynamic_field_member_for_file(
+                db,
+                file_id,
+                prefix_type,
+                &member_key,
+                own_writes_only,
+            )
         });
 
         members.push(LuaMemberInfo {
@@ -1244,6 +1302,13 @@ fn append_dynamic_fields_for_type(
     }
 
     false
+}
+
+/// Whether this lookup sees only the fields written on `owner` itself: a class
+/// reached from a subclass passes down those, not the ones its other subclasses'
+/// writes put on it.
+fn reads_own_writes_only(ctx: &FindMembersContext, owner: &crate::DynamicFieldOwner) -> bool {
+    ctx.inherited && matches!(owner, crate::DynamicFieldOwner::Type(_))
 }
 
 fn append_dynamic_fields_for_table(
@@ -1278,69 +1343,15 @@ fn append_dynamic_fields_for_table(
         return should_stop;
     }
 
-    let index = db.get_dynamic_field_index();
-    let mut field_names = if emmyrc.gmod.dynamic_fields_global {
-        index
-            .get_fields(&owner)
-            .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
-            .unwrap_or_default()
-    } else if let Some(file_id) = ctx.file_id() {
-        index
-            .get_fields_in_file(&owner, file_id)
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        index
-            .get_fields(&owner)
-            .map(|fields| fields.keys().cloned().collect::<Vec<_>>())
-            .unwrap_or_default()
-    };
-
-    field_names.sort_unstable();
-    field_names.dedup();
-    let access_site = ctx.dynamic_field_access_site(db);
-    let existing = members
-        .iter()
-        .map(|member| member.key.clone())
-        .collect::<HashSet<_>>();
-
-    for field_name in field_names {
-        let member_key = LuaMemberKey::Name(field_name.clone());
-        if !should_include_member(&member_key, filter) {
-            continue;
-        }
-
-        if existing.contains(&member_key) {
-            continue;
-        }
-
-        if let Some(site) = &access_site
-            && !dynamic_field_visible_at_offset(db, &owner, &field_name, site)
-        {
-            continue;
-        }
-
-        let resolved = ctx.file_id().and_then(|file_id| {
-            resolve_dynamic_field_member_for_file(db, file_id, &prefix_type, &member_key)
-        });
-
-        members.push(LuaMemberInfo {
-            property_owner_id: None,
-            key: member_key,
-            typ: resolved
-                .map(|resolution| resolution.typ)
-                .unwrap_or(LuaType::Any),
-            feature: None,
-            overload_index: None,
-        });
-
-        if should_stop_collecting(members.len(), filter) {
-            return true;
-        }
-    }
-
-    false
+    append_dynamic_field_names(
+        db,
+        ctx,
+        &owner,
+        &prefix_type,
+        members,
+        filter,
+        emmyrc.gmod.dynamic_fields_global,
+    )
 }
 
 /// A dynamic field is only as visible as its assignments. GLua load order only
@@ -1361,10 +1372,14 @@ fn dynamic_field_visible_at_offset(
     owner: &crate::DynamicFieldOwner,
     field_name: &str,
     site: &DynamicFieldAccessSite,
+    own_writes_only: bool,
 ) -> bool {
-    let definitions = db
-        .get_dynamic_field_index()
-        .field_definitions(owner, field_name);
+    let index = db.get_dynamic_field_index();
+    let definitions = if own_writes_only {
+        index.direct_definitions_of(owner, field_name)
+    } else {
+        index.field_definitions(owner, field_name)
+    };
     if definitions.is_empty() {
         return true;
     }
@@ -1407,10 +1422,15 @@ fn append_keyed_dynamic_field(
         return Some(false);
     }
 
+    let own_writes_only = reads_own_writes_only(ctx, owner);
+    let in_file = (!dynamic_fields_global).then(|| ctx.file_id()).flatten();
     let index = db.get_dynamic_field_index();
-    let is_visible = if dynamic_fields_global {
-        index.has_field(owner, field_name)
-    } else if let Some(file_id) = ctx.file_id() {
+    let is_visible = if own_writes_only {
+        index
+            .direct_definitions_of(owner, field_name)
+            .iter()
+            .any(|definition| in_file.is_none_or(|file_id| definition.file_id == file_id))
+    } else if let Some(file_id) = in_file {
         index.has_field_in_file(owner, field_name, file_id)
     } else {
         index.has_field(owner, field_name)
@@ -1419,13 +1439,13 @@ fn append_keyed_dynamic_field(
         return Some(false);
     }
     if let Some(site) = ctx.dynamic_field_access_site(db)
-        && !dynamic_field_visible_at_offset(db, owner, field_name, &site)
+        && !dynamic_field_visible_at_offset(db, owner, field_name, &site, own_writes_only)
     {
         return Some(false);
     }
 
     let resolved = ctx.file_id().and_then(|file_id| {
-        resolve_dynamic_field_member_for_file(db, file_id, prefix_type, member_key)
+        resolve_dynamic_field_member_for_file(db, file_id, prefix_type, member_key, own_writes_only)
     });
     members.push(LuaMemberInfo {
         property_owner_id: None,

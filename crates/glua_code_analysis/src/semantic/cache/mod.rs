@@ -329,8 +329,9 @@ pub struct LuaInferCache {
     /// declaration's block each time.
     pub in_place_ipairs_transform_cache:
         Untracked<FxHashMap<LuaDeclId, Option<(TextSize, LuaType)>>>,
+    /// Keyed by whether the lookup reached the type from a subclass.
     pub dynamic_field_resolution_cache: TrackedMap<
-        (LuaType, LuaMemberKey, Option<TextSize>),
+        (LuaType, LuaMemberKey, Option<TextSize>, bool),
         Option<(LuaType, Option<LuaSemanticDeclId>)>,
     >,
     /// A table literal's own informative answer for a literal key, by where

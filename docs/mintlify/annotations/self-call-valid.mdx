@@ -1,0 +1,55 @@
+---
+title: "@self_call_valid"
+description: Mark a callback where a method on self always returns a valid value.
+---
+import AdvancedAnnotation from "/snippets/advanced-annotation.mdx"
+
+<AdvancedAnnotation />
+
+## Overview
+
+Some callbacks only run when a value is known to be valid. A weapon's `Think` only runs while a player holds the weapon, so `self:GetOwner()` is always valid there, even though `GetOwner` can return `NULL` elsewhere.
+
+`self_call_valid` goes on the callback and names that method. Inside the callback, calls of it on `self` are treated as valid.
+
+The official annotations already mark the weapon and entity callbacks where this holds.
+
+---
+
+## Syntax
+
+```lua
+---@[self_call_valid("MethodName")]
+```
+
+Put it with the callback's other annotations. Add one line per method.
+
+---
+
+## Example
+
+```lua
+---@return nil
+---@[self_call_valid("GetOwner")]
+function WEAPON:Think() end
+```
+
+```lua
+function SWEP:Think()
+    local owner = self:GetOwner()
+    owner:GetAimVector() -- no nil or NULL warning
+end
+```
+
+---
+
+## Keep it narrow
+
+It applies only inside the annotated callback. Helper methods the callback calls do not get it, and `GetOwner` keeps its normal return type everywhere else.
+
+---
+
+## See also
+
+- [`@valid_guard`](/annotations/valid-guard): a function that proves its argument is valid
+- [`@self_guard`](/annotations/self-guard): a method that proves its receiver is valid

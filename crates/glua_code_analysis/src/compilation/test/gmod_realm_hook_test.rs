@@ -3788,6 +3788,40 @@ end
         );
     }
 
+    /// `include` names a file under `lua/`, so a folder's `init.lua` is reached
+    /// like any other file, as ULib's loader reaches `ulib/init.lua`.
+    #[gtest]
+    fn test_include_reaches_a_folder_init_file_by_its_lua_path() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let server_id = ws.def_file("lua/mylib/init.lua", r#"include("mylib/shared/hook.lua")"#);
+        ws.def_file(
+            "lua/mylib/cl_init.lua",
+            r#"include("mylib/shared/hook.lua")"#,
+        );
+        let shared_id = ws.def_file("lua/mylib/shared/hook.lua", "return true");
+        ws.def_file(
+            "lua/autorun/mylib_init.lua",
+            r#"
+            if SERVER then
+                include("mylib/init.lua")
+            else
+                include("mylib/cl_init.lua")
+            end
+            "#,
+        );
+
+        let load_index = ws.analysis.compilation.get_db().get_gmod_load_index();
+        let state_mask = |file_id| {
+            load_index
+                .get_file_info(&file_id)
+                .map(|info| info.state_mask)
+        };
+        assert_that!(state_mask(server_id), some(eq(GmodStateMask::SERVER)));
+        assert_that!(state_mask(shared_id), some(eq(GmodStateMask::SHARED)));
+    }
+
     #[gtest]
     fn test_load_index_dynamic_file_find_conventional_entrypoint_loader() {
         let mut ws = VirtualWorkspace::new();

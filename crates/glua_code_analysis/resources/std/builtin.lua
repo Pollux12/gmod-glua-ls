@@ -197,6 +197,24 @@
 --- - `return_self`: Whether the constructor is forced to return `self`, defaults to `true`
 ---@attribute constructor(name: string, root_class: string?, strip_self: boolean?, return_self: boolean?)
 
+---
+--- Marks a function parameter whose table gets a new field when the function is called.
+--- The field is added to the table the caller passes, so it is known after the call.
+--- Repeat the attribute to add several fields.
+---
+--- Parameters:
+--- - `name`: The name of the field.
+--- - `type`: The type of the field, such as `integer`, `string` or a class name. Add `?` for an optional field. Defaults to `any`.
+---@attribute adds_field(name: string, type: string?)
+
+---
+--- Marks a parameter whose argument names the parent class of the class this call creates.
+--- A string argument is wrapped in the same prefix and suffix as the function's string-template class
+--- parameter, so `CreateMetaTable("Walker", "Mech")` makes `battlemechs.Walker` inherit `battlemechs.Mech`.
+--- A class value, such as the table an earlier call returned, names its own class.
+--- The parent must be a class that exists; otherwise only `root_class` applies.
+---@attribute base_class()
+
 --- Marks a function whose first return value is the exact value passed in one
 --- of its arguments. This is stronger than a generic parameter/return type
 --- correlation because it preserves runtime value identity.
@@ -277,6 +295,12 @@
 ---@attribute valid_guard()
 
 ---@attribute fresh_result()
+
+--- Marks a method that takes no arguments and returns the class name of the object it is
+--- called on, such as `Entity:GetClass`. Comparing the result with a class name, or passing it to
+--- a base test such as `scripted_ents.IsBasedOn`, narrows that object to the class. Results of
+--- other methods, such as `ent:GetOwnerClass()`, leave the object as it was.
+---@attribute self_class_name()
 
 --- Marks a function that returns a new table starting with the contents of its
 --- first argument, such as `table.Copy`. Writes to the copy never reach the

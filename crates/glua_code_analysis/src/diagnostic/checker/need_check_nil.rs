@@ -2300,27 +2300,19 @@ fn guard_continuing_clauses_reassign_guarded_expr(
     guarded_expr: &LuaExpr,
     if_stat: &LuaIfStat,
 ) -> bool {
-    for elseif_clause in if_stat.get_else_if_clause_list() {
-        if elseif_clause.get_block().is_some_and(|block| {
-            block.descendants::<LuaAssignStat>().any(|assign_stat| {
-                assign_stat_reassigns_guarded_expr(semantic_model, &assign_stat, guarded_expr)
-            })
-        }) {
-            return true;
-        }
-    }
-
-    if if_stat.get_else_clause().is_some_and(|else_clause| {
-        else_clause.get_block().is_some_and(|block| {
+    if_stat
+        .get_else_if_clause_list()
+        .filter_map(|clause| clause.get_block())
+        .chain(
+            if_stat
+                .get_else_clause()
+                .and_then(|clause| clause.get_block()),
+        )
+        .any(|block| {
             block.descendants::<LuaAssignStat>().any(|assign_stat| {
                 assign_stat_reassigns_guarded_expr(semantic_model, &assign_stat, guarded_expr)
             })
         })
-    }) {
-        return true;
-    }
-
-    false
 }
 
 fn guarded_expr_reassigned_between(

@@ -46,6 +46,7 @@ use infer_name::infer_name_expr;
 pub(crate) use infer_name::is_authoritative_self_receiver_type;
 pub(crate) use infer_name::is_concrete_self_receiver_type;
 pub(crate) use infer_name::resolve_global_singleton_scripted_type_decl_id;
+pub(crate) use infer_name::resolve_type_text;
 pub(crate) use infer_name::try_local_decl_initializer_fallback_type;
 pub(crate) use infer_name::type_decl_is_vgui_panel;
 pub(crate) use infer_name::{ParamInferenceSource, infer_param_is_weak, infer_param_source};
@@ -59,7 +60,8 @@ pub use narrow::{SelfRefId, VarRefId, VarRefRootId};
 pub(crate) use narrow::{
     condition_has_concrete_type_evidence, condition_nominal_type, contains_gmod_null_type,
     get_var_expr_var_ref_id, getter_access_path, is_gmod_null_entity_candidate,
-    presence_guard_target, raw_get_access_path, remove_false_or_nil,
+    narrowing_root_decl, presence_guard_target, raw_get_access_path, remove_false_or_nil,
+    respell_path_root,
 };
 
 use rowan::TextRange;

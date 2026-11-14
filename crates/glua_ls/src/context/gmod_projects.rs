@@ -969,7 +969,7 @@ mod tests {
             ),
             module(
                 "garrysmod/gamemodes/beta/gamemode/init.lua",
-                "gamemode",
+                "gamemode.init",
                 "garrysmod/gamemodes/beta",
             ),
         ];
@@ -1026,7 +1026,7 @@ mod tests {
                 ),
                 module(
                     "garrysmod/gamemodes/beta/gamemode/init.lua",
-                    "gamemode",
+                    "gamemode.init",
                     "garrysmod/gamemodes/beta",
                 ),
             ]
