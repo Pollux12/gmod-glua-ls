@@ -6083,3 +6083,22 @@ fn dangling_scoped_class_ref_matches_its_own_def() {
         "a value of a dangling scripted-class ref must satisfy its own type: {diags:#?}"
     );
 }
+
+/// A parameter typed only by its name, as `mat` is `IMaterial` by default,
+/// holds a guess: passing it on does not report a mismatch.
+#[test]
+fn a_parameter_typed_by_its_name_alone_does_not_mismatch() {
+    let mut ws = crate::VirtualWorkspace::new();
+    ws.def("---@class IMaterial");
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::ParamTypeMismatch,
+        r#"
+        ---@param path string
+        local function set_material(path) end
+
+        function OnMaterialChanged(mat)
+            set_material(mat)
+        end
+        "#,
+    ));
+}

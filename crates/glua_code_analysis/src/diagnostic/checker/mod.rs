@@ -1238,15 +1238,34 @@ fn strip_inferred_uncertainty(typ: &LuaType) -> LuaType {
     }
 }
 
+/// Whether `expr` reads a parameter whose type is only a guess, from its name
+/// or from how it is used.
+fn reads_guessed_param(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {
+    let Some(decl) = inference_trust::local_read_declaration(semantic_model, expr) else {
+        return false;
+    };
+    decl.is_param()
+        && inference_trust::param_read_rests_on_declaration(semantic_model, expr, decl)
+        && crate::semantic::infer_param_is_weak(
+            semantic_model.get_db(),
+            &mut semantic_model.get_cache().borrow_mut(),
+            decl,
+        )
+}
+
 pub fn should_suppress_inferred_value_mismatch(
     semantic_model: &SemanticModel,
     expected_type: &LuaType,
     actual_type: &LuaType,
     actual_expr: &LuaExpr,
 ) -> bool {
-    if semantic_model.get_emmyrc().strict.inferred_type_mismatch
-        || !expr_has_inferred_type(semantic_model, actual_expr)
-    {
+    if semantic_model.get_emmyrc().strict.inferred_type_mismatch {
+        return false;
+    }
+    if reads_guessed_param(semantic_model, actual_expr) {
+        return true;
+    }
+    if !expr_has_inferred_type(semantic_model, actual_expr) {
         return false;
     }
 
