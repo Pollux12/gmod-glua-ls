@@ -181,8 +181,16 @@ pub struct GmodNetworkVarCallRoles {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GmodClassRegistrationCallRoles {
     pub define: GmodClassCallArgSource,
-    pub table: Option<GmodClassCallArgSource>,
+    pub table: Option<GmodRegisteredTableSource>,
     pub base: Option<GmodClassCallArgSource>,
+}
+
+/// Where a registration call finds the table it registers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GmodRegisteredTableSource {
+    Arg(GmodClassCallArgSource),
+    /// The table the call returns.
+    Result,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -229,11 +237,18 @@ impl GmodScriptedClassCallMetadata {
             .unwrap_or(0)
     }
 
-    pub fn class_registration_table_arg_idx(&self, default_arg_idx: usize) -> usize {
+    /// The argument holding the registered table. `None` when the call
+    /// returns it instead.
+    pub fn class_registration_table_arg_idx(&self, default_arg_idx: usize) -> Option<usize> {
+        self.class_registration_table_arg_source(default_arg_idx)
+            .map(|source| source.arg_idx)
+    }
+
+    /// Whether the call returns the table it registers.
+    pub fn class_registration_table_is_result(&self) -> bool {
         self.class_registration_roles
             .as_ref()
-            .and_then(|roles| roles.table.as_ref().map(|source| source.arg_idx))
-            .unwrap_or(default_arg_idx)
+            .is_some_and(|roles| roles.table == Some(GmodRegisteredTableSource::Result))
     }
 
     pub fn class_registration_base_arg_idx(&self, default_arg_idx: Option<usize>) -> Option<usize> {
@@ -250,14 +265,21 @@ impl GmodScriptedClassCallMetadata {
             .unwrap_or_else(|| GmodClassCallArgSource::direct(0))
     }
 
+    /// The argument holding the registered table. `None` when the call
+    /// returns it instead.
     pub fn class_registration_table_arg_source(
         &self,
         default_arg_idx: usize,
-    ) -> GmodClassCallArgSource {
-        self.class_registration_roles
+    ) -> Option<GmodClassCallArgSource> {
+        match self
+            .class_registration_roles
             .as_ref()
-            .and_then(|roles| roles.table.clone())
-            .unwrap_or_else(|| GmodClassCallArgSource::direct(default_arg_idx))
+            .and_then(|roles| roles.table.as_ref())
+        {
+            Some(GmodRegisteredTableSource::Arg(source)) => Some(source.clone()),
+            Some(GmodRegisteredTableSource::Result) => None,
+            None => Some(GmodClassCallArgSource::direct(default_arg_idx)),
+        }
     }
 
     pub fn class_registration_base_arg_source(

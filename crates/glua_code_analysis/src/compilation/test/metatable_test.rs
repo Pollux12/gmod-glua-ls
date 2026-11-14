@@ -2343,6 +2343,145 @@ mod test {
         );
     }
 
+    const METATABLE_FACTORY: (&str, &str) = (
+        "lua/autorun/sh_meta.lua",
+        r#"
+        function CreateMetaTable(name)
+            local metaName = "Example." .. name
+            local meta = FindMetaTable(metaName)
+            if meta then
+                return meta
+            end
+
+            local proxy = newproxy(true)
+            meta = getmetatable(proxy)
+            RegisterMetaTable(metaName, meta)
+            meta.__index = meta
+            return meta
+        end
+        "#,
+    );
+
+    /// A function that registers the metatable it returns makes each call a
+    /// class registration: the local the call fills is the named class.
+    #[test]
+    fn a_metatable_factory_call_registers_the_class_it_returns() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![METATABLE_FACTORY]);
+        let bone = ws.def_file(
+            "lua/autorun/sh_bone.lua",
+            r#"
+            local BONE = CreateMetaTable("Bone")
+            function BONE:Name() return "bone" end
+            "#,
+        );
+        let reader = ws.def_file(
+            "lua/autorun/sh_reader.lua",
+            r#"
+            local found = FindMetaTable("Example.Bone")
+            local name = found.Name
+            "#,
+        );
+
+        let class = ws.local_ty(bone, "BONE");
+        assert_eq!(ws.humanize_type(class), "Example.Bone");
+        let found = ws.local_ty(reader, "found");
+        assert_eq!(ws.humanize_type(found), "Example.Bone");
+        assert!(is_function_type(&ws.local_ty(reader, "name")));
+    }
+
+    /// A function that returns what a factory call returns is a factory
+    /// too, whether it returns the call or a local holding it.
+    #[test]
+    fn a_function_returning_a_factory_call_is_a_factory() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![(
+            "lua/autorun/sh_meta.lua",
+            r#"
+            function NewClass(name)
+                local meta = {}
+                meta.__index = meta
+                RegisterMetaTable(name, meta)
+                return meta
+            end
+
+            function NewWidget(name)
+                return NewClass("Widget." .. name)
+            end
+
+            function NewGadget(name)
+                local gadget = NewClass("Gadget." .. name)
+                gadget.Kind = name
+                return gadget
+            end
+            "#,
+        )]);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_use.lua",
+            r#"
+            local WIDGET = NewWidget("Button")
+            local GADGET = NewGadget("Lamp")
+            "#,
+        );
+
+        let widget = ws.local_ty(file_id, "WIDGET");
+        assert_eq!(ws.humanize_type(widget), "Widget.Button");
+        let gadget = ws.local_ty(file_id, "GADGET");
+        assert_eq!(ws.humanize_type(gadget), "Gadget.Lamp");
+    }
+
+    /// Factories are not particular to metatables: a function returning the
+    /// panel table it registers makes each call a panel class.
+    #[test]
+    fn a_panel_factory_call_registers_the_panel_it_returns() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![(
+            "lua/autorun/client/cl_panels.lua",
+            r#"
+            function MakePanel(name)
+                local PANEL = {}
+                vgui.Register(name, PANEL, "DPanel")
+                return PANEL
+            end
+            "#,
+        )]);
+        let file_id = ws.def_file(
+            "lua/autorun/client/cl_use.lua",
+            r#"
+            local PNL = MakePanel("MyPanel")
+            "#,
+        );
+
+        let panel = ws.local_ty(file_id, "PNL");
+        assert_eq!(ws.humanize_type(panel), "MyPanel");
+    }
+
+    /// Making the factory return something else, and back, leaves what a
+    /// fresh analysis of the final text has.
+    #[test]
+    fn editing_a_metatable_factory_matches_a_fresh_analysis() {
+        let user = (
+            "lua/autorun/sh_bone.lua",
+            "local BONE = CreateMetaTable(\"Bone\")\nfunction BONE:Name() return self end",
+        );
+        let (head, tail) = METATABLE_FACTORY
+            .1
+            .rsplit_once("return meta")
+            .expect("return");
+        let not_returned = format!("{head}return proxy{tail}");
+        let setup = |ws: &mut VirtualWorkspace| {
+            ws.def_gmod_call_arg_builtins();
+        };
+        VirtualWorkspace::assert_warm_matches_cold(
+            setup,
+            &[METATABLE_FACTORY, user],
+            &[(METATABLE_FACTORY.0, &not_returned), METATABLE_FACTORY],
+        );
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }

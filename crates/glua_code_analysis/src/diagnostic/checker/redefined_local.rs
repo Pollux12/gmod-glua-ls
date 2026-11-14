@@ -325,8 +325,11 @@ fn gmod_registration_consumes_decl_before_reuse(
     old_decl: &LuaDecl,
     current_decl: &LuaDecl,
     call: &GmodScriptedClassCallMetadata,
-    table_source: GmodClassCallArgSource,
+    table_source: Option<GmodClassCallArgSource>,
 ) -> bool {
+    let Some(table_source) = table_source else {
+        return false;
+    };
     if !matches!(
         call.value_for_arg_source(&table_source),
         Some(GmodClassCallLiteral::NameRef(table_name)) if table_name == name

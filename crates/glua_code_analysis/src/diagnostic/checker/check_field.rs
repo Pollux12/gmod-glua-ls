@@ -1514,7 +1514,7 @@ fn is_unresolved_panel_registration_table(
             )
         })
     })
-    .filter(|(source, _)| !source.is_derived())
+    .filter_map(|(source, call)| Some((source.filter(|source| !source.is_derived())?, call)))
     .any(|(source, call)| {
         call.args
             .get(source.arg_idx)

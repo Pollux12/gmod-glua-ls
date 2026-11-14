@@ -23,12 +23,12 @@ use crate::semantic::{
 use crate::{
     EmmyrcGmodRealm, FileId, GlobalId, GmodClassCallArg, GmodClassCallArgSource,
     GmodClassCallLiteral, GmodClassRegistrationCallRoles, GmodDermaSkinCallRoles,
-    GmodNamedStringCallRoles, GmodNetworkVarCallRoles, GmodScriptedClassCallKind,
-    GmodScriptedClassCallMetadata, GmodScriptedClassFileMetadata, GmodScriptedClassRegisterRoles,
-    GmodVguiParentCallMetadata, GmodVguiParentSource, InFiled, LuaCallArgRole, LuaDecl,
-    LuaDeclExtra, LuaDeclId, LuaDeclTypeKind, LuaFunctionType, LuaInferCache, LuaMember,
-    LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignature, LuaSignatureId, LuaType,
-    LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
+    GmodNamedStringCallRoles, GmodNetworkVarCallRoles, GmodRegisteredTableSource,
+    GmodScriptedClassCallKind, GmodScriptedClassCallMetadata, GmodScriptedClassFileMetadata,
+    GmodScriptedClassRegisterRoles, GmodVguiParentCallMetadata, GmodVguiParentSource, InFiled,
+    LuaCallArgRole, LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclTypeKind, LuaFunctionType,
+    LuaInferCache, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignature,
+    LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{
         AnalyzeContext,
         common::{TypeCacheWriteMode, write_type_cache},
@@ -672,6 +672,8 @@ struct ForwardedCall {
     callee_path: String,
     callee_is_colon: bool,
     args: Vec<ForwardedArg>,
+    /// Whether the function returns the call's result.
+    returned: bool,
 }
 
 /// An argument of a [`ForwardedCall`], written in terms of the function's
@@ -685,6 +687,8 @@ enum ForwardedArg {
         prefix: String,
         suffix: String,
     },
+    /// A local the function returns at every `return`.
+    Returned,
     Other,
 }
 
@@ -722,9 +726,18 @@ fn collect_forwarded_calls(
         let Some(args_list) = call_expr.get_args_list() else {
             continue;
         };
+        let local_value =
+            |name_expr: &LuaNameExpr| wrapper_local_value(db, file_id, &closure, name_expr);
         let args = args_list
             .get_args()
-            .map(|arg| forwarded_arg(&arg, &signature.params))
+            .map(
+                |arg| match forwarded_arg(&arg, &signature.params, &local_value) {
+                    ForwardedArg::Other if wrapper_returns(db, file_id, &closure, &arg) => {
+                        ForwardedArg::Returned
+                    }
+                    forwarded => forwarded,
+                },
+            )
             .collect::<Vec<_>>();
         if args.iter().all(|arg| matches!(arg, ForwardedArg::Other)) {
             continue;
@@ -734,26 +747,100 @@ fn collect_forwarded_calls(
             callee_path: callee_path.to_string(),
             callee_is_colon: call_expr.is_colon_call(),
             args,
+            returned: wrapper_returns(db, file_id, &closure, &LuaExpr::CallExpr(call_expr.clone())),
         });
     }
     forwarded_calls
 }
 
-fn forwarded_arg(expr: &LuaExpr, params: &[SmolStr]) -> ForwardedArg {
+/// The value a local of `closure` that is never reassigned was initialised
+/// with.
+fn wrapper_local_value(
+    db: &DbIndex,
+    file_id: FileId,
+    closure: &LuaClosureExpr,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaExpr> {
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, name_expr.get_range())?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let is_mutated = db
+        .get_reference_index()
+        .get_decl_references(&file_id, &decl_id)
+        .is_some_and(|references| references.mutable);
+    if !decl.is_local() || is_mutated || !closure.get_range().contains(decl_id.position) {
+        return None;
+    }
+    match local_initializer_expr(db, decl_id)? {
+        (0, value) => Some(value),
+        _ => None,
+    }
+}
+
+/// Whether every `return` of `closure` returns the value of `expr`: the
+/// local it names, or the call itself or the local that holds it.
+fn wrapper_returns(
+    db: &DbIndex,
+    file_id: FileId,
+    closure: &LuaClosureExpr,
+    expr: &LuaExpr,
+) -> bool {
+    let decl_of = |name_expr: &LuaNameExpr| {
+        db.get_reference_index()
+            .get_var_reference_decl(&file_id, name_expr.get_range())
+    };
+    let holder = match expr {
+        LuaExpr::NameExpr(name_expr) => decl_of(name_expr),
+        LuaExpr::CallExpr(_) => expr
+            .get_parent::<LuaLocalStat>()
+            .and_then(|local_stat| {
+                let idx = local_stat
+                    .get_value_exprs()
+                    .position(|value| value.syntax() == expr.syntax())?;
+                local_stat.get_local_name_list().nth(idx)
+            })
+            .map(|local_name| crate::LuaDeclId::new(file_id, local_name.get_position())),
+        _ => None,
+    };
+    let mut returns = closure
+        .descendants::<glua_parser::LuaReturnStat>()
+        .filter(|return_stat| {
+            return_stat.ancestors::<LuaClosureExpr>().next().as_ref() == Some(closure)
+        })
+        .peekable();
+    returns.peek().is_some()
+        && returns.all(|return_stat| match return_stat.get_expr_list().next() {
+            Some(LuaExpr::NameExpr(name_expr)) => holder.is_some() && decl_of(&name_expr) == holder,
+            Some(returned) => returned.syntax() == expr.syntax(),
+            None => false,
+        })
+}
+
+fn forwarded_arg(
+    expr: &LuaExpr,
+    params: &[SmolStr],
+    local_value: &dyn Fn(&LuaNameExpr) -> Option<LuaExpr>,
+) -> ForwardedArg {
     enum Piece {
         Text(String),
         Param(usize, Vec<String>),
         Other,
     }
 
-    fn push_pieces(expr: &LuaExpr, params: &[SmolStr], pieces: &mut Vec<Piece>) {
+    fn push_pieces(
+        expr: &LuaExpr,
+        params: &[SmolStr],
+        local_value: &dyn Fn(&LuaNameExpr) -> Option<LuaExpr>,
+        pieces: &mut Vec<Piece>,
+    ) {
         let param_idx = |name: &str| params.iter().position(|param| param == name);
         match expr {
             LuaExpr::LiteralExpr(_) => {
                 pieces.push(static_literal_string(expr).map_or(Piece::Other, Piece::Text));
             }
             LuaExpr::ParenExpr(paren_expr) => match paren_expr.get_expr() {
-                Some(inner) => push_pieces(&inner, params, pieces),
+                Some(inner) => push_pieces(&inner, params, local_value, pieces),
                 None => pieces.push(Piece::Other),
             },
             LuaExpr::BinaryExpr(binary_expr)
@@ -763,18 +850,21 @@ fn forwarded_arg(expr: &LuaExpr, params: &[SmolStr]) -> ForwardedArg {
             {
                 match binary_expr.get_exprs() {
                     Some((left, right)) => {
-                        push_pieces(&left, params, pieces);
-                        push_pieces(&right, params, pieces);
+                        push_pieces(&left, params, local_value, pieces);
+                        push_pieces(&right, params, local_value, pieces);
                     }
                     None => pieces.push(Piece::Other),
                 }
             }
-            LuaExpr::NameExpr(name_expr) => pieces.push(
-                name_expr
-                    .get_name_text()
-                    .and_then(|name| param_idx(&name))
-                    .map_or(Piece::Other, |idx| Piece::Param(idx, Vec::new())),
-            ),
+            LuaExpr::NameExpr(name_expr) => {
+                match name_expr.get_name_text().and_then(|name| param_idx(&name)) {
+                    Some(idx) => pieces.push(Piece::Param(idx, Vec::new())),
+                    None => match local_value(name_expr) {
+                        Some(value) => push_pieces(&value, params, local_value, pieces),
+                        None => pieces.push(Piece::Other),
+                    },
+                }
+            }
             LuaExpr::IndexExpr(index_expr) => {
                 pieces.push(match index_expr_root_and_field_path(index_expr) {
                     Some((LuaExpr::NameExpr(root), field_path)) => root
@@ -789,7 +879,7 @@ fn forwarded_arg(expr: &LuaExpr, params: &[SmolStr]) -> ForwardedArg {
     }
 
     let mut pieces = Vec::new();
-    push_pieces(expr, params, &mut pieces);
+    push_pieces(expr, params, local_value, &mut pieces);
     let mut prefix = String::new();
     let mut suffix = String::new();
     let mut param = None;
@@ -4378,8 +4468,9 @@ fn synthesize_vgui_registrations(
             );
             let mut resolved_registration = None;
             if let Some(panel_name) = panel_name.as_deref() {
-                if let Some(GmodClassCallLiteral::NameRef(table_var)) =
-                    call.value_for_arg_source(&table_source)
+                if let Some(GmodClassCallLiteral::NameRef(table_var)) = table_source
+                    .as_ref()
+                    .and_then(|source| call.value_for_arg_source(source))
                     && let Some((decl_id, region_start)) =
                         resolve_local_registration_region(db, file_id, table_var, register_position)
                 {
@@ -4421,7 +4512,9 @@ fn synthesize_vgui_registrations(
 
         for call in &metadata.vgui_register_table_calls {
             let register_position = call.syntax_id.get_range().start();
-            let table_source = call.class_registration_table_arg_source(0);
+            let Some(table_source) = call.class_registration_table_arg_source(0) else {
+                continue;
+            };
             let is_actual_registration =
                 actual_register_table_positions.contains(&register_position);
             if !is_actual_registration
@@ -4501,8 +4594,9 @@ fn synthesize_vgui_registrations(
             );
             let mut resolved_registration = None;
             if let Some(panel_name) = panel_name.as_deref() {
-                if let Some(GmodClassCallLiteral::NameRef(table_var)) =
-                    call.value_for_arg_source(&table_source)
+                if let Some(GmodClassCallLiteral::NameRef(table_var)) = table_source
+                    .as_ref()
+                    .and_then(|source| call.value_for_arg_source(source))
                     && let Some((decl_id, region_start)) =
                         resolve_local_registration_region(db, file_id, table_var, register_position)
                 {
@@ -6292,7 +6386,10 @@ fn synthesize_vgui_register(
     let table_source = call.class_registration_table_arg_source(1);
     let base_source = call.class_registration_base_arg_source(Some(2));
 
-    let table_var_name = match call.value_for_arg_source(&table_source) {
+    let table_var_name = match table_source
+        .as_ref()
+        .and_then(|source| call.value_for_arg_source(source))
+    {
         Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
         _ => None,
     };
@@ -6324,11 +6421,14 @@ fn synthesize_metatable_register(
     resolved_registration: Option<ResolvedVguiRegistrationRegion>,
     phase: VguiSynthesisPhase,
 ) {
-    let table_var_name =
-        match call.value_for_arg_source(&call.class_registration_table_arg_source(1)) {
-            Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
-            _ => None,
-        };
+    let table_var_name = match call
+        .class_registration_table_arg_source(1)
+        .as_ref()
+        .and_then(|source| call.value_for_arg_source(source))
+    {
+        Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
+        _ => None,
+    };
     synthesize_registered_class(
         db,
         cache,
@@ -6360,7 +6460,10 @@ fn synthesize_derma_define_control(
     let table_source = call.class_registration_table_arg_source(2);
     let base_source = call.class_registration_base_arg_source(Some(3));
 
-    let table_var_name = match call.value_for_arg_source(&table_source) {
+    let table_var_name = match table_source
+        .as_ref()
+        .and_then(|source| call.value_for_arg_source(source))
+    {
         Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
         _ => None,
     };
@@ -6399,7 +6502,10 @@ fn synthesize_vgui_register_table(
     let table_source = call.class_registration_table_arg_source(0);
     let base_source = call.class_registration_base_arg_source(Some(1));
 
-    let table_var_name = match call.value_for_arg_source(&table_source) {
+    let table_var_name = match table_source
+        .as_ref()
+        .and_then(|source| call.value_for_arg_source(source))
+    {
         Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
         _ => None,
     };
@@ -7131,6 +7237,13 @@ fn synthesize_registered_class_with_id(
         {
             bind_panel_table_decl(db, decl_id, &LuaType::Def(class_decl_id.clone()));
         }
+    } else if bind
+        && call.class_registration_table_is_result()
+        && let Some(decl_id) = local_decl_for_call_result(db, file_id, call.syntax_id)
+        && !cached_decl_has_reassignment(cache, db, file_id, decl_id)
+    {
+        // The local the call initialises holds the table the call registered.
+        bind_panel_table_decl(db, decl_id, &LuaType::Def(class_decl_id));
     }
 }
 
@@ -7162,7 +7275,7 @@ fn find_inline_vgui_panel_table_expr(
         _ => return None,
     };
 
-    find_table_expr_for_arg_source(db, file_id, call, &table_source)
+    find_table_expr_for_arg_source(db, file_id, call, &table_source?)
 }
 
 fn find_table_expr_for_arg_source(
@@ -7826,6 +7939,8 @@ struct AnnotatedGmodCallRoles {
     class_registration_kind: Option<GmodScriptedClassCallKind>,
     class_registration_define_roles: Vec<AnnotatedGmodCallArgRole>,
     class_registration_table_roles: Vec<AnnotatedGmodCallArgRole>,
+    /// The registered table is what the function returns.
+    class_registration_table_is_result: bool,
     class_registration_base_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_reference_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_child_self_roles: Vec<AnnotatedGmodCallArgRole>,
@@ -8331,17 +8446,33 @@ impl AnnotatedGmodCallRoles {
         {
             return None;
         }
-        let forwarded = |role: &AnnotatedGmodCallArgRole| {
+        let forwarded_arg = |role: &AnnotatedGmodCallArgRole| {
             let arg_idx = param_idx_to_call_arg_idx(
                 role.param_idx,
                 forward.callee_is_colon,
                 self.is_colon_define,
             )?;
-            forward.args.get(arg_idx)?.forward_role(role)
+            forward.args.get(arg_idx)
         };
-        let table = forwarded(self.class_registration_table_roles.first()?).filter(|role| {
-            role.field_path.is_empty() && role.prefix.is_empty() && role.suffix.is_empty()
-        })?;
+        let forwarded = |role: &AnnotatedGmodCallArgRole| forwarded_arg(role)?.forward_role(role);
+        let (table, table_is_result) = match self.class_registration_table_roles.first() {
+            Some(role) if forwarded_arg(role) == Some(&ForwardedArg::Returned) => {
+                (Vec::new(), true)
+            }
+            Some(role) => (
+                vec![forwarded(role).filter(|role| {
+                    role.field_path.is_empty() && role.prefix.is_empty() && role.suffix.is_empty()
+                })?],
+                false,
+            ),
+            None if self.class_registration_table_is_result && forward.returned => {
+                (Vec::new(), true)
+            }
+            None => return None,
+        };
+        if table_is_result && kind == GmodScriptedClassCallKind::VguiRegisterTable {
+            return None;
+        }
         let define = match self.class_registration_define_roles.first() {
             Some(role) => vec![forwarded(role)?],
             None => Vec::new(),
@@ -8355,7 +8486,8 @@ impl AnnotatedGmodCallRoles {
         Some(Self {
             class_registration_kind: self.class_registration_kind,
             class_registration_define_roles: define,
-            class_registration_table_roles: vec![table],
+            class_registration_table_roles: table,
+            class_registration_table_is_result: table_is_result,
             class_registration_base_roles: base,
             ..Self::default()
         })
@@ -8382,10 +8514,14 @@ impl AnnotatedGmodCallRoles {
             kind,
             GmodClassRegistrationCallRoles {
                 define,
-                table: self
-                    .class_registration_table_roles
-                    .first()
-                    .and_then(|role| role.to_arg_source(is_colon_call, self.is_colon_define)),
+                table: if self.class_registration_table_is_result {
+                    Some(GmodRegisteredTableSource::Result)
+                } else {
+                    self.class_registration_table_roles
+                        .first()
+                        .and_then(|role| role.to_arg_source(is_colon_call, self.is_colon_define))
+                        .map(GmodRegisteredTableSource::Arg)
+                },
                 base: self
                     .class_registration_base_roles
                     .first()
@@ -9884,7 +10020,10 @@ fn vgui_panel_field_sources(
 ) -> Vec<crate::GmodClassCallArgSource> {
     let mut sources = Vec::new();
     for source in std::iter::once(&roles.define)
-        .chain(roles.table.as_ref())
+        .chain(match &roles.table {
+            Some(crate::GmodRegisteredTableSource::Arg(source)) => Some(source),
+            _ => None,
+        })
         .chain(roles.base.as_ref())
     {
         if source.is_derived() && !sources.iter().any(|existing| existing == source) {
