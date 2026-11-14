@@ -123,7 +123,12 @@ pub(super) fn stabilize_unknown_locals(
                     .map(|(tree, flow)| tree.reaching_definitions(decl_id, flow))
                     .unwrap_or_else(|| Arc::from([crate::LuaDefinitionId::Declaration(decl_id)]))
             };
-            for definition in definitions.iter().cloned() {
+            let cache = context.infer_manager.get_infer_cache(file_id);
+            for definition in definitions
+                .iter()
+                .filter(|definition| definition_is_guessed(db, cache, definition))
+                .cloned()
+            {
                 let target = LuaInferenceNodeId::Definition(definition);
                 evidence_by_node.entry(target.clone()).or_default().push(
                     ContextualTypeEvidence::anchored(
@@ -165,7 +170,10 @@ pub(super) fn stabilize_unknown_locals(
     changed_any
 }
 
-/// The declarations of `file_id` this pass guesses, with their references.
+/// The declarations of `file_id` this pass may guess a definition of, with
+/// their references: a local the statements left without a type, one holding
+/// a guess it published before, or one assigned again, since what an
+/// assignment stores may be what has no type.
 fn guessed_decls(
     db: &crate::DbIndex,
     file_id: crate::FileId,
@@ -174,17 +182,67 @@ fn guessed_decls(
         .get_decl_references_map(&file_id)
         .into_iter()
         .flatten()
-        .filter(|(decl_id, _)| guesses(db, decl_id))
+        .filter(|(decl_id, references)| {
+            guesses(db, decl_id)
+                || (is_local(db, decl_id) && references.cells.iter().any(|cell| cell.is_write))
+        })
+}
+
+/// Whether this pass guesses the value `definition` gives its local: a
+/// declaration it guesses, or an assignment whose stored value has no type of
+/// its own. A definition with a value of its own keeps it however the local is
+/// used, and a guess that types the declaration through a slot the local is
+/// stored in and read back from does not turn off the guess it rests on.
+fn definition_is_guessed(
+    db: &crate::DbIndex,
+    cache: &mut LuaInferCache,
+    definition: &crate::LuaDefinitionId,
+) -> bool {
+    match definition {
+        crate::LuaDefinitionId::Declaration(decl_id) => guesses(db, decl_id),
+        crate::LuaDefinitionId::Assignment {
+            file_id,
+            assignment,
+            target_idx,
+        } => {
+            let Some(assign) = db
+                .get_vfs()
+                .syntax_tree_at_statement(file_id, assignment.get_range())
+                .and_then(|tree| assignment.to_node_from_root(&tree.get_red_root()))
+                .and_then(LuaAssignStat::cast)
+            else {
+                return false;
+            };
+            let exprs = assign.get_var_and_expr_list().1;
+            let target_idx = usize::from(*target_idx);
+            let (expr, ret_idx) = match exprs.get(target_idx) {
+                Some(expr) => (expr.clone(), 0),
+                None => match exprs.last() {
+                    Some(last) => (last.clone(), target_idx + 1 - exprs.len()),
+                    None => return false,
+                },
+            };
+            let value = match infer_expr(db, cache, expr) {
+                Ok(LuaType::Variadic(multi)) => multi.get_type(ret_idx).cloned(),
+                Ok(typ) if ret_idx == 0 => Some(typ),
+                Ok(_) => None,
+                Err(_) => Some(LuaType::Unknown),
+            };
+            value.is_none_or(|value| super::is_uninformative_or_template_leak(&value))
+        }
+    }
+}
+
+fn is_local(db: &crate::DbIndex, decl_id: &crate::LuaDeclId) -> bool {
+    db.get_decl_index()
+        .get_decl(decl_id)
+        .is_some_and(|decl| matches!(decl.extra, crate::LuaDeclExtra::Local { .. }))
 }
 
 /// Whether this pass guesses `decl_id`'s type from its uses: a local the
 /// statements left without a type, or one holding a guess it published before.
 fn guesses(db: &crate::DbIndex, decl_id: &crate::LuaDeclId) -> bool {
-    let is_local = db
-        .get_decl_index()
-        .get_decl(decl_id)
-        .is_some_and(|decl| matches!(decl.extra, crate::LuaDeclExtra::Local { .. }));
-    if !is_local {
+    if !is_local(db, decl_id) {
         return false;
     }
     // `never` is the bottom of the same uninformative band as `unknown` (see
@@ -237,19 +295,24 @@ fn guessed_slot_evidence(
         .filter(|item| item.get_member_ids().contains(&member_id))
     else {
         let prefix_type = infer_expr(db, cache, target.get_prefix_expr()?).ok()?;
+        let writer_cache =
+            std::cell::RefCell::new(LuaInferCache::new(file_id, cache.get_config().clone()));
         return dynamic_field_type_without(
             db,
             cache,
             &prefix_type,
             key.get_name()?,
             name_expr.get_position(),
-            |writer| writer.file_id == file_id && stores_guessed_local(db, writer),
+            |writer| {
+                writer.file_id == file_id
+                    && stores_guessed_local(db, &mut writer_cache.borrow_mut(), writer)
+            },
         );
     };
     let (guessed, others): (Vec<_>, Vec<_>) = item
         .get_member_ids()
         .into_iter()
-        .partition(|writer| writer.file_id == file_id && stores_guessed_local(db, *writer));
+        .partition(|writer| writer.file_id == file_id && stores_guessed_local(db, cache, *writer));
     if guessed.is_empty() {
         return None;
     }
@@ -261,13 +324,18 @@ fn guessed_slot_evidence(
     Some(
         others
             .resolve_type_with_realm_at_offset(db, &file_id, name_expr.get_position())
-            .ok(),
+            .ok()
+            .map(|typ| crate::widen_literal_type_for_assignment(&typ)),
     )
 }
 
-/// Whether member `writer` is a store `t.k = local` of the value a local this
-/// pass guesses was declared with: only its declaration reaches the store.
-fn stores_guessed_local(db: &crate::DbIndex, writer: crate::LuaMemberId) -> bool {
+/// Whether member `writer` is a store `t.k = local` of a value this pass
+/// guesses: it guesses every definition of the local reaching the store.
+fn stores_guessed_local(
+    db: &crate::DbIndex,
+    cache: &mut LuaInferCache,
+    writer: crate::LuaMemberId,
+) -> bool {
     let syntax_id = writer.get_syntax_id();
     let Some(index_expr) = db
         .get_vfs()
@@ -295,17 +363,18 @@ fn stores_guessed_local(db: &crate::DbIndex, writer: crate::LuaMemberId) -> bool
     else {
         return false;
     };
-    guesses(db, &decl_id)
-        && db
-            .get_flow_index()
-            .get_flow_tree(&writer.file_id)
-            .and_then(|tree| {
-                let flow = tree.get_flow_id(value.get_syntax_id())?;
-                Some(tree.reaching_definitions(decl_id, flow))
-            })
-            .is_some_and(|definitions| {
-                definitions.as_ref() == [crate::LuaDefinitionId::Declaration(decl_id)]
-            })
+    db.get_flow_index()
+        .get_flow_tree(&writer.file_id)
+        .and_then(|tree| {
+            let flow = tree.get_flow_id(value.get_syntax_id())?;
+            Some(tree.reaching_definitions(decl_id, flow))
+        })
+        .is_some_and(|definitions| {
+            !definitions.is_empty()
+                && definitions
+                    .iter()
+                    .all(|definition| definition_is_guessed(db, cache, definition))
+        })
 }
 
 /// Whether reaching this read with a nil value would be a runtime error.
@@ -373,6 +442,9 @@ fn rederive_settled_initializers(
 ) {
     let mut roots = FxHashMap::<crate::FileId, glua_parser::LuaSyntaxNode>::default();
     candidates.retain(|(file_id, decl_id, _)| {
+        if !guesses(db, decl_id) {
+            return true;
+        }
         let root = match roots.entry(*file_id) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {

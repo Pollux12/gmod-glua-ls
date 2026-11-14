@@ -478,6 +478,62 @@ mod tests {
         assert_eq!(found, Vec::new());
     }
 
+    /// An assignment with a value of its own keeps it, however the local is
+    /// used afterwards.
+    #[test]
+    fn an_assignment_with_a_value_of_its_own_is_not_guessed_from_usage() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/own_value.lua",
+            r#"
+            ---@param s string
+            local function takes(s) end
+            ---@return unknown
+            local function unknown_source() end
+
+            local value = unknown_source()
+            value = 5
+            local copy = value
+            takes(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(local_type(&ws, file_id, "copy")),
+            "integer"
+        );
+    }
+
+    /// A guess stored in a field that types the local again when read back
+    /// does not take away the reason for the guess, so the analysis settles
+    /// on it.
+    #[test]
+    fn a_guess_read_back_through_fields_settles() {
+        const SOURCE: &str = r#"
+            ---@param expanded number
+            local function draw(expanded) end
+            ---@return unknown
+            local function unknown_source(value) end
+
+            function ENT:Draw()
+                local current = self._read
+                current = unknown_source(current)
+                self._written = current
+                draw(current)
+            end
+            function ENT:Sync()
+                self._read = self._written
+            end
+            "#;
+        let path = "lua/entities/base_thing/cl_init.lua";
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(path, SOURCE);
+
+        let found = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown);
+        assert_eq!(found.len(), 1);
+        VirtualWorkspace::assert_warm_matches_cold(|_| {}, &[(path, SOURCE)], &[(path, SOURCE)]);
+    }
+
     #[test]
     fn declared_overload_return_does_not_infer_from_usage_context() {
         let mut ws = VirtualWorkspace::new();
