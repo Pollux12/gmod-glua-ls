@@ -534,6 +534,40 @@ mod tests {
         VirtualWorkspace::assert_warm_matches_cold(|_| {}, &[(path, SOURCE)], &[(path, SOURCE)]);
     }
 
+    /// A slot whose other writers only empty it says nothing of what a store
+    /// of an untyped value puts there: the local holds that value, not the one
+    /// it held before.
+    #[test]
+    fn a_slot_only_ever_emptied_does_not_type_what_is_stored_in_it() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_spectate.lua",
+            r#"
+            ---@param value any
+            ---@return boolean
+            local function IsValid(value) end
+
+            local command = {}
+            command.OnRun = function(self, client, target)
+                client._spectate = false
+                local targetobj = false
+                targetobj = target
+                local now = targetobj
+                if not IsValid(targetobj) then
+                    client._spectate = targetobj
+                end
+            end
+            "#,
+        );
+
+        let now = ws.local_ty(file_id, "now");
+        assert!(
+            !matches!(now, LuaType::BooleanConst(false)),
+            "{}",
+            ws.humanize_type(now)
+        );
+    }
+
     /// A read that several guessed assignments reach is reported once.
     #[test]
     fn a_read_of_several_guessed_assignments_is_reported_once() {

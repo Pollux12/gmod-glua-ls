@@ -109,7 +109,9 @@ pub(super) fn stabilize_unknown_locals(
             } else {
                 candidate
             };
-            if super::is_uninformative_or_template_leak(&candidate) {
+            // A use that takes only `nil` or `false`, such as a store into a
+            // slot nothing but `t.k = false` fills, says nothing of the value.
+            if super::is_uninformative_or_template_leak(&candidate) || only_empties(&candidate) {
                 continue;
             }
             let definitions = if is_function_definition {
@@ -327,6 +329,15 @@ fn guessed_slot_evidence(
             .ok()
             .map(|typ| crate::widen_literal_type_for_assignment(&typ)),
     )
+}
+
+/// Whether every value `typ` allows is `nil` or `false`.
+fn only_empties(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Nil | LuaType::BooleanConst(false) | LuaType::DocBooleanConst(false) => true,
+        LuaType::Union(union) => union.types().all(only_empties),
+        _ => false,
+    }
 }
 
 /// Whether member `writer` is a store `t.k = local` of a value this pass
