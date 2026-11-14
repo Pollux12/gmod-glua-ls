@@ -748,8 +748,10 @@ end
         );
     }
 
+    /// `G.Use` can run more than once, so its read before the write sees what
+    /// an earlier call wrote, as a write in another function would.
     #[test]
-    fn same_function_later_global_field_assign_stays_order_sensitive() {
+    fn same_function_later_global_field_assign_is_seen_by_an_earlier_read() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -769,14 +771,10 @@ end
 
         let before_ty = ws.expr_ty("A");
         let after_ty = ws.expr_ty("B");
-        assert_ne!(
-            ws.humanize_type(before_ty.clone()),
-            ws.humanize_type(after_ty.clone()),
-            "same-function later assign must not type earlier read as the later type; before={}, after={}",
-            ws.humanize_type(before_ty),
-            ws.humanize_type(after_ty)
+        assert_eq!(
+            (ws.humanize_type(before_ty), ws.humanize_type(after_ty)),
+            ("string".to_string(), "string".to_string())
         );
-        assert_eq!(ws.humanize_type(after_ty), "string");
     }
 
     #[test]

@@ -16687,6 +16687,45 @@ end
         expect_that!(warm_after_edit, eq(true));
         expect_that!(warm_after_edit, eq(cold_after_edit));
     }
+
+    /// A method can run many times, so a `self` field it writes after reading
+    /// may already hold the value an earlier call wrote.
+    #[gtest]
+    fn a_receiver_field_read_before_its_write_in_the_same_method_is_not_absent() {
+        let mut ws = gmod_ws();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::UncheckedNilAccess,
+            r#"
+            ---@class RecreatedThing
+            local Thing = {}
+            function Thing:Create()
+                if self.Ent:IsValid() then self.Ent:Remove() end
+                self.Ent = ClientsideModel("models/error.mdl") or NULL
+            end
+            "#,
+        );
+        expect_that!(diagnostics, is_empty());
+    }
+
+    /// A table the function creates itself has nothing in it before the
+    /// function's own write.
+    #[gtest]
+    fn a_local_table_field_read_before_its_write_in_the_same_function_is_absent() {
+        let mut ws = gmod_ws();
+        let file_id = ws.def(
+            r#"
+            local function build()
+                local t = {}
+                local before = t.x
+                t.x = 1
+                return before
+            end
+            "#,
+        );
+        let before = ws.local_ty(file_id, "before");
+        expect_that!(ws.humanize_type(before), not(contains_substring("integer")));
+    }
 }
 
 #[cfg(test)]

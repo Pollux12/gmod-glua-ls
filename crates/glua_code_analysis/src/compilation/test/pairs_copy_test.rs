@@ -106,7 +106,7 @@ end
             (
                 "(string|unknown)".to_string(),
                 "1".to_string(),
-                "any".to_string()
+                "Entity".to_string()
             )
         );
     }
@@ -282,7 +282,7 @@ local name = Sizes.name
             (
                 "(string|unknown)".to_string(),
                 "1".to_string(),
-                "any".to_string()
+                "Entity".to_string()
             )
         );
     }

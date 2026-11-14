@@ -1934,6 +1934,30 @@ parser:parse()",
         assert_that!(ws.humanize_type(current), eq("0"));
     }
 
+    /// A method that runs every frame reads back what its last run stored.
+    #[gtest]
+    fn a_field_a_method_reads_before_storing_it_again_holds_the_stored_values() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "lua/entities/base_thing/cl_init.lua",
+            r#"
+            ---@param from number
+            ---@param to number
+            ---@return number
+            local function decay(from, to) return to + (from - to) * 0.5 end
+            function ENT:Think()
+                local stored = self._expanded
+                local current = stored or 0
+                current = decay(current, 1)
+                self._expanded = current
+            end
+            "#,
+        );
+
+        let stored = ws.local_ty(file, "stored");
+        assert_that!(ws.humanize_type(stored), eq("number"));
+    }
+
     #[gtest]
     fn computed_key_nil_delete_is_not_a_member_before_or_after_reindex() {
         let mut ws = VirtualWorkspace::new();

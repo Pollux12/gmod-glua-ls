@@ -615,6 +615,39 @@ fn same_file_define_shares_execution_region(
         member_index.enclosing_function_scope_range(*caller_file_id, caller_position);
 
     member_function == caller_function
+        && member_function.is_none_or(|function| {
+            owner_created_in_function(db, member_id, caller_file_id, function)
+        })
+}
+
+/// Whether the table a member is written on is created inside `function`, so
+/// each call starts with it empty. A receiver that outlives the call (`self`,
+/// a parameter, an upvalue, a global) may hold what an earlier call wrote.
+fn owner_created_in_function(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+    file_id: &FileId,
+    function: rowan::TextRange,
+) -> bool {
+    let member_index = db.get_member_index();
+    let created_in = |position| {
+        member_index.enclosing_function_scope_range(*file_id, position) == Some(function)
+    };
+    match member_index.get_member_owner(&member_id) {
+        Some(LuaMemberOwner::Element(table)) => {
+            table.file_id == *file_id && created_in(table.value.start())
+        }
+        Some(LuaMemberOwner::Type(decl_id)) => db
+            .get_type_index()
+            .get_type_decl(decl_id)
+            .is_some_and(|decl| {
+                decl.get_locations().iter().any(|location| {
+                    location.file_id == *file_id && created_in(location.range.start())
+                })
+            }),
+        Some(LuaMemberOwner::LocalUnresolve) | None => true,
+        Some(LuaMemberOwner::GlobalPath(_)) => false,
+    }
 }
 
 fn member_hidden_by_enclosing_assignment_with_root(
@@ -2452,7 +2485,10 @@ mod tests {
         let caller_file = FileId::new(10);
         let earlier_member = make_member_id_with_kind(caller_file, 10, LuaSyntaxKind::IndexExpr);
         let later_member = make_member_id_with_kind(caller_file, 30, LuaSyntaxKind::IndexExpr);
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OrderSensitiveOwner"));
+        let owner = LuaMemberOwner::Element(InFiled::new(
+            caller_file,
+            TextRange::new(TextSize::new(2), TextSize::new(4)),
+        ));
         let key = LuaMemberKey::Name("field".into());
         let shared_scope = TextRange::new(TextSize::new(0), TextSize::new(100));
 
@@ -2485,7 +2521,10 @@ mod tests {
         let future_only_member =
             make_member_id_with_kind(caller_file, 50, LuaSyntaxKind::IndexExpr);
         db.get_member_index_mut().add_member(
-            LuaMemberOwner::Type(LuaTypeDeclId::global("FutureOnlyOwner")),
+            LuaMemberOwner::Element(InFiled::new(
+                caller_file,
+                TextRange::new(TextSize::new(5), TextSize::new(7)),
+            )),
             LuaMember::new(
                 future_only_member,
                 LuaMemberKey::Name("field".into()),
