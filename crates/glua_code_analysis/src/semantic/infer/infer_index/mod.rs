@@ -1,3 +1,4 @@
+mod function_index;
 mod infer_array;
 pub(crate) use infer_array::{check_index_in_range, check_iter_var_range};
 
@@ -1414,6 +1415,11 @@ fn infer_table_metatable_member(
                     super::infer_call::MetatableIndexCandidate::Supported(index_type) => index_type,
                     super::infer_call::MetatableIndexCandidate::Unsupported => index_type,
                 };
+            if let Some(typ) =
+                function_index::infer_function_index_member(db, cache, &index_type, index_key)
+            {
+                return Ok(typ);
+            }
             if !metatable_index_type_points_to_table(&index_type, table_range)
                 && let Ok(typ) = infer_member_by_member_key_with_table_guard(
                     db,
@@ -3875,6 +3881,23 @@ fn infer_member_by_index_custom_type(
                 Err(err) => return Err(err),
             }
         }
+    }
+
+    let index_function = find_members_with_key(
+        db,
+        &LuaType::Ref(prefix_type_id.clone()),
+        LuaMemberKey::Name("__index".into()),
+        true,
+    )
+    .into_iter()
+    .flatten()
+    .map(|member| member.typ)
+    .find(|typ| matches!(typ, LuaType::Signature(_)));
+    if let Some(index_function) = index_function
+        && let Some(typ) =
+            function_index::infer_function_index_member(db, cache, &index_function, &index_key)
+    {
+        return Ok(typ);
     }
 
     Err(InferFailReason::FieldNotFound)

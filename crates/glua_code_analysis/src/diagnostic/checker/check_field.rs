@@ -839,6 +839,19 @@ fn has_unresolved_metatable_index_inner(
             position,
             visited,
         ),
+        // A class is the metatable of the values typed as it: an `__index`
+        // function of its own, or one it inherits, answers any key.
+        LuaType::Ref(_) | LuaType::Def(_) => crate::semantic::find_members_with_key(
+            db,
+            prefix_typ,
+            LuaMemberKey::Name("__index".into()),
+            true,
+        )
+        .is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| matches!(member.typ, LuaType::Signature(_)))
+        }),
         LuaType::Union(union) => match union.nullable_inner() {
             Some(typ) => {
                 has_unresolved_metatable_index_inner(db, semantic_model, typ, position, visited)

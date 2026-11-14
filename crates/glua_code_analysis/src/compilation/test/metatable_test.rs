@@ -2514,6 +2514,66 @@ mod test {
         );
     }
 
+    const STORED_OBJECT: (&str, &str) = (
+        "lua/autorun/sh_stored.lua",
+        r#"
+        local Storage = setmetatable({}, { __mode = "k" })
+        local META = {}
+        RegisterMetaTable("Stored", META)
+
+        function META:__index(key)
+            local value = Storage[self][key]
+            if value ~= nil then
+                return value
+            end
+            return rawget(META, key)
+        end
+
+        function META:GetCount()
+            local count = self.Count
+            local label = self.Label
+            local other = self.Unlisted
+            return count
+        end
+
+        function NewStored(label)
+            local object = setmetatable({}, META)
+            Storage[object] = { Label = label, Count = 0 }
+            return object
+        end
+        "#,
+    );
+
+    /// A key a class does not define reads what its `__index` function
+    /// returns: with `__index` reading `Storage[self][key]`, the fields of
+    /// the stored table are the object's fields.
+    #[test]
+    fn a_function_index_reads_fields_from_the_table_it_looks_in() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        let file_id = ws.def_file(STORED_OBJECT.0, STORED_OBJECT.1);
+
+        let count = ws.local_ty(file_id, "count");
+        assert_eq!(ws.humanize_type(count), "integer");
+        let label = ws.local_ty(file_id, "label");
+        assert!(!label.is_nil(), "{}", ws.humanize_type(label));
+        let other = ws.local_ty(file_id, "other");
+        assert!(!other.is_nil(), "{}", ws.humanize_type(other));
+    }
+
+    /// A class whose `__index` is a function can answer any key, so no
+    /// key it does not list is undefined.
+    #[test]
+    fn a_function_index_leaves_no_field_undefined() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        assert!(ws.check_file_for(
+            DiagnosticCode::UndefinedField,
+            STORED_OBJECT.0,
+            STORED_OBJECT.1,
+        ));
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }
