@@ -1912,6 +1912,28 @@ parser:parse()",
         assert_that!(ws.humanize_type(alpha), eq("1?"));
     }
 
+    /// A field only ever written with what is read back from it holds the
+    /// values that enter from outside the cycle: the `0` default.
+    #[gtest]
+    fn a_member_written_only_from_its_own_reads_holds_the_values_entering_the_cycle() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "lua/entities/base_thing/cl_init.lua",
+            r#"
+            function ENT:Read()
+                local current = self._value or 0
+                return current
+            end
+            function ENT:Tick()
+                self._value = self:Read()
+            end
+            "#,
+        );
+
+        let current = ws.local_ty(file, "current");
+        assert_that!(ws.humanize_type(current), eq("0"));
+    }
+
     #[gtest]
     fn computed_key_nil_delete_is_not_a_member_before_or_after_reindex() {
         let mut ws = VirtualWorkspace::new();

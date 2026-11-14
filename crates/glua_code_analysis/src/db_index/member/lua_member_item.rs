@@ -784,16 +784,21 @@ fn typed_members<'a>(
         }
     }
     match untyped {
-        Some(member_id)
-            if typed.is_empty()
-                || !db.stage_rule_holds(
-                    crate::db_index::derivation::StageRule::SkipUntypedWriters,
-                ) =>
-        {
+        Some(member_id) if !untyped_writers_are_skipped(db, typed.is_empty()) => {
             Err(InferFailReason::UnResolveMemberType(member_id))
         }
         _ => Ok(typed),
     }
+}
+
+/// Whether a slot's untyped writers are left out. While others have a type
+/// they are from the stage that skips them; when none has, they hold no value
+/// yet only until the run closes, so writers on a cycle through the slot
+/// settle from nothing and a writer that never lands still reads as a floor.
+fn untyped_writers_are_skipped(db: &DbIndex, none_typed: bool) -> bool {
+    use crate::db_index::derivation::StageRule;
+    db.stage_rule_holds(StageRule::SkipUntypedWriters)
+        && !(none_typed && db.stage_rule_holds(StageRule::FloorUnsettled))
 }
 
 fn resolve_member_type(
@@ -805,6 +810,7 @@ fn resolve_member_type(
             let member_type_cache = db.get_type_index().get_type_cache(&(*member_id).into());
             match member_type_cache {
                 Some(cache) => Ok(cache.as_type().clone()),
+                None if untyped_writers_are_skipped(db, true) => Ok(LuaType::Never),
                 None => Err(InferFailReason::UnResolveMemberType(*member_id)),
             }
         }
