@@ -145,6 +145,15 @@ pub fn infer_newproxy_call(
     }
 }
 
+/// The metatable of the proxy `expr` is, or evaluates to.
+pub(crate) fn proxy_metatable(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> Option<InFiled<rowan::TextRange>> {
+    proxy_metatable_range(db, cache, expr, &mut Vec::new())
+}
+
 /// The metatable of the proxy `expr` is, or evaluates to. `newproxy(true)`
 /// creates a metatable, named here by the call's range; `newproxy(p)`
 /// shares p's.

@@ -68,7 +68,9 @@ pub(crate) use infer::{
     take_access_path_snapshot, with_access_paths,
 };
 pub(crate) use infer::{declaring_for_range, try_infer_enclosing_for_range_iter_type};
-pub(crate) use infer::{getmetatable_call_metatable, table_backing_range_from_expr};
+pub(crate) use infer::{
+    getmetatable_call_metatable, proxy_metatable, table_backing_range_from_expr,
+};
 use infer::{infer_call_arg_expr_list_types, infer_expr_list_value_type_at};
 pub use infer::{infer_table_field_value_should_be, infer_table_should_be};
 use lsp_types::Uri;

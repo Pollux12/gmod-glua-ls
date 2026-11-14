@@ -2574,6 +2574,164 @@ mod test {
         ));
     }
 
+    const KIND_FACTORY: (&str, &str) = (
+        "lua/autorun/sh_kinds.lua",
+        r#"
+        Kinds = Kinds or { Root = {} }
+        Make = Make or {}
+
+        function Kinds.Root:Describe() return "kind" end
+
+        local function lookup(meta, key)
+            while meta do
+                local value = rawget(meta, key)
+                if value ~= nil then
+                    return value
+                end
+                meta = rawget(meta, "Parent")
+            end
+        end
+
+        function DefineKind(name, parent)
+            local meta = {}
+            RegisterMetaTable("Kind." .. name, meta)
+            Kinds[name] = meta
+            meta.Parent = parent and Kinds[parent] or Kinds.Root
+
+            function meta:__index(key)
+                return lookup(meta, key)
+            end
+
+            Make[name] = function(...)
+                local object = setmetatable({}, meta)
+                return object
+            end
+            return meta
+        end
+        "#,
+    );
+
+    const KIND_USES: (&str, &str) = (
+        "lua/autorun/sh_animals.lua",
+        r#"
+        local ANIMAL = DefineKind("Animal")
+        function ANIMAL:Speak() return "..." end
+        local DOG = DefineKind("Dog", "Animal")
+        "#,
+    );
+
+    /// Writes a factory makes under a key built from its parameters are
+    /// named per call: the registry entry is the call's class, and a
+    /// constructor returning the factory's instances returns that class.
+    #[test]
+    fn a_factory_call_names_what_the_factory_writes_under_its_arguments() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![KIND_FACTORY, KIND_USES]);
+        let reader = ws.def_file(
+            "lua/autorun/sh_reader.lua",
+            r#"
+            local registered = Kinds.Dog
+            local dog = Make.Dog()
+            "#,
+        );
+
+        let registered = ws.local_ty(reader, "registered");
+        assert_eq!(ws.humanize_type(registered), "Kind.Dog");
+        let dog = ws.local_ty(reader, "dog");
+        assert_eq!(ws.humanize_type(dog), "Kind.Dog");
+    }
+
+    /// An `__index` walking `rawget(meta, "Parent")` inherits through
+    /// `Parent`: what the factory stores there for a call is the class's
+    /// parent.
+    #[test]
+    fn an_index_walk_through_a_parent_field_is_inheritance() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![KIND_FACTORY, KIND_USES]);
+        let reader = ws.def_file(
+            "lua/autorun/sh_reader.lua",
+            r#"
+            local speak = Kinds.Dog.Speak
+            local describe = Kinds.Animal.Describe
+            "#,
+        );
+
+        assert!(is_function_type(&ws.local_ty(reader, "speak")));
+        assert!(is_function_type(&ws.local_ty(reader, "describe")));
+    }
+
+    /// Renaming a factory call's arguments, and back, leaves what a fresh
+    /// analysis of the final text has.
+    #[test]
+    fn editing_a_factory_call_argument_matches_a_fresh_analysis() {
+        let reader = (
+            "lua/autorun/sh_reader.lua",
+            "local dog = Make.Dog()\nlocal speak = Kinds.Dog.Speak",
+        );
+        let renamed = KIND_USES
+            .1
+            .replace("\"Dog\", \"Animal\"", "\"Dog\", \"Plant\"");
+        assert_ne!(renamed, KIND_USES.1);
+        let setup = |ws: &mut VirtualWorkspace| {
+            ws.def_gmod_call_arg_builtins();
+        };
+        VirtualWorkspace::assert_warm_matches_cold(
+            setup,
+            &[KIND_FACTORY, KIND_USES, reader],
+            &[(KIND_USES.0, &renamed), KIND_USES],
+        );
+    }
+
+    /// A factory in a `module` file writing a constructor into the module
+    /// table under the call's name gives each call a constructor of its class.
+    #[test]
+    fn a_module_factory_names_a_constructor_per_call() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![
+            (
+                "lua/kinds/sh_meta.lua",
+                r#"
+            module("kinds", package.seeall)
+            Registry = Registry or {}
+            function Define(name)
+                local metaName = "K." .. name
+                local proxy = newproxy(true)
+                local meta = getmetatable(proxy)
+                RegisterMetaTable(metaName, meta)
+                Registry[name] = meta
+                kinds[name] = function(owner, ...)
+                    local instance = newproxy(proxy)
+                    return instance
+                end
+                return meta
+            end
+            "#,
+            ),
+            (
+                "lua/kinds/sh_bone.lua",
+                r#"
+            module("kinds", package.seeall)
+            local BONE = Define("Bone")
+            function BONE:Grow() end
+            "#,
+            ),
+        ]);
+        let reader = ws.def_file(
+            "lua/autorun/sh_reader.lua",
+            r#"
+            local made = kinds.Bone(1)
+            local registered = kinds.Registry.Bone
+            "#,
+        );
+        let made = ws.local_ty(reader, "made");
+        assert_eq!(ws.humanize_type(made), "K.Bone");
+        let registered = ws.local_ty(reader, "registered");
+        assert_eq!(ws.humanize_type(registered), "K.Bone");
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }
