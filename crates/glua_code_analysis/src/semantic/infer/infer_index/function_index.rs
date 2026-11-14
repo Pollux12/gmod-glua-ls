@@ -1,9 +1,10 @@
 use glua_parser::{LuaAstNode, LuaClosureExpr, LuaExpr, LuaIndexKey, LuaNameExpr, LuaReturnStat};
 
 use crate::db_index::widen_literal_type_for_assignment;
+use crate::semantic::member::LuaMemberInfo;
 use crate::{
-    DbIndex, LuaDeclExtra, LuaInferCache, LuaMemberKey, LuaSignatureId, LuaType, TypeOps,
-    infer_expr,
+    DbIndex, LuaDeclExtra, LuaInferCache, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId,
+    LuaSignatureId, LuaType, TypeOps, infer_expr,
     semantic::{local_initializer_expr, member::find_members_with_key},
 };
 
@@ -78,6 +79,28 @@ pub(super) fn infer_function_index_member(
         LuaType::Nil => Some(LuaType::Unknown),
         returned => Some(returned),
     }
+}
+
+/// The `__index` function code gives values of `prefix_type`, its own or one
+/// it inherits. One written on a class a doc declares does not count: that
+/// class keeps the shape it is declared with.
+pub(crate) fn code_index_function(db: &DbIndex, prefix_type: &LuaType) -> Option<LuaType> {
+    find_members_with_key(db, prefix_type, LuaMemberKey::Name("__index".into()), true)?
+        .into_iter()
+        .filter(|member| matches!(member.typ, LuaType::Signature(_)))
+        .find(|member| !written_on_declared_class(db, member))
+        .map(|member| member.typ)
+}
+
+fn written_on_declared_class(db: &DbIndex, member: &LuaMemberInfo) -> bool {
+    let Some(LuaSemanticDeclId::Member(member_id)) = member.property_owner_id else {
+        return false;
+    };
+    matches!(
+        db.get_member_index().get_member_owner(&member_id),
+        Some(LuaMemberOwner::Type(type_id))
+            if db.get_type_index().get_source_type_decl(type_id).is_some()
+    )
 }
 
 fn signature_closure(db: &DbIndex, signature_id: &LuaSignatureId) -> Option<LuaClosureExpr> {

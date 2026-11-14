@@ -2561,6 +2561,32 @@ mod test {
         assert!(!other.is_nil(), "{}", ws.humanize_type(other));
     }
 
+    /// An `__index` function written on a class a doc declares, as code
+    /// that speeds up `Entity` lookups does, leaves the class its declared
+    /// shape: a key it does not declare is still undefined.
+    #[test]
+    fn an_index_function_on_a_declared_class_keeps_its_fields_checked() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!ws.check_file_for(
+            DiagnosticCode::UndefinedField,
+            "lua/autorun/sh_fast_index.lua",
+            r#"
+            ---@class Thing
+            ---@field Name string
+            local THING = {}
+
+            function THING:__index(key)
+                return rawget(THING, key)
+            end
+
+            ---@param thing Thing
+            local function read(thing)
+                return thing.Nmae
+            end
+            "#,
+        ));
+    }
+
     /// A class whose `__index` is a function can answer any key, so no
     /// key it does not list is undefined.
     #[test]

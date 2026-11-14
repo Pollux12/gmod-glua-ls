@@ -1,4 +1,5 @@
 mod function_index;
+pub(crate) use function_index::code_index_function;
 mod infer_array;
 pub(crate) use infer_array::{check_index_in_range, check_iter_var_range};
 
@@ -3883,17 +3884,7 @@ fn infer_member_by_index_custom_type(
         }
     }
 
-    let index_function = find_members_with_key(
-        db,
-        &LuaType::Ref(prefix_type_id.clone()),
-        LuaMemberKey::Name("__index".into()),
-        true,
-    )
-    .into_iter()
-    .flatten()
-    .map(|member| member.typ)
-    .find(|typ| matches!(typ, LuaType::Signature(_)));
-    if let Some(index_function) = index_function
+    if let Some(index_function) = code_index_function(db, &LuaType::Ref(prefix_type_id.clone()))
         && let Some(typ) =
             function_index::infer_function_index_member(db, cache, &index_function, &index_key)
     {
