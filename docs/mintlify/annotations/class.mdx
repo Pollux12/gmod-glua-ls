@@ -66,6 +66,32 @@ end
 
 ---
 
+## Metatable classes <a id="metatable-classes" />
+
+GLuaLS reads common metatable code as classes, so you don't need `@class` for it:
+
+```lua
+local COLOR = {}
+COLOR.__index = COLOR
+function COLOR:Brighten() return self end
+RegisterMetaTable("MyColor", COLOR)
+
+local c = setmetatable({}, COLOR)       -- MyColor
+local meta = FindMetaTable("MyColor")  -- MyColor
+```
+
+It also follows:
+
+- `newproxy(true)` and `getmetatable(proxy)`. A proxy made with `newproxy(other)` shares `other`'s metatable.
+- Factories. A function that registers the table it returns makes a class at each call, so `local BONE = CreateMetaTable("Bone")` gives `BONE` the class that call registers. Whatever the factory puts on that table belongs to every class it makes.
+- Writes a factory makes under its arguments, such as `Registry[name] = meta` or `Make[name] = function(...) return setmetatable({}, meta) end`. Each call names them: `Registry.Bone` is the class, and `Make.Bone()` returns it.
+- An `__index` function. A key the class doesn't define reads what `__index` returns. If `__index` returns `Storage[self][key]`, the fields of the stored table become the object's fields.
+- Custom inheritance. If `__index` walks parents with `meta = rawget(meta, "Parent")` or `meta = meta.Parent`, each class inherits from what its factory call stores in `Parent`.
+
+Annotate only when the code builds names or parents in ways GLuaLS can't follow, for example `string.upper(name)` as a key.
+
+---
+
 ## Exact classes <a id="exact-classes" />
 
 Mark a class as `(exact)` to prevent dynamic field additions. GLuaLS can report a diagnostic when code assigns a field outside the class definition:
