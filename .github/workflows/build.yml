@@ -32,7 +32,7 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: filter
@@ -67,7 +67,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ startsWith(matrix.platform, 'darwin-') }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install Rust toolchain
@@ -171,7 +171,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install Rust toolchain
@@ -239,7 +239,7 @@ jobs:
             echo "::error::CARGO_TOKEN is required for this publish-crates run."
             exit 1
           fi
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install Rust toolchain
