@@ -9,7 +9,10 @@ use crate::{
     db_index::{WorkspaceKind, WorkspaceResolutionKey, gmod_infer::GmodRealm},
     is_informative_type, is_table_assignment_merge_type, widen_literal_type_for_assignment,
 };
-use glua_parser::{BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, LuaSyntaxNode, PathTrait};
+use glua_parser::{
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaSyntaxNode,
+    LuaTableExpr, PathTrait,
+};
 use rowan::TextSize;
 
 use super::{LuaMemberFeature, LuaMemberId, LuaMemberOwner};
@@ -633,6 +636,9 @@ fn owner_created_in_function(
     let created_in = |position| {
         member_index.enclosing_function_scope_range(*file_id, position) == Some(function)
     };
+    if written_through_fresh_local(db, member_id, created_in).is_some() {
+        return true;
+    }
     match member_index.get_member_owner(&member_id) {
         Some(LuaMemberOwner::Element(table)) => {
             table.file_id == *file_id && created_in(table.value.start())
@@ -648,6 +654,40 @@ fn owner_created_in_function(
         Some(LuaMemberOwner::LocalUnresolve) | None => true,
         Some(LuaMemberOwner::GlobalPath(_)) => false,
     }
+}
+
+/// Whether a member is written through a never-reassigned local of the
+/// function that a table constructor or a call initialises: each call makes
+/// that table anew, whatever class the write is filed under.
+fn written_through_fresh_local(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+    created_in: impl Fn(TextSize) -> bool,
+) -> Option<()> {
+    let file_id = member_id.file_id;
+    let member_range = db.get_member_index().get_member(&member_id)?.get_range();
+    let root = db
+        .get_vfs()
+        .syntax_tree_around(&file_id, member_range)?
+        .get_red_root();
+    let index_expr = LuaIndexExpr::cast(member_id.get_syntax_id().to_node_from_root(&root)?)?;
+    let LuaExpr::NameExpr(receiver) = index_expr.get_prefix_expr()? else {
+        return None;
+    };
+    let references = db.get_reference_index().get_local_reference(&file_id)?;
+    let decl_id = references.get_decl_id(&receiver.get_range())?;
+    if !created_in(decl_id.position)
+        || references
+            .get_decl_references(&decl_id)
+            .is_some_and(|reference| reference.mutable)
+    {
+        return None;
+    }
+    let initializer = db.get_decl_index().get_decl(&decl_id)?.get_initializer()?;
+    let kind = initializer.get_expr_syntax_id().get_kind();
+    (initializer.get_ret_idx() == 0
+        && (LuaTableExpr::can_cast(kind) || LuaCallExpr::can_cast(kind)))
+    .then_some(())
 }
 
 fn member_hidden_by_enclosing_assignment_with_root(

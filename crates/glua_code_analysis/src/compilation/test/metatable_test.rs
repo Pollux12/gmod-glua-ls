@@ -2758,6 +2758,31 @@ mod test {
         assert_eq!(ws.humanize_type(registered), "K.Bone");
     }
 
+    /// A method that makes an instance of `self` and turns it into a class
+    /// of its own (`sub.__index = sub`) settles: the instance is `self`'s
+    /// class, and the write to its `__index` does not feed back into it.
+    #[test]
+    fn a_subclass_made_from_self_settles() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_extend.lua",
+            r#"
+            local Base = {}
+            Base.__index = Base
+            function Base:extend()
+                local sub = setmetatable({}, self)
+                sub.__index = sub
+                return sub
+            end
+            function Base:Hello() return 1 end
+            local Sub = Base:extend()
+            local hello = Sub.Hello
+            "#,
+        );
+
+        assert!(is_function_type(&ws.local_ty(file_id, "hello")));
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }
