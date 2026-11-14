@@ -40,9 +40,10 @@ use crate::{
 };
 use infer_require::infer_require_call;
 pub(crate) use infer_setmetatable::{
-    MetatableIndexCandidate, classify_metatable_index_candidate, table_backing_range_from_expr,
+    MetatableIndexCandidate, classify_metatable_index_candidate, getmetatable_call_metatable,
+    table_backing_range_from_expr,
 };
-use infer_setmetatable::{infer_getmetatable_call, infer_setmetatable_call};
+use infer_setmetatable::{infer_getmetatable_call, infer_newproxy_call, infer_setmetatable_call};
 
 mod infer_require;
 mod infer_setmetatable;
@@ -2367,6 +2368,8 @@ pub fn infer_call_expr(
         return infer_setmetatable_call(db, cache, call_expr);
     } else if let Some(metatable) = infer_getmetatable_call(db, cache, &call_expr) {
         return Ok(metatable);
+    } else if let Some(proxy) = infer_newproxy_call(db, cache, &call_expr) {
+        return Ok(proxy);
     }
 
     check_can_infer(db, cache, &call_expr)?;

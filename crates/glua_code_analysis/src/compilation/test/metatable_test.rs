@@ -2223,6 +2223,126 @@ mod test {
         );
     }
 
+    /// `newproxy(true)` gives the proxy a metatable of its own, which
+    /// `getmetatable` returns; `newproxy(p)` shares p's metatable, and reads
+    /// on a proxy go through that metatable's `__index`.
+    #[test]
+    fn a_proxy_has_the_metatable_newproxy_gave_it() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/proxy.lua",
+            r#"
+            local proxy = newproxy(true)
+            local meta = getmetatable(proxy)
+            meta.__index = meta
+            function meta:Name() return "proxy" end
+
+            local other = newproxy(proxy)
+            local from_meta = getmetatable(proxy).Name
+            local from_shared = getmetatable(other).Name
+            local called = other:Name()
+            "#,
+        );
+
+        for name in ["from_meta", "from_shared"] {
+            let typ = ws.local_ty(file_id, name);
+            assert!(is_function_type(&typ), "{name}: {}", ws.humanize_type(typ));
+        }
+        let called = ws.local_ty(file_id, "called");
+        assert_eq!(ws.humanize_type(called), "\"proxy\"");
+    }
+
+    /// A proxy's metatable registered under a name is that class, and the
+    /// proxies sharing it are its instances.
+    #[test]
+    fn a_registered_proxy_metatable_is_a_class() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_handle.lua",
+            r#"
+            local proxy = newproxy(true)
+            local meta = getmetatable(proxy)
+            RegisterMetaTable("Handle", meta)
+            meta.__index = meta
+            function meta:Close() return true end
+
+            local handle = newproxy(proxy)
+            local found = FindMetaTable("Handle")
+            local close = found.Close
+            "#,
+        );
+
+        let handle = ws.local_ty(file_id, "handle");
+        assert_eq!(ws.humanize_type(handle), "Handle");
+        let found = ws.local_ty(file_id, "found");
+        assert_eq!(ws.humanize_type(found), "Handle");
+        assert!(is_function_type(&ws.local_ty(file_id, "close")));
+    }
+
+    const HANDLE_PROXY: (&str, &str) = (
+        "lua/autorun/sh_handle.lua",
+        r#"
+        local meta = FindMetaTable("Handle")
+        local proxy = newproxy(true)
+        meta = getmetatable(proxy)
+        RegisterMetaTable("Handle", meta)
+        meta.__index = meta
+        function meta:Close() return true end
+        HandleProxy = proxy
+        "#,
+    );
+
+    /// The reload-safe form, which reuses the local `FindMetaTable` filled,
+    /// registers the proxy's metatable too, and another file's proxies made
+    /// from the shared one are its instances.
+    #[test]
+    fn a_proxy_metatable_registered_through_a_reused_local_is_a_class() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![HANDLE_PROXY]);
+        let reader = ws.def_file(
+            "lua/autorun/sh_reader.lua",
+            r#"
+            local handle = newproxy(HandleProxy)
+            local closed = handle:Close()
+            local close = FindMetaTable("Handle").Close
+            "#,
+        );
+
+        let handle = ws.local_ty(reader, "handle");
+        assert_eq!(ws.humanize_type(handle), "Handle");
+        let closed = ws.local_ty(reader, "closed");
+        assert_eq!(ws.humanize_type(closed), "true");
+        assert!(is_function_type(&ws.local_ty(reader, "close")));
+    }
+
+    /// Dropping the registration or the proxy's own metatable, and putting
+    /// them back, leaves what a fresh analysis of the final text has.
+    #[test]
+    fn editing_a_proxy_metatable_matches_a_fresh_analysis() {
+        let reader = (
+            "lua/autorun/sh_reader.lua",
+            "local handle = newproxy(HandleProxy)\nlocal closed = handle:Close()",
+        );
+        let unregistered = HANDLE_PROXY
+            .1
+            .replace("RegisterMetaTable(\"Handle\", meta)", "");
+        let no_metatable = HANDLE_PROXY.1.replace("newproxy(true)", "newproxy(false)");
+        let setup = |ws: &mut VirtualWorkspace| {
+            ws.def_gmod_call_arg_builtins();
+        };
+        VirtualWorkspace::assert_warm_matches_cold(
+            setup,
+            &[HANDLE_PROXY, reader],
+            &[
+                (HANDLE_PROXY.0, &unregistered),
+                (HANDLE_PROXY.0, &no_metatable),
+                HANDLE_PROXY,
+            ],
+        );
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }

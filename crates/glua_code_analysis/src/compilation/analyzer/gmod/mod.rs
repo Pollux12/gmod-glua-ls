@@ -17,7 +17,9 @@ use glua_parser::{
     NumberResult, PathTrait,
 };
 
-use crate::semantic::{local_initializer_expr, semantic_decl_closure_signature_id};
+use crate::semantic::{
+    getmetatable_call_metatable, local_initializer_expr, semantic_decl_closure_signature_id,
+};
 use crate::{
     EmmyrcGmodRealm, FileId, GlobalId, GmodClassCallArg, GmodClassCallArgSource,
     GmodClassCallLiteral, GmodClassRegistrationCallRoles, GmodDermaSkinCallRoles,
@@ -6776,6 +6778,19 @@ fn find_registered_table_expr_at_write_position(
     file_id: FileId,
     write_position: TextSize,
 ) -> Option<LuaTableExpr> {
+    value_expr_as_table(&registered_value_expr_at_write_position(
+        db,
+        file_id,
+        write_position,
+    )?)
+}
+
+/// The value the write of a local at `write_position` stores.
+fn registered_value_expr_at_write_position(
+    db: &DbIndex,
+    file_id: FileId,
+    write_position: TextSize,
+) -> Option<LuaExpr> {
     let tree = db.get_vfs().get_syntax_tree(&file_id)?;
     let chunk = tree.get_chunk_node();
 
@@ -6794,7 +6809,7 @@ fn find_registered_table_expr_at_write_position(
                 name.get_name_token()
                     .is_some_and(|tok| tok.syntax().text_range().start() == write_position)
             })?;
-            return value_expr_as_table(values.get(var_index)?);
+            return values.get(var_index).cloned();
         }
 
         if let Some(assign_stat) = LuaAssignStat::cast(ancestor.clone()) {
@@ -6802,11 +6817,27 @@ fn find_registered_table_expr_at_write_position(
             let var_index = vars
                 .iter()
                 .position(|var| var.syntax().text_range().start() == write_position)?;
-            return value_expr_as_table(exprs.get(var_index)?);
+            return exprs.get(var_index).cloned();
         }
     }
 
     None
+}
+
+/// The metatable a `getmetatable(...)` call written to the registered local
+/// at `write_position` returns.
+fn registered_metatable(
+    db: &DbIndex,
+    file_id: FileId,
+    write_position: TextSize,
+) -> Option<InFiled<TextRange>> {
+    let LuaExpr::CallExpr(call) =
+        registered_value_expr_at_write_position(db, file_id, write_position)?
+    else {
+        return None;
+    };
+    let mut cache = LuaInferCache::new(file_id, super::call_target::pass_view());
+    getmetatable_call_metatable(db, &mut cache, &call)
 }
 
 /// Unwrap parenthesized expressions and require a table constructor.
@@ -6932,6 +6963,14 @@ fn synthesize_registered_class_with_id(
 
         // Resolve the concrete `{}` table literal backing this registration.
         let registered_table = cached_registered_table_expr(cache, db, file_id, region_start);
+        if bind
+            && registered_table.is_none()
+            && let Some(metatable) = registered_metatable(db, file_id, region_start)
+        {
+            cache
+                .table_const_replacements
+                .insert(metatable, class_type.clone());
+        }
 
         if let Some(table_expr) = registered_table.as_ref().filter(|_| bind) {
             // Bind the class to this exact table-constructor expression.

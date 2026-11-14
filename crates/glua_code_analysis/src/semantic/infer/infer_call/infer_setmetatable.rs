@@ -83,13 +83,24 @@ pub fn infer_setmetatable_call(
     }
 }
 
-/// `getmetatable(t)` for a table `setmetatable` gave a metatable: that
-/// metatable. `None` for any other call, which then reads as declared.
+/// `getmetatable(t)` for a table `setmetatable` gave a metatable, or a
+/// proxy `newproxy` gave one: that metatable. `None` for any other call,
+/// which then reads as declared.
 pub fn infer_getmetatable_call(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     call_expr: &LuaCallExpr,
 ) -> Option<LuaType> {
+    getmetatable_call_metatable(db, cache, call_expr).map(|metatable| metatable_type(db, metatable))
+}
+
+/// The table a `getmetatable(t)` call returns, before any registration made
+/// a class of it.
+pub(crate) fn getmetatable_call_metatable(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<InFiled<rowan::TextRange>> {
     let LuaExpr::NameExpr(name) = call_expr.get_prefix_expr()? else {
         return None;
     };
@@ -102,10 +113,98 @@ pub fn infer_getmetatable_call(
         .collect::<Vec<_>>()
         .try_into()
         .ok()?;
+    if let Some(metatable) = proxy_metatable_range(db, cache, &table, &mut Vec::new()) {
+        return Some(metatable);
+    }
     let range = resolve_table_backing_range(db, cache, &table)
         .or_else(|| setmetatable_target_range(db, cache, &table))?;
-    let metatable = db.get_metatable_index().get(&range)?;
-    Some(LuaType::TableConst(metatable.clone()))
+    db.get_metatable_index().get(&range).cloned()
+}
+
+/// The class a registration made of `metatable`, or the table itself.
+fn metatable_type(db: &DbIndex, metatable: InFiled<rowan::TextRange>) -> LuaType {
+    db.get_type_index()
+        .table_class(&metatable)
+        .cloned()
+        .unwrap_or(LuaType::TableConst(metatable))
+}
+
+/// `newproxy(...)` for a proxy whose metatable has a table `__index`: what
+/// reads on the proxy reach. `None` for any other call, which then reads as
+/// declared.
+pub fn infer_newproxy_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<LuaType> {
+    let call = LuaExpr::CallExpr(call_expr.clone());
+    let metatable = proxy_metatable_range(db, cache, &call, &mut Vec::new())?;
+    match index_type_from_writers(db, &metatable_type(db, metatable))? {
+        MetatableIndex::Index(index_type) => Some(index_type),
+        MetatableIndex::NoIndex(_) | MetatableIndex::Unresolved => None,
+    }
+}
+
+/// The metatable of the proxy `expr` is, or evaluates to. `newproxy(true)`
+/// creates a metatable, named here by the call's range; `newproxy(p)`
+/// shares p's.
+fn proxy_metatable_range(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+    visited: &mut Vec<InFiled<rowan::TextRange>>,
+) -> Option<InFiled<rowan::TextRange>> {
+    let (file_id, value) = match expr {
+        LuaExpr::CallExpr(_) => (cache.get_file_id(), expr.clone()),
+        LuaExpr::ParenExpr(paren_expr) => {
+            return proxy_metatable_range(db, cache, &paren_expr.get_expr()?, visited);
+        }
+        _ => semantic_decl_value(
+            db,
+            infer_expr_semantic_decl(
+                db,
+                cache,
+                expr.clone(),
+                SemanticDeclGuard::default(),
+                SemanticDeclLevel::default(),
+            )?,
+        )?,
+    };
+    let value_range = InFiled::new(file_id, value.get_range());
+    if visited.contains(&value_range) {
+        return None;
+    }
+    visited.push(value_range);
+    if file_id != cache.get_file_id() {
+        let mut value_cache = LuaInferCache::new(file_id, cache.get_config().clone());
+        return proxy_metatable_of_value(db, &mut value_cache, &value, visited);
+    }
+    proxy_metatable_of_value(db, cache, &value, visited)
+}
+
+fn proxy_metatable_of_value(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    value: &LuaExpr,
+    visited: &mut Vec<InFiled<rowan::TextRange>>,
+) -> Option<InFiled<rowan::TextRange>> {
+    let LuaExpr::CallExpr(call) = value else {
+        return proxy_metatable_range(db, cache, value, visited);
+    };
+    let LuaExpr::NameExpr(name) = call.get_prefix_expr()? else {
+        return None;
+    };
+    if name.get_name_text()? != "newproxy" {
+        return None;
+    }
+    let arg = call.get_args_list()?.get_args().next()?;
+    match infer_expr(db, cache, arg.clone()).ok()? {
+        LuaType::BooleanConst(true) | LuaType::DocBooleanConst(true) => {
+            Some(InFiled::new(cache.get_file_id(), call.get_range()))
+        }
+        LuaType::BooleanConst(false) | LuaType::DocBooleanConst(false) => None,
+        _ => proxy_metatable_range(db, cache, &arg, visited),
+    }
 }
 
 /// The table literal a `setmetatable(t, mt)` call `expr` evaluates to, or is
@@ -271,26 +370,8 @@ fn infer_metatable_index_type(
         ExactMetatableIndexType::None => {}
     }
 
-    // Every `__index` writer, so writers that disagree are seen to disagree.
-    if let Some(meta_members) =
-        find_members_with_key(db, &meta_type, LuaMemberKey::Name("__index".into()), true)
-    {
-        let mut index_types = Vec::with_capacity(meta_members.len());
-        for meta_member in meta_members {
-            match classify_metatable_index_candidate(&meta_member.typ) {
-                MetatableIndexCandidate::Supported(index_type) => index_types.push(index_type),
-                MetatableIndexCandidate::Unsupported => {
-                    return Ok(MetatableIndex::NoIndex(LuaType::Unknown));
-                }
-            }
-        }
-
-        if let Some(index_type) = index_types.first() {
-            if index_types.iter().all(|candidate| candidate == index_type) {
-                return Ok(MetatableIndex::Index(index_type.clone()));
-            }
-            return Ok(MetatableIndex::NoIndex(LuaType::Unknown));
-        }
+    if let Some(index) = index_type_from_writers(db, &meta_type) {
+        return Ok(index);
     }
 
     // No `__index` was found. Whether that is an answer depends on whether
@@ -302,6 +383,30 @@ fn infer_metatable_index_type(
         return Ok(MetatableIndex::Unresolved);
     }
     Ok(MetatableIndex::NoIndex(meta_type))
+}
+
+/// The `__index` every writer of it on `meta_type` agrees on, so writers that
+/// disagree are seen to disagree. `None` when nothing writes `__index`.
+fn index_type_from_writers(db: &DbIndex, meta_type: &LuaType) -> Option<MetatableIndex> {
+    let meta_members =
+        find_members_with_key(db, meta_type, LuaMemberKey::Name("__index".into()), true)?;
+    let mut index_types = Vec::with_capacity(meta_members.len());
+    for meta_member in meta_members {
+        match classify_metatable_index_candidate(&meta_member.typ) {
+            MetatableIndexCandidate::Supported(index_type) => index_types.push(index_type),
+            MetatableIndexCandidate::Unsupported => {
+                return Some(MetatableIndex::NoIndex(LuaType::Unknown));
+            }
+        }
+    }
+    let index_type = index_types.first()?;
+    Some(
+        if index_types.iter().all(|candidate| candidate == index_type) {
+            MetatableIndex::Index(index_type.clone())
+        } else {
+            MetatableIndex::NoIndex(LuaType::Unknown)
+        },
+    )
 }
 
 /// Whether the resolution machinery has already given up on this
