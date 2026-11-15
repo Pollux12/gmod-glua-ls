@@ -449,6 +449,12 @@ function derma.DefineControl(class, description, panel, base) end
 ---@param metaTable table
 function RegisterMetaTable(metaName, metaTable) end
 
+---@generic T : table, B : table
+---@param target T
+---@param base B
+---@return T & B & { BaseClass: B }
+function table.Inherit(target, base) end
+
 ---@generic T : table
 ---@param metaName `T`
 ---@return (definition) T

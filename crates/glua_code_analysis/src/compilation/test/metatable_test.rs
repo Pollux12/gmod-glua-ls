@@ -3017,6 +3017,29 @@ mod test {
         assert!(!is_function_type(&ws.local_ty(file_id, "baseOnlyA")));
     }
 
+    /// `table.Inherit` gives its target the base's members and `BaseClass`.
+    #[test]
+    fn table_inherit_gives_the_target_the_base_members() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_inherit.lua",
+            r#"
+            local Base = { hp = 100 }
+            function Base:Heal() return self.hp end
+            local Child = table.Inherit({ armor = 5 }, Base)
+            local heal = Child.Heal
+            local armor = Child.armor
+            local base = Child.BaseClass
+            local baseHeal = base.Heal
+            "#,
+        );
+
+        assert!(is_function_type(&ws.local_ty(file_id, "heal")));
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "armor")), "5");
+        assert!(is_function_type(&ws.local_ty(file_id, "baseHeal")));
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }
