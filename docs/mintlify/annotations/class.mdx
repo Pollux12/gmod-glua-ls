@@ -89,7 +89,9 @@ It also follows:
 - Custom inheritance. If `__index` walks parents with `meta = rawget(meta, "Parent")` or `meta = meta.Parent`, each class inherits from what its factory call stores in `Parent`.
 - Subclasses. `local Dog = setmetatable({}, Animal)` with `Dog.__index = Dog` inherits `Animal`'s methods, and the methods you define on `Dog` stay off `Animal`.
 - Constructors that work on their receiver, such as `function Class:new(o) setmetatable(o, self) self.__index = self return o end`. Each call makes an instance of the table it's called on, so `Special = Account:new()` followed by `function Special:limit() end` is a subclass of `Account`.
-- `__call`. Calling a table runs its `__call` with the table passed first, so `Point(1, 2)` returns what `__call` returns.
+- `__call`. Calling a table runs its `__call` with the table passed first, so `Point(1, 2)` returns what `__call` returns. This also works when the metatable defines it as a method, `function Object:__call(...)`.
+- Class helpers. A function that builds a new class table on each call, such as `local function class(base)`, makes a separate class each time. `local Dog = class(Animal)` has its own methods and inherits `Animal`'s, and a field the helper sets from its arguments, such as `{ name = name }`, holds what that call passed. This covers `extend` methods that call the helper on `self`, `__call` constructors that return `cls.new(...)`, and libraries such as `classic`.
+- Constructor arguments. A function stored on a local table gets its parameter types from the calls through that table, so `o.x = x` in `function Point.new(x)` has the type that `Point.new(3)` passes.
 - Operators. `a + b`, `-a`, `a .. b` and the other operators return what the metamethod (`__add`, `__unm`, `__concat`, ...) returns.
 - `__metatable`. `getmetatable(t)` returns the metatable's `__metatable` field when it has one.
 
