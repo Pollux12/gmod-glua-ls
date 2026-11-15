@@ -1,4 +1,6 @@
-use glua_parser::{LuaAstNode, LuaClosureExpr, LuaExpr, LuaIndexKey, LuaNameExpr, LuaReturnStat};
+use glua_parser::{
+    BinaryOperator, LuaAstNode, LuaClosureExpr, LuaExpr, LuaIndexKey, LuaNameExpr, LuaReturnStat,
+};
 
 use crate::db_index::widen_literal_type_for_assignment;
 use crate::semantic::member::LuaMemberInfo;
@@ -9,9 +11,9 @@ use crate::{
 };
 
 /// What a read of `key` gets from an `__index` function: a key the table
-/// does not hold reaches `__index(self, key)`. Each `return P[key]`, also
-/// through a local holding it, gives `P`'s field `key`, widened as the
-/// stored value can change. Without such a return the read is what the
+/// does not hold reaches `__index(self, key)`. Each `return P[key]` or
+/// `rawget(P, key)` (see [`collect_key_sources`]) gives `P`'s field `key`,
+/// widened as the stored value can change. Without such a return the read is what the
 /// function returns.
 pub(super) fn infer_function_index_member(
     db: &DbIndex,
@@ -41,32 +43,25 @@ pub(super) fn infer_function_index_member(
         let Some(returned) = return_stat.get_expr_list().next() else {
             continue;
         };
-        let Some(LuaExpr::IndexExpr(lookup)) = unaliased(db, signature_id, returned) else {
-            continue;
-        };
-        let reads_key = matches!(
-            lookup.get_index_key(),
-            Some(LuaIndexKey::Expr(LuaExpr::NameExpr(name)))
-                if is_param(db, signature_id, &name, key_param_idx)
-        );
-        let Some(source) = lookup.get_prefix_expr().filter(|_| reads_key) else {
-            continue;
-        };
-        let Ok(source_type) = infer_expr(db, &mut value_cache, source) else {
-            continue;
-        };
-        let members = find_members_with_key(
-            db,
-            &source_type,
-            LuaMemberKey::Name(key_name.as_str().into()),
-            true,
-        );
-        field_types.extend(
-            members
-                .into_iter()
-                .flatten()
-                .map(|member| widen_literal_type_for_assignment(&member.typ)),
-        );
+        let mut sources = Vec::new();
+        collect_key_sources(db, signature_id, key_param_idx, returned, &mut sources);
+        for source in sources {
+            let Ok(source_type) = infer_expr(db, &mut value_cache, source) else {
+                continue;
+            };
+            let members = find_members_with_key(
+                db,
+                &source_type,
+                LuaMemberKey::Name(key_name.as_str().into()),
+                true,
+            );
+            field_types.extend(
+                members
+                    .into_iter()
+                    .flatten()
+                    .map(|member| widen_literal_type_for_assignment(&member.typ)),
+            );
+        }
     }
 
     if let Some(field_type) = field_types
@@ -78,6 +73,55 @@ pub(super) fn infer_function_index_member(
     match signature.get_return_type() {
         LuaType::Nil => Some(LuaType::Unknown),
         returned => Some(returned),
+    }
+}
+
+/// The tables `returned` reads the key param from: `P` of `P[key]` or
+/// `rawget(P, key)`, also through a local holding it or either side of `or`.
+fn collect_key_sources(
+    db: &DbIndex,
+    signature_id: &LuaSignatureId,
+    key_param_idx: usize,
+    returned: LuaExpr,
+    sources: &mut Vec<LuaExpr>,
+) {
+    let is_key = |expr: Option<LuaExpr>| matches!(expr, Some(LuaExpr::NameExpr(name)) if is_param(db, signature_id, &name, key_param_idx));
+    match unaliased(db, signature_id, returned) {
+        Some(LuaExpr::IndexExpr(lookup)) => {
+            let key = match lookup.get_index_key() {
+                Some(LuaIndexKey::Expr(key)) => Some(key),
+                _ => None,
+            };
+            if is_key(key)
+                && let Some(source) = lookup.get_prefix_expr()
+            {
+                sources.push(source);
+            }
+        }
+        Some(LuaExpr::CallExpr(call)) => {
+            let is_rawget = matches!(
+                call.get_prefix_expr(),
+                Some(LuaExpr::NameExpr(callee)) if callee.get_name_text().as_deref() == Some("rawget")
+            );
+            let mut args = call
+                .get_args_list()
+                .into_iter()
+                .flat_map(|args| args.get_args());
+            if let (true, Some(source), key) = (is_rawget, args.next(), args.next())
+                && is_key(key)
+            {
+                sources.push(source);
+            }
+        }
+        Some(LuaExpr::BinaryExpr(binary))
+            if binary.get_op_token().map(|op| op.get_op()) == Some(BinaryOperator::OpOr) =>
+        {
+            if let Some((left, right)) = binary.get_exprs() {
+                collect_key_sources(db, signature_id, key_param_idx, left, sources);
+                collect_key_sources(db, signature_id, key_param_idx, right, sources);
+            }
+        }
+        _ => {}
     }
 }
 

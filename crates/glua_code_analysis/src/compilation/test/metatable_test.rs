@@ -3040,6 +3040,27 @@ mod test {
         assert!(is_function_type(&ws.local_ty(file_id, "baseHeal")));
     }
 
+    /// An `__index` function reading the key with `rawget(P, key)`, also as
+    /// one side of an `or`, gives `P`'s field.
+    #[test]
+    fn an_index_function_reading_with_rawget_gives_the_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_rawget.lua",
+            r#"
+            local MT = {}
+            MT.__index = function(self, key)
+                return rawget(MT, key) or rawget(self, "_" .. key)
+            end
+            function MT:Ping() return "pong" end
+            local object = setmetatable({}, MT)
+            local ping = object.Ping
+            "#,
+        );
+
+        assert!(is_function_type(&ws.local_ty(file_id, "ping")));
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }
