@@ -43,7 +43,9 @@ pub(crate) use infer_setmetatable::{
     MetatableIndexCandidate, classify_metatable_index_candidate, getmetatable_call_metatable,
     proxy_metatable, table_backing_range_from_expr,
 };
-use infer_setmetatable::{infer_getmetatable_call, infer_newproxy_call, infer_setmetatable_call};
+use infer_setmetatable::{
+    infer_getmetatable_call, infer_instance_of, infer_newproxy_call, infer_setmetatable_call,
+};
 
 mod infer_require;
 mod infer_setmetatable;
@@ -839,7 +841,8 @@ fn infer_doc_function(
     if let Some(signature_id) = prefix_signature_id
         && let Some(signature) = db.get_signature_index().get(&signature_id)
         && ((signature.direct_param_return_alias().is_some()
-            || signature.class_name_param_return_alias().is_some())
+            || signature.class_name_param_return_alias().is_some()
+            || signature.instance_return_alias().is_some())
             || !signature.falsy_param_nil_free_return_slots().is_empty()
             || !signature.falsy_param_return_aliases().is_empty())
     {
@@ -1389,18 +1392,28 @@ fn specialize_return_aliases_for_call(
     func_ty: &LuaFunctionType,
     call_expr: &LuaCallExpr,
 ) -> Option<Arc<LuaFunctionType>> {
-    specialize_direct_param_return_alias_for_call(db, cache, signature, func_ty, call_expr)
-        .or_else(|| {
-            specialize_class_name_param_return_alias_for_call(
-                db,
-                cache,
-                signature_id,
-                signature,
-                func_ty,
-                call_expr,
-            )
-        })
-        .or_else(|| restore_definition_through_return_alias(db, cache, func_ty, call_expr))
+    specialize_instance_return_alias_for_call(
+        db,
+        cache,
+        signature_id,
+        signature,
+        func_ty,
+        call_expr,
+    )
+    .or_else(|| {
+        specialize_direct_param_return_alias_for_call(db, cache, signature, func_ty, call_expr)
+    })
+    .or_else(|| {
+        specialize_class_name_param_return_alias_for_call(
+            db,
+            cache,
+            signature_id,
+            signature,
+            func_ty,
+            call_expr,
+        )
+    })
+    .or_else(|| restore_definition_through_return_alias(db, cache, func_ty, call_expr))
 }
 
 /// Gives back the definition a declared pass-through was handed.
@@ -1471,6 +1484,39 @@ fn restore_definition_through_return_alias(
             func_ty.is_variadic(),
             func_ty.get_params().to_vec(),
             restored,
+        )
+        .with_optional_params(func_ty.get_optional_params().to_vec()),
+    ))
+}
+
+fn specialize_instance_return_alias_for_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    signature_id: LuaSignatureId,
+    signature: &LuaSignature,
+    func_ty: &LuaFunctionType,
+    call_expr: &LuaCallExpr,
+) -> Option<Arc<LuaFunctionType>> {
+    let alias = signature.instance_return_alias()?;
+    let args = call_expr
+        .get_args_list()
+        .map(|args| args.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let metatable = call_arg_for_dot_param(call_expr, &args, alias.metatable_param)?;
+    let table = alias.table.map(|table| {
+        InFiled::new(
+            signature_id.get_file_id(),
+            table + signature_id.get_position(),
+        )
+    });
+    let instance = infer_instance_of(db, cache, call_expr, metatable, table)?;
+    Some(Arc::new(
+        LuaFunctionType::new(
+            func_ty.get_async_state(),
+            func_ty.is_colon_define(),
+            func_ty.is_variadic(),
+            func_ty.get_params().to_vec(),
+            instance,
         )
         .with_optional_params(func_ty.get_optional_params().to_vec()),
     ))
@@ -1761,14 +1807,31 @@ fn call_arg_for_param(
     args: &[LuaExpr],
     param_idx: usize,
 ) -> Option<LuaExpr> {
-    match (func_ty.is_colon_define(), call_expr.is_colon_call()) {
-        (true, false) => args.get(param_idx.checked_add(1)?).cloned(),
-        (false, true) if param_idx == 0 => match call_expr.get_prefix_expr()? {
+    let dot_param_idx = if func_ty.is_colon_define() {
+        param_idx.checked_add(1)?
+    } else {
+        param_idx
+    };
+    call_arg_for_dot_param(call_expr, args, dot_param_idx)
+}
+
+/// The value a call passes for parameter `param_idx` of a function counted
+/// with a method's `self` as parameter 0: the receiver of a colon call, or an
+/// argument.
+fn call_arg_for_dot_param(
+    call_expr: &LuaCallExpr,
+    args: &[LuaExpr],
+    param_idx: usize,
+) -> Option<LuaExpr> {
+    if !call_expr.is_colon_call() {
+        return args.get(param_idx).cloned();
+    }
+    match param_idx.checked_sub(1) {
+        Some(arg_idx) => args.get(arg_idx).cloned(),
+        None => match call_expr.get_prefix_expr()? {
             LuaExpr::IndexExpr(index_expr) => index_expr.get_prefix_expr(),
             _ => None,
         },
-        (false, true) => args.get(param_idx.checked_sub(1)?).cloned(),
-        _ => args.get(param_idx).cloned(),
     }
 }
 

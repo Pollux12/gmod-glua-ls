@@ -1194,13 +1194,15 @@ mod test {
     }
 
     #[test]
-    fn test_arbitrary_factory_parameter_leaves_instance_methods_open_but_unattributed() {
+    fn test_arbitrary_factory_parameter_makes_an_instance_of_each_argument() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(
             r#"
             local Class = {}
             Class.__index = Class
             function Class:known() end
+            local Other = {}
+            Other.__index = Other
 
             local function make(metatable)
                 return setmetatable({}, metatable)
@@ -1208,9 +1210,11 @@ mod test {
 
             make(Class):known()
             local probe = make(Class).known
+            local other = make(Other).known
             "#,
         );
-        assert!(!is_function_type(&ws.local_ty(file_id, "probe")));
+        assert!(is_function_type(&ws.local_ty(file_id, "probe")));
+        assert!(!is_function_type(&ws.local_ty(file_id, "other")));
     }
 
     #[test]
@@ -2941,6 +2945,76 @@ mod test {
 
         assert!(is_function_type(&ws.local_ty(file_id, "length")));
         assert!(is_function_type(&ws.local_ty(file_id, "area")));
+    }
+
+    const ACCOUNT_CLASS: &str = r#"
+            Account = { balance = 0 }
+            function Account:new(o)
+                o = o or {}
+                setmetatable(o, self)
+                self.__index = self
+                return o
+            end
+            function Account:deposit(v) self.balance = self.balance + v end
+            SpecialAccount = Account:new()
+            function SpecialAccount:getLimit() return self.limit or 0 end
+    "#;
+
+    /// `Class:new(o)` makes an instance of whatever it is called on, so a
+    /// class made by calling it on another is a subclass with its own methods.
+    #[test]
+    fn a_new_method_makes_an_instance_of_its_receiver() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_account.lua",
+            &format!(
+                "{ACCOUNT_CLASS}
+            local account = Account:new({{ balance = 10 }})
+            local special = SpecialAccount:new({{ limit = 100 }})
+            local accountDeposit = account.deposit
+            local accountLimit = account.getLimit
+            local specialDeposit = special.deposit
+            local specialLimit = special.getLimit
+            "
+            ),
+        );
+
+        assert!(is_function_type(&ws.local_ty(file_id, "accountDeposit")));
+        assert!(!is_function_type(&ws.local_ty(file_id, "accountLimit")));
+        assert!(is_function_type(&ws.local_ty(file_id, "specialDeposit")));
+        assert!(is_function_type(&ws.local_ty(file_id, "specialLimit")));
+    }
+
+    /// A method returning `setmetatable({}, self)` extends whatever it is
+    /// called on: a class extended from a subclass inherits both.
+    #[test]
+    fn an_extend_method_extends_its_receiver() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_extend.lua",
+            r#"
+            local Base = {}
+            Base.__index = Base
+            function Base:extend()
+                local sub = setmetatable({}, self)
+                sub.__index = sub
+                return sub
+            end
+            function Base:hello() return 1 end
+            local A = Base:extend()
+            function A:onlyA() return 2 end
+            local B = A:extend()
+            local b = setmetatable({}, B)
+            local bHello = b.hello
+            local bOnlyA = b.onlyA
+            local base = setmetatable({}, Base)
+            local baseOnlyA = base.onlyA
+            "#,
+        );
+
+        assert!(is_function_type(&ws.local_ty(file_id, "bHello")));
+        assert!(is_function_type(&ws.local_ty(file_id, "bOnlyA")));
+        assert!(!is_function_type(&ws.local_ty(file_id, "baseOnlyA")));
     }
 
     fn is_function_type(typ: &LuaType) -> bool {

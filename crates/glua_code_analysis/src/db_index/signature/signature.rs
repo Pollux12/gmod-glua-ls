@@ -63,12 +63,24 @@ struct SignatureFacts {
     class_name_param_return_alias: Option<LuaClassNameReturnAlias>,
     /// Every return is the colon receiver `self`, never reassigned.
     returns_receiver: bool,
+    instance_return_alias: Option<LuaInstanceReturnAlias>,
     falsy_param_nil_free_return_slots: Vec<LuaFalsyParamNilFreeReturnSlot>,
     falsy_param_return_aliases: Vec<LuaFalsyParamReturnAlias>,
     /// The table constructors and calls whose value the function returns and
     /// which each call of it evaluates anew, relative to the function's start
     /// so a shift of its file leaves the fact unchanged.
     fresh_returned_values: Vec<TextRange>,
+}
+
+/// A function whose every return is a table given the metatable its parameter
+/// `metatable_param` holds, counting a method's `self` as parameter 0: each
+/// call returns an instance of what it passes there.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LuaInstanceReturnAlias {
+    pub metatable_param: usize,
+    /// The table constructor every call makes anew for the instance, relative
+    /// to the function's start so a shift of its file leaves the fact unchanged.
+    pub table: Option<TextRange>,
 }
 
 /// A call whose result the function returns and which is handed some of the
@@ -174,6 +186,7 @@ impl Hash for LuaSignature {
         self.direct_param_return_alias().hash(state);
         self.class_name_param_return_alias().hash(state);
         self.returns_receiver().hash(state);
+        self.instance_return_alias().hash(state);
         self.falsy_param_nil_free_return_slots().hash(state);
         self.falsy_param_return_aliases().hash(state);
         self.fresh_returned_values().hash(state);
@@ -262,6 +275,14 @@ impl LuaSignature {
 
     pub fn set_returns_receiver(&mut self) {
         self.facts_mut().returns_receiver = true;
+    }
+
+    pub fn set_instance_return_alias(&mut self, alias: LuaInstanceReturnAlias) {
+        self.facts_mut().instance_return_alias = Some(alias);
+    }
+
+    pub fn instance_return_alias(&self) -> Option<&LuaInstanceReturnAlias> {
+        self.facts.as_ref()?.instance_return_alias.as_ref()
     }
 
     pub fn returns_receiver(&self) -> bool {

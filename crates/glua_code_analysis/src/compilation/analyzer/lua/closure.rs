@@ -18,8 +18,8 @@ use crate::{
         UnResolveParentClosureParams, UnResolveReturn,
     },
     db_index::{
-        LuaClassNameReturnAlias, LuaDocReturnInfo, LuaMemberOwner, LuaReturnCorrelation,
-        LuaSignatureId,
+        LuaClassNameReturnAlias, LuaDocReturnInfo, LuaInstanceReturnAlias, LuaMemberOwner,
+        LuaReturnCorrelation, LuaSignatureId,
     },
     infer_expr,
 };
@@ -61,6 +61,7 @@ pub fn analyze_closure(analyzer: &mut LuaAnalyzer, closure: LuaClosureExpr) -> O
     analyze_direct_param_return_alias(analyzer, &signature_id, &closure);
     analyze_class_name_param_return_alias(analyzer, &signature_id, &closure);
     analyze_returns_receiver(analyzer, &signature_id, &closure);
+    analyze_instance_return_alias(analyzer, &signature_id, &closure);
     analyze_fresh_returned_values(analyzer, &signature_id, &closure);
     analyze_return(analyzer, &signature_id, &closure);
     Some(())
@@ -264,6 +265,131 @@ fn analyze_returns_receiver(
         change: SignatureChange::ReturnsReceiver,
     });
     Some(())
+}
+
+/// Records which parameter a function returns an instance of: each return
+/// gives `setmetatable(t, p)`, or a name such a call gave its metatable earlier
+/// in the body, for one never-reassigned parameter `p` (`self` in a method).
+fn analyze_instance_return_alias(
+    analyzer: &mut LuaAnalyzer,
+    signature_id: &LuaSignatureId,
+    closure: &LuaClosureExpr,
+) -> Option<()> {
+    let signature = analyzer.db.get_signature_index().get(signature_id)?;
+    if !signature.overloads.is_empty()
+        || (signature.resolve_return == SignatureReturnStatus::DocResolve
+            && !signature.return_docs.is_empty())
+    {
+        return Some(());
+    }
+    let params = signature
+        .is_colon_define
+        .then(|| "self".to_string())
+        .into_iter()
+        .chain(closure.get_params_list()?.get_params().filter_map(|param| {
+            param
+                .get_name_token()
+                .map(|name| name.get_name_text().to_string())
+        }))
+        .collect::<Vec<_>>();
+    let block = closure.get_block()?;
+    let closure_start = closure.get_range().start();
+    let mut alias = None;
+    for return_stat in closure_own_return_stats(analyzer, closure, &block).iter() {
+        let mut exprs = return_stat.get_expr_list();
+        let (Some(expr), None) = (exprs.next(), exprs.next()) else {
+            return Some(());
+        };
+        let call = match expr {
+            LuaExpr::CallExpr(call) => call,
+            LuaExpr::NameExpr(name) => {
+                setmetatable_given_to(&block, &name.get_name_text()?, return_stat.get_position())?
+            }
+            _ => return Some(()),
+        };
+        let (table, metatable) = setmetatable_args(&call)?;
+        let metatable = expr_name_text(&metatable)?;
+        let metatable_param = params.iter().position(|param| *param == metatable)?;
+        let table = match table {
+            LuaExpr::TableExpr(table) => Some(table.get_range() - closure_start),
+            _ => None,
+        };
+        let found = LuaInstanceReturnAlias {
+            metatable_param,
+            table,
+        };
+        if alias.as_ref().is_some_and(|existing| *existing != found) {
+            return Some(());
+        }
+        alias = Some(found);
+    }
+    let alias = alias?;
+    if block
+        .get_stats()
+        .any(|stat| stat_may_write_name(&stat, &params[alias.metatable_param]))
+    {
+        return Some(());
+    }
+    analyzer.write(StatementWrite::Signature {
+        signature_id: *signature_id,
+        change: SignatureChange::InstanceReturnAlias(alias),
+    });
+    Some(())
+}
+
+/// The `setmetatable(name, mt)` or `local name = setmetatable(t, mt)` before
+/// `position` that last gave `name` its metatable, when nothing after it
+/// writes `name`.
+fn setmetatable_given_to(block: &LuaBlock, name: &str, position: TextSize) -> Option<LuaCallExpr> {
+    let stats = block
+        .get_stats()
+        .filter(|stat| stat.get_position() < position)
+        .collect::<Vec<_>>();
+    let (at, call) = stats.iter().enumerate().rev().find_map(|(at, stat)| {
+        let call = match stat {
+            LuaStat::CallExprStat(call_stat) => {
+                let call = call_stat.get_call_expr()?;
+                let (table, _) = setmetatable_args(&call)?;
+                (expr_name_text(&table)?.as_str() == name).then_some(call)?
+            }
+            LuaStat::LocalStat(local_stat) => {
+                let mut names = local_stat.get_local_name_list();
+                let (Some(local), None) = (names.next(), names.next()) else {
+                    return None;
+                };
+                if local.get_name_token()?.get_name_text() != name {
+                    return None;
+                }
+                let mut values = local_stat.get_value_exprs();
+                let (Some(LuaExpr::CallExpr(call)), None) = (values.next(), values.next()) else {
+                    return None;
+                };
+                setmetatable_args(&call)?;
+                call
+            }
+            _ => return None,
+        };
+        Some((at, call))
+    })?;
+    stats[at + 1..]
+        .iter()
+        .all(|stat| !stat_may_write_name(stat, name))
+        .then_some(call)
+}
+
+/// `(t, mt)` of a `setmetatable(t, mt)` call.
+fn setmetatable_args(call: &LuaCallExpr) -> Option<(LuaExpr, LuaExpr)> {
+    let LuaExpr::NameExpr(callee) = call.get_prefix_expr()? else {
+        return None;
+    };
+    if callee.get_name_text()? != "setmetatable" {
+        return None;
+    }
+    let mut args = call.get_args_list()?.get_args();
+    let (Some(table), Some(metatable), None) = (args.next(), args.next(), args.next()) else {
+        return None;
+    };
+    Some((table, metatable))
 }
 
 /// Records the table constructors and calls a function returns on its own,
