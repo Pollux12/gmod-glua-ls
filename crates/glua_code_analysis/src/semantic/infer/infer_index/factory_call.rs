@@ -29,29 +29,27 @@ pub(super) fn infer_factory_call_value(
     if !constructs_table {
         return None;
     }
-    infer_forwarded_arg(
-        db,
-        cache,
-        InFiled::new(calls[at].file_id, arg),
-        &calls[..at],
-    )
+    infer_forwarded_arg(db, cache, calls[at].file_id, arg, &calls[..at])
 }
 
-/// What the argument `arg` holds, reading a parameter of the function it is
-/// written in as what the innermost of `calls` calling that function passes.
+/// What the argument `arg` of a call in `file_id` holds, `nil` when the call
+/// passes none, reading a parameter of the function it is written in as what
+/// the innermost of `calls` calling that function passes.
 fn infer_forwarded_arg(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    arg: InFiled<LuaExpr>,
+    file_id: crate::FileId,
+    arg: Option<LuaExpr>,
     calls: &[InFiled<TextRange>],
 ) -> Option<LuaType> {
+    let Some(arg) = arg else {
+        return Some(LuaType::Nil);
+    };
+    let arg = InFiled::new(file_id, arg);
     match bound_arg(db, cache, &arg, calls) {
-        Some((at, _, outer)) => infer_forwarded_arg(
-            db,
-            cache,
-            InFiled::new(calls[at].file_id, outer),
-            &calls[..at],
-        ),
+        Some((at, _, outer)) => {
+            infer_forwarded_arg(db, cache, calls[at].file_id, outer, &calls[..at])
+        }
         None => with_file_cache(cache, arg.file_id, |cache| {
             infer_expr(db, cache, arg.value).ok()
         }),
@@ -60,13 +58,13 @@ fn infer_forwarded_arg(
 
 /// The index into `calls` of the innermost call of the function whose
 /// parameter `expr` names, that function, and the argument the call passes
-/// for the parameter.
+/// for the parameter: `None` when it passes nothing there.
 fn bound_arg(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     expr: &InFiled<LuaExpr>,
     calls: &[InFiled<TextRange>],
-) -> Option<(usize, LuaSignatureId, LuaExpr)> {
+) -> Option<(usize, LuaSignatureId, Option<LuaExpr>)> {
     let LuaExpr::NameExpr(name) = &expr.value else {
         return None;
     };
@@ -94,8 +92,20 @@ fn bound_arg(
         if callee != signature_id {
             return None;
         }
-        Some((at, signature_id, arg_for_param(&call_expr, param)?))
+        Some((at, signature_id, passed_arg(&call_expr, param)?))
     })
+}
+
+/// What `call` passes for parameter `param`: `Some(None)` when it passes
+/// nothing there, which the parameter reads as `nil`, and `None` when a last
+/// argument that expands may reach it.
+fn passed_arg(call: &LuaCallExpr, param: usize) -> Option<Option<LuaExpr>> {
+    if let Some(arg) = arg_for_param(call, param) {
+        return Some(Some(arg));
+    }
+    let last = call.get_args_list()?.get_args().last();
+    (!last.is_some_and(|last| crate::compilation::analyzer::expr_expands_to_fill_slots(&last)))
+        .then_some(None)
 }
 
 /// What `call` passes for parameter `param`, counting a method's `self` as

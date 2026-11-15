@@ -42,7 +42,7 @@ pub(crate) use infer_index::{
     AccessPaths, keep_access_paths, restore_access_path_snapshot, stop_keeping_access_paths,
     take_access_path_snapshot, with_access_paths,
 };
-pub(crate) use infer_index::{arg_for_param, with_file_cache};
+pub(crate) use infer_index::{arg_for_param, factory_bound_metatable_index, with_file_cache};
 pub(crate) use infer_name::find_self_ref_id;
 pub(crate) use infer_name::infer_authoritative_method_self_type;
 pub(crate) use infer_name::infer_enclosing_self_type;

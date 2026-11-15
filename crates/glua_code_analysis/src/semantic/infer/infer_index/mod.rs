@@ -1051,8 +1051,14 @@ fn infer_table_member_owner(
     );
     let literal_key = !matches!(key, LuaMemberKey::ExprType(_));
     if literal_key
-        && let Some(member_type) =
-            factory_call_member_type(db, cache, &inst, &owner, &key, table_member_lookup_guard)
+        && let Some(member_type) = factory_call_member_type(
+            db,
+            cache,
+            &inst,
+            &owner,
+            &key,
+            &table_member_lookup_guard.made_by,
+        )
     {
         return Ok(member_type);
     }
@@ -1447,7 +1453,7 @@ fn infer_table_metatable_member(
                 metatable,
                 &meta_owner,
                 &index_member_key,
-                table_member_lookup_guard,
+                &table_member_lookup_guard.made_by,
             )
             .unwrap_or(index_type);
             let index_type =
@@ -1460,7 +1466,9 @@ fn infer_table_metatable_member(
             {
                 return Ok(typ);
             }
-            if !metatable_index_type_points_to_table(&index_type, table_range)
+            // A `nil` `__index` is none: the lookup ends at the table.
+            if !index_type.is_nil()
+                && !metatable_index_type_points_to_table(&index_type, table_range)
                 && let Ok(typ) = infer_member_by_member_key_with_table_guard(
                     db,
                     cache,
@@ -1511,9 +1519,9 @@ fn factory_call_member_type(
     table: &InFiled<TextRange>,
     owner: &LuaMemberOwner,
     key: &LuaMemberKey,
-    table_member_lookup_guard: &TableMemberLookupGuard,
+    made_by: &[InFiled<TextRange>],
 ) -> Option<LuaType> {
-    if table_member_lookup_guard.made_by.is_empty() {
+    if made_by.is_empty() {
         return None;
     }
     let members = db.get_member_index().get_members_with_key(owner, key)?;
@@ -1526,7 +1534,28 @@ fn factory_call_member_type(
         cache,
         table,
         InFiled::new(member.get_id().file_id, value),
-        &table_member_lookup_guard.made_by,
+        made_by,
+    )
+}
+
+/// The `__index` the metatable of the table literal `table` holds in the copy
+/// of it the calls `made_by`, innermost last, made, when its one write sets it
+/// from their arguments.
+pub(crate) fn factory_bound_metatable_index(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    table: &InFiled<TextRange>,
+    made_by: &[InFiled<TextRange>],
+) -> Option<LuaType> {
+    let metatable = db.get_metatable_index().get(table)?;
+    let owner = crate::semantic::metatable_member_owner(db, metatable);
+    factory_call_member_type(
+        db,
+        cache,
+        metatable,
+        &owner,
+        &LuaMemberKey::Name("__index".into()),
+        made_by,
     )
 }
 

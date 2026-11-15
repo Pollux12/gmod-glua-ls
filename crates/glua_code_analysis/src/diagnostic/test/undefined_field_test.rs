@@ -4813,6 +4813,50 @@ owner:CompletelyMadeUpMethod()
         ));
     }
 
+    /// A class a factory makes inherits only from the parent its own call
+    /// passed: one made without a parent has no `__index`, and one made with
+    /// one reads that parent's methods and no others.
+    #[test]
+    fn test_factory_class_reads_only_the_parent_its_call_passed() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedMethod);
+        let file_id = ws.def(
+            r#"
+            local function Class(name, parent)
+                local t = {}
+                local meta = {}
+                meta.__call = function(_, ...)
+                    return setmetatable({}, {__index = t})
+                end
+                if parent then meta.__index = parent end
+                setmetatable(t, meta)
+                return t
+            end
+            local Base = Class("Base")
+            function Base:Foo() end
+            local Child = Class("Child", Base)
+            local child = Child()
+            child:Foo()
+            child:Bogus()
+            local Lone = Class("Lone")
+            Lone:Bogus()
+            "#,
+        );
+        let messages = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            vec!["Undefined method `Bogus`. ", "Undefined method `Bogus`. "]
+        );
+    }
+
     #[test]
     fn test_nil_guard_in_condition_truthy_check() {
         let mut ws = VirtualWorkspace::new();
