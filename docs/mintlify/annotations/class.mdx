@@ -85,8 +85,13 @@ It also follows:
 - `newproxy(true)` and `getmetatable(proxy)`. A proxy made with `newproxy(other)` shares `other`'s metatable.
 - Factories. A function that registers the table it returns makes a class at each call, so `local BONE = CreateMetaTable("Bone")` gives `BONE` the class that call registers. Whatever the factory puts on that table belongs to every class it makes.
 - Writes a factory makes under its arguments, such as `Registry[name] = meta` or `Make[name] = function(...) return setmetatable({}, meta) end`. Each call names them: `Registry.Bone` is the class, and `Make.Bone()` returns it.
-- An `__index` function. A key the class doesn't define reads what `__index` returns. If `__index` returns `Storage[self][key]`, the fields of the stored table become the object's fields.
+- An `__index` function. A key the class doesn't define reads what `__index` returns. If `__index` returns `Storage[self][key]` or `rawget(Storage, key)`, the fields of that table become the object's fields.
 - Custom inheritance. If `__index` walks parents with `meta = rawget(meta, "Parent")` or `meta = meta.Parent`, each class inherits from what its factory call stores in `Parent`.
+- Subclasses. `local Dog = setmetatable({}, Animal)` with `Dog.__index = Dog` inherits `Animal`'s methods, and the methods you define on `Dog` stay off `Animal`.
+- Constructors that work on their receiver, such as `function Class:new(o) setmetatable(o, self) self.__index = self return o end`. Each call makes an instance of the table it's called on, so `Special = Account:new()` followed by `function Special:limit() end` is a subclass of `Account`.
+- `__call`. Calling a table runs its `__call` with the table passed first, so `Point(1, 2)` returns what `__call` returns.
+- Operators. `a + b`, `-a`, `a .. b` and the other operators return what the metamethod (`__add`, `__unm`, `__concat`, ...) returns.
+- `__metatable`. `getmetatable(t)` returns the metatable's `__metatable` field when it has one.
 
 Annotate only when the code builds names or parents in ways GLuaLS can't follow, for example `string.upper(name)` as a key.
 
