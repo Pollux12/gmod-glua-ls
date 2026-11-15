@@ -3061,6 +3061,24 @@ mod test {
         assert!(is_function_type(&ws.local_ty(file_id, "ping")));
     }
 
+    /// `getmetatable` gives a metatable's `__metatable` field when it has one.
+    #[test]
+    fn getmetatable_gives_the_metatable_field_that_hides_it() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_locked.lua",
+            r#"
+            local Locked = setmetatable({}, { __metatable = "locked", __index = { a = 1 } })
+            local Open = setmetatable({}, { __index = { a = 1 } })
+            local locked = getmetatable(Locked)
+            local open = getmetatable(Open).__index
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "locked")), "string");
+        assert!(ws.humanize_type(ws.local_ty(file_id, "open")).contains("a"));
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }

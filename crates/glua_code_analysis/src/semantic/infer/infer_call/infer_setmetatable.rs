@@ -212,14 +212,26 @@ pub(crate) fn infer_instance_of(
 }
 
 /// `getmetatable(t)` for a table `setmetatable` gave a metatable, or a
-/// proxy `newproxy` gave one: that metatable. `None` for any other call,
-/// which then reads as declared.
+/// proxy `newproxy` gave one: that metatable, or its `__metatable` field,
+/// which Lua returns in its place. `None` for any other call, which then
+/// reads as declared.
 pub fn infer_getmetatable_call(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     call_expr: &LuaCallExpr,
 ) -> Option<LuaType> {
-    getmetatable_call_metatable(db, cache, call_expr).map(|metatable| metatable_type(db, metatable))
+    let metatable = metatable_type(db, getmetatable_call_metatable(db, cache, call_expr)?);
+    let hidden_by = find_members_with_key(
+        db,
+        &metatable,
+        LuaMemberKey::Name("__metatable".into()),
+        false,
+    )
+    .and_then(|members| members.into_iter().next());
+    Some(match hidden_by {
+        Some(member) => crate::db_index::widen_literal_type_for_assignment(&member.typ),
+        None => metatable,
+    })
 }
 
 /// The table a `getmetatable(t)` call returns, before any registration made
