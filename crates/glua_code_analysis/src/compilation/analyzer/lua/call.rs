@@ -1563,8 +1563,18 @@ fn find_owner_for_prefix(analyzer: &mut LuaAnalyzer, prefix: &LuaExpr) -> Option
         return Some(LuaMemberOwner::Type(type_decl_id));
     }
 
-    match analyzer.infer_expr(prefix).ok()? {
-        LuaType::TableConst(range) => Some(LuaMemberOwner::Element(range)),
+    table_owner(&analyzer.infer_expr(prefix).ok()?)
+}
+
+/// The owner of the members written into the table `typ`: a per-call copy
+/// holds its own, any other instance's belong to the table it folds into.
+fn table_owner(typ: &LuaType) -> Option<LuaMemberOwner> {
+    match typ {
+        LuaType::TableConst(range) => Some(LuaMemberOwner::Element(range.clone())),
+        LuaType::Instance(instance) if instance.get_kind() != crate::LuaInstanceKind::Shared => {
+            Some(LuaMemberOwner::Element(instance.get_range().clone()))
+        }
+        LuaType::Instance(instance) => table_owner(instance.get_base()),
         _ => None,
     }
 }
