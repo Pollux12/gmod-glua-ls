@@ -3079,6 +3079,37 @@ mod test {
         assert!(ws.humanize_type(ws.local_ty(file_id, "open")).contains("a"));
     }
 
+    /// A function stored on a local table takes its parameter types from the
+    /// calls through that table, as a local function does, so the fields a
+    /// constructor copies from them have those types.
+    #[test]
+    fn a_constructor_field_takes_the_type_its_callers_pass() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_point.lua",
+            r#"
+            local Point = {}
+            Point.__index = Point
+            function Point.new(x, label)
+                local o = setmetatable({}, Point)
+                o.x = x
+                o.label = label
+                return o
+            end
+            function Point:Scale(by) return by end
+            local p = Point.new(3, "a")
+            local q = Point.new(4.5, "b")
+            local px = p.x
+            local plabel = p.label
+            local scaled = Point:Scale(2)
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "px")), "(3|4.5)");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "plabel")), r#"("a"|"b")"#);
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "scaled")), "2");
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }

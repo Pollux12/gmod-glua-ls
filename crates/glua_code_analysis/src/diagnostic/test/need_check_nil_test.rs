@@ -10626,7 +10626,9 @@ mod test {
                 return LANG.Strings[raw_lang_name]
             end
 
-            local L = LANG.CreateLanguage("English")
+            ---@type string
+            local lang_name
+            local L = LANG.CreateLanguage(lang_name)
             L.phrase = "unsafe"
         "#;
 
@@ -10665,7 +10667,9 @@ mod test {
                 return LANG.Strings[raw_lang_name]
             end
 
-            local L = LANG.CreateLanguage("English")
+            ---@type string
+            local lang_name
+            local L = LANG.CreateLanguage(lang_name)
             L.phrase = "unsafe"
         "#;
 
@@ -10698,7 +10702,9 @@ mod test {
                 return LANG.Strings[raw_lang_name]
             end
 
-            local L = LANG.CreateLanguage("English")
+            ---@type string
+            local lang_name
+            local L = LANG.CreateLanguage(lang_name)
             L.phrase = "unsafe"
         "#;
 
@@ -10734,7 +10740,9 @@ mod test {
                 return LANG.Strings[raw_lang_name]
             end
 
-            local L = LANG.CreateLanguage("English")
+            ---@type string
+            local lang_name
+            local L = LANG.CreateLanguage(lang_name)
             L.phrase = "unsafe"
         "#;
 
@@ -11307,7 +11315,9 @@ mod test {
                 return LANG.Strings[raw_name_extra]
             end
 
-            local L = LANG.CreateLanguage("English")
+            ---@type string
+            local lang_name
+            local L = LANG.CreateLanguage(lang_name)
             L.phrase = "unsafe"
         "#;
 
@@ -11342,7 +11352,9 @@ mod test {
                 return LANG.Strings[raw_lang_name]
             end
 
-            local L = LANG.CreateLanguage("English")
+            ---@type string
+            local lang_name
+            local L = LANG.CreateLanguage(lang_name)
             L.phrase = "unsafe"
         "#;
 

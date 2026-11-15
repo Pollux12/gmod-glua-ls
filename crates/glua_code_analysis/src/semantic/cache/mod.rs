@@ -21,7 +21,7 @@ use crate::db_index::derivation::{
 };
 use crate::{
     FileId, FlowId, GmodRealm, InFiled, LuaDeclId, LuaFunctionType, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, VarRefId, VarRefRootId,
+    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, VarRefId, VarRefRootId,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::{
         generic::FuncGenericBinding,
@@ -390,9 +390,9 @@ pub struct LuaInferCache {
     /// contradicts, so the files holding these reads are re-derived alongside
     /// the fallback files once the chains settle.
     pub vgui_parent_chain_calls: FxHashSet<LuaSyntaxId>,
-    /// Call sites of a local function, keyed by its declaration. Syntax ids,
-    /// not nodes: red nodes are `!Send`.
-    pub local_function_call_sites_cache: FxHashMap<LuaDeclId, Arc<Vec<LuaSyntaxId>>>,
+    /// Same-file call sites of a function called through a local name, keyed
+    /// by its signature. Syntax ids, not nodes: red nodes are `!Send`.
+    pub local_function_call_sites_cache: FxHashMap<LuaSignatureId, Arc<Vec<LuaSyntaxId>>>,
     /// Whether a call diverges, keyed by the call expression. The flow walk asks
     /// this of every call node it reaches, and answering means resolving what
     /// the call targets through the reference, property, member and signature
