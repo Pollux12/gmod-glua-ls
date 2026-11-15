@@ -64,6 +64,7 @@ pub(crate) use infer::pairs_iter_value_registry_path;
 pub(crate) use infer::presence_guard_target;
 pub(crate) use infer::resolve_decl_backed_global_path_member_type;
 pub(crate) use infer::resolve_type_text;
+pub(crate) use infer::setmetatable_target_of_literal;
 pub(crate) use infer::{
     AccessPaths, keep_access_paths, restore_access_path_snapshot, stop_keeping_access_paths,
     take_access_path_snapshot, with_access_paths,

@@ -12,7 +12,9 @@ use crate::{
     get_real_type,
 };
 
-use super::{InferFailReason, InferResult, get_custom_type_operator, infer_expr};
+use super::{
+    InferFailReason, InferResult, get_custom_type_operator, infer_expr, infer_metamethod_result,
+};
 
 pub fn infer_binary_expr(
     db: &DbIndex,
@@ -327,6 +329,13 @@ fn infer_binary_custom_operator(
         }
     }
 
+    if let Some(result) = [left, right]
+        .into_iter()
+        .find_map(|operand| infer_metamethod_result(db, operand, op))
+    {
+        return result;
+    }
+
     match op {
         LuaOperatorMetaMethod::Add
         | LuaOperatorMetaMethod::Sub
@@ -539,7 +548,7 @@ fn infer_binary_expr_pow(db: &DbIndex, left: LuaType, right: LuaType) -> InferRe
 }
 
 fn infer_binary_expr_concat(db: &DbIndex, left: LuaType, right: LuaType) -> InferResult {
-    if left.is_number() || left.is_string() || right.is_number() || right.is_string() {
+    if (left.is_number() || left.is_string()) && (right.is_number() || right.is_string()) {
         match (&left, &right) {
             (LuaType::StringConst(s1), LuaType::StringConst(s2)) => {
                 return Ok(LuaType::StringConst(

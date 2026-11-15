@@ -2837,6 +2837,112 @@ mod test {
         assert!(is_function_type(&ws.local_ty(file_id, "dogFetch")));
     }
 
+    const VECTOR_CLASS: &str = r#"
+            local V = {}
+            V.__index = V
+            local function new(x) return setmetatable({ x = x }, V) end
+            V.__add = function(a, b) return new(a.x + b.x) end
+            function V.__unm(a) return new(-a.x) end
+            V.__concat = function(a, b) return new(0) end
+            function V:Length() return 1 end
+            local v = new(1)
+    "#;
+
+    /// An operator on values whose metatable defines its metamethod returns
+    /// what the metamethod returns, however the metamethod was written.
+    #[test]
+    fn an_operator_returns_what_its_metamethod_returns() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_vector.lua",
+            &format!(
+                "{VECTOR_CLASS}
+            local sum = v + v
+            local neg = -v
+            local joined = v .. v
+            local sumLength = sum.Length
+            local negLength = neg.Length
+            local joinedLength = joined.Length
+            "
+            ),
+        );
+
+        assert!(is_function_type(&ws.local_ty(file_id, "sumLength")));
+        assert!(is_function_type(&ws.local_ty(file_id, "negLength")));
+        assert!(is_function_type(&ws.local_ty(file_id, "joinedLength")));
+    }
+
+    /// A metamethod on a registered class types the operator on its
+    /// instances.
+    #[test]
+    fn an_operator_on_a_registered_class_returns_what_its_metamethod_returns() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_money.lua",
+            r#"
+            local META = {}
+            META.__index = META
+            function META.__add(a, b) return a end
+            RegisterMetaTable("Money", META)
+            local money = setmetatable({}, FindMetaTable("Money"))
+            local total = money + money
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "total")), "Money");
+    }
+
+    /// Without a metamethod the operator keeps its plain Lua result.
+    #[test]
+    fn an_operator_without_a_metamethod_keeps_its_plain_result() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_plain.lua",
+            r#"
+            local P = {}
+            P.__index = P
+            local p = setmetatable({}, P)
+            local joined = p .. "x"
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "joined")), "string");
+    }
+
+    /// A table made callable by `__call` returns what `__call` returns, with
+    /// the table itself passed first.
+    #[test]
+    fn calling_a_table_runs_its_call_metamethod_on_it() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_point.lua",
+            r#"
+            local Point = {}
+            Point.__index = Point
+            function Point:Length() return 1 end
+            function Point.new(x)
+                local o = setmetatable({}, Point)
+                o.x = x
+                return o
+            end
+            setmetatable(Point, { __call = function(cls, x) return cls.new(x) end })
+            local Shape = setmetatable({}, { __call = function(cls)
+                return setmetatable({}, cls)
+            end })
+            Shape.__index = Shape
+            function Shape:Area() return 2 end
+            local point = Point(1)
+            local length = point.Length
+            local shape = Shape()
+            local area = shape.Area
+            "#,
+        );
+
+        assert!(is_function_type(&ws.local_ty(file_id, "length")));
+        assert!(is_function_type(&ws.local_ty(file_id, "area")));
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }

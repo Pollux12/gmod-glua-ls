@@ -338,6 +338,9 @@ fn receiver_owner_table_range(
     }
 
     let table = field.syntax().parent().and_then(LuaTableExpr::cast)?;
+    if let Some(target) = crate::semantic::setmetatable_target_of_literal(&table) {
+        return table_backing_range_from_expr(analyzer, &target);
+    }
     Some(InFiled::new(analyzer.file_id, table.get_range()))
 }
 

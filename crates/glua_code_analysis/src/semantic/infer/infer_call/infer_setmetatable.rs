@@ -598,39 +598,7 @@ fn infer_receiver_owner_type(
             .map(ReceiverOwnerType::Exact)
             .unwrap_or(ReceiverOwnerType::Rejected);
     }
-    if implicit_self || signature.is_colon_define {
-        return ReceiverOwnerType::NotReceiver;
-    }
-
-    let Some(closure) = name_expr
-        .syntax()
-        .ancestors()
-        .find_map(LuaClosureExpr::cast)
-    else {
-        return ReceiverOwnerType::NotReceiver;
-    };
-    if crate::LuaSignatureId::from_closure(cache.get_file_id(), &closure) != signature_id {
-        return ReceiverOwnerType::NotReceiver;
-    }
-    let Some(field) = closure.syntax().parent().and_then(LuaTableField::cast) else {
-        return ReceiverOwnerType::NotReceiver;
-    };
-    let Some(LuaIndexKey::Name(key)) = field.get_field_key() else {
-        return ReceiverOwnerType::NotReceiver;
-    };
-    if key.get_name_text() != "__call" {
-        return ReceiverOwnerType::NotReceiver;
-    }
-    let Some(owner) = field.syntax().parent().and_then(LuaTableExpr::cast) else {
-        return ReceiverOwnerType::NotReceiver;
-    };
-    if decl_is_mutated(db, &decl_id) {
-        return ReceiverOwnerType::Rejected;
-    }
-    ReceiverOwnerType::Exact(LuaType::TableConst(InFiled::new(
-        cache.get_file_id(),
-        owner.get_range(),
-    )))
+    ReceiverOwnerType::NotReceiver
 }
 
 fn decl_is_mutated(db: &DbIndex, decl_id: &crate::LuaDeclId) -> bool {

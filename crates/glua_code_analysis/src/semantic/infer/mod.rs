@@ -50,6 +50,7 @@ pub(crate) use infer_name::is_authoritative_self_receiver_type;
 pub(crate) use infer_name::is_concrete_self_receiver_type;
 pub(crate) use infer_name::resolve_global_singleton_scripted_type_decl_id;
 pub(crate) use infer_name::resolve_type_text;
+pub(crate) use infer_name::setmetatable_target_of_literal;
 pub(crate) use infer_name::try_local_decl_initializer_fallback_type;
 pub(crate) use infer_name::type_decl_is_vgui_panel;
 pub(crate) use infer_name::{ParamInferenceSource, infer_param_is_weak, infer_param_source};
@@ -333,6 +334,72 @@ fn get_custom_type_operator(
         Some(operators)
     } else {
         None
+    }
+}
+
+/// What the metamethod `op` on `operand`'s metatable returns, when code
+/// writes it there: `MT.__add = f`, `function MT.__add(a, b)`, or a field of
+/// a metatable literal. Lua reads a metamethod raw, so one an `__index`
+/// parent defines does not apply.
+fn infer_metamethod_result(
+    db: &DbIndex,
+    operand: &LuaType,
+    op: LuaOperatorMetaMethod,
+) -> Option<InferResult> {
+    let key = LuaMemberKey::Name(op.metatable_name()?.into());
+    let mut owners = Vec::new();
+    collect_metatable_owners(db, operand, &mut owners);
+    owners.into_iter().find_map(|owner| {
+        let member_index = db.get_member_index();
+        let member = member_index
+            .get_current_owner_members_for_key(&owner, &key)
+            .into_iter()
+            .next()?;
+        let metamethod = db
+            .get_type_index()
+            .get_type_cache(&member.get_id().into())?
+            .as_type()
+            .clone();
+        match metamethod {
+            LuaType::Signature(signature_id) => {
+                let signature = db.get_signature_index().get(&signature_id)?;
+                Some(if signature.is_resolve_return() {
+                    Ok(first_value(db, signature.get_return_type()))
+                } else {
+                    Err(InferFailReason::UnResolveSignatureReturn(signature_id))
+                })
+            }
+            LuaType::DocFunction(func) => Some(Ok(first_value(db, func.get_ret().clone()))),
+            _ => None,
+        }
+    })
+}
+
+/// The owners of the metatables `operand` reads metamethods from: a table
+/// instances fold into is its instances' metatable, so it comes before the
+/// metatable `setmetatable` gave it.
+fn collect_metatable_owners(
+    db: &DbIndex,
+    operand: &LuaType,
+    owners: &mut Vec<crate::LuaMemberOwner>,
+) {
+    match operand {
+        LuaType::TableConst(table) => {
+            owners.push(crate::semantic::metatable_member_owner(db, table));
+            if let Some(metatable) = db.get_metatable_index().get(table) {
+                owners.push(crate::semantic::metatable_member_owner(db, metatable));
+            }
+        }
+        LuaType::Instance(instance) => {
+            if let Some(metatable) = db.get_metatable_index().get(instance.get_range()) {
+                owners.push(crate::semantic::metatable_member_owner(db, metatable));
+            }
+            collect_metatable_owners(db, instance.get_base(), owners);
+        }
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            owners.push(crate::LuaMemberOwner::Type(type_id.clone()));
+        }
+        _ => {}
     }
 }
 

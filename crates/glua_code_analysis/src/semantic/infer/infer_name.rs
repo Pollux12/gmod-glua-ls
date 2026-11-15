@@ -1082,6 +1082,24 @@ fn infer_param_inner(
         _ => unreachable!(),
     };
 
+    // A metamethod's first param is the value Lua calls it on, which a
+    // contract the slot filled in (`std.metatable`) leaves untyped.
+    if param_idx == 0
+        && let Some(member_id) = member_id
+        && let Some(cache) = cache.as_mut()
+        && db
+            .get_signature_index()
+            .get(&signature_id)
+            .is_some_and(|signature| {
+                !signature.is_colon_define
+                    && (signature.params_filled_from_slot
+                        || signature.get_param_info_by_id(0).is_none())
+            })
+        && let Some(receiver) = metamethod_receiver_type(db, cache, member_id)
+    {
+        return Ok((receiver, ParamInferenceSource::Concrete));
+    }
+
     let mut colon_define = false;
     // find local annotation
     if let Some(signature) = db.get_signature_index().get_declared(&signature_id) {
@@ -1948,6 +1966,59 @@ fn find_param_type_from_inherited_members(
     }
 
     None
+}
+
+/// The value Lua passes first to the metamethod `member_id`: for a field of
+/// `setmetatable(t, { __call = f })`'s literal, `t`; for another literal's
+/// field, that table; for `T.__add = f` or `function T.__add`, `T`. A table
+/// instances fold into stands for them.
+fn metamethod_receiver_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    member_id: LuaMemberId,
+) -> Option<LuaType> {
+    let member = db.get_member_index().get_member(&member_id)?;
+    let LuaMemberKey::Name(name) = member.get_key() else {
+        return None;
+    };
+    crate::LuaOperatorMetaMethod::from_metatable_name(name)?;
+    let root = db
+        .get_vfs()
+        .syntax_tree_around(&member_id.file_id, member_id.get_syntax_id().get_range())?
+        .get_red_root();
+    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
+    if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
+        return infer_expr(db, cache, index_expr.get_prefix_expr()?).ok();
+    }
+    let literal = LuaTableField::cast(node)?.get_parent::<LuaTableExpr>()?;
+    if let Some(target) = setmetatable_target_of_literal(&literal) {
+        return infer_expr(db, cache, target).ok();
+    }
+    let table = crate::InFiled::new(member_id.file_id, literal.get_range());
+    Some(
+        db.get_type_index()
+            .table_class(&table)
+            .cloned()
+            .unwrap_or(LuaType::TableConst(table)),
+    )
+}
+
+/// `t` in `setmetatable(t, literal)`.
+pub(crate) fn setmetatable_target_of_literal(literal: &LuaTableExpr) -> Option<LuaExpr> {
+    let call = literal
+        .syntax()
+        .parent()
+        .and_then(|args| args.parent())
+        .and_then(LuaCallExpr::cast)?;
+    let LuaExpr::NameExpr(callee) = call.get_prefix_expr()? else {
+        return None;
+    };
+    if callee.get_name_text().as_deref() != Some("setmetatable") {
+        return None;
+    }
+    let mut args = call.get_args_list()?.get_args();
+    let target = args.next()?;
+    (args.next()?.syntax() == literal.syntax()).then_some(target)
 }
 
 fn find_param_type_from_outer_factory_member(
