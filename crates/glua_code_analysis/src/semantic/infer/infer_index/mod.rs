@@ -952,13 +952,30 @@ fn infer_table_member(
         return Err(InferFailReason::FieldNotFound);
     }
 
-    let result = infer_table_member_owner(
+    let mut result = infer_table_member_owner(
         db,
         cache,
         inst.clone(),
-        index_expr,
+        index_expr.clone(),
         table_member_lookup_guard,
     );
+    // A field the table may not hold reads through to its metatable's
+    // `__index` when it is absent.
+    if let Ok(own) = &result
+        && own.is_nullable()
+        && db.get_metatable_index().get(&inst).is_some()
+        && let Some(index_key) = index_expr.get_index_key()
+        && let Ok(fallback) = infer_table_metatable_member(
+            db,
+            cache,
+            &inst,
+            index_expr,
+            &index_key,
+            table_member_lookup_guard,
+        )
+    {
+        result = Ok(read_through_to(db, own, &fallback));
+    }
     table_member_lookup_guard.remove(&inst);
     result
 }
@@ -1510,6 +1527,19 @@ fn factory_call_member_type(
         InFiled::new(member.get_id().file_id, value),
         &table_member_lookup_guard.made_by,
     )
+}
+
+/// A field a table may not hold, `own`, read where Lua falls back to
+/// `fallback` when it is absent: what both agree on, or either one.
+fn read_through_to(db: &DbIndex, own: &LuaType, fallback: &LuaType) -> LuaType {
+    if fallback.is_nullable() {
+        return own.clone();
+    }
+    let present = TypeOps::Remove.apply(db, own, &LuaType::Nil);
+    match TypeOps::Intersect.apply(db, fallback, &present) {
+        LuaType::Never => TypeOps::Union.apply(db, &present, fallback),
+        intersected => intersected,
+    }
 }
 
 fn metatable_index_type_points_to_table(typ: &LuaType, table_range: &InFiled<TextRange>) -> bool {
@@ -3377,6 +3407,9 @@ fn infer_instance_member(
             index_expr.clone(),
             table_member_lookup_guard,
         ) {
+            Ok(table_type) if table_type.is_nullable() && !typ.is_nullable() => {
+                return Ok(read_through_to(db, &table_type, &typ));
+            }
             Ok(table_type) => {
                 return Ok(match TypeOps::Intersect.apply(db, &typ, &table_type) {
                     LuaType::Never if table_type.is_nullable() => {
