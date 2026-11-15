@@ -346,6 +346,26 @@ fn infer_metamethod_result(
     operand: &LuaType,
     op: LuaOperatorMetaMethod,
 ) -> Option<InferResult> {
+    match metamethod_of(db, operand, op)? {
+        LuaType::Signature(signature_id) => {
+            let signature = db.get_signature_index().get(&signature_id)?;
+            Some(if signature.is_resolve_return() {
+                Ok(first_value(db, signature.get_return_type()))
+            } else {
+                Err(InferFailReason::UnResolveSignatureReturn(signature_id))
+            })
+        }
+        LuaType::DocFunction(func) => Some(Ok(first_value(db, func.get_ret().clone()))),
+        _ => None,
+    }
+}
+
+/// The function code writes as the metamethod `op` of `operand`'s metatable.
+pub(crate) fn metamethod_of(
+    db: &DbIndex,
+    operand: &LuaType,
+    op: LuaOperatorMetaMethod,
+) -> Option<LuaType> {
     let key = LuaMemberKey::Name(op.metatable_name()?.into());
     let mut owners = Vec::new();
     collect_metatable_owners(db, operand, &mut owners);
@@ -360,18 +380,7 @@ fn infer_metamethod_result(
             .get_type_cache(&member.get_id().into())?
             .as_type()
             .clone();
-        match metamethod {
-            LuaType::Signature(signature_id) => {
-                let signature = db.get_signature_index().get(&signature_id)?;
-                Some(if signature.is_resolve_return() {
-                    Ok(first_value(db, signature.get_return_type()))
-                } else {
-                    Err(InferFailReason::UnResolveSignatureReturn(signature_id))
-                })
-            }
-            LuaType::DocFunction(func) => Some(Ok(first_value(db, func.get_ret().clone()))),
-            _ => None,
-        }
+        matches!(metamethod, LuaType::Signature(_) | LuaType::DocFunction(_)).then_some(metamethod)
     })
 }
 

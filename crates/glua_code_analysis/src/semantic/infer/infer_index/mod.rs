@@ -1,3 +1,4 @@
+mod factory_call;
 mod function_index;
 pub(crate) use function_index::code_index_function;
 mod infer_array;
@@ -68,23 +69,28 @@ use super::{
     infer_name::{contains_self_infer, infer_global_type},
 };
 
-/// The tables a member lookup is walking, the per-call table whose base
-/// the lookup is reading through, and whether it reached the current class
-/// from one of its subclasses.
+/// The tables a member lookup is walking, each with the innermost instance it
+/// reached it through, the per-call table whose base the lookup is reading
+/// through, the ranges of the instances it is reading through, outermost
+/// first, which name the calls that made per-call copies, and whether it
+/// reached the current class from one of its subclasses.
 #[derive(Default)]
 struct TableMemberLookupGuard {
-    tables: FxHashSet<InFiled<TextRange>>,
+    tables: FxHashSet<(InFiled<TextRange>, Option<InFiled<TextRange>>)>,
     instance: Option<Arc<LuaInstanceType>>,
+    made_by: Vec<InFiled<TextRange>>,
     inherited: bool,
 }
 
 impl TableMemberLookupGuard {
     fn insert(&mut self, table: InFiled<TextRange>) -> bool {
-        self.tables.insert(table)
+        let made_by = self.made_by.last().cloned();
+        self.tables.insert((table, made_by))
     }
 
     fn remove(&mut self, table: &InFiled<TextRange>) {
-        self.tables.remove(table);
+        let made_by = self.made_by.last().cloned();
+        self.tables.remove(&(table.clone(), made_by));
     }
 
     /// The type the dynamic fields of `table` are read through: the per-call
@@ -1028,6 +1034,12 @@ fn infer_table_member_owner(
     let literal_key = !matches!(key, LuaMemberKey::ExprType(_));
     if literal_key
         && let Some(member_type) =
+            factory_call_member_type(db, cache, &inst, &owner, &key, table_member_lookup_guard)
+    {
+        return Ok(member_type);
+    }
+    if literal_key
+        && let Some(member_type) =
             exact_member_memo_get(cache, &memo_key, site_realm, access_position)
     {
         return Ok(member_type);
@@ -1411,6 +1423,15 @@ fn infer_table_metatable_member(
         None,
     ) {
         Ok(index_type) => {
+            let index_type = factory_call_member_type(
+                db,
+                cache,
+                metatable,
+                &meta_owner,
+                &index_member_key,
+                table_member_lookup_guard,
+            )
+            .unwrap_or(index_type);
             let index_type =
                 match super::infer_call::classify_metatable_index_candidate(&index_type) {
                     super::infer_call::MetatableIndexCandidate::Supported(index_type) => index_type,
@@ -1461,6 +1482,34 @@ fn infer_table_metatable_member(
     }
 
     Err(InferFailReason::FieldNotFound)
+}
+
+/// The member `key` of `owner`, the table literal `table`, in the copy of it
+/// a factory call the lookup reads through made, when its one write sets it
+/// from that call's arguments.
+fn factory_call_member_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    table: &InFiled<TextRange>,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    table_member_lookup_guard: &TableMemberLookupGuard,
+) -> Option<LuaType> {
+    if table_member_lookup_guard.made_by.is_empty() {
+        return None;
+    }
+    let members = db.get_member_index().get_members_with_key(owner, key)?;
+    let [member] = members.as_slice() else {
+        return None;
+    };
+    let value = crate::semantic::get_member_value_expr(db, member.get_id())?;
+    factory_call::infer_factory_call_value(
+        db,
+        cache,
+        table,
+        InFiled::new(member.get_id().file_id, value),
+        &table_member_lookup_guard.made_by,
+    )
 }
 
 fn metatable_index_type_points_to_table(typ: &LuaType, table_range: &InFiled<TextRange>) -> bool {
@@ -3307,6 +3356,7 @@ fn infer_instance_member(
             .instance
             .replace(Arc::new(inst.clone()))
     });
+    table_member_lookup_guard.made_by.push(range.clone());
     let base_result = infer_member_by_member_key_with_table_guard(
         db,
         cache,
@@ -3315,6 +3365,7 @@ fn infer_instance_member(
         infer_guard,
         table_member_lookup_guard,
     );
+    table_member_lookup_guard.made_by.pop();
     if let Some(previous) = previous_instance {
         table_member_lookup_guard.instance = previous;
     }

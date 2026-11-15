@@ -72,15 +72,34 @@ struct SignatureFacts {
     fresh_returned_values: Vec<TextRange>,
 }
 
-/// A function whose every return is a table given the metatable its parameter
-/// `metatable_param` holds, counting a method's `self` as parameter 0: each
-/// call returns an instance of what it passes there.
+/// A function whose every return is a table given the metatable `metatable`
+/// names: each call returns an instance of that call's metatable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaInstanceReturnAlias {
-    pub metatable_param: usize,
+    pub metatable: LuaInstanceMetatable,
+    /// Whether the metatable is the literal `{ __index = X }` around what
+    /// `metatable` names, which instances then read through directly.
+    pub index_is_metatable_field: bool,
     /// The table constructor every call makes anew for the instance, relative
     /// to the function's start so a shift of its file leaves the fact unchanged.
     pub table: Option<TextRange>,
+}
+
+/// Where a call of a function with a [`LuaInstanceReturnAlias`] takes the
+/// metatable of the instance it returns from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LuaInstanceMetatable {
+    /// Its parameter, counting a method's `self` as parameter 0.
+    Param(usize),
+    /// A table the function that made it constructs, named at `name`
+    /// (relative to the function's start). That function makes a new one on
+    /// each call, along with this function, so a call through one of those
+    /// tables makes instances of that one.
+    Upvalue { name: TextRange },
+    /// Its parameter `param`, when it returns the call `param.key(...)` or
+    /// `param:key(...)` at `call` (relative to the function's start) and that
+    /// call makes an instance of `param`.
+    MadeBy { param: usize, call: TextRange },
 }
 
 /// A call whose result the function returns and which is handed some of the

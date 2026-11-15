@@ -3106,8 +3106,209 @@ mod test {
         );
 
         assert_eq!(ws.humanize_type(ws.local_ty(file_id, "px")), "(3|4.5)");
-        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "plabel")), r#"("a"|"b")"#);
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "plabel")),
+            r#"("a"|"b")"#
+        );
         assert_eq!(ws.humanize_type(ws.local_ty(file_id, "scaled")), "2");
+    }
+
+    /// A `class(base)` helper makes a new table on each call, with `base` as
+    /// its parent: each class has its own methods and inherits its parent's,
+    /// also for a class made by a method calling the helper on `self`.
+    #[test]
+    fn a_class_helper_makes_each_class_inherit_from_its_base() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_class.lua",
+            r#"
+            local function class(base)
+                local c = {}
+                c.__index = c
+                setmetatable(c, { __index = base, __call = function(cls, ...) return cls.new(...) end })
+                function c.new(...)
+                    local o = setmetatable({}, c)
+                    if o.init then o:init(...) end
+                    return o
+                end
+                function c:extend() return class(self) end
+                return c
+            end
+            local Animal = class()
+            function Animal:Speak() return "..." end
+            local Dog = class(Animal)
+            function Dog:Fetch() return 1 end
+            local Puppy = Dog:extend()
+            function Puppy:Nap() return true end
+            local dog = Dog.new()
+            local animal = Animal.new()
+            local puppy = Puppy()
+            local dogSpeak = dog.Speak
+            local dogFetch = dog.Fetch
+            local dogNap = dog.Nap
+            local animalFetch = animal.Fetch
+            local puppySpeak = puppy.Speak
+            local puppyFetch = puppy.Fetch
+            local puppyNap = puppy.Nap
+            "#,
+        );
+
+        for name in [
+            "dogSpeak",
+            "dogFetch",
+            "puppySpeak",
+            "puppyFetch",
+            "puppyNap",
+        ] {
+            assert!(is_function_type(&ws.local_ty(file_id, name)), "{name}");
+        }
+        for name in ["dogNap", "animalFetch"] {
+            assert!(!is_function_type(&ws.local_ty(file_id, name)), "{name}");
+        }
+    }
+
+    /// A class library whose `extend` copies a class into a new table with
+    /// the class as its metatable, and whose `__call` method makes instances:
+    /// each class has its own methods, and `super` names its own parent.
+    #[test]
+    fn a_class_library_extending_through_a_metatable_keeps_each_class() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_classic.lua",
+            r#"
+            local Object = {}
+            Object.__index = Object
+            function Object:new() end
+            function Object:extend()
+                local cls = {}
+                for k, v in pairs(self) do
+                    if k:find("__") == 1 then
+                        cls[k] = v
+                    end
+                end
+                cls.__index = cls
+                cls.super = self
+                setmetatable(cls, self)
+                return cls
+            end
+            function Object:__call(...)
+                local obj = setmetatable({}, self)
+                obj:new(...)
+                return obj
+            end
+            local Point = Object:extend()
+            function Point:Len() return 1 end
+            local Rect = Point:extend()
+            function Rect:Area() return 2 end
+            local p = Point()
+            local r = Rect()
+            local pointLen = p.Len
+            local pointArea = p.Area
+            local rectLen = r.Len
+            local rectArea = r.Area
+            local rectSuperLen = Rect.super.Len
+            local pointSuperLen = Point.super.Len
+            "#,
+        );
+
+        for name in ["pointLen", "rectLen", "rectArea", "rectSuperLen"] {
+            assert!(is_function_type(&ws.local_ty(file_id, name)), "{name}");
+        }
+        for name in ["pointArea", "pointSuperLen"] {
+            assert!(!is_function_type(&ws.local_ty(file_id, name)), "{name}");
+        }
+    }
+
+    /// A factory whose metatable's `__call` makes instances reading through
+    /// the class it made, with a parent per call: an instance reads its
+    /// class's members and its parent's, including accessors a helper
+    /// installs on the parent, past the ones it may install on the class.
+    #[test]
+    fn a_call_metamethod_closing_over_its_class_makes_instances_of_it() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_oop.lua",
+            r#"
+            local function Class(name, parent)
+                local t = {}
+                local meta = {}
+                meta.__call = function(_, ...)
+                    local inst = setmetatable({}, {__index = t})
+                    if inst.initialize then inst:initialize(...) end
+                    return inst
+                end
+                if parent then meta.__index = parent end
+                setmetatable(t, meta)
+                return t
+            end
+            local function AccessorFunc(panel, fieldname, name)
+                panel["Get" .. name] = function(self) return self[fieldname] end
+                panel["Set" .. name] = function(self, value) self[fieldname] = value end
+            end
+            local GridDim = Class("GridDim")
+            AccessorFunc(GridDim, "_size", "Size")
+            function GridDim:Reset() end
+            local Row = Class("Row", GridDim)
+            AccessorFunc(Row, "_marginTop", "MarginTop")
+            function Row:Width() return 1 end
+            local Cell = Class("Cell")
+            local PANEL = {}
+            function PANEL:Init() self._rows = {} end
+            function PANEL:Row()
+                local row = Row()
+                self._rows[#self._rows + 1] = row
+                return row
+            end
+            function PANEL:RowCount() return #self._rows end
+            function PANEL:Layout()
+                for r = 1, self:RowCount() do
+                    local row = self._rows[r]
+                    local rowSetSize = row.SetSize
+                end
+            end
+            local row = Row()
+            local cell = Cell()
+            local rowReset = row.Reset
+            local rowWidth = row.Width
+            local cellReset = cell.Reset
+            "#,
+        );
+
+        for name in ["rowSetSize", "rowReset", "rowWidth"] {
+            assert!(is_function_type(&ws.local_ty(file_id, name)), "{name}");
+        }
+        assert!(!is_function_type(&ws.local_ty(file_id, "cellReset")));
+    }
+
+    /// A field a factory sets from its parameter holds what the call making
+    /// the table passed.
+    #[test]
+    fn a_factory_field_holds_what_its_call_passed() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_named.lua",
+            r#"
+            local function class(name)
+                local cls = { name = name }
+                cls.__index = cls
+                return cls
+            end
+            local Shape = class("Shape")
+            local Square = class("Square")
+            local shapeName = Shape.name
+            local squareName = Square.name
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "shapeName")),
+            r#""Shape""#
+        );
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "squareName")),
+            r#""Square""#
+        );
     }
 
     fn is_function_type(typ: &LuaType) -> bool {

@@ -166,35 +166,59 @@ fn is_class_use(name: &LuaNameExpr) -> bool {
 }
 
 /// Whether `index` already reads through the table at `range`, which Lua
-/// rejects as a loop in `gettable`.
+/// rejects as a loop in `gettable`. The tables under a per-call copy are the
+/// ones another call made, so a constructor there is a different table.
 fn index_chain_reaches(index: &LuaType, range: &InFiled<rowan::TextRange>) -> bool {
     let mut current = index;
+    if current == &LuaType::TableConst(range.clone()) {
+        return true;
+    }
     while let LuaType::Instance(instance) = current {
         if instance.get_range() == range {
             return true;
+        }
+        if instance.get_kind() != crate::LuaInstanceKind::Shared {
+            return false;
         }
         current = instance.get_base();
     }
     false
 }
 
-/// What a call of a function returning an instance of `metatable` gives (see
-/// `LuaInstanceReturnAlias`): the class `metatable`'s `__index` names, on the
-/// table the function makes for it, and for a result used as a class of its
-/// own, an instance at the call so each call's class keeps its own members.
-pub(crate) fn infer_instance_of(
+/// The `__index` of the metatable `metatable`, which its instances read
+/// through.
+pub(crate) fn infer_metatable_index_of(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    metatable: LuaExpr,
+) -> Option<LuaType> {
+    match infer_metatable_index_type(db, cache, metatable).ok()? {
+        MetatableIndex::Index(index) => Some(index),
+        _ => None,
+    }
+}
+
+/// What a call of a function returning an instance reading through `index`
+/// gives (see `LuaInstanceReturnAlias`): `index`, on the
+/// table the function makes for it when the function writes members into it,
+/// and for a result used as a class of its own, an instance at the call so
+/// each call's class keeps its own members. A table made empty folds into the
+/// class, as `setmetatable({}, Class)` does.
+pub(crate) fn infer_instance_on_index(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     call_expr: &LuaCallExpr,
-    metatable: LuaExpr,
+    index: LuaType,
     table: Option<InFiled<rowan::TextRange>>,
 ) -> Option<LuaType> {
-    let MetatableIndex::Index(index) = infer_metatable_index_type(db, cache, metatable).ok()?
-    else {
-        return None;
-    };
     let index = match table {
-        Some(table) if !index_chain_reaches(&index, &table) => {
+        Some(table)
+            if !index_chain_reaches(&index, &table)
+                && db
+                    .get_member_index()
+                    .get_members(&LuaMemberOwner::Element(table.clone()))
+                    .is_some_and(|members| !members.is_empty()) =>
+        {
             LuaType::Instance(LuaInstanceType::new(index, table).into())
         }
         _ => index,

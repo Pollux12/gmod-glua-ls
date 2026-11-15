@@ -18,8 +18,8 @@ use crate::{
         UnResolveParentClosureParams, UnResolveReturn,
     },
     db_index::{
-        LuaClassNameReturnAlias, LuaDocReturnInfo, LuaInstanceReturnAlias, LuaMemberOwner,
-        LuaReturnCorrelation, LuaSignatureId,
+        LuaClassNameReturnAlias, LuaDocReturnInfo, LuaInstanceMetatable, LuaInstanceReturnAlias,
+        LuaMemberOwner, LuaReturnCorrelation, LuaSignatureId,
     },
     infer_expr,
 };
@@ -307,26 +307,73 @@ fn analyze_instance_return_alias(
             }
             _ => return Some(()),
         };
-        let (table, metatable) = setmetatable_args(&call)?;
-        let metatable = expr_name_text(&metatable)?;
-        let metatable_param = params.iter().position(|param| *param == metatable)?;
-        let table = match table {
-            LuaExpr::TableExpr(table) => Some(table.get_range() - closure_start),
-            _ => None,
-        };
-        let found = LuaInstanceReturnAlias {
-            metatable_param,
-            table,
+        let found = match setmetatable_args(&call) {
+            Some((table, metatable)) => {
+                let (named, index_is_metatable_field) = match metatable {
+                    LuaExpr::TableExpr(literal) => (metatable_index_field(&literal)?, true),
+                    metatable => (metatable, false),
+                };
+                let LuaExpr::NameExpr(named) = named else {
+                    return Some(());
+                };
+                let name = named.get_name_text()?;
+                // A literal metatable over a parameter, given to a table the
+                // function returns as its own, is that table's per-call
+                // parent, which reading the copy each call makes binds.
+                let metatable = match params.iter().position(|param| *param == name) {
+                    Some(_)
+                        if index_is_metatable_field && !matches!(table, LuaExpr::TableExpr(_)) =>
+                    {
+                        return Some(());
+                    }
+                    Some(param) => LuaInstanceMetatable::Param(param),
+                    None if local_table_constructor(&block, &name).is_none() => {
+                        LuaInstanceMetatable::Upvalue {
+                            name: named.get_range() - closure_start,
+                        }
+                    }
+                    None => return Some(()),
+                };
+                let table = match table {
+                    LuaExpr::TableExpr(table) => Some(table.get_range() - closure_start),
+                    LuaExpr::NameExpr(name) => {
+                        local_table_constructor(&block, &name.get_name_text()?)
+                            .map(|table| table.get_range() - closure_start)
+                    }
+                    _ => None,
+                };
+                let alias = LuaInstanceReturnAlias {
+                    metatable,
+                    index_is_metatable_field,
+                    table,
+                };
+                (alias, name)
+            }
+            None => {
+                let LuaExpr::IndexExpr(callee) = call.get_prefix_expr()? else {
+                    return Some(());
+                };
+                let receiver = expr_name_text(&callee.get_prefix_expr()?)?;
+                let alias = LuaInstanceReturnAlias {
+                    metatable: LuaInstanceMetatable::MadeBy {
+                        param: params.iter().position(|param| *param == receiver)?,
+                        call: call.get_range() - closure_start,
+                    },
+                    index_is_metatable_field: false,
+                    table: None,
+                };
+                (alias, receiver.into())
+            }
         };
         if alias.as_ref().is_some_and(|existing| *existing != found) {
             return Some(());
         }
         alias = Some(found);
     }
-    let alias = alias?;
+    let (alias, metatable_name) = alias?;
     if block
         .get_stats()
-        .any(|stat| stat_may_write_name(&stat, &params[alias.metatable_param]))
+        .any(|stat| stat_may_write_name(&stat, &metatable_name))
     {
         return Some(());
     }
@@ -375,6 +422,39 @@ fn setmetatable_given_to(block: &LuaBlock, name: &str, position: TextSize) -> Op
         .iter()
         .all(|stat| !stat_may_write_name(stat, name))
         .then_some(call)
+}
+
+/// `X` of a metatable literal `{ __index = X, ... }`.
+fn metatable_index_field(literal: &LuaTableExpr) -> Option<LuaExpr> {
+    literal.get_fields().find_map(|field| {
+        let LuaIndexKey::Name(key) = field.get_field_key()? else {
+            return None;
+        };
+        (key.get_name_text() == "__index")
+            .then(|| field.get_value_expr())
+            .flatten()
+    })
+}
+
+/// The table constructor `local name = {...}` of `block` initialises `name`
+/// with, each run of the block making a new table.
+fn local_table_constructor(block: &LuaBlock, name: &str) -> Option<LuaTableExpr> {
+    block.get_stats().find_map(|stat| {
+        let LuaStat::LocalStat(local_stat) = stat else {
+            return None;
+        };
+        let mut names = local_stat.get_local_name_list();
+        let (Some(local), None) = (names.next(), names.next()) else {
+            return None;
+        };
+        if local.get_name_token()?.get_name_text() != name {
+            return None;
+        }
+        match local_stat.get_value_exprs().next()? {
+            LuaExpr::TableExpr(table) => Some(table),
+            _ => None,
+        }
+    })
 }
 
 /// `(t, mt)` of a `setmetatable(t, mt)` call.
