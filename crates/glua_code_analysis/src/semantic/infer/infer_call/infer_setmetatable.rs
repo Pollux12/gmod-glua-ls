@@ -1,12 +1,13 @@
 use glua_parser::{
-    BinaryOperator, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexKey,
-    LuaTableExpr, LuaTableField, LuaVarExpr,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaClosureExpr,
+    LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaNameExpr, LuaStat, LuaTableExpr,
+    LuaTableField, LuaVarExpr,
 };
 
 use crate::semantic::semantic_decl_value;
 use crate::{
-    DbIndex, InFiled, InferFailReason, LuaDeclExtra, LuaInferCache, LuaInstanceType, LuaMemberKey,
-    LuaMemberOwner, LuaType, SemanticDeclLevel, infer_expr,
+    DbIndex, InFiled, InferFailReason, LuaDeclExtra, LuaDeclId, LuaInferCache, LuaInstanceType,
+    LuaMemberKey, LuaMemberOwner, LuaType, SemanticDeclLevel, infer_expr,
     semantic::{
         SemanticDeclGuard, get_member_value_expr, infer::InferResult, infer_expr_semantic_decl,
         member::find_members_with_key,
@@ -48,7 +49,7 @@ pub fn infer_setmetatable_call(
     };
     match &basic_table {
         LuaExpr::TableExpr(table_expr) => {
-            if table_expr.is_empty() && is_index {
+            if table_expr.is_empty() && is_index && !result_used_as_class(db, cache, &call_expr) {
                 return Ok(meta_type);
             }
 
@@ -81,6 +82,82 @@ pub fn infer_setmetatable_call(
             Ok(meta_type)
         }
     }
+}
+
+/// Whether the table `setmetatable({}, mt)` makes is used as a class of its
+/// own: the variable holding it gets its own `__index`, or is the metatable of
+/// another `setmetatable` call. Such a table is a subclass that keeps its own
+/// members; a plain instance shares its class's.
+fn result_used_as_class(db: &DbIndex, cache: &LuaInferCache, call_expr: &LuaCallExpr) -> bool {
+    let Some(holder) = call_expr.get_parent::<LuaStat>() else {
+        return false;
+    };
+    let Some(root) = call_expr.syntax().ancestors().last() else {
+        return false;
+    };
+    let file_id = cache.get_file_id();
+    match holder {
+        LuaStat::LocalStat(local_stat) => {
+            let Some(name) = local_stat.get_local_name_list().next() else {
+                return false;
+            };
+            let decl_id = LuaDeclId::new(file_id, name.get_position());
+            db.get_reference_index()
+                .get_decl_references(&file_id, &decl_id)
+                .is_some_and(|references| {
+                    references.cells.iter().any(|cell| {
+                        root.covering_element(cell.range)
+                            .parent()
+                            .and_then(LuaNameExpr::cast)
+                            .is_some_and(|use_| is_class_use(&use_))
+                    })
+                })
+        }
+        LuaStat::AssignStat(assign_stat) => {
+            let (vars, _) = assign_stat.get_var_and_expr_list();
+            let Some(LuaVarExpr::NameExpr(global)) = vars.first() else {
+                return false;
+            };
+            let Some(name) = global.get_name_text() else {
+                return false;
+            };
+            root.descendants()
+                .filter_map(LuaNameExpr::cast)
+                .any(|use_| use_.get_name_text() == Some(name.clone()) && is_class_use(&use_))
+        }
+        _ => false,
+    }
+}
+
+/// `name.__index = ...` or `setmetatable(x, name)`.
+fn is_class_use(name: &LuaNameExpr) -> bool {
+    let Some(parent) = name.syntax().parent() else {
+        return false;
+    };
+    if let Some(index_expr) = LuaIndexExpr::cast(parent.clone()) {
+        return index_expr
+            .get_name_token()
+            .is_some_and(|key| key.get_name_text() == "__index")
+            && index_expr
+                .get_parent::<LuaAssignStat>()
+                .is_some_and(|assign| {
+                    assign
+                        .get_var_and_expr_list()
+                        .0
+                        .iter()
+                        .any(|var| var.syntax() == index_expr.syntax())
+                });
+    }
+    let Some(args) = LuaCallArgList::cast(parent) else {
+        return false;
+    };
+    args.get_args().nth(1).is_some_and(|arg| arg.syntax() == name.syntax())
+        && args
+            .get_parent::<LuaCallExpr>()
+            .and_then(|call| call.get_prefix_expr())
+            .is_some_and(|prefix| {
+                matches!(prefix, LuaExpr::NameExpr(callee) if callee.get_name_text().as_deref() == Some("setmetatable"))
+            })
 }
 
 /// `getmetatable(t)` for a table `setmetatable` gave a metatable, or a

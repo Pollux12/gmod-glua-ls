@@ -2783,6 +2783,60 @@ mod test {
         assert!(is_function_type(&ws.local_ty(file_id, "hello")));
     }
 
+    /// A method defined on a subclass belongs to the subclass: an instance of
+    /// the parent does not have it, while an instance of the subclass still
+    /// inherits the parent's methods.
+    #[test]
+    fn a_subclass_method_stays_off_the_parent() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_animals.lua",
+            r#"
+            local Animal = {}
+            Animal.__index = Animal
+            function Animal:Speak() return "..." end
+            local Dog = setmetatable({}, Animal)
+            Dog.__index = Dog
+            function Dog:Fetch() return true end
+            local cat = setmetatable({}, Animal)
+            local catFetch = cat.Fetch
+            local dog = setmetatable({}, Dog)
+            local dogSpeak = dog.Speak
+            local dogFetch = dog.Fetch
+            "#,
+        );
+
+        assert!(!is_function_type(&ws.local_ty(file_id, "catFetch")));
+        assert!(is_function_type(&ws.local_ty(file_id, "dogSpeak")));
+        assert!(is_function_type(&ws.local_ty(file_id, "dogFetch")));
+    }
+
+    /// The same holds for a subclass held in a global.
+    #[test]
+    fn a_global_subclass_method_stays_off_the_parent() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_animals.lua",
+            r#"
+            Animal = {}
+            Animal.__index = Animal
+            function Animal:Speak() return "..." end
+            Dog = setmetatable({}, Animal)
+            Dog.__index = Dog
+            function Dog:Fetch() return true end
+            local cat = setmetatable({}, Animal)
+            local catFetch = cat.Fetch
+            local dog = setmetatable({}, Dog)
+            local dogSpeak = dog.Speak
+            local dogFetch = dog.Fetch
+            "#,
+        );
+
+        assert!(!is_function_type(&ws.local_ty(file_id, "catFetch")));
+        assert!(is_function_type(&ws.local_ty(file_id, "dogSpeak")));
+        assert!(is_function_type(&ws.local_ty(file_id, "dogFetch")));
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }
