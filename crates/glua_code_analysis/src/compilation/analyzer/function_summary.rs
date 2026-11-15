@@ -16,8 +16,8 @@ use crate::{DbIndex, FileId, LuaSignatureId};
 /// A file's function summaries, each keyed by its closure's position.
 #[derive(Debug, Default)]
 pub(crate) struct FileFunctionSummaries {
-    /// The closures whose body writes `table_param[key_param]`.
-    pub(super) field_setter_helpers: FxHashMap<TextSize, Vec<dynamic_field::FieldSetterHelper>>,
+    /// The writes of each closure whose key is built from its parameters.
+    pub(super) field_installers: FxHashMap<TextSize, Vec<dynamic_field::FieldInstaller>>,
     /// The parameters each function statement assigns to.
     pub(super) mutated_params: FxHashMap<TextSize, Vec<usize>>,
     /// The parameters each function installs named members on.
@@ -34,7 +34,7 @@ pub(crate) struct FileFunctionSummaries {
 
 impl FileFunctionSummaries {
     fn is_empty(&self) -> bool {
-        self.field_setter_helpers.is_empty()
+        self.field_installers.is_empty()
             && self.mutated_params.is_empty()
             && self.installer_params.is_empty()
             && self.filled_params.is_empty()
@@ -69,7 +69,7 @@ fn hash_sorted<H: Hasher, V: Hash>(entries: &FxHashMap<TextSize, V>, state: &mut
 
 impl Hash for FileFunctionSummaries {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        hash_sorted(&self.field_setter_helpers, state);
+        hash_sorted(&self.field_installers, state);
         hash_sorted(&self.mutated_params, state);
         hash_sorted(&self.installer_params, state);
         hash_sorted(&self.filled_params, state);
@@ -98,7 +98,7 @@ pub(super) fn collect_function_summaries(
     let (mutated_params, installer_params, filled_params, returns_explicit_self) =
         call_site_params::collect_param_summaries(db, file_id, root);
     let summaries = FileFunctionSummaries {
-        field_setter_helpers: dynamic_field::collect_field_setter_helpers(root),
+        field_installers: dynamic_field::collect_field_installers(db, file_id, root),
         mutated_params,
         installer_params,
         filled_params,

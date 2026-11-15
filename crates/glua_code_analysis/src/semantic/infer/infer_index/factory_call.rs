@@ -29,12 +29,12 @@ pub(super) fn infer_factory_call_value(
     if !constructs_table {
         return None;
     }
-    Some(infer_forwarded_arg(
+    infer_forwarded_arg(
         db,
         cache,
         InFiled::new(calls[at].file_id, arg),
         &calls[..at],
-    )?)
+    )
 }
 
 /// What the argument `arg` holds, reading a parameter of the function it is
@@ -100,7 +100,7 @@ fn bound_arg(
 
 /// What `call` passes for parameter `param`, counting a method's `self` as
 /// parameter 0.
-fn arg_for_param(call: &LuaCallExpr, param: usize) -> Option<LuaExpr> {
+pub(crate) fn arg_for_param(call: &LuaCallExpr, param: usize) -> Option<LuaExpr> {
     let mut args = call.get_args_list()?.get_args();
     if !call.is_colon_call() {
         return args.nth(param);
@@ -136,7 +136,7 @@ fn signature_closure(db: &DbIndex, signature_id: LuaSignatureId) -> Option<LuaCl
         .find(|closure| closure.get_position() == signature_id.get_position())
 }
 
-fn with_file_cache<T>(
+pub(crate) fn with_file_cache<T>(
     cache: &mut LuaInferCache,
     file_id: crate::FileId,
     f: impl FnOnce(&mut LuaInferCache) -> Option<T>,

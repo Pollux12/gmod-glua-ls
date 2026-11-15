@@ -492,6 +492,13 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
     )) {
         return Some(());
     }
+    if super::super::dynamic_field::is_write_of_seen_installer(
+        &analyzer.db,
+        analyzer.file_id,
+        &index_expr,
+    ) {
+        return Some(());
+    }
     let prefix_expr = index_expr.get_prefix_expr()?;
     if prefix_path_has_computed_segment(&prefix_expr) {
         let member_id = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);

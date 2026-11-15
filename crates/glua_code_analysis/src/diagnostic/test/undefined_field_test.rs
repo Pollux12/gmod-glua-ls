@@ -4662,6 +4662,157 @@ owner:CompletelyMadeUpMethod()
         ));
     }
 
+    fn dynamic_field_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws
+    }
+
+    const INSTALL: &str = r#"
+        local function Install(t, name, value)
+            t["Set" .. name] = value
+        end
+    "#;
+
+    /// A function building a key from its parameters gives each table the
+    /// names its own calls pass, not every caller's.
+    #[test]
+    fn test_installed_key_names_belong_to_the_call_that_passed_them() {
+        let mut ws = dynamic_field_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!(
+                r#"{INSTALL}
+                local A, B = {{}}, {{}}
+                Install(A, "X", 1)
+                Install(B, "Y", "s")
+                local ax = A.SetX
+                local by = B.SetY
+                "#
+            ),
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!(
+                r#"{INSTALL}
+                local A, B = {{}}, {{}}
+                Install(A, "X", 1)
+                Install(B, "Y", "s")
+                local ay = A.SetY
+                "#
+            ),
+        ));
+    }
+
+    /// A field a call installs holds the value that call passed.
+    #[test]
+    fn test_installed_field_holds_the_value_its_call_passed() {
+        let mut ws = dynamic_field_workspace();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_vehicles.lua",
+            r#"
+            Vehicles = {}
+            local function RegisterVehicle(name, data)
+                Vehicles["Car" .. name] = data
+            end
+            RegisterVehicle("Sedan", { seats = 4 })
+            RegisterVehicle("Truck", { cargo = 100 })
+            local seats = Vehicles.CarSedan.seats
+            local cargo = Vehicles.CarTruck.cargo
+
+            local function set(t, k, v) t[k] = v end
+            local C = {}
+            set(C, "x", 5)
+            local x = C.x
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "seats")), "4");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "cargo")), "100");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "x")), "5");
+    }
+
+    /// A registry only holds the keys its calls register.
+    #[test]
+    fn test_registry_reports_a_key_no_call_registered() {
+        let mut ws = dynamic_field_workspace();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local Vehicles = {}
+            local function RegisterVehicle(name, data)
+                Vehicles["Car" .. name] = data
+            end
+            RegisterVehicle("Sedan", { seats = 4 })
+            local bogus = Vehicles.CarBogus
+            "#,
+        ));
+    }
+
+    /// A call passing a string whose value is unknown may install any key, on
+    /// its own table only.
+    #[test]
+    fn test_unknown_installed_name_accepts_any_key_on_that_table_only() {
+        let mut ws = dynamic_field_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!(
+                r#"{INSTALL}
+                ---@type string
+                local someName
+                local D = {{}}
+                Install(D, someName, 1)
+                local anything = D.SetAnything
+                "#
+            ),
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!(
+                r#"{INSTALL}
+                ---@type string
+                local someName
+                local D, E = {{}}, {{}}
+                Install(D, someName, 1)
+                Install(E, "Known", 1)
+                local anything = E.SetAnything
+                "#
+            ),
+        ));
+    }
+
+    /// A function whose calls cannot all be seen, such as one passed on as a
+    /// value or called by the engine, keeps accepting any key it may write.
+    #[test]
+    fn test_writes_of_a_function_with_unseen_calls_accept_any_key() {
+        let mut ws = dynamic_field_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local Vehicles = {}
+            local function RegisterVehicle(name, data)
+                Vehicles["Car" .. name] = data
+            end
+            Registry = { register = RegisterVehicle }
+            RegisterVehicle("Sedan", { seats = 4 })
+            local other = Vehicles.CarOther
+            "#,
+        ));
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local Commands = {}
+            OnCommand(function(text)
+                Commands["cmd_" .. text] = true
+            end)
+            local help = Commands.cmd_help
+            "#,
+        ));
+    }
+
     #[test]
     fn test_nil_guard_in_condition_truthy_check() {
         let mut ws = VirtualWorkspace::new();

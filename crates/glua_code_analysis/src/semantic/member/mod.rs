@@ -1157,6 +1157,7 @@ fn resolve_dynamic_field_uncached(
         db,
         cache,
         definitions,
+        field_name,
         false,
     ))
 }
@@ -1194,7 +1195,7 @@ pub(crate) fn dynamic_field_type_without(
         return Some(None);
     }
     Some(Some(
-        dynamic_field_definitions_type(db, cache, kept, true).0,
+        dynamic_field_definitions_type(db, cache, kept, field_name, true).0,
     ))
 }
 
@@ -1208,6 +1209,7 @@ fn dynamic_field_definitions_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     definitions: Vec<VisibleDynamicFieldDefinition>,
+    field_name: &str,
     informative_only: bool,
 ) -> (LuaType, Option<LuaSemanticDeclId>) {
     let mut member_types = Vec::new();
@@ -1220,7 +1222,7 @@ fn dynamic_field_definitions_type(
         if semantic_decl.is_none() {
             semantic_decl = Some(LuaSemanticDeclId::Member(member_id));
         }
-        if let Some(typ) = dynamic_field_member_type(db, cache, &member_id)
+        if let Some(typ) = dynamic_field_member_type(db, cache, &member_id, field_name)
             && !(informative_only && matches!(typ, LuaType::Any | LuaType::Unknown))
         {
             member_types.push(typ);
@@ -1260,12 +1262,20 @@ pub(crate) fn resolve_dynamic_field_member_for_file(
         .unwrap_or_default()
 }
 
+/// What the definition `member_id` gives `field_name`. A definition at a
+/// call's argument is a call through a function writing a key built from its
+/// parameters, whose fields differ by name, so it is not cached by member.
 fn dynamic_field_member_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     member_id: &LuaMemberId,
+    field_name: &str,
 ) -> Option<LuaType> {
-    if let Some(cached) = cache.tracked_get(|cache| &mut cache.dynamic_field_type_cache, member_id)
+    let kind = member_id.get_syntax_id().get_kind();
+    let is_call_install = kind != LuaSyntaxKind::IndexExpr && !LuaTableField::can_cast(kind);
+    if !is_call_install
+        && let Some(cached) =
+            cache.tracked_get(|cache| &mut cache.dynamic_field_type_cache, member_id)
     {
         return cached;
     }
@@ -1275,6 +1285,14 @@ fn dynamic_field_member_type(
         return None;
     }
 
+    if is_call_install {
+        cache
+            .dynamic_field_resolving
+            .insert(*member_id, crate::db_index::derivation::scope_mark());
+        let result = installed_member_type(db, cache, member_id, field_name);
+        cache.dynamic_field_resolving.remove(member_id);
+        return result;
+    }
     let frame = crate::db_index::derivation::open_frame();
     cache
         .dynamic_field_resolving
@@ -1331,6 +1349,23 @@ fn dynamic_field_member_type_inner(
     }
 
     None
+}
+
+/// What the call whose argument `member_id` is gives `field_name` through a
+/// function writing a key built from its parameters.
+fn installed_member_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    member_id: &LuaMemberId,
+    field_name: &str,
+) -> Option<LuaType> {
+    let root = db
+        .get_vfs()
+        .syntax_tree_around(&member_id.file_id, member_id.get_syntax_id().get_range())?
+        .get_red_root();
+    let arg = LuaExpr::cast(member_id.get_syntax_id().to_node_from_root(&root)?)?;
+    let mut call_cache = dynamic_field_definition_cache(cache, member_id.file_id);
+    crate::compilation::analyzer::installed_field_type(db, &mut call_cache, &arg, field_name)
 }
 
 fn dynamic_field_definition_cache(cache: &LuaInferCache, file_id: FileId) -> LuaInferCache {
@@ -1673,6 +1708,15 @@ fn dynamic_field_definition_syntax_uncached(
                     || table_field.get_field_key().and_then(|key| key.get_range()) == Some(range))
             {
                 syntax.member_id = Some(LuaMemberId::new(table_field.get_syntax_id(), file_id));
+            }
+            if syntax.member_id.is_none()
+                && node.text_range() == range
+                && node.parent().is_some_and(|parent| {
+                    glua_parser::LuaCallArgList::can_cast(parent.kind().into())
+                })
+                && let Some(arg) = LuaExpr::cast(node.clone())
+            {
+                syntax.member_id = Some(LuaMemberId::new(arg.get_syntax_id(), file_id));
             }
         }
         if syntax.enclosing_assign_range.is_none()

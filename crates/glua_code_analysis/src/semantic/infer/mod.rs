@@ -42,12 +42,14 @@ pub(crate) use infer_index::{
     AccessPaths, keep_access_paths, restore_access_path_snapshot, stop_keeping_access_paths,
     take_access_path_snapshot, with_access_paths,
 };
+pub(crate) use infer_index::{arg_for_param, with_file_cache};
 pub(crate) use infer_name::find_self_ref_id;
 pub(crate) use infer_name::infer_authoritative_method_self_type;
 pub(crate) use infer_name::infer_enclosing_self_type;
 use infer_name::infer_name_expr;
 pub(crate) use infer_name::is_authoritative_self_receiver_type;
 pub(crate) use infer_name::is_concrete_self_receiver_type;
+pub(crate) use infer_name::local_function_calls_are_all_seen;
 pub(crate) use infer_name::resolve_global_singleton_scripted_type_decl_id;
 pub(crate) use infer_name::resolve_type_text;
 pub(crate) use infer_name::setmetatable_target_of_literal;

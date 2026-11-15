@@ -23,7 +23,8 @@ pub(crate) use common::{
 };
 pub(crate) use dynamic_field::is_provably_builtin_iterator_call;
 pub(crate) use dynamic_field::{
-    copies_table_into_itself, for_range_pairs_source_for_var, writes_own_pairs_key,
+    copies_table_into_itself, for_range_pairs_source_for_var, installed_field_type,
+    writes_own_pairs_key,
 };
 pub(crate) use engine::EngineStats;
 #[cfg(test)]

@@ -43,10 +43,61 @@ pub(super) enum DynamicFieldAnalysisMode {
     Full,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct FieldSetterHelper {
-    table_param_index: usize,
-    key_param_index: usize,
+/// A write `table[key] = value` in a function's body whose key is built from
+/// the function's parameters: each call of the function writes the fields its
+/// own arguments name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FieldInstaller {
+    table: InstallTable,
+    /// The key's pieces, joined: at least one is a parameter.
+    key: Vec<KeyPart>,
+    /// The written index expression.
+    write: rowan::TextRange,
+}
+
+impl FieldInstaller {
+    fn joins_literal(&self) -> bool {
+        self.key
+            .iter()
+            .any(|part| matches!(part, KeyPart::Literal(_)))
+    }
+}
+
+impl std::hash::Hash for FieldInstaller {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.table.hash(state);
+        self.key.hash(state);
+        crate::db_index::derivation::hash_local(&self.write, state);
+    }
+}
+
+/// The table an installer writes into.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum InstallTable {
+    Param(usize),
+    /// What a name declared outside the function holds, such as a registry.
+    Outer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum KeyPart {
+    Literal(SmolStr),
+    Param(usize),
+}
+
+/// The key one call of an installer writes.
+enum InstalledKey {
+    Names(Vec<SmolStr>),
+    /// A string the call does not say: any key of that table.
+    AnyString,
+}
+
+/// What one call of an installer writes.
+struct Install {
+    key: InstalledKey,
+    /// The argument the first parameter of the key is: where the fields it
+    /// writes are defined.
+    definition: LuaExpr,
 }
 
 #[derive(Default)]
@@ -71,11 +122,11 @@ type FiniteNamedMemberEvidence = (
     bool,
 );
 
-fn patterns_for_signature(db: &DbIndex, signature_id: LuaSignatureId) -> Vec<FieldSetterHelper> {
+fn installers_of(db: &DbIndex, signature_id: LuaSignatureId) -> Vec<FieldInstaller> {
     super::function_summary::function_summaries(db, signature_id.get_file_id())
         .and_then(|summaries| {
             summaries
-                .field_setter_helpers
+                .field_installers
                 .get(&signature_id.get_position())
                 .cloned()
         })
@@ -236,13 +287,13 @@ fn prefix_holds_call_result(
 }
 
 /// Whether a node is a write site of its own: a statement with an indexed
-/// target, or a call with two or more arguments, which can set fields
-/// through `setmetatable` or a setter helper.
+/// target, or a call with arguments, which can set fields through
+/// `setmetatable` or a function whose key is built from its parameters.
 pub(super) fn is_write_site(node: &LuaSyntaxNode) -> bool {
     if let Some(call) = LuaCallExpr::cast(node.clone()) {
         return call
             .get_args_list()
-            .is_some_and(|args| args.get_args().nth(1).is_some());
+            .is_some_and(|args| args.get_args().next().is_some());
     }
     defines_fields(node.kind()) && !indexed_targets(node).is_empty()
 }
@@ -500,6 +551,9 @@ fn collect_statement_fields(
     // different table than the complete one will. Neither is read here, so
     // both builds decide the same way.
     for (var, index_expr, value_expr) in field_definition_sites(db, file_id, node) {
+        if is_write_of_seen_installer(db, file_id, &index_expr) {
+            continue;
+        }
         let value_expr = value_expr.as_ref();
         let Some(ReachedTarget {
             prefix_expr,
@@ -640,7 +694,15 @@ fn collect_call_fields(
         return;
     }
     let file_id = cache.get_file_id();
-    collect_field_setter_helper_call_fields(db, cache, call_expr, file_id, &mut fields.named);
+    let mut per_call_bases = Vec::new();
+    collect_installed_call_fields(
+        db,
+        cache,
+        call_expr,
+        &mut fields.named,
+        &mut per_call_bases,
+        &mut fields.wildcards,
+    );
     collect_setmetatable_table_fields(
         db,
         cache,
@@ -651,7 +713,11 @@ fn collect_call_fields(
     );
     if mode.propagate_to_super_types() {
         fields.propagated = propagate_dynamic_fields_to_super_types(db, &fields.named);
+        fields
+            .propagated
+            .extend(propagate_dynamic_fields_to_super_types(db, &per_call_bases));
     }
+    fields.propagated.extend(per_call_bases);
 }
 
 /// The view dynamic fields are collected under: the records this pass builds
@@ -732,10 +798,17 @@ pub(super) fn apply_site_dynamic_fields(
     }
 }
 
-pub(super) fn collect_field_setter_helpers(
+/// Each closure's writes whose key is built from its parameters, by the
+/// closure's position.
+pub(super) fn collect_field_installers(
+    db: &DbIndex,
+    file_id: crate::FileId,
     root: &glua_parser::LuaChunk,
-) -> FxHashMap<TextSize, Vec<FieldSetterHelper>> {
-    let mut helpers: FxHashMap<TextSize, Vec<FieldSetterHelper>> = FxHashMap::default();
+) -> FxHashMap<TextSize, Vec<FieldInstaller>> {
+    let mut installers: FxHashMap<TextSize, Vec<FieldInstaller>> = FxHashMap::default();
+    let Some(references) = db.get_reference_index().get_local_reference(&file_id) else {
+        return installers;
+    };
     for assign in root.descendants::<LuaAssignStat>() {
         let Some(closure) = assign.ancestors::<LuaClosureExpr>().next() else {
             continue;
@@ -743,166 +816,421 @@ pub(super) fn collect_field_setter_helpers(
         let Some(params_list) = closure.get_params_list() else {
             continue;
         };
-        let param_names = params_list
+        let params = params_list
             .get_params()
-            .filter_map(|param| {
-                param
-                    .get_name_token()
-                    .map(|token| token.get_name_text().to_string())
+            .enumerate()
+            .filter_map(|(idx, param)| {
+                let token = param.get_name_token()?;
+                Some((idx, LuaDeclId::new(file_id, token.get_range().start())))
             })
             .collect::<Vec<_>>();
-        if param_names.len() < 2 {
-            continue;
-        }
-
-        let (vars, _) = assign.get_var_and_expr_list();
-        for var in vars.iter() {
+        let param_of = |expr: &LuaExpr| {
+            let LuaExpr::NameExpr(name_expr) = expr else {
+                return None;
+            };
+            let decl_id = references.get_decl_id(&name_expr.get_range())?;
+            params
+                .iter()
+                .find(|(_, param)| *param == decl_id)
+                .map(|(idx, _)| *idx)
+        };
+        for var in assign.get_var_and_expr_list().0 {
             let LuaVarExpr::IndexExpr(index_expr) = var else {
                 continue;
             };
-            let Some(table_param_index) = index_expr
-                .get_prefix_expr()
-                .and_then(|expr| param_expr_index(&expr, &param_names))
-            else {
+            let Some(LuaIndexKey::Expr(key_expr)) = index_expr.get_index_key() else {
                 continue;
             };
-            let Some(key_param_index) = index_expr
-                .get_index_key()
-                .and_then(|key| param_index_key_index(&key, &param_names))
-            else {
+            let mut key = Vec::new();
+            if key_template(&key_expr, &param_of, &mut key).is_none()
+                || !key.iter().any(|part| matches!(part, KeyPart::Param(_)))
+            {
+                continue;
+            }
+            let Some(prefix) = index_expr.get_prefix_expr() else {
                 continue;
             };
-
-            helpers
+            // A bare key written into an outer table is typed by the write
+            // itself, as an index of whatever the key's parameter holds.
+            let joins_literal = key.iter().any(|part| matches!(part, KeyPart::Literal(_)));
+            let table = match param_of(&prefix) {
+                Some(idx) => InstallTable::Param(idx),
+                None if joins_literal && is_outer_path(&prefix, references, &closure) => {
+                    InstallTable::Outer
+                }
+                None => continue,
+            };
+            installers
                 .entry(closure.get_position())
                 .or_default()
-                .push(FieldSetterHelper {
-                    table_param_index,
-                    key_param_index,
+                .push(FieldInstaller {
+                    table,
+                    key,
+                    write: index_expr.get_range(),
                 });
         }
     }
-
-    helpers
+    installers
 }
 
-fn collect_field_setter_helper_call_fields(
+/// The pieces a key joins, each a string literal or a parameter.
+fn key_template(
+    expr: &LuaExpr,
+    param_of: &impl Fn(&LuaExpr) -> Option<usize>,
+    parts: &mut Vec<KeyPart>,
+) -> Option<()> {
+    match expr {
+        LuaExpr::LiteralExpr(literal) => match literal.get_literal()? {
+            LuaLiteralToken::String(value) => {
+                parts.push(KeyPart::Literal(value.get_value().into()))
+            }
+            _ => return None,
+        },
+        LuaExpr::ParenExpr(paren) => key_template(&paren.get_expr()?, param_of, parts)?,
+        LuaExpr::BinaryExpr(binary)
+            if binary.get_op_token().map(|token| token.get_op())
+                == Some(BinaryOperator::OpConcat) =>
+        {
+            let (left, right) = binary.get_exprs()?;
+            key_template(&left, param_of, parts)?;
+            key_template(&right, param_of, parts)?;
+        }
+        _ => parts.push(KeyPart::Param(param_of(expr)?)),
+    }
+    Some(())
+}
+
+/// Whether `prefix` names, or reads a field path from, a variable declared
+/// outside `closure`, other than `self`: the same table at every call.
+fn is_outer_path(
+    prefix: &LuaExpr,
+    references: &crate::FileReference,
+    closure: &LuaClosureExpr,
+) -> bool {
+    match prefix {
+        LuaExpr::NameExpr(name_expr) => {
+            name_expr.get_name_text().is_some_and(|name| name != "self")
+                && references
+                    .get_decl_id(&name_expr.get_range())
+                    .is_none_or(|decl_id| !closure.get_range().contains(decl_id.position))
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            matches!(
+                index_expr.get_index_key(),
+                Some(LuaIndexKey::Name(_) | LuaIndexKey::String(_))
+            ) && index_expr
+                .get_prefix_expr()
+                .is_some_and(|prefix| is_outer_path(&prefix, references, closure))
+        }
+        _ => false,
+    }
+}
+
+/// The fields a call writes through the installers of the functions it calls:
+/// those its arguments name, or any key of a table it passes a string the call
+/// does not say.
+fn collect_installed_call_fields(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     call_expr: &LuaCallExpr,
-    file_id: crate::FileId,
-    collected: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    named: &mut Vec<CollectedField>,
+    per_call_bases: &mut Vec<CollectedField>,
+    wildcards: &mut Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
 ) {
-    let Some(args_list) = call_expr.get_args_list() else {
-        return;
-    };
-    let mut args_iter = args_list.get_args();
-    let Some(first_arg) = args_iter.next() else {
-        return;
-    };
-    let Some(second_arg) = args_iter.next() else {
-        return;
-    };
-
-    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
-        return;
-    };
-    let helper_patterns = helper_patterns_for_call(db, cache, &prefix_expr);
-    if helper_patterns.is_empty() {
-        return;
-    };
-    let mut args = Vec::with_capacity(2 + args_iter.size_hint().0);
-    args.push(first_arg);
-    args.push(second_arg);
-    args.extend(args_iter);
-    for helper in helper_patterns {
-        let Some(table_arg) = args.get(helper.table_param_index) else {
+    let file_id = cache.get_file_id();
+    for (signature_id, installer) in call_installers(db, cache, call_expr) {
+        let Some(install) = evaluate_install(db, cache, call_expr, signature_id, &installer) else {
             continue;
         };
-        let Some(key_arg) = args.get(helper.key_param_index) else {
+        let Some(table_type) = installed_table_type(db, cache, call_expr, signature_id, &installer)
+        else {
             continue;
         };
-        let field_names = field_names_from_key_arg(db, cache, key_arg);
-        if field_names.is_empty() {
-            continue;
-        }
-        let definition_range = key_arg.syntax().text_range();
-        let Ok(table_type) = infer_expr(db, cache, table_arg.clone()) else {
-            continue;
-        };
-
-        for field_name in field_names {
-            collect_for_type(
-                db,
-                &table_type,
-                &field_name,
-                file_id,
-                definition_range,
-                collected,
-            );
-        }
-    }
-}
-
-fn field_names_from_key_arg(
-    db: &DbIndex,
-    cache: &mut crate::LuaInferCache,
-    key_arg: &LuaExpr,
-) -> Vec<SmolStr> {
-    if let LuaExpr::LiteralExpr(literal_expr) = key_arg
-        && let Some(glua_parser::LuaLiteralToken::String(string_token)) = literal_expr.get_literal()
-    {
-        return vec![string_token.get_value().into()];
-    }
-
-    string_const_names(&infer_expr(db, cache, key_arg.clone()).ok())
-}
-
-fn helper_patterns_for_call(
-    db: &DbIndex,
-    cache: &mut crate::LuaInferCache,
-    prefix_expr: &LuaExpr,
-) -> Vec<FieldSetterHelper> {
-    if let LuaExpr::NameExpr(name_expr) = prefix_expr
-        && let Some(signature_id) = direct_name_expr_signature_id(db, cache, name_expr)
-    {
-        return patterns_for_signature(db, signature_id);
-    }
-
-    helper_patterns_for_call_fallback(db, cache, prefix_expr)
-}
-
-fn helper_patterns_for_call_fallback(
-    db: &DbIndex,
-    cache: &mut crate::LuaInferCache,
-    prefix_expr: &LuaExpr,
-) -> Vec<FieldSetterHelper> {
-    let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
-        return Vec::new();
-    };
-
-    let mut result = Vec::new();
-    collect_helper_patterns_from_type(db, &prefix_type, &mut result);
-    result
-}
-
-fn collect_helper_patterns_from_type(
-    db: &DbIndex,
-    typ: &LuaType,
-    result: &mut Vec<FieldSetterHelper>,
-) {
-    match typ {
-        LuaType::Signature(signature_id) => {
-            result.extend(patterns_for_signature(db, *signature_id));
-        }
-        LuaType::Union(union_type) => {
-            for typ in union_type.types() {
-                collect_helper_patterns_from_type(db, typ, result);
+        let definition_range = install.definition.syntax().text_range();
+        match install.key {
+            InstalledKey::Names(names) => {
+                for name in names {
+                    collect_for_written_type(
+                        db,
+                        &table_type,
+                        &name,
+                        file_id,
+                        definition_range,
+                        named,
+                        per_call_bases,
+                    );
+                }
+            }
+            InstalledKey::AnyString => {
+                collect_wildcard_for_type(db, &table_type, file_id, definition_range, wildcards);
             }
         }
-        LuaType::TypeGuard(inner) => collect_helper_patterns_from_type(db, inner, result),
+    }
+}
+
+/// What the field `field_name`, defined at the argument `definition` of a call
+/// through an installer, holds: the value its write assigns, read with the
+/// call's arguments for the function's parameters.
+pub(crate) fn installed_field_type(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    definition: &LuaExpr,
+    field_name: &str,
+) -> Option<LuaType> {
+    let call_expr = definition
+        .get_parent::<glua_parser::LuaCallArgList>()?
+        .get_parent::<LuaCallExpr>()?;
+    let mut types = Vec::new();
+    for (signature_id, installer) in call_installers(db, cache, &call_expr) {
+        let Some(install) = evaluate_install(db, cache, &call_expr, signature_id, &installer)
+        else {
+            continue;
+        };
+        let names_field = match &install.key {
+            InstalledKey::Names(names) => names.iter().any(|name| name == field_name),
+            InstalledKey::AnyString => false,
+        };
+        if !names_field || install.definition.get_range() != definition.get_range() {
+            continue;
+        }
+        let Some(value) =
+            installer_write(db, signature_id, &installer).and_then(|write| assigned_value(&write))
+        else {
+            continue;
+        };
+        let forwarded = forwarded_param(db, signature_id, &value)
+            .and_then(|param| installer_arg(db, &call_expr, signature_id, param));
+        let typ = match forwarded {
+            Some(arg) => infer_expr(db, cache, arg).ok(),
+            None => crate::semantic::with_file_cache(cache, signature_id.get_file_id(), |cache| {
+                infer_expr(db, cache, value).ok()
+            }),
+        };
+        types.extend(typ);
+    }
+    (!types.is_empty()).then(|| LuaType::from_vec(types))
+}
+
+/// The functions `call_expr` calls, with the installers each has.
+fn call_installers(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Vec<(LuaSignatureId, FieldInstaller)> {
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return Vec::new();
+    };
+    let mut signatures = Vec::new();
+    match &prefix_expr {
+        LuaExpr::NameExpr(name_expr)
+            if let Some(signature_id) = direct_name_expr_signature_id(db, cache, name_expr) =>
+        {
+            signatures.push(signature_id);
+        }
+        _ => {
+            if let Ok(prefix_type) = infer_expr(db, cache, prefix_expr) {
+                collect_signatures_of_type(&prefix_type, &mut signatures);
+            }
+        }
+    }
+    signatures
+        .into_iter()
+        .flat_map(|signature_id| {
+            installers_of(db, signature_id)
+                .into_iter()
+                .map(move |installer| (signature_id, installer))
+        })
+        .collect()
+}
+
+fn collect_signatures_of_type(typ: &LuaType, result: &mut Vec<LuaSignatureId>) {
+    match typ {
+        LuaType::Signature(signature_id) => result.push(*signature_id),
+        LuaType::Union(union_type) => {
+            for typ in union_type.types() {
+                collect_signatures_of_type(typ, result);
+            }
+        }
+        LuaType::TypeGuard(inner) => collect_signatures_of_type(inner, result),
         _ => {}
     }
+}
+
+/// The key one call of `installer` writes. A key joined with a literal is a
+/// string whatever the call passes; a bare parameter is `None` when the call
+/// passes a value not known to be a string.
+fn evaluate_install(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+    installer: &FieldInstaller,
+) -> Option<Install> {
+    let joins_literal = installer.joins_literal();
+    let mut names = vec![String::new()];
+    let mut definition = None;
+    let mut any_string = false;
+    for part in &installer.key {
+        match part {
+            KeyPart::Literal(text) => {
+                for name in &mut names {
+                    name.push_str(text);
+                }
+            }
+            KeyPart::Param(param) => {
+                let arg = installer_arg(db, call_expr, signature_id, *param)?;
+                let arg_names = match key_arg_names(db, cache, &arg) {
+                    Some(arg_names) => arg_names,
+                    None if joins_literal => None,
+                    None => return None,
+                };
+                match arg_names {
+                    Some(values) => {
+                        names = names
+                            .iter()
+                            .flat_map(|name| {
+                                values.iter().map(move |value| format!("{name}{value}"))
+                            })
+                            .collect();
+                    }
+                    None => any_string = true,
+                }
+                definition.get_or_insert(arg);
+            }
+        }
+    }
+    let key = if any_string {
+        InstalledKey::AnyString
+    } else {
+        InstalledKey::Names(names.into_iter().map(SmolStr::from).collect())
+    };
+    Some(Install {
+        key,
+        definition: definition?,
+    })
+}
+
+/// The strings a key argument may be: `Some(None)` for a string it does not
+/// say, `None` for a value not known to be a string.
+fn key_arg_names(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    arg: &LuaExpr,
+) -> Option<Option<Vec<SmolStr>>> {
+    if let LuaExpr::LiteralExpr(literal_expr) = arg
+        && let Some(LuaLiteralToken::String(string_token)) = literal_expr.get_literal()
+    {
+        return Some(Some(vec![string_token.get_value().into()]));
+    }
+    let typ = infer_expr(db, cache, arg.clone()).ok()?;
+    let names = string_const_names(&Some(typ.clone()));
+    if !names.is_empty() {
+        return Some(Some(names));
+    }
+    let is_string = match &typ {
+        LuaType::Union(union_type) => union_type.types().any(LuaType::is_string),
+        typ => typ.is_string(),
+    };
+    is_string.then_some(None)
+}
+
+/// The table one call of `installer` writes into.
+fn installed_table_type(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+    installer: &FieldInstaller,
+) -> Option<LuaType> {
+    match installer.table {
+        InstallTable::Param(param) => infer_expr(
+            db,
+            cache,
+            installer_arg(db, call_expr, signature_id, param)?,
+        )
+        .ok(),
+        InstallTable::Outer => {
+            let prefix = installer_write(db, signature_id, installer)?.get_prefix_expr()?;
+            crate::semantic::with_file_cache(cache, signature_id.get_file_id(), |cache| {
+                infer_expr(db, cache, prefix).ok()
+            })
+        }
+    }
+}
+
+/// What `call_expr` passes for parameter `param` of the function `signature_id`.
+fn installer_arg(
+    db: &DbIndex,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+    param: usize,
+) -> Option<LuaExpr> {
+    let is_colon_define = db
+        .get_signature_index()
+        .get(&signature_id)
+        .is_some_and(|signature| signature.is_colon_define);
+    crate::semantic::arg_for_param(call_expr, param + usize::from(is_colon_define))
+}
+
+fn installer_write(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+    installer: &FieldInstaller,
+) -> Option<glua_parser::LuaIndexExpr> {
+    db.get_vfs()
+        .syntax_tree_around(&signature_id.get_file_id(), installer.write)?
+        .get_red_root()
+        .covering_element(installer.write)
+        .ancestors()
+        .find_map(glua_parser::LuaIndexExpr::cast)
+        .filter(|index_expr| index_expr.get_range() == installer.write)
+}
+
+/// The value an assignment gives `target`.
+fn assigned_value(target: &glua_parser::LuaIndexExpr) -> Option<LuaExpr> {
+    let assign = target.get_parent::<LuaAssignStat>()?;
+    let (vars, exprs) = assign.get_var_and_expr_list();
+    let position = vars
+        .iter()
+        .position(|var| var.get_syntax_id() == target.get_syntax_id())?;
+    exprs.get(position).cloned()
+}
+
+/// The parameter of `signature_id` that `value` reads.
+fn forwarded_param(db: &DbIndex, signature_id: LuaSignatureId, value: &LuaExpr) -> Option<usize> {
+    let LuaExpr::NameExpr(name_expr) = value else {
+        return None;
+    };
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&signature_id.get_file_id(), name_expr.get_range())?;
+    match db.get_decl_index().get_decl(&decl_id)?.extra {
+        crate::LuaDeclExtra::Param {
+            idx,
+            signature_id: param_signature,
+            ..
+        } if param_signature == signature_id => Some(idx),
+        _ => None,
+    }
+}
+
+/// Whether `index_expr` is an installer write joining a literal into its key,
+/// of a function whose every call is seen: each call writes the fields it
+/// names, so the write names none. A bare parameter key keeps the write, whose
+/// key type may be no string at all.
+pub(in crate::compilation::analyzer) fn is_write_of_seen_installer(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    index_expr: &glua_parser::LuaIndexExpr,
+) -> bool {
+    let Some(closure) = index_expr.ancestors::<LuaClosureExpr>().next() else {
+        return false;
+    };
+    let signature_id = LuaSignatureId::new(file_id, closure.get_position());
+    installers_of(db, signature_id)
+        .iter()
+        .any(|installer| installer.write == index_expr.get_range() && installer.joins_literal())
+        && crate::semantic::local_function_calls_are_all_seen(db, signature_id)
 }
 
 fn direct_name_expr_signature_id(
@@ -917,23 +1245,6 @@ fn direct_name_expr_signature_id(
     let value_syntax_id = decl.get_value_syntax_id()?;
     (value_syntax_id.get_kind() == LuaSyntaxKind::ClosureExpr)
         .then(|| LuaSignatureId::new(decl.get_file_id(), value_syntax_id.get_range().start()))
-}
-
-fn param_index_key_index(key: &LuaIndexKey, param_names: &[String]) -> Option<usize> {
-    match key {
-        LuaIndexKey::Expr(expr) => param_expr_index(expr, param_names),
-        _ => None,
-    }
-}
-
-fn param_expr_index(expr: &LuaExpr, param_names: &[String]) -> Option<usize> {
-    let LuaExpr::NameExpr(name_expr) = expr else {
-        return None;
-    };
-    let name = name_expr.get_name_text()?;
-    param_names
-        .iter()
-        .position(|param_name| *param_name == name)
 }
 
 fn collect_setmetatable_table_fields(
