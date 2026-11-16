@@ -3351,6 +3351,32 @@ _2 = a[1]
         assert_eq!(ws.humanize_type(written), "table");
     }
 
+    /// A number equal to a constant is that constant, so it reads the entry the
+    /// constant keys.
+    #[gtest]
+    fn test_number_equal_to_a_constant_narrows_to_it() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            local MODE_WORLD = 1
+            local CALC_POS = { [MODE_WORLD] = { up = 1 } }
+
+            ---@param mode number
+            function Calc(mode)
+                if mode == MODE_WORLD then
+                    narrowed = mode
+                    entry = CALC_POS[mode]
+                end
+            end
+            "#,
+        );
+
+        let narrowed = ws.expr_ty("narrowed");
+        assert_eq!(ws.humanize_type(narrowed), "1");
+        let entry = ws.expr_ty("entry");
+        assert!(!entry.is_nullable(), "{entry:?}");
+    }
+
     #[gtest]
     fn test_nil_guard_reassignment_join_keeps_non_nil() {
         let mut ws = VirtualWorkspace::new();
