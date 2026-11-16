@@ -4783,6 +4783,40 @@ owner:CompletelyMadeUpMethod()
         ));
     }
 
+    /// A field read by name from a table another file fills under string keys
+    /// holds the class those writes store.
+    #[test]
+    fn test_named_read_of_a_string_keyed_table_from_another_file_keeps_its_class() {
+        let mut ws = dynamic_field_workspace();
+        ws.def_file(
+            "lua/autorun/sh_sounds.lua",
+            r#"
+            ---@class LoopSound
+            ---@field Stop fun(self: LoopSound)
+
+            ---@return LoopSound
+            function MakeSound() end
+
+            Sounds = {}
+            ---@param id string
+            function AddSound(id)
+                Sounds[id] = MakeSound()
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_use.lua",
+            r#"
+            if Sounds.turbo then
+                turbo = Sounds.turbo
+            end
+            "#,
+        );
+
+        let turbo = ws.expr_ty("turbo");
+        assert_eq!(ws.humanize_type(turbo), "LoopSound");
+    }
+
     /// A key parameter the body rewrites no longer holds the name the call
     /// passed, so the write keeps accepting any key.
     #[test]

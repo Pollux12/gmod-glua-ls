@@ -1249,8 +1249,19 @@ fn infer_table_member_owner(
             // named read of a registry (`cityrp.item.stored.pot`) that a bare
             // `table` answers as `any` with no nil at all, which is strictly
             // less that we know. Whether a computed key may be missing is
-            // decided per access by `table_index_result_may_be_nil`.
-            return Ok(LuaType::Any);
+            // decided per access by `table_index_result_may_be_nil`. A class
+            // those writes store is still what the key holds.
+            return Ok(infer_table_dynamic_key_member_type(
+                db,
+                &owner,
+                &key,
+                cache.get_file_id(),
+                Some(index_expr.get_position()),
+                source_min_position.as_ref(),
+                false,
+            )
+            .filter(is_precise_unknown_wildcard_value_type)
+            .unwrap_or(LuaType::Any));
         }
     }
 
