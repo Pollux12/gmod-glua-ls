@@ -294,6 +294,43 @@ mod test {
         }
     }
 
+    /// A local function's parameter takes what its callers pass from the
+    /// variables of `ipairs` and numeric `for` loops, alongside the literals
+    /// they pass.
+    #[test]
+    fn a_local_function_param_takes_loop_values_its_callers_pass() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@class Thing
+            ---@field name string
+
+            ---@type Thing[]
+            local things = {}
+
+            local function show(thing)
+                shown = thing
+            end
+            for _, thing in ipairs(things) do
+                show(thing)
+            end
+
+            local function count(value)
+                counted = value
+            end
+            for i = 1, 3 do
+                count(i)
+            end
+            count("none")
+            "#,
+        );
+
+        for (name, expected) in [("shown", "Thing"), ("counted", r#"("none"|integer)"#)] {
+            let typ = ws.expr_ty(name);
+            assert_eq!(ws.humanize_type(typ), expected, "{name}");
+        }
+    }
+
     /// A parameter of a method or global function takes the values its
     /// callers in other files pass, as a local function's does.
     #[test]

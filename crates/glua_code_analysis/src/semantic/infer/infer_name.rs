@@ -1,8 +1,8 @@
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaChunk, LuaClosureExpr,
-    LuaExpr, LuaForRangeStat, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat, LuaNameExpr,
-    LuaReturnStat, LuaStat, LuaSyntaxId, LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr,
-    PathTrait,
+    LuaExpr, LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat,
+    LuaNameExpr, LuaReturnStat, LuaStat, LuaSyntaxId, LuaSyntaxNode, LuaTableExpr, LuaTableField,
+    LuaVarExpr, PathTrait,
 };
 use rowan::{TextRange, TextSize};
 use std::sync::Arc;
@@ -1425,7 +1425,7 @@ fn infer_param_type_from_local_call_sites_inner(
         if !is_local_call_site_arg_shape_supported(&arg) {
             continue;
         }
-        let arg_type = if is_global_pairs_for_range_var_arg(db, file_id, &arg) {
+        let arg_type = if is_builtin_loop_var_arg(db, file_id, &arg) {
             let Ok(arg_type) = infer_expr(db, cache, arg) else {
                 continue;
             };
@@ -1550,7 +1550,7 @@ fn is_local_call_site_arg_read(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> 
     match arg {
         LuaExpr::NameExpr(name_expr) => {
             param_arg_decl(db, file_id, arg).is_some()
-                || is_global_pairs_for_range_var_arg(db, file_id, arg)
+                || is_builtin_loop_var_arg(db, file_id, arg)
                 || supported_local_value_expr(db, file_id, name_expr).is_some()
         }
         _ => is_local_call_site_arg_shape_supported(arg),
@@ -1871,7 +1871,7 @@ fn can_call_arg_drive_local_param_inference(
     target_param_idx: usize,
 ) -> bool {
     if is_for_range_var_arg(db, file_id, arg) {
-        return is_global_pairs_for_range_var_arg(db, file_id, arg);
+        return is_builtin_loop_var_arg(db, file_id, arg);
     }
 
     if is_mutable_local_name_arg(db, file_id, arg) {
@@ -1933,7 +1933,9 @@ fn is_for_range_var_arg(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> bool {
         })
 }
 
-fn is_global_pairs_for_range_var_arg(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> bool {
+/// Whether `arg` reads a variable of a loop the standard library drives: a
+/// numeric `for`, or a `for` over the global `pairs` or `ipairs`.
+fn is_builtin_loop_var_arg(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> bool {
     let LuaExpr::NameExpr(name_expr) = arg else {
         return false;
     };
@@ -1945,16 +1947,19 @@ fn is_global_pairs_for_range_var_arg(db: &DbIndex, file_id: FileId, arg: &LuaExp
         return false;
     };
 
-    name_expr
-        .syntax()
-        .ancestors()
-        .find_map(LuaForRangeStat::cast)
-        .is_some_and(|for_range| {
-            let is_loop_var = for_range
+    name_expr.syntax().ancestors().any(|node| {
+        if let Some(for_stat) = LuaForStat::cast(node.clone()) {
+            return for_stat
+                .get_var_name()
+                .is_some_and(|var_name| var_name.get_position() == decl_id.position);
+        }
+        LuaForRangeStat::cast(node).is_some_and(|for_range| {
+            for_range
                 .get_var_name_list()
-                .any(|var_name| var_name.get_position() == decl_id.position);
-            is_loop_var && is_global_pairs_for_range(db, file_id, &for_range)
+                .any(|var_name| var_name.get_position() == decl_id.position)
+                && is_global_pairs_for_range(db, file_id, &for_range)
         })
+    })
 }
 
 fn is_global_pairs_for_range(db: &DbIndex, file_id: FileId, for_range: &LuaForRangeStat) -> bool {
@@ -1964,7 +1969,10 @@ fn is_global_pairs_for_range(db: &DbIndex, file_id: FileId, for_range: &LuaForRa
     let Some(LuaExpr::NameExpr(name_expr)) = call_expr.get_prefix_expr() else {
         return false;
     };
-    if name_expr.get_name_text().as_deref() != Some("pairs") {
+    if !matches!(
+        name_expr.get_name_text().as_deref(),
+        Some("pairs" | "ipairs")
+    ) {
         return false;
     }
 
