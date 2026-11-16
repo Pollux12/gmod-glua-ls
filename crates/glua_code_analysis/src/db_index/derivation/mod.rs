@@ -2210,9 +2210,7 @@ fn record_read(evaluation: &mut Evaluation, key: HashedKey) -> Option<KeyIdx> {
                 }
             };
             evaluation.log_slot(table, slot);
-            if table.taints(slot) {
-                frames::taint_evaluation(evaluation);
-            }
+            frames::note_slot_read(evaluation, table, slot);
             Some(slot)
         }
         None => {
@@ -2239,9 +2237,7 @@ fn log_recorded(evaluation: &mut Evaluation, slot: KeyIdx) {
         KEYS.with(|keys| {
             if let Some(table) = keys.borrow_mut().as_mut() {
                 evaluation.log_slot(table, slot);
-                if table.taints(slot) {
-                    frames::taint_evaluation(evaluation);
-                }
+                frames::note_slot_read(evaluation, table, slot);
             }
         });
     }
@@ -2706,9 +2702,7 @@ impl FactRead {
                         slot
                     });
                     evaluation.log_slot(table, slot);
-                    if table.taints(slot) {
-                        frames::taint_evaluation(evaluation);
-                    }
+                    frames::note_slot_read(evaluation, table, slot);
                 } else {
                     VIEW.with(|view| {
                         let view = view.borrow();

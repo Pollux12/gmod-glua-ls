@@ -11,7 +11,8 @@
 //! the inherited query realm, whether a reference walks from a keyed origin —
 //! reads the same. A frame that saw something its reads cannot vouch for (a
 //! memo hit without reads, a recursion cut, a caller-supplied seed) is
-//! tainted, and its value stays with the evaluation.
+//! tainted, and its value stays with the evaluation. A frame that read a key
+//! a cleared loop holds is shared only until the hold moves on.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -47,6 +48,8 @@ pub(super) struct Frame {
     /// evaluation's log of them; see [`consult_unkeyed`].
     unkeyed: u32,
     pub(super) has_query: bool,
+    /// Whether it read a key a cleared loop holds.
+    held: bool,
 }
 
 /// An open frame, to hand back to [`close_frame`].
@@ -157,6 +160,9 @@ struct Computed {
     /// viewing the reader graph: it holds only within that evaluation, whose
     /// reads hold its own.
     viewed: bool,
+    /// Whether it read a key a cleared loop holds: it holds only within that
+    /// hold; see [`KeyTable::hold_moved`].
+    held: bool,
 }
 
 #[cfg(test)]
@@ -406,11 +412,28 @@ impl Provenance {
     /// computed.
     fn freshness(&self, table: &KeyTable, reads: &[KeyIdx]) -> Freshness {
         if !table.written_after(self.0.checked.load(Ordering::Relaxed)) {
-            return Freshness::Unwritten;
+            return self.within_hold(table, Freshness::Unwritten);
         }
         let freshness = table.written_since(reads, self.0.since);
         if freshness == Freshness::Unwritten {
             self.0.checked.store(latest_stamp(), Ordering::Relaxed);
+        }
+        self.within_hold(table, freshness)
+    }
+
+    #[cfg(test)]
+    pub(super) fn read_a_held_key(&self) -> bool {
+        self.0.held
+    }
+
+    /// `freshness`, `table`'s answer for this value's reads, for a value that
+    /// read a held key: written once the hold moved on, or once a held key it
+    /// read was written again within it.
+    fn within_hold(&self, table: &KeyTable, freshness: Freshness) -> Freshness {
+        if self.0.held
+            && (self.0.since <= table.hold_moved() || freshness == Freshness::Recomputing)
+        {
+            return Freshness::Written;
         }
         freshness
     }
@@ -501,6 +524,7 @@ fn push_frame(evaluation: &mut Evaluation, absorbs: u64) -> OpenFrame {
         absorbs,
         unkeyed: u32::try_from(evaluation.unkeyed.len()).expect("fewer than 2^32 context reads"),
         has_query: false,
+        held: false,
     });
     OpenFrame(depth)
 }
@@ -537,6 +561,7 @@ pub fn close_frame(frame: OpenFrame, view: Gates) -> Option<Provenance> {
             }
             parent.gates |= closed.gates;
             parent.has_query |= closed.has_query;
+            parent.held |= closed.held;
             if let Some((realm, base)) = closed.realm
                 && base <= parent_depth
             {
@@ -569,6 +594,7 @@ pub fn close_frame(frame: OpenFrame, view: Gates) -> Option<Provenance> {
             unkeyed,
             has_query: closed.has_query,
             viewed: !super::transport::active() && KEYS.with(|keys| keys.borrow().is_none()),
+            held: closed.held,
         })))
     })
 }
@@ -861,6 +887,7 @@ fn record_context(
     if let Some(frame) = evaluation.frames.last_mut() {
         frame.gates |= provenance.0.gates;
         frame.has_query |= provenance.0.has_query;
+        frame.held |= provenance.0.held;
         let base = realm.map_or(0, |(_, base)| base);
         if provenance.0.realm.is_some() && base < depth {
             frame.realm = Some((realm.map(|(realm, _)| realm), base));
@@ -920,7 +947,8 @@ fn reuse_on_worker(
         if provenance.0.has_query && !worker.local_queries_hold(&evaluation.log[range.clone()]) {
             return Reuse::Elsewhere;
         }
-        match worker.local_freshness(&evaluation.log[range.clone()], provenance.0.since) {
+        let freshness = worker.local_freshness(&evaluation.log[range.clone()], provenance.0.since);
+        match provenance.within_hold(worker.graph().keys(), freshness) {
             Freshness::Unwritten => {}
             Freshness::Recomputing => return Reuse::Elsewhere,
             Freshness::Written => {
@@ -952,7 +980,8 @@ fn reuse_on_worker(
         if provenance.0.has_query && !worker.local_queries_hold(&reads) {
             return Reuse::Elsewhere;
         }
-        match worker.local_freshness(&reads, provenance.0.since) {
+        let freshness = worker.local_freshness(&reads, provenance.0.since);
+        match provenance.within_hold(worker.graph().keys(), freshness) {
             Freshness::Unwritten => {}
             Freshness::Recomputing => return Reuse::Elsewhere,
             Freshness::Written => {
@@ -980,10 +1009,11 @@ fn reuse_on_worker(
         if provenance.0.has_query && !worker.canonical_queries_hold(reads) {
             return Reuse::Elsewhere;
         }
-        match provenance
-            .freshness(worker.graph().keys(), reads)
-            .and(worker.snapshot_freshness(reads, provenance.0.since))
-        {
+        let table = worker.graph().keys();
+        let freshness = provenance
+            .freshness(table, reads)
+            .and(worker.snapshot_freshness(reads, provenance.0.since));
+        match provenance.within_hold(table, freshness) {
             Freshness::Unwritten => {}
             Freshness::Recomputing => return Reuse::Elsewhere,
             Freshness::Written => return Reuse::Stale,
@@ -1135,6 +1165,25 @@ pub fn note_recomputed(unchanged: impl Fn(&super::HashedKey) -> bool) {
 pub(super) fn taint_evaluation(evaluation: &mut Evaluation) {
     if let Some(frame) = evaluation.frames.last_mut() {
         frame.taint = Some(0);
+    }
+}
+
+/// Notes that the open frames of `evaluation` read a key a cleared loop
+/// holds: their values hold only within that hold.
+pub(super) fn note_held_read(evaluation: &mut Evaluation) {
+    if let Some(frame) = evaluation.frames.last_mut() {
+        frame.held = true;
+    }
+}
+
+/// Notes for the open frames of `evaluation` what reading `slot` of `table`
+/// leaves them: tainted if it is being computed again, bound to the hold if a
+/// cleared loop holds it.
+pub(super) fn note_slot_read(evaluation: &mut Evaluation, table: &KeyTable, slot: KeyIdx) {
+    if table.taints(slot) {
+        taint_evaluation(evaluation);
+    } else if table.held(slot) {
+        note_held_read(evaluation);
     }
 }
 
@@ -1585,23 +1634,32 @@ mod tests {
         );
     }
 
-    /// A value computed from a fact a cleared loop holds saw a value the loop
-    /// may still move and come back from, so it is not shared.
+    /// A value computed from a fact a cleared loop holds is shared while the
+    /// loop settles, stale once the loop writes the fact again, and never
+    /// holds after the loop is released, even if the fact settled back as it
+    /// was before the loop was cleared: it may have read a value from the way.
     #[test]
-    fn a_value_computed_from_a_held_fact_is_not_shared() {
+    fn a_value_computed_from_a_held_fact_holds_only_while_the_loop_settles() {
         let read = || FactKey::GmodRealm(FileId::new(1));
+        let other = || FactKey::GmodRealm(FileId::new(2));
         derivation::lend_keys(KeyTable::default());
         let _ = value_reading(read);
+        let _ = value_reading(other);
         hold(read());
-        let _recording = derivation::begin(DerivationId::workspace(DerivationKind::ValidGuards));
-        let frame = open_frame().expect("a table is lent");
-        derivation::note_read(read);
-        let shared = close_frame(frame, 0).is_some();
-        derivation::end();
+        hold(other());
+        let held = value_reading(read);
+        let while_held = reused(&held);
+        let rewritten = value_reading(other);
+        write(other);
+        let after_rewrite = reused(&rewritten);
         release(true);
+        let after_release = reused(&held);
         derivation::take_keys();
 
-        assert!(!shared);
+        assert_eq!(
+            (while_held, after_rewrite, after_release),
+            (Reuse::Held, Reuse::Stale, Reuse::Stale)
+        );
     }
 
     /// A value that read a reference as unkeyed holds wherever that reference

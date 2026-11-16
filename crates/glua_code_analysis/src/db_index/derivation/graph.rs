@@ -652,6 +652,9 @@ pub struct KeyTable {
     /// The keys a cleared loop took away until it settles again, each with the
     /// stamp it was written at before; see [`Self::hold_window`].
     held: FxHashMap<KeyIdx, u64>,
+    /// The stamp of the latest hold or release: a value computed from a held
+    /// key before it holds no longer; see [`Self::hold_moved`].
+    hold_moved: u64,
     /// The live slots of the keys naming each file's positions, built by the
     /// first edit that renames keys and kept from then on.
     positional: Option<FxHashMap<FileId, FxHashSet<KeyIdx>>>,
@@ -1045,6 +1048,7 @@ impl KeyTable {
         let Some(slot) = self.find(key) else {
             return;
         };
+        self.hold_moved = self.hold_moved.max(now);
         self.last_written = self.last_written.max(now);
         let derived = self.derived.get(&slot).into_iter().flat_map(|d| &d.slots);
         for slot in std::iter::once(&slot).chain(derived) {
@@ -1058,6 +1062,7 @@ impl KeyTable {
     /// Closes every held window: a key `unchanged` accepts, and each key read
     /// out of it, is written as it was before its window opened.
     pub(super) fn release_held(&mut self, unchanged: impl Fn(&HashedKey) -> bool) {
+        self.hold_moved = super::new_stamp();
         let held = std::mem::take(&mut self.held);
         for (slot, before) in &held {
             let entry = &mut self.keys[*slot as usize];
@@ -1174,11 +1179,24 @@ impl KeyTable {
     }
 
     /// Whether a read of `slot` sees a value only the evaluation reading it
-    /// can rely on: one being computed again, or one a cleared loop holds
-    /// until it settles.
+    /// can rely on: one being computed again.
     pub(super) fn taints(&self, slot: KeyIdx) -> bool {
-        let entry = &self.keys[slot as usize];
-        entry.marked(WINDOWED | HELD)
+        self.keys[slot as usize].marked(WINDOWED)
+    }
+
+    /// Whether a read of `slot` sees a value being computed again or one a
+    /// cleared loop holds: what an evaluation recorded without seeing it so
+    /// does not hold.
+    pub(super) fn recomputing_or_held(&self, slot: KeyIdx) -> bool {
+        self.keys[slot as usize].marked(WINDOWED | HELD)
+    }
+
+    /// The stamp of the latest hold or release: a value computed from a held
+    /// key holds only if it was computed after it, since the loop holding the
+    /// key may move it and settle it back, and a release restores the stamp
+    /// it was written at.
+    pub(super) fn hold_moved(&self) -> u64 {
+        self.hold_moved
     }
 
     /// Whether a slot was written or released after stamp `stamp`.

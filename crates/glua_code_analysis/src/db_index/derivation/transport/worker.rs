@@ -420,12 +420,13 @@ impl ComputeInputs {
                 };
                 table
                     .find(&keys.new_keys[index as usize])
-                    .is_none_or(|slot| !table.taints(slot))
+                    .is_none_or(|slot| !table.recomputing_or_held(slot))
             })
-            && self
-                .absent_base_flags
-                .iter()
-                .all(|key| table.find(key).is_none_or(|slot| !table.taints(slot)))
+            && self.absent_base_flags.iter().all(|key| {
+                table
+                    .find(key)
+                    .is_none_or(|slot| !table.recomputing_or_held(slot))
+            })
             && self.reads.iter().all(|(local, seen)| {
                 let (key, slot) = match keys.entries[*local as usize] {
                     super::WorkerKey::Known(slot) => (table.live_key(slot), Some(slot)),
@@ -986,6 +987,28 @@ mod tests {
             guard.finish(&mut table);
             graph.restore_keys(table);
         }
+    }
+
+    #[test]
+    fn a_task_memo_that_read_a_held_key_holds_until_the_task_writes_it() {
+        let mut graph = ReaderGraph::default();
+        graph.intern_read(key(1));
+        graph.hold_windows([&key(1)]);
+        let (snapshot, guard) = snapshot(graph);
+        let recorder = TaskRecorder::start(&snapshot);
+        let (proof, _) = evaluate(&recorder, || memo_of(&key(1)));
+        evaluate(&recorder, || {
+            assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Held);
+        });
+        evaluate(&recorder, || write(&key(1)));
+        evaluate(&recorder, || {
+            assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Stale);
+        });
+        drop(recorder.finish());
+        let mut graph = recover(snapshot);
+        let mut table = graph.lend_keys();
+        guard.finish(&mut table);
+        graph.restore_keys(table);
     }
 
     #[test]

@@ -47,6 +47,13 @@ pub(crate) enum WorkerKey {
     New(u32),
 }
 
+/// A [`WorkerKeys`] entry's flag: the snapshot computes it again.
+const TAINTS: u8 = 1;
+/// A [`WorkerKeys`] entry's flag: it is a query's output.
+const QUERY: u8 = 2;
+/// A [`WorkerKeys`] entry's flag: a cleared loop holds it in the snapshot.
+const HELD: u8 = 4;
+
 #[derive(Debug, Default)]
 pub(crate) struct WorkerKeys {
     entries: Vec<WorkerKey>,
@@ -90,7 +97,7 @@ impl WorkerKeys {
                 (stored, stored.key().is_query_output())
             }
         };
-        let flags = u8::from(self.snapshot_taints(local, snapshot)) | (u8::from(query) << 1);
+        let flags = self.snapshot_marks(local, snapshot) | if query { QUERY } else { 0 };
         self.flags.push(flags);
         self.hashes.push(stored.hash);
         let hashes = &self.hashes;
@@ -335,25 +342,31 @@ impl WorkerKeys {
         }
     }
 
-    fn snapshot_taints(&self, local: u32, snapshot: &ReaderGraph) -> bool {
-        let key = self.key(local, snapshot);
-        if let WorkerKey::Known(slot) = self.entries[local as usize]
-            && snapshot.keys().taints(slot)
-        {
-            return true;
+    /// [`TAINTS`] if the snapshot is computing `local` or a key it is read
+    /// out of again, else [`HELD`] if a cleared loop holds one of them.
+    fn snapshot_marks(&self, local: u32, snapshot: &ReaderGraph) -> u8 {
+        let own = match self.entries[local as usize] {
+            WorkerKey::Known(slot) => Some(slot),
+            WorkerKey::New(_) => None,
+        };
+        let bases = std::iter::successors(
+            self.key(local, snapshot).base().map(HashedKey::new),
+            |key| key.base().map(HashedKey::new),
+        )
+        .filter_map(|key| snapshot.find_slot(&key));
+        let table = snapshot.keys();
+        let (mut taints, mut held) = (false, false);
+        for slot in own.into_iter().chain(bases) {
+            taints |= table.taints(slot);
+            held |= table.held(slot);
         }
-        let mut base = key.base();
-        while let Some(key) = base {
-            let key = HashedKey::new(key);
-            if snapshot
-                .find_slot(&key)
-                .is_some_and(|slot| snapshot.keys().taints(slot))
-            {
-                return true;
-            }
-            base = key.base();
+        if taints {
+            TAINTS
+        } else if held {
+            HELD
+        } else {
+            0
         }
-        false
     }
 
     fn log(&mut self, evaluation: &mut Evaluation, local: u32, _snapshot: &ReaderGraph) {
@@ -371,13 +384,15 @@ impl WorkerKeys {
                 evaluation.read.push(local);
             }
         }
-        if self.flags[local as usize] & 1 != 0 || self.windowed[local as usize] {
+        if self.flags[local as usize] & TAINTS != 0 || self.windowed[local as usize] {
             frames::taint_evaluation(evaluation);
+        } else if self.flags[local as usize] & HELD != 0 {
+            frames::note_held_read(evaluation);
         }
     }
 
     fn is_query(&self, local: u32) -> bool {
-        self.flags[local as usize] & 2 != 0
+        self.flags[local as usize] & QUERY != 0
     }
 
     pub(crate) fn record(
@@ -624,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_transport_new_projected_reads_taint_for_held_and_windowed_bases() {
+    fn parallel_transport_new_projected_reads_mark_held_bases_and_taint_windowed_ones() {
         for held in [false, true] {
             let mut graph = ReaderGraph::default();
             graph.intern_read(key(1));
@@ -647,14 +662,18 @@ mod tests {
             assert_eq!(keys.new_keys.len(), 1);
             derivation::lend_keys(table);
             let _recording = derivation::resume(evaluation);
-            assert!(derivation::close_frame(frame, 0).is_none());
+            let closed = derivation::close_frame(frame, 0);
+            assert_eq!(
+                closed.map(|value| value.read_a_held_key()),
+                held.then_some(true)
+            );
             derivation::end();
             derivation::take_keys();
         }
     }
 
     #[test]
-    fn parallel_transport_cached_taint_covers_known_new_and_inherited_flags() {
+    fn parallel_transport_cached_marks_cover_known_new_and_inherited_flags() {
         for held in [false, true] {
             for known in [false, true] {
                 for inherited in [false, true] {
@@ -686,8 +705,12 @@ mod tests {
                             &graph,
                         )
                     });
-                    assert_eq!(keys.flags, vec![1]);
-                    assert!(derivation::close_frame(frame, 0).is_none());
+                    let mark = if held { HELD } else { TAINTS };
+                    let shared = |frame| {
+                        derivation::close_frame(frame, 0).map(|value| value.read_a_held_key())
+                    };
+                    assert_eq!(keys.flags, vec![mark]);
+                    assert_eq!(shared(frame), held.then_some(true));
                     let frame = derivation::open_frame().unwrap();
                     derivation::CURRENT.with(|current| {
                         let mut current = current.borrow_mut();
@@ -695,9 +718,9 @@ mod tests {
                         keys.log(evaluation, local, &graph);
                         assert_eq!(keys.record(evaluation, child.clone(), &graph), local);
                     });
-                    assert!(derivation::close_frame(frame, 0).is_none());
+                    assert_eq!(shared(frame), held.then_some(true));
                     assert_eq!(keys.entries.len(), 1);
-                    assert_eq!(keys.flags, vec![1]);
+                    assert_eq!(keys.flags, vec![mark]);
                     let evaluation = derivation::suspend();
                     assert_eq!(evaluation.log, vec![local, local]);
                     derivation::take_keys();
