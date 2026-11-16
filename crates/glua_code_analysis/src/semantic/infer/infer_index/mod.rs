@@ -1112,6 +1112,11 @@ fn infer_table_member_owner(
                     return Err(reason);
                 }
             }
+        } else if matches!(key, LuaMemberKey::ExprType(LuaType::String))
+            && !constructed_under_the_reads_key(db, cache.get_file_id(), &owner, &key, &index_key)
+        {
+            // A write under some string key proves only the keys it wrote.
+            nullable_if_needed(db, member_type)
         } else {
             member_type
         };
@@ -3860,6 +3865,55 @@ fn is_inferred_index_member_key(key: &LuaMemberKey) -> bool {
 /// Whether a member key is a non-constant numeric index (`integer`/`number`),
 /// as opposed to a constant `[n]`. Used to decide when to fall back to a
 /// `TableConst`'s unioned array element base.
+/// Whether every write of `key` on `owner` is a table constructor field keyed
+/// by the same local the read uses, which no later write changes: the table
+/// holds that key from the start.
+fn constructed_under_the_reads_key(
+    db: &DbIndex,
+    file_id: FileId,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    index_key: &LuaIndexKey,
+) -> bool {
+    let LuaIndexKey::Expr(LuaExpr::NameExpr(read_key)) = index_key else {
+        return false;
+    };
+    let Some(file_refs) = db.get_reference_index().get_local_reference(&file_id) else {
+        return false;
+    };
+    let Some(decl_id) = file_refs.get_decl_id(&read_key.get_range()) else {
+        return false;
+    };
+    if file_refs
+        .get_decl_references(&decl_id)
+        .is_none_or(|refs| refs.is_written_after_declaration(decl_id.position))
+    {
+        return false;
+    }
+    let Some(item) = db.get_member_index().get_member_item(owner, key) else {
+        return false;
+    };
+    item.member_ids_slice().iter().all(|member_id| {
+        let Some(root) = db
+            .get_vfs()
+            .syntax_tree_around(&member_id.file_id, member_id.get_syntax_id().get_range())
+        else {
+            return false;
+        };
+        member_id
+            .get_syntax_id()
+            .to_node_from_root(&root.get_red_root())
+            .and_then(glua_parser::LuaTableField::cast)
+            .and_then(|field| match field.get_field_key()? {
+                LuaIndexKey::Expr(LuaExpr::NameExpr(name)) => {
+                    file_refs.get_decl_id(&name.get_range())
+                }
+                _ => None,
+            })
+            == Some(decl_id)
+    })
+}
+
 fn dynamic_numeric_index_key(key: &LuaMemberKey) -> bool {
     matches!(
         key,

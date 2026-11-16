@@ -3322,6 +3322,35 @@ _2 = a[1]
         assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
     }
 
+    /// A write under a string key proves only that key, so a read under the
+    /// same key after a branch that may skip the write may be nil.
+    #[gtest]
+    fn test_conditional_write_under_a_string_key_keeps_the_read_nilable() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@return boolean
+            local function ShouldAssign() end
+
+            ---@param key string
+            function Fill(key)
+                local cache = {}
+                if ShouldAssign() then
+                    cache[key] = {}
+                end
+                skipped = cache[key]
+                cache[key] = {}
+                written = cache[key]
+            end
+            "#,
+        );
+
+        let skipped = ws.expr_ty("skipped");
+        assert_eq!(ws.humanize_type(skipped), "table?");
+        let written = ws.expr_ty("written");
+        assert_eq!(ws.humanize_type(written), "table");
+    }
+
     #[gtest]
     fn test_nil_guard_reassignment_join_keeps_non_nil() {
         let mut ws = VirtualWorkspace::new();
