@@ -3596,11 +3596,18 @@ fn infer_global_path_member(
     };
 
     let owner = LuaMemberOwner::GlobalPath(GlobalId::new(&prefix_path));
+    let access_position = index_expr.get_position();
     let Some(member_item) = db.get_member_index().get_member_item(&owner, &member_key) else {
-        return Err(InferFailReason::FieldNotFound);
+        return registry_computed_value_type(
+            db,
+            cache.get_file_id(),
+            &prefix_path,
+            &member_key,
+            access_position,
+        )
+        .ok_or(InferFailReason::FieldNotFound);
     };
 
-    let access_position = index_expr.get_position();
     let mut visible_member_ids = member_item.visible_member_ids_with_realm_at_offset(
         db,
         &cache.get_file_id(),
@@ -3645,6 +3652,51 @@ fn infer_global_path_member(
     }
 
     resolved
+}
+
+/// What `key` may hold on the global path `path` when nothing writes it by
+/// name: a value written there under a computed key, or into every entry of
+/// the registry `path` is an entry of (`REG.[]` for `REG.alpha`). Such a write
+/// is evidence about the values, not that this key is one, so it may be nil.
+fn registry_computed_value_type(
+    db: &DbIndex,
+    file_id: FileId,
+    path: &str,
+    key: &LuaMemberKey,
+    position: TextSize,
+) -> Option<LuaType> {
+    let access_key_type = member_key_as_type(key)?;
+    let matcher = crate::semantic::member::AccessKeyMatcher::new(&access_key_type);
+    let sibling = path
+        .rsplit_once('.')
+        .filter(|(_, last)| *last != "[]")
+        .map(|(registry, _)| format!("{registry}.[]"));
+    let mut types = Vec::new();
+    for path in std::iter::once(path.to_string()).chain(sibling) {
+        let owner = LuaMemberOwner::GlobalPath(GlobalId::new(&path));
+        for member in db
+            .get_member_index()
+            .get_expr_key_members(&owner)
+            .unwrap_or_default()
+        {
+            if !(member_key_is_unknown_expr(member.get_key())
+                || matcher.matches(db, member.get_key()))
+            {
+                continue;
+            }
+            types.extend(
+                resolve_member_item_with_realm(
+                    db,
+                    &LuaMemberIndexItem::One(member.get_id()),
+                    file_id,
+                    Some(position),
+                    None,
+                )
+                .ok(),
+            );
+        }
+    }
+    (!types.is_empty()).then(|| nullable_if_needed(db, TypeOps::union_all(db, types)))
 }
 
 pub(crate) fn global_expr_access_path(

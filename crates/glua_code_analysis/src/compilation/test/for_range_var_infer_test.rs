@@ -679,6 +679,28 @@ mod test {
         assert_eq!(ws.humanize_type(ty), "table?");
     }
 
+    /// An entry read by name may hold what the loop wrote into every entry,
+    /// under the key read by name or by a string-typed key.
+    #[test]
+    fn pairs_value_var_write_is_read_back_from_a_named_entry() {
+        let mut ws = load_registry("REGNAMED", "REGNAMED", false);
+        ws.def_file(
+            "lua/autorun/sh_regnamed_named.lua",
+            r#"
+            named_door = REGNAMED.alpha.door
+            ---@param name string
+            ---@param key string
+            function REGNAMED_ReadTyped(name, key)
+                typed_door = REGNAMED[name][key]
+            end
+            "#,
+        );
+        for name in ["named_door", "typed_door"] {
+            let ty = ws.expr_ty(name);
+            assert_eq!(ws.humanize_type(ty), "table?", "{name}");
+        }
+    }
+
     #[test]
     fn registry_wildcard_bucket_does_not_depend_on_file_order() {
         let forward = load_registry("REGORDER", "REGORDER", false);
