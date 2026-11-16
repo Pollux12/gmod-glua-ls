@@ -5,7 +5,7 @@
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use glua_parser::LuaChunk;
+use glua_parser::{LuaAstNode, LuaChunk};
 use rowan::TextSize;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -26,6 +26,9 @@ pub(crate) struct FileFunctionSummaries {
     pub(super) filled_params: FxHashMap<TextSize, Vec<usize>>,
     /// The closures whose unmutated explicit `self` parameter is returned.
     pub(super) returns_explicit_self: FxHashSet<TextSize>,
+    /// The closures whose parameters take their callers' arguments where they
+    /// are read: local functions, and those stored on a local table.
+    pub(super) locally_called: FxHashSet<TextSize>,
     /// Access path → the signatures of the function statements declaring it,
     /// by position. Left out of the fingerprint: only the file's own passes
     /// read it, and its source layer replaces them.
@@ -39,6 +42,7 @@ impl FileFunctionSummaries {
             && self.installer_params.is_empty()
             && self.filled_params.is_empty()
             && self.returns_explicit_self.is_empty()
+            && self.locally_called.is_empty()
             && self.source_signatures.is_empty()
     }
 
@@ -73,11 +77,13 @@ impl Hash for FileFunctionSummaries {
         hash_sorted(&self.mutated_params, state);
         hash_sorted(&self.installer_params, state);
         hash_sorted(&self.filled_params, state);
-        let mut returns_explicit_self = self.returns_explicit_self.iter().collect::<Vec<_>>();
-        returns_explicit_self.sort();
-        returns_explicit_self.len().hash(state);
-        for position in returns_explicit_self {
-            hash_local(position, state);
+        for positions in [&self.returns_explicit_self, &self.locally_called] {
+            let mut positions = positions.iter().collect::<Vec<_>>();
+            positions.sort();
+            positions.len().hash(state);
+            for position in positions {
+                hash_local(position, state);
+            }
         }
     }
 }
@@ -103,6 +109,16 @@ pub(super) fn collect_function_summaries(
         installer_params,
         filled_params,
         returns_explicit_self,
+        locally_called: root
+            .descendants::<glua_parser::LuaClosureExpr>()
+            .map(|closure| closure.get_position())
+            .filter(|position| {
+                crate::semantic::takes_local_call_site_args(
+                    db,
+                    LuaSignatureId::new(file_id, *position),
+                )
+            })
+            .collect(),
         source_signatures: call_site_params::source_signatures_in_file(file_id, root),
     };
     if summaries.is_empty() {

@@ -661,12 +661,13 @@ mod test {
     }
 
     /// Without the wildcard bucket this read answers `any?`, which is what the
-    /// `may be nil` reports on such registries come from.
+    /// `may be nil` reports on such registries come from. The key is a string
+    /// its callers pass, which the computed write does not prove present.
     #[test]
     fn pairs_value_var_write_is_read_back_through_the_registry_path() {
         let mut ws = load_registry("REGREAD", "REGREAD", false);
         let ty = ws.expr_ty("REGREAD_Read('alpha', 'door')");
-        assert_eq!(ws.humanize_type(ty), "table");
+        assert_eq!(ws.humanize_type(ty), "table?");
     }
 
     /// Same member, reached through a second loop's value variable. Nullable

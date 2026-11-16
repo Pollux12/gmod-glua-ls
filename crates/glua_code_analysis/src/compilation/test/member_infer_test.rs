@@ -1488,7 +1488,7 @@ parser:parse()",
         let owner_display = ws.humanize_type_detailed(owner_ty);
         assert_that!(
             owner_display.as_str(),
-            contains_substring("[dynamic]"),
+            contains_substring("[string]"),
             "expected real-style registry fixture to preserve dynamic owner shape: {}",
             owner_display
         );
@@ -5313,11 +5313,10 @@ marauth.character = marauth.character or {}
         let cold = local_name_type(&mut ws, consumer, "cost");
         ws.analysis.reindex_files(vec![consumer]);
         let warm = local_name_type(&mut ws, consumer, "cost");
-        // The member the read waits on holds an `unknown` value, so the sealed
-        // index answers `unknown|nil` for `stored[itemID]` and `.cost` of its
-        // unknown arm is `unknown` — the answer the read must also reach when
-        // it first runs before the deferred write lands.
-        assert_that!(warm, eq(&LuaType::Unknown));
+        // The member the read waits on holds the registered `ITEM`, so `.cost`
+        // is its `0` — the answer the read must also reach when it first runs
+        // before the deferred write lands.
+        assert_that!(warm, eq(&LuaType::IntegerConst(0)));
         assert_eq!(cold, warm, "re-index moved the dynamic-key read's answer");
     }
 

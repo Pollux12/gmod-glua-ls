@@ -54,6 +54,38 @@ pub(super) type Contribution = (LuaSignatureId, usize, Option<LuaTypeFact>);
 struct CallScope {
     returned_tables: HashMap<FileId, Option<Arc<ReturnedTableInfo>>>,
     local_values: HashMap<(LuaDeclId, bool), Option<(LuaType, LuaInferenceProvenanceKind)>>,
+    /// Where the call is, when one call is collected: a local's writes after
+    /// it reach its arguments only around a loop holding it.
+    call_reach: Option<CallReach>,
+}
+
+struct CallReach {
+    position: TextSize,
+    loops: Vec<TextRange>,
+}
+
+impl CallReach {
+    fn new(call_expr: &LuaCallExpr) -> Self {
+        let loops = call_expr
+            .syntax()
+            .ancestors()
+            .filter(|node| {
+                glua_parser::LuaWhileStat::cast(node.clone()).is_some()
+                    || glua_parser::LuaRepeatStat::cast(node.clone()).is_some()
+                    || glua_parser::LuaForStat::cast(node.clone()).is_some()
+                    || glua_parser::LuaForRangeStat::cast(node.clone()).is_some()
+            })
+            .map(|node| node.text_range())
+            .collect();
+        Self {
+            position: call_expr.get_position(),
+            loops,
+        }
+    }
+
+    fn reached_by(&self, write: TextRange) -> bool {
+        write.start() < self.position || self.loops.iter().any(|range| range.contains_range(write))
+    }
 }
 
 /// The last function statement of `file_id` at or before `position`
@@ -65,6 +97,16 @@ fn source_signature_at(
     position: TextSize,
 ) -> Option<LuaSignatureId> {
     function_summaries(db, file_id)?.source_signature_at(path, position)
+}
+
+/// Whether the parameters of `signature_id` take its callers' arguments where
+/// they are read.
+fn takes_local_call_site_args(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    function_summaries(db, signature_id.get_file_id()).is_some_and(|summaries| {
+        summaries
+            .locally_called
+            .contains(&signature_id.get_position())
+    })
 }
 
 /// Whether the function declaring `signature_id` defines methods on parameter
@@ -115,10 +157,14 @@ pub(super) fn derive_call_site_param(
     };
     let range = call_expr.get_range();
     let mut contributions = Vec::new();
+    let mut scope = CallScope {
+        call_reach: Some(CallReach::new(&call_expr)),
+        ..CallScope::default()
+    };
     collect_call_site_param_types(
         db,
         cache,
-        &mut CallScope::default(),
+        &mut scope,
         file_id,
         call_expr,
         &mut contributions,
@@ -809,6 +855,9 @@ fn collect_call_site_param_types(
             if is_pooled_callee && installs_on_arg && !is_explicit_receiver {
                 continue;
             }
+            // A function other files may call takes what its seen calls pass,
+            // widened: the literals they pass do not bound the others.
+            let mut open_callee = false;
             if !is_implicit_receiver && !is_exact_include_receiver {
                 let Some(param_name) = signature.params.get(param_idx) else {
                     continue;
@@ -816,7 +865,11 @@ fn collect_call_site_param_types(
                 if !has_gmod_param_name_hint(db, signature_id.get_file_id(), param_name)
                     && !installs_on_arg
                 {
-                    continue;
+                    // A local function takes its callers' arguments where it is read.
+                    if takes_local_call_site_args(db, signature_id) {
+                        continue;
+                    }
+                    open_callee = true;
                 }
             }
             if is_param_mutated(db, signature_id, param_idx) {
@@ -844,6 +897,11 @@ fn collect_call_site_param_types(
                     contributions.push((signature_id, param_idx, None));
                 }
                 continue;
+            };
+            let arg_type = if open_callee {
+                crate::widen_literal_type_for_assignment(&arg_type)
+            } else {
+                arg_type
             };
 
             let kind = if is_implicit_receiver || is_explicit_receiver || is_exact_include_receiver
@@ -2539,7 +2597,14 @@ fn infer_call_site_value_type(
                     .get_decl_references(&decl_id)?
                     .cells
                     .iter()
-                    .filter(|cell| cell.is_write && cell.range != decl.get_range())
+                    .filter(|cell| {
+                        cell.is_write
+                            && cell.range != decl.get_range()
+                            && scope
+                                .call_reach
+                                .as_ref()
+                                .is_none_or(|reach| reach.reached_by(cell.range))
+                    })
                     .collect::<Vec<_>>();
                 writes.sort_unstable_by_key(|cell| cell.range.start());
                 for write in writes {

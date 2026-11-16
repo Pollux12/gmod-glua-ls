@@ -9853,7 +9853,7 @@ end
         let sounds_ty = index_expr_type(&mut ws, file_id, "selfTbl.sounds");
         let sounds_ty_text = ws.humanize_type_detailed(sounds_ty.clone());
         assert!(
-            sounds_ty_text.contains("[dynamic]: CSoundPatch"),
+            sounds_ty_text.contains("[string]: CSoundPatch"),
             "expected GetTable(self).sounds to preserve dynamic sound table type, got {:?}",
             sounds_ty
         );

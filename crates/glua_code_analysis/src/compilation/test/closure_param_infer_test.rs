@@ -294,6 +294,67 @@ mod test {
         }
     }
 
+    /// A parameter of a method or global function takes the values its
+    /// callers in other files pass, as a local function's does.
+    #[test]
+    fn a_method_or_global_param_takes_the_values_its_callers_pass() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/sh_money.lua",
+            r#"
+            Money = {}
+            function Money:SetAmount(amount)
+                self._Amount = amount
+            end
+            function Describe(label)
+                shown = label
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_use.lua",
+            r#"
+            Money:SetAmount(5)
+            Describe("cash")
+            stored = Money._Amount
+            "#,
+        );
+
+        for (name, expected) in [("stored", LuaType::Integer), ("shown", LuaType::String)] {
+            let typ = ws.expr_ty(name);
+            assert!(
+                !typ.is_unknown() && !typ.is_any() && ws.check_type(&expected, &typ),
+                "{name}: {typ:?}"
+            );
+        }
+    }
+
+    /// An argument holds what its local holds at the call, not what the local
+    /// is written later.
+    #[test]
+    fn a_callers_later_write_to_its_argument_does_not_reach_the_param() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/sh_apply.lua",
+            r#"
+            function Apply(list)
+                got = list
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_use.lua",
+            r#"
+            local list = { 1 }
+            Apply(list)
+            list = nil
+            "#,
+        );
+
+        let got = ws.expr_ty("got");
+        assert!(!got.is_nullable() && !got.is_unknown(), "{got:?}");
+    }
+
     #[test]
     fn test_closure_param_infer() {
         let mut ws = VirtualWorkspace::new();

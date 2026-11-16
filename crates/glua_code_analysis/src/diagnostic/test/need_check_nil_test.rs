@@ -15750,7 +15750,7 @@ end
                 "lua/autorun/client/cl_use.lua",
                 r#"
                 function CanConstrain(value, bone)
-                    return value ~= nil
+                    return bone ~= nil
                 end
 
                 ---@type Entity?

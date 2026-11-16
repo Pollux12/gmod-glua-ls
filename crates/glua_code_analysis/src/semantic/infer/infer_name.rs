@@ -1703,6 +1703,19 @@ fn local_function_call_sites(
         .collect()
 }
 
+/// Whether the parameters of `signature_id` take their callers' arguments
+/// where they are read: a local function, or one stored on a local table.
+pub(crate) fn takes_local_call_site_args(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    db.get_signature_index()
+        .local_func_decl_for(&signature_id)
+        .is_some()
+        || db
+            .get_reference_index()
+            .get_local_reference(&signature_id.get_file_id())
+            .and_then(|file_refs| local_table_member_call_sites(db, file_refs, signature_id))
+            .is_some()
+}
+
 fn find_local_function_call_sites(db: &DbIndex, signature_id: LuaSignatureId) -> Vec<LuaSyntaxId> {
     let file_id = signature_id.get_file_id();
     let Some(file_refs) = db.get_reference_index().get_local_reference(&file_id) else {
