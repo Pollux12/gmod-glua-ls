@@ -1952,10 +1952,10 @@ function UnknownPosition() end"
         );
     }
 
-    /// A table populated only through computed keys has no statically knowable
-    /// field names, so reads off it are never actionable typos.
+    /// A table populated only through computed keys holds the names its
+    /// function's calls pass, when every call is seen.
     #[gtest]
-    fn test_pure_computed_key_registry_suppresses_undefined_field() {
+    fn test_computed_key_registry_reports_names_no_call_passes() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def_file(
             "lua/registry.lua",
@@ -1977,7 +1977,7 @@ function UnknownPosition() end"
 
         assert_eq!(
             diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedField),
-            Vec::<String>::new()
+            vec!["Undefined field `Anything`. "]
         );
     }
 

@@ -2180,7 +2180,7 @@ fn is_literal_member_key(key: &LuaMemberKey) -> bool {
     matches!(key, LuaMemberKey::Name(_) | LuaMemberKey::Integer(_))
 }
 
-fn member_is_finite_named_dynamic_assignment(
+pub(crate) fn member_is_finite_named_dynamic_assignment(
     db: &DbIndex,
     access_file_id: FileId,
     owner: &LuaMemberOwner,

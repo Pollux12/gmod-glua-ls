@@ -1909,7 +1909,7 @@ parser:parse()",
         let user = ws.def_file("lua/c_user.lua", "local alpha = Meta.Alpha\n");
 
         let alpha = ws.local_ty(user, "alpha");
-        assert_that!(ws.humanize_type(alpha), eq("1?"));
+        assert_that!(ws.humanize_type(alpha), eq("1"));
     }
 
     /// A function in the read's own file may run before the read, so what it

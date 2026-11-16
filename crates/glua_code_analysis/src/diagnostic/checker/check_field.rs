@@ -1561,15 +1561,24 @@ fn table_const_has_only_dynamic_key_members(
     id: &crate::InFiled<rowan::TextRange>,
 ) -> bool {
     // Literal-key writes fold to `Name`/`Integer` in `LuaMemberKey::from_expr_type`.
-    // An all-`ExprType` owner therefore has a fully dynamic key set, not a closed struct.
+    // An all-`ExprType` owner therefore has a fully dynamic key set, not a closed struct,
+    // unless every computed write names a known set of fields.
     let owner = LuaMemberOwner::Element(id.clone());
     let Some(members) = db.get_member_index().get_members(&owner) else {
         return false;
+    };
+    let dynamic_owner = crate::dynamic_field_owner_of(db, &owner);
+    let names_known = |member: &crate::LuaMember| {
+        dynamic_owner.as_ref().is_some_and(|dynamic_owner| {
+            db.get_dynamic_field_index()
+                .member_has_finite_named_definition(dynamic_owner, member.get_id())
+        })
     };
     !members.is_empty()
         && members
             .iter()
             .all(|member| matches!(member.get_key(), LuaMemberKey::ExprType(_)))
+        && !members.iter().all(|member| names_known(member))
 }
 
 fn index_key_is_literal_member(index_key: &LuaIndexKey) -> bool {

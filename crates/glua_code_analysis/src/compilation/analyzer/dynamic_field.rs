@@ -56,10 +56,9 @@ pub(super) struct FieldInstaller {
 }
 
 impl FieldInstaller {
-    fn joins_literal(&self) -> bool {
-        self.key
-            .iter()
-            .any(|part| matches!(part, KeyPart::Literal(_)))
+    /// Whether the key is a join, a string whatever the call passes.
+    fn is_join(&self) -> bool {
+        self.key.len() > 1
     }
 }
 
@@ -82,7 +81,12 @@ enum InstallTable {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum KeyPart {
     Literal(SmolStr),
-    Param(usize),
+    /// A parameter, or `default` where a call passes nothing for it:
+    /// `(prefix or "Get")`.
+    Param {
+        param: usize,
+        default: Option<SmolStr>,
+    },
 }
 
 /// The key one call of an installer writes.
@@ -551,20 +555,22 @@ fn collect_statement_fields(
     // different table than the complete one will. Neither is read here, so
     // both builds decide the same way.
     for (var, index_expr, value_expr) in field_definition_sites(db, file_id, node) {
-        if is_write_of_seen_installer(db, file_id, &index_expr) {
-            continue;
-        }
+        let named_by_calls = installer_write_named_by_calls(db, file_id, &index_expr);
         let value_expr = value_expr.as_ref();
         let Some(ReachedTarget {
             prefix_expr,
             definition_range,
-            field_names,
+            mut field_names,
             collect_finite_direct_assignment,
             should_collect_wildcard,
         }) = reach_target(db, cache, root, sites, mode, &index_expr, value_expr)
         else {
             continue;
         };
+        // Calls the write's function may get beyond those seen pass other names.
+        if named_by_calls == Some(false) {
+            field_names.may_have_other_string_names = true;
+        }
 
         let key = PrefixKey::from_expr(db, cache, &prefix_expr);
         let at = sites.target_at(statement, var);
@@ -599,6 +605,20 @@ fn collect_statement_fields(
             && !matches!(made_table, LuaType::TableConst(_))
             && owner.is_some_and(|owner| !extends_prototype_class(db, owner, member_id))
         {
+            continue;
+        }
+        // Each call of the function names the fields this write makes, so the
+        // write stays only as what the table holds under a computed key.
+        if named_by_calls == Some(true) {
+            collect_finite_member_for_type(
+                db,
+                &effective_type,
+                member_id,
+                file_id,
+                definition_range,
+                true,
+                &mut fields.finite,
+            );
             continue;
         }
         if should_collect_wildcard {
@@ -823,6 +843,12 @@ pub(super) fn collect_field_installers(
                 let token = param.get_name_token()?;
                 Some((idx, LuaDeclId::new(file_id, token.get_range().start())))
             })
+            // A parameter the body writes no longer holds what the call passed.
+            .filter(|(_, decl_id)| {
+                references
+                    .get_decl_references(decl_id)
+                    .is_none_or(|refs| !refs.is_written_after_declaration(decl_id.position))
+            })
             .collect::<Vec<_>>();
         let param_of = |expr: &LuaExpr| {
             let LuaExpr::NameExpr(name_expr) = expr else {
@@ -834,6 +860,21 @@ pub(super) fn collect_field_installers(
                 .find(|(_, param)| *param == decl_id)
                 .map(|(idx, _)| *idx)
         };
+        // A local of the function never written again holds its initializer.
+        let local_value = |expr: &LuaExpr| {
+            let LuaExpr::NameExpr(name_expr) = expr else {
+                return None;
+            };
+            let decl_id = references.get_decl_id(&name_expr.get_range())?;
+            if !closure.get_range().contains(decl_id.position)
+                || references
+                    .get_decl_references(&decl_id)
+                    .is_none_or(|refs| refs.is_written_after_declaration(decl_id.position))
+            {
+                return None;
+            }
+            local_initializer_expr(db, decl_id)
+        };
         for var in assign.get_var_and_expr_list().0 {
             let LuaVarExpr::IndexExpr(index_expr) = var else {
                 continue;
@@ -842,22 +883,17 @@ pub(super) fn collect_field_installers(
                 continue;
             };
             let mut key = Vec::new();
-            if key_template(&key_expr, &param_of, &mut key).is_none()
-                || !key.iter().any(|part| matches!(part, KeyPart::Param(_)))
+            if key_template(&key_expr, &param_of, &local_value, &mut key).is_none()
+                || !key.iter().any(|part| matches!(part, KeyPart::Param { .. }))
             {
                 continue;
             }
             let Some(prefix) = index_expr.get_prefix_expr() else {
                 continue;
             };
-            // A bare key written into an outer table is typed by the write
-            // itself, as an index of whatever the key's parameter holds.
-            let joins_literal = key.iter().any(|part| matches!(part, KeyPart::Literal(_)));
             let table = match param_of(&prefix) {
                 Some(idx) => InstallTable::Param(idx),
-                None if joins_literal && is_outer_path(&prefix, references, &closure) => {
-                    InstallTable::Outer
-                }
+                None if is_outer_path(&prefix, references, &closure) => InstallTable::Outer,
                 None => continue,
             };
             installers
@@ -873,29 +909,40 @@ pub(super) fn collect_field_installers(
     installers
 }
 
-/// The pieces a key joins, each a string literal or a parameter.
+/// The pieces a key joins, each a string literal or a parameter, read
+/// through the locals that hold them.
 fn key_template(
     expr: &LuaExpr,
     param_of: &impl Fn(&LuaExpr) -> Option<usize>,
+    local_value: &impl Fn(&LuaExpr) -> Option<LuaExpr>,
     parts: &mut Vec<KeyPart>,
 ) -> Option<()> {
     match expr {
-        LuaExpr::LiteralExpr(literal) => match literal.get_literal()? {
-            LuaLiteralToken::String(value) => {
-                parts.push(KeyPart::Literal(value.get_value().into()))
-            }
-            _ => return None,
-        },
-        LuaExpr::ParenExpr(paren) => key_template(&paren.get_expr()?, param_of, parts)?,
-        LuaExpr::BinaryExpr(binary)
-            if binary.get_op_token().map(|token| token.get_op())
-                == Some(BinaryOperator::OpConcat) =>
-        {
-            let (left, right) = binary.get_exprs()?;
-            key_template(&left, param_of, parts)?;
-            key_template(&right, param_of, parts)?;
+        LuaExpr::LiteralExpr(_) => parts.push(KeyPart::Literal(literal_string(expr)?.into())),
+        LuaExpr::ParenExpr(paren) => {
+            key_template(&paren.get_expr()?, param_of, local_value, parts)?
         }
-        _ => parts.push(KeyPart::Param(param_of(expr)?)),
+        LuaExpr::BinaryExpr(binary) => {
+            let (left, right) = binary.get_exprs()?;
+            match binary.get_op_token()?.get_op() {
+                BinaryOperator::OpConcat => {
+                    key_template(&left, param_of, local_value, parts)?;
+                    key_template(&right, param_of, local_value, parts)?;
+                }
+                BinaryOperator::OpOr => parts.push(KeyPart::Param {
+                    param: param_of(&left)?,
+                    default: Some(literal_string(&right)?.into()),
+                }),
+                _ => return None,
+            }
+        }
+        _ => match param_of(expr) {
+            Some(param) => parts.push(KeyPart::Param {
+                param,
+                default: None,
+            }),
+            None => key_template(&local_value(expr)?, param_of, local_value, parts)?,
+        },
     }
     Some(())
 }
@@ -1056,7 +1103,7 @@ fn collect_signatures_of_type(typ: &LuaType, result: &mut Vec<LuaSignatureId>) {
     }
 }
 
-/// The key one call of `installer` writes. A key joined with a literal is a
+/// The key one call of `installer` writes. A joined key is a
 /// string whatever the call passes; a bare parameter is `None` when the call
 /// passes a value not known to be a string.
 fn evaluate_install(
@@ -1066,7 +1113,7 @@ fn evaluate_install(
     signature_id: LuaSignatureId,
     installer: &FieldInstaller,
 ) -> Option<Install> {
-    let joins_literal = installer.joins_literal();
+    let is_join = installer.is_join();
     let mut names = vec![String::new()];
     let mut definition = None;
     let mut any_string = false;
@@ -1077,12 +1124,16 @@ fn evaluate_install(
                     name.push_str(text);
                 }
             }
-            KeyPart::Param(param) => {
-                let arg = installer_arg(db, call_expr, signature_id, *param)?;
-                let arg_names = match key_arg_names(db, cache, &arg) {
-                    Some(arg_names) => arg_names,
-                    None if joins_literal => None,
-                    None => return None,
+            KeyPart::Param { param, default } => {
+                let arg = installer_arg(db, call_expr, signature_id, *param);
+                let arg_names = match (&arg, default) {
+                    (None, Some(default)) => Some(vec![default.clone()]),
+                    (None, None) => return None,
+                    (Some(arg), _) => match key_arg_names(db, cache, arg, default.as_ref()) {
+                        Some(arg_names) => arg_names,
+                        None if is_join => None,
+                        None => return None,
+                    },
                 };
                 match arg_names {
                     Some(values) => {
@@ -1095,7 +1146,9 @@ fn evaluate_install(
                     }
                     None => any_string = true,
                 }
-                definition.get_or_insert(arg);
+                if let Some(arg) = arg {
+                    definition.get_or_insert(arg);
+                }
             }
         }
     }
@@ -1110,19 +1163,28 @@ fn evaluate_install(
     })
 }
 
-/// The strings a key argument may be: `Some(None)` for a string it does not
-/// say, `None` for a value not known to be a string.
+/// The strings a key argument may be, with `default` where it may be `nil`:
+/// `Some(None)` for a string it does not say, `None` for a value not known to
+/// be a string.
 fn key_arg_names(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     arg: &LuaExpr,
+    default: Option<&SmolStr>,
 ) -> Option<Option<Vec<SmolStr>>> {
-    if let LuaExpr::LiteralExpr(literal_expr) = arg
-        && let Some(LuaLiteralToken::String(string_token)) = literal_expr.get_literal()
-    {
-        return Some(Some(vec![string_token.get_value().into()]));
+    if let Some(value) = literal_string(arg) {
+        return Some(Some(vec![value.into()]));
     }
     let typ = infer_expr(db, cache, arg.clone()).ok()?;
+    if let Some(default) = default
+        && typ.is_nullable()
+    {
+        let mut names = string_const_names(&Some(typ.clone()));
+        if typ.is_nil() || !names.is_empty() {
+            names.push(default.clone());
+            return Some(Some(names));
+        }
+    }
     let names = string_const_names(&Some(typ.clone()));
     if !names.is_empty() {
         return Some(Some(names));
@@ -1214,23 +1276,58 @@ fn forwarded_param(db: &DbIndex, signature_id: LuaSignatureId, value: &LuaExpr) 
     }
 }
 
-/// Whether `index_expr` is an installer write joining a literal into its key,
-/// of a function whose every call is seen: each call writes the fields it
-/// names, so the write names none. A bare parameter key keeps the write, whose
-/// key type may be no string at all.
-pub(in crate::compilation::analyzer) fn is_write_of_seen_installer(
+/// For an installer write, whether its function's calls name every field it
+/// makes: every call is seen and the key is a string. A bare parameter key is
+/// a string when its parameter is declared one or every call passes one;
+/// otherwise the write keeps its key type, which may be no string at all.
+/// `None` when `index_expr` is no installer write.
+fn installer_write_named_by_calls(
     db: &DbIndex,
     file_id: crate::FileId,
     index_expr: &glua_parser::LuaIndexExpr,
-) -> bool {
-    let Some(closure) = index_expr.ancestors::<LuaClosureExpr>().next() else {
-        return false;
-    };
+) -> Option<bool> {
+    let closure = index_expr.ancestors::<LuaClosureExpr>().next()?;
     let signature_id = LuaSignatureId::new(file_id, closure.get_position());
-    installers_of(db, signature_id)
-        .iter()
-        .any(|installer| installer.write == index_expr.get_range() && installer.joins_literal())
-        && crate::semantic::local_function_calls_are_all_seen(db, signature_id)
+    let installer = installers_of(db, signature_id)
+        .into_iter()
+        .find(|installer| installer.write == index_expr.get_range())?;
+    let Some(calls) = crate::semantic::seen_local_function_calls(db, signature_id) else {
+        return Some(false);
+    };
+    if installer.is_join() {
+        return Some(true);
+    }
+    let [KeyPart::Param { param, default }] = installer.key.as_slice() else {
+        return Some(false);
+    };
+    let declared_string = db
+        .get_signature_index()
+        .get(&signature_id)
+        .and_then(|signature| signature.get_param_info_by_id(*param))
+        .is_some_and(|info| match &info.type_ref {
+            LuaType::Union(union_type) => union_type.types().all(LuaType::is_string),
+            typ => typ.is_string(),
+        });
+    Some(
+        declared_string
+            || calls.iter().all(|call_expr| {
+                match installer_arg(db, call_expr, signature_id, *param) {
+                    Some(arg) => is_string_expr(&arg),
+                    None => default.is_some(),
+                }
+            }),
+    )
+}
+
+/// Whether `expr` is a string whatever its parts hold: a literal or a join.
+fn is_string_expr(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::ParenExpr(paren) => paren.get_expr().is_some_and(|inner| is_string_expr(&inner)),
+        LuaExpr::BinaryExpr(binary) => {
+            binary.get_op_token().map(|token| token.get_op()) == Some(BinaryOperator::OpConcat)
+        }
+        expr => literal_string(expr).is_some(),
+    }
 }
 
 fn direct_name_expr_signature_id(

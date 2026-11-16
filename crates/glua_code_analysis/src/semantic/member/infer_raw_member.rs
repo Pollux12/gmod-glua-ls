@@ -375,7 +375,8 @@ fn infer_owner_raw_member_type_with_realm_uncached(
     // Two literal keys match only when they are equal, which the exact-key
     // lookup above already covered, so a literal access that reaches here can
     // only be answered by an expression-keyed member.
-    let owner_members = if matches!(member_key, LuaMemberKey::Name(_) | LuaMemberKey::Integer(_)) {
+    let literal_key = matches!(member_key, LuaMemberKey::Name(_) | LuaMemberKey::Integer(_));
+    let owner_members = if literal_key {
         member_index.get_expr_key_members(member_owner)
     } else {
         member_index.get_members(member_owner)
@@ -391,7 +392,16 @@ fn infer_owner_raw_member_type_with_realm_uncached(
     let mut pending_reason = None;
     let matcher = super::AccessKeyMatcher::new(&access_key_type);
     for member in owner_members {
-        if !matcher.matches(db, member.get_key()) {
+        // A computed write whose fields are named elsewhere holds no other key.
+        if !matcher.matches(db, member.get_key())
+            || literal_key
+                && crate::semantic::infer::member_is_finite_named_dynamic_assignment(
+                    db,
+                    caller_file_id,
+                    member_owner,
+                    member,
+                )
+        {
             continue;
         }
 

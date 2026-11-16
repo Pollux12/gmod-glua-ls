@@ -4752,6 +4752,102 @@ owner:CompletelyMadeUpMethod()
         ));
     }
 
+    /// A key built into a local first, or from a parameter with a default,
+    /// names what each call passes, or the default when it passes nothing.
+    #[test]
+    fn test_installed_key_through_a_local_and_a_default() {
+        const REGISTER: &str = r#"
+            local Vehicles = {}
+            local function RegisterVehicle(name, data, prefix)
+                local key = (prefix or "Car") .. name
+                Vehicles[key] = data
+            end
+            RegisterVehicle("Sedan", { seats = 4 })
+            RegisterVehicle("Mk1", { armor = 2 }, "Tank")
+        "#;
+        let mut ws = dynamic_field_workspace();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_vehicles.lua",
+            &format!(
+                r#"{REGISTER}
+                local seats = Vehicles.CarSedan.seats
+                local armor = Vehicles.TankMk1.armor
+                "#
+            ),
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "seats")), "4");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "armor")), "2");
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!("{REGISTER}\nlocal bogus = Vehicles.CarMk1"),
+        ));
+    }
+
+    /// A key parameter the body rewrites no longer holds the name the call
+    /// passed, so the write keeps accepting any key.
+    #[test]
+    fn test_rewritten_key_param_installs_no_name() {
+        let mut ws = dynamic_field_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local Registry = {}
+            local function Register(name, value)
+                name = name .. "_x"
+                Registry[name] = value
+            end
+            Register("Sedan", 4)
+            local renamed = Registry.Sedan_x
+            "#,
+        ));
+    }
+
+    /// A registry written under a bare string key holds only the keys its
+    /// calls pass, when every call is seen and passes a string.
+    #[test]
+    fn test_string_keyed_registry_reports_a_key_no_call_registered() {
+        let mut ws = dynamic_field_workspace();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_registry.lua",
+            r#"
+            local Registry = {}
+            local function Register(name, value)
+                Registry[name] = value
+            end
+            Register("Sedan", 4)
+            local sedan = Registry.Sedan
+            function Lookup(key)
+                broad = Registry[key]
+            end
+            "#,
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "sedan")), "4");
+        let broad = ws.expr_ty("broad");
+        assert_eq!(ws.humanize_type(broad), "4?");
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local Registry = {}
+            local function Register(name, value)
+                Registry[name] = value
+            end
+            Register("Sedan", 4)
+            local bogus = Registry.Bogus
+            "#,
+        ));
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local Registry = {}
+            local function Register(name, value)
+                Registry[name] = value
+            end
+            Register(GetName(), 4)
+            local any = Registry.Anything
+            "#,
+        ));
+    }
+
     /// A call passing a string whose value is unknown may install any key, on
     /// its own table only.
     #[test]

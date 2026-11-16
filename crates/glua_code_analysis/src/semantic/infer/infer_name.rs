@@ -1719,33 +1719,31 @@ fn find_local_function_call_sites(db: &DbIndex, signature_id: LuaSignatureId) ->
     local_table_member_call_sites(db, file_refs, signature_id).unwrap_or_default()
 }
 
-/// Whether every call of the function `signature_id` is in its file: a local
-/// holds it, nothing reassigns that local, and every reference calls it.
-pub(crate) fn local_function_calls_are_all_seen(
+/// Every call of the function `signature_id`, when all are in its file: a
+/// local holds it, nothing reassigns that local, and every reference calls it.
+pub(crate) fn seen_local_function_calls(
     db: &DbIndex,
     signature_id: LuaSignatureId,
-) -> bool {
+) -> Option<Vec<LuaCallExpr>> {
     let file_id = signature_id.get_file_id();
-    let Some(file_refs) = db.get_reference_index().get_local_reference(&file_id) else {
-        return false;
-    };
-    let Some(decl_id) = local_decl_holding(db, signature_id) else {
-        return false;
-    };
+    let file_refs = db.get_reference_index().get_local_reference(&file_id)?;
+    let decl_id = local_decl_holding(db, signature_id)?;
     if file_refs
         .get_decl_references(&decl_id)
         .is_none_or(|refs| refs.is_written_after_declaration(decl_id.position))
     {
-        return false;
+        return None;
     }
     decl_name_exprs(db, file_id, file_refs, decl_id)
         .into_iter()
-        .all(|name_expr| {
-            name_expr
-                .get_parent::<LuaCallExpr>()
-                .and_then(|call_expr| call_expr.get_prefix_expr())
-                .is_some_and(|prefix| prefix.get_syntax_id() == name_expr.get_syntax_id())
+        .map(|name_expr| {
+            name_expr.get_parent::<LuaCallExpr>().filter(|call_expr| {
+                call_expr
+                    .get_prefix_expr()
+                    .is_some_and(|prefix| prefix.get_syntax_id() == name_expr.get_syntax_id())
+            })
         })
+        .collect()
 }
 
 /// The local the function `signature_id` is declared as or assigned to.

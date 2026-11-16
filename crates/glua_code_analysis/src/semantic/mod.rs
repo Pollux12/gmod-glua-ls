@@ -70,8 +70,7 @@ pub(crate) use infer::{
     take_access_path_snapshot, with_access_paths,
 };
 pub(crate) use infer::{
-    arg_for_param, factory_bound_metatable_index, local_function_calls_are_all_seen,
-    with_file_cache,
+    arg_for_param, factory_bound_metatable_index, seen_local_function_calls, with_file_cache,
 };
 pub(crate) use infer::{declaring_for_range, try_infer_enclosing_for_range_iter_type};
 pub(crate) use infer::{
