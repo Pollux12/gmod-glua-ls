@@ -1486,6 +1486,79 @@ mod test {
         assert_eq!(ws.expr_ty("overriding_param"), LuaType::Any);
     }
 
+    /// A replacement whose own return says nothing, such as one returning
+    /// `func(object)` for an `any` object, returns what the global it replaces
+    /// documents.
+    #[test]
+    fn a_global_replacement_with_an_uninformative_return_returns_the_documented_type() {
+        let mut ws = VirtualWorkspace::new();
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "library/globals.lua",
+            r#"
+            ---@meta
+            ---@param toBeValidated any
+            ---@return boolean
+            function IsValid(toBeValidated) end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_optimisation.lua",
+            r#"
+            function IsValid(object)
+                if not object then return false end
+                local func = object.IsValid
+                if not func then return false end
+                return func(object)
+            end
+            "#,
+        );
+        ws.def_file("lua/autorun/sh_caller.lua", "valid = IsValid(5)");
+
+        assert_eq!(ws.expr_ty("valid"), LuaType::Boolean);
+    }
+
+    /// A replacement's return that settles after the documented one filled
+    /// it, as when an edit gives the function it returns a value, is its own,
+    /// as in a cold build.
+    #[test]
+    fn a_global_replacement_whose_return_settles_after_an_edit_keeps_its_own_return() {
+        const DESCRIBE_FILE: &str = "lua/autorun/sh_describe.lua";
+        const DESCRIBED: &str = "function Describe(object) return \"described\" end";
+        let workspace = |describe: &str| {
+            let mut ws = VirtualWorkspace::new();
+            let library_root = ws.virtual_url_generator.base.join("library");
+            ws.analysis.add_library_workspace(library_root);
+            ws.def_file(
+                "library/globals.lua",
+                r#"
+                ---@meta
+                ---@param toBeValidated any
+                ---@return boolean
+                function IsValid(toBeValidated) end
+                "#,
+            );
+            ws.def_file(
+                "lua/autorun/sh_optimisation.lua",
+                "function IsValid(object) return Describe(object) end",
+            );
+            ws.def_file(DESCRIBE_FILE, describe);
+            ws.def_file("lua/autorun/sh_caller.lua", "valid = IsValid(5)");
+            ws
+        };
+        let mut warm = workspace("function Describe(object) return Unknown end");
+        warm.def_file(DESCRIBE_FILE, DESCRIBED);
+        let mut cold = workspace(DESCRIBED);
+
+        let warm_valid = warm.expr_ty("valid");
+        let cold_valid = cold.expr_ty("valid");
+        assert_eq!(
+            warm.humanize_type(warm_valid),
+            cold.humanize_type(cold_valid)
+        );
+    }
+
     #[test]
     fn test_explicit_member_function_type_overrides_inherited_contract() {
         let mut ws = VirtualWorkspace::new();

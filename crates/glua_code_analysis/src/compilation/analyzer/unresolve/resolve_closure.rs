@@ -16,8 +16,10 @@ use crate::{
 
 use super::{
     ResolveResult, UnResolveCallClosureParams, UnResolveClosureReturn, UnResolveParentAst,
-    UnResolveParentClosureParams, UnResolveReturn, find_decl_function::find_decl_function_type,
-    resolve::try_resolve_return_point, writes::ResolveWrites,
+    UnResolveParentClosureParams, UnResolveReturn,
+    find_decl_function::find_decl_function_type,
+    resolve::{is_unsettled_inferred_return, try_resolve_return_point},
+    writes::ResolveWrites,
 };
 
 pub fn try_resolve_call_closure_params(
@@ -562,8 +564,9 @@ pub fn try_resolve_closure_parent_params(
 }
 
 /// Gives a workspace function replacing a global a library documents that
-/// global's parameter types. Its returns stay its body's: a replacement may
-/// return what the documented one does not.
+/// global's parameter types. Its returns stay its body's, as a replacement
+/// may return what the documented one does not, unless the body's return
+/// says nothing: then it returns the documented one.
 fn resolve_documented_global_params(
     db: &DbIndex,
     writes: &mut ResolveWrites,
@@ -606,13 +609,46 @@ fn resolve_documented_global_params(
         .get(&closure_params.signature_id)
         .ok_or(InferFailReason::None)?;
     let contract = Arc::new(contract_outside_signature(db, documented, LuaType::Unknown));
+    let documented_return = documented.get_return_type();
+    let signature_id = closure_params.signature_id;
     defer_resolve_doc_function(
         db,
         writes,
-        closure_params.signature_id,
+        signature_id,
         &contract_for_target(db, target, &contract),
         None,
-    )
+    )?;
+    writes.push(move |db, _| fill_unsettled_return(db, signature_id, documented_return));
+    Ok(())
+}
+
+/// Fills the inferred return of `signature_id` with `documented_return` while
+/// the body's says nothing. The fill stays marked as one, so a return the body
+/// settles later replaces it.
+fn fill_unsettled_return(
+    db: &mut DbIndex,
+    signature_id: LuaSignatureId,
+    documented_return: LuaType,
+) {
+    let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id) else {
+        return;
+    };
+    let fillable = signature.resolve_return == SignatureReturnStatus::InferResolve
+        && (signature.return_filled_from_slot
+            || is_unsettled_inferred_return(&signature.get_return_type()));
+    if !fillable || signature.get_return_type() == documented_return {
+        return;
+    }
+    signature.return_filled_from_slot = true;
+    signature.return_docs = vec![LuaDocReturnInfo {
+        name: None,
+        type_ref: documented_return,
+        default_value: None,
+        description: None,
+        attributes: None,
+        return_kind: ReturnTypeKind::default(),
+    }];
+    db.get_signature_index_mut().note_return_write(signature_id);
 }
 
 /// Defers one `resolve_doc_function` write. The signature's existence is the

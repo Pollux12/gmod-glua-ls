@@ -543,6 +543,7 @@ pub fn try_resolve_return_point(
     // costs two field reads instead of a full inference.
     if let Some(signature) = db.get_signature_index().get(&return_.signature_id)
         && signature.resolve_return == SignatureReturnStatus::InferResolve
+        && !signature.return_filled_from_slot
     {
         let current_return = signature.get_return_type();
         if !is_unsettled_inferred_return(&current_return) {
@@ -613,6 +614,7 @@ pub fn try_resolve_return_point(
             let correlations_moved =
                 signature.return_correlations() != return_correlations.as_slice();
             signature.resolve_return = SignatureReturnStatus::InferResolve;
+            signature.return_filled_from_slot = false;
             signature.return_docs = return_docs;
             signature.set_return_correlations(return_correlations);
             if moved || correlations_moved {
@@ -639,13 +641,17 @@ fn should_apply_resolved_return_docs(
         return false;
     }
 
+    if signature.return_filled_from_slot {
+        return !is_unsettled_inferred_return(&new_return);
+    }
+
     inferred_return_improves(&current_return, &new_return)
 }
 
 /// An inferred return that says nothing yet. `never` belongs here: a function
 /// whose body returns an expression cannot return no value, so a `never`
 /// return is an operand that had not resolved when the body was read.
-fn is_unsettled_inferred_return(return_type: &LuaType) -> bool {
+pub(super) fn is_unsettled_inferred_return(return_type: &LuaType) -> bool {
     match return_type {
         LuaType::Unknown | LuaType::Any | LuaType::Never => true,
         LuaType::Variadic(variadic) => match variadic.as_ref() {
