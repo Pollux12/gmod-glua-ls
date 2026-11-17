@@ -1427,6 +1427,37 @@ mod test {
     }
 
     #[test]
+    fn a_global_function_overriding_a_documented_one_takes_its_param_types() {
+        let mut ws = VirtualWorkspace::new();
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "library/globals.lua",
+            r#"
+            ---@meta
+            ---@param toBeValidated any
+            ---@return boolean
+            function IsValid(toBeValidated) end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_optimisation.lua",
+            r#"
+            function IsValid(object)
+                overriding_param = object
+                if not object then return false end
+                local func = object.IsValid
+                if not func then return false end
+                return func(object)
+            end
+            "#,
+        );
+        ws.def_file("lua/autorun/sh_caller.lua", "IsValid(5)");
+
+        assert_eq!(ws.expr_ty("overriding_param"), LuaType::Any);
+    }
+
+    #[test]
     fn test_explicit_member_function_type_overrides_inherited_contract() {
         let mut ws = VirtualWorkspace::new();
         ws.def(

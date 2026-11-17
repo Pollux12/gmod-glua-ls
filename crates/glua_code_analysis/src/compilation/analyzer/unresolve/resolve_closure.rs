@@ -495,7 +495,14 @@ pub fn try_resolve_closure_parent_params(
                     )
                     .ok_or(InferFailReason::None)?
                 }
-                _ => return Ok(()),
+                LuaVarExpr::NameExpr(name_expr) => {
+                    return resolve_documented_global_params(
+                        db,
+                        writes,
+                        closure_params,
+                        &name_expr,
+                    );
+                }
             }
         }
         UnResolveParentAst::LuaTableField(table_field) => {
@@ -537,7 +544,9 @@ pub fn try_resolve_closure_parent_params(
                     )
                     .ok_or(InferFailReason::None)?
                 }
-                _ => return Ok(()),
+                LuaVarExpr::NameExpr(name_expr) => {
+                    return resolve_documented_global_params(db, writes, closure_params, name_expr);
+                }
             }
         }
     };
@@ -549,6 +558,60 @@ pub fn try_resolve_closure_parent_params(
         &member_type,
         self_type,
         &InferGuard::new(),
+    )
+}
+
+/// Gives a workspace function replacing a global a library documents that
+/// global's parameter types. Its returns stay its body's: a replacement may
+/// return what the documented one does not.
+fn resolve_documented_global_params(
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
+    closure_params: &UnResolveParentClosureParams,
+    name_expr: &glua_parser::LuaNameExpr,
+) -> ResolveResult {
+    let Some(name) = name_expr.get_name_text() else {
+        return Ok(());
+    };
+    let module_index = db.get_module_index();
+    let workspace_id = module_index
+        .get_workspace_id(closure_params.file_id)
+        .unwrap_or(crate::WorkspaceId::MAIN);
+    // The library this file resolves the name to first; within it, the
+    // earliest declaration.
+    let Some(documented) = db
+        .get_global_index()
+        .get_global_decl_id_priority_tiers(&name, module_index, workspace_id)
+        .into_iter()
+        .flatten()
+        .flat_map(|(_, mut decl_ids)| {
+            decl_ids.retain(|decl_id| {
+                module_index.is_library(&decl_id.file_id) || module_index.is_std(&decl_id.file_id)
+            });
+            decl_ids.sort_by_key(|decl_id| (decl_id.file_id, decl_id.position));
+            decl_ids
+        })
+        .filter_map(|decl_id| db.get_type_index().get_type_cache(&decl_id.into()))
+        .find_map(|cache| match cache.as_type() {
+            LuaType::Signature(id) if *id != closure_params.signature_id => {
+                db.get_signature_index().get(id)
+            }
+            _ => None,
+        })
+    else {
+        return Ok(());
+    };
+    let target = db
+        .get_signature_index()
+        .get(&closure_params.signature_id)
+        .ok_or(InferFailReason::None)?;
+    let contract = Arc::new(contract_outside_signature(db, documented, LuaType::Unknown));
+    defer_resolve_doc_function(
+        db,
+        writes,
+        closure_params.signature_id,
+        &contract_for_target(db, target, &contract),
+        None,
     )
 }
 
@@ -741,17 +804,15 @@ fn resolve_doc_function(
     doc_func: &LuaFunctionType,
     self_type: Option<LuaType>,
 ) -> ResolveResult {
-    let signature = db
-        .get_signature_index_mut()
-        .get_mut(&signature_id)
-        .ok_or(InferFailReason::None)?;
-
-    let async_before = signature.async_state;
-    signature.async_state = doc_func.get_async_state();
-
+    let is_colon_define = db
+        .get_signature_index()
+        .get(&signature_id)
+        .ok_or(InferFailReason::None)?
+        .is_colon_define;
     let mut doc_params = doc_func.get_params().to_vec();
+    let optional_params = optional_params_for(doc_func, is_colon_define);
     // doc_func is the valid signature traced upwards, signature is the unresolved signature
-    match (doc_func.is_colon_define(), signature.is_colon_define) {
+    match (doc_func.is_colon_define(), is_colon_define) {
         (true, false) => {
             // The original signature is colon-defined but the unresolved one is not, so the first parameter must be inserted
             doc_params.insert(0, ("self".to_string(), Some(LuaType::SelfInfer)));
@@ -763,6 +824,26 @@ fn resolve_doc_function(
         }
         _ => {}
     }
+    // An optional param may be left out, as a documented `name?` may.
+    for (param, _) in doc_params
+        .iter_mut()
+        .zip(&optional_params)
+        .filter(|(_, optional)| **optional)
+    {
+        if let Some(typ) = &param.1
+            && !typ.is_nullable()
+        {
+            param.1 = Some(TypeOps::Union.apply(db, typ, &LuaType::Nil));
+        }
+    }
+
+    let signature = db
+        .get_signature_index_mut()
+        .get_mut(&signature_id)
+        .ok_or(InferFailReason::None)?;
+
+    let async_before = signature.async_state;
+    signature.async_state = doc_func.get_async_state();
 
     let receiver_filled_from_slot = !signature.is_colon_define
         && doc_params
@@ -792,7 +873,7 @@ fn resolve_doc_function(
                 type_ref: param.1.clone().unwrap_or(LuaType::Any),
                 default_value: None,
                 description: None,
-                nullable: false,
+                nullable: optional_params.get(index).copied().unwrap_or(false),
                 attributes: None,
             },
         );
@@ -1053,13 +1134,18 @@ fn contract_outside_signature(db: &DbIndex, sig: &LuaSignature, ret: LuaType) ->
             ))
         })
         .collect();
+    let main_params = sig.get_type_params();
     let params = merge_contract_params(
         db,
-        instantiate_params(&sig.get_type_params()),
+        instantiate_params(&main_params),
         sig.is_colon_define,
         &overloads,
         ParamMerge::Agreement,
     );
+    // A param only an overload has is one the main form is called without.
+    let mut optional_params = sig.get_param_optional_flags();
+    optional_params.resize(main_params.len(), false);
+    optional_params.resize(params.len(), true);
     LuaFunctionType::new(
         sig.async_state,
         sig.is_colon_define,
@@ -1067,7 +1153,7 @@ fn contract_outside_signature(db: &DbIndex, sig: &LuaSignature, ret: LuaType) ->
         params,
         instantiate_outside_signature(db, sig, &ret),
     )
-    .with_optional_params(sig.get_param_optional_flags())
+    .with_optional_params(optional_params)
 }
 
 /// `contract` as `target` takes it, by `target`'s own params.
@@ -1094,6 +1180,21 @@ fn contract_for_target(
         ),
         contract.get_ret().clone(),
     )
+    .with_optional_params(optional_params_for(contract, target.is_colon_define))
+}
+
+/// `contract`'s optional-param flags at the positions a signature defined
+/// with or without a colon, as `is_colon_define` says, gives its params.
+fn optional_params_for(contract: &LuaFunctionType, is_colon_define: bool) -> Vec<bool> {
+    let mut optional_params = contract.get_optional_params().to_vec();
+    match (contract.is_colon_define(), is_colon_define) {
+        (true, false) => optional_params.insert(0, false),
+        (false, true) if !optional_params.is_empty() => {
+            optional_params.remove(0);
+        }
+        _ => {}
+    }
+    optional_params
 }
 
 /// How [`merge_contract_params`] settles a position its contracts type

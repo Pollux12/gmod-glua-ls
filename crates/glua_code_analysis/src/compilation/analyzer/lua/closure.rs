@@ -1997,9 +1997,13 @@ fn analyze_lambda_params(
         }
         LuaAst::LuaFuncStat(func_stat) => {
             // `try_resolve_closure_parent_params` returns `Ok` without reading
-            // or writing anything unless the defined name is an index expression,
-            // so a plain `function foo() end` is not enqueued.
-            if !func_stat_defines_index_target(&func_stat) {
+            // or writing anything unless the defined name is an index expression
+            // or a global a library may document, so a local one is not enqueued.
+            if !func_stat_defines_index_target(&func_stat)
+                && !func_stat
+                    .get_func_name()
+                    .is_some_and(|name| names_global(analyzer, &name))
+            {
                 return Some(());
             }
             let unresolved = UnResolveParentClosureParams {
@@ -2021,10 +2025,13 @@ fn analyze_lambda_params(
         }
         LuaAst::LuaAssignStat(assign_stat) => {
             // Same no-op rule as the `FuncStat` arm: an assignment whose slot for
-            // this closure is a plain name returns `Ok` with no reads or writes.
-            // Only the slot at this closure's position matters; when it cannot
-            // be identified the item is enqueued as before.
-            if assign_slot_is_plain_name(&assign_stat, closure.get_position()) {
+            // this closure is a plain local name returns `Ok` with no reads or
+            // writes. Only the slot at this closure's position matters; when it
+            // cannot be identified the item is enqueued as before.
+            if assign_slot_is_plain_name(&assign_stat, closure.get_position())
+                && !assign_slot(&assign_stat, closure.get_position())
+                    .is_some_and(|var| names_global(analyzer, &var))
+            {
                 return Some(());
             }
             let unresolved = UnResolveParentClosureParams {
@@ -2047,16 +2054,36 @@ fn func_stat_defines_index_target(func_stat: &LuaFuncStat) -> bool {
     matches!(func_stat.get_func_name(), Some(LuaVarExpr::IndexExpr(_)))
 }
 
-/// Whether the assignment slot holding the closure at `closure_pos` is a plain
-/// name. Mirrors the `UnResolveParentClosureParams::LuaAssignStat` attempt,
-/// which returns `Ok` without reads or writes for any non-index target. A slot
-/// that cannot be found is enqueued.
-fn assign_slot_is_plain_name(assign_stat: &LuaAssignStat, closure_pos: rowan::TextSize) -> bool {
+/// Whether `var` is a name no local declares: a definition through it may
+/// replace a global a library documents.
+fn names_global(analyzer: &LuaAnalyzer, var: &LuaVarExpr) -> bool {
+    let LuaVarExpr::NameExpr(name_expr) = var else {
+        return false;
+    };
+    !analyzer
+        .db
+        .get_reference_index()
+        .get_local_reference(&analyzer.file_id)
+        .and_then(|references| references.get_decl_id(&name_expr.get_range()))
+        .and_then(|decl_id| analyzer.db.get_decl_index().get_decl(&decl_id))
+        .is_some_and(|decl| decl.is_local())
+}
+
+/// The assignment target holding the closure at `closure_pos`.
+fn assign_slot(assign_stat: &LuaAssignStat, closure_pos: rowan::TextSize) -> Option<LuaVarExpr> {
     let (vars, exprs) = assign_stat.get_var_and_expr_list();
     exprs
         .iter()
         .position(|expr| expr.get_position() == closure_pos)
-        .and_then(|idx| vars.get(idx))
+        .and_then(|idx| vars.get(idx).cloned())
+}
+
+/// Whether the assignment slot holding the closure at `closure_pos` is a plain
+/// name. Mirrors the `UnResolveParentClosureParams::LuaAssignStat` attempt,
+/// which reads a plain name only for a global a library documents. A slot
+/// that cannot be found is enqueued.
+fn assign_slot_is_plain_name(assign_stat: &LuaAssignStat, closure_pos: rowan::TextSize) -> bool {
+    assign_slot(assign_stat, closure_pos)
         .is_some_and(|var| !matches!(var, LuaVarExpr::IndexExpr(_)))
 }
 
