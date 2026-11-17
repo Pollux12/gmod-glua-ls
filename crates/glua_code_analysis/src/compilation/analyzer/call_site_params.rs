@@ -2416,6 +2416,32 @@ fn infer_supported_call_site_arg_type(
     })
 }
 
+/// `typ`, the values a local passed as `arg` takes, without `nil` and `false`
+/// when the guards before the call leave `arg` holding neither.
+fn without_values_guarded_out(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    arg: &LuaExpr,
+    typ: LuaType,
+) -> LuaType {
+    if !matches!(unparenthesized(arg.clone()), LuaExpr::NameExpr(_)) {
+        return typ;
+    }
+    let Ok(at_call) = infer_expr(db, cache, arg.clone()) else {
+        return typ;
+    };
+    if at_call.is_unknown()
+        || at_call.is_any()
+        || crate::semantic::remove_false_or_nil(at_call.clone()) != at_call
+    {
+        return typ;
+    }
+    match crate::semantic::remove_false_or_nil(typ.clone()) {
+        truthy if truthy.is_unknown() => typ,
+        truthy => truthy,
+    }
+}
+
 /// Whether `expr` names its function's receiver: an implicit `self` or a leading `self` parameter.
 fn is_receiver_self(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> bool {
     let LuaExpr::NameExpr(name_expr) = expr else {
@@ -2456,7 +2482,8 @@ fn infer_call_site_arg_value(
         0,
         calls_with_args,
         &mut HashSet::default(),
-    );
+    )
+    .map(|(typ, kind)| (without_values_guarded_out(db, cache, &arg, typ), kind));
     if !calls_with_args {
         return value;
     }

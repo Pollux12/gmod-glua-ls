@@ -392,6 +392,35 @@ mod test {
         assert!(!got.is_nullable() && !got.is_unknown(), "{got:?}");
     }
 
+    /// A guard before the call rules out the values the argument cannot hold
+    /// there, so they do not reach the param.
+    #[test]
+    fn a_callers_guarded_argument_passes_only_what_the_guard_lets_through() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/sh_use.lua",
+            r#"
+            function Use(value)
+                got = value
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_caller.lua",
+            r#"
+            local value = false
+            if Flag then
+                value = "found"
+            end
+            if not value then return end
+            Use(value)
+            "#,
+        );
+
+        let got = ws.expr_ty("got");
+        assert_eq!(ws.humanize_type(got), "string");
+    }
+
     #[test]
     fn test_closure_param_infer() {
         let mut ws = VirtualWorkspace::new();
