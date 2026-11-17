@@ -6102,3 +6102,61 @@ fn a_parameter_typed_by_its_name_alone_does_not_mismatch() {
         "#,
     ));
 }
+
+/// A table no overload accepts is reported against the overload whose fields
+/// it fits best: one wrong field there, not the first overload's other fields.
+#[test]
+fn a_table_no_overload_accepts_is_reported_against_its_closest_overload() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    let file = ws.def(
+        r#"
+---@alias RequestMethodWithParameters "GET"|"POST"
+---@alias RequestMethodWithoutParameters "PUT"|"DELETE"
+
+---@class (partial) Request
+---@field method string
+---@field headers? table<string, string>
+
+---@class (exact) RequestWithParameters : Request
+---@field method RequestMethodWithParameters
+---@field parameters? table<string, string>
+
+---@class (exact) RequestWithoutParameters : Request
+---@field method RequestMethodWithoutParameters
+---@field parameters nil
+
+---@overload fun(request: RequestWithParameters): boolean
+---@overload fun(request: RequestWithoutParameters): boolean
+---@param request Request
+function Send(request) end
+
+---@type (false|string)?
+local secret
+
+Send({
+    method = "DELETE",
+    headers = { ["X-Secret"] = secret },
+})
+"#,
+    );
+
+    let reports = [
+        crate::DiagnosticCode::ParamTypeMismatch,
+        crate::DiagnosticCode::AssignTypeMismatch,
+    ]
+    .into_iter()
+    .flat_map(|code| {
+        ws.analysis.diagnostic.enable_only(code);
+        ws.analysis
+            .diagnose_file(file, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default()
+    })
+    .map(|diagnostic| diagnostic.message)
+    .collect::<Vec<_>>();
+    assert!(
+        reports.len() == 1
+            && reports[0].contains("expected `RequestWithoutParameters`")
+            && reports[0].contains("member headers"),
+        "{reports:#?}"
+    );
+}

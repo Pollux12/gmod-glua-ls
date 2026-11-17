@@ -5,7 +5,7 @@ use rowan::TextRange;
 use crate::{
     InferFailReason, check_type_compact,
     db_index::{DbIndex, LuaFunctionType, LuaType},
-    semantic::{infer::InferCallFuncResult, is_nullable},
+    semantic::{find_members_with_key, get_member_map, infer::InferCallFuncResult, is_nullable},
 };
 
 pub fn resolve_signature_by_args(
@@ -53,6 +53,7 @@ pub fn resolve_signature_by_args(
     for (arg_index, (expr_type, _)) in expr_types.iter().enumerate() {
         let mut current_match_result = ParamMatchResult::Not;
         let mut skipped_implicit_self = false;
+        let mut rejecting = Vec::new();
         for (func_index, opt_func) in need_resolve_funcs.iter_mut().enumerate() {
             let func = match opt_func.as_ref() {
                 None => continue,
@@ -106,6 +107,7 @@ pub fn resolve_signature_by_args(
             }
 
             if match_result == ParamMatchResult::Not {
+                rejecting.push((func.clone(), param_type));
                 *opt_func = None;
                 continue;
             }
@@ -122,6 +124,9 @@ pub fn resolve_signature_by_args(
         }
 
         if current_match_result == ParamMatchResult::Not && !skipped_implicit_self {
+            if let Some(closest) = closest_table_fit(db, &rejecting, expr_type) {
+                best_match_result = closest;
+            }
             break;
         }
     }
@@ -226,6 +231,39 @@ pub fn resolve_signature_by_args(
     }
 
     Ok(best_match_result)
+}
+
+/// Among overloads that all reject the table literal `expr_type`, the one
+/// whose fields it misses fewest of, the first on a tie.
+fn closest_table_fit(
+    db: &DbIndex,
+    rejecting: &[(Arc<LuaFunctionType>, LuaType)],
+    expr_type: &LuaType,
+) -> Option<Arc<LuaFunctionType>> {
+    if !matches!(expr_type, LuaType::TableConst(_)) {
+        return None;
+    }
+    let fields = get_member_map(db, expr_type)?;
+    let misses = |param_type: &LuaType| {
+        fields
+            .iter()
+            .filter(|(key, values)| {
+                !find_members_with_key(db, param_type, (*key).clone(), false).is_some_and(
+                    |expected| {
+                        expected.iter().any(|expected| {
+                            values.iter().all(|value| {
+                                check_type_compact(db, &expected.typ, &value.typ).is_ok()
+                            })
+                        })
+                    },
+                )
+            })
+            .count()
+    };
+    rejecting
+        .iter()
+        .min_by_key(|(_, param_type)| misses(param_type))
+        .map(|(func, _)| func.clone())
 }
 
 fn is_func_last_param_variadic(func: &LuaFunctionType) -> bool {
