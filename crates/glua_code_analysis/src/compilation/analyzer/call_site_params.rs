@@ -2674,6 +2674,24 @@ fn infer_call_site_value_type(
                     LuaInferenceProvenanceKind::ExplicitAnnotation,
                 ));
             }
+            // A local bound to a class's own table and never reassigned, such as
+            // a plugin's `PLUGIN`, holds that class.
+            if let Some(class) = db
+                .get_type_index()
+                .get_type_cache(&decl_id.into())
+                .map(|cache| cache.as_type())
+                .filter(|typ| matches!(typ, LuaType::Def(_)))
+                && !refs
+                    .get_decl_references(&decl_id)
+                    .is_some_and(|references| {
+                        references
+                            .cells
+                            .iter()
+                            .any(|cell| cell.is_write && cell.range != decl.get_range())
+                    })
+            {
+                return Some((class.clone(), LuaInferenceProvenanceKind::ConcreteValue));
+            }
             if let Some(result) = scope.local_values.get(&(decl_id, calls_with_args)) {
                 return result.clone();
             }

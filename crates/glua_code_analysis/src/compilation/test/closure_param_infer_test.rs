@@ -2514,4 +2514,76 @@ end
             ("unknown", "string[]", "unknown", "string[]")
         );
     }
+
+    const PLUGIN_COMMANDS: &str = r#"
+---@type PLUGIN
+local PLUGIN = PLUGIN
+PLUGIN.commands = {}
+
+function PLUGIN.commands:issue(transactionId, steamId)
+    local issueSelf = self
+    self.commands.sync(self, steamId)
+end
+
+function PLUGIN.commands:sync(steamId)
+    local syncSelf = self
+end
+
+function PLUGIN:sync(ply)
+end
+"#;
+
+    fn plugin_command_selves(dispatch: &str) -> (String, String) {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "gamemodes/cityrp/gamemode/core/libraries/sh_plugin.lua",
+            "--- @class PLUGIN
+",
+        );
+        let file = ws.def_file(
+            "gamemodes/cityrp/plugins/tebex/sv_init.lua",
+            &format!("{PLUGIN_COMMANDS}{dispatch}"),
+        );
+        let issue_self = ws.local_ty(file, "issueSelf");
+        let sync_self = ws.local_ty(file, "syncSelf");
+        (ws.humanize_type(issue_self), ws.humanize_type(sync_self))
+    }
+
+    /// A plugin's command methods, kept in a table on the plugin and run with
+    /// the plugin as receiver, take the plugin as `self`.
+    #[test]
+    fn plugin_commands_called_with_the_plugin_take_it_as_self() {
+        let selves = plugin_command_selves(
+            r#"
+---@param sub string
+function RunSub(sub, ...)
+    local command = PLUGIN.commands[sub]
+    return command(PLUGIN, ...)
+end
+"#,
+        );
+
+        assert_eq!(selves, ("tebex".to_string(), "tebex".to_string()));
+    }
+
+    /// A plugin local written again holds whatever was written, so calls
+    /// passing it say nothing about the plugin.
+    #[test]
+    fn a_reassigned_plugin_local_passes_no_plugin_receiver() {
+        let selves = plugin_command_selves(
+            r#"
+---@param sub string
+function RunSub(sub, ...)
+    local command = PLUGIN.commands[sub]
+    PLUGIN = {}
+    return command(PLUGIN, ...)
+end
+"#,
+        );
+
+        assert_ne!(selves.0, "tebex");
+    }
 }
