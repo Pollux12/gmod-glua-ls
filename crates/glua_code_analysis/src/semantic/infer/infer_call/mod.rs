@@ -49,6 +49,7 @@ use infer_setmetatable::{
     infer_newproxy_call, infer_setmetatable_call,
 };
 
+mod infer_net_read;
 mod infer_require;
 mod infer_setmetatable;
 
@@ -2694,6 +2695,9 @@ pub fn infer_call_expr(
     )?
     .get_ret()
     .clone();
+    let ret_type =
+        infer_net_read::infer_net_read_call(db, cache, &call_expr, &prefix_type, &ret_type)
+            .unwrap_or(ret_type);
 
     if let Some(tree) = db.get_flow_index().get_flow_tree(&cache.get_file_id())
         && let Some(flow_id) = tree.get_flow_id(call_expr.get_syntax_id())

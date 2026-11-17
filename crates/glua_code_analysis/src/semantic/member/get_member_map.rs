@@ -1,6 +1,6 @@
 use rustc_hash::FxHashMap;
 
-use crate::{DbIndex, FileId, LuaMemberKey, LuaType, WorkspaceId};
+use crate::{DbIndex, FileId, LuaMemberKey, LuaObjectType, LuaType, WorkspaceId};
 
 use super::{
     LuaMemberInfo,
@@ -41,6 +41,27 @@ pub fn get_member_map_in_workspace_for_file_at_offset(
         caller_position,
     )?;
     build_member_map(members)
+}
+
+/// The fields of the table literal `typ` as a shape of their own, for a value
+/// copied out of the file that holds the literal.
+pub(crate) fn snapshot_table_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
+    if !matches!(typ, LuaType::TableConst(_)) {
+        return None;
+    }
+    let fields = get_member_map(db, typ)?
+        .into_iter()
+        .filter_map(|(key, members)| {
+            let member_type = LuaType::from_inferred_vec(
+                members
+                    .into_iter()
+                    .map(|member| member.typ)
+                    .collect::<Vec<_>>(),
+            );
+            (!member_type.is_never()).then_some((key, member_type))
+        })
+        .collect();
+    Some(LuaObjectType::new_with_fields(fields, Vec::new()).into())
 }
 
 fn build_member_map(

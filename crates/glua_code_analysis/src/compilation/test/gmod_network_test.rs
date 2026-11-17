@@ -702,4 +702,155 @@ end
             .len();
         expect_that!(flows, eq(2usize));
     }
+
+    /// The type `ret` holds once a client file reads `receive` from what the
+    /// server files `sends` write.
+    fn received(sends: &[&str], receive: &str, expr: &str) -> String {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        for (idx, send) in sends.iter().enumerate() {
+            ws.def_file(
+                &format!("addons/mytest/lua/autorun/server/send{idx}.lua"),
+                &format!(
+                    "util.AddNetworkString(\"Msg\")
+{send}"
+                ),
+            );
+        }
+        ws.def_file("addons/mytest/lua/autorun/client/receive.lua", receive);
+        let typ = ws.expr_ty(expr);
+        ws.humanize_type(typ)
+    }
+
+    #[gtest]
+    fn test_net_read_holds_what_its_paired_write_sends() {
+        let typ = received(
+            &[r#"
+            net.Start("Msg")
+            net.WriteString("hi")
+            net.WriteTable({ name = "door", count = 2 })
+            net.Broadcast()
+            "#],
+            r#"
+            net.Receive("Msg", function()
+                local greeting = net.ReadString()
+                local door = net.ReadTable()
+                ret = door.count
+            end)
+            "#,
+            "ret",
+        );
+        expect_that!(typ.as_str(), eq("2"));
+    }
+
+    #[gtest]
+    fn test_net_read_holds_what_every_sender_writes() {
+        let typ = received(
+            &[
+                r#"
+            net.Start("Msg")
+            net.WriteTable({ count = 2 })
+            net.Broadcast()
+            "#,
+                r#"
+            net.Start("Msg")
+            net.WriteTable({ count = "many" })
+            net.Broadcast()
+            "#,
+            ],
+            r#"
+            net.Receive("Msg", function()
+                ret = net.ReadTable().count
+            end)
+            "#,
+            "ret",
+        );
+        expect_that!(typ.as_str(), eq(r#"("many"|2)"#));
+    }
+
+    #[gtest]
+    fn test_net_read_keeps_its_annotation_when_a_write_is_not_known() {
+        let unknown_value = received(
+            &[r#"
+            net.Start("Msg")
+            net.WriteTable(SomethingElse)
+            net.Broadcast()
+            "#],
+            r#"
+            net.Receive("Msg", function()
+                ret = net.ReadTable()
+            end)
+            "#,
+            "ret",
+        );
+        let after_a_branch = received(
+            &[r#"
+            net.Start("Msg")
+            if Flag then net.WriteString("x") end
+            net.WriteTable({ count = 2 })
+            net.Broadcast()
+            "#],
+            r#"
+            net.Receive("Msg", function()
+                if Flag then net.ReadString() end
+                ret = net.ReadTable()
+            end)
+            "#,
+            "ret",
+        );
+        expect_that!(
+            (unknown_value.as_str(), after_a_branch.as_str()),
+            eq(("table", "table"))
+        );
+    }
+
+    #[gtest]
+    fn test_net_read_on_the_server_keeps_its_annotation() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "addons/mytest/lua/autorun/server/receive.lua",
+            r#"
+            util.AddNetworkString("Msg")
+            net.Receive("Msg", function(len, ply)
+                local data = net.ReadTable()
+                ret = data
+            end)
+            "#,
+        );
+        ws.def_file(
+            "addons/mytest/lua/autorun/client/send.lua",
+            r#"
+            net.Start("Msg")
+            net.WriteTable({ count = 2 })
+            net.SendToServer()
+            "#,
+        );
+        let typ = ws.expr_ty("ret");
+        expect_that!(ws.humanize_type(typ).as_str(), eq("table"));
+    }
+
+    #[gtest]
+    fn test_net_read_of_a_table_receives_no_nil() {
+        let typ = received(
+            &[r#"
+            local Questions = {}
+            for i = 1, Amount do
+                Questions[i] = { question = "why" }
+            end
+            for i = 0, Amount do
+                net.Start("Msg")
+                net.WriteTable(Questions[i])
+                net.Broadcast()
+            end
+            "#],
+            r#"
+            net.Receive("Msg", function()
+                ret = net.ReadTable()
+            end)
+            "#,
+            "ret",
+        );
+        expect_that!(typ.as_str(), not(ends_with("?")));
+    }
 }

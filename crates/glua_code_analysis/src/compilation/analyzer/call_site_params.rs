@@ -6,10 +6,10 @@ use crate::{
     DbIndex, FileId, InFiled, LuaCallTarget, LuaDeclExtra, LuaDeclId, LuaDependencyKind,
     LuaInferCache, LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
     LuaInferenceProvenanceKind, LuaInferenceStep, LuaMemberId, LuaMemberIndexItem, LuaMemberKey,
-    LuaMemberOwner, LuaObjectType, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId,
-    LuaTypeFact, TypeOps, WorkspaceId, find_signature_attribute_use, get_member_map,
-    get_member_value_expr, get_prefix_expr_signature_id, infer_authoritative_method_self_type,
-    infer_expr, infer_expr_semantic_decl,
+    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId, LuaTypeFact,
+    TypeOps, WorkspaceId, find_signature_attribute_use, get_member_value_expr,
+    get_prefix_expr_signature_id, infer_authoritative_method_self_type, infer_expr,
+    infer_expr_semantic_decl, snapshot_table_type,
 };
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,
@@ -1181,7 +1181,7 @@ fn callback_args(db: &DbIndex, callee_signature_id: LuaSignatureId) -> Vec<Callb
                 let Ok(arg_type) = infer_expr(db, &mut cache, callback_arg) else {
                     continue;
                 };
-                let Some(typ) = snapshot_callback_table_type(db, &arg_type) else {
+                let Some(typ) = snapshot_table_type(db, &arg_type) else {
                     continue;
                 };
                 args.push(CallbackArg {
@@ -1194,25 +1194,6 @@ fn callback_args(db: &DbIndex, callee_signature_id: LuaSignatureId) -> Vec<Callb
         }
     }
     args
-}
-
-fn snapshot_callback_table_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
-    if !matches!(typ, LuaType::TableConst(_)) {
-        return None;
-    }
-    let fields = get_member_map(db, typ)?
-        .into_iter()
-        .filter_map(|(key, members)| {
-            let member_type = LuaType::from_inferred_vec(
-                members
-                    .into_iter()
-                    .map(|member| member.typ)
-                    .collect::<Vec<_>>(),
-            );
-            (!member_type.is_never()).then_some((key, member_type))
-        })
-        .collect();
-    Some(LuaObjectType::new_with_fields(fields, Vec::new()).into())
 }
 
 fn call_arg_to_param_index(

@@ -10,6 +10,8 @@ import AdvancedAnnotation from "/snippets/advanced-annotation.mdx"
 
 `net_payload` marks a function like `net.WriteString` or `net.ReadUInt`. GLuaLS compares the writes in a message's sender with the reads in its receiver, and warns when they do not match in order or kind.
 
+A read on the client has the type of what the server writes at the same place in the message. `net.ReadTable()` has the fields of the table the server sends, and `net.ReadEntity()` has the entity's class. A read keeps its annotated type when a write before it is inside an `if` or a loop, when a sender's value is not known, and on the server, which cannot rely on what a client sends.
+
 The official annotations already mark the `net` library, and wrappers that call it are detected automatically.
 
 ---

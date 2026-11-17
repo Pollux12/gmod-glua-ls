@@ -23,6 +23,7 @@ pub use find_members::{
 pub(crate) use find_members::{
     find_structural_members, visible_super_types_in_workspace_for_file_at_offset,
 };
+pub(crate) use get_member_map::snapshot_table_type;
 pub use get_member_map::{
     get_member_map, get_member_map_in_workspace_for_file,
     get_member_map_in_workspace_for_file_at_offset,
