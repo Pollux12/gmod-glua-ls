@@ -15,28 +15,10 @@ use crate::{
     find_signature_attribute_use,
     semantic::{
         contains_gmod_null_type, declaring_for_range, find_members_with_key,
-        get_var_expr_var_ref_id, infer_expr, raw_get_access_path,
-        try_infer_enclosing_for_range_iter_type, unwrap_paren_to_name_expr,
+        get_var_expr_var_ref_id, infer_expr, try_infer_enclosing_for_range_iter_type,
+        unwrap_paren_to_name_expr,
     },
 };
-
-/// The reference a write's prefix names: its variable when it names one
-/// (the same variable at different positions is one reference), else the
-/// prefix expression itself.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-enum PrefixKey {
-    Var(VarRefId),
-    Range(rowan::TextRange),
-}
-
-impl PrefixKey {
-    fn from_expr(db: &DbIndex, cache: &mut crate::LuaInferCache, expr: &LuaExpr) -> Self {
-        match get_var_expr_var_ref_id(db, cache, expr.clone()) {
-            Some(var_ref_id) => PrefixKey::Var(var_ref_id),
-            None => PrefixKey::Range(expr.syntax().text_range()),
-        }
-    }
-}
 
 #[derive(Clone, Copy)]
 pub(super) enum DynamicFieldAnalysisMode {
@@ -307,47 +289,14 @@ pub(super) fn is_write_site(node: &LuaSyntaxNode) -> bool {
 /// file's syntax, declarations and local references hold for all of it.
 #[derive(Default)]
 pub(crate) struct FileWriteSites {
-    /// Every indexed target of an assignment or function statement, in the
-    /// order a walk of the file meets them.
-    targets: Vec<WriteTarget>,
     /// The setmetatable calls of each binding scope, in tree order.
     setmetatables: FxHashMap<LuaSyntaxId, Vec<LuaSyntaxId>>,
     /// The positions each local of the file is reassigned at, sorted.
     reassignments: std::sync::OnceLock<FxHashMap<LuaDeclId, Vec<TextSize>>>,
 }
 
-/// An indexed target of an assignment or function statement.
-struct WriteTarget {
-    statement: LuaSyntaxId,
-    /// The target's position among the statement's assigned variables.
-    var: usize,
-    /// The class of the target's prefix: two prefixes can name the same
-    /// variable only within one class. `None` for a prefix that names none.
-    prefix: Option<u32>,
-}
-
 impl FileWriteSites {
     pub(crate) fn new(root: &glua_parser::LuaChunk) -> Self {
-        let mut classes = FxHashMap::<String, u32>::default();
-        let mut targets = Vec::new();
-        for node in root.syntax().descendants_matching(defines_fields) {
-            let statement = LuaSyntaxId::from_node(&node);
-            for (var, index_expr) in indexed_targets(&node) {
-                let prefix = index_expr
-                    .get_prefix_expr()
-                    .as_ref()
-                    .and_then(prefix_class)
-                    .map(|class| {
-                        let next = classes.len() as u32;
-                        *classes.entry(class).or_insert(next)
-                    });
-                targets.push(WriteTarget {
-                    statement,
-                    var,
-                    prefix,
-                });
-            }
-        }
         let mut setmetatables = FxHashMap::<LuaSyntaxId, Vec<LuaSyntaxId>>::default();
         for call in root.descendants::<LuaCallExpr>() {
             if !call.is_setmetatable() {
@@ -361,22 +310,9 @@ impl FileWriteSites {
             }
         }
         Self {
-            targets,
             setmetatables,
             reassignments: std::sync::OnceLock::new(),
         }
-    }
-
-    /// Where the target at position `var` of `statement` is among the
-    /// targets.
-    fn target_at(&self, statement: LuaSyntaxId, var: usize) -> Option<usize> {
-        let order = |target: &WriteTarget| (target.statement.get_range().start(), target.var);
-        let key = (statement.get_range().start(), var);
-        let at = self.targets.partition_point(|target| order(target) < key);
-        self.targets
-            .get(at)
-            .is_some_and(|target| target.statement == statement && target.var == var)
-            .then_some(at)
     }
 
     fn reassignments(
@@ -387,18 +323,6 @@ impl FileWriteSites {
     ) -> &FxHashMap<LuaDeclId, Vec<TextSize>> {
         self.reassignments
             .get_or_init(|| collect_local_reassignment_positions(db, file_id, root))
-    }
-}
-
-/// What a prefix's text says of the variable it names: a name, or an access
-/// path. Two prefixes that name the same variable have the same class; `None`
-/// for a prefix that names no variable.
-fn prefix_class(prefix: &LuaExpr) -> Option<String> {
-    match prefix {
-        LuaExpr::NameExpr(name_expr) => Some(format!("name {}", name_expr.get_name_text()?)),
-        LuaExpr::IndexExpr(index_expr) => Some(format!("path {}", index_expr.get_access_path()?)),
-        LuaExpr::CallExpr(call_expr) => Some(format!("path {}", raw_get_access_path(call_expr)?)),
-        _ => None,
     }
 }
 
@@ -467,60 +391,6 @@ fn reach_target(
     })
 }
 
-/// The type every write through `key` takes its prefix to have: the type
-/// inferred at the first target in tree order the pass collects from whose
-/// prefix names that reference, the target at `at` included, unless that type
-/// says nothing about the value, when this write's own prefix type is used. A
-/// prefix that names no variable is a reference of its own.
-fn shared_prefix_type(
-    db: &DbIndex,
-    cache: &mut crate::LuaInferCache,
-    root: &glua_parser::LuaChunk,
-    sites: &FileWriteSites,
-    mode: DynamicFieldAnalysisMode,
-    at: Option<usize>,
-    key: &PrefixKey,
-    prefix_expr: &LuaExpr,
-) -> Option<LuaType> {
-    let file_id = cache.get_file_id();
-    if let (PrefixKey::Var(_), Some(at)) = (key, at)
-        && let Some(class) = sites.targets[at].prefix
-    {
-        for earlier in sites.targets[..at]
-            .iter()
-            .filter(|target| target.prefix == Some(class))
-        {
-            let Some(node) = earlier.statement.to_node_from_root(root.syntax()) else {
-                continue;
-            };
-            let Some((_, index_expr, value_expr)) = field_definition_sites(db, file_id, &node)
-                .into_iter()
-                .find(|(var, _, _)| *var == earlier.var)
-            else {
-                continue;
-            };
-            let Some(reached) = reach_target(
-                db,
-                cache,
-                root,
-                sites,
-                mode,
-                &index_expr,
-                value_expr.as_ref(),
-            ) else {
-                continue;
-            };
-            if PrefixKey::from_expr(db, cache, &reached.prefix_expr) == *key {
-                return infer_expr(db, cache, reached.prefix_expr)
-                    .ok()
-                    .filter(crate::db_index::is_informative_type)
-                    .or_else(|| infer_expr(db, cache, prefix_expr.clone()).ok());
-            }
-        }
-    }
-    infer_expr(db, cache, prefix_expr.clone()).ok()
-}
-
 /// What one write site files: the fields it writes on each owner, those
 /// propagated to the owners' super types, its wildcard definitions, its
 /// finite-member evidence and the names it writes on no owner.
@@ -548,13 +418,12 @@ fn collect_statement_fields(
     fields: &mut SiteDynamicFields,
 ) {
     let file_id = cache.get_file_id();
-    let statement = LuaSyntaxId::from_node(node);
     // The records are what this pass is building. A cold build has none yet,
     // and a re-index of some sites has the rest of the workspace's, with the
     // re-indexed sites' contributions removed: a partial record that names a
     // different table than the complete one will. Neither is read here, so
     // both builds decide the same way.
-    for (var, index_expr, value_expr) in field_definition_sites(db, file_id, node) {
+    for (_, index_expr, value_expr) in field_definition_sites(db, file_id, node) {
         let named_by_calls = installer_write_named_by_calls(db, file_id, &index_expr);
         let value_expr = value_expr.as_ref();
         let Some(ReachedTarget {
@@ -572,11 +441,7 @@ fn collect_statement_fields(
             field_names.may_have_other_string_names = true;
         }
 
-        let key = PrefixKey::from_expr(db, cache, &prefix_expr);
-        let at = sites.target_at(statement, var);
-        let Some(prefix_type) =
-            shared_prefix_type(db, cache, root, sites, mode, at, &key, &prefix_expr)
-        else {
+        let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
             continue;
         };
 

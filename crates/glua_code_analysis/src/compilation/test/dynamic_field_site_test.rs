@@ -89,8 +89,8 @@ e[key] = 4
 
     /// Several writes through one reference, across two files: an edit, a
     /// shift and a revert leave the dynamic fields and diagnostics a cold
-    /// build has, and a later write through a reference takes the prefix type
-    /// its first write inferred.
+    /// build has, and each write lands on the table the reference holds when
+    /// it runs.
     #[test]
     fn writes_through_one_reference_settle_as_a_cold_build_after_edits() {
         let mut cold = dynamic_field_workspace();
@@ -108,9 +108,14 @@ e[key] = 4
             (dynamic_field_state(&warm), warm.settled_digest()),
             (dynamic_field_state(&cold), cold.settled_digest())
         );
-        let first = owner_of(&cold, "first");
-        assert!(matches!(first.as_slice(), [DynamicFieldOwner::Table(_)]));
-        assert_eq!(owner_of(&cold, "second"), first);
+        assert!(matches!(
+            owner_of(&cold, "first").as_slice(),
+            [DynamicFieldOwner::Table(_)]
+        ));
+        assert!(matches!(
+            owner_of(&cold, "second").as_slice(),
+            [DynamicFieldOwner::Type(ent)] if ent.get_name() == "Ent"
+        ));
     }
 
     /// The write site of `text`, an assignment of `file_id`.
