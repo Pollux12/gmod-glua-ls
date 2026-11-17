@@ -2586,4 +2586,177 @@ end
 
         assert_ne!(selves.0, "tebex");
     }
+
+    const AREA_REGISTRY: &str = r#"
+---@class AreaColor
+---@return AreaColor
+function MakeAreaColor() end
+
+---@class AreaButton
+---@return AreaButton
+function MakeAreaButton() end
+
+---@param color AreaColor
+function UseAreaColor(color) end
+
+AreaTypes = { string = 1, bool = 4, color = 1024 }
+AreaProps = {}
+
+function AddAreaProperty(name, type, default)
+    AreaProps[name] = { type = type, default = default }
+end
+"#;
+    const AREA_REGISTRATIONS_FILE: &str = "lua/autorun/sh_area_props.lua";
+    const AREA_REGISTRATIONS: &str = r#"
+AddAreaProperty("color", AreaTypes.color, MakeAreaColor())
+AddAreaProperty("display", AreaTypes.bool, true)
+AreaProps.color.label = "Colour"
+"#;
+    const AREA_EDITOR_FILE: &str = "lua/autorun/cl_area_edit.lua";
+    const AREA_EDITOR: &str = r#"
+for _, v in pairs(AreaProps) do
+    if v.type == AreaTypes.color then
+        local panel = MakeAreaButton()
+        panel.value = v.default
+        UseAreaColor(panel.value)
+        local label = v.label
+    end
+end
+"#;
+
+    fn area_workspace(registrations: Option<&str>) -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut config = Emmyrc::default();
+        config.gmod.enabled = true;
+        ws.update_emmyrc(config);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file("lua/autorun/sh_area.lua", AREA_REGISTRY);
+        if let Some(registrations) = registrations {
+            ws.def_file(AREA_REGISTRATIONS_FILE, registrations);
+        }
+        ws.def_file(AREA_EDITOR_FILE, AREA_EDITOR);
+        ws
+    }
+
+    /// What the editor sees for an entry it picked: its default, the label
+    /// written onto it later, and whether passing the default on is reported.
+    fn area_editor_view(ws: &mut VirtualWorkspace) -> (String, String, Vec<String>) {
+        let uri = ws.virtual_url_generator.new_uri(AREA_EDITOR_FILE);
+        let file = ws.analysis.get_file_id(&uri).expect("editor file");
+        let (default, label) = {
+            let semantic_model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file)
+                .expect("semantic model");
+            let read = |text: &str| {
+                let index_expr = semantic_model
+                    .get_root()
+                    .descendants::<LuaIndexExpr>()
+                    .find(|expr| expr.syntax().text() == text)
+                    .expect("index expression");
+                match semantic_model.infer_expr(LuaExpr::IndexExpr(index_expr)) {
+                    Ok(typ) => ws.humanize_type(typ),
+                    Err(reason) => format!("{reason:?}"),
+                }
+            };
+            (read("v.default"), read("v.label"))
+        };
+        let code = crate::DiagnosticCode::ParamTypeMismatch;
+        ws.analysis.diagnostic.enable_only(code);
+        let reports = ws
+            .analysis
+            .diagnose_file(file, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(lsp_types::NumberOrString::String(
+                        code.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        (default, label, reports)
+    }
+
+    /// Entries a registry function builds from its arguments keep each call's
+    /// pairing, so testing one field against a constant picks the entries
+    /// with that value and the sibling fields they were given, and a field
+    /// written onto an entry afterwards stays on it.
+    #[test]
+    fn a_registry_entry_tested_by_a_constant_field_holds_its_own_siblings() {
+        let mut ws = area_workspace(Some(AREA_REGISTRATIONS));
+
+        assert_eq!(
+            area_editor_view(&mut ws),
+            ("AreaColor".to_string(), "\"Colour\"".to_string(), vec![])
+        );
+    }
+
+    /// A table literal's field is only its first value, so testing it against
+    /// another constant keeps the table: code may set the field later.
+    #[test]
+    fn a_table_whose_field_starts_as_another_constant_survives_the_test() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+---@type boolean
+Flag = nil
+local target = { active = false, name = "a" }
+if Flag then
+    target = { active = false, name = 1 }
+end
+function Activate()
+    target.active = true
+end
+if target.active == true then
+    picked = target.name
+end
+"#,
+        );
+
+        let picked = ws.expr_ty("picked");
+        assert_eq!(ws.humanize_type(picked), "(\"a\"|1)");
+    }
+
+    #[test]
+    fn registry_calls_shifted_edited_deleted_and_reopened_settle_as_a_cold_build() {
+        const SHIFTED: &str = r#"
+
+AddAreaProperty("color", AreaTypes.color, MakeAreaColor())
+AddAreaProperty("display", AreaTypes.bool, true)
+AreaProps.color.label = "Colour"
+"#;
+        const EDITED: &str = r#"
+AddAreaProperty("color", AreaTypes.color, true)
+AreaProps.color.label = "Colour"
+"#;
+        let cold =
+            |registrations: Option<&str>| area_editor_view(&mut area_workspace(registrations));
+        let mut warm = area_workspace(Some(AREA_REGISTRATIONS));
+        let uri = warm.virtual_url_generator.new_uri(AREA_REGISTRATIONS_FILE);
+
+        warm.def_file(AREA_REGISTRATIONS_FILE, SHIFTED);
+        let shifted = area_editor_view(&mut warm);
+        warm.def_file(AREA_REGISTRATIONS_FILE, EDITED);
+        let edited = area_editor_view(&mut warm);
+        warm.analysis
+            .remove_file_by_uri(&uri)
+            .0
+            .expect("registrations must be removed");
+        let deleted = area_editor_view(&mut warm);
+        warm.def_file(AREA_REGISTRATIONS_FILE, AREA_REGISTRATIONS);
+        let reopened = area_editor_view(&mut warm);
+
+        assert_eq!(
+            (shifted, edited, deleted, reopened),
+            (
+                cold(Some(SHIFTED)),
+                cold(Some(EDITED)),
+                cold(None),
+                cold(Some(AREA_REGISTRATIONS))
+            )
+        );
+    }
 }

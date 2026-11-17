@@ -1177,12 +1177,11 @@ fn maybe_field_literal_eq_narrow(
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     // only check left as need narrow
     let syntax_id = left_expr.get_syntax_id();
-    let (index_expr, literal_expr) = match (left_expr, right_expr) {
-        (LuaExpr::IndexExpr(index_expr), LuaExpr::LiteralExpr(literal_expr)) => {
-            (index_expr, literal_expr)
-        }
-        (LuaExpr::LiteralExpr(literal_expr), LuaExpr::IndexExpr(index_expr)) => {
-            (index_expr, literal_expr)
+    let (index_expr, value_expr) = match (left_expr, right_expr) {
+        (LuaExpr::IndexExpr(index_expr), value_expr @ LuaExpr::LiteralExpr(_))
+        | (value_expr @ LuaExpr::LiteralExpr(_), LuaExpr::IndexExpr(index_expr))
+        | (LuaExpr::IndexExpr(index_expr), value_expr @ LuaExpr::IndexExpr(_)) => {
+            (index_expr, value_expr)
         }
         _ => return Ok(ResultTypeOrContinue::Continue),
     };
@@ -1209,13 +1208,22 @@ fn maybe_field_literal_eq_narrow(
         return Ok(ResultTypeOrContinue::Continue);
     }
 
+    let right_type = infer_expr(db, cache, value_expr)?;
+    if !right_type.is_const() || matches!(right_type, LuaType::TableConst(_)) {
+        return Ok(ResultTypeOrContinue::Continue);
+    }
     let left_type =
         get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
-    let LuaType::Union(union_type) = left_type else {
-        return Ok(ResultTypeOrContinue::Continue);
+    // A registry entry's field holds the value its own call passed, so only an
+    // equal constant keeps the entry.
+    let (union_types, is_registry) = match left_type {
+        LuaType::Union(union_type) => (union_type.into_vec(), false),
+        _ => match registry_entries(db, cache, &prefix_expr) {
+            Some(entries) => (entries, true),
+            None => return Ok(ResultTypeOrContinue::Continue),
+        },
     };
 
-    let right_type = infer_expr(db, cache, LuaExpr::LiteralExpr(literal_expr))?;
     let Some(index_key) = index_expr.get_index_key() else {
         return Ok(ResultTypeOrContinue::Continue);
     };
@@ -1230,7 +1238,6 @@ fn maybe_field_literal_eq_narrow(
             .insert(syntax_id, crate::db_index::derivation::scope_mark());
     }
     let mut narrowed = Vec::new();
-    let union_types = union_type.into_vec();
     for sub_type in &union_types {
         let member_type = super::index_flow::infer_field_guard_member(
             db,
@@ -1241,7 +1248,11 @@ fn maybe_field_literal_eq_narrow(
         );
         let survives = match member_type {
             Ok(member_type) if condition_flow.is_true() => {
-                crate::check_type_compact(db, &member_type, &right_type).is_ok()
+                if is_registry && member_type.is_const() {
+                    const_type_eq(&member_type, &right_type)
+                } else {
+                    crate::check_type_compact(db, &member_type, &right_type).is_ok()
+                }
             }
             Ok(member_type) => !const_type_eq(&member_type, &right_type),
             Err(_) => true,
@@ -1264,6 +1275,51 @@ fn maybe_field_literal_eq_narrow(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+/// The entries of the registry a `pairs` loop value `expr` iterates, as the
+/// tables each call storing one built: what the value may be, one entry at a
+/// time. The table the storing function builds stands for all of them, so it
+/// is left out once its calls' own tables are seen.
+fn registry_entries(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> Option<Vec<LuaType>> {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return None;
+    };
+    let file_id = cache.get_file_id();
+    let source =
+        crate::compilation::analyzer::for_range_pairs_source_for_var(db, file_id, name_expr, 1)?;
+    let registry = infer_expr(db, cache, source.source_expr).ok()?;
+    let workspace_id = db.get_module_index().get_workspace_id(file_id)?;
+    let members = crate::semantic::member::get_member_map_in_workspace_for_file(
+        db,
+        &registry,
+        workspace_id,
+        file_id,
+    )?;
+    let mut members = members.into_iter().collect::<Vec<_>>();
+    members.sort_by_cached_key(|(key, _)| format!("{key:?}"));
+    let mut entries = members
+        .into_iter()
+        .flat_map(|(_, infos)| infos)
+        .map(|member| member.typ)
+        .filter(|typ| !typ.is_any() && !typ.is_unknown())
+        .collect::<Vec<_>>();
+    let built = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            LuaType::Instance(instance) if instance.get_kind() == crate::LuaInstanceKind::Made => {
+                Some(instance.get_base().clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    entries.retain(|entry| !built.contains(entry));
+    entries.dedup();
+    (entries.len() > 1).then_some(entries)
 }
 
 #[allow(clippy::too_many_arguments)]

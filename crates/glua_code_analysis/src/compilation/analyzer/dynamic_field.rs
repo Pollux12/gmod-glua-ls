@@ -912,15 +912,44 @@ pub(crate) fn installed_field_type(
         };
         let forwarded = forwarded_param(db, signature_id, &value)
             .and_then(|param| installer_arg(db, &call_expr, signature_id, param));
-        let typ = match forwarded {
-            Some(arg) => infer_expr(db, cache, arg).ok(),
-            None => crate::semantic::with_file_cache(cache, signature_id.get_file_id(), |cache| {
-                infer_expr(db, cache, value).ok()
-            }),
+        let typ = match (forwarded, &value) {
+            (Some(arg), _) => infer_expr(db, cache, arg).ok(),
+            (None, LuaExpr::TableExpr(table_expr)) => {
+                per_call_table_type(db, cache, &call_expr, signature_id, table_expr)
+            }
+            (None, _) => {
+                crate::semantic::with_file_cache(cache, signature_id.get_file_id(), |cache| {
+                    infer_expr(db, cache, value).ok()
+                })
+            }
         };
         types.extend(typ);
     }
     (!types.is_empty()).then(|| LuaType::from_vec(types))
+}
+
+/// The table literal `table_expr` that one call of the function
+/// `signature_id` builds and stores: that call's own table, whose fields read
+/// the arguments the call passed for the parameters they hold.
+fn per_call_table_type(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+    table_expr: &LuaTableExpr,
+) -> Option<LuaType> {
+    let table_type =
+        crate::semantic::with_file_cache(cache, signature_id.get_file_id(), |cache| {
+            infer_expr(db, cache, LuaExpr::TableExpr(table_expr.clone())).ok()
+        })?;
+    Some(LuaType::Instance(
+        crate::LuaInstanceType::with_kind(
+            table_type,
+            InFiled::new(cache.get_file_id(), call_expr.get_range()),
+            LuaInstanceKind::Made,
+        )
+        .into(),
+    ))
 }
 
 /// The functions `call_expr` calls, with the installers each has.
