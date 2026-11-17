@@ -2720,6 +2720,29 @@ end
         assert_eq!(ws.humanize_type(picked), "(\"a\"|1)");
     }
 
+    /// An entry's field written again through a loop over the registry may
+    /// hold the new value, so testing for that value keeps the entry.
+    #[test]
+    fn a_registry_entry_whose_field_is_written_again_survives_the_test() {
+        let mut ws = area_workspace(Some(AREA_REGISTRATIONS));
+        ws.def_file(
+            "lua/autorun/cl_area_flags.lua",
+            r#"
+for _, e in pairs(AreaProps) do
+    e.type = AreaTypes.bool
+end
+for _, v in pairs(AreaProps) do
+    if v.type == AreaTypes.bool then
+        flagDefault = v.default
+    end
+end
+"#,
+        );
+
+        let default = ws.expr_ty("flagDefault");
+        assert_eq!(ws.humanize_type(default), "(AreaColor|boolean)");
+    }
+
     #[test]
     fn registry_calls_shifted_edited_deleted_and_reopened_settle_as_a_cold_build() {
         const SHIFTED: &str = r#"
