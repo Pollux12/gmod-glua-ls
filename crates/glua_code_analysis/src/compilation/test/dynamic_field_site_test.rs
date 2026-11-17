@@ -118,6 +118,51 @@ e[key] = 4
         ));
     }
 
+    const PARENT_FILE: &str = "lua/autorun/sh_parent.lua";
+    const PARENT: &str = r#"---@class DeclParent
+local DeclParent = {}
+---@return string
+function DeclParent:GetValue() end
+---@class DeclChild : DeclParent
+"#;
+    const PARENT_WITHOUT_METHOD: &str = r#"---@class DeclParent
+local DeclParent = {}
+---@class DeclChild : DeclParent
+"#;
+    const CHILD_FILE: &str = "lua/autorun/sh_child.lua";
+    const CHILD: &str = r#"---@type DeclChild
+local child
+child.GetValue = function() return 5 end
+"#;
+
+    /// Removing and restoring the parent's declaration of a member a subclass
+    /// writes leaves the dynamic fields a cold build has: whether the write
+    /// reaches the parent follows the declaration.
+    #[test]
+    fn a_parents_declaration_edited_away_and_back_settles_as_a_cold_build() {
+        let cold = |parent: &str| {
+            let mut ws = dynamic_field_workspace();
+            ws.def_file(PARENT_FILE, parent);
+            ws.def_file(CHILD_FILE, CHILD);
+            (dynamic_field_state(&ws), ws.settled_digest())
+        };
+        assert_ne!(cold(PARENT).0, cold(PARENT_WITHOUT_METHOD).0);
+        let mut warm = dynamic_field_workspace();
+        warm.def_file(PARENT_FILE, PARENT);
+        warm.def_file(CHILD_FILE, CHILD);
+
+        warm.def_file(PARENT_FILE, PARENT_WITHOUT_METHOD);
+        assert_eq!(
+            (dynamic_field_state(&warm), warm.settled_digest()),
+            cold(PARENT_WITHOUT_METHOD)
+        );
+        warm.def_file(PARENT_FILE, PARENT);
+        assert_eq!(
+            (dynamic_field_state(&warm), warm.settled_digest()),
+            cold(PARENT)
+        );
+    }
+
     /// The write site of `text`, an assignment of `file_id`.
     fn write_site(ws: &VirtualWorkspace, file_id: FileId, text: &str) -> DerivationId {
         let tree = ws
