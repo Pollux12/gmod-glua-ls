@@ -799,6 +799,15 @@ fn collect_call_site_param_types(
                 &call_args,
                 contributions,
             );
+            collect_named_callback_param_types(
+                db,
+                cache,
+                file_id,
+                signature_id,
+                &call_expr,
+                &call_args,
+                contributions,
+            );
         }
     }
     for signature_id in signature_ids {
@@ -1082,6 +1091,83 @@ fn collect_direct_callback_param_types(
                 Some(LuaTypeFact::new(
                     callback_arg.typ.clone(),
                     LuaInferenceConfidence::Certain,
+                    Arc::from([LuaInferenceStep {
+                        event,
+                        support: Arc::from([]),
+                        inferred_type: None,
+                        found_type: None,
+                    }]),
+                )),
+            ));
+        }
+    }
+}
+
+/// What a function passed by name where `callee_signature_id` documents a
+/// callback receives: the parameter types that callback is documented with.
+/// The function may be called elsewhere too, so they are context for it, not
+/// its declaration.
+fn collect_named_callback_param_types(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    callee_signature_id: LuaSignatureId,
+    call_expr: &LuaCallExpr,
+    call_args: &[LuaExpr],
+    contributions: &mut Vec<Contribution>,
+) {
+    let Some(callee_signature) = db.get_signature_index().get_declared(&callee_signature_id) else {
+        return;
+    };
+    for (arg_idx, arg) in call_args.iter().enumerate() {
+        if !matches!(arg, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)) {
+            continue;
+        }
+        let Some(LuaType::DocFunction(callback)) =
+            call_arg_to_param_index(callee_signature, call_expr.is_colon_call(), arg_idx)
+                .and_then(|param_idx| callee_signature.param_docs.get(&param_idx))
+                .map(|param| &param.type_ref)
+        else {
+            continue;
+        };
+        let Ok(LuaType::Signature(target_signature_id)) = infer_expr(db, cache, arg.clone()) else {
+            continue;
+        };
+        let Some(target_signature) = db.get_signature_index().get_declared(&target_signature_id)
+        else {
+            continue;
+        };
+        let receiver_shift = usize::from(target_signature.is_colon_define);
+        for (callback_param_idx, (_, typ)) in callback.get_params().iter().enumerate() {
+            let Some(typ) = typ else {
+                continue;
+            };
+            let Some(target_param_idx) = callback_param_idx.checked_sub(receiver_shift) else {
+                continue;
+            };
+            if target_param_idx >= target_signature.params.len()
+                || target_signature.param_docs.contains_key(&target_param_idx)
+                || is_param_mutated(db, target_signature_id, target_param_idx)
+            {
+                continue;
+            }
+            let Ok(param_idx) = u16::try_from(target_param_idx) else {
+                continue;
+            };
+            let event = LuaInferenceEventId {
+                node: LuaInferenceNodeId::SignatureParam {
+                    signature_id: target_signature_id,
+                    param_idx,
+                },
+                kind: LuaInferenceProvenanceKind::ConcreteValue,
+                source: InFiled::new(file_id, arg.get_syntax_id()),
+            };
+            contributions.push((
+                target_signature_id,
+                target_param_idx,
+                Some(LuaTypeFact::new(
+                    typ.clone(),
+                    LuaInferenceConfidence::Anchored,
                     Arc::from([LuaInferenceStep {
                         event,
                         support: Arc::from([]),

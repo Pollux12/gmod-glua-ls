@@ -2422,4 +2422,96 @@ mod test {
             .expect("diagnostics")
             .len()
     }
+
+    /// A global function passed where a callback is documented takes the
+    /// parameter types the callback is documented to receive, as a function
+    /// written in place does.
+    #[test]
+    fn a_global_function_passed_as_a_documented_callback_takes_its_param_types() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lib.lua",
+            "---@meta
+concommand = {}
+---@param name string
+---@param callback fun(ply: Player, cmd: string, args: string[], argStr: string)
+function concommand.Add(name, callback) end
+---@class Player
+",
+        );
+        let file = ws.def_file(
+            "lua/autorun/sh_cmd.lua",
+            "function OnCommand(ply, cmd, args)
+    local commandArgs = args
+end
+concommand.Add(\"example\", OnCommand)
+",
+        );
+
+        let args = ws.local_ty(file, "commandArgs");
+        assert_eq!(ws.humanize_type(args), "string[]");
+    }
+
+    /// Removing the call that passes the function as a callback, putting it
+    /// back, and deleting and reopening its file move its parameter types as a
+    /// cold build has them.
+    #[test]
+    fn a_callback_registration_edited_deleted_and_reopened_moves_the_param_types() {
+        const LIB: &str = "---@meta
+concommand = {}
+---@param name string
+---@param callback fun(ply: Player, cmd: string, args: string[])
+function concommand.Add(name, callback) end
+---@class Player
+";
+        const HANDLER: &str = "function OnCommand(ply, cmd, args)
+    local commandArgs = args
+end
+";
+        const REGISTER_FILE: &str = "lua/autorun/sh_register.lua";
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lib.lua", LIB);
+        let handler = ws.def_file("lua/autorun/sh_handler.lua", HANDLER);
+        ws.def_file(
+            REGISTER_FILE,
+            "concommand.Add(\"example\", OnCommand)
+",
+        );
+        let args = |ws: &VirtualWorkspace| ws.humanize_type(ws.local_ty(handler, "commandArgs"));
+
+        ws.def_file(
+            REGISTER_FILE,
+            "
+",
+        );
+        let removed = args(&ws);
+        ws.def_file(
+            REGISTER_FILE,
+            "concommand.Add(\"example\", OnCommand)
+",
+        );
+        let restored = args(&ws);
+        let register_uri = ws.virtual_url_generator.new_uri(REGISTER_FILE);
+        ws.analysis
+            .remove_file_by_uri(&register_uri)
+            .0
+            .expect("registering file must be removed");
+        let deleted = args(&ws);
+        ws.def_file(
+            REGISTER_FILE,
+            "concommand.Add(\"example\", OnCommand)
+",
+        );
+        let reopened = args(&ws);
+
+        assert_eq!(
+            (
+                removed.as_str(),
+                restored.as_str(),
+                deleted.as_str(),
+                reopened.as_str()
+            ),
+            ("unknown", "string[]", "unknown", "string[]")
+        );
+    }
 }
