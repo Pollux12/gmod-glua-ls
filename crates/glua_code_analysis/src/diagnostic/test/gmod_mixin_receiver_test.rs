@@ -224,8 +224,10 @@ mod tests {
         assert!(!has_undefined_method(&ws, target_file_id));
     }
 
+    /// `assert` is documented to return its argument, so the mode it checks is
+    /// the included mixin the call dispatches into.
     #[test]
-    fn unannotated_assert_override_does_not_claim_returned_value_identity() {
+    fn an_assert_documented_to_return_its_argument_passes_the_included_mixin_through() {
         let mut ws = gmod_workspace();
         ws.def_file(
             "annotations/global.lua",
@@ -266,8 +268,8 @@ mod tests {
         ]);
 
         let target_file_id = file_id(&ws, "lua/mixins/unannotated_assert.lua");
-        assert!(!has_inferred_receiver(&ws, target_file_id, "MIXIN.Run"));
-        assert!(has_undefined_method(&ws, target_file_id));
+        assert!(has_inferred_receiver(&ws, target_file_id, "MIXIN.Run"));
+        assert!(!has_undefined_method(&ws, target_file_id));
     }
 
     #[test]
@@ -744,8 +746,10 @@ mod tests {
         ));
     }
 
+    /// Either compiled mixin may be the one dispatched, so each runs with the
+    /// panel as its receiver.
     #[test]
-    fn ambiguous_compilefile_targets_do_not_receive_dispatch_receiver() {
+    fn either_compilefile_target_receives_the_dispatch_receiver() {
         let mut ws = gmod_workspace();
         let _file_ids = ws.def_files(vec![
             (
@@ -792,7 +796,7 @@ mod tests {
             "lua/mixins/compiled_first.lua",
             "lua/mixins/compiled_second.lua",
         ] {
-            assert!(!has_inferred_receiver(&ws, file_id(&ws, path), "MIXIN.Run"));
+            assert!(has_inferred_receiver(&ws, file_id(&ws, path), "MIXIN.Run"));
         }
     }
 
@@ -1224,8 +1228,10 @@ mod tests {
         ));
     }
 
+    /// `pick` returns its first argument, so only the first included mixin is
+    /// dispatched; the second never runs.
     #[test]
-    fn nested_unrelated_source_members_do_not_select_an_include_target() {
+    fn only_the_mixin_a_helper_returns_receives_the_dispatch_receiver() {
         let mut ws = gmod_workspace();
         let _file_ids = ws.def_files(vec![
             (
@@ -1268,7 +1274,7 @@ mod tests {
             ),
         ]);
 
-        assert!(!has_inferred_receiver(
+        assert!(has_inferred_receiver(
             &ws,
             file_id(&ws, "lua/mixins/pick_selected.lua"),
             "SELECTED.Run"
@@ -1280,8 +1286,10 @@ mod tests {
         ));
     }
 
+    /// A function documented to return its argument hands the included mixin
+    /// on, as a plain table is handed on.
     #[test]
-    fn generic_return_correlation_does_not_select_include_source() {
+    fn a_generic_identity_call_passes_the_included_mixin_through() {
         let mut ws = gmod_workspace();
         let target_file_id = ws.def_file(
             "lua/mixins/generic_wrapper.lua",
@@ -1313,7 +1321,7 @@ mod tests {
             "#,
         );
 
-        assert!(!has_inferred_receiver(&ws, target_file_id, "MIXIN.Run"));
+        assert!(has_inferred_receiver(&ws, target_file_id, "MIXIN.Run"));
     }
 
     #[test]
@@ -1516,8 +1524,10 @@ mod tests {
         ));
     }
 
+    /// The mixin method runs with the panel whenever the branch that replaces
+    /// the callback is not taken.
     #[test]
-    fn conditionally_reassigned_callback_does_not_receive_dispatch_receiver() {
+    fn a_conditionally_replaced_callback_still_receives_the_dispatch_receiver() {
         let mut ws = gmod_workspace();
         let _file_ids = ws.def_files(vec![
             (
@@ -1549,15 +1559,17 @@ mod tests {
             ),
         ]);
 
-        assert!(!has_inferred_receiver(
+        assert!(has_inferred_receiver(
             &ws,
             file_id(&ws, "lua/mixins/conditional_callback.lua"),
             "MIXIN.Run"
         ));
     }
 
+    /// The mixin method runs with the panel whenever the loop that replaces the
+    /// callback runs no iterations.
     #[test]
-    fn loop_reassigned_callback_does_not_receive_dispatch_receiver() {
+    fn a_callback_a_loop_may_replace_still_receives_the_dispatch_receiver() {
         let mut ws = gmod_workspace();
         let _file_ids = ws.def_files(vec![
             (
@@ -1589,15 +1601,17 @@ mod tests {
             ),
         ]);
 
-        assert!(!has_inferred_receiver(
+        assert!(has_inferred_receiver(
             &ws,
             file_id(&ws, "lua/mixins/loop_callback.lua"),
             "MIXIN.Run"
         ));
     }
 
+    /// The mixin method runs with the panel whenever the closure that replaces
+    /// the callback is not called.
     #[test]
-    fn captured_callback_reassignment_does_not_receive_dispatch_receiver() {
+    fn a_callback_a_closure_may_replace_still_receives_the_dispatch_receiver() {
         let mut ws = gmod_workspace();
         let _file_ids = ws.def_files(vec![
             (
@@ -1632,7 +1646,7 @@ mod tests {
             ),
         ]);
 
-        assert!(!has_inferred_receiver(
+        assert!(has_inferred_receiver(
             &ws,
             file_id(&ws, "lua/mixins/captured_callback.lua"),
             "MIXIN.Run"

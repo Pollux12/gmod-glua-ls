@@ -18,10 +18,10 @@ use glua_parser::{
 #[cfg(test)]
 pub(crate) use infer_binary::CONSTANT_EXPR_CLASSIFICATIONS;
 use infer_binary::infer_binary_expr;
-pub(crate) use infer_call::get_prefix_expr_signature_id;
 use infer_call::infer_call_expr;
 pub use infer_call::infer_call_expr_func;
 pub(crate) use infer_call::signature_call_selects_declared_overload;
+pub(crate) use infer_call::{get_prefix_expr_signature_id, loaded_file_of_call};
 pub(crate) use infer_call::{
     getmetatable_call_metatable, proxy_metatable, table_backing_range_from_expr,
 };

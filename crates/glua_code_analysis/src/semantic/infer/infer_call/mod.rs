@@ -39,7 +39,8 @@ use crate::{
     infer_self_type, instantiate_func_generic, instantiate_func_generic_with_bindings,
     semantic::infer_expr,
 };
-use infer_require::infer_require_call;
+pub(crate) use infer_require::loaded_file_of_call;
+use infer_require::{infer_loaded_file_call, infer_require_call, load_call_result_is_unspecified};
 pub(crate) use infer_setmetatable::{
     MetatableIndexCandidate, classify_metatable_index_candidate, getmetatable_call_metatable,
     proxy_metatable, table_backing_range_from_expr,
@@ -2673,6 +2674,10 @@ pub fn infer_call_expr(
 ) -> InferResult {
     if call_expr.is_require() {
         return infer_require_call(db, cache, call_expr);
+    } else if let Some(loaded_file_id) = loaded_file_of_call(db, cache.get_file_id(), &call_expr)
+        && load_call_result_is_unspecified(db, cache, &call_expr)
+    {
+        return infer_loaded_file_call(db, cache, &call_expr, loaded_file_id);
     } else if call_expr.is_setmetatable() {
         return infer_setmetatable_call(db, cache, call_expr);
     } else if let Some(metatable) = infer_getmetatable_call(db, cache, &call_expr) {
@@ -2698,6 +2703,8 @@ pub fn infer_call_expr(
     let ret_type =
         infer_net_read::infer_net_read_call(db, cache, &call_expr, &prefix_type, &ret_type)
             .unwrap_or(ret_type);
+    // A loader whose own result says nothing returns what the file it runs
+    // returns.
 
     if let Some(tree) = db.get_flow_index().get_flow_tree(&cache.get_file_id())
         && let Some(flow_id) = tree.get_flow_id(call_expr.get_syntax_id())

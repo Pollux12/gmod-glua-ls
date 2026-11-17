@@ -186,4 +186,137 @@ mod test {
                 .is_some_and(|files| files.contains(&ids[1]))
         );
     }
+
+    fn gmod_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws
+    }
+
+    const IDS_FILE: &str = "lua/mylib/ids.lua";
+    const IDS: &str = "local IDS = { first = 1, second = \"two\" }\nreturn IDS\n";
+    const CONSUMER_FILE: &str = "lua/autorun/sh_consumer.lua";
+    const CONSUMER: &str = "local ids = include(\"mylib/ids.lua\")\nlocal first = ids.first\n";
+
+    fn consumer_first(ws: &VirtualWorkspace) -> String {
+        let consumer = ws
+            .analysis
+            .get_file_id(&ws.virtual_url_generator.new_uri(CONSUMER_FILE))
+            .expect("consumer file");
+        ws.humanize_type(ws.local_ty(consumer, "first"))
+    }
+
+    /// `include` returns what the file it loads returns.
+    #[test]
+    fn an_include_returns_the_table_the_included_file_returns() {
+        let mut ws = gmod_workspace();
+        ws.def_file(IDS_FILE, IDS);
+        ws.def_file(CONSUMER_FILE, CONSUMER);
+
+        assert_eq!(consumer_first(&ws), "1");
+    }
+
+    /// Calling what `CompileFile` returns runs the file it compiled.
+    #[test]
+    fn a_compiled_file_returns_the_table_the_file_returns() {
+        let mut ws = gmod_workspace();
+        ws.def_file(IDS_FILE, IDS);
+        ws.def_file(
+            CONSUMER_FILE,
+            "local ids = CompileFile(\"mylib/ids.lua\")()\nlocal first = ids.first\n",
+        );
+
+        assert_eq!(consumer_first(&ws), "1");
+    }
+
+    /// An included file that returns nothing gives its includer nothing.
+    #[test]
+    fn an_include_of_a_file_returning_nothing_is_nil() {
+        let mut ws = gmod_workspace();
+        ws.def_file(IDS_FILE, "IdsLoaded = true\n");
+        let consumer = ws.def_file(CONSUMER_FILE, "local ids = include(\"mylib/ids.lua\")\n");
+
+        let ids = ws.local_ty(consumer, "ids");
+        assert_eq!(ws.humanize_type(ids), "nil");
+    }
+
+    /// A load function that documents its own return keeps it; only an
+    /// `include`'s unspecified results are the file's.
+    #[test]
+    fn a_load_function_documenting_its_return_keeps_it() {
+        let mut ws = gmod_workspace();
+        ws.def_file(IDS_FILE, IDS);
+        ws.def_file(
+            "lua/autorun/sh_loader.lua",
+            "---@[call_arg(\"gmod.load\", \"include\")]\n---@param file string\n---@return boolean\nfunction LoadChecked(file) end\n",
+        );
+        let consumer = ws.def_file(
+            CONSUMER_FILE,
+            "local loaded = LoadChecked(\"mylib/ids.lua\")\n",
+        );
+
+        let loaded = ws.local_ty(consumer, "loaded");
+        assert_eq!(ws.humanize_type(loaded), "boolean");
+    }
+
+    /// Giving an included file a `return`, and taking it away again, moves
+    /// what its includer reads as a cold build has it.
+    #[test]
+    fn an_included_file_gaining_and_losing_a_return_settles_as_a_cold_build() {
+        const RETURNS_NOTHING: &str = "IdsLoaded = true\n";
+        let cold = |ids: &str| {
+            let mut ws = gmod_workspace();
+            ws.def_file(IDS_FILE, ids);
+            ws.def_file(CONSUMER_FILE, CONSUMER);
+            consumer_first(&ws)
+        };
+        let mut warm = gmod_workspace();
+        warm.def_file(IDS_FILE, RETURNS_NOTHING);
+        warm.def_file(CONSUMER_FILE, CONSUMER);
+
+        warm.def_file(IDS_FILE, IDS);
+        let gained = consumer_first(&warm);
+        warm.def_file(IDS_FILE, RETURNS_NOTHING);
+        let lost = consumer_first(&warm);
+
+        assert_eq!((gained, lost), (cold(IDS), cold(RETURNS_NOTHING)));
+    }
+
+    /// Editing, deleting and reopening the included file leaves what its
+    /// includer reads as a cold build has it.
+    #[test]
+    fn an_included_file_edited_deleted_and_reopened_settles_as_a_cold_build() {
+        const IDS_EDITED: &str = "local IDS = { first = \"one\" }\nreturn IDS\n";
+        let cold = |ids: Option<&str>| {
+            let mut ws = gmod_workspace();
+            if let Some(ids) = ids {
+                ws.def_file(IDS_FILE, ids);
+            }
+            ws.def_file(CONSUMER_FILE, CONSUMER);
+            consumer_first(&ws)
+        };
+        let mut warm = gmod_workspace();
+        warm.def_file(IDS_FILE, IDS);
+        warm.def_file(CONSUMER_FILE, CONSUMER);
+        let ids_uri = warm.virtual_url_generator.new_uri(IDS_FILE);
+
+        warm.def_file(IDS_FILE, IDS_EDITED);
+        let edited = consumer_first(&warm);
+        warm.analysis
+            .remove_file_by_uri(&ids_uri)
+            .0
+            .expect("included file must be removed");
+        let deleted = consumer_first(&warm);
+        warm.def_file(IDS_FILE, IDS);
+        let reopened = consumer_first(&warm);
+
+        assert_eq!(
+            (edited.as_str(), deleted, reopened),
+            ("\"one\"", cold(None), cold(Some(IDS)))
+        );
+        assert_eq!(cold(Some(IDS_EDITED)), "\"one\"");
+    }
 }
