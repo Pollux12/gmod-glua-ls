@@ -1364,11 +1364,12 @@ impl Engine {
             || self.carried.iter().any(|plan| plan.touches_file(file_id))
     }
 
-    /// Whether `file_id` is in the focus that is still settling and has work
-    /// left in it: one whose own work settled answers while the rest of the
-    /// focus settles.
+    /// Whether `file_id` is in the focus that is still settling, or becomes it
+    /// once cleared loops settle, and has work left in it: one whose own work
+    /// settled answers while the rest of the focus settles.
     pub(crate) fn in_focus(&self, file_id: crate::FileId) -> bool {
-        self.focus.contains(&file_id) && self.has_work(file_id)
+        (self.focus.contains(&file_id) || self.after_loops.contains(&file_id))
+            && self.has_work(file_id)
     }
 
     /// Whether `reader` waits for the focus to settle.
@@ -6427,6 +6428,18 @@ print(tuned{index})"
         assert!(engine.in_focus(FileId::new(FILE)));
         assert!(!engine.in_focus(settled));
         assert!(engine.is_settling(settled));
+    }
+
+    /// A file edited while cleared loops settle becomes the focus once they
+    /// have: until then its document must not answer half evaluated.
+    #[test]
+    fn a_file_prioritised_while_cleared_loops_settle_settles_first() {
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        engine.loop_focus.insert(statement(1));
+        engine.prioritise(&[FileId::new(FILE)]);
+        engine.changed(statement(2));
+
+        assert!(engine.in_focus(FileId::new(FILE)));
     }
 
     #[test]
