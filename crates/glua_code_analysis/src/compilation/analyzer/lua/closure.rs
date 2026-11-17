@@ -2560,7 +2560,7 @@ pub fn analyze_return_point(
     for point in return_points {
         match point {
             LuaReturnPoint::Expr(expr) => {
-                let expr_type = infer_expr(db, cache, expr.clone())?;
+                let expr_type = returned_value_type(db, cache, expr)?;
                 let expr_type = super::super::common::widen_mutable_local_name_copy(
                     db,
                     cache.get_file_id(),
@@ -2608,6 +2608,63 @@ pub fn analyze_return_point(
         attributes: None,
         return_kind: ReturnTypeKind::default(),
     }])
+}
+
+/// The value `expr` returns. In `cond and value.Member`, a member the
+/// receiver lacks is read only where `cond` holds, so it holds the member of
+/// the class a truthy chain narrows the receiver to, or `nil` for the rest.
+fn returned_value_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> Result<LuaType, InferFailReason> {
+    let and_operands = match expr {
+        LuaExpr::BinaryExpr(binary)
+            if binary
+                .get_op_token()
+                .is_some_and(|token| token.get_op() == BinaryOperator::OpAnd) =>
+        {
+            binary.get_exprs()
+        }
+        _ => None,
+    };
+    let Some((left, right)) = and_operands else {
+        return infer_expr(db, cache, expr.clone());
+    };
+    let left_type = returned_value_type(db, cache, &left)?;
+    let right_type = match missing_member_read_under(db, cache, &right, expr) {
+        Some(member_type) => TypeOps::Union.apply(db, &member_type, &LuaType::Nil),
+        None => infer_expr(db, cache, right)?,
+    };
+    crate::semantic::infer_binary_expr_and(db, left_type, right_type)
+}
+
+/// The type of the member `read` names on the class `condition` narrows its
+/// receiver to, when the receiver as it reaches `read` lacks that member.
+fn missing_member_read_under(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    read: &LuaExpr,
+    condition: &LuaExpr,
+) -> Option<LuaType> {
+    let LuaExpr::IndexExpr(index_expr) = read else {
+        return None;
+    };
+    let receiver = index_expr.get_prefix_expr()?;
+    if !matches!(receiver, LuaExpr::NameExpr(_)) {
+        return None;
+    }
+    let receiver_type = infer_expr(db, cache, receiver.clone()).ok()?;
+    let member = glua_parser::LuaIndexMemberExpr::IndexExpr(index_expr.clone());
+    if !matches!(
+        crate::semantic::infer_member_by_member_key(db, cache, &receiver_type, member.clone()),
+        Err(InferFailReason::FieldNotFound)
+    ) {
+        return None;
+    }
+    let (_, narrowed) =
+        crate::semantic::infer_true_condition_narrowing(db, cache, receiver, condition.clone())?;
+    crate::semantic::infer_member_by_member_key(db, cache, &narrowed, member).ok()
 }
 
 pub fn analyze_return_correlations(

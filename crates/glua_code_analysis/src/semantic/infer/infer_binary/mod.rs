@@ -2,7 +2,8 @@ mod infer_binary_and;
 mod infer_binary_or;
 
 use glua_parser::{BinaryOperator, LuaAstNode, LuaBinaryExpr, LuaExpr, LuaIndexKey, LuaNameExpr};
-use infer_binary_and::{infer_binary_expr_and, special_and_rule};
+pub(crate) use infer_binary_and::infer_binary_expr_and;
+use infer_binary_and::special_and_rule;
 use infer_binary_or::{infer_binary_expr_or, special_or_rule};
 use smol_str::SmolStr;
 

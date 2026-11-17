@@ -1941,7 +1941,7 @@ fn inferred_positive_guard_for_closure(
         LuaType::Variadic(values) => values.get_type(0).cloned().unwrap_or(LuaType::Nil),
         typ => typ,
     };
-    if !type_is_boolean(&return_type) {
+    if !type_is_boolean(&return_type) && !truthy_exprs.iter().all(|expr| is_and_chain(expr)) {
         return None;
     }
     let mut candidates = closure
@@ -2098,6 +2098,18 @@ fn is_type_test_result(typ: &LuaType) -> bool {
             | LuaType::Userdata
             | LuaType::Thread
     )
+}
+
+/// Whether `expr` is an `and` chain: truthy only where every operand holds,
+/// whatever value it yields.
+fn is_and_chain(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::ParenExpr(paren) => paren.get_expr().is_some_and(|inner| is_and_chain(&inner)),
+        LuaExpr::BinaryExpr(binary) => binary
+            .get_op_token()
+            .is_some_and(|token| token.get_op() == BinaryOperator::OpAnd),
+        _ => false,
+    }
 }
 
 /// Whether `typ` is a predicate's boolean result: booleans, possibly nil, since nil is falsy.
@@ -2684,11 +2696,21 @@ fn is_condition_evidence(index_expr: &LuaIndexExpr) -> bool {
                 LuaElseIfClauseStat::cast(node.clone()).and_then(|stat| stat.get_condition_expr())
             })
             .or_else(|| LuaWhileStat::cast(node.clone()).and_then(|stat| stat.get_condition_expr()))
-            .or_else(|| LuaRepeatStat::cast(node).and_then(|stat| stat.get_condition_expr()));
+            .or_else(|| {
+                LuaRepeatStat::cast(node.clone()).and_then(|stat| stat.get_condition_expr())
+            });
         if condition
             .is_some_and(|condition| condition.syntax().text_range().contains_range(index_range))
         {
             return true;
+        }
+
+        // `return IsValid(ent) and ent.Marker` returns a verdict its callers
+        // test, as a condition written in place would.
+        if let Some(return_stat) = LuaReturnStat::cast(node) {
+            return return_stat.get_expr_list().next().is_some_and(|expr| {
+                is_and_chain(&expr) && logical_condition_contains_index(&expr, index_expr)
+            });
         }
     }
 
