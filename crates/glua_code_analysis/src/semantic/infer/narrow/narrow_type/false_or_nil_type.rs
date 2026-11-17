@@ -14,7 +14,7 @@ use crate::{DbIndex, LuaType, semantic::infer::narrow::narrow_type::narrow_down_
 /// - `string` → `Never` (strings cannot be falsy)
 pub fn narrow_false_or_nil(db: &DbIndex, t: LuaType) -> LuaType {
     match &t {
-        LuaType::Boolean => {
+        LuaType::Boolean | LuaType::TypeGuard(_) => {
             return LuaType::BooleanConst(false);
         }
         LuaType::Union(u) => {
