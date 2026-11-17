@@ -2410,6 +2410,60 @@ function UnknownPosition() end"
         assert_eq!(ws.humanize_type(ws.local_ty(reader, "speed")), "1");
     }
 
+    /// A registered panel's instance overriding a method its base declares
+    /// changes that panel class, not the method every other panel reads.
+    #[gtest]
+    fn subclass_write_of_a_member_an_ancestor_declares_stays_off_the_parents() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Panel
+            local Panel = {}
+            ---@return any
+            function Panel:GetValue() end
+            ---@class DTextEntry: Panel
+
+            vgui = {}
+            ---@generic T: Panel
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@param classname `T`
+            ---@return (instance) T?
+            function vgui.Create(classname) end
+
+            ---@[call_arg("gmod.vgui_panel", "define")]
+            ---@param name string
+            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@param panel table
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param base string
+            function vgui.Register(name, panel, base) end
+            "#,
+        );
+        ws.def_file(
+            "lua/vgui/my_text_entry.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Init() end
+            vgui.Register("myTextEntry", PANEL, "DTextEntry")
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/client/use_entries.lua",
+            r#"
+            local panel = vgui.Create("myTextEntry")
+            panel.GetValue = function() return 5 end
+            local entry = vgui.Create("DTextEntry")
+            local v = entry:GetValue()
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "v")), "any");
+    }
+
     #[gtest]
     fn parent_read_of_dynamic_field_written_by_two_subclasses_unions_their_types() {
         let mut ws = VirtualWorkspace::new();

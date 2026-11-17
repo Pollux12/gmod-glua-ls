@@ -2485,6 +2485,7 @@ fn propagate_dynamic_fields_to_super_types(
         for super_type in super_types {
             if let LuaType::Ref(super_id) = &super_type
                 && !scoped_globals.contains(super_id.get_name())
+                && !declares_member(db, super_id, field_name)
             {
                 propagated.push((
                     DynamicFieldOwner::Type(super_id.clone()),
@@ -2511,6 +2512,23 @@ fn metatable_index_owner(
         ),
         _ => None,
     }
+}
+
+/// Whether `type_id` or a type it extends declares `name`: a write through a
+/// subclass changes that subclass, not the member the parent already has.
+fn declares_member(db: &DbIndex, type_id: &crate::LuaTypeDeclId, name: &SmolStr) -> bool {
+    let mut types = vec![LuaType::Ref(type_id.clone())];
+    type_id.collect_super_types(db, &mut types);
+    let key = LuaMemberKey::Name(name.clone());
+    types.iter().any(|typ| {
+        let LuaType::Ref(id) = typ else {
+            return false;
+        };
+        db.get_member_index()
+            .get_current_owner_members_for_key(&LuaMemberOwner::Type(id.clone()), &key)
+            .into_iter()
+            .any(|member| member.get_feature().is_decl())
+    })
 }
 
 /// Whether `owner` already declares `name`, so a propagated field would only blur its type.
