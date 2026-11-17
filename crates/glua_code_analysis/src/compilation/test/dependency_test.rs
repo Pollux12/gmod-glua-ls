@@ -319,4 +319,124 @@ mod test {
         );
         assert_eq!(cold(Some(IDS_EDITED)), "\"one\"");
     }
+
+    const LOADER_FILE: &str = "lua/autorun/sh_loader.lua";
+    const LOADER: &str = "function MyLoad(path)\n    return include(path)\nend\n";
+    const THING_FILE: &str = "lua/mylib/thing.lua";
+    const BOOT_FILE: &str = "lua/autorun/sh_boot.lua";
+
+    fn loads_thing(ws: &mut VirtualWorkspace) -> bool {
+        let uri = |path| ws.virtual_url_generator.new_uri(path);
+        let (boot, thing) = (uri(BOOT_FILE), uri(THING_FILE));
+        let file_id = |uri| ws.analysis.get_file_id(&uri).expect("file");
+        let (boot, thing) = (file_id(boot), file_id(thing));
+        ws.get_db_mut()
+            .get_file_dependencies_index()
+            .get_dependency_kinds(&boot, &thing)
+            .is_some_and(|kinds| kinds.contains(&LuaDependencyKind::Include))
+    }
+
+    /// A function that passes its parameter on as the path of an `include`
+    /// loads the file each call names, as `include` would.
+    #[test]
+    fn a_call_of_an_unannotated_include_wrapper_loads_the_file_it_names() {
+        let mut ws = gmod_workspace();
+        ws.def_file(THING_FILE, "return {}");
+        ws.def_file(LOADER_FILE, LOADER);
+        ws.def_file(BOOT_FILE, "MyLoad(\"mylib/thing.lua\")\n");
+
+        assert!(loads_thing(&mut ws));
+    }
+
+    /// A loader that picks between `include` and `AddCSLuaFile`, or loads
+    /// only under a condition, is not taken as loading the file in its
+    /// caller's realm: which realm runs the file depends on its branches.
+    #[test]
+    fn a_call_of_a_dispatching_or_conditional_loader_adds_no_load() {
+        for loader in [
+            "function MyLoad(path)\n    if SERVER then AddCSLuaFile(path) end\n    include(path)\nend\n",
+            "function MyLoad(path)\n    if SERVER then include(path) end\nend\n",
+        ] {
+            let mut ws = gmod_workspace();
+            ws.def_file(THING_FILE, "return {}");
+            ws.def_file(LOADER_FILE, loader);
+            ws.def_file(BOOT_FILE, "MyLoad(\"mylib/thing.lua\")\n");
+
+            let file_id = |ws: &VirtualWorkspace, path| {
+                ws.analysis
+                    .get_file_id(&ws.virtual_url_generator.new_uri(path))
+                    .expect("file")
+            };
+            let (boot, thing) = (file_id(&ws, BOOT_FILE), file_id(&ws, THING_FILE));
+            let kinds = ws
+                .get_db_mut()
+                .get_file_dependencies_index()
+                .get_dependency_kinds(&boot, &thing)
+                .cloned()
+                .unwrap_or_default();
+            assert!(kinds.is_empty(), "{loader}: {kinds:?}");
+        }
+    }
+
+    /// A wrapper returning its `include` returns the table the file it loads
+    /// returns.
+    #[test]
+    fn an_include_wrapper_returns_the_table_the_file_returns() {
+        let mut ws = gmod_workspace();
+        ws.def_file(THING_FILE, "return { first = 1 }");
+        ws.def_file(
+            LOADER_FILE,
+            "CNC = {}\nfunction CNC.Import(path)\n    return include(path)\nend\n",
+        );
+        let boot = ws.def_file(
+            BOOT_FILE,
+            "local thing = CNC.Import(\"mylib/thing.lua\")\nlocal first = thing.first\n",
+        );
+
+        let first = ws.local_ty(boot, "first");
+        assert_eq!(ws.humanize_type(first), "1");
+    }
+
+    /// A wrapper of a wrapper loads the file too.
+    #[test]
+    fn a_call_of_a_wrapper_of_an_include_wrapper_loads_the_file_it_names() {
+        let mut ws = gmod_workspace();
+        ws.def_file(THING_FILE, "return {}");
+        ws.def_file(
+            LOADER_FILE,
+            &format!("{LOADER}function LoadTwice(path)\n    MyLoad(path)\nend\n"),
+        );
+        ws.def_file(BOOT_FILE, "LoadTwice(\"mylib/thing.lua\")\n");
+
+        assert!(loads_thing(&mut ws));
+    }
+
+    /// Editing the wrapper so it no longer includes its parameter, deleting
+    /// it, and putting it back each move the load of its calls as a cold
+    /// build has it.
+    #[test]
+    fn an_include_wrapper_edited_deleted_and_reopened_moves_its_calls_loads() {
+        let mut ws = gmod_workspace();
+        ws.def_file(THING_FILE, "return {}");
+        ws.def_file(LOADER_FILE, LOADER);
+        ws.def_file(BOOT_FILE, "MyLoad(\"mylib/thing.lua\")\n");
+        let loader_uri = ws.virtual_url_generator.new_uri(LOADER_FILE);
+
+        ws.def_file(LOADER_FILE, "function MyLoad(path)\nend\n");
+        let edited = loads_thing(&mut ws);
+        ws.def_file(LOADER_FILE, LOADER);
+        let restored = loads_thing(&mut ws);
+        ws.analysis
+            .remove_file_by_uri(&loader_uri)
+            .0
+            .expect("loader must be removed");
+        let deleted = loads_thing(&mut ws);
+        ws.def_file(LOADER_FILE, LOADER);
+        let reopened = loads_thing(&mut ws);
+
+        assert_eq!(
+            (edited, restored, deleted, reopened),
+            (false, true, false, true)
+        );
+    }
 }

@@ -408,9 +408,9 @@ impl GmodCallRoles {
         keys
     }
 
-    /// The roles of every function that registers a panel by passing its
-    /// parameters on, for the paths no file contributes roles for. Wrappers of
-    /// wrappers settle round by round.
+    /// The roles of every function that registers a panel or loads a file by
+    /// passing its parameters on, for the paths no file contributes roles for.
+    /// Wrappers of wrappers settle round by round.
     fn derive_forwarded_roles(&self) -> HashMap<String, (AnnotatedGmodCallRoles, Fingerprint)> {
         let contributions = &*self.contributions;
         let mut files = contributions
@@ -424,42 +424,70 @@ impl GmodCallRoles {
             .flat_map(|(scan, _)| scan.forwarded_calls.iter())
             .collect::<Vec<_>>();
 
-        let mut derived: HashMap<String, AnnotatedGmodCallRoles> = HashMap::default();
-        loop {
-            let mut grew = false;
-            for forward in &forwarded_calls {
-                let path = &forward.wrapper_path;
-                if derived.contains_key(path) || contributions.path_winner(path).is_some() {
-                    continue;
-                }
-                let callee = forward
-                    .callee_path
-                    .strip_prefix("_G.")
-                    .unwrap_or(&forward.callee_path);
-                let inner = derived.get(callee).or_else(|| {
-                    contributions
-                        .path_winner(callee)
-                        .and_then(|_| self.roles.roles_by_path.get(callee))
-                });
-                let Some(roles) =
-                    inner.and_then(|inner| inner.forwarded_class_registration(forward))
-                else {
-                    continue;
-                };
-                derived.insert(path.clone(), roles);
-                grew = true;
-            }
-            if !grew {
-                break;
-            }
-        }
-        derived
-            .into_iter()
-            .map(|(path, roles)| {
-                let fingerprint = derivation::fingerprint_of(&roles);
-                (path, (roles, fingerprint))
+        let callee_roles = |derived: &HashMap<String, AnnotatedGmodCallRoles>,
+                            forward: &ForwardedCall| {
+            let callee = forward
+                .callee_path
+                .strip_prefix("_G.")
+                .unwrap_or(&forward.callee_path)
+                .to_string();
+            derived.get(&callee).cloned().or_else(|| {
+                contributions
+                    .path_winner(&callee)
+                    .and_then(|_| self.roles.roles_by_path.get(&callee).cloned())
             })
-            .collect()
+        };
+        // A function that makes several load calls picks among them, so which
+        // realm runs the file it is given depends on its branches.
+        let mut picks_among_loads: HashSet<String> = HashSet::default();
+        loop {
+            let mut derived: HashMap<String, AnnotatedGmodCallRoles> = HashMap::default();
+            loop {
+                let mut grew = false;
+                for forward in &forwarded_calls {
+                    let path = &forward.wrapper_path;
+                    if derived.contains_key(path) || contributions.path_winner(path).is_some() {
+                        continue;
+                    }
+                    let Some(inner) = callee_roles(&derived, forward) else {
+                        continue;
+                    };
+                    let Some(roles) = inner.forwarded_class_registration(forward).or_else(|| {
+                        (!picks_among_loads.contains(path))
+                            .then(|| inner.forwarded_load(forward))
+                            .flatten()
+                    }) else {
+                        continue;
+                    };
+                    derived.insert(path.clone(), roles);
+                    grew = true;
+                }
+                if !grew {
+                    break;
+                }
+            }
+            let mut load_calls: HashMap<&str, usize> = HashMap::default();
+            for forward in &forwarded_calls {
+                if callee_roles(&derived, forward).is_some_and(|roles| roles.loads()) {
+                    *load_calls.entry(forward.wrapper_path.as_str()).or_default() += 1;
+                }
+            }
+            let newly_picking = load_calls
+                .into_iter()
+                .filter(|(path, count)| *count > 1 && !picks_among_loads.contains(*path))
+                .map(|(path, _)| path.to_string())
+                .collect::<Vec<_>>();
+            if newly_picking.is_empty() {
+                break derived;
+            }
+            picks_among_loads.extend(newly_picking);
+        }
+        .into_iter()
+        .map(|(path, roles)| {
+            let fingerprint = derivation::fingerprint_of(&roles);
+            (path, (roles, fingerprint))
+        })
+        .collect()
     }
 
     /// The paths whose forwarded roles differ from those in place.

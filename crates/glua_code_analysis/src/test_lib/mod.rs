@@ -66,6 +66,7 @@ function file.Find(name, path, sorting) end
 
 ---@[call_arg("gmod.load", "include")]
 ---@param fileName string
+---@return ...
 function include(fileName) end
 
 ---@[call_arg("gmod.load", "addcsluafile")]

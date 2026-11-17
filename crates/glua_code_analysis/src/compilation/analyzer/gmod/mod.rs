@@ -675,6 +675,9 @@ struct ForwardedCall {
     args: Vec<ForwardedArg>,
     /// Whether the function returns the call's result.
     returned: bool,
+    /// Whether every call of the function makes this call: it is not under a
+    /// condition or in a loop.
+    unconditional: bool,
 }
 
 /// An argument of a [`ForwardedCall`], written in terms of the function's
@@ -749,9 +752,33 @@ fn collect_forwarded_calls(
             callee_is_colon: call_expr.is_colon_call(),
             args,
             returned: wrapper_returns(db, file_id, &closure, &LuaExpr::CallExpr(call_expr.clone())),
+            unconditional: runs_on_every_call(&call_expr, &closure),
         });
     }
     forwarded_calls
+}
+
+/// Whether `call_expr` runs whenever `closure` does: no condition, loop or
+/// short-circuit operand of `closure` holds it.
+fn runs_on_every_call(call_expr: &LuaCallExpr, closure: &LuaClosureExpr) -> bool {
+    call_expr
+        .syntax()
+        .ancestors()
+        .take_while(|node| node != closure.syntax())
+        .all(|node| {
+            !matches!(
+                node.kind().into(),
+                glua_parser::LuaSyntaxKind::IfStat
+                    | glua_parser::LuaSyntaxKind::WhileStat
+                    | glua_parser::LuaSyntaxKind::RepeatStat
+                    | glua_parser::LuaSyntaxKind::ForStat
+                    | glua_parser::LuaSyntaxKind::ForRangeStat
+            ) && !LuaBinaryExpr::cast(node).is_some_and(|binary| {
+                binary.get_op_token().is_some_and(|op| {
+                    matches!(op.get_op(), BinaryOperator::OpAnd | BinaryOperator::OpOr)
+                })
+            })
+        })
 }
 
 /// The value a local of `closure` that is never reassigned was initialised
@@ -8467,6 +8494,36 @@ impl AnnotatedGmodCallRoles {
                 )?,
             },
         ))
+    }
+
+    /// Whether calls with these roles load a file.
+    fn loads(&self) -> bool {
+        !self.load_roles.is_empty()
+    }
+
+    /// The roles of a function that loads a file by passing its parameter on,
+    /// unchanged, as the path of a call with these roles that it always makes.
+    fn forwarded_load(&self, forward: &ForwardedCall) -> Option<Self> {
+        if !forward.unconditional {
+            return None;
+        }
+        let (kind, role) = self.load_roles.first()?;
+        let arg_idx = param_idx_to_call_arg_idx(
+            role.param_idx,
+            forward.callee_is_colon,
+            self.is_colon_define,
+        )?;
+        let role = forward
+            .args
+            .get(arg_idx)?
+            .forward_role(role)
+            .filter(|role| {
+                role.field_path.is_empty() && role.prefix.is_empty() && role.suffix.is_empty()
+            })?;
+        Some(Self {
+            load_roles: vec![(*kind, role)],
+            ..Self::default()
+        })
     }
 
     /// The roles of a function that registers a panel by passing its
