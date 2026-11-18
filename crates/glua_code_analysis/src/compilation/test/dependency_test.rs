@@ -348,14 +348,31 @@ mod test {
         assert!(loads_thing(&mut ws));
     }
 
+    /// A loader in the shape of CityRP's: it picks `include` or `AddCSLuaFile`
+    /// by its realm argument and the file's prefix.
+    const REALM_LOADER: &str = r#"function MyLoad(path, realm)
+    if (realm == "server" or path:find("sv_")) and SERVER then
+        return include(path)
+    elseif realm == "client" or path:find("cl_") then
+        if SERVER then
+            AddCSLuaFile(path)
+        else
+            return include(path)
+        end
+    end
+end
+"#;
+
     /// A loader that picks between `include` and `AddCSLuaFile`, or loads
-    /// only under a condition, is not taken as loading the file in its
-    /// caller's realm: which realm runs the file depends on its branches.
+    /// only under a condition, names the file its call gives without loading
+    /// it in the caller's realm: which realm runs the file depends on its
+    /// branches.
     #[test]
-    fn a_call_of_a_dispatching_or_conditional_loader_adds_no_load() {
+    fn a_call_of_a_dispatching_or_conditional_loader_only_names_the_file() {
         for loader in [
             "function MyLoad(path)\n    if SERVER then AddCSLuaFile(path) end\n    include(path)\nend\n",
             "function MyLoad(path)\n    if SERVER then include(path) end\nend\n",
+            REALM_LOADER,
         ] {
             let mut ws = gmod_workspace();
             ws.def_file(THING_FILE, "return {}");
@@ -374,8 +391,65 @@ mod test {
                 .get_dependency_kinds(&boot, &thing)
                 .cloned()
                 .unwrap_or_default();
-            assert!(kinds.is_empty(), "{loader}: {kinds:?}");
+            assert_eq!(
+                kinds.into_iter().collect::<Vec<_>>(),
+                vec![LuaDependencyKind::Dispatched],
+                "{loader}"
+            );
         }
+    }
+
+    fn names_thing(ws: &mut VirtualWorkspace) -> bool {
+        let uri = |path| ws.virtual_url_generator.new_uri(path);
+        let (boot, thing) = (uri(BOOT_FILE), uri(THING_FILE));
+        let file_id = |uri| ws.analysis.get_file_id(&uri).expect("file");
+        let (boot, thing) = (file_id(boot), file_id(thing));
+        ws.get_db_mut()
+            .get_file_dependencies_index()
+            .get_dependency_kinds(&boot, &thing)
+            .is_some_and(|kinds| kinds.contains(&LuaDependencyKind::Dispatched))
+    }
+
+    /// A shift above a dispatching loader leaves what its calls name, so
+    /// their files do not run again.
+    #[test]
+    fn a_shift_above_a_dispatching_loader_re_runs_nothing_in_its_callers() {
+        let mut ws = gmod_workspace();
+        ws.def_file(THING_FILE, "return {}");
+        ws.def_file(LOADER_FILE, REALM_LOADER);
+        ws.def_file(BOOT_FILE, "MyLoad(\"mylib/thing.lua\", \"server\")\n");
+
+        let loader = ws.def_file(LOADER_FILE, &format!("\n{REALM_LOADER}"));
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![loader]);
+    }
+
+    /// Editing a dispatching loader so it loads nothing, deleting it, and
+    /// putting it back each move what its calls name as a cold build has it.
+    #[test]
+    fn a_dispatching_loader_edited_deleted_and_reopened_moves_what_its_calls_name() {
+        let mut ws = gmod_workspace();
+        ws.def_file(THING_FILE, "return {}");
+        ws.def_file(LOADER_FILE, REALM_LOADER);
+        ws.def_file(BOOT_FILE, "MyLoad(\"mylib/thing.lua\", \"server\")\n");
+        let loader_uri = ws.virtual_url_generator.new_uri(LOADER_FILE);
+
+        ws.def_file(LOADER_FILE, "function MyLoad(path, realm)\nend\n");
+        let edited = names_thing(&mut ws);
+        ws.def_file(LOADER_FILE, REALM_LOADER);
+        let restored = names_thing(&mut ws);
+        ws.analysis
+            .remove_file_by_uri(&loader_uri)
+            .0
+            .expect("loader must be removed");
+        let deleted = names_thing(&mut ws);
+        ws.def_file(LOADER_FILE, REALM_LOADER);
+        let reopened = names_thing(&mut ws);
+
+        assert_eq!(
+            (edited, restored, deleted, reopened),
+            (false, true, false, true)
+        );
     }
 
     /// A wrapper returning its `include` returns the table the file it loads

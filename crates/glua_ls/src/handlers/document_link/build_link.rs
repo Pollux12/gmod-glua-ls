@@ -194,4 +194,38 @@ mod tests {
             ]
         );
     }
+
+    /// A path given to a loader that picks `include` or `AddCSLuaFile` by
+    /// realm links to the file it loads.
+    #[gtest]
+    fn a_path_given_to_a_realm_dispatching_loader_links_to_the_file() {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file("lua/mylib/apiclient.lua", "return {}");
+        ws.def_file(
+            "lua/autorun/sh_util.lua",
+            r#"function IncludeFile(fileName, realm)
+    if (realm == "server" or fileName:find("sv_")) and SERVER then
+        return include(fileName)
+    elseif realm == "client" or fileName:find("cl_") then
+        if SERVER then
+            AddCSLuaFile(fileName)
+        else
+            return include(fileName)
+        end
+    end
+end
+"#,
+        );
+        let boot = ws.def_file(
+            "lua/autorun/sv_boot.lua",
+            "IncludeFile(\"mylib/apiclient.lua\", \"server\")\n",
+        );
+
+        let targets = link_targets(&ws, boot);
+        expect_that!(targets, elements_are![ends_with("lua/mylib/apiclient.lua")]);
+    }
 }

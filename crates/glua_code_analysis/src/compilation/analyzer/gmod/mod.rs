@@ -8502,12 +8502,16 @@ impl AnnotatedGmodCallRoles {
     }
 
     /// The roles of a function that loads a file by passing its parameter on,
-    /// unchanged, as the path of a call with these roles that it always makes.
-    fn forwarded_load(&self, forward: &ForwardedCall) -> Option<Self> {
-        if !forward.unconditional {
-            return None;
-        }
+    /// unchanged, as the path of a call with these roles. A call it does not
+    /// always make, or one of several loads it `picks_among`, loads the file
+    /// in a realm its branches decide.
+    fn forwarded_load(&self, forward: &ForwardedCall, picks_among: bool) -> Option<Self> {
         let (kind, role) = self.load_roles.first()?;
+        let kind = if forward.unconditional && !picks_among {
+            *kind
+        } else {
+            LuaDependencyKind::Dispatched
+        };
         let arg_idx = param_idx_to_call_arg_idx(
             role.param_idx,
             forward.callee_is_colon,
@@ -8521,7 +8525,7 @@ impl AnnotatedGmodCallRoles {
                 role.field_path.is_empty() && role.prefix.is_empty() && role.suffix.is_empty()
             })?;
         Some(Self {
-            load_roles: vec![(*kind, role)],
+            load_roles: vec![(kind, role)],
             ..Self::default()
         })
     }
@@ -11621,6 +11625,9 @@ fn rebuild_gmod_load_index(
                 .get_dependency_sites(file_id)
                 .unwrap_or_default()
         })
+        // Which realm a dispatching loader runs its file in is up to its
+        // branches, which the load graph does not follow.
+        .filter(|site| site.kind != LuaDependencyKind::Dispatched)
         .collect::<Vec<_>>();
     let mut dependency_sites = super::parallel::map_items_recorded(&sites, |site| {
         resolve_load_dependency_site(db, (**site).clone())
@@ -11918,7 +11925,9 @@ impl DynamicLoadAlias {
                 path_arg_idx: Some(path_arg_idx),
                 ..Self::default()
             }),
-            LuaDependencyKind::Require | LuaDependencyKind::CompileFile => None,
+            LuaDependencyKind::Require
+            | LuaDependencyKind::CompileFile
+            | LuaDependencyKind::Dispatched => None,
         }
     }
 
@@ -13720,7 +13729,8 @@ pub(crate) fn resolve_load_dependency_target(
         LuaDependencyKind::Include
         | LuaDependencyKind::CompileFile
         | LuaDependencyKind::AddCSLuaFile
-        | LuaDependencyKind::IncludeCS => {
+        | LuaDependencyKind::IncludeCS
+        | LuaDependencyKind::Dispatched => {
             resolve_load_include_target(db, source_file_id, dependency_path)
                 .or_else(|| module_index.find_module_file_for_file(dependency_path, source_file_id))
         }
@@ -13833,6 +13843,7 @@ fn load_site_sort_key(
         LuaDependencyKind::CompileFile => 2,
         LuaDependencyKind::AddCSLuaFile => 3,
         LuaDependencyKind::IncludeCS => 4,
+        LuaDependencyKind::Dispatched => 5,
     };
     (
         source_path,
@@ -13916,7 +13927,7 @@ fn apply_load_site(
                 );
             }
         }
-        LuaDependencyKind::CompileFile => {}
+        LuaDependencyKind::CompileFile | LuaDependencyKind::Dispatched => {}
         LuaDependencyKind::IncludeCS => {
             target_info.client_send_available = true;
             changed |= target_info.mark_states(

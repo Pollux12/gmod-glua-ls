@@ -453,9 +453,7 @@ impl GmodCallRoles {
                         continue;
                     };
                     let Some(roles) = inner.forwarded_class_registration(forward).or_else(|| {
-                        (!picks_among_loads.contains(path))
-                            .then(|| inner.forwarded_load(forward))
-                            .flatten()
+                        inner.forwarded_load(forward, picks_among_loads.contains(path))
                     }) else {
                         continue;
                     };

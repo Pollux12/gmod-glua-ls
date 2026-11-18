@@ -24,6 +24,10 @@ pub enum LuaDependencyKind {
     CompileFile,
     AddCSLuaFile,
     IncludeCS,
+    /// Loaded through a function whose branches decide which realm runs the
+    /// file, such as one that picks `include` or `AddCSLuaFile` by the file's
+    /// name.
+    Dispatched,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

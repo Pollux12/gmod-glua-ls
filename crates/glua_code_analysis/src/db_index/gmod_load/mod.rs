@@ -170,6 +170,7 @@ pub enum GmodLoadEdgeKind {
     WrapperAddCSLuaFile,
     DynamicInclude,
     DynamicAddCSLuaFile,
+    Dispatched,
     EngineAutoload,
 }
 
@@ -181,6 +182,7 @@ impl From<LuaDependencyKind> for GmodLoadEdgeKind {
             LuaDependencyKind::CompileFile => Self::CompileFile,
             LuaDependencyKind::AddCSLuaFile => Self::AddCSLuaFile,
             LuaDependencyKind::IncludeCS => Self::IncludeCS,
+            LuaDependencyKind::Dispatched => Self::Dispatched,
         }
     }
 }
