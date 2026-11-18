@@ -42,3 +42,10 @@ pub fn collect() {
     // SAFETY: `mi_collect` may be called from any thread at any time.
     unsafe { mi_collect(true) }
 }
+
+/// Returns every analysis worker's free heap pages, and the caller's, to the
+/// process.
+pub fn collect_all() {
+    rayon::broadcast(|_| collect());
+    collect();
+}

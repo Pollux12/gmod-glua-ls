@@ -974,6 +974,7 @@ version = "0.1.5"
 dependencies = [
  "libc",
  "mimalloc",
+ "rayon",
 ]
 
 [[package]]

@@ -780,6 +780,8 @@ async fn run() {
     let indexing_duration = t.elapsed();
     glua_code_analysis::profile::work::report("index");
     glua_code_analysis::profile::memory::checkpoint("after indexing");
+    glua_heap::collect_all();
+    glua_code_analysis::profile::memory::checkpoint("after collecting");
     alloc_report!("indexing", alloc_mark);
     // `BENCH_MEM_PARTS=1` (with `--features alloc-stats`) drops the indexed analysis
     // part by part and prints the live bytes each part held, then exits.
