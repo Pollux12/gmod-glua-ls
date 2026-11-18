@@ -95,6 +95,12 @@ The code name is shown at the end of each warning. [Diagnostics settings](/confi
 - Make sure you did not open the whole `garrysmod/` folder. Open each addon or gamemode instead.
 - Skip large folders you do not work on. Right-click a folder in the Explorer and choose **Add Directory to Ignore List**.
 
+## High memory use on Linux
+
+On Linux, GLuaLS keeps its memory in a temporary file instead of plain RAM. When the machine or container runs low on memory, Linux moves the parts GLuaLS is not using to disk, so a large workspace slows down instead of being killed.
+
+The file is created in whichever of `$XDG_CACHE_HOME`, `~/.cache`, `/var/tmp` and `/tmp` is on disk and has the most free space. It is removed when GLuaLS exits. Set the `GLUALS_HEAP_DIR` environment variable to choose the folder yourself, or to `off` to keep everything in RAM.
+
 ## Still stuck
 
 Click **GLuaLS** in the status bar and choose **Show Output**. The output often explains what went wrong, and it is useful to include when you [open an issue](https://github.com/Pollux12/gmod-glua-ls/issues).

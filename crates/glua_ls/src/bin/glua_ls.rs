@@ -1,7 +1,7 @@
 use clap::Parser;
 use glua_code_analysis::ANALYSIS_STACK_SIZE;
+use glua_heap::MiMalloc;
 use glua_ls::cmd_args::CmdArgs;
-use mimalloc::MiMalloc;
 use std::error::Error;
 
 #[global_allocator]

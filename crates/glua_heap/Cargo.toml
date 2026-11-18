@@ -1,0 +1,20 @@
+[package]
+name = "glua_heap"
+version = "0.1.5"
+edition = "2024"
+authors = ["Pollux12"]
+description = "Process heap for the GLuaLS binaries: mimalloc, kept on a disk file where the platform allows."
+license = "MIT"
+repository = "https://github.com/Pollux12/gmod-glua-ls"
+keywords = ["gmod", "glua", "lua", "allocator"]
+categories = ["development-tools"]
+
+[dependencies]
+mimalloc.workspace = true
+rayon.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

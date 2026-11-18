@@ -13,6 +13,7 @@
 - `crates/glua_ls`: LSP server and handlers. Consume analyzer APIs; do not reimplement analysis.
 - `crates/glua_parser`, `crates/glua_parser_desc`: parser, AST, syntax APIs.
 - `crates/glua_check`: CLI diagnostics runner; preferred corpus entry point.
+- `crates/glua_heap`: the binaries' allocator (mimalloc). On Linux the heap is an unlinked file mapped shared, set up before `main`; `GLUALS_HEAP_DIR` picks its directory or, as `off`, keeps it in anonymous memory.
 - `crates/glua_doc_cli`, `crates/schema_to_glua`, `tools/schema_json_gen`: docs and schema tooling.
 - `tools/benchmark`: large-workspace benchmark (`BENCH_CODEBASE` + `BENCH_ANNOTATIONS` required).
 - `tools/determinism`: determinism harness (`DET_CODEBASE` + `DET_ANNOTATIONS` required).
@@ -55,6 +56,7 @@
   The run exits non-zero on any divergence, including a `noop`/`touch`/`shift` re-analysis that evaluated files beyond the edited ones, so a green exit means every stage that ran passed.
 - Server drift gate: `node tools/lsp_drift.js` drives a real `glua_ls` (typing with real debounce, revert, watched delete and re-create) and compares every diagnostic it shows with a cold `glua_check`; part of every tier.
 - Perf: `GLUALS_PROFILE=1` for phase timings; `cargo run --release -p benchmark` for large-workspace. For `samply` (ETW on Windows, needs elevation and therefore user permission first) three things have to be right or the profile is useless: build with `CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release -p benchmark` so the PDB exists; run from `target/release`, because samply resolves the PDB by the relative path recorded in the exe; and do not pass `--main-thread-only`, because analysis runs on a spawned big-stack thread and the main thread only shows a join. Example: `cd target/release && BENCH_CODEBASE=<path> samply record --save-only --unstable-presymbolicate -o out.json.gz ./benchmark.exe`. That writes `out.json.gz` plus an `out.json.syms.json` sidecar; the profile holds only addresses, so symbol names come from joining the two by `libs[].debugName` and the frame address against each module's `symbol_table` rva ranges.
+- Heap: `cargo run --release -p benchmark --features alloc-stats` prints live and peak bytes at each `[mem]` checkpoint (`BENCH_MEM_PARTS=1` adds what each index part holds). `--features alloc-sample` (build with `CARGO_PROFILE_RELEASE_DEBUG=1`) samples allocations with their stacks: `BENCH_SAMPLE_AT_MB=<n>` writes folded stacks of what is live when the heap first passes `n` MB and again after indexing, to `<BENCH_SAMPLE_OUT>.{peak,indexed}.folded`.
 - Before running Samply on Windows, check `tools/samply-bridge.ps1 -Status` and use that bridge when available.
 
 ## Commands

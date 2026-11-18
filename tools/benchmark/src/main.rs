@@ -3,7 +3,7 @@
 static GLOBAL: dhat::Alloc = dhat::Alloc;
 
 #[cfg(not(feature = "dhat-heap"))]
-use mimalloc::MiMalloc;
+use glua_heap::MiMalloc;
 
 /// Report allocator counters for the phase just finished (no-op without
 /// `--features alloc-stats`).
@@ -56,10 +56,15 @@ mod alloc_stats {
             let live = LIVE.fetch_add(layout.size(), Relaxed) + layout.size();
             PEAK.fetch_max(live, Relaxed);
             PEAK_SINCE.fetch_max(live, Relaxed);
-            unsafe { self.0.alloc(layout) }
+            let ptr = unsafe { self.0.alloc(layout) };
+            #[cfg(feature = "alloc-sample")]
+            crate::alloc_sample::allocated(ptr, layout.size(), live);
+            ptr
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
             LIVE.fetch_sub(layout.size(), Relaxed);
+            #[cfg(feature = "alloc-sample")]
+            crate::alloc_sample::freed(ptr);
             unsafe { self.0.dealloc(ptr, layout) }
         }
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -69,7 +74,12 @@ mod alloc_stats {
             let live = LIVE.fetch_add(new_size, Relaxed) + new_size;
             PEAK.fetch_max(live, Relaxed);
             PEAK_SINCE.fetch_max(live, Relaxed);
-            unsafe { self.0.realloc(ptr, layout, new_size) }
+            #[cfg(feature = "alloc-sample")]
+            crate::alloc_sample::freed(ptr);
+            let ptr = unsafe { self.0.realloc(ptr, layout, new_size) };
+            #[cfg(feature = "alloc-sample")]
+            crate::alloc_sample::allocated(ptr, new_size, live);
+            ptr
         }
     }
 
@@ -90,6 +100,9 @@ mod alloc_stats {
 #[cfg(all(feature = "alloc-stats", not(feature = "dhat-heap")))]
 #[global_allocator]
 static GLOBAL: alloc_stats::Counting = alloc_stats::Counting(MiMalloc);
+
+#[cfg(all(feature = "alloc-sample", not(feature = "dhat-heap")))]
+mod alloc_sample;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -570,6 +583,8 @@ async fn run() {
     let mut alloc_mark = (0u64, 0u64);
     #[cfg(all(feature = "alloc-stats", not(feature = "dhat-heap")))]
     alloc_stats::lend_to_profile();
+    #[cfg(all(feature = "alloc-sample", not(feature = "dhat-heap")))]
+    alloc_sample::init();
     setup_logger();
 
     let large_codebase = std::env::var("BENCH_CODEBASE").unwrap_or_else(|_| {
@@ -627,6 +642,7 @@ async fn run() {
     };
     glua_code_analysis::set_analysis_threads(parallelism);
     eprintln!("Threads: {parallelism}");
+    eprintln!("Heap: {:?}", glua_heap::backing());
 
     // Phase 1: Config loading
     let t = Instant::now();
@@ -779,6 +795,10 @@ async fn run() {
     let indexing_duration = t.elapsed();
     glua_code_analysis::profile::work::report("index");
     glua_code_analysis::profile::memory::checkpoint("after indexing");
+    #[cfg(all(feature = "alloc-sample", not(feature = "dhat-heap")))]
+    alloc_sample::dump("indexed");
+    glua_heap::collect_all();
+    glua_code_analysis::profile::memory::checkpoint("after collecting");
     alloc_report!("indexing", alloc_mark);
     // `BENCH_MEM_PARTS=1` (with `--features alloc-stats`) drops the indexed analysis
     // part by part and prints the live bytes each part held, then exits.
