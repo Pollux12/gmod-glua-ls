@@ -2782,4 +2782,61 @@ AreaProps.color.label = "Colour"
             )
         );
     }
+
+    /// A local holding a call's result passes that result to the functions it
+    /// is given to, as a literal or variable would.
+    #[test]
+    fn a_param_takes_the_result_a_caller_holds_in_a_local() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "lua/autorun/sh_cmd.lua",
+            r#"
+---@param separator string
+---@param str string
+---@return string[]
+function Explode(separator, str) end
+
+function HandleArgs(args)
+    local commandArgs = args
+end
+
+function OnCommand(argStr)
+    local args = Explode(" ", argStr)
+    HandleArgs(args)
+end
+"#,
+        );
+
+        let args = ws.local_ty(file, "commandArgs");
+        assert_eq!(ws.humanize_type(args), "string[]");
+    }
+
+    /// A local the caller checks before passing it holds no `nil` there, even
+    /// when the call it holds may return nothing.
+    #[test]
+    fn a_param_takes_a_held_result_without_the_nil_its_caller_checked_out() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            crate::DiagnosticCode::NeedCheckNil,
+            r#"
+---@class PoseVehicle
+local PoseVehicle = {}
+function PoseVehicle:GetPose(seat) end
+
+---@type PoseVehicle
+ThePoseVehicle = nil
+
+function ApplyPose(pose)
+    local bone = pose["spine"]
+end
+
+function TickPose()
+    local pose = ThePoseVehicle:GetPose(1)
+    if pose then
+        ApplyPose(pose)
+    end
+end
+"#,
+        ));
+    }
 }

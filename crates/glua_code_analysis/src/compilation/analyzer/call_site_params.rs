@@ -2493,7 +2493,9 @@ fn infer_supported_call_site_arg_type(
 }
 
 /// `typ`, the values a local passed as `arg` takes, without `nil` and `false`
-/// when the guards before the call leave `arg` holding neither.
+/// when the guards before the call leave `arg` holding neither. A guard that
+/// leaves a local of only `nil` or `false` truthy proves `typ` incomplete, so
+/// it says nothing then.
 fn without_values_guarded_out(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -2506,6 +2508,9 @@ fn without_values_guarded_out(
     let Ok(at_call) = infer_expr(db, cache, arg.clone()) else {
         return typ;
     };
+    if at_call.is_unknown() && typ.is_always_falsy() {
+        return LuaType::Unknown;
+    }
     if at_call.is_unknown()
         || at_call.is_any()
         || crate::semantic::remove_false_or_nil(at_call.clone()) != at_call
@@ -2629,10 +2634,9 @@ fn infer_call_site_value_type(
         }
         LuaExpr::CallExpr(ref call) => {
             let fact = crate::semantic::infer_expr_fact_with_cache(db, cache, expr.clone());
-            // A call that takes arguments is evidence for an installer parameter, and only
-            // when its result is certain.
-            let accepted = is_zero_arg_call(call)
-                || (calls_with_args && fact.confidence() >= LuaInferenceConfidence::Certain);
+            // A call that takes arguments is evidence only when its result is certain.
+            let accepted =
+                is_zero_arg_call(call) || fact.confidence() >= LuaInferenceConfidence::Certain;
             if !accepted {
                 return None;
             }
