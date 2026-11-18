@@ -395,8 +395,6 @@ pub(crate) struct Reanalysed {
     pub(crate) stats: engine::EngineStats,
     /// The scripted scopes, to lend the next re-analysis.
     pub(crate) scopes: ScopesCache,
-    /// Each evaluated file's inference memo, for its diagnostics.
-    pub(crate) memos: HashMap<FileId, crate::LuaInferCache>,
 }
 
 /// A re-analysis in progress. It re-analyses files from their current text:
@@ -417,9 +415,6 @@ pub(crate) struct Reanalysis {
     /// The stage the run is at while it waits for its next slice.
     stage: derivation::AnalysisStage,
     scopes: ScopesCache,
-    /// The inference memos of the passes that settled; a later pass's
-    /// replaces an earlier one's.
-    memos: HashMap<FileId, crate::LuaInferCache>,
     /// Whether the run settled and was wrapped up, leaving the check of
     /// which diagnostics went stale; see [`Self::wrap_up`].
     wrapped: bool,
@@ -447,7 +442,6 @@ impl Reanalysis {
             access_paths: crate::semantic::AccessPaths::default(),
             stage: derivation::AnalysisStage::Closed,
             scopes,
-            memos: HashMap::default(),
             wrapped: false,
             stale: None,
         };
@@ -507,7 +501,9 @@ impl Reanalysis {
             if let Some(Pass::Open(recipes)) = self.pass.take() {
                 let recipes = std::sync::Arc::into_inner(recipes)
                     .expect("no superstep's tasks outlive their pass");
-                self.memos.extend(recipes.into_memos());
+                // Freeing every file's memo takes long enough to hold up
+                // the next pass.
+                std::thread::spawn(move || drop(recipes.into_memos()));
             }
             let stale = self.engine.take_stale_sources();
             crate::semantic::stop_keeping_access_paths();
@@ -673,7 +669,6 @@ impl Reanalysis {
             evaluated_files: self.engine.evaluated_files(),
             stats: self.engine.stats().clone(),
             scopes: self.scopes,
-            memos: self.memos,
         }
     }
 }
