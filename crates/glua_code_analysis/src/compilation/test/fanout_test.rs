@@ -1039,6 +1039,106 @@ function Drive(car) local speed = car.speed end
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![car]);
     }
 
+    const FACTORY: &str = "gamemodes/cityrp/gamemode/core/sh_factory.lua";
+    const FACTORY_TEXT: &str = "function MakeTab(name)
+    return { name = name }
+end
+";
+    const FACTORY_READER: &str = "gamemodes/cityrp/gamemode/core/cl_menu.lua";
+    const FACTORY_READER_TEXT: &str = "local tab = MakeTab(\"Inventory\")
+local name = tab.name
+";
+
+    /// A field of a table a factory builds reads as what the call passed, found
+    /// in the factory's function; a shift above that function moves it
+    /// without changing what the field holds.
+    #[test]
+    fn a_shift_above_a_factory_re_runs_nothing_in_a_file_reading_what_it_built() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            (FACTORY, FACTORY_TEXT),
+            (FACTORY_READER, FACTORY_READER_TEXT),
+        ]);
+
+        let factory = ws.def_file(FACTORY, &format!("\n{FACTORY_TEXT}"));
+
+        assert_eq!(
+            ws.analysis.compilation.last_evaluated_files(),
+            vec![factory]
+        );
+    }
+
+    /// A read through an `__index` function gets what that function returns,
+    /// found in its body; a shift above the function moves it without
+    /// changing the read.
+    #[test]
+    fn a_shift_above_an_index_function_re_runs_nothing_in_a_file_reading_through_it() {
+        const PROXY: &str = "gamemodes/cityrp/gamemode/core/sh_proxy.lua";
+        const PROXY_TEXT: &str = "Base = { speed = 1 }
+Proxy = setmetatable({}, { __index = function(t, k) return Base[k] end })
+";
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            (PROXY, PROXY_TEXT),
+            (
+                "gamemodes/cityrp/gamemode/core/cl_drive.lua",
+                "local speed = Proxy.speed\n",
+            ),
+        ]);
+
+        let proxy = ws.def_file(PROXY, &format!("\n{PROXY_TEXT}"));
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![proxy]);
+    }
+
+    /// A call of a function that forwards its class name to `vgui.Create` gets
+    /// that class, found at the create call in the function; a shift above the
+    /// function moves the call without changing what it creates.
+    #[test]
+    fn a_shift_above_a_create_wrapper_re_runs_nothing_in_its_callers() {
+        const WRAPPER: &str = "gamemodes/cityrp/gamemode/core/cl_util.lua";
+        const WRAPPER_TEXT: &str = "function MakePanel(class)
+    local panel = vgui.Create(class)
+    return panel
+end
+";
+        let mut ws = VirtualWorkspace::new();
+        gmod(&mut ws);
+        ws.def_files(vec![
+            (WRAPPER, WRAPPER_TEXT),
+            (
+                "gamemodes/cityrp/gamemode/core/cl_menu.lua",
+                "local button = MakePanel(\"DButton\")\n",
+            ),
+        ]);
+
+        let wrapper = ws.def_file(WRAPPER, &format!("\n{WRAPPER_TEXT}"));
+
+        assert_eq!(
+            ws.analysis.compilation.last_evaluated_files(),
+            vec![wrapper]
+        );
+    }
+
+    /// An edit of what the factory puts in the table reaches the file reading
+    /// the field.
+    #[test]
+    fn an_edit_inside_a_factory_re_runs_a_file_reading_what_it_built() {
+        let ws = VirtualWorkspace::assert_warm_matches_cold(
+            |_| {},
+            &[
+                (FACTORY, FACTORY_TEXT),
+                (FACTORY_READER, FACTORY_READER_TEXT),
+            ],
+            &[(
+                FACTORY,
+                &FACTORY_TEXT.replace("name = name", "name = #name"),
+            )],
+        );
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files().len(), 2);
+    }
+
     /// A field a class does not declare is looked up on the local tables bound
     /// to it; an edit elsewhere in their file leaves that lookup standing.
     #[test]

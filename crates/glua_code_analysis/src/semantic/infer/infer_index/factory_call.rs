@@ -126,7 +126,7 @@ pub(crate) fn arg_for_param(call: &LuaCallExpr, param: usize) -> Option<LuaExpr>
 
 fn call_at(db: &DbIndex, call: &InFiled<TextRange>) -> Option<LuaCallExpr> {
     db.get_vfs()
-        .get_syntax_tree(&call.file_id)?
+        .syntax_tree_around(&call.file_id, call.value)?
         .get_red_root()
         .token_at_offset(call.value.start())
         .right_biased()?
@@ -136,14 +136,15 @@ fn call_at(db: &DbIndex, call: &InFiled<TextRange>) -> Option<LuaCallExpr> {
 }
 
 fn signature_closure(db: &DbIndex, signature_id: LuaSignatureId) -> Option<LuaClosureExpr> {
+    let position = signature_id.get_position();
     db.get_vfs()
-        .get_syntax_tree(&signature_id.get_file_id())?
+        .syntax_tree_around(&signature_id.get_file_id(), TextRange::empty(position))?
         .get_red_root()
-        .token_at_offset(signature_id.get_position())
+        .token_at_offset(position)
         .right_biased()?
         .parent_ancestors()
         .filter_map(LuaClosureExpr::cast)
-        .find(|closure| closure.get_position() == signature_id.get_position())
+        .find(|closure| closure.get_position() == position)
 }
 
 pub(crate) fn with_file_cache<T>(

@@ -148,10 +148,14 @@ fn written_on_declared_class(db: &DbIndex, member: &LuaMemberInfo) -> bool {
 }
 
 fn signature_closure(db: &DbIndex, signature_id: &LuaSignatureId) -> Option<LuaClosureExpr> {
+    let position = signature_id.get_position();
     db.get_vfs()
-        .get_syntax_tree(&signature_id.get_file_id())?
+        .syntax_tree_around(
+            &signature_id.get_file_id(),
+            rowan::TextRange::empty(position),
+        )?
         .get_red_root()
-        .token_at_offset(signature_id.get_position())
+        .token_at_offset(position)
         .right_biased()?
         .parent_ancestors()
         .find_map(LuaClosureExpr::cast)

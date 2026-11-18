@@ -1369,7 +1369,7 @@ fn call_in_signature(
 ) -> Option<LuaCallExpr> {
     let range = range + signature_id.get_position();
     db.get_vfs()
-        .get_syntax_tree(&signature_id.get_file_id())?
+        .syntax_tree_around(&signature_id.get_file_id(), range)?
         .get_red_root()
         .token_at_offset(range.start())
         .right_biased()?
