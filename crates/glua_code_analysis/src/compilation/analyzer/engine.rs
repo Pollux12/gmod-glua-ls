@@ -1347,9 +1347,10 @@ impl Engine {
     }
 
     /// Whether `file_id` has work still to settle: queued, waiting, in the
-    /// focus or a source layer to rebuild.
+    /// focus or a source layer to rebuild. Every file settles while cleared
+    /// loops do: their facts are reset, and any file can read them.
     pub(crate) fn is_settling(&self, file_id: crate::FileId) -> bool {
-        self.focus.contains(&file_id) || self.has_work(file_id)
+        self.focus.contains(&file_id) || !self.loop_focus.is_empty() || self.has_work(file_id)
     }
 
     /// Whether `file_id` has work queued, waiting, held or on a worker, or a
