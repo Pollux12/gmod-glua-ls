@@ -32,6 +32,7 @@ glua_code_analysis = { path = "crates/glua_code_analysis", version = "0.1.5" }
 glua_parser = { path = "crates/glua_parser", version = "0.1.5" }
 glua_parser_desc = { path = "crates/glua_parser_desc", version = "0.1.5" }
 glua_diagnostic_macro = { path = "crates/glua_diagnostic_macro", version = "0.1.5" }
+glua_heap = { path = "crates/glua_heap", version = "0.1.5" }
 schema_to_glua = { path = "crates/schema_to_glua", version = "0.1.5" }
 
 # external
@@ -85,6 +86,7 @@ rustc-hash = "2"
 hashbrown = { version = "0.15", default-features = false }
 rayon = "1.11"
 stacker = "0.1"
+libc = "0.2"
 
 [profile.profiling]
 inherits = "release"

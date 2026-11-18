@@ -3,7 +3,7 @@
 static GLOBAL: dhat::Alloc = dhat::Alloc;
 
 #[cfg(not(feature = "dhat-heap"))]
-use mimalloc::MiMalloc;
+use glua_heap::MiMalloc;
 
 /// Report allocator counters for the phase just finished (no-op without
 /// `--features alloc-stats`).
@@ -627,6 +627,7 @@ async fn run() {
     };
     glua_code_analysis::set_analysis_threads(parallelism);
     eprintln!("Threads: {parallelism}");
+    eprintln!("Heap: {:?}", glua_heap::backing());
 
     // Phase 1: Config loading
     let t = Instant::now();

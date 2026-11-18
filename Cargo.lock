@@ -192,9 +192,9 @@ dependencies = [
  "emmy_lsp_types",
  "fern",
  "glua_code_analysis",
+ "glua_heap",
  "glua_parser",
  "log",
- "mimalloc",
  "serde",
  "serde_json",
  "tokio",
@@ -867,10 +867,10 @@ dependencies = [
  "emmy_lsp_types",
  "fern",
  "glua_code_analysis",
+ "glua_heap",
  "glua_parser",
  "glua_rowan",
  "log",
- "mimalloc",
  "serde",
  "serde_json",
  "tokio",
@@ -969,6 +969,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "glua_heap"
+version = "0.1.5"
+dependencies = [
+ "libc",
+ "mimalloc",
+]
+
+[[package]]
 name = "glua_ls"
 version = "0.1.5"
 dependencies = [
@@ -980,6 +988,7 @@ dependencies = [
  "fern",
  "glob",
  "glua_code_analysis",
+ "glua_heap",
  "glua_parser",
  "glua_parser_desc",
  "glua_rowan",
@@ -988,7 +997,6 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "lsp-server",
- "mimalloc",
  "notify",
  "rustc-hash 2.1.1",
  "serde",

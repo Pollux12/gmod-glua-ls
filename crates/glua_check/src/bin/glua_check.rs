@@ -1,6 +1,6 @@
 use clap::Parser;
 use glua_check::{cmd_args::CmdArgs, run_check};
-use mimalloc::MiMalloc;
+use glua_heap::MiMalloc;
 use std::error::Error;
 
 #[global_allocator]

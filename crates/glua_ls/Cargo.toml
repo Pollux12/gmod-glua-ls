@@ -45,7 +45,7 @@ rustc-hash.workspace = true
 workspace = true
 optional = true
 
-[dependencies.mimalloc]
+[dependencies.glua_heap]
 workspace = true
 optional = true
 
@@ -60,4 +60,4 @@ required-features = ["cli"]
 
 [features]
 default = ["cli"]
-cli = ["dep:clap", "dep:mimalloc"]
+cli = ["dep:clap", "dep:glua_heap"]
