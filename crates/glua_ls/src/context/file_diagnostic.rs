@@ -108,6 +108,7 @@ impl FileDiagnostic {
 
         info!("workspace loaded; language server is ready while diagnostics may continue");
         self.send_server_status("workspaceLoaded");
+        release_free_memory();
     }
 
     fn notify_startup_complete(&self) {
@@ -241,6 +242,14 @@ impl FileDiagnostic {
         } else {
             self.notify_startup_complete();
         }
+        release_free_memory();
+    }
+}
+
+/// Returns the heap pages the work just finished left free to the system.
+fn release_free_memory() {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn_blocking(glua_heap::collect_all);
     }
 }
 

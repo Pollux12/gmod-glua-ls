@@ -27,11 +27,20 @@ type CommitFn = unsafe extern "C" fn(
     arg: *mut c_void,
 ) -> bool;
 
+/// `mi_option_purge_delay`.
+const PURGE_DELAY: c_int = 15;
+/// Giving a range back punches a hole in the file, and taking it again
+/// allocates its blocks anew, so only ranges left free this long go back.
+const IDLE_BEFORE_PURGE_MS: std::ffi::c_long = 10_000;
+
 unsafe extern "C" {
+    fn mi_option_set(option: c_int, value: std::ffi::c_long);
     fn mi_manage_memory(
         start: *mut c_void,
         size: usize,
         is_committed: bool,
+        // mimalloc releases disagree on which of these is `is_pinned` and
+        // which `is_zero`; both are passed false.
         is_pinned: bool,
         is_zero: bool,
         numa_node: c_int,
@@ -70,7 +79,7 @@ extern "C" fn install() {
                 ARENA,
                 false,
                 false,
-                true,
+                false,
                 -1,
                 false,
                 commit,
@@ -86,6 +95,7 @@ extern "C" fn install() {
         if managed == 0 {
             libc::close(fd);
         } else {
+            mi_option_set(PURGE_DELAY, IDLE_BEFORE_PURGE_MS);
             INSTALLED.store(true, Relaxed);
         }
     }
@@ -131,10 +141,9 @@ unsafe fn map(fd: c_int) -> Option<*mut c_void> {
     }
 }
 
-/// Reserves the file's blocks under a range mimalloc is about to use, or
-/// gives them back with the pages over them. A range that cannot be reserved
-/// is refused, and mimalloc allocates elsewhere, so a full disk is never
-/// found by writing to the mapping.
+/// Reserves the file's blocks under a range mimalloc commits, or gives them
+/// back with the pages over them. A range that cannot be reserved is
+/// refused, and mimalloc allocates elsewhere.
 unsafe extern "C" fn commit(
     commit: bool,
     start: *mut c_void,

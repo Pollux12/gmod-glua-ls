@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 # local
 glua_code_analysis.workspace = true
+glua_heap.workspace = true
 glua_parser.workspace = true
 glua_parser_desc.workspace = true
 
@@ -45,9 +46,6 @@ rustc-hash.workspace = true
 workspace = true
 optional = true
 
-[dependencies.glua_heap]
-workspace = true
-optional = true
 
 [dev-dependencies]
 crossbeam-channel.workspace = true
@@ -60,4 +58,4 @@ required-features = ["cli"]
 
 [features]
 default = ["cli"]
-cli = ["dep:clap", "dep:glua_heap"]
+cli = ["dep:clap"]
