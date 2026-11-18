@@ -4,8 +4,8 @@ use glua_parser::{
 };
 
 use crate::{
-    DbIndex, GlobalId, InferFailReason, LuaDeclId, LuaInferCache, LuaInstanceType, LuaMemberId,
-    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
+    DbIndex, GlobalId, InferFailReason, LuaDeclId, LuaInferCache, LuaInstanceKind, LuaInstanceType,
+    LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
     compilation::analyzer::gmod::name_expr_resolves_to_scoped_authoring_table,
     semantic::{
         member::{
@@ -665,7 +665,12 @@ fn infer_instance_member_semantic_decl_by_member_key(
     let range = inst.get_range();
 
     let origin_type = inst.get_base();
-    let Some(next_guard) = semantic_guard.next_level() else {
+    let next_guard = if inst.get_kind() == LuaInstanceKind::Made {
+        semantic_guard.next_super_level()
+    } else {
+        semantic_guard.next_level()
+    };
+    let Some(next_guard) = next_guard else {
         return Ok(None);
     };
     let pending = match infer_member_semantic_decl_by_member_key(

@@ -2885,7 +2885,12 @@ fn has_dynamic_field_for_type_inner(
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => {
             let owner = crate::DynamicFieldOwner::Type(id.clone());
-            if index.has_field(&owner, field_name) || owner_wildcard_covers_any_field(db, &owner) {
+            let has_field = if direct_only {
+                index.has_direct_field(&owner, field_name)
+            } else {
+                index.has_field(&owner, field_name)
+            };
+            if has_field || owner_wildcard_covers_any_field(db, &owner) {
                 return true;
             }
             // Walk parent types: dynamic fields written on a parent class

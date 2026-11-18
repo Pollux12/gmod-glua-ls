@@ -1417,7 +1417,7 @@ fn dynamic_field_definitions_of(
             field_name,
             access_position,
             None,
-            false,
+            direct_only,
         ),
         LuaType::TableConst(table_range) => dynamic_field_definitions_for_table(
             db,

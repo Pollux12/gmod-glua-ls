@@ -7165,7 +7165,10 @@ function ents.Create(class) end
     }
 
     fn unguarded_child_messages(ws: &mut VirtualWorkspace, file_id: FileId) -> Vec<String> {
-        let code = DiagnosticCode::InferUnguardedChild;
+        messages(ws, file_id, DiagnosticCode::InferUnguardedChild)
+    }
+
+    fn messages(ws: &mut VirtualWorkspace, file_id: FileId, code: DiagnosticCode) -> Vec<String> {
         ws.analysis.diagnostic.enable_only(code);
         ws.analysis
             .diagnose_file(file_id, CancellationToken::new())
@@ -7190,6 +7193,24 @@ function ents.Create(class) end
         assert_eq!(
             ws.humanize_type(ws.local_ty(reader, "d")),
             ws.humanize_type(ws.local_ty(reader, "control"))
+        );
+    }
+
+    /// Reading a field another created entity was given is reported as
+    /// undefined, as a field no entity was given is.
+    #[test]
+    fn a_field_only_another_created_entity_was_given_is_undefined() {
+        let (mut ws, reader) = workspace(
+            "local a = ents.Create(\"prop_physics\")\na.OnlyA = 1\n",
+            "local b = ents.Create(\"prop_physics\")\nprint(b.OnlyA)\nprint(b.NeverWritten)\n",
+        );
+
+        assert_eq!(
+            messages(&mut ws, reader, DiagnosticCode::UndefinedField),
+            [
+                "Undefined field `OnlyA`. ",
+                "Undefined field `NeverWritten`. "
+            ]
         );
     }
 

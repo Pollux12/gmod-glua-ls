@@ -167,7 +167,8 @@ struct FindMembersContext {
     file_id: Option<FileId>,
     caller_position: Option<TextSize>,
     dynamic_fields: bool,
-    /// Whether the lookup reached the current class from one of its subclasses.
+    /// Whether the lookup reached the current class from one of its subclasses
+    /// or from an object a call made of it.
     inherited: bool,
 }
 
@@ -1093,7 +1094,14 @@ fn find_instance_members(
     }
 
     let origin_type = ctx.instantiate_type(db, inst.get_base());
-    if let Some(origin_members) = find_members_guard(db, &origin_type, ctx, filter) {
+    // An object a call made has the fields written on its class, not those
+    // the class's other objects were given.
+    let origin_ctx = if inst.get_kind() == crate::LuaInstanceKind::Made {
+        ctx.inherited()
+    } else {
+        ctx.clone()
+    };
+    if let Some(origin_members) = find_members_guard(db, &origin_type, &origin_ctx, filter) {
         members.extend(origin_members);
     }
 
