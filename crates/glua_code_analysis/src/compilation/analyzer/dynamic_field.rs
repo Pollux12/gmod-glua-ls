@@ -391,12 +391,14 @@ fn reach_target(
     })
 }
 
-/// What one write site files: the fields it writes on each owner, those
-/// propagated to the owners' super types, its wildcard definitions, its
+/// What one write site files: the fields it writes on each owner, those it
+/// writes on objects a call made (filed on the classes they were made of),
+/// those propagated to the owners' super types, its wildcard definitions, its
 /// finite-member evidence and the names it writes on no owner.
 #[derive(Default)]
 pub(super) struct SiteDynamicFields {
     named: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    made: Vec<CollectedField>,
     propagated: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
     wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
     finite: Vec<FiniteNamedMemberEvidence>,
@@ -562,7 +564,7 @@ fn collect_statement_fields(
                 .propagated
                 .extend(propagate_dynamic_fields_to_super_types(db, &per_call_bases));
         }
-        fields.propagated.extend(per_call_bases);
+        fields.made.extend(per_call_bases);
         fields.named.extend(target_named);
     }
 }
@@ -602,7 +604,7 @@ fn collect_call_fields(
             .propagated
             .extend(propagate_dynamic_fields_to_super_types(db, &per_call_bases));
     }
-    fields.propagated.extend(per_call_bases);
+    fields.made.extend(per_call_bases);
 }
 
 /// The view dynamic fields are collected under: the records this pass builds
@@ -653,6 +655,7 @@ pub(super) fn apply_site_dynamic_fields(
 ) {
     let SiteDynamicFields {
         named,
+        made,
         propagated,
         wildcards,
         finite,
@@ -666,6 +669,9 @@ pub(super) fn apply_site_dynamic_fields(
     }
     for (owner, field_name, _, range) in named {
         index.add_field(site, owner, field_name, range);
+    }
+    for (owner, field_name, _, range) in made {
+        index.add_made_field(site, owner, field_name, range);
     }
     for (owner, field_name, _, range) in propagated {
         index.add_propagated_field(site, owner, field_name, range);

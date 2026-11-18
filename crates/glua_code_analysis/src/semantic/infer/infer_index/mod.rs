@@ -2754,7 +2754,20 @@ fn infer_custom_type_member(
         }
     }
 
-    let resolve_dynamic_field = if table_member_lookup_guard.inherited {
+    // Read through one object a call made of the class, the class passes down
+    // the fields written on it, not those other objects' writes put there.
+    let through_made = table_member_lookup_guard
+        .instance
+        .as_ref()
+        .is_some_and(|instance| {
+            let is_class = |typ: &LuaType| matches!(typ, LuaType::Ref(_) | LuaType::Def(_));
+            instance.get_kind() == crate::LuaInstanceKind::Made
+                && match instance.get_base() {
+                    LuaType::Union(union) => union.types().all(is_class),
+                    base => is_class(base),
+                }
+        });
+    let resolve_dynamic_field = if table_member_lookup_guard.inherited || through_made {
         resolve_inherited_dynamic_field_member
     } else {
         resolve_dynamic_field_member

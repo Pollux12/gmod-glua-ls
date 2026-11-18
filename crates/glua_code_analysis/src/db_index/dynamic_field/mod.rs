@@ -113,9 +113,9 @@ pub struct DynamicFieldIndex {
     /// them. Keyed by index key, so two same-name writes in one file each own
     /// their record.
     unattributed_fields: CowShards<SmolStr, HashSet<InFiled<TextRange>>>,
-    /// field_name → the types that hold a direct definition of the name,
-    /// each with how many it holds, so tasks that each drop one merge to the
-    /// count left.
+    /// field_name → the types that hold a direct definition of the name or
+    /// one written on an object made of the type, each with how many it
+    /// holds, so tasks that each drop one merge to the count left.
     declaring_types: CowShards<SmolStr, HashMap<LuaTypeDeclId, u32>>,
     /// Write site → what its derivation filed, so retracting the site or
     /// removing its file visits only the owners it touched. Keyed by the
@@ -132,6 +132,8 @@ pub struct DynamicFieldIndex {
 struct SiteContributions {
     /// Definitions new to the union of direct and propagated definitions.
     named: Vec<(DynamicFieldOwner, SmolStr, TextRange)>,
+    /// Types a field is declared on by a write to an object made of them.
+    made: Vec<(LuaTypeDeclId, SmolStr, TextRange)>,
     wildcards: Vec<(DynamicFieldOwner, TextRange)>,
     finite: Vec<(DynamicFieldOwner, LuaMemberId)>,
     unattributed: Vec<(SmolStr, TextRange)>,
@@ -140,6 +142,7 @@ struct SiteContributions {
 impl SiteContributions {
     fn is_empty(&self) -> bool {
         self.named.is_empty()
+            && self.made.is_empty()
             && self.wildcards.is_empty()
             && self.finite.is_empty()
             && self.unattributed.is_empty()
@@ -152,6 +155,12 @@ impl std::hash::Hash for SiteContributions {
         self.named.len().hash(state);
         for (owner, field_name, range) in &self.named {
             owner.hash(state);
+            field_name.hash(state);
+            derivation::hash_local(range, state);
+        }
+        self.made.len().hash(state);
+        for (type_id, field_name, range) in &self.made {
+            type_id.hash(state);
             field_name.hash(state);
             derivation::hash_local(range, state);
         }
@@ -286,16 +295,7 @@ impl DynamicFieldIndex {
             .or_default();
         let is_new_direct = insert_definition(direct_definitions, definition);
         if is_new_direct && let DynamicFieldOwner::Type(type_id) = &owner {
-            let held = self
-                .declaring_types
-                .entry(field_name.clone())
-                .or_default()
-                .entry(type_id.clone())
-                .or_default();
-            *held += 1;
-            if *held == 1 {
-                derivation::note_write(|| FactKey::DynamicFieldName(field_name.clone()));
-            }
+            self.hold_declaring_type(type_id, &field_name);
         }
         let is_new_definition =
             self.add_field_inner(site, owner.clone(), field_name.clone(), range);
@@ -324,6 +324,60 @@ impl DynamicFieldIndex {
             self.add_field_inner(site, owner.clone(), field_name.clone(), range);
         self.settle_named(&owner, &field_name, old_slot);
         is_new_definition
+    }
+
+    /// [`Self::add_propagated_field`] for a definition written on an object a
+    /// call made of `owner`: the object's class declares the field, though
+    /// the class's other objects do not hold it.
+    pub fn add_made_field(
+        &mut self,
+        site: &InFiled<TextRange>,
+        owner: DynamicFieldOwner,
+        field_name: SmolStr,
+        range: TextRange,
+    ) -> bool {
+        let is_new_definition =
+            self.add_propagated_field(site, owner.clone(), field_name.clone(), range);
+        let DynamicFieldOwner::Type(type_id) = owner else {
+            return is_new_definition;
+        };
+        let declaration = (type_id, field_name, range);
+        if self.site_record(site).made.contains(&declaration) {
+            return is_new_definition;
+        }
+        self.hold_declaring_type(&declaration.0, &declaration.1);
+        self.site_record(site).made.push(declaration);
+        true
+    }
+
+    fn hold_declaring_type(&mut self, type_id: &LuaTypeDeclId, field_name: &SmolStr) {
+        let held = self
+            .declaring_types
+            .entry(field_name.clone())
+            .or_default()
+            .entry(type_id.clone())
+            .or_default();
+        *held += 1;
+        if *held == 1 {
+            derivation::note_write(|| FactKey::DynamicFieldName(field_name.clone()));
+        }
+    }
+
+    fn release_declaring_type(&mut self, type_id: &LuaTypeDeclId, field_name: &SmolStr) {
+        let Some(types) = self.declaring_types.get_mut(field_name.as_str()) else {
+            return;
+        };
+        let Some(held) = types.get_mut(type_id) else {
+            return;
+        };
+        *held -= 1;
+        if *held == 0 {
+            types.remove(type_id);
+            derivation::note_write(|| FactKey::DynamicFieldName(field_name.clone()));
+        }
+        if types.is_empty() {
+            self.declaring_types.remove(field_name.as_str());
+        }
     }
 
     fn add_field_inner(
@@ -424,6 +478,9 @@ impl DynamicFieldIndex {
         for (owner, field_name, range) in contributions.named {
             self.retract_named(file_id, &owner, &field_name, range);
         }
+        for (type_id, field_name, _) in contributions.made {
+            self.release_declaring_type(&type_id, &field_name);
+        }
         for (owner, range) in contributions.wildcards {
             let definition = InFiled::new(file_id, range);
             if let Some(definitions) = self.wildcard_definitions.get_mut(&owner) {
@@ -475,19 +532,8 @@ impl DynamicFieldIndex {
             field_name,
             &definition,
         );
-        if removed_direct
-            && let DynamicFieldOwner::Type(type_id) = owner
-            && let Some(types) = self.declaring_types.get_mut(field_name.as_str())
-            && let Some(held) = types.get_mut(type_id)
-        {
-            *held -= 1;
-            if *held == 0 {
-                types.remove(type_id);
-                derivation::note_write(|| FactKey::DynamicFieldName(field_name.clone()));
-            }
-            if types.is_empty() {
-                self.declaring_types.remove(field_name.as_str());
-            }
+        if removed_direct && let DynamicFieldOwner::Type(type_id) = owner {
+            self.release_declaring_type(type_id, field_name);
         }
         // Draining a definition is a novel fact for the slot's readers,
         // mirroring the signature index's removal tombstones.

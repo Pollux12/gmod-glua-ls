@@ -19,7 +19,7 @@ use crate::{
     CacheEntry, DbIndex, InFiled, LuaArrayType, LuaFunctionType, LuaGenericType, LuaInstanceKind,
     LuaInstanceType, LuaIntersectionType, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignature,
     LuaSignatureId, LuaTupleType, LuaType, LuaTypeDeclId, LuaTypeFlag, LuaUnionType,
-    ReturnTypeKind, TypeVisitTrait, VariadicType,
+    ReturnTypeKind, SignatureReturnStatus, TypeVisitTrait, VariadicType,
 };
 use crate::{GMOD_DOMAIN_CONVAR, GMOD_ROLE_REFERENCE, signature_copies_result};
 use crate::{GmodConVarKind, GmodLoadEdgeKind, GmodStateMask};
@@ -2473,8 +2473,10 @@ pub(crate) fn unwrapp_return_type(
             ));
         }
         LuaType::Instance(inst) => {
+            let declared = declares_instance_return(db, callee, inst);
             if inst.get_kind() != LuaInstanceKind::Shared
                 && !returned_value_is_fresh(db, callee, inst.get_range())
+                && !declared
             {
                 return Ok(return_type);
             }
@@ -2484,8 +2486,11 @@ pub(crate) fn unwrapp_return_type(
                     value: call_expr.get_range(),
                 };
 
-                let base = if matches!(inst.get_base(), LuaType::Instance(_))
-                    && !instance_has_installed_members(db, inst)
+                // A declared `(instance)` names no table of its own: each call's
+                // object is one of the class.
+                let base = if declared
+                    || matches!(inst.get_base(), LuaType::Instance(_))
+                        && !instance_has_installed_members(db, inst)
                 {
                     inst.get_base().clone()
                 } else {
@@ -2568,6 +2573,28 @@ fn returned_value_is_fresh(
             signature
                 .fresh_returned_values()
                 .contains(&(range.value - callee.get_position()))
+        })
+}
+
+/// Whether `callee` declares `instance` with `---@return (instance)`: each of
+/// its calls returns a new object.
+fn declares_instance_return(
+    db: &DbIndex,
+    callee: Option<LuaSignatureId>,
+    instance: &LuaInstanceType,
+) -> bool {
+    callee
+        .and_then(|callee| db.get_signature_index().get(&callee))
+        .filter(|signature| signature.resolve_return == SignatureReturnStatus::DocResolve)
+        .is_some_and(|signature| {
+            signature.return_docs.iter().any(|doc| {
+                let mut declared = false;
+                TypeVisitTrait::visit_type(&doc.type_ref, &mut |typ| {
+                    declared |= matches!(typ, LuaType::Instance(declared_instance)
+                        if declared_instance.get_range() == instance.get_range());
+                });
+                declared
+            })
         })
 }
 
