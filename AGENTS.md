@@ -13,6 +13,7 @@
 - `crates/glua_ls`: LSP server and handlers. Consume analyzer APIs; do not reimplement analysis.
 - `crates/glua_parser`, `crates/glua_parser_desc`: parser, AST, syntax APIs.
 - `crates/glua_check`: CLI diagnostics runner; preferred corpus entry point.
+- `crates/glua_heap`: the binaries' allocator (mimalloc). On Linux the heap is an unlinked file mapped shared, set up before `main`; `GLUALS_HEAP_DIR` picks its directory or, as `off`, keeps it in anonymous memory.
 - `crates/glua_doc_cli`, `crates/schema_to_glua`, `tools/schema_json_gen`: docs and schema tooling.
 - `tools/benchmark`: large-workspace benchmark (`BENCH_CODEBASE` + `BENCH_ANNOTATIONS` required).
 - `tools/determinism`: determinism harness (`DET_CODEBASE` + `DET_ANNOTATIONS` required).
