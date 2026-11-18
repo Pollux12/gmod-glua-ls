@@ -1091,6 +1091,61 @@ Proxy = setmetatable({}, { __index = function(t, k) return Base[k] end })
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![proxy]);
     }
 
+    const PANELS: &str = "gamemodes/cityrp/gamemode/core/sh_panels.lua";
+    const PANELS_TEXT: &str = "---@class Panel
+---@class DFrame: Panel
+---@field GetTitle fun(self: DFrame): string
+";
+    const ELEMENTS: &str = "gamemodes/cityrp/gamemode/core/derma/cl_elements.lua";
+    const ELEMENTS_TEXT: &str = "local PANEL = {}
+AccessorFunc(PANEL, \"m_sTitle\", \"Title\")
+vgui.Register(\"MCategory\", PANEL, \"Panel\")
+";
+    const SKIN: &str = "gamemodes/cityrp/gamemode/core/cl_skin.lua";
+    const SKIN_TEXT: &str = "---@param panel Panel
+local function PaintFrame(panel)
+    local title = panel:GetTitle()
+    print(panel)
+end
+";
+
+    /// A panel parameter calling a method only some panel classes have reads
+    /// as those classes; a shift in the file registering one of them leaves
+    /// the guess as it is.
+    #[test]
+    fn a_shift_in_a_file_registering_a_guessed_panel_re_runs_nothing_in_the_guess() {
+        let mut ws = VirtualWorkspace::new();
+        gmod(&mut ws);
+        ws.def_files(vec![
+            (PANELS, PANELS_TEXT),
+            (ELEMENTS, ELEMENTS_TEXT),
+            (SKIN, SKIN_TEXT),
+        ]);
+
+        let elements = ws.def_file(ELEMENTS, &format!("\n{ELEMENTS_TEXT}"));
+
+        assert_eq!(
+            ws.analysis.compilation.last_evaluated_files(),
+            vec![elements]
+        );
+    }
+
+    /// Renaming the registered class reaches the guess.
+    #[test]
+    fn renaming_a_guessed_panel_re_runs_the_guess() {
+        let ws = VirtualWorkspace::assert_warm_matches_cold(
+            gmod,
+            &[
+                (PANELS, PANELS_TEXT),
+                (ELEMENTS, ELEMENTS_TEXT),
+                (SKIN, SKIN_TEXT),
+            ],
+            &[(ELEMENTS, &ELEMENTS_TEXT.replace("MCategory", "MCollapse"))],
+        );
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files().len(), 2);
+    }
+
     /// A call of a function that forwards its class name to `vgui.Create` gets
     /// that class, found at the create call in the function; a shift above the
     /// function moves the call without changing what it creates.
