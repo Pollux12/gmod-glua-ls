@@ -9,6 +9,7 @@ glua_code_analysis.workspace = true
 glua_parser.workspace = true
 
 dhat = { version = "0.3.3", optional = true }
+backtrace = { version = "0.3", optional = true }
 tokio.workspace = true
 tokio-util.workspace = true
 log.workspace = true
@@ -22,6 +23,7 @@ chrono.workspace = true
 [features]
 dhat-heap = ["dep:dhat"]
 alloc-stats = []
+alloc-sample = ["alloc-stats", "dep:backtrace"]
 
 [[bin]]
 name = "benchmark"
