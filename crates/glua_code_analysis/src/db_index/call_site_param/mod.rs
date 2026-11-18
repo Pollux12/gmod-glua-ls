@@ -19,8 +19,21 @@ use crate::{
 pub struct CallSiteParamContribution {
     pub signature_id: LuaSignatureId,
     pub param_idx: usize,
+    pub param_use: ParamUse,
     pub param_fact: Option<LuaTypeFact>,
 }
+
+/// What evidence says of a parameter: the value it is passed, or one
+/// argument a call of the function it holds passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ParamUse {
+    Value,
+    CalledWith(usize),
+}
+
+/// A call passing a parameter's function the argument `arg_idx` of type
+/// `fact`.
+pub type ParamCall = (LuaSignatureId, usize, usize, LuaTypeFact);
 
 struct CallSiteParamAccumulator {
     first_fact: LuaTypeFact,
@@ -66,7 +79,7 @@ impl CallSiteParamAccumulator {
     }
 }
 
-type ParamSlot = (LuaSignatureId, usize);
+type ParamSlot = (LuaSignatureId, usize, ParamUse);
 
 /// Where a file's evidence comes from: one call, or its callback receivers.
 /// Ordered as a walk of the tree meets the calls (by start, the outer of two
@@ -117,8 +130,8 @@ pub struct CallSiteParamIndex {
     file_contributions: CowShards<FileId, Arc<FileEvidence>>,
     /// parameter → the sources contributing evidence for it.
     contributors: CowShards<ParamSlot, BTreeSet<(FileId, EvidenceSource)>>,
-    /// signature → param index → the folded fact.
-    inferred_params: CowShards<LuaSignatureId, HashMap<usize, LuaTypeFact>>,
+    /// signature → param index and use → the folded fact.
+    inferred_params: CowShards<LuaSignatureId, HashMap<(usize, ParamUse), LuaTypeFact>>,
     /// file → the other files whose evidence names one of its identities: a
     /// callee signature, or a table, signature or node its types and
     /// provenance name.
@@ -130,13 +143,29 @@ impl CallSiteParamIndex {
         Self::default()
     }
 
-    /// Replaces the evidence the call at `range` of `file_id` contributes.
+    /// Replaces the evidence the call at `range` of `file_id` contributes:
+    /// what it passes parameters, and what it passes the functions
+    /// parameters hold.
     pub fn set_call_contributions(
         &mut self,
         file_id: FileId,
         range: TextRange,
         contributions: Vec<(LuaSignatureId, usize, Option<LuaTypeFact>)>,
+        calls: Vec<ParamCall>,
     ) {
+        let mut contributions = values(contributions);
+        contributions.extend(
+            calls
+                .into_iter()
+                .map(
+                    |(signature_id, param_idx, arg_idx, fact)| CallSiteParamContribution {
+                        signature_id,
+                        param_idx,
+                        param_use: ParamUse::CalledWith(arg_idx),
+                        param_fact: Some(fact),
+                    },
+                ),
+        );
         self.set_source(file_id, EvidenceSource::call(range), contributions);
     }
 
@@ -146,14 +175,14 @@ impl CallSiteParamIndex {
         file_id: FileId,
         contributions: Vec<(LuaSignatureId, usize, Option<LuaTypeFact>)>,
     ) {
-        self.set_source(file_id, EvidenceSource::Callbacks, contributions);
+        self.set_source(file_id, EvidenceSource::Callbacks, values(contributions));
     }
 
     fn set_source(
         &mut self,
         file_id: FileId,
         source: EvidenceSource,
-        contributions: Vec<(LuaSignatureId, usize, Option<LuaTypeFact>)>,
+        contributions: Vec<CallSiteParamContribution>,
     ) {
         derivation::note_write(|| source.fact_key(file_id));
         let mut slots = self.take_source(file_id, source);
@@ -162,18 +191,8 @@ impl CallSiteParamIndex {
             return;
         }
         derivation::note_write(|| FactKey::CallSiteFile(file_id));
-        let contributions = contributions
-            .into_iter()
-            .map(
-                |(signature_id, param_idx, param_fact)| CallSiteParamContribution {
-                    signature_id,
-                    param_idx,
-                    param_fact,
-                },
-            )
-            .collect::<Vec<_>>();
         for contribution in &contributions {
-            let slot = (contribution.signature_id, contribution.param_idx);
+            let slot = contribution.slot();
             self.contributors
                 .entry(slot)
                 .or_default()
@@ -283,7 +302,7 @@ impl CallSiteParamIndex {
     ) -> HashSet<ParamSlot> {
         let mut slots = HashSet::default();
         for contribution in contributions {
-            let slot = (contribution.signature_id, contribution.param_idx);
+            let slot = contribution.slot();
             if let Some(sources) = self.contributors.get_mut(&slot) {
                 sources.remove(&(file_id, source));
                 if sources.is_empty() {
@@ -307,7 +326,7 @@ impl CallSiteParamIndex {
                     .into_iter()
                     .filter_map(move |index| index.inferred_params.get(&signature_id))
                     .flat_map(|params| params.keys().copied())
-                    .map(move |param_idx| (signature_id, param_idx))
+                    .map(move |(param_idx, param_use)| (signature_id, param_idx, param_use))
             })
             .chain(
                 self.contributors
@@ -341,7 +360,7 @@ impl CallSiteParamIndex {
                 .filter_map(|index| index.file_contributions.get(&file_id))
             {
                 for contribution in held.sources.values().flatten() {
-                    let slot = (contribution.signature_id, contribution.param_idx);
+                    let slot = contribution.slot();
                     let other_changed = [self, frozen]
                         .into_iter()
                         .filter_map(|index| index.contributors.get(&slot))
@@ -359,22 +378,15 @@ impl CallSiteParamIndex {
     /// Re-folds `slots` from their contributors' evidence, in file order and
     /// then source order.
     fn refold(&mut self, slots: HashSet<ParamSlot>) {
-        for (signature_id, param_idx) in slots {
-            derivation::note_write(|| FactKey::Contrib(signature_id, param_idx));
+        for slot in slots {
+            let (signature_id, param_idx, param_use) = slot;
+            derivation::note_write(|| slot_fact_key(slot));
             let mut accumulator: Option<CallSiteParamAccumulator> = None;
             let mut complete = true;
-            for (file_id, source) in self
-                .contributors
-                .get(&(signature_id, param_idx))
-                .into_iter()
-                .flatten()
-            {
+            for (file_id, source) in self.contributors.get(&slot).into_iter().flatten() {
                 for contribution in self.file_contributions[file_id].sources[source]
                     .iter()
-                    .filter(|contribution| {
-                        contribution.signature_id == signature_id
-                            && contribution.param_idx == param_idx
-                    })
+                    .filter(|contribution| contribution.slot() == slot)
                 {
                     let Some(fact) = &contribution.param_fact else {
                         complete = false;
@@ -391,11 +403,11 @@ impl CallSiteParamIndex {
                     self.inferred_params
                         .entry(signature_id)
                         .or_default()
-                        .insert(param_idx, accumulator.finish());
+                        .insert((param_idx, param_use), accumulator.finish());
                 }
                 None => {
                     if let Some(params) = self.inferred_params.get_mut(&signature_id) {
-                        params.remove(&param_idx);
+                        params.remove(&(param_idx, param_use));
                         if params.is_empty() {
                             self.inferred_params.remove(&signature_id);
                         }
@@ -445,7 +457,11 @@ impl CallSiteParamIndex {
                                 .inspect(|_| moved = true)
                                 .unwrap_or_else(|| fact.clone())
                         });
-                        (signature_id, contribution.param_idx, param_fact)
+                        CallSiteParamContribution {
+                            signature_id,
+                            param_fact,
+                            ..contribution.clone()
+                        }
                     })
                     .collect::<Vec<_>>();
                 if lost {
@@ -470,7 +486,8 @@ impl CallSiteParamIndex {
             .flat_map(|(signature_id, params)| {
                 params
                     .iter()
-                    .map(move |(param_idx, fact)| (signature_id, *param_idx, fact))
+                    .filter(|((_, param_use), _)| *param_use == ParamUse::Value)
+                    .map(move |((param_idx, _), fact)| (signature_id, *param_idx, fact))
             })
     }
 
@@ -505,7 +522,8 @@ impl CallSiteParamIndex {
     /// Whether any call or callback receiver contributed evidence for the parameter, typed or not.
     pub fn has_param_evidence(&self, signature_id: &LuaSignatureId, param_idx: usize) -> bool {
         derivation::note_read(|| FactKey::Contrib(*signature_id, param_idx));
-        self.contributors.contains_key(&(*signature_id, param_idx))
+        self.contributors
+            .contains_key(&(*signature_id, param_idx, ParamUse::Value))
     }
 
     fn inferred_param(
@@ -515,7 +533,29 @@ impl CallSiteParamIndex {
     ) -> Option<&LuaTypeFact> {
         self.inferred_params
             .get(signature_id)
-            .and_then(|params| params.get(&param_idx))
+            .and_then(|params| params.get(&(param_idx, ParamUse::Value)))
+    }
+
+    /// What calls elsewhere pass the function the parameter holds, by
+    /// argument position.
+    pub fn param_calls(
+        &self,
+        signature_id: &LuaSignatureId,
+        param_idx: usize,
+    ) -> Vec<(usize, &LuaTypeFact)> {
+        derivation::note_read(|| FactKey::ParamCalls(*signature_id, param_idx));
+        let mut calls = self
+            .inferred_params
+            .get(signature_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|((called, param_use), fact)| match param_use {
+                ParamUse::CalledWith(arg_idx) if *called == param_idx => Some((*arg_idx, fact)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        calls.sort_unstable_by_key(|(arg_idx, _)| *arg_idx);
+        calls
     }
 
     /// The inference events `file_id`'s own evidence carries, each with the
@@ -529,7 +569,12 @@ impl CallSiteParamIndex {
         let Some(held) = self.file_contributions.get(&file_id) else {
             return events;
         };
-        for contribution in held.sources.values().flatten() {
+        for contribution in held
+            .sources
+            .values()
+            .flatten()
+            .filter(|contribution| contribution.param_use == ParamUse::Value)
+        {
             let Some(fact) =
                 self.get_inferred_param_fact(&contribution.signature_id, contribution.param_idx)
             else {
@@ -563,15 +608,32 @@ impl CallSiteParamIndex {
     pub(crate) fn fact_fingerprint(&self, key: &FactKey) -> Fingerprint {
         match key {
             FactKey::Contrib(signature_id, param_idx) => {
-                if self.contributors.contains_key(&(*signature_id, *param_idx)) {
-                    derivation::fingerprint_of(
-                        &self
-                            .inferred_params
-                            .get(signature_id)
-                            .and_then(|params| params.get(param_idx)),
-                    )
+                if self
+                    .contributors
+                    .contains_key(&(*signature_id, *param_idx, ParamUse::Value))
+                {
+                    derivation::fingerprint_of(&self.inferred_param(signature_id, *param_idx))
                 } else {
                     derivation::ABSENT
+                }
+            }
+            FactKey::ParamCalls(signature_id, param_idx) => {
+                let calls = self
+                    .inferred_params
+                    .get(signature_id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|((called, param_use), fact)| match param_use {
+                        ParamUse::CalledWith(arg_idx) if called == param_idx => {
+                            Some((*arg_idx, fact))
+                        }
+                        _ => None,
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                if calls.is_empty() {
+                    derivation::ABSENT
+                } else {
+                    derivation::fingerprint_of(&calls)
                 }
             }
             FactKey::CallSiteParam(site) => derivation::fingerprint_opt(
@@ -628,8 +690,8 @@ impl LuaIndex for CallSiteParamIndex {
     }
 
     fn clear(&mut self) {
-        for (signature_id, param_idx) in self.contributors.keys() {
-            derivation::note_write(|| FactKey::Contrib(*signature_id, *param_idx));
+        for slot in self.contributors.keys() {
+            derivation::note_write(|| slot_fact_key(*slot));
         }
         for (file_id, held) in self.file_contributions.iter() {
             derivation::note_write(|| FactKey::CallSiteFile(*file_id));
@@ -642,6 +704,37 @@ impl LuaIndex for CallSiteParamIndex {
         self.inferred_params.clear();
         self.referencing.clear();
     }
+}
+
+impl CallSiteParamContribution {
+    fn slot(&self) -> ParamSlot {
+        (self.signature_id, self.param_idx, self.param_use)
+    }
+}
+
+/// The fact readers of `slot` read.
+fn slot_fact_key((signature_id, param_idx, param_use): ParamSlot) -> FactKey {
+    match param_use {
+        ParamUse::Value => FactKey::Contrib(signature_id, param_idx),
+        ParamUse::CalledWith(_) => FactKey::ParamCalls(signature_id, param_idx),
+    }
+}
+
+/// Evidence for what parameters are passed.
+fn values(
+    contributions: Vec<(LuaSignatureId, usize, Option<LuaTypeFact>)>,
+) -> Vec<CallSiteParamContribution> {
+    contributions
+        .into_iter()
+        .map(
+            |(signature_id, param_idx, param_fact)| CallSiteParamContribution {
+                signature_id,
+                param_idx,
+                param_use: ParamUse::Value,
+                param_fact,
+            },
+        )
+        .collect()
 }
 
 /// The files other than `file_id` that its evidence names.

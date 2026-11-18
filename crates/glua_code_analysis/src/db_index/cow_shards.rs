@@ -131,6 +131,7 @@ file_keys! {
     LuaDefinitionId => |key| key.file_id();
     DerivationId => |key| key.file_id;
     (LuaSignatureId, usize) => |key| key.0.get_file_id();
+    (LuaSignatureId, usize, super::call_site_param::ParamUse) => |key| key.0.get_file_id();
     (FileId, rowan::TextSize) => |key| key.0;
     (FileId, rowan::TextRange) => |key| key.0;
     (LuaTypeDeclId, FileId, rowan::TextRange) => |key| key.1;

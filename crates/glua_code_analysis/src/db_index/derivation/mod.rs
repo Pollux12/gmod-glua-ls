@@ -293,6 +293,9 @@ pub enum FactKey {
     ReceiverOutParam(SmolStr),
     /// A call-site-inferred parameter of a callee.
     Contrib(LuaSignatureId, usize),
+    /// The arguments calls elsewhere pass a callee's parameter, through the
+    /// tables holding it.
+    ParamCalls(LuaSignatureId, usize),
     /// The call-site parameter evidence one file holds, every call's and its
     /// callback receivers'.
     CallSiteFile(FileId),
@@ -727,6 +730,7 @@ impl FactKey {
                 | K::MemberOwnerExprKeys(_)
                 | K::MemberOwnerFields(_)
                 | K::Contrib(..)
+                | K::ParamCalls(..)
                 | K::CallSiteFile(_)
                 | K::CallSiteParam(_)
                 | K::CallSiteCallbacks(_)
@@ -785,6 +789,7 @@ impl FactKey {
                 | K::DynamicFieldWildcards(_)
                 | K::DynamicFieldFinite(_)
                 | K::Contrib(..)
+                | K::ParamCalls(..)
                 | K::CallRole(_)
                 | K::GmodRealm(_)
                 | K::GmodLoadFile(_)
@@ -909,6 +914,7 @@ impl FactKey {
             | K::ValidGuard(signature_id)
             | K::InferredGuard(signature_id)
             | K::Contrib(signature_id, _)
+            | K::ParamCalls(signature_id, _)
             | K::ReceiverAuthority(signature_id)
             | K::CallbackParams(signature_id)
             | K::CallRole(CallRoleKey::Signature(signature_id)) => Some(signature_id.get_file_id()),

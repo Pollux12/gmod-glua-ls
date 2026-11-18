@@ -13,13 +13,13 @@ use crate::{
 };
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,
-    LuaIfStat, LuaIndexKey, LuaLocalFuncStat, LuaNameExpr, LuaReturnStat, LuaTableExpr,
-    LuaTableField, LuaVarExpr, PathTrait,
+    LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat, LuaNameExpr, LuaReturnStat,
+    LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use rowan::{TextRange, TextSize};
 
-use crate::db_index::QueryFamily;
 use crate::db_index::derivation::{DerivationKind, FactKey};
+use crate::db_index::{ParamCall, QueryFamily};
 use glua_parser::LuaSyntaxId;
 
 use super::{
@@ -171,6 +171,7 @@ pub(super) fn derive_call_site_param(
         call_reach: Some(CallReach::new(&call_expr)),
         ..CallScope::default()
     };
+    let calls = collect_param_calls(db, cache, &mut scope, file_id, &call_expr);
     collect_call_site_param_types(
         db,
         cache,
@@ -180,7 +181,7 @@ pub(super) fn derive_call_site_param(
         &mut contributions,
     );
     db.get_call_site_param_index_mut()
-        .set_call_contributions(file_id, range, contributions);
+        .set_call_contributions(file_id, range, contributions, calls);
 }
 
 /// What the named vgui callbacks of `file_id` receive, which is decided by
@@ -1253,6 +1254,26 @@ fn callback_args(db: &DbIndex, callee_signature_id: LuaSignatureId) -> Vec<Callb
         {
             continue;
         }
+        for (arg_idx, fact) in db
+            .get_call_site_param_index()
+            .param_calls(&callee_signature_id, param_idx)
+        {
+            let Some(step) = fact.provenance().first() else {
+                continue;
+            };
+            let kind = if fact.confidence() >= LuaInferenceConfidence::Certain {
+                LuaInferenceProvenanceKind::ConcreteValue
+            } else {
+                step.event.kind
+            };
+            args.push(CallbackArg {
+                param_idx,
+                arg_idx,
+                source: step.event.source.clone(),
+                typ: fact.typ().clone(),
+                kind,
+            });
+        }
         let callee_param_decl_id = LuaDeclId::new(source_file_id, callee_param.get_position());
         let Some(references) = source_refs.get_decl_references(&callee_param_decl_id) else {
             continue;
@@ -1291,16 +1312,9 @@ fn callback_args(db: &DbIndex, callee_signature_id: LuaSignatureId) -> Vec<Callb
                     .and_then(|arg_type| snapshot_table_type(db, &arg_type));
                 let typed = match snapshot {
                     Some(typ) => Some((typ, LuaInferenceProvenanceKind::ConcreteValue)),
-                    None => infer_call_site_arg_value(
-                        db,
-                        &mut cache,
-                        &mut scope,
-                        source_file_id,
-                        callback_arg,
-                        false,
-                    )
-                    .filter(|(typ, _)| !holds_table_const(typ))
-                    .map(|(typ, kind)| (crate::widen_literal_type_for_assignment(&typ), kind)),
+                    None => {
+                        callback_arg_type(db, &mut cache, &mut scope, source_file_id, callback_arg)
+                    }
                 };
                 let Some((typ, kind)) = typed else {
                     continue;
@@ -1338,6 +1352,39 @@ fn callback_args(db: &DbIndex, callee_signature_id: LuaSignatureId) -> Vec<Callb
     args
 }
 
+/// What a call passes a callback for `arg`: what a call-site argument holds,
+/// or what a name or field the caller does not hold in a local infers to,
+/// which stays contextual unless it is certain.
+fn callback_arg_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    scope: &mut CallScope,
+    file_id: FileId,
+    arg: LuaExpr,
+) -> Option<(LuaType, LuaInferenceProvenanceKind)> {
+    infer_call_site_arg_value(db, cache, scope, file_id, arg.clone(), false)
+        .or_else(|| {
+            let arg = unparenthesized(arg);
+            if !matches!(arg, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)) {
+                return None;
+            }
+            let fact = crate::semantic::infer_expr_fact_with_cache(db, cache, arg);
+            let typ = fact.typ();
+            let kind = if fact.confidence() >= LuaInferenceConfidence::Certain {
+                LuaInferenceProvenanceKind::ConcreteValue
+            } else {
+                LuaInferenceProvenanceKind::ContextualUnknown
+            };
+            (!typ.is_unknown()
+                && !typ.is_any()
+                && !typ.is_never()
+                && !matches!(typ, LuaType::Variadic(_)))
+            .then(|| (typ.clone(), kind))
+        })
+        .filter(|(typ, _)| !holds_table_const(typ))
+        .map(|(typ, kind)| (crate::widen_literal_type_for_assignment(&typ), kind))
+}
+
 /// The call that calls the function `name_expr` reads, and the first of its
 /// arguments the function receives: a call of it, or a call passing it where
 /// the callee calls it with its own varargs, as `pcall(f, ...)` does.
@@ -1358,13 +1405,152 @@ fn call_of_callback(
     let arg_idx = arg_list
         .get_args()
         .position(|arg| arg.syntax() == name_expr.syntax())?;
+    forwarded_arg(db, cache, &call, arg_idx).map(|first_arg| (call, first_arg))
+}
+
+/// The first argument of `call` its callee passes to the function argument
+/// `arg_idx`, when the callee calls that function with its own varargs.
+fn forwarded_arg(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call: &LuaCallExpr,
+    arg_idx: usize,
+) -> Option<usize> {
     let Ok(LuaType::Signature(callee)) = infer_expr(db, cache, call.get_prefix_expr()?) else {
         return None;
     };
     let signature = db.get_signature_index().get(&callee)?;
     let param_idx = call_arg_to_param_index(signature, call.is_colon_call(), arg_idx)?;
     let varargs_idx = forwarded_varargs(signature, param_idx)?;
-    Some((call, arg_idx + varargs_idx - param_idx))
+    Some(arg_idx + varargs_idx - param_idx)
+}
+
+/// What `call` passes the function a parameter holds when it calls that
+/// function through the table field the parameter was stored in, as a
+/// registry does: `stored[name] = { callback = callback }` and later
+/// `stored[name].callback(...)` or `pcall(stored[name].callback, ...)`.
+fn collect_param_calls(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    scope: &mut CallScope,
+    file_id: FileId,
+    call: &LuaCallExpr,
+) -> Vec<ParamCall> {
+    let Some(args) = call.get_args_list() else {
+        return Vec::new();
+    };
+    let args = args.get_args().collect::<Vec<_>>();
+    let called = match call.get_prefix_expr() {
+        Some(LuaExpr::IndexExpr(field)) => Some((field, 0)),
+        _ => args
+            .iter()
+            .enumerate()
+            .find_map(|(arg_idx, arg)| match arg {
+                LuaExpr::IndexExpr(field) => forwarded_arg(db, cache, call, arg_idx)
+                    .map(|first_arg| (field.clone(), first_arg)),
+                _ => None,
+            }),
+    };
+    let Some((field, first_arg)) = called else {
+        return Vec::new();
+    };
+    // A field holding a known function is a callee of its own; what a
+    // parameter stores is unknown until its callers are seen.
+    let holds_unknown = infer_expr(db, cache, LuaExpr::IndexExpr(field.clone()))
+        .is_ok_and(|typ| crate::semantic::remove_false_or_nil(typ).is_unknown());
+    if !holds_unknown {
+        return Vec::new();
+    }
+    let Some((signature_id, param_idx)) = param_stored_in(db, cache, field) else {
+        return Vec::new();
+    };
+    let Ok(node_param_idx) = u16::try_from(param_idx) else {
+        return Vec::new();
+    };
+    args.into_iter()
+        .skip(first_arg)
+        .enumerate()
+        .filter_map(|(arg_idx, arg)| {
+            let source = InFiled::new(file_id, arg.get_syntax_id());
+            let (typ, kind) = callback_arg_type(db, cache, scope, file_id, arg)?;
+            let confidence = if kind == LuaInferenceProvenanceKind::ConcreteValue {
+                LuaInferenceConfidence::Certain
+            } else {
+                LuaInferenceConfidence::Anchored
+            };
+            let event = LuaInferenceEventId {
+                node: LuaInferenceNodeId::SignatureParam {
+                    signature_id,
+                    param_idx: node_param_idx,
+                },
+                kind,
+                source,
+            };
+            let fact = LuaTypeFact::new(
+                typ.clone(),
+                confidence,
+                Arc::from([LuaInferenceStep {
+                    event,
+                    support: Arc::from([]),
+                    inferred_type: Some(Arc::new(typ)),
+                    found_type: None,
+                }]),
+            );
+            Some((signature_id, param_idx, arg_idx, fact))
+        })
+        .collect()
+}
+
+/// The parameter whose value the field `field` reads was written from: an
+/// undocumented one its function never reassigns, stored by a table field
+/// or an assignment.
+fn param_stored_in(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    field: LuaIndexExpr,
+) -> Option<(LuaSignatureId, usize)> {
+    let Some(LuaSemanticDeclId::Member(member_id)) = infer_expr_semantic_decl(
+        db,
+        cache,
+        LuaExpr::IndexExpr(field),
+        Default::default(),
+        Default::default(),
+    ) else {
+        return None;
+    };
+    let member_file_id = member_id.file_id;
+    let syntax_id = *member_id.get_syntax_id();
+    let tree = db
+        .get_vfs()
+        .syntax_tree_around(&member_file_id, syntax_id.get_range())?;
+    let node = syntax_id.to_node_from_root(&tree.get_red_root())?;
+    let value = if let Some(table_field) = LuaTableField::cast(node.clone()) {
+        table_field.get_value_expr()?
+    } else {
+        let target = LuaVarExpr::cast(node.clone())?;
+        let assign = node.parent().and_then(LuaAssignStat::cast)?;
+        let (vars, exprs) = assign.get_var_and_expr_list();
+        let position = vars
+            .iter()
+            .position(|var| var.syntax() == target.syntax())?;
+        exprs.get(position)?.clone()
+    };
+    let LuaExpr::NameExpr(name) = value else {
+        return None;
+    };
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&member_file_id, name.get_range())?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let LuaDeclExtra::Param {
+        idx, signature_id, ..
+    } = &decl.extra
+    else {
+        return None;
+    };
+    let signature = db.get_signature_index().get_declared(signature_id)?;
+    (!signature.param_docs.contains_key(idx) && !is_param_mutated(db, *signature_id, *idx))
+        .then_some((*signature_id, *idx))
 }
 
 /// The parameter holding the varargs `signature` calls its function

@@ -2901,4 +2901,137 @@ end)
             ("integer".to_string(), "string".to_string())
         );
     }
+
+    const REGISTRY_TYPES: &str = "---@meta
+---@class RegistryPlayer
+";
+    const REGISTRY: &str = r#"
+cmds = cmds or {}
+cmds.stored = cmds.stored or {}
+function cmds.add(name, callback)
+    cmds.stored[name] = { access = 1, callback = callback }
+end
+"#;
+    const DISPATCH: &str = r#"
+---@param who RegistryPlayer
+---@param list string[]
+function cmds.run(name, who, list)
+    pcall(cmds.stored[name].callback, who, list)
+end
+"#;
+    const COMMAND: &str = r#"
+cmds.add("kick", function(who, list)
+    local target = who
+    local words = list
+end)
+"#;
+    const REGISTRY_FILES: [(&str, &str); 4] = [
+        ("lua/includes/registry_types.lua", REGISTRY_TYPES),
+        ("lua/autorun/sh_registry.lua", REGISTRY),
+        ("lua/autorun/sh_dispatch.lua", DISPATCH),
+        ("lua/autorun/sh_command.lua", COMMAND),
+    ];
+
+    fn registry_param_types(ws: &VirtualWorkspace) -> (String, String) {
+        let command = ws
+            .analysis
+            .get_file_id(&ws.virtual_url_generator.new_uri(REGISTRY_FILES[3].0))
+            .expect("command file");
+        (
+            ws.humanize_type(ws.local_ty(command, "target")),
+            ws.humanize_type(ws.local_ty(command, "words")),
+        )
+    }
+
+    /// A closure registered in a table takes what the code calling it out of
+    /// the table passes, through `pcall`.
+    #[test]
+    fn a_registered_closure_takes_what_its_registry_calls_it_with() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_files(REGISTRY_FILES.to_vec());
+
+        assert_eq!(
+            registry_param_types(&ws),
+            ("RegistryPlayer".to_string(), "string[]".to_string())
+        );
+    }
+
+    /// A function stored directly under a key takes what a call of that key
+    /// passes.
+    #[test]
+    fn a_function_stored_under_a_key_takes_what_a_call_of_the_key_passes() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "lua/autorun/sh_plain.lua",
+            r#"
+Handlers = {}
+function On(name, handler)
+    Handlers[name] = handler
+end
+function Emit(name)
+    Handlers[name](42)
+end
+On("tick", function(who)
+    local count = who
+end)
+Emit("tick")
+"#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file, "count")), "integer");
+    }
+
+    /// Edits to the registry, the code calling through it and a registering
+    /// file each settle as a cold build.
+    #[test]
+    fn registry_edits_settle_as_a_cold_build() {
+        let setup = |ws: &mut VirtualWorkspace| ws.analysis.init_std_lib();
+        for (path, text) in [
+            (
+                REGISTRY_FILES[1].0,
+                "
+-- moved
+"
+                .to_string()
+                    + REGISTRY,
+            ),
+            (
+                REGISTRY_FILES[2].0,
+                DISPATCH.replace(
+                    "who, list)
+end",
+                    "who)
+end",
+                ),
+            ),
+            (
+                REGISTRY_FILES[3].0,
+                "
+"
+                .to_string()
+                    + COMMAND,
+            ),
+        ] {
+            VirtualWorkspace::assert_warm_matches_cold(setup, &REGISTRY_FILES, &[(path, &text)]);
+        }
+    }
+
+    /// Deleting the code calling through the registry withdraws what it gave
+    /// the closures, and reopening it gives it back.
+    #[test]
+    fn deleting_and_reopening_the_dispatch_withdraws_and_restores_the_types() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_files(REGISTRY_FILES.to_vec());
+        let typed = registry_param_types(&ws);
+        let dispatch = ws.virtual_url_generator.new_uri(REGISTRY_FILES[2].0);
+        ws.analysis
+            .remove_file_by_uri(&dispatch)
+            .0
+            .expect("dispatch file must be removed");
+        let deleted = registry_param_types(&ws);
+        ws.def_file(REGISTRY_FILES[2].0, DISPATCH);
+        let reopened = registry_param_types(&ws);
+
+        assert_eq!((deleted.0.as_str(), reopened == typed), ("unknown", true));
+    }
 }

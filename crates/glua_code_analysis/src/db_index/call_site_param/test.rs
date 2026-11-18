@@ -36,7 +36,7 @@ mod tests {
         range: TextRange,
         contributions: Vec<(LuaSignatureId, usize, LuaType)>,
     ) {
-        index.set_call_contributions(file_id, range, facts(contributions));
+        index.set_call_contributions(file_id, range, facts(contributions), Vec::new());
     }
 
     fn inferred_union_members(
@@ -332,7 +332,12 @@ mod tests {
             vec![(signature, 0, LuaType::Nil)],
         );
         let before = index.fact_fingerprint(&FactKey::Contrib(signature, 0));
-        index.set_call_contributions(unsupported, call(0, 10), vec![(signature, 0, None)]);
+        index.set_call_contributions(
+            unsupported,
+            call(0, 10),
+            vec![(signature, 0, None)],
+            Vec::new(),
+        );
         assert!(index.get_inferred_param(&signature, 0).is_none());
         assert_ne!(
             before,
@@ -359,6 +364,7 @@ mod tests {
             FileId { id: 3 },
             call(0, 10),
             vec![(signature, 0, None)],
+            Vec::new(),
         );
         for reverse in [false, true] {
             let mut index = frozen.clone();
@@ -380,8 +386,8 @@ mod tests {
         let signature = signature_id(FileId { id: 1 }, 0);
         let (left, right) = (FileId { id: 2 }, FileId { id: 3 });
         let mut frozen = CallSiteParamIndex::new();
-        frozen.set_call_contributions(left, call(0, 10), vec![(signature, 0, None)]);
-        frozen.set_call_contributions(right, call(0, 10), vec![(signature, 0, None)]);
+        frozen.set_call_contributions(left, call(0, 10), vec![(signature, 0, None)], Vec::new());
+        frozen.set_call_contributions(right, call(0, 10), vec![(signature, 0, None)], Vec::new());
         let mut left_fork = frozen.task_fork();
         let mut right_fork = frozen.task_fork();
         set_call(
@@ -415,7 +421,7 @@ mod tests {
         let key = FactKey::Contrib(signature, 0);
         let empty = CallSiteParamIndex::new();
         let mut untyped = CallSiteParamIndex::new();
-        untyped.set_call_contributions(caller, call(0, 10), vec![(signature, 0, None)]);
+        untyped.set_call_contributions(caller, call(0, 10), vec![(signature, 0, None)], Vec::new());
 
         assert!(!empty.has_param_evidence(&signature, 0));
         assert!(untyped.has_param_evidence(&signature, 0));
