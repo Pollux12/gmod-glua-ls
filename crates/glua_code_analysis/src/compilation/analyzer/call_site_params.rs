@@ -1082,15 +1082,20 @@ fn collect_direct_callback_param_types(
             };
             let event = LuaInferenceEventId {
                 node,
-                kind: LuaInferenceProvenanceKind::ConcreteValue,
+                kind: callback_arg.kind,
                 source: callback_arg.source.clone(),
+            };
+            let confidence = if callback_arg.kind == LuaInferenceProvenanceKind::ConcreteValue {
+                LuaInferenceConfidence::Certain
+            } else {
+                LuaInferenceConfidence::Anchored
             };
             contributions.push((
                 target_signature_id,
                 target_param_idx,
                 Some(LuaTypeFact::new(
                     callback_arg.typ.clone(),
-                    LuaInferenceConfidence::Certain,
+                    confidence,
                     Arc::from([LuaInferenceStep {
                         event,
                         support: Arc::from([]),
@@ -1180,8 +1185,8 @@ fn collect_named_callback_param_types(
     }
 }
 
-/// What a function passes to the callback parameters it calls: a table
-/// literal argument of a call of one, as the type a callback receives.
+/// What a function passes to the callback parameters it calls: an argument
+/// of a call of one, as the type a callback receives.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CallbackArg {
     /// The callee's parameter the call calls.
@@ -1190,6 +1195,7 @@ pub(crate) struct CallbackArg {
     arg_idx: usize,
     source: InFiled<LuaSyntaxId>,
     typ: LuaType,
+    kind: LuaInferenceProvenanceKind,
 }
 
 /// The callback arguments of a function, owned by the function: every caller
@@ -1239,6 +1245,8 @@ fn callback_args(db: &DbIndex, callee_signature_id: LuaSignatureId) -> Vec<Callb
         return args;
     };
     let mut cache = LuaInferCache::new(source_file_id, super::call_target::pass_view());
+    let mut scope = CallScope::default();
+    let mut calls = Vec::new();
     for (param_idx, callee_param) in callee_params.get_params().enumerate() {
         if callee_signature.param_docs.contains_key(&param_idx)
             || is_param_mutated(db, callee_signature_id, param_idx)
@@ -1258,26 +1266,43 @@ fn callback_args(db: &DbIndex, callee_signature_id: LuaSignatureId) -> Vec<Callb
             else {
                 continue;
             };
-            let Some(callback_call) = name_expr
-                .syntax()
-                .ancestors()
-                .find_map(LuaCallExpr::cast)
-                .filter(|call| {
-                    call.get_prefix_expr()
-                        .is_some_and(|prefix| prefix.syntax() == name_expr.syntax())
-                })
+            let Some((callback_call, first_arg)) = call_of_callback(db, &mut cache, &name_expr)
             else {
                 continue;
             };
             let Some(callback_call_args) = callback_call.get_args_list() else {
                 continue;
             };
-            for (arg_idx, callback_arg) in callback_call_args.get_args().enumerate() {
+            let call_args = callback_call_args
+                .get_args()
+                .skip(first_arg)
+                .collect::<Vec<_>>();
+            if !call_args.last().is_some_and(spreads_values) {
+                calls.push((
+                    param_idx,
+                    InFiled::new(source_file_id, callback_call.get_syntax_id()),
+                    call_args.len(),
+                ));
+            }
+            for (arg_idx, callback_arg) in call_args.into_iter().enumerate() {
                 let source = InFiled::new(source_file_id, callback_arg.get_syntax_id());
-                let Ok(arg_type) = infer_expr(db, &mut cache, callback_arg) else {
-                    continue;
+                let snapshot = infer_expr(db, &mut cache, callback_arg.clone())
+                    .ok()
+                    .and_then(|arg_type| snapshot_table_type(db, &arg_type));
+                let typed = match snapshot {
+                    Some(typ) => Some((typ, LuaInferenceProvenanceKind::ConcreteValue)),
+                    None => infer_call_site_arg_value(
+                        db,
+                        &mut cache,
+                        &mut scope,
+                        source_file_id,
+                        callback_arg,
+                        false,
+                    )
+                    .filter(|(typ, _)| !holds_table_const(typ))
+                    .map(|(typ, kind)| (crate::widen_literal_type_for_assignment(&typ), kind)),
                 };
-                let Some(typ) = snapshot_table_type(db, &arg_type) else {
+                let Some((typ, kind)) = typed else {
                     continue;
                 };
                 args.push(CallbackArg {
@@ -1285,11 +1310,95 @@ fn callback_args(db: &DbIndex, callee_signature_id: LuaSignatureId) -> Vec<Callb
                     arg_idx,
                     source,
                     typ,
+                    kind,
                 });
             }
         }
     }
+    // A call passing fewer arguments than another passes `nil` for the rest.
+    for (param_idx, source, passed) in calls {
+        let Some(taken) = args
+            .iter()
+            .filter(|arg| arg.param_idx == param_idx)
+            .map(|arg| arg.arg_idx + 1)
+            .max()
+        else {
+            continue;
+        };
+        for arg_idx in passed..taken {
+            args.push(CallbackArg {
+                param_idx,
+                arg_idx,
+                source: source.clone(),
+                typ: LuaType::Nil,
+                kind: LuaInferenceProvenanceKind::ConcreteValue,
+            });
+        }
+    }
     args
+}
+
+/// The call that calls the function `name_expr` reads, and the first of its
+/// arguments the function receives: a call of it, or a call passing it where
+/// the callee calls it with its own varargs, as `pcall(f, ...)` does.
+fn call_of_callback(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+) -> Option<(LuaCallExpr, usize)> {
+    let parent = name_expr.syntax().parent()?;
+    if let Some(call) = LuaCallExpr::cast(parent.clone()) {
+        return call
+            .get_prefix_expr()
+            .is_some_and(|prefix| prefix.syntax() == name_expr.syntax())
+            .then_some((call, 0));
+    }
+    let arg_list = glua_parser::LuaCallArgList::cast(parent)?;
+    let call = arg_list.get_parent::<LuaCallExpr>()?;
+    let arg_idx = arg_list
+        .get_args()
+        .position(|arg| arg.syntax() == name_expr.syntax())?;
+    let Ok(LuaType::Signature(callee)) = infer_expr(db, cache, call.get_prefix_expr()?) else {
+        return None;
+    };
+    let signature = db.get_signature_index().get(&callee)?;
+    let param_idx = call_arg_to_param_index(signature, call.is_colon_call(), arg_idx)?;
+    let varargs_idx = forwarded_varargs(signature, param_idx)?;
+    Some((call, arg_idx + varargs_idx - param_idx))
+}
+
+/// The parameter holding the varargs `signature` calls its function
+/// parameter `param_idx` with: `f: fun(...: T...)` beside `...: T...`.
+fn forwarded_varargs(signature: &crate::LuaSignature, param_idx: usize) -> Option<usize> {
+    let LuaType::DocFunction(callback) = &signature.param_docs.get(&param_idx)?.type_ref else {
+        return None;
+    };
+    let [(name, Some(callback_varargs))] = callback.get_params() else {
+        return None;
+    };
+    let varargs_idx = signature.params.iter().position(|param| param == "...")?;
+    (name == "..."
+        && varargs_idx > param_idx
+        && signature
+            .param_docs
+            .get(&varargs_idx)
+            .is_some_and(|varargs| varargs.type_ref == *callback_varargs))
+    .then_some(varargs_idx)
+}
+
+/// Whether `arg`, the last argument of a call, passes as many values as it
+/// holds: a call or `...`.
+fn spreads_values(arg: &LuaExpr) -> bool {
+    match arg {
+        LuaExpr::CallExpr(_) => true,
+        LuaExpr::LiteralExpr(literal) => {
+            matches!(
+                literal.get_literal(),
+                Some(glua_parser::LuaLiteralToken::Dots(_))
+            )
+        }
+        _ => false,
+    }
 }
 
 fn call_arg_to_param_index(

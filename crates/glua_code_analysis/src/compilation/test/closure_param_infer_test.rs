@@ -447,7 +447,7 @@ mod test {
     }
 
     #[test]
-    fn unannotated_function_callback_infers_table_param_from_direct_invocations() {
+    fn unannotated_function_callback_infers_params_from_direct_invocations() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -499,7 +499,7 @@ mod test {
                 .clone()
         };
 
-        assert_eq!(param_type("ok"), LuaType::Unknown);
+        assert_eq!(ws.humanize_type(param_type("ok")), "boolean");
         let proc_expr = semantic_model
             .get_root()
             .descendants::<LuaIndexExpr>()
@@ -511,7 +511,7 @@ mod test {
                 .expect("callback proc type"),
             expected_entity
         );
-        assert_eq!(param_type("err"), LuaType::Unknown);
+        assert_eq!(ws.humanize_type(param_type("err")), "string?");
     }
 
     #[test]
@@ -2838,5 +2838,67 @@ function TickPose()
 end
 "#,
         ));
+    }
+
+    /// A closure given to a helper takes what the helper calls it with.
+    #[test]
+    fn a_closure_given_to_a_helper_takes_what_the_helper_calls_it_with() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "lua/autorun/sh_helper.lua",
+            r#"
+local function Run(callback)
+    callback(1, "name")
+end
+
+Run(function(who, label)
+    local count = who
+    local text = label
+end)
+"#,
+        );
+
+        assert_eq!(
+            (
+                ws.humanize_type(ws.local_ty(file, "count")),
+                ws.humanize_type(ws.local_ty(file, "text"))
+            ),
+            ("integer".to_string(), "string".to_string())
+        );
+    }
+
+    /// A closure a helper hands to `pcall` or `xpcall` takes the arguments
+    /// they forward to it.
+    #[test]
+    fn a_closure_takes_what_pcall_and_xpcall_forward_to_it() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "lua/autorun/sh_safe.lua",
+            r#"
+local function RunSafe(callback)
+    pcall(callback, 1)
+end
+
+local function RunHandled(callback)
+    xpcall(callback, print, "name")
+end
+
+RunSafe(function(who)
+    local count = who
+end)
+
+RunHandled(function(who)
+    local text = who
+end)
+"#,
+        );
+
+        assert_eq!(
+            (
+                ws.humanize_type(ws.local_ty(file, "count")),
+                ws.humanize_type(ws.local_ty(file, "text"))
+            ),
+            ("integer".to_string(), "string".to_string())
+        );
     }
 }
