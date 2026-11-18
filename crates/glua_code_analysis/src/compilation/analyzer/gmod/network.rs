@@ -1442,9 +1442,7 @@ impl NetCollectCtx<'_> {
 
     fn reach(&mut self, id: &HelperId) -> NetReach {
         let db = self.site.db;
-        composed(&mut self.compositions.reach, id, || {
-            reach_walk(db, id, &mut Vec::new(), &mut HashMap::default()).0
-        })
+        composed(&mut self.compositions.reach, id, || reach_walk(db, id))
     }
 
     fn send(&mut self, id: &HelperId) -> Option<HelperSendAnswer> {
@@ -2532,50 +2530,38 @@ impl NetReach {
     }
 }
 
-/// What `helper_id`'s expansion reaches, and the lowest open helper the walk
-/// was pruned at. Only answers that assumed nothing about a helper still open
-/// on `stack` are memoised, so a cycle is never answered from a pruned walk.
-fn reach_walk(
-    db: &DbIndex,
-    helper_id: &HelperId,
-    stack: &mut Vec<HelperId>,
-    memo: &mut HashMap<HelperId, NetReach>,
-) -> (NetReach, usize) {
-    if let Some(cached) = memo.get(helper_id) {
-        return (*cached, NO_CYCLE);
-    }
-    if let Some(open_depth) = stack.iter().position(|open| open == helper_id) {
-        return (NetReach::default(), open_depth);
-    }
-    let depth = stack.len();
-    stack.push(helper_id.clone());
-
-    let helper = helper_summary(db, helper_id);
+/// What `helper_id`'s expansion reaches: its own calls and those of every
+/// helper it can call.
+fn reach_walk(db: &DbIndex, helper_id: &HelperId) -> NetReach {
     let mut reach = NetReach::default();
-    for call in &helper.calls {
-        reach = reach.union(NetReach::of_role(call.role.as_ref()));
-    }
-    // A function its caller passes may write anything.
-    reach.payload |= helper
-        .ops
-        .iter()
-        .any(|item| matches!(item, NetOpItem::Param { .. }));
-    let mut low = NO_CYCLE;
-    for target in helper.calls.iter().filter_map(|call| call.target.as_ref()) {
+    let mut seen = HashSet::default();
+    seen.insert(helper_id.clone());
+    let mut open = vec![helper_id.clone()];
+    while let Some(id) = open.pop() {
+        let helper = helper_summary(db, &id);
+        for call in &helper.calls {
+            reach = reach.union(NetReach::of_role(call.role.as_ref()));
+        }
+        // A function its caller passes may write anything.
+        reach.payload |= helper
+            .ops
+            .iter()
+            .any(|item| matches!(item, NetOpItem::Param { .. }));
         if reach == NetReach::ALL {
             break;
         }
-        let (nested_reach, nested_low) = reach_walk(db, target, stack, memo);
-        low = low.min(nested_low);
-        reach = reach.union(nested_reach);
+        for target in helper
+            .calls
+            .iter()
+            .rev()
+            .filter_map(|call| call.target.as_ref())
+        {
+            if seen.insert(target.clone()) {
+                open.push(target.clone());
+            }
+        }
     }
-
-    stack.pop();
-    if reach == NetReach::ALL || low >= depth {
-        memo.insert(helper_id.clone(), reach);
-        return (reach, NO_CYCLE);
-    }
-    (reach, low)
+    reach
 }
 
 /// The send `helper_id`'s expansion ends a message with: the one its sends
