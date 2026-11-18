@@ -1146,6 +1146,57 @@ end
         assert_eq!(ws.analysis.compilation.last_evaluated_files().len(), 2);
     }
 
+    /// Dropping the registration takes the class out of the guess.
+    #[test]
+    fn unregistering_a_guessed_panel_settles_as_a_cold_build() {
+        VirtualWorkspace::assert_warm_matches_cold(
+            gmod,
+            &[
+                (PANELS, PANELS_TEXT),
+                (ELEMENTS, ELEMENTS_TEXT),
+                (SKIN, SKIN_TEXT),
+            ],
+            &[(
+                ELEMENTS,
+                &ELEMENTS_TEXT.replace("vgui.Register(\"MCategory\", PANEL, \"Panel\")", ""),
+            )],
+        );
+    }
+
+    /// Deleting the file registering a guessed panel and opening it again
+    /// each settle as a cold build of what is left.
+    #[test]
+    fn a_guessed_panels_file_deleted_and_reopened_settles_as_a_cold_build() {
+        let cold = |files: &[(&str, &str)]| {
+            let mut ws = VirtualWorkspace::new();
+            gmod(&mut ws);
+            ws.def_files(files.to_vec());
+            ws.semantic_digest()
+        };
+        let all = [
+            (PANELS, PANELS_TEXT),
+            (ELEMENTS, ELEMENTS_TEXT),
+            (SKIN, SKIN_TEXT),
+        ];
+        let mut ws = VirtualWorkspace::new();
+        gmod(&mut ws);
+        ws.def_files(all.to_vec());
+        let elements = ws.virtual_url_generator.new_uri(ELEMENTS);
+
+        ws.analysis.remove_file_by_uri(&elements);
+        let deleted = ws.semantic_digest();
+        ws.def_file(ELEMENTS, ELEMENTS_TEXT);
+        let reopened = ws.semantic_digest();
+
+        assert_eq!(
+            (deleted, reopened),
+            (
+                cold(&[(PANELS, PANELS_TEXT), (SKIN, SKIN_TEXT)]),
+                cold(&all)
+            )
+        );
+    }
+
     /// A call of a function that forwards its class name to `vgui.Create` gets
     /// that class, found at the create call in the function; a shift above the
     /// function moves the call without changing what it creates.
