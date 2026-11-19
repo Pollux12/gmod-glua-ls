@@ -648,7 +648,9 @@ pub(crate) struct Engine {
     /// What the outputs of the loops being cleared held before: a memo that
     /// read one holds again once the loops settle if it settles back to it.
     loop_before: FxHashMap<HashedKey, derivation::Fingerprint>,
-    /// How often each derivation ran since the run entered its stage.
+    /// How often each derivation ran since the run entered its stage. One
+    /// [`Self::admit_run`] stopped keeps its count into later stages, so it
+    /// stays stopped until the run starts over or its loop is cleared.
     stage_runs: FxHashMap<DerivationId, StageRuns>,
     /// Whether a derivation that runs more often within a stage than settling
     /// can need panics rather than being left as its last run left it.
@@ -1463,6 +1465,7 @@ impl Engine {
 
     /// Starts the run over from the first stage.
     pub(crate) fn open(&mut self, db: &mut DbIndex) {
+        self.stage_runs.clear();
         self.enter_stage(db, AnalysisStage::Open);
     }
 
@@ -2509,7 +2512,7 @@ impl Engine {
         let stale = crate::profile::phase("engine: stale check", || {
             self.needs_evaluation(db, id, reason)
         });
-        if !stale || !self.admit_run(id) {
+        if !stale || !self.admit_run(db, id) {
             self.moved_from.remove(&id);
             if id.kind.is_query() {
                 db.queries().set_stale(id, false);
@@ -3067,6 +3070,7 @@ impl Engine {
             // The loop's own reset is not a fact from outside it.
             self.moved_from.remove(&member);
             self.settled_on.remove(&member);
+            self.stage_runs.remove(&member);
             self.stats.requeue_cause(member, "loop cleared");
             self.queue(member, Reason::Changed);
         }
@@ -3152,8 +3156,9 @@ impl Engine {
     /// [`MAX_INDEX_RUNS`] within one stage the facts it reads keep moving, so
     /// some rule among them does not converge: it panics under
     /// `GLUALS_CHECK_CONVERGENCE` or debug assertions, and otherwise warns
-    /// once and leaves `id` as its last run left it.
-    fn admit_run(&mut self, id: DerivationId) -> bool {
+    /// once, naming where, and leaves `id` as its last run left it for the
+    /// rest of the run.
+    fn admit_run(&mut self, db: &DbIndex, id: DerivationId) -> bool {
         let runs = &mut self.stage_runs.entry(id).or_default().on_index;
         *runs = runs.saturating_add(1);
         self.stats.note_runs(id, *runs);
@@ -3162,11 +3167,14 @@ impl Engine {
         }
         assert!(
             !self.unsettled_panics,
-            "{id:?} evaluated {runs} times without the run moving to another stage"
+            "{id:?} at {} evaluated {runs} times without the run moving to another stage",
+            location(db, id)
         );
         if *runs == MAX_INDEX_RUNS + 1 {
             log::warn!(
-                "{id:?} ran {MAX_INDEX_RUNS} times without settling; it keeps what its last run left"
+                "analysis did not settle at {}: its {:?} ran {MAX_INDEX_RUNS} times and keeps what its last run left. This is a language server bug; please report it with the code there",
+                location(db, id),
+                id.kind
             );
         }
         false
@@ -3181,7 +3189,10 @@ impl Engine {
 
     /// Moves the run to `stage`. Returns the keys of the rules that moved.
     fn enter_stage(&mut self, db: &mut DbIndex, stage: AnalysisStage) -> Vec<HashedKey> {
-        self.stage_runs.clear();
+        self.stage_runs.retain(|_, runs| {
+            runs.in_tasks = 0;
+            runs.on_index > MAX_INDEX_RUNS
+        });
         self.serial_files.clear();
         self.cycle_members.clear();
         self.cycle_outputs.clear();
@@ -3438,7 +3449,7 @@ impl Engine {
             }
             // A member left out is counted when it is stepped.
             let joins = co_producers(db, id).len() == 1;
-            if joins && !self.admit_run(id) {
+            if joins && !self.admit_run(db, id) {
                 continue;
             }
             self.trace_evaluation(db, id, reason);
@@ -3594,7 +3605,7 @@ impl Engine {
             let runs = self.needs_evaluation(db, id, reason);
             let batched = runs && co_producers(db, id).len() == 1;
             // A query left out of the batch is counted when it is stepped.
-            if !runs || (batched && !self.admit_run(id)) {
+            if !runs || (batched && !self.admit_run(db, id)) {
                 self.moved_from.remove(&id);
                 db.queries().set_stale(id, false);
                 continue;
@@ -5357,6 +5368,21 @@ fn scopeguard_lent_keys() -> impl Drop {
     OnDrop(derivation::forget_lent_keys)
 }
 
+/// Where `id` is in the workspace, as `path:line:column`.
+fn location(db: &DbIndex, id: DerivationId) -> String {
+    let Some(document) = db.get_vfs().get_document(&id.file_id) else {
+        return "the workspace".to_string();
+    };
+    let start = id.syntax_id().get_range().start();
+    let (line, column) = document.get_line_col(start).unwrap_or_default();
+    format!(
+        "{}:{}:{}",
+        document.get_file_path().display(),
+        line + 1,
+        column + 1
+    )
+}
+
 /// How often one derivation may run on the index within one stage before
 /// [`Engine::admit_run`] takes it that the facts it reads do not settle.
 const MAX_INDEX_RUNS: u16 = 16;
@@ -5948,6 +5974,48 @@ print(tuned{index})"
             (settled, integer(db, COPIED), integer(db, WRITTEN)),
             (true, runs, runs)
         );
+    }
+
+    /// [`Feedback`] whose reader also reads every stage rule, so each stage
+    /// barrier queues it again.
+    struct StagedFeedback;
+
+    impl Recipe for StagedFeedback {
+        fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+            for rule in StageRule::ALL {
+                db.stage_rule_holds(rule);
+            }
+            Feedback.evaluate(db, id);
+        }
+
+        fn splits(&self, _: DerivationKind) -> bool {
+            false
+        }
+
+        fn compute(&self, _: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
+            unreachable!("feedback does not split")
+        }
+
+        fn apply(&self, _: &mut DbIndex, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
+            unreachable!("feedback does not split")
+        }
+    }
+
+    #[test]
+    fn a_loop_that_never_settles_stays_stopped_in_later_stages() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        engine.unsettled_panics = false;
+        for start in [READER, WRITER] {
+            engine.changed(statement(start));
+        }
+        engine.open(db);
+
+        let settled = engine.run(db, &StagedFeedback, Slice::Whole);
+
+        let runs = i64::from(MAX_INDEX_RUNS);
+        assert_eq!((settled, integer(db, COPIED)), (true, runs));
     }
 
     #[test]
