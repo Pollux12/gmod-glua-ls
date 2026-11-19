@@ -148,4 +148,115 @@ mod test {
         );
         assert!(digest.is_some(), "the analysis settles");
     }
+
+    /// The digest of `files` analysed together, or `None` when the analysis
+    /// does not settle within a generous bound.
+    fn settled_files_digest(files: &[(&'static str, String)]) -> Option<Vec<String>> {
+        let files = files.to_vec();
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let mut ws = VirtualWorkspace::new();
+                ws.def_files(
+                    files
+                        .iter()
+                        .map(|(path, text)| (*path, text.as_str()))
+                        .collect(),
+                );
+                let _ = tx.send(ws.semantic_digest());
+            })
+            .expect("analysis thread");
+        rx.recv_timeout(Duration::from_secs(30)).ok()
+    }
+
+    const REGISTRY: &str = "lua/includes/modules/gamemode.lua";
+
+    /// A registry whose entries are built from one another by `build`, the
+    /// shape of GMod's own `includes/modules/gamemode.lua`.
+    fn registry(build_return: &str, build: &str) -> String {
+        format!(
+            r#"
+            ---@generic T, B
+            ---@param target T
+            ---@param base B
+            ---@return {build_return}
+            local function Inherit(target, base) end
+
+            local GameList = {{}}
+            function Register(t, name, derived)
+                local basetable = Get(derived)
+                if basetable then
+                    t = {build}
+                end
+                GameList[name] = t
+            end
+            function Get(name)
+                return GameList[name]
+            end
+            "#
+        )
+    }
+
+    /// An entry built from the entry it derives from settles whatever the
+    /// generic returns around its base: the type does not nest a level deeper
+    /// on every pass round the registry.
+    #[test]
+    fn a_registry_built_from_its_own_entries_settles() {
+        for build_return in ["T & B", "{ BaseClass: B }", "T & B & { BaseClass: B }"] {
+            let source = registry(build_return, "Inherit(t, basetable)");
+            assert!(
+                settled_files_digest(&[(REGISTRY, source)]).is_some(),
+                "{build_return} settles"
+            );
+        }
+    }
+
+    /// The same registry split over two files, the caller registering into it
+    /// from another file.
+    #[test]
+    fn a_registry_filled_from_another_file_settles() {
+        let source = registry("T & B & { BaseClass: B }", "Inherit(t, basetable)");
+        let caller =
+            "Register({}, \"sandbox\", \"base\")\nlocal sandbox = Get(\"sandbox\")\n".to_string();
+        assert!(
+            settled_files_digest(&[(REGISTRY, source), ("lua/autorun/sh_caller.lua", caller)])
+                .is_some()
+        );
+    }
+
+    /// Editing the registry, deleting it and opening it again leaves what a
+    /// cold build of the same files has.
+    #[test]
+    fn a_registry_edited_deleted_and_reopened_settles_as_a_cold_build() {
+        let source = registry("T & B & { BaseClass: B }", "Inherit(t, basetable)");
+        let edited = registry("T & B & { BaseClass: B }", "Inherit(basetable, t)");
+        let caller = "local sandbox = Get(\"sandbox\")\n";
+        let cold = |registry: Option<&str>| {
+            let mut files = vec![("lua/autorun/sh_caller.lua", caller.to_string())];
+            files.extend(registry.map(|text| (REGISTRY, text.to_string())));
+            settled_files_digest(&files).expect("the cold build settles")
+        };
+        let (tx, rx) = mpsc::channel();
+        let (source_c, edited_c) = (source.clone(), edited.clone());
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let mut ws = VirtualWorkspace::new();
+                ws.def_file("lua/autorun/sh_caller.lua", caller);
+                ws.def_file(REGISTRY, &source_c);
+                ws.def_file(REGISTRY, &edited_c);
+                let edited = ws.semantic_digest();
+                let uri = ws.virtual_url_generator.new_uri(REGISTRY);
+                ws.analysis.remove_file_by_uri(&uri);
+                let deleted = ws.semantic_digest();
+                ws.def_file(REGISTRY, &source_c);
+                let _ = tx.send((edited, deleted, ws.semantic_digest()));
+            })
+            .expect("analysis thread");
+        let warm = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the warm edits settle");
+        assert_eq!(warm, (cold(Some(&edited)), cold(None), cold(Some(&source))));
+    }
 }
