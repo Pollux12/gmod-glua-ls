@@ -5,6 +5,7 @@ mod test {
     #[test]
     fn test_1() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "A.lua",
             r#"
@@ -29,6 +30,7 @@ mod test {
     #[test]
     fn deferred_module_export_resolves() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let files = ws.def_files(vec![
             ("a_exp.lua", r#"return require("z_dep")"#),
             ("z_dep.lua", r#"return { answer = 42 }"#),

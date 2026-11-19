@@ -1001,6 +1001,7 @@ mod test {
     #[test]
     fn test_issue_416() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_files(vec![
             (
                 "test.lua",
@@ -1097,6 +1098,7 @@ mod test {
     #[test]
     fn test_issue_498() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_files(vec![
             (
                 "test.lua",

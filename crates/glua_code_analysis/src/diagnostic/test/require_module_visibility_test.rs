@@ -32,6 +32,7 @@ mod tests {
     #[test]
     fn test_2() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::RequireModuleNotVisible);
 
         // `@export` without a namespace restriction

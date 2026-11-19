@@ -7,6 +7,7 @@ mod tests {
     #[gtest]
     fn test_1() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         ws.def_file(
             "2.lua",
             r#"

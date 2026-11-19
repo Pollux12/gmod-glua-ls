@@ -384,6 +384,7 @@ end
     #[test]
     fn deleting_one_entitys_shared_file_re_runs_nothing_in_another_entity() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
@@ -1696,6 +1697,7 @@ end
         const INIT: &str = "lua/entities/shift_car/init.lua";
         const INIT_TEXT: &str = "include(\"sv_input.lua\")\n\nfunction ENT:Initialize()\n    self.holdInputActions = {}\nend\n";
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
@@ -1721,6 +1723,7 @@ end
         const INIT: &str = "lua/entities/shift_car/init.lua";
         const INIT_TEXT: &str = "include(\"sv_input.lua\")\n\nfunction ENT:Initialize()\n    self.holdInputActions = {}\nend\n";
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);

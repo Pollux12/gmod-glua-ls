@@ -1870,6 +1870,7 @@ mod tests {
     #[gtest]
     fn test_require_private() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.doc.private_name = vec!["_*".to_string()];
         ws.update_emmyrc(emmyrc);
@@ -5876,6 +5877,7 @@ mod tests {
     #[gtest]
     fn test_gmod_include_path_completion_filters_to_lua_files() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
@@ -5909,9 +5911,40 @@ mod tests {
         verify_that!(items.iter().any(|item| item.label == "icon.png"), eq(false))
     }
 
+    /// A path given to `require` completes module names; one given to a local
+    /// function of that name does not.
+    #[gtest]
+    fn test_require_path_completes_modules_only_for_the_loader() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
+        ws.def_file("mymodule.lua", "return {}");
+        let mut lists_module = |text: &str| -> Result<bool> {
+            let (content, position) = ProviderVirtualWorkspace::handle_file_content(text)?;
+            let file_id = ws.def(&content);
+            let items = match completion(
+                &ws.analysis,
+                file_id,
+                position,
+                CompletionTriggerKind::INVOKED,
+                CancellationToken::new(),
+            ) {
+                Some(CompletionResponse::Array(items)) => items,
+                Some(CompletionResponse::List(list)) => list.items,
+                None => Vec::new(),
+            };
+            Ok(items.iter().any(|item| item.label == "mymodule"))
+        };
+
+        let loader = lists_module("local m = require(\"<??>\")\n")?;
+        let shadowed =
+            lists_module("local function require(n) end\nlocal m = require(\"<??>\")\n")?;
+        verify_that!((loader, shadowed), eq((true, false)))
+    }
+
     #[gtest]
     fn test_member_named_include_uses_annotation_path_kind() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         let root = crate::util::TempDir::new("glua_ls_member_include_path");
         fs::create_dir_all(root.join("materials/icons")).or_fail()?;
         fs::write(root.join("materials/icons/icon.png"), "").or_fail()?;

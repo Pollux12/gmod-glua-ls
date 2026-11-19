@@ -1796,6 +1796,7 @@ mod test {
     #[test]
     fn test_require_with_computed_path_is_unresolved() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def(
             r#"
             some_computed_path = nil

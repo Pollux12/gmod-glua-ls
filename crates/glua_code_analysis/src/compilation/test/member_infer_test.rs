@@ -317,6 +317,7 @@ parser:parse()",
 
     fn setup_vehicle_weapon_registry_real_multifile_fixture() -> (VirtualWorkspace, crate::FileId) {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
@@ -6147,6 +6148,7 @@ end
         #[test]
         fn test_plugin_shared_local_alias_preserves_included_fields_and_methods() {
             let mut ws = VirtualWorkspace::new();
+            ws.def_gmod_call_arg_builtins();
             ws.def_file(
                 "lua/plugins/plugin_a/config.lua",
                 r#"

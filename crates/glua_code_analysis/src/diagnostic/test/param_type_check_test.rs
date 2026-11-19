@@ -2966,6 +2966,7 @@ mod test {
     #[test]
     fn test_self_1() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "1.lua",
             r#"
@@ -4712,6 +4713,7 @@ mod test {
     #[test]
     fn test_and_or_chain_false_suppression() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         // Idiomatic Lua pattern: require(a and "x" or b and "y")
         // The `and` operator produces `false | "literal"` when left operand may be falsy.
         // The `false` is an inference artifact that should be stripped for diagnostic purposes.

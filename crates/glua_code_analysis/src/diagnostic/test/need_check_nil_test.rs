@@ -1891,6 +1891,7 @@ mod test {
     #[test]
     fn test_unresolved_prefix_chain_is_not_warned() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         assert_that!(
             ws.check_code_for(
                 DiagnosticCode::UncheckedNilAccess,
@@ -1912,6 +1913,7 @@ mod test {
             ("---@class ReceiverChain\nlocal m = {}", false),
         ] {
             let mut ws = VirtualWorkspace::new();
+            ws.def_gmod_call_arg_builtins();
             assert_that!(
                 ws.check_code_for(
                     DiagnosticCode::UncheckedNilAccess,
@@ -6354,6 +6356,7 @@ mod test {
     #[gtest]
     fn test_cross_file_numeric_range_population_include_call_rejects_fact() {
         let mut ws = gmod_ws();
+        ws.def_gmod_call_arg_builtins();
         ws.def_file("lua/autorun/shared/a_colors.lua", r#"ROLE_MIN=1 ROLE_MAX=3 ROLE_TRAITOR=2 ROLE_COLORS={} local function fill(list) for i=ROLE_MIN,ROLE_MAX do list[i]={r=1} end end fill(ROLE_COLORS)"#);
         let reader = ws.def_file(
             "lua/autorun/shared/c_reader.lua",

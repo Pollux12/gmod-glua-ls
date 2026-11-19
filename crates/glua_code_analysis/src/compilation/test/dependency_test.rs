@@ -403,6 +403,48 @@ local first = ids.first
         assert_eq!(first, "1");
     }
 
+    /// Tagging a wrapper as a `require` loader, and taking the tag away, moves
+    /// what its callers read as a cold build has it.
+    #[test]
+    fn a_require_tag_added_and_removed_settles_as_a_cold_build() {
+        const TAGGED: &str = "---@[call_arg(\"gmod.load\", \"require\")]
+---@param name string
+function RequireModule(name) end
+";
+        const UNTAGGED: &str = "---@param name string
+function RequireModule(name) end
+";
+        const REQUIRER: &str = "local ids = RequireModule(\"mylib_ids\")
+local first = ids.first
+";
+        let cold = |loader: &str| {
+            let mut ws = gmod_workspace();
+            ws.def_file(MODULE_FILE, IDS);
+            ws.def_file(LOADER_FILE, loader);
+            requirer_first(&mut ws, REQUIRER)
+        };
+        let mut warm = gmod_workspace();
+        warm.def_file(MODULE_FILE, IDS);
+        warm.def_file(LOADER_FILE, UNTAGGED);
+        let untagged = requirer_first(&mut warm, REQUIRER);
+        let requirer_uri = warm.virtual_url_generator.new_uri(REQUIRER_FILE);
+        let read = |ws: &VirtualWorkspace| {
+            let file_id = ws.analysis.get_file_id(&requirer_uri).expect("requirer");
+            ws.humanize_type(ws.local_ty(file_id, "first"))
+        };
+
+        warm.def_file(LOADER_FILE, TAGGED);
+        let tagged = read(&warm);
+        warm.def_file(LOADER_FILE, UNTAGGED);
+        let untagged_again = read(&warm);
+
+        assert_eq!(
+            (untagged.clone(), tagged.as_str(), untagged_again),
+            (cold(UNTAGGED), "1", untagged)
+        );
+        assert_eq!(cold(TAGGED), "1");
+    }
+
     /// Editing, deleting and reopening a required module leaves what its
     /// requirer reads as a cold build has it.
     #[test]

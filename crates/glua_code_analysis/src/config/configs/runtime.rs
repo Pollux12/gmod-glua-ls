@@ -219,6 +219,20 @@ impl From<EmmyrcSpecialSymbol> for Option<SpecialFunction> {
 mod tests {
     use super::*;
 
+    /// A config written for name-matched loaders still loads; the loaders come
+    /// from `gmod.load` annotations instead.
+    #[test]
+    fn a_config_naming_require_like_functions_still_loads() {
+        let runtime: EmmyrcRuntime = serde_json::from_str(
+            r#"{ "requireLikeFunction": ["MyAddon.Load"], "special": { "MyAddon.Load": "require" } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.special.get("MyAddon.Load"),
+            Some(&EmmyrcSpecialSymbol::None)
+        );
+    }
+
     #[test]
     fn test_emmyrc_runtime() {
         let json1 = r#"{

@@ -243,6 +243,7 @@ mod tests {
     #[gtest]
     fn test_module_return_2() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         ws.def_file(
             "a.lua",
             r#"

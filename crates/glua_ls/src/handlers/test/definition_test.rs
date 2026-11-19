@@ -449,6 +449,7 @@ end
     #[gtest]
     fn test_goto_require_return_table_fallback() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         ws.def_file(
             "reported-tasks.lua",
             r#"
@@ -1189,6 +1190,7 @@ end
     #[gtest]
     fn test_goto_prefers_same_file_in_included_server_scripted_class_file() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
@@ -1259,6 +1261,7 @@ end
     #[gtest]
     fn test_goto_scripted_class_field_definitions_survive_load_order_changes() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
@@ -2307,6 +2310,7 @@ end
     #[gtest]
     fn test_member_variable_definition_via_typed_instance() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         ws.def_file(
             "inner.lua",
             r#"

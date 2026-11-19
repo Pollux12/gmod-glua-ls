@@ -84,6 +84,7 @@ mod tests {
     #[gtest]
     fn test_addcsluafile_no_realm_diagnostic_in_client_file() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
@@ -115,6 +116,7 @@ mod tests {
     #[gtest]
     fn test_addcsluafile_no_realm_diagnostic_in_explicit_client_branch() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
