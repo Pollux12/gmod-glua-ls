@@ -482,10 +482,17 @@ fn try_analyze_legacy_module_call(analyzer: &mut DeclAnalyzer, expr: &LuaCallExp
         return Some(());
     }
 
-    let Some(call_name) = get_call_name(expr) else {
+    // Roles come from annotations only after this pass, so `module` is told
+    // apart by scope: the global, not a member or a local of that name.
+    let LuaExpr::NameExpr(name_expr) = expr.get_prefix_expr()? else {
         return Some(());
     };
-    if call_name != "module" {
+    let name_token = name_expr.get_name_token()?;
+    if name_token.get_name_text() != "module"
+        || analyzer
+            .find_decl("module", name_token.get_position())
+            .is_some_and(|decl| decl.is_local() && !analyzer.localises_global_of_its_name(decl))
+    {
         return Some(());
     }
 
@@ -551,18 +558,6 @@ fn try_analyze_legacy_module_call(analyzer: &mut DeclAnalyzer, expr: &LuaCallExp
     }
 
     Some(())
-}
-
-fn get_call_name(expr: &LuaCallExpr) -> Option<String> {
-    match expr.get_prefix_expr()? {
-        LuaExpr::NameExpr(name_expr) => name_expr.get_name_text().map(Into::into),
-        LuaExpr::IndexExpr(index_expr) => match index_expr.get_index_key()? {
-            LuaIndexKey::Name(name) => Some(name.get_name_text().to_string()),
-            LuaIndexKey::String(string) => Some(string.get_value()),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 fn get_static_string_arg(expr: &LuaCallExpr) -> Option<String> {

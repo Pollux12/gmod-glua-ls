@@ -8,6 +8,35 @@ mod test {
         LuaType, RenderLevel, VirtualWorkspace,
     };
 
+    /// Only the global `module` makes a file a module: a method or a local
+    /// function of that name does not.
+    #[test]
+    fn a_call_of_something_else_named_module_makes_no_module() {
+        for source in [
+            "local obj = {}
+function obj.module(name) end
+obj.module(\"zzz\")
+",
+            "local obj = {}
+function obj:module(name) end
+obj:module(\"zzz\")
+",
+            "local function module(name) end
+module(\"zzz\")
+",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            let file_id = ws.def_file("lua/autorun/sh_caller.lua", source);
+            assert!(
+                ws.get_db_mut()
+                    .get_module_index()
+                    .get_legacy_module_env(file_id)
+                    .is_none(),
+                "{source}"
+            );
+        }
+    }
+
     fn local_type_by_name(
         ws: &mut VirtualWorkspace,
         file_id: crate::FileId,
