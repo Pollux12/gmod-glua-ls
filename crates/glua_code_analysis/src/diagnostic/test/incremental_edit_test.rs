@@ -10,6 +10,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.diagnostics.enables = codes;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws
     }
 
@@ -887,6 +888,7 @@ mod tests {
         emmyrc.gmod.enabled = true;
         emmyrc.diagnostics.enables = vec![DiagnosticCode::GmodRealmMismatch];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         let utils_uri = ws.virtual_url_generator.new_uri("lua/utils.lua");
         write(
             &mut ws,

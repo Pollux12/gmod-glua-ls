@@ -2208,6 +2208,7 @@ print(\"server-only\")
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
 
+        ws.def_gmod_call_arg_builtins();
         let utils_file_id = ws.def_file("lua/utils.lua", r#"AddCSLuaFile()"#);
 
         assert_eq!(
@@ -2228,6 +2229,7 @@ print(\"server-only\")
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
 
+        ws.def_gmod_call_arg_builtins();
         let sv_boot_file_id = ws.def_file("lua/sv_boot.lua", r#"AddCSLuaFile()"#);
 
         assert_eq!(
@@ -2571,6 +2573,7 @@ print(\"server-only\")
     fn test_forward_only_propagation_no_backward_from_shared() -> googletest::Result<()> {
         let mut ws = VirtualWorkspace::new();
 
+        ws.def_gmod_call_arg_builtins();
         let sh_config_id = ws.def_file(
             "gamemodes/test/gamemode/sh_config.lua",
             "return { version = 1 }",

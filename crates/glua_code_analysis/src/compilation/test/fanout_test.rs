@@ -266,6 +266,7 @@ end
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "lua/utils.lua",
             "Utils = Utils or {}\nfunction Utils.Ping() return 1 end\n",

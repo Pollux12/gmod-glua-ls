@@ -178,6 +178,10 @@ mod tests {
     #[gtest]
     fn a_load_path_links_to_the_file_it_loads() {
         let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.def_file("lua/mylib/ids.lua", "return {}");
         ws.def_file("lua/entities/thing/shared.lua", "return {}");
         let init = ws.def_file(

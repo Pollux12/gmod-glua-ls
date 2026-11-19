@@ -114,6 +114,10 @@ mod tests {
             {
                 let mut analysis = snapshot.analysis().write().await;
                 analysis.add_main_workspace(root.clone());
+                analysis.update_file_by_uri(
+                    &uri(&root, "lua/includes/glua_ls_gmod_call_arg_builtins.lua"),
+                    Some(glua_code_analysis::GMOD_CALL_ARG_BUILTINS_FIXTURE.to_string()),
+                );
                 for (path, text) in files {
                     analysis.update_file_by_uri(&uri(&root, path), Some(text.to_string()));
                 }

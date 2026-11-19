@@ -50,6 +50,7 @@ mod test {
     #[gtest]
     fn a_file_rename_rewrites_only_the_strings_loading_it() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_files(vec![
             ("lua/myaddon/sh_config.lua", "return {}\n"),
             ("lua/myaddon/sh_unrelated.lua", "return {}\n"),
@@ -119,6 +120,7 @@ mod test {
     #[gtest]
     fn a_folder_rename_rewrites_the_paths_into_it() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_files(vec![
             ("gamemodes/mygm/gamemode/shared.lua", "return {}\n"),
             ("gamemodes/mygm/gamemode/modules/sh_round.lua", "return {}\n"),
@@ -167,6 +169,7 @@ mod test {
     #[gtest]
     fn moving_the_including_file_rewrites_its_relative_paths() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_files(vec![
             ("lua/autorun/server/sv_helpers.lua", "return {}\n"),
             (
@@ -234,6 +237,7 @@ mod test {
     #[test]
     fn a_new_path_is_written_for_the_literal_it_goes_into() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_files(vec![
             ("lua/autorun/sh_old.lua", "return {}\n"),
             (
@@ -261,6 +265,7 @@ mod test {
     #[test]
     fn a_path_spelled_with_escapes_is_rewritten_again() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_files(vec![
             ("lua/autorun/sh_o'b.lua", "return {}\n"),
             (

@@ -8,6 +8,7 @@ mod test {
     fn test_dependency_edge_kinds_for_require_include_and_addcsluafile() {
         let mut ws = VirtualWorkspace::new();
 
+        ws.def_gmod_call_arg_builtins();
         let shared_id = ws.def_file("lua/entities/test/shared.lua", "return {}");
         let client_id = ws.def_file("lua/entities/test/cl_init.lua", "return {}");
         let required_id = ws.def_file("lua/dep.lua", "return {}");
@@ -56,6 +57,7 @@ mod test {
     #[gtest]
     fn a_relative_include_resolves_next_to_the_including_file() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let alpha_shared = ws.def_file("lua/entities/alpha/shared.lua", "return {}");
         let beta_shared = ws.def_file("lua/entities/beta/shared.lua", "return {}");
         ws.def_file("lua/entities/alpha/init.lua", "include(\"shared.lua\")\n");
@@ -138,10 +140,37 @@ mod test {
         assert_eq!(ranges, vec![(8, 20)]);
     }
 
+    /// A method that shares a loader's name is not a loader.
+    #[test]
+    fn a_method_named_like_a_loader_loads_nothing() {
+        let mut ws = gmod_workspace();
+        ws.def_file("lua/mylib/target.lua", "return {}");
+        let source_id = ws.def_file(
+            "lua/autorun/sh_source.lua",
+            r#"
+            local builder = {}
+            function builder:include(path) end
+            function builder.AddCSLuaFile(path) end
+            function builder.IncludeCS(path) end
+            builder:include("mylib/target.lua")
+            builder.AddCSLuaFile("mylib/target.lua")
+            builder.IncludeCS("mylib/target.lua")
+            "#,
+        );
+
+        let dependency_index = ws.get_db_mut().get_file_dependencies_index();
+        assert!(
+            dependency_index
+                .get_dependency_sites(&source_id)
+                .is_none_or(<[_]>::is_empty)
+        );
+    }
+
     #[test]
     fn test_dynamic_include_path_does_not_add_dependency_edge() {
         let mut ws = VirtualWorkspace::new();
 
+        ws.def_gmod_call_arg_builtins();
         let _shared_id = ws.def_file("lua/entities/test/shared.lua", "return {}");
         let init_id = ws.def_file(
             "lua/entities/test/init.lua",
@@ -159,6 +188,7 @@ mod test {
     fn test_includecs_without_argument_does_not_add_dependency_edge() {
         let mut ws = VirtualWorkspace::new();
 
+        ws.def_gmod_call_arg_builtins();
         let source_id = ws.def_file("lua/autorun/server/sv_boot.lua", "IncludeCS()");
         let dependency_index = ws.get_db_mut().get_file_dependencies_index();
 
@@ -171,6 +201,7 @@ mod test {
     fn test_include_resolves_to_a_file_later_in_the_same_batch() {
         let mut ws = VirtualWorkspace::new();
 
+        ws.def_gmod_call_arg_builtins();
         let ids = ws.def_files(vec![
             (
                 "lua/autorun/includer.lua",

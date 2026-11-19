@@ -377,11 +377,17 @@ fn collect_annotated_load_dependency_site(
     let (kind, path_arg_idx) = annotated_roles.load_call(db, file_id, &call_expr, &call_path)?;
     let arg_expr = call_expr
         .get_args_list()
-        .and_then(|args| args.get_args().nth(path_arg_idx))?;
-    let path = static_literal_string(&arg_expr);
-    let target_file_id = path
-        .as_deref()
-        .and_then(|path| resolve_load_dependency_target(db, file_id, kind, path));
+        .and_then(|args| args.get_args().nth(path_arg_idx));
+    // `AddCSLuaFile()` with no path sends the calling file itself.
+    let sends_itself = arg_expr.is_none() && kind == LuaDependencyKind::AddCSLuaFile;
+    if arg_expr.is_none() && !sends_itself {
+        return None;
+    }
+    let path = arg_expr.as_ref().and_then(static_literal_string);
+    let target_file_id = match path.as_deref() {
+        Some(path) => resolve_load_dependency_target(db, file_id, kind, path),
+        None => sends_itself.then_some(file_id),
+    };
     let path_keys = path
         .as_deref()
         .map(|path| crate::dependency_site_path_keys(db, file_id, path))
@@ -395,7 +401,7 @@ fn collect_annotated_load_dependency_site(
         path_keys,
         original_expr: call_expr.syntax().text().to_string(),
         call_range: call_expr.get_range(),
-        range: arg_expr.get_range(),
+        range: arg_expr.map_or(call_expr.get_range(), |arg| arg.get_range()),
     }));
     Some(())
 }

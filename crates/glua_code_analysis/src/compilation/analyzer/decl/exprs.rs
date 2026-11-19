@@ -8,10 +8,7 @@ use smol_str::SmolStr;
 use crate::{
     EmmyrcLuaVersion, FileId, InFiled, LegacyModuleEnv, LuaDeclExtra, LuaDeclId, LuaMemberFeature,
     LuaMemberId, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDeclId,
-    db_index::{
-        GmodScriptedClassCallKind, LuaDecl, LuaDependencyKind, LuaMember, LuaMemberKey,
-        LuaMemberOwner,
-    },
+    db_index::{GmodScriptedClassCallKind, LuaDecl, LuaMember, LuaMemberKey, LuaMemberOwner},
 };
 
 use super::{DeclAnalyzer, DeclOp};
@@ -416,33 +413,17 @@ pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Opti
     try_analyze_legacy_module_call(analyzer, &expr);
     try_declare_define_baseclass_local(analyzer, &expr);
 
-    let Some((dependency_kind, dependency_path)) = get_dependency_call_info(&expr) else {
+    if !expr.is_require() {
         return Some(());
-    };
-
-    let file_id = analyzer.get_file_id();
-
-    // No-arg AddCSLuaFile() means "send self to client": a self-reference.
-    let self_reference = dependency_path.is_none()
-        && dependency_kind == LuaDependencyKind::AddCSLuaFile
-        && dependency_call_has_no_args(&expr);
-    let dependency_path_keys = dependency_path
-        .as_deref()
-        .map(|path| crate::dependency_site_path_keys(analyzer.db, file_id, path))
-        .unwrap_or_default();
-
-    let call_range = expr.get_range();
-    let range = expr
-        .get_args_list()
-        .and_then(|args| args.get_args().next())
-        .map_or(call_range, |arg| arg.get_range());
-    analyzer.ops.push(DeclOp::Dependency {
-        kind: dependency_kind,
-        path: dependency_path,
-        self_reference,
-        path_keys: dependency_path_keys,
+    }
+    let path = get_static_string_arg(&expr)?;
+    let range = expr.get_args_list()?.get_args().next()?.get_range();
+    let path_keys = crate::dependency_site_path_keys(analyzer.db, analyzer.get_file_id(), &path);
+    analyzer.ops.push(DeclOp::Require {
+        path,
+        path_keys,
         original_expr: expr.syntax().text().to_string(),
-        call_range,
+        call_range: expr.get_range(),
         range,
     });
 
@@ -570,29 +551,6 @@ fn try_analyze_legacy_module_call(analyzer: &mut DeclAnalyzer, expr: &LuaCallExp
     }
 
     Some(())
-}
-
-fn get_dependency_call_info(expr: &LuaCallExpr) -> Option<(LuaDependencyKind, Option<String>)> {
-    let dependency_kind = if expr.is_require() {
-        LuaDependencyKind::Require
-    } else {
-        match get_call_name(expr).as_deref()? {
-            "include" => LuaDependencyKind::Include,
-            "AddCSLuaFile" => LuaDependencyKind::AddCSLuaFile,
-            "IncludeCS" => LuaDependencyKind::IncludeCS,
-            _ => return None,
-        }
-    };
-    let dependency_path = get_static_string_arg(expr);
-    if dependency_path.is_none() && dependency_kind == LuaDependencyKind::Require {
-        return None;
-    }
-    Some((dependency_kind, dependency_path))
-}
-
-fn dependency_call_has_no_args(expr: &LuaCallExpr) -> bool {
-    expr.get_args_list()
-        .is_none_or(|args| args.get_args().next().is_none())
 }
 
 fn get_call_name(expr: &LuaCallExpr) -> Option<String> {
