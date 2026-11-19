@@ -1,10 +1,7 @@
 use std::path::PathBuf;
 
-use glua_code_analysis::{DbIndex, FileId, LuaDocument, file_path_to_uri};
-use glua_parser::{
-    LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaLiteralExpr, LuaStringToken,
-    LuaSyntaxNode,
-};
+use glua_code_analysis::{DbIndex, FileId, LuaDependencyKind, LuaDocument, file_path_to_uri};
+use glua_parser::{LuaAstToken, LuaStringToken, LuaSyntaxNode};
 use lsp_types::DocumentLink;
 
 pub fn build_links(
@@ -89,39 +86,24 @@ fn has_linkable_path_component(path: &str) -> bool {
 /// taking it loads, or the module a `require` of it finds.
 pub fn linked_file(db: &DbIndex, file_id: FileId, token: &LuaStringToken) -> Option<FileId> {
     let range = token.get_range();
-    let loaded = db
+    let site = db
         .get_file_dependencies_index()
-        .get_dependency_sites(&file_id)
-        .unwrap_or_default()
+        .get_dependency_sites(&file_id)?
         .iter()
-        .find(|site| site.range == range)
-        .and_then(|site| site.target_file_id);
-    if loaded.is_some() {
-        return loaded;
-    }
-    if !is_require_path(token.clone()).unwrap_or(false) {
-        return None;
-    }
-    Some(
-        db.get_module_index()
-            .find_module(&token.get_value())?
-            .file_id,
-    )
-}
-
-fn is_require_path(token: LuaStringToken) -> Option<bool> {
-    let call_expr = token
-        .get_parent::<LuaLiteralExpr>()?
-        .get_parent::<LuaCallArgList>()?
-        .get_parent::<LuaCallExpr>()?;
-
-    Some(call_expr.is_require())
+        .find(|site| site.range == range)?;
+    site.target_file_id.or_else(|| {
+        (site.kind == LuaDependencyKind::Require)
+            .then(|| db.get_module_index().find_module(&token.get_value()))
+            .flatten()
+            .map(|module| module.file_id)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, check};
+    use glua_parser::LuaAstNode;
     use googletest::prelude::*;
 
     #[gtest]
@@ -178,10 +160,7 @@ mod tests {
     #[gtest]
     fn a_load_path_links_to_the_file_it_loads() {
         let mut ws = ProviderVirtualWorkspace::new();
-        let mut emmyrc = ws.get_emmyrc();
-        emmyrc.gmod.enabled = true;
-        ws.update_emmyrc(emmyrc);
-        ws.def_gmod_call_arg_builtins();
+        ws.enable_gmod_loaders();
         ws.def_file("lua/mylib/ids.lua", "return {}");
         ws.def_file("lua/entities/thing/shared.lua", "return {}");
         let init = ws.def_file(

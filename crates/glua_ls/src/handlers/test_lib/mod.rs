@@ -153,6 +153,15 @@ impl ProviderVirtualWorkspace {
             .unwrap()
     }
 
+    /// Turns GMod on and loads the builtins that annotate its loaders, so
+    /// `require` and `include` load what they name.
+    pub fn enable_gmod_loaders(&mut self) {
+        let mut emmyrc = self.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        self.update_emmyrc(emmyrc);
+        self.def_gmod_call_arg_builtins();
+    }
+
     pub fn def_gmod_call_arg_builtins(&mut self) -> FileId {
         self.def_file(
             "lua/includes/glua_ls_gmod_call_arg_builtins.lua",

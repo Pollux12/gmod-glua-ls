@@ -261,6 +261,19 @@ impl LuaDependencyIndex {
         self.dependency_sites.get(file_id).map(Vec::as_slice)
     }
 
+    /// The kind of load the call spanning `call_range` in `file_id` makes,
+    /// as the annotated loader it calls says.
+    pub fn load_kind_of_call(
+        &self,
+        file_id: &FileId,
+        call_range: TextRange,
+    ) -> Option<LuaDependencyKind> {
+        self.get_dependency_sites(file_id)?
+            .iter()
+            .find(|site| site.call_range == call_range)
+            .map(|site| site.kind)
+    }
+
     /// The sites that resolve to `target_file_id`.
     pub fn get_sites_loading(
         &self,

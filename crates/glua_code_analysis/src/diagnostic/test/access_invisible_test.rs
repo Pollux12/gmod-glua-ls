@@ -40,6 +40,7 @@ mod tests {
     #[test]
     fn test_2() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "test.lua",
             r#"

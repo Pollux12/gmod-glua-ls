@@ -19,7 +19,11 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         .get_parent::<LuaCallArgList>()?
         .get_parent::<LuaCallExpr>()?;
 
-    if !call_expr.is_require() {
+    if !glua_code_analysis::is_require_call(
+        builder.semantic_model.get_db(),
+        builder.semantic_model.get_file_id(),
+        &call_expr,
+    ) {
         return None;
     }
 

@@ -85,7 +85,7 @@ pub fn try_infer_expr_semantic_decl(
             };
             infer_closure_expr_semantic_decl(db, cache, closure_expr, next_guard, level)
         }
-        LuaExpr::CallExpr(call_expr) if call_expr.is_require() => {
+        LuaExpr::CallExpr(call_expr) if crate::is_require_call(db, file_id, &call_expr) => {
             Ok(infer_require_module_semantic_decl(db, cache, call_expr))
         }
         _ => {
@@ -172,14 +172,13 @@ fn infer_name_expr_semantic_decl(
                     return Ok(Some(semantic_id));
                 }
             }
-            LuaSyntaxKind::RequireCallExpr => {
+            _ if crate::is_require_decl(db, &decl) => {
                 let file_id = decl.get_file_id();
                 let call_expr = db
                     .get_vfs()
                     .syntax_node_around(&file_id, value_expr_id)
                     .and_then(LuaCallExpr::cast);
                 if let Some(call_expr) = call_expr
-                    && call_expr.is_require()
                     && let Some(semantic_id) =
                         infer_require_module_semantic_decl(db, cache, call_expr)
                 {

@@ -1019,7 +1019,11 @@ fn extend_module_return_value_references<'a>(
                 continue;
             };
 
-            if !call_expr.is_require() {
+            if !glua_code_analysis::is_require_call(
+                dependent_semantic_model.get_db(),
+                dependent_file_id,
+                &call_expr,
+            ) {
                 continue;
             }
 

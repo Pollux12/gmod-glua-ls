@@ -157,6 +157,7 @@ mod test {
     #[test]
     fn test_duplicate_function_2() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "1.lua",
             r#"

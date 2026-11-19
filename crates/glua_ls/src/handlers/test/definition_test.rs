@@ -319,6 +319,7 @@ end
     #[gtest]
     fn test_goto_return_field() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         ws.def_file(
             "test.lua",
             r#"
@@ -349,6 +350,7 @@ end
     #[gtest]
     fn test_goto_return_field_2() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
+        ws.enable_gmod_loaders();
         ws.def_file(
             "test.lua",
             r#"
@@ -508,6 +510,7 @@ end
     #[gtest]
     fn test_goto_export_function() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         ws.def_file(
             "a.lua",
             r#"
@@ -554,6 +557,7 @@ end
     #[gtest]
     fn test_goto_export_function_2() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         ws.def_file(
             "a.lua",
             r#"
@@ -692,6 +696,7 @@ end
     #[gtest]
     fn test_goto_variable_param() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         ws.def_file(
             "a.lua",
             r#"
@@ -2336,6 +2341,7 @@ end
     {
         let mut ws = ProviderVirtualWorkspace::new();
 
+        ws.enable_gmod_loaders();
         ws.def_file(
             "glide_engine.lua",
             r#"

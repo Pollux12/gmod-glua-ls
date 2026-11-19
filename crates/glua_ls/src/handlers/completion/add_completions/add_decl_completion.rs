@@ -160,7 +160,6 @@ fn can_expr_syntax_have_completion_literal(kind: LuaSyntaxKind) -> bool {
         kind,
         LuaSyntaxKind::CallExpr
             | LuaSyntaxKind::LiteralExpr
-            | LuaSyntaxKind::RequireCallExpr
             | LuaSyntaxKind::AssertCallExpr
             | LuaSyntaxKind::ErrorCallExpr
             | LuaSyntaxKind::TypeCallExpr

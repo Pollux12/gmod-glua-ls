@@ -30,7 +30,7 @@ pub use configs::{
     IgnoreDirDefaultDefinition, IgnoreDirDefaultEntry, ResolvedGmodScriptedClassDefinition,
     ResolvedGmodScriptedClassMatch,
 };
-use glua_parser::{LuaLanguageLevel, LuaNonStdSymbolSet, ParserConfig, SpecialFunction};
+use glua_parser::{LuaLanguageLevel, LuaNonStdSymbolSet, ParserConfig};
 use rowan::NodeCache;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -110,9 +110,6 @@ impl Emmyrc {
             if let Some(func) = (*func).into() {
                 special_like.insert(name.clone(), func);
             }
-        }
-        for name in self.runtime.require_like_function.iter() {
-            special_like.insert(name.clone(), SpecialFunction::Require);
         }
         let mut non_std_symbols = LuaNonStdSymbolSet::new();
         for symbol in self.runtime.nonstandard_symbol.iter() {

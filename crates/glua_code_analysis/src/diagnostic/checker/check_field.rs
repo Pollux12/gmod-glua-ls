@@ -1824,8 +1824,7 @@ fn is_nil_safe_expr_context<T: LuaAstNode>(semantic_model: &SemanticModel, node:
 
                 return false;
             }
-            LuaSyntaxKind::RequireCallExpr
-            | LuaSyntaxKind::ErrorCallExpr
+            LuaSyntaxKind::ErrorCallExpr
             | LuaSyntaxKind::AssertCallExpr
             | LuaSyntaxKind::TypeCallExpr
             | LuaSyntaxKind::SetmetatableCallExpr

@@ -135,6 +135,7 @@ end
             end
             build(true)
         "#;
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(path, definitions);
         assert!(ws.check_file_for(DiagnosticCode::UndefinedMethod, reader_path, reader));
         ws.def_file(path, &definitions.replace("Init", "Other"));

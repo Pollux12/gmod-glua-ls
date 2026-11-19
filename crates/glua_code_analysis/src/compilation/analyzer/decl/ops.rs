@@ -10,12 +10,11 @@ use crate::{
     compilation::analyzer::{
         AnalyzeContext,
         common::{TypeCacheWriteMode, bind_type, write_type_cache},
-        gmod::{ensure_scoped_class_type_decl_for_file, resolve_load_dependency_target},
+        gmod::ensure_scoped_class_type_decl_for_file,
     },
     db_index::{
         DbIndex, FileReferenceBatch, GlobalId, GmodScopedClassInfo, LegacyModuleEnv, LuaDecl,
-        LuaDeclId, LuaDeclarationTree, LuaDependencyKind, LuaDependencySite, LuaMember,
-        LuaMemberOwner, LuaTypeCache, LuaTypeDecl,
+        LuaDeclId, LuaDeclarationTree, LuaMember, LuaMemberOwner, LuaTypeCache, LuaTypeDecl,
     },
 };
 
@@ -71,16 +70,6 @@ pub(super) enum DeclOp {
     },
     ModuleVersions(Vec<LuaVersionCondition>),
     LegacyModuleEnv(LegacyModuleEnv),
-    /// A `require` call. Its target is looked up when the op is applied: it
-    /// depends on the modules the files before it registered.
-    Require {
-        path: String,
-        path_keys: Vec<String>,
-        original_expr: String,
-        call_range: TextRange,
-        /// The path argument's range.
-        range: TextRange,
-    },
 }
 
 /// What the walk adds to the file's [`AnalyzeContext`].
@@ -229,27 +218,6 @@ impl DeclOp {
             Self::LegacyModuleEnv(env) => db
                 .get_module_index_mut()
                 .set_legacy_module_env(file_id, env),
-            Self::Require {
-                path,
-                path_keys,
-                original_expr,
-                call_range,
-                range,
-            } => {
-                let kind = LuaDependencyKind::Require;
-                let target_file_id = resolve_load_dependency_target(db, file_id, kind, &path);
-                db.get_file_dependencies_index_mut()
-                    .add_dependency_site(LuaDependencySite {
-                        source_file_id: file_id,
-                        target_file_id,
-                        kind,
-                        path: Some(path),
-                        path_keys,
-                        original_expr,
-                        call_range,
-                        range,
-                    });
-            }
         }
     }
 }

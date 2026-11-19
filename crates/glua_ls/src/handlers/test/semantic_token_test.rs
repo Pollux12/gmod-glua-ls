@@ -89,6 +89,7 @@ mod tests {
     #[gtest]
     fn test_require_alias_prefix_is_namespace_in_index_expr() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         ws.def_file("mod.lua", "return {}");
         let main = ws.def_file(
             "main.lua",

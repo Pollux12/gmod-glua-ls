@@ -2,14 +2,31 @@ pub(crate) mod value;
 
 use rustc_hash::FxHashSet;
 
-use glua_parser::{LuaAstNode, LuaCallExpr, LuaIndexExpr, LuaSyntaxKind};
+use glua_parser::{LuaAstNode, LuaCallExpr, LuaIndexExpr};
 use rowan::NodeOrToken;
 
 use crate::{
-    DbIndex, LuaDecl, LuaDeclId, LuaInferCache, LuaSemanticDeclId, LuaType, ModuleInfo,
-    SemanticDeclLevel, SemanticModel, infer_node_semantic_decl,
+    DbIndex, FileId, LuaDecl, LuaDeclId, LuaDependencyKind, LuaInferCache, LuaSemanticDeclId,
+    LuaType, ModuleInfo, SemanticDeclLevel, SemanticModel, infer_node_semantic_decl,
     semantic::semantic_info::infer_token_semantic_decl,
 };
+
+/// Whether `call_expr` in `file_id` calls a loader the annotations make a
+/// `require`.
+pub fn is_require_call(db: &DbIndex, file_id: FileId, call_expr: &LuaCallExpr) -> bool {
+    db.get_file_dependencies_index()
+        .load_kind_of_call(&file_id, call_expr.get_range())
+        == Some(LuaDependencyKind::Require)
+}
+
+/// Whether `decl` takes its value from a `require` call.
+pub fn is_require_decl(db: &DbIndex, decl: &LuaDecl) -> bool {
+    decl.get_value_syntax_id().is_some_and(|value| {
+        db.get_file_dependencies_index()
+            .load_kind_of_call(&decl.get_file_id(), value.get_range())
+            == Some(LuaDependencyKind::Require)
+    })
+}
 
 pub fn enum_variable_is_param(
     db: &DbIndex,
@@ -110,10 +127,10 @@ pub fn parse_require_module_info<'a>(
     semantic_model: &'a SemanticModel,
     decl: &LuaDecl,
 ) -> Option<&'a ModuleInfo> {
-    let value_syntax_id = decl.get_value_syntax_id()?;
-    if value_syntax_id.get_kind() != LuaSyntaxKind::RequireCallExpr {
+    if !is_require_decl(semantic_model.get_db(), decl) {
         return None;
     }
+    let value_syntax_id = decl.get_value_syntax_id()?;
 
     let node = semantic_model
         .get_db()

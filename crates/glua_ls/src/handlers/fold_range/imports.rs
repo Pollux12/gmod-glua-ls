@@ -1,4 +1,4 @@
-use glua_code_analysis::Emmyrc;
+use glua_code_analysis::{SemanticModel, is_require_call};
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr, LuaStat};
 use lsp_types::{FoldingRange, FoldingRangeKind};
 use rowan::TextSize;
@@ -8,15 +8,14 @@ use super::builder::FoldingRangeBuilder;
 pub fn build_imports_fold_range(
     builder: &mut FoldingRangeBuilder,
     root: LuaChunk,
-    emmyrc: &Emmyrc,
+    semantic_model: &SemanticModel,
 ) -> Option<()> {
     let root_block = root.get_block()?;
-    let require_like_func = &emmyrc.runtime.require_like_function;
 
     let mut start: Option<TextSize> = None;
     let mut end: Option<TextSize> = None;
     for stat in root_block.get_stats() {
-        if is_require_stat(stat.clone(), require_like_func).unwrap_or(false) {
+        if is_require_stat(semantic_model, &stat) {
             let range = stat.get_range();
             if start.is_none() {
                 start = Some(range.start());
@@ -46,46 +45,39 @@ pub fn build_imports_fold_range(
     Some(())
 }
 
-fn is_require_stat(stat: LuaStat, require_like_func: &[String]) -> Option<bool> {
+/// Whether `stat` takes a value from a `require`, as `local m = require("m")`
+/// or `require("m").setup()` do.
+pub(crate) fn is_require_stat(semantic_model: &SemanticModel, stat: &LuaStat) -> bool {
     match stat {
-        LuaStat::LocalStat(local_stat) => {
-            let exprs = local_stat.get_value_exprs();
-            for expr in exprs {
-                if is_require_expr(expr, require_like_func).unwrap_or(false) {
-                    return Some(true);
-                }
-            }
-        }
-        LuaStat::AssignStat(assign_stat) => {
-            let (_, exprs) = assign_stat.get_var_and_expr_list();
-            for expr in exprs {
-                if is_require_expr(expr, require_like_func).unwrap_or(false) {
-                    return Some(true);
-                }
-            }
-        }
-        LuaStat::CallExprStat(call_expr_stat) => {
-            let expr = call_expr_stat.get_call_expr()?;
-            if is_require_expr(expr.into(), require_like_func).unwrap_or(false) {
-                return Some(true);
-            }
-        }
-        _ => {}
+        LuaStat::LocalStat(local_stat) => local_stat
+            .get_value_exprs()
+            .any(|expr| is_require_expr(semantic_model, expr)),
+        LuaStat::AssignStat(assign_stat) => assign_stat
+            .get_var_and_expr_list()
+            .1
+            .into_iter()
+            .any(|expr| is_require_expr(semantic_model, expr)),
+        LuaStat::CallExprStat(call_expr_stat) => call_expr_stat
+            .get_call_expr()
+            .is_some_and(|call_expr| is_require_expr(semantic_model, call_expr.into())),
+        _ => false,
     }
-
-    Some(false)
 }
 
-fn is_require_expr(expr: LuaExpr, require_like_func: &[String]) -> Option<bool> {
-    if let LuaExpr::CallExpr(call_expr) = expr {
-        let name = call_expr.get_prefix_expr()?;
-        if let LuaExpr::NameExpr(name_expr) = name {
-            let name = name_expr.get_name_text()?;
-            if require_like_func.contains(&name.to_string()) || name == "require" {
-                return Some(true);
-            }
+fn is_require_expr(semantic_model: &SemanticModel, expr: LuaExpr) -> bool {
+    match expr {
+        LuaExpr::CallExpr(call_expr) => {
+            is_require_call(
+                semantic_model.get_db(),
+                semantic_model.get_file_id(),
+                &call_expr,
+            ) || call_expr
+                .get_prefix_expr()
+                .is_some_and(|prefix| is_require_expr(semantic_model, prefix))
         }
+        LuaExpr::IndexExpr(index_expr) => index_expr
+            .get_prefix_expr()
+            .is_some_and(|prefix| is_require_expr(semantic_model, prefix)),
+        _ => false,
     }
-
-    Some(false)
 }

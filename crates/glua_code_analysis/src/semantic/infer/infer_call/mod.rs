@@ -2699,7 +2699,7 @@ pub fn infer_call_expr(
     cache: &mut LuaInferCache,
     call_expr: LuaCallExpr,
 ) -> InferResult {
-    if call_expr.is_require() {
+    if crate::is_require_call(db, cache.get_file_id(), &call_expr) {
         return infer_require_call(db, cache, call_expr);
     } else if let Some(loaded_file_id) = loaded_file_of_call(db, cache.get_file_id(), &call_expr)
         && load_call_result_is_unspecified(db, cache, &call_expr)

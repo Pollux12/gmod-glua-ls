@@ -14,7 +14,11 @@ impl Checker for RequireModuleVisibilityChecker {
             return;
         };
         for call_expr in buckets.call_exprs.iter().cloned() {
-            if call_expr.is_require() {
+            if crate::is_require_call(
+                semantic_model.get_db(),
+                semantic_model.get_file_id(),
+                &call_expr,
+            ) {
                 check_require_call_expr(context, semantic_model, call_expr);
             }
         }

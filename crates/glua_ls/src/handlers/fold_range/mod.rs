@@ -7,9 +7,10 @@ mod stats;
 use builder::FoldingRangeBuilder;
 use comment::build_comment_fold_range;
 use expr::{build_closure_expr_fold_range, build_string_fold_range, build_table_expr_fold_range};
-use glua_code_analysis::Emmyrc;
+use glua_code_analysis::SemanticModel;
 use glua_parser::{LuaAst, LuaAstNode};
 use imports::build_imports_fold_range;
+pub(crate) use imports::is_require_stat;
 use lsp_types::{
     ClientCapabilities, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
     ServerCapabilities,
@@ -58,10 +59,9 @@ pub async fn on_folding_range_handler(
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
     let document = semantic_model.get_document();
     let root = semantic_model.get_root();
-    let emmyrc = semantic_model.get_emmyrc();
 
     let mut builder = FoldingRangeBuilder::new(&document, root.clone(), client_id);
-    build_folding_ranges(&mut builder, emmyrc, &cancel_token);
+    build_folding_ranges(&mut builder, &semantic_model, &cancel_token);
     if cancel_token.is_cancelled() {
         return None;
     }
@@ -70,7 +70,7 @@ pub async fn on_folding_range_handler(
 
 fn build_folding_ranges(
     builder: &mut FoldingRangeBuilder,
-    emmyrc: &Emmyrc,
+    semantic_model: &SemanticModel,
     cancel_token: &CancellationToken,
 ) {
     let root = builder.get_root().clone();
@@ -113,7 +113,7 @@ fn build_folding_ranges(
         }
     }
 
-    build_imports_fold_range(builder, root, emmyrc);
+    build_imports_fold_range(builder, root, semantic_model);
 }
 
 pub struct FoldRangeCapabilities;

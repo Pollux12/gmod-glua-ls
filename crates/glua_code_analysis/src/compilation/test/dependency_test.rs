@@ -351,6 +351,101 @@ mod test {
         assert_eq!(cold(Some(IDS_EDITED)), "\"one\"");
     }
 
+    const MODULE_FILE: &str = "lua/includes/modules/mylib_ids.lua";
+    const REQUIRER_FILE: &str = "lua/autorun/sh_requirer.lua";
+
+    fn requirer_first(ws: &mut VirtualWorkspace, requirer: &str) -> String {
+        let file_id = ws.def_file(REQUIRER_FILE, requirer);
+        ws.humanize_type(ws.local_ty(file_id, "first"))
+    }
+
+    /// A local function named `require` is not the loader: it loads nothing
+    /// and its call has no module's value.
+    #[test]
+    fn a_local_named_require_loads_nothing() {
+        let mut ws = gmod_workspace();
+        ws.def_file(MODULE_FILE, IDS);
+        let requirer = ws.def_file(
+            REQUIRER_FILE,
+            "local function require(name) end
+local ids = require(\"mylib_ids\")
+",
+        );
+
+        let sites = ws
+            .get_db_mut()
+            .get_file_dependencies_index()
+            .get_dependency_sites(&requirer)
+            .map(<[_]>::len);
+        assert_eq!(sites, None);
+    }
+
+    /// A function the annotations make a `require` loader returns the module
+    /// it names, as `require` does.
+    #[test]
+    fn an_annotated_require_wrapper_returns_the_module() {
+        let mut ws = gmod_workspace();
+        ws.def_file(MODULE_FILE, IDS);
+        ws.def_file(
+            LOADER_FILE,
+            "---@[call_arg(\"gmod.load\", \"require\")]
+---@param name string
+function RequireModule(name) end
+",
+        );
+
+        let first = requirer_first(
+            &mut ws,
+            "local ids = RequireModule(\"mylib_ids\")
+local first = ids.first
+",
+        );
+        assert_eq!(first, "1");
+    }
+
+    /// Editing, deleting and reopening a required module leaves what its
+    /// requirer reads as a cold build has it.
+    #[test]
+    fn a_required_module_edited_deleted_and_reopened_settles_as_a_cold_build() {
+        const REQUIRER: &str = "local ids = require(\"mylib_ids\")
+local first = ids.first
+";
+        const IDS_EDITED: &str = "local IDS = { first = \"one\" }
+return IDS
+";
+        let cold = |ids: Option<&str>| {
+            let mut ws = gmod_workspace();
+            if let Some(ids) = ids {
+                ws.def_file(MODULE_FILE, ids);
+            }
+            requirer_first(&mut ws, REQUIRER)
+        };
+        let mut warm = gmod_workspace();
+        warm.def_file(MODULE_FILE, IDS);
+        let first = requirer_first(&mut warm, REQUIRER);
+        let module_uri = warm.virtual_url_generator.new_uri(MODULE_FILE);
+        let requirer_uri = warm.virtual_url_generator.new_uri(REQUIRER_FILE);
+        let read = |ws: &VirtualWorkspace| {
+            let file_id = ws.analysis.get_file_id(&requirer_uri).expect("requirer");
+            ws.humanize_type(ws.local_ty(file_id, "first"))
+        };
+
+        warm.def_file(MODULE_FILE, IDS_EDITED);
+        let edited = read(&warm);
+        warm.analysis
+            .remove_file_by_uri(&module_uri)
+            .0
+            .expect("required module must be removed");
+        let deleted = read(&warm);
+        warm.def_file(MODULE_FILE, IDS);
+        let reopened = read(&warm);
+
+        assert_eq!(
+            (first.as_str(), edited.as_str(), deleted, reopened),
+            ("1", "\"one\"", cold(None), cold(Some(IDS)))
+        );
+    }
+
     const LOADER_FILE: &str = "lua/autorun/sh_loader.lua";
     const LOADER: &str = "function MyLoad(path)\n    return include(path)\nend\n";
     const THING_FILE: &str = "lua/mylib/thing.lua";

@@ -375,6 +375,7 @@ mod tests {
     #[gtest]
     fn test_require_function() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         ws.def_file(
             "test.lua",
             r#"
@@ -393,7 +394,7 @@ mod tests {
                 local si<??>gnal = test.signal
             "#,
             VirtualHoverResult {
-                value: "```lua\nlocal function signal()\n```\n\n---\n\n测试".to_string(),
+                value: "```lua\nlocal function signal()\n```\n\n---\n\n![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png) **SHARED**\n\n测试".to_string(),
             },
         ));
         Ok(())
@@ -485,6 +486,7 @@ mod tests {
     #[gtest]
     fn test_other_file_function() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         ws.def_file(
             "a.lua",
             r#"
@@ -500,7 +502,7 @@ mod tests {
                 <??>zipLatest()
             "#,
             VirtualHoverResult {
-                value: "```lua\nlocal function zipLatest(...)\n```\n\n---\n\n测试".to_string(),
+                value: "```lua\nlocal function zipLatest(...)\n```\n\n---\n\n![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png) **SHARED**\n\n测试".to_string(),
             },
         ));
         Ok(())
@@ -1041,6 +1043,7 @@ mod tests {
     fn test_require_module_member_rich_hover() -> Result<()> {
         // Regression test for required module hovers using the module export owner.
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         ws.def_file(
             "netstream.lua",
             r#"
@@ -1074,7 +1077,7 @@ mod tests {
                 local send_<??>fn = netstream.Send
             "#,
             VirtualHoverResult {
-                value: "```lua\n(method) NetStream:Send(channel: string, data: table)\n  -> success: boolean\n\n```\n\n---\n\nSend data over the network stream\n\n@*param* `channel` — The channel to send on\n\n@*param* `data` — The data to send\n\n@*return* `success`  — Whether the send succeeded".to_string(),
+                value: "```lua\n(method) NetStream:Send(channel: string, data: table)\n  -> success: boolean\n\n```\n\n---\n\n![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png) **SHARED**\n\nSend data over the network stream\n\n@*param* `channel` — The channel to send on\n\n@*param* `data` — The data to send\n\n@*return* `success`  — Whether the send succeeded".to_string(),
             },
         ));
 

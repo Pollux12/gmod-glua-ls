@@ -10,12 +10,13 @@ Most projects never need these settings.
 | Option | Default | Description |
 |---|---|---|
 | `runtime.nonstandardSymbol` | GLua symbols | Extra syntax the parser accepts. See below |
-| `runtime.requireLikeFunction` | `[]` | Your own functions that load modules like `require` |
 | `runtime.requirePattern` | `[]` | Path patterns for `require`, such as `"?.lua"` and `"?/init.lua"` |
-| `runtime.special` | `{}` | Treat your own functions like a built-in: `"require"`, `"error"`, `"assert"`, `"type"`, `"setmetatable"` or `"none"` |
+| `runtime.special` | `{}` | Treat your own functions like a built-in: `"error"`, `"assert"`, `"type"`, `"setmetatable"` or `"none"` |
 | `runtime.extensions` | `[]` | Extra file extensions to read as Lua, such as `".lua.txt"` |
 
 `runtime.version` has no effect. Garry's Mod always uses LuaJIT.
+
+To make your own function load modules like `require`, annotate it with [`@call_arg("gmod.load", "require")`](/annotations/call-arg).
 
 ### GLua syntax
 
@@ -24,7 +25,6 @@ By default GLuaLS accepts the GLua additions `//`, `/* */`, `continue`, `!=`, `|
 ```json .gluarc.json
 {
   "runtime": {
-    "requireLikeFunction": ["MyAddon.Load"],
     "special": {
       "MyAddon.Assert": "assert"
     }

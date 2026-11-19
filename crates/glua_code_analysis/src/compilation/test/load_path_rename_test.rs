@@ -89,6 +89,7 @@ mod test {
     #[gtest]
     fn a_module_rename_rewrites_its_require() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_files(vec![
             ("lua/includes/modules/myutil.lua", "return {}\n"),
             (
@@ -289,6 +290,7 @@ mod test {
     #[gtest]
     fn a_require_names_only_the_module_it_loaded() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_files(vec![
             ("zlib/old.lua", "return {}\n"),
             ("new.lua", "return {}\n"),
@@ -320,6 +322,7 @@ mod test {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.runtime.require_pattern = vec!["?.lua".to_string(), "?/main.lua".to_string()];
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.def_files(vec![
             ("mylib/core/util/main.lua", "return {}\n"),
             (

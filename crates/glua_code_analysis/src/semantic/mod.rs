@@ -35,7 +35,9 @@ pub(crate) use decl::value::{
     local_name_value, metatable_member_owner, semantic_decl_closure_signature_id,
     semantic_decl_signature_id, semantic_decl_value, semantic_decl_value_expr,
 };
-pub use decl::{enum_variable_is_param, parse_require_module_info};
+pub use decl::{
+    enum_variable_is_param, is_require_call, is_require_decl, parse_require_module_info,
+};
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaDocType,
     LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, LuaNameExpr, LuaParseError,

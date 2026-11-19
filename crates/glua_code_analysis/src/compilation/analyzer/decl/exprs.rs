@@ -413,20 +413,6 @@ pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Opti
     try_analyze_legacy_module_call(analyzer, &expr);
     try_declare_define_baseclass_local(analyzer, &expr);
 
-    if !expr.is_require() {
-        return Some(());
-    }
-    let path = get_static_string_arg(&expr)?;
-    let range = expr.get_args_list()?.get_args().next()?.get_range();
-    let path_keys = crate::dependency_site_path_keys(analyzer.db, analyzer.get_file_id(), &path);
-    analyzer.ops.push(DeclOp::Require {
-        path,
-        path_keys,
-        original_expr: expr.syntax().text().to_string(),
-        call_range: expr.get_range(),
-        range,
-    });
-
     Some(())
 }
 

@@ -6,6 +6,7 @@ mod tests {
     fn test() {
         let mut ws = VirtualWorkspace::new();
         // Different scopes
+        ws.def_gmod_call_arg_builtins();
         assert!(ws.check_code_for(
             DiagnosticCode::DuplicateRequire,
             r#"

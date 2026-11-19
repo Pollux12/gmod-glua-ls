@@ -12,6 +12,7 @@ mod tests {
     #[gtest]
     fn test_function_references() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         check!(ws.check_references(
             r#"
                 local export = {}
@@ -64,6 +65,7 @@ mod tests {
     #[gtest]
     fn test_function_references_2() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         check!(ws.check_references(
             r#"
                 local function fl<??>ush()
@@ -152,6 +154,7 @@ mod tests {
     #[gtest]
     fn test_decl_usages_traverses_module_alias_without_counting_alias_binding() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
         let module_file_id = ws.def_file(
             "a.lua",
             r#"
@@ -201,6 +204,7 @@ mod tests {
     fn test_module_return() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
 
+        ws.enable_gmod_loaders();
         check!(ws.check_references(
             r#"
                 local function init()

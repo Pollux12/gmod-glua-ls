@@ -5,8 +5,8 @@ use glua_parser::{
 };
 
 use crate::{
-    DiagnosticCode, LuaDecl, LuaDeclExtra, LuaMember, LuaMemberFeature, LuaMemberKey,
-    LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel, SemanticModel,
+    DiagnosticCode, LuaDeclExtra, LuaMember, LuaMemberFeature, LuaMemberKey, LuaSemanticDeclId,
+    LuaType, LuaTypeDeclId, SemanticDeclLevel, SemanticModel,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -61,11 +61,11 @@ fn get_decl_set(
                 LuaType::Def(id) => {
                     type_decl_id_set.insert(DeclInfo {
                         id,
-                        is_require: is_require_decl(decl),
+                        is_require: crate::is_require_decl(semantic_model.get_db(), decl),
                     });
                 }
                 LuaType::Ref(id) => {
-                    if is_require_decl(decl) {
+                    if crate::is_require_decl(semantic_model.get_db(), decl) {
                         type_decl_id_set.insert(DeclInfo {
                             id,
                             is_require: true,
@@ -93,13 +93,6 @@ fn get_decl_set(
     }
 
     Some(type_decl_id_set)
-}
-
-fn is_require_decl(decl: &LuaDecl) -> bool {
-    let Some(expr_id) = decl.get_value_syntax_id() else {
-        return false;
-    };
-    expr_id.get_kind() == LuaSyntaxKind::RequireCallExpr
 }
 
 struct DiagnosticMemberInfo<'a> {
