@@ -3,7 +3,7 @@ mod call_flow;
 mod index_flow;
 
 pub(crate) use binary_flow::type_name_test;
-pub(crate) use call_flow::presence_guard_target;
+pub(crate) use call_flow::{presence_guard_target, type_guard_target_expr};
 
 use std::sync::Arc;
 

@@ -71,6 +71,7 @@ pub(crate) use narrow::{
     condition_has_concrete_type_evidence, condition_nominal_type, contains_gmod_null_type,
     get_var_expr_var_ref_id, getter_access_path, is_gmod_null_entity_candidate,
     narrowing_root_decl, presence_guard_target, remove_false_or_nil, respell_path_root,
+    type_guard_target_expr,
 };
 
 use rowan::TextRange;

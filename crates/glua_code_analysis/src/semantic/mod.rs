@@ -64,7 +64,6 @@ pub(crate) use infer::narrow::{
     get_var_ref_type, infer_true_condition_narrowing, infer_var_type_at_node, type_name_test,
 };
 pub(crate) use infer::pairs_iter_value_registry_path;
-pub(crate) use infer::presence_guard_target;
 pub(crate) use infer::resolve_decl_backed_global_path_member_type;
 pub(crate) use infer::resolve_type_text;
 pub(crate) use infer::setmetatable_target_of_literal;
@@ -82,6 +81,7 @@ pub(crate) use infer::{
 };
 use infer::{infer_call_arg_expr_list_types, infer_expr_list_value_type_at};
 pub use infer::{infer_table_field_value_should_be, infer_table_should_be};
+pub(crate) use infer::{presence_guard_target, type_guard_target_expr};
 use lsp_types::Uri;
 pub use member::LuaMemberInfo;
 pub use member::find_index_operations;

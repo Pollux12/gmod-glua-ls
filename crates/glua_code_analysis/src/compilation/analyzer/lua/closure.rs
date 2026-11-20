@@ -2561,6 +2561,14 @@ pub fn analyze_return_point(
         match point {
             LuaReturnPoint::Expr(expr) => {
                 let expr_type = returned_value_type(db, cache, expr)?;
+                let expr_type = match expr_type {
+                    LuaType::TypeGuard(_)
+                        if !tests_guard_subject(db, cache.get_file_id(), expr) =>
+                    {
+                        LuaType::Boolean
+                    }
+                    expr_type => expr_type,
+                };
                 let expr_type = super::super::common::widen_mutable_local_name_copy(
                     db,
                     cache.get_file_id(),
@@ -2608,6 +2616,50 @@ pub fn analyze_return_point(
         attributes: None,
         return_kind: ReturnTypeKind::default(),
     }])
+}
+
+/// Whether `expr`, returned from its function, is a guard call testing the
+/// value a call of that function narrows as a guard: its first parameter, or
+/// `self` in a method. A returned guard testing anything else is a plain
+/// boolean to the function's callers.
+fn tests_guard_subject(db: &DbIndex, file_id: crate::FileId, expr: &LuaExpr) -> bool {
+    let mut expr = expr.clone();
+    while let LuaExpr::ParenExpr(paren) = expr {
+        let Some(inner) = paren.get_expr() else {
+            return false;
+        };
+        expr = inner;
+    }
+    let LuaExpr::CallExpr(call) = expr else {
+        return false;
+    };
+    let Some(LuaExpr::NameExpr(tested)) = crate::semantic::type_guard_target_expr(&call) else {
+        return false;
+    };
+    let Some(closure) = call.ancestors::<LuaClosureExpr>().next() else {
+        return false;
+    };
+    let method_index_token = closure
+        .get_parent::<LuaFuncStat>()
+        .and_then(|func_stat| func_stat.get_func_name())
+        .and_then(|name| match name {
+            LuaVarExpr::IndexExpr(index_expr) => index_expr.get_index_token(),
+            LuaVarExpr::NameExpr(_) => None,
+        })
+        .filter(|token| token.is_colon());
+    let subject_position = match method_index_token {
+        Some(colon) => colon.get_range().start(),
+        None => match closure
+            .get_params_list()
+            .and_then(|params| params.get_params().next())
+        {
+            Some(first_param) => first_param.get_position(),
+            None => return false,
+        },
+    };
+    db.get_reference_index()
+        .get_var_reference_decl(&file_id, tested.get_range())
+        == Some(LuaDeclId::new(file_id, subject_position))
 }
 
 /// The value `expr` returns. In `cond and value.Member`, a member the

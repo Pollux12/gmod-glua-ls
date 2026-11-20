@@ -3531,6 +3531,43 @@ _2 = a[1]
         assert_eq!(ws.humanize_type(narrowed), "(Entity|true)");
     }
 
+    /// The types two locals have inside `if <call> then`, where both are
+    /// `Entity?` before it and `helper` defines the predicate `call` uses.
+    fn guarded_pair(helper: &str, call: &str) -> (String, String) {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+        let file_id = ws.def(&format!(
+            r#"
+            ---@return Entity?
+            local function find() end
+
+            {helper}
+
+            local function use()
+                local x, y = find(), find()
+                if {call} then
+                    local first, second = x, y
+                    print(first, second)
+                end
+            end
+            "#
+        ));
+        let types = [("first", 0), ("second", 0)]
+            .map(|(name, nth)| nth_name_expr_type_from_end(&mut ws, file_id, name, nth));
+        let [first, second] = types.map(|typ| ws.humanize_type(typ));
+        (first, second)
+    }
+
+    #[gtest]
+    fn test_predicate_wrapper_narrows_only_the_argument_it_tests() {
+        let narrowed = guarded_pair(
+            "local function ok(reason, ent) return IsValid(ent) end",
+            "ok(x, y)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity".to_string()));
+    }
+
     #[gtest]
     fn test_unannotated_predicate_wrapper_narrows_member_expression_on_true_branch() {
         let mut ws = VirtualWorkspace::new();

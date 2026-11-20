@@ -1137,7 +1137,7 @@ fn asserted_type_by_function_type(
     }
 }
 
-fn type_guard_target_expr(call_expr: &LuaCallExpr) -> Option<LuaExpr> {
+pub(crate) fn type_guard_target_expr(call_expr: &LuaCallExpr) -> Option<LuaExpr> {
     let mut target = if call_expr.is_colon_call()
         && let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr()
         && let Some(self_expr) = index_expr.get_prefix_expr()

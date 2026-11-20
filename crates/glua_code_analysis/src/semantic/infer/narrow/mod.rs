@@ -17,7 +17,7 @@ use crate::{
 };
 pub(crate) use condition_flow::{
     InferConditionFlow, condition_has_concrete_type_evidence, condition_nominal_type,
-    presence_guard_target, type_name_test,
+    presence_guard_target, type_guard_target_expr, type_name_test,
 };
 pub(crate) use get_type_at_cast_flow::apply_cast;
 pub use get_type_at_cast_flow::get_type_at_call_expr_inline_cast;
