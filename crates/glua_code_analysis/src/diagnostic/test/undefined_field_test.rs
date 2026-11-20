@@ -1499,6 +1499,10 @@ mod test {
         let command_path = schema_root.join("schema/sh_commands.lua");
         analysis.update_files_by_path(vec![
             (
+                helix_root.join("builtins.lua"),
+                Some(crate::GMOD_CALL_ARG_BUILTINS_FIXTURE.to_string()),
+            ),
+            (
                 helix_root.join("gamemode/shared.lua"),
                 Some(shared.to_string()),
             ),
@@ -1520,6 +1524,24 @@ mod test {
         let shared_file = analysis
             .get_file_id(&shared_uri)
             .expect("expected shared file id");
+        let init_uri = lsp_types::Uri::parse_from_file_path(&helix_root.join("gamemode/init.lua"))
+            .expect("expected init path to convert to uri");
+        let init_file = analysis
+            .get_file_id(&init_uri)
+            .expect("expected init file id");
+        let init_loads = analysis
+            .compilation
+            .get_db()
+            .get_file_dependencies_index()
+            .get_dependency_sites(&init_file)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|site| site.target_file_id)
+            .collect::<Vec<_>>();
+        assert!(
+            init_loads.contains(&shared_file),
+            "init.lua should load shared.lua, loads {init_loads:?}"
+        );
         let tree = analysis
             .compilation
             .get_db()
