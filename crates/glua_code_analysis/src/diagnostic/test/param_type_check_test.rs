@@ -5946,6 +5946,26 @@ mod test {
         );
     }
 
+    /// An intersection with a table member is a table, as what `table.Inherit`
+    /// returns is.
+    #[test]
+    fn an_intersection_of_tables_is_accepted_where_a_table_is_expected() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param t table
+            local function take(t) end
+
+            ---@class Base
+            ---@type { a: integer } & Base
+            local both
+            take(both)
+            "#
+        ));
+    }
+
     /// The same runtime write also reached table compatibility, which reported
     /// the literal as missing a member the class never declared.
     #[test]

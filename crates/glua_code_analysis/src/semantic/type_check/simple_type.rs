@@ -47,6 +47,21 @@ pub fn check_simple_type_compact(
             ) {
                 return Ok(());
             }
+            // A value that is all of its members is a table if one of them is.
+            if let LuaType::Intersection(intersection) = compact_type {
+                for member in intersection.get_types() {
+                    if check_general_type_compact(
+                        context,
+                        source,
+                        member,
+                        check_guard.next_level()?,
+                    )
+                    .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
         }
         LuaType::Userdata => {
             if matches!(
