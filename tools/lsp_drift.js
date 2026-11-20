@@ -372,6 +372,8 @@ async function main() {
         await settle();
         differences += compare('recreate', shown, await originalCold);
 
+        for (const panic of client.panics) console.log(`[panic] ${panic}`);
+        differences += client.panics.length;
         console.log(`[time] total ${((Date.now() - started) / 1000).toFixed(1)}s`);
         return differences;
     } finally {
