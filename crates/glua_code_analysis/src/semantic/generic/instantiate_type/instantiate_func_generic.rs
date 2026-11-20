@@ -534,7 +534,8 @@ pub fn instantiate_func_generic_with_bindings(
 
     let function = if let LuaType::DocFunction(f) = instantiate_doc_function(db, func, &substitutor)
     {
-        f.deref().clone()
+        let ret = super::bounded_depth::bounded(f.get_ret());
+        f.deref().clone().with_ret(ret)
     } else {
         func.clone()
     };

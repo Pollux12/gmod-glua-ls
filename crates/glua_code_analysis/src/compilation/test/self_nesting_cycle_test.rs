@@ -172,11 +172,27 @@ mod test {
 
     const REGISTRY: &str = "lua/includes/modules/gamemode.lua";
 
+    /// What generics in [`registry`] may return around their arguments: every
+    /// kind of structure a template builds by value.
+    const BUILD_RETURNS: [&str; 8] = [
+        "T & B",
+        "{ BaseClass: B }",
+        "T & B & { BaseClass: B }",
+        "(T | B)[]",
+        "{ list: B[], self: T }",
+        "{ get: fun(): B, me: fun(): T }",
+        "[T, B]",
+        "Wrapper<T | B>",
+    ];
+
     /// A registry whose entries are built from one another by `build`, the
     /// shape of GMod's own `includes/modules/gamemode.lua`.
     fn registry(build_return: &str, build: &str) -> String {
         format!(
             r#"
+            ---@class Wrapper<V>
+            ---@field value V
+
             ---@generic T, B
             ---@param target T
             ---@param base B
@@ -203,7 +219,7 @@ mod test {
     /// on every pass round the registry.
     #[test]
     fn a_registry_built_from_its_own_entries_settles() {
-        for build_return in ["T & B", "{ BaseClass: B }", "T & B & { BaseClass: B }"] {
+        for build_return in BUILD_RETURNS {
             let source = registry(build_return, "Inherit(t, basetable)");
             assert!(
                 settled_files_digest(&[(REGISTRY, source)]).is_some(),
@@ -229,8 +245,14 @@ mod test {
     /// cold build of the same files has.
     #[test]
     fn a_registry_edited_deleted_and_reopened_settles_as_a_cold_build() {
-        let source = registry("T & B & { BaseClass: B }", "Inherit(t, basetable)");
-        let edited = registry("T & B & { BaseClass: B }", "Inherit(basetable, t)");
+        for build_return in ["T & B & { BaseClass: B }", "(T | B)[]"] {
+            registry_edited_deleted_and_reopened_settles_as_a_cold_build(build_return);
+        }
+    }
+
+    fn registry_edited_deleted_and_reopened_settles_as_a_cold_build(build_return: &str) {
+        let source = registry(build_return, "Inherit(t, basetable)");
+        let edited = registry(build_return, "Inherit(basetable, t)");
         let caller = "local sandbox = Get(\"sandbox\")\n";
         let cold = |registry: Option<&str>| {
             let mut files = vec![("lua/autorun/sh_caller.lua", caller.to_string())];
@@ -257,6 +279,38 @@ mod test {
         let warm = rx
             .recv_timeout(Duration::from_secs(60))
             .expect("the warm edits settle");
-        assert_eq!(warm, (cold(Some(&edited)), cold(None), cold(Some(&source))));
+        assert_eq!(
+            warm,
+            (cold(Some(&edited)), cold(None), cold(Some(&source))),
+            "{build_return}"
+        );
+    }
+
+    /// A value that is not built from itself keeps the structure it nests
+    /// through a generic's array and callback.
+    #[test]
+    fn a_nested_value_through_a_generic_keeps_its_fields() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@generic T
+            ---@param value T
+            ---@return T[], fun(): T
+            local function wrap(value) end
+
+            ---@type { a: { b: { c: { d: integer } } } }
+            local deep
+            local list, get = wrap(deep)
+            fromList = list[1].a.b.c.d
+            fromGet = get().a.b.c.d
+            "#,
+        );
+
+        let types = (ws.expr_ty("fromList"), ws.expr_ty("fromGet"));
+
+        assert_eq!(
+            (ws.humanize_type(types.0), ws.humanize_type(types.1)),
+            ("integer".to_string(), "integer".to_string())
+        );
     }
 }

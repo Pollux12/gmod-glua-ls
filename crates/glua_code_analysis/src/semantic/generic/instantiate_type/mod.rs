@@ -1,3 +1,4 @@
+mod bounded_depth;
 mod instantiate_func_generic;
 mod instantiate_special_generic;
 
@@ -314,7 +315,7 @@ fn instantiate_object(
 
     let mut new_fields = BTreeMap::new();
     for (key, field) in fields {
-        let new_field = instantiate_part(db, field, substitutor);
+        let new_field = instantiate_type_generic(db, field, substitutor);
         new_fields.insert(key.clone(), new_field);
     }
 
@@ -347,78 +348,13 @@ fn instantiate_intersection(
     let mut new_types = intersection
         .get_types()
         .iter()
-        .map(|t| instantiate_part(db, t, substitutor))
+        .map(|t| instantiate_type_generic(db, t, substitutor))
         .filter(|t| !t.is_unknown())
         .collect::<Vec<_>>();
     match new_types.len() {
         0 => LuaType::Unknown,
         1 => new_types.remove(0),
         _ => LuaType::Intersection(LuaIntersectionType::new(new_types).into()),
-    }
-}
-
-/// A part of a type the template builds, such as a field of `{ BaseClass: B }`
-/// or a member of `T & B`. A parameter there takes its argument with what the
-/// argument nests collapsed: its own fields stay, but an object or
-/// intersection inside it reads as `table`. A value a registry builds from its
-/// own entries then nests no deeper on each pass round the registry.
-fn instantiate_part(db: &DbIndex, part: &LuaType, substitutor: &TypeSubstitutor) -> LuaType {
-    match part {
-        LuaType::TplRef(_) => by_reference(instantiate_type_generic(db, part, substitutor)),
-        LuaType::Union(union) => LuaType::from_vec(
-            union
-                .into_vec()
-                .iter()
-                .map(|member| instantiate_part(db, member, substitutor))
-                .collect(),
-        ),
-        _ => instantiate_type_generic(db, part, substitutor),
-    }
-}
-
-fn by_reference(typ: LuaType) -> LuaType {
-    match typ {
-        LuaType::Union(union) => {
-            LuaType::from_vec(union.into_vec().into_iter().map(by_reference).collect())
-        }
-        LuaType::Object(object) => LuaType::Object(
-            LuaObjectType::new_with_fields(
-                object
-                    .get_fields()
-                    .iter()
-                    .map(|(key, field)| (key.clone(), collapsed(field.clone())))
-                    .collect(),
-                object
-                    .get_index_access()
-                    .iter()
-                    .map(|(key, value)| (key.clone(), collapsed(value.clone())))
-                    .collect(),
-            )
-            .into(),
-        ),
-        LuaType::Intersection(intersection) => LuaType::Intersection(
-            LuaIntersectionType::new(
-                intersection
-                    .get_types()
-                    .iter()
-                    .cloned()
-                    .map(collapsed)
-                    .collect(),
-            )
-            .into(),
-        ),
-        typ => typ,
-    }
-}
-
-/// `typ` with every object or intersection in it read as `table`.
-fn collapsed(typ: LuaType) -> LuaType {
-    match typ {
-        LuaType::Object(_) | LuaType::Intersection(_) => LuaType::Table,
-        LuaType::Union(union) => {
-            LuaType::from_vec(union.into_vec().into_iter().map(collapsed).collect())
-        }
-        typ => typ,
     }
 }
 
