@@ -8,19 +8,20 @@ use std::sync::Arc;
 
 use crate::{
     LuaArrayType, LuaFunctionType, LuaGenericType, LuaIntersectionType, LuaMergedTableType,
-    LuaObjectType, LuaTupleType, LuaType, VariadicType,
+    LuaMultiLineUnion, LuaObjectType, LuaTupleType, LuaType, VariadicType,
 };
 
 /// The levels of by-value structure a call's result keeps.
 pub(super) const MAX_DEPTH: usize = 6;
 
 /// `typ` with every by-value structure nested deeper than [`MAX_DEPTH`] read as
-/// its plain kind: `table` or `function`.
+/// its plain kind: `table`, `function` or `boolean`.
 pub(super) fn bounded(typ: &LuaType) -> LuaType {
-    bounded_to(typ, MAX_DEPTH)
+    cut(typ, MAX_DEPTH).unwrap_or_else(|| typ.clone())
 }
 
-fn bounded_to(typ: &LuaType, depth: usize) -> LuaType {
+/// `typ` cut to `depth` levels, or `None` when it is already within them.
+fn cut(typ: &LuaType, depth: usize) -> Option<LuaType> {
     match typ {
         LuaType::Unknown
         | LuaType::Any
@@ -59,27 +60,32 @@ fn bounded_to(typ: &LuaType, depth: usize) -> LuaType {
         | LuaType::DocAttribute(_)
         | LuaType::Conditional(_)
         | LuaType::ConditionalInfer(_)
-        | LuaType::Mapped(_) => typ.clone(),
+        | LuaType::Mapped(_) => None,
         // Alternatives and return lists add no level: neither nests in itself.
-        LuaType::Union(union) => LuaType::from_vec(
-            union
-                .into_vec()
-                .iter()
-                .map(|member| bounded_to(member, depth))
-                .collect(),
-        ),
-        LuaType::MultiLineUnion(union) => bounded_to(&union.to_union(), depth),
-        LuaType::Variadic(variadic) => LuaType::Variadic(Arc::new(match variadic.as_ref() {
-            VariadicType::Multi(types) => VariadicType::Multi(
-                types
-                    .iter()
-                    .map(|member| bounded_to(member, depth))
-                    .collect(),
-            ),
-            VariadicType::Base(base) => VariadicType::Base(bounded_to(base, depth)),
-        })),
-        LuaType::DocFunction(_) if depth == 0 => LuaType::Function,
-        LuaType::TypeGuard(_) if depth == 0 => LuaType::Boolean,
+        LuaType::Union(union) => cut_all(union.types(), depth).map(LuaType::from_vec),
+        LuaType::MultiLineUnion(union) => {
+            cut_all(union.get_unions().iter().map(|(member, _)| member), depth).map(|members| {
+                LuaType::MultiLineUnion(
+                    LuaMultiLineUnion::new(
+                        members
+                            .into_iter()
+                            .zip(union.get_unions())
+                            .map(|(member, (_, description))| (member, description.clone()))
+                            .collect(),
+                    )
+                    .into(),
+                )
+            })
+        }
+        LuaType::Variadic(variadic) => match variadic.as_ref() {
+            VariadicType::Multi(types) => cut_all(types.iter(), depth)
+                .map(|types| LuaType::Variadic(Arc::new(VariadicType::Multi(types)))),
+            VariadicType::Base(base) => {
+                cut(base, depth).map(|base| LuaType::Variadic(Arc::new(VariadicType::Base(base))))
+            }
+        },
+        LuaType::DocFunction(_) if depth == 0 => Some(LuaType::Function),
+        LuaType::TypeGuard(_) if depth == 0 => Some(LuaType::Boolean),
         LuaType::Array(_)
         | LuaType::Tuple(_)
         | LuaType::Object(_)
@@ -90,99 +96,113 @@ fn bounded_to(typ: &LuaType, depth: usize) -> LuaType {
         | LuaType::TableOf(_)
             if depth == 0 =>
         {
-            LuaType::Table
+            Some(LuaType::Table)
         }
         LuaType::DocFunction(function) => {
-            let inner = |typ: &LuaType| bounded_to(typ, depth - 1);
-            LuaType::DocFunction(
+            let declared = function
+                .get_params()
+                .iter()
+                .filter_map(|(_, typ)| typ.as_ref());
+            let cut_params = cut_all(declared, depth - 1);
+            let cut_ret = cut(function.get_ret(), depth - 1);
+            if cut_params.is_none() && cut_ret.is_none() {
+                return None;
+            }
+            let params = match cut_params {
+                Some(cut_params) => {
+                    let mut cut_params = cut_params.into_iter();
+                    function
+                        .get_params()
+                        .iter()
+                        .map(|(name, typ)| {
+                            (name.clone(), typ.as_ref().and_then(|_| cut_params.next()))
+                        })
+                        .collect()
+                }
+                None => function.get_params().to_vec(),
+            };
+            Some(LuaType::DocFunction(
                 LuaFunctionType::new(
                     function.get_async_state(),
                     function.is_colon_define(),
                     function.is_variadic(),
-                    function
-                        .get_params()
-                        .iter()
-                        .map(|(name, typ)| (name.clone(), typ.as_ref().map(inner)))
-                        .collect(),
-                    inner(function.get_ret()),
+                    params,
+                    cut_ret.unwrap_or_else(|| function.get_ret().clone()),
                 )
                 .with_optional_params(function.get_optional_params().to_vec())
                 .with_call_arg_roles(function.get_call_arg_roles().to_vec())
                 .into(),
-            )
+            ))
         }
-        LuaType::Array(array) => LuaType::Array(
-            LuaArrayType::new(
-                bounded_to(array.get_base(), depth - 1),
-                array.get_len().clone(),
-            )
-            .into(),
-        ),
-        LuaType::Tuple(tuple) => LuaType::Tuple(
-            LuaTupleType::new(
-                tuple
-                    .get_types()
-                    .iter()
-                    .map(|member| bounded_to(member, depth - 1))
-                    .collect(),
-                tuple.status,
-            )
-            .into(),
-        ),
-        LuaType::Object(object) => LuaType::Object(
-            LuaObjectType::new_with_fields(
-                object
-                    .get_fields()
-                    .iter()
-                    .map(|(key, field)| (key.clone(), bounded_to(field, depth - 1)))
-                    .collect(),
-                object
-                    .get_index_access()
-                    .iter()
-                    .map(|(key, value)| (bounded_to(key, depth - 1), bounded_to(value, depth - 1)))
-                    .collect(),
-            )
-            .into(),
-        ),
-        LuaType::Intersection(intersection) => LuaType::Intersection(
-            LuaIntersectionType::new(
-                intersection
-                    .get_types()
-                    .iter()
-                    .map(|member| bounded_to(member, depth - 1))
-                    .collect(),
-            )
-            .into(),
-        ),
-        LuaType::MergedTable(merged) => LuaType::MergedTable(
-            LuaMergedTableType::new(
-                merged
-                    .get_types()
-                    .iter()
-                    .map(|member| bounded_to(member, depth - 1))
-                    .collect(),
-            )
-            .into(),
-        ),
-        LuaType::Generic(generic) => LuaType::Generic(
-            LuaGenericType::new(
-                generic.get_base_type_id(),
-                generic
-                    .get_params()
-                    .iter()
-                    .map(|param| bounded_to(param, depth - 1))
-                    .collect(),
-            )
-            .into(),
-        ),
-        LuaType::TableGeneric(params) => LuaType::TableGeneric(
-            params
+        LuaType::Array(array) => cut(array.get_base(), depth - 1)
+            .map(|base| LuaType::Array(LuaArrayType::new(base, array.get_len().clone()).into())),
+        LuaType::Tuple(tuple) => cut_all(tuple.get_types().iter(), depth - 1)
+            .map(|types| LuaType::Tuple(LuaTupleType::new(types, tuple.status).into())),
+        LuaType::Object(object) => {
+            let cut_fields = cut_all(object.get_fields().values(), depth - 1);
+            let entries = object
+                .get_index_access()
                 .iter()
-                .map(|param| bounded_to(param, depth - 1))
-                .collect::<Vec<_>>()
-                .into(),
-        ),
-        LuaType::TableOf(inner) => LuaType::TableOf(Box::new(bounded_to(inner, depth - 1))),
-        LuaType::TypeGuard(guarded) => LuaType::TypeGuard(bounded_to(guarded, depth - 1).into()),
+                .flat_map(|(key, value)| [key, value]);
+            let cut_entries = cut_all(entries, depth - 1);
+            if cut_fields.is_none() && cut_entries.is_none() {
+                return None;
+            }
+            let fields = match cut_fields {
+                Some(fields) => object.get_fields().keys().cloned().zip(fields).collect(),
+                None => object.get_fields().clone(),
+            };
+            let index_access = match cut_entries {
+                Some(entries) => entries
+                    .chunks(2)
+                    .map(|pair| (pair[0].clone(), pair[1].clone()))
+                    .collect(),
+                None => object.get_index_access().to_vec(),
+            };
+            Some(LuaType::Object(
+                LuaObjectType::new_with_fields(fields, index_access).into(),
+            ))
+        }
+        LuaType::Intersection(intersection) => cut_all(intersection.get_types().iter(), depth - 1)
+            .map(|types| LuaType::Intersection(LuaIntersectionType::new(types).into())),
+        LuaType::MergedTable(merged) => cut_all(merged.get_types().iter(), depth - 1)
+            .map(|types| LuaType::MergedTable(LuaMergedTableType::new(types).into())),
+        LuaType::Generic(generic) => {
+            cut_all(generic.get_params().iter(), depth - 1).map(|params| {
+                LuaType::Generic(LuaGenericType::new(generic.get_base_type_id(), params).into())
+            })
+        }
+        LuaType::TableGeneric(params) => {
+            cut_all(params.iter(), depth - 1).map(|params| LuaType::TableGeneric(params.into()))
+        }
+        LuaType::TableOf(inner) => {
+            cut(inner, depth - 1).map(|inner| LuaType::TableOf(Box::new(inner)))
+        }
+        LuaType::TypeGuard(guarded) => {
+            cut(guarded, depth - 1).map(|guarded| LuaType::TypeGuard(guarded.into()))
+        }
     }
+}
+
+/// `types` each cut to `depth` levels, or `None` when every one is within
+/// them; nothing is copied until the first that is not.
+fn cut_all<'a>(
+    types: impl Iterator<Item = &'a LuaType> + Clone,
+    depth: usize,
+) -> Option<Vec<LuaType>> {
+    let (first, first_cut) = types
+        .clone()
+        .enumerate()
+        .find_map(|(index, typ)| cut(typ, depth).map(|cut| (index, cut)))?;
+    let mut first_cut = Some(first_cut);
+    Some(
+        types
+            .enumerate()
+            .map(|(index, typ)| match index {
+                _ if index < first => typ.clone(),
+                _ if index == first => first_cut.take().unwrap_or_else(|| typ.clone()),
+                _ => cut(typ, depth).unwrap_or_else(|| typ.clone()),
+            })
+            .collect(),
+    )
 }

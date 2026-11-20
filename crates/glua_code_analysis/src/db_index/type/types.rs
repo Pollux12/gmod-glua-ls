@@ -1363,6 +1363,7 @@ impl LuaUnionType {
 /// Borrowing iterator over the members of a [`LuaUnionType`], produced by
 /// [`LuaUnionType::types`]. Avoids the `into_vec` clone in hot inference and
 /// dynamic-field scans.
+#[derive(Clone)]
 pub enum UnionTypeIter<'a> {
     Nullable {
         ty: Option<&'a LuaType>,
