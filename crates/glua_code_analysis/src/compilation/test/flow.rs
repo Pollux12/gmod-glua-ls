@@ -3534,7 +3534,7 @@ _2 = a[1]
     /// The types two locals have inside `if <call> then`, where both are
     /// `Entity?` before it and `helper` defines the predicate `call` uses.
     fn guarded_pair(helper: &str, call: &str) -> (String, String) {
-        let mut ws = VirtualWorkspace::new();
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
         set_gmod_enabled(&mut ws);
         def_isvalid_guard(&mut ws);
         let file_id = ws.def(&format!(
@@ -3584,6 +3584,33 @@ _2 = a[1]
         let narrowed = guarded_pair(
             "local function both(a, b) return IsValid(a) and IsValid(b) end",
             "not both(x, y)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    #[gtest]
+    fn test_helper_that_errors_unless_valid_narrows_its_argument() {
+        let narrowed = guarded_pair(
+            "local function RequireValid(ent) if not IsValid(ent) then error(\"invalid\") end return true end",
+            "RequireValid(x)",
+        );
+        assert_eq!(narrowed, ("Entity".to_string(), "Entity?".to_string()));
+    }
+
+    #[gtest]
+    fn test_helper_that_asserts_validity_narrows_its_argument() {
+        let narrowed = guarded_pair(
+            "local function RequireValid(ent) assert(IsValid(ent)) return true end",
+            "RequireValid(x)",
+        );
+        assert_eq!(narrowed, ("Entity".to_string(), "Entity?".to_string()));
+    }
+
+    #[gtest]
+    fn test_helper_that_always_returns_true_narrows_nothing() {
+        let narrowed = guarded_pair(
+            "local function Always(ent) print(ent) return true end",
+            "Always(x)",
         );
         assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
     }

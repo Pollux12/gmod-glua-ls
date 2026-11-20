@@ -160,7 +160,8 @@ fn is_structural_inferred_guard_candidate(closure: &LuaClosureExpr) -> bool {
     let Some(block) = closure.get_block() else {
         return false;
     };
-    let return_points = super::super::lua::func_body::analyze_func_body_returns(None, block);
+    let return_points =
+        super::super::lua::func_body::analyze_func_body_returns(None, block.clone());
     let mut truthy_exprs = Vec::new();
     for point in &return_points {
         match point {
@@ -174,9 +175,16 @@ fn is_structural_inferred_guard_candidate(closure: &LuaClosureExpr) -> bool {
         }
     }
     if return_points.len() == 1 {
-        return truthy_exprs
-            .first()
-            .is_some_and(|expr| inferred_guard_candidate_references_param(expr, &param_names));
+        // A lone literal return proves something of a parameter only through
+        // the statements before it, such as an `error` unless it is valid.
+        return truthy_exprs.first().is_some_and(|expr| match expr {
+            LuaExpr::LiteralExpr(_) => block.descendants::<LuaNameExpr>().any(|name_expr| {
+                name_expr
+                    .get_name_text()
+                    .is_some_and(|name| param_names.iter().any(|param| *param == name))
+            }),
+            expr => inferred_guard_candidate_references_param(expr, &param_names),
+        });
     }
     !truthy_exprs.is_empty()
         && truthy_exprs.iter().all(|expr| {
