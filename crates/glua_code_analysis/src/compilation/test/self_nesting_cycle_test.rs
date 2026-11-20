@@ -286,6 +286,43 @@ mod test {
         );
     }
 
+    /// Inheriting from an inherited table keeps the fields each table nests.
+    #[test]
+    fn a_chain_of_inherits_keeps_nested_fields() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@generic T : table, B : table
+            ---@param target T
+            ---@param base B
+            ---@return T & B & { BaseClass: B }
+            local function Inherit(target, base) end
+
+            ---@type { a: { deep: integer } }
+            local a
+            ---@type { b: { deep: string } }
+            local b
+            ---@type { c: { deep: boolean } }
+            local c
+            local inherited = Inherit(Inherit(a, b), c)
+            fromTarget = inherited.a.deep
+            fromInnerBase = inherited.b.deep
+            fromBase = inherited.BaseClass.c.deep
+            "#,
+        );
+
+        let types = [
+            ws.expr_ty("fromTarget"),
+            ws.expr_ty("fromInnerBase"),
+            ws.expr_ty("fromBase"),
+        ];
+
+        assert_eq!(
+            types.map(|typ| ws.humanize_type(typ)),
+            ["integer", "string", "boolean"].map(str::to_string)
+        );
+    }
+
     /// A value that is not built from itself keeps the structure it nests
     /// through a generic's array and callback.
     #[test]

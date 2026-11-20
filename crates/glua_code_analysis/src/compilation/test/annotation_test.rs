@@ -840,6 +840,24 @@ local value = receiver.value
         assert_eq!(ty, expected);
     }
 
+    /// A field that is a table in two members holds both tables' fields.
+    #[test]
+    fn a_field_that_is_a_table_in_both_members_has_both_tables_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+        ---@return { y: { a: number } } & { y: { b: string } }
+        local function foo() end
+
+        c = foo()
+        "#,
+        );
+
+        let types = [ws.expr_ty("c.y.a"), ws.expr_ty("c.y.b")];
+        assert_eq!(types, [ws.ty("number"), ws.ty("string")]);
+    }
+
     #[test]
     fn test_type_return_usage() {
         let mut ws = VirtualWorkspace::new();

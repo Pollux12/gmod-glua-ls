@@ -8,8 +8,8 @@ use std::sync::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    DbIndex, FileId, GmodStateMask, InFiled, LuaDecl, LuaInstanceKind, LuaMemberFeature,
-    LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, TypeOps,
+    DbIndex, FileId, GmodStateMask, InFiled, LuaDecl, LuaInstanceKind, LuaIntersectionType,
+    LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, TypeOps,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::type_check::check_type_compact,
 };
@@ -70,10 +70,28 @@ type RawGetMemberTypeResult = Result<LuaType, InferFailReason>;
 
 pub(crate) fn intersect_member_types(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
     if left == right {
-        left
-    } else {
-        TypeOps::Intersect.apply(db, &left, &right)
+        return left;
     }
+    match TypeOps::Intersect.apply(db, &left, &right) {
+        // A table can hold every field each shape asks for.
+        LuaType::Never if is_table_shape(&left) && is_table_shape(&right) => {
+            LuaType::Intersection(LuaIntersectionType::new(vec![left, right]).into())
+        }
+        intersected => intersected,
+    }
+}
+
+fn is_table_shape(typ: &LuaType) -> bool {
+    matches!(
+        typ,
+        LuaType::Object(_)
+            | LuaType::Intersection(_)
+            | LuaType::TableConst(_)
+            | LuaType::Array(_)
+            | LuaType::Tuple(_)
+            | LuaType::TableGeneric(_)
+            | LuaType::MergedTable(_)
+    )
 }
 
 pub(crate) fn merge_open_table_types(db: &DbIndex, types: Vec<LuaType>) -> LuaType {
