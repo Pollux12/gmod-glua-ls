@@ -415,7 +415,6 @@ pub async fn on_request_handler(
     }, wait_for_taken_text: {
         // Must not resolve declarations/members/globals through the index —
         // those need the `wait_for_fresh_index` arm.
-        FoldingRangeRequest => on_folding_range_handler,
         EmmySyntaxTreeRequest => on_emmy_syntax_tree_handler,
         SelectionRangeRequest => on_document_selection_range_handle,
         Formatting => on_formatting_handler,
@@ -434,6 +433,8 @@ pub async fn on_request_handler(
         SignatureHelpRequest => on_signature_helper_handler,
         DocumentHighlightRequest => on_document_highlight_handler,
         DocumentSymbolRequest => on_document_symbol,
+        // Import folds read which calls load modules.
+        FoldingRangeRequest => on_folding_range_handler,
         WorkspaceSymbolRequest => on_workspace_symbol_handler,
         CodeActionRequest => on_code_action_handler,
         InlineValueRequest => on_inline_values_handler,
@@ -528,6 +529,49 @@ mod tests {
                 .expect("a response must arrive once analysis is fresh");
             verify_that!(matches!(message, Message::Response(_)), eq(true))?;
             Ok(())
+        })
+    }
+
+    /// Import folds read which calls load modules from the index, so folding
+    /// waits for its document's own entries, not only for its text.
+    #[gtest]
+    fn folding_waits_until_its_document_is_reindexed() -> Result<()> {
+        use super::{FoldingRangeRequest, LspRequest, on_request_handler};
+        use crate::context::ServerContext;
+        use glua_code_analysis::FileId;
+        use lsp_server::{Connection, Message};
+        use lsp_types::ClientCapabilities;
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (server_connection, peer) = Connection::memory();
+
+        runtime.block_on(async {
+            let mut context =
+                ServerContext::new_idle(server_connection, ClientCapabilities::default());
+            let debounced_analysis = context.snapshot().debounced_analysis_arc();
+            let uri = Uri::from_str("file:///test.lua").expect("uri should parse");
+            debounced_analysis
+                .schedule(FileId::new(1), uri.clone())
+                .await;
+
+            let request = lsp_server::Request::new(
+                1.into(),
+                FoldingRangeRequest::METHOD.to_string(),
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            on_request_handler(request, &mut context)
+                .await
+                .expect("dispatch should succeed");
+
+            let early = peer.receiver.recv_timeout(Duration::from_millis(500));
+            verify_that!(early.is_err(), eq(true))?;
+
+            debounced_analysis
+                .release_documents_for_test(&[FileId::new(1)])
+                .await;
+            let answered = peer.receiver.recv_timeout(Duration::from_secs(5));
+            verify_that!(matches!(answered, Ok(Message::Response(_))), eq(true))
         })
     }
 

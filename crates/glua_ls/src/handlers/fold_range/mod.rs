@@ -35,7 +35,8 @@ pub async fn on_folding_range_handler(
     }
     let uri = params.text_document.uri;
 
-    // Tree-offset answer: needs the latest document version, not a fresh index.
+    // Ranges are offsets into the latest document version; the dispatcher has
+    // already waited for this document's index entries, which import folds read.
     if !context
         .wait_until_latest_document_version_applied(&uri, &cancel_token)
         .await
