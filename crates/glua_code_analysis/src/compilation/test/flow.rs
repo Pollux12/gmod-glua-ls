@@ -3569,6 +3569,15 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_method_predicate_wrapper_narrows_its_argument() {
+        let narrowed = guarded_pair(
+            "Checks = {}\nfunction Checks:Usable(ent) return IsValid(ent) end",
+            "Checks:Usable(x)",
+        );
+        assert_eq!(narrowed, ("Entity".to_string(), "Entity?".to_string()));
+    }
+
+    #[gtest]
     fn test_unannotated_predicate_wrapper_narrows_member_expression_on_true_branch() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);

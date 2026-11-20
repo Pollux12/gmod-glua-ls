@@ -431,9 +431,6 @@ fn try_inferred_positive_guard(
     condition_flow: InferConditionFlow,
     policy: FlowWalkPolicy,
 ) -> Result<Option<LuaType>, InferFailReason> {
-    if call_expr.is_colon_call() {
-        return Ok(None);
-    }
     let Some(guard) = db
         .get_signature_index()
         .inferred_positive_guard(&signature_id)
