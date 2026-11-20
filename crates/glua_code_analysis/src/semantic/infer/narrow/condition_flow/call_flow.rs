@@ -1,8 +1,10 @@
 use std::{ops::Deref, sync::Arc};
 
+use rowan::TextRange;
+
 use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr,
-    LuaLiteralToken, LuaTableExpr, LuaTableField,
+    LuaAstNode, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
+    LuaIndexKey, LuaIndexMemberExpr, LuaLiteralToken, LuaTableExpr, LuaTableField,
 };
 
 use crate::{
@@ -439,7 +441,7 @@ fn try_inferred_positive_guard(
         return Ok(None);
     };
     if let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr()
-        && typed_literal_field_has_writes(db, cache, &index_expr)
+        && typed_literal_field_has_writes(db, cache, &index_expr, Some(signature_id))
     {
         return Ok(None);
     }
@@ -1365,7 +1367,7 @@ fn get_callable_expr_signature_id(
     }
 
     if let LuaExpr::IndexExpr(index_expr) = &expr
-        && typed_literal_field_has_writes(db, cache, index_expr)
+        && typed_literal_field_has_writes(db, cache, index_expr, None)
     {
         return None;
     }
@@ -1427,10 +1429,15 @@ fn declared_signature_id(
     get_value_expr_signature_id(db, cache, file_id, value_expr, depth)
 }
 
+/// Whether the field `index_expr` reads on a typed table literal is written
+/// outside the literal, so a call through it may not reach the function the
+/// literal holds. The statement defining `defined`, the function the call is
+/// known to reach, is not such a write.
 fn typed_literal_field_has_writes(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     index_expr: &LuaIndexExpr,
+    defined: Option<LuaSignatureId>,
 ) -> bool {
     let Some(LuaExpr::NameExpr(receiver)) = index_expr.get_prefix_expr() else {
         return false;
@@ -1461,12 +1468,19 @@ fn typed_literal_field_has_writes(
                 _ => None,
             }),
     );
+    let defining_name = defined.and_then(|signature_id| defining_name_range(db, signature_id));
+    let defines = |file_id: FileId, range: TextRange| {
+        defining_name
+            .as_ref()
+            .is_some_and(|name| name.file_id == file_id && name.value.contains_range(range))
+    };
     owners.iter().any(|owner| {
         db.get_member_index()
             .get_members_for_owner_key(owner, &member_key)
             .iter()
             .any(|member| {
                 member.get_syntax_id().get_kind() == glua_parser::LuaSyntaxKind::IndexExpr
+                    && !defines(member.get_file_id(), member.get_syntax_id().get_range())
             })
             || crate::dynamic_field_owner_of(db, owner).is_some_and(|owner| match &member_key {
                 LuaMemberKey::Name(name) => db
@@ -1474,15 +1488,30 @@ fn typed_literal_field_has_writes(
                     .field_definitions(&owner, name.as_str())
                     .iter()
                     .any(|definition| {
-                        definition.file_id != table_file
-                            || !table.get_fields().any(|field| {
-                                field.get_field_key().and_then(|key| key.get_range())
-                                    == Some(definition.value)
-                            })
+                        !defines(definition.file_id, definition.value)
+                            && (definition.file_id != table_file
+                                || !table.get_fields().any(|field| {
+                                    field.get_field_key().and_then(|key| key.get_range())
+                                        == Some(definition.value)
+                                }))
                     }),
                 _ => false,
             })
     })
+}
+
+/// The name a `function` statement defining `signature_id` assigns, as
+/// `Checks.Usable` in `function Checks.Usable(ent) ... end`.
+fn defining_name_range(db: &DbIndex, signature_id: LuaSignatureId) -> Option<InFiled<TextRange>> {
+    let file_id = signature_id.get_file_id();
+    let root = db.get_vfs().get_syntax_tree(&file_id)?.get_red_root();
+    let closure = root
+        .token_at_offset(signature_id.get_position())
+        .right_biased()?
+        .parent_ancestors()
+        .find_map(LuaClosureExpr::cast)?;
+    let name = closure.get_parent::<LuaFuncStat>()?.get_func_name()?;
+    Some(InFiled::new(file_id, name.get_range()))
 }
 
 fn receiver_table_literal(

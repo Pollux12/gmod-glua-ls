@@ -3577,6 +3577,95 @@ _2 = a[1]
         assert_eq!(narrowed, ("Entity".to_string(), "Entity?".to_string()));
     }
 
+    const IS_PLAYER: &str = "---@class Entity\n---@field IsPlayer fun(self: Entity): boolean";
+
+    #[gtest]
+    fn test_method_predicate_chain_narrows_its_argument() {
+        let narrowed = guarded_pair(
+            &format!(
+                "{IS_PLAYER}\nChecks = {{}}\n---@param ent Entity?\nfunction Checks:Usable(ent) return IsValid(ent) and ent:IsPlayer() end"
+            ),
+            "Checks:Usable(x)",
+        );
+        assert_eq!(narrowed, ("Entity".to_string(), "Entity?".to_string()));
+    }
+
+    /// The statement defining a table's predicate field writes that field,
+    /// but nothing replaces the predicate it defines.
+    #[gtest]
+    fn test_table_field_predicate_narrows_in_its_own_file() {
+        let narrowed = guarded_pair(
+            &format!(
+                "{IS_PLAYER}\nChecks = {{}}\n---@param ent Entity?\nfunction Checks.Usable(ent) return IsValid(ent) and ent:IsPlayer() end"
+            ),
+            "Checks.Usable(x)",
+        );
+        assert_eq!(narrowed, ("Entity".to_string(), "Entity?".to_string()));
+    }
+
+    /// A predicate field another statement replaces may no longer be the
+    /// predicate defined first, so a call through it narrows nothing.
+    #[gtest]
+    fn test_replaced_table_field_predicate_does_not_narrow() {
+        let narrowed = guarded_pair(
+            &format!(
+                "{IS_PLAYER}\nChecks = {{}}\n---@param ent Entity?\nfunction Checks.Usable(ent) return IsValid(ent) and ent:IsPlayer() end\nChecks.Usable = function(ent) return true end"
+            ),
+            "Checks.Usable(x)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    /// A replacement of the predicate field in another file stops the
+    /// narrowing, and deleting and reopening that file follows it.
+    #[gtest]
+    fn test_table_field_predicate_follows_a_replacement_in_another_file() {
+        const REPLACEMENT: &str = "lua/autorun/sh_replace.lua";
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_checks.lua",
+            &format!(
+                r#"
+                {IS_PLAYER}
+                Checks = {{}}
+                ---@param ent Entity?
+                function Checks.Usable(ent) return IsValid(ent) and ent:IsPlayer() end
+
+                ---@return Entity?
+                local function find() end
+
+                local function use()
+                    local x = find()
+                    if Checks.Usable(x) then
+                        local first = x
+                        print(first)
+                    end
+                end
+                "#
+            ),
+        );
+        let replacement = "Checks.Usable = function(ent) return true end";
+        let narrowed = |ws: &mut VirtualWorkspace| {
+            let typ = nth_name_expr_type_from_end(ws, file_id, "first", 0);
+            ws.humanize_type(typ)
+        };
+        let alone = narrowed(&mut ws);
+        ws.def_file(REPLACEMENT, replacement);
+        let replaced = narrowed(&mut ws);
+        let uri = ws.virtual_url_generator.new_uri(REPLACEMENT);
+        ws.analysis.remove_file_by_uri(&uri);
+        let deleted = narrowed(&mut ws);
+        ws.def_file(REPLACEMENT, replacement);
+        let reopened = narrowed(&mut ws);
+
+        assert_eq!(
+            [alone, replaced, deleted, reopened],
+            ["Entity", "Entity?", "Entity", "Entity?"].map(str::to_string)
+        );
+    }
+
     #[gtest]
     fn test_unannotated_predicate_wrapper_narrows_member_expression_on_true_branch() {
         let mut ws = VirtualWorkspace::new();
