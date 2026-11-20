@@ -86,33 +86,52 @@ pub struct LuaSignatureIndex {
 }
 
 /// A conservative parameter narrowing derived from a function body: the type
-/// the parameter holds where the call is truthy, and, for a helper that is
-/// exactly one primitive or leaf-class type test, the type removed where it is falsy.
+/// each parameter it narrows holds where the call is truthy, and, for a
+/// helper that is exactly one primitive or leaf-class type test of one
+/// parameter, the type removed where it is falsy.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaInferredPositiveGuard {
+    pub narrowed: Vec<LuaGuardedParam>,
+    pub false_removed_type: Option<LuaType>,
+}
+
+/// A parameter an inferred guard narrows, and the type it holds where the
+/// call is truthy.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LuaGuardedParam {
     pub param_idx: usize,
     pub narrowed_type: LuaType,
-    pub false_removed_type: Option<LuaType>,
 }
 
 impl LuaInferredPositiveGuard {
     fn payload_types(&self) -> impl Iterator<Item = &LuaType> {
-        std::iter::once(&self.narrowed_type).chain(self.false_removed_type.as_ref())
+        self.narrowed
+            .iter()
+            .map(|param| &param.narrowed_type)
+            .chain(self.false_removed_type.as_ref())
     }
 
-    /// Remaps both payload types as one unit; `true` when either names an
+    /// Remaps every payload type as one unit; `true` when any names an
     /// identity the remap lost, leaving the guard untouched.
     fn remap_payload_types(&mut self, remap: &crate::FileRemap) -> bool {
-        let narrowed = crate::db_index::remap_identities_in_type(&self.narrowed_type, remap);
+        let narrowed = self
+            .narrowed
+            .iter()
+            .map(|param| crate::db_index::remap_identities_in_type(&param.narrowed_type, remap))
+            .collect::<Vec<_>>();
         let removed = self
             .false_removed_type
             .as_ref()
             .map(|typ| crate::db_index::remap_identities_in_type(typ, remap));
-        if narrowed.lost || removed.as_ref().is_some_and(|removed| removed.lost) {
+        if narrowed.iter().any(|narrowed| narrowed.lost)
+            || removed.as_ref().is_some_and(|removed| removed.lost)
+        {
             return true;
         }
-        if let Some(typ) = narrowed.typ {
-            self.narrowed_type = typ;
+        for (param, narrowed) in self.narrowed.iter_mut().zip(narrowed) {
+            if let Some(typ) = narrowed.typ {
+                param.narrowed_type = typ;
+            }
         }
         if let Some(typ) = removed.and_then(|removed| removed.typ) {
             self.false_removed_type = Some(typ);
@@ -976,8 +995,10 @@ mod tests {
         index.inferred_guard_facts.insert(
             owner.clone(),
             LuaInferredPositiveGuard {
-                param_idx: 0,
-                narrowed_type: LuaType::String,
+                narrowed: vec![LuaGuardedParam {
+                    param_idx: 0,
+                    narrowed_type: LuaType::String,
+                }],
                 false_removed_type: None,
             },
         );
@@ -1081,8 +1102,10 @@ mod tests {
         index.set_inferred_positive_guard(
             signature_id,
             LuaInferredPositiveGuard {
-                param_idx: 0,
-                narrowed_type: table_ref(source_b, 0, 1),
+                narrowed: vec![LuaGuardedParam {
+                    param_idx: 0,
+                    narrowed_type: table_ref(source_b, 0, 1),
+                }],
                 false_removed_type: None,
             },
         );
@@ -1095,8 +1118,10 @@ mod tests {
             fact_owner.signature_id(),
             fact_owner.clone(),
             LuaInferredPositiveGuard {
-                param_idx: 0,
-                narrowed_type: table_ref(source_c, 0, 1),
+                narrowed: vec![LuaGuardedParam {
+                    param_idx: 0,
+                    narrowed_type: table_ref(source_c, 0, 1),
+                }],
                 false_removed_type: None,
             },
         );
@@ -1168,11 +1193,13 @@ mod tests {
             .inferred_positive_guards
             .get_mut(&signature_id)
             .expect("guard")
+            .narrowed[0]
             .narrowed_type = LuaType::String;
         index
             .inferred_guard_facts
             .get_mut(&fact_owner)
             .expect("fact")
+            .narrowed[0]
             .narrowed_type = LuaType::String;
         index.snapshot_payload_refs(holder);
 

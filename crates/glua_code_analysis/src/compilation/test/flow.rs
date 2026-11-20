@@ -3569,6 +3569,26 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_predicate_wrapper_narrows_every_argument_it_tests() {
+        let narrowed = guarded_pair(
+            "local function both(a, b) return IsValid(a) and IsValid(b) end",
+            "both(x, y)",
+        );
+        assert_eq!(narrowed, ("Entity".to_string(), "Entity".to_string()));
+    }
+
+    /// A false result only says the arguments are not all valid, so it rules
+    /// out nothing for any one of them.
+    #[gtest]
+    fn test_false_predicate_wrapper_of_several_arguments_narrows_none() {
+        let narrowed = guarded_pair(
+            "local function both(a, b) return IsValid(a) and IsValid(b) end",
+            "not both(x, y)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    #[gtest]
     fn test_method_predicate_wrapper_narrows_its_argument() {
         let narrowed = guarded_pair(
             "Checks = {}\nfunction Checks:Usable(ent) return IsValid(ent) end",
@@ -3714,10 +3734,11 @@ _2 = a[1]
                     .get_signature_index()
                     .inferred_positive_guard(signature_id)
             })
-            .map(|guard| {
+            .flat_map(|guard| guard.narrowed.iter())
+            .map(|param| {
                 (
-                    guard.param_idx,
-                    ws.humanize_type(guard.narrowed_type.clone()),
+                    param.param_idx,
+                    ws.humanize_type(param.narrowed_type.clone()),
                 )
             })
             .collect::<Vec<_>>();
@@ -4469,7 +4490,9 @@ _2 = a[1]
                             .into_values()
                             .next()
                             .expect("wrapper inferred guard")
+                            .narrowed[0]
                             .narrowed_type
+                            .clone()
                     })
                     .collect::<Vec<_>>()
             };

@@ -448,24 +448,22 @@ fn try_inferred_positive_guard(
     let Some(signature) = db.get_signature_index().get(&signature_id) else {
         return Ok(None);
     };
-    let Some(argument) = inferred_guard_target_expr(call_expr, signature, guard.param_idx) else {
+    let Some(narrowed_type) = guard.narrowed.iter().find_map(|param| {
+        let argument = inferred_guard_target_expr(call_expr, signature, param.param_idx)?;
+        let argument_ref_id = get_var_expr_var_ref_id(db, cache, argument.clone())?;
+        (argument_ref_id == *var_ref_id
+            || can_narrow_type_guard_through_decl_alias(
+                db,
+                cache,
+                root,
+                var_ref_id,
+                &argument_ref_id,
+                &argument,
+            ))
+        .then(|| param.narrowed_type.clone())
+    }) else {
         return Ok(None);
     };
-    let Some(argument_ref_id) = get_var_expr_var_ref_id(db, cache, argument.clone()) else {
-        return Ok(None);
-    };
-    if argument_ref_id != *var_ref_id
-        && !can_narrow_type_guard_through_decl_alias(
-            db,
-            cache,
-            root,
-            var_ref_id,
-            &argument_ref_id,
-            &argument,
-        )
-    {
-        return Ok(None);
-    }
 
     let antecedent_type = get_condition_antecedent_type(
         db,
@@ -480,7 +478,7 @@ fn try_inferred_positive_guard(
         InferConditionFlow::TrueCondition => Some(narrow_type_guard_true_branch(
             db,
             antecedent_type,
-            guard.narrowed_type,
+            narrowed_type,
             false,
         )),
         InferConditionFlow::FalseCondition => guard
@@ -1110,14 +1108,16 @@ fn asserted_type_by_function_type(
     let id = signature_id?;
     let signature = db.get_signature_index().get(&id)?;
     if let Some(guard) = db.get_signature_index().inferred_positive_guard(&id)
-        && targets_var(
-            cache,
-            inferred_guard_target_expr(call_expr, signature, guard.param_idx),
-        )
-        && !guard.narrowed_type.is_any()
-        && !guard.narrowed_type.is_unknown()
+        && let Some(param) = guard.narrowed.iter().find(|param| {
+            targets_var(
+                cache,
+                inferred_guard_target_expr(call_expr, signature, param.param_idx),
+            )
+        })
+        && !param.narrowed_type.is_any()
+        && !param.narrowed_type.is_unknown()
     {
-        return Some(guard.narrowed_type.clone());
+        return Some(param.narrowed_type.clone());
     }
     let cast = signature.return_cast.as_ref()?;
     let target = if cast.name == "self" {
@@ -1311,15 +1311,17 @@ pub(crate) fn presence_guard_target(
     if let Some(guard) = db
         .get_signature_index()
         .inferred_positive_guard(&signature_id)
-        && !guard.narrowed_type.contain_tpl()
-        && !may_be_nil(
-            db,
-            &guard.narrowed_type,
-            &mut rustc_hash::FxHashSet::default(),
-        )
+        && let Some(param) = guard.narrowed.iter().find(|param| {
+            !param.narrowed_type.contain_tpl()
+                && !may_be_nil(
+                    db,
+                    &param.narrowed_type,
+                    &mut rustc_hash::FxHashSet::default(),
+                )
+        })
         && let Some(signature) = db.get_signature_index().get(&signature_id)
     {
-        return inferred_guard_target_expr(call_expr, signature, guard.param_idx);
+        return inferred_guard_target_expr(call_expr, signature, param.param_idx);
     }
     let guards_presence = call_prefix_signature_is_valid_guard(db, cache, call_expr, signature_id)
         || db

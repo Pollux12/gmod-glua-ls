@@ -13,10 +13,10 @@ use glua_parser::{
 use rustc_hash::FxHashSet;
 
 use crate::{
-    FlowNodeKind, InFiled, LuaDefinitionId, LuaInferenceConfidence, LuaInferenceEventId,
-    LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaInferenceStep, LuaInferredGuardOwner,
-    LuaInferredPositiveGuard, LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType, LuaTypeDeclId,
-    LuaTypeFact, SignatureReturnStatus, TypeOps, check_type_compact,
+    FlowNodeKind, InFiled, LuaDefinitionId, LuaGuardedParam, LuaInferenceConfidence,
+    LuaInferenceEventId, LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaInferenceStep,
+    LuaInferredGuardOwner, LuaInferredPositiveGuard, LuaMemberKey, LuaMemberOwner, LuaSignatureId,
+    LuaType, LuaTypeDeclId, LuaTypeFact, SignatureReturnStatus, TypeOps, check_type_compact,
     compilation::analyzer::AnalyzeContext,
     semantic::{
         LuaInferCache, VarRefId, VarRefRootId, dynamic_field_type_without, get_var_expr_var_ref_id,
@@ -1944,7 +1944,7 @@ fn inferred_positive_guard_for_closure(
     if !type_is_boolean(&return_type) && !truthy_exprs.iter().all(|expr| is_and_chain(expr)) {
         return None;
     }
-    let mut candidates = closure
+    let candidates = closure
         .get_params_list()?
         .get_params()
         .enumerate()
@@ -1990,14 +1990,35 @@ fn inferred_positive_guard_for_closure(
                     &truthy_exprs,
                 )?
             };
-            Some(LuaInferredPositiveGuard {
-                param_idx,
-                narrowed_type,
+            Some((
+                LuaGuardedParam {
+                    param_idx,
+                    narrowed_type,
+                },
                 false_removed_type,
-            })
-        });
-    let guard = candidates.next()?;
-    candidates.next().is_none().then_some((guard, returns))
+            ))
+        })
+        .collect::<Vec<_>>();
+    // A falsy call of a guard on several parameters only says they are not
+    // all narrowed, which removes nothing from any one of them.
+    let false_removed_type = match candidates.as_slice() {
+        [(_, removed)] => removed.clone(),
+        _ => None,
+    };
+    let narrowed = candidates
+        .into_iter()
+        .map(|(param, _)| param)
+        .collect::<Vec<_>>();
+    if narrowed.is_empty() {
+        return None;
+    }
+    Some((
+        LuaInferredPositiveGuard {
+            narrowed,
+            false_removed_type,
+        },
+        returns,
+    ))
 }
 
 fn names_param(
