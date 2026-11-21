@@ -12,9 +12,13 @@ use super::LuaIndex;
 
 /// `None` when the edit destroyed the literal this range named.
 fn map_range(remap: &crate::FileRemap, range: &InFiled<TextRange>) -> Option<InFiled<TextRange>> {
-    match remap.table_range(range) {
+    kept_or_moved(remap.table_range(range), range.clone())
+}
+
+fn kept_or_moved<T>(remap: crate::Remap<T>, unchanged: T) -> Option<T> {
+    match remap {
         crate::Remap::Moved(new) => Some(new),
-        crate::Remap::Unrelated => Some(range.clone()),
+        crate::Remap::Unrelated => Some(unchanged),
         crate::Remap::Lost => None,
     }
 }
@@ -80,7 +84,7 @@ impl MetatableBinding {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SetmetatableFactoryBinding {
     pub file_id: FileId,
     pub table_range: InFiled<TextRange>,
@@ -88,6 +92,28 @@ pub struct SetmetatableFactoryBinding {
     pub local_name: SmolStr,
     pub call_position: TextSize,
     pub function_scope: TextRange,
+}
+
+/// The call position and scope are positions of the writing file, hashed as
+/// positions of it like the ranges are.
+impl std::hash::Hash for SetmetatableFactoryBinding {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        use crate::db_index::derivation::FilePosition;
+        let Self {
+            file_id,
+            table_range,
+            metatable_range,
+            local_name,
+            call_position,
+            function_scope,
+        } = self;
+        file_id.hash(state);
+        table_range.hash(state);
+        metatable_range.hash(state);
+        local_name.hash(state);
+        call_position.hash_in_file(*file_id, state);
+        function_scope.hash_in_file(*file_id, state);
+    }
 }
 
 impl Default for LuaMetatableIndex {
@@ -388,14 +414,24 @@ impl LuaMetatableIndex {
             derivation::note_write(|| FactKey::MetatableFactory(writer));
             let previous = bindings.clone();
             bindings.retain_mut(|binding| {
-                let (Some(table_range), Some(metatable_range)) = (
+                let (Some(table_range), Some(metatable_range), Some(call_position), Some(scope)) = (
                     map_range(remap, &binding.table_range),
                     map_range(remap, &binding.metatable_range),
+                    kept_or_moved(
+                        remap.pos(binding.file_id, binding.call_position),
+                        binding.call_position,
+                    ),
+                    kept_or_moved(
+                        remap.range(binding.file_id, binding.function_scope),
+                        binding.function_scope,
+                    ),
                 ) else {
                     return false;
                 };
                 binding.table_range = table_range;
                 binding.metatable_range = metatable_range;
+                binding.call_position = call_position;
+                binding.function_scope = scope;
                 true
             });
             if bindings.len() != previous.len() {

@@ -782,7 +782,7 @@ impl FileRemap {
         file_id == self.file_id
     }
 
-    fn pos(&self, file_id: FileId, position: TextSize) -> Remap<TextSize> {
+    pub(crate) fn pos(&self, file_id: FileId, position: TextSize) -> Remap<TextSize> {
         if !self.owns(file_id) {
             return Remap::Unrelated;
         }
@@ -792,7 +792,7 @@ impl FileRemap {
         }
     }
 
-    fn range(&self, file_id: FileId, range: TextRange) -> Remap<TextRange> {
+    pub(crate) fn range(&self, file_id: FileId, range: TextRange) -> Remap<TextRange> {
         if !self.owns(file_id) {
             return Remap::Unrelated;
         }
