@@ -461,6 +461,7 @@ fn get_type_at_flow_walk(
     let mut skip_lookup = initial_missed;
     let numeric_index_query = OnceCell::new();
     let has_special_call_effect = OnceCell::new();
+    let passed_to_call = OnceCell::new();
     loop {
         // Check cache for intermediate flow nodes (both success and error).
         // This is critical for performance in large files where many walks
@@ -702,7 +703,11 @@ fn get_type_at_flow_walk(
                 if call_expr_returns_never(db, cache, call_expr.clone()) {
                     return Ok(LuaType::Never);
                 }
-                if let Some(asserted_type) = get_type_after_asserting_call(
+                // Only an argument can be asserted, and the binder records
+                // what call statements pass.
+                if *passed_to_call.get_or_init(|| {
+                    var_ref_passed_to_call(db, tree.get_narrowing_capability(), var_ref_id)
+                }) && let Some(asserted_type) = get_type_after_asserting_call(
                     db,
                     tree,
                     cache,

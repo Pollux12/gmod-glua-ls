@@ -549,19 +549,7 @@ pub(in crate::semantic::infer::narrow) fn asserted_call_type(
         .get_args_list()?
         .get_args()
         .filter(|argument| names_entry || !matches!(argument, LuaExpr::CallExpr(_)))
-        .any(|argument| {
-            get_var_expr_var_ref_id(db, cache, argument.clone()).is_some_and(|argument_ref_id| {
-                argument_ref_id == *var_ref_id
-                    || can_narrow_type_guard_through_decl_alias(
-                        db,
-                        cache,
-                        root,
-                        var_ref_id,
-                        &argument_ref_id,
-                        &argument,
-                    )
-            })
-        });
+        .any(|argument| get_var_expr_var_ref_id(db, cache, argument).as_ref() == Some(var_ref_id));
     if !passes_var {
         return None;
     }
