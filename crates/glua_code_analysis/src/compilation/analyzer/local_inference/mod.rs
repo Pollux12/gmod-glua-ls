@@ -21,7 +21,8 @@ use crate::{
     semantic::{
         LuaInferCache, VarRefId, VarRefRootId, dynamic_field_type_without, get_var_expr_var_ref_id,
         get_var_ref_type, infer_bind_value_type, infer_expr, infer_true_condition_narrowing,
-        infer_var_type_at_node, resolve_dynamic_field_member, type_name_test,
+        infer_var_type_at_closure_end, infer_var_type_at_node, resolve_dynamic_field_member,
+        type_name_test,
     },
 };
 
@@ -1813,7 +1814,8 @@ pub(super) fn publish_inferred_positive_guards(
             continue;
         };
         let mut return_changed = false;
-        if let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id)
+        if let Some(returns) = returns
+            && let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id)
             && signature.resolve_return == SignatureReturnStatus::UnResolve
         {
             signature.return_docs = returns;
@@ -1888,18 +1890,59 @@ fn global_path_from_index_expr(
     Some(path)
 }
 
+/// What a closure's body proves of its parameters, with the returns its
+/// truthy guard was inferred from.
 fn inferred_positive_guard_for_closure(
     db: &crate::DbIndex,
     context: &mut AnalyzeContext,
     file_id: crate::FileId,
     closure: &LuaClosureExpr,
-) -> Option<(LuaInferredPositiveGuard, Vec<crate::LuaDocReturnInfo>)> {
+) -> Option<(
+    LuaInferredPositiveGuard,
+    Option<Vec<crate::LuaDocReturnInfo>>,
+)> {
     let signature_id = LuaSignatureId::from_closure(file_id, closure);
     let signature = db.get_signature_index().get(&signature_id)?;
     if signature.is_generic() || signature.is_vararg || !signature.overloads.is_empty() {
         return None;
     }
+    let guard = truthy_guard_for_closure(db, context, file_id, closure, signature);
+    let asserted = asserted_params(
+        db,
+        context.infer_manager.get_infer_cache(file_id),
+        closure,
+        signature,
+    );
+    if guard.is_none() && asserted.is_empty() {
+        return None;
+    }
+    let (narrowed, false_removed_type, returns) = guard
+        .map_or((Vec::new(), None, None), |(narrowed, removed, returns)| {
+            (narrowed, removed, Some(returns))
+        });
+    Some((
+        LuaInferredPositiveGuard {
+            narrowed,
+            asserted,
+            false_removed_type,
+        },
+        returns,
+    ))
+}
 
+/// The parameters a truthy call narrows, the type a falsy call removes, and
+/// the returns they were inferred from.
+fn truthy_guard_for_closure(
+    db: &crate::DbIndex,
+    context: &mut AnalyzeContext,
+    file_id: crate::FileId,
+    closure: &LuaClosureExpr,
+    signature: &crate::LuaSignature,
+) -> Option<(
+    Vec<LuaGuardedParam>,
+    Option<LuaType>,
+    Vec<crate::LuaDocReturnInfo>,
+)> {
     let return_points =
         super::lua::func_body::analyze_func_body_returns(Some((db, file_id)), closure.get_block()?);
     let mut truthy_exprs = Vec::new();
@@ -2012,13 +2055,80 @@ fn inferred_positive_guard_for_closure(
     if narrowed.is_empty() {
         return None;
     }
-    Some((
-        LuaInferredPositiveGuard {
-            narrowed,
-            false_removed_type,
-        },
-        returns,
-    ))
+    Some((narrowed, false_removed_type, returns))
+}
+
+/// The parameters `closure` narrows on every path that returns: each
+/// `return` and the end of its body.
+fn asserted_params(
+    db: &crate::DbIndex,
+    cache: &mut LuaInferCache,
+    closure: &LuaClosureExpr,
+    signature: &crate::LuaSignature,
+) -> Vec<LuaGuardedParam> {
+    let file_id = cache.get_file_id();
+    let (Some(params), Some(block)) = (closure.get_params_list(), closure.get_block()) else {
+        return Vec::new();
+    };
+    let returns = block
+        .descendants::<LuaReturnStat>()
+        .filter(|return_stat| {
+            return_stat.ancestors::<LuaClosureExpr>().next().as_ref() == Some(closure)
+        })
+        .collect::<Vec<_>>();
+    params
+        .get_params()
+        .enumerate()
+        .filter_map(|(param_idx, param)| {
+            let decl_id = crate::LuaDeclId::new(file_id, param.get_position());
+            if db
+                .get_reference_index()
+                .get_decl_references(&file_id, &decl_id)
+                .is_none_or(|references| references.mutable)
+            {
+                return None;
+            }
+            let var_ref_id = VarRefId::VarRef(decl_id);
+            let mut exit_types = returns
+                .iter()
+                .map(|return_stat| {
+                    infer_var_type_at_node(db, cache, return_stat, var_ref_id.clone()).ok()
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if let Some(end_type) =
+                infer_var_type_at_closure_end(db, cache, closure, var_ref_id.clone())
+            {
+                exit_types.push(end_type.ok()?);
+            }
+            exit_types.retain(|typ| !typ.is_never());
+            if exit_types.is_empty() {
+                return None;
+            }
+            let declared = get_var_ref_type(db, cache, &var_ref_id).ok()?;
+            let narrowed_type = LuaType::from_vec(exit_types);
+            if narrowed_type == declared
+                || declared.is_any()
+                || narrowed_type.is_any()
+                || narrowed_type.is_unknown()
+                || narrowed_type.is_nil()
+            {
+                return None;
+            }
+            if declared.is_unknown() {
+                if !is_type_test_result(&narrowed_type) {
+                    return None;
+                }
+            } else if signature.param_docs.contains_key(&param_idx)
+                && check_type_compact(db, &declared, &narrowed_type).is_err()
+            {
+                return None;
+            }
+            Some(LuaGuardedParam {
+                param_idx,
+                narrowed_type,
+            })
+        })
+        .collect()
 }
 
 fn names_param(

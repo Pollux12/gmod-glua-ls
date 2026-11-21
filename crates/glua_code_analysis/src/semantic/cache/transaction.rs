@@ -203,6 +203,7 @@ impl LuaInferCache {
             dynamic_field_type_cache,
             dynamic_field_definition_syntax_cache,
             call_returns_never_cache,
+            asserting_callees_cache,
             owner_raw_member_type_cache,
             gamemode_class_cache
         );

@@ -1,8 +1,8 @@
 mod bind_binary_expr;
 
 use glua_parser::{
-    LuaAst, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIndexExpr, LuaNameExpr,
-    LuaTableExpr, LuaUnaryExpr, UnaryOperator,
+    LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIndexExpr,
+    LuaNameExpr, LuaSyntaxId, LuaTableExpr, LuaTokenKind, LuaUnaryExpr, UnaryOperator,
 };
 
 use crate::{
@@ -121,7 +121,12 @@ pub fn bind_closure_expr(
     // their references again.
     binder.condition_refs_recorded = false;
 
-    bind_each_child(binder, LuaAst::LuaClosureExpr(closure_expr), entry);
+    let end = bind_each_child(binder, LuaAst::LuaClosureExpr(closure_expr.clone()), entry);
+    if end != binder.unreachable
+        && let Some(end_token) = closure_expr.token_by_kind(LuaTokenKind::TkEnd)
+    {
+        binder.bind_syntax_node(LuaSyntaxId::from_token(end_token.syntax()), end);
+    }
 
     binder.loop_label = old_loop;
     binder.break_target_label = old_break;

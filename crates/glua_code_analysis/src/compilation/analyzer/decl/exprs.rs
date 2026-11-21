@@ -160,6 +160,12 @@ fn is_structural_inferred_guard_candidate(closure: &LuaClosureExpr) -> bool {
     let Some(block) = closure.get_block() else {
         return false;
     };
+    if block
+        .descendants::<LuaCallExpr>()
+        .any(|call| call.is_assert() || call.is_error())
+    {
+        return true;
+    }
     let return_points =
         super::super::lua::func_body::analyze_func_body_returns(None, block.clone());
     let mut truthy_exprs = Vec::new();

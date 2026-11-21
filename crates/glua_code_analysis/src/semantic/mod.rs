@@ -61,7 +61,8 @@ pub use infer::narrow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
 };
 pub(crate) use infer::narrow::{
-    get_var_ref_type, infer_true_condition_narrowing, infer_var_type_at_node, type_name_test,
+    get_var_ref_type, infer_true_condition_narrowing, infer_var_type_at_closure_end,
+    infer_var_type_at_node, type_name_test,
 };
 pub(crate) use infer::pairs_iter_value_registry_path;
 pub(crate) use infer::resolve_decl_backed_global_path_member_type;

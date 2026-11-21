@@ -10,10 +10,10 @@ use glua_parser::{
 use crate::{
     DbIndex, FileId, FlowNode, FlowTree, GMOD_ATTR_SELF_GUARD, GMOD_DOMAIN_SCRIPTED_CLASS,
     GMOD_ROLE_SCRIPTED_BASED_ON, GMOD_ROLE_SCRIPTED_CLASS_NAME, InFiled, InferFailReason,
-    InferGuard, LuaAliasCallKind, LuaAliasCallType, LuaFunctionType, LuaInferCache, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType, TypeOps,
-    check_type_compact, find_best_direct_call_arg_role_for_param, find_signature_attribute_use,
-    infer_call_expr_func, infer_expr,
+    InferGuard, LuaAliasCallKind, LuaAliasCallType, LuaFunctionType, LuaGuardedParam,
+    LuaInferCache, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast,
+    LuaSignatureId, LuaType, TypeOps, check_type_compact, find_best_direct_call_arg_role_for_param,
+    find_signature_attribute_use, infer_call_expr_func, infer_expr,
     semantic::{
         SemanticDeclGuard, SemanticDeclLevel,
         infer::{
@@ -445,23 +445,15 @@ fn try_inferred_positive_guard(
     {
         return Ok(None);
     }
-    let Some(signature) = db.get_signature_index().get(&signature_id) else {
-        return Ok(None);
-    };
-    let Some(narrowed_type) = guard.narrowed.iter().find_map(|param| {
-        let argument = inferred_guard_target_expr(call_expr, signature, param.param_idx)?;
-        let argument_ref_id = get_var_expr_var_ref_id(db, cache, argument.clone())?;
-        (argument_ref_id == *var_ref_id
-            || can_narrow_type_guard_through_decl_alias(
-                db,
-                cache,
-                root,
-                var_ref_id,
-                &argument_ref_id,
-                &argument,
-            ))
-        .then(|| param.narrowed_type.clone())
-    }) else {
+    let Some(narrowed_type) = guarded_param_type(
+        db,
+        cache,
+        root,
+        var_ref_id,
+        call_expr,
+        signature_id,
+        &guard.narrowed,
+    ) else {
         return Ok(None);
     };
 
@@ -485,6 +477,172 @@ fn try_inferred_positive_guard(
             .false_removed_type
             .map(|removed| TypeOps::Remove.apply(db, &antecedent_type, &removed)),
     })
+}
+
+/// The type `params` give the argument of `call_expr` that names `var_ref_id`.
+fn guarded_param_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+    params: &[LuaGuardedParam],
+) -> Option<LuaType> {
+    let signature = db.get_signature_index().get(&signature_id)?;
+    params.iter().find_map(|param| {
+        let argument = inferred_guard_target_expr(call_expr, signature, param.param_idx)?;
+        let argument_ref_id = get_var_expr_var_ref_id(db, cache, argument.clone())?;
+        (argument_ref_id == *var_ref_id
+            || can_narrow_type_guard_through_decl_alias(
+                db,
+                cache,
+                root,
+                var_ref_id,
+                &argument_ref_id,
+                &argument,
+            ))
+        .then(|| param.narrowed_type.clone())
+    })
+}
+
+/// The type `var_ref_id` holds once `call_expr` returns, where every function
+/// the call may reach returns only with the argument naming it narrowed.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::semantic::infer::narrow) fn get_type_after_asserting_call(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    call_expr: &LuaCallExpr,
+    policy: FlowWalkPolicy,
+) -> Result<Option<LuaType>, InferFailReason> {
+    let Some(narrowed_type) = asserted_call_type(db, cache, root, var_ref_id, call_expr) else {
+        return Ok(None);
+    };
+    let antecedent_type =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
+    Ok(Some(narrow_type_guard_true_branch(
+        db,
+        antecedent_type,
+        narrowed_type,
+        false,
+    )))
+}
+
+/// The type every function `call_expr` may reach asserts of the argument
+/// naming `var_ref_id`.
+pub(in crate::semantic::infer::narrow) fn asserted_call_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    call_expr: &LuaCallExpr,
+) -> Option<LuaType> {
+    // Only an argument can be asserted, so a call passing none naming the
+    // variable is passed by without resolving what it calls. A call names at
+    // most an entry, as `call_names_var` explains.
+    let names_entry = matches!(var_ref_id, VarRefId::IndexRef(..));
+    let passes_var = call_expr
+        .get_args_list()?
+        .get_args()
+        .filter(|argument| names_entry || !matches!(argument, LuaExpr::CallExpr(_)))
+        .any(|argument| {
+            get_var_expr_var_ref_id(db, cache, argument.clone()).is_some_and(|argument_ref_id| {
+                argument_ref_id == *var_ref_id
+                    || can_narrow_type_guard_through_decl_alias(
+                        db,
+                        cache,
+                        root,
+                        var_ref_id,
+                        &argument_ref_id,
+                        &argument,
+                    )
+            })
+        });
+    if !passes_var {
+        return None;
+    }
+    let callees = asserting_callees(db, cache, call_expr)?;
+    let mut narrowed_type = LuaType::Never;
+    for signature_id in callees.iter().copied() {
+        let asserted = db
+            .get_signature_index()
+            .inferred_positive_guard(&signature_id)
+            .map(|guard| guard.asserted.clone())?;
+        let typ = guarded_param_type(
+            db,
+            cache,
+            root,
+            var_ref_id,
+            call_expr,
+            signature_id,
+            &asserted,
+        )?;
+        narrowed_type = TypeOps::Union.apply(db, &narrowed_type, &typ);
+    }
+    Some(narrowed_type)
+}
+
+/// The signatures `call_expr` may reach when every one asserts some of its
+/// arguments. The flow walk asks this of every call node it reaches, so the
+/// answer is memoised for as long as the facts it reads hold still.
+fn asserting_callees(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<Arc<[LuaSignatureId]>> {
+    let syntax_id = call_expr.get_syntax_id();
+    if let Some(callees) = cache.tracked_get(|cache| &mut cache.asserting_callees_cache, &syntax_id)
+    {
+        return callees;
+    }
+    let frame = crate::db_index::derivation::open_frame();
+    let callees = asserting_callees_uncached(db, cache, call_expr);
+    cache.tracked_insert(
+        |cache| &mut cache.asserting_callees_cache,
+        syntax_id,
+        callees.clone(),
+        frame,
+    );
+    callees
+}
+
+fn asserting_callees_uncached(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<Arc<[LuaSignatureId]>> {
+    let prefix_expr = call_expr.get_prefix_expr()?;
+    let function_type = infer_expr(db, cache, prefix_expr.clone()).ok()?;
+    let candidates = match &function_type {
+        LuaType::Union(union) => union.types().cloned().collect(),
+        typ => vec![typ.clone()],
+    };
+    let mut callees = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let signature_id = match candidate {
+            LuaType::Signature(signature_id) => signature_id,
+            LuaType::DocFunction(_) => get_call_prefix_signature_id(db, cache, call_expr)?,
+            _ => return None,
+        };
+        let asserts = db
+            .get_signature_index()
+            .inferred_positive_guard(&signature_id)
+            .is_some_and(|guard| !guard.asserted.is_empty());
+        if !asserts {
+            return None;
+        }
+        if let LuaExpr::IndexExpr(index_expr) = &prefix_expr
+            && typed_literal_field_has_writes(db, cache, index_expr, Some(signature_id))
+        {
+            return None;
+        }
+        callees.push(signature_id);
+    }
+    Some(callees.into())
 }
 
 /// Narrows the object a scripted-class base test checks: the callee marks the

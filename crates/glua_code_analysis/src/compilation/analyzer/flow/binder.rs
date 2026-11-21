@@ -27,6 +27,8 @@ enum NarrowingTarget {
     IndexPath(ArcIntern<SmolStr>),
     OpaqueName,
     OpaqueIndex,
+    CallArgumentName(ArcIntern<SmolStr>),
+    CallArgumentPath(ArcIntern<SmolStr>),
 }
 
 #[derive(Debug, Clone)]
@@ -335,6 +337,12 @@ impl<'a> FlowBinder<'a> {
                 NarrowingTarget::OpaqueIndex => {
                     capability.has_opaque_index_target = true;
                 }
+                NarrowingTarget::CallArgumentName(name) => {
+                    capability.call_argument_names.insert(name.clone());
+                }
+                NarrowingTarget::CallArgumentPath(path) => {
+                    capability.call_argument_paths.insert(path.clone());
+                }
             }
         }
         capability
@@ -417,6 +425,62 @@ impl<'a> FlowBinder<'a> {
     /// references as narrowable. Used for cast expressions.
     pub fn record_narrowable_refs_in_expr(&mut self, expr: &LuaExpr) {
         self.record_narrowable_refs(expr, false);
+    }
+
+    /// Record the names and paths a call statement passes, which a callee that
+    /// returns only once they hold some type narrows.
+    pub fn record_call_argument_refs(&mut self, call: &glua_parser::LuaCallExpr) {
+        use glua_parser::PathTrait;
+        for arg in call
+            .get_args_list()
+            .into_iter()
+            .flat_map(|args| args.get_args())
+        {
+            match arg {
+                LuaExpr::NameExpr(name_expr) => {
+                    if let Some(name) = name_expr.get_name_text() {
+                        self.record_call_argument(NarrowingTarget::CallArgumentName(
+                            crate::db_index::intern_smol_str(&name),
+                        ));
+                    }
+                }
+                LuaExpr::IndexExpr(index_expr) => {
+                    let Some(path) = crate::semantic::getter_access_path(&LuaExpr::IndexExpr(
+                        index_expr.clone(),
+                    ))
+                    .map(SmolStr::new)
+                    .or_else(|| index_expr.get_access_path()) else {
+                        continue;
+                    };
+                    if let Some(aliased) = self.aliased_index_path(&index_expr, &path) {
+                        self.record_call_argument(NarrowingTarget::CallArgumentPath(
+                            crate::db_index::intern_smol_str(&aliased),
+                        ));
+                    }
+                    self.record_call_argument(NarrowingTarget::CallArgumentPath(
+                        crate::db_index::intern_smol_str(&path),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn record_call_argument(&mut self, target: NarrowingTarget) {
+        match &target {
+            NarrowingTarget::CallArgumentName(name) => {
+                self.narrowing_capability
+                    .call_argument_names
+                    .insert(name.clone());
+            }
+            NarrowingTarget::CallArgumentPath(path) => {
+                self.narrowing_capability
+                    .call_argument_paths
+                    .insert(path.clone());
+            }
+            _ => {}
+        }
+        self.push_narrowing_event(target, true);
     }
 
     /// Record condition references separately from assignment and cast targets,

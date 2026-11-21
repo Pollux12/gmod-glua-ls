@@ -24,7 +24,9 @@ pub use get_type_at_cast_flow::get_type_at_call_expr_inline_cast;
 pub use get_type_at_flow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
 };
-use glua_parser::{LuaAstNode, LuaChunk, LuaExpr};
+use glua_parser::{
+    LuaAstNode, LuaAstToken, LuaChunk, LuaClosureExpr, LuaExpr, LuaSyntaxId, LuaTokenKind,
+};
 pub use narrow_type::{
     narrow_direct_name_false_or_nil, narrow_down_type, narrow_false_or_nil, remove_false_or_nil,
 };
@@ -151,6 +153,7 @@ pub(crate) fn var_ref_can_be_narrowed(
         // site exists in the file, the walk is provably a no-op.
         VarRefId::IndexRef(root, path) => {
             capability.index_path_can_be_narrowed(path)
+                || capability.call_argument_paths.contains(path)
                 || root
                     .as_decl_id()
                     .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
@@ -162,6 +165,29 @@ pub(crate) fn var_ref_can_be_narrowed(
                                 .any(|name| name.as_str() == decl.get_name())
                     })
         }
+    }
+}
+
+/// Whether a call statement in the file passes `var_ref_id` as an argument.
+pub(crate) fn var_ref_passed_to_call(
+    db: &DbIndex,
+    capability: &crate::FileNarrowingCapability,
+    var_ref_id: &VarRefId,
+) -> bool {
+    let passes_name = |name: &str| {
+        capability
+            .call_argument_names
+            .iter()
+            .any(|argument| argument.as_str() == name)
+    };
+    match var_ref_id {
+        VarRefId::VarRef(decl_id) => db
+            .get_decl_index()
+            .get_decl(decl_id)
+            .is_some_and(|decl| passes_name(decl.get_name())),
+        VarRefId::SelfRef(_) => passes_name("self"),
+        VarRefId::GlobalName(name, _) => passes_name(name),
+        VarRefId::IndexRef(_, path) => capability.call_argument_paths.contains(path),
     }
 }
 
@@ -182,6 +208,32 @@ pub(crate) fn infer_var_type_at_node(
     node: &impl LuaAstNode,
     var_ref_id: VarRefId,
 ) -> InferResult {
+    infer_var_type_at(db, cache, node, node.get_syntax_id(), var_ref_id)
+}
+
+/// The type of `var_ref_id` where control falls off the end of `closure`'s
+/// body, or `None` when no path reaches it.
+pub(crate) fn infer_var_type_at_closure_end(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    closure: &LuaClosureExpr,
+    var_ref_id: VarRefId,
+) -> Option<InferResult> {
+    let end = closure.token_by_kind(LuaTokenKind::TkEnd)?;
+    let end_id = LuaSyntaxId::from_token(end.syntax());
+    db.get_flow_index()
+        .get_flow_tree(&cache.get_file_id())?
+        .get_flow_id(end_id)?;
+    Some(infer_var_type_at(db, cache, closure, end_id, var_ref_id))
+}
+
+fn infer_var_type_at(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    node: &impl LuaAstNode,
+    syntax_id: LuaSyntaxId,
+    var_ref_id: VarRefId,
+) -> InferResult {
     let file_id = cache.get_file_id();
 
     // Fast path: if this reference can never be narrowed anywhere in the file,
@@ -195,7 +247,7 @@ pub(crate) fn infer_var_type_at_node(
         return get_var_ref_type(db, cache, &var_ref_id);
     };
 
-    let Some(flow_id) = flow_tree.get_flow_id(node.get_syntax_id()) else {
+    let Some(flow_id) = flow_tree.get_flow_id(syntax_id) else {
         return get_var_ref_type(db, cache, &var_ref_id);
     };
 

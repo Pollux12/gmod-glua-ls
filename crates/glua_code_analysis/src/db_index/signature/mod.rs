@@ -86,17 +86,18 @@ pub struct LuaSignatureIndex {
 }
 
 /// A conservative parameter narrowing derived from a function body: the type
-/// each parameter it narrows holds where the call is truthy, and, for a
-/// helper that is exactly one primitive or leaf-class type test of one
-/// parameter, the type removed where it is falsy.
+/// each parameter it narrows holds where the call is truthy, the type each
+/// holds once the call returns, and, for a helper that is exactly one
+/// primitive or leaf-class type test of one parameter, the type removed where
+/// it is falsy.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaInferredPositiveGuard {
     pub narrowed: Vec<LuaGuardedParam>,
+    pub asserted: Vec<LuaGuardedParam>,
     pub false_removed_type: Option<LuaType>,
 }
 
-/// A parameter an inferred guard narrows, and the type it holds where the
-/// call is truthy.
+/// A parameter an inferred guard narrows, and the type it holds there.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaGuardedParam {
     pub param_idx: usize,
@@ -107,6 +108,7 @@ impl LuaInferredPositiveGuard {
     fn payload_types(&self) -> impl Iterator<Item = &LuaType> {
         self.narrowed
             .iter()
+            .chain(&self.asserted)
             .map(|param| &param.narrowed_type)
             .chain(self.false_removed_type.as_ref())
     }
@@ -117,6 +119,7 @@ impl LuaInferredPositiveGuard {
         let narrowed = self
             .narrowed
             .iter()
+            .chain(&self.asserted)
             .map(|param| crate::db_index::remap_identities_in_type(&param.narrowed_type, remap))
             .collect::<Vec<_>>();
         let removed = self
@@ -128,7 +131,12 @@ impl LuaInferredPositiveGuard {
         {
             return true;
         }
-        for (param, narrowed) in self.narrowed.iter_mut().zip(narrowed) {
+        for (param, narrowed) in self
+            .narrowed
+            .iter_mut()
+            .chain(&mut self.asserted)
+            .zip(narrowed)
+        {
             if let Some(typ) = narrowed.typ {
                 param.narrowed_type = typ;
             }
@@ -999,6 +1007,7 @@ mod tests {
                     param_idx: 0,
                     narrowed_type: LuaType::String,
                 }],
+                asserted: Vec::new(),
                 false_removed_type: None,
             },
         );
@@ -1106,6 +1115,7 @@ mod tests {
                     param_idx: 0,
                     narrowed_type: table_ref(source_b, 0, 1),
                 }],
+                asserted: Vec::new(),
                 false_removed_type: None,
             },
         );
@@ -1122,6 +1132,7 @@ mod tests {
                     param_idx: 0,
                     narrowed_type: table_ref(source_c, 0, 1),
                 }],
+                asserted: Vec::new(),
                 false_removed_type: None,
             },
         );

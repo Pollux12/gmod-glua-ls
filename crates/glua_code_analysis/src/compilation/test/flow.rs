@@ -3534,6 +3534,22 @@ _2 = a[1]
     /// The types two locals have inside `if <call> then`, where both are
     /// `Entity?` before it and `helper` defines the predicate `call` uses.
     fn guarded_pair(helper: &str, call: &str) -> (String, String) {
+        pair_types(
+            helper,
+            &format!("if {call} then local first, second = x, y print(first, second) end"),
+        )
+    }
+
+    /// The types two locals have after `statements`, where both are `Entity?`
+    /// before them and `helper` defines what they call.
+    fn asserted_pair(helper: &str, statements: &str) -> (String, String) {
+        pair_types(
+            helper,
+            &format!("{statements}\nlocal first, second = x, y\nprint(first, second)"),
+        )
+    }
+
+    fn pair_types(helper: &str, body: &str) -> (String, String) {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         set_gmod_enabled(&mut ws);
         def_isvalid_guard(&mut ws);
@@ -3546,10 +3562,7 @@ _2 = a[1]
 
             local function use()
                 local x, y = find(), find()
-                if {call} then
-                    local first, second = x, y
-                    print(first, second)
-                end
+                {body}
             end
             "#
         ));
@@ -3710,6 +3723,163 @@ _2 = a[1]
         assert_eq!(
             [alone, replaced, deleted, reopened],
             ["Entity", "Entity?", "Entity", "Entity?"].map(str::to_string)
+        );
+    }
+
+    const ASSERT_VALID: &str = "local function AssertValid(ent) assert(IsValid(ent)) end";
+
+    #[gtest]
+    fn test_helper_that_errors_unless_valid_narrows_its_argument_after_the_call() {
+        let narrowed = asserted_pair(
+            "local function AssertValid(ent) if not IsValid(ent) then error(\"invalid\") end end",
+            "AssertValid(y)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity".to_string()));
+    }
+
+    #[gtest]
+    fn test_helper_that_asserts_validity_narrows_its_argument_after_the_call() {
+        let narrowed = asserted_pair(ASSERT_VALID, "AssertValid(y)");
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity".to_string()));
+    }
+
+    #[gtest]
+    fn test_helper_that_asserts_several_arguments_narrows_each() {
+        let narrowed = asserted_pair(
+            "local function AssertBoth(a, b) assert(IsValid(a)) assert(IsValid(b)) end",
+            "AssertBoth(x, y)",
+        );
+        assert_eq!(narrowed, ("Entity".to_string(), "Entity".to_string()));
+    }
+
+    #[gtest]
+    fn test_method_helper_that_asserts_narrows_its_argument_after_the_call() {
+        let narrowed = asserted_pair(
+            "Checks = {}\nfunction Checks:Require(ent) assert(IsValid(ent)) end",
+            "Checks:Require(y)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity".to_string()));
+    }
+
+    /// A helper that can return before it checks its argument proves nothing
+    /// of it once it returns.
+    #[gtest]
+    fn test_helper_that_can_return_before_asserting_narrows_nothing() {
+        let narrowed = asserted_pair(
+            "local function MaybeAssert(ent, strict) if not strict then return end assert(IsValid(ent)) end",
+            "MaybeAssert(y, false)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    /// A predicate returns whether its argument is valid, so calling it as a
+    /// statement proves nothing.
+    #[gtest]
+    fn test_predicate_called_as_a_statement_narrows_nothing() {
+        let narrowed = asserted_pair("local function ok(ent) return IsValid(ent) end", "ok(y)");
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    /// A helper that asserts a value it assigned to its parameter proves
+    /// nothing of the argument.
+    #[gtest]
+    fn test_helper_asserting_a_reassigned_parameter_narrows_nothing() {
+        let narrowed = asserted_pair(
+            "local function Refind(ent) ent = find() assert(IsValid(ent)) end",
+            "Refind(y)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    #[gtest]
+    fn test_asserted_argument_reassigned_after_the_call_is_not_narrowed() {
+        let narrowed = asserted_pair(ASSERT_VALID, "AssertValid(y) y = find()");
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    /// The narrowing reaches past a branch whose every arm asserts.
+    #[gtest]
+    fn test_asserting_call_in_every_branch_narrows_after_them() {
+        let narrowed = asserted_pair(
+            ASSERT_VALID,
+            "if math.random() > 0.5 then AssertValid(y) else AssertValid(y) end",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity".to_string()));
+    }
+
+    #[gtest]
+    fn test_replaced_table_field_assertion_does_not_narrow() {
+        let narrowed = asserted_pair(
+            "Checks = {}\nfunction Checks.Require(ent) assert(IsValid(ent)) end\nChecks.Require = function(ent) end",
+            "Checks.Require(y)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    #[gtest]
+    fn test_helper_that_asserts_narrows_a_field_argument() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+        let file_id = ws.def(&format!(
+            r#"
+            ---@class Holder
+            ---@field Owner Entity?
+
+            {ASSERT_VALID}
+
+            ---@param holder Holder
+            local function use(holder)
+                AssertValid(holder.Owner)
+                local owner = holder.Owner
+                print(owner)
+            end
+            "#
+        ));
+        let owner = nth_name_expr_type_from_end(&mut ws, file_id, "owner", 0);
+        assert_eq!(ws.humanize_type(owner), "Entity");
+    }
+
+    /// An asserting helper in another file narrows while it asserts, and
+    /// editing, deleting and reopening that file follows it.
+    #[gtest]
+    fn test_asserting_helper_follows_edits_in_another_file() {
+        const HELPER: &str = "lua/autorun/sh_assert.lua";
+        let asserting = "function AssertValid(ent) assert(IsValid(ent)) end";
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+        ws.def_file(HELPER, asserting);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_use.lua",
+            r#"
+            ---@return Entity?
+            local function find() end
+
+            local function use()
+                local x = find()
+                AssertValid(x)
+                local first = x
+                print(first)
+            end
+            "#,
+        );
+        let narrowed = |ws: &mut VirtualWorkspace| {
+            let typ = nth_name_expr_type_from_end(ws, file_id, "first", 0);
+            ws.humanize_type(typ)
+        };
+        let asserted = narrowed(&mut ws);
+        ws.def_file(HELPER, "function AssertValid(ent) print(ent) end");
+        let edited = narrowed(&mut ws);
+        let uri = ws.virtual_url_generator.new_uri(HELPER);
+        ws.analysis.remove_file_by_uri(&uri);
+        let deleted = narrowed(&mut ws);
+        ws.def_file(HELPER, asserting);
+        let reopened = narrowed(&mut ws);
+
+        assert_eq!(
+            [asserted, edited, deleted, reopened],
+            ["Entity", "Entity?", "Entity?", "Entity"].map(str::to_string)
         );
     }
 

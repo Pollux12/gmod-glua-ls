@@ -30,7 +30,10 @@ use crate::{
         infer_param_with_cache,
         narrow::{
             ResultTypeOrContinue,
-            condition_flow::{InferConditionFlow, get_type_at_condition_flow},
+            condition_flow::{
+                InferConditionFlow, asserted_call_type, get_type_after_asserting_call,
+                get_type_at_condition_flow,
+            },
             get_single_antecedent,
             get_type_at_cast_flow::get_type_at_cast_flow,
             get_var_ref_type, narrow_direct_name_false_or_nil, narrow_down_type,
@@ -39,6 +42,7 @@ use crate::{
                 get_var_expr_var_ref_id, is_immutable_direct_lexical_decl,
                 is_untyped_param_rooted_index,
             },
+            var_ref_passed_to_call,
         },
     },
 };
@@ -526,13 +530,7 @@ fn get_type_at_flow_walk(
                     if can_skip
                         && all_branch_antecedents_alive(tree, flow_node)
                         && !branch_has_relevant_special_call_effects(
-                            db,
-                            tree,
-                            cache,
-                            root,
-                            flow_node,
-                            info.common_predecessor,
-                            var_ref_id,
+                            db, tree, cache, root, flow_node, info, var_ref_id,
                         )
                     {
                         antecedent_flow_id = info.common_predecessor;
@@ -703,6 +701,18 @@ fn get_type_at_flow_walk(
                 let call_expr = call_ptr.to_node(root).ok_or(InferFailReason::None)?;
                 if call_expr_returns_never(db, cache, call_expr.clone()) {
                     return Ok(LuaType::Never);
+                }
+                if let Some(asserted_type) = get_type_after_asserting_call(
+                    db,
+                    tree,
+                    cache,
+                    root,
+                    var_ref_id,
+                    flow_node,
+                    &call_expr,
+                    policy.clone(),
+                )? {
+                    return Ok(asserted_type);
                 }
 
                 let file_id = cache.get_file_id();
@@ -1290,13 +1300,7 @@ fn split_entry(
     let info = tree.get_branch_label_info(flow_node.id)?;
     (!branch_can_write_var_ref(db, info, var_ref_id)
         && !branch_has_relevant_special_call_effects(
-            db,
-            tree,
-            cache,
-            root,
-            flow_node,
-            info.common_predecessor,
-            var_ref_id,
+            db, tree, cache, root, flow_node, info, var_ref_id,
         ))
     .then_some(info.common_predecessor)
 }
@@ -1715,20 +1719,22 @@ fn branch_has_relevant_special_call_effects(
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     flow_node: &FlowNode,
-    stop_at: FlowId,
+    info: &crate::BranchLabelInfo,
     var_ref_id: &VarRefId,
 ) -> bool {
+    let stop_at = info.common_predecessor;
     let Some(FlowAntecedent::Multiple(idx)) = &flow_node.antecedent else {
         return false;
     };
     let Some(antecedents) = tree.get_multi_antecedents(*idx) else {
         return false;
     };
-    // Without a special-call effect on the reference in the file, no region
-    // of it holds one.
+    // Without a special-call effect on the reference in the file or a call
+    // statement passing it in the branch, no region of it holds either.
     if !db
         .get_flow_index()
         .has_special_call_effect_for(&cache.get_file_id(), var_ref_id)
+        && !var_ref_passed_to_call(db, &info.narrowing_capability, var_ref_id)
     {
         return false;
     }
@@ -1870,11 +1876,12 @@ fn branch_special_call_effect_uncached(
     };
 
     if let FlowNodeKind::Call(call_ptr) = &flow_node.kind
-        && let Some(call_expr_stat) = call_ptr.to_node(root)
-        && let Some(effects) = db
+        && let Some(call_expr) = call_ptr.to_node(root)
+        && (db
             .get_flow_index()
-            .get_special_call_effects(&cache.get_file_id(), call_expr_stat.get_position())
-        && effects.iter().any(|effect| effect.narrows(var_ref_id))
+            .get_special_call_effects(&cache.get_file_id(), call_expr.get_position())
+            .is_some_and(|effects| effects.iter().any(|effect| effect.narrows(var_ref_id)))
+            || asserted_call_type(db, cache, root, var_ref_id, &call_expr).is_some())
     {
         return true;
     }

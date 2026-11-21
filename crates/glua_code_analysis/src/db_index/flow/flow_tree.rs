@@ -40,6 +40,11 @@ pub struct FileNarrowingCapability {
     /// respectively to stay sound.
     pub has_opaque_name_target: bool,
     pub has_opaque_index_target: bool,
+    /// Names a call statement passes as an argument, which a callee that
+    /// asserts it narrows once the call returns.
+    pub call_argument_names: HashSet<ArcIntern<SmolStr>>,
+    /// Access paths a call statement passes as an argument.
+    pub call_argument_paths: HashSet<ArcIntern<SmolStr>>,
 }
 
 /// Names hash by their text: an interned name hashes its pointer, which a name
@@ -51,6 +56,10 @@ impl Hash for FileNarrowingCapability {
             .hash(state);
         self.has_opaque_name_target.hash(state);
         self.has_opaque_index_target.hash(state);
+        unordered_fingerprint(self.call_argument_names.iter().map(|name| name.as_str()))
+            .hash(state);
+        unordered_fingerprint(self.call_argument_paths.iter().map(|path| path.as_str()))
+            .hash(state);
     }
 }
 
