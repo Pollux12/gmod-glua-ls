@@ -1221,7 +1221,7 @@ impl Engine {
         reader: DerivationId,
         seen: derivation::Fingerprint,
     ) {
-        if reader.kind.is_statement() {
+        if reader.kind.closes_loops() {
             let settled = db.analysis_stage() == AnalysisStage::Closed;
             let moved = self.moved_from.entry(reader).or_default();
             if moved.iter().all(|moved| moved.key != *key) {
@@ -1938,14 +1938,14 @@ impl Engine {
             }
             self.unqueue(*member);
             self.stats.evaluated(*member);
-            if member.kind.is_statement()
+            if member.kind.closes_loops()
                 && self.ran.insert(*member)
                 && db.reader_graph().contains(*member)
             {
                 self.from_before.insert(*member);
             }
             let mut moved = self.moved_from.remove(member).unwrap_or_default();
-            if member.kind.is_statement() {
+            if member.kind.closes_loops() {
                 for (key, seen) in moved_in_task {
                     if moved.iter().all(|moved| moved.key != *key) {
                         moved.push(Moved {
@@ -2228,7 +2228,7 @@ impl Engine {
                 .iter()
                 .flat_map(|(_, groups, ..)| groups.iter().flat_map(|group| &group.members))
             {
-                if member.kind.is_statement() && self.rebuilt.contains(&member.file_id) {
+                if member.kind.closes_loops() && self.rebuilt.contains(&member.file_id) {
                     self.settled_on_removed(db, *member);
                 }
             }
@@ -2564,14 +2564,14 @@ impl Engine {
                 ran.insert(*member);
             }
             self.stats.evaluated(*member);
-            if member.kind.is_statement()
+            if member.kind.closes_loops()
                 && self.ran.insert(*member)
                 && db.reader_graph().contains(*member)
             {
                 self.from_before.insert(*member);
             }
             let moved = self.moved_from.remove(member).unwrap_or_default();
-            if member.kind.is_statement() {
+            if member.kind.closes_loops() {
                 self.settled_on(*member, moved);
             }
         }
@@ -2584,7 +2584,7 @@ impl Engine {
         let rebuilt = group
             .iter()
             .copied()
-            .filter(|member| member.kind.is_statement() && self.rebuilt.contains(&member.file_id))
+            .filter(|member| member.kind.closes_loops() && self.rebuilt.contains(&member.file_id))
             .collect::<Vec<_>>();
         let started = self.stats.profiling().then(std::time::Instant::now);
         let touched = crate::profile::phase("engine: evaluate", || {
@@ -5089,7 +5089,7 @@ fn moved_in_task(
     written: &FxHashSet<HashedKey>,
     member: DerivationId,
 ) -> Vec<(HashedKey, derivation::Fingerprint)> {
-    if !member.kind.is_statement() || written.is_empty() {
+    if !member.kind.closes_loops() || written.is_empty() {
         return Vec::new();
     }
     let graph = frozen.reader_graph();
@@ -7608,11 +7608,28 @@ function holder.receiver:Use() end
     /// positions it reads: each binds there the union of what it reads and
     /// what the group it runs in wrote there before it, as statements assigning
     /// one local add to its type. An unknown adds nothing to a known value.
+    /// The entries at `passes` are instead call-site passes, which run once
+    /// the statements settle.
     struct Supplies {
         writes: Vec<(u32, u32, Vec<u32>)>,
+        passes: Vec<u32>,
     }
 
     impl Supplies {
+        fn id(&self, start: u32) -> DerivationId {
+            if !self.passes.contains(&start) {
+                return statement(start);
+            }
+            DerivationId::new(
+                DerivationKind::CallSiteParam,
+                FileId::new(FILE),
+                LuaSyntaxId::new(
+                    LuaSyntaxKind::CallExpr.into(),
+                    TextRange::at(TextSize::new(start), TextSize::new(1)),
+                ),
+            )
+        }
+
         fn bound(&self, db: &DbIndex) -> Vec<Option<LuaType>> {
             self.writes
                 .iter()
@@ -7632,7 +7649,7 @@ function holder.receiver:Use() end
             bind(db, INPUT, value);
             let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
             for (start, _, _) in &self.writes {
-                engine.changed(statement(*start));
+                engine.changed(self.id(*start));
             }
             engine.open(db);
             assert!(engine.run(db, self, Slice::Whole));
@@ -7700,6 +7717,45 @@ function holder.receiver:Use() end
                 (30, 30, vec![20]),
                 (40, 10, vec![10, 30]),
             ],
+            passes: Vec::new(),
+        };
+
+        for serial in [true, false] {
+            for schedule in [
+                Schedule::Canonical,
+                Schedule::Reversed,
+                Schedule::Shuffled(7),
+                Schedule::Deferred,
+            ] {
+                let _serial = serial.then(serial_engine);
+                let mut warm = recipe.settled_from(text("old"));
+                let db = warm.get_db_mut();
+                let mut engine = Engine::new(derivation::EditMaps::default(), schedule);
+                bind(db, INPUT, LuaType::Unknown);
+                let input = HashedKey::new(FactKey::TypeCache(owner(INPUT)));
+                db.reader_graph().forget_fingerprint(&input);
+                engine.readers_of(db, [&input]);
+                engine.open(db);
+                assert!(engine.run(db, &recipe, Slice::Whole));
+
+                assert_eq!(
+                    recipe.bound(db),
+                    recipe.bound(recipe.settled_from(LuaType::Unknown).get_db_mut()),
+                    "{schedule:?} serial={serial}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_loop_whose_only_outside_reader_is_a_pass_settles_as_a_cold_build() {
+        // A pass guesses `x` from `INPUT` and from `y`, and `y = x` reads the
+        // guess back: the loop keeps what `INPUT` gave it unless it is
+        // cleared, and only the pass, which runs once statements settle,
+        // reads `INPUT`.
+        let recipe = Supplies {
+            writes: vec![(10, 10, vec![INPUT, 20]), (20, 20, vec![10])],
+            passes: vec![10],
         };
 
         for serial in [true, false] {

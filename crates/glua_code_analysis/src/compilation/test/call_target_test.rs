@@ -322,14 +322,14 @@ Greet(Probe())
         assert_eq!(warm.semantic_digest(), reverted.semantic_digest());
     }
 
-    /// Editing what one call's argument depends on re-runs that call's
-    /// call-site derivation alone, not the other calls of its file, including
-    /// the calls of the callee whose parameter its evidence moves, and leaves
-    /// what a cold build of the edit has. A local callee takes no evidence
-    /// from its calls here, so none of them runs again.
+    /// Editing what one call's argument depends on re-runs the call-site
+    /// derivations of the calls that read the callee's parameter back through
+    /// its return, as a cold build settles them together, and leaves what a
+    /// cold build of the edit has. A local callee takes no evidence from its
+    /// calls here, so none of them runs again.
     #[test]
-    fn editing_one_calls_argument_re_runs_only_that_calls_call_site_params() {
-        for (greeter_text, expected) in [(GREETER_TEXT, 1), (LOCAL_GREETER_TEXT, 0)] {
+    fn editing_one_calls_argument_re_runs_the_calls_its_evidence_reaches() {
+        for (greeter_text, expected) in [(GREETER_TEXT, 3), (LOCAL_GREETER_TEXT, 0)] {
             let mut ws = gmod_workspace();
             ws.def_files(vec![(PROBE, PROBE_TEXT), (GREETER, greeter_text)]);
             ws.def_file(PROBE, EDITED_PROBE_TEXT);
