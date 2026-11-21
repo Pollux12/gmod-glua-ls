@@ -77,8 +77,11 @@ fn transferable_factory_member_ids(
     Some(member_ids)
 }
 
-/// The owner of the table the metatable's `__index` names: the class whose
-/// methods read what each instance the constructor makes starts with.
+/// The class whose methods read what each instance the constructor makes
+/// starts with: the metatable when it indexes itself, or a table literal it
+/// indexes whose methods take the instance as `self`. A table indexed only
+/// for its defaults has no such methods, and what instances start with is
+/// not its own.
 fn prototype_owner(db: &DbIndex, binding: &SetmetatableFactoryBinding) -> Option<LuaMemberOwner> {
     let owner = crate::semantic::metatable_member_owner(db, &binding.metatable_range);
     let key = LuaMemberKey::Name("__index".into());
@@ -86,23 +89,59 @@ fn prototype_owner(db: &DbIndex, binding: &SetmetatableFactoryBinding) -> Option
         .get_current_owner_members_for_key(&owner, &key)
         .into_iter()
         .find_map(|member| {
-            db.get_type_index()
-                .get_type_cache(&member.get_id().into())
-                .and_then(|cache| table_owner(db, cache.as_type()))
+            let cache = db
+                .get_type_index()
+                .get_type_cache(&member.get_id().into())?;
+            prototype_of(db, cache.as_type(), binding, &owner)
         })
 }
 
-fn table_owner(db: &DbIndex, typ: &LuaType) -> Option<LuaMemberOwner> {
+fn prototype_of(
+    db: &DbIndex,
+    typ: &LuaType,
+    binding: &SetmetatableFactoryBinding,
+    metatable_owner: &LuaMemberOwner,
+) -> Option<LuaMemberOwner> {
     match typ {
-        LuaType::TableConst(range) => Some(crate::semantic::metatable_member_owner(db, range)),
-        LuaType::Instance(instance) => Some(crate::semantic::metatable_member_owner(
-            db,
-            instance.get_range(),
-        )),
-        LuaType::Def(id) | LuaType::Ref(id) => Some(LuaMemberOwner::Type(id.clone())),
-        LuaType::TypeGuard(inner) => table_owner(db, inner),
+        LuaType::TableConst(_) | LuaType::Instance(_)
+            if typ_range(typ) == Some(&binding.metatable_range) =>
+        {
+            Some(metatable_owner.clone())
+        }
+        LuaType::Def(id) | LuaType::Ref(id) if metatable_owner.get_type_id() == Some(id) => {
+            Some(metatable_owner.clone())
+        }
+        LuaType::TableConst(range) => {
+            let prototype = crate::semantic::metatable_member_owner(db, range);
+            has_method(db, &prototype).then_some(prototype)
+        }
+        LuaType::TypeGuard(inner) => prototype_of(db, inner, binding, metatable_owner),
         _ => None,
     }
+}
+
+fn typ_range(typ: &LuaType) -> Option<&crate::InFiled<TextRange>> {
+    match typ {
+        LuaType::TableConst(range) => Some(range),
+        LuaType::Instance(instance) => Some(instance.get_range()),
+        _ => None,
+    }
+}
+
+fn has_method(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
+    db.get_member_index()
+        .get_members(owner)
+        .into_iter()
+        .flatten()
+        .any(|member| {
+            db.get_type_index()
+                .get_type_cache(&member.get_id().into())
+                .is_some_and(|cache| {
+                    matches!(cache.as_type(), LuaType::Signature(signature_id)
+                        if db.get_signature_index().get(signature_id)
+                            .is_some_and(|signature| signature.is_colon_define))
+                })
+        })
 }
 
 fn factory_local_has_blocking_write_or_alias(

@@ -596,6 +596,100 @@ mod test {
         ));
     }
 
+    /// Editing the constructor literal changes what the prototype's methods
+    /// read, and editing it back restores it.
+    #[test]
+    fn test_prototype_follows_edits_to_its_constructor_literal() {
+        let source = |fields: &str| {
+            format!(
+                r#"
+                local Tween = {{}}
+                Tween.__index = Tween
+
+                function Tween:set(clock)
+                    if clock >= self.duration then
+                        self.clock = self.duration
+                    end
+                end
+
+                function Tween:update(dt)
+                    return self:set(self.clock + dt)
+                end
+
+                ---@param duration number
+                function NewTween(duration)
+                    return setmetatable({{ {fields} }}, Tween)
+                end
+                "#
+            )
+        };
+        let mut ws = VirtualWorkspace::new();
+        let mut reads_set_fields = |fields: &str| {
+            ws.check_file_for(
+                DiagnosticCode::NeedCheckNil,
+                "lua/autorun/sh_tween.lua",
+                &source(fields),
+            )
+        };
+        let full = reads_set_fields("duration = duration, clock = 0");
+        let without_duration = reads_set_fields("clock = 0");
+        let restored = reads_set_fields("duration = duration, clock = 0");
+
+        assert_eq!([full, without_duration, restored], [true, false, true]);
+    }
+
+    /// A table of defaults behind `__index` has no methods reading an
+    /// instance as `self`, so what instances start with is not its own.
+    #[test]
+    fn test_defaults_table_behind_index_keeps_its_own_fields() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            local defaults = { color = "red" }
+            local mt = { __index = defaults }
+
+            function NewThing()
+                return setmetatable({ size = 1 }, mt)
+            end
+            "#,
+        );
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let defaults_range = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaTableExpr>()
+            .next()
+            .expect("expected the defaults table")
+            .get_range();
+        let owner = LuaMemberOwner::Element(InFiled::new(file_id, defaults_range));
+        let keys = semantic_model
+            .get_db()
+            .get_member_index()
+            .get_members(&owner)
+            .unwrap_or_default()
+            .iter()
+            .map(|member| member.get_key().clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(keys, vec![LuaMemberKey::Name("color".into())]);
+    }
+
+    #[test]
+    fn test_environment_behind_index_keeps_globals_unchanged() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            local env = setmetatable({ sandboxed = true }, { __index = _G })
+            print(sandboxed)
+            "#,
+        ));
+    }
+
     #[test]
     fn test_callable_table_parameter_resolves_as_instance_metatable() {
         let mut ws = VirtualWorkspace::new();
