@@ -550,6 +550,52 @@ mod test {
         );
     }
 
+    /// A prototype method reads the fields every instance its constructor
+    /// literal makes starts with.
+    fn prototype_reads_constructor_fields(metatable: &str, constructor_metatable: &str) -> bool {
+        let mut ws = VirtualWorkspace::new();
+        ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            &format!(
+                r#"
+                local Tween = {{}}
+                {metatable}
+
+                function Tween:set(clock)
+                    if clock >= self.duration then
+                        self.clock = self.duration
+                    end
+                end
+
+                function Tween:update(dt)
+                    return self:set(self.clock + dt)
+                end
+
+                ---@param duration number
+                function NewTween(duration)
+                    return setmetatable({{ duration = duration, clock = 0 }}, {constructor_metatable})
+                end
+                "#
+            ),
+        )
+    }
+
+    #[test]
+    fn test_self_indexed_prototype_reads_inline_constructor_fields() {
+        assert!(prototype_reads_constructor_fields(
+            "Tween.__index = Tween",
+            "Tween"
+        ));
+    }
+
+    #[test]
+    fn test_prototype_behind_index_metatable_reads_inline_constructor_fields() {
+        assert!(prototype_reads_constructor_fields(
+            "local Tween_mt = { __index = Tween }",
+            "Tween_mt"
+        ));
+    }
+
     #[test]
     fn test_callable_table_parameter_resolves_as_instance_metatable() {
         let mut ws = VirtualWorkspace::new();

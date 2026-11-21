@@ -89,7 +89,9 @@ pub struct SetmetatableFactoryBinding {
     pub file_id: FileId,
     pub table_range: InFiled<TextRange>,
     pub metatable_range: InFiled<TextRange>,
-    pub local_name: SmolStr,
+    /// The local the constructor fills before the call, or `None` for a table
+    /// literal written in the call itself.
+    pub local_name: Option<SmolStr>,
     pub call_position: TextSize,
     pub function_scope: TextRange,
 }
@@ -663,7 +665,7 @@ abc",
             file_id: writer,
             table_range: InFiled::new(writer, range(0)),
             metatable_range: InFiled::new(metatable_file, range(40)),
-            local_name: "object".into(),
+            local_name: Some("object".into()),
             call_position: TextSize::new(0),
             function_scope: range(0),
         });
