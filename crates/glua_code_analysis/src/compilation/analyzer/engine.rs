@@ -608,6 +608,10 @@ pub(crate) struct Engine {
     /// before they were removed: what a reader settled on of it, whatever it
     /// saw while the files were rebuilt.
     removed_outputs: FxHashMap<HashedKey, derivation::Fingerprint>,
+    /// The derivations that stopped producing each key during this run: what
+    /// a reader settled on of it may have come from one that no longer
+    /// supplies it.
+    withdrawn: std::cell::RefCell<FxHashMap<HashedKey, Vec<DerivationId>>>,
     /// The members of the loops this run cleared at quiescence for good, at
     /// the first check after them that cleared none (see
     /// [`Self::settled_loop_members`]). Settled again from nothing once the
@@ -959,17 +963,34 @@ impl Engine {
         self.removed_outputs.entry(key).or_insert(fingerprint);
     }
 
-    /// Carries the removed outputs noted so far to where `edits` moved them.
+    /// Notes that `id` no longer produces any of `keys`.
+    fn note_withdrawn(&self, id: DerivationId, keys: Vec<HashedKey>) {
+        let mut withdrawn = self.withdrawn.borrow_mut();
+        for key in keys {
+            let producers = withdrawn.entry(key).or_default();
+            if !producers.contains(&id) {
+                producers.push(id);
+            }
+        }
+    }
+
+    /// Carries the removed and withdrawn outputs noted so far to where `edits`
+    /// moved them.
     pub(crate) fn follow_removed_outputs(&mut self, edits: &derivation::EditMaps) {
+        let follow = |key: HashedKey| {
+            edits
+                .map_key(&key)
+                .filter(|moved| moved != key.key())
+                .map_or(key, HashedKey::new)
+        };
         self.removed_outputs = std::mem::take(&mut self.removed_outputs)
             .into_iter()
-            .map(|(key, fingerprint)| {
-                let key = edits
-                    .map_key(&key)
-                    .filter(|moved| moved != key.key())
-                    .map_or(key, HashedKey::new);
-                (key, fingerprint)
-            })
+            .map(|(key, fingerprint)| (follow(key), fingerprint))
+            .collect();
+        let withdrawn = self.withdrawn.get_mut();
+        *withdrawn = std::mem::take(withdrawn)
+            .into_iter()
+            .map(|(key, ids)| (follow(key), ids))
             .collect();
     }
 
@@ -2195,10 +2216,13 @@ impl Engine {
             produced
         };
         drop(producing);
-        crate::profile::phase("records: replace all kept", || {
+        let withdrawn = crate::profile::phase("records: replace all kept", || {
             db.reader_graph_mut()
                 .replace_all_kept(records, &mut released, derivation::new_stamp)
         });
+        for (id, keys) in withdrawn {
+            self.note_withdrawn(id, keys);
+        }
         if !self.removed_outputs.is_empty() {
             for member in tasks
                 .iter()
@@ -2686,15 +2710,22 @@ impl Engine {
             .chain(moved_since)
             .flatten()
             .any(|moved| {
-                // A fact a removed derivation wrote is read from outside the
-                // loop: what the removed writer supplied, nothing in the loop
+                // A fact a removed derivation wrote, or one a derivation
+                // outside the loop stopped writing, is read from outside the
+                // loop: what that writer supplied, nothing in the loop
                 // supplies any more.
                 self.net_moved(db, member, moved)
-                    && (self.removed_outputs.contains_key(&moved.key) || {
-                        let mut producers = graph.producers(&moved.key).peekable();
-                        producers.peek().is_none()
-                            || producers.any(|producer| !lp.contains(&producer))
-                    })
+                    && (self.removed_outputs.contains_key(&moved.key)
+                        || self
+                            .withdrawn
+                            .borrow()
+                            .get(&moved.key)
+                            .is_some_and(|ids| ids.iter().any(|id| !lp.contains(id)))
+                        || {
+                            let mut producers = graph.producers(&moved.key).peekable();
+                            producers.peek().is_none()
+                                || producers.any(|producer| !lp.contains(&producer))
+                        })
             })
     }
 
@@ -4013,7 +4044,7 @@ impl Engine {
                 }
                 None => slots.into_iter().map(|slot| (slot, None)).collect(),
             };
-            graph.replace_slots(
+            let withdrawn = graph.replace_slots(
                 id,
                 slots,
                 outputs,
@@ -4021,6 +4052,7 @@ impl Engine {
                 &mut released,
                 now,
             );
+            self.note_withdrawn(id, withdrawn);
         }
         graph.release_keys(released);
         *db.reader_graph_mut() = graph;

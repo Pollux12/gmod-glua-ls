@@ -447,4 +447,122 @@ print(mine, theirs)
             .map_or(0, |data| data.send_flows.len() + data.receive_flows.len());
         assert_eq!(flows, 0);
     }
+
+    /// Two `= nil` writes through a param typed from its callers keep each
+    /// other filed once another writer of the same field landed on the
+    /// socket table first; when deleting the base moves that writer to
+    /// another table, the writes it supported fall as in a cold build.
+    #[test]
+    fn writes_kept_up_by_a_writer_that_moved_away_settle_as_a_cold_build() {
+        let base = "lua/entities/base_glide/shared.lua";
+        let workspace = || {
+            let mut ws = VirtualWorkspace::new();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            emmyrc
+                .gmod
+                .file_param_defaults
+                .insert("vehicle".to_string(), "base_glide_car".to_string());
+            ws.update_emmyrc(emmyrc);
+            ws.analysis.init_std_lib();
+            ws.def_gmod_call_arg_builtins();
+            ws
+        };
+        let files = [
+            (
+                "lua/entities/base_glide/sv_sockets.lua",
+                r#"
+                function ENT:SocketInit()
+                    Glide.TrackVehicleSockets(self)
+                end
+
+                local function AttemptConnection(plug)
+                    plug.attemptReceptacle = nil
+                    plug.attemptReceptacle = nil
+                end
+
+                function ENT:SocketThink()
+                    for _, socket in ipairs(self.Sockets) do
+                        AttemptConnection(socket)
+                    end
+                end
+                "#,
+            ),
+            (
+                "lua/entities/base_glide_car/shared.lua",
+                "DEFINE_BASECLASS(\"base_glide\")\n",
+            ),
+            (
+                "lua/entities/base_glide_trailer.lua",
+                "DEFINE_BASECLASS(\"base_glide\")\n",
+            ),
+            (
+                "lua/entities/gtav_hauler.lua",
+                "ENT.Base = \"base_glide_car\"\nENT.Sockets = {\n    { id = \"TruckSocket\", isReceptacle = true },\n}\n",
+            ),
+            (
+                "lua/entities/gtav_trailer_flat.lua",
+                "ENT.Base = \"base_glide_trailer\"\nENT.Sockets = {\n    { id = \"TruckSocket\", isReceptacle = false },\n}\n",
+            ),
+            (
+                "lua/glide/server/sockets.lua",
+                r#"
+                local vehiclesWithSockets = {}
+
+                function Glide.TrackVehicleSockets(vehicle)
+                    vehiclesWithSockets[#vehiclesWithSockets + 1] = vehicle
+                end
+
+                timer.Create("Glide.UpdateSockets", 0.1, 0, function()
+                    local receptacles, plugs = {}, {}
+                    for i = #vehiclesWithSockets, 1, -1 do
+                        local vehicle = vehiclesWithSockets[i]
+                        for _, socket in ipairs(vehicle.Sockets) do
+                            if socket.isReceptacle == true then
+                                receptacles[#receptacles + 1] = socket
+                            else
+                                plugs[#plugs + 1] = socket
+                            end
+                        end
+                    end
+                    for _, plug in ipairs(plugs) do
+                        plug.attemptReceptacle = receptacles[1]
+                    end
+                end)
+                "#,
+            ),
+            (base, "ENT.Sockets = {}\n"),
+        ];
+        let mut warm = workspace();
+        warm.def_files(files.to_vec());
+        let uri = warm.virtual_url_generator.new_uri(base);
+        warm.analysis.remove_file_by_uri(&uri);
+        let mut cold = workspace();
+        cold.def_files(files[..files.len() - 1].to_vec());
+
+        // The settled digest with each file id written as its path: the two
+        // workspaces number their files differently.
+        let digest = |ws: &VirtualWorkspace| {
+            let vfs = ws.analysis.compilation.get_db().get_vfs();
+            let mut lines = ws.settled_digest();
+            for line in &mut lines {
+                while let Some(start) = line.find("FileId { id: ") {
+                    let rest = &line[start + "FileId { id: ".len()..];
+                    let end = rest.find(" }").expect("file id");
+                    let id = rest[..end].parse().expect("file id number");
+                    let path = vfs
+                        .get_file_path(&FileId { id })
+                        .map(|path| path.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_default();
+                    *line = format!("{}<{path}>{}", &line[..start], &rest[end + 2..]);
+                }
+            }
+            lines.sort();
+            lines
+        };
+        let (warm, cold) = (digest(&warm), digest(&cold));
+        let only_warm: Vec<_> = warm.iter().filter(|line| !cold.contains(line)).collect();
+        let only_cold: Vec<_> = cold.iter().filter(|line| !warm.contains(line)).collect();
+        assert_eq!((only_warm, only_cold), (Vec::new(), Vec::new()));
+    }
 }

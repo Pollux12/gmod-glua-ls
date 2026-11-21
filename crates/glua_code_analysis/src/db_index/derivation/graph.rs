@@ -1729,18 +1729,28 @@ impl ReaderGraph {
     /// `stamp` gives each. Each record is diffed against the one it replaces
     /// on worker threads, unless the batch files one derivation twice, and
     /// the readers of the keys they read are updated a page of slots at a
-    /// time on worker threads.
+    /// time on worker threads. Returns, per derivation, the outputs its
+    /// previous evaluation produced and this one did not.
     pub fn replace_all_kept(
         &mut self,
         records: Vec<KeptRecord>,
         released: &mut Vec<KeyIdx>,
         mut stamp: impl FnMut() -> u64,
-    ) {
+    ) -> Vec<(DerivationId, Vec<HashedKey>)> {
         use rayon::prelude::*;
         let mut ids = FxHashSet::with_capacity_and_hasher(records.len(), Default::default());
         let distinct = records.iter().all(|record| ids.insert(record.id));
         drop(ids);
         let mut ops = Vec::with_capacity(records.len());
+        let mut withdrawn = Vec::new();
+        let mut finish = |graph: &mut Self, diffed: DiffedRecord, ops: &mut Vec<_>| {
+            let id = diffed.id;
+            let (dropped, record_ops) = graph.finish_kept(diffed, released);
+            if !dropped.is_empty() {
+                withdrawn.push((id, dropped));
+            }
+            ops.push(record_ops);
+        };
         if distinct {
             let known = crate::profile::phase("records: kept known", || {
                 records
@@ -1771,7 +1781,7 @@ impl ReaderGraph {
             });
             crate::profile::phase("records: kept finish", || {
                 for diffed in diffed {
-                    ops.push(self.finish_kept(diffed, released).1);
+                    finish(self, diffed, &mut ops);
                 }
             });
         } else {
@@ -1782,12 +1792,13 @@ impl ReaderGraph {
                 let deriv = self.intern_derivation(record.id);
                 let prepared = self.prepare_kept(record, deriv, now);
                 let diffed = prepared.diff(self.derivations[deriv as usize].record.as_ref(), None);
-                ops.push(self.finish_kept(diffed, released).1);
+                finish(self, diffed, &mut ops);
             }
         }
         crate::profile::phase("records: apply reader ops", || {
             self.table.apply_reader_ops(ops)
         });
+        withdrawn
     }
 
     /// Interns the outputs of `record`, which is `deriv`'s, at `now`.
