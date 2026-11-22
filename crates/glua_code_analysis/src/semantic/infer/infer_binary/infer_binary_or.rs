@@ -12,7 +12,10 @@ use crate::{
         infer::{
             InferFailReason, InferResult,
             infer_index::{get_index_expr_var_ref_id, infer_index_expr},
-            narrow::{infer_expr_narrow_type, remove_false_or_nil},
+            narrow::{
+                InferConditionFlow, infer_condition_narrowing, infer_expr_narrow_type,
+                remove_false_or_nil,
+            },
         },
         resolve_global_decl_id, unwrap_paren_to_name_expr,
     },
@@ -138,18 +141,27 @@ pub fn special_or_rule(
         return Some(narrowed);
     }
 
-    // `c and a or b` with an always-truthy `a` yields `a` or `b` when `c` may go either way.
+    // `c and a or b` with an always-truthy `a` yields `a` or `b` when `c` may go
+    // either way, and reaches `b` only where `c` failed.
     if !left_type.is_always_truthy()
         && !left_type.is_always_falsy()
         && let LuaExpr::BinaryExpr(and_expr) = &left_expr
         && and_expr
             .get_op_token()
             .is_some_and(|token| token.get_op() == glua_parser::BinaryOperator::OpAnd)
-        && let Some((_, truthy_expr)) = and_expr.get_exprs()
+        && let Some((condition_expr, truthy_expr)) = and_expr.get_exprs()
         && let Ok(truthy_type) = crate::infer_expr(db, cache, truthy_expr)
         && truthy_type.is_always_truthy()
     {
-        return Some(TypeOps::Union.apply(db, &truthy_type, right_type));
+        let fallback_type = infer_condition_narrowing(
+            db,
+            cache,
+            right_expr,
+            condition_expr,
+            InferConditionFlow::FalseCondition,
+        )
+        .map_or_else(|| right_type.clone(), |(_, narrowed)| narrowed);
+        return Some(TypeOps::Union.apply(db, &truthy_type, &fallback_type));
     }
 
     if is_unresolved_global_unknown_name_expr(db, cache, &left_expr, left_type) {

@@ -3678,6 +3678,42 @@ mod test {
     }
 
     #[test]
+    fn an_or_after_a_guard_and_a_never_falsy_call_takes_only_what_failed_the_guard() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number
+            local function take(n) end
+            ---@return number
+            local function roll(low, high) return low end
+            ---@param dmg number|number[]
+            local function deal(dmg)
+                take(type(dmg) == "table" and roll(dmg[1], dmg[2]) or dmg)
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn an_or_after_a_call_that_may_be_nil_still_takes_what_passed_the_guard() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number
+            local function take(n) end
+            ---@return number?
+            local function roll(low, high) return low end
+            ---@param dmg number|number[]
+            local function deal(dmg)
+                take(type(dmg) == "table" and roll(dmg[1], dmg[2]) or dmg)
+            end
+            "#,
+        ));
+    }
+
+    #[test]
     fn a_call_no_overload_accepts_reports_the_main_signature() {
         let mut ws = VirtualWorkspace::new();
         ws.enable_check(DiagnosticCode::ParamTypeMismatch);

@@ -351,7 +351,7 @@ pub(crate) fn infer_condition_narrowing(
             &var_ref_id,
             &flow_node,
             condition,
-            InferConditionFlow::TrueCondition,
+            edge,
             policy,
         )
         .ok()?
