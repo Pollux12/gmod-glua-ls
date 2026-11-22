@@ -2326,24 +2326,32 @@ pub(crate) fn normalize_call_operator_doc_function(func: &LuaFunctionType) -> Ar
     )
 }
 
-/// Orders a union callee's arms by what they are: a signature by its file's
-/// path and position, a function type by its rendering.
-fn callee_arm_order_key(db: &DbIndex, arm: &LuaType) -> (u8, String, u32) {
+/// Orders a union callee's arms by what they are: a signature by whether a
+/// library holds it, its file's module name and its position, a function type
+/// by its rendering. None of it depends on where the workspace or its
+/// libraries sit on disk.
+fn callee_arm_order_key(db: &DbIndex, arm: &LuaType) -> (u8, bool, String, u32) {
     match arm {
-        LuaType::Signature(signature_id) => (
-            0,
-            db.get_vfs()
-                .get_file_path(&signature_id.get_file_id())
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            u32::from(signature_id.get_position()),
-        ),
+        LuaType::Signature(signature_id) => {
+            let module_index = db.get_module_index();
+            let file_id = signature_id.get_file_id();
+            (
+                0,
+                module_index.is_library(&file_id),
+                module_index
+                    .get_module(file_id)
+                    .map(|module| module.full_module_name.clone())
+                    .unwrap_or_default(),
+                u32::from(signature_id.get_position()),
+            )
+        }
         LuaType::DocFunction(_) => (
             1,
+            false,
             crate::humanize_type(db, arm, crate::RenderLevel::Detailed),
             0,
         ),
-        _ => (2, String::new(), 0),
+        _ => (2, false, String::new(), 0),
     }
 }
 
