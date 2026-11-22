@@ -8,9 +8,12 @@ use crate::{
     semantic::{find_members_with_key, get_member_map, infer::InferCallFuncResult, is_nullable},
 };
 
+/// When no candidate accepts the first argument, the result is the main form
+/// (`main_idx`, else the first candidate), so a mismatch reports against it.
 pub fn resolve_signature_by_args(
     db: &DbIndex,
     overloads: &[Arc<LuaFunctionType>],
+    main_idx: Option<usize>,
     expr_types: &[(LuaType, TextRange)],
     is_colon_call: bool,
     arg_count: Option<usize>,
@@ -46,7 +49,7 @@ pub fn resolve_signature_by_args(
         }
     }
 
-    let mut best_match_result = need_resolve_funcs[0]
+    let mut best_match_result = need_resolve_funcs[main_idx.unwrap_or(0)]
         .clone()
         .expect("Match result should exist");
     let mut fits_only_union_components = vec![false; need_resolve_funcs.len()];

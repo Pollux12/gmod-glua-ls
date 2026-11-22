@@ -3678,6 +3678,37 @@ mod test {
     }
 
     #[test]
+    fn a_call_no_overload_accepts_reports_the_main_signature() {
+        let mut ws = VirtualWorkspace::new();
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        let file_id = ws.def(
+            r#"
+            ---@overload fun(index: 1): string
+            ---@param index number
+            ---@return boolean
+            local function lookup(index) return true end
+
+            ---@param text string
+            local function lookup_text(text) return lookup(text) end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == code)
+            .map(|diag| diag.message.clone())
+            .collect();
+
+        assert_eq!(messages, ["expected `number` but found `string`. "]);
+    }
+
+    #[test]
     fn test_vgui_instance_close_override_does_not_poison_sibling_dframe_close() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
