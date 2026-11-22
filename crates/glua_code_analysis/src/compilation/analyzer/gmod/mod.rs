@@ -9406,11 +9406,11 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
         {
             return None;
         }
-        let signature_id = db
-            .get_call_target_index()
+        db.get_call_target_index()
             .target(self.file_id, call_expr.get_range())?
-            .declared?;
-        roles_from_signature(db, signature_id)?.select_for_call(call_expr)
+            .declared_then_unique()
+            .find_map(|signature_id| roles_from_signature(db, signature_id))?
+            .select_for_call(call_expr)
     }
 }
 
