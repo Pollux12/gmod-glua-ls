@@ -9408,7 +9408,7 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
         }
         db.get_call_target_index()
             .target(self.file_id, call_expr.get_range())?
-            .declared_then_unique()
+            .unique_then_declared()
             .find_map(|signature_id| roles_from_signature(db, signature_id))?
             .select_for_call(call_expr)
     }

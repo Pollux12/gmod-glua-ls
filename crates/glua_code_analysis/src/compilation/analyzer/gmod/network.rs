@@ -643,7 +643,7 @@ fn net_call_fact(
     let call_target = super::super::call_target::call_target_of(db, file_id, call_expr);
     let signature_id = call_target.and_then(crate::LuaCallTarget::signature_id);
     let role_signature = call_target.and_then(|call_target| {
-        call_target.declared_then_unique().find_map(|signature_id| {
+        call_target.unique_then_declared().find_map(|signature_id| {
             Some((signature_id, net_call_role(db, call_expr, signature_id)?))
         })
     });

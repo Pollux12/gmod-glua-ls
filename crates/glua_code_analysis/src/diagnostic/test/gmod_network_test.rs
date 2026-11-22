@@ -4871,4 +4871,39 @@ mod tests {
         let diagnostics = file_diagnostics(&mut ws, server_file_id);
         assert_that!(missing_counterpart_messages(&diagnostics), is_empty());
     }
+
+    #[gtest]
+    fn a_write_keeps_its_documented_role_where_the_workspace_aliases_it() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteTypeMismatch);
+        ws.def_file(
+            "lua/includes/extensions/net.lua",
+            "net.WriteBool = net.WriteBit\n",
+        );
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("Aliased")
+            net.Start("Aliased")
+            net.WriteBool(true)
+            net.Broadcast()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("Aliased", function()
+                local enabled = net.ReadBool()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        assert_that!(
+            count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteTypeMismatch),
+            eq(0usize)
+        );
+    }
 }
