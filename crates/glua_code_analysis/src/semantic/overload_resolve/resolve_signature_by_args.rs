@@ -8,8 +8,9 @@ use crate::{
     semantic::{find_members_with_key, get_member_map, infer::InferCallFuncResult, is_nullable},
 };
 
-/// When no candidate accepts the first argument, the result is the main form
-/// (`main_idx`, else the first candidate), so a mismatch reports against it.
+/// When no candidate accepts the first argument, the result is a candidate
+/// that takes as many arguments as the call passes, the main form (`main_idx`)
+/// first, so a mismatch reports against the form the call was written for.
 pub fn resolve_signature_by_args(
     db: &DbIndex,
     overloads: &[Arc<LuaFunctionType>],
@@ -49,7 +50,12 @@ pub fn resolve_signature_by_args(
         }
     }
 
-    let mut best_match_result = need_resolve_funcs[main_idx.unwrap_or(0)]
+    let fits = |idx: &usize| takes_arg_count(db, &overloads[*idx], arg_count, is_colon_call);
+    let fallback_idx = main_idx
+        .filter(fits)
+        .or_else(|| (0..overloads.len()).find(fits))
+        .unwrap_or(0);
+    let mut best_match_result = need_resolve_funcs[fallback_idx]
         .clone()
         .expect("Match result should exist");
     let mut fits_only_union_components = vec![false; need_resolve_funcs.len()];
@@ -395,6 +401,37 @@ fn classify_arg_match(db: &DbIndex, param_type: &LuaType, expr_type: &LuaType) -
 }
 
 /// How many call arguments `func` takes without a surplus.
+/// Whether `func` takes `arg_count` arguments: no more than it has room for,
+/// and every parameter past them may be left out.
+fn takes_arg_count(
+    db: &DbIndex,
+    func: &LuaFunctionType,
+    arg_count: usize,
+    is_colon_call: bool,
+) -> bool {
+    let variadic = is_func_last_param_variadic(func);
+    if !variadic && arg_capacity(func, is_colon_call) < arg_count {
+        return false;
+    }
+    let supplied = effective_arg_count(arg_count, func.is_colon_define(), is_colon_call);
+    let params = func.get_params();
+    let fixed = if variadic {
+        params.len() - 1
+    } else {
+        params.len()
+    };
+    params[..fixed]
+        .iter()
+        .enumerate()
+        .skip(supplied)
+        .all(|(param_index, (_, param_type))| {
+            func.is_param_optional(param_index)
+                || param_type
+                    .as_ref()
+                    .is_none_or(|param_type| is_nullable(db, param_type))
+        })
+}
+
 fn arg_capacity(func: &LuaFunctionType, is_colon_call: bool) -> usize {
     let param_len = func.get_params().len();
     match (func.is_colon_define(), is_colon_call) {

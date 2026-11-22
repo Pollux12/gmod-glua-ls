@@ -3714,6 +3714,36 @@ mod test {
     }
 
     #[test]
+    fn a_call_no_form_accepts_is_checked_against_the_form_its_arg_count_fits() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::MissingParameter);
+        let file_id = ws.def(
+            r#"
+            ---@class Tint
+            local Tint = {}
+
+            ---@overload fun(tint: Tint)
+            ---@param r number
+            ---@param g number
+            ---@param b number
+            ---@param a? number
+            function set_tint(r, g, b, a) end
+
+            ---@param unset nil
+            local function apply(unset) set_tint(unset) end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
     fn a_call_no_overload_accepts_reports_the_main_signature() {
         let mut ws = VirtualWorkspace::new();
         ws.enable_check(DiagnosticCode::ParamTypeMismatch);
