@@ -2856,81 +2856,34 @@ fn union_return_expr(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
                     let union_base = TypeOps::Union.apply(db, left_base, right_base);
                     LuaType::Variadic(VariadicType::Base(union_base).into())
                 }
-                (VariadicType::Multi(left_multi), VariadicType::Multi(right_multi)) => {
-                    let mut new_multi = vec![];
-                    let max_len = left_multi.len().max(right_multi.len());
-                    for i in 0..max_len {
-                        let left_type = left_multi.get(i).cloned().unwrap_or(LuaType::Nil);
-                        let right_type = right_multi.get(i).cloned().unwrap_or(LuaType::Nil);
-                        new_multi.push(TypeOps::Union.apply(db, &left_type, &right_type));
-                    }
-                    LuaType::Variadic(VariadicType::Multi(new_multi).into())
-                }
-                // difficult to merge the type, use let
-                _ => left.clone(),
+                _ => union_return_packs(db, left_variadic, right_variadic),
             }
         }
         (LuaType::Variadic(variadic), _) => {
-            let first_type = variadic.get_type(0).cloned().unwrap_or(LuaType::Unknown);
-            let first_union_type = union_return_expr(db, first_type, right.clone());
-
-            match variadic.deref() {
-                VariadicType::Base(base) => {
-                    let union_base = union_return_expr(db, base.clone(), LuaType::Nil);
-                    LuaType::Variadic(
-                        VariadicType::Multi(vec![
-                            first_union_type,
-                            LuaType::Variadic(VariadicType::Base(union_base).into()),
-                        ])
-                        .into(),
-                    )
-                }
-                VariadicType::Multi(multi) => {
-                    let mut new_multi = multi.clone();
-                    if !new_multi.is_empty() {
-                        new_multi[0] = first_union_type;
-                        for mult in new_multi.iter_mut().skip(1) {
-                            *mult = union_return_expr(db, mult.clone(), LuaType::Nil);
-                        }
-                    } else {
-                        new_multi.push(first_union_type);
-                    }
-
-                    LuaType::Variadic(VariadicType::Multi(new_multi).into())
-                }
-            }
+            union_return_packs(db, variadic, &VariadicType::Multi(vec![right.clone()]))
         }
         (_, LuaType::Variadic(variadic)) => {
-            let first_type = variadic.get_type(0).cloned().unwrap_or(LuaType::Unknown);
-            let first_union_type = union_return_expr(db, left.clone(), first_type);
-            match variadic.deref() {
-                VariadicType::Base(base) => {
-                    let union_base = union_return_expr(db, base.clone(), LuaType::Nil);
-                    LuaType::Variadic(
-                        VariadicType::Multi(vec![
-                            first_union_type,
-                            LuaType::Variadic(VariadicType::Base(union_base).into()),
-                        ])
-                        .into(),
-                    )
-                }
-                VariadicType::Multi(multi) => {
-                    let mut new_multi = multi.clone();
-                    if !new_multi.is_empty() {
-                        new_multi[0] = first_union_type;
-                        for mult in new_multi.iter_mut().skip(1) {
-                            *mult = union_return_expr(db, mult.clone(), LuaType::Nil);
-                        }
-                    } else {
-                        new_multi.push(first_union_type);
-                    }
-
-                    LuaType::Variadic(VariadicType::Multi(new_multi).into())
-                }
-            }
+            union_return_packs(db, &VariadicType::Multi(vec![left.clone()]), variadic)
         }
         _ => TypeOps::Union.apply(db, &left, &right),
     }
+}
+
+/// Merges two return packs position by position: a position one pack does
+/// not reach is `nil` there, and past the positions both fix, a pack with an
+/// open tail keeps returning its tail's values.
+fn union_return_packs(db: &DbIndex, left: &VariadicType, right: &VariadicType) -> LuaType {
+    let fixed = |pack: &VariadicType| pack.get_max_len().or(pack.get_min_len()).unwrap_or(0);
+    let at = |pack: &VariadicType, idx: usize| pack.get_type(idx).cloned().unwrap_or(LuaType::Nil);
+    let len = fixed(left).max(fixed(right));
+    let mut types = (0..len)
+        .map(|idx| union_return_expr(db, at(left, idx), at(right, idx)))
+        .collect::<Vec<_>>();
+    if left.get_max_len().is_none() || right.get_max_len().is_none() {
+        let tail = union_return_expr(db, at(left, len), at(right, len));
+        types.push(LuaType::Variadic(VariadicType::Base(tail).into()));
+    }
+    LuaType::Variadic(VariadicType::Multi(types).into())
 }
 
 fn table_const_has_no_known_members(db: &DbIndex, table: &crate::InFiled<TextRange>) -> bool {

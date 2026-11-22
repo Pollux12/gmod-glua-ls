@@ -489,13 +489,19 @@ fn table_generic_tpl_pattern_match(
             )?;
         }
         LuaType::Tuple(target_tuple) => {
-            let len = target_tuple.get_types().len();
-            let mut keys = Vec::new();
-            for i in 0..len {
-                keys.push(LuaType::IntegerConst((i as i64) + 1));
-            }
-
-            let key_type = LuaType::Union(LuaUnionType::from_vec(keys).into());
+            let types = target_tuple.get_types();
+            let key_type = if matches!(types.last(), Some(LuaType::Variadic(_))) {
+                LuaType::Integer
+            } else {
+                LuaType::Union(
+                    LuaUnionType::from_vec(
+                        (1..=types.len() as i64)
+                            .map(LuaType::IntegerConst)
+                            .collect(),
+                    )
+                    .into(),
+                )
+            };
             let target_base = target_tuple.cast_down_array_base(context.db);
             tpl_pattern_match(context, &table_generic_params[0], &key_type)?;
             tpl_pattern_match(context, &table_generic_params[1], &target_base)?;

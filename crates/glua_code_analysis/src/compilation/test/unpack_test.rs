@@ -3,6 +3,45 @@ mod test {
     use crate::{DiagnosticCode, EmmyrcLuaVersion, LuaType, VirtualWorkspace};
 
     #[test]
+    fn test_unpack_table_filled_through_a_spread_returns_every_position() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            local function pick(...)
+                local picked = {}
+                for k, v in pairs{...} do
+                    picked[k] = v
+                end
+                return unpack(picked)
+            end
+            first, second = pick("a", "a")
+        "#,
+        );
+
+        let second = ws.expr_ty("second");
+        assert_eq!(ws.humanize_type(second), "\"a\"?");
+    }
+
+    #[test]
+    fn test_early_bare_return_keeps_a_spread_return_open() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@type string[]
+            local names
+
+            local function all(skip)
+                if skip then return end
+                return unpack(names)
+            end
+            first, second = all(false)
+        "#,
+        );
+
+        assert_eq!(ws.expr_ty("second"), ws.ty("string?"));
+    }
+
+    #[test]
     fn test_unpack() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 
