@@ -1488,6 +1488,72 @@ mod test {
         assert_eq!(ws.expr_ty("overriding_param"), LuaType::Any);
     }
 
+    /// GMod's `hook.lua`, `markup.lua` and `derma.lua` define `hook.Remove( event_name, name )`,
+    /// `markup.Color( col )` and `derma.Color( strName, panel, default )` after `module()`,
+    /// while a global `Color` exists.
+    #[test]
+    fn a_module_function_takes_its_documented_members_param_types() {
+        let mut ws = VirtualWorkspace::new();
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "library/globals.lua",
+            r#"
+            ---@meta
+            ---@param r number
+            ---@return table
+            function Color(r) end
+
+            markup = {}
+            ---@param col table
+            ---@return string
+            function markup.Color(col) end
+
+            hook = {}
+            ---@param eventName string
+            ---@param identifier any
+            function hook.Remove(eventName, identifier) end
+            "#,
+        );
+        ws.def_files(vec![
+            (
+                "lua/includes/modules/markup.lua",
+                r#"
+                module( "markup", package.seeall )
+                function Color( col )
+                    _G.color_param = col
+                end
+                "#,
+            ),
+            (
+                "lua/includes/modules/hook.lua",
+                r#"
+                module( "hook", package.seeall )
+                function Remove( event_name, name )
+                    _G.remove_param = name
+                end
+                "#,
+            ),
+            (
+                "lua/includes/modules/skin.lua",
+                r#"
+                module( "skin", package.seeall )
+                function Color( name )
+                    _G.undocumented_param = name
+                end
+                "#,
+            ),
+            (
+                "lua/autorun/sh_caller.lua",
+                r#"hook.Remove( "Think", "id" )"#,
+            ),
+        ]);
+
+        assert_eq!(ws.expr_ty("color_param"), LuaType::Table);
+        assert_eq!(ws.expr_ty("remove_param"), LuaType::Any);
+        assert_ne!(ws.expr_ty("undocumented_param"), LuaType::Number);
+    }
+
     /// A replacement whose own return says nothing, such as one returning
     /// `func(object)` for an `any` object, returns what the global it replaces
     /// documents.

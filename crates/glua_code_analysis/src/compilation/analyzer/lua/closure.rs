@@ -2055,7 +2055,7 @@ fn func_stat_defines_index_target(func_stat: &LuaFuncStat) -> bool {
 }
 
 /// Whether `var` is a name no local declares: a definition through it may
-/// replace a global a library documents.
+/// replace a function a library documents.
 fn names_global(analyzer: &LuaAnalyzer, var: &LuaVarExpr) -> bool {
     let LuaVarExpr::NameExpr(name_expr) = var else {
         return false;

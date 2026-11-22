@@ -1,17 +1,19 @@
 use std::{ops::Deref, sync::Arc};
 
 use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexMemberExpr, LuaLiteralToken, LuaTableExpr, LuaVarExpr,
+    LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexMemberExpr, LuaLiteralToken, LuaNameExpr,
+    LuaTableExpr, LuaVarExpr,
 };
 use rustc_hash::FxHashSet;
 use smol_str::SmolStr;
 
 use crate::{
-    DbIndex, GlobalId, GmodHookKind, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo,
-    LuaDocReturnInfo, LuaFunctionType, LuaInferCache, LuaMemberKey, LuaMemberOwner, LuaSignature,
-    LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel, ReturnTypeKind, SignatureReturnStatus,
-    TypeOps, VariadicType, get_real_type, humanize_type, infer_call_expr_func, infer_expr,
-    infer_table_should_be, instantiate_outside_signature,
+    DbIndex, FileId, GlobalId, GmodHookKind, InferFailReason, InferGuard, InferGuardRef,
+    LuaDocParamInfo, LuaDocReturnInfo, LuaFunctionType, LuaInferCache, LuaMemberKey,
+    LuaMemberOwner, LuaSignature, LuaSignatureId, LuaType, LuaTypeDeclId, LuaTypeOwner,
+    RenderLevel, ReturnTypeKind, SignatureReturnStatus, TypeOps, VariadicType, get_real_type,
+    humanize_type, infer_call_expr_func, infer_expr, infer_table_should_be,
+    instantiate_outside_signature,
 };
 
 use super::{
@@ -563,45 +565,17 @@ pub fn try_resolve_closure_parent_params(
     )
 }
 
-/// Gives a workspace function replacing a global a library documents that
-/// global's parameter types. Its returns stay its body's, as a replacement
-/// may return what the documented one does not, unless the body's return
-/// says nothing: then it returns the documented one.
+/// Gives a workspace function replacing a global, or a `module()` member, a
+/// library documents that function's parameter types. Its returns stay its
+/// body's, as a replacement may return what the documented one does not,
+/// unless the body's return says nothing: then it returns the documented one.
 fn resolve_documented_global_params(
     db: &DbIndex,
     writes: &mut ResolveWrites,
     closure_params: &UnResolveParentClosureParams,
-    name_expr: &glua_parser::LuaNameExpr,
+    name_expr: &LuaNameExpr,
 ) -> ResolveResult {
-    let Some(name) = name_expr.get_name_text() else {
-        return Ok(());
-    };
-    let module_index = db.get_module_index();
-    let workspace_id = module_index
-        .get_workspace_id(closure_params.file_id)
-        .unwrap_or(crate::WorkspaceId::MAIN);
-    // The library this file resolves the name to first; within it, the
-    // earliest declaration.
-    let Some(documented) = db
-        .get_global_index()
-        .get_global_decl_id_priority_tiers(&name, module_index, workspace_id)
-        .into_iter()
-        .flatten()
-        .flat_map(|(_, mut decl_ids)| {
-            decl_ids.retain(|decl_id| {
-                module_index.is_library(&decl_id.file_id) || module_index.is_std(&decl_id.file_id)
-            });
-            decl_ids.sort_by_key(|decl_id| (decl_id.file_id, decl_id.position));
-            decl_ids
-        })
-        .filter_map(|decl_id| db.get_type_index().get_type_cache(&decl_id.into()))
-        .find_map(|cache| match cache.as_type() {
-            LuaType::Signature(id) if *id != closure_params.signature_id => {
-                db.get_signature_index().get(id)
-            }
-            _ => None,
-        })
-    else {
+    let Some(documented) = documented_signature(db, closure_params, name_expr) else {
         return Ok(());
     };
     let target = db
@@ -620,6 +594,66 @@ fn resolve_documented_global_params(
     )?;
     writes.push(move |db, _| fill_unsettled_return(db, signature_id, documented_return));
     Ok(())
+}
+
+/// The library signature the function `name_expr` defines replaces: the
+/// documented member of its `module()`, or else the documented global of its
+/// name. Within the library this file resolves to first, the earliest
+/// declaration. A local replaces nothing.
+fn documented_signature<'a>(
+    db: &'a DbIndex,
+    closure_params: &UnResolveParentClosureParams,
+    name_expr: &LuaNameExpr,
+) -> Option<&'a LuaSignature> {
+    let name = name_expr.get_name_text()?;
+    let module_index = db.get_module_index();
+    let documents =
+        |file_id: &FileId| module_index.is_library(file_id) || module_index.is_std(file_id);
+    let decl = db
+        .get_reference_index()
+        .get_local_reference(&closure_params.file_id)
+        .and_then(|references| references.get_decl_id(&name_expr.get_range()))
+        .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id));
+    let owners: Vec<LuaTypeOwner> = match decl {
+        Some(decl) if decl.is_local() => return None,
+        Some(decl) if decl.is_module_scoped() => {
+            let owner = LuaMemberOwner::GlobalPath(GlobalId::new(decl.get_module_path()?));
+            let mut member_ids = db
+                .get_member_index()
+                .get_members_with_key(&owner, &LuaMemberKey::Name(name.clone()))?
+                .into_iter()
+                .map(|member| member.get_id())
+                .filter(|member_id| documents(&member_id.file_id))
+                .collect::<Vec<_>>();
+            member_ids.sort_by_key(|member_id| (member_id.file_id, member_id.get_position()));
+            member_ids.into_iter().map(Into::into).collect()
+        }
+        _ => {
+            let workspace_id = module_index
+                .get_workspace_id(closure_params.file_id)
+                .unwrap_or(crate::WorkspaceId::MAIN);
+            db.get_global_index()
+                .get_global_decl_id_priority_tiers(&name, module_index, workspace_id)
+                .into_iter()
+                .flatten()
+                .flat_map(|(_, mut decl_ids)| {
+                    decl_ids.retain(|decl_id| documents(&decl_id.file_id));
+                    decl_ids.sort_by_key(|decl_id| (decl_id.file_id, decl_id.position));
+                    decl_ids
+                })
+                .map(Into::into)
+                .collect()
+        }
+    };
+    owners
+        .iter()
+        .filter_map(|owner| db.get_type_index().get_type_cache(owner))
+        .find_map(|cache| match cache.as_type() {
+            LuaType::Signature(id) if *id != closure_params.signature_id => {
+                db.get_signature_index().get(id)
+            }
+            _ => None,
+        })
 }
 
 /// Fills the inferred return of `signature_id` with `documented_return` while
