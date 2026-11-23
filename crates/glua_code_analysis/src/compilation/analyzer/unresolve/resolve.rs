@@ -5,20 +5,19 @@ use std::{
 };
 
 use glua_parser::{
-    BinaryOperator, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaTableExpr,
-    LuaTableField, PathTrait,
+    BinaryOperator, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaSyntaxId,
+    LuaTableExpr, LuaTableField, PathTrait,
 };
 use rowan::TextSize;
 
-use crate::InFiled;
 use crate::compilation::analyzer::function_summary::installed_methods_of;
 use crate::semantic::{semantic_decl_closure_signature_id, semantic_decl_value_expr};
 use crate::{
-    DbIndex, FileId, GlobalId, InferFailReason, LuaDeclId, LuaDeclOrMemberId, LuaDeclTypeKind,
-    LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaOperator,
-    LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl,
-    LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel, ReturnTypeKind,
-    SemanticDeclLevel, SignatureReturnStatus, TypeOps, VariadicType,
+    DbIndex, FileId, GlobalId, InFiled, InferFailReason, LuaDeclId, LuaDeclOrMemberId,
+    LuaDeclTypeKind, LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey,
+    LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache,
+    LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel,
+    ReturnTypeKind, SemanticDeclLevel, SignatureReturnStatus, TypeOps, VariadicType,
     compilation::analyzer::{
         common::{
             DeclWrite, TypeCacheWriteMode, add_member, bind_decl_write, bind_resolved_type,
@@ -43,7 +42,6 @@ use crate::{
         try_infer_expr_semantic_decl,
     },
 };
-use glua_parser::LuaSyntaxId;
 
 use super::{
     ResolveResult, UnResolveDecl, UnResolveMember, UnResolveModule, UnResolveReturn,
