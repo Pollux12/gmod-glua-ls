@@ -603,7 +603,7 @@ fn documented_module_member(
     name_expr: &LuaNameExpr,
 ) -> Option<LuaType> {
     let owner = LuaMemberOwner::GlobalPath(GlobalId::new(decl.get_module_path()?));
-    let key = LuaMemberKey::Name(name_expr.get_name_text()?.into());
+    let key = LuaMemberKey::Name(name_expr.get_name_text()?);
     let module_index = db.get_module_index();
     let mut member_ids = db
         .get_member_index()
