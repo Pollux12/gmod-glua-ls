@@ -749,6 +749,29 @@ mod test {
     }
 
     #[test]
+    fn test_union_containing_unknown_is_not_a_param_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param armor number
+            local function SetArmor(armor) end
+
+            local Holder = {}
+            function Holder.Set(id)
+                Holder.value = id
+            end
+            function Holder.Reset()
+                Holder.value = true
+            end
+
+            SetArmor(Holder.value)
+        "#
+        ));
+    }
+
+    #[test]
     fn test_issue_216() {
         let mut ws = VirtualWorkspace::new();
 
