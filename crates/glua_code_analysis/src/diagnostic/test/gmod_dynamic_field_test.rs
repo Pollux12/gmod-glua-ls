@@ -1598,6 +1598,70 @@ function UnknownPosition() end"
         );
     }
 
+    /// GMod's `permissions.lua` reads `self:GetParent():GetParent().Title` as
+    /// a `Panel`: `ServerPermissionsPanel` sets it from an untyped group id,
+    /// `ugcpublish.lua`'s window to a `DTextEntry`.
+    #[gtest]
+    fn test_base_panel_field_one_subclass_sets_untyped_is_no_param_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/gmod.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@class Panel : Entity
+            ---@return Panel
+            function Panel:GetParent() end
+            ---@class DTextEntry : Panel
+            ---@class DFrame : Panel
+            ---@generic T: Panel
+            ---@param classname `T`
+            ---@param parent? Panel
+            ---@return (instance) T?
+            function vgui.Create(classname, parent) end
+            ---@generic T: Panel
+            ---@param classname string
+            ---@param panelTable T
+            ---@param baseName? string
+            ---@return T
+            function vgui.Register(classname, panelTable, baseName) end
+            ---@param name string
+            function permissions_Revoke(name) end
+            "#,
+        );
+        ws.def_file(
+            "lua/menu/ugcpublish.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Init()
+                self.Title = vgui.Create("DTextEntry", self)
+            end
+            vgui.Register("UGCPublishWindow", PANEL, "DFrame")
+            "#,
+        );
+        let target_file = ws.def_file(
+            "lua/menu/problems/permissions.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:SetGroup(groupID)
+                self.Title = groupID
+            end
+            vgui.Register("ServerPermissionsPanel", PANEL, "Panel")
+
+            ---@param row Panel
+            local function revoke(row)
+                permissions_Revoke(row:GetParent().Title)
+            end
+            "#,
+        );
+
+        assert_that!(
+            diagnostic_messages_for_file(&mut ws, target_file, DiagnosticCode::ParamTypeMismatch),
+            is_empty()
+        );
+    }
+
     #[gtest]
     fn test_reassigned_param_is_not_treated_as_direct_return_alias() {
         let mut ws = VirtualWorkspace::new();

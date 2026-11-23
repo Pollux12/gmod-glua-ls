@@ -1061,6 +1061,8 @@ enum DynamicFieldDefinitionVisibility {
 struct VisibleDynamicFieldDefinition {
     member_id: Option<LuaMemberId>,
     visibility: DynamicFieldDefinitionVisibility,
+    /// Written on a subclass of the class read, not on the class itself.
+    on_subclass: bool,
 }
 
 pub(crate) fn resolve_dynamic_field_member(
@@ -1220,10 +1222,12 @@ pub(crate) fn dynamic_field_type_without(
 
 /// The type the dynamic writers `definitions` give a field, with the member
 /// the first of them names. `informative_only` leaves out writers whose value
-/// is `any` or `unknown`, which say nothing of the field. A writer whose value
-/// is unresolved adds no type while another writer has one, as a member
-/// slot's untyped writers do not: otherwise the floor a cycle of writers took
-/// before one of them landed stays in the field for good.
+/// is `any` or `unknown`, which say nothing of the field. A writer on the
+/// class read whose value is unresolved adds no type while another writer has
+/// one, as a member slot's untyped writers do not: otherwise the floor a
+/// cycle of writers took before one of them landed stays in the field for
+/// good. One on a subclass keeps its unresolved value: another subclass's
+/// writer says nothing of what the field holds on it.
 fn dynamic_field_definitions_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -1244,15 +1248,19 @@ fn dynamic_field_definitions_type(
         if let Some(typ) = dynamic_field_member_type(db, cache, &member_id, field_name)
             && !(informative_only && matches!(typ, LuaType::Any | LuaType::Unknown))
         {
-            member_types.push(typ);
+            member_types.push((typ, definition.on_subclass));
             if definition.visibility == DynamicFieldDefinitionVisibility::Runtime {
                 has_runtime_type = true;
             }
         }
     }
-    if member_types.iter().any(|typ| !typ.is_unknown()) {
-        member_types.retain(|typ| !typ.is_unknown());
+    if member_types.iter().any(|(typ, _)| !typ.is_unknown()) {
+        member_types.retain(|(typ, on_subclass)| *on_subclass || !typ.is_unknown());
     }
+    let mut member_types = member_types
+        .into_iter()
+        .map(|(typ, _)| typ)
+        .collect::<Vec<_>>();
 
     if !member_types.is_empty() && !has_runtime_type {
         member_types.push(LuaType::Nil);
@@ -1583,10 +1591,14 @@ fn dynamic_field_definitions_for_owner(
     // Consulted in the index's canonical order, unfiltered and unsorted: the
     // elected arm and the elected semantic decl both follow it.
     let index = db.get_dynamic_field_index();
-    let definitions = if direct_only {
-        index.direct_definitions_of(owner, field_name)
+    let (definitions, direct) = if direct_only {
+        (index.direct_definitions_of(owner, field_name), None)
     } else {
-        index.field_definitions(owner, field_name)
+        let definitions = index.field_definitions(owner, field_name);
+        let direct = matches!(owner, crate::DynamicFieldOwner::Type(_))
+            .then(|| index.direct_definitions_of(owner, field_name))
+            .filter(|direct| direct.len() != definitions.len());
+        (definitions, direct)
     };
     for definition in definitions {
         if source_min_position.is_some_and(|source_min_position| {
@@ -1617,6 +1629,7 @@ fn dynamic_field_definitions_for_owner(
             visible.push(VisibleDynamicFieldDefinition {
                 member_id: syntax.member_id,
                 visibility,
+                on_subclass: direct.is_some_and(|direct| !direct.contains(definition)),
             });
         }
     }
