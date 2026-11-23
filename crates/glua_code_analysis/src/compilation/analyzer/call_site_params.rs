@@ -736,7 +736,10 @@ fn get_mutated_params(
     mutated
 }
 
-fn implicit_receiver_decl_id(file_id: FileId, closure: &LuaClosureExpr) -> Option<LuaDeclId> {
+pub(super) fn implicit_receiver_decl_id(
+    file_id: FileId,
+    closure: &LuaClosureExpr,
+) -> Option<LuaDeclId> {
     let LuaVarExpr::IndexExpr(func_name) = closure.get_parent::<LuaFuncStat>()?.get_func_name()?
     else {
         return None;

@@ -1204,6 +1204,68 @@ local value = receiver.value
         );
     }
 
+    /// GMod's `prop_vectorcolor.lua` calls `BaseClass.Setup( self, vars )`,
+    /// then keeps the `SetValue` it installed before overriding it.
+    #[test]
+    fn test_a_field_the_callee_sets_on_its_receiver_holds_after_the_call() {
+        let mut ws = VirtualWorkspace::new();
+        let base = r#"
+            ---@class BaseRow
+            BaseRow = {}
+            function BaseRow:Setup()
+                self.Format = function(slf, val) return "text" end
+            end
+        "#;
+        ws.def_file("lua/vgui/base_row.lua", base);
+        ws.def_file(
+            "lua/vgui/vector_row.lua",
+            r#"
+            ---@class VectorRow : BaseRow
+            VectorRow = {}
+            function VectorRow:Setup()
+                BaseRow.Setup(self)
+                local inherited = self.Format
+                _G.inherited_result = inherited(self, 1)
+                self.Format = function(slf, val) return 1 end
+            end
+            "#,
+        );
+
+        let inherited_result = ws.expr_ty("inherited_result");
+        assert_eq!(ws.humanize_type(inherited_result), r#""text""#);
+
+        ws.def_file(
+            "lua/vgui/base_row.lua",
+            &base.replace(r#"return "text""#, "return true"),
+        );
+
+        let inherited_result = ws.expr_ty("inherited_result");
+        assert_eq!(ws.humanize_type(inherited_result), "true");
+    }
+
+    #[test]
+    fn test_a_field_the_callee_sets_only_on_some_paths_is_no_call_effect() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "fill.lua",
+            r#"
+            ---@param box table
+            ---@param cond boolean
+            function fill(box, cond)
+                if cond then
+                    box.value = "text"
+                end
+            end
+
+            local box = { value = 1 }
+            fill(box, true)
+            _G.after = box.value
+            "#,
+        );
+
+        assert_ne!(ws.expr_ty("after"), ws.ty("string"));
+    }
+
     #[test]
     fn test_outparam_only_applies_after_call() {
         let mut ws = VirtualWorkspace::new();
@@ -1839,5 +1901,42 @@ local value = receiver.value
             .and_then(|property| property.tag_content().map(|tags| tags.get_all_tags().len()));
 
         assert_eq!(tags, Some(1));
+    }
+
+    /// After CityRP's dispatch map: `CameraPosition( p )` sets a field of `p`
+    /// and keeps `p` in an upvalue later passed back to it, so `p`'s type
+    /// comes partly from that call.
+    #[test]
+    fn test_a_param_the_callee_fills_keeps_its_callers_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/map.lua",
+            r#"
+            ---@class Vector
+            ---@field z number
+            ---@return Vector
+            function Vector(x, y, z) end
+
+            function make_map()
+                local GCameraPosition
+                function CameraPosition(p)
+                    _G.camera_param = p
+                    p.Refresh = function() return 5 end
+                    GCameraPosition = p
+                end
+                CameraPosition(Vector(0, 0, 0))
+                local function drag()
+                    local dragOrigin = GCameraPosition
+                    CameraPosition(dragOrigin)
+                    _G.refreshed = dragOrigin.Refresh()
+                end
+            end
+            "#,
+        );
+
+        let camera_param = ws.expr_ty("camera_param");
+        assert_eq!(ws.humanize_type(camera_param), "Vector?");
+        let refreshed = ws.expr_ty("refreshed");
+        assert_eq!(ws.humanize_type(refreshed), "5");
     }
 }

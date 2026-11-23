@@ -1355,6 +1355,7 @@ fn document_source(
         }
     }
     if let Some((summaries, fingerprint)) = tail.summaries {
+        function_summary::register_receiver_writers(db, file_id, &source_root, &summaries);
         db.set_function_summaries(file_id, summaries, fingerprint);
     }
     if let Some(mentions) = tail.role_mentions {

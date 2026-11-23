@@ -1,6 +1,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::StatementWrite;
+use crate::compilation::analyzer::function_summary::installed_methods_of;
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
     LuaIndexKey, LuaLiteralToken, LuaNameExpr, LuaTableExpr, LuaVarExpr, NumberResult, PathTrait,
@@ -1070,9 +1071,11 @@ fn get_member_owner_for_cached_type(prefix_type: LuaType) -> Option<LuaMemberOwn
 
 fn type_has_special_call_signature(db: &DbIndex, typ: &LuaType) -> bool {
     match typ {
-        LuaType::Signature(signature_id) => db
-            .get_signature_index()
-            .has_special_call_params(signature_id),
+        LuaType::Signature(signature_id) => {
+            db.get_signature_index()
+                .has_special_call_params(signature_id)
+                || !installed_methods_of(db, *signature_id).is_empty()
+        }
         LuaType::DocFunction(func) => func.get_params().iter().any(|(_, param_type)| {
             param_type
                 .as_ref()

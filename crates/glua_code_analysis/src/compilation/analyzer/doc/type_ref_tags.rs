@@ -346,7 +346,9 @@ pub fn analyze_outparam(analyzer: &mut DocAnalyzer, tag: LuaDocTagOutparam) -> O
     Some(())
 }
 
-fn receiver_member_name_for_closure(closure: &LuaClosureExpr) -> Option<String> {
+pub(in crate::compilation::analyzer) fn receiver_member_name_for_closure(
+    closure: &LuaClosureExpr,
+) -> Option<String> {
     if let Some(func_stat) = closure.get_parent::<LuaFuncStat>() {
         let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
             return None;

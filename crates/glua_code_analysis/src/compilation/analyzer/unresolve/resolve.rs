@@ -10,6 +10,8 @@ use glua_parser::{
 };
 use rowan::TextSize;
 
+use crate::InFiled;
+use crate::compilation::analyzer::function_summary::installed_methods_of;
 use crate::semantic::{semantic_decl_closure_signature_id, semantic_decl_value_expr};
 use crate::{
     DbIndex, FileId, GlobalId, InferFailReason, LuaDeclId, LuaDeclOrMemberId, LuaDeclTypeKind,
@@ -41,6 +43,7 @@ use crate::{
         try_infer_expr_semantic_decl,
     },
 };
+use glua_parser::LuaSyntaxId;
 
 use super::{
     ResolveResult, UnResolveDecl, UnResolveMember, UnResolveModule, UnResolveReturn,
@@ -906,8 +909,17 @@ struct SpecialCallParamInfo {
 struct SpecialCallOutParamInfo {
     root: LuaOutParamRoot,
     field_path: Vec<String>,
-    type_ref: LuaType,
+    type_ref: OutParamType,
     is_colon_define: bool,
+}
+
+/// What a call leaves in an out-param field.
+#[derive(Debug, Clone)]
+enum OutParamType {
+    /// The type an `---@outparam` documents.
+    Documented(LuaType),
+    /// The type of the value the callee itself writes into the field.
+    Written(InFiled<LuaSyntaxId>),
 }
 
 #[derive(Debug, Clone)]
@@ -1424,7 +1436,7 @@ fn collect_special_call_out_param_infos_from_operator_owner(
                     .get(&signature_id)
                     .map(|signature| {
                         adjust_operator_special_call_out_param_infos(
-                            collect_signature_special_call_out_params(signature),
+                            collect_signature_special_call_out_params(db, signature_id),
                             should_strip_first_operator_param(signature.is_colon_define, owner),
                         )
                     })
@@ -1599,11 +1611,7 @@ fn collect_special_call_out_param_infos_from_semantic_decl(
                 .get_property_index()
                 .get_signature_owner(&LuaSemanticDeclId::LuaDecl(decl_id))
             {
-                let out_params = db
-                    .get_signature_index()
-                    .get(&signature_id)
-                    .map(collect_signature_special_call_out_params)
-                    .unwrap_or_default();
+                let out_params = collect_signature_special_call_out_params(db, signature_id);
                 if !out_params.is_empty() {
                     return Ok(out_params);
                 }
@@ -1611,11 +1619,7 @@ fn collect_special_call_out_param_infos_from_semantic_decl(
             if let Some(signature_id) =
                 semantic_decl_closure_signature_id(db, LuaSemanticDeclId::LuaDecl(decl_id))
             {
-                let out_params = db
-                    .get_signature_index()
-                    .get(&signature_id)
-                    .map(collect_signature_special_call_out_params)
-                    .unwrap_or_default();
+                let out_params = collect_signature_special_call_out_params(db, signature_id);
                 if !out_params.is_empty() {
                     return Ok(out_params);
                 }
@@ -1634,11 +1638,7 @@ fn collect_special_call_out_param_infos_from_semantic_decl(
                 .get_property_index()
                 .get_signature_owner(&LuaSemanticDeclId::Member(member_id))
             {
-                let out_params = db
-                    .get_signature_index()
-                    .get(&signature_id)
-                    .map(collect_signature_special_call_out_params)
-                    .unwrap_or_default();
+                let out_params = collect_signature_special_call_out_params(db, signature_id);
                 if !out_params.is_empty() {
                     return Ok(out_params);
                 }
@@ -1646,11 +1646,7 @@ fn collect_special_call_out_param_infos_from_semantic_decl(
             if let Some(signature_id) =
                 semantic_decl_closure_signature_id(db, LuaSemanticDeclId::Member(member_id))
             {
-                let out_params = db
-                    .get_signature_index()
-                    .get(&signature_id)
-                    .map(collect_signature_special_call_out_params)
-                    .unwrap_or_default();
+                let out_params = collect_signature_special_call_out_params(db, signature_id);
                 if !out_params.is_empty() {
                     return Ok(out_params);
                 }
@@ -1671,12 +1667,9 @@ fn collect_special_call_out_param_infos_from_semantic_decl(
                 type_cache.as_type(),
             ))
         }
-        LuaSemanticDeclId::Signature(signature_id) => Ok(db
-            .get_signature_index()
-            .get(&signature_id)
-            .filter(|signature| signature_has_any_special_call_params(signature))
-            .map(collect_signature_special_call_out_params)
-            .unwrap_or_default()),
+        LuaSemanticDeclId::Signature(signature_id) => {
+            Ok(collect_signature_special_call_out_params(db, signature_id))
+        }
         LuaSemanticDeclId::TypeDecl(_) => Ok(Vec::new()),
     }
 }
@@ -1739,12 +1732,9 @@ fn collect_special_call_out_param_infos(
     callable_type: &LuaType,
 ) -> Vec<SpecialCallOutParamInfo> {
     match callable_type {
-        LuaType::Signature(signature_id) => db
-            .get_signature_index()
-            .get(signature_id)
-            .filter(|signature| signature_has_any_special_call_params(signature))
-            .map(collect_signature_special_call_out_params)
-            .unwrap_or_default(),
+        LuaType::Signature(signature_id) => {
+            collect_signature_special_call_out_params(db, *signature_id)
+        }
         LuaType::TypeGuard(inner) => collect_special_call_out_param_infos(db, inner),
         LuaType::Union(union) => union
             .types()
@@ -1796,18 +1786,38 @@ fn collect_signature_special_call_params(
 }
 
 fn collect_signature_special_call_out_params(
-    signature: &LuaSignature,
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
 ) -> Vec<SpecialCallOutParamInfo> {
+    let Some(signature) = db.get_signature_index().get(&signature_id) else {
+        return Vec::new();
+    };
     let mut out_params = signature
         .out_params
         .iter()
         .map(|out_param| SpecialCallOutParamInfo {
             root: out_param.root.clone(),
             field_path: out_param.field_path.clone(),
-            type_ref: out_param.type_ref.clone(),
+            type_ref: OutParamType::Documented(out_param.type_ref.clone()),
             is_colon_define: signature.is_colon_define,
         })
         .collect::<Vec<_>>();
+    // A documented out-param overrides what the body's own write says.
+    for method in installed_methods_of(db, signature_id) {
+        let field_path = vec![method.name];
+        if out_params
+            .iter()
+            .any(|out_param| out_param.root == method.root && out_param.field_path == field_path)
+        {
+            continue;
+        }
+        out_params.push(SpecialCallOutParamInfo {
+            root: method.root,
+            field_path,
+            type_ref: OutParamType::Written(InFiled::new(signature_id.get_file_id(), method.value)),
+            is_colon_define: signature.is_colon_define,
+        });
+    }
     out_params.sort_by_key(|out_param| match out_param.root {
         LuaOutParamRoot::Param(param_idx) => (0, param_idx),
         LuaOutParamRoot::SelfReceiver => (1, 0),
@@ -1865,39 +1875,78 @@ fn apply_out_param_from_call(
     let Some(arg_expr) = get_out_param_root_expr(call_expr, out_param_info, is_colon_call) else {
         return Ok(());
     };
-
-    let arg_expr_for_effects = arg_expr.clone();
-    let mut visited = HashSet::new();
-    let Some(target) = resolve_out_param_target(
-        db,
-        cache,
-        file_id,
-        arg_expr,
-        &out_param_info.field_path,
-        &mut visited,
-    )?
-    else {
-        return Ok(());
+    let (type_ref, target) = match &out_param_info.type_ref {
+        OutParamType::Documented(typ) => {
+            let mut visited = HashSet::new();
+            let Some(target) = resolve_out_param_target(
+                db,
+                cache,
+                file_id,
+                arg_expr.clone(),
+                &out_param_info.field_path,
+                &mut visited,
+            )?
+            else {
+                return Ok(());
+            };
+            (typ.clone(), target)
+        }
+        // The callee sets the field itself, so it lands on the argument's own
+        // path whatever the argument's type, which may rest on this very call.
+        // An unresolved write says nothing of what the call leaves.
+        OutParamType::Written(value) => {
+            let typ = written_value_type(db, value)?;
+            if matches!(typ, LuaType::Unknown | LuaType::Any) {
+                return Ok(());
+            }
+            (
+                typ,
+                ResolvedOutParamTarget {
+                    owner: None,
+                    value_expr: None,
+                },
+            )
+        }
     };
 
     let effect_targets = collect_out_param_effect_targets(
         db,
         cache,
-        arg_expr_for_effects,
+        arg_expr,
         &out_param_info.field_path,
         &target,
-        matches!(out_param_info.root, LuaOutParamRoot::Param(_)),
+        matches!(out_param_info.root, LuaOutParamRoot::Param(_))
+            && matches!(out_param_info.type_ref, OutParamType::Documented(_)),
     )?;
     for effect_target in effect_targets {
         db.get_flow_index_mut().add_special_call_effect(
             file_id,
             call_expr.get_position(),
             effect_target,
-            out_param_info.type_ref.clone(),
+            type_ref.clone(),
         );
     }
 
     Ok(())
+}
+
+/// The type of `value`, a value a callee writes into a field of its
+/// argument, read in the callee's file: not through the written member,
+/// whose owner can rest on the very calls the write's effect follows.
+fn written_value_type(
+    db: &DbIndex,
+    value: &InFiled<LuaSyntaxId>,
+) -> Result<LuaType, InferFailReason> {
+    let Some(expr) = db
+        .get_vfs()
+        .syntax_tree_around(&value.file_id, value.value.get_range())
+        .and_then(|tree| value.value.to_node_from_root(&tree.get_red_root()))
+        .and_then(LuaExpr::cast)
+    else {
+        return Ok(LuaType::Unknown);
+    };
+    let mut cache = LuaInferCache::new(value.file_id, Default::default());
+    infer_expr(db, &mut cache, expr)
 }
 
 fn get_out_param_root_expr(
