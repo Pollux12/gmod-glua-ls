@@ -499,12 +499,7 @@ pub fn try_resolve_closure_parent_params(
                     .ok_or(InferFailReason::None)?
                 }
                 LuaVarExpr::NameExpr(name_expr) => {
-                    return resolve_documented_global_params(
-                        db,
-                        writes,
-                        closure_params,
-                        &name_expr,
-                    );
+                    return resolve_name_defined_params(db, writes, closure_params, &name_expr);
                 }
             }
         }
@@ -548,7 +543,7 @@ pub fn try_resolve_closure_parent_params(
                     .ok_or(InferFailReason::None)?
                 }
                 LuaVarExpr::NameExpr(name_expr) => {
-                    return resolve_documented_global_params(db, writes, closure_params, name_expr);
+                    return resolve_name_defined_params(db, writes, closure_params, name_expr);
                 }
             }
         }
@@ -564,6 +559,73 @@ pub fn try_resolve_closure_parent_params(
     )
 }
 
+/// Gives a function a name defines the parameter types of the library
+/// function it replaces. A `module()` member takes its documented member's
+/// contract, as `function module.Name` does; a global takes the documented
+/// global's; a local replaces nothing.
+fn resolve_name_defined_params(
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
+    closure_params: &mut UnResolveParentClosureParams,
+    name_expr: &LuaNameExpr,
+) -> ResolveResult {
+    let decl = db
+        .get_reference_index()
+        .get_local_reference(&closure_params.file_id)
+        .and_then(|references| references.get_decl_id(&name_expr.get_range()))
+        .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id));
+    match decl {
+        Some(decl) if decl.is_module_scoped() => {
+            let Some(member_type) = documented_module_member(db, closure_params, decl, name_expr)
+            else {
+                return Ok(());
+            };
+            resolve_closure_member_type(
+                db,
+                writes,
+                closure_params,
+                &member_type,
+                None,
+                &InferGuard::new(),
+            )
+        }
+        Some(decl) if !decl.is_global() => Ok(()),
+        _ => resolve_documented_global_params(db, writes, closure_params, name_expr),
+    }
+}
+
+/// The documented member of `decl`'s `module()` the function `name_expr`
+/// defines replaces: the library's earliest.
+fn documented_module_member(
+    db: &DbIndex,
+    closure_params: &UnResolveParentClosureParams,
+    decl: &crate::LuaDecl,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaType> {
+    let owner = LuaMemberOwner::GlobalPath(GlobalId::new(decl.get_module_path()?));
+    let key = LuaMemberKey::Name(name_expr.get_name_text()?.into());
+    let module_index = db.get_module_index();
+    let mut member_ids = db
+        .get_member_index()
+        .get_members_with_key(&owner, &key)?
+        .into_iter()
+        .map(|member| member.get_id())
+        .filter(|member_id| {
+            module_index.is_library(&member_id.file_id) || module_index.is_std(&member_id.file_id)
+        })
+        .collect::<Vec<_>>();
+    member_ids.sort_by_key(|member_id| (member_id.file_id, member_id.get_position()));
+    member_ids
+        .into_iter()
+        .filter_map(|member_id| db.get_type_index().get_type_cache(&member_id.into()))
+        .find_map(|cache| match cache.as_type() {
+            LuaType::Signature(id) if *id != closure_params.signature_id => {
+                Some(LuaType::Signature(*id))
+            }
+            _ => None,
+        })
+}
+
 /// Gives a workspace function replacing a global a library documents that
 /// global's parameter types. Its returns stay its body's, as a replacement
 /// may return what the documented one does not, unless the body's return
@@ -574,7 +636,7 @@ fn resolve_documented_global_params(
     closure_params: &UnResolveParentClosureParams,
     name_expr: &LuaNameExpr,
 ) -> ResolveResult {
-    let Some(documented) = documented_signature(db, closure_params, name_expr) else {
+    let Some(documented) = documented_global(db, closure_params, name_expr) else {
         return Ok(());
     };
     let target = db
@@ -596,23 +658,13 @@ fn resolve_documented_global_params(
 }
 
 /// The library global the function `name_expr` defines replaces: within the
-/// library this file resolves the name to first, the earliest declaration. A
-/// local or a `module()` member replaces no global.
-fn documented_signature<'a>(
+/// library this file resolves the name to first, the earliest declaration.
+fn documented_global<'a>(
     db: &'a DbIndex,
     closure_params: &UnResolveParentClosureParams,
     name_expr: &LuaNameExpr,
 ) -> Option<&'a LuaSignature> {
     let name = name_expr.get_name_text()?;
-    let names_global = db
-        .get_reference_index()
-        .get_local_reference(&closure_params.file_id)
-        .and_then(|references| references.get_decl_id(&name_expr.get_range()))
-        .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
-        .is_none_or(|decl| decl.is_global());
-    if !names_global {
-        return None;
-    }
     let module_index = db.get_module_index();
     let workspace_id = module_index
         .get_workspace_id(closure_params.file_id)
