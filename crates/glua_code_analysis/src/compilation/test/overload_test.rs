@@ -733,4 +733,43 @@ mod test {
             union_callee_call_type(closure, "documented")
         );
     }
+
+    /// The type a call settles to on a local holding a library function or a
+    /// workspace one, with the library in `library` under the workspace.
+    fn library_or_workspace_call_type(library: &str) -> String {
+        let mut ws = VirtualWorkspace::new();
+        let library_root = ws.virtual_url_generator.base.join(library);
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            &format!("{library}/lib.lua"),
+            r#"
+            ---@meta
+            ---@return string
+            function LibFn() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/main.lua",
+            r#"
+            local function ws_fn() return 1 end
+            local f
+            if Cond then
+                f = LibFn
+            else
+                f = ws_fn
+            end
+            local r = f()
+            "#,
+        );
+        let typ = ws.local_ty(file_id, "r");
+        ws.humanize_type(typ)
+    }
+
+    #[test]
+    fn a_call_on_a_library_or_workspace_callable_infers_the_same_wherever_the_library_sits() {
+        assert_eq!(
+            library_or_workspace_call_type("aaa_library"),
+            library_or_workspace_call_type("zzz_library")
+        );
+    }
 }
