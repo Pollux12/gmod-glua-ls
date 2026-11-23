@@ -1507,12 +1507,15 @@ impl Engine {
             if !on_workers {
                 self.requeue_carried();
             }
+            // Cleared loops settle in supersteps even within one file: a
+            // loop with more than one fixed point lands on the one its
+            // order of evaluation reaches, which must not hang on whether
+            // a loop in another file was cleared with it.
             let superstep_due = on_workers
                 && (!self.carried.is_empty()
-                    || self
-                        .worklist
-                        .first_rank()
-                        .is_some_and(|rank| self.worklist.spans_files(rank)));
+                    || self.worklist.first_rank().is_some_and(|rank| {
+                        !self.loop_focus.is_empty() || self.worklist.spans_files(rank)
+                    }));
             if interrupted || slice.over(self.stats.total_evaluations() - started) {
                 // The superstep due next runs while readers share the index,
                 // and the next slice installs it.
@@ -7567,6 +7570,102 @@ function holder.receiver:Use() end
                 assert_eq!(stats.loop_waves, 3, "{schedule:?} serial={serial}");
             }
         }
+    }
+
+    /// [`Unions`]' statements, each binding what the first of its reads that
+    /// is bound holds, tagged with its own position when that is `INPUT`: a
+    /// loop of them settles on whichever value its order of evaluation
+    /// reaches first.
+    struct FirstBound(Unions);
+
+    impl Recipe for FirstBound {
+        fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+            let start = u32::from(id.syntax_id().get_range().start());
+            let (_, reads) = self
+                .0
+                .reads
+                .iter()
+                .find(|(at, _)| *at == start)
+                .expect("a statement of the recipe");
+            let read = reads
+                .iter()
+                .map(|position| {
+                    let read = db
+                        .get_type_index()
+                        .get_type_cache(&owner(*position))
+                        .map(|cache| cache.as_type().clone());
+                    (*position, read)
+                })
+                .collect::<Vec<_>>();
+            if let Some((position, value)) = read
+                .into_iter()
+                .find_map(|(position, read)| Some((position, read?)))
+            {
+                let value = if position == INPUT {
+                    TypeOps::Union.apply(db, &value, &text(&start.to_string()))
+                } else {
+                    value
+                };
+                bind(db, start, value);
+            }
+        }
+
+        fn splits(&self, _: DerivationKind) -> bool {
+            false
+        }
+
+        fn compute(&self, _: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
+            unreachable!("first-bound statements do not split")
+        }
+
+        fn apply(&self, _: &mut DbIndex, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
+            unreachable!("first-bound statements do not split")
+        }
+    }
+
+    /// What `recipe`'s statements bind once `INPUT` turns from "old" to "new"
+    /// under them, on worker supersteps.
+    fn first_bound_after_edit(recipe: &FirstBound) -> Vec<Option<LuaType>> {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+        bind(db, INPUT, text("old"));
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        for (start, _) in &recipe.0.reads {
+            engine.changed(recipe.0.derivation(*start));
+        }
+        engine.open(db);
+        assert!(engine.run(db, recipe, Slice::Whole));
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        move_input(db, &mut engine, "new");
+        engine.open(db);
+        assert!(engine.run(db, recipe, Slice::Whole));
+        recipe.0.bound(db)
+    }
+
+    #[test]
+    fn a_loop_cleared_alone_settles_as_when_a_loop_in_another_file_clears_with_it() {
+        let reads = vec![
+            (10, vec![30, INPUT, 40]),
+            (20, vec![10, 40]),
+            (30, vec![50, INPUT]),
+            (40, vec![10]),
+            (50, vec![20]),
+        ];
+        let mut with_other = reads.clone();
+        with_other.extend([(110, vec![INPUT, 120]), (120, vec![110])]);
+        let alone = FirstBound(Unions {
+            reads,
+            exports: Vec::new(),
+        });
+        let with_other = FirstBound(Unions {
+            reads: with_other,
+            exports: Vec::new(),
+        });
+
+        let alone = first_bound_after_edit(&alone);
+        let with_other = first_bound_after_edit(&with_other);
+
+        assert_eq!(alone, with_other[..alone.len()]);
     }
 
     #[test]
