@@ -1005,7 +1005,8 @@ fn collect_signatures_of_type(typ: &LuaType, result: &mut Vec<LuaSignatureId>) {
 
 /// The key one call of `installer` writes. A joined key is a
 /// string whatever the call passes; a bare parameter is `None` when the call
-/// passes a value not known to be a string.
+/// passes a value not known to be a string. A parameter the key reads twice
+/// holds the same string both times.
 fn evaluate_install(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
@@ -1014,53 +1015,76 @@ fn evaluate_install(
     installer: &FieldInstaller,
 ) -> Option<Install> {
     let is_join = installer.is_join();
-    let mut names = vec![String::new()];
     let mut definition = None;
+    let mut part_values: Vec<(&KeyPart, Vec<SmolStr>)> = Vec::new();
     let mut any_string = false;
     for part in &installer.key {
-        match part {
-            KeyPart::Literal(text) => {
-                for name in &mut names {
-                    name.push_str(text);
-                }
-            }
-            KeyPart::Param { param, default } => {
-                let arg = installer_arg(db, call_expr, signature_id, *param);
-                let arg_names = match (&arg, default) {
-                    (None, Some(default)) => Some(vec![default.clone()]),
-                    (None, None) => return None,
-                    (Some(arg), _) => match key_arg_names(db, cache, arg, default.as_ref()) {
-                        Some(arg_names) => arg_names,
-                        None if is_join => None,
-                        None => return None,
-                    },
-                };
-                match arg_names {
-                    Some(values) => {
-                        names = names
-                            .iter()
-                            .flat_map(|name| {
-                                values.iter().map(move |value| format!("{name}{value}"))
-                            })
-                            .collect();
-                    }
-                    None => any_string = true,
-                }
-                if let Some(arg) = arg {
-                    definition.get_or_insert(arg);
-                }
-            }
+        let KeyPart::Param { param, default } = part else {
+            continue;
+        };
+        if part_values.iter().any(|(bound, _)| *bound == part) {
+            continue;
+        }
+        let arg = installer_arg(db, call_expr, signature_id, *param);
+        let arg_names = match (&arg, default) {
+            (None, Some(default)) => Some(vec![default.clone()]),
+            (None, None) => return None,
+            (Some(arg), _) => match key_arg_names(db, cache, arg, default.as_ref()) {
+                Some(arg_names) => arg_names,
+                None if is_join => None,
+                None => return None,
+            },
+        };
+        match arg_names {
+            Some(values) => part_values.push((part, values)),
+            None => any_string = true,
+        }
+        if let Some(arg) = arg {
+            definition.get_or_insert(arg);
         }
     }
     let key = if any_string {
         InstalledKey::AnyString
     } else {
-        InstalledKey::Names(names.into_iter().map(SmolStr::from).collect())
+        InstalledKey::Names(key_names(&installer.key, &part_values))
     };
     Some(Install {
         key,
         definition: definition?,
     })
+}
+
+/// The keys `key` joins to, one for each choice of a string for each of its
+/// parameter parts from `part_values`.
+fn key_names(key: &[KeyPart], part_values: &[(&KeyPart, Vec<SmolStr>)]) -> Vec<SmolStr> {
+    let mut choices: Vec<Vec<&SmolStr>> = vec![Vec::new()];
+    for (_, values) in part_values {
+        choices = choices
+            .into_iter()
+            .flat_map(|choice| {
+                values.iter().map(move |value| {
+                    let mut choice = choice.clone();
+                    choice.push(value);
+                    choice
+                })
+            })
+            .collect();
+    }
+    choices
+        .into_iter()
+        .map(|choice| {
+            key.iter()
+                .map(|part| match part {
+                    KeyPart::Literal(text) => text.as_str(),
+                    KeyPart::Param { .. } => part_values
+                        .iter()
+                        .position(|(bound, _)| *bound == part)
+                        .map_or("", |idx| choice[idx].as_str()),
+                })
+                .collect::<String>()
+                .into()
+        })
+        .collect()
 }
 
 /// The strings a key argument may be, with `default` where it may be `nil`:

@@ -4730,6 +4730,31 @@ owner:CompletelyMadeUpMethod()
         ));
     }
 
+    /// A key reading the same parameter twice holds the same string both
+    /// times: a call passing `"a"` or `"b"` installs `a_a` or `b_b`, never a
+    /// key mixing the two.
+    #[test]
+    fn test_installed_key_reading_a_parameter_twice_uses_one_string() {
+        const INSTALL_TWICE: &str = r#"
+            local function InstallTwice(t, name)
+                t[name .. "_" .. name] = true
+            end
+            ---@type "a"|"b"
+            local name = "a"
+            local A = {}
+            InstallTwice(A, name)
+        "#;
+        let mut ws = dynamic_field_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!("{INSTALL_TWICE}\nlocal aa, bb = A.a_a, A.b_b\n"),
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!("{INSTALL_TWICE}\nlocal ab = A.a_b\n"),
+        ));
+    }
+
     /// A field a call installs holds the value that call passed.
     #[test]
     fn test_installed_field_holds_the_value_its_call_passed() {
