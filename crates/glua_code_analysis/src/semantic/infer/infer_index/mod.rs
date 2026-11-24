@@ -1576,17 +1576,11 @@ pub(crate) fn factory_bound_metatable_index(
 }
 
 /// A field a table may not hold, `own`, read where Lua falls back to
-/// `fallback` when it is absent: what both agree on, or either one. A
-/// fallback that may be missing too leaves either one or `nil`.
+/// `fallback` when it is absent: the field when it is there, the fallback
+/// when it is not.
 fn read_through_to(db: &DbIndex, own: &LuaType, fallback: &LuaType) -> LuaType {
     let present = TypeOps::Remove.apply(db, own, &LuaType::Nil);
-    if fallback.is_nullable() {
-        return TypeOps::Union.apply(db, &present, fallback);
-    }
-    match TypeOps::Intersect.apply(db, fallback, &present) {
-        LuaType::Never => TypeOps::Union.apply(db, &present, fallback),
-        intersected => intersected,
-    }
+    TypeOps::Union.apply(db, &present, fallback)
 }
 
 fn metatable_index_type_points_to_table(typ: &LuaType, table_range: &InFiled<TextRange>) -> bool {

@@ -3254,6 +3254,26 @@ mod test {
         );
     }
 
+    /// A field a table may not hold reads as its own value when it is there
+    /// and the `__index` table's when it is not: either one, not only what
+    /// both could be.
+    #[test]
+    fn a_field_the_table_may_lack_reads_its_value_or_the_index_value() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_read_through.lua",
+            r#"
+            ---@return number?
+            local function maybeSize() end
+            local sized = { size = maybeSize() }
+            setmetatable(sized, { __index = { size = 1 } })
+            local size = sized.size
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "size")), "number");
+    }
+
     /// A field a table may not hold, read through an `__index` table whose
     /// field may be missing too, keeps what both may hold.
     #[test]
