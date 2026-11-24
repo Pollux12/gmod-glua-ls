@@ -13982,16 +13982,18 @@ fn source_states_for_load_site(
                 .find(|range| range.range.contains(site.range.start()))
         })
         .map(|range| GmodStateMask::from_realm(range.realm));
-    [branch_realm, site.realms]
+    let Some(limit) = [branch_realm, site.realms]
         .into_iter()
         .flatten()
-        .fold(source_states, |states, limit| {
-            if states.is_empty() {
-                limit
-            } else {
-                states.intersection(limit)
-            }
-        })
+        .reduce(GmodStateMask::intersection)
+    else {
+        return source_states;
+    };
+    if source_states.is_empty() {
+        limit
+    } else {
+        source_states.intersection(limit)
+    }
 }
 
 fn load_site_sort_key(

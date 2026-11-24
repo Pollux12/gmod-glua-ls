@@ -3585,6 +3585,7 @@ end
             "function MyLoad(path)\n    if CLIENT then return end\n    include(path)\nend\n",
             "function MyLoad(path)\n    if SERVER then include(path) end\nend\n",
             "function MyLoad(path)\n    if CLIENT then\n        return\n    else\n        include(path)\n    end\nend\n",
+            "function MyLoad(path)\n    if CLIENT then return else print(path) end\n    include(path)\nend\n",
         ] {
             let mut ws = VirtualWorkspace::new();
             set_gmod_enabled(&mut ws);
@@ -3600,6 +3601,31 @@ end
                 GmodRealm::Server,
             );
         }
+    }
+
+    /// A client-only loader called under `if CLIENT` from a server-only file
+    /// never runs, so it loads the file in no realm.
+    #[gtest]
+    fn test_load_index_realm_wrapper_in_a_branch_its_caller_never_runs_loads_nowhere() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let thing_id = ws.def_file("lua/mylib/thing.lua", "return true");
+        ws.def_file(
+            "lua/autorun/sh_loader.lua",
+            "function IncludeCL(path)\n    if CLIENT then include(path) end\nend\n",
+        );
+        ws.def_file(
+            "lua/autorun/server/sv_boot.lua",
+            "if CLIENT then IncludeCL(\"mylib/thing.lua\") end\n",
+        );
+
+        let state_mask = ws
+            .get_db_mut()
+            .get_gmod_load_index()
+            .get_file_info(&thing_id)
+            .map(|info| info.state_mask)
+            .unwrap_or_default();
+        assert_eq!(state_mask, GmodStateMask::empty());
     }
 
     /// A global loader that sends its file to clients on the server and
