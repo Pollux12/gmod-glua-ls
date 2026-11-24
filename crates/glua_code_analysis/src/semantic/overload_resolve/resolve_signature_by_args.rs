@@ -243,7 +243,8 @@ pub fn resolve_signature_by_args(
 }
 
 /// Among overloads that all reject the table literal `expr_type`, the one
-/// whose fields it misses fewest of, the first on a tie.
+/// whose fields it misses fewest of, the first on a tie. An overload whose
+/// parameter is a scalar no table could fill is no candidate.
 fn closest_table_fit(
     db: &DbIndex,
     rejecting: &[(Arc<LuaFunctionType>, LuaType)],
@@ -271,6 +272,18 @@ fn closest_table_fit(
     };
     rejecting
         .iter()
+        .filter(|(_, param_type)| {
+            !(param_type.is_string()
+                || param_type.is_number()
+                || param_type.is_boolean()
+                || matches!(
+                    param_type,
+                    LuaType::Nil
+                        | LuaType::Function
+                        | LuaType::DocFunction(_)
+                        | LuaType::Signature(_)
+                ))
+        })
         .min_by_key(|(_, param_type)| misses(param_type))
         .map(|(func, _)| func.clone())
 }

@@ -6302,3 +6302,38 @@ Send({
         "{reports:#?}"
     );
 }
+
+/// A table no overload accepts is reported against a table overload, not a
+/// scalar one listed before it that misses its fields as often.
+#[test]
+fn a_table_no_overload_accepts_is_not_reported_against_a_scalar_overload() {
+    for call in ["f({ count = \"wrong\" })", "f({})"] {
+        let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def(&format!(
+            r#"
+---@overload fun(name: string)
+---@param opts {{ count: number }}
+local function f(opts) end
+{call}
+"#
+        ));
+        let reports = [
+            crate::DiagnosticCode::ParamTypeMismatch,
+            crate::DiagnosticCode::AssignTypeMismatch,
+            crate::DiagnosticCode::MissingFields,
+        ]
+        .into_iter()
+        .flat_map(|code| {
+            ws.analysis.diagnostic.enable_only(code);
+            ws.analysis
+                .diagnose_file(file, tokio_util::sync::CancellationToken::new())
+                .unwrap_or_default()
+        })
+        .map(|diagnostic| diagnostic.message)
+        .collect::<Vec<_>>();
+        assert!(
+            !reports.is_empty() && !reports.iter().any(|report| report.contains("expected `string`")),
+            "{call}: {reports:#?}"
+        );
+    }
+}
