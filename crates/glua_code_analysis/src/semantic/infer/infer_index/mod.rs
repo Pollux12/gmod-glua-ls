@@ -963,9 +963,9 @@ fn infer_table_member(
     // A field the table may not hold reads through to its metatable's
     // `__index` when it is absent.
     if let Ok(own) = &result
-        && own.is_nullable()
         && db.get_metatable_index().get(&inst).is_some()
         && let Some(index_key) = index_expr.get_index_key()
+        && reads_through(&index_key, own)
         && let Ok(fallback) = infer_table_metatable_member(
             db,
             cache,
@@ -1573,6 +1573,15 @@ pub(crate) fn factory_bound_metatable_index(
         &LuaMemberKey::Name("__index".into()),
         made_by,
     )
+}
+
+/// Whether a read of `key` that finds `own` in the table reaches the
+/// metatable. A key naming a field does when the field may be absent. A key
+/// computed at runtime does not say which field is absent, so it does only
+/// when the table holds nothing for it, instead of taking in every value the
+/// metatable holds besides the table's own.
+fn reads_through(key: &LuaIndexKey, own: &LuaType) -> bool {
+    own.is_nullable() && (!matches!(key, LuaIndexKey::Expr(_)) || own.is_nil())
 }
 
 /// A field a table may not hold, `own`, read where Lua falls back to
@@ -3461,7 +3470,11 @@ fn infer_instance_member(
             index_expr.clone(),
             table_member_lookup_guard,
         ) {
-            Ok(table_type) if table_type.is_nullable() => {
+            Ok(table_type)
+                if index_expr
+                    .get_index_key()
+                    .is_some_and(|key| reads_through(&key, &table_type)) =>
+            {
                 return Ok(read_through_to(db, &table_type, &typ));
             }
             Ok(table_type) => {

@@ -3274,6 +3274,37 @@ mod test {
         assert_eq!(ws.humanize_type(ws.local_ty(file_id, "size")), "number");
     }
 
+    /// A key computed at runtime does not name a field the table lacks: a
+    /// table holding values of its own reads as them, not as every member its
+    /// class holds too, while one holding nothing reads its class's.
+    #[test]
+    fn a_runtime_key_reads_the_class_only_when_the_table_holds_nothing() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_runtime_key.lua",
+            r#"
+            local Stream = {}
+            Stream.__index = Stream
+            function Stream:Destroy() end
+            ---@return string
+            local function anyKey() end
+            local filled = setmetatable({ id = 1, label = "x" }, Stream)
+            local fromFilled = filled[anyKey()]
+            local empty = setmetatable({}, Stream)
+            local fromEmpty = empty[anyKey()]
+            "#,
+        );
+
+        let holds_method = |name: &str| match ws.local_ty(file_id, name) {
+            LuaType::Union(union) => union.types().any(is_function_type),
+            typ => is_function_type(&typ),
+        };
+        assert_eq!(
+            (holds_method("fromFilled"), holds_method("fromEmpty")),
+            (false, true)
+        );
+    }
+
     /// A field a table may not hold, read through an `__index` table whose
     /// field may be missing too, keeps what both may hold.
     #[test]
