@@ -582,6 +582,8 @@ end
         for loader in [
             "function MyLoad(path)\n    if not path then return end\n    include(path)\nend\n",
             "function MyLoad(path, enabled)\n    if enabled then include(path) end\nend\n",
+            "function MyLoad(path, skip)\n    if CLIENT then return elseif skip then return end\n    include(path)\nend\n",
+            "function MyLoad(path, skip)\n    if CLIENT then return else if skip then return end end\n    include(path)\nend\n",
             REALM_LOADER,
         ] {
             let mut ws = gmod_workspace();
