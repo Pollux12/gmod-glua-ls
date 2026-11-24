@@ -11,7 +11,7 @@ pub use load_path_rename::{LoadPathEdit, load_path_rename_edits};
 use rowan::TextRange;
 
 use crate::{
-    FileId,
+    FileId, GmodStateMask,
     db_index::derivation::{self, FactKey, Fingerprint},
 };
 
@@ -35,6 +35,9 @@ pub struct LuaDependencySite {
     pub source_file_id: FileId,
     pub target_file_id: Option<FileId>,
     pub kind: LuaDependencyKind,
+    /// The realms a loader's own realm branches leave the load to run in;
+    /// `None` when they do not limit it.
+    pub realms: Option<GmodStateMask>,
     pub path: Option<String>,
     /// Resolver-equivalent path keys retained while resolved so target removal
     /// can transition this site into the reverse unresolved index without a scan.
@@ -52,6 +55,7 @@ impl Hash for LuaDependencySite {
             source_file_id,
             target_file_id,
             kind,
+            realms,
             path,
             path_keys,
             original_expr,
@@ -61,6 +65,7 @@ impl Hash for LuaDependencySite {
         source_file_id.hash(state);
         target_file_id.hash(state);
         kind.hash(state);
+        realms.hash(state);
         path.hash(state);
         path_keys.hash(state);
         original_expr.hash(state);
@@ -77,6 +82,7 @@ impl LuaDependencySite {
             source_file_id,
             target_file_id: _,
             kind,
+            realms,
             path,
             path_keys,
             original_expr,
@@ -85,6 +91,7 @@ impl LuaDependencySite {
         } = self;
         *source_file_id == other.source_file_id
             && *kind == other.kind
+            && *realms == other.realms
             && *path == other.path
             && *path_keys == other.path_keys
             && *original_expr == other.original_expr
@@ -615,6 +622,7 @@ mod tests {
             path: Some("removed.lua".to_string()),
             path_keys: vec!["removed.lua".to_string()],
             original_expr: "include(\"removed\")".to_string(),
+            realms: None,
             call_range: TextRange::new(TextSize::new(0), TextSize::new(1)),
             range: TextRange::new(TextSize::new(0), TextSize::new(1)),
         });
@@ -653,6 +661,7 @@ mod tests {
             path: path.map(str::to_string),
             path_keys: path.into_iter().map(str::to_string).collect(),
             original_expr: "include(...)".to_string(),
+            realms: None,
             call_range: TextRange::new(TextSize::new(0), TextSize::new(1)),
             range: TextRange::new(TextSize::new(0), TextSize::new(1)),
         };
@@ -679,6 +688,7 @@ mod tests {
             path: Some(path.to_string()),
             path_keys: vec![path.to_string()],
             original_expr: "include(...)".to_string(),
+            realms: None,
             call_range: TextRange::new(TextSize::new(0), TextSize::new(1)),
             range: TextRange::new(TextSize::new(0), TextSize::new(1)),
         };
@@ -717,6 +727,7 @@ mod tests {
                 path: Some(path.clone()),
                 path_keys: vec![path],
                 original_expr: "include(...)".to_string(),
+                realms: None,
                 call_range: TextRange::new(TextSize::new(0), TextSize::new(1)),
                 range: TextRange::new(TextSize::new(0), TextSize::new(1)),
             });
@@ -729,6 +740,7 @@ mod tests {
             path: Some("target.lua".to_string()),
             path_keys: vec!["target.lua".to_string()],
             original_expr: "include(...)".to_string(),
+            realms: None,
             call_range: TextRange::new(TextSize::new(0), TextSize::new(1)),
             range: TextRange::new(TextSize::new(0), TextSize::new(1)),
         });
@@ -753,6 +765,7 @@ mod tests {
             path: Some("target.lua".to_string()),
             path_keys: vec!["target.lua".to_string()],
             original_expr: "MyInclude(\"target.lua\")".to_string(),
+            realms: None,
             call_range: TextRange::new(TextSize::new(0), TextSize::new(1)),
             range: TextRange::new(TextSize::new(0), TextSize::new(1)),
         });
@@ -777,6 +790,7 @@ mod tests {
                 path: Some(path.clone()),
                 path_keys: vec![path],
                 original_expr: "include(...)".to_string(),
+                realms: None,
                 call_range: range,
                 range,
             });
@@ -791,6 +805,7 @@ mod tests {
             path: Some("target.lua".to_string()),
             path_keys: vec!["target.lua".to_string()],
             original_expr: "CompileFile(... )()".to_string(),
+            realms: None,
             call_range: range,
             range,
         });

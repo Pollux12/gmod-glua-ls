@@ -581,8 +581,8 @@ end
     fn a_call_of_a_dispatching_or_conditional_loader_only_names_the_file() {
         for loader in [
             "function MyLoad(path)\n    if SERVER then AddCSLuaFile(path) end\n    include(path)\nend\n",
-            "function MyLoad(path)\n    if SERVER then include(path) end\nend\n",
-            "function MyLoad(path)\n    if CLIENT then return end\n    include(path)\nend\n",
+            "function MyLoad(path)\n    if not path then return end\n    include(path)\nend\n",
+            "function MyLoad(path, enabled)\n    if enabled then include(path) end\nend\n",
             REALM_LOADER,
         ] {
             let mut ws = gmod_workspace();

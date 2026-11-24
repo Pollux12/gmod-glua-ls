@@ -374,7 +374,11 @@ fn collect_annotated_load_dependency_site(
     pending: &mut Vec<PendingCallSite>,
 ) -> Option<()> {
     let call_path = call_expr.get_access_path()?;
-    let (kind, path_arg_idx) = annotated_roles.load_call(db, file_id, &call_expr, &call_path)?;
+    let LoadCall {
+        kind,
+        path_arg_idx,
+        realms,
+    } = annotated_roles.load_call(db, file_id, &call_expr, &call_path)?;
     let arg_expr = call_expr
         .get_args_list()
         .and_then(|args| args.get_args().nth(path_arg_idx));
@@ -397,6 +401,7 @@ fn collect_annotated_load_dependency_site(
         source_file_id: file_id,
         target_file_id,
         kind,
+        realms,
         path,
         path_keys,
         original_expr: call_expr.syntax().text().to_string(),
@@ -671,6 +676,14 @@ impl HelperRegistryBuilder {
     }
 }
 
+/// The load a call of an annotated loader makes: its kind, the argument
+/// naming the file, and the realms the loader's realm branches leave it.
+struct LoadCall {
+    kind: LuaDependencyKind,
+    path_arg_idx: usize,
+    realms: Option<GmodStateMask>,
+}
+
 /// A call inside a global function that passes the function's parameters on.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ForwardedCall {
@@ -681,9 +694,19 @@ struct ForwardedCall {
     args: Vec<ForwardedArg>,
     /// Whether the function returns the call's result.
     returned: bool,
-    /// Whether every call of the function makes this call: it is not under a
-    /// condition or in a loop.
-    unconditional: bool,
+    /// Whether every call of the function makes this call.
+    reach: ForwardedReach,
+}
+
+/// Whether every call of a function makes a call in its body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ForwardedReach {
+    /// Every call makes it, in the realms the function's realm branches
+    /// leave it: `None` when no realm branch holds it.
+    Always(Option<GmodStateMask>),
+    /// A condition other than the realm, a loop, a short-circuit operand or
+    /// an earlier exit can skip it.
+    Sometimes,
 }
 
 /// An argument of a [`ForwardedCall`], written in terms of the function's
@@ -758,37 +781,73 @@ fn collect_forwarded_calls(
             callee_is_colon: call_expr.is_colon_call(),
             args,
             returned: wrapper_returns(db, file_id, &closure, &LuaExpr::CallExpr(call_expr.clone())),
-            unconditional: runs_on_every_call(&call_expr, &closure),
+            reach: forwarded_reach(&call_expr, &closure),
         });
     }
     forwarded_calls
 }
 
-/// Whether `call_expr` runs whenever `closure` does: no condition, loop or
-/// short-circuit operand of `closure` holds it, and nothing before it can
-/// leave `closure` or jump past it.
-fn runs_on_every_call(call_expr: &LuaCallExpr, closure: &LuaClosureExpr) -> bool {
-    call_expr
+/// Whether every call of `closure` makes `call_expr`. A realm branch does
+/// not skip it but leaves it the realms it names: an `if` whose block, `elseif`
+/// or `else` holds it, or an earlier `if CLIENT then return end`. Any other
+/// condition, loop, short-circuit operand, `return` or `goto` before it can.
+fn forwarded_reach(call_expr: &LuaCallExpr, closure: &LuaClosureExpr) -> ForwardedReach {
+    let position = call_expr.get_position();
+    let mut realm_ranges = Vec::new();
+    // An `if` naming the realm the call runs in when it holds it, or returns
+    // before it on the others.
+    let mut narrows_realm = |if_stat: &LuaIfStat| {
+        let mut ranges = Vec::new();
+        collect_if_realm_ranges(if_stat, &mut ranges);
+        let before = realm_ranges.len();
+        realm_ranges.extend(
+            ranges
+                .into_iter()
+                .filter(|range| range.range.contains(position)),
+        );
+        realm_ranges.len() > before
+    };
+    for node in call_expr
         .syntax()
         .ancestors()
         .take_while(|node| node != closure.syntax())
-        .all(|node| {
-            !matches!(
-                node.kind().into(),
-                glua_parser::LuaSyntaxKind::IfStat
-                    | glua_parser::LuaSyntaxKind::WhileStat
-                    | glua_parser::LuaSyntaxKind::RepeatStat
-                    | glua_parser::LuaSyntaxKind::ForStat
-                    | glua_parser::LuaSyntaxKind::ForRangeStat
-            ) && !LuaBinaryExpr::cast(node.clone()).is_some_and(|binary| {
-                binary.get_op_token().is_some_and(|op| {
-                    matches!(op.get_op(), BinaryOperator::OpAnd | BinaryOperator::OpOr)
+    {
+        let skips = match LuaIfStat::cast(node.clone()) {
+            Some(if_stat) => !narrows_realm(&if_stat),
+            None => {
+                matches!(
+                    node.kind().into(),
+                    glua_parser::LuaSyntaxKind::WhileStat
+                        | glua_parser::LuaSyntaxKind::RepeatStat
+                        | glua_parser::LuaSyntaxKind::ForStat
+                        | glua_parser::LuaSyntaxKind::ForRangeStat
+                ) || LuaBinaryExpr::cast(node.clone()).is_some_and(|binary| {
+                    binary.get_op_token().is_some_and(|op| {
+                        matches!(op.get_op(), BinaryOperator::OpAnd | BinaryOperator::OpOr)
+                    })
                 })
-            }) && !node
-                .siblings(rowan::Direction::Prev)
-                .skip(1)
-                .any(|earlier| may_leave(&earlier, closure))
-        })
+            }
+        };
+        if skips {
+            return ForwardedReach::Sometimes;
+        }
+        if node.parent().and_then(LuaBlock::cast).is_none() {
+            continue;
+        }
+        for earlier in node.siblings(rowan::Direction::Prev).skip(1) {
+            let guards_realm =
+                LuaIfStat::cast(earlier.clone()).is_some_and(|if_stat| narrows_realm(&if_stat));
+            if !guards_realm && may_leave(&earlier, closure) {
+                return ForwardedReach::Sometimes;
+            }
+        }
+    }
+    ForwardedReach::Always(
+        realm_ranges
+            .into_iter()
+            .min_by_key(|range| range.range.len())
+            .map(|range| GmodStateMask::from_realm(range.realm)),
+    )
 }
 
 /// Whether `node` holds a `return` of `closure` or a `goto`.
@@ -8007,6 +8066,8 @@ struct AnnotatedGmodCallRoles {
     hook_roles: Vec<(GmodHookKind, AnnotatedGmodCallArgRole)>,
     hook_callback_roles: Vec<AnnotatedGmodCallArgRole>,
     load_roles: Vec<(LuaDependencyKind, AnnotatedGmodCallArgRole)>,
+    /// The realms a wrapper's realm branches leave its load to run in.
+    load_realms: Option<GmodStateMask>,
     compilefile_roles: Vec<AnnotatedGmodCallArgRole>,
     environment_target_roles: Vec<AnnotatedGmodCallArgRole>,
     environment_table_roles: Vec<AnnotatedGmodCallArgRole>,
@@ -8439,18 +8500,27 @@ impl AnnotatedGmodCallRoles {
         ))
     }
 
-    fn load_call(&self, is_colon_call: bool) -> Option<(LuaDependencyKind, usize)> {
+    fn load_call(&self, is_colon_call: bool) -> Option<LoadCall> {
         self.load_roles
             .first()
             .and_then(|(kind, role)| {
-                Some((
-                    *kind,
-                    param_idx_to_call_arg_idx(role.param_idx, is_colon_call, self.is_colon_define)?,
-                ))
+                Some(LoadCall {
+                    kind: *kind,
+                    path_arg_idx: param_idx_to_call_arg_idx(
+                        role.param_idx,
+                        is_colon_call,
+                        self.is_colon_define,
+                    )?,
+                    realms: self.load_realms,
+                })
             })
             .or_else(|| {
                 self.compilefile_call(is_colon_call)
-                    .map(|path_arg_idx| (LuaDependencyKind::CompileFile, path_arg_idx))
+                    .map(|path_arg_idx| LoadCall {
+                        kind: LuaDependencyKind::CompileFile,
+                        path_arg_idx,
+                        realms: None,
+                    })
             })
     }
 
@@ -8470,9 +8540,7 @@ impl AnnotatedGmodCallRoles {
 
     fn load_alias(&self, is_colon_call: bool) -> Option<DynamicLoadAlias> {
         self.load_call(is_colon_call)
-            .and_then(|(kind, path_arg_idx)| {
-                DynamicLoadAlias::from_dependency_kind(kind, path_arg_idx)
-            })
+            .and_then(|load| DynamicLoadAlias::from_dependency_kind(load.kind, load.path_arg_idx))
             .or_else(|| {
                 self.overloads
                     .iter()
@@ -8523,15 +8591,21 @@ impl AnnotatedGmodCallRoles {
     }
 
     /// The roles of a function that loads a file by passing its parameter on,
-    /// unchanged, as the path of a call with these roles. A call it does not
-    /// always make, or one of several loads it `picks_among`, loads the file
-    /// in a realm its branches decide.
+    /// unchanged, as the path of a call with these roles, in the realms its
+    /// realm branches leave the call. A call it does not always make, or one
+    /// of several loads it `picks_among`, loads the file in a realm its
+    /// branches decide.
     fn forwarded_load(&self, forward: &ForwardedCall, picks_among: bool) -> Option<Self> {
         let (kind, role) = self.load_roles.first()?;
-        let kind = if forward.unconditional && !picks_among {
-            *kind
-        } else {
-            LuaDependencyKind::Dispatched
+        let (kind, load_realms) = match forward.reach {
+            ForwardedReach::Always(realms) if !picks_among => (
+                *kind,
+                match (self.load_realms, realms) {
+                    (Some(inner), Some(outer)) => Some(inner.intersection(outer)),
+                    (inner, outer) => inner.or(outer),
+                },
+            ),
+            _ => (LuaDependencyKind::Dispatched, None),
         };
         let arg_idx = param_idx_to_call_arg_idx(
             role.param_idx,
@@ -8547,6 +8621,7 @@ impl AnnotatedGmodCallRoles {
             })?;
         Some(Self {
             load_roles: vec![(kind, role)],
+            load_realms,
             ..Self::default()
         })
     }
@@ -9197,7 +9272,7 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
         file_id: FileId,
         call_expr: &LuaCallExpr,
         call_path: &str,
-    ) -> Option<(LuaDependencyKind, usize)> {
+    ) -> Option<LoadCall> {
         self.roles_for_call(db, file_id, call_expr, call_path)
             .and_then(|roles| roles.load_call(call_expr.is_colon_call()))
     }
@@ -13832,25 +13907,24 @@ fn source_states_for_load_site(
         .filter(|states| !states.is_empty())
         .or_else(|| fallback_masks.get(&site.source_file_id).copied())
         .unwrap_or_else(GmodStateMask::empty);
-
-    let Some(ranges) = branch_realm_ranges.get(&site.source_file_id) else {
-        return source_states;
-    };
-
-    let Some(branch_realm) = ranges
-        .iter()
-        .find(|range| range.range.contains(site.range.start()))
-        .map(|range| range.realm)
-    else {
-        return source_states;
-    };
-
-    let branch_states = GmodStateMask::from_realm(branch_realm);
-    if source_states.is_empty() {
-        branch_states
-    } else {
-        source_states.intersection(branch_states)
-    }
+    let branch_realm = branch_realm_ranges
+        .get(&site.source_file_id)
+        .and_then(|ranges| {
+            ranges
+                .iter()
+                .find(|range| range.range.contains(site.range.start()))
+        })
+        .map(|range| GmodStateMask::from_realm(range.realm));
+    [branch_realm, site.realms]
+        .into_iter()
+        .flatten()
+        .fold(source_states, |states, limit| {
+            if states.is_empty() {
+                limit
+            } else {
+                states.intersection(limit)
+            }
+        })
 }
 
 fn load_site_sort_key(

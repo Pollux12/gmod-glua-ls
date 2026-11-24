@@ -3576,35 +3576,88 @@ end
         );
     }
 
-    /// A global loader that returns early on the client before its `include`
-    /// does not run the file on the client: a call from shared code leaves
-    /// the file's realm to its own evidence instead of loading it in both.
+    /// A global loader whose `include` runs only on the server, past an
+    /// early return on the client or inside an `if SERVER`, loads the file
+    /// on the server only when shared code calls it.
     #[gtest]
-    fn test_load_index_global_wrapper_returning_early_on_client_does_not_load_on_client() {
-        let mut ws = VirtualWorkspace::new();
-        set_gmod_enabled(&mut ws);
-        let thing_id = ws.def_file("lua/mylib/thing.lua", "return true");
-        ws.def_file(
-            "lua/autorun/sh_loader.lua",
-            "function MyLoad(path)
-    if CLIENT then return end
-    include(path)
-end
-",
-        );
-        ws.def_file(
-            "lua/autorun/sh_boot.lua",
-            "MyLoad(\"mylib/thing.lua\")
-",
-        );
+    fn test_load_index_global_wrapper_realm_branch_loads_in_that_realm() {
+        for loader in [
+            "function MyLoad(path)\n    if CLIENT then return end\n    include(path)\nend\n",
+            "function MyLoad(path)\n    if SERVER then include(path) end\nend\n",
+            "function MyLoad(path)\n    if CLIENT then\n        return\n    else\n        include(path)\n    end\nend\n",
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            set_gmod_enabled(&mut ws);
+            let thing_id = ws.def_file("lua/mylib/thing.lua", "return true");
+            ws.def_file("lua/autorun/sh_loader.lua", loader);
+            ws.def_file("lua/autorun/sh_boot.lua", "MyLoad(\"mylib/thing.lua\")\n");
 
-        let state_mask = ws
-            .get_db_mut()
-            .get_gmod_load_index()
-            .get_file_info(&thing_id)
-            .map(|info| info.state_mask)
-            .unwrap_or_default();
-        assert_that!(state_mask.contains(GmodStateMask::CLIENT), eq(false));
+            expect_dynamic_load_info(
+                &mut ws,
+                thing_id,
+                GmodStateMask::SERVER,
+                false,
+                GmodRealm::Server,
+            );
+        }
+    }
+
+    /// Adding a client guard to a loader, taking it away, deleting the loader
+    /// and putting it back each move the realm its file loads in as a cold
+    /// build has it.
+    #[gtest]
+    fn test_load_index_global_wrapper_realm_guard_edits_settle_as_cold_build() {
+        const GUARDED: &str =
+            "function MyLoad(path)\n    if CLIENT then return end\n    include(path)\nend\n";
+        const UNGUARDED: &str = "function MyLoad(path)\n    include(path)\nend\n";
+        const LOADER: &str = "lua/autorun/sh_loader.lua";
+        let states = |ws: &mut VirtualWorkspace| {
+            let thing = ws
+                .analysis
+                .get_file_id(&ws.virtual_url_generator.new_uri("lua/mylib/thing.lua"))
+                .expect("thing");
+            ws.get_db_mut()
+                .get_gmod_load_index()
+                .get_file_info(&thing)
+                .map(|info| info.state_mask)
+                .unwrap_or_default()
+        };
+        let build = |loader: Option<&str>| {
+            let mut ws = VirtualWorkspace::new();
+            set_gmod_enabled(&mut ws);
+            ws.def_file("lua/mylib/thing.lua", "return true");
+            if let Some(loader) = loader {
+                ws.def_file(LOADER, loader);
+            }
+            ws.def_file("lua/autorun/sh_boot.lua", "MyLoad(\"mylib/thing.lua\")\n");
+            ws
+        };
+        let mut warm = build(Some(GUARDED));
+        let guarded = states(&mut warm);
+        warm.def_file(LOADER, UNGUARDED);
+        let unguarded = states(&mut warm);
+        warm.def_file(LOADER, GUARDED);
+        let reguarded = states(&mut warm);
+        let loader_uri = warm.virtual_url_generator.new_uri(LOADER);
+        warm.analysis
+            .remove_file_by_uri(&loader_uri)
+            .0
+            .expect("loader must be removed");
+        let deleted = states(&mut warm);
+        warm.def_file(LOADER, GUARDED);
+        let reopened = states(&mut warm);
+
+        let cold = |loader| states(&mut build(loader));
+        assert_eq!(
+            (guarded, unguarded, reguarded, deleted, reopened),
+            (
+                GmodStateMask::SERVER,
+                cold(Some(UNGUARDED)),
+                GmodStateMask::SERVER,
+                cold(None),
+                GmodStateMask::SERVER
+            )
+        );
     }
 
     #[gtest]
