@@ -582,6 +582,7 @@ end
         for loader in [
             "function MyLoad(path)\n    if SERVER then AddCSLuaFile(path) end\n    include(path)\nend\n",
             "function MyLoad(path)\n    if SERVER then include(path) end\nend\n",
+            "function MyLoad(path)\n    if CLIENT then return end\n    include(path)\nend\n",
             REALM_LOADER,
         ] {
             let mut ws = gmod_workspace();

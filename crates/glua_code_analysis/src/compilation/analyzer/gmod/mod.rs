@@ -765,7 +765,8 @@ fn collect_forwarded_calls(
 }
 
 /// Whether `call_expr` runs whenever `closure` does: no condition, loop or
-/// short-circuit operand of `closure` holds it.
+/// short-circuit operand of `closure` holds it, and nothing before it can
+/// leave `closure` or jump past it.
 fn runs_on_every_call(call_expr: &LuaCallExpr, closure: &LuaClosureExpr) -> bool {
     call_expr
         .syntax()
@@ -779,12 +780,26 @@ fn runs_on_every_call(call_expr: &LuaCallExpr, closure: &LuaClosureExpr) -> bool
                     | glua_parser::LuaSyntaxKind::RepeatStat
                     | glua_parser::LuaSyntaxKind::ForStat
                     | glua_parser::LuaSyntaxKind::ForRangeStat
-            ) && !LuaBinaryExpr::cast(node).is_some_and(|binary| {
+            ) && !LuaBinaryExpr::cast(node.clone()).is_some_and(|binary| {
                 binary.get_op_token().is_some_and(|op| {
                     matches!(op.get_op(), BinaryOperator::OpAnd | BinaryOperator::OpOr)
                 })
-            })
+            }) && !node
+                .siblings(rowan::Direction::Prev)
+                .skip(1)
+                .any(|earlier| may_leave(&earlier, closure))
         })
+}
+
+/// Whether `node` holds a `return` of `closure` or a `goto`.
+fn may_leave(node: &LuaSyntaxNode, closure: &LuaClosureExpr) -> bool {
+    node.descendants().any(|node| match node.kind().into() {
+        glua_parser::LuaSyntaxKind::ReturnStat => {
+            node.ancestors().find_map(LuaClosureExpr::cast).as_ref() == Some(closure)
+        }
+        glua_parser::LuaSyntaxKind::GotoStat => true,
+        _ => false,
+    })
 }
 
 /// The value a local of `closure` that is never reassigned was initialised

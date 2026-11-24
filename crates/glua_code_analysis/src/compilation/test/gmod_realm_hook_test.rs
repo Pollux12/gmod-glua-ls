@@ -3576,6 +3576,37 @@ end
         );
     }
 
+    /// A global loader that returns early on the client before its `include`
+    /// does not run the file on the client: a call from shared code leaves
+    /// the file's realm to its own evidence instead of loading it in both.
+    #[gtest]
+    fn test_load_index_global_wrapper_returning_early_on_client_does_not_load_on_client() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let thing_id = ws.def_file("lua/mylib/thing.lua", "return true");
+        ws.def_file(
+            "lua/autorun/sh_loader.lua",
+            "function MyLoad(path)
+    if CLIENT then return end
+    include(path)
+end
+",
+        );
+        ws.def_file(
+            "lua/autorun/sh_boot.lua",
+            "MyLoad(\"mylib/thing.lua\")
+",
+        );
+
+        let state_mask = ws
+            .get_db_mut()
+            .get_gmod_load_index()
+            .get_file_info(&thing_id)
+            .map(|info| info.state_mask)
+            .unwrap_or_default();
+        assert_that!(state_mask.contains(GmodStateMask::CLIENT), eq(false));
+    }
+
     #[gtest]
     fn test_load_index_dynamic_file_find_folder_dispatch_beats_nested_entrypoint_name() {
         let mut ws = VirtualWorkspace::new();
