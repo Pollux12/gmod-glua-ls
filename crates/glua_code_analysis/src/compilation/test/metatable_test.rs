@@ -3132,10 +3132,7 @@ mod test {
             local inst = Class:TryCreate(Cond)
             "#,
         );
-        assert_eq!(
-            ws.humanize_type(ws.local_ty(file_id, "inst")),
-            "table?"
-        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "inst")), "table?");
     }
 
     const ACCOUNT_CLASS: &str = r#"

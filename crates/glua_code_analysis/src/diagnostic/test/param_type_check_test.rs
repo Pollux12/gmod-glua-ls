@@ -6332,7 +6332,10 @@ local function f(opts) end
         .map(|diagnostic| diagnostic.message)
         .collect::<Vec<_>>();
         assert!(
-            !reports.is_empty() && !reports.iter().any(|report| report.contains("expected `string`")),
+            !reports.is_empty()
+                && !reports
+                    .iter()
+                    .any(|report| report.contains("expected `string`")),
             "{call}: {reports:#?}"
         );
     }
