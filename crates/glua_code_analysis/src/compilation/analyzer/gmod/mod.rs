@@ -890,8 +890,8 @@ fn forwarded_reach(call_expr: &LuaCallExpr, closure: &LuaClosureExpr) -> Forward
     ForwardedReach::Always(
         realm_ranges
             .into_iter()
-            .min_by_key(|range| range.range.len())
-            .map(|range| GmodStateMask::from_realm(range.realm)),
+            .map(|range| GmodStateMask::from_realm(range.realm))
+            .reduce(GmodStateMask::intersection),
     )
 }
 
