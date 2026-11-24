@@ -3087,6 +3087,34 @@ mod test {
         assert!(is_function_type(&ws.local_ty(file_id, "area")));
     }
 
+    /// An `__index` function that reads back through the table it serves
+    /// recurses forever at runtime; typing a read through it still ends.
+    #[test]
+    fn an_index_function_reading_back_through_its_table_types_a_read() {
+        for code in [
+            r#"
+            local M = {}
+            setmetatable(M, M)
+            function M:__index(key)
+                return self.parent[key]
+            end
+            local x = M.foo
+            "#,
+            r#"
+            local M = {}
+            local inst = setmetatable({}, M)
+            function M:__index(key)
+                return inst.fallback
+            end
+            local x = inst.foo
+            "#,
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let file_id = ws.def(code);
+            assert_eq!(ws.humanize_type(ws.local_ty(file_id, "x")), "unknown");
+        }
+    }
+
     /// A method that may end without returning its instance returns `nil`
     /// then, as a plain table or a local function returning one would.
     #[test]
