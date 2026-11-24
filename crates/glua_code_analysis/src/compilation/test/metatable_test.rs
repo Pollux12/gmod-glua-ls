@@ -3087,6 +3087,29 @@ mod test {
         assert!(is_function_type(&ws.local_ty(file_id, "area")));
     }
 
+    /// A method that may end without returning its instance returns `nil`
+    /// then, as a plain table or a local function returning one would.
+    #[test]
+    fn a_method_that_may_not_return_its_instance_may_return_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            local Class = {}
+            Class.__index = Class
+            function Class:TryCreate(ok)
+                if ok then
+                    return setmetatable({}, self)
+                end
+            end
+            local inst = Class:TryCreate(Cond)
+            "#,
+        );
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "inst")),
+            "table?"
+        );
+    }
+
     const ACCOUNT_CLASS: &str = r#"
             Account = { balance = 0 }
             function Account:new(o)

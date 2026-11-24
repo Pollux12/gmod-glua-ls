@@ -374,6 +374,9 @@ fn analyze_instance_return_alias(
     if block
         .get_stats()
         .any(|stat| stat_may_write_name(&stat, &metatable_name))
+        || analyze_func_body_returns(Some((analyzer.db, analyzer.file_id)), block)
+            .iter()
+            .any(|point| matches!(point, LuaReturnPoint::Nil))
     {
         return Some(());
     }
