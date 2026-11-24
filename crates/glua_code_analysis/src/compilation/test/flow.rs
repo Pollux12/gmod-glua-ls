@@ -3840,6 +3840,65 @@ _2 = a[1]
         assert_eq!(ws.humanize_type(owner), "Entity");
     }
 
+    /// A helper that lets `nil` through narrows an argument without making it
+    /// nilable: a non-nil argument stays non-nil, a nilable one stays nilable.
+    #[gtest]
+    fn test_helper_that_lets_nil_through_keeps_the_arguments_nilability() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@param x string|number|nil
+            local function forbid_number(x)
+                if type(x) == "number" then error("no numbers") end
+            end
+
+            ---@param s string
+            ---@param m string|number|nil
+            local function use(s, m)
+                forbid_number(s)
+                forbid_number(m)
+                after_s = s
+                after_m = m
+            end
+            "#,
+        );
+        let after_s = ws.expr_ty("after_s");
+        let after_m = ws.expr_ty("after_m");
+        assert_eq!(
+            (ws.humanize_type(after_s), ws.humanize_type(after_m)),
+            ("string".to_string(), "string?".to_string())
+        );
+    }
+
+    /// A helper that other calls pass a nilable value to narrows each
+    /// caller's own argument, not by what the other calls passed.
+    #[gtest]
+    fn test_helper_called_with_a_nilable_value_elsewhere_narrows_each_argument() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            function require_present(x)
+                if not x then error("missing") end
+            end
+            ---@return string?
+            local function maybe() end
+            require_present(maybe())
+
+            ---@class Ent
+
+            ---@param map table<string, Ent>
+            ---@param k string
+            local function use(map, k)
+                local ent = map[k]
+                require_present(ent)
+                after = ent
+            end
+            "#,
+        );
+        let after = ws.expr_ty("after");
+        assert_eq!(ws.humanize_type(after), "Ent");
+    }
+
     /// A helper that asserts or errors on its argument narrows a getter
     /// passed to it, as a guard on the getter would.
     #[gtest]

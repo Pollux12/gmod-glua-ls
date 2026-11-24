@@ -524,12 +524,24 @@ pub(in crate::semantic::infer::narrow) fn get_type_after_asserting_call(
     };
     let antecedent_type =
         get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
-    Ok(Some(narrow_type_guard_true_branch(
-        db,
-        antecedent_type,
-        narrowed_type,
-        false,
-    )))
+    if !narrowed_type.is_nullable() {
+        return Ok(Some(narrow_type_guard_true_branch(
+            db,
+            antecedent_type,
+            narrowed_type,
+            false,
+        )));
+    }
+    // A helper that lets `nil` through keeps it only for an argument that
+    // could hold it.
+    let could_be_nil = antecedent_type.is_optional();
+    let non_nil = TypeOps::Remove.apply(db, &narrowed_type, &LuaType::Nil);
+    let narrowed = narrow_type_guard_true_branch(db, antecedent_type, non_nil, false);
+    Ok(Some(if could_be_nil {
+        TypeOps::Union.apply(db, &narrowed, &LuaType::Nil)
+    } else {
+        narrowed
+    }))
 }
 
 /// The type every function `call_expr` may reach asserts of the argument
