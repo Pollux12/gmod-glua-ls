@@ -461,6 +461,13 @@ impl<'a> FlowBinder<'a> {
                         crate::db_index::intern_smol_str(&path),
                     ));
                 }
+                LuaExpr::CallExpr(_) => {
+                    if let Some(path) = crate::semantic::getter_access_path(&arg) {
+                        self.record_call_argument(NarrowingTarget::CallArgumentPath(
+                            crate::db_index::intern_smol_str(&path),
+                        ));
+                    }
+                }
                 _ => {}
             }
         }

@@ -3840,6 +3840,40 @@ _2 = a[1]
         assert_eq!(ws.humanize_type(owner), "Entity");
     }
 
+    /// A helper that asserts or errors on its argument narrows a getter
+    /// passed to it, as a guard on the getter would.
+    #[gtest]
+    fn test_helper_that_asserts_narrows_a_getter_argument() {
+        for call in [
+            "AssertValid(holder:GetOwner())",
+            "RequireValid(holder:GetOwner())",
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            set_gmod_enabled(&mut ws);
+            def_isvalid_guard(&mut ws);
+            let file_id = ws.def(&format!(
+                r#"
+                ---@class Holder
+                local Holder = {{}}
+                ---@return Entity?
+                function Holder:GetOwner() end
+
+                {ASSERT_VALID}
+                local function RequireValid(ent) if not IsValid(ent) then error("invalid") end end
+
+                ---@param holder Holder
+                local function use(holder)
+                    {call}
+                    local owner = holder:GetOwner()
+                    print(owner)
+                end
+                "#
+            ));
+            let owner = nth_name_expr_type_from_end(&mut ws, file_id, "owner", 0);
+            assert_eq!(ws.humanize_type(owner), "Entity", "{call}");
+        }
+    }
+
     /// An asserting helper in another file narrows while it asserts, and
     /// editing, deleting and reopening that file follows it.
     #[gtest]
