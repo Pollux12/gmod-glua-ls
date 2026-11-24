@@ -105,7 +105,7 @@ fn bound_arg(
 /// What `call` passes for parameter `param`: `Some(None)` when it passes
 /// nothing there, which the parameter reads as `nil`, and `None` when a last
 /// argument that expands may reach it.
-fn passed_arg(call: &LuaCallExpr, param: usize) -> Option<Option<LuaExpr>> {
+pub(crate) fn passed_arg(call: &LuaCallExpr, param: usize) -> Option<Option<LuaExpr>> {
     if let Some(arg) = arg_for_param(call, param) {
         return Some(Some(arg));
     }

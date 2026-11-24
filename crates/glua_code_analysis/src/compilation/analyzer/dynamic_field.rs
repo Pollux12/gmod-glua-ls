@@ -917,9 +917,10 @@ pub(crate) fn installed_field_type(
             continue;
         };
         let forwarded = forwarded_param(db, signature_id, &value)
-            .and_then(|param| installer_arg(db, &call_expr, signature_id, param));
+            .and_then(|param| installer_passed_arg(db, &call_expr, signature_id, param));
         let typ = match (forwarded, &value) {
-            (Some(arg), _) => infer_expr(db, cache, arg).ok(),
+            (Some(Some(arg)), _) => infer_expr(db, cache, arg).ok(),
+            (Some(None), _) => Some(LuaType::Nil),
             (None, LuaExpr::TableExpr(table_expr)) => {
                 per_call_table_type(db, cache, &call_expr, signature_id, table_expr)
             }
@@ -1151,11 +1152,22 @@ fn installer_arg(
     signature_id: LuaSignatureId,
     param: usize,
 ) -> Option<LuaExpr> {
+    installer_passed_arg(db, call_expr, signature_id, param).flatten()
+}
+
+/// What `call_expr` passes for installer parameter `param`, as
+/// `crate::semantic::passed_arg` tells it.
+fn installer_passed_arg(
+    db: &DbIndex,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+    param: usize,
+) -> Option<Option<LuaExpr>> {
     let is_colon_define = db
         .get_signature_index()
         .get(&signature_id)
         .is_some_and(|signature| signature.is_colon_define);
-    crate::semantic::arg_for_param(call_expr, param + usize::from(is_colon_define))
+    crate::semantic::passed_arg(call_expr, param + usize::from(is_colon_define))
 }
 
 fn installer_write(

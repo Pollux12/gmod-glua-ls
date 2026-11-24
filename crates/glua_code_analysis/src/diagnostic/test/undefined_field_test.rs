@@ -4783,6 +4783,30 @@ owner:CompletelyMadeUpMethod()
         assert_eq!(ws.humanize_type(ws.local_ty(file_id, "x")), "5");
     }
 
+    /// A field a call installs without passing its value holds `nil`, not
+    /// what other calls passed, unless an expanding last argument may fill it.
+    #[test]
+    fn test_installed_field_a_call_passes_no_value_for_holds_nil() {
+        let mut ws = dynamic_field_workspace();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_fields.lua",
+            r#"
+            local function set_field(t, k, v) t[k] = v end
+            ---@return integer
+            local function value() end
+            local A, B, C = {}, {}, {}
+            set_field(A, "x", 123)
+            set_field(B, "y")
+            set_field(C, "z", value())
+            local y = B.y
+            local z = C.z
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "y")), "nil");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "z")), "integer");
+    }
+
     /// A registry only holds the keys its calls register.
     #[test]
     fn test_registry_reports_a_key_no_call_registered() {

@@ -45,7 +45,7 @@ pub(crate) use infer_index::{
 };
 pub(crate) use infer_index::{
     arg_for_param, factory_bound_metatable_index, member_is_finite_named_dynamic_assignment,
-    with_file_cache,
+    passed_arg, with_file_cache,
 };
 pub(crate) use infer_name::find_self_ref_id;
 pub(crate) use infer_name::infer_authoritative_method_self_type;

@@ -1,5 +1,5 @@
 mod factory_call;
-pub(crate) use factory_call::{arg_for_param, with_file_cache};
+pub(crate) use factory_call::{arg_for_param, passed_arg, with_file_cache};
 mod function_index;
 pub(crate) use function_index::code_index_function;
 mod infer_array;
