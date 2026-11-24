@@ -573,14 +573,13 @@ return IDS
 end
 "#;
 
-    /// A loader that picks between `include` and `AddCSLuaFile`, or loads
-    /// only under a condition, names the file its call gives without loading
-    /// it in the caller's realm: which realm runs the file depends on its
-    /// branches.
+    /// A loader that picks between `include` and `AddCSLuaFile` by its
+    /// arguments, or loads only under a condition other than the realm, names
+    /// the file its call gives without loading it in the caller's realm:
+    /// which realm runs the file depends on its branches.
     #[test]
     fn a_call_of_a_dispatching_or_conditional_loader_only_names_the_file() {
         for loader in [
-            "function MyLoad(path)\n    if SERVER then AddCSLuaFile(path) end\n    include(path)\nend\n",
             "function MyLoad(path)\n    if not path then return end\n    include(path)\nend\n",
             "function MyLoad(path, enabled)\n    if enabled then include(path) end\nend\n",
             REALM_LOADER,

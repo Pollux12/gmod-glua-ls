@@ -374,40 +374,42 @@ fn collect_annotated_load_dependency_site(
     pending: &mut Vec<PendingCallSite>,
 ) -> Option<()> {
     let call_path = call_expr.get_access_path()?;
-    let LoadCall {
+    for LoadCall {
         kind,
         path_arg_idx,
         realms,
-    } = annotated_roles.load_call(db, file_id, &call_expr, &call_path)?;
-    let arg_expr = call_expr
-        .get_args_list()
-        .and_then(|args| args.get_args().nth(path_arg_idx));
-    // `AddCSLuaFile()` with no path sends the calling file itself.
-    let sends_itself = arg_expr.is_none() && kind == LuaDependencyKind::AddCSLuaFile;
-    if arg_expr.is_none() && !sends_itself {
-        return None;
-    }
-    let path = arg_expr.as_ref().and_then(static_literal_string);
-    let target_file_id = match path.as_deref() {
-        Some(path) => resolve_load_dependency_target(db, file_id, kind, path),
-        None => sends_itself.then_some(file_id),
-    };
-    let path_keys = path
-        .as_deref()
-        .map(|path| crate::dependency_site_path_keys(db, file_id, path))
-        .unwrap_or_default();
+    } in annotated_roles.load_calls(db, file_id, &call_expr, &call_path)
+    {
+        let arg_expr = call_expr
+            .get_args_list()
+            .and_then(|args| args.get_args().nth(path_arg_idx));
+        // `AddCSLuaFile()` with no path sends the calling file itself.
+        let sends_itself = arg_expr.is_none() && kind == LuaDependencyKind::AddCSLuaFile;
+        if arg_expr.is_none() && !sends_itself {
+            continue;
+        }
+        let path = arg_expr.as_ref().and_then(static_literal_string);
+        let target_file_id = match path.as_deref() {
+            Some(path) => resolve_load_dependency_target(db, file_id, kind, path),
+            None => sends_itself.then_some(file_id),
+        };
+        let path_keys = path
+            .as_deref()
+            .map(|path| crate::dependency_site_path_keys(db, file_id, path))
+            .unwrap_or_default();
 
-    pending.push(PendingCallSite::Dependency(LuaDependencySite {
-        source_file_id: file_id,
-        target_file_id,
-        kind,
-        realms,
-        path,
-        path_keys,
-        original_expr: call_expr.syntax().text().to_string(),
-        call_range: call_expr.get_range(),
-        range: arg_expr.map_or(call_expr.get_range(), |arg| arg.get_range()),
-    }));
+        pending.push(PendingCallSite::Dependency(LuaDependencySite {
+            source_file_id: file_id,
+            target_file_id,
+            kind,
+            realms,
+            path,
+            path_keys,
+            original_expr: call_expr.syntax().text().to_string(),
+            call_range: call_expr.get_range(),
+            range: arg_expr.map_or(call_expr.get_range(), |arg| arg.get_range()),
+        }));
+    }
     Some(())
 }
 
@@ -674,6 +676,49 @@ impl HelperRegistryBuilder {
             local_member,
         ));
     }
+}
+
+/// A load a function's calls make: its kind, the parameter naming the file,
+/// and the realms the function's realm branches leave it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct LoadRole {
+    kind: LuaDependencyKind,
+    arg: AnnotatedGmodCallArgRole,
+    realms: Option<GmodStateMask>,
+}
+
+impl LoadRole {
+    fn new(kind: LuaDependencyKind, arg: AnnotatedGmodCallArgRole) -> Self {
+        Self {
+            kind,
+            arg,
+            realms: None,
+        }
+    }
+}
+
+/// The dynamic load a call making `loads` stands for: what its loads do
+/// together. A load its file's realm decides, or an `include` a realm branch
+/// holds, leaves it none, since a dynamic load runs in its caller's realms.
+fn load_calls_alias(loads: &[LoadCall]) -> Option<DynamicLoadAlias> {
+    let mut alias: Option<DynamicLoadAlias> = None;
+    for load in loads {
+        if load.realms.is_some() && load.kind != LuaDependencyKind::AddCSLuaFile {
+            return None;
+        }
+        let Some(load_alias) = DynamicLoadAlias::from_dependency_kind(load.kind, load.path_arg_idx)
+        else {
+            if load.kind == LuaDependencyKind::Dispatched {
+                return None;
+            }
+            continue;
+        };
+        match &mut alias {
+            Some(alias) => alias.merge(load_alias),
+            None => alias = Some(load_alias),
+        }
+    }
+    alias
 }
 
 /// The load a call of an annotated loader makes: its kind, the argument
@@ -8003,7 +8048,7 @@ struct AnnotatedGmodCallRoleMap<'a> {
     file_id: FileId,
 }
 
-#[derive(Clone, Default, Hash)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 struct AnnotatedGmodCallArgRole {
     param_idx: usize,
     priority: i64,
@@ -8065,9 +8110,7 @@ struct AnnotatedGmodCallRoles {
     system_callback_roles: Vec<(GmodSystemCallKind, AnnotatedGmodCallArgRole)>,
     hook_roles: Vec<(GmodHookKind, AnnotatedGmodCallArgRole)>,
     hook_callback_roles: Vec<AnnotatedGmodCallArgRole>,
-    load_roles: Vec<(LuaDependencyKind, AnnotatedGmodCallArgRole)>,
-    /// The realms a wrapper's realm branches leave its load to run in.
-    load_realms: Option<GmodStateMask>,
+    load_roles: Vec<LoadRole>,
     compilefile_roles: Vec<AnnotatedGmodCallArgRole>,
     environment_target_roles: Vec<AnnotatedGmodCallArgRole>,
     environment_table_roles: Vec<AnnotatedGmodCallArgRole>,
@@ -8172,18 +8215,18 @@ impl AnnotatedGmodCallRoles {
             ("gmod.hook", "callback") => {
                 self.hook_callback_roles.push(arg_role);
             }
-            ("gmod.load", "require") => {
-                self.load_roles.push((LuaDependencyKind::Require, arg_role))
-            }
-            ("gmod.load", "include") => {
-                self.load_roles.push((LuaDependencyKind::Include, arg_role))
-            }
+            ("gmod.load", "require") => self
+                .load_roles
+                .push(LoadRole::new(LuaDependencyKind::Require, arg_role)),
+            ("gmod.load", "include") => self
+                .load_roles
+                .push(LoadRole::new(LuaDependencyKind::Include, arg_role)),
             ("gmod.load", "addcsluafile") | ("gmod.load", "add_cs_lua_file") => self
                 .load_roles
-                .push((LuaDependencyKind::AddCSLuaFile, arg_role)),
+                .push(LoadRole::new(LuaDependencyKind::AddCSLuaFile, arg_role)),
             ("gmod.load", "includecs") | ("gmod.load", "include_cs") => self
                 .load_roles
-                .push((LuaDependencyKind::IncludeCS, arg_role)),
+                .push(LoadRole::new(LuaDependencyKind::IncludeCS, arg_role)),
             ("gmod.load", "compilefile") => self.compilefile_roles.push(arg_role),
             ("gmod.environment", "target") => self.environment_target_roles.push(arg_role),
             ("gmod.environment", "environment") => self.environment_table_roles.push(arg_role),
@@ -8284,7 +8327,7 @@ impl AnnotatedGmodCallRoles {
         self.hook_roles.sort_by_key(|(_, role)| role.sort_key());
         self.hook_callback_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
-        self.load_roles.sort_by_key(|(_, role)| role.sort_key());
+        self.load_roles.sort_by_key(|load| load.arg.sort_key());
         self.compilefile_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.environment_target_roles
@@ -8500,28 +8543,34 @@ impl AnnotatedGmodCallRoles {
         ))
     }
 
-    fn load_call(&self, is_colon_call: bool) -> Option<LoadCall> {
+    /// The loads a call with these roles makes: one for each load role, or
+    /// the `CompileFile` it makes.
+    fn load_calls(&self, is_colon_call: bool) -> Vec<LoadCall> {
+        if self.load_roles.is_empty() {
+            return self
+                .compilefile_call(is_colon_call)
+                .map(|path_arg_idx| LoadCall {
+                    kind: LuaDependencyKind::CompileFile,
+                    path_arg_idx,
+                    realms: None,
+                })
+                .into_iter()
+                .collect();
+        }
         self.load_roles
-            .first()
-            .and_then(|(kind, role)| {
+            .iter()
+            .filter_map(|load| {
                 Some(LoadCall {
-                    kind: *kind,
+                    kind: load.kind,
                     path_arg_idx: param_idx_to_call_arg_idx(
-                        role.param_idx,
+                        load.arg.param_idx,
                         is_colon_call,
                         self.is_colon_define,
                     )?,
-                    realms: self.load_realms,
+                    realms: load.realms,
                 })
             })
-            .or_else(|| {
-                self.compilefile_call(is_colon_call)
-                    .map(|path_arg_idx| LoadCall {
-                        kind: LuaDependencyKind::CompileFile,
-                        path_arg_idx,
-                        realms: None,
-                    })
-            })
+            .collect()
     }
 
     fn compilefile_call(&self, is_colon_call: bool) -> Option<usize> {
@@ -8539,13 +8588,11 @@ impl AnnotatedGmodCallRoles {
     }
 
     fn load_alias(&self, is_colon_call: bool) -> Option<DynamicLoadAlias> {
-        self.load_call(is_colon_call)
-            .and_then(|load| DynamicLoadAlias::from_dependency_kind(load.kind, load.path_arg_idx))
-            .or_else(|| {
-                self.overloads
-                    .iter()
-                    .find_map(|overload| overload.load_alias(is_colon_call))
-            })
+        load_calls_alias(&self.load_calls(is_colon_call)).or_else(|| {
+            self.overloads
+                .iter()
+                .find_map(|overload| overload.load_alias(is_colon_call))
+        })
     }
 
     fn file_find_call(&self, is_colon_call: bool) -> Option<(usize, usize)> {
@@ -8585,45 +8632,59 @@ impl AnnotatedGmodCallRoles {
         ))
     }
 
-    /// Whether calls with these roles load a file.
-    fn loads(&self) -> bool {
-        !self.load_roles.is_empty()
-    }
-
-    /// The roles of a function that loads a file by passing its parameter on,
-    /// unchanged, as the path of a call with these roles, in the realms its
-    /// realm branches leave the call. A call it does not always make, or one
-    /// of several loads it `picks_among`, loads the file in a realm its
+    /// The roles of a function that loads files by passing its parameter on,
+    /// unchanged, as the path of a call with these roles: each load the call
+    /// makes, in the realms the function's realm branches leave the call. A
+    /// call the function does not always make loads its file in a realm its
     /// branches decide.
-    fn forwarded_load(&self, forward: &ForwardedCall, picks_among: bool) -> Option<Self> {
-        let (kind, role) = self.load_roles.first()?;
-        let (kind, load_realms) = match forward.reach {
-            ForwardedReach::Always(realms) if !picks_among => (
-                *kind,
-                match (self.load_realms, realms) {
-                    (Some(inner), Some(outer)) => Some(inner.intersection(outer)),
-                    (inner, outer) => inner.or(outer),
-                },
-            ),
-            _ => (LuaDependencyKind::Dispatched, None),
-        };
-        let arg_idx = param_idx_to_call_arg_idx(
-            role.param_idx,
-            forward.callee_is_colon,
-            self.is_colon_define,
-        )?;
-        let role = forward
-            .args
-            .get(arg_idx)?
-            .forward_role(role)
-            .filter(|role| {
-                role.field_path.is_empty() && role.prefix.is_empty() && role.suffix.is_empty()
-            })?;
-        Some(Self {
-            load_roles: vec![(kind, role)],
-            load_realms,
+    fn forwarded_load(&self, forward: &ForwardedCall) -> Option<Self> {
+        let load_roles = self
+            .load_roles
+            .iter()
+            .filter_map(|load| {
+                let (kind, realms) = match forward.reach {
+                    ForwardedReach::Always(realms) => (
+                        load.kind,
+                        match (load.realms, realms) {
+                            (Some(inner), Some(outer)) => Some(inner.intersection(outer)),
+                            (inner, outer) => inner.or(outer),
+                        },
+                    ),
+                    ForwardedReach::Sometimes => (LuaDependencyKind::Dispatched, None),
+                };
+                let arg_idx = param_idx_to_call_arg_idx(
+                    load.arg.param_idx,
+                    forward.callee_is_colon,
+                    self.is_colon_define,
+                )?;
+                let arg = forward
+                    .args
+                    .get(arg_idx)?
+                    .forward_role(&load.arg)
+                    .filter(|role| {
+                        role.field_path.is_empty()
+                            && role.prefix.is_empty()
+                            && role.suffix.is_empty()
+                    })?;
+                Some(LoadRole { kind, arg, realms })
+            })
+            .collect::<Vec<_>>();
+        (!load_roles.is_empty()).then(|| Self {
+            load_roles,
             ..Self::default()
         })
+    }
+
+    /// Adds the loads of `other`, another call in the same function, that
+    /// these roles do not already make: whether any were new.
+    fn add_loads(&mut self, other: Self) -> bool {
+        let before = self.load_roles.len();
+        for load in other.load_roles {
+            if !self.load_roles.contains(&load) {
+                self.load_roles.push(load);
+            }
+        }
+        self.load_roles.len() > before
     }
 
     /// The roles of a function that registers a panel by passing its
@@ -9266,15 +9327,16 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             })
     }
 
-    fn load_call(
+    fn load_calls(
         &self,
         db: &DbIndex,
         file_id: FileId,
         call_expr: &LuaCallExpr,
         call_path: &str,
-    ) -> Option<LoadCall> {
+    ) -> Vec<LoadCall> {
         self.roles_for_call(db, file_id, call_expr, call_path)
-            .and_then(|roles| roles.load_call(call_expr.is_colon_call()))
+            .map(|roles| roles.load_calls(call_expr.is_colon_call()))
+            .unwrap_or_default()
     }
 
     fn compilefile_call(

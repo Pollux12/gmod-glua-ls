@@ -3602,6 +3602,108 @@ end
         }
     }
 
+    /// A global loader that sends its file to clients on the server and
+    /// includes it everywhere loads the file in every realm its shared caller
+    /// runs in, ready for clients, as calling both itself would.
+    #[gtest]
+    fn test_load_index_global_wrapper_sending_and_including_loads_shared() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let thing_id = ws.def_file("lua/mylib/thing.lua", "return true");
+        ws.def_file(
+            "lua/autorun/sh_loader.lua",
+            "function MyLoad(path)\n    if SERVER then AddCSLuaFile(path) end\n    include(path)\nend\n",
+        );
+        ws.def_file("lua/autorun/sh_boot.lua", "MyLoad(\"mylib/thing.lua\")\n");
+
+        expect_dynamic_load_info(
+            &mut ws,
+            thing_id,
+            GmodStateMask::SHARED,
+            true,
+            GmodRealm::Shared,
+        );
+    }
+
+    /// A wrapper of a loader that sends and includes its file makes both
+    /// loads too.
+    #[gtest]
+    fn test_load_index_wrapper_of_sending_and_including_loader_loads_shared() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let thing_id = ws.def_file("lua/mylib/thing.lua", "return true");
+        ws.def_file(
+            "lua/autorun/sh_loader.lua",
+            "function MyLoad(path)\n    if SERVER then AddCSLuaFile(path) end\n    include(path)\nend\nfunction LoadLib(path)\n    MyLoad(path)\nend\n",
+        );
+        ws.def_file("lua/autorun/sh_boot.lua", "LoadLib(\"mylib/thing.lua\")\n");
+
+        expect_dynamic_load_info(
+            &mut ws,
+            thing_id,
+            GmodStateMask::SHARED,
+            true,
+            GmodRealm::Shared,
+        );
+    }
+
+    /// Turning an including loader into one that also sends its file, back
+    /// again, deleting it and putting it back each move how its file loads as
+    /// a cold build has it.
+    #[gtest]
+    fn test_load_index_wrapper_gaining_and_losing_a_send_settles_as_cold_build() {
+        const SENDING: &str = "function MyLoad(path)\n    if SERVER then AddCSLuaFile(path) end\n    include(path)\nend\n";
+        const INCLUDING: &str = "function MyLoad(path)\n    include(path)\nend\n";
+        const LOADER: &str = "lua/autorun/sh_loader.lua";
+        let load = |ws: &mut VirtualWorkspace| {
+            let thing = ws
+                .analysis
+                .get_file_id(&ws.virtual_url_generator.new_uri("lua/mylib/thing.lua"))
+                .expect("thing");
+            ws.get_db_mut()
+                .get_gmod_load_index()
+                .get_file_info(&thing)
+                .map(|info| (info.state_mask, info.client_send_available))
+                .unwrap_or_default()
+        };
+        let build = |loader: Option<&str>| {
+            let mut ws = VirtualWorkspace::new();
+            set_gmod_enabled(&mut ws);
+            ws.def_file("lua/mylib/thing.lua", "return true");
+            if let Some(loader) = loader {
+                ws.def_file(LOADER, loader);
+            }
+            ws.def_file("lua/autorun/sh_boot.lua", "MyLoad(\"mylib/thing.lua\")\n");
+            ws
+        };
+        let mut warm = build(Some(INCLUDING));
+        let including = load(&mut warm);
+        warm.def_file(LOADER, SENDING);
+        let sending = load(&mut warm);
+        warm.def_file(LOADER, INCLUDING);
+        let including_again = load(&mut warm);
+        let loader_uri = warm.virtual_url_generator.new_uri(LOADER);
+        warm.analysis
+            .remove_file_by_uri(&loader_uri)
+            .0
+            .expect("loader must be removed");
+        let deleted = load(&mut warm);
+        warm.def_file(LOADER, SENDING);
+        let reopened = load(&mut warm);
+
+        let cold = |loader| load(&mut build(loader));
+        assert_eq!(
+            (including, sending, including_again, deleted, reopened),
+            (
+                cold(Some(INCLUDING)),
+                (GmodStateMask::SHARED, true),
+                cold(Some(INCLUDING)),
+                cold(None),
+                (GmodStateMask::SHARED, true)
+            )
+        );
+    }
+
     /// Adding a client guard to a loader, taking it away, deleting the loader
     /// and putting it back each move the realm its file loads in as a cold
     /// build has it.

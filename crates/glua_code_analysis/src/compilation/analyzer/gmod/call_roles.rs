@@ -437,48 +437,38 @@ impl GmodCallRoles {
                     .and_then(|_| self.roles.roles_by_path.get(&callee).cloned())
             })
         };
-        // A function that makes several load calls picks among them, so which
-        // realm runs the file it is given depends on its branches.
-        let mut picks_among_loads: HashSet<String> = HashSet::default();
+        // A wrapper makes the loads of each call it forwards its parameters
+        // to, and a wrapper of a wrapper those of the inner one, so the roles
+        // only grow until no wrapper gains one.
+        let mut derived: HashMap<String, AnnotatedGmodCallRoles> = HashMap::default();
         loop {
-            let mut derived: HashMap<String, AnnotatedGmodCallRoles> = HashMap::default();
-            loop {
-                let mut grew = false;
-                for forward in &forwarded_calls {
-                    let path = &forward.wrapper_path;
-                    if derived.contains_key(path) || contributions.path_winner(path).is_some() {
-                        continue;
-                    }
-                    let Some(inner) = callee_roles(&derived, forward) else {
-                        continue;
-                    };
-                    let Some(roles) = inner.forwarded_class_registration(forward).or_else(|| {
-                        inner.forwarded_load(forward, picks_among_loads.contains(path))
-                    }) else {
-                        continue;
-                    };
-                    derived.insert(path.clone(), roles);
-                    grew = true;
-                }
-                if !grew {
-                    break;
-                }
-            }
-            let mut load_calls: HashMap<&str, usize> = HashMap::default();
+            let mut grew = false;
             for forward in &forwarded_calls {
-                if callee_roles(&derived, forward).is_some_and(|roles| roles.loads()) {
-                    *load_calls.entry(forward.wrapper_path.as_str()).or_default() += 1;
+                let path = &forward.wrapper_path;
+                if contributions.path_winner(path).is_some() {
+                    continue;
+                }
+                let Some(inner) = callee_roles(&derived, forward) else {
+                    continue;
+                };
+                if let Some(roles) = inner.forwarded_class_registration(forward) {
+                    if !derived.contains_key(path) {
+                        derived.insert(path.clone(), roles);
+                        grew = true;
+                    }
+                } else if let Some(roles) = inner.forwarded_load(forward) {
+                    match derived.get_mut(path) {
+                        Some(existing) => grew |= existing.add_loads(roles),
+                        None => {
+                            derived.insert(path.clone(), roles);
+                            grew = true;
+                        }
+                    }
                 }
             }
-            let newly_picking = load_calls
-                .into_iter()
-                .filter(|(path, count)| *count > 1 && !picks_among_loads.contains(*path))
-                .map(|(path, _)| path.to_string())
-                .collect::<Vec<_>>();
-            if newly_picking.is_empty() {
+            if !grew {
                 break derived;
             }
-            picks_among_loads.extend(newly_picking);
         }
         .into_iter()
         .map(|(path, roles)| {

@@ -40,8 +40,9 @@ fn require_site(
     call_range: TextRange,
 ) -> Option<&crate::LuaDependencySite> {
     db.get_file_dependencies_index()
-        .load_site_of_call(&file_id, call_range)
-        .filter(|site| site.kind == LuaDependencyKind::Require)
+        .get_dependency_sites(&file_id)?
+        .iter()
+        .find(|site| site.call_range == call_range && site.kind == LuaDependencyKind::Require)
 }
 
 pub fn enum_variable_is_param(
