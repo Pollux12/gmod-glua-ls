@@ -13,14 +13,19 @@ impl Checker for RequireModuleVisibilityChecker {
         let Some(buckets) = context.file_buckets() else {
             return;
         };
-        for call_expr in buckets.call_exprs.iter().cloned() {
-            if let Some(path_arg) = crate::require_path_arg(
-                semantic_model.get_db(),
-                semantic_model.get_file_id(),
-                &call_expr,
-            ) {
-                check_require_path(context, semantic_model, path_arg);
-            }
+        let path_args = buckets
+            .call_exprs
+            .iter()
+            .filter_map(|call_expr| {
+                crate::require_path_arg(
+                    semantic_model.get_db(),
+                    semantic_model.get_file_id(),
+                    call_expr,
+                )
+            })
+            .collect::<Vec<_>>();
+        for path_arg in path_args {
+            check_require_path(context, semantic_model, path_arg);
         }
     }
 }
