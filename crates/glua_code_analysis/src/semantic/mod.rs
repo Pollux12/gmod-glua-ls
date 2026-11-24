@@ -73,11 +73,11 @@ pub(crate) use infer::{
     AccessPaths, keep_access_paths, restore_access_path_snapshot, stop_keeping_access_paths,
     take_access_path_snapshot, with_access_paths,
 };
+pub(crate) use infer::{declaring_for_range, try_infer_enclosing_for_range_iter_type};
 pub(crate) use infer::{
-    arg_for_param, factory_bound_metatable_index, passed_arg, seen_local_function_calls,
+    factory_bound_metatable_index, passed_arg, seen_local_function_calls,
     takes_local_call_site_args, with_file_cache,
 };
-pub(crate) use infer::{declaring_for_range, try_infer_enclosing_for_range_iter_type};
 pub(crate) use infer::{
     getmetatable_call_metatable, proxy_metatable, table_backing_range_from_expr,
 };

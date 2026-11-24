@@ -116,7 +116,7 @@ pub(crate) fn passed_arg(call: &LuaCallExpr, param: usize) -> Option<Option<LuaE
 
 /// What `call` passes for parameter `param`, counting a method's `self` as
 /// parameter 0.
-pub(crate) fn arg_for_param(call: &LuaCallExpr, param: usize) -> Option<LuaExpr> {
+fn arg_for_param(call: &LuaCallExpr, param: usize) -> Option<LuaExpr> {
     let mut args = call.get_args_list()?.get_args();
     if !call.is_colon_call() {
         return args.nth(param);
