@@ -3201,6 +3201,59 @@ mod test {
         assert!(is_function_type(&ws.local_ty(file_id, "ping")));
     }
 
+    /// An `__index` function returning a lookup `or` a default gives the
+    /// field when it is there and the default when it is not.
+    #[test]
+    fn an_index_function_with_a_default_gives_the_field_or_the_default() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_defaults.lua",
+            r#"
+            ---@type { label: string? }
+            local Stored = {}
+            local MT = {}
+            MT.__index = function(self, key)
+                return Stored[key] or 5
+            end
+            local object = setmetatable({}, MT)
+            local label = object.label
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "label")),
+            "(integer|string)"
+        );
+    }
+
+    /// An `__index` function that returns a value of its own for some keys
+    /// gives that value too, not only the field it looks up.
+    #[test]
+    fn an_index_function_returning_its_own_value_for_some_keys_gives_it_too() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_special_key.lua",
+            r#"
+            ---@type { label: string }
+            local Stored = {}
+            local MT = {}
+            MT.__index = function(self, key)
+                if key == "id" then
+                    return false
+                end
+                return Stored[key]
+            end
+            local object = setmetatable({}, MT)
+            local label = object.label
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "label")),
+            "(boolean|string)"
+        );
+    }
+
     /// `getmetatable` gives a metatable's `__metatable` field when it has one.
     #[test]
     fn getmetatable_gives_the_metatable_field_that_hides_it() {

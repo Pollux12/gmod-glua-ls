@@ -11,10 +11,11 @@ use crate::{
 };
 
 /// What a read of `key` gets from an `__index` function: a key the table
-/// does not hold reaches `__index(self, key)`. Each `return P[key]` or
-/// `rawget(P, key)` (see [`collect_key_sources`]) gives `P`'s field `key`,
-/// widened as the stored value can change. Without such a return the read is what the
-/// function returns.
+/// does not hold reaches `__index(self, key)`. Each `P[key]` or
+/// `rawget(P, key)` it returns (see [`KeyRead`]) gives `P`'s field `key`,
+/// widened as the stored value can change, and every other value it returns
+/// counts as itself. Without a lookup that finds the field the read is what
+/// the function returns.
 pub(super) fn infer_function_index_member(
     db: &DbIndex,
     cache: &LuaInferCache,
@@ -31,44 +32,32 @@ pub(super) fn infer_function_index_member(
     };
     let closure = signature_closure(db, signature_id)?;
     let signature = db.get_signature_index().get(signature_id)?;
-    let key_param_idx = if signature.is_colon_define { 0 } else { 1 };
-
-    let file_id = signature_id.get_file_id();
-    let mut value_cache = LuaInferCache::new(file_id, cache.get_config().clone());
-    let mut field_types = Vec::new();
+    let mut read = KeyRead {
+        db,
+        signature_id,
+        key_param_idx: if signature.is_colon_define { 0 } else { 1 },
+        key_name: LuaMemberKey::Name(key_name.into()),
+        cache: LuaInferCache::new(signature_id.get_file_id(), cache.get_config().clone()),
+        found_field: false,
+    };
+    let mut returned_types = Vec::new();
     for return_stat in closure.descendants::<LuaReturnStat>() {
         if return_stat.ancestors::<LuaClosureExpr>().next().as_ref() != Some(&closure) {
             continue;
         }
-        let Some(returned) = return_stat.get_expr_list().next() else {
-            continue;
+        let returned_type = match return_stat.get_expr_list().next() {
+            Some(returned) => read.value_type(returned),
+            None => Some(LuaType::Nil),
         };
-        let mut sources = Vec::new();
-        collect_key_sources(db, signature_id, key_param_idx, returned, &mut sources);
-        for source in sources {
-            let Ok(source_type) = infer_expr(db, &mut value_cache, source) else {
-                continue;
-            };
-            let members = find_members_with_key(
-                db,
-                &source_type,
-                LuaMemberKey::Name(key_name.as_str().into()),
-                true,
-            );
-            field_types.extend(
-                members
-                    .into_iter()
-                    .flatten()
-                    .map(|member| widen_literal_type_for_assignment(&member.typ)),
-            );
-        }
+        returned_types.extend(returned_type);
     }
 
-    if let Some(field_type) = field_types
-        .into_iter()
-        .reduce(|left, right| TypeOps::Union.apply(db, &left, &right))
+    if read.found_field
+        && let Some(returned_type) = returned_types
+            .into_iter()
+            .reduce(|left, right| TypeOps::Union.apply(db, &left, &right))
     {
-        return Some(field_type);
+        return Some(returned_type);
     }
     match signature.get_return_type() {
         LuaType::Nil => Some(LuaType::Unknown),
@@ -76,52 +65,79 @@ pub(super) fn infer_function_index_member(
     }
 }
 
-/// The tables `returned` reads the key param from: `P` of `P[key]` or
-/// `rawget(P, key)`, also through a local holding it or either side of `or`.
-fn collect_key_sources(
-    db: &DbIndex,
-    signature_id: &LuaSignatureId,
+/// Reads of the key parameter of an `__index` function from the tables it
+/// looks in: `P[key]` or `rawget(P, key)`, also through a local holding it.
+struct KeyRead<'a> {
+    db: &'a DbIndex,
+    signature_id: &'a LuaSignatureId,
     key_param_idx: usize,
-    returned: LuaExpr,
-    sources: &mut Vec<LuaExpr>,
-) {
-    let is_key = |expr: Option<LuaExpr>| matches!(expr, Some(LuaExpr::NameExpr(name)) if is_param(db, signature_id, &name, key_param_idx));
-    match unaliased(db, signature_id, returned) {
-        Some(LuaExpr::IndexExpr(lookup)) => {
-            let key = match lookup.get_index_key() {
-                Some(LuaIndexKey::Expr(key)) => Some(key),
-                _ => None,
-            };
-            if is_key(key)
-                && let Some(source) = lookup.get_prefix_expr()
-            {
-                sources.push(source);
-            }
+    key_name: LuaMemberKey,
+    cache: LuaInferCache,
+    /// Whether a lookup found the field in the table it looks in.
+    found_field: bool,
+}
+
+impl KeyRead<'_> {
+    /// What `expr` gives when the function returns it: `None` when it is a
+    /// lookup of a table without the field, or cannot be inferred.
+    fn value_type(&mut self, expr: LuaExpr) -> Option<LuaType> {
+        let expr = unaliased(self.db, self.signature_id, expr.clone()).unwrap_or(expr);
+        if let Some(source) = self.lookup_source(&expr) {
+            return self.field_type(source);
         }
-        Some(LuaExpr::CallExpr(call)) => {
-            let is_rawget = matches!(
-                call.get_prefix_expr(),
-                Some(LuaExpr::NameExpr(callee)) if callee.get_name_text().as_deref() == Some("rawget")
-            );
-            let mut args = call
-                .get_args_list()
-                .into_iter()
-                .flat_map(|args| args.get_args());
-            if let (true, Some(source), key) = (is_rawget, args.next(), args.next())
-                && is_key(key)
-            {
-                sources.push(source);
-            }
-        }
-        Some(LuaExpr::BinaryExpr(binary))
-            if binary.get_op_token().map(|op| op.get_op()) == Some(BinaryOperator::OpOr) =>
+        if let LuaExpr::BinaryExpr(binary) = &expr
+            && binary.get_op_token().map(|op| op.get_op()) == Some(BinaryOperator::OpOr)
         {
-            if let Some((left, right)) = binary.get_exprs() {
-                collect_key_sources(db, signature_id, key_param_idx, left, sources);
-                collect_key_sources(db, signature_id, key_param_idx, right, sources);
-            }
+            let (left, right) = binary.get_exprs()?;
+            let left = self.value_type(left);
+            let right = self.value_type(right);
+            return match (left, right) {
+                (Some(left), _) if !left.is_nullable() => Some(left),
+                (Some(left), Some(right)) => Some(TypeOps::Union.apply(
+                    self.db,
+                    &TypeOps::Remove.apply(self.db, &left, &LuaType::Nil),
+                    &right,
+                )),
+                (left, right) => left.or(right),
+            };
         }
-        _ => {}
+        infer_expr(self.db, &mut self.cache, expr)
+            .ok()
+            .map(|typ| widen_literal_type_for_assignment(&typ))
+    }
+
+    /// `P` of `P[key]` or `rawget(P, key)`.
+    fn lookup_source(&self, expr: &LuaExpr) -> Option<LuaExpr> {
+        match expr {
+            LuaExpr::IndexExpr(lookup) => match lookup.get_index_key() {
+                Some(LuaIndexKey::Expr(key)) if self.is_key(&key) => lookup.get_prefix_expr(),
+                _ => None,
+            },
+            LuaExpr::CallExpr(call) => {
+                let is_rawget = matches!(
+                    call.get_prefix_expr(),
+                    Some(LuaExpr::NameExpr(callee)) if callee.get_name_text().as_deref() == Some("rawget")
+                );
+                let mut args = call.get_args_list()?.get_args();
+                let (source, key) = (args.next()?, args.next()?);
+                (is_rawget && self.is_key(&key)).then_some(source)
+            }
+            _ => None,
+        }
+    }
+
+    fn is_key(&self, expr: &LuaExpr) -> bool {
+        matches!(expr, LuaExpr::NameExpr(name) if is_param(self.db, self.signature_id, name, self.key_param_idx))
+    }
+
+    fn field_type(&mut self, source: LuaExpr) -> Option<LuaType> {
+        let source_type = infer_expr(self.db, &mut self.cache, source).ok()?;
+        let field_type = find_members_with_key(self.db, &source_type, self.key_name.clone(), true)?
+            .into_iter()
+            .map(|member| widen_literal_type_for_assignment(&member.typ))
+            .reduce(|left, right| TypeOps::Union.apply(self.db, &left, &right))?;
+        self.found_field = true;
+        Some(field_type)
     }
 }
 
