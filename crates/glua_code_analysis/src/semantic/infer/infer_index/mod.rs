@@ -1576,12 +1576,13 @@ pub(crate) fn factory_bound_metatable_index(
 }
 
 /// A field a table may not hold, `own`, read where Lua falls back to
-/// `fallback` when it is absent: what both agree on, or either one.
+/// `fallback` when it is absent: what both agree on, or either one. A
+/// fallback that may be missing too leaves either one or `nil`.
 fn read_through_to(db: &DbIndex, own: &LuaType, fallback: &LuaType) -> LuaType {
-    if fallback.is_nullable() {
-        return own.clone();
-    }
     let present = TypeOps::Remove.apply(db, own, &LuaType::Nil);
+    if fallback.is_nullable() {
+        return TypeOps::Union.apply(db, &present, fallback);
+    }
     match TypeOps::Intersect.apply(db, fallback, &present) {
         LuaType::Never => TypeOps::Union.apply(db, &present, fallback),
         intersected => intersected,
@@ -3466,7 +3467,7 @@ fn infer_instance_member(
             index_expr.clone(),
             table_member_lookup_guard,
         ) {
-            Ok(table_type) if table_type.is_nullable() && !typ.is_nullable() => {
+            Ok(table_type) if table_type.is_nullable() => {
                 return Ok(read_through_to(db, &table_type, &typ));
             }
             Ok(table_type) => {

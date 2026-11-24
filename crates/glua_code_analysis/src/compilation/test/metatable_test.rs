@@ -3254,6 +3254,29 @@ mod test {
         );
     }
 
+    /// A field a table may not hold, read through an `__index` table whose
+    /// field may be missing too, keeps what both may hold.
+    #[test]
+    fn a_field_both_tables_may_lack_reads_either_value_or_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_read_through_nil.lua",
+            r#"
+            ---@return string?
+            local function maybeLabel() end
+            ---@return integer?
+            local function maybeId() end
+            local labelled = setmetatable({ label = maybeLabel() }, { __index = { label = maybeId() } })
+            local label = labelled.label
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "label")),
+            "(integer|string)?"
+        );
+    }
+
     /// `getmetatable` gives a metatable's `__metatable` field when it has one.
     #[test]
     fn getmetatable_gives_the_metatable_field_that_hides_it() {
