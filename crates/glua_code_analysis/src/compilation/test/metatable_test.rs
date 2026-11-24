@@ -3451,6 +3451,28 @@ mod test {
         );
     }
 
+    /// A factory that gives its parameter a default before storing it stores
+    /// the default when its call passes nothing, not the `nil` it was passed.
+    #[test]
+    fn a_factory_field_from_a_reassigned_parameter_holds_the_new_value() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_named.lua",
+            r#"
+            local function class(name)
+                name = name or "Object"
+                local cls = { name = name }
+                cls.__index = cls
+                return cls
+            end
+            local Base = class()
+            local baseName = Base.name
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "baseName")), "string");
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }

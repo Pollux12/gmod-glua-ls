@@ -58,7 +58,8 @@ fn infer_forwarded_arg(
 
 /// The index into `calls` of the innermost call of the function whose
 /// parameter `expr` names, that function, and the argument the call passes
-/// for the parameter: `None` when it passes nothing there.
+/// for the parameter: `None` when it passes nothing there. A parameter the
+/// function assigns to holds what it assigned, not what a call passed.
 fn bound_arg(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -68,9 +69,14 @@ fn bound_arg(
     let LuaExpr::NameExpr(name) = &expr.value else {
         return None;
     };
-    let decl_id = db
-        .get_reference_index()
-        .get_var_reference_decl(&expr.file_id, name.get_range())?;
+    let references = db.get_reference_index();
+    let decl_id = references.get_var_reference_decl(&expr.file_id, name.get_range())?;
+    if references
+        .get_decl_references(&expr.file_id, &decl_id)
+        .is_some_and(|refs| refs.is_written_after_declaration(decl_id.position))
+    {
+        return None;
+    }
     let (signature_id, param) = match db.get_decl_index().get_decl(&decl_id)?.extra {
         LuaDeclExtra::Param {
             idx, signature_id, ..
