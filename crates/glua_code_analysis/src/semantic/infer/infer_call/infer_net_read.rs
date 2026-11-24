@@ -60,39 +60,37 @@ fn received_type(
     declared: &LuaType,
 ) -> Option<LuaType> {
     let network = db.get_gmod_network_index();
-    let (flow, place) = network
-        .get_file_data(file_id)?
-        .receive_flows
-        .iter()
-        .find_map(|flow| {
-            let place = flow
-                .reads
-                .iter()
-                .position(|entry| entry.file_id == file_id && entry.range == range)?;
-            Some((flow, place))
-        })?;
-    if flow.reads_opaque || !fixed_up_to(&flow.reads, place) {
-        return None;
-    }
-    let read = &flow.reads[place];
-    let senders = pair_senders_for_receive(network, db.get_gmod_infer_index(), file_id, flow);
+    // A helper several receivers call, or one calls more than once, reads at
+    // each of those places, so it returns whatever any of them is sent.
     let mut received: Option<LuaType> = None;
-    for (_, sender) in senders {
-        if !sender.payload_known() || !fixed_up_to(&sender.writes, place) {
-            return None;
+    for flow in &network.get_file_data(file_id)?.receive_flows {
+        for (place, read) in flow.reads.iter().enumerate() {
+            if read.file_id != file_id || read.range != range {
+                continue;
+            }
+            if flow.reads_opaque || !fixed_up_to(&flow.reads, place) {
+                return None;
+            }
+            let senders =
+                pair_senders_for_receive(network, db.get_gmod_infer_index(), file_id, flow);
+            for (_, sender) in senders {
+                if !sender.payload_known() || !fixed_up_to(&sender.writes, place) {
+                    return None;
+                }
+                let write = sender.writes.get(place)?;
+                if !write.op.pairs_with(&read.op) {
+                    return None;
+                }
+                let written = written_type(db, cache, write, declared)?;
+                if check_type_compact(db, declared, &written).is_err() {
+                    return None;
+                }
+                received = Some(match received {
+                    Some(received) => TypeOps::Union.apply(db, &received, &written),
+                    None => written,
+                });
+            }
         }
-        let write = sender.writes.get(place)?;
-        if !write.op.pairs_with(&read.op) {
-            return None;
-        }
-        let written = written_type(db, cache, write, declared)?;
-        if check_type_compact(db, declared, &written).is_err() {
-            return None;
-        }
-        received = Some(match received {
-            Some(received) => TypeOps::Union.apply(db, &received, &written),
-            None => written,
-        });
     }
     received
 }

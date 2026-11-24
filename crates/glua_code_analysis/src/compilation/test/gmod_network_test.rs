@@ -722,6 +722,39 @@ end
         ws.humanize_type(typ)
     }
 
+    /// A read helper that two receivers call returns what either message
+    /// sends, not only the first receiver's payload: each field may be absent,
+    /// as the other message does not send it.
+    #[gtest]
+    fn test_net_read_helper_shared_by_two_receivers_holds_both_payloads() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "addons/mytest/lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("MsgA")
+            util.AddNetworkString("MsgB")
+            net.Start("MsgA") net.WriteTable({ alpha = 1 }) net.Broadcast()
+            net.Start("MsgB") net.WriteTable({ beta = "x" }) net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "addons/mytest/lua/autorun/client/receive.lua",
+            r#"
+            local function read_entry()
+                return net.ReadTable()
+            end
+            net.Receive("MsgA", function() alpha = read_entry().alpha end)
+            net.Receive("MsgB", function() beta = read_entry().beta end)
+            "#,
+        );
+        let [alpha, beta] = ["alpha", "beta"].map(|name| {
+            let typ = ws.expr_ty(name);
+            ws.humanize_type(typ)
+        });
+        expect_that!((alpha.as_str(), beta.as_str()), eq(("1?", "\"x\"?")));
+    }
+
     #[gtest]
     fn test_net_read_holds_what_its_paired_write_sends() {
         let typ = received(
