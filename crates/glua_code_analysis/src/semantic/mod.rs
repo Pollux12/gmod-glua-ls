@@ -37,6 +37,7 @@ pub(crate) use decl::value::{
 };
 pub use decl::{
     enum_variable_is_param, is_require_call, is_require_decl, parse_require_module_info,
+    require_path_arg,
 };
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaDocType,

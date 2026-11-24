@@ -388,7 +388,8 @@ local ids = require(\"mylib_ids\")
         ws.def_file(MODULE_FILE, IDS);
         ws.def_file(
             LOADER_FILE,
-            "---@[call_arg(\"gmod.load\", \"require\")]
+            "---@meta
+---@[call_arg(\"gmod.load\", \"require\")]
 ---@param name string
 function RequireModule(name) end
 ",
@@ -403,15 +404,56 @@ local first = ids.first
         assert_eq!(first, "1");
     }
 
+    /// A wrapper passing a later parameter on to `require` returns the module
+    /// that parameter names, not one its first argument names.
+    #[test]
+    fn a_require_wrapper_returns_the_module_its_path_parameter_names() {
+        let mut ws = gmod_workspace();
+        ws.def_file(MODULE_FILE, IDS);
+        ws.def_file(
+            "lua/includes/modules/context.lua",
+            "return { first = \"wrong\" }\n",
+        );
+        ws.def_file(
+            LOADER_FILE,
+            "function LoadModule(context, name)\n    return require(name)\nend\n",
+        );
+
+        let first = requirer_first(
+            &mut ws,
+            "local ids = LoadModule(\"context\", \"mylib_ids\")
+local first = ids.first
+",
+        );
+        assert_eq!(first, "1");
+    }
+
+    /// A wrapper that requires a module without returning it gives its caller
+    /// nothing.
+    #[test]
+    fn a_require_wrapper_returning_nothing_is_nil() {
+        let mut ws = gmod_workspace();
+        ws.def_file(MODULE_FILE, IDS);
+        ws.def_file(
+            LOADER_FILE,
+            "function LoadModule(name)\n    local module = require(name)\n    module.ready = true\nend\n",
+        );
+        let requirer = ws.def_file(REQUIRER_FILE, "local ids = LoadModule(\"mylib_ids\")\n");
+
+        assert_eq!(ws.humanize_type(ws.local_ty(requirer, "ids")), "nil");
+    }
+
     /// Tagging a wrapper as a `require` loader, and taking the tag away, moves
     /// what its callers read as a cold build has it.
     #[test]
     fn a_require_tag_added_and_removed_settles_as_a_cold_build() {
-        const TAGGED: &str = "---@[call_arg(\"gmod.load\", \"require\")]
+        const TAGGED: &str = "---@meta
+---@[call_arg(\"gmod.load\", \"require\")]
 ---@param name string
 function RequireModule(name) end
 ";
-        const UNTAGGED: &str = "---@param name string
+        const UNTAGGED: &str = "---@meta
+---@param name string
 function RequireModule(name) end
 ";
         const REQUIRER: &str = "local ids = RequireModule(\"mylib_ids\")

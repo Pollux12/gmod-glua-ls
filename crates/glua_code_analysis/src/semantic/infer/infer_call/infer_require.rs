@@ -5,14 +5,14 @@ use crate::{
     ModuleInfo, SignatureReturnStatus, VariadicType, infer_expr, semantic::infer::InferResult,
 };
 
+/// What a `require` call returns: the module `path_arg` names.
 pub fn infer_require_call(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    call_expr: LuaCallExpr,
+    call_expr: &LuaCallExpr,
+    path_arg: LuaExpr,
 ) -> InferResult {
-    let arg_list = call_expr.get_args_list().ok_or(InferFailReason::None)?;
-    let first_arg = arg_list.get_args().next().ok_or(InferFailReason::None)?;
-    let require_path_type = infer_expr(db, cache, first_arg)?;
+    let require_path_type = infer_expr(db, cache, path_arg)?;
     let module_path: String = match &require_path_type {
         LuaType::StringConst(module_path) => module_path.as_ref().to_string(),
         // A computed path names a module the analyzer cannot identify, so the
@@ -26,7 +26,7 @@ pub fn infer_require_call(
         .get_module_index()
         .find_module_for_file(&module_path, cache.get_file_id())
         .ok_or(InferFailReason::None)?;
-    module_export(module_info, cache, &call_expr)
+    module_export(module_info, cache, call_expr)
 }
 
 /// What a call that runs another file returns: the value that file returns.

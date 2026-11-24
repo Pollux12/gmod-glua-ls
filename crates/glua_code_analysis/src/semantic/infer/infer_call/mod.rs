@@ -2707,8 +2707,10 @@ pub fn infer_call_expr(
     cache: &mut LuaInferCache,
     call_expr: LuaCallExpr,
 ) -> InferResult {
-    if crate::is_require_call(db, cache.get_file_id(), &call_expr) {
-        return infer_require_call(db, cache, call_expr);
+    if let Some(path_arg) = crate::require_path_arg(db, cache.get_file_id(), &call_expr)
+        && load_call_result_is_unspecified(db, cache, &call_expr)
+    {
+        return infer_require_call(db, cache, &call_expr, path_arg);
     } else if let Some(loaded_file_id) = loaded_file_of_call(db, cache.get_file_id(), &call_expr)
         && load_call_result_is_unspecified(db, cache, &call_expr)
     {

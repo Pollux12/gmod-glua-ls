@@ -14,16 +14,17 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
     }
 
     let string_token = LuaStringToken::cast(builder.trigger_token.clone())?;
-    let call_expr = string_token
-        .get_parent::<LuaLiteralExpr>()?
+    let literal_expr = string_token.get_parent::<LuaLiteralExpr>()?;
+    let call_expr = literal_expr
         .get_parent::<LuaCallArgList>()?
         .get_parent::<LuaCallExpr>()?;
 
-    if !glua_code_analysis::is_require_call(
+    let path_arg = glua_code_analysis::require_path_arg(
         builder.semantic_model.get_db(),
         builder.semantic_model.get_file_id(),
         &call_expr,
-    ) {
+    )?;
+    if path_arg.get_range() != literal_expr.get_range() {
         return None;
     }
 

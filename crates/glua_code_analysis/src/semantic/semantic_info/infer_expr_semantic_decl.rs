@@ -85,8 +85,10 @@ pub fn try_infer_expr_semantic_decl(
             };
             infer_closure_expr_semantic_decl(db, cache, closure_expr, next_guard, level)
         }
-        LuaExpr::CallExpr(call_expr) if crate::is_require_call(db, file_id, &call_expr) => {
-            Ok(infer_require_module_semantic_decl(db, cache, call_expr))
+        LuaExpr::CallExpr(call_expr)
+            if let Some(path_arg) = crate::require_path_arg(db, file_id, &call_expr) =>
+        {
+            Ok(infer_require_module_semantic_decl(db, cache, path_arg))
         }
         _ => {
             let member_id = LuaMemberId::new(expr.get_syntax_id(), file_id);
@@ -174,13 +176,14 @@ fn infer_name_expr_semantic_decl(
             }
             _ if crate::is_require_decl(db, &decl) => {
                 let file_id = decl.get_file_id();
-                let call_expr = db
+                let path_arg = db
                     .get_vfs()
                     .syntax_node_around(&file_id, value_expr_id)
-                    .and_then(LuaCallExpr::cast);
-                if let Some(call_expr) = call_expr
+                    .and_then(LuaCallExpr::cast)
+                    .and_then(|call_expr| crate::require_path_arg(db, file_id, &call_expr));
+                if let Some(path_arg) = path_arg
                     && let Some(semantic_id) =
-                        infer_require_module_semantic_decl(db, cache, call_expr)
+                        infer_require_module_semantic_decl(db, cache, path_arg)
                 {
                     return Ok(Some(semantic_id));
                 }
@@ -195,10 +198,9 @@ fn infer_name_expr_semantic_decl(
 fn infer_require_module_semantic_decl(
     db: &DbIndex,
     cache: &LuaInferCache,
-    call_expr: LuaCallExpr,
+    path_arg: LuaExpr,
 ) -> Option<LuaSemanticDeclId> {
-    let first_arg = call_expr.get_args_list()?.get_args().next()?;
-    let module_path = match first_arg {
+    let module_path = match path_arg {
         LuaExpr::LiteralExpr(literal_expr) => {
             let literal_token = literal_expr.get_literal()?;
             match literal_token {

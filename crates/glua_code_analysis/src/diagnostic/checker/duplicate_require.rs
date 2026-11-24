@@ -1,4 +1,4 @@
-use glua_parser::{LuaAstNode, LuaBlock, LuaCallExpr, LuaIndexExpr};
+use glua_parser::{LuaAstNode, LuaBlock, LuaCallExpr, LuaExpr, LuaIndexExpr};
 use rowan::TextRange;
 
 use crate::{DiagnosticCode, LuaType, SemanticModel};
@@ -16,12 +16,18 @@ impl Checker for DuplicateRequireChecker {
             return;
         };
         for call_expr in buckets.call_exprs.iter().cloned() {
-            if crate::is_require_call(
+            if let Some(path_arg) = crate::require_path_arg(
                 semantic_model.get_db(),
                 semantic_model.get_file_id(),
                 &call_expr,
             ) {
-                check_require_call_expr(context, semantic_model, call_expr, &mut require_calls);
+                check_require_call_expr(
+                    context,
+                    semantic_model,
+                    call_expr,
+                    path_arg,
+                    &mut require_calls,
+                );
             }
         }
     }
@@ -31,15 +37,14 @@ fn check_require_call_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     call_expr: LuaCallExpr,
+    path_arg: LuaExpr,
     require_calls: &mut Vec<(TextRange, String)>,
 ) -> Option<()> {
     if call_expr.get_parent::<LuaIndexExpr>().is_some() {
         return Some(());
     }
-    let args_list = call_expr.get_args_list()?;
-    let arg_expr = args_list.get_args().next()?;
 
-    let ty = semantic_model.infer_expr(arg_expr).unwrap_or(LuaType::Any);
+    let ty = semantic_model.infer_expr(path_arg).unwrap_or(LuaType::Any);
     if let LuaType::StringConst(s) = ty {
         let parent_block = call_expr
             .ancestors::<LuaBlock>()

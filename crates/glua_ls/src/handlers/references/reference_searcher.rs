@@ -1019,15 +1019,15 @@ fn extend_module_return_value_references<'a>(
                 continue;
             };
 
-            if !glua_code_analysis::is_require_call(
+            let Some(path_arg) = glua_code_analysis::require_path_arg(
                 dependent_semantic_model.get_db(),
                 dependent_file_id,
                 &call_expr,
-            ) {
+            ) else {
                 continue;
-            }
+            };
 
-            if resolve_require_target_file_id(dependent_semantic_model.as_ref(), &call_expr)
+            if resolve_require_target_file_id(dependent_semantic_model.as_ref(), path_arg)
                 != Some(module_file_id)
             {
                 continue;
@@ -1059,11 +1059,9 @@ fn extend_module_return_value_references<'a>(
 
 fn resolve_require_target_file_id(
     semantic_model: &SemanticModel,
-    call_expr: &LuaCallExpr,
+    path_arg: LuaExpr,
 ) -> Option<FileId> {
-    let args = call_expr.get_args_list()?;
-    let first_arg = args.get_args().next()?;
-    let require_path_type = semantic_model.infer_expr(first_arg).ok()?;
+    let require_path_type = semantic_model.infer_expr(path_arg).ok()?;
     let module_path: String = match &require_path_type {
         LuaType::StringConst(module_path) => module_path.as_ref().to_string(),
         _ => return None,
