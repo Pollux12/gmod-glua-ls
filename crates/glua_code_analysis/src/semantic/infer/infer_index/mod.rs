@@ -3978,6 +3978,9 @@ fn constructed_under_the_reads_key(
         return false;
     };
     item.member_ids_slice().iter().all(|member_id| {
+        if member_id.file_id != file_id {
+            return false;
+        }
         let Some(root) = db
             .get_vfs()
             .syntax_tree_around(&member_id.file_id, member_id.get_syntax_id().get_range())
