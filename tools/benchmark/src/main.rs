@@ -5,6 +5,20 @@ static GLOBAL: dhat::Alloc = dhat::Alloc;
 #[cfg(not(feature = "dhat-heap"))]
 use mimalloc::MiMalloc;
 
+#[cfg(not(feature = "dhat-heap"))]
+unsafe extern "C" {
+    fn mi_collect(force: bool);
+}
+
+fn collect_thread_heap(force: bool) {
+    #[cfg(not(feature = "dhat-heap"))]
+    unsafe {
+        mi_collect(force);
+    }
+    #[cfg(feature = "dhat-heap")]
+    let _ = force;
+}
+
 /// Report allocator counters for the phase just finished (no-op without
 /// `--features alloc-stats`).
 macro_rules! alloc_report {
@@ -794,6 +808,8 @@ async fn run() {
     let indexing_duration = t.elapsed();
     glua_code_analysis::profile::work::report("index");
     glua_code_analysis::profile::memory::checkpoint("after indexing");
+    glua_code_analysis::release_analysis_caches_with(|| collect_thread_heap(true));
+    glua_code_analysis::profile::memory::checkpoint("after collecting");
     #[cfg(all(feature = "alloc-sample", not(feature = "dhat-heap")))]
     alloc_sample::dump("indexed");
     alloc_report!("indexing", alloc_mark);
@@ -891,6 +907,8 @@ async fn run() {
                         }
                     }
                 }
+                glua_code_analysis::release_thread_caches();
+                collect_thread_heap(true);
             });
         }
     });
@@ -901,6 +919,7 @@ async fn run() {
     let hints = hint_count.load(std::sync::atomic::Ordering::Relaxed);
     let diagnostics_duration = t.elapsed();
     glua_code_analysis::profile::work::report("diagnostics");
+    glua_code_analysis::release_analysis_caches_with(|| collect_thread_heap(true));
     glua_code_analysis::profile::memory::checkpoint("after diagnostics");
     if glua_code_analysis::profile::profiling() {
         eprintln!("[mem] {}", analysis.compilation.memory_census());

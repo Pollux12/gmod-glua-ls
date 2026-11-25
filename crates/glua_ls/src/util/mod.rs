@@ -2,12 +2,14 @@ mod analysis_progress;
 mod desc;
 mod long_running_watchdog;
 pub mod ls_profile;
+mod memory;
 mod module_name_convert;
 mod time_cancel_token;
 
 pub use analysis_progress::AnalysisProgressReporter;
 pub use desc::*;
 pub use long_running_watchdog::*;
+pub(crate) use memory::{ClearThreadCachesOnDrop, spawn_release_free_memory};
 pub use module_name_convert::{
     file_name_convert, module_name_convert, to_camel_case, to_pascal_case, to_snake_case,
 };

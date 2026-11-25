@@ -704,6 +704,7 @@ impl DiagnosticStore {
         if self.is_idle() {
             crate::util::ls_profile::emit_ls_diagnostics_idle();
             self.idle.notify_one();
+            crate::util::spawn_release_free_memory();
         }
         self.computed.notify_waiters();
         self.dirtied.notify_waiters();
@@ -831,6 +832,7 @@ impl DiagnosticStore {
             .panic_computes
             .load(std::sync::atomic::Ordering::Acquire);
         let computed = tokio::task::spawn_blocking(move || {
+            let _caches = crate::util::ClearThreadCachesOnDrop::with_heap_sweep();
             #[cfg(test)]
             if panics {
                 panic!("injected diagnostic computation panic");

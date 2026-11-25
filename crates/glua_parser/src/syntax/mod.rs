@@ -135,7 +135,7 @@ impl LuaSyntaxResolver {
 mod node_memo {
     use super::{LuaSyntaxId, LuaSyntaxNode, LuaSyntaxResolver};
 
-    const MAX_ROOTS: usize = 32;
+    const MAX_ROOTS: usize = 8;
 
     #[derive(Default)]
     pub(super) struct NodeMemo {
@@ -167,6 +167,11 @@ mod node_memo {
                 }
             }
         }
+
+        pub(super) fn clear(&mut self) {
+            self.roots.clear();
+            self.roots.shrink_to_fit();
+        }
     }
 }
 
@@ -180,6 +185,12 @@ thread_local! {
 pub fn with_syntax_resolver<R>(root: &LuaSyntaxNode, f: impl FnOnce() -> R) -> R {
     NODE_MEMO.with(|memo| memo.borrow_mut().touch(root));
     f()
+}
+
+/// Drops every cached syntax root and resolved node on the calling thread so
+/// idle worker threads do not retain dead syntax trees across passes or edits.
+pub fn clear_syntax_resolver_memo() {
+    NODE_MEMO.with(|memo| memo.borrow_mut().clear());
 }
 
 #[cfg(test)]
@@ -308,6 +319,18 @@ end
             assert_eq!(memo_entries(root), Some(1));
         }
         assert!(memo_roots_len() <= roots.len());
+    }
+
+    #[test]
+    fn clear_syntax_resolver_memo_drops_cached_roots() {
+        let root = parsed_root("local value = 1\n");
+        let id = LuaSyntaxId::from_node(&root.descendants().next().unwrap());
+        assert!(id.to_node_from_root(&root).is_some());
+        assert!(memo_has_root(&root));
+
+        clear_syntax_resolver_memo();
+        assert_eq!(memo_roots_len(), 0);
+        assert!(!memo_has_root(&root));
     }
 }
 

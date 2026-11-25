@@ -2262,17 +2262,25 @@ fn content_detail(ty: &LuaType) -> (u64, Option<Arc<[u64]>>) {
 /// the type, which keeps that allocation alive: no other live type can reuse
 /// the address while it is a key, and dropping an entry drops the type with
 /// it. Nothing derived from the address leaves this function.
+/// Entries are dropped wholesale rather than individually, so a session that
+/// churns through types cannot grow the cache without bound.
+const TYPE_DETAIL_MEMO_CAPACITY: usize = 4096;
+
+thread_local! {
+    static TYPE_DETAIL_MEMO: std::cell::RefCell<
+        rustc_hash::FxHashMap<(u8, usize), (LuaType, (u64, Option<Arc<[u64]>>))>,
+    > = Default::default();
+}
+
+pub(crate) fn clear_type_detail_memo() {
+    TYPE_DETAIL_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        memo.clear();
+        memo.shrink_to_fit();
+    });
+}
+
 fn memoized_content_detail(ty: &LuaType) -> (u64, Option<Arc<[u64]>>) {
-    /// Entries are dropped wholesale rather than individually, so a session that
-    /// churns through types cannot grow the cache without bound.
-    const CAPACITY: usize = 1 << 16;
-
-    thread_local! {
-        static MEMO: std::cell::RefCell<
-            rustc_hash::FxHashMap<(u8, usize), (LuaType, (u64, Option<Arc<[u64]>>))>,
-        > = Default::default();
-    }
-
     let Some(address) = payload_address(ty) else {
         return content_detail(ty);
     };
@@ -2280,13 +2288,13 @@ fn memoized_content_detail(ty: &LuaType) -> (u64, Option<Arc<[u64]>>) {
     // and they hash differently.
     let id = (lua_type_sort_ordinal(ty), address);
 
-    MEMO.with(|memo| {
+    TYPE_DETAIL_MEMO.with(|memo| {
         if let Some((_, detail)) = memo.borrow().get(&id) {
             return detail.clone();
         }
         let detail = content_detail(ty);
         let mut memo = memo.borrow_mut();
-        if memo.len() >= CAPACITY {
+        if memo.len() >= TYPE_DETAIL_MEMO_CAPACITY {
             memo.clear();
         }
         memo.insert(id, (ty.clone(), detail.clone()));

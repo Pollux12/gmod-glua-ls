@@ -80,6 +80,25 @@ pub(crate) fn analysis_stack_exhausted() -> bool {
     }
 }
 
+/// Drops thread-local caches held on the calling thread (syntax resolver
+/// memo, type-detail hash memo, and per-thread interner front-caches).
+pub fn release_thread_caches() {
+    glua_parser::clear_syntax_resolver_memo();
+    db_index::clear_thread_caches();
+}
+
+/// Drops thread-local analysis caches on every worker in the global Rayon
+/// pool and on the calling thread, running `on_thread` on each thread
+/// afterward (e.g. an allocator collection hook).
+pub fn release_analysis_caches_with(on_thread: impl Fn() + Sync) {
+    rayon::broadcast(|_| {
+        release_thread_caches();
+        on_thread();
+    });
+    release_thread_caches();
+    on_thread();
+}
+
 /// True when `call_expr` calls an annotated net operation — a message start, a
 /// send terminator, or a payload write/read.
 ///

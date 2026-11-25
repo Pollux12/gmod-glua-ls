@@ -34,6 +34,13 @@ pub(crate) use query::QueryFamily;
 #[cfg(test)]
 pub(crate) use query::QueryStats;
 
+pub(crate) fn clear_thread_caches() {
+    r#type::clear_type_detail_memo();
+    intern::clear_smol_str_intern_cache();
+    r#type::clear_type_decl_id_intern_cache();
+    global::clear_global_id_intern_cache();
+}
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{path::PathBuf, sync::Arc};
 

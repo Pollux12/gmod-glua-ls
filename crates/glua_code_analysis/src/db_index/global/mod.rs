@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use global_id::GlobalId;
+pub(crate) use global_id::clear_global_id_intern_cache;
 
 use crate::FileId;
 use crate::db_index::derivation::{self, FactKey, Fingerprint};

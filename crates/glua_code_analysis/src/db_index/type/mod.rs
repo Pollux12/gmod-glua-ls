@@ -29,13 +29,14 @@ use rowan::{TextRange, TextSize};
 // hashing alone was 3.9% of all CPU under the default SipHash.
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
-pub(crate) use type_decl::LuaTypeExtra;
 pub use type_decl::{LuaDeclLocation, LuaDeclTypeKind, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag};
+pub(crate) use type_decl::{LuaTypeExtra, clear_type_decl_id_intern_cache};
 pub use type_ops::TypeOps;
 pub(crate) use type_owner::widens_primitive;
 pub use type_owner::{LuaTypeCache, LuaTypeOwner, is_informative_type, leaks_unsubstituted_tpl};
 pub(crate) use type_owner::{is_undetermined_type, is_unresolved_type};
 pub use type_visit_trait::TypeVisitTrait;
+pub(crate) use types::clear_type_detail_memo;
 pub use types::*;
 
 #[derive(Debug, Clone)]

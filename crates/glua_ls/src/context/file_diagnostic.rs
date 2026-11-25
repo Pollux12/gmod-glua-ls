@@ -108,6 +108,7 @@ impl FileDiagnostic {
 
         info!("workspace loaded; language server is ready while diagnostics may continue");
         self.send_server_status("workspaceLoaded");
+        crate::util::spawn_release_free_memory();
     }
 
     fn notify_startup_complete(&self) {
@@ -241,6 +242,7 @@ impl FileDiagnostic {
         } else {
             self.notify_startup_complete();
         }
+        crate::util::spawn_release_free_memory();
     }
 }
 

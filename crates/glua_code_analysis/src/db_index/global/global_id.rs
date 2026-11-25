@@ -54,6 +54,18 @@ mod global_id_intern {
             id
         })
     }
+
+    pub fn clear() {
+        CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.clear();
+            cache.shrink_to_fit();
+        });
+    }
+}
+
+pub(crate) fn clear_global_id_intern_cache() {
+    global_id_intern::clear();
 }
 
 impl GlobalId {

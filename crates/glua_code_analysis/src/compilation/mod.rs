@@ -187,6 +187,7 @@ impl LuaCompilation {
         self.scopes = reanalysed.scopes;
         self.last_evaluated_files = reanalysed.evaluated_files;
         self.last_stats = reanalysed.stats;
+        crate::release_analysis_caches_with(|| {});
         UpdateProgress::Settled(reanalysed.stale_diagnostics)
     }
 

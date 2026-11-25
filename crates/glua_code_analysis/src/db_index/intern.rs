@@ -30,3 +30,11 @@ pub(crate) fn intern_smol_str(name: &str) -> ArcIntern<SmolStr> {
         interned
     })
 }
+
+pub(crate) fn clear_smol_str_intern_cache() {
+    SMOL_STR.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.clear();
+        cache.shrink_to_fit();
+    });
+}

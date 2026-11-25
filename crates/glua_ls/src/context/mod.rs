@@ -328,7 +328,12 @@ impl ServerContext {
             // Own task per handler: a panic must not skip the response or the
             // `requests` cleanup below.
             let handler_token = cancel_token.clone();
-            let res = match tokio::spawn(exec(handler_token)).await {
+            let res = match tokio::spawn(async move {
+                let _caches = crate::util::ClearThreadCachesOnDrop::caches_only();
+                exec(handler_token).await
+            })
+            .await
+            {
                 Ok(res) => res,
                 Err(err) => {
                     log::error!(

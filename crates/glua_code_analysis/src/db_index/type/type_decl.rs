@@ -551,6 +551,23 @@ mod decl_id_intern {
             id
         })
     }
+
+    pub fn clear() {
+        GLOBAL.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.clear();
+            cache.shrink_to_fit();
+        });
+        LOCAL.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.clear();
+            cache.shrink_to_fit();
+        });
+    }
+}
+
+pub(crate) fn clear_type_decl_id_intern_cache() {
+    decl_id_intern::clear();
 }
 
 impl LuaTypeDeclId {
