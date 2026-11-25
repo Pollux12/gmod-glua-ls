@@ -38,56 +38,59 @@ pub fn analyze_func_body_returns(
     returns
 }
 
+/// How `block` ends. A statement that leaves it ends it unless a label
+/// follows: a `goto` may jump there, so the statements after the label run.
 fn analyze_block_returns(
     context: Option<(&DbIndex, FileId)>,
     block: LuaBlock,
     returns: &mut Vec<LuaReturnPoint>,
 ) -> Option<ChangeFlow> {
-    for stat in block.get_stats() {
-        match stat {
-            LuaStat::DoStat(do_stat) => {
-                let flow = analyze_do_stat_returns(context, do_stat, returns);
-                match flow {
-                    Some(ChangeFlow::None) => {}
-                    _ => return flow,
-                }
-            }
-            LuaStat::WhileStat(while_stat) => {
-                analyze_while_stat_returns(context, while_stat, returns);
-            }
-            LuaStat::RepeatStat(repeat_stat) => {
-                analyze_repeat_stat_returns(context, repeat_stat, returns);
-            }
-            LuaStat::IfStat(if_stat) => {
-                let flow = analyze_if_stat_returns(context, if_stat, returns);
-                match flow {
-                    Some(ChangeFlow::None) => {}
-                    _ => return flow,
-                }
-            }
-            LuaStat::ForStat(for_stat) => {
-                analyze_for_stat_returns(context, for_stat, returns);
-            }
-            LuaStat::ForRangeStat(for_range_stat) => {
-                analyze_for_range_stat_returns(context, for_range_stat, returns);
-            }
-            LuaStat::CallExprStat(call_expr) => {
-                let flow = analyze_call_expr_stat_returns(context, call_expr, returns);
-                if let Some(ChangeFlow::Error) = flow {
-                    return Some(ChangeFlow::Error);
-                }
-            }
-            LuaStat::BreakStat(_) => {
-                return Some(ChangeFlow::Break);
-            }
-            LuaStat::ReturnStat(return_stat) => {
-                return analyze_return_stat_returns(return_stat, returns);
-            }
-            _ => {}
-        };
+    let mut stats = block.get_stats();
+    while let Some(stat) = stats.next() {
+        let flow = analyze_stat_returns(context, stat, returns);
+        if flow != Some(ChangeFlow::None)
+            && !stats.any(|stat| matches!(stat, LuaStat::LabelStat(_)))
+        {
+            return flow;
+        }
     }
 
     Some(ChangeFlow::None)
+}
+
+fn analyze_stat_returns(
+    context: Option<(&DbIndex, FileId)>,
+    stat: LuaStat,
+    returns: &mut Vec<LuaReturnPoint>,
+) -> Option<ChangeFlow> {
+    match stat {
+        LuaStat::DoStat(do_stat) => analyze_do_stat_returns(context, do_stat, returns),
+        LuaStat::IfStat(if_stat) => analyze_if_stat_returns(context, if_stat, returns),
+        LuaStat::CallExprStat(call_expr) => {
+            analyze_call_expr_stat_returns(context, call_expr, returns).or(Some(ChangeFlow::None))
+        }
+        LuaStat::BreakStat(_) => Some(ChangeFlow::Break),
+        LuaStat::ReturnStat(return_stat) => analyze_return_stat_returns(return_stat, returns),
+        // A loop runs on after its body leaves it by `break`, and may not run
+        // its body at all.
+        LuaStat::WhileStat(while_stat) => {
+            analyze_while_stat_returns(context, while_stat, returns);
+            Some(ChangeFlow::None)
+        }
+        LuaStat::RepeatStat(repeat_stat) => {
+            analyze_repeat_stat_returns(context, repeat_stat, returns);
+            Some(ChangeFlow::None)
+        }
+        LuaStat::ForStat(for_stat) => {
+            analyze_for_stat_returns(context, for_stat, returns);
+            Some(ChangeFlow::None)
+        }
+        LuaStat::ForRangeStat(for_range_stat) => {
+            analyze_for_range_stat_returns(context, for_range_stat, returns);
+            Some(ChangeFlow::None)
+        }
+        _ => Some(ChangeFlow::None),
+    }
 }
 
 fn analyze_do_stat_returns(

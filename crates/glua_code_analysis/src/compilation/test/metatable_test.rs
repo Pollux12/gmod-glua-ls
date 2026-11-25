@@ -3121,23 +3121,39 @@ mod test {
     }
 
     /// A method that may end without returning its instance returns `nil`
-    /// then, as a plain table or a local function returning one would.
+    /// then, as a plain table or a local function returning one would: also
+    /// when a `goto` skips its `return`, but not when one only skips to the
+    /// next turn of a loop.
     #[test]
     fn a_method_that_may_not_return_its_instance_may_return_nil() {
-        let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        let file_id = ws.def(
-            r#"
-            local Class = {}
-            Class.__index = Class
-            function Class:TryCreate(ok)
-                if ok then
-                    return setmetatable({}, self)
+        for (body, expected) in [
+            ("if ok then return setmetatable({}, self) end", "table?"),
+            (
+                "if not ok then goto done end do return setmetatable({}, self) end ::done::",
+                "table?",
+            ),
+            (
+                "for i = 1, 3 do if i == 2 then goto continue end ::continue:: end return setmetatable({}, self)",
+                "table",
+            ),
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let file_id = ws.def(&format!(
+                r#"
+                local Class = {{}}
+                Class.__index = Class
+                function Class:TryCreate(ok)
+                    {body}
                 end
-            end
-            local inst = Class:TryCreate(Cond)
-            "#,
-        );
-        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "inst")), "table?");
+                local inst = Class:TryCreate(Cond)
+                "#
+            ));
+            assert_eq!(
+                ws.humanize_type(ws.local_ty(file_id, "inst")),
+                expected,
+                "{body}"
+            );
+        }
     }
 
     const ACCOUNT_CLASS: &str = r#"
