@@ -790,6 +790,8 @@ pub(super) fn collect_field_installers(
     installers
 }
 
+const MAX_KEY_TEMPLATE_PARTS: usize = 64;
+
 /// The pieces a key joins, each a string literal or a parameter, read
 /// through the locals that hold them.
 fn key_template(
@@ -798,6 +800,9 @@ fn key_template(
     local_value: &impl Fn(&LuaExpr) -> Option<LuaExpr>,
     parts: &mut Vec<KeyPart>,
 ) -> Option<()> {
+    if parts.len() >= MAX_KEY_TEMPLATE_PARTS {
+        return None;
+    }
     match expr {
         LuaExpr::LiteralExpr(_) => parts.push(KeyPart::Literal(literal_string(expr)?.into())),
         LuaExpr::ParenExpr(paren) => {
@@ -1018,6 +1023,13 @@ fn collect_signatures_of_type(typ: &LuaType, result: &mut Vec<LuaSignatureId>) {
     }
 }
 
+const MAX_INSTALLED_KEY_COMBINATIONS: usize = 256;
+
+enum ParamKeyChoice {
+    Str(SmolStr),
+    Falsy,
+}
+
 /// The key one call of `installer` writes. A joined key is a
 /// string whatever the call passes; a bare parameter is `None` when the call
 /// passes a value not known to be a string. A parameter the key reads twice
@@ -1031,37 +1043,63 @@ fn evaluate_install(
 ) -> Option<Install> {
     let is_join = installer.is_join();
     let mut definition = None;
-    let mut part_values: Vec<(&KeyPart, Vec<SmolStr>)> = Vec::new();
+    let mut param_choices: Vec<(usize, Vec<ParamKeyChoice>)> = Vec::new();
     let mut any_string = false;
     for part in &installer.key {
-        let KeyPart::Param { param, default } = part else {
+        let KeyPart::Param { param, .. } = part else {
             continue;
         };
-        if part_values.iter().any(|(bound, _)| *bound == part) {
+        if param_choices.iter().any(|(bound, _)| bound == param) {
             continue;
         }
+        let has_default = installer.key.iter().any(|other| {
+            matches!(
+                other,
+                KeyPart::Param {
+                    param: other_param,
+                    default: Some(_),
+                } if other_param == param
+            )
+        });
+        let has_bare = installer.key.iter().any(|other| {
+            matches!(
+                other,
+                KeyPart::Param {
+                    param: other_param,
+                    default: None,
+                } if other_param == param
+            )
+        });
         let arg = installer_arg(db, call_expr, signature_id, *param);
-        let arg_names = match (&arg, default) {
-            (None, Some(default)) => Some(vec![default.clone()]),
-            (None, None) => return None,
-            (Some(arg), _) => match key_arg_names(db, cache, arg, default.as_ref()) {
-                Some(arg_names) => arg_names,
+        let choices = match &arg {
+            None if has_bare => return None,
+            None => Some(vec![ParamKeyChoice::Falsy]),
+            Some(arg) => match key_arg_choices(db, cache, arg, has_default, has_bare) {
+                Some(choices) => choices,
                 None if is_join => None,
                 None => return None,
             },
         };
-        match arg_names {
-            Some(values) => part_values.push((part, values)),
+        match choices {
+            Some(values) => param_choices.push((*param, values)),
             None => any_string = true,
         }
         if let Some(arg) = arg {
             definition.get_or_insert(arg);
         }
     }
-    let key = if any_string {
+    let too_many_combinations = param_choices.len() > 1
+        && param_choices
+            .iter()
+            .try_fold(1usize, |acc, (_, values)| {
+                acc.checked_mul(values.len())
+                    .filter(|&count| count <= MAX_INSTALLED_KEY_COMBINATIONS)
+            })
+            .is_none();
+    let key = if any_string || too_many_combinations {
         InstalledKey::AnyString
     } else {
-        InstalledKey::Names(key_names(&installer.key, &part_values))
+        InstalledKey::Names(key_names(&installer.key, &param_choices))
     };
     Some(Install {
         key,
@@ -1069,11 +1107,11 @@ fn evaluate_install(
     })
 }
 
-/// The keys `key` joins to, one for each choice of a string for each of its
-/// parameter parts from `part_values`.
-fn key_names(key: &[KeyPart], part_values: &[(&KeyPart, Vec<SmolStr>)]) -> Vec<SmolStr> {
-    let mut choices: Vec<Vec<&SmolStr>> = vec![Vec::new()];
-    for (_, values) in part_values {
+/// The keys `key` joins to, one for each choice of a value for each distinct
+/// parameter in `param_choices`.
+fn key_names(key: &[KeyPart], param_choices: &[(usize, Vec<ParamKeyChoice>)]) -> Vec<SmolStr> {
+    let mut choices: Vec<Vec<&ParamKeyChoice>> = vec![Vec::new()];
+    for (_, values) in param_choices {
         choices = choices
             .into_iter()
             .flat_map(|choice| {
@@ -1087,47 +1125,52 @@ fn key_names(key: &[KeyPart], part_values: &[(&KeyPart, Vec<SmolStr>)]) -> Vec<S
     }
     choices
         .into_iter()
-        .map(|choice| {
-            key.iter()
-                .map(|part| match part {
-                    KeyPart::Literal(text) => text.as_str(),
-                    KeyPart::Param { .. } => part_values
-                        .iter()
-                        .position(|(bound, _)| *bound == part)
-                        .map_or("", |idx| choice[idx].as_str()),
-                })
-                .collect::<String>()
-                .into()
+        .filter_map(|choice| {
+            let mut joined = String::new();
+            for part in key {
+                match part {
+                    KeyPart::Literal(text) => joined.push_str(text.as_str()),
+                    KeyPart::Param { param, default } => {
+                        let idx = param_choices.iter().position(|(bound, _)| bound == param)?;
+                        match choice[idx] {
+                            ParamKeyChoice::Str(text) => joined.push_str(text.as_str()),
+                            ParamKeyChoice::Falsy => joined.push_str(default.as_deref()?),
+                        }
+                    }
+                }
+            }
+            Some(joined.into())
         })
         .collect()
 }
 
-/// The strings a key argument may be, with `default` where it may be `nil`:
-/// `Some(None)` for a string it does not say, `None` for a value not known to
-/// be a string.
-fn key_arg_names(
+/// The values a key argument may hold: `Some(None)` for a string it does not
+/// say, `None` for a value not known to be a string.
+fn key_arg_choices(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     arg: &LuaExpr,
-    default: Option<&SmolStr>,
-) -> Option<Option<Vec<SmolStr>>> {
+    has_default: bool,
+    has_bare: bool,
+) -> Option<Option<Vec<ParamKeyChoice>>> {
     if let Some(value) = literal_string(arg) {
-        return Some(Some(vec![value.into()]));
+        return Some(Some(vec![ParamKeyChoice::Str(value.into())]));
     }
     let typ = infer_expr(db, cache, arg.clone()).ok()?;
-    if let Some(default) = default {
+    let names = string_const_names(&Some(typ.clone()));
+    if has_default {
         let may_be_falsy = crate::semantic::remove_false_or_nil(typ.clone()) != typ;
-        if may_be_falsy {
-            let mut names = string_const_names(&Some(typ.clone()));
-            if typ.is_always_falsy() || !names.is_empty() {
-                names.push(default.clone());
-                return Some(Some(names));
-            }
+        if may_be_falsy && ((!has_bare && typ.is_always_falsy()) || !names.is_empty()) {
+            let mut choices = names
+                .into_iter()
+                .map(ParamKeyChoice::Str)
+                .collect::<Vec<_>>();
+            choices.push(ParamKeyChoice::Falsy);
+            return Some(Some(choices));
         }
     }
-    let names = string_const_names(&Some(typ.clone()));
     if !names.is_empty() {
-        return Some(Some(names));
+        return Some(Some(names.into_iter().map(ParamKeyChoice::Str).collect()));
     }
     let is_string = match &typ {
         LuaType::Union(union_type) => union_type.types().any(LuaType::is_string),
@@ -1699,8 +1742,8 @@ fn get_field_names(
             }
 
             let names = {
-                let mut visiting = FxHashSet::default();
-                finite_dynamic_key_strings(db, cache, &expr, &mut visiting)
+                let mut state = FiniteKeyState::default();
+                finite_dynamic_key_strings(db, cache, &expr, &mut state)
             };
             ResolvedDynamicFieldNames {
                 may_have_other_string_names: names.is_empty(),
@@ -1790,11 +1833,19 @@ fn has_local_reassignment_before(
         .is_some_and(|position| *position < query_position)
 }
 
+const MAX_DYNAMIC_FIELD_NAME_LEN: usize = 512;
+
+#[derive(Default)]
+struct FiniteKeyState {
+    visiting: FxHashSet<LuaDeclId>,
+    memo: FxHashMap<LuaDeclId, Vec<SmolStr>>,
+}
+
 fn finite_dynamic_key_strings(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     expr: &LuaExpr,
-    visiting: &mut FxHashSet<LuaDeclId>,
+    state: &mut FiniteKeyState,
 ) -> Vec<SmolStr> {
     let inferred = string_const_names(&computed_key_type(db, cache, expr));
     if !inferred.is_empty() {
@@ -1808,7 +1859,7 @@ fn finite_dynamic_key_strings(
         },
         LuaExpr::ParenExpr(paren) => paren
             .get_expr()
-            .map(|inner| finite_dynamic_key_strings(db, cache, &inner, visiting))
+            .map(|inner| finite_dynamic_key_strings(db, cache, &inner, state))
             .unwrap_or_default(),
         LuaExpr::NameExpr(name_expr) => {
             let Some(decl_id) = db
@@ -1818,13 +1869,17 @@ fn finite_dynamic_key_strings(
             else {
                 return Vec::new();
             };
-            if !visiting.insert(decl_id) {
+            if let Some(cached) = state.memo.get(&decl_id) {
+                return cached.clone();
+            }
+            if !state.visiting.insert(decl_id) {
                 return Vec::new();
             }
             let result = local_initializer_expr(db, decl_id)
-                .map(|initializer| finite_dynamic_key_strings(db, cache, &initializer, visiting))
+                .map(|initializer| finite_dynamic_key_strings(db, cache, &initializer, state))
                 .unwrap_or_default();
-            visiting.remove(&decl_id);
+            state.visiting.remove(&decl_id);
+            state.memo.insert(decl_id, result.clone());
             result
         }
         LuaExpr::BinaryExpr(binary) => {
@@ -1834,13 +1889,16 @@ fn finite_dynamic_key_strings(
             let Some((left, right)) = binary.get_exprs() else {
                 return Vec::new();
             };
-            let left = finite_dynamic_key_strings(db, cache, &left, visiting);
-            let right = finite_dynamic_key_strings(db, cache, &right, visiting);
+            let left = finite_dynamic_key_strings(db, cache, &left, state);
+            if left.is_empty() {
+                return Vec::new();
+            }
+            let right = finite_dynamic_key_strings(db, cache, &right, state);
             concatenate_finite_strings(&left, &right)
         }
-        LuaExpr::CallExpr(call) => finite_string_transform_call(db, cache, call, visiting),
+        LuaExpr::CallExpr(call) => finite_string_transform_call(db, cache, call, state),
         LuaExpr::IndexExpr(index_expr) => {
-            finite_numeric_loop_table_values(db, cache, index_expr, visiting)
+            finite_numeric_loop_table_values(db, cache, index_expr, state)
         }
         _ => Vec::new(),
     }
@@ -1854,12 +1912,15 @@ fn local_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<LuaExpr> {
 }
 
 fn concatenate_finite_strings(left: &[SmolStr], right: &[SmolStr]) -> Vec<SmolStr> {
-    if left.len() != 1 && right.len() != 1 {
+    if left.is_empty() || right.is_empty() || (left.len() != 1 && right.len() != 1) {
         return Vec::new();
     }
     let mut result = Vec::with_capacity(left.len().saturating_mul(right.len()));
     for left in left {
         for right in right {
+            if left.len().saturating_add(right.len()) > MAX_DYNAMIC_FIELD_NAME_LEN {
+                return Vec::new();
+            }
             result.push(SmolStr::new(format!("{left}{right}")));
         }
     }
@@ -1870,7 +1931,7 @@ fn finite_string_transform_call(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     call: &LuaCallExpr,
-    visiting: &mut FxHashSet<LuaDeclId>,
+    state: &mut FiniteKeyState,
 ) -> Vec<SmolStr> {
     if call.get_access_path().as_deref() != Some("string.gsub") {
         return Vec::new();
@@ -1886,7 +1947,7 @@ fn finite_string_transform_call(
         return Vec::new();
     }
 
-    finite_dynamic_key_strings(db, cache, &args[0], visiting)
+    finite_dynamic_key_strings(db, cache, &args[0], state)
         .into_iter()
         .map(|value| {
             SmolStr::new(
@@ -1913,7 +1974,7 @@ fn finite_numeric_loop_table_values(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     index_expr: &glua_parser::LuaIndexExpr,
-    visiting: &mut FxHashSet<LuaDeclId>,
+    state: &mut FiniteKeyState,
 ) -> Vec<SmolStr> {
     let Some(LuaIndexKey::Expr(LuaExpr::NameExpr(key_name))) = index_expr.get_index_key() else {
         return Vec::new();
@@ -1958,7 +2019,7 @@ fn finite_numeric_loop_table_values(
             if let Some(crate::LuaSemanticDeclId::Member(member_id)) = member_info.property_owner_id
                 && let Some(value_expr) = crate::semantic::get_member_value_expr(db, member_id)
             {
-                values.extend(finite_dynamic_key_strings(db, cache, &value_expr, visiting));
+                values.extend(finite_dynamic_key_strings(db, cache, &value_expr, state));
             }
             collect_string_const_names(&member_info.typ, &mut values);
         }

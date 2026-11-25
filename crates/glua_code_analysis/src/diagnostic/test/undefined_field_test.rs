@@ -4755,6 +4755,74 @@ owner:CompletelyMadeUpMethod()
         ));
     }
 
+    /// A defaulted parameter read twice with different defaults still takes
+    /// one value per call: either the passed string both times, or each
+    /// occurrence's default when absent.
+    #[test]
+    fn test_installed_key_reading_defaulted_parameter_twice_uses_one_value() {
+        const INSTALL_DEFAULTED: &str = r#"
+            local function InstallDefaulted(t, name)
+                t[(name or "x") .. "_" .. (name or "y")] = true
+            end
+            ---@type "a"|nil
+            local name = "a"
+            local A = {}
+            InstallDefaulted(A, name)
+        "#;
+        let mut ws = dynamic_field_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!("{INSTALL_DEFAULTED}\nlocal aa, xy = A.a_a, A.x_y\n"),
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!("{INSTALL_DEFAULTED}\nlocal ay = A.a_y\n"),
+        ));
+    }
+
+    /// An installer whose distinct parameters would expand into a large
+    /// Cartesian product widens to a wildcard string key instead of blowing up.
+    #[test]
+    fn test_installed_key_with_many_param_combinations_widens_to_any_string() {
+        let mut ws = dynamic_field_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local function InstallMany(t, a, b, c, d, e, f, g, h, i)
+                t[a .. b .. c .. d .. e .. f .. g .. h .. i] = true
+            end
+            ---@type "a"|"b"
+            local k = "a"
+            local A = {}
+            InstallMany(A, k, k, k, k, k, k, k, k, k)
+            local any_field = A.anything_at_all
+            "#,
+        ));
+    }
+
+    /// Chained local concatenations inside an installer do not expand
+    /// `key_template` exponentially.
+    #[test]
+    fn test_installed_key_with_chained_local_concat_stays_bounded() {
+        let mut source = String::from("local function InstallChain(t, k)\n    local s0 = k\n");
+        for i in 1..=30 {
+            let prev = i - 1;
+            source.push_str(&format!("    local s{i} = s{prev} .. s{prev}\n"));
+        }
+        source.push_str(
+            r#"
+                t[s30] = true
+            end
+            ---@type "a"|"b"
+            local k = "a"
+            local A = {}
+            InstallChain(A, k)
+            "#,
+        );
+        let mut ws = dynamic_field_workspace();
+        ws.def_file("lua/autorun/sh_chain.lua", &source);
+    }
+
     /// A field a call installs holds the value that call passed.
     #[test]
     fn test_installed_field_holds_the_value_its_call_passed() {
