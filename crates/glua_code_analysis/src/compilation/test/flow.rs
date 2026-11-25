@@ -3841,7 +3841,9 @@ _2 = a[1]
     }
 
     /// A helper that lets `nil` through narrows an argument without making it
-    /// nilable: a non-nil argument stays non-nil, a nilable one stays nilable.
+    /// nilable: a non-nil argument stays non-nil, a nilable one stays nilable,
+    /// and one whose other values it rejects can only be `nil`. A predicate
+    /// that lets `nil` through narrows its true branch the same way.
     #[gtest]
     fn test_helper_that_lets_nil_through_keeps_the_arguments_nilability() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
@@ -3852,22 +3854,37 @@ _2 = a[1]
                 if type(x) == "number" then error("no numbers") end
             end
 
+            ---@param x string|number|nil
+            local function is_not_number(x)
+                if type(x) == "number" then return false end
+                return true
+            end
+
             ---@param s string
             ---@param m string|number|nil
-            local function use(s, m)
+            ---@param n number?
+            ---@param g string
+            local function use(s, m, n, g)
+                local none = nil
                 forbid_number(s)
                 forbid_number(m)
+                forbid_number(n)
+                forbid_number(none)
                 after_s = s
                 after_m = m
+                after_n = n
+                after_none = none
+                if is_not_number(g) then
+                    guarded = g
+                end
             end
             "#,
         );
-        let after_s = ws.expr_ty("after_s");
-        let after_m = ws.expr_ty("after_m");
-        assert_eq!(
-            (ws.humanize_type(after_s), ws.humanize_type(after_m)),
-            ("string".to_string(), "string?".to_string())
-        );
+        let types = ["after_s", "after_m", "after_n", "after_none", "guarded"].map(|name| {
+            let typ = ws.expr_ty(name);
+            ws.humanize_type(typ)
+        });
+        assert_eq!(types, ["string", "string?", "nil", "nil", "string"]);
     }
 
     /// A helper that other calls pass a nilable value to narrows each

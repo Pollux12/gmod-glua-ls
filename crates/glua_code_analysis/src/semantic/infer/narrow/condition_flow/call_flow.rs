@@ -524,24 +524,12 @@ pub(in crate::semantic::infer::narrow) fn get_type_after_asserting_call(
     };
     let antecedent_type =
         get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
-    if !narrowed_type.is_nullable() {
-        return Ok(Some(narrow_type_guard_true_branch(
-            db,
-            antecedent_type,
-            narrowed_type,
-            false,
-        )));
-    }
-    // A helper that lets `nil` through keeps it only for an argument that
-    // could hold it.
-    let could_be_nil = antecedent_type.is_optional();
-    let non_nil = TypeOps::Remove.apply(db, &narrowed_type, &LuaType::Nil);
-    let narrowed = narrow_type_guard_true_branch(db, antecedent_type, non_nil, false);
-    Ok(Some(if could_be_nil {
-        TypeOps::Union.apply(db, &narrowed, &LuaType::Nil)
-    } else {
-        narrowed
-    }))
+    Ok(Some(narrow_type_guard_true_branch(
+        db,
+        antecedent_type,
+        narrowed_type,
+        false,
+    )))
 }
 
 /// The type every function `call_expr` may reach asserts of the argument
@@ -1333,7 +1321,7 @@ fn narrow_type_guard_true_branch(
     }
 
     if guard_type.is_nullable() {
-        return guard_type;
+        return narrow_by_nullable_guard(db, antecedent_type, guard_type);
     }
 
     if let Some(narrowed_type) =
@@ -1347,12 +1335,50 @@ fn narrow_type_guard_true_branch(
     guard_accepted_arms(db, &antecedent_type, &guard_type).unwrap_or(guard_type)
 }
 
+/// A guard that lets `nil` through keeps it only for a value that could hold
+/// it, and narrows the rest by what else it accepts. A value none of whose
+/// other arms it accepts can only have been `nil`.
+fn narrow_by_nullable_guard(
+    db: &DbIndex,
+    antecedent_type: LuaType,
+    guard_type: LuaType,
+) -> LuaType {
+    if antecedent_type.is_any() || antecedent_type.is_unknown() {
+        return guard_type;
+    }
+    let could_be_nil = antecedent_type.is_optional();
+    let value = TypeOps::Remove.apply(db, &antecedent_type, &LuaType::Nil);
+    if value.is_never() {
+        return LuaType::Nil;
+    }
+    let guard_type = TypeOps::Remove.apply(db, &guard_type, &LuaType::Nil);
+    let narrowed = narrow_down_type(db, value.clone(), guard_type.clone(), None)
+        .or_else(|| guard_accepted_arms(db, &value, &guard_type));
+    match narrowed {
+        Some(narrowed) if could_be_nil => TypeOps::Union.apply(db, &narrowed, &LuaType::Nil),
+        Some(narrowed) => narrowed,
+        None if could_be_nil && union_arms(&value).iter().all(is_settled_value_type) => {
+            LuaType::Nil
+        }
+        None => antecedent_type,
+    }
+}
+
+fn union_arms(typ: &LuaType) -> Vec<LuaType> {
+    match typ {
+        LuaType::Union(union) => union.types().cloned().collect(),
+        _ => vec![typ.clone()],
+    }
+}
+
+/// Whether a failed guard check on `typ` proves the value is not one: a
+/// generic, a class or an unsettled type may still turn out to pass.
+fn is_settled_value_type(typ: &LuaType) -> bool {
+    typ.is_string() || typ.is_number() || typ.is_boolean() || typ.is_function() || typ.is_table()
+}
+
 fn guard_accepted_arms(db: &DbIndex, value: &LuaType, guard_type: &LuaType) -> Option<LuaType> {
-    let arms = match value {
-        LuaType::Union(union) => union.types().cloned().collect::<Vec<_>>(),
-        _ => vec![value.clone()],
-    };
-    let accepted = arms
+    let accepted = union_arms(value)
         .into_iter()
         .filter(|arm| {
             !arm.is_nil()
