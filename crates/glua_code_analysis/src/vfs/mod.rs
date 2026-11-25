@@ -334,7 +334,7 @@ impl Vfs {
     ) -> Option<Staged> {
         self.content_revision += 1;
         let revision = self.content_revision;
-        if content.is_none() && !is_remote {
+        if content.is_none() {
             self.deleted.insert(fid);
         }
         let content = content.map(|content| FileContent {
@@ -437,10 +437,24 @@ impl Vfs {
                 .file_data
                 .get(fid.id as usize)
                 .is_some_and(Option::is_none)
-                && let Some(path) = self.file_path_map.remove(&fid.id)
             {
-                self.file_id_map.remove(&path);
-                self.file_order_keys.remove(&fid.id);
+                if let Some(path) = self.file_path_map.remove(&fid.id) {
+                    self.file_id_map.remove(&path);
+                    self.file_order_keys.remove(&fid.id);
+                } else {
+                    let mut removed_remote = false;
+                    self.remote_file_id_map.retain(|_, &mut id| {
+                        if id == fid {
+                            removed_remote = true;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if removed_remote {
+                        self.file_order_keys.remove(&fid.id);
+                    }
+                }
             }
         }
     }
@@ -850,6 +864,8 @@ impl Vfs {
         self.file_id_map.clear();
         self.file_path_map.clear();
         self.file_order_keys.clear();
+        self.order_roots.clear();
+        self.remote_file_id_map.clear();
         self.file_data.clear();
         self.line_index_map.clear();
         self.tree_map.clear();
@@ -1361,5 +1377,30 @@ mod tests {
             .expect(
                 "production-sized worker must not overflow when VFS clears or drops deep trees",
             );
+    }
+
+    #[test]
+    fn remote_file_deletions_and_clear_release_remote_entries() {
+        let mut vfs = new_vfs();
+        let uri_a: Uri = "https://example.com/a.json".parse().expect("valid uri");
+        let uri_b: Uri = "https://example.com/b.json".parse().expect("valid uri");
+
+        let fid_a = vfs.set_remote_file_content(&uri_a, Some("{}".to_string()));
+        let fid_b = vfs.set_remote_file_content(&uri_b, Some("{}".to_string()));
+        vfs.take_staged(&[fid_a, fid_b]);
+
+        vfs.set_remote_file_content(&uri_a, None);
+        vfs.take_staged(&[fid_a]);
+        vfs.forget_taken_deletions();
+        assert!(!vfs.remote_file_id_map.contains_key(&uri_a));
+        assert!(!vfs.file_order_keys.contains_key(&fid_a.id));
+        assert!(vfs.remote_file_id_map.contains_key(&uri_b));
+
+        vfs.clear();
+        assert!(vfs.remote_file_id_map.is_empty());
+        assert!(vfs.order_roots.is_empty());
+        vfs.update_config(Arc::new(Emmyrc::default()));
+        let fid_b_after = vfs.set_remote_file_content(&uri_b, Some("{}".to_string()));
+        assert_eq!(fid_b_after, super::FileId { id: 0 });
     }
 }

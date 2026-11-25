@@ -323,7 +323,23 @@ pub async fn on_did_close_document(
     params: DidCloseTextDocumentParams,
     session: u64,
 ) -> Option<()> {
+    struct ForgetClosedOnDrop<'a> {
+        context: &'a ServerContextSnapshot,
+        uri: &'a lsp_types::Uri,
+        session: u64,
+    }
+    impl Drop for ForgetClosedOnDrop<'_> {
+        fn drop(&mut self) {
+            self.context.forget_closed_document(self.uri, self.session);
+        }
+    }
+
     let uri = &params.text_document.uri;
+    let _forget_closed = ForgetClosedOnDrop {
+        context: &context,
+        uri,
+        session,
+    };
     // Checked under the analysis lock: a reopen opens the file under the
     // write lock, so it cannot slip between the check and the store update.
     let encoding = {

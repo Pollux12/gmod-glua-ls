@@ -823,6 +823,9 @@ impl KeyTable {
             for file_id in positional_files(key) {
                 if let Some(slots) = positional.get_mut(&file_id) {
                     slots.remove(&slot);
+                    if slots.is_empty() {
+                        positional.remove(&file_id);
+                    }
                 }
             }
         }

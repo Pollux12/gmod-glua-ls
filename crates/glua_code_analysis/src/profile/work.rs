@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::hash::{BuildHasher, Hash};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
@@ -30,7 +30,7 @@ struct Bucket {
 /// Per work and derivation kind; `None` is work outside any derivation.
 type Table = FxHashMap<(Work, Option<DerivationKind>), Bucket>;
 
-static TABLES: Mutex<Vec<Arc<Mutex<Table>>>> = Mutex::new(Vec::new());
+static TABLES: Mutex<Vec<Weak<Mutex<Table>>>> = Mutex::new(Vec::new());
 
 /// The distinct keys the last `index` report saw, so later reports can say
 /// how much of their work indexing had already done.
@@ -39,7 +39,7 @@ static INDEXED: Mutex<BTreeMap<Work, FxHashSet<u64>>> = Mutex::new(BTreeMap::new
 thread_local! {
     static TABLE: Arc<Mutex<Table>> = {
         let table = Arc::<Mutex<Table>>::default();
-        lock(&TABLES).push(Arc::clone(&table));
+        lock(&TABLES).push(Arc::downgrade(&table));
         table
     };
 }
@@ -85,13 +85,17 @@ pub fn report(label: &str) {
         return;
     }
     let mut merged = BTreeMap::<(Work, Option<DerivationKind>), Bucket>::new();
-    for table in lock(&TABLES).iter() {
-        for (key, bucket) in std::mem::take(&mut *lock(table)) {
+    lock(&TABLES).retain(|weak| {
+        let Some(table) = weak.upgrade() else {
+            return false;
+        };
+        for (key, bucket) in std::mem::take(&mut *lock(&table)) {
             let entry = merged.entry(key).or_default();
             entry.computed += bucket.computed;
             entry.distinct.extend(bucket.distinct);
         }
-    }
+        true
+    });
     let mut indexed = lock(&INDEXED);
     for work in [Work::Infer, Work::Flow] {
         let mut rows = merged
