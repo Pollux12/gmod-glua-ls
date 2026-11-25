@@ -1412,11 +1412,25 @@ fn infer_param_type_from_local_call_sites_inner(
     is_dots: bool,
 ) -> Option<LuaType> {
     let mut inferred_type: Option<LuaType> = None;
+    let mut has_omitted_arg = false;
     for (file_id, call_expr) in call_sites {
-        let Some(arg) = call_expr
-            .get_args_list()
-            .and_then(|args| args.get_args().nth(param_idx))
-        else {
+        let Some(args) = call_expr.get_args_list() else {
+            continue;
+        };
+        let Some(arg) = args.get_args().nth(param_idx) else {
+            let is_complete_call = args.is_single_arg_no_parens()
+                || args.syntax().children_with_tokens().any(|el| {
+                    el.kind()
+                        == glua_parser::LuaKind::Token(glua_parser::LuaTokenKind::TkRightParen)
+                });
+            if !is_dots
+                && is_complete_call
+                && !args.get_args().last().is_some_and(|last| {
+                    crate::compilation::analyzer::expr_expands_to_fill_slots(&last)
+                })
+            {
+                has_omitted_arg = true;
+            }
             continue;
         };
         if !can_call_arg_drive_local_param_inference(db, file_id, &arg, param_idx) {
@@ -1492,6 +1506,11 @@ fn infer_param_type_from_local_call_sites_inner(
             Some(current) => TypeOps::Union.apply(db, &current, &arg_type),
             None => arg_type,
         });
+    }
+
+    if has_omitted_arg {
+        inferred_type =
+            inferred_type.map(|current| TypeOps::Union.apply(db, &current, &LuaType::Nil));
     }
 
     inferred_type
@@ -1833,13 +1852,71 @@ fn local_table_member_call_sites(
     let mut calls = Vec::new();
     for name_expr in decl_name_exprs(db, file_id, file_refs, table_decl_id) {
         let Some(index_expr) = name_expr.get_parent::<LuaIndexExpr>() else {
-            continue;
+            // Allow `T.__index = T` and `setmetatable(..., T)` without treating `T` as escaping.
+            let is_self_index_assign =
+                name_expr
+                    .get_parent::<LuaAssignStat>()
+                    .is_some_and(|assign| {
+                        let (vars, exprs) = assign.get_var_and_expr_list();
+                        exprs
+                            .iter()
+                            .position(|expr| expr.get_syntax_id() == name_expr.get_syntax_id())
+                            .and_then(|pos| vars.get(pos))
+                            .is_some_and(|var| match var {
+                                LuaVarExpr::IndexExpr(lhs) => {
+                                    matches!(
+                                        lhs.get_prefix_expr(),
+                                        Some(LuaExpr::NameExpr(prefix))
+                                            if file_refs.get_decl_id(&prefix.get_range())
+                                                == Some(table_decl_id)
+                                    ) && lhs
+                                        .get_name_token()
+                                        .is_some_and(|name| name.get_name_text() == "__index")
+                                }
+                                LuaVarExpr::NameExpr(_) => false,
+                            })
+                    });
+            let is_setmetatable_arg = name_expr
+                .get_parent::<glua_parser::LuaCallArgList>()
+                .and_then(|args| args.get_parent::<LuaCallExpr>())
+                .is_some_and(|call| call.is_setmetatable());
+            if is_self_index_assign || is_setmetatable_arg {
+                continue;
+            }
+            return None;
         };
-        if index_expr.get_syntax_id() == target.get_syntax_id()
-            || index_expr
-                .get_name_token()
-                .is_none_or(|name| name.get_name_text() != key)
+        if index_expr
+            .get_prefix_expr()
+            .is_none_or(|prefix| prefix.get_syntax_id() != name_expr.get_syntax_id())
         {
+            return None;
+        }
+        if index_expr.get_syntax_id() == target.get_syntax_id() {
+            continue;
+        }
+        let is_same_key = match index_expr.get_index_key() {
+            Some(LuaIndexKey::Name(name)) => name.get_name_text() == key,
+            Some(LuaIndexKey::String(string)) => string.get_value() == key,
+            Some(LuaIndexKey::Integer(_)) => false,
+            _ => return None,
+        };
+        if !is_same_key {
+            if let Some(other_func) = index_expr.get_parent::<LuaFuncStat>()
+                && let Some(other_closure) = other_func.get_closure()
+                && other_closure.descendants::<LuaIndexExpr>().any(|nested| {
+                    matches!(
+                        nested.get_prefix_expr(),
+                        Some(LuaExpr::NameExpr(prefix))
+                            if prefix.get_name_text().as_deref() == Some("self")
+                    ) && match nested.get_index_key() {
+                        Some(LuaIndexKey::Name(name)) => name.get_name_text() == key,
+                        Some(LuaIndexKey::String(string)) => string.get_value() == key,
+                        _ => false,
+                    }
+                })
+            {
+                return None;
+            }
             continue;
         }
         let writes_key = index_expr.get_parent::<LuaFuncStat>().is_some()
@@ -1855,11 +1932,15 @@ fn local_table_member_call_sites(
         if writes_key {
             return None;
         }
-        if let Some(call_expr) = index_expr.get_parent::<LuaCallExpr>()
-            && call_expr.is_colon_call() == is_colon
+        let call_expr = index_expr.get_parent::<LuaCallExpr>()?;
+        if call_expr
+            .get_prefix_expr()
+            .is_none_or(|prefix| prefix.get_syntax_id() != index_expr.get_syntax_id())
+            || call_expr.is_colon_call() != is_colon
         {
-            calls.push(call_expr.get_syntax_id());
+            return None;
         }
+        calls.push(call_expr.get_syntax_id());
     }
     Some(calls)
 }
@@ -2097,6 +2178,14 @@ fn metamethod_receiver_type(
     cache: &mut LuaInferCache,
     member_id: LuaMemberId,
 ) -> Option<LuaType> {
+    fn usable_receiver(typ: LuaType) -> Option<LuaType> {
+        (!matches!(
+            typ,
+            LuaType::Unknown | LuaType::Nil | LuaType::Never | LuaType::Any
+        ))
+        .then_some(typ)
+    }
+
     let member = db.get_member_index().get_member(&member_id)?;
     let LuaMemberKey::Name(name) = member.get_key() else {
         return None;
@@ -2108,11 +2197,40 @@ fn metamethod_receiver_type(
         .get_red_root();
     let node = member_id.get_syntax_id().to_node_from_root(&root)?;
     if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
-        return infer_expr(db, cache, index_expr.get_prefix_expr()?).ok();
+        let prefix_type = infer_expr(db, cache, index_expr.get_prefix_expr()?)
+            .ok()
+            .and_then(usable_receiver)?;
+        // When a separate metatable table defines `__index = Class`, the
+        // receiver passed to its metamethods is an instance of `Class`, not
+        // the metatable table itself.
+        if let LuaType::TableConst(table_range) = &prefix_type
+            && db.get_type_index().table_class(table_range).is_none()
+            && let Some(index_members) = db.get_member_index().get_members_with_key(
+                &crate::LuaMemberOwner::Element(table_range.clone()),
+                &LuaMemberKey::Name("__index".into()),
+            )
+            && let Some(index_target) = index_members.into_iter().find_map(|index_member| {
+                let target = db
+                    .get_type_index()
+                    .get_type_cache(&index_member.get_id().into())?
+                    .as_type()
+                    .clone();
+                match &target {
+                    LuaType::Ref(_) | LuaType::Def(_) => Some(target),
+                    LuaType::TableConst(target_range) if target_range != table_range => {
+                        Some(target)
+                    }
+                    _ => None,
+                }
+            })
+        {
+            return Some(index_target);
+        }
+        return Some(prefix_type);
     }
     let literal = LuaTableField::cast(node)?.get_parent::<LuaTableExpr>()?;
     if let Some(target) = setmetatable_target_of_literal(&literal) {
-        return infer_expr(db, cache, target).ok();
+        return infer_expr(db, cache, target).ok().and_then(usable_receiver);
     }
     let table = crate::InFiled::new(member_id.file_id, literal.get_range());
     Some(

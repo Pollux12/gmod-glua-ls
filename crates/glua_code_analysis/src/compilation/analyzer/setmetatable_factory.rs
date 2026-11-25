@@ -50,7 +50,8 @@ fn transferable_factory_member_ids(
     for member in members {
         let member_id = member.get_id();
         let member_position = member_id.get_position();
-        let in_constructor = binding.table_range.value.contains(member_position);
+        let in_constructor = binding.table_range.file_id == binding.file_id
+            && binding.table_range.value.contains(member_position);
         if member_id.file_id != binding.file_id
             || (member_position >= binding.call_position && !in_constructor)
         {
@@ -113,6 +114,10 @@ fn prototype_of(
         }
         LuaType::TableConst(range) => {
             let prototype = crate::semantic::metatable_member_owner(db, range);
+            has_method(db, &prototype).then_some(prototype)
+        }
+        LuaType::Def(id) => {
+            let prototype = LuaMemberOwner::Type(id.clone());
             has_method(db, &prototype).then_some(prototype)
         }
         LuaType::TypeGuard(inner) => prototype_of(db, inner, binding, metatable_owner),

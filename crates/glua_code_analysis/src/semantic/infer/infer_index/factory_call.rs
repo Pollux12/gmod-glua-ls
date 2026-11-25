@@ -1,13 +1,22 @@
 //! A table a function constructs on each call holds what that call passed:
 //! the function's code reads a parameter as the argument the call gave it.
 
-use glua_parser::{LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr};
+use std::cell::RefCell;
+
+use glua_parser::{LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaVarExpr};
 use rowan::TextRange;
+use rustc_hash::FxHashSet;
 
 use crate::{
-    DbIndex, InFiled, LuaDeclExtra, LuaInferCache, LuaSignatureId, LuaType,
+    DbIndex, FileId, InFiled, LuaDeclExtra, LuaInferCache, LuaSignatureId, LuaType,
     semantic::infer::{infer_call::get_prefix_expr_signature_id, infer_expr},
 };
+
+thread_local! {
+    /// Arguments currently being forwarded across files, to stop mutual factory
+    /// cycles before `with_file_cache` opens fresh caches without end.
+    static FORWARDING: RefCell<FxHashSet<(FileId, TextRange)>> = RefCell::default();
+}
 
 /// The value `expr`, written into the table constructor `table`, holds in the
 /// copy of it one of `calls`, innermost last, made. `expr` names a parameter
@@ -45,15 +54,25 @@ fn infer_forwarded_arg(
     let Some(arg) = arg else {
         return Some(LuaType::Nil);
     };
+    let key = (file_id, arg.get_range());
+    if !FORWARDING.with(|active| active.borrow_mut().insert(key)) {
+        return None;
+    }
     let arg = InFiled::new(file_id, arg);
-    match bound_arg(db, cache, &arg, calls) {
+    let result = match bound_arg(db, cache, &arg, calls) {
         Some((at, _, outer)) => {
             infer_forwarded_arg(db, cache, calls[at].file_id, outer, &calls[..at])
         }
         None => with_file_cache(cache, arg.file_id, |cache| {
             infer_expr(db, cache, arg.value).ok()
+        })
+        .map(|typ| match typ {
+            LuaType::Variadic(multi) => multi.get_type(0).cloned().unwrap_or(LuaType::Nil),
+            other => other,
         }),
-    }
+    };
+    FORWARDING.with(|active| active.borrow_mut().remove(&key));
+    result
 }
 
 /// The index into `calls` of the innermost call of the function whose
@@ -85,7 +104,24 @@ fn bound_arg(
             (signature_id, idx + usize::from(signature.is_colon_define))
         }
         LuaDeclExtra::ImplicitSelf { .. } => {
-            let closure = name.syntax().ancestors().find_map(LuaClosureExpr::cast)?;
+            let closure = name
+                .syntax()
+                .ancestors()
+                .filter_map(LuaFuncStat::cast)
+                .find(|func_stat| {
+                    matches!(
+                        func_stat.get_func_name(),
+                        Some(LuaVarExpr::IndexExpr(index_expr))
+                            if index_expr
+                                .get_index_token()
+                                .is_some_and(|token| {
+                                    token.is_colon()
+                                        && glua_parser::LuaAstToken::get_range(&token).start()
+                                            == decl_id.position
+                                })
+                    )
+                })
+                .and_then(|func_stat| func_stat.get_closure())?;
             (LuaSignatureId::from_closure(expr.file_id, &closure), 0)
         }
         _ => return None,

@@ -406,7 +406,9 @@ fn infer_binary_expr_add(db: &DbIndex, left: LuaType, right: LuaType) -> InferRe
     // a string Lua coerces, and nothing known otherwise. A `nil` leaves the
     // answer to the other operand's `__add` when that takes `nil`.
     let sum_with_unknown = |unknown_side: &LuaType, other: &LuaType| {
-        if unknown_side.is_nil() && has_operator_taking_nil(db, other, BinaryOperator::OpAdd) {
+        if (unknown_side.is_nil() && has_operator_taking_nil(db, other, BinaryOperator::OpAdd))
+            || infer_metamethod_result(db, other, LuaOperatorMetaMethod::Add).is_some()
+        {
             None
         } else if other.is_number() || other.is_custom_type() {
             Some(other.clone())

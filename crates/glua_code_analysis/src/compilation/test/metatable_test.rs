@@ -3669,6 +3669,88 @@ mod test {
         assert_eq!(ws.humanize_type(ws.local_ty(file_id, "baseName")), "string");
     }
 
+    /// An `__index` function returning `left or right` falls through to `right`
+    /// when `left` can be `false`, not only when `left` can be `nil`.
+    #[test]
+    fn function_index_or_falls_through_on_false() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            local Primary = { flag = false }
+            local Fallback = { flag = 42 }
+            local obj = setmetatable({}, {
+                __index = function(_, key)
+                    return Primary[key] or Fallback[key]
+                end,
+            })
+            local value = obj.flag
+            "#,
+        );
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "value")),
+            "(integer|true)"
+        );
+    }
+
+    /// A local `getmetatable` shadows the builtin rather than returning the
+    /// argument's metatable.
+    #[test]
+    fn shadowed_local_getmetatable_does_not_act_as_builtin() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            local function getmetatable(_)
+                return 123
+            end
+            local t = setmetatable({}, { x = "hi" })
+            local mt = getmetatable(t)
+            "#,
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "mt")), "123");
+    }
+
+    /// Adding an `unknown` operand to a class with `__add` resolves through
+    /// `__add` instead of collapsing to `number`.
+    #[test]
+    fn add_with_unknown_respects_add_metamethod() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@class Vec2
+            ---@operator add(any): Vec2
+            local Vec2 = {}
+            ---@type Vec2
+            local v
+            ---@type unknown
+            local u
+            local sum1 = v + u
+            local sum2 = u + v
+            "#,
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "sum1")), "Vec2");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "sum2")), "Vec2");
+    }
+
+    /// A separate metatable table with `__index = Proto` types `self` in its
+    /// metamethods as `Proto`, not the metatable table itself.
+    #[test]
+    fn separate_metatable_metamethod_self_uses_index_target() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@class Vec3
+            ---@field x number
+            local Vec3 = {}
+            local mt = { __index = Vec3 }
+            function mt.__add(self, other)
+                local sx = self.x
+                return sx
+            end
+            "#,
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "sx")), "number");
+    }
+
     fn is_function_type(typ: &LuaType) -> bool {
         matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
     }

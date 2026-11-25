@@ -248,8 +248,26 @@ pub fn special_or_rule(
                 return None;
             }
 
+            let left_truthy = remove_false_or_nil(left_type.clone());
+            // Non-doc literal constants (like `123` inside `123?`) are compact
+            // with any value of their base primitive type, so `check_type_compact`
+            // alone would drop a distinct literal fallback such as `0` in `v or 0`.
+            if left_truthy.is_const()
+                || matches!(
+                    &left_truthy,
+                    LuaType::Union(union)
+                        if union.types().any(|arm| {
+                            arm.is_const()
+                                && arm != right_type
+                                && check_type_compact(db, arm, right_type).is_ok()
+                        })
+                )
+            {
+                return None;
+            }
+
             if check_type_compact(db, left_type, right_type).is_ok() {
-                return Some(remove_false_or_nil(left_type.clone()));
+                return Some(left_truthy);
             }
         }
 

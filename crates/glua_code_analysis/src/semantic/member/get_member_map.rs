@@ -46,22 +46,64 @@ pub fn get_member_map_in_workspace_for_file_at_offset(
 /// The fields of the table literal `typ` as a shape of their own, for a value
 /// copied out of the file that holds the literal.
 pub(crate) fn snapshot_table_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
-    if !matches!(typ, LuaType::TableConst(_)) {
+    let mut visited = rustc_hash::FxHashSet::default();
+    snapshot_table_type_inner(db, typ, &mut visited)
+}
+
+fn snapshot_table_type_inner(
+    db: &DbIndex,
+    typ: &LuaType,
+    visited: &mut rustc_hash::FxHashSet<LuaType>,
+) -> Option<LuaType> {
+    if let LuaType::Union(union) = typ {
+        let mut changed = false;
+        let members = union
+            .types()
+            .map(|arm| match snapshot_table_type_inner(db, arm, visited) {
+                Some(snap) => {
+                    changed = true;
+                    snap
+                }
+                None => arm.clone(),
+            })
+            .collect::<Vec<_>>();
+        return changed.then(|| LuaType::from_vec(members));
+    }
+    if !matches!(typ, LuaType::TableConst(_)) || !visited.insert(typ.clone()) {
         return None;
     }
-    let fields = get_member_map(db, typ)?
-        .into_iter()
-        .filter_map(|(key, members)| {
-            let member_type = LuaType::from_inferred_vec(
-                members
-                    .into_iter()
-                    .map(|member| member.typ)
-                    .collect::<Vec<_>>(),
-            );
-            (!member_type.is_never()).then_some((key, member_type))
-        })
-        .collect();
-    Some(LuaObjectType::new_with_fields(fields, Vec::new()).into())
+    let member_map = match get_member_map(db, typ) {
+        Some(map) => map,
+        None => {
+            visited.remove(typ);
+            return None;
+        }
+    };
+    let mut fields = std::collections::BTreeMap::new();
+    let mut index_access = Vec::new();
+    let mut entries = member_map.into_iter().collect::<Vec<_>>();
+    entries.sort_by_cached_key(|(key, _)| format!("{key:?}"));
+    for (key, members) in entries {
+        let member_type = LuaType::from_inferred_vec(
+            members
+                .into_iter()
+                .map(|member| member.typ)
+                .collect::<Vec<_>>(),
+        );
+        if member_type.is_never() {
+            continue;
+        }
+        let member_type =
+            snapshot_table_type_inner(db, &member_type, visited).unwrap_or(member_type);
+        match key {
+            LuaMemberKey::ExprType(key_type) => index_access.push((key_type, member_type)),
+            other => {
+                fields.insert(other, member_type);
+            }
+        }
+    }
+    visited.remove(typ);
+    Some(LuaObjectType::new_with_fields(fields, index_access).into())
 }
 
 fn build_member_map(

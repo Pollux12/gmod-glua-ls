@@ -312,7 +312,11 @@ impl LuaMetatableIndex {
     pub fn add_factory_binding(&mut self, binding: SetmetatableFactoryBinding) {
         let file_id = binding.file_id;
         derivation::note_write(|| FactKey::MetatableFactory(file_id));
-        for named in [binding.table_range.file_id, binding.metatable_range.file_id] {
+        for named in [
+            file_id,
+            binding.table_range.file_id,
+            binding.metatable_range.file_id,
+        ] {
             if !self
                 .factory_writers_by_file
                 .get(&named)
@@ -557,7 +561,13 @@ fn site_sort_key(site: &InFiled<TextRange>) -> (FileId, TextSize, TextSize) {
 fn factory_files(bindings: &[SetmetatableFactoryBinding]) -> HashSet<FileId> {
     bindings
         .iter()
-        .flat_map(|binding| [binding.table_range.file_id, binding.metatable_range.file_id])
+        .flat_map(|binding| {
+            [
+                binding.file_id,
+                binding.table_range.file_id,
+                binding.metatable_range.file_id,
+            ]
+        })
         .collect()
 }
 

@@ -1643,16 +1643,7 @@ fn specialize_instance_return_alias_for_call(
         infer_instance_made_by(db, cache, signature_id, signature, call_expr, |param| {
             call_arg_for_dot_param(call_expr, &args, param)
         })?;
-    Some(Arc::new(
-        LuaFunctionType::new(
-            func_ty.get_async_state(),
-            func_ty.is_colon_define(),
-            func_ty.is_variadic(),
-            func_ty.get_params().to_vec(),
-            instance,
-        )
-        .with_optional_params(func_ty.get_optional_params().to_vec()),
-    ))
+    Some(Arc::new(func_ty.clone().with_ret(instance)))
 }
 
 fn specialize_direct_param_return_alias_for_call(
@@ -2225,16 +2216,7 @@ fn specialize_call_operator_for_call(
             },
         );
     match instance {
-        Some(instance) => Arc::new(
-            LuaFunctionType::new(
-                func.get_async_state(),
-                func.is_colon_define(),
-                func.is_variadic(),
-                func.get_params().to_vec(),
-                instance,
-            )
-            .with_optional_params(func.get_optional_params().to_vec()),
-        ),
+        Some(instance) => Arc::new((*func).clone().with_ret(instance)),
         None => func,
     }
 }
@@ -2740,8 +2722,6 @@ pub fn infer_call_expr(
     let ret_type =
         infer_net_read::infer_net_read_call(db, cache, &call_expr, &prefix_type, &ret_type)
             .unwrap_or(ret_type);
-    // A loader whose own result says nothing returns what the file it runs
-    // returns.
 
     if let Some(tree) = db.get_flow_index().get_flow_tree(&cache.get_file_id())
         && let Some(flow_id) = tree.get_flow_id(call_expr.get_syntax_id())

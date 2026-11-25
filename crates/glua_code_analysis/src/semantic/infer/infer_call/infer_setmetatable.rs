@@ -98,34 +98,66 @@ fn result_used_as_class(db: &DbIndex, cache: &LuaInferCache, call_expr: &LuaCall
         return false;
     };
     let file_id = cache.get_file_id();
+    let decl_used_as_class = |decl_id: LuaDeclId| {
+        db.get_reference_index()
+            .get_decl_references(&file_id, &decl_id)
+            .is_some_and(|references| {
+                references.cells.iter().any(|cell| {
+                    root.covering_element(cell.range)
+                        .parent()
+                        .and_then(LuaNameExpr::cast)
+                        .is_some_and(|use_| is_class_use(&use_))
+                })
+            })
+    };
     match holder {
         LuaStat::LocalStat(local_stat) => {
-            let Some(name) = local_stat.get_local_name_list().next() else {
+            let Some(pos) = local_stat
+                .get_value_exprs()
+                .position(|expr| expr.syntax() == call_expr.syntax())
+            else {
                 return false;
             };
-            let decl_id = LuaDeclId::new(file_id, name.get_position());
-            db.get_reference_index()
-                .get_decl_references(&file_id, &decl_id)
-                .is_some_and(|references| {
-                    references.cells.iter().any(|cell| {
-                        root.covering_element(cell.range)
-                            .parent()
-                            .and_then(LuaNameExpr::cast)
-                            .is_some_and(|use_| is_class_use(&use_))
-                    })
-                })
+            let Some(name) = local_stat.get_local_name_list().nth(pos) else {
+                return false;
+            };
+            decl_used_as_class(LuaDeclId::new(file_id, name.get_position()))
         }
         LuaStat::AssignStat(assign_stat) => {
-            let (vars, _) = assign_stat.get_var_and_expr_list();
-            let Some(LuaVarExpr::NameExpr(global)) = vars.first() else {
+            let (vars, exprs) = assign_stat.get_var_and_expr_list();
+            let Some(pos) = exprs
+                .iter()
+                .position(|expr| expr.syntax() == call_expr.syntax())
+            else {
                 return false;
             };
-            let Some(name) = global.get_name_text() else {
+            let Some(LuaVarExpr::NameExpr(target)) = vars.get(pos) else {
+                return false;
+            };
+            if let Some(decl_id) = db
+                .get_reference_index()
+                .get_var_reference_decl(&file_id, target.get_range())
+                && db
+                    .get_decl_index()
+                    .get_decl(&decl_id)
+                    .is_some_and(|decl| decl.is_local())
+            {
+                return decl_used_as_class(decl_id);
+            }
+            let Some(name) = target.get_name_text() else {
                 return false;
             };
             root.descendants()
                 .filter_map(LuaNameExpr::cast)
-                .any(|use_| use_.get_name_text() == Some(name.clone()) && is_class_use(&use_))
+                .any(|use_| {
+                    use_.get_name_text() == Some(name.clone())
+                        && !db
+                            .get_reference_index()
+                            .get_var_reference_decl(&file_id, use_.get_range())
+                            .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
+                            .is_some_and(|decl| decl.is_local())
+                        && is_class_use(&use_)
+                })
         }
         _ => false,
     }
@@ -170,10 +202,13 @@ fn is_class_use(name: &LuaNameExpr) -> bool {
 /// ones another call made, so a constructor there is a different table.
 fn index_chain_reaches(index: &LuaType, range: &InFiled<rowan::TextRange>) -> bool {
     let mut current = index;
-    if current == &LuaType::TableConst(range.clone()) {
-        return true;
-    }
-    while let LuaType::Instance(instance) = current {
+    loop {
+        if current == &LuaType::TableConst(range.clone()) {
+            return true;
+        }
+        let LuaType::Instance(instance) = current else {
+            return false;
+        };
         if instance.get_range() == range {
             return true;
         }
@@ -182,7 +217,6 @@ fn index_chain_reaches(index: &LuaType, range: &InFiled<rowan::TextRange>) -> bo
         }
         current = instance.get_base();
     }
-    false
 }
 
 /// The `__index` of the metatable `metatable`, which its instances read
@@ -244,16 +278,16 @@ pub fn infer_getmetatable_call(
     cache: &mut LuaInferCache,
     call_expr: &LuaCallExpr,
 ) -> Option<LuaType> {
-    let metatable = metatable_type(db, getmetatable_call_metatable(db, cache, call_expr)?);
-    let hidden_by = find_members_with_key(
-        db,
-        &metatable,
-        LuaMemberKey::Name("__metatable".into()),
-        false,
-    )
-    .and_then(|members| members.into_iter().next());
+    let metatable_range = getmetatable_call_metatable(db, cache, call_expr)?;
+    let metatable = metatable_type(db, metatable_range.clone());
+    let owner = crate::semantic::metatable_member_owner(db, &metatable_range);
+    let hidden_by = db
+        .get_member_index()
+        .get_member_item(&owner, &LuaMemberKey::Name("__metatable".into()))
+        .and_then(|item| item.resolve_type(db).ok())
+        .filter(|typ| !typ.is_nil() && !typ.is_never() && !typ.is_unknown());
     Some(match hidden_by {
-        Some(member) => crate::db_index::widen_literal_type_for_assignment(&member.typ),
+        Some(typ) => crate::db_index::widen_literal_type_for_assignment(&typ),
         None => metatable,
     })
 }
@@ -268,7 +302,8 @@ pub(crate) fn getmetatable_call_metatable(
     let LuaExpr::NameExpr(name) = call_expr.get_prefix_expr()? else {
         return None;
     };
-    if name.get_name_text()? != "getmetatable" {
+    if name.get_name_text()? != "getmetatable" || is_shadowed_local(db, cache.get_file_id(), &name)
+    {
         return None;
     }
     let [table]: [LuaExpr; 1] = call_expr
@@ -283,6 +318,13 @@ pub(crate) fn getmetatable_call_metatable(
     let range = resolve_table_backing_range(db, cache, &table)
         .or_else(|| setmetatable_target_range(db, cache, &table))?;
     db.get_metatable_index().get(&range).cloned()
+}
+
+fn is_shadowed_local(db: &DbIndex, file_id: crate::FileId, name: &LuaNameExpr) -> bool {
+    db.get_reference_index()
+        .get_var_reference_decl(&file_id, name.get_range())
+        .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
+        .is_some_and(|decl| decl.is_local())
 }
 
 /// The class a registration made of `metatable`, or the table itself.
@@ -367,15 +409,15 @@ fn proxy_metatable_of_value(
     let LuaExpr::NameExpr(name) = call.get_prefix_expr()? else {
         return None;
     };
-    if name.get_name_text()? != "newproxy" {
+    if name.get_name_text()? != "newproxy" || is_shadowed_local(db, cache.get_file_id(), &name) {
         return None;
     }
     let arg = call.get_args_list()?.get_args().next()?;
-    match infer_expr(db, cache, arg.clone()).ok()? {
-        LuaType::BooleanConst(true) | LuaType::DocBooleanConst(true) => {
+    match infer_expr(db, cache, arg.clone()) {
+        Ok(LuaType::BooleanConst(true) | LuaType::DocBooleanConst(true)) => {
             Some(InFiled::new(cache.get_file_id(), call.get_range()))
         }
-        LuaType::BooleanConst(false) | LuaType::DocBooleanConst(false) => None,
+        Ok(LuaType::BooleanConst(false) | LuaType::DocBooleanConst(false)) => None,
         _ => proxy_metatable_range(db, cache, &arg, visited),
     }
 }
@@ -407,7 +449,9 @@ fn setmetatable_target_range(
         return None;
     }
     let target = call.get_args_list()?.get_args().next()?;
-    table_backing_range_from_expr(file_id, &target)
+    crate::semantic::with_file_cache(cache, file_id, |cache| {
+        resolve_table_backing_range(db, cache, &target)
+    })
 }
 
 fn resolve_table_backing_range(

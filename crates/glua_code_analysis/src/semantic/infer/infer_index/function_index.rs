@@ -44,11 +44,21 @@ pub(super) fn infer_function_index_member(
         return None;
     };
     let key_name = match key {
-        LuaIndexKey::Name(name) => name.get_name_text().to_string(),
-        LuaIndexKey::String(string) => string.get_value(),
-        _ => return Some(LuaType::Unknown),
+        LuaIndexKey::Name(name) => Some(LuaMemberKey::Name(name.get_name_text().into())),
+        LuaIndexKey::String(string) => Some(LuaMemberKey::Name(string.get_value().into())),
+        LuaIndexKey::Integer(int) => match int.get_number_value() {
+            glua_parser::NumberResult::Int(value) => Some(LuaMemberKey::Integer(value)),
+            _ => None,
+        },
+        _ => None,
     };
-    let key_name = LuaMemberKey::Name(key_name.into());
+    let Some(key_name) = key_name else {
+        let signature = db.get_signature_index().get(signature_id)?;
+        return match single_value_type(signature.get_return_type()) {
+            LuaType::Nil => None,
+            returned => Some(returned),
+        };
+    };
     let reading = (*signature_id, key_name.clone());
     if !READING.with(|reading_now| reading_now.borrow_mut().insert(reading.clone())) {
         // Where the cycle is cut depends on which read started it.
@@ -97,9 +107,16 @@ fn function_index_member(
     {
         return Some(returned_type);
     }
-    match signature.get_return_type() {
+    match single_value_type(signature.get_return_type()) {
         LuaType::Nil => Some(LuaType::Unknown),
         returned => Some(returned),
+    }
+}
+
+fn single_value_type(typ: LuaType) -> LuaType {
+    match typ {
+        LuaType::Variadic(multi) => multi.get_type(0).cloned().unwrap_or(LuaType::Nil),
+        other => other,
     }
 }
 
@@ -130,12 +147,16 @@ impl KeyRead<'_> {
             let left = self.value_type(left);
             let right = self.value_type(right);
             return match (left, right) {
-                (Some(left), _) if !left.is_nullable() => Some(left),
-                (Some(left), Some(right)) => Some(TypeOps::Union.apply(
-                    self.db,
-                    &TypeOps::Remove.apply(self.db, &left, &LuaType::Nil),
-                    &right,
-                )),
+                (Some(left), _) if left.is_always_truthy() => Some(left),
+                (Some(left), Some(right)) if left.is_always_falsy() => Some(right),
+                (Some(left), Some(right)) => {
+                    let truthy = crate::semantic::remove_false_or_nil(left);
+                    if truthy.is_unknown() {
+                        Some(right)
+                    } else {
+                        Some(TypeOps::Union.apply(self.db, &truthy, &right))
+                    }
+                }
                 (left, right) => left.or(right),
             };
         }

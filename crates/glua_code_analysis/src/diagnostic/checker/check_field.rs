@@ -835,17 +835,32 @@ fn has_unresolved_metatable_index_inner(
         // A table one call made has the metatable `__index` that call's
         // arguments give it.
         LuaType::Instance(instance) => {
-            if instance.get_kind() != crate::LuaInstanceKind::Shared
+            let factory_index = if instance.get_kind() != crate::LuaInstanceKind::Shared
                 && let LuaType::TableConst(base) = instance.get_base()
-                && let Some(index_type) = crate::semantic::factory_bound_metatable_index(
+            {
+                crate::semantic::factory_bound_metatable_index(
                     db,
                     &mut semantic_model.get_cache().borrow_mut(),
                     base,
                     std::slice::from_ref(instance.get_range()),
                 )
-            {
+            } else {
+                None
+            };
+            if let Some(index_type) = factory_index {
                 return index_type.is_unknown()
-                    || matches!(index_type, LuaType::Signature(_) | LuaType::DocFunction(_));
+                    || index_type.is_any()
+                    || matches!(
+                        index_type,
+                        LuaType::Function | LuaType::Signature(_) | LuaType::DocFunction(_)
+                    )
+                    || has_unresolved_metatable_index_inner(
+                        db,
+                        semantic_model,
+                        &index_type,
+                        position,
+                        visited,
+                    );
             }
             has_unresolved_metatable_index_inner(
                 db,
