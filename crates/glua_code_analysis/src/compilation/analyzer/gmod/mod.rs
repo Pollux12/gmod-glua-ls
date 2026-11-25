@@ -834,8 +834,8 @@ fn collect_forwarded_calls(
 
 /// Whether every call of `closure` makes `call_expr`. A realm branch does
 /// not skip it but leaves it the realms it names: an `if` whose block, `elseif`
-/// or `else` holds it, or an earlier `if CLIENT then return end` whose other
-/// clauses cannot leave. Any other
+/// or `else` holds it after only realm conditions, or an earlier
+/// `if CLIENT then return end` whose other clauses cannot leave. Any other
 /// condition, loop, short-circuit operand, `return` or `goto` before it can.
 fn forwarded_reach(call_expr: &LuaCallExpr, closure: &LuaClosureExpr) -> ForwardedReach {
     let position = call_expr.get_position();
@@ -859,7 +859,19 @@ fn forwarded_reach(call_expr: &LuaCallExpr, closure: &LuaClosureExpr) -> Forward
         .take_while(|node| node != closure.syntax())
     {
         let skips = match LuaIfStat::cast(node.clone()) {
-            Some(if_stat) => !narrows_realm(&if_stat),
+            Some(if_stat) => {
+                !narrows_realm(&if_stat)
+                    || if_stat
+                        .get_all_clause()
+                        .take_while(|clause| !clause.get_range().contains(position))
+                        .any(|clause| {
+                            clause
+                                .get_condition_expr()
+                                .as_ref()
+                                .and_then(realm_from_condition)
+                                .is_none()
+                        })
+            }
             None => {
                 matches!(
                     node.kind().into(),
