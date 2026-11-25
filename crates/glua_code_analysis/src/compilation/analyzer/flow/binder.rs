@@ -444,6 +444,20 @@ impl<'a> FlowBinder<'a> {
                             crate::db_index::intern_smol_str(&name),
                         ));
                     }
+                    if let Some(decl_id) = self
+                        .db
+                        .get_reference_index()
+                        .get_var_reference_decl(&self.file_id, name_expr.get_range())
+                    {
+                        let source_id = crate::semantic::narrowing_root_decl(self.db, decl_id);
+                        if source_id != decl_id
+                            && let Some(source) = self.db.get_decl_index().get_decl(&source_id)
+                        {
+                            self.record_call_argument(NarrowingTarget::CallArgumentName(
+                                crate::db_index::intern_smol_str(source.get_name()),
+                            ));
+                        }
+                    }
                 }
                 LuaExpr::IndexExpr(index_expr) => {
                     let Some(path) = crate::semantic::getter_access_path(&LuaExpr::IndexExpr(

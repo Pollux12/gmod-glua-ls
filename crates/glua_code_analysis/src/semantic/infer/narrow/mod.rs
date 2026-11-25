@@ -181,10 +181,17 @@ pub(crate) fn var_ref_passed_to_call(
             .any(|argument| argument.as_str() == name)
     };
     match var_ref_id {
-        VarRefId::VarRef(decl_id) => db
-            .get_decl_index()
-            .get_decl(decl_id)
-            .is_some_and(|decl| passes_name(decl.get_name())),
+        VarRefId::VarRef(decl_id) => {
+            let root_id = crate::semantic::narrowing_root_decl(db, *decl_id);
+            db.get_decl_index()
+                .get_decl(decl_id)
+                .is_some_and(|decl| passes_name(decl.get_name()))
+                || (root_id != *decl_id
+                    && db
+                        .get_decl_index()
+                        .get_decl(&root_id)
+                        .is_some_and(|decl| passes_name(decl.get_name())))
+        }
         VarRefId::SelfRef(_) => passes_name("self"),
         VarRefId::GlobalName(name, _) => passes_name(name),
         VarRefId::IndexRef(_, path) => capability.call_argument_paths.contains(path),

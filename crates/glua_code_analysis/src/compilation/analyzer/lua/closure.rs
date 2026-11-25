@@ -2660,9 +2660,17 @@ fn tests_guard_subject(db: &DbIndex, file_id: crate::FileId, expr: &LuaExpr) -> 
             None => return false,
         },
     };
+    let subject_decl_id = LuaDeclId::new(file_id, subject_position);
+    if db
+        .get_reference_index()
+        .get_decl_references(&file_id, &subject_decl_id)
+        .is_some_and(|references| references.is_written_after_declaration(subject_decl_id.position))
+    {
+        return false;
+    }
     db.get_reference_index()
         .get_var_reference_decl(&file_id, tested.get_range())
-        == Some(LuaDeclId::new(file_id, subject_position))
+        == Some(subject_decl_id)
 }
 
 /// The value `expr` returns. In `cond and value.Member`, a member the

@@ -1179,9 +1179,26 @@ fn maybe_field_literal_eq_narrow(
     let syntax_id = left_expr.get_syntax_id();
     let (index_expr, value_expr) = match (left_expr, right_expr) {
         (LuaExpr::IndexExpr(index_expr), value_expr @ LuaExpr::LiteralExpr(_))
-        | (value_expr @ LuaExpr::LiteralExpr(_), LuaExpr::IndexExpr(index_expr))
-        | (LuaExpr::IndexExpr(index_expr), value_expr @ LuaExpr::IndexExpr(_)) => {
+        | (value_expr @ LuaExpr::LiteralExpr(_), LuaExpr::IndexExpr(index_expr)) => {
             (index_expr, value_expr)
+        }
+        (LuaExpr::IndexExpr(left_index), LuaExpr::IndexExpr(right_index)) => {
+            let left_matches = left_index
+                .get_prefix_expr()
+                .and_then(|prefix| get_var_expr_var_ref_id(db, cache, prefix))
+                .as_ref()
+                == Some(var_ref_id);
+            let right_matches = !left_matches
+                && right_index
+                    .get_prefix_expr()
+                    .and_then(|prefix| get_var_expr_var_ref_id(db, cache, prefix))
+                    .as_ref()
+                    == Some(var_ref_id);
+            if right_matches {
+                (right_index, LuaExpr::IndexExpr(left_index))
+            } else {
+                (left_index, LuaExpr::IndexExpr(right_index))
+            }
         }
         _ => return Ok(ResultTypeOrContinue::Continue),
     };
@@ -1217,9 +1234,30 @@ fn maybe_field_literal_eq_narrow(
     // A registry entry's field holds the value its own call passed, so only an
     // equal constant keeps the entry.
     let (union_types, is_registry) = match left_type {
-        LuaType::Union(union_type) => (union_type.into_vec(), false),
-        _ => match registry_entries(db, cache, &prefix_expr) {
-            Some(entries) => (entries, true),
+        LuaType::Union(union_type) => {
+            let arms = union_type.into_vec();
+            let is_registry = registry_entries(db, cache, &prefix_expr)
+                .is_some_and(|entries| arms.iter().all(|arm| entries.contains(arm)));
+            (arms, is_registry)
+        }
+        other => match registry_entries(db, cache, &prefix_expr) {
+            Some(entries) if entries.contains(&other) => (vec![other], true),
+            Some(entries) => {
+                let is_unnarrowed = other.is_any()
+                    || other.is_unknown()
+                    || matches!(other, LuaType::Table | LuaType::MergedTable(_))
+                    || entries.iter().any(|entry| {
+                        matches!(
+                            entry,
+                            LuaType::Instance(instance) if instance.get_base() == &other
+                        )
+                    });
+                if is_unnarrowed {
+                    (entries, true)
+                } else {
+                    return Ok(ResultTypeOrContinue::Continue);
+                }
+            }
             None => return Ok(ResultTypeOrContinue::Continue),
         },
     };

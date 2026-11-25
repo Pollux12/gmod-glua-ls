@@ -133,7 +133,9 @@ pub fn resolve_signature_by_args(
         }
 
         if current_match_result == ParamMatchResult::Not && !skipped_implicit_self {
-            if let Some(closest) = closest_table_fit(db, &rejecting, expr_type) {
+            if let Some(closest) =
+                closest_table_fit(db, &rejecting, expr_type, expr_len, is_colon_call)
+            {
                 best_match_result = closest;
             }
             break;
@@ -249,6 +251,8 @@ fn closest_table_fit(
     db: &DbIndex,
     rejecting: &[(Arc<LuaFunctionType>, LuaType)],
     expr_type: &LuaType,
+    expr_len: usize,
+    is_colon_call: bool,
 ) -> Option<Arc<LuaFunctionType>> {
     if !matches!(expr_type, LuaType::TableConst(_)) {
         return None;
@@ -273,7 +277,12 @@ fn closest_table_fit(
     rejecting
         .iter()
         .filter(|(_, param_type)| check_type_compact(db, param_type, &LuaType::Table).is_ok())
-        .min_by_key(|(_, param_type)| misses(param_type))
+        .min_by_key(|(func, param_type)| {
+            (
+                misses(param_type),
+                !takes_arg_count(db, func, expr_len, is_colon_call),
+            )
+        })
         .map(|(func, _)| func.clone())
 }
 
@@ -412,10 +421,10 @@ fn takes_arg_count(
     is_colon_call: bool,
 ) -> bool {
     let variadic = is_func_last_param_variadic(func);
-    if !variadic && arg_capacity(func, is_colon_call) < arg_count {
+    let supplied = effective_arg_count(arg_count, func.is_colon_define(), is_colon_call);
+    if !variadic && supplied > func.get_params().len() {
         return false;
     }
-    let supplied = effective_arg_count(arg_count, func.is_colon_define(), is_colon_call);
     let params = func.get_params();
     let fixed = if variadic {
         params.len() - 1

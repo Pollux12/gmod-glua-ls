@@ -550,7 +550,20 @@ pub(in crate::semantic::infer::narrow) fn asserted_call_type(
         .get_args()
         .map(crate::semantic::without_parens)
         .filter(|argument| names_entry || !matches!(argument, LuaExpr::CallExpr(_)))
-        .any(|argument| get_var_expr_var_ref_id(db, cache, argument).as_ref() == Some(var_ref_id));
+        .any(|argument| {
+            let Some(argument_ref_id) = get_var_expr_var_ref_id(db, cache, argument.clone()) else {
+                return false;
+            };
+            argument_ref_id == *var_ref_id
+                || can_narrow_type_guard_through_decl_alias(
+                    db,
+                    cache,
+                    root,
+                    var_ref_id,
+                    &argument_ref_id,
+                    &argument,
+                )
+        });
     if !passes_var {
         return None;
     }
@@ -610,11 +623,14 @@ fn asserting_callees_uncached(
         LuaType::Union(union) => union.types().cloned().collect(),
         typ => vec![typ.clone()],
     };
+    let single_candidate = candidates.len() == 1;
     let mut callees = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let signature_id = match candidate {
             LuaType::Signature(signature_id) => signature_id,
-            LuaType::DocFunction(_) => get_call_prefix_signature_id(db, cache, call_expr)?,
+            LuaType::DocFunction(_) if single_candidate => {
+                get_call_prefix_signature_id(db, cache, call_expr)?
+            }
             _ => return None,
         };
         let asserts = db
@@ -1346,12 +1362,15 @@ fn narrow_by_nullable_guard(
     if antecedent_type.is_any() || antecedent_type.is_unknown() {
         return guard_type;
     }
+    let guard_type = TypeOps::Remove.apply(db, &guard_type, &LuaType::Nil);
+    if guard_type.is_never() {
+        return LuaType::Nil;
+    }
     let could_be_nil = antecedent_type.is_optional();
     let value = TypeOps::Remove.apply(db, &antecedent_type, &LuaType::Nil);
     if value.is_never() {
         return LuaType::Nil;
     }
-    let guard_type = TypeOps::Remove.apply(db, &guard_type, &LuaType::Nil);
     let narrowed = narrow_down_type(db, value.clone(), guard_type.clone(), None)
         .or_else(|| guard_accepted_arms(db, &value, &guard_type));
     match narrowed {

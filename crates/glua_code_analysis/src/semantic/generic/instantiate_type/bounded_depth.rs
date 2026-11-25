@@ -49,7 +49,6 @@ fn cut(typ: &LuaType, depth: usize) -> Option<LuaType> {
         | LuaType::StrTplRef(_)
         | LuaType::ConstTplRef(_)
         | LuaType::Signature(_)
-        | LuaType::Instance(_)
         | LuaType::DocStringConst(_)
         | LuaType::DocIntegerConst(_)
         | LuaType::DocBooleanConst(_)
@@ -61,6 +60,8 @@ fn cut(typ: &LuaType, depth: usize) -> Option<LuaType> {
         | LuaType::Conditional(_)
         | LuaType::ConditionalInfer(_)
         | LuaType::Mapped(_) => None,
+        LuaType::Instance(instance) => cut(instance.get_base(), depth)
+            .map(|base| LuaType::Instance(instance.rebased(base).into())),
         // Alternatives and return lists add no level: neither nests in itself.
         LuaType::Union(union) => cut_all(union.types(), depth).map(LuaType::from_vec),
         LuaType::MultiLineUnion(union) => {

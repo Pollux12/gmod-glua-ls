@@ -10569,4 +10569,72 @@ _2 = a[1]
         expect_that!(at_label, not(eq("unknown")));
         expect_that!(at_label, eq(&local_in_function(while_loop, "seen")));
     }
+
+    #[gtest]
+    fn nil_type_guard_narrows_to_nil_on_true_branch() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@param x any
+            ---@return TypeGuard<nil>
+            local function is_nil(x) return x == nil end
+
+            ---@param v string?
+            local function check(v)
+                if is_nil(v) then
+                    local inside = v
+                else
+                    local outside = v
+                end
+            end
+            "#,
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "inside")), "nil");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "outside")), "string");
+    }
+
+    #[gtest]
+    fn asserting_helper_narrows_aliased_source_local() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            local function require_str(x)
+                assert(type(x) == "string")
+            end
+
+            ---@param raw string?
+            local function check(raw)
+                local alias = raw
+                require_str(raw)
+                local after = alias
+            end
+            "#,
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "after")), "string");
+    }
+
+    #[gtest]
+    fn mutated_guard_subject_does_not_produce_type_guard() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@param x any
+            local function misleading(x)
+                x = "always"
+                return type(x) == "string"
+            end
+
+            ---@param v integer|string
+            local function check(v)
+                if misleading(v) then
+                    local inside = v
+                end
+            end
+            "#,
+        );
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "inside")),
+            "(integer|string)"
+        );
+    }
 }
