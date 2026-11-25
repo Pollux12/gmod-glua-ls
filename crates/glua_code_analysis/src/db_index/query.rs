@@ -305,7 +305,7 @@ impl<F: QueryFamily> QueryTable<F> {
         if is_computing(id) {
             return;
         }
-        let (fresh, _) = computing(id, || {
+        let (fresh, reads) = computing(id, || {
             let _transaction = crate::semantic::detach_transaction();
             derivation::detached(id, || F::compute(db, key))
         });
@@ -313,6 +313,9 @@ impl<F: QueryFamily> QueryTable<F> {
             return;
         }
         if Self::fingerprint_of(&fresh) != memo.fingerprint {
+            if derivation::any_in_flight(&reads) {
+                return;
+            }
             Counters::bump(&self.counters.mismatches);
             eprintln!(
                 "[query] {:?} {key:?} mismatch: memo {:?}, fresh {fresh:?}",
@@ -634,6 +637,7 @@ mod transport_tests {
     thread_local! {
         static RACING: RefCell<Option<RacingCompute>> = const { RefCell::new(None) };
         static COMPUTE_CHILD: Cell<bool> = const { Cell::new(false) };
+        static READ_KEY: RefCell<Option<FactKey>> = const { RefCell::new(None) };
     }
 
     struct TestQuery;
@@ -647,6 +651,11 @@ mod transport_tests {
         }
 
         fn compute(db: &DbIndex, _: LuaSignatureId) -> u64 {
+            READ_KEY.with(|read| {
+                if let Some(key) = read.borrow().as_ref() {
+                    derivation::note_read(|| key.clone());
+                }
+            });
             if COMPUTE_CHILD.with(Cell::get) {
                 db.queries()
                     .receiver_authority
@@ -936,5 +945,60 @@ mod transport_tests {
             table.ready_fingerprint(key()),
             Some(derivation::fingerprint_of(&1u64))
         );
+    }
+
+    #[test]
+    fn query_check_skips_in_flight_recomputing_reads_and_reports_settled_mismatches() {
+        let table = QueryTable::<TestQuery>::default();
+        memo(&table, false);
+        let stored = table.memos().get(&key()).unwrap().clone();
+        let db = DbIndex::new();
+        let dep = FactKey::Contrib(key(), 0);
+        let mut graph = derivation::ReaderGraph::default();
+        let _ = graph.intern_read_at(HashedKey::new(dep.clone()), 1);
+        derivation::lend_keys(graph.lend_keys());
+        derivation::note_recomputing([HashedKey::new(dep.clone())]);
+        READ_KEY.with(|read| *read.borrow_mut() = Some(dep.clone()));
+
+        // While `dep` is in an open recomputing window, a disagreement is skipped.
+        table.check(&db, key(), &stored);
+        assert_eq!(table.stats().mismatches, 0);
+
+        // Once the window closes unchanged and keys return, a real disagreement is reported.
+        derivation::note_recomputed(|_| true);
+        graph.restore_keys(derivation::take_keys());
+        table.check(&db, key(), &stored);
+        READ_KEY.with(|read| *read.borrow_mut() = None);
+        assert_eq!(table.stats().mismatches, 1);
+    }
+
+    #[test]
+    fn query_check_skips_task_written_reads_and_reports_unwritten_worker_mismatches() {
+        let table = QueryTable::<TestQuery>::default();
+        let fingerprint = memo(&table, false);
+        let stored = table.memos().get(&key()).unwrap().clone();
+        let dep = FactKey::Contrib(key(), 0);
+        let other = FactKey::Contrib(key(), 1);
+        let (snap, _graph, _quarantine) = snapshot(FxHashMap::from_iter([(
+            HashedKey::new(TestQuery::output(key())),
+            fingerprint,
+        )]));
+        let db = DbIndex::new();
+        let recorder = derivation::TaskRecorder::start(&snap);
+        recorder.begin(QueryTable::<TestQuery>::id(key()));
+        derivation::note_written([HashedKey::new(dep.clone())]);
+
+        // Reading a key written earlier in the same task skips the disagreement.
+        READ_KEY.with(|read| *read.borrow_mut() = Some(dep));
+        table.check(&db, key(), &stored);
+        assert_eq!(table.stats().mismatches, 0);
+
+        // Reading a key the task did NOT touch still reports the disagreement.
+        READ_KEY.with(|read| *read.borrow_mut() = Some(other));
+        table.check(&db, key(), &stored);
+        READ_KEY.with(|read| *read.borrow_mut() = None);
+        let _ = recorder.end();
+        drop(recorder);
+        assert_eq!(table.stats().mismatches, 1);
     }
 }

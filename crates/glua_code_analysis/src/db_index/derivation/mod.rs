@@ -1812,8 +1812,47 @@ pub fn rehoming<T>(f: impl FnOnce() -> T) -> T {
 
 /// Lends `table` to this thread: evaluations begun until [`take_keys`]
 /// intern their reads as they make them.
-pub fn lend_keys(table: KeyTable) {
+pub fn lend_keys(mut table: KeyTable) {
+    table.mark_lent();
     KEYS.with(|keys| *keys.borrow_mut() = Some(table));
+}
+
+/// Whether any of `keys` has an uncommitted write or open recomputing window
+/// in the active evaluation or worker task whose readers have not yet been
+/// notified. Used by `GLUALS_CHECK_QUERY` so checking a memo hit does not flag
+/// reads against in-flight resets or task-local writes.
+pub(crate) fn any_in_flight(keys: &[HashedKey]) -> bool {
+    if let Some(in_flight) =
+        transport::with_keys(|worker| keys.iter().any(|key| worker.in_flight(key)))
+    {
+        return in_flight;
+    }
+    if KEYS.with(|table| {
+        table
+            .borrow()
+            .as_ref()
+            .is_some_and(|table| keys.iter().any(|key| table.in_flight(key)))
+    }) {
+        return true;
+    }
+    CURRENT.with(|current| {
+        current.borrow().as_ref().is_some_and(|evaluation| {
+            keys.iter().any(|key| {
+                let mut current = Some(std::borrow::Cow::Borrowed(key));
+                while let Some(key) = current {
+                    if evaluation.outputs.contains(key.as_ref())
+                        || evaluation.moved.contains(key.as_ref())
+                    {
+                        return true;
+                    }
+                    current = key
+                        .base()
+                        .map(|base| std::borrow::Cow::Owned(HashedKey::new(base)));
+                }
+                false
+            })
+        })
+    })
 }
 
 /// Takes back the table [`lend_keys`] lent.

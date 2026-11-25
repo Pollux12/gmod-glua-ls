@@ -646,6 +646,9 @@ pub struct KeyTable {
     more_producers: FxHashMap<KeyIdx, Vec<DerivIdx>>,
     /// The stamp of the latest write or release of a live slot.
     last_written: u64,
+    /// The value of [`Self::last_written`] when this table was last lent to an
+    /// evaluation thread: writes stamped after it have not notified readers yet.
+    lent_at: u64,
     /// The keys an evaluation took away to compute again, each with the stamp
     /// it was written at before; see [`Self::open_window`].
     windows: FxHashMap<KeyIdx, u64>,
@@ -1214,6 +1217,29 @@ impl KeyTable {
     /// The stamp of the latest write or release of a live slot.
     pub(super) fn last_written(&self) -> u64 {
         self.last_written
+    }
+
+    /// Marks the write watermark at which this table was lent to an evaluation.
+    pub(super) fn mark_lent(&mut self) {
+        self.lent_at = self.last_written;
+    }
+
+    /// Whether `key` (or any base key it is read out of) has an open
+    /// recomputing window or a write made since this table was lent.
+    pub(super) fn in_flight(&self, key: &HashedKey) -> bool {
+        let mut current = Some(std::borrow::Cow::Borrowed(key));
+        while let Some(key) = current {
+            if let Some(slot) = self.find(key.as_ref()) {
+                let entry = &self.keys[slot as usize];
+                if entry.marked(WINDOWED) || entry.written > self.lent_at {
+                    return true;
+                }
+            }
+            current = key
+                .base()
+                .map(|base| std::borrow::Cow::Owned(HashedKey::new(base)));
+        }
+        false
     }
 
     /// Whether any of `slots` was written after stamp `since`.

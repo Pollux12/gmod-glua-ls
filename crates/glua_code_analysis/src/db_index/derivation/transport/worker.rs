@@ -208,6 +208,30 @@ impl WorkerContext {
                 .is_some_and(|slot| self.graph().keys().windowed(slot))
     }
 
+    /// Whether `key` (or a base key it is read out of) has an uncommitted
+    /// write or open recomputing window on this worker or in its snapshot.
+    pub(in super::super) fn in_flight(&self, key: &HashedKey) -> bool {
+        if self.keys.in_flight(key, &self.snapshot.graph) {
+            return true;
+        }
+        let table = self.snapshot.graph.keys();
+        let mut current = Some(std::borrow::Cow::Borrowed(key));
+        while let Some(key) = current {
+            if self
+                .snapshot
+                .graph
+                .find_slot(key.as_ref())
+                .is_some_and(|slot| table.windowed(slot))
+            {
+                return true;
+            }
+            current = key
+                .base()
+                .map(|base| std::borrow::Cow::Owned(HashedKey::new(base)));
+        }
+        false
+    }
+
     /// Whether any of the entries `locals` was written here after `since`.
     pub(in super::super) fn local_freshness(&self, locals: &[u32], since: u64) -> Freshness {
         self.keys.freshness(locals, since)

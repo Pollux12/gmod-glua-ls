@@ -306,6 +306,25 @@ impl WorkerKeys {
                 .is_some_and(|local| self.written[local as usize] != 0)
     }
 
+    /// Whether `key` (or any base key it is read out of) was written or opened
+    /// in a recomputing window on this worker, before the barrier published it.
+    pub(crate) fn in_flight(&self, key: &HashedKey, snapshot: &ReaderGraph) -> bool {
+        let mut current = Some(std::borrow::Cow::Borrowed(key));
+        while let Some(key) = current {
+            let key_ref = key.as_ref();
+            if self.written_here(key_ref, snapshot)
+                || self.windowed(key_ref, snapshot)
+                || self.unread_writes.contains(key_ref)
+            {
+                return true;
+            }
+            current = key_ref
+                .base()
+                .map(|base| std::borrow::Cow::Owned(HashedKey::new(base)));
+        }
+        false
+    }
+
     /// The snapshot slot of the entry `local`, unless its key is new here.
     pub(crate) fn snapshot_slot(&self, local: u32) -> Option<KeyIdx> {
         match self.entries[local as usize] {

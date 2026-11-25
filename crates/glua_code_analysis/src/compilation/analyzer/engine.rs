@@ -3302,6 +3302,10 @@ impl Engine {
             }
             for reader in waited {
                 self.stats.stage_requeued(reader);
+                if reader.kind.is_query() {
+                    db.queries().set_stale(reader, true);
+                    self.pending_stale_queries.remove(&reader);
+                }
                 if crate::profile::tracing_evaluations() {
                     self.trace(db, reader, "stage barrier queues", &[]);
                 }
