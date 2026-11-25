@@ -452,11 +452,15 @@ impl GmodCallRoles {
                     continue;
                 };
                 if let Some(roles) = inner.forwarded_class_registration(forward) {
-                    if !derived.contains_key(path) {
-                        derived.insert(path.clone(), roles);
-                        grew = true;
+                    match derived.get_mut(path) {
+                        Some(existing) => grew |= existing.add_class_registration(roles),
+                        None => {
+                            derived.insert(path.clone(), roles);
+                            grew = true;
+                        }
                     }
-                } else if let Some(roles) = inner.forwarded_load(forward) {
+                }
+                if let Some(roles) = inner.forwarded_load(forward) {
                     match derived.get_mut(path) {
                         Some(existing) => grew |= existing.add_loads(roles),
                         None => {

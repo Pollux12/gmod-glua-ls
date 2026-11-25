@@ -226,12 +226,16 @@ fn definition_is_guessed(
                 },
             };
             let value = match infer_expr(db, cache, expr) {
-                Ok(LuaType::Variadic(multi)) => multi.get_type(ret_idx).cloned(),
-                Ok(typ) if ret_idx == 0 => Some(typ),
-                Ok(_) => None,
-                Err(_) => Some(LuaType::Unknown),
+                Ok(LuaType::Variadic(multi)) => match multi.get_type(ret_idx) {
+                    Some(typ) => typ.clone(),
+                    None => return false,
+                },
+                Ok(typ) if ret_idx == 0 => typ,
+                Ok(typ) if typ.is_unknown() || typ.is_any() => typ,
+                Ok(_) => return false,
+                Err(_) => LuaType::Unknown,
             };
-            value.is_none_or(|value| super::is_uninformative_or_template_leak(&value))
+            super::is_uninformative_or_template_leak(&value)
         }
     }
 }

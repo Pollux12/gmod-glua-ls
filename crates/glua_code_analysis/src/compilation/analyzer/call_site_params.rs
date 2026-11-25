@@ -72,6 +72,7 @@ struct CallScope {
 struct CallReach {
     position: TextSize,
     loops: Vec<TextRange>,
+    closures: Vec<TextRange>,
 }
 
 impl CallReach {
@@ -87,14 +88,26 @@ impl CallReach {
             })
             .map(|node| node.text_range())
             .collect();
+        let closures = call_expr
+            .syntax()
+            .ancestors()
+            .filter_map(LuaClosureExpr::cast)
+            .map(|closure| closure.get_range())
+            .collect();
         Self {
             position: call_expr.get_position(),
             loops,
+            closures,
         }
     }
 
-    fn reached_by(&self, write: TextRange) -> bool {
-        write.start() < self.position || self.loops.iter().any(|range| range.contains_range(write))
+    fn reached_by(&self, decl_pos: TextSize, write: TextRange) -> bool {
+        write.start() < self.position
+            || self.loops.iter().any(|range| range.contains_range(write))
+            || self
+                .closures
+                .iter()
+                .any(|closure| !closure.contains(decl_pos))
     }
 }
 
@@ -536,7 +549,7 @@ pub(super) fn collect_param_summaries(
     let mut filled_params = HashMap::default();
     let mut returns_explicit_self = HashSet::default();
     for closure in root.descendants::<LuaClosureExpr>() {
-        let mutated = function_statement_mutated_params(db, file_id, &closure);
+        let mutated = closure_mutated_params(db, file_id, &closure);
         if !mutated.is_empty() {
             mutated_params.insert(closure.get_position(), mutated);
         }
@@ -621,28 +634,17 @@ fn method_installer_params(
     (installed, filled)
 }
 
-/// The parameters a function statement assigns to; empty for any other
-/// function.
-fn function_statement_mutated_params(
-    db: &DbIndex,
-    file_id: FileId,
-    closure: &LuaClosureExpr,
-) -> Vec<usize> {
-    let Some(func_name) = closure
+/// The parameters a function assigns to.
+fn closure_mutated_params(db: &DbIndex, file_id: FileId, closure: &LuaClosureExpr) -> Vec<usize> {
+    let is_colon_define = closure
         .get_parent::<LuaFuncStat>()
         .and_then(|func_stat| func_stat.get_func_name())
-    else {
-        return Vec::new();
-    };
-    if func_name.get_access_path().is_none() {
-        return Vec::new();
-    }
-    let is_colon_define = match &func_name {
-        LuaVarExpr::IndexExpr(index_expr) => index_expr
-            .get_index_token()
-            .is_some_and(|token| token.is_colon()),
-        LuaVarExpr::NameExpr(_) => false,
-    };
+        .is_some_and(|func_name| match func_name {
+            LuaVarExpr::IndexExpr(index_expr) => index_expr
+                .get_index_token()
+                .is_some_and(|token| token.is_colon()),
+            LuaVarExpr::NameExpr(_) => false,
+        });
     get_mutated_params(db, file_id, closure, is_colon_define)
 }
 
@@ -888,6 +890,9 @@ fn collect_call_site_param_types(
                 if !has_gmod_param_name_hint(db, signature_id.get_file_id(), param_name)
                     && !installs_on_arg
                 {
+                    if lookup_kind != SignatureLookupKind::Direct && !is_explicit_receiver {
+                        continue;
+                    }
                     // A local function takes its callers' arguments where it is read.
                     if takes_local_call_site_args(db, signature_id) {
                         continue;
@@ -1128,16 +1133,58 @@ fn collect_named_callback_param_types(
     let Some(callee_signature) = db.get_signature_index().get_declared(&callee_signature_id) else {
         return;
     };
+    let has_named_callback_candidate = call_args.iter().enumerate().any(|(arg_idx, arg)| {
+        if !matches!(arg, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)) {
+            return false;
+        }
+        let main_has =
+            call_arg_to_param_index(callee_signature, call_expr.is_colon_call(), arg_idx)
+                .and_then(|param_idx| callee_signature.param_docs.get(&param_idx))
+                .is_some_and(|param| type_may_be_doc_function(&param.type_ref));
+        main_has
+            || callee_signature.overloads.iter().any(|overload| {
+                let param_idx = match (call_expr.is_colon_call(), overload.is_colon_define()) {
+                    (true, false) => Some(arg_idx + 1),
+                    (false, true) => arg_idx.checked_sub(1),
+                    _ => Some(arg_idx),
+                };
+                param_idx
+                    .and_then(|idx| overload.get_params().get(idx))
+                    .and_then(|(_, typ)| typ.as_ref())
+                    .is_some_and(type_may_be_doc_function)
+            })
+    });
+    if !has_named_callback_candidate {
+        return;
+    }
+    let Ok(call_func) = crate::semantic::infer_call_expr_func(
+        db,
+        cache,
+        call_expr.clone(),
+        LuaType::Signature(callee_signature_id),
+        &crate::InferGuard::new(),
+        None,
+    ) else {
+        return;
+    };
+    let call_params = call_func.get_params();
     for (arg_idx, arg) in call_args.iter().enumerate() {
         if !matches!(arg, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)) {
             continue;
         }
-        let Some(LuaType::DocFunction(callback)) =
-            call_arg_to_param_index(callee_signature, call_expr.is_colon_call(), arg_idx)
-                .and_then(|param_idx| callee_signature.param_docs.get(&param_idx))
-                .map(|param| &param.type_ref)
-        else {
+        let Some(param_idx) = (match (call_expr.is_colon_call(), call_func.is_colon_define()) {
+            (true, false) => Some(arg_idx + 1),
+            (false, true) => arg_idx.checked_sub(1),
+            _ => Some(arg_idx),
+        }) else {
             continue;
+        };
+        let Some(param_type) = call_params.get(param_idx).and_then(|(_, typ)| typ.as_ref()) else {
+            continue;
+        };
+        let callback = match crate::semantic::remove_false_or_nil(param_type.clone()) {
+            LuaType::DocFunction(callback) => callback,
+            _ => continue,
         };
         let Ok(LuaType::Signature(target_signature_id)) = infer_expr(db, cache, arg.clone()) else {
             continue;
@@ -1146,12 +1193,18 @@ fn collect_named_callback_param_types(
         else {
             continue;
         };
-        let receiver_shift = usize::from(target_signature.is_colon_define);
+        let optional_params = callback.get_optional_params();
         for (callback_param_idx, (_, typ)) in callback.get_params().iter().enumerate() {
             let Some(typ) = typ else {
                 continue;
             };
-            let Some(target_param_idx) = callback_param_idx.checked_sub(receiver_shift) else {
+            let Some(target_param_idx) =
+                (match (callback.is_colon_define(), target_signature.is_colon_define) {
+                    (false, true) => callback_param_idx.checked_sub(1),
+                    (true, false) => Some(callback_param_idx + 1),
+                    _ => Some(callback_param_idx),
+                })
+            else {
                 continue;
             };
             if target_param_idx >= target_signature.params.len()
@@ -1159,6 +1212,24 @@ fn collect_named_callback_param_types(
                 || is_param_mutated(db, target_signature_id, target_param_idx)
             {
                 continue;
+            }
+            if typ.contain_tpl()
+                || crate::db_index::leaks_unsubstituted_tpl(typ)
+                || typ.is_self_infer()
+                || typ.is_any()
+                || typ.is_unknown()
+                || typ.is_never()
+            {
+                continue;
+            }
+            let mut param_type = typ.clone();
+            if optional_params
+                .get(callback_param_idx)
+                .copied()
+                .unwrap_or(false)
+                && !param_type.is_nullable()
+            {
+                param_type = TypeOps::Union.apply(db, &param_type, &LuaType::Nil);
             }
             let Ok(param_idx) = u16::try_from(target_param_idx) else {
                 continue;
@@ -1175,7 +1246,7 @@ fn collect_named_callback_param_types(
                 target_signature_id,
                 target_param_idx,
                 Some(LuaTypeFact::new(
-                    typ.clone(),
+                    param_type,
                     LuaInferenceConfidence::Anchored,
                     Arc::from([LuaInferenceStep {
                         event,
@@ -1186,6 +1257,15 @@ fn collect_named_callback_param_types(
                 )),
             ));
         }
+    }
+}
+
+/// Whether `typ` can resolve to a documented callback `DocFunction`.
+fn type_may_be_doc_function(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::DocFunction(_) | LuaType::TplRef(_) | LuaType::Ref(_) => true,
+        LuaType::Union(union) => union.types().any(type_may_be_doc_function),
+        _ => false,
     }
 }
 
@@ -1444,18 +1524,26 @@ fn collect_param_calls(
     };
     let args = args.get_args().collect::<Vec<_>>();
     let called = match call.get_prefix_expr() {
-        Some(LuaExpr::IndexExpr(field)) => Some((field, 0)),
+        Some(LuaExpr::IndexExpr(field)) => Some((field, 0, call.is_colon_call())),
         _ => args
             .iter()
             .enumerate()
             .find_map(|(arg_idx, arg)| match arg {
                 LuaExpr::IndexExpr(field) => forwarded_arg(db, cache, call, arg_idx)
-                    .map(|first_arg| (field.clone(), first_arg)),
+                    .map(|first_arg| (field.clone(), first_arg, false)),
                 _ => None,
             }),
     };
-    let Some((field, first_arg)) = called else {
+    let Some((field, first_arg, is_direct_colon)) = called else {
         return Vec::new();
+    };
+    let colon_receiver = if is_direct_colon {
+        let Some(receiver) = field.get_prefix_expr() else {
+            return Vec::new();
+        };
+        Some(receiver)
+    } else {
+        None
     };
     // A field holding a known function is a callee of its own; what a
     // parameter stores is unknown until its callers are seen.
@@ -1470,8 +1558,9 @@ fn collect_param_calls(
     let Ok(node_param_idx) = u16::try_from(param_idx) else {
         return Vec::new();
     };
-    args.into_iter()
-        .skip(first_arg)
+    colon_receiver
+        .into_iter()
+        .chain(args.into_iter().skip(first_arg))
         .enumerate()
         .filter_map(|(arg_idx, arg)| {
             let source = InFiled::new(file_id, arg.get_syntax_id());
@@ -2426,6 +2515,7 @@ fn include_targets_from_exact_member(
         LuaExpr::CallExpr(call_expr) => {
             if let Some(target_file_id) =
                 crate::semantic::loaded_file_of_call(db, member_id.file_id, &call_expr)
+                    .and_then(|loaded| loaded.file_id())
             {
                 vec![target_file_id]
             } else if let Some(signature_id) = get_prefix_expr_signature_id(db, cache, &call_expr)
@@ -2815,10 +2905,7 @@ fn without_values_guarded_out(
     {
         return typ;
     }
-    match crate::semantic::remove_false_or_nil(typ.clone()) {
-        truthy if truthy.is_unknown() => typ,
-        truthy => truthy,
-    }
+    crate::semantic::remove_false_or_nil(typ)
 }
 
 /// Whether `expr` names its function's receiver: an implicit `self` or a leading `self` parameter.
@@ -3023,10 +3110,9 @@ fn infer_call_site_value_type(
                     .filter(|cell| {
                         cell.is_write
                             && cell.range != decl.get_range()
-                            && scope
-                                .call_reach
-                                .as_ref()
-                                .is_none_or(|reach| reach.reached_by(cell.range))
+                            && scope.call_reach.as_ref().is_none_or(|reach| {
+                                reach.reached_by(decl.get_position(), cell.range)
+                            })
                     })
                     .collect::<Vec<_>>();
                 writes.sort_unstable_by_key(|cell| cell.range.start());

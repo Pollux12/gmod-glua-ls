@@ -726,4 +726,47 @@ end
             (false, true, false, true)
         );
     }
+
+    /// An include wrapper that discards `include()`'s result does not return
+    /// the loaded file's export.
+    #[test]
+    fn an_include_wrapper_discarding_result_does_not_return_loaded_export() {
+        let mut ws = gmod_workspace();
+        ws.def_file(THING_FILE, "return { first = 1 }");
+        ws.def_file(
+            LOADER_FILE,
+            "CNC = {}\nfunction CNC.LoadOnly(path)\n    include(path)\n    return true\nend\n",
+        );
+        let boot = ws.def_file(BOOT_FILE, "local res = CNC.LoadOnly(\"mylib/thing.lua\")\n");
+
+        assert_eq!(ws.humanize_type(ws.local_ty(boot, "res")), "true");
+    }
+
+    /// A client-only include wrapper returns `nil` on server and `export?` in
+    /// shared code.
+    #[test]
+    fn a_realm_gated_include_wrapper_respects_caller_realm() {
+        let mut ws = gmod_workspace();
+        ws.def_file(THING_FILE, "return { first = 1 }");
+        ws.def_file(
+            LOADER_FILE,
+            "CNC = {}\nfunction CNC.ImportClient(path)\n    if CLIENT then return include(path) end\nend\n",
+        );
+        let server = ws.def_file(
+            "lua/autorun/server/sv_boot.lua",
+            "local res = CNC.ImportClient(\"mylib/thing.lua\")\n",
+        );
+        let shared = ws.def_file(
+            "lua/autorun/sh_boot.lua",
+            "local res = CNC.ImportClient(\"mylib/thing.lua\")\n",
+        );
+        let client = ws.def_file(
+            "lua/autorun/client/cl_boot.lua",
+            "local res = CNC.ImportClient(\"mylib/thing.lua\")\nlocal first = res.first\n",
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(server, "res")), "nil");
+        assert!(ws.local_ty(shared, "res").is_nullable());
+        assert_eq!(ws.humanize_type(ws.local_ty(client, "first")), "1");
+    }
 }

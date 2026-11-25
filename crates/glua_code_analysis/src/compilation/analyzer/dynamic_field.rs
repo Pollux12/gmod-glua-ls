@@ -346,6 +346,7 @@ fn reach_target(
     mode: DynamicFieldAnalysisMode,
     index_expr: &glua_parser::LuaIndexExpr,
     value_expr: Option<&LuaExpr>,
+    may_have_other_calls: bool,
 ) -> Option<ReachedTarget> {
     let prefix_expr = index_expr.get_prefix_expr()?;
     let definition_range = index_expr.get_index_key().and_then(|k| k.get_range())?;
@@ -359,7 +360,7 @@ fn reach_target(
     {
         return None;
     }
-    let field_names = if copies_own_shape {
+    let mut field_names = if copies_own_shape {
         ResolvedDynamicFieldNames {
             names: Vec::new(),
             may_have_other_string_names: true,
@@ -367,6 +368,10 @@ fn reach_target(
     } else {
         get_field_names(db, cache, root, sites, index_expr)
     };
+    // Calls the write's function may get beyond those seen pass other names.
+    if may_have_other_calls {
+        field_names.may_have_other_string_names = true;
+    }
     let collect_finite_direct_assignment = mode.collect_finite_direct_assignments()
         && is_dynamic_index_key(index_expr)
         && !field_names.names.is_empty();
@@ -431,17 +436,22 @@ fn collect_statement_fields(
         let Some(ReachedTarget {
             prefix_expr,
             definition_range,
-            mut field_names,
+            field_names,
             collect_finite_direct_assignment,
             should_collect_wildcard,
-        }) = reach_target(db, cache, root, sites, mode, &index_expr, value_expr)
+        }) = reach_target(
+            db,
+            cache,
+            root,
+            sites,
+            mode,
+            &index_expr,
+            value_expr,
+            named_by_calls == Some(false),
+        )
         else {
             continue;
         };
-        // Calls the write's function may get beyond those seen pass other names.
-        if named_by_calls == Some(false) {
-            field_names.may_have_other_string_names = true;
-        }
 
         let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
             continue;
@@ -896,8 +906,12 @@ pub(crate) fn installed_field_type(
     field_name: &str,
 ) -> Option<LuaType> {
     let call_expr = definition
-        .get_parent::<glua_parser::LuaCallArgList>()?
-        .get_parent::<LuaCallExpr>()?;
+        .get_parent::<glua_parser::LuaCallArgList>()
+        .and_then(|args| args.get_parent::<LuaCallExpr>())
+        .or_else(|| match definition {
+            LuaExpr::CallExpr(call) => Some(call.clone()),
+            _ => None,
+        })?;
     let mut types = Vec::new();
     for (signature_id, installer) in call_installers(db, cache, &call_expr) {
         let Some(install) = evaluate_install(db, cache, &call_expr, signature_id, &installer)
@@ -1051,7 +1065,7 @@ fn evaluate_install(
     };
     Some(Install {
         key,
-        definition: definition?,
+        definition: definition.unwrap_or_else(|| LuaExpr::CallExpr(call_expr.clone())),
     })
 }
 
@@ -1101,13 +1115,14 @@ fn key_arg_names(
         return Some(Some(vec![value.into()]));
     }
     let typ = infer_expr(db, cache, arg.clone()).ok()?;
-    if let Some(default) = default
-        && typ.is_nullable()
-    {
-        let mut names = string_const_names(&Some(typ.clone()));
-        if typ.is_nil() || !names.is_empty() {
-            names.push(default.clone());
-            return Some(Some(names));
+    if let Some(default) = default {
+        let may_be_falsy = crate::semantic::remove_false_or_nil(typ.clone()) != typ;
+        if may_be_falsy {
+            let mut names = string_const_names(&Some(typ.clone()));
+            if typ.is_always_falsy() || !names.is_empty() {
+                names.push(default.clone());
+                return Some(Some(names));
+            }
         }
     }
     let names = string_const_names(&Some(typ.clone()));
@@ -1282,6 +1297,13 @@ fn direct_name_expr_signature_id(
         .get_reference_index()
         .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())?;
     let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let is_reassigned = db
+        .get_reference_index()
+        .get_decl_references(&decl.get_file_id(), &decl_id)
+        .is_some_and(|references| references.is_written_after_declaration(decl_id.position));
+    if is_reassigned {
+        return None;
+    }
     let value_syntax_id = decl.get_value_syntax_id()?;
     (value_syntax_id.get_kind() == LuaSyntaxKind::ClosureExpr)
         .then(|| LuaSignatureId::new(decl.get_file_id(), value_syntax_id.get_range().start()))

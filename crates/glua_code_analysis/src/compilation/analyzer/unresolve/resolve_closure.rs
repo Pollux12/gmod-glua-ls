@@ -605,13 +605,22 @@ fn documented_module_member(
     let owner = LuaMemberOwner::GlobalPath(GlobalId::new(decl.get_module_path()?));
     let key = LuaMemberKey::Name(name_expr.get_name_text()?);
     let module_index = db.get_module_index();
+    let gmod_enabled = db.get_emmyrc().gmod.enabled;
+    let infer_index = db.get_gmod_infer_index();
+    let caller_mask =
+        infer_index.get_state_mask_at_offset(&closure_params.file_id, name_expr.get_position());
     let mut member_ids = db
         .get_member_index()
         .get_members_with_key(&owner, &key)?
         .into_iter()
         .map(|member| member.get_id())
         .filter(|member_id| {
-            module_index.is_library(&member_id.file_id) || module_index.is_std(&member_id.file_id)
+            (module_index.is_library(&member_id.file_id) || module_index.is_std(&member_id.file_id))
+                && (!gmod_enabled
+                    || caller_mask.is_compatible_with(
+                        infer_index
+                            .get_state_mask_at_offset(&member_id.file_id, member_id.get_position()),
+                    ))
         })
         .collect::<Vec<_>>();
     member_ids.sort_by_key(|member_id| (member_id.file_id, member_id.get_position()));
@@ -636,15 +645,19 @@ fn resolve_documented_global_params(
     closure_params: &UnResolveParentClosureParams,
     name_expr: &LuaNameExpr,
 ) -> ResolveResult {
-    let Some(documented) = documented_global(db, closure_params, name_expr) else {
+    let Some((documented_id, documented)) = documented_global(db, closure_params, name_expr) else {
         return Ok(());
     };
+    if !documented.is_resolve_return() {
+        return Err(InferFailReason::UnResolveSignatureReturn(documented_id));
+    }
     let target = db
         .get_signature_index()
         .get(&closure_params.signature_id)
         .ok_or(InferFailReason::None)?;
     let contract = Arc::new(contract_outside_signature(db, documented, LuaType::Unknown));
-    let documented_return = documented.get_return_type();
+    let documented_return =
+        instantiate_outside_signature(db, documented, &documented.get_return_type());
     let signature_id = closure_params.signature_id;
     defer_resolve_doc_function(
         db,
@@ -663,9 +676,13 @@ fn documented_global<'a>(
     db: &'a DbIndex,
     closure_params: &UnResolveParentClosureParams,
     name_expr: &LuaNameExpr,
-) -> Option<&'a LuaSignature> {
+) -> Option<(LuaSignatureId, &'a LuaSignature)> {
     let name = name_expr.get_name_text()?;
     let module_index = db.get_module_index();
+    let gmod_enabled = db.get_emmyrc().gmod.enabled;
+    let infer_index = db.get_gmod_infer_index();
+    let caller_mask =
+        infer_index.get_state_mask_at_offset(&closure_params.file_id, name_expr.get_position());
     let workspace_id = module_index
         .get_workspace_id(closure_params.file_id)
         .unwrap_or(crate::WorkspaceId::MAIN);
@@ -676,7 +693,12 @@ fn documented_global<'a>(
         .flatten()
         .flat_map(|(_, mut decl_ids)| {
             decl_ids.retain(|decl_id| {
-                module_index.is_library(&decl_id.file_id) || module_index.is_std(&decl_id.file_id)
+                (module_index.is_library(&decl_id.file_id) || module_index.is_std(&decl_id.file_id))
+                    && (!gmod_enabled
+                        || caller_mask.is_compatible_with(
+                            infer_index
+                                .get_state_mask_at_offset(&decl_id.file_id, decl_id.position),
+                        ))
             });
             decl_ids.sort_by_key(|decl_id| (decl_id.file_id, decl_id.position));
             decl_ids
@@ -688,7 +710,7 @@ fn documented_global<'a>(
         .filter_map(|owner| db.get_type_index().get_type_cache(owner))
         .find_map(|cache| match cache.as_type() {
             LuaType::Signature(id) if *id != closure_params.signature_id => {
-                db.get_signature_index().get(id)
+                db.get_signature_index().get(id).map(|sig| (*id, sig))
             }
             _ => None,
         })

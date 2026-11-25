@@ -229,6 +229,19 @@ fn installed_methods(
                 }
             }
         }
+        for func_stat in stat.descendants::<glua_parser::LuaFuncStat>() {
+            if !in_body(&func_stat, closure) {
+                continue;
+            }
+            if let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name()
+                && let Some(LuaIndexKey::Name(name)) = index_expr.get_index_key()
+                && let Some((decl_id, _)) = index_expr
+                    .get_prefix_expr()
+                    .and_then(|prefix| root_of(&prefix))
+            {
+                elsewhere.insert((decl_id, name.get_name_text().to_string()));
+            }
+        }
         may_have_returned |= stat
             .descendants::<LuaReturnStat>()
             .any(|ret| in_body(&ret, closure));

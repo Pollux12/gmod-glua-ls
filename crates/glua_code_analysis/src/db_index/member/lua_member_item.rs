@@ -685,9 +685,30 @@ fn written_through_fresh_local(
     }
     let initializer = db.get_decl_index().get_decl(&decl_id)?.get_initializer()?;
     let kind = initializer.get_expr_syntax_id().get_kind();
-    (initializer.get_ret_idx() == 0
-        && (LuaTableExpr::can_cast(kind) || LuaCallExpr::can_cast(kind)))
-    .then_some(())
+    if initializer.get_ret_idx() != 0 {
+        return None;
+    }
+    if LuaTableExpr::can_cast(kind) {
+        return Some(());
+    }
+    if LuaCallExpr::can_cast(kind) {
+        let is_fresh_call = db
+            .get_type_index()
+            .get_type_cache(&decl_id.into())
+            .is_some_and(|cache| {
+                matches!(
+                    cache.as_type(),
+                    LuaType::Instance(_) | LuaType::TableConst(_)
+                )
+            })
+            || initializer
+                .get_expr_syntax_id()
+                .to_node_from_root(&root)
+                .and_then(LuaCallExpr::cast)
+                .is_some_and(|call| call.is_setmetatable());
+        return is_fresh_call.then_some(());
+    }
+    None
 }
 
 fn member_hidden_by_enclosing_assignment_with_root(

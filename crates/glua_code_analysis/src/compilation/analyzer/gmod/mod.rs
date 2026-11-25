@@ -378,6 +378,7 @@ fn collect_annotated_load_dependency_site(
         kind,
         path_arg_idx,
         realms,
+        returns_result,
     } in annotated_roles.load_calls(db, file_id, &call_expr, &call_path)
     {
         let arg_expr = call_expr
@@ -403,6 +404,7 @@ fn collect_annotated_load_dependency_site(
             target_file_id,
             kind,
             realms,
+            returns_result,
             path,
             path_keys,
             original_expr: call_expr.syntax().text().to_string(),
@@ -685,6 +687,7 @@ struct LoadRole {
     kind: LuaDependencyKind,
     arg: AnnotatedGmodCallArgRole,
     realms: Option<GmodStateMask>,
+    returns_result: bool,
 }
 
 impl LoadRole {
@@ -693,6 +696,7 @@ impl LoadRole {
             kind,
             arg,
             realms: None,
+            returns_result: true,
         }
     }
 }
@@ -727,6 +731,7 @@ struct LoadCall {
     kind: LuaDependencyKind,
     path_arg_idx: usize,
     realms: Option<GmodStateMask>,
+    returns_result: bool,
 }
 
 /// A call inside a global function that passes the function's parameters on.
@@ -804,18 +809,38 @@ fn collect_forwarded_calls(
         let Some(args_list) = call_expr.get_args_list() else {
             continue;
         };
+        let param_idx = |name_expr: &LuaNameExpr| {
+            let decl_id = db
+                .get_reference_index()
+                .get_var_reference_decl(&file_id, name_expr.get_range())?;
+            let is_mutated = db
+                .get_reference_index()
+                .get_decl_references(&file_id, &decl_id)
+                .is_some_and(|references| {
+                    references.is_written_after_declaration(decl_id.position)
+                });
+            if is_mutated {
+                return None;
+            }
+            match &db.get_decl_index().get_decl(&decl_id)?.extra {
+                crate::LuaDeclExtra::Param {
+                    idx,
+                    signature_id: param_sig,
+                    ..
+                } if *param_sig == signature_id => Some(*idx),
+                _ => None,
+            }
+        };
         let local_value =
             |name_expr: &LuaNameExpr| wrapper_local_value(db, file_id, &closure, name_expr);
         let args = args_list
             .get_args()
-            .map(
-                |arg| match forwarded_arg(&arg, &signature.params, &local_value) {
-                    ForwardedArg::Other if wrapper_returns(db, file_id, &closure, &arg) => {
-                        ForwardedArg::Returned
-                    }
-                    forwarded => forwarded,
-                },
-            )
+            .map(|arg| match forwarded_arg(&arg, &param_idx, &local_value) {
+                ForwardedArg::Other if wrapper_returns(db, file_id, &closure, &arg) => {
+                    ForwardedArg::Returned
+                }
+                forwarded => forwarded,
+            })
             .collect::<Vec<_>>();
         if args.iter().all(|arg| matches!(arg, ForwardedArg::Other)) {
             continue;
@@ -989,7 +1014,7 @@ fn wrapper_returns(
 
 fn forwarded_arg(
     expr: &LuaExpr,
-    params: &[SmolStr],
+    param_idx: &dyn Fn(&LuaNameExpr) -> Option<usize>,
     local_value: &dyn Fn(&LuaNameExpr) -> Option<LuaExpr>,
 ) -> ForwardedArg {
     enum Piece {
@@ -1000,17 +1025,16 @@ fn forwarded_arg(
 
     fn push_pieces(
         expr: &LuaExpr,
-        params: &[SmolStr],
+        param_idx: &dyn Fn(&LuaNameExpr) -> Option<usize>,
         local_value: &dyn Fn(&LuaNameExpr) -> Option<LuaExpr>,
         pieces: &mut Vec<Piece>,
     ) {
-        let param_idx = |name: &str| params.iter().position(|param| param == name);
         match expr {
             LuaExpr::LiteralExpr(_) => {
                 pieces.push(static_literal_string(expr).map_or(Piece::Other, Piece::Text));
             }
             LuaExpr::ParenExpr(paren_expr) => match paren_expr.get_expr() {
-                Some(inner) => push_pieces(&inner, params, local_value, pieces),
+                Some(inner) => push_pieces(&inner, param_idx, local_value, pieces),
                 None => pieces.push(Piece::Other),
             },
             LuaExpr::BinaryExpr(binary_expr)
@@ -1020,27 +1044,24 @@ fn forwarded_arg(
             {
                 match binary_expr.get_exprs() {
                     Some((left, right)) => {
-                        push_pieces(&left, params, local_value, pieces);
-                        push_pieces(&right, params, local_value, pieces);
+                        push_pieces(&left, param_idx, local_value, pieces);
+                        push_pieces(&right, param_idx, local_value, pieces);
                     }
                     None => pieces.push(Piece::Other),
                 }
             }
-            LuaExpr::NameExpr(name_expr) => {
-                match name_expr.get_name_text().and_then(|name| param_idx(&name)) {
-                    Some(idx) => pieces.push(Piece::Param(idx, Vec::new())),
-                    None => match local_value(name_expr) {
-                        Some(value) => push_pieces(&value, params, local_value, pieces),
-                        None => pieces.push(Piece::Other),
-                    },
-                }
-            }
+            LuaExpr::NameExpr(name_expr) => match param_idx(name_expr) {
+                Some(idx) => pieces.push(Piece::Param(idx, Vec::new())),
+                None => match local_value(name_expr) {
+                    Some(value) => push_pieces(&value, param_idx, local_value, pieces),
+                    None => pieces.push(Piece::Other),
+                },
+            },
             LuaExpr::IndexExpr(index_expr) => {
                 pieces.push(match index_expr_root_and_field_path(index_expr) {
-                    Some((LuaExpr::NameExpr(root), field_path)) => root
-                        .get_name_text()
-                        .and_then(|name| param_idx(&name))
-                        .map_or(Piece::Other, |idx| Piece::Param(idx, field_path)),
+                    Some((LuaExpr::NameExpr(root), field_path)) => {
+                        param_idx(&root).map_or(Piece::Other, |idx| Piece::Param(idx, field_path))
+                    }
                     _ => Piece::Other,
                 });
             }
@@ -1049,7 +1070,7 @@ fn forwarded_arg(
     }
 
     let mut pieces = Vec::new();
-    push_pieces(expr, params, local_value, &mut pieces);
+    push_pieces(expr, param_idx, local_value, &mut pieces);
     let mut prefix = String::new();
     let mut suffix = String::new();
     let mut param = None;
@@ -8570,6 +8591,7 @@ impl AnnotatedGmodCallRoles {
                     kind: LuaDependencyKind::CompileFile,
                     path_arg_idx,
                     realms: None,
+                    returns_result: true,
                 })
                 .into_iter()
                 .collect();
@@ -8585,6 +8607,7 @@ impl AnnotatedGmodCallRoles {
                         self.is_colon_define,
                     )?,
                     realms: load.realms,
+                    returns_result: load.returns_result,
                 })
             })
             .collect()
@@ -8683,7 +8706,12 @@ impl AnnotatedGmodCallRoles {
                             && role.prefix.is_empty()
                             && role.suffix.is_empty()
                     })?;
-                Some(LoadRole { kind, arg, realms })
+                Some(LoadRole {
+                    kind,
+                    arg,
+                    realms,
+                    returns_result: load.returns_result && forward.returned,
+                })
             })
             .collect::<Vec<_>>();
         (!load_roles.is_empty()).then(|| Self {
@@ -8702,6 +8730,20 @@ impl AnnotatedGmodCallRoles {
             }
         }
         self.load_roles.len() > before
+    }
+
+    /// Adds the class registration of `other`, another call in the same
+    /// function, when these roles do not already carry one.
+    fn add_class_registration(&mut self, other: Self) -> bool {
+        if self.class_registration_kind.is_some() || other.class_registration_kind.is_none() {
+            return false;
+        }
+        self.class_registration_kind = other.class_registration_kind;
+        self.class_registration_define_roles = other.class_registration_define_roles;
+        self.class_registration_table_roles = other.class_registration_table_roles;
+        self.class_registration_table_is_result = other.class_registration_table_is_result;
+        self.class_registration_base_roles = other.class_registration_base_roles;
+        true
     }
 
     /// The roles of a function that registers a panel by passing its

@@ -4826,6 +4826,7 @@ owner:CompletelyMadeUpMethod()
                 t[k] = v
             end
             local T, U = {}, {}
+            set_defaulted(T, "a", 123)
             set_defaulted(T, "b")
             set_converted(U, "c", "42")
             local b = T.b
@@ -8408,5 +8409,70 @@ mod presence_argument_target_tests {
         warm.analysis.remove_file_by_uri(&uri);
         let reopened = warm.def_file(PATH, SOURCE);
         assert_eq!(diagnostics(&mut warm, reopened), vec![]);
+    }
+
+    #[test]
+    fn test_installer_with_omitted_defaulted_key_and_falsy_key() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+        let file_id = ws.def(
+            r#"
+            local function install(target, key, value)
+                local k = key or "DefaultKey"
+                target[k] = value
+            end
+            local function install_const(target, key)
+                local k = key or "DefaultKey"
+                target[k] = 99
+            end
+            local T = {}
+            install(T, nil, 1)
+            install(T, false, 2)
+            local U = {}
+            install_const(U)
+            local a = T.DefaultKey
+            local b = U.DefaultKey
+            "#,
+        );
+        let diags = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(diags.is_empty(), "{diags:#?}");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "a")), "(1|2)");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "b")), "99");
+    }
+
+    #[test]
+    fn test_persistent_call_receiver_sees_later_same_function_field_write() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+        let file_id = ws.def(
+            r#"
+            ---@class PersistentPlayer
+            local PersistentPlayer = {}
+
+            ---@return PersistentPlayer
+            local function GetCurrentPlayer()
+                return PersistentPlayer
+            end
+
+            local function think()
+                local ply = GetCurrentPlayer()
+                local prev = ply.lastTick
+                ply.lastTick = 123
+                return prev
+            end
+            "#,
+        );
+        let diags = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(diags.is_empty(), "{diags:#?}");
     }
 }

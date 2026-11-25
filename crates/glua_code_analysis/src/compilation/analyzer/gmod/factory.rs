@@ -113,6 +113,9 @@ impl FactoryCall {
             .iter()
             .map(|literal| match literal {
                 Some(GmodClassCallLiteral::String(value)) => Value::String(value.clone()),
+                Some(GmodClassCallLiteral::Nil | GmodClassCallLiteral::Boolean(false)) => {
+                    Value::Falsy
+                }
                 _ => Value::Unknown,
             })
             .collect();
@@ -548,6 +551,13 @@ impl FactoryCall {
     }
 
     fn param_idx(&self, db: &DbIndex, decl_id: LuaDeclId) -> Option<usize> {
+        let is_mutated = db
+            .get_reference_index()
+            .get_decl_references(&self.file_id, &decl_id)
+            .is_some_and(|references| references.is_written_after_declaration(decl_id.position));
+        if is_mutated {
+            return None;
+        }
         match &db.get_decl_index().get_decl(&decl_id)?.extra {
             LuaDeclExtra::Param {
                 idx, signature_id, ..

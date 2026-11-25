@@ -146,7 +146,10 @@ pub(in crate::compilation::analyzer) fn build_special_call_direct_matcher(
         .get_signature_index()
         .iter()
         .filter_map(|(signature_id, signature)| {
-            signature.has_special_call_params().then_some(*signature_id)
+            (signature.has_special_call_params()
+                || !super::super::function_summary::installed_methods_of(db, *signature_id)
+                    .is_empty())
+            .then_some(*signature_id)
         })
         .collect::<Vec<_>>();
     let mut matcher = SpecialCallDirectMatcher::default();
@@ -544,7 +547,9 @@ fn expr_matches_direct_special_call(
         return analyzer
             .db
             .get_signature_index()
-            .has_special_call_params(&signature_id);
+            .has_special_call_params(&signature_id)
+            || !super::super::function_summary::installed_methods_of(analyzer.db, signature_id)
+                .is_empty();
     }
 
     if let Some(name_expr) = LuaNameExpr::cast(node.clone())

@@ -1299,7 +1299,16 @@ fn dynamic_field_member_type(
     field_name: &str,
 ) -> Option<LuaType> {
     let kind = member_id.get_syntax_id().get_kind();
-    let is_call_install = kind != LuaSyntaxKind::IndexExpr && !LuaTableField::can_cast(kind);
+    let is_call_install = if LuaTableField::can_cast(kind) {
+        false
+    } else if kind == LuaSyntaxKind::IndexExpr {
+        db.get_vfs()
+            .syntax_node_around(&member_id.file_id, *member_id.get_syntax_id())
+            .and_then(|node| node.parent())
+            .is_some_and(|parent| glua_parser::LuaCallArgList::can_cast(parent.kind().into()))
+    } else {
+        true
+    };
     if !is_call_install
         && let Some(cached) =
             cache.tracked_get(|cache| &mut cache.dynamic_field_type_cache, member_id)
@@ -1743,9 +1752,9 @@ fn dynamic_field_definition_syntax_uncached(
             }
             if syntax.member_id.is_none()
                 && node.text_range() == range
-                && node.parent().is_some_and(|parent| {
+                && (node.parent().is_some_and(|parent| {
                     glua_parser::LuaCallArgList::can_cast(parent.kind().into())
-                })
+                }) || glua_parser::LuaCallExpr::can_cast(node.kind().into()))
                 && let Some(arg) = LuaExpr::cast(node.clone())
             {
                 syntax.member_id = Some(LuaMemberId::new(arg.get_syntax_id(), file_id));
