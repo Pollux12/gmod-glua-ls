@@ -828,6 +828,98 @@ end
         );
     }
 
+    /// A read helper also reached through a receiver whose callback is a named
+    /// function in another file keeps its declared type instead of narrowing
+    /// to only the directly visible receiver's payload.
+    #[gtest]
+    fn test_net_read_helper_reached_from_cross_file_named_callback_keeps_its_type() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "addons/mytest/lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("MsgA")
+            util.AddNetworkString("MsgB")
+            net.Start("MsgA") net.WriteTable({ alpha = 1 }) net.Broadcast()
+            net.Start("MsgB") net.WriteTable({ beta = "x" }) net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "addons/mytest/lua/autorun/client/cl_a.lua",
+            r#"
+            function ReadEntry() return net.ReadTable() end
+            net.Receive("MsgA", function() from_a = ReadEntry() end)
+            "#,
+        );
+        let fb = ws.def_file(
+            "addons/mytest/lua/autorun/client/cl_b.lua",
+            r#"
+            function HandleB()
+                local data = ReadEntry()
+                beta = data.beta
+            end
+            "#,
+        );
+        ws.def_file(
+            "addons/mytest/lua/autorun/client/cl_c.lua",
+            r#"
+            net.Receive("MsgB", HandleB)
+            "#,
+        );
+        ws.analysis
+            .diagnostic
+            .enable_only(crate::DiagnosticCode::UndefinedField);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(fb, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        expect_that!(diagnostics, is_empty());
+        let from_a = ws.expr_ty("from_a");
+        expect_that!(ws.humanize_type(from_a), eq("table"));
+    }
+
+    /// A read helper also called from a dynamic handler table or hook keeps
+    /// its declared type, while an unrelated inline receiver in the same
+    /// workspace still narrows to its paired sender.
+    #[gtest]
+    fn test_net_read_helper_reached_from_handler_table_keeps_its_type() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "addons/mytest/lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("MsgA")
+            util.AddNetworkString("Router")
+            util.AddNetworkString("Direct")
+            net.Start("MsgA") net.WriteTable({ alpha = 1 }) net.Broadcast()
+            net.Start("Router") net.WriteString("beta") net.WriteTable({ beta = "x" }) net.Broadcast()
+            net.Start("Direct") net.WriteTable({ gamma = 9 }) net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "addons/mytest/lua/autorun/client/receive.lua",
+            r#"
+            local function read_entry() return net.ReadTable() end
+            net.Receive("MsgA", function() from_a = read_entry() end)
+
+            local handlers = {}
+            handlers.beta = function() from_beta = read_entry() end
+            handlers.other = function() from_other = net.ReadString() end
+            net.Receive("Router", function()
+                handlers[net.ReadString()]()
+            end)
+
+            net.Receive("Direct", function() from_direct = net.ReadTable().gamma end)
+            "#,
+        );
+        let from_a = ws.expr_ty("from_a");
+        let from_beta = ws.expr_ty("from_beta");
+        let from_direct = ws.expr_ty("from_direct");
+        expect_that!(ws.humanize_type(from_a), eq("table"));
+        expect_that!(ws.humanize_type(from_beta), eq("table"));
+        expect_that!(ws.humanize_type(from_direct), eq("9"));
+    }
+
     #[gtest]
     fn test_net_read_holds_what_its_paired_write_sends() {
         let typ = received(
@@ -958,5 +1050,37 @@ end
             "ret",
         );
         expect_that!(typ.as_str(), not(ends_with("?")));
+    }
+
+    #[gtest]
+    fn test_net_read_keeps_declared_type_when_wrapped_sender_exists() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "addons/mytest/lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("Msg")
+            net.Start("Msg")
+            net.WriteTable({ known = 1 })
+            net.Broadcast()
+
+            local function send_any(payload)
+                net.Start("Msg")
+                net.WriteTable(payload)
+            end
+            send_any({})
+            net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "addons/mytest/lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("Msg", function()
+                ret = net.ReadTable()
+            end)
+            "#,
+        );
+        let typ = ws.expr_ty("ret");
+        expect_that!(ws.humanize_type(typ).as_str(), eq("table"));
     }
 }
