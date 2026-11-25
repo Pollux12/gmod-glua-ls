@@ -755,6 +755,79 @@ end
         expect_that!((alpha.as_str(), beta.as_str()), eq(("1?", "\"x\"?")));
     }
 
+    /// A read helper one receiver with no sender in the workspace also calls
+    /// can be sent anything, so it keeps its declared type.
+    #[gtest]
+    fn test_net_read_helper_a_receiver_without_senders_calls_keeps_its_type() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "addons/mytest/lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("MsgA")
+            net.Start("MsgA") net.WriteTable({ alpha = 1 }) net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "addons/mytest/lua/autorun/client/receive.lua",
+            r#"
+            local function read_entry() return net.ReadTable() end
+            net.Receive("MsgA", function() from_a = read_entry() end)
+            net.Receive("MsgOther", function() from_other = read_entry() end)
+            "#,
+        );
+        let typ = ws.expr_ty("from_a");
+        expect_that!(ws.humanize_type(typ), eq("table"));
+    }
+
+    /// A read helper receivers in other files call holds what each of them is
+    /// sent, as those files are added, edited and deleted.
+    #[gtest]
+    fn test_net_read_helper_follows_receivers_in_other_files() {
+        const OTHER: &str = "addons/mytest/lua/autorun/client/cl_b.lua";
+        let other = r#"
+            net.Receive("MsgB", function() beta = SharedReadEntry().beta end)
+            "#;
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "addons/mytest/lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("MsgA")
+            util.AddNetworkString("MsgB")
+            net.Start("MsgA") net.WriteTable({ alpha = 1 }) net.Broadcast()
+            net.Start("MsgB") net.WriteTable({ beta = "x" }) net.Broadcast()
+            "#,
+        );
+        ws.def_file(
+            "addons/mytest/lua/autorun/client/cl_a.lua",
+            r#"
+            function SharedReadEntry() return net.ReadTable() end
+            net.Receive("MsgA", function() alpha = SharedReadEntry().alpha end)
+            "#,
+        );
+        let alpha = |ws: &mut VirtualWorkspace| {
+            let typ = ws.expr_ty("alpha");
+            ws.humanize_type(typ)
+        };
+        let alone = alpha(&mut ws);
+        ws.def_file(OTHER, other);
+        let shared = alpha(&mut ws);
+        let beta = ws.expr_ty("beta");
+        let beta = ws.humanize_type(beta);
+        ws.def_file(OTHER, "print(1)");
+        let edited = alpha(&mut ws);
+        ws.def_file(OTHER, other);
+        let uri = ws.virtual_url_generator.new_uri(OTHER);
+        ws.analysis.remove_file_by_uri(&uri);
+        let deleted = alpha(&mut ws);
+
+        expect_that!(
+            [alone, shared, beta, edited, deleted],
+            eq(&["1", "1?", "\"x\"?", "1", "1"].map(str::to_string))
+        );
+    }
+
     #[gtest]
     fn test_net_read_holds_what_its_paired_write_sends() {
         let typ = received(

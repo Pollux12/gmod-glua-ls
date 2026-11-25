@@ -63,7 +63,7 @@ fn received_type(
     // A helper several receivers call, or one calls more than once, reads at
     // each of those places, so it returns whatever any of them is sent.
     let mut received: Option<LuaType> = None;
-    for flow in &network.get_file_data(file_id)?.receive_flows {
+    for (receive_file_id, flow) in network.receive_flows_reading(file_id) {
         for (place, read) in flow.reads.iter().enumerate() {
             if read.file_id != file_id || read.range != range {
                 continue;
@@ -72,7 +72,11 @@ fn received_type(
                 return None;
             }
             let senders =
-                pair_senders_for_receive(network, db.get_gmod_infer_index(), file_id, flow);
+                pair_senders_for_receive(network, db.get_gmod_infer_index(), receive_file_id, flow);
+            // A sender outside the workspace may send what this one receives.
+            if senders.is_empty() {
+                return None;
+            }
             for (_, sender) in senders {
                 if !sender.payload_known() || !fixed_up_to(&sender.writes, place) {
                     return None;
