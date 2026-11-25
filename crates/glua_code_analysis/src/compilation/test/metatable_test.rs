@@ -3343,6 +3343,35 @@ mod test {
         assert_eq!(ws.humanize_type(ws.local_ty(file_id, "size")), "number");
     }
 
+    /// A bracketed key expression whose type names one exact field reads
+    /// through to the metatable fallback just like a dot-named field access.
+    #[test]
+    fn an_exact_bracket_key_reads_through_to_the_metatable_like_a_field_name() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_read_through_const_key.lua",
+            r#"
+            ---@return number?
+            local function maybeNumber() end
+            ---@type "size"
+            local key = "size"
+            local sized = { size = maybeNumber() }
+            setmetatable(sized, { __index = { size = "fallback" } })
+            local viaDot = sized.size
+            local viaKey = sized[key]
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "viaKey")),
+            ws.humanize_type(ws.local_ty(file_id, "viaDot"))
+        );
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "viaKey")),
+            "(\"fallback\"|number)"
+        );
+    }
+
     /// A key computed at runtime does not name a field the table lacks: a
     /// table holding values of its own reads as them, not as every member its
     /// class holds too, while one holding nothing reads its class's.

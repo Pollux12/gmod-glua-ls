@@ -967,7 +967,7 @@ fn infer_table_member(
     if let Ok(own) = &result
         && db.get_metatable_index().get(&inst).is_some()
         && let Some(index_key) = index_expr.get_index_key()
-        && reads_through(&index_key, own)
+        && reads_through(db, cache, &index_key, own)
         && let Ok(fallback) = infer_table_metatable_member(
             db,
             cache,
@@ -1582,8 +1582,13 @@ pub(crate) fn factory_bound_metatable_index(
 /// computed at runtime does not say which field is absent, so it does only
 /// when the table holds nothing for it, instead of taking in every value the
 /// metatable holds besides the table's own.
-fn reads_through(key: &LuaIndexKey, own: &LuaType) -> bool {
-    own.is_nullable() && (!matches!(key, LuaIndexKey::Expr(_)) || own.is_nil())
+fn reads_through(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    key: &LuaIndexKey,
+    own: &LuaType,
+) -> bool {
+    own.is_nullable() && (own.is_nil() || !LuaMemberKey::index_key_is_dynamic(db, cache, key))
 }
 
 /// A field a table may not hold, `own`, read where Lua falls back to
@@ -3475,7 +3480,7 @@ fn infer_instance_member(
             Ok(table_type)
                 if index_expr
                     .get_index_key()
-                    .is_some_and(|key| reads_through(&key, &table_type)) =>
+                    .is_some_and(|key| reads_through(db, cache, &key, &table_type)) =>
             {
                 return Ok(read_through_to(db, &table_type, &typ));
             }
