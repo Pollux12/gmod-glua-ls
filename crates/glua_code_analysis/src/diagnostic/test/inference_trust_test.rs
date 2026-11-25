@@ -478,6 +478,124 @@ mod tests {
         assert_eq!(found, Vec::new());
     }
 
+    /// An assignment with a value of its own keeps it, however the local is
+    /// used afterwards.
+    #[test]
+    fn an_assignment_with_a_value_of_its_own_is_not_guessed_from_usage() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/own_value.lua",
+            r#"
+            ---@param s string
+            local function takes(s) end
+            ---@return unknown
+            local function unknown_source() end
+
+            local value = unknown_source()
+            value = 5
+            local copy = value
+            takes(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(local_type(&ws, file_id, "copy")),
+            "integer"
+        );
+    }
+
+    /// A guess stored in a field that types the local again when read back
+    /// does not take away the reason for the guess, so the analysis settles
+    /// on it.
+    #[test]
+    fn a_guess_read_back_through_fields_settles() {
+        const SOURCE: &str = r#"
+            ---@param expanded number
+            local function draw(expanded) end
+            ---@return unknown
+            local function unknown_source(value) end
+
+            function ENT:Draw()
+                local current = self._read
+                current = unknown_source(current)
+                self._written = current
+                draw(current)
+            end
+            function ENT:Sync()
+                self._read = self._written
+            end
+            "#;
+        let path = "lua/entities/base_thing/cl_init.lua";
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(path, SOURCE);
+
+        let found = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown);
+        assert_eq!(found.len(), 1);
+        VirtualWorkspace::assert_warm_matches_cold(|_| {}, &[(path, SOURCE)], &[(path, SOURCE)]);
+    }
+
+    /// A slot whose other writers only empty it says nothing of what a store
+    /// of an untyped value puts there: the local holds that value, not the one
+    /// it held before.
+    #[test]
+    fn a_slot_only_ever_emptied_does_not_type_what_is_stored_in_it() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_spectate.lua",
+            r#"
+            ---@param value any
+            ---@return boolean
+            local function IsValid(value) end
+
+            local command = {}
+            command.OnRun = function(self, client, target)
+                client._spectate = false
+                local targetobj = false
+                targetobj = target
+                local now = targetobj
+                if not IsValid(targetobj) then
+                    client._spectate = targetobj
+                end
+            end
+            "#,
+        );
+
+        let now = ws.local_ty(file_id, "now");
+        assert!(
+            !matches!(now, LuaType::BooleanConst(false)),
+            "{}",
+            ws.humanize_type(now)
+        );
+    }
+
+    /// A read that several guessed assignments reach is reported once.
+    #[test]
+    fn a_read_of_several_guessed_assignments_is_reported_once() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_step.lua",
+            r#"
+            ---@param value number
+            local function takes_number(value) end
+            ---@return unknown
+            local function unknown_source() end
+
+            local fraction
+            if unknown_source() then
+                fraction = unknown_source()
+            elseif unknown_source() then
+                fraction = unknown_source()
+            else
+                fraction = unknown_source()
+            end
+            takes_number(fraction)
+            "#,
+        );
+
+        let found = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown);
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
     #[test]
     fn declared_overload_return_does_not_infer_from_usage_context() {
         let mut ws = VirtualWorkspace::new();

@@ -63,6 +63,17 @@ impl LuaCallTarget {
         self.declared.or(self.unique)
     }
 
+    /// The one signature every callable member of the inferred type names,
+    /// then the declared one: where the workspace replaces or aliases a
+    /// documented function, the declaration is the workspace's value while the
+    /// prefix's type still names the documented contract and its metadata.
+    pub fn unique_then_declared(&self) -> impl Iterator<Item = LuaSignatureId> {
+        self.unique.into_iter().chain(
+            self.declared
+                .filter(|declared| self.unique != Some(*declared)),
+        )
+    }
+
     fn signature_ids(&self) -> impl Iterator<Item = &LuaSignatureId> {
         self.declared
             .iter()

@@ -12,13 +12,14 @@ use super::{
 use crate::AsyncState;
 use crate::LuaMemberOwner;
 use crate::compilation::analyzer::unresolve::get_wrapped_callable_target_expr;
+use crate::db_index::LuaInstanceMetatable;
 use crate::db_index::callee_signature_ids;
 use crate::semantic::{local_name_closure_signature_id, semantic_decl_signature_id};
 use crate::{
     CacheEntry, DbIndex, InFiled, LuaArrayType, LuaFunctionType, LuaGenericType, LuaInstanceKind,
     LuaInstanceType, LuaIntersectionType, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignature,
     LuaSignatureId, LuaTupleType, LuaType, LuaTypeDeclId, LuaTypeFlag, LuaUnionType,
-    ReturnTypeKind, TypeVisitTrait, VariadicType,
+    ReturnTypeKind, SignatureReturnStatus, TypeVisitTrait, VariadicType,
 };
 use crate::{GMOD_DOMAIN_CONVAR, GMOD_ROLE_REFERENCE, signature_copies_result};
 use crate::{GmodConVarKind, GmodLoadEdgeKind, GmodStateMask};
@@ -38,12 +39,18 @@ use crate::{
     infer_self_type, instantiate_func_generic, instantiate_func_generic_with_bindings,
     semantic::infer_expr,
 };
-use infer_require::infer_require_call;
-use infer_setmetatable::infer_setmetatable_call;
+pub(crate) use infer_require::loaded_file_of_call;
+use infer_require::{infer_loaded_file_call, infer_require_call, load_call_result_is_unspecified};
 pub(crate) use infer_setmetatable::{
-    MetatableIndexCandidate, classify_metatable_index_candidate, table_backing_range_from_expr,
+    MetatableIndexCandidate, classify_metatable_index_candidate, getmetatable_call_metatable,
+    proxy_metatable, table_backing_range_from_expr,
+};
+use infer_setmetatable::{
+    infer_getmetatable_call, infer_instance_on_index, infer_metatable_index_of,
+    infer_newproxy_call, infer_setmetatable_call,
 };
 
+mod infer_net_read;
 mod infer_require;
 mod infer_setmetatable;
 
@@ -314,8 +321,11 @@ fn infer_call_expr_func_miss(
             infer_guard,
             args_count,
         ),
-        LuaType::Instance(inst) => infer_instance_type_doc_function(db, inst),
-        LuaType::TableConst(meta_table) => infer_table_type_doc_function(db, meta_table.clone()),
+        LuaType::Instance(_) | LuaType::TableConst(_) => {
+            infer_table_call_function(db, &call_expr_type).map(|func| {
+                specialize_call_operator_for_call(db, cache, &call_expr_type, &call_expr, func)
+            })
+        }
         LuaType::TplRef(_) | LuaType::ConstTplRef(_) | LuaType::StrTplRef(_) => infer_tpl_ref_call(
             db,
             cache,
@@ -838,7 +848,8 @@ fn infer_doc_function(
     if let Some(signature_id) = prefix_signature_id
         && let Some(signature) = db.get_signature_index().get(&signature_id)
         && ((signature.direct_param_return_alias().is_some()
-            || signature.class_name_param_return_alias().is_some())
+            || signature.class_name_param_return_alias().is_some()
+            || signature.instance_return_alias().is_some())
             || !signature.falsy_param_nil_free_return_slots().is_empty()
             || !signature.falsy_param_return_aliases().is_empty())
     {
@@ -1277,19 +1288,9 @@ fn specialize_class_name_param_return_alias_for_call(
         return None;
     }
     let wrapper_file = signature_id.get_file_id();
-    let wrapper_start = signature_id.get_position();
-    let root = db.get_vfs().get_syntax_tree(&wrapper_file)?.get_red_root();
-    let call_at = |range: TextRange| {
-        let range = range + wrapper_start;
-        root.token_at_offset(range.start())
-            .right_biased()?
-            .parent_ancestors()
-            .find_map(LuaCallExpr::cast)
-            .filter(|call| call.get_range() == range)
-    };
-    let create_call = call_at(alias.create_call)?;
+    let create_call = call_in_signature(db, signature_id, alias.create_call)?;
     let receiver_call = match alias.receiver_call {
-        Some(range) => Some(call_at(range)?),
+        Some(range) => Some(call_in_signature(db, signature_id, range)?),
         None => None,
     };
 
@@ -1360,6 +1361,147 @@ fn specialize_class_name_param_return_alias_for_call(
     ))
 }
 
+/// The call at `range`, relative to the start of the function `signature_id`.
+fn call_in_signature(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+    range: TextRange,
+) -> Option<LuaCallExpr> {
+    let range = range + signature_id.get_position();
+    db.get_vfs()
+        .syntax_tree_around(&signature_id.get_file_id(), range)?
+        .get_red_root()
+        .token_at_offset(range.start())
+        .right_biased()?
+        .parent_ancestors()
+        .find_map(LuaCallExpr::cast)
+        .filter(|call| call.get_range() == range)
+}
+
+/// The instance a call of `signature`, which has a [`LuaInstanceReturnAlias`],
+/// returns, where `arg(k)` is what the call passes for parameter `k`, counting
+/// a method's `self` as parameter 0. A table the function closes over names
+/// the copy of it the call goes through only when a factory made that copy:
+/// through any other table the function's return reads as written.
+fn infer_instance_made_by(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    signature_id: LuaSignatureId,
+    signature: &LuaSignature,
+    call_expr: &LuaCallExpr,
+    arg: impl Fn(usize) -> Option<LuaExpr>,
+) -> Option<LuaType> {
+    let alias = signature.instance_return_alias()?;
+    let (named, alias, signature_id) = match alias.metatable {
+        LuaInstanceMetatable::Param(param) => (arg(param)?, alias, signature_id),
+        LuaInstanceMetatable::Upvalue { name } => {
+            let through = called_through(call_expr)?;
+            if !is_per_call_copy_of(db, cache, signature_id, name, &through) {
+                return None;
+            }
+            (through, alias, signature_id)
+        }
+        LuaInstanceMetatable::MadeBy { param, call } => {
+            let receiver = arg(param)?;
+            let inner = call_in_signature(db, signature_id, call)?;
+            let mut foreign_cache =
+                (signature_id.get_file_id() != cache.get_file_id()).then(|| {
+                    LuaInferCache::new(signature_id.get_file_id(), cache.get_config().clone())
+                });
+            let callee_id = get_prefix_expr_signature_id(
+                db,
+                foreign_cache.as_mut().unwrap_or(&mut *cache),
+                &inner,
+            )?;
+            let callee_alias = db
+                .get_signature_index()
+                .get(&callee_id)?
+                .instance_return_alias()?;
+            let makes_receiver = match callee_alias.metatable {
+                LuaInstanceMetatable::Upvalue { name } => {
+                    is_per_call_copy_of(db, cache, callee_id, name, &receiver)
+                }
+                LuaInstanceMetatable::Param(0) => inner.is_colon_call(),
+                _ => false,
+            };
+            if !makes_receiver {
+                return None;
+            }
+            (receiver, callee_alias, callee_id)
+        }
+    };
+    let index = if alias.index_is_metatable_field {
+        infer_expr(db, cache, named).ok()?
+    } else {
+        infer_metatable_index_of(db, cache, named)?
+    };
+    let table = alias.table.map(|table| {
+        InFiled::new(
+            signature_id.get_file_id(),
+            table + signature_id.get_position(),
+        )
+    });
+    infer_instance_on_index(db, cache, call_expr, index, table)
+}
+
+/// The value a call goes through to reach its function: the table `X` of
+/// `X.f(...)` or `X:f(...)`, or the called value of `X(...)`.
+fn called_through(call_expr: &LuaCallExpr) -> Option<LuaExpr> {
+    match call_expr.get_prefix_expr()? {
+        LuaExpr::IndexExpr(callee) => callee.get_prefix_expr(),
+        prefix => Some(prefix),
+    }
+}
+
+/// Whether `expr` holds the copy one call of a factory made of the table the
+/// function `signature_id`, which that factory makes along with it, names at
+/// `name`: the table its call goes through makes instances of that table.
+fn is_per_call_copy_of(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    signature_id: LuaSignatureId,
+    name: TextRange,
+    expr: &LuaExpr,
+) -> bool {
+    let Some(constructor) = upvalue_table_constructor(db, signature_id, name) else {
+        return false;
+    };
+    let Ok(mut current) = infer_expr(db, cache, expr.clone()) else {
+        return false;
+    };
+    while let LuaType::Instance(instance) = current {
+        if instance.get_kind() != LuaInstanceKind::Shared
+            && instance.get_base() == &LuaType::TableConst(constructor.clone())
+        {
+            return true;
+        }
+        current = instance.get_base().clone();
+    }
+    false
+}
+
+/// The table constructor initialising the local the function `signature_id`
+/// names at `name` (relative to its start), declared in a function around it.
+fn upvalue_table_constructor(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+    name: TextRange,
+) -> Option<InFiled<TextRange>> {
+    let file_id = signature_id.get_file_id();
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, name + signature_id.get_position())?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    if !matches!(decl.extra, crate::LuaDeclExtra::Local { .. })
+        || decl.get_position() >= signature_id.get_position()
+    {
+        return None;
+    }
+    let value = decl.get_value_syntax_id()?;
+    glua_parser::LuaTableExpr::can_cast(value.get_kind())
+        .then(|| InFiled::new(file_id, value.get_range()))
+}
+
 /// Resolve a classname argument to a concrete string. Supports string literals
 /// and already-inferred string constants (including flow-narrowed defaults).
 fn resolve_class_name_string_from_arg(
@@ -1388,18 +1530,28 @@ fn specialize_return_aliases_for_call(
     func_ty: &LuaFunctionType,
     call_expr: &LuaCallExpr,
 ) -> Option<Arc<LuaFunctionType>> {
-    specialize_direct_param_return_alias_for_call(db, cache, signature, func_ty, call_expr)
-        .or_else(|| {
-            specialize_class_name_param_return_alias_for_call(
-                db,
-                cache,
-                signature_id,
-                signature,
-                func_ty,
-                call_expr,
-            )
-        })
-        .or_else(|| restore_definition_through_return_alias(db, cache, func_ty, call_expr))
+    specialize_instance_return_alias_for_call(
+        db,
+        cache,
+        signature_id,
+        signature,
+        func_ty,
+        call_expr,
+    )
+    .or_else(|| {
+        specialize_direct_param_return_alias_for_call(db, cache, signature, func_ty, call_expr)
+    })
+    .or_else(|| {
+        specialize_class_name_param_return_alias_for_call(
+            db,
+            cache,
+            signature_id,
+            signature,
+            func_ty,
+            call_expr,
+        )
+    })
+    .or_else(|| restore_definition_through_return_alias(db, cache, func_ty, call_expr))
 }
 
 /// Gives back the definition a declared pass-through was handed.
@@ -1473,6 +1625,25 @@ fn restore_definition_through_return_alias(
         )
         .with_optional_params(func_ty.get_optional_params().to_vec()),
     ))
+}
+
+fn specialize_instance_return_alias_for_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    signature_id: LuaSignatureId,
+    signature: &LuaSignature,
+    func_ty: &LuaFunctionType,
+    call_expr: &LuaCallExpr,
+) -> Option<Arc<LuaFunctionType>> {
+    let args = call_expr
+        .get_args_list()
+        .map(|args| args.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let instance =
+        infer_instance_made_by(db, cache, signature_id, signature, call_expr, |param| {
+            call_arg_for_dot_param(call_expr, &args, param)
+        })?;
+    Some(Arc::new(func_ty.clone().with_ret(instance)))
 }
 
 fn specialize_direct_param_return_alias_for_call(
@@ -1760,14 +1931,31 @@ fn call_arg_for_param(
     args: &[LuaExpr],
     param_idx: usize,
 ) -> Option<LuaExpr> {
-    match (func_ty.is_colon_define(), call_expr.is_colon_call()) {
-        (true, false) => args.get(param_idx.checked_add(1)?).cloned(),
-        (false, true) if param_idx == 0 => match call_expr.get_prefix_expr()? {
+    let dot_param_idx = if func_ty.is_colon_define() {
+        param_idx.checked_add(1)?
+    } else {
+        param_idx
+    };
+    call_arg_for_dot_param(call_expr, args, dot_param_idx)
+}
+
+/// The value a call passes for parameter `param_idx` of a function counted
+/// with a method's `self` as parameter 0: the receiver of a colon call, or an
+/// argument.
+fn call_arg_for_dot_param(
+    call_expr: &LuaCallExpr,
+    args: &[LuaExpr],
+    param_idx: usize,
+) -> Option<LuaExpr> {
+    if !call_expr.is_colon_call() {
+        return args.get(param_idx).cloned();
+    }
+    match param_idx.checked_sub(1) {
+        Some(arg_idx) => args.get(arg_idx).cloned(),
+        None => match call_expr.get_prefix_expr()? {
             LuaExpr::IndexExpr(index_expr) => index_expr.get_prefix_expr(),
             _ => None,
         },
-        (false, true) => args.get(param_idx.checked_sub(1)?).cloned(),
-        _ => args.get(param_idx).cloned(),
     }
 }
 
@@ -1995,6 +2183,111 @@ pub(crate) fn infer_table_type_doc_function(
     Err(InferFailReason::None)
 }
 
+/// `func`, the `__call` of the table `callee` a call calls, returning the
+/// instance its return alias names for that call, where the table is the
+/// metamethod's parameter 0.
+fn specialize_call_operator_for_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    callee: &LuaType,
+    call_expr: &LuaCallExpr,
+    func: Arc<LuaFunctionType>,
+) -> Arc<LuaFunctionType> {
+    let Some(signature_id) = call_operator_signature(db, callee) else {
+        return func;
+    };
+    let Some(signature) = db.get_signature_index().get(&signature_id) else {
+        return func;
+    };
+    let args = call_expr
+        .get_args_list()
+        .map(|args| args.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let instance =
+        infer_instance_made_by(
+            db,
+            cache,
+            signature_id,
+            signature,
+            call_expr,
+            |param| match param.checked_sub(1) {
+                Some(arg_idx) => args.get(arg_idx).cloned(),
+                None => call_expr.get_prefix_expr(),
+            },
+        );
+    match instance {
+        Some(instance) => Arc::new((*func).clone().with_ret(instance)),
+        None => func,
+    }
+}
+
+/// What calling the table `callee` calls: the `__call` its metatable declares,
+/// or the one code writes there.
+fn infer_table_call_function(db: &DbIndex, callee: &LuaType) -> InferCallFuncResult {
+    let declared = match callee {
+        LuaType::Instance(instance) => infer_instance_type_doc_function(db, instance),
+        LuaType::TableConst(table) => infer_table_type_doc_function(db, table.clone()),
+        _ => Err(InferFailReason::None),
+    };
+    if !matches!(declared, Err(InferFailReason::None)) {
+        return declared;
+    }
+    match super::metamethod_of(db, callee, LuaOperatorMetaMethod::Call) {
+        Some(LuaType::Signature(signature_id)) => {
+            let signature = db
+                .get_signature_index()
+                .get(&signature_id)
+                .ok_or(InferFailReason::None)?;
+            if !signature.is_resolve_return() {
+                return Err(InferFailReason::UnResolveSignatureReturn(signature_id));
+            }
+            Ok(apply_signature_return_kinds_to_function(
+                signature,
+                signature.to_call_operator_func_type().as_ref(),
+            ))
+        }
+        Some(LuaType::DocFunction(func)) => Ok(normalize_call_operator_doc_function(&func)),
+        _ => Err(InferFailReason::None),
+    }
+}
+
+/// The function the `__call` of the table `callee`'s metatable is, found as
+/// [`infer_table_call_function`] finds it.
+fn call_operator_signature(db: &DbIndex, callee: &LuaType) -> Option<LuaSignatureId> {
+    declared_call_operator_signature(db, callee).or_else(|| {
+        match super::metamethod_of(db, callee, LuaOperatorMetaMethod::Call)? {
+            LuaType::Signature(signature_id) => Some(signature_id),
+            _ => None,
+        }
+    })
+}
+
+fn declared_call_operator_signature(db: &DbIndex, callee: &LuaType) -> Option<LuaSignatureId> {
+    let signature_of = |table: &InFiled<TextRange>| {
+        let meta_table = db.get_metatable_index().get(table)?;
+        let operator_index = db.get_operator_index();
+        let operator_id = operator_index
+            .get_operators(
+                &LuaOperatorOwner::Table(meta_table.clone()),
+                LuaOperatorMetaMethod::Call,
+            )?
+            .first()?;
+        match operator_index
+            .get_operator(operator_id)?
+            .get_operator_func(db)
+        {
+            LuaType::Signature(signature_id) => Some(signature_id),
+            _ => None,
+        }
+    };
+    match callee {
+        LuaType::TableConst(table) => signature_of(table),
+        LuaType::Instance(instance) => signature_of(instance.get_range())
+            .or_else(|| declared_call_operator_signature(db, instance.get_base())),
+        _ => None,
+    }
+}
+
 pub(crate) fn normalize_call_operator_doc_function(func: &LuaFunctionType) -> Arc<LuaFunctionType> {
     let mut params = func.get_params().to_vec();
     let mut optional_params = func.get_optional_params().to_vec();
@@ -2015,24 +2308,32 @@ pub(crate) fn normalize_call_operator_doc_function(func: &LuaFunctionType) -> Ar
     )
 }
 
-/// Orders a union callee's arms by what they are: a signature by its file's
-/// path and position, a function type by its rendering.
-fn callee_arm_order_key(db: &DbIndex, arm: &LuaType) -> (u8, String, u32) {
+/// Orders a union callee's arms by what they are: a signature by whether a
+/// library holds it, its file's module name and its position, a function type
+/// by its rendering. None of it depends on where the workspace or its
+/// libraries sit on disk.
+fn callee_arm_order_key(db: &DbIndex, arm: &LuaType) -> (u8, bool, String, u32) {
     match arm {
-        LuaType::Signature(signature_id) => (
-            0,
-            db.get_vfs()
-                .get_file_path(&signature_id.get_file_id())
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            u32::from(signature_id.get_position()),
-        ),
+        LuaType::Signature(signature_id) => {
+            let module_index = db.get_module_index();
+            let file_id = signature_id.get_file_id();
+            (
+                0,
+                module_index.is_library(&file_id),
+                module_index
+                    .get_module(file_id)
+                    .map(|module| module.full_module_name.clone())
+                    .unwrap_or_default(),
+                u32::from(signature_id.get_position()),
+            )
+        }
         LuaType::DocFunction(_) => (
             1,
+            false,
             crate::humanize_type(db, arm, crate::RenderLevel::Detailed),
             0,
         ),
-        _ => (2, String::new(), 0),
+        _ => (2, false, String::new(), 0),
     }
 }
 
@@ -2162,8 +2463,10 @@ pub(crate) fn unwrapp_return_type(
             ));
         }
         LuaType::Instance(inst) => {
+            let declared = declares_instance_return(db, callee, inst);
             if inst.get_kind() != LuaInstanceKind::Shared
                 && !returned_value_is_fresh(db, callee, inst.get_range())
+                && !declared
             {
                 return Ok(return_type);
             }
@@ -2173,8 +2476,11 @@ pub(crate) fn unwrapp_return_type(
                     value: call_expr.get_range(),
                 };
 
-                let base = if matches!(inst.get_base(), LuaType::Instance(_))
-                    && !instance_has_installed_members(db, inst)
+                // A declared `(instance)` names no table of its own: each call's
+                // object is one of the class.
+                let base = if declared
+                    || matches!(inst.get_base(), LuaType::Instance(_))
+                        && !instance_has_installed_members(db, inst)
                 {
                     inst.get_base().clone()
                 } else {
@@ -2257,6 +2563,28 @@ fn returned_value_is_fresh(
             signature
                 .fresh_returned_values()
                 .contains(&(range.value - callee.get_position()))
+        })
+}
+
+/// Whether `callee` declares `instance` with `---@return (instance)`: each of
+/// its calls returns a new object.
+fn declares_instance_return(
+    db: &DbIndex,
+    callee: Option<LuaSignatureId>,
+    instance: &LuaInstanceType,
+) -> bool {
+    callee
+        .and_then(|callee| db.get_signature_index().get(&callee))
+        .filter(|signature| signature.resolve_return == SignatureReturnStatus::DocResolve)
+        .is_some_and(|signature| {
+            signature.return_docs.iter().any(|doc| {
+                let mut declared = false;
+                TypeVisitTrait::visit_type(&doc.type_ref, &mut |typ| {
+                    declared |= matches!(typ, LuaType::Instance(declared_instance)
+                        if declared_instance.get_range() == instance.get_range());
+                });
+                declared
+            })
         })
 }
 
@@ -2361,10 +2689,20 @@ pub fn infer_call_expr(
     cache: &mut LuaInferCache,
     call_expr: LuaCallExpr,
 ) -> InferResult {
-    if call_expr.is_require() {
-        return infer_require_call(db, cache, call_expr);
+    if let Some(path_arg) = crate::require_path_arg(db, cache.get_file_id(), &call_expr)
+        && load_call_result_is_unspecified(db, cache, &call_expr)
+    {
+        return infer_require_call(db, cache, &call_expr, path_arg);
+    } else if let Some(loaded_file_id) = loaded_file_of_call(db, cache.get_file_id(), &call_expr)
+        && load_call_result_is_unspecified(db, cache, &call_expr)
+    {
+        return infer_loaded_file_call(db, cache, &call_expr, loaded_file_id);
     } else if call_expr.is_setmetatable() {
         return infer_setmetatable_call(db, cache, call_expr);
+    } else if let Some(metatable) = infer_getmetatable_call(db, cache, &call_expr) {
+        return Ok(metatable);
+    } else if let Some(proxy) = infer_newproxy_call(db, cache, &call_expr) {
+        return Ok(proxy);
     }
 
     check_can_infer(db, cache, &call_expr)?;
@@ -2381,6 +2719,9 @@ pub fn infer_call_expr(
     )?
     .get_ret()
     .clone();
+    let ret_type =
+        infer_net_read::infer_net_read_call(db, cache, &call_expr, &prefix_type, &ret_type)
+            .unwrap_or(ret_type);
 
     if let Some(tree) = db.get_flow_index().get_flow_tree(&cache.get_file_id())
         && let Some(flow_id) = tree.get_flow_id(call_expr.get_syntax_id())

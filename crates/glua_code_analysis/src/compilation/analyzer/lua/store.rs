@@ -133,6 +133,7 @@ pub(in crate::compilation::analyzer) enum SignatureChange {
     /// by class name, or has overloads.
     ClassNameParamReturnAlias(LuaClassNameReturnAlias),
     ReturnsReceiver,
+    InstanceReturnAlias(crate::db_index::LuaInstanceReturnAlias),
     /// Constructors and calls whose value the function returns and that every
     /// call of it evaluates anew, relative to the function's start.
     FreshReturnedValues(Vec<rowan::TextRange>),
@@ -171,6 +172,9 @@ impl SignatureChange {
                 }
             }
             SignatureChange::ReturnsReceiver => signature.set_returns_receiver(),
+            SignatureChange::InstanceReturnAlias(alias) => {
+                signature.set_instance_return_alias(alias.clone())
+            }
             SignatureChange::FreshReturnedValues(tables) => {
                 signature.set_fresh_returned_values(tables.clone())
             }

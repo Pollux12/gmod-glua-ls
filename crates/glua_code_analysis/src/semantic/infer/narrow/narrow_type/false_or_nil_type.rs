@@ -14,7 +14,7 @@ use crate::{DbIndex, LuaType, semantic::infer::narrow::narrow_type::narrow_down_
 /// - `string` → `Never` (strings cannot be falsy)
 pub fn narrow_false_or_nil(db: &DbIndex, t: LuaType) -> LuaType {
     match &t {
-        LuaType::Boolean => {
+        LuaType::Boolean | LuaType::TypeGuard(_) => {
             return LuaType::BooleanConst(false);
         }
         LuaType::Union(u) => {
@@ -73,7 +73,7 @@ pub fn remove_false_or_nil(t: LuaType) -> LuaType {
         LuaType::Nil => LuaType::Unknown,
         LuaType::BooleanConst(false) => LuaType::Unknown,
         LuaType::DocBooleanConst(false) => LuaType::Unknown,
-        LuaType::Boolean => LuaType::BooleanConst(true),
+        LuaType::Boolean | LuaType::TypeGuard(_) => LuaType::BooleanConst(true),
         LuaType::Unknown => LuaType::Unknown,
         LuaType::Union(u) => {
             let mut new_types = Vec::new();
@@ -82,7 +82,7 @@ pub fn remove_false_or_nil(t: LuaType) -> LuaType {
                     LuaType::Nil => {}
                     LuaType::BooleanConst(false) => {}
                     LuaType::DocBooleanConst(false) => {}
-                    LuaType::Boolean => {
+                    LuaType::Boolean | LuaType::TypeGuard(_) => {
                         new_types.push(LuaType::BooleanConst(true));
                     }
                     _ => {

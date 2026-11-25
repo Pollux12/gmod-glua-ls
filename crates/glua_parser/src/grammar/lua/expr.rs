@@ -553,7 +553,6 @@ fn parse_suffixed_expr(p: &mut LuaParser) -> ParseResult {
 fn parse_name_or_special_function(p: &mut LuaParser) -> ParseResult {
     let m = p.mark(LuaSyntaxKind::NameExpr);
     let special_kind = match p.parse_config.get_special_function(p.current_token_text()) {
-        SpecialFunction::Require => LuaSyntaxKind::RequireCallExpr,
         SpecialFunction::Assert => LuaSyntaxKind::AssertCallExpr,
         SpecialFunction::Error => LuaSyntaxKind::ErrorCallExpr,
         SpecialFunction::Type => LuaSyntaxKind::TypeCallExpr,

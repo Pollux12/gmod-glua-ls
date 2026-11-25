@@ -2,14 +2,48 @@ pub(crate) mod value;
 
 use rustc_hash::FxHashSet;
 
-use glua_parser::{LuaAstNode, LuaCallExpr, LuaIndexExpr, LuaSyntaxKind};
-use rowan::NodeOrToken;
+use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr};
+use rowan::{NodeOrToken, TextRange};
 
 use crate::{
-    DbIndex, LuaDecl, LuaDeclId, LuaInferCache, LuaSemanticDeclId, LuaType, ModuleInfo,
-    SemanticDeclLevel, SemanticModel, infer_node_semantic_decl,
+    DbIndex, FileId, LuaDecl, LuaDeclId, LuaDependencyKind, LuaInferCache, LuaSemanticDeclId,
+    LuaType, ModuleInfo, SemanticDeclLevel, SemanticModel, infer_node_semantic_decl,
     semantic::semantic_info::infer_token_semantic_decl,
 };
+
+/// Whether `call_expr` in `file_id` calls a loader the annotations make a
+/// `require`.
+pub fn is_require_call(db: &DbIndex, file_id: FileId, call_expr: &LuaCallExpr) -> bool {
+    require_site(db, file_id, call_expr.get_range()).is_some()
+}
+
+/// Whether `decl` takes its value from a `require` call.
+pub fn is_require_decl(db: &DbIndex, decl: &LuaDecl) -> bool {
+    decl.get_value_syntax_id()
+        .is_some_and(|value| require_site(db, decl.get_file_id(), value.get_range()).is_some())
+}
+
+/// The argument of the `require` call `call_expr` in `file_id` that names the
+/// module: the one its loader takes the path from, which a wrapper may take
+/// anywhere among its arguments.
+pub fn require_path_arg(db: &DbIndex, file_id: FileId, call_expr: &LuaCallExpr) -> Option<LuaExpr> {
+    let site = require_site(db, file_id, call_expr.get_range())?;
+    call_expr
+        .get_args_list()?
+        .get_args()
+        .find(|arg| arg.get_range() == site.range)
+}
+
+fn require_site(
+    db: &DbIndex,
+    file_id: FileId,
+    call_range: TextRange,
+) -> Option<&crate::LuaDependencySite> {
+    db.get_file_dependencies_index()
+        .get_dependency_sites(&file_id)?
+        .iter()
+        .find(|site| site.call_range == call_range && site.kind == LuaDependencyKind::Require)
+}
 
 pub fn enum_variable_is_param(
     db: &DbIndex,
@@ -111,9 +145,6 @@ pub fn parse_require_module_info<'a>(
     decl: &LuaDecl,
 ) -> Option<&'a ModuleInfo> {
     let value_syntax_id = decl.get_value_syntax_id()?;
-    if value_syntax_id.get_kind() != LuaSyntaxKind::RequireCallExpr {
-        return None;
-    }
 
     let node = semantic_model
         .get_db()
@@ -121,9 +152,8 @@ pub fn parse_require_module_info<'a>(
         .syntax_node_around(&decl.get_file_id(), value_syntax_id)?;
 
     let call_expr = LuaCallExpr::cast(node)?;
-    let arg_list = call_expr.get_args_list()?;
-    let first_arg = arg_list.get_args().next()?;
-    let require_path_type = semantic_model.infer_expr(first_arg.clone()).ok()?;
+    let path_arg = require_path_arg(semantic_model.get_db(), decl.get_file_id(), &call_expr)?;
+    let require_path_type = semantic_model.infer_expr(path_arg).ok()?;
     let module_path: String = match &require_path_type {
         LuaType::StringConst(module_path) => module_path.as_ref().to_string(),
         _ => {

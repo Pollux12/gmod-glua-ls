@@ -991,6 +991,14 @@ impl DebouncedAnalysis {
         true
     }
 
+    /// [`Self::release_documents`], waking the requests waiting on them as a
+    /// re-analysis does once they settle.
+    #[cfg(test)]
+    pub(crate) async fn release_documents_for_test(&self, file_ids: &[FileId]) {
+        self.release_documents(file_ids).await;
+        self.reindex_notify.notify_waiters();
+    }
+
     /// Lets requests aimed at `file_ids` through: their own entries match
     /// their text.
     async fn release_documents(&self, file_ids: &[FileId]) {

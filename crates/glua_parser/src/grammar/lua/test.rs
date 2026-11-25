@@ -648,7 +648,7 @@ Syntax(Chunk)@0..183
     Token(TkEndOfLine)@65..66 "\n"
     Token(TkWhitespace)@66..74 "        "
     Syntax(CallExprStat)@74..93
-      Syntax(RequireCallExpr)@74..93
+      Syntax(CallExpr)@74..93
         Syntax(NameExpr)@74..81
           Token(TkName)@74..81 "require"
         Token(TkWhitespace)@81..82 " "

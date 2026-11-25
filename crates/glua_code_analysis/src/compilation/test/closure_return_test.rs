@@ -305,6 +305,48 @@ mod test {
         assert_eq!(signature.get_return_type(), LuaType::Nil);
     }
 
+    /// An unconstrained `any` or `any...` callback contract must not stamp
+    /// `DocResolve` before body return inference resolves a deferred return
+    /// expression.
+    #[test]
+    fn unconstrained_any_and_variadic_callback_return_keeps_deferred_body_inference() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Box
+            ---@field value integer
+
+            ---@param cb fun(box: Box): any
+            ---@return any
+            local function run_one(cb) end
+
+            ---@param cb fun(box: Box): any...
+            ---@return any...
+            local function run_many(cb) end
+
+            ---@type Box
+            local b
+
+            local f1 = function(box)
+                return box.value
+            end
+            run_one(f1)
+
+            local f2 = function(box)
+                return box.value, "ok"
+            end
+            run_many(f2)
+
+            local r1 = f1(b)
+            local r2a, r2b = f2(b)
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "r1")), "integer");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "r2a")), "integer");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "r2b")), "\"ok\"");
+    }
+
     /// `analyze_return` derives a closure's return before its own body
     /// statements have bound the global's declaration cache. The `DeclPosition`
     /// fallback then substitutes the raw initializer literal (`integerconst(0)`)

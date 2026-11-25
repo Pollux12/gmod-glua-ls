@@ -1891,6 +1891,7 @@ mod test {
     #[test]
     fn test_unresolved_prefix_chain_is_not_warned() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         assert_that!(
             ws.check_code_for(
                 DiagnosticCode::UncheckedNilAccess,
@@ -1912,6 +1913,7 @@ mod test {
             ("---@class ReceiverChain\nlocal m = {}", false),
         ] {
             let mut ws = VirtualWorkspace::new();
+            ws.def_gmod_call_arg_builtins();
             assert_that!(
                 ws.check_code_for(
                     DiagnosticCode::UncheckedNilAccess,
@@ -6354,6 +6356,7 @@ mod test {
     #[gtest]
     fn test_cross_file_numeric_range_population_include_call_rejects_fact() {
         let mut ws = gmod_ws();
+        ws.def_gmod_call_arg_builtins();
         ws.def_file("lua/autorun/shared/a_colors.lua", r#"ROLE_MIN=1 ROLE_MAX=3 ROLE_TRAITOR=2 ROLE_COLORS={} local function fill(list) for i=ROLE_MIN,ROLE_MAX do list[i]={r=1} end end fill(ROLE_COLORS)"#);
         let reader = ws.def_file(
             "lua/autorun/shared/c_reader.lua",
@@ -10626,7 +10629,9 @@ mod test {
                 return LANG.Strings[raw_lang_name]
             end
 
-            local L = LANG.CreateLanguage("English")
+            ---@type string
+            local lang_name
+            local L = LANG.CreateLanguage(lang_name)
             L.phrase = "unsafe"
         "#;
 
@@ -10665,7 +10670,9 @@ mod test {
                 return LANG.Strings[raw_lang_name]
             end
 
-            local L = LANG.CreateLanguage("English")
+            ---@type string
+            local lang_name
+            local L = LANG.CreateLanguage(lang_name)
             L.phrase = "unsafe"
         "#;
 
@@ -10698,7 +10705,9 @@ mod test {
                 return LANG.Strings[raw_lang_name]
             end
 
-            local L = LANG.CreateLanguage("English")
+            ---@type string
+            local lang_name
+            local L = LANG.CreateLanguage(lang_name)
             L.phrase = "unsafe"
         "#;
 
@@ -10734,7 +10743,9 @@ mod test {
                 return LANG.Strings[raw_lang_name]
             end
 
-            local L = LANG.CreateLanguage("English")
+            ---@type string
+            local lang_name
+            local L = LANG.CreateLanguage(lang_name)
             L.phrase = "unsafe"
         "#;
 
@@ -11307,7 +11318,9 @@ mod test {
                 return LANG.Strings[raw_name_extra]
             end
 
-            local L = LANG.CreateLanguage("English")
+            ---@type string
+            local lang_name
+            local L = LANG.CreateLanguage(lang_name)
             L.phrase = "unsafe"
         "#;
 
@@ -11342,7 +11355,9 @@ mod test {
                 return LANG.Strings[raw_lang_name]
             end
 
-            local L = LANG.CreateLanguage("English")
+            ---@type string
+            local lang_name
+            local L = LANG.CreateLanguage(lang_name)
             L.phrase = "unsafe"
         "#;
 
@@ -15738,7 +15753,7 @@ end
                 "lua/autorun/client/cl_use.lua",
                 r#"
                 function CanConstrain(value, bone)
-                    return value ~= nil
+                    return bone ~= nil
                 end
 
                 ---@type Entity?
@@ -16686,6 +16701,45 @@ end
         let cold_after_edit = slot_alias_warns(&mut cold, file, unguarded);
         expect_that!(warm_after_edit, eq(true));
         expect_that!(warm_after_edit, eq(cold_after_edit));
+    }
+
+    /// A method can run many times, so a `self` field it writes after reading
+    /// may already hold the value an earlier call wrote.
+    #[gtest]
+    fn a_receiver_field_read_before_its_write_in_the_same_method_is_not_absent() {
+        let mut ws = gmod_ws();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::UncheckedNilAccess,
+            r#"
+            ---@class RecreatedThing
+            local Thing = {}
+            function Thing:Create()
+                if self.Ent:IsValid() then self.Ent:Remove() end
+                self.Ent = ClientsideModel("models/error.mdl") or NULL
+            end
+            "#,
+        );
+        expect_that!(diagnostics, is_empty());
+    }
+
+    /// A table the function creates itself has nothing in it before the
+    /// function's own write.
+    #[gtest]
+    fn a_local_table_field_read_before_its_write_in_the_same_function_is_absent() {
+        let mut ws = gmod_ws();
+        let file_id = ws.def(
+            r#"
+            local function build()
+                local t = {}
+                local before = t.x
+                t.x = 1
+                return before
+            end
+            "#,
+        );
+        let before = ws.local_ty(file_id, "before");
+        expect_that!(ws.humanize_type(before), not(contains_substring("integer")));
     }
 }
 

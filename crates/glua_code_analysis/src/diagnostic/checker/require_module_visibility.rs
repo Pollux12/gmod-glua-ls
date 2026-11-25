@@ -1,4 +1,4 @@
-use glua_parser::{LuaAstNode, LuaCallExpr};
+use glua_parser::{LuaAstNode, LuaExpr};
 
 use crate::{DiagnosticCode, LuaType, SemanticModel, check_export_visibility};
 
@@ -13,22 +13,28 @@ impl Checker for RequireModuleVisibilityChecker {
         let Some(buckets) = context.file_buckets() else {
             return;
         };
-        for call_expr in buckets.call_exprs.iter().cloned() {
-            if call_expr.is_require() {
-                check_require_call_expr(context, semantic_model, call_expr);
-            }
+        let path_args = buckets
+            .call_exprs
+            .iter()
+            .filter_map(|call_expr| {
+                crate::require_path_arg(
+                    semantic_model.get_db(),
+                    semantic_model.get_file_id(),
+                    call_expr,
+                )
+            })
+            .collect::<Vec<_>>();
+        for path_arg in path_args {
+            check_require_path(context, semantic_model, path_arg);
         }
     }
 }
 
-fn check_require_call_expr(
+fn check_require_path(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
-    call_expr: LuaCallExpr,
+    arg_expr: LuaExpr,
 ) -> Option<()> {
-    let args_list = call_expr.get_args_list()?;
-    let arg_expr = args_list.get_args().next()?;
-
     // Get the module path
     let ty = semantic_model
         .infer_expr(arg_expr.clone())

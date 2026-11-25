@@ -141,6 +141,8 @@ Common string-template forms:
 
 ## Naming the parent class with `base_class`
 
+You don't need this when the factory registers the table it returns and its `__index` walks to the parent; see [Metatable classes](/annotations/class#metatable-classes). Use it for factories GLuaLS can't follow.
+
 A factory can create a class from one string and take its parent in another argument. Put `base_class` on the parameter that holds the parent:
 
 ```lua

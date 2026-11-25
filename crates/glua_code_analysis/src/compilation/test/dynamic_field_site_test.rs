@@ -89,8 +89,8 @@ e[key] = 4
 
     /// Several writes through one reference, across two files: an edit, a
     /// shift and a revert leave the dynamic fields and diagnostics a cold
-    /// build has, and a later write through a reference takes the prefix type
-    /// its first write inferred.
+    /// build has, and each write lands on the table the reference holds when
+    /// it runs.
     #[test]
     fn writes_through_one_reference_settle_as_a_cold_build_after_edits() {
         let mut cold = dynamic_field_workspace();
@@ -108,9 +108,59 @@ e[key] = 4
             (dynamic_field_state(&warm), warm.settled_digest()),
             (dynamic_field_state(&cold), cold.settled_digest())
         );
-        let first = owner_of(&cold, "first");
-        assert!(matches!(first.as_slice(), [DynamicFieldOwner::Table(_)]));
-        assert_eq!(owner_of(&cold, "second"), first);
+        assert!(matches!(
+            owner_of(&cold, "first").as_slice(),
+            [DynamicFieldOwner::Table(_)]
+        ));
+        assert!(matches!(
+            owner_of(&cold, "second").as_slice(),
+            [DynamicFieldOwner::Type(ent)] if ent.get_name() == "Ent"
+        ));
+    }
+
+    const PARENT_FILE: &str = "lua/autorun/sh_parent.lua";
+    const PARENT: &str = r#"---@class DeclParent
+local DeclParent = {}
+---@return string
+function DeclParent:GetValue() end
+---@class DeclChild : DeclParent
+"#;
+    const PARENT_WITHOUT_METHOD: &str = r#"---@class DeclParent
+local DeclParent = {}
+---@class DeclChild : DeclParent
+"#;
+    const CHILD_FILE: &str = "lua/autorun/sh_child.lua";
+    const CHILD: &str = r#"---@type DeclChild
+local child
+child.GetValue = function() return 5 end
+"#;
+
+    /// Removing and restoring the parent's declaration of a member a subclass
+    /// writes leaves the dynamic fields a cold build has: whether the write
+    /// reaches the parent follows the declaration.
+    #[test]
+    fn a_parents_declaration_edited_away_and_back_settles_as_a_cold_build() {
+        let cold = |parent: &str| {
+            let mut ws = dynamic_field_workspace();
+            ws.def_file(PARENT_FILE, parent);
+            ws.def_file(CHILD_FILE, CHILD);
+            (dynamic_field_state(&ws), ws.settled_digest())
+        };
+        assert_ne!(cold(PARENT).0, cold(PARENT_WITHOUT_METHOD).0);
+        let mut warm = dynamic_field_workspace();
+        warm.def_file(PARENT_FILE, PARENT);
+        warm.def_file(CHILD_FILE, CHILD);
+
+        warm.def_file(PARENT_FILE, PARENT_WITHOUT_METHOD);
+        assert_eq!(
+            (dynamic_field_state(&warm), warm.settled_digest()),
+            cold(PARENT_WITHOUT_METHOD)
+        );
+        warm.def_file(PARENT_FILE, PARENT);
+        assert_eq!(
+            (dynamic_field_state(&warm), warm.settled_digest()),
+            cold(PARENT)
+        );
     }
 
     /// The write site of `text`, an assignment of `file_id`.

@@ -232,7 +232,7 @@ fn gmod_registered_local_reuse(
                     old_decl,
                     current_decl,
                     call,
-                    call.vgui_panel_table_arg_source(1),
+                    call.class_registration_table_arg_source(1),
                 )
             }) || metadata.vgui_register_table_calls.iter().any(|call| {
                 gmod_registration_consumes_decl_before_reuse(
@@ -242,7 +242,7 @@ fn gmod_registered_local_reuse(
                     old_decl,
                     current_decl,
                     call,
-                    call.vgui_panel_table_arg_source(0),
+                    call.class_registration_table_arg_source(0),
                 )
             }) || metadata.derma_define_control_calls.iter().any(|call| {
                 gmod_registration_consumes_decl_before_reuse(
@@ -252,7 +252,7 @@ fn gmod_registered_local_reuse(
                     old_decl,
                     current_decl,
                     call,
-                    call.vgui_panel_table_arg_source(2),
+                    call.class_registration_table_arg_source(2),
                 )
             })
         })
@@ -325,8 +325,11 @@ fn gmod_registration_consumes_decl_before_reuse(
     old_decl: &LuaDecl,
     current_decl: &LuaDecl,
     call: &GmodScriptedClassCallMetadata,
-    table_source: GmodClassCallArgSource,
+    table_source: Option<GmodClassCallArgSource>,
 ) -> bool {
+    let Some(table_source) = table_source else {
+        return false;
+    };
     if !matches!(
         call.value_for_arg_source(&table_source),
         Some(GmodClassCallLiteral::NameRef(table_name)) if table_name == name

@@ -1,10 +1,7 @@
 use std::path::PathBuf;
 
-use glua_code_analysis::{DbIndex, LuaDocument, file_path_to_uri};
-use glua_parser::{
-    LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaLiteralExpr, LuaStringToken,
-    LuaSyntaxNode,
-};
+use glua_code_analysis::{DbIndex, FileId, LuaDependencyKind, LuaDocument, file_path_to_uri};
+use glua_parser::{LuaAstToken, LuaStringToken, LuaSyntaxNode};
 use lsp_types::DocumentLink;
 
 pub fn build_links(
@@ -31,8 +28,13 @@ fn try_build_file_link(
     document: &LuaDocument,
     result: &mut Vec<DocumentLink>,
 ) -> Option<()> {
-    if is_require_path(token.clone()).unwrap_or(false) {
-        try_build_module_link(db, token, document, result);
+    if let Some(target_file_id) = linked_file(db, document.get_file_id(), &token) {
+        result.push(DocumentLink {
+            target: Some(db.get_vfs().get_uri(&target_file_id)?.clone()),
+            range: document.to_lsp_range(token.get_range())?,
+            tooltip: None,
+            data: None,
+        });
         return Some(());
     }
 
@@ -80,45 +82,28 @@ fn has_linkable_path_component(path: &str) -> bool {
         .any(|component| !component.is_empty() && component != "." && component != "..")
 }
 
-fn try_build_module_link(
-    db: &DbIndex,
-    token: LuaStringToken,
-    document: &LuaDocument,
-    result: &mut Vec<DocumentLink>,
-) -> Option<()> {
-    let module_path = token.get_value();
-    let module_index = db.get_module_index();
-    let founded_module = module_index.find_module(&module_path)?;
-    let file_id = founded_module.file_id;
-    let vfs = db.get_vfs();
-    let uri = vfs.get_uri(&file_id)?;
+/// The file the path string `token` of `file_id` names: the one a load call
+/// taking it loads, or the module a `require` of it finds.
+pub fn linked_file(db: &DbIndex, file_id: FileId, token: &LuaStringToken) -> Option<FileId> {
     let range = token.get_range();
-    let lsp_range = document.to_lsp_range(range)?;
-    let document_link = DocumentLink {
-        target: Some(uri.clone()),
-        range: lsp_range,
-        tooltip: None,
-        data: None,
-    };
-
-    result.push(document_link);
-
-    Some(())
-}
-
-pub fn is_require_path(token: LuaStringToken) -> Option<bool> {
-    let call_expr = token
-        .get_parent::<LuaLiteralExpr>()?
-        .get_parent::<LuaCallArgList>()?
-        .get_parent::<LuaCallExpr>()?;
-
-    Some(call_expr.is_require())
+    let site = db
+        .get_file_dependencies_index()
+        .get_dependency_sites(&file_id)?
+        .iter()
+        .find(|site| site.range == range)?;
+    site.target_file_id.or_else(|| {
+        (site.kind == LuaDependencyKind::Require)
+            .then(|| db.get_module_index().find_module(&token.get_value()))
+            .flatten()
+            .map(|module| module.file_id)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, check};
+    use glua_parser::LuaAstNode;
     use googletest::prelude::*;
 
     #[gtest]
@@ -148,5 +133,82 @@ mod tests {
 
         expect_that!(links, is_empty());
         Ok(())
+    }
+
+    fn link_targets(
+        ws: &ProviderVirtualWorkspace,
+        file_id: glua_code_analysis::FileId,
+    ) -> Vec<String> {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        build_links(
+            semantic_model.get_db(),
+            semantic_model.get_root().syntax().clone(),
+            &semantic_model.get_document(),
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|link| Some(link.target?.as_str().to_string()))
+        .collect()
+    }
+
+    /// A path a load call takes links to the file it loads, wherever the
+    /// workspace root is, including one relative to the loading file.
+    #[gtest]
+    fn a_load_path_links_to_the_file_it_loads() {
+        let mut ws = ProviderVirtualWorkspace::new();
+        ws.enable_gmod_loaders();
+        ws.def_file("lua/mylib/ids.lua", "return {}");
+        ws.def_file("lua/entities/thing/shared.lua", "return {}");
+        let init = ws.def_file(
+            "lua/entities/thing/init.lua",
+            "include(\"shared.lua\")\nAddCSLuaFile(\"mylib/ids.lua\")\n",
+        );
+
+        let targets = link_targets(&ws, init);
+        expect_that!(
+            targets,
+            elements_are![
+                ends_with("lua/entities/thing/shared.lua"),
+                ends_with("lua/mylib/ids.lua")
+            ]
+        );
+    }
+
+    /// A path given to a loader that picks `include` or `AddCSLuaFile` by
+    /// realm links to the file it loads.
+    #[gtest]
+    fn a_path_given_to_a_realm_dispatching_loader_links_to_the_file() {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file("lua/mylib/apiclient.lua", "return {}");
+        ws.def_file(
+            "lua/autorun/sh_util.lua",
+            r#"function IncludeFile(fileName, realm)
+    if (realm == "server" or fileName:find("sv_")) and SERVER then
+        return include(fileName)
+    elseif realm == "client" or fileName:find("cl_") then
+        if SERVER then
+            AddCSLuaFile(fileName)
+        else
+            return include(fileName)
+        end
+    end
+end
+"#,
+        );
+        let boot = ws.def_file(
+            "lua/autorun/sv_boot.lua",
+            "IncludeFile(\"mylib/apiclient.lua\", \"server\")\n",
+        );
+
+        let targets = link_targets(&ws, boot);
+        expect_that!(targets, elements_are![ends_with("lua/mylib/apiclient.lua")]);
     }
 }

@@ -158,7 +158,7 @@ mod test {
     fn test_issue_360() {
         let mut ws = VirtualWorkspace::new();
 
-        assert!(!ws.check_code_for(
+        assert!(ws.check_code_for(
             DiagnosticCode::RedundantParameter,
             r#"
                 ---@alias buz number
@@ -169,6 +169,28 @@ mod test {
                 end
 
                 local c = test({'test'})
+        "#
+        ));
+    }
+
+    #[test]
+    fn a_union_callee_takes_the_arguments_of_the_arm_they_fit() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedundantParameter,
+            r#"
+                ---@param a number
+                local function short(a) end
+
+                ---@param a number
+                ---@param b number
+                ---@param c number
+                local function long(a, b, c) end
+
+                ---@type fun(a: number)|fun(a: number, b: number, c: number)
+                local either = math.random() > 0.5 and short or long
+                either(1, 2, 3)
         "#
         ));
     }

@@ -2364,6 +2364,32 @@ local EscapeStringMap: {
     }
 
     #[gtest]
+    fn test_hover_class_table_shows_its_own_index_as_self() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(
+            ws.check_hover(
+                r#"
+                local Animal = {}
+                Animal.__index = Animal
+                function Animal:Speak() return "..." end
+                local c<??>at = setmetatable({}, Animal)
+            "#,
+                VirtualHoverResult {
+                    value: "```lua
+local cat: {
+    __index: self,
+    Speak: fun() -> \"...\",
+}
+```"
+                    .to_string(),
+                },
+            )
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_dynamic_field_respects_file_scope() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

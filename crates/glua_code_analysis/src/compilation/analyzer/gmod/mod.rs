@@ -17,16 +17,18 @@ use glua_parser::{
     NumberResult, PathTrait,
 };
 
-use crate::semantic::{local_initializer_expr, semantic_decl_closure_signature_id};
+use crate::semantic::{
+    getmetatable_call_metatable, local_initializer_expr, semantic_decl_closure_signature_id,
+};
 use crate::{
     EmmyrcGmodRealm, FileId, GlobalId, GmodClassCallArg, GmodClassCallArgSource,
-    GmodClassCallLiteral, GmodDermaSkinCallRoles, GmodNamedStringCallRoles,
-    GmodNetworkVarCallRoles, GmodScriptedClassCallKind, GmodScriptedClassCallMetadata,
-    GmodScriptedClassFileMetadata, GmodScriptedClassRegisterRoles, GmodVguiPanelCallRoles,
-    GmodVguiParentCallMetadata, GmodVguiParentSource, InFiled, LuaCallArgRole, LuaDecl,
-    LuaDeclExtra, LuaDeclId, LuaDeclTypeKind, LuaFunctionType, LuaInferCache, LuaMember,
-    LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignature, LuaSignatureId, LuaType,
-    LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
+    GmodClassCallLiteral, GmodClassRegistrationCallRoles, GmodDermaSkinCallRoles,
+    GmodNamedStringCallRoles, GmodNetworkVarCallRoles, GmodRegisteredTableSource,
+    GmodScriptedClassCallKind, GmodScriptedClassCallMetadata, GmodScriptedClassFileMetadata,
+    GmodScriptedClassRegisterRoles, GmodVguiParentCallMetadata, GmodVguiParentSource, InFiled,
+    LuaCallArgRole, LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclTypeKind, LuaFunctionType,
+    LuaInferCache, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignature,
+    LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{
         AnalyzeContext,
         common::{TypeCacheWriteMode, write_type_cache},
@@ -52,6 +54,7 @@ use smol_str::SmolStr;
 
 mod call_roles;
 mod derive;
+mod factory;
 mod network;
 mod numeric_range_population;
 
@@ -371,29 +374,44 @@ fn collect_annotated_load_dependency_site(
     pending: &mut Vec<PendingCallSite>,
 ) -> Option<()> {
     let call_path = call_expr.get_access_path()?;
-    let (kind, path_arg_idx) = annotated_roles.load_call(db, file_id, &call_expr, &call_path)?;
-    let arg_expr = call_expr
-        .get_args_list()
-        .and_then(|args| args.get_args().nth(path_arg_idx))?;
-    let path = static_literal_string(&arg_expr);
-    let target_file_id = path
-        .as_deref()
-        .and_then(|path| resolve_load_dependency_target(db, file_id, kind, path));
-    let path_keys = path
-        .as_deref()
-        .map(|path| crate::dependency_site_path_keys(db, file_id, path))
-        .unwrap_or_default();
-
-    pending.push(PendingCallSite::Dependency(LuaDependencySite {
-        source_file_id: file_id,
-        target_file_id,
+    for LoadCall {
         kind,
-        path,
-        path_keys,
-        original_expr: call_expr.syntax().text().to_string(),
-        call_range: call_expr.get_range(),
-        range: arg_expr.get_range(),
-    }));
+        path_arg_idx,
+        realms,
+        returns_result,
+    } in annotated_roles.load_calls(db, file_id, &call_expr, &call_path)
+    {
+        let arg_expr = call_expr
+            .get_args_list()
+            .and_then(|args| args.get_args().nth(path_arg_idx));
+        // `AddCSLuaFile()` with no path sends the calling file itself.
+        let sends_itself = arg_expr.is_none() && kind == LuaDependencyKind::AddCSLuaFile;
+        if arg_expr.is_none() && !sends_itself {
+            continue;
+        }
+        let path = arg_expr.as_ref().and_then(static_literal_string);
+        let target_file_id = match path.as_deref() {
+            Some(path) => resolve_load_dependency_target(db, file_id, kind, path),
+            None => sends_itself.then_some(file_id),
+        };
+        let path_keys = path
+            .as_deref()
+            .map(|path| crate::dependency_site_path_keys(db, file_id, path))
+            .unwrap_or_default();
+
+        pending.push(PendingCallSite::Dependency(LuaDependencySite {
+            source_file_id: file_id,
+            target_file_id,
+            kind,
+            realms,
+            returns_result,
+            path,
+            path_keys,
+            original_expr: call_expr.syntax().text().to_string(),
+            call_range: call_expr.get_range(),
+            range: arg_expr.map_or(call_expr.get_range(), |arg| arg.get_range()),
+        }));
+    }
     Some(())
 }
 
@@ -662,6 +680,60 @@ impl HelperRegistryBuilder {
     }
 }
 
+/// A load a function's calls make: its kind, the parameter naming the file,
+/// and the realms the function's realm branches leave it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct LoadRole {
+    kind: LuaDependencyKind,
+    arg: AnnotatedGmodCallArgRole,
+    realms: Option<GmodStateMask>,
+    returns_result: bool,
+}
+
+impl LoadRole {
+    fn new(kind: LuaDependencyKind, arg: AnnotatedGmodCallArgRole) -> Self {
+        Self {
+            kind,
+            arg,
+            realms: None,
+            returns_result: true,
+        }
+    }
+}
+
+/// The dynamic load a call making `loads` stands for: what its loads do
+/// together. A load its file's realm decides, or an `include` a realm branch
+/// holds, leaves it none, since a dynamic load runs in its caller's realms.
+fn load_calls_alias(loads: &[LoadCall]) -> Option<DynamicLoadAlias> {
+    let mut alias: Option<DynamicLoadAlias> = None;
+    for load in loads {
+        if load.realms.is_some() && load.kind != LuaDependencyKind::AddCSLuaFile {
+            return None;
+        }
+        let Some(load_alias) = DynamicLoadAlias::from_dependency_kind(load.kind, load.path_arg_idx)
+        else {
+            if load.kind == LuaDependencyKind::Dispatched {
+                return None;
+            }
+            continue;
+        };
+        match &mut alias {
+            Some(alias) => alias.merge(load_alias),
+            None => alias = Some(load_alias),
+        }
+    }
+    alias
+}
+
+/// The load a call of an annotated loader makes: its kind, the argument
+/// naming the file, and the realms the loader's realm branches leave it.
+struct LoadCall {
+    kind: LuaDependencyKind,
+    path_arg_idx: usize,
+    realms: Option<GmodStateMask>,
+    returns_result: bool,
+}
+
 /// A call inside a global function that passes the function's parameters on.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ForwardedCall {
@@ -670,6 +742,21 @@ struct ForwardedCall {
     callee_path: String,
     callee_is_colon: bool,
     args: Vec<ForwardedArg>,
+    /// Whether the function returns the call's result.
+    returned: bool,
+    /// Whether every call of the function makes this call.
+    reach: ForwardedReach,
+}
+
+/// Whether every call of a function makes a call in its body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ForwardedReach {
+    /// Every call makes it, in the realms the function's realm branches
+    /// leave it: `None` when no realm branch holds it.
+    Always(Option<GmodStateMask>),
+    /// A condition other than the realm, a loop, a short-circuit operand or
+    /// an earlier exit can skip it.
+    Sometimes,
 }
 
 /// An argument of a [`ForwardedCall`], written in terms of the function's
@@ -683,6 +770,8 @@ enum ForwardedArg {
         prefix: String,
         suffix: String,
     },
+    /// A local the function returns at every `return`.
+    Returned,
     Other,
 }
 
@@ -720,9 +809,38 @@ fn collect_forwarded_calls(
         let Some(args_list) = call_expr.get_args_list() else {
             continue;
         };
+        let param_idx = |name_expr: &LuaNameExpr| {
+            let decl_id = db
+                .get_reference_index()
+                .get_var_reference_decl(&file_id, name_expr.get_range())?;
+            let is_mutated = db
+                .get_reference_index()
+                .get_decl_references(&file_id, &decl_id)
+                .is_some_and(|references| {
+                    references.is_written_after_declaration(decl_id.position)
+                });
+            if is_mutated {
+                return None;
+            }
+            match &db.get_decl_index().get_decl(&decl_id)?.extra {
+                crate::LuaDeclExtra::Param {
+                    idx,
+                    signature_id: param_sig,
+                    ..
+                } if *param_sig == signature_id => Some(*idx),
+                _ => None,
+            }
+        };
+        let local_value =
+            |name_expr: &LuaNameExpr| wrapper_local_value(db, file_id, &closure, name_expr);
         let args = args_list
             .get_args()
-            .map(|arg| forwarded_arg(&arg, &signature.params))
+            .map(|arg| match forwarded_arg(&arg, &param_idx, &local_value) {
+                ForwardedArg::Other if wrapper_returns(db, file_id, &closure, &arg) => {
+                    ForwardedArg::Returned
+                }
+                forwarded => forwarded,
+            })
             .collect::<Vec<_>>();
         if args.iter().all(|arg| matches!(arg, ForwardedArg::Other)) {
             continue;
@@ -732,26 +850,191 @@ fn collect_forwarded_calls(
             callee_path: callee_path.to_string(),
             callee_is_colon: call_expr.is_colon_call(),
             args,
+            returned: wrapper_returns(db, file_id, &closure, &LuaExpr::CallExpr(call_expr.clone())),
+            reach: forwarded_reach(&call_expr, &closure),
         });
     }
     forwarded_calls
 }
 
-fn forwarded_arg(expr: &LuaExpr, params: &[SmolStr]) -> ForwardedArg {
+/// Whether every call of `closure` makes `call_expr`. A realm branch does
+/// not skip it but leaves it the realms it names: an `if` whose block, `elseif`
+/// or `else` holds it after only realm conditions, or an earlier
+/// `if CLIENT then return end` whose other clauses cannot leave. Any other
+/// condition, loop, short-circuit operand, `return` or `goto` before it can.
+fn forwarded_reach(call_expr: &LuaCallExpr, closure: &LuaClosureExpr) -> ForwardedReach {
+    let position = call_expr.get_position();
+    let mut realm_ranges = Vec::new();
+    // An `if` naming the realm the call runs in when it holds it, or returns
+    // before it on the others.
+    let mut narrows_realm = |if_stat: &LuaIfStat| {
+        let mut ranges = Vec::new();
+        collect_if_realm_ranges(if_stat, &mut ranges);
+        let before = realm_ranges.len();
+        realm_ranges.extend(
+            ranges
+                .into_iter()
+                .filter(|range| range.range.contains(position)),
+        );
+        realm_ranges.len() > before
+    };
+    for node in call_expr
+        .syntax()
+        .ancestors()
+        .take_while(|node| node != closure.syntax())
+    {
+        let skips = match LuaIfStat::cast(node.clone()) {
+            Some(if_stat) => {
+                !narrows_realm(&if_stat)
+                    || if_stat
+                        .get_all_clause()
+                        .take_while(|clause| clause.get_range().end() <= position)
+                        .any(|clause| {
+                            clause
+                                .get_condition_expr()
+                                .as_ref()
+                                .and_then(realm_from_condition)
+                                .is_none()
+                        })
+            }
+            None => {
+                matches!(
+                    node.kind().into(),
+                    glua_parser::LuaSyntaxKind::WhileStat
+                        | glua_parser::LuaSyntaxKind::RepeatStat
+                        | glua_parser::LuaSyntaxKind::ForStat
+                        | glua_parser::LuaSyntaxKind::ForRangeStat
+                ) || LuaBinaryExpr::cast(node.clone()).is_some_and(|binary| {
+                    binary.get_op_token().is_some_and(|op| {
+                        matches!(op.get_op(), BinaryOperator::OpAnd | BinaryOperator::OpOr)
+                    })
+                })
+            }
+        };
+        if skips {
+            return ForwardedReach::Sometimes;
+        }
+        if node.parent().and_then(LuaBlock::cast).is_none() {
+            continue;
+        }
+        for earlier in node.siblings(rowan::Direction::Prev).skip(1) {
+            let guards_realm = LuaIfStat::cast(earlier.clone()).is_some_and(|if_stat| {
+                !if_stat
+                    .get_all_clause()
+                    .any(|clause| may_leave(clause.syntax(), closure))
+                    && narrows_realm(&if_stat)
+            });
+            if !guards_realm && may_leave(&earlier, closure) {
+                return ForwardedReach::Sometimes;
+            }
+        }
+    }
+    ForwardedReach::Always(
+        realm_ranges
+            .into_iter()
+            .map(|range| GmodStateMask::from_realm(range.realm))
+            .reduce(GmodStateMask::intersection),
+    )
+}
+
+/// Whether `node` holds a `return` of `closure` or a `goto`.
+fn may_leave(node: &LuaSyntaxNode, closure: &LuaClosureExpr) -> bool {
+    node.descendants().any(|node| match node.kind().into() {
+        glua_parser::LuaSyntaxKind::ReturnStat => {
+            node.ancestors().find_map(LuaClosureExpr::cast).as_ref() == Some(closure)
+        }
+        glua_parser::LuaSyntaxKind::GotoStat => true,
+        _ => false,
+    })
+}
+
+/// The value a local of `closure` that is never reassigned was initialised
+/// with.
+fn wrapper_local_value(
+    db: &DbIndex,
+    file_id: FileId,
+    closure: &LuaClosureExpr,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaExpr> {
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&file_id, name_expr.get_range())?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let is_mutated = db
+        .get_reference_index()
+        .get_decl_references(&file_id, &decl_id)
+        .is_some_and(|references| references.mutable);
+    if !decl.is_local() || is_mutated || !closure.get_range().contains(decl_id.position) {
+        return None;
+    }
+    match local_initializer_expr(db, decl_id)? {
+        (0, value) => Some(value),
+        _ => None,
+    }
+}
+
+/// Whether every `return` of `closure` returns the value of `expr`: the
+/// local it names, or the call itself or the local that holds it.
+fn wrapper_returns(
+    db: &DbIndex,
+    file_id: FileId,
+    closure: &LuaClosureExpr,
+    expr: &LuaExpr,
+) -> bool {
+    let decl_of = |name_expr: &LuaNameExpr| {
+        db.get_reference_index()
+            .get_var_reference_decl(&file_id, name_expr.get_range())
+    };
+    let holder = match expr {
+        LuaExpr::NameExpr(name_expr) => decl_of(name_expr),
+        LuaExpr::CallExpr(_) => expr
+            .get_parent::<LuaLocalStat>()
+            .and_then(|local_stat| {
+                let idx = local_stat
+                    .get_value_exprs()
+                    .position(|value| value.syntax() == expr.syntax())?;
+                local_stat.get_local_name_list().nth(idx)
+            })
+            .map(|local_name| crate::LuaDeclId::new(file_id, local_name.get_position())),
+        _ => None,
+    };
+    let mut returns = closure
+        .descendants::<glua_parser::LuaReturnStat>()
+        .filter(|return_stat| {
+            return_stat.ancestors::<LuaClosureExpr>().next().as_ref() == Some(closure)
+        })
+        .peekable();
+    returns.peek().is_some()
+        && returns.all(|return_stat| match return_stat.get_expr_list().next() {
+            Some(LuaExpr::NameExpr(name_expr)) => holder.is_some() && decl_of(&name_expr) == holder,
+            Some(returned) => returned.syntax() == expr.syntax(),
+            None => false,
+        })
+}
+
+fn forwarded_arg(
+    expr: &LuaExpr,
+    param_idx: &dyn Fn(&LuaNameExpr) -> Option<usize>,
+    local_value: &dyn Fn(&LuaNameExpr) -> Option<LuaExpr>,
+) -> ForwardedArg {
     enum Piece {
         Text(String),
         Param(usize, Vec<String>),
         Other,
     }
 
-    fn push_pieces(expr: &LuaExpr, params: &[SmolStr], pieces: &mut Vec<Piece>) {
-        let param_idx = |name: &str| params.iter().position(|param| param == name);
+    fn push_pieces(
+        expr: &LuaExpr,
+        param_idx: &dyn Fn(&LuaNameExpr) -> Option<usize>,
+        local_value: &dyn Fn(&LuaNameExpr) -> Option<LuaExpr>,
+        pieces: &mut Vec<Piece>,
+    ) {
         match expr {
             LuaExpr::LiteralExpr(_) => {
                 pieces.push(static_literal_string(expr).map_or(Piece::Other, Piece::Text));
             }
             LuaExpr::ParenExpr(paren_expr) => match paren_expr.get_expr() {
-                Some(inner) => push_pieces(&inner, params, pieces),
+                Some(inner) => push_pieces(&inner, param_idx, local_value, pieces),
                 None => pieces.push(Piece::Other),
             },
             LuaExpr::BinaryExpr(binary_expr)
@@ -761,24 +1044,24 @@ fn forwarded_arg(expr: &LuaExpr, params: &[SmolStr]) -> ForwardedArg {
             {
                 match binary_expr.get_exprs() {
                     Some((left, right)) => {
-                        push_pieces(&left, params, pieces);
-                        push_pieces(&right, params, pieces);
+                        push_pieces(&left, param_idx, local_value, pieces);
+                        push_pieces(&right, param_idx, local_value, pieces);
                     }
                     None => pieces.push(Piece::Other),
                 }
             }
-            LuaExpr::NameExpr(name_expr) => pieces.push(
-                name_expr
-                    .get_name_text()
-                    .and_then(|name| param_idx(&name))
-                    .map_or(Piece::Other, |idx| Piece::Param(idx, Vec::new())),
-            ),
+            LuaExpr::NameExpr(name_expr) => match param_idx(name_expr) {
+                Some(idx) => pieces.push(Piece::Param(idx, Vec::new())),
+                None => match local_value(name_expr) {
+                    Some(value) => push_pieces(&value, param_idx, local_value, pieces),
+                    None => pieces.push(Piece::Other),
+                },
+            },
             LuaExpr::IndexExpr(index_expr) => {
                 pieces.push(match index_expr_root_and_field_path(index_expr) {
-                    Some((LuaExpr::NameExpr(root), field_path)) => root
-                        .get_name_text()
-                        .and_then(|name| param_idx(&name))
-                        .map_or(Piece::Other, |idx| Piece::Param(idx, field_path)),
+                    Some((LuaExpr::NameExpr(root), field_path)) => {
+                        param_idx(&root).map_or(Piece::Other, |idx| Piece::Param(idx, field_path))
+                    }
                     _ => Piece::Other,
                 });
             }
@@ -787,7 +1070,7 @@ fn forwarded_arg(expr: &LuaExpr, params: &[SmolStr]) -> ForwardedArg {
     }
 
     let mut pieces = Vec::new();
-    push_pieces(expr, params, &mut pieces);
+    push_pieces(expr, param_idx, local_value, &mut pieces);
     let mut prefix = String::new();
     let mut suffix = String::new();
     let mut param = None;
@@ -4340,6 +4623,7 @@ fn synthesize_vgui_registrations(
                     || !m.vgui_register_table_calls.is_empty()
                     || !m.derma_define_control_calls.is_empty()
                     || !m.vgui_register_file_calls.is_empty()
+                    || !m.metatable_register_calls.is_empty()
             }
             None => continue,
         };
@@ -4352,10 +4636,20 @@ fn synthesize_vgui_registrations(
             .expect("metadata present (checked above)")
             .clone();
 
-        for call in &metadata.vgui_register_calls {
+        let named_registrations = metadata
+            .vgui_register_calls
+            .iter()
+            .map(|call| (GmodScriptedClassCallKind::VguiRegister, call))
+            .chain(
+                metadata
+                    .metatable_register_calls
+                    .iter()
+                    .map(|call| (GmodScriptedClassCallKind::MetaTableRegister, call)),
+            );
+        for (kind, call) in named_registrations {
             let register_position = call.syntax_id.get_range().start();
-            let panel_source = call.vgui_panel_define_arg_source();
-            let table_source = call.vgui_panel_table_arg_source(1);
+            let panel_source = call.class_registration_define_arg_source();
+            let table_source = call.class_registration_table_arg_source(1);
             let panel_name = resolve_vgui_registration_name(
                 db,
                 context.infer_manager.get_infer_cache(file_id),
@@ -4365,8 +4659,9 @@ fn synthesize_vgui_registrations(
             );
             let mut resolved_registration = None;
             if let Some(panel_name) = panel_name.as_deref() {
-                if let Some(GmodClassCallLiteral::NameRef(table_var)) =
-                    call.value_for_arg_source(&table_source)
+                if let Some(GmodClassCallLiteral::NameRef(table_var)) = table_source
+                    .as_ref()
+                    .and_then(|source| call.value_for_arg_source(source))
                     && let Some((decl_id, region_start)) =
                         resolve_local_registration_region(db, file_id, table_var, register_position)
                 {
@@ -4382,7 +4677,12 @@ fn synthesize_vgui_registrations(
                         region_end: register_position,
                     });
                 }
-                synthesize_vgui_register(
+                let synthesize = if kind == GmodScriptedClassCallKind::MetaTableRegister {
+                    synthesize_metatable_register
+                } else {
+                    synthesize_vgui_register
+                };
+                synthesize(
                     db,
                     &mut synthesis_cache,
                     file_id,
@@ -4403,7 +4703,9 @@ fn synthesize_vgui_registrations(
 
         for call in &metadata.vgui_register_table_calls {
             let register_position = call.syntax_id.get_range().start();
-            let table_source = call.vgui_panel_table_arg_source(0);
+            let Some(table_source) = call.class_registration_table_arg_source(0) else {
+                continue;
+            };
             let is_actual_registration =
                 actual_register_table_positions.contains(&register_position);
             if !is_actual_registration
@@ -4472,8 +4774,8 @@ fn synthesize_vgui_registrations(
 
         for call in &metadata.derma_define_control_calls {
             let register_position = call.syntax_id.get_range().start();
-            let panel_source = call.vgui_panel_define_arg_source();
-            let table_source = call.vgui_panel_table_arg_source(2);
+            let panel_source = call.class_registration_define_arg_source();
+            let table_source = call.class_registration_table_arg_source(2);
             let panel_name = resolve_vgui_registration_name(
                 db,
                 context.infer_manager.get_infer_cache(file_id),
@@ -4483,8 +4785,9 @@ fn synthesize_vgui_registrations(
             );
             let mut resolved_registration = None;
             if let Some(panel_name) = panel_name.as_deref() {
-                if let Some(GmodClassCallLiteral::NameRef(table_var)) =
-                    call.value_for_arg_source(&table_source)
+                if let Some(GmodClassCallLiteral::NameRef(table_var)) = table_source
+                    .as_ref()
+                    .and_then(|source| call.value_for_arg_source(source))
                     && let Some((decl_id, region_start)) =
                         resolve_local_registration_region(db, file_id, table_var, register_position)
                 {
@@ -6271,17 +6574,20 @@ fn synthesize_vgui_register(
     // args[0] = panel name (string)
     // args[1] = table variable (name ref)
     // args[2] = base panel name (string)
-    let table_source = call.vgui_panel_table_arg_source(1);
-    let base_source = call.vgui_panel_base_arg_source(Some(2));
+    let table_source = call.class_registration_table_arg_source(1);
+    let base_source = call.class_registration_base_arg_source(Some(2));
 
-    let table_var_name = match call.value_for_arg_source(&table_source) {
+    let table_var_name = match table_source
+        .as_ref()
+        .and_then(|source| call.value_for_arg_source(source))
+    {
         Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
         _ => None,
     };
 
     let base_panel = registered_panel_base(call, base_source.as_ref());
 
-    synthesize_panel_class(
+    synthesize_registered_class(
         db,
         cache,
         file_id,
@@ -6289,6 +6595,39 @@ fn synthesize_vgui_register(
         table_var_name.as_deref(),
         base_panel.as_deref(),
         GmodScriptedClassCallKind::VguiRegister,
+        call,
+        resolved_registration,
+        phase,
+    );
+}
+
+/// `RegisterMetaTable(name, table)`: the table is the class of that name, with
+/// no base; GMod gives the userdata whose metatable it is the class's methods.
+fn synthesize_metatable_register(
+    db: &mut DbIndex,
+    cache: &mut VguiSynthesisCache,
+    file_id: FileId,
+    call: &GmodScriptedClassCallMetadata,
+    class_name: &str,
+    resolved_registration: Option<ResolvedVguiRegistrationRegion>,
+    phase: VguiSynthesisPhase,
+) {
+    let table_var_name = match call
+        .class_registration_table_arg_source(1)
+        .as_ref()
+        .and_then(|source| call.value_for_arg_source(source))
+    {
+        Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
+        _ => None,
+    };
+    synthesize_registered_class(
+        db,
+        cache,
+        file_id,
+        class_name,
+        table_var_name.as_deref(),
+        None,
+        GmodScriptedClassCallKind::MetaTableRegister,
         call,
         resolved_registration,
         phase,
@@ -6309,17 +6648,20 @@ fn synthesize_derma_define_control(
     // args[1] = description (string, ignored)
     // args[2] = table variable (name ref)
     // args[3] = base panel name (string)
-    let table_source = call.vgui_panel_table_arg_source(2);
-    let base_source = call.vgui_panel_base_arg_source(Some(3));
+    let table_source = call.class_registration_table_arg_source(2);
+    let base_source = call.class_registration_base_arg_source(Some(3));
 
-    let table_var_name = match call.value_for_arg_source(&table_source) {
+    let table_var_name = match table_source
+        .as_ref()
+        .and_then(|source| call.value_for_arg_source(source))
+    {
         Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
         _ => None,
     };
 
     let base_panel = registered_panel_base(call, base_source.as_ref());
 
-    synthesize_panel_class(
+    synthesize_registered_class(
         db,
         cache,
         file_id,
@@ -6348,10 +6690,13 @@ fn synthesize_vgui_register_table(
     // vgui.RegisterTable(TABLE, "BasePanel")
     // args[0] = table variable (name ref)
     // args[1] = base panel name (string)
-    let table_source = call.vgui_panel_table_arg_source(0);
-    let base_source = call.vgui_panel_base_arg_source(Some(1));
+    let table_source = call.class_registration_table_arg_source(0);
+    let base_source = call.class_registration_base_arg_source(Some(1));
 
-    let table_var_name = match call.value_for_arg_source(&table_source) {
+    let table_var_name = match table_source
+        .as_ref()
+        .and_then(|source| call.value_for_arg_source(source))
+    {
         Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
         _ => None,
     };
@@ -6359,7 +6704,7 @@ fn synthesize_vgui_register_table(
     let base_panel = registered_panel_base(call, base_source.as_ref());
 
     let class_decl_id = vgui_register_table_type_decl_id(file_id, call);
-    synthesize_panel_class_with_id(
+    synthesize_registered_class_with_id(
         db,
         cache,
         file_id,
@@ -6381,7 +6726,7 @@ fn synthesize_vgui_register_file_target(
     // vgui.RegisterFile("path/to/panel.lua") includes a file with a temporary
     // global PANEL table. The file itself is not a named VGUI class, but its
     // methods should still see PANEL.Base inheritance while it is being loaded.
-    let panel_source = call.vgui_panel_define_arg_source();
+    let panel_source = call.class_registration_define_arg_source();
     let GmodClassCallLiteral::String(path) = call.value_for_arg_source(&panel_source)? else {
         return None;
     };
@@ -6730,6 +7075,19 @@ fn find_registered_table_expr_at_write_position(
     file_id: FileId,
     write_position: TextSize,
 ) -> Option<LuaTableExpr> {
+    value_expr_as_table(&registered_value_expr_at_write_position(
+        db,
+        file_id,
+        write_position,
+    )?)
+}
+
+/// The value the write of a local at `write_position` stores.
+fn registered_value_expr_at_write_position(
+    db: &DbIndex,
+    file_id: FileId,
+    write_position: TextSize,
+) -> Option<LuaExpr> {
     let tree = db.get_vfs().get_syntax_tree(&file_id)?;
     let chunk = tree.get_chunk_node();
 
@@ -6748,7 +7106,7 @@ fn find_registered_table_expr_at_write_position(
                 name.get_name_token()
                     .is_some_and(|tok| tok.syntax().text_range().start() == write_position)
             })?;
-            return value_expr_as_table(values.get(var_index)?);
+            return values.get(var_index).cloned();
         }
 
         if let Some(assign_stat) = LuaAssignStat::cast(ancestor.clone()) {
@@ -6756,11 +7114,27 @@ fn find_registered_table_expr_at_write_position(
             let var_index = vars
                 .iter()
                 .position(|var| var.syntax().text_range().start() == write_position)?;
-            return value_expr_as_table(exprs.get(var_index)?);
+            return exprs.get(var_index).cloned();
         }
     }
 
     None
+}
+
+/// The metatable a `getmetatable(...)` call written to the registered local
+/// at `write_position` returns.
+fn registered_metatable(
+    db: &DbIndex,
+    file_id: FileId,
+    write_position: TextSize,
+) -> Option<InFiled<TextRange>> {
+    let LuaExpr::CallExpr(call) =
+        registered_value_expr_at_write_position(db, file_id, write_position)?
+    else {
+        return None;
+    };
+    let mut cache = LuaInferCache::new(file_id, super::call_target::pass_view());
+    getmetatable_call_metatable(db, &mut cache, &call)
 }
 
 /// Unwrap parenthesized expressions and require a table constructor.
@@ -6777,7 +7151,7 @@ fn value_expr_as_table(expr: &LuaExpr) -> Option<LuaTableExpr> {
     }
 }
 
-fn synthesize_panel_class(
+fn synthesize_registered_class(
     db: &mut DbIndex,
     cache: &mut VguiSynthesisCache,
     file_id: FileId,
@@ -6790,7 +7164,7 @@ fn synthesize_panel_class(
     phase: VguiSynthesisPhase,
 ) {
     let class_decl_id = LuaTypeDeclId::global(panel_name);
-    synthesize_panel_class_with_id(
+    synthesize_registered_class_with_id(
         db,
         cache,
         file_id,
@@ -6804,7 +7178,7 @@ fn synthesize_panel_class(
     );
 }
 
-fn synthesize_panel_class_with_id(
+fn synthesize_registered_class_with_id(
     db: &mut DbIndex,
     cache: &mut VguiSynthesisCache,
     file_id: FileId,
@@ -6886,6 +7260,14 @@ fn synthesize_panel_class_with_id(
 
         // Resolve the concrete `{}` table literal backing this registration.
         let registered_table = cached_registered_table_expr(cache, db, file_id, region_start);
+        if bind
+            && registered_table.is_none()
+            && let Some(metatable) = registered_metatable(db, file_id, region_start)
+        {
+            cache
+                .table_const_replacements
+                .insert(metatable, class_type.clone());
+        }
 
         if let Some(table_expr) = registered_table.as_ref().filter(|_| bind) {
             // Bind the class to this exact table-constructor expression.
@@ -7046,6 +7428,45 @@ fn synthesize_panel_class_with_id(
         {
             bind_panel_table_decl(db, decl_id, &LuaType::Def(class_decl_id.clone()));
         }
+    } else if bind && call.class_registration_table_is_result() {
+        if let Some(factory) = factory::FactoryCall::resolve(db, file_id, call) {
+            synthesize_factory_call(db, file_id, call, &class_decl_id, &factory);
+        }
+        // The local the call initialises holds the table the call registered.
+        if let Some(decl_id) = local_decl_for_call_result(db, file_id, call.syntax_id)
+            && !cached_decl_has_reassignment(cache, db, file_id, decl_id)
+        {
+            bind_panel_table_decl(db, decl_id, &LuaType::Def(class_decl_id));
+        }
+    }
+}
+
+/// The class a factory call makes inherits what the factory puts on the
+/// table it registers, and the parents its `__index` walks to; what the
+/// factory writes under keys built from its arguments is named per call.
+fn synthesize_factory_call(
+    db: &mut DbIndex,
+    file_id: FileId,
+    call: &GmodScriptedClassCallMetadata,
+    class_decl_id: &LuaTypeDeclId,
+    factory: &factory::FactoryCall,
+) {
+    let parents = factory.walked_parents(db, class_decl_id);
+    let members = factory.keyed_members(db, file_id, call.syntax_id, class_decl_id);
+    let call_range = call.syntax_id.get_range();
+    for parent in std::iter::once(LuaType::TableConst(factory.table.clone())).chain(parents) {
+        db.get_type_index_mut()
+            .add_super_type(class_decl_id.clone(), file_id, call_range, parent);
+    }
+    for (owner, member, typ) in members {
+        let member_id = member.get_id();
+        db.get_member_index_mut().add_member(owner, member);
+        write_type_cache(
+            db,
+            member_id.into(),
+            LuaTypeCache::InferType(typ),
+            TypeCacheWriteMode::InsertOnly,
+        );
     }
 }
 
@@ -7067,13 +7488,17 @@ fn find_inline_vgui_panel_table_expr(
     call: &GmodScriptedClassCallMetadata,
 ) -> Option<LuaTableExpr> {
     let table_source = match call_kind {
-        GmodScriptedClassCallKind::VguiRegister => call.vgui_panel_table_arg_source(1),
-        GmodScriptedClassCallKind::VguiRegisterTable => call.vgui_panel_table_arg_source(0),
-        GmodScriptedClassCallKind::DermaDefineControl => call.vgui_panel_table_arg_source(2),
+        GmodScriptedClassCallKind::VguiRegister | GmodScriptedClassCallKind::MetaTableRegister => {
+            call.class_registration_table_arg_source(1)
+        }
+        GmodScriptedClassCallKind::VguiRegisterTable => call.class_registration_table_arg_source(0),
+        GmodScriptedClassCallKind::DermaDefineControl => {
+            call.class_registration_table_arg_source(2)
+        }
         _ => return None,
     };
 
-    find_table_expr_for_arg_source(db, file_id, call, &table_source)
+    find_table_expr_for_arg_source(db, file_id, call, &table_source?)
 }
 
 fn find_table_expr_for_arg_source(
@@ -7332,9 +7757,13 @@ fn synthesize_panel_baseclass_member(
     call: &GmodScriptedClassCallMetadata,
 ) {
     let base_arg_source = match call_kind {
-        GmodScriptedClassCallKind::VguiRegister => call.vgui_panel_base_arg_source(Some(2)),
-        GmodScriptedClassCallKind::VguiRegisterTable => call.vgui_panel_base_arg_source(Some(1)),
-        GmodScriptedClassCallKind::DermaDefineControl => call.vgui_panel_base_arg_source(Some(3)),
+        GmodScriptedClassCallKind::VguiRegister => call.class_registration_base_arg_source(Some(2)),
+        GmodScriptedClassCallKind::VguiRegisterTable => {
+            call.class_registration_base_arg_source(Some(1))
+        }
+        GmodScriptedClassCallKind::DermaDefineControl => {
+            call.class_registration_base_arg_source(Some(3))
+        }
         _ => return,
     };
 
@@ -7657,7 +8086,7 @@ struct AnnotatedGmodCallRoleMap<'a> {
     file_id: FileId,
 }
 
-#[derive(Clone, Default, Hash)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 struct AnnotatedGmodCallArgRole {
     param_idx: usize,
     priority: i64,
@@ -7719,7 +8148,7 @@ struct AnnotatedGmodCallRoles {
     system_callback_roles: Vec<(GmodSystemCallKind, AnnotatedGmodCallArgRole)>,
     hook_roles: Vec<(GmodHookKind, AnnotatedGmodCallArgRole)>,
     hook_callback_roles: Vec<AnnotatedGmodCallArgRole>,
-    load_roles: Vec<(LuaDependencyKind, AnnotatedGmodCallArgRole)>,
+    load_roles: Vec<LoadRole>,
     compilefile_roles: Vec<AnnotatedGmodCallArgRole>,
     environment_target_roles: Vec<AnnotatedGmodCallArgRole>,
     environment_table_roles: Vec<AnnotatedGmodCallArgRole>,
@@ -7730,10 +8159,12 @@ struct AnnotatedGmodCallRoles {
     network_var_slot_only: bool,
     network_var_type_roles: Vec<AnnotatedGmodCallArgRole>,
     network_var_define_roles: Vec<AnnotatedGmodCallArgRole>,
-    vgui_panel_kind: Option<GmodScriptedClassCallKind>,
-    vgui_panel_define_roles: Vec<AnnotatedGmodCallArgRole>,
-    vgui_panel_table_roles: Vec<AnnotatedGmodCallArgRole>,
-    vgui_panel_base_roles: Vec<AnnotatedGmodCallArgRole>,
+    class_registration_kind: Option<GmodScriptedClassCallKind>,
+    class_registration_define_roles: Vec<AnnotatedGmodCallArgRole>,
+    class_registration_table_roles: Vec<AnnotatedGmodCallArgRole>,
+    /// The registered table is what the function returns.
+    class_registration_table_is_result: bool,
+    class_registration_base_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_reference_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_child_self_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_parent_roles: Vec<AnnotatedGmodCallArgRole>,
@@ -7822,18 +8253,18 @@ impl AnnotatedGmodCallRoles {
             ("gmod.hook", "callback") => {
                 self.hook_callback_roles.push(arg_role);
             }
-            ("gmod.load", "require") => {
-                self.load_roles.push((LuaDependencyKind::Require, arg_role))
-            }
-            ("gmod.load", "include") => {
-                self.load_roles.push((LuaDependencyKind::Include, arg_role))
-            }
+            ("gmod.load", "require") => self
+                .load_roles
+                .push(LoadRole::new(LuaDependencyKind::Require, arg_role)),
+            ("gmod.load", "include") => self
+                .load_roles
+                .push(LoadRole::new(LuaDependencyKind::Include, arg_role)),
             ("gmod.load", "addcsluafile") | ("gmod.load", "add_cs_lua_file") => self
                 .load_roles
-                .push((LuaDependencyKind::AddCSLuaFile, arg_role)),
+                .push(LoadRole::new(LuaDependencyKind::AddCSLuaFile, arg_role)),
             ("gmod.load", "includecs") | ("gmod.load", "include_cs") => self
                 .load_roles
-                .push((LuaDependencyKind::IncludeCS, arg_role)),
+                .push(LoadRole::new(LuaDependencyKind::IncludeCS, arg_role)),
             ("gmod.load", "compilefile") => self.compilefile_roles.push(arg_role),
             ("gmod.environment", "target") => self.environment_target_roles.push(arg_role),
             ("gmod.environment", "environment") => self.environment_table_roles.push(arg_role),
@@ -7867,28 +8298,28 @@ impl AnnotatedGmodCallRoles {
                 self.network_var_define_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "define") => {
-                self.vgui_panel_kind = self
-                    .vgui_panel_kind
+                self.class_registration_kind = self
+                    .class_registration_kind
                     .or(Some(GmodScriptedClassCallKind::VguiRegister));
-                self.vgui_panel_define_roles.push(arg_role);
+                self.class_registration_define_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "define_control") => {
-                self.vgui_panel_kind = Some(GmodScriptedClassCallKind::DermaDefineControl);
-                self.vgui_panel_define_roles.push(arg_role);
+                self.class_registration_kind = Some(GmodScriptedClassCallKind::DermaDefineControl);
+                self.class_registration_define_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "register_file") => {
-                self.vgui_panel_kind = Some(GmodScriptedClassCallKind::VguiRegisterFile);
-                self.vgui_panel_define_roles.push(arg_role);
+                self.class_registration_kind = Some(GmodScriptedClassCallKind::VguiRegisterFile);
+                self.class_registration_define_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "register_table") => {
-                self.vgui_panel_kind = Some(GmodScriptedClassCallKind::VguiRegisterTable);
-                self.vgui_panel_table_roles.push(arg_role);
+                self.class_registration_kind = Some(GmodScriptedClassCallKind::VguiRegisterTable);
+                self.class_registration_table_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "table") => {
-                self.vgui_panel_table_roles.push(arg_role);
+                self.class_registration_table_roles.push(arg_role);
             }
             ("gmod.vgui_panel", "base") => {
-                self.vgui_panel_base_roles.push(arg_role);
+                self.class_registration_base_roles.push(arg_role);
             }
             ("gmod.vgui_panel", crate::GMOD_ROLE_REFERENCE) => {
                 self.vgui_panel_reference_roles.push(arg_role);
@@ -7904,6 +8335,13 @@ impl AnnotatedGmodCallRoles {
             }
             ("gmod.derma_skin", "define") => {
                 self.derma_skin_define_roles.push(arg_role);
+            }
+            ("gmod.metatable", "define") => {
+                self.class_registration_kind = Some(GmodScriptedClassCallKind::MetaTableRegister);
+                self.class_registration_define_roles.push(arg_role);
+            }
+            ("gmod.metatable", "table") => {
+                self.class_registration_table_roles.push(arg_role);
             }
             ("gmod.scripted_class", "define") => {
                 self.scripted_class_define_roles.push(arg_role);
@@ -7927,7 +8365,7 @@ impl AnnotatedGmodCallRoles {
         self.hook_roles.sort_by_key(|(_, role)| role.sort_key());
         self.hook_callback_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
-        self.load_roles.sort_by_key(|(_, role)| role.sort_key());
+        self.load_roles.sort_by_key(|load| load.arg.sort_key());
         self.compilefile_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.environment_target_roles
@@ -7944,11 +8382,11 @@ impl AnnotatedGmodCallRoles {
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.network_var_define_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
-        self.vgui_panel_define_roles
+        self.class_registration_define_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
-        self.vgui_panel_table_roles
+        self.class_registration_table_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
-        self.vgui_panel_base_roles
+        self.class_registration_base_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.vgui_panel_reference_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
@@ -7979,7 +8417,7 @@ impl AnnotatedGmodCallRoles {
             || !self.file_find_search_path_roles.is_empty()
             || !self.inheritance_roles.is_empty()
             || !self.network_var_define_roles.is_empty()
-            || !self.vgui_panel_define_roles.is_empty()
+            || !self.class_registration_define_roles.is_empty()
             || (!self.vgui_panel_reference_roles.is_empty()
                 && (!self.vgui_panel_parent_roles.is_empty()
                     || !self.vgui_panel_parent_self_roles.is_empty()))
@@ -7987,7 +8425,7 @@ impl AnnotatedGmodCallRoles {
                 && (!self.vgui_panel_parent_roles.is_empty()
                     || !self.vgui_panel_parent_self_roles.is_empty()))
             || matches!(
-                self.vgui_panel_kind,
+                self.class_registration_kind,
                 Some(
                     GmodScriptedClassCallKind::VguiRegisterFile
                         | GmodScriptedClassCallKind::VguiRegisterTable
@@ -8107,7 +8545,7 @@ impl AnnotatedGmodCallRoles {
                 || !self.file_find_search_path_roles.is_empty(),
             has_scripted_class: !self.inheritance_roles.is_empty()
                 || !self.network_var_define_roles.is_empty()
-                || !self.vgui_panel_define_roles.is_empty()
+                || !self.class_registration_define_roles.is_empty()
                 || (!self.vgui_panel_reference_roles.is_empty()
                     && (!self.vgui_panel_parent_roles.is_empty()
                         || !self.vgui_panel_parent_self_roles.is_empty()))
@@ -8115,7 +8553,7 @@ impl AnnotatedGmodCallRoles {
                     && (!self.vgui_panel_parent_roles.is_empty()
                         || !self.vgui_panel_parent_self_roles.is_empty()))
                 || matches!(
-                    self.vgui_panel_kind,
+                    self.class_registration_kind,
                     Some(
                         GmodScriptedClassCallKind::VguiRegisterFile
                             | GmodScriptedClassCallKind::VguiRegisterTable
@@ -8143,19 +8581,36 @@ impl AnnotatedGmodCallRoles {
         ))
     }
 
-    fn load_call(&self, is_colon_call: bool) -> Option<(LuaDependencyKind, usize)> {
+    /// The loads a call with these roles makes: one for each load role, or
+    /// the `CompileFile` it makes.
+    fn load_calls(&self, is_colon_call: bool) -> Vec<LoadCall> {
+        if self.load_roles.is_empty() {
+            return self
+                .compilefile_call(is_colon_call)
+                .map(|path_arg_idx| LoadCall {
+                    kind: LuaDependencyKind::CompileFile,
+                    path_arg_idx,
+                    realms: None,
+                    returns_result: true,
+                })
+                .into_iter()
+                .collect();
+        }
         self.load_roles
-            .first()
-            .and_then(|(kind, role)| {
-                Some((
-                    *kind,
-                    param_idx_to_call_arg_idx(role.param_idx, is_colon_call, self.is_colon_define)?,
-                ))
+            .iter()
+            .filter_map(|load| {
+                Some(LoadCall {
+                    kind: load.kind,
+                    path_arg_idx: param_idx_to_call_arg_idx(
+                        load.arg.param_idx,
+                        is_colon_call,
+                        self.is_colon_define,
+                    )?,
+                    realms: load.realms,
+                    returns_result: load.returns_result,
+                })
             })
-            .or_else(|| {
-                self.compilefile_call(is_colon_call)
-                    .map(|path_arg_idx| (LuaDependencyKind::CompileFile, path_arg_idx))
-            })
+            .collect()
     }
 
     fn compilefile_call(&self, is_colon_call: bool) -> Option<usize> {
@@ -8173,15 +8628,11 @@ impl AnnotatedGmodCallRoles {
     }
 
     fn load_alias(&self, is_colon_call: bool) -> Option<DynamicLoadAlias> {
-        self.load_call(is_colon_call)
-            .and_then(|(kind, path_arg_idx)| {
-                DynamicLoadAlias::from_dependency_kind(kind, path_arg_idx)
-            })
-            .or_else(|| {
-                self.overloads
-                    .iter()
-                    .find_map(|overload| overload.load_alias(is_colon_call))
-            })
+        load_calls_alias(&self.load_calls(is_colon_call)).or_else(|| {
+            self.overloads
+                .iter()
+                .find_map(|overload| overload.load_alias(is_colon_call))
+        })
     }
 
     fn file_find_call(&self, is_colon_call: bool) -> Option<(usize, usize)> {
@@ -8221,57 +8672,148 @@ impl AnnotatedGmodCallRoles {
         ))
     }
 
+    /// The roles of a function that loads files by passing its parameter on,
+    /// unchanged, as the path of a call with these roles: each load the call
+    /// makes, in the realms the function's realm branches leave the call. A
+    /// call the function does not always make loads its file in a realm its
+    /// branches decide.
+    fn forwarded_load(&self, forward: &ForwardedCall) -> Option<Self> {
+        let load_roles = self
+            .load_roles
+            .iter()
+            .filter_map(|load| {
+                let (kind, realms) = match forward.reach {
+                    ForwardedReach::Always(realms) => (
+                        load.kind,
+                        match (load.realms, realms) {
+                            (Some(inner), Some(outer)) => Some(inner.intersection(outer)),
+                            (inner, outer) => inner.or(outer),
+                        },
+                    ),
+                    ForwardedReach::Sometimes => (LuaDependencyKind::Dispatched, None),
+                };
+                let arg_idx = param_idx_to_call_arg_idx(
+                    load.arg.param_idx,
+                    forward.callee_is_colon,
+                    self.is_colon_define,
+                )?;
+                let arg = forward
+                    .args
+                    .get(arg_idx)?
+                    .forward_role(&load.arg)
+                    .filter(|role| {
+                        role.field_path.is_empty()
+                            && role.prefix.is_empty()
+                            && role.suffix.is_empty()
+                    })?;
+                Some(LoadRole {
+                    kind,
+                    arg,
+                    realms,
+                    returns_result: load.returns_result && forward.returned,
+                })
+            })
+            .collect::<Vec<_>>();
+        (!load_roles.is_empty()).then(|| Self {
+            load_roles,
+            ..Self::default()
+        })
+    }
+
+    /// Adds the loads of `other`, another call in the same function, that
+    /// these roles do not already make: whether any were new.
+    fn add_loads(&mut self, other: Self) -> bool {
+        let before = self.load_roles.len();
+        for load in other.load_roles {
+            if !self.load_roles.contains(&load) {
+                self.load_roles.push(load);
+            }
+        }
+        self.load_roles.len() > before
+    }
+
+    /// Adds the class registration of `other`, another call in the same
+    /// function, when these roles do not already carry one.
+    fn add_class_registration(&mut self, other: Self) -> bool {
+        if self.class_registration_kind.is_some() || other.class_registration_kind.is_none() {
+            return false;
+        }
+        self.class_registration_kind = other.class_registration_kind;
+        self.class_registration_define_roles = other.class_registration_define_roles;
+        self.class_registration_table_roles = other.class_registration_table_roles;
+        self.class_registration_table_is_result = other.class_registration_table_is_result;
+        self.class_registration_base_roles = other.class_registration_base_roles;
+        true
+    }
+
     /// The roles of a function that registers a panel by passing its
     /// parameters to a call with these roles.
-    fn forwarded_vgui_panel_registration(&self, forward: &ForwardedCall) -> Option<Self> {
-        let kind = self.vgui_panel_kind?;
+    fn forwarded_class_registration(&self, forward: &ForwardedCall) -> Option<Self> {
+        let kind = self.class_registration_kind?;
         if kind == GmodScriptedClassCallKind::VguiRegisterFile
-            || (self.vgui_panel_define_roles.is_empty()
+            || (self.class_registration_define_roles.is_empty()
                 && kind != GmodScriptedClassCallKind::VguiRegisterTable)
         {
             return None;
         }
-        let forwarded = |role: &AnnotatedGmodCallArgRole| {
+        let forwarded_arg = |role: &AnnotatedGmodCallArgRole| {
             let arg_idx = param_idx_to_call_arg_idx(
                 role.param_idx,
                 forward.callee_is_colon,
                 self.is_colon_define,
             )?;
-            forward.args.get(arg_idx)?.forward_role(role)
+            forward.args.get(arg_idx)
         };
-        let table = forwarded(self.vgui_panel_table_roles.first()?).filter(|role| {
-            role.field_path.is_empty() && role.prefix.is_empty() && role.suffix.is_empty()
-        })?;
-        let define = match self.vgui_panel_define_roles.first() {
+        let forwarded = |role: &AnnotatedGmodCallArgRole| forwarded_arg(role)?.forward_role(role);
+        let (table, table_is_result) = match self.class_registration_table_roles.first() {
+            Some(role) if forwarded_arg(role) == Some(&ForwardedArg::Returned) => {
+                (Vec::new(), true)
+            }
+            Some(role) => (
+                vec![forwarded(role).filter(|role| {
+                    role.field_path.is_empty() && role.prefix.is_empty() && role.suffix.is_empty()
+                })?],
+                false,
+            ),
+            None if self.class_registration_table_is_result && forward.returned => {
+                (Vec::new(), true)
+            }
+            None => return None,
+        };
+        if table_is_result && kind == GmodScriptedClassCallKind::VguiRegisterTable {
+            return None;
+        }
+        let define = match self.class_registration_define_roles.first() {
             Some(role) => vec![forwarded(role)?],
             None => Vec::new(),
         };
         let base = self
-            .vgui_panel_base_roles
+            .class_registration_base_roles
             .first()
             .and_then(forwarded)
             .into_iter()
             .collect();
         Some(Self {
-            vgui_panel_kind: self.vgui_panel_kind,
-            vgui_panel_define_roles: define,
-            vgui_panel_table_roles: vec![table],
-            vgui_panel_base_roles: base,
+            class_registration_kind: self.class_registration_kind,
+            class_registration_define_roles: define,
+            class_registration_table_roles: table,
+            class_registration_table_is_result: table_is_result,
+            class_registration_base_roles: base,
             ..Self::default()
         })
     }
 
-    fn vgui_panel_call(
+    fn class_registration_call(
         &self,
         is_colon_call: bool,
-    ) -> Option<(GmodScriptedClassCallKind, GmodVguiPanelCallRoles)> {
+    ) -> Option<(GmodScriptedClassCallKind, GmodClassRegistrationCallRoles)> {
         let kind = self
-            .vgui_panel_kind
+            .class_registration_kind
             .unwrap_or(GmodScriptedClassCallKind::VguiRegister);
-        let define = if let Some(role) = self.vgui_panel_define_roles.first() {
+        let define = if let Some(role) = self.class_registration_define_roles.first() {
             role.to_arg_source(is_colon_call, self.is_colon_define)?
         } else if kind == GmodScriptedClassCallKind::VguiRegisterTable {
-            self.vgui_panel_table_roles
+            self.class_registration_table_roles
                 .first()?
                 .to_arg_source(is_colon_call, self.is_colon_define)?
         } else {
@@ -8280,14 +8822,18 @@ impl AnnotatedGmodCallRoles {
 
         Some((
             kind,
-            GmodVguiPanelCallRoles {
+            GmodClassRegistrationCallRoles {
                 define,
-                table: self
-                    .vgui_panel_table_roles
-                    .first()
-                    .and_then(|role| role.to_arg_source(is_colon_call, self.is_colon_define)),
+                table: if self.class_registration_table_is_result {
+                    Some(GmodRegisteredTableSource::Result)
+                } else {
+                    self.class_registration_table_roles
+                        .first()
+                        .and_then(|role| role.to_arg_source(is_colon_call, self.is_colon_define))
+                        .map(GmodRegisteredTableSource::Arg)
+                },
                 base: self
-                    .vgui_panel_base_roles
+                    .class_registration_base_roles
                     .first()
                     .and_then(|role| role.to_arg_source(is_colon_call, self.is_colon_define)),
             },
@@ -8840,15 +9386,16 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             })
     }
 
-    fn load_call(
+    fn load_calls(
         &self,
         db: &DbIndex,
         file_id: FileId,
         call_expr: &LuaCallExpr,
         call_path: &str,
-    ) -> Option<(LuaDependencyKind, usize)> {
+    ) -> Vec<LoadCall> {
         self.roles_for_call(db, file_id, call_expr, call_path)
-            .and_then(|roles| roles.load_call(call_expr.is_colon_call()))
+            .map(|roles| roles.load_calls(call_expr.is_colon_call()))
+            .unwrap_or_default()
     }
 
     fn compilefile_call(
@@ -8932,15 +9479,15 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             .and_then(|roles| roles.file_find_call(call_expr.is_colon_call()))
     }
 
-    fn vgui_panel_call(
+    fn class_registration_call(
         &self,
         db: &DbIndex,
         file_id: FileId,
         call_expr: &LuaCallExpr,
         call_path: &str,
-    ) -> Option<(GmodScriptedClassCallKind, GmodVguiPanelCallRoles)> {
+    ) -> Option<(GmodScriptedClassCallKind, GmodClassRegistrationCallRoles)> {
         self.roles_for_call(db, file_id, call_expr, call_path)
-            .and_then(|roles| roles.vgui_panel_call(call_expr.is_colon_call()))
+            .and_then(|roles| roles.class_registration_call(call_expr.is_colon_call()))
     }
 
     fn vgui_parent_call(
@@ -9070,11 +9617,11 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
         {
             return None;
         }
-        let signature_id = db
-            .get_call_target_index()
+        db.get_call_target_index()
             .target(self.file_id, call_expr.get_range())?
-            .declared?;
-        roles_from_signature(db, signature_id)?.select_for_call(call_expr)
+            .unique_then_declared()
+            .find_map(|signature_id| roles_from_signature(db, signature_id))?
+            .select_for_call(call_expr)
     }
 }
 
@@ -9528,7 +10075,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 field_args,
                 inheritance_roles: Some(inheritance_roles),
                 network_var_roles: None,
-                vgui_panel_roles: None,
+                class_registration_roles: None,
                 derma_skin_roles: None,
                 register_roles: None,
             }),
@@ -9550,7 +10097,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 field_args,
                 inheritance_roles: None,
                 network_var_roles: Some(network_var_roles),
-                vgui_panel_roles: None,
+                class_registration_roles: None,
                 derma_skin_roles: None,
                 register_roles: None,
             }),
@@ -9558,10 +10105,10 @@ fn collect_annotated_scripted_class_call_metadata(
         return Some(());
     }
 
-    if let Some((kind, vgui_panel_roles)) =
-        annotated_roles.vgui_panel_call(db, file_id, &call_expr, &call_path)
+    if let Some((kind, class_registration_roles)) =
+        annotated_roles.class_registration_call(db, file_id, &call_expr, &call_path)
     {
-        let field_sources = vgui_panel_field_sources(&vgui_panel_roles);
+        let field_sources = vgui_panel_field_sources(&class_registration_roles);
         let (literal_args, args, field_args) =
             extract_gmod_class_call_args(db, file_id, &call_expr, &field_sources);
         pending.push(PendingCallSite::ScriptedClass(
@@ -9573,7 +10120,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 field_args,
                 inheritance_roles: None,
                 network_var_roles: None,
-                vgui_panel_roles: Some(vgui_panel_roles),
+                class_registration_roles: Some(class_registration_roles),
                 derma_skin_roles: None,
                 register_roles: None,
             }),
@@ -9595,7 +10142,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 field_args,
                 inheritance_roles: None,
                 network_var_roles: None,
-                vgui_panel_roles: None,
+                class_registration_roles: None,
                 derma_skin_roles: None,
                 register_roles: Some(register_roles),
             }),
@@ -9617,7 +10164,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 field_args,
                 inheritance_roles: None,
                 network_var_roles: None,
-                vgui_panel_roles: None,
+                class_registration_roles: None,
                 derma_skin_roles: Some(derma_skin_roles),
                 register_roles: None,
             }),
@@ -9779,10 +10326,15 @@ fn extract_gmod_class_call_args(
     (literal_args, args, field_args)
 }
 
-fn vgui_panel_field_sources(roles: &GmodVguiPanelCallRoles) -> Vec<crate::GmodClassCallArgSource> {
+fn vgui_panel_field_sources(
+    roles: &GmodClassRegistrationCallRoles,
+) -> Vec<crate::GmodClassCallArgSource> {
     let mut sources = Vec::new();
     for source in std::iter::once(&roles.define)
-        .chain(roles.table.as_ref())
+        .chain(match &roles.table {
+            Some(crate::GmodRegisteredTableSource::Arg(source)) => Some(source),
+            _ => None,
+        })
         .chain(roles.base.as_ref())
     {
         if source.is_derived() && !sources.iter().any(|existing| existing == source) {
@@ -11290,6 +11842,9 @@ fn rebuild_gmod_load_index(
                 .get_dependency_sites(file_id)
                 .unwrap_or_default()
         })
+        // Which realm a dispatching loader runs its file in is up to its
+        // branches, which the load graph does not follow.
+        .filter(|site| site.kind != LuaDependencyKind::Dispatched)
         .collect::<Vec<_>>();
     let mut dependency_sites = super::parallel::map_items_recorded(&sites, |site| {
         resolve_load_dependency_site(db, (**site).clone())
@@ -11587,7 +12142,9 @@ impl DynamicLoadAlias {
                 path_arg_idx: Some(path_arg_idx),
                 ..Self::default()
             }),
-            LuaDependencyKind::Require | LuaDependencyKind::CompileFile => None,
+            LuaDependencyKind::Require
+            | LuaDependencyKind::CompileFile
+            | LuaDependencyKind::Dispatched => None,
         }
     }
 
@@ -13226,7 +13783,7 @@ fn source_states_for_dynamic_operation(
     source_file_id: FileId,
     ranges: &[TextRange],
 ) -> GmodStateMask {
-    let mut source_states = file_infos
+    let source_states = file_infos
         .get(&source_file_id)
         .map(|info| info.state_mask)
         .filter(|states| !states.is_empty())
@@ -13236,24 +13793,29 @@ fn source_states_for_dynamic_operation(
     let Some(branch_ranges) = branch_realm_ranges.get(&source_file_id) else {
         return source_states;
     };
-
-    for range in ranges {
-        let Some(branch_realm) = branch_ranges
-            .iter()
-            .find(|branch_range| branch_range.range.contains(range.start()))
-            .map(|branch_range| branch_range.realm)
-        else {
-            continue;
-        };
-        let branch_states = GmodStateMask::from_realm(branch_realm);
-        source_states = if source_states.is_empty() {
-            branch_states
-        } else {
-            source_states.intersection(branch_states)
-        };
+    let Some(limit) = ranges
+        .iter()
+        .filter_map(|range| branch_states_at(branch_ranges, range.start()))
+        .reduce(GmodStateMask::intersection)
+    else {
+        return source_states;
+    };
+    if source_states.is_empty() {
+        limit
+    } else {
+        source_states.intersection(limit)
     }
+}
 
-    source_states
+/// The states the realm branches holding `position` run it in: those every
+/// enclosing branch names, so a branch inside one for the other realm never
+/// runs.
+fn branch_states_at(branch_ranges: &[GmodRealmRange], position: TextSize) -> Option<GmodStateMask> {
+    branch_ranges
+        .iter()
+        .filter(|branch_range| branch_range.range.contains(position))
+        .map(|branch_range| GmodStateMask::from_realm(branch_range.realm))
+        .reduce(GmodStateMask::intersection)
 }
 
 fn dynamic_operation_target_states(
@@ -13389,7 +13951,8 @@ pub(crate) fn resolve_load_dependency_target(
         LuaDependencyKind::Include
         | LuaDependencyKind::CompileFile
         | LuaDependencyKind::AddCSLuaFile
-        | LuaDependencyKind::IncludeCS => {
+        | LuaDependencyKind::IncludeCS
+        | LuaDependencyKind::Dispatched => {
             resolve_load_include_target(db, source_file_id, dependency_path)
                 .or_else(|| module_index.find_module_file_for_file(dependency_path, source_file_id))
         }
@@ -13470,24 +14033,20 @@ fn source_states_for_load_site(
         .filter(|states| !states.is_empty())
         .or_else(|| fallback_masks.get(&site.source_file_id).copied())
         .unwrap_or_else(GmodStateMask::empty);
-
-    let Some(ranges) = branch_realm_ranges.get(&site.source_file_id) else {
-        return source_states;
-    };
-
-    let Some(branch_realm) = ranges
-        .iter()
-        .find(|range| range.range.contains(site.range.start()))
-        .map(|range| range.realm)
+    let branch_realm = branch_realm_ranges
+        .get(&site.source_file_id)
+        .and_then(|ranges| branch_states_at(ranges, site.range.start()));
+    let Some(limit) = [branch_realm, site.realms]
+        .into_iter()
+        .flatten()
+        .reduce(GmodStateMask::intersection)
     else {
         return source_states;
     };
-
-    let branch_states = GmodStateMask::from_realm(branch_realm);
     if source_states.is_empty() {
-        branch_states
+        limit
     } else {
-        source_states.intersection(branch_states)
+        source_states.intersection(limit)
     }
 }
 
@@ -13502,6 +14061,7 @@ fn load_site_sort_key(
         LuaDependencyKind::CompileFile => 2,
         LuaDependencyKind::AddCSLuaFile => 3,
         LuaDependencyKind::IncludeCS => 4,
+        LuaDependencyKind::Dispatched => 5,
     };
     (
         source_path,
@@ -13585,7 +14145,7 @@ fn apply_load_site(
                 );
             }
         }
-        LuaDependencyKind::CompileFile => {}
+        LuaDependencyKind::CompileFile | LuaDependencyKind::Dispatched => {}
         LuaDependencyKind::IncludeCS => {
             target_info.client_send_available = true;
             changed |= target_info.mark_states(

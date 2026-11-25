@@ -871,6 +871,27 @@ impl GmodNetworkIndex {
             })
     }
 
+    /// The receive flows that may read at positions of `file_id`: its own and
+    /// those of every file whose flows name one of its positions, as a
+    /// receiver calling a read helper defined there does.
+    pub fn receive_flows_reading(&self, file_id: FileId) -> Vec<(FileId, &NetReceiveFlow)> {
+        // A file that starts calling a helper here changes none of this
+        // file's facts, only the whole map.
+        derivation::note_read(|| FactKey::NetworkScan);
+        let mut files = self
+            .referencing
+            .get(&file_id)
+            .map(|files| files.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        files.push(file_id);
+        files.sort_unstable_by_key(|file_id| file_id.id);
+        files
+            .into_iter()
+            .filter_map(|file_id| self.file_data.get(&file_id).map(|data| (file_id, data)))
+            .flat_map(|(file_id, data)| data.receive_flows.iter().map(move |flow| (file_id, flow)))
+            .collect()
+    }
+
     /// Notes a read of the flows sent under `name`.
     pub(crate) fn note_sends_read(name: &str) {
         derivation::note_read(|| FactKey::NetSends(SmolStr::new(name)));

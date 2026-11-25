@@ -5,12 +5,16 @@ use rowan::TextRange;
 use crate::{
     InferFailReason, check_type_compact,
     db_index::{DbIndex, LuaFunctionType, LuaType},
-    semantic::{infer::InferCallFuncResult, is_nullable},
+    semantic::{find_members_with_key, get_member_map, infer::InferCallFuncResult, is_nullable},
 };
 
+/// When no candidate accepts the first argument, the result is a candidate
+/// that takes as many arguments as the call passes, the main form (`main_idx`)
+/// first, so a mismatch reports against the form the call was written for.
 pub fn resolve_signature_by_args(
     db: &DbIndex,
     overloads: &[Arc<LuaFunctionType>],
+    main_idx: Option<usize>,
     expr_types: &[(LuaType, TextRange)],
     is_colon_call: bool,
     arg_count: Option<usize>,
@@ -46,13 +50,19 @@ pub fn resolve_signature_by_args(
         }
     }
 
-    let mut best_match_result = need_resolve_funcs[0]
+    let fits = |idx: &usize| takes_arg_count(db, &overloads[*idx], arg_count, is_colon_call);
+    let fallback_idx = main_idx
+        .filter(fits)
+        .or_else(|| (0..overloads.len()).find(fits))
+        .unwrap_or(0);
+    let mut best_match_result = need_resolve_funcs[fallback_idx]
         .clone()
         .expect("Match result should exist");
     let mut fits_only_union_components = vec![false; need_resolve_funcs.len()];
     for (arg_index, (expr_type, _)) in expr_types.iter().enumerate() {
         let mut current_match_result = ParamMatchResult::Not;
         let mut skipped_implicit_self = false;
+        let mut rejecting = Vec::new();
         for (func_index, opt_func) in need_resolve_funcs.iter_mut().enumerate() {
             let func = match opt_func.as_ref() {
                 None => continue,
@@ -106,6 +116,7 @@ pub fn resolve_signature_by_args(
             }
 
             if match_result == ParamMatchResult::Not {
+                rejecting.push((func.clone(), param_type));
                 *opt_func = None;
                 continue;
             }
@@ -122,6 +133,11 @@ pub fn resolve_signature_by_args(
         }
 
         if current_match_result == ParamMatchResult::Not && !skipped_implicit_self {
+            if let Some(closest) =
+                closest_table_fit(db, &rejecting, expr_type, expr_len, is_colon_call)
+            {
+                best_match_result = closest;
+            }
             break;
         }
     }
@@ -226,6 +242,48 @@ pub fn resolve_signature_by_args(
     }
 
     Ok(best_match_result)
+}
+
+/// Among overloads that all reject the table literal `expr_type`, the one
+/// whose fields it misses fewest of, the first on a tie. An overload whose
+/// parameter no table could fill is no candidate.
+fn closest_table_fit(
+    db: &DbIndex,
+    rejecting: &[(Arc<LuaFunctionType>, LuaType)],
+    expr_type: &LuaType,
+    expr_len: usize,
+    is_colon_call: bool,
+) -> Option<Arc<LuaFunctionType>> {
+    if !matches!(expr_type, LuaType::TableConst(_)) {
+        return None;
+    }
+    let fields = get_member_map(db, expr_type)?;
+    let misses = |param_type: &LuaType| {
+        fields
+            .iter()
+            .filter(|(key, values)| {
+                !find_members_with_key(db, param_type, (*key).clone(), false).is_some_and(
+                    |expected| {
+                        expected.iter().any(|expected| {
+                            values.iter().all(|value| {
+                                check_type_compact(db, &expected.typ, &value.typ).is_ok()
+                            })
+                        })
+                    },
+                )
+            })
+            .count()
+    };
+    rejecting
+        .iter()
+        .filter(|(_, param_type)| check_type_compact(db, param_type, &LuaType::Table).is_ok())
+        .min_by_key(|(func, param_type)| {
+            (
+                misses(param_type),
+                !takes_arg_count(db, func, expr_len, is_colon_call),
+            )
+        })
+        .map(|(func, _)| func.clone())
 }
 
 fn is_func_last_param_variadic(func: &LuaFunctionType) -> bool {
@@ -354,6 +412,37 @@ fn classify_arg_match(db: &DbIndex, param_type: &LuaType, expr_type: &LuaType) -
 }
 
 /// How many call arguments `func` takes without a surplus.
+/// Whether `func` takes `arg_count` arguments: no more than it has room for,
+/// and every parameter past them may be left out.
+fn takes_arg_count(
+    db: &DbIndex,
+    func: &LuaFunctionType,
+    arg_count: usize,
+    is_colon_call: bool,
+) -> bool {
+    let variadic = is_func_last_param_variadic(func);
+    let supplied = effective_arg_count(arg_count, func.is_colon_define(), is_colon_call);
+    if !variadic && supplied > func.get_params().len() {
+        return false;
+    }
+    let params = func.get_params();
+    let fixed = if variadic {
+        params.len() - 1
+    } else {
+        params.len()
+    };
+    params[..fixed]
+        .iter()
+        .enumerate()
+        .skip(supplied)
+        .all(|(param_index, (_, param_type))| {
+            func.is_param_optional(param_index)
+                || param_type
+                    .as_ref()
+                    .is_none_or(|param_type| is_nullable(db, param_type))
+        })
+}
+
 fn arg_capacity(func: &LuaFunctionType, is_colon_call: bool) -> usize {
     let param_len = func.get_params().len();
     match (func.is_colon_define(), is_colon_call) {

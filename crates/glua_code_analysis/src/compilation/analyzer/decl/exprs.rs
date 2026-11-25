@@ -8,10 +8,7 @@ use smol_str::SmolStr;
 use crate::{
     EmmyrcLuaVersion, FileId, InFiled, LegacyModuleEnv, LuaDeclExtra, LuaDeclId, LuaMemberFeature,
     LuaMemberId, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDeclId,
-    db_index::{
-        GmodScriptedClassCallKind, LuaDecl, LuaDependencyKind, LuaMember, LuaMemberKey,
-        LuaMemberOwner,
-    },
+    db_index::{GmodScriptedClassCallKind, LuaDecl, LuaMember, LuaMemberKey, LuaMemberOwner},
 };
 
 use super::{DeclAnalyzer, DeclOp};
@@ -163,7 +160,14 @@ fn is_structural_inferred_guard_candidate(closure: &LuaClosureExpr) -> bool {
     let Some(block) = closure.get_block() else {
         return false;
     };
-    let return_points = super::super::lua::func_body::analyze_func_body_returns(None, block);
+    if block
+        .descendants::<LuaCallExpr>()
+        .any(|call| call.is_assert() || call.is_error())
+    {
+        return true;
+    }
+    let return_points =
+        super::super::lua::func_body::analyze_func_body_returns(None, block.clone());
     let mut truthy_exprs = Vec::new();
     for point in &return_points {
         match point {
@@ -177,9 +181,16 @@ fn is_structural_inferred_guard_candidate(closure: &LuaClosureExpr) -> bool {
         }
     }
     if return_points.len() == 1 {
-        return truthy_exprs
-            .first()
-            .is_some_and(|expr| inferred_guard_candidate_references_param(expr, &param_names));
+        // A lone literal return proves something of a parameter only through
+        // the statements before it, such as an `error` unless it is valid.
+        return truthy_exprs.first().is_some_and(|expr| match expr {
+            LuaExpr::LiteralExpr(_) => block.descendants::<LuaNameExpr>().any(|name_expr| {
+                name_expr
+                    .get_name_text()
+                    .is_some_and(|name| param_names.iter().any(|param| *param == name))
+            }),
+            expr => inferred_guard_candidate_references_param(expr, &param_names),
+        });
     }
     !truthy_exprs.is_empty()
         && truthy_exprs.iter().all(|expr| {
@@ -416,36 +427,6 @@ pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Opti
     try_analyze_legacy_module_call(analyzer, &expr);
     try_declare_define_baseclass_local(analyzer, &expr);
 
-    let Some((dependency_kind, dependency_path)) = get_dependency_call_info(&expr) else {
-        return Some(());
-    };
-
-    let file_id = analyzer.get_file_id();
-
-    // No-arg AddCSLuaFile() means "send self to client": a self-reference.
-    let self_reference = dependency_path.is_none()
-        && dependency_kind == LuaDependencyKind::AddCSLuaFile
-        && dependency_call_has_no_args(&expr);
-    let dependency_path_keys = dependency_path
-        .as_deref()
-        .map(|path| crate::dependency_site_path_keys(analyzer.db, file_id, path))
-        .unwrap_or_default();
-
-    let call_range = expr.get_range();
-    let range = expr
-        .get_args_list()
-        .and_then(|args| args.get_args().next())
-        .map_or(call_range, |arg| arg.get_range());
-    analyzer.ops.push(DeclOp::Dependency {
-        kind: dependency_kind,
-        path: dependency_path,
-        self_reference,
-        path_keys: dependency_path_keys,
-        original_expr: expr.syntax().text().to_string(),
-        call_range,
-        range,
-    });
-
     Some(())
 }
 
@@ -501,10 +482,17 @@ fn try_analyze_legacy_module_call(analyzer: &mut DeclAnalyzer, expr: &LuaCallExp
         return Some(());
     }
 
-    let Some(call_name) = get_call_name(expr) else {
+    // Roles come from annotations only after this pass, so `module` is told
+    // apart by scope: the global, not a member or a local of that name.
+    let LuaExpr::NameExpr(name_expr) = expr.get_prefix_expr()? else {
         return Some(());
     };
-    if call_name != "module" {
+    let name_token = name_expr.get_name_token()?;
+    if name_token.get_name_text() != "module"
+        || analyzer
+            .find_decl("module", name_token.get_position())
+            .is_some_and(|decl| decl.is_local() && !analyzer.localises_global_of_its_name(decl))
+    {
         return Some(());
     }
 
@@ -570,41 +558,6 @@ fn try_analyze_legacy_module_call(analyzer: &mut DeclAnalyzer, expr: &LuaCallExp
     }
 
     Some(())
-}
-
-fn get_dependency_call_info(expr: &LuaCallExpr) -> Option<(LuaDependencyKind, Option<String>)> {
-    let dependency_kind = if expr.is_require() {
-        LuaDependencyKind::Require
-    } else {
-        match get_call_name(expr).as_deref()? {
-            "include" => LuaDependencyKind::Include,
-            "AddCSLuaFile" => LuaDependencyKind::AddCSLuaFile,
-            "IncludeCS" => LuaDependencyKind::IncludeCS,
-            _ => return None,
-        }
-    };
-    let dependency_path = get_static_string_arg(expr);
-    if dependency_path.is_none() && dependency_kind == LuaDependencyKind::Require {
-        return None;
-    }
-    Some((dependency_kind, dependency_path))
-}
-
-fn dependency_call_has_no_args(expr: &LuaCallExpr) -> bool {
-    expr.get_args_list()
-        .is_none_or(|args| args.get_args().next().is_none())
-}
-
-fn get_call_name(expr: &LuaCallExpr) -> Option<String> {
-    match expr.get_prefix_expr()? {
-        LuaExpr::NameExpr(name_expr) => name_expr.get_name_text().map(Into::into),
-        LuaExpr::IndexExpr(index_expr) => match index_expr.get_index_key()? {
-            LuaIndexKey::Name(name) => Some(name.get_name_text().to_string()),
-            LuaIndexKey::String(string) => Some(string.get_value()),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 fn get_static_string_arg(expr: &LuaCallExpr) -> Option<String> {

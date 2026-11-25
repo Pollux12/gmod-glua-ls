@@ -53,29 +53,41 @@ impl LuaOperatorMetaMethod {
     }
 
     pub fn from_metatable_name(name: &str) -> Option<Self> {
-        match name {
-            "__add" => Some(LuaOperatorMetaMethod::Add),
-            "__sub" => Some(LuaOperatorMetaMethod::Sub),
-            "__mul" => Some(LuaOperatorMetaMethod::Mul),
-            "__div" => Some(LuaOperatorMetaMethod::Div),
-            "__mod" => Some(LuaOperatorMetaMethod::Mod),
-            "__pow" => Some(LuaOperatorMetaMethod::Pow),
-            "__unm" => Some(LuaOperatorMetaMethod::Unm),
-            "__idiv" => Some(LuaOperatorMetaMethod::IDiv),
-            "__band" => Some(LuaOperatorMetaMethod::BAnd),
-            "__bor" => Some(LuaOperatorMetaMethod::BOr),
-            "__bxor" => Some(LuaOperatorMetaMethod::BXor),
-            "__bnot" => Some(LuaOperatorMetaMethod::BNot),
-            "__shl" => Some(LuaOperatorMetaMethod::Shl),
-            "__shr" => Some(LuaOperatorMetaMethod::Shr),
-            "__concat" => Some(LuaOperatorMetaMethod::Concat),
-            "__len" => Some(LuaOperatorMetaMethod::Len),
-            "__eq" => Some(LuaOperatorMetaMethod::Eq),
-            "__lt" => Some(LuaOperatorMetaMethod::Lt),
-            "__le" => Some(LuaOperatorMetaMethod::Le),
-            "__index" => Some(LuaOperatorMetaMethod::Index),
-            "__call" => Some(LuaOperatorMetaMethod::Call),
-            _ => None,
-        }
+        METATABLE_NAMES
+            .iter()
+            .find(|(metatable_name, _)| *metatable_name == name)
+            .map(|(_, method)| *method)
+    }
+
+    /// The metatable key Lua reads for this metamethod, such as `__add`.
+    pub fn metatable_name(self) -> Option<&'static str> {
+        METATABLE_NAMES
+            .iter()
+            .find(|(_, method)| *method == self)
+            .map(|(name, _)| *name)
     }
 }
+
+const METATABLE_NAMES: [(&str, LuaOperatorMetaMethod); 21] = [
+    ("__add", LuaOperatorMetaMethod::Add),
+    ("__sub", LuaOperatorMetaMethod::Sub),
+    ("__mul", LuaOperatorMetaMethod::Mul),
+    ("__div", LuaOperatorMetaMethod::Div),
+    ("__mod", LuaOperatorMetaMethod::Mod),
+    ("__pow", LuaOperatorMetaMethod::Pow),
+    ("__unm", LuaOperatorMetaMethod::Unm),
+    ("__idiv", LuaOperatorMetaMethod::IDiv),
+    ("__band", LuaOperatorMetaMethod::BAnd),
+    ("__bor", LuaOperatorMetaMethod::BOr),
+    ("__bxor", LuaOperatorMetaMethod::BXor),
+    ("__bnot", LuaOperatorMetaMethod::BNot),
+    ("__shl", LuaOperatorMetaMethod::Shl),
+    ("__shr", LuaOperatorMetaMethod::Shr),
+    ("__concat", LuaOperatorMetaMethod::Concat),
+    ("__len", LuaOperatorMetaMethod::Len),
+    ("__eq", LuaOperatorMetaMethod::Eq),
+    ("__lt", LuaOperatorMetaMethod::Lt),
+    ("__le", LuaOperatorMetaMethod::Le),
+    ("__index", LuaOperatorMetaMethod::Index),
+    ("__call", LuaOperatorMetaMethod::Call),
+];

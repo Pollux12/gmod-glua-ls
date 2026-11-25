@@ -39,7 +39,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use crate::{Emmyrc, FileId, Vfs, profile::Profile};
 pub use accessor_func::*;
-pub use call_site_param::{CallSiteParamContribution, CallSiteParamIndex};
+pub use call_site_param::{CallSiteParamContribution, CallSiteParamIndex, ParamCall};
 pub use call_target::{LuaCallTarget, LuaCallTargetIndex};
 use cow_shards::{CowCell, CowShards};
 pub use declaration::*;
@@ -611,9 +611,11 @@ impl DbIndex {
             | K::InferredGuard(_)
             | K::SignatureFile(_)
             | K::ReceiverOutParam(_) => self.signature_index.fact_fingerprint(key),
-            K::Contrib(..) | K::CallSiteFile(_) | K::CallSiteParam(_) | K::CallSiteCallbacks(_) => {
-                self.call_site_param_index.fact_fingerprint(key)
-            }
+            K::Contrib(..)
+            | K::ParamCalls(..)
+            | K::CallSiteFile(_)
+            | K::CallSiteParam(_)
+            | K::CallSiteCallbacks(_) => self.call_site_param_index.fact_fingerprint(key),
             K::Module(_)
             | K::ModuleMeta(_)
             | K::ModuleName(_)

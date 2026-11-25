@@ -640,9 +640,13 @@ fn net_call_fact(
     helper_registry: &HelperRegistry,
     syntax: &FileNetSyntax,
 ) -> Option<NetCallFact> {
-    let signature_id = super::super::call_target::call_target_of(db, file_id, call_expr)
-        .and_then(crate::LuaCallTarget::signature_id);
-    let role = signature_id.and_then(|signature_id| net_call_role(db, call_expr, signature_id));
+    let call_target = super::super::call_target::call_target_of(db, file_id, call_expr);
+    let signature_id = call_target.and_then(crate::LuaCallTarget::signature_id);
+    let role_signature = call_target.and_then(|call_target| {
+        call_target.unique_then_declared().find_map(|signature_id| {
+            Some((signature_id, net_call_role(db, call_expr, signature_id)?))
+        })
+    });
     let target = resolve_call_to_function_block(
         file_id,
         call_expr,
@@ -651,15 +655,16 @@ fn net_call_fact(
         signature_id,
         db,
     );
-    if role.is_none() && target.is_none() {
+    if role_signature.is_none() && target.is_none() {
         return None;
     }
-    let bits_param_idx = match (&role, signature_id) {
-        (Some(NetCallRole::Payload(_)), Some(signature_id)) => {
-            bits_param_idx(db, call_expr, signature_id)
+    let bits_param_idx = match &role_signature {
+        Some((signature_id, NetCallRole::Payload(_))) => {
+            bits_param_idx(db, call_expr, *signature_id)
         }
         _ => None,
     };
+    let role = role_signature.map(|(_, role)| role);
     Some(NetCallFact {
         role,
         target,

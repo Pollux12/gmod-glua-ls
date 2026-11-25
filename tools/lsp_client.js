@@ -26,7 +26,14 @@ class LspClient {
         // LSP_SERVER_STDERR_STAMP=1 prefixes each line with the epoch ms it arrived at.
         const stamp = process.env.LSP_SERVER_STDERR_STAMP === '1';
         let partial = '';
+        // Panics the server recovers from, which a tool that compares only
+        // what the server shows would otherwise miss.
+        this.panics = [];
+        let unread = '';
         proc.stderr.on('data', (chunk) => {
+            const complete = (unread + chunk).split('\n');
+            unread = complete.pop();
+            this.panics.push(...complete.filter((line) => line.includes('panicked')));
             if (!stderrPath) return;
             if (!stamp) return fs.appendFileSync(stderrPath, chunk);
             const lines = (partial + chunk).split('\n');
@@ -122,6 +129,7 @@ class LspClient {
     async waitForStatus(state, timeoutMs) {
         const deadline = Date.now() + timeoutMs;
         while (!this.statusAt.has(state)) {
+            if (this.panics.length) throw new Error(`server panicked: ${this.panics.join(' | ')}`);
             if (Date.now() >= deadline) throw new Error(`timeout waiting for server status ${state}`);
             await sleep(100);
         }
@@ -275,9 +283,9 @@ async function startServer(server, workspace, annotations) {
     let loadedAt;
     try {
         loadedAt = await client.waitForStatus('workspaceLoaded', 300000);
-    } catch {
+    } catch (error) {
         proc.kill();
-        throw new Error('workspace never finished loading (5 minute timeout)');
+        throw new Error(`workspace never finished loading: ${error.message}`);
     }
     const sync = capabilities.textDocumentSync;
     const incremental = (typeof sync === 'number' ? sync : sync?.change) === 2;

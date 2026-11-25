@@ -12,9 +12,13 @@ use super::LuaIndex;
 
 /// `None` when the edit destroyed the literal this range named.
 fn map_range(remap: &crate::FileRemap, range: &InFiled<TextRange>) -> Option<InFiled<TextRange>> {
-    match remap.table_range(range) {
+    kept_or_moved(remap.table_range(range), range.clone())
+}
+
+fn kept_or_moved<T>(remap: crate::Remap<T>, unchanged: T) -> Option<T> {
+    match remap {
         crate::Remap::Moved(new) => Some(new),
-        crate::Remap::Unrelated => Some(range.clone()),
+        crate::Remap::Unrelated => Some(unchanged),
         crate::Remap::Lost => None,
     }
 }
@@ -80,14 +84,38 @@ impl MetatableBinding {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SetmetatableFactoryBinding {
     pub file_id: FileId,
     pub table_range: InFiled<TextRange>,
     pub metatable_range: InFiled<TextRange>,
-    pub local_name: SmolStr,
+    /// The local the constructor fills before the call, or `None` for a table
+    /// literal written in the call itself.
+    pub local_name: Option<SmolStr>,
     pub call_position: TextSize,
     pub function_scope: TextRange,
+}
+
+/// The call position and scope are positions of the writing file, hashed as
+/// positions of it like the ranges are.
+impl std::hash::Hash for SetmetatableFactoryBinding {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        use crate::db_index::derivation::FilePosition;
+        let Self {
+            file_id,
+            table_range,
+            metatable_range,
+            local_name,
+            call_position,
+            function_scope,
+        } = self;
+        file_id.hash(state);
+        table_range.hash(state);
+        metatable_range.hash(state);
+        local_name.hash(state);
+        call_position.hash_in_file(*file_id, state);
+        function_scope.hash_in_file(*file_id, state);
+    }
 }
 
 impl Default for LuaMetatableIndex {
@@ -284,7 +312,11 @@ impl LuaMetatableIndex {
     pub fn add_factory_binding(&mut self, binding: SetmetatableFactoryBinding) {
         let file_id = binding.file_id;
         derivation::note_write(|| FactKey::MetatableFactory(file_id));
-        for named in [binding.table_range.file_id, binding.metatable_range.file_id] {
+        for named in [
+            file_id,
+            binding.table_range.file_id,
+            binding.metatable_range.file_id,
+        ] {
             if !self
                 .factory_writers_by_file
                 .get(&named)
@@ -388,14 +420,24 @@ impl LuaMetatableIndex {
             derivation::note_write(|| FactKey::MetatableFactory(writer));
             let previous = bindings.clone();
             bindings.retain_mut(|binding| {
-                let (Some(table_range), Some(metatable_range)) = (
+                let (Some(table_range), Some(metatable_range), Some(call_position), Some(scope)) = (
                     map_range(remap, &binding.table_range),
                     map_range(remap, &binding.metatable_range),
+                    kept_or_moved(
+                        remap.pos(binding.file_id, binding.call_position),
+                        binding.call_position,
+                    ),
+                    kept_or_moved(
+                        remap.range(binding.file_id, binding.function_scope),
+                        binding.function_scope,
+                    ),
                 ) else {
                     return false;
                 };
                 binding.table_range = table_range;
                 binding.metatable_range = metatable_range;
+                binding.call_position = call_position;
+                binding.function_scope = scope;
                 true
             });
             if bindings.len() != previous.len() {
@@ -519,7 +561,13 @@ fn site_sort_key(site: &InFiled<TextRange>) -> (FileId, TextSize, TextSize) {
 fn factory_files(bindings: &[SetmetatableFactoryBinding]) -> HashSet<FileId> {
     bindings
         .iter()
-        .flat_map(|binding| [binding.table_range.file_id, binding.metatable_range.file_id])
+        .flat_map(|binding| {
+            [
+                binding.file_id,
+                binding.table_range.file_id,
+                binding.metatable_range.file_id,
+            ]
+        })
         .collect()
 }
 
@@ -627,7 +675,7 @@ abc",
             file_id: writer,
             table_range: InFiled::new(writer, range(0)),
             metatable_range: InFiled::new(metatable_file, range(40)),
-            local_name: "object".into(),
+            local_name: Some("object".into()),
             call_position: TextSize::new(0),
             function_scope: range(0),
         });

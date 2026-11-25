@@ -1,11 +1,13 @@
 use std::{collections::HashMap, time::Duration};
 
 use glua_code_analysis::FileId;
-use glua_parser::{LuaAstNode, LuaExpr, LuaStat};
+use glua_parser::{LuaAstNode, LuaStat};
 use lsp_types::{ApplyWorkspaceEditParams, Command, Position, TextEdit, WorkspaceEdit};
 use serde_json::Value;
 
-use crate::{context::ServerContextSnapshot, util::time_cancel_token};
+use crate::{
+    context::ServerContextSnapshot, handlers::fold_range::is_require_stat, util::time_cancel_token,
+};
 
 use super::CommandSpec;
 
@@ -33,7 +35,6 @@ impl CommandSpec for AutoRequireCommand {
             .get_module_index()
             .get_module(need_require_file_id)?;
         let emmyrc = semantic_model.get_emmyrc();
-        let require_like_func = &emmyrc.runtime.require_like_function;
         let auto_require_func = emmyrc.completion.auto_require_function.clone();
         let require_separator = emmyrc.completion.auto_require_separator.clone();
         let full_module_path = match require_separator.as_str() {
@@ -67,7 +68,7 @@ impl CommandSpec for AutoRequireCommand {
                 break;
             }
 
-            if is_require_stat(stat.clone(), require_like_func).unwrap_or(false) {
+            if is_require_stat(&semantic_model, &stat) {
                 last_require_stat = Some(stat);
             }
         }
@@ -123,73 +124,6 @@ impl CommandSpec for AutoRequireCommand {
 
         Some(())
     }
-}
-
-fn is_require_stat(stat: LuaStat, require_like_func: &[String]) -> Option<bool> {
-    match stat {
-        LuaStat::LocalStat(local_stat) => {
-            let exprs = local_stat.get_value_exprs();
-            for expr in exprs {
-                if is_require_expr(expr, require_like_func, 0).unwrap_or(false) {
-                    return Some(true);
-                }
-            }
-        }
-        LuaStat::AssignStat(assign_stat) => {
-            let (_, exprs) = assign_stat.get_var_and_expr_list();
-            for expr in exprs {
-                if is_require_expr(expr, require_like_func, 0).unwrap_or(false) {
-                    return Some(true);
-                }
-            }
-        }
-        LuaStat::CallExprStat(call_expr_stat) => {
-            let expr = call_expr_stat.get_call_expr()?;
-            if is_require_expr(expr.into(), require_like_func, 0).unwrap_or(false) {
-                return Some(true);
-            }
-        }
-        _ => {}
-    }
-
-    Some(false)
-}
-
-fn is_require_expr(expr: LuaExpr, require_like_func: &[String], depth: usize) -> Option<bool> {
-    if depth > 5 {
-        return Some(false);
-    }
-    match expr {
-        LuaExpr::CallExpr(call_expr) => {
-            let name = call_expr.get_prefix_expr()?;
-            match name {
-                LuaExpr::NameExpr(name_expr) => {
-                    let name = name_expr.get_name_text()?;
-                    if require_like_func.contains(&name.to_string()) || name == "require" {
-                        return Some(true);
-                    }
-                }
-                LuaExpr::CallExpr(prefix_call_expr) => {
-                    if is_require_expr(prefix_call_expr.into(), require_like_func, depth + 1)
-                        .unwrap_or(false)
-                    {
-                        return Some(true);
-                    }
-                }
-                _ => {}
-            }
-        }
-        LuaExpr::IndexExpr(index_expr) => {
-            if is_require_expr(index_expr.get_prefix_expr()?, require_like_func, depth + 1)
-                .unwrap_or(false)
-            {
-                return Some(true);
-            }
-        }
-        _ => {}
-    }
-
-    Some(false)
 }
 
 pub fn make_auto_require(

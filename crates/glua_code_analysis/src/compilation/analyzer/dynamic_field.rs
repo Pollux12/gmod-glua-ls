@@ -15,38 +15,75 @@ use crate::{
     find_signature_attribute_use,
     semantic::{
         contains_gmod_null_type, declaring_for_range, find_members_with_key,
-        get_var_expr_var_ref_id, infer_expr, raw_get_access_path,
-        try_infer_enclosing_for_range_iter_type, unwrap_paren_to_name_expr,
+        get_var_expr_var_ref_id, infer_expr, try_infer_enclosing_for_range_iter_type,
+        unwrap_paren_to_name_expr,
     },
 };
-
-/// The reference a write's prefix names: its variable when it names one
-/// (the same variable at different positions is one reference), else the
-/// prefix expression itself.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-enum PrefixKey {
-    Var(VarRefId),
-    Range(rowan::TextRange),
-}
-
-impl PrefixKey {
-    fn from_expr(db: &DbIndex, cache: &mut crate::LuaInferCache, expr: &LuaExpr) -> Self {
-        match get_var_expr_var_ref_id(db, cache, expr.clone()) {
-            Some(var_ref_id) => PrefixKey::Var(var_ref_id),
-            None => PrefixKey::Range(expr.syntax().text_range()),
-        }
-    }
-}
 
 #[derive(Clone, Copy)]
 pub(super) enum DynamicFieldAnalysisMode {
     Full,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct FieldSetterHelper {
-    table_param_index: usize,
-    key_param_index: usize,
+/// A write `table[key] = value` in a function's body whose key is built from
+/// the function's parameters: each call of the function writes the fields its
+/// own arguments name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FieldInstaller {
+    table: InstallTable,
+    /// The key's pieces, joined: at least one is a parameter.
+    key: Vec<KeyPart>,
+    /// The written index expression.
+    write: rowan::TextRange,
+}
+
+impl FieldInstaller {
+    /// Whether the key is a join, a string whatever the call passes.
+    fn is_join(&self) -> bool {
+        self.key.len() > 1
+    }
+}
+
+impl std::hash::Hash for FieldInstaller {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.table.hash(state);
+        self.key.hash(state);
+        crate::db_index::derivation::hash_local(&self.write, state);
+    }
+}
+
+/// The table an installer writes into.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum InstallTable {
+    Param(usize),
+    /// What a name declared outside the function holds, such as a registry.
+    Outer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum KeyPart {
+    Literal(SmolStr),
+    /// A parameter, or `default` where a call passes nothing for it:
+    /// `(prefix or "Get")`.
+    Param {
+        param: usize,
+        default: Option<SmolStr>,
+    },
+}
+
+/// The key one call of an installer writes.
+enum InstalledKey {
+    Names(Vec<SmolStr>),
+    /// A string the call does not say: any key of that table.
+    AnyString,
+}
+
+/// What one call of an installer writes.
+struct Install {
+    key: InstalledKey,
+    /// The argument the first parameter of the key is: where the fields it
+    /// writes are defined.
+    definition: LuaExpr,
 }
 
 #[derive(Default)]
@@ -71,11 +108,11 @@ type FiniteNamedMemberEvidence = (
     bool,
 );
 
-fn patterns_for_signature(db: &DbIndex, signature_id: LuaSignatureId) -> Vec<FieldSetterHelper> {
+fn installers_of(db: &DbIndex, signature_id: LuaSignatureId) -> Vec<FieldInstaller> {
     super::function_summary::function_summaries(db, signature_id.get_file_id())
         .and_then(|summaries| {
             summaries
-                .field_setter_helpers
+                .field_installers
                 .get(&signature_id.get_position())
                 .cloned()
         })
@@ -236,13 +273,13 @@ fn prefix_holds_call_result(
 }
 
 /// Whether a node is a write site of its own: a statement with an indexed
-/// target, or a call with two or more arguments, which can set fields
-/// through `setmetatable` or a setter helper.
+/// target, or a call with arguments, which can set fields through
+/// `setmetatable` or a function whose key is built from its parameters.
 pub(super) fn is_write_site(node: &LuaSyntaxNode) -> bool {
     if let Some(call) = LuaCallExpr::cast(node.clone()) {
         return call
             .get_args_list()
-            .is_some_and(|args| args.get_args().nth(1).is_some());
+            .is_some_and(|args| args.get_args().next().is_some());
     }
     defines_fields(node.kind()) && !indexed_targets(node).is_empty()
 }
@@ -252,47 +289,14 @@ pub(super) fn is_write_site(node: &LuaSyntaxNode) -> bool {
 /// file's syntax, declarations and local references hold for all of it.
 #[derive(Default)]
 pub(crate) struct FileWriteSites {
-    /// Every indexed target of an assignment or function statement, in the
-    /// order a walk of the file meets them.
-    targets: Vec<WriteTarget>,
     /// The setmetatable calls of each binding scope, in tree order.
     setmetatables: FxHashMap<LuaSyntaxId, Vec<LuaSyntaxId>>,
     /// The positions each local of the file is reassigned at, sorted.
     reassignments: std::sync::OnceLock<FxHashMap<LuaDeclId, Vec<TextSize>>>,
 }
 
-/// An indexed target of an assignment or function statement.
-struct WriteTarget {
-    statement: LuaSyntaxId,
-    /// The target's position among the statement's assigned variables.
-    var: usize,
-    /// The class of the target's prefix: two prefixes can name the same
-    /// variable only within one class. `None` for a prefix that names none.
-    prefix: Option<u32>,
-}
-
 impl FileWriteSites {
     pub(crate) fn new(root: &glua_parser::LuaChunk) -> Self {
-        let mut classes = FxHashMap::<String, u32>::default();
-        let mut targets = Vec::new();
-        for node in root.syntax().descendants_matching(defines_fields) {
-            let statement = LuaSyntaxId::from_node(&node);
-            for (var, index_expr) in indexed_targets(&node) {
-                let prefix = index_expr
-                    .get_prefix_expr()
-                    .as_ref()
-                    .and_then(prefix_class)
-                    .map(|class| {
-                        let next = classes.len() as u32;
-                        *classes.entry(class).or_insert(next)
-                    });
-                targets.push(WriteTarget {
-                    statement,
-                    var,
-                    prefix,
-                });
-            }
-        }
         let mut setmetatables = FxHashMap::<LuaSyntaxId, Vec<LuaSyntaxId>>::default();
         for call in root.descendants::<LuaCallExpr>() {
             if !call.is_setmetatable() {
@@ -306,22 +310,9 @@ impl FileWriteSites {
             }
         }
         Self {
-            targets,
             setmetatables,
             reassignments: std::sync::OnceLock::new(),
         }
-    }
-
-    /// Where the target at position `var` of `statement` is among the
-    /// targets.
-    fn target_at(&self, statement: LuaSyntaxId, var: usize) -> Option<usize> {
-        let order = |target: &WriteTarget| (target.statement.get_range().start(), target.var);
-        let key = (statement.get_range().start(), var);
-        let at = self.targets.partition_point(|target| order(target) < key);
-        self.targets
-            .get(at)
-            .is_some_and(|target| target.statement == statement && target.var == var)
-            .then_some(at)
     }
 
     fn reassignments(
@@ -332,18 +323,6 @@ impl FileWriteSites {
     ) -> &FxHashMap<LuaDeclId, Vec<TextSize>> {
         self.reassignments
             .get_or_init(|| collect_local_reassignment_positions(db, file_id, root))
-    }
-}
-
-/// What a prefix's text says of the variable it names: a name, or an access
-/// path. Two prefixes that name the same variable have the same class; `None`
-/// for a prefix that names no variable.
-fn prefix_class(prefix: &LuaExpr) -> Option<String> {
-    match prefix {
-        LuaExpr::NameExpr(name_expr) => Some(format!("name {}", name_expr.get_name_text()?)),
-        LuaExpr::IndexExpr(index_expr) => Some(format!("path {}", index_expr.get_access_path()?)),
-        LuaExpr::CallExpr(call_expr) => Some(format!("path {}", raw_get_access_path(call_expr)?)),
-        _ => None,
     }
 }
 
@@ -367,6 +346,7 @@ fn reach_target(
     mode: DynamicFieldAnalysisMode,
     index_expr: &glua_parser::LuaIndexExpr,
     value_expr: Option<&LuaExpr>,
+    may_have_other_calls: bool,
 ) -> Option<ReachedTarget> {
     let prefix_expr = index_expr.get_prefix_expr()?;
     let definition_range = index_expr.get_index_key().and_then(|k| k.get_range())?;
@@ -380,7 +360,7 @@ fn reach_target(
     {
         return None;
     }
-    let field_names = if copies_own_shape {
+    let mut field_names = if copies_own_shape {
         ResolvedDynamicFieldNames {
             names: Vec::new(),
             may_have_other_string_names: true,
@@ -388,6 +368,10 @@ fn reach_target(
     } else {
         get_field_names(db, cache, root, sites, index_expr)
     };
+    // Calls the write's function may get beyond those seen pass other names.
+    if may_have_other_calls {
+        field_names.may_have_other_string_names = true;
+    }
     let collect_finite_direct_assignment = mode.collect_finite_direct_assignments()
         && is_dynamic_index_key(index_expr)
         && !field_names.names.is_empty();
@@ -412,66 +396,14 @@ fn reach_target(
     })
 }
 
-/// The type every write through `key` takes its prefix to have: the type
-/// inferred at the first target in tree order the pass collects from whose
-/// prefix names that reference, the target at `at` included, unless that type
-/// says nothing about the value, when this write's own prefix type is used. A
-/// prefix that names no variable is a reference of its own.
-fn shared_prefix_type(
-    db: &DbIndex,
-    cache: &mut crate::LuaInferCache,
-    root: &glua_parser::LuaChunk,
-    sites: &FileWriteSites,
-    mode: DynamicFieldAnalysisMode,
-    at: Option<usize>,
-    key: &PrefixKey,
-    prefix_expr: &LuaExpr,
-) -> Option<LuaType> {
-    let file_id = cache.get_file_id();
-    if let (PrefixKey::Var(_), Some(at)) = (key, at)
-        && let Some(class) = sites.targets[at].prefix
-    {
-        for earlier in sites.targets[..at]
-            .iter()
-            .filter(|target| target.prefix == Some(class))
-        {
-            let Some(node) = earlier.statement.to_node_from_root(root.syntax()) else {
-                continue;
-            };
-            let Some((_, index_expr, value_expr)) = field_definition_sites(db, file_id, &node)
-                .into_iter()
-                .find(|(var, _, _)| *var == earlier.var)
-            else {
-                continue;
-            };
-            let Some(reached) = reach_target(
-                db,
-                cache,
-                root,
-                sites,
-                mode,
-                &index_expr,
-                value_expr.as_ref(),
-            ) else {
-                continue;
-            };
-            if PrefixKey::from_expr(db, cache, &reached.prefix_expr) == *key {
-                return infer_expr(db, cache, reached.prefix_expr)
-                    .ok()
-                    .filter(crate::db_index::is_informative_type)
-                    .or_else(|| infer_expr(db, cache, prefix_expr.clone()).ok());
-            }
-        }
-    }
-    infer_expr(db, cache, prefix_expr.clone()).ok()
-}
-
-/// What one write site files: the fields it writes on each owner, those
-/// propagated to the owners' super types, its wildcard definitions, its
+/// What one write site files: the fields it writes on each owner, those it
+/// writes on objects a call made (filed on the classes they were made of),
+/// those propagated to the owners' super types, its wildcard definitions, its
 /// finite-member evidence and the names it writes on no owner.
 #[derive(Default)]
 pub(super) struct SiteDynamicFields {
     named: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    made: Vec<CollectedField>,
     propagated: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
     wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
     finite: Vec<FiniteNamedMemberEvidence>,
@@ -493,13 +425,13 @@ fn collect_statement_fields(
     fields: &mut SiteDynamicFields,
 ) {
     let file_id = cache.get_file_id();
-    let statement = LuaSyntaxId::from_node(node);
     // The records are what this pass is building. A cold build has none yet,
     // and a re-index of some sites has the rest of the workspace's, with the
     // re-indexed sites' contributions removed: a partial record that names a
     // different table than the complete one will. Neither is read here, so
     // both builds decide the same way.
-    for (var, index_expr, value_expr) in field_definition_sites(db, file_id, node) {
+    for (_, index_expr, value_expr) in field_definition_sites(db, file_id, node) {
+        let named_by_calls = installer_write_named_by_calls(db, file_id, &index_expr);
         let value_expr = value_expr.as_ref();
         let Some(ReachedTarget {
             prefix_expr,
@@ -507,16 +439,21 @@ fn collect_statement_fields(
             field_names,
             collect_finite_direct_assignment,
             should_collect_wildcard,
-        }) = reach_target(db, cache, root, sites, mode, &index_expr, value_expr)
+        }) = reach_target(
+            db,
+            cache,
+            root,
+            sites,
+            mode,
+            &index_expr,
+            value_expr,
+            named_by_calls == Some(false),
+        )
         else {
             continue;
         };
 
-        let key = PrefixKey::from_expr(db, cache, &prefix_expr);
-        let at = sites.target_at(statement, var);
-        let Some(prefix_type) =
-            shared_prefix_type(db, cache, root, sites, mode, at, &key, &prefix_expr)
-        else {
+        let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
             continue;
         };
 
@@ -545,6 +482,20 @@ fn collect_statement_fields(
             && !matches!(made_table, LuaType::TableConst(_))
             && owner.is_some_and(|owner| !extends_prototype_class(db, owner, member_id))
         {
+            continue;
+        }
+        // Each call of the function names the fields this write makes, so the
+        // write stays only as what the table holds under a computed key.
+        if named_by_calls == Some(true) {
+            collect_finite_member_for_type(
+                db,
+                &effective_type,
+                member_id,
+                file_id,
+                definition_range,
+                true,
+                &mut fields.finite,
+            );
             continue;
         }
         if should_collect_wildcard {
@@ -623,7 +574,7 @@ fn collect_statement_fields(
                 .propagated
                 .extend(propagate_dynamic_fields_to_super_types(db, &per_call_bases));
         }
-        fields.propagated.extend(per_call_bases);
+        fields.made.extend(per_call_bases);
         fields.named.extend(target_named);
     }
 }
@@ -640,7 +591,15 @@ fn collect_call_fields(
         return;
     }
     let file_id = cache.get_file_id();
-    collect_field_setter_helper_call_fields(db, cache, call_expr, file_id, &mut fields.named);
+    let mut per_call_bases = Vec::new();
+    collect_installed_call_fields(
+        db,
+        cache,
+        call_expr,
+        &mut fields.named,
+        &mut per_call_bases,
+        &mut fields.wildcards,
+    );
     collect_setmetatable_table_fields(
         db,
         cache,
@@ -651,7 +610,11 @@ fn collect_call_fields(
     );
     if mode.propagate_to_super_types() {
         fields.propagated = propagate_dynamic_fields_to_super_types(db, &fields.named);
+        fields
+            .propagated
+            .extend(propagate_dynamic_fields_to_super_types(db, &per_call_bases));
     }
+    fields.made.extend(per_call_bases);
 }
 
 /// The view dynamic fields are collected under: the records this pass builds
@@ -702,6 +665,7 @@ pub(super) fn apply_site_dynamic_fields(
 ) {
     let SiteDynamicFields {
         named,
+        made,
         propagated,
         wildcards,
         finite,
@@ -715,6 +679,9 @@ pub(super) fn apply_site_dynamic_fields(
     }
     for (owner, field_name, _, range) in named {
         index.add_field(site, owner, field_name, range);
+    }
+    for (owner, field_name, _, range) in made {
+        index.add_made_field(site, owner, field_name, range);
     }
     for (owner, field_name, _, range) in propagated {
         index.add_propagated_field(site, owner, field_name, range);
@@ -732,10 +699,17 @@ pub(super) fn apply_site_dynamic_fields(
     }
 }
 
-pub(super) fn collect_field_setter_helpers(
+/// Each closure's writes whose key is built from its parameters, by the
+/// closure's position.
+pub(super) fn collect_field_installers(
+    db: &DbIndex,
+    file_id: crate::FileId,
     root: &glua_parser::LuaChunk,
-) -> FxHashMap<TextSize, Vec<FieldSetterHelper>> {
-    let mut helpers: FxHashMap<TextSize, Vec<FieldSetterHelper>> = FxHashMap::default();
+) -> FxHashMap<TextSize, Vec<FieldInstaller>> {
+    let mut installers: FxHashMap<TextSize, Vec<FieldInstaller>> = FxHashMap::default();
+    let Some(references) = db.get_reference_index().get_local_reference(&file_id) else {
+        return installers;
+    };
     for assign in root.descendants::<LuaAssignStat>() {
         let Some(closure) = assign.ancestors::<LuaClosureExpr>().next() else {
             continue;
@@ -743,165 +717,617 @@ pub(super) fn collect_field_setter_helpers(
         let Some(params_list) = closure.get_params_list() else {
             continue;
         };
-        let param_names = params_list
+        let params = params_list
             .get_params()
-            .filter_map(|param| {
-                param
-                    .get_name_token()
-                    .map(|token| token.get_name_text().to_string())
+            .enumerate()
+            .filter_map(|(idx, param)| {
+                let token = param.get_name_token()?;
+                Some((idx, LuaDeclId::new(file_id, token.get_range().start())))
+            })
+            // A parameter the body writes no longer holds what the call passed.
+            .filter(|(_, decl_id)| {
+                references
+                    .get_decl_references(decl_id)
+                    .is_none_or(|refs| !refs.is_written_after_declaration(decl_id.position))
             })
             .collect::<Vec<_>>();
-        if param_names.len() < 2 {
-            continue;
-        }
-
-        let (vars, _) = assign.get_var_and_expr_list();
-        for var in vars.iter() {
+        let param_of = |expr: &LuaExpr| {
+            let LuaExpr::NameExpr(name_expr) = expr else {
+                return None;
+            };
+            let decl_id = references.get_decl_id(&name_expr.get_range())?;
+            params
+                .iter()
+                .find(|(_, param)| *param == decl_id)
+                .map(|(idx, _)| *idx)
+        };
+        // A local of the function never written again holds its initializer.
+        let local_value = |expr: &LuaExpr| {
+            let LuaExpr::NameExpr(name_expr) = expr else {
+                return None;
+            };
+            let decl_id = references.get_decl_id(&name_expr.get_range())?;
+            if !closure.get_range().contains(decl_id.position)
+                || references
+                    .get_decl_references(&decl_id)
+                    .is_none_or(|refs| refs.is_written_after_declaration(decl_id.position))
+            {
+                return None;
+            }
+            local_initializer_expr(db, decl_id)
+        };
+        for var in assign.get_var_and_expr_list().0 {
             let LuaVarExpr::IndexExpr(index_expr) = var else {
                 continue;
             };
-            let Some(table_param_index) = index_expr
-                .get_prefix_expr()
-                .and_then(|expr| param_expr_index(&expr, &param_names))
-            else {
+            let Some(LuaIndexKey::Expr(key_expr)) = index_expr.get_index_key() else {
                 continue;
             };
-            let Some(key_param_index) = index_expr
-                .get_index_key()
-                .and_then(|key| param_index_key_index(&key, &param_names))
-            else {
+            let mut key = Vec::new();
+            if key_template(&key_expr, &param_of, &local_value, &mut key).is_none()
+                || !key.iter().any(|part| matches!(part, KeyPart::Param { .. }))
+            {
+                continue;
+            }
+            let Some(prefix) = index_expr.get_prefix_expr() else {
                 continue;
             };
-
-            helpers
+            let table = match param_of(&prefix) {
+                Some(idx) => InstallTable::Param(idx),
+                None if is_outer_path(&prefix, references, &closure) => InstallTable::Outer,
+                None => continue,
+            };
+            installers
                 .entry(closure.get_position())
                 .or_default()
-                .push(FieldSetterHelper {
-                    table_param_index,
-                    key_param_index,
+                .push(FieldInstaller {
+                    table,
+                    key,
+                    write: index_expr.get_range(),
                 });
         }
     }
-
-    helpers
+    installers
 }
 
-fn collect_field_setter_helper_call_fields(
+const MAX_KEY_TEMPLATE_PARTS: usize = 64;
+
+/// The pieces a key joins, each a string literal or a parameter, read
+/// through the locals that hold them.
+fn key_template(
+    expr: &LuaExpr,
+    param_of: &impl Fn(&LuaExpr) -> Option<usize>,
+    local_value: &impl Fn(&LuaExpr) -> Option<LuaExpr>,
+    parts: &mut Vec<KeyPart>,
+) -> Option<()> {
+    if parts.len() >= MAX_KEY_TEMPLATE_PARTS {
+        return None;
+    }
+    match expr {
+        LuaExpr::LiteralExpr(_) => parts.push(KeyPart::Literal(literal_string(expr)?.into())),
+        LuaExpr::ParenExpr(paren) => {
+            key_template(&paren.get_expr()?, param_of, local_value, parts)?
+        }
+        LuaExpr::BinaryExpr(binary) => {
+            let (left, right) = binary.get_exprs()?;
+            match binary.get_op_token()?.get_op() {
+                BinaryOperator::OpConcat => {
+                    key_template(&left, param_of, local_value, parts)?;
+                    key_template(&right, param_of, local_value, parts)?;
+                }
+                BinaryOperator::OpOr => parts.push(KeyPart::Param {
+                    param: param_of(&left)?,
+                    default: Some(literal_string(&right)?.into()),
+                }),
+                _ => return None,
+            }
+        }
+        _ => match param_of(expr) {
+            Some(param) => parts.push(KeyPart::Param {
+                param,
+                default: None,
+            }),
+            None => key_template(&local_value(expr)?, param_of, local_value, parts)?,
+        },
+    }
+    Some(())
+}
+
+/// Whether `prefix` names, or reads a field path from, a variable declared
+/// outside `closure`, other than `self`: the same table at every call.
+fn is_outer_path(
+    prefix: &LuaExpr,
+    references: &crate::FileReference,
+    closure: &LuaClosureExpr,
+) -> bool {
+    match prefix {
+        LuaExpr::NameExpr(name_expr) => {
+            name_expr.get_name_text().is_some_and(|name| name != "self")
+                && references
+                    .get_decl_id(&name_expr.get_range())
+                    .is_none_or(|decl_id| !closure.get_range().contains(decl_id.position))
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            matches!(
+                index_expr.get_index_key(),
+                Some(LuaIndexKey::Name(_) | LuaIndexKey::String(_))
+            ) && index_expr
+                .get_prefix_expr()
+                .is_some_and(|prefix| is_outer_path(&prefix, references, closure))
+        }
+        _ => false,
+    }
+}
+
+/// The fields a call writes through the installers of the functions it calls:
+/// those its arguments name, or any key of a table it passes a string the call
+/// does not say.
+fn collect_installed_call_fields(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     call_expr: &LuaCallExpr,
-    file_id: crate::FileId,
-    collected: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    named: &mut Vec<CollectedField>,
+    per_call_bases: &mut Vec<CollectedField>,
+    wildcards: &mut Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
 ) {
-    let Some(args_list) = call_expr.get_args_list() else {
-        return;
-    };
-    let mut args_iter = args_list.get_args();
-    let Some(first_arg) = args_iter.next() else {
-        return;
-    };
-    let Some(second_arg) = args_iter.next() else {
-        return;
-    };
-
-    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
-        return;
-    };
-    let helper_patterns = helper_patterns_for_call(db, cache, &prefix_expr);
-    if helper_patterns.is_empty() {
-        return;
-    };
-    let mut args = Vec::with_capacity(2 + args_iter.size_hint().0);
-    args.push(first_arg);
-    args.push(second_arg);
-    args.extend(args_iter);
-    for helper in helper_patterns {
-        let Some(table_arg) = args.get(helper.table_param_index) else {
+    let file_id = cache.get_file_id();
+    for (signature_id, installer) in call_installers(db, cache, call_expr) {
+        let Some(install) = evaluate_install(db, cache, call_expr, signature_id, &installer) else {
             continue;
         };
-        let Some(key_arg) = args.get(helper.key_param_index) else {
+        let Some(table_type) = installed_table_type(db, cache, call_expr, signature_id, &installer)
+        else {
             continue;
         };
-        let field_names = field_names_from_key_arg(db, cache, key_arg);
-        if field_names.is_empty() {
-            continue;
-        }
-        let definition_range = key_arg.syntax().text_range();
-        let Ok(table_type) = infer_expr(db, cache, table_arg.clone()) else {
-            continue;
-        };
-
-        for field_name in field_names {
-            collect_for_type(
-                db,
-                &table_type,
-                &field_name,
-                file_id,
-                definition_range,
-                collected,
-            );
-        }
-    }
-}
-
-fn field_names_from_key_arg(
-    db: &DbIndex,
-    cache: &mut crate::LuaInferCache,
-    key_arg: &LuaExpr,
-) -> Vec<SmolStr> {
-    if let LuaExpr::LiteralExpr(literal_expr) = key_arg
-        && let Some(glua_parser::LuaLiteralToken::String(string_token)) = literal_expr.get_literal()
-    {
-        return vec![string_token.get_value().into()];
-    }
-
-    string_const_names(&infer_expr(db, cache, key_arg.clone()).ok())
-}
-
-fn helper_patterns_for_call(
-    db: &DbIndex,
-    cache: &mut crate::LuaInferCache,
-    prefix_expr: &LuaExpr,
-) -> Vec<FieldSetterHelper> {
-    if let LuaExpr::NameExpr(name_expr) = prefix_expr
-        && let Some(signature_id) = direct_name_expr_signature_id(db, cache, name_expr)
-    {
-        return patterns_for_signature(db, signature_id);
-    }
-
-    helper_patterns_for_call_fallback(db, cache, prefix_expr)
-}
-
-fn helper_patterns_for_call_fallback(
-    db: &DbIndex,
-    cache: &mut crate::LuaInferCache,
-    prefix_expr: &LuaExpr,
-) -> Vec<FieldSetterHelper> {
-    let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
-        return Vec::new();
-    };
-
-    let mut result = Vec::new();
-    collect_helper_patterns_from_type(db, &prefix_type, &mut result);
-    result
-}
-
-fn collect_helper_patterns_from_type(
-    db: &DbIndex,
-    typ: &LuaType,
-    result: &mut Vec<FieldSetterHelper>,
-) {
-    match typ {
-        LuaType::Signature(signature_id) => {
-            result.extend(patterns_for_signature(db, *signature_id));
-        }
-        LuaType::Union(union_type) => {
-            for typ in union_type.types() {
-                collect_helper_patterns_from_type(db, typ, result);
+        let definition_range = install.definition.syntax().text_range();
+        match install.key {
+            InstalledKey::Names(names) => {
+                for name in names {
+                    collect_for_written_type(
+                        db,
+                        &table_type,
+                        &name,
+                        file_id,
+                        definition_range,
+                        named,
+                        per_call_bases,
+                    );
+                }
+            }
+            InstalledKey::AnyString => {
+                collect_wildcard_for_type(db, &table_type, file_id, definition_range, wildcards);
             }
         }
-        LuaType::TypeGuard(inner) => collect_helper_patterns_from_type(db, inner, result),
+    }
+}
+
+/// What the field `field_name`, defined at the argument `definition` of a call
+/// through an installer, holds: the value its write assigns, read with the
+/// call's arguments for the function's parameters.
+pub(crate) fn installed_field_type(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    definition: &LuaExpr,
+    field_name: &str,
+) -> Option<LuaType> {
+    let call_expr = definition
+        .get_parent::<glua_parser::LuaCallArgList>()
+        .and_then(|args| args.get_parent::<LuaCallExpr>())
+        .or_else(|| match definition {
+            LuaExpr::CallExpr(call) => Some(call.clone()),
+            _ => None,
+        })?;
+    let mut types = Vec::new();
+    for (signature_id, installer) in call_installers(db, cache, &call_expr) {
+        let Some(install) = evaluate_install(db, cache, &call_expr, signature_id, &installer)
+        else {
+            continue;
+        };
+        let names_field = match &install.key {
+            InstalledKey::Names(names) => names.iter().any(|name| name == field_name),
+            InstalledKey::AnyString => false,
+        };
+        if !names_field || install.definition.get_range() != definition.get_range() {
+            continue;
+        }
+        let Some(value) =
+            installer_write(db, signature_id, &installer).and_then(|write| assigned_value(&write))
+        else {
+            continue;
+        };
+        let forwarded = forwarded_param(db, signature_id, &value)
+            .and_then(|param| installer_passed_arg(db, &call_expr, signature_id, param));
+        let typ = match (forwarded, &value) {
+            (Some(Some(arg)), _) => infer_expr(db, cache, arg).ok(),
+            (Some(None), _) => Some(LuaType::Nil),
+            (None, LuaExpr::TableExpr(table_expr)) => {
+                per_call_table_type(db, cache, &call_expr, signature_id, table_expr)
+            }
+            (None, _) => {
+                crate::semantic::with_file_cache(cache, signature_id.get_file_id(), |cache| {
+                    infer_expr(db, cache, value).ok()
+                })
+            }
+        };
+        types.extend(typ);
+    }
+    (!types.is_empty()).then(|| LuaType::from_vec(types))
+}
+
+/// The table literal `table_expr` that one call of the function
+/// `signature_id` builds and stores: that call's own table, whose fields read
+/// the arguments the call passed for the parameters they hold.
+fn per_call_table_type(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+    table_expr: &LuaTableExpr,
+) -> Option<LuaType> {
+    let table_type =
+        crate::semantic::with_file_cache(cache, signature_id.get_file_id(), |cache| {
+            infer_expr(db, cache, LuaExpr::TableExpr(table_expr.clone())).ok()
+        })?;
+    Some(LuaType::Instance(
+        crate::LuaInstanceType::with_kind(
+            table_type,
+            InFiled::new(cache.get_file_id(), call_expr.get_range()),
+            LuaInstanceKind::Made,
+        )
+        .into(),
+    ))
+}
+
+/// The functions `call_expr` calls, with the installers each has.
+fn call_installers(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Vec<(LuaSignatureId, FieldInstaller)> {
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return Vec::new();
+    };
+    let mut signatures = Vec::new();
+    match &prefix_expr {
+        LuaExpr::NameExpr(name_expr)
+            if let Some(signature_id) = direct_name_expr_signature_id(db, cache, name_expr) =>
+        {
+            signatures.push(signature_id);
+        }
+        _ => {
+            if let Ok(prefix_type) = infer_expr(db, cache, prefix_expr) {
+                collect_signatures_of_type(&prefix_type, &mut signatures);
+            }
+        }
+    }
+    signatures
+        .into_iter()
+        .flat_map(|signature_id| {
+            installers_of(db, signature_id)
+                .into_iter()
+                .map(move |installer| (signature_id, installer))
+        })
+        .collect()
+}
+
+fn collect_signatures_of_type(typ: &LuaType, result: &mut Vec<LuaSignatureId>) {
+    match typ {
+        LuaType::Signature(signature_id) => result.push(*signature_id),
+        LuaType::Union(union_type) => {
+            for typ in union_type.types() {
+                collect_signatures_of_type(typ, result);
+            }
+        }
+        LuaType::TypeGuard(inner) => collect_signatures_of_type(inner, result),
         _ => {}
+    }
+}
+
+const MAX_INSTALLED_KEY_COMBINATIONS: usize = 256;
+
+enum ParamKeyChoice {
+    Str(SmolStr),
+    Falsy,
+}
+
+/// The key one call of `installer` writes. A joined key is a
+/// string whatever the call passes; a bare parameter is `None` when the call
+/// passes a value not known to be a string. A parameter the key reads twice
+/// holds the same string both times.
+fn evaluate_install(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+    installer: &FieldInstaller,
+) -> Option<Install> {
+    let is_join = installer.is_join();
+    let mut definition = None;
+    let mut param_choices: Vec<(usize, Vec<ParamKeyChoice>)> = Vec::new();
+    let mut any_string = false;
+    for part in &installer.key {
+        let KeyPart::Param { param, .. } = part else {
+            continue;
+        };
+        if param_choices.iter().any(|(bound, _)| bound == param) {
+            continue;
+        }
+        let has_default = installer.key.iter().any(|other| {
+            matches!(
+                other,
+                KeyPart::Param {
+                    param: other_param,
+                    default: Some(_),
+                } if other_param == param
+            )
+        });
+        let has_bare = installer.key.iter().any(|other| {
+            matches!(
+                other,
+                KeyPart::Param {
+                    param: other_param,
+                    default: None,
+                } if other_param == param
+            )
+        });
+        let arg = installer_arg(db, call_expr, signature_id, *param);
+        let choices = match &arg {
+            None if has_bare => return None,
+            None => Some(vec![ParamKeyChoice::Falsy]),
+            Some(arg) => match key_arg_choices(db, cache, arg, has_default, has_bare) {
+                Some(choices) => choices,
+                None if is_join => None,
+                None => return None,
+            },
+        };
+        match choices {
+            Some(values) => param_choices.push((*param, values)),
+            None => any_string = true,
+        }
+        if let Some(arg) = arg {
+            definition.get_or_insert(arg);
+        }
+    }
+    let too_many_combinations = param_choices.len() > 1
+        && param_choices
+            .iter()
+            .try_fold(1usize, |acc, (_, values)| {
+                acc.checked_mul(values.len())
+                    .filter(|&count| count <= MAX_INSTALLED_KEY_COMBINATIONS)
+            })
+            .is_none();
+    let key = if any_string || too_many_combinations {
+        InstalledKey::AnyString
+    } else {
+        InstalledKey::Names(key_names(&installer.key, &param_choices))
+    };
+    Some(Install {
+        key,
+        definition: definition.unwrap_or_else(|| LuaExpr::CallExpr(call_expr.clone())),
+    })
+}
+
+/// The keys `key` joins to, one for each choice of a value for each distinct
+/// parameter in `param_choices`.
+fn key_names(key: &[KeyPart], param_choices: &[(usize, Vec<ParamKeyChoice>)]) -> Vec<SmolStr> {
+    let mut choices: Vec<Vec<&ParamKeyChoice>> = vec![Vec::new()];
+    for (_, values) in param_choices {
+        choices = choices
+            .into_iter()
+            .flat_map(|choice| {
+                values.iter().map(move |value| {
+                    let mut choice = choice.clone();
+                    choice.push(value);
+                    choice
+                })
+            })
+            .collect();
+    }
+    choices
+        .into_iter()
+        .filter_map(|choice| {
+            let mut joined = String::new();
+            for part in key {
+                match part {
+                    KeyPart::Literal(text) => joined.push_str(text.as_str()),
+                    KeyPart::Param { param, default } => {
+                        let idx = param_choices.iter().position(|(bound, _)| bound == param)?;
+                        match choice[idx] {
+                            ParamKeyChoice::Str(text) => joined.push_str(text.as_str()),
+                            ParamKeyChoice::Falsy => joined.push_str(default.as_deref()?),
+                        }
+                    }
+                }
+            }
+            Some(joined.into())
+        })
+        .collect()
+}
+
+/// The values a key argument may hold: `Some(None)` for a string it does not
+/// say, `None` for a value not known to be a string.
+fn key_arg_choices(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    arg: &LuaExpr,
+    has_default: bool,
+    has_bare: bool,
+) -> Option<Option<Vec<ParamKeyChoice>>> {
+    if let Some(value) = literal_string(arg) {
+        return Some(Some(vec![ParamKeyChoice::Str(value.into())]));
+    }
+    let typ = infer_expr(db, cache, arg.clone()).ok()?;
+    let names = string_const_names(&Some(typ.clone()));
+    if has_default {
+        let may_be_falsy = crate::semantic::remove_false_or_nil(typ.clone()) != typ;
+        if may_be_falsy && ((!has_bare && typ.is_always_falsy()) || !names.is_empty()) {
+            let mut choices = names
+                .into_iter()
+                .map(ParamKeyChoice::Str)
+                .collect::<Vec<_>>();
+            choices.push(ParamKeyChoice::Falsy);
+            return Some(Some(choices));
+        }
+    }
+    if !names.is_empty() {
+        return Some(Some(names.into_iter().map(ParamKeyChoice::Str).collect()));
+    }
+    let is_string = match &typ {
+        LuaType::Union(union_type) => union_type.types().any(LuaType::is_string),
+        typ => typ.is_string(),
+    };
+    is_string.then_some(None)
+}
+
+/// The table one call of `installer` writes into.
+fn installed_table_type(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+    installer: &FieldInstaller,
+) -> Option<LuaType> {
+    match installer.table {
+        InstallTable::Param(param) => infer_expr(
+            db,
+            cache,
+            installer_arg(db, call_expr, signature_id, param)?,
+        )
+        .ok(),
+        InstallTable::Outer => {
+            let prefix = installer_write(db, signature_id, installer)?.get_prefix_expr()?;
+            crate::semantic::with_file_cache(cache, signature_id.get_file_id(), |cache| {
+                infer_expr(db, cache, prefix).ok()
+            })
+        }
+    }
+}
+
+/// What `call_expr` passes for parameter `param` of the function `signature_id`.
+fn installer_arg(
+    db: &DbIndex,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+    param: usize,
+) -> Option<LuaExpr> {
+    installer_passed_arg(db, call_expr, signature_id, param).flatten()
+}
+
+/// What `call_expr` passes for installer parameter `param`, as
+/// `crate::semantic::passed_arg` tells it.
+fn installer_passed_arg(
+    db: &DbIndex,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+    param: usize,
+) -> Option<Option<LuaExpr>> {
+    let is_colon_define = db
+        .get_signature_index()
+        .get(&signature_id)
+        .is_some_and(|signature| signature.is_colon_define);
+    crate::semantic::passed_arg(call_expr, param + usize::from(is_colon_define))
+}
+
+fn installer_write(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+    installer: &FieldInstaller,
+) -> Option<glua_parser::LuaIndexExpr> {
+    db.get_vfs()
+        .syntax_tree_around(&signature_id.get_file_id(), installer.write)?
+        .get_red_root()
+        .covering_element(installer.write)
+        .ancestors()
+        .find_map(glua_parser::LuaIndexExpr::cast)
+        .filter(|index_expr| index_expr.get_range() == installer.write)
+}
+
+/// The value an assignment gives `target`.
+fn assigned_value(target: &glua_parser::LuaIndexExpr) -> Option<LuaExpr> {
+    let assign = target.get_parent::<LuaAssignStat>()?;
+    let (vars, exprs) = assign.get_var_and_expr_list();
+    let position = vars
+        .iter()
+        .position(|var| var.get_syntax_id() == target.get_syntax_id())?;
+    exprs.get(position).cloned()
+}
+
+/// The parameter of `signature_id` that `value` reads, when the body never
+/// writes it: a written one no longer holds what the call passed.
+fn forwarded_param(db: &DbIndex, signature_id: LuaSignatureId, value: &LuaExpr) -> Option<usize> {
+    let LuaExpr::NameExpr(name_expr) = value else {
+        return None;
+    };
+    let file_id = signature_id.get_file_id();
+    let references = db.get_reference_index();
+    let decl_id = references.get_var_reference_decl(&file_id, name_expr.get_range())?;
+    if references
+        .get_decl_references(&file_id, &decl_id)
+        .is_some_and(|refs| refs.is_written_after_declaration(decl_id.position))
+    {
+        return None;
+    }
+    match db.get_decl_index().get_decl(&decl_id)?.extra {
+        crate::LuaDeclExtra::Param {
+            idx,
+            signature_id: param_signature,
+            ..
+        } if param_signature == signature_id => Some(idx),
+        _ => None,
+    }
+}
+
+/// For an installer write, whether its function's calls name every field it
+/// makes: every call is seen and the key is a string. A bare parameter key is
+/// a string when its parameter is declared one or every call passes one;
+/// otherwise the write keeps its key type, which may be no string at all.
+/// `None` when `index_expr` is no installer write.
+fn installer_write_named_by_calls(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    index_expr: &glua_parser::LuaIndexExpr,
+) -> Option<bool> {
+    let closure = index_expr.ancestors::<LuaClosureExpr>().next()?;
+    let signature_id = LuaSignatureId::new(file_id, closure.get_position());
+    let installer = installers_of(db, signature_id)
+        .into_iter()
+        .find(|installer| installer.write == index_expr.get_range())?;
+    let Some(calls) = crate::semantic::seen_local_function_calls(db, signature_id) else {
+        return Some(false);
+    };
+    if installer.is_join() {
+        return Some(true);
+    }
+    let [KeyPart::Param { param, default }] = installer.key.as_slice() else {
+        return Some(false);
+    };
+    let declared_string = db
+        .get_signature_index()
+        .get(&signature_id)
+        .and_then(|signature| signature.get_param_info_by_id(*param))
+        .is_some_and(|info| match &info.type_ref {
+            LuaType::Union(union_type) => union_type.types().all(LuaType::is_string),
+            typ => typ.is_string(),
+        });
+    Some(
+        declared_string
+            || calls.iter().all(|call_expr| {
+                match installer_arg(db, call_expr, signature_id, *param) {
+                    Some(arg) => is_string_expr(&arg),
+                    None => default.is_some(),
+                }
+            }),
+    )
+}
+
+/// Whether `expr` is a string whatever its parts hold: a literal or a join.
+fn is_string_expr(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::ParenExpr(paren) => paren.get_expr().is_some_and(|inner| is_string_expr(&inner)),
+        LuaExpr::BinaryExpr(binary) => {
+            binary.get_op_token().map(|token| token.get_op()) == Some(BinaryOperator::OpConcat)
+        }
+        expr => literal_string(expr).is_some(),
     }
 }
 
@@ -914,26 +1340,16 @@ fn direct_name_expr_signature_id(
         .get_reference_index()
         .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())?;
     let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let is_reassigned = db
+        .get_reference_index()
+        .get_decl_references(&decl.get_file_id(), &decl_id)
+        .is_some_and(|references| references.is_written_after_declaration(decl_id.position));
+    if is_reassigned {
+        return None;
+    }
     let value_syntax_id = decl.get_value_syntax_id()?;
     (value_syntax_id.get_kind() == LuaSyntaxKind::ClosureExpr)
         .then(|| LuaSignatureId::new(decl.get_file_id(), value_syntax_id.get_range().start()))
-}
-
-fn param_index_key_index(key: &LuaIndexKey, param_names: &[String]) -> Option<usize> {
-    match key {
-        LuaIndexKey::Expr(expr) => param_expr_index(expr, param_names),
-        _ => None,
-    }
-}
-
-fn param_expr_index(expr: &LuaExpr, param_names: &[String]) -> Option<usize> {
-    let LuaExpr::NameExpr(name_expr) = expr else {
-        return None;
-    };
-    let name = name_expr.get_name_text()?;
-    param_names
-        .iter()
-        .position(|param_name| *param_name == name)
 }
 
 fn collect_setmetatable_table_fields(
@@ -1326,8 +1742,8 @@ fn get_field_names(
             }
 
             let names = {
-                let mut visiting = FxHashSet::default();
-                finite_dynamic_key_strings(db, cache, &expr, &mut visiting)
+                let mut state = FiniteKeyState::default();
+                finite_dynamic_key_strings(db, cache, &expr, &mut state)
             };
             ResolvedDynamicFieldNames {
                 may_have_other_string_names: names.is_empty(),
@@ -1417,11 +1833,19 @@ fn has_local_reassignment_before(
         .is_some_and(|position| *position < query_position)
 }
 
+const MAX_DYNAMIC_FIELD_NAME_LEN: usize = 512;
+
+#[derive(Default)]
+struct FiniteKeyState {
+    visiting: FxHashSet<LuaDeclId>,
+    memo: FxHashMap<LuaDeclId, Vec<SmolStr>>,
+}
+
 fn finite_dynamic_key_strings(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     expr: &LuaExpr,
-    visiting: &mut FxHashSet<LuaDeclId>,
+    state: &mut FiniteKeyState,
 ) -> Vec<SmolStr> {
     let inferred = string_const_names(&computed_key_type(db, cache, expr));
     if !inferred.is_empty() {
@@ -1435,7 +1859,7 @@ fn finite_dynamic_key_strings(
         },
         LuaExpr::ParenExpr(paren) => paren
             .get_expr()
-            .map(|inner| finite_dynamic_key_strings(db, cache, &inner, visiting))
+            .map(|inner| finite_dynamic_key_strings(db, cache, &inner, state))
             .unwrap_or_default(),
         LuaExpr::NameExpr(name_expr) => {
             let Some(decl_id) = db
@@ -1445,13 +1869,17 @@ fn finite_dynamic_key_strings(
             else {
                 return Vec::new();
             };
-            if !visiting.insert(decl_id) {
+            if let Some(cached) = state.memo.get(&decl_id) {
+                return cached.clone();
+            }
+            if !state.visiting.insert(decl_id) {
                 return Vec::new();
             }
             let result = local_initializer_expr(db, decl_id)
-                .map(|initializer| finite_dynamic_key_strings(db, cache, &initializer, visiting))
+                .map(|initializer| finite_dynamic_key_strings(db, cache, &initializer, state))
                 .unwrap_or_default();
-            visiting.remove(&decl_id);
+            state.visiting.remove(&decl_id);
+            state.memo.insert(decl_id, result.clone());
             result
         }
         LuaExpr::BinaryExpr(binary) => {
@@ -1461,13 +1889,16 @@ fn finite_dynamic_key_strings(
             let Some((left, right)) = binary.get_exprs() else {
                 return Vec::new();
             };
-            let left = finite_dynamic_key_strings(db, cache, &left, visiting);
-            let right = finite_dynamic_key_strings(db, cache, &right, visiting);
+            let left = finite_dynamic_key_strings(db, cache, &left, state);
+            if left.is_empty() {
+                return Vec::new();
+            }
+            let right = finite_dynamic_key_strings(db, cache, &right, state);
             concatenate_finite_strings(&left, &right)
         }
-        LuaExpr::CallExpr(call) => finite_string_transform_call(db, cache, call, visiting),
+        LuaExpr::CallExpr(call) => finite_string_transform_call(db, cache, call, state),
         LuaExpr::IndexExpr(index_expr) => {
-            finite_numeric_loop_table_values(db, cache, index_expr, visiting)
+            finite_numeric_loop_table_values(db, cache, index_expr, state)
         }
         _ => Vec::new(),
     }
@@ -1481,12 +1912,15 @@ fn local_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<LuaExpr> {
 }
 
 fn concatenate_finite_strings(left: &[SmolStr], right: &[SmolStr]) -> Vec<SmolStr> {
-    if left.len() != 1 && right.len() != 1 {
+    if left.is_empty() || right.is_empty() || (left.len() != 1 && right.len() != 1) {
         return Vec::new();
     }
     let mut result = Vec::with_capacity(left.len().saturating_mul(right.len()));
     for left in left {
         for right in right {
+            if left.len().saturating_add(right.len()) > MAX_DYNAMIC_FIELD_NAME_LEN {
+                return Vec::new();
+            }
             result.push(SmolStr::new(format!("{left}{right}")));
         }
     }
@@ -1497,7 +1931,7 @@ fn finite_string_transform_call(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     call: &LuaCallExpr,
-    visiting: &mut FxHashSet<LuaDeclId>,
+    state: &mut FiniteKeyState,
 ) -> Vec<SmolStr> {
     if call.get_access_path().as_deref() != Some("string.gsub") {
         return Vec::new();
@@ -1513,7 +1947,7 @@ fn finite_string_transform_call(
         return Vec::new();
     }
 
-    finite_dynamic_key_strings(db, cache, &args[0], visiting)
+    finite_dynamic_key_strings(db, cache, &args[0], state)
         .into_iter()
         .map(|value| {
             SmolStr::new(
@@ -1540,7 +1974,7 @@ fn finite_numeric_loop_table_values(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
     index_expr: &glua_parser::LuaIndexExpr,
-    visiting: &mut FxHashSet<LuaDeclId>,
+    state: &mut FiniteKeyState,
 ) -> Vec<SmolStr> {
     let Some(LuaIndexKey::Expr(LuaExpr::NameExpr(key_name))) = index_expr.get_index_key() else {
         return Vec::new();
@@ -1585,7 +2019,7 @@ fn finite_numeric_loop_table_values(
             if let Some(crate::LuaSemanticDeclId::Member(member_id)) = member_info.property_owner_id
                 && let Some(value_expr) = crate::semantic::get_member_value_expr(db, member_id)
             {
-                values.extend(finite_dynamic_key_strings(db, cache, &value_expr, visiting));
+                values.extend(finite_dynamic_key_strings(db, cache, &value_expr, state));
             }
             collect_string_const_names(&member_info.typ, &mut values);
         }
@@ -2077,6 +2511,7 @@ fn propagate_dynamic_fields_to_super_types(
         for super_type in super_types {
             if let LuaType::Ref(super_id) = &super_type
                 && !scoped_globals.contains(super_id.get_name())
+                && !declares_member(db, super_id, field_name)
             {
                 propagated.push((
                     DynamicFieldOwner::Type(super_id.clone()),
@@ -2103,6 +2538,23 @@ fn metatable_index_owner(
         ),
         _ => None,
     }
+}
+
+/// Whether `type_id` or a type it extends declares `name`: a write through a
+/// subclass changes that subclass, not the member the parent already has.
+fn declares_member(db: &DbIndex, type_id: &crate::LuaTypeDeclId, name: &SmolStr) -> bool {
+    let mut types = vec![LuaType::Ref(type_id.clone())];
+    type_id.collect_super_types(db, &mut types);
+    let key = LuaMemberKey::Name(name.clone());
+    types.iter().any(|typ| {
+        let LuaType::Ref(id) = typ else {
+            return false;
+        };
+        db.get_member_index()
+            .get_current_owner_members_for_key(&LuaMemberOwner::Type(id.clone()), &key)
+            .into_iter()
+            .any(|member| member.get_feature().is_decl())
+    })
 }
 
 /// Whether `owner` already declares `name`, so a propagated field would only blur its type.

@@ -13,15 +13,16 @@ use glua_parser::{
 use rustc_hash::FxHashSet;
 
 use crate::{
-    FlowNodeKind, InFiled, LuaDefinitionId, LuaInferenceConfidence, LuaInferenceEventId,
-    LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaInferenceStep, LuaInferredGuardOwner,
-    LuaInferredPositiveGuard, LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType, LuaTypeDeclId,
-    LuaTypeFact, SignatureReturnStatus, TypeOps, check_type_compact,
+    FlowNodeKind, InFiled, LuaDefinitionId, LuaGuardedParam, LuaInferenceConfidence,
+    LuaInferenceEventId, LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaInferenceStep,
+    LuaInferredGuardOwner, LuaInferredPositiveGuard, LuaMemberKey, LuaMemberOwner, LuaSignatureId,
+    LuaType, LuaTypeDeclId, LuaTypeFact, SignatureReturnStatus, TypeOps, check_type_compact,
     compilation::analyzer::AnalyzeContext,
     semantic::{
         LuaInferCache, VarRefId, VarRefRootId, dynamic_field_type_without, get_var_expr_var_ref_id,
         get_var_ref_type, infer_bind_value_type, infer_expr, infer_true_condition_narrowing,
-        infer_var_type_at_node, resolve_dynamic_field_member, type_name_test,
+        infer_var_type_at_closure_end, infer_var_type_at_node, resolve_dynamic_field_member,
+        type_name_test,
     },
 };
 
@@ -109,7 +110,9 @@ pub(super) fn stabilize_unknown_locals(
             } else {
                 candidate
             };
-            if super::is_uninformative_or_template_leak(&candidate) {
+            // A use that takes only `nil` or `false`, such as a store into a
+            // slot nothing but `t.k = false` fills, says nothing of the value.
+            if super::is_uninformative_or_template_leak(&candidate) || only_empties(&candidate) {
                 continue;
             }
             let definitions = if is_function_definition {
@@ -123,7 +126,12 @@ pub(super) fn stabilize_unknown_locals(
                     .map(|(tree, flow)| tree.reaching_definitions(decl_id, flow))
                     .unwrap_or_else(|| Arc::from([crate::LuaDefinitionId::Declaration(decl_id)]))
             };
-            for definition in definitions.iter().cloned() {
+            let cache = context.infer_manager.get_infer_cache(file_id);
+            for definition in definitions
+                .iter()
+                .filter(|definition| definition_is_guessed(db, cache, definition))
+                .cloned()
+            {
                 let target = LuaInferenceNodeId::Definition(definition);
                 evidence_by_node.entry(target.clone()).or_default().push(
                     ContextualTypeEvidence::anchored(
@@ -165,7 +173,10 @@ pub(super) fn stabilize_unknown_locals(
     changed_any
 }
 
-/// The declarations of `file_id` this pass guesses, with their references.
+/// The declarations of `file_id` this pass may guess a definition of, with
+/// their references: a local the statements left without a type, one holding
+/// a guess it published before, or one assigned again, since what an
+/// assignment stores may be what has no type.
 fn guessed_decls(
     db: &crate::DbIndex,
     file_id: crate::FileId,
@@ -174,17 +185,71 @@ fn guessed_decls(
         .get_decl_references_map(&file_id)
         .into_iter()
         .flatten()
-        .filter(|(decl_id, _)| guesses(db, decl_id))
+        .filter(|(decl_id, references)| {
+            guesses(db, decl_id)
+                || (is_local(db, decl_id) && references.cells.iter().any(|cell| cell.is_write))
+        })
+}
+
+/// Whether this pass guesses the value `definition` gives its local: a
+/// declaration it guesses, or an assignment whose stored value has no type of
+/// its own. A definition with a value of its own keeps it however the local is
+/// used, and a guess that types the declaration through a slot the local is
+/// stored in and read back from does not turn off the guess it rests on.
+fn definition_is_guessed(
+    db: &crate::DbIndex,
+    cache: &mut LuaInferCache,
+    definition: &crate::LuaDefinitionId,
+) -> bool {
+    match definition {
+        crate::LuaDefinitionId::Declaration(decl_id) => guesses(db, decl_id),
+        crate::LuaDefinitionId::Assignment {
+            file_id,
+            assignment,
+            target_idx,
+        } => {
+            let Some(assign) = db
+                .get_vfs()
+                .syntax_tree_at_statement(file_id, assignment.get_range())
+                .and_then(|tree| assignment.to_node_from_root(&tree.get_red_root()))
+                .and_then(LuaAssignStat::cast)
+            else {
+                return false;
+            };
+            let exprs = assign.get_var_and_expr_list().1;
+            let target_idx = usize::from(*target_idx);
+            let (expr, ret_idx) = match exprs.get(target_idx) {
+                Some(expr) => (expr.clone(), 0),
+                None => match exprs.last() {
+                    Some(last) => (last.clone(), target_idx + 1 - exprs.len()),
+                    None => return false,
+                },
+            };
+            let value = match infer_expr(db, cache, expr) {
+                Ok(LuaType::Variadic(multi)) => match multi.get_type(ret_idx) {
+                    Some(typ) => typ.clone(),
+                    None => return false,
+                },
+                Ok(typ) if ret_idx == 0 => typ,
+                Ok(typ) if typ.is_unknown() || typ.is_any() => typ,
+                Ok(_) => return false,
+                Err(_) => LuaType::Unknown,
+            };
+            super::is_uninformative_or_template_leak(&value)
+        }
+    }
+}
+
+fn is_local(db: &crate::DbIndex, decl_id: &crate::LuaDeclId) -> bool {
+    db.get_decl_index()
+        .get_decl(decl_id)
+        .is_some_and(|decl| matches!(decl.extra, crate::LuaDeclExtra::Local { .. }))
 }
 
 /// Whether this pass guesses `decl_id`'s type from its uses: a local the
 /// statements left without a type, or one holding a guess it published before.
 fn guesses(db: &crate::DbIndex, decl_id: &crate::LuaDeclId) -> bool {
-    let is_local = db
-        .get_decl_index()
-        .get_decl(decl_id)
-        .is_some_and(|decl| matches!(decl.extra, crate::LuaDeclExtra::Local { .. }));
-    if !is_local {
+    if !is_local(db, decl_id) {
         return false;
     }
     // `never` is the bottom of the same uninformative band as `unknown` (see
@@ -237,19 +302,24 @@ fn guessed_slot_evidence(
         .filter(|item| item.get_member_ids().contains(&member_id))
     else {
         let prefix_type = infer_expr(db, cache, target.get_prefix_expr()?).ok()?;
+        let writer_cache =
+            std::cell::RefCell::new(LuaInferCache::new(file_id, cache.get_config().clone()));
         return dynamic_field_type_without(
             db,
             cache,
             &prefix_type,
             key.get_name()?,
             name_expr.get_position(),
-            |writer| writer.file_id == file_id && stores_guessed_local(db, writer),
+            |writer| {
+                writer.file_id == file_id
+                    && stores_guessed_local(db, &mut writer_cache.borrow_mut(), writer)
+            },
         );
     };
     let (guessed, others): (Vec<_>, Vec<_>) = item
         .get_member_ids()
         .into_iter()
-        .partition(|writer| writer.file_id == file_id && stores_guessed_local(db, *writer));
+        .partition(|writer| writer.file_id == file_id && stores_guessed_local(db, cache, *writer));
     if guessed.is_empty() {
         return None;
     }
@@ -261,13 +331,27 @@ fn guessed_slot_evidence(
     Some(
         others
             .resolve_type_with_realm_at_offset(db, &file_id, name_expr.get_position())
-            .ok(),
+            .ok()
+            .map(|typ| crate::widen_literal_type_for_assignment(&typ)),
     )
 }
 
-/// Whether member `writer` is a store `t.k = local` of the value a local this
-/// pass guesses was declared with: only its declaration reaches the store.
-fn stores_guessed_local(db: &crate::DbIndex, writer: crate::LuaMemberId) -> bool {
+/// Whether every value `typ` allows is `nil` or `false`.
+fn only_empties(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Nil | LuaType::BooleanConst(false) | LuaType::DocBooleanConst(false) => true,
+        LuaType::Union(union) => union.types().all(only_empties),
+        _ => false,
+    }
+}
+
+/// Whether member `writer` is a store `t.k = local` of a value this pass
+/// guesses: it guesses every definition of the local reaching the store.
+fn stores_guessed_local(
+    db: &crate::DbIndex,
+    cache: &mut LuaInferCache,
+    writer: crate::LuaMemberId,
+) -> bool {
     let syntax_id = writer.get_syntax_id();
     let Some(index_expr) = db
         .get_vfs()
@@ -295,17 +379,18 @@ fn stores_guessed_local(db: &crate::DbIndex, writer: crate::LuaMemberId) -> bool
     else {
         return false;
     };
-    guesses(db, &decl_id)
-        && db
-            .get_flow_index()
-            .get_flow_tree(&writer.file_id)
-            .and_then(|tree| {
-                let flow = tree.get_flow_id(value.get_syntax_id())?;
-                Some(tree.reaching_definitions(decl_id, flow))
-            })
-            .is_some_and(|definitions| {
-                definitions.as_ref() == [crate::LuaDefinitionId::Declaration(decl_id)]
-            })
+    db.get_flow_index()
+        .get_flow_tree(&writer.file_id)
+        .and_then(|tree| {
+            let flow = tree.get_flow_id(value.get_syntax_id())?;
+            Some(tree.reaching_definitions(decl_id, flow))
+        })
+        .is_some_and(|definitions| {
+            !definitions.is_empty()
+                && definitions
+                    .iter()
+                    .all(|definition| definition_is_guessed(db, cache, definition))
+        })
 }
 
 /// Whether reaching this read with a nil value would be a runtime error.
@@ -373,6 +458,9 @@ fn rederive_settled_initializers(
 ) {
     let mut roots = FxHashMap::<crate::FileId, glua_parser::LuaSyntaxNode>::default();
     candidates.retain(|(file_id, decl_id, _)| {
+        if !guesses(db, decl_id) {
+            return true;
+        }
         let root = match roots.entry(*file_id) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -1730,7 +1818,8 @@ pub(super) fn publish_inferred_positive_guards(
             continue;
         };
         let mut return_changed = false;
-        if let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id)
+        if let Some(returns) = returns
+            && let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id)
             && signature.resolve_return == SignatureReturnStatus::UnResolve
         {
             signature.return_docs = returns;
@@ -1805,18 +1894,59 @@ fn global_path_from_index_expr(
     Some(path)
 }
 
+/// What a closure's body proves of its parameters, with the returns its
+/// truthy guard was inferred from.
 fn inferred_positive_guard_for_closure(
     db: &crate::DbIndex,
     context: &mut AnalyzeContext,
     file_id: crate::FileId,
     closure: &LuaClosureExpr,
-) -> Option<(LuaInferredPositiveGuard, Vec<crate::LuaDocReturnInfo>)> {
+) -> Option<(
+    LuaInferredPositiveGuard,
+    Option<Vec<crate::LuaDocReturnInfo>>,
+)> {
     let signature_id = LuaSignatureId::from_closure(file_id, closure);
     let signature = db.get_signature_index().get(&signature_id)?;
     if signature.is_generic() || signature.is_vararg || !signature.overloads.is_empty() {
         return None;
     }
+    let guard = truthy_guard_for_closure(db, context, file_id, closure, signature);
+    let asserted = asserted_params(
+        db,
+        context.infer_manager.get_infer_cache(file_id),
+        closure,
+        signature,
+    );
+    if guard.is_none() && asserted.is_empty() {
+        return None;
+    }
+    let (narrowed, false_removed_type, returns) = guard
+        .map_or((Vec::new(), None, None), |(narrowed, removed, returns)| {
+            (narrowed, removed, Some(returns))
+        });
+    Some((
+        LuaInferredPositiveGuard {
+            narrowed,
+            asserted,
+            false_removed_type,
+        },
+        returns,
+    ))
+}
 
+/// The parameters a truthy call narrows, the type a falsy call removes, and
+/// the returns they were inferred from.
+fn truthy_guard_for_closure(
+    db: &crate::DbIndex,
+    context: &mut AnalyzeContext,
+    file_id: crate::FileId,
+    closure: &LuaClosureExpr,
+    signature: &crate::LuaSignature,
+) -> Option<(
+    Vec<LuaGuardedParam>,
+    Option<LuaType>,
+    Vec<crate::LuaDocReturnInfo>,
+)> {
     let return_points =
         super::lua::func_body::analyze_func_body_returns(Some((db, file_id)), closure.get_block()?);
     let mut truthy_exprs = Vec::new();
@@ -1858,10 +1988,10 @@ fn inferred_positive_guard_for_closure(
         LuaType::Variadic(values) => values.get_type(0).cloned().unwrap_or(LuaType::Nil),
         typ => typ,
     };
-    if !type_is_boolean(&return_type) {
+    if !type_is_boolean(&return_type) && !truthy_exprs.iter().all(|expr| is_and_chain(expr)) {
         return None;
     }
-    let mut candidates = closure
+    let candidates = closure
         .get_params_list()?
         .get_params()
         .enumerate()
@@ -1907,14 +2037,102 @@ fn inferred_positive_guard_for_closure(
                     &truthy_exprs,
                 )?
             };
-            Some(LuaInferredPositiveGuard {
+            Some((
+                LuaGuardedParam {
+                    param_idx,
+                    narrowed_type,
+                },
+                false_removed_type,
+            ))
+        })
+        .collect::<Vec<_>>();
+    // A falsy call of a guard on several parameters only says they are not
+    // all narrowed, which removes nothing from any one of them.
+    let false_removed_type = match candidates.as_slice() {
+        [(_, removed)] => removed.clone(),
+        _ => None,
+    };
+    let narrowed = candidates
+        .into_iter()
+        .map(|(param, _)| param)
+        .collect::<Vec<_>>();
+    if narrowed.is_empty() {
+        return None;
+    }
+    Some((narrowed, false_removed_type, returns))
+}
+
+/// The parameters `closure` narrows on every path that returns: each
+/// `return` and the end of its body.
+fn asserted_params(
+    db: &crate::DbIndex,
+    cache: &mut LuaInferCache,
+    closure: &LuaClosureExpr,
+    signature: &crate::LuaSignature,
+) -> Vec<LuaGuardedParam> {
+    let file_id = cache.get_file_id();
+    let (Some(params), Some(block)) = (closure.get_params_list(), closure.get_block()) else {
+        return Vec::new();
+    };
+    let returns = block
+        .descendants::<LuaReturnStat>()
+        .filter(|return_stat| {
+            return_stat.ancestors::<LuaClosureExpr>().next().as_ref() == Some(closure)
+        })
+        .collect::<Vec<_>>();
+    params
+        .get_params()
+        .enumerate()
+        .filter_map(|(param_idx, param)| {
+            let decl_id = crate::LuaDeclId::new(file_id, param.get_position());
+            if db
+                .get_reference_index()
+                .get_decl_references(&file_id, &decl_id)
+                .is_none_or(|references| references.mutable)
+            {
+                return None;
+            }
+            let var_ref_id = VarRefId::VarRef(decl_id);
+            let mut exit_types = returns
+                .iter()
+                .map(|return_stat| {
+                    infer_var_type_at_node(db, cache, return_stat, var_ref_id.clone()).ok()
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if let Some(end_type) =
+                infer_var_type_at_closure_end(db, cache, closure, var_ref_id.clone())
+            {
+                exit_types.push(end_type.ok()?);
+            }
+            exit_types.retain(|typ| !typ.is_never());
+            if exit_types.is_empty() {
+                return None;
+            }
+            let declared = get_var_ref_type(db, cache, &var_ref_id).ok()?;
+            let narrowed_type = LuaType::from_vec(exit_types);
+            if narrowed_type == declared
+                || declared.is_any()
+                || narrowed_type.is_any()
+                || narrowed_type.is_unknown()
+                || narrowed_type.is_nil()
+            {
+                return None;
+            }
+            if declared.is_unknown() {
+                if !is_type_test_result(&narrowed_type) {
+                    return None;
+                }
+            } else if signature.param_docs.contains_key(&param_idx)
+                && check_type_compact(db, &declared, &narrowed_type).is_err()
+            {
+                return None;
+            }
+            Some(LuaGuardedParam {
                 param_idx,
                 narrowed_type,
-                false_removed_type,
             })
-        });
-    let guard = candidates.next()?;
-    candidates.next().is_none().then_some((guard, returns))
+        })
+        .collect()
 }
 
 fn names_param(
@@ -2015,6 +2233,18 @@ fn is_type_test_result(typ: &LuaType) -> bool {
             | LuaType::Userdata
             | LuaType::Thread
     )
+}
+
+/// Whether `expr` is an `and` chain: truthy only where every operand holds,
+/// whatever value it yields.
+fn is_and_chain(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::ParenExpr(paren) => paren.get_expr().is_some_and(|inner| is_and_chain(&inner)),
+        LuaExpr::BinaryExpr(binary) => binary
+            .get_op_token()
+            .is_some_and(|token| token.get_op() == BinaryOperator::OpAnd),
+        _ => false,
+    }
 }
 
 /// Whether `typ` is a predicate's boolean result: booleans, possibly nil, since nil is falsy.
@@ -2601,11 +2831,21 @@ fn is_condition_evidence(index_expr: &LuaIndexExpr) -> bool {
                 LuaElseIfClauseStat::cast(node.clone()).and_then(|stat| stat.get_condition_expr())
             })
             .or_else(|| LuaWhileStat::cast(node.clone()).and_then(|stat| stat.get_condition_expr()))
-            .or_else(|| LuaRepeatStat::cast(node).and_then(|stat| stat.get_condition_expr()));
+            .or_else(|| {
+                LuaRepeatStat::cast(node.clone()).and_then(|stat| stat.get_condition_expr())
+            });
         if condition
             .is_some_and(|condition| condition.syntax().text_range().contains_range(index_range))
         {
             return true;
+        }
+
+        // `return IsValid(ent) and ent.Marker` returns a verdict its callers
+        // test, as a condition written in place would.
+        if let Some(return_stat) = LuaReturnStat::cast(node) {
+            return return_stat.get_expr_list().next().is_some_and(|expr| {
+                is_and_chain(&expr) && logical_condition_contains_index(&expr, index_expr)
+            });
         }
     }
 
@@ -2804,20 +3044,9 @@ fn is_presence_guard_target(
     value: &LuaExpr,
 ) -> bool {
     crate::semantic::presence_guard_target(db, cache, call).is_some_and(|target| {
-        without_parens(target).syntax() == without_parens(value.clone()).syntax()
+        crate::semantic::without_parens(target).syntax()
+            == crate::semantic::without_parens(value.clone()).syntax()
     })
-}
-
-fn without_parens(mut expr: LuaExpr) -> LuaExpr {
-    loop {
-        let LuaExpr::ParenExpr(paren) = &expr else {
-            return expr;
-        };
-        let Some(inner) = paren.get_expr() else {
-            return expr;
-        };
-        expr = inner;
-    }
 }
 
 fn is_equality_operand(index_expr: &LuaIndexExpr) -> bool {

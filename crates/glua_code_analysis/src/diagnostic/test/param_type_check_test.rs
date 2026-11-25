@@ -749,6 +749,29 @@ mod test {
     }
 
     #[test]
+    fn test_union_containing_unknown_is_not_a_param_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param armor number
+            local function SetArmor(armor) end
+
+            local Holder = {}
+            function Holder.Set(id)
+                Holder.value = id
+            end
+            function Holder.Reset()
+                Holder.value = true
+            end
+
+            SetArmor(Holder.value)
+        "#
+        ));
+    }
+
+    #[test]
     fn test_issue_216() {
         let mut ws = VirtualWorkspace::new();
 
@@ -2966,6 +2989,7 @@ mod test {
     #[test]
     fn test_self_1() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "1.lua",
             r#"
@@ -3674,6 +3698,103 @@ mod test {
             "{}",
             messages[0]
         );
+    }
+
+    #[test]
+    fn an_or_after_a_guard_and_a_never_falsy_call_takes_only_what_failed_the_guard() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number
+            local function take(n) end
+            ---@return number
+            local function roll(low, high) return low end
+            ---@param dmg number|number[]
+            local function deal(dmg)
+                take(type(dmg) == "table" and roll(dmg[1], dmg[2]) or dmg)
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn an_or_after_a_call_that_may_be_nil_still_takes_what_passed_the_guard() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param n number
+            local function take(n) end
+            ---@return number?
+            local function roll(low, high) return low end
+            ---@param dmg number|number[]
+            local function deal(dmg)
+                take(type(dmg) == "table" and roll(dmg[1], dmg[2]) or dmg)
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_call_no_form_accepts_is_checked_against_the_form_its_arg_count_fits() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::MissingParameter);
+        let file_id = ws.def(
+            r#"
+            ---@class Tint
+            local Tint = {}
+
+            ---@overload fun(tint: Tint)
+            ---@param r number
+            ---@param g number
+            ---@param b number
+            ---@param a? number
+            function set_tint(r, g, b, a) end
+
+            ---@param unset nil
+            local function apply(unset) set_tint(unset) end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn a_call_no_overload_accepts_reports_the_main_signature() {
+        let mut ws = VirtualWorkspace::new();
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        let file_id = ws.def(
+            r#"
+            ---@overload fun(index: 1): string
+            ---@param index number
+            ---@return boolean
+            local function lookup(index) return true end
+
+            ---@param text string
+            local function lookup_text(text) return lookup(text) end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == code)
+            .map(|diag| diag.message.clone())
+            .collect();
+
+        assert_eq!(messages, ["expected `number` but found `string`. "]);
     }
 
     #[test]
@@ -4712,6 +4833,7 @@ mod test {
     #[test]
     fn test_and_or_chain_false_suppression() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         // Idiomatic Lua pattern: require(a and "x" or b and "y")
         // The `and` operator produces `false | "literal"` when left operand may be falsy.
         // The `false` is an inference artifact that should be stripped for diagnostic purposes.
@@ -5944,6 +6066,26 @@ mod test {
         );
     }
 
+    /// An intersection with a table member is a table, as what `table.Inherit`
+    /// returns is.
+    #[test]
+    fn an_intersection_of_tables_is_accepted_where_a_table_is_expected() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param t table
+            local function take(t) end
+
+            ---@class Base
+            ---@type { a: integer } & Base
+            local both
+            take(both)
+            "#
+        ));
+    }
+
     /// The same runtime write also reached table compatibility, which reported
     /// the literal as missing a member the class never declared.
     #[test]
@@ -6082,4 +6224,129 @@ fn dangling_scoped_class_ref_matches_its_own_def() {
         diags.is_empty(),
         "a value of a dangling scripted-class ref must satisfy its own type: {diags:#?}"
     );
+}
+
+/// A parameter typed only by its name, as `mat` is `IMaterial` by default,
+/// holds a guess: passing it on does not report a mismatch.
+#[test]
+fn a_parameter_typed_by_its_name_alone_does_not_mismatch() {
+    let mut ws = crate::VirtualWorkspace::new();
+    ws.def("---@class IMaterial");
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::ParamTypeMismatch,
+        r#"
+        ---@param path string
+        local function set_material(path) end
+
+        function OnMaterialChanged(mat)
+            set_material(mat)
+        end
+        "#,
+    ));
+}
+
+/// A table no overload accepts is reported against the overload whose fields
+/// it fits best: one wrong field there, not the first overload's other fields.
+#[test]
+fn a_table_no_overload_accepts_is_reported_against_its_closest_overload() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    let file = ws.def(
+        r#"
+---@alias RequestMethodWithParameters "GET"|"POST"
+---@alias RequestMethodWithoutParameters "PUT"|"DELETE"
+
+---@class (partial) Request
+---@field method string
+---@field headers? table<string, string>
+
+---@class (exact) RequestWithParameters : Request
+---@field method RequestMethodWithParameters
+---@field parameters? table<string, string>
+
+---@class (exact) RequestWithoutParameters : Request
+---@field method RequestMethodWithoutParameters
+---@field parameters nil
+
+---@overload fun(request: RequestWithParameters): boolean
+---@overload fun(request: RequestWithoutParameters): boolean
+---@param request Request
+function Send(request) end
+
+---@type (false|string)?
+local secret
+
+Send({
+    method = "DELETE",
+    headers = { ["X-Secret"] = secret },
+})
+"#,
+    );
+
+    let reports = [
+        crate::DiagnosticCode::ParamTypeMismatch,
+        crate::DiagnosticCode::AssignTypeMismatch,
+    ]
+    .into_iter()
+    .flat_map(|code| {
+        ws.analysis.diagnostic.enable_only(code);
+        ws.analysis
+            .diagnose_file(file, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default()
+    })
+    .map(|diagnostic| diagnostic.message)
+    .collect::<Vec<_>>();
+    assert!(
+        reports.len() == 1
+            && reports[0].contains("expected `RequestWithoutParameters`")
+            && reports[0].contains("member headers"),
+        "{reports:#?}"
+    );
+}
+
+/// A table no overload accepts is reported against a table overload, not a
+/// scalar one listed before it that misses its fields as often: optional,
+/// union and literal scalars included.
+#[test]
+fn a_table_no_overload_accepts_is_not_reported_against_a_scalar_overload() {
+    for (scalar, call) in [
+        "string",
+        "string?",
+        "string|number",
+        "1",
+        "\"a\"|\"b\"",
+        "fun()?",
+    ]
+    .into_iter()
+    .flat_map(|scalar| [(scalar, "f({ count = \"wrong\" })"), (scalar, "f({})")])
+    {
+        let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def(&format!(
+            r#"
+---@overload fun(name: {scalar})
+---@param opts {{ count: number }}
+local function f(opts) end
+{call}
+"#
+        ));
+        let reports = [
+            crate::DiagnosticCode::ParamTypeMismatch,
+            crate::DiagnosticCode::AssignTypeMismatch,
+            crate::DiagnosticCode::MissingFields,
+        ]
+        .into_iter()
+        .flat_map(|code| {
+            ws.analysis.diagnostic.enable_only(code);
+            ws.analysis
+                .diagnose_file(file, tokio_util::sync::CancellationToken::new())
+                .unwrap_or_default()
+        })
+        .map(|diagnostic| diagnostic.message)
+        .collect::<Vec<_>>();
+        assert!(
+            !reports.is_empty()
+                && !reports.iter().any(|report| report.starts_with("expected `")
+                    && !report.starts_with("expected `{ count: number }`")),
+            "{scalar} {call}: {reports:#?}"
+        );
+    }
 }

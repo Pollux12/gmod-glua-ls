@@ -782,7 +782,7 @@ impl FileRemap {
         file_id == self.file_id
     }
 
-    fn pos(&self, file_id: FileId, position: TextSize) -> Remap<TextSize> {
+    pub(crate) fn pos(&self, file_id: FileId, position: TextSize) -> Remap<TextSize> {
         if !self.owns(file_id) {
             return Remap::Unrelated;
         }
@@ -792,7 +792,7 @@ impl FileRemap {
         }
     }
 
-    fn range(&self, file_id: FileId, range: TextRange) -> Remap<TextRange> {
+    pub(crate) fn range(&self, file_id: FileId, range: TextRange) -> Remap<TextRange> {
         if !self.owns(file_id) {
             return Remap::Unrelated;
         }
@@ -907,20 +907,21 @@ impl FileRemap {
         // file, the fact is re-homed onto that site's location: uniqueness is
         // the identity (a same-span rename keeps one site, a deletion leaves
         // none, a same-span collision leaves several — both stay `Lost`).
-        if !id.is_token() && id.get_kind() == LuaSyntaxKind::DocTagClass && self.owns(file_id) {
-            if let Remap::Moved(moved) = &mapped {
-                let mapped_range = moved.get_range();
-                if !self
-                    .facts
-                    .as_ref()
-                    .is_some_and(|facts| facts.syntax_ids.contains(moved))
-                    && let Some(cover) = self
-                        .facts
-                        .as_ref()
-                        .and_then(|facts| facts.unique_covering_decl(mapped_range))
-                {
-                    return Remap::Moved(with_range(id, cover));
-                }
+        // A class registered by a call (`vgui.Register`) sits at that call,
+        // which the re-indexed tree confirms before the registration is
+        // derived again.
+        if !id.is_token()
+            && id.get_kind() == LuaSyntaxKind::DocTagClass
+            && self.owns(file_id)
+            && let (Remap::Moved(moved), Some(facts)) = (&mapped, &self.facts)
+            && !facts.syntax_ids.contains(moved)
+        {
+            let mapped_range = moved.get_range();
+            if facts.owner_ranges.contains(&mapped_range) {
+                return mapped;
+            }
+            if let Some(cover) = facts.unique_covering_decl(mapped_range) {
+                return Remap::Moved(with_range(id, cover));
             }
         }
         self.resolve(

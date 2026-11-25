@@ -27,8 +27,8 @@ use crate::{
     compilation::analyzer::common::{TypeCacheWriteMode, bind_type, write_type_cache},
     db_index::{
         AccessorFuncAnnotation, AccessorOwner, AccessorPrefix, AccessorTemplate, LuaDeclId,
-        LuaDocParamInfo, LuaDocReturnInfo, LuaInstanceType, LuaMemberId, LuaOperator,
-        LuaOutParamInfo, LuaOutParamRoot, LuaSemanticDeclId, LuaSignatureId, LuaType,
+        LuaDocParamInfo, LuaDocReturnInfo, LuaInstanceKind, LuaInstanceType, LuaMemberId,
+        LuaOperator, LuaOutParamInfo, LuaOutParamRoot, LuaSemanticDeclId, LuaSignatureId, LuaType,
     },
 };
 
@@ -346,7 +346,9 @@ pub fn analyze_outparam(analyzer: &mut DocAnalyzer, tag: LuaDocTagOutparam) -> O
     Some(())
 }
 
-fn receiver_member_name_for_closure(closure: &LuaClosureExpr) -> Option<String> {
+pub(in crate::compilation::analyzer) fn receiver_member_name_for_closure(
+    closure: &LuaClosureExpr,
+) -> Option<String> {
     if let Some(func_stat) = closure.get_parent::<LuaFuncStat>() {
         let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
             return None;
@@ -419,9 +421,12 @@ pub fn analyze_return(analyzer: &mut DocAnalyzer, tag: LuaDocTagReturn) -> Optio
             let mut type_ref =
                 apply_nullable_doc_default(analyzer, inferred_type, false, default_value.as_ref());
             match return_kind {
+                // Each call returns a new object: fields set on it are its own.
                 ReturnTypeKind::Instance => {
                     let range = InFiled::new(analyzer.file_id, tag.syntax().text_range());
-                    type_ref = LuaType::Instance(LuaInstanceType::new(type_ref, range).into());
+                    type_ref = LuaType::Instance(
+                        LuaInstanceType::with_kind(type_ref, range, LuaInstanceKind::Made).into(),
+                    );
                 }
                 ReturnTypeKind::Definition => {
                     if let LuaType::Ref(ref_id) = type_ref {

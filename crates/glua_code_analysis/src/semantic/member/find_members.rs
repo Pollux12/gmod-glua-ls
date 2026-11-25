@@ -167,7 +167,8 @@ struct FindMembersContext {
     file_id: Option<FileId>,
     caller_position: Option<TextSize>,
     dynamic_fields: bool,
-    /// Whether the lookup reached the current class from one of its subclasses.
+    /// Whether the lookup reached the current class from one of its subclasses
+    /// or from an object a call made of it.
     inherited: bool,
 }
 
@@ -757,14 +758,26 @@ fn find_tuple_members(
     filter: &FindMemberFilter,
 ) -> FindMembersResult {
     let mut members = Vec::new();
-    for (idx, typ) in tuple_type.get_types().iter().enumerate() {
-        let member_key = LuaMemberKey::Integer((idx + 1) as i64);
+    let types = tuple_type.get_types();
+    for (idx, typ) in types.iter().enumerate() {
+        // A spread in last position covers every index from its own on, so
+        // it is one integer-keyed member rather than a member at that index.
+        let (member_key, typ) = match typ {
+            LuaType::Variadic(variadic) if idx + 1 == types.len() => (
+                LuaMemberKey::ExprType(LuaType::Integer),
+                LuaType::from_vec(variadic.element_types().into_iter().cloned().collect()),
+            ),
+            _ => (
+                LuaMemberKey::Integer((idx + 1) as i64),
+                tuple_type.get_type(idx).cloned().unwrap_or(LuaType::Nil),
+            ),
+        };
 
         if should_include_member(&member_key, filter) {
             members.push(LuaMemberInfo {
                 property_owner_id: None,
                 key: member_key,
-                typ: ctx.instantiate_type(db, typ),
+                typ: ctx.instantiate_type(db, &typ),
                 feature: None,
                 overload_index: None,
             });
@@ -1093,7 +1106,14 @@ fn find_instance_members(
     }
 
     let origin_type = ctx.instantiate_type(db, inst.get_base());
-    if let Some(origin_members) = find_members_guard(db, &origin_type, ctx, filter) {
+    // An object a call made has the fields written on its class, not those
+    // the class's other objects were given.
+    let origin_ctx = if inst.get_kind() == crate::LuaInstanceKind::Made {
+        ctx.inherited()
+    } else {
+        ctx.clone()
+    };
+    if let Some(origin_members) = find_members_guard(db, &origin_type, &origin_ctx, filter) {
         members.extend(origin_members);
     }
 

@@ -66,6 +66,7 @@ function file.Find(name, path, sorting) end
 
 ---@[call_arg("gmod.load", "include")]
 ---@param fileName string
+---@return ...
 function include(fileName) end
 
 ---@[call_arg("gmod.load", "addcsluafile")]
@@ -440,6 +441,25 @@ function vgui.RegisterTable(panel, base) end
 ---@[call_arg("gmod.vgui_panel", "base")]
 ---@param base string
 function derma.DefineControl(class, description, panel, base) end
+
+---@[call_arg("gmod.metatable", "define")]
+---@param metaName string
+---@[call_arg("gmod.metatable", "table")]
+---@[adds_field("MetaID", "integer")]
+---@[adds_field("MetaName", "string")]
+---@param metaTable table
+function RegisterMetaTable(metaName, metaTable) end
+
+---@generic T : table, B : table
+---@param target T
+---@param base B
+---@return T & B & { BaseClass: B }
+function table.Inherit(target, base) end
+
+---@generic T : table
+---@param metaName `T`
+---@return (definition) T
+function FindMetaTable(metaName) end
 
 ---@[call_arg("gmod.derma_skin", "define")]
 ---@param name string

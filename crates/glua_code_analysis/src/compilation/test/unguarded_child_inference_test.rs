@@ -4563,6 +4563,140 @@ filter:SetUpdateOnType(true)
             .unwrap() as u32;
         assert_eq!(lines, vec![unguarded]);
     }
+
+    const GLIDE_CLASS_FILE: &str = "lua/glide/sh_classes.lua";
+    const GLIDE_CLASS: &str = r#"
+---@class GlideVehicle: Entity
+---@field IsGlideVehicle boolean
+---@field wheels table
+---@class GlideCar: GlideVehicle
+---@field GetGear fun(self: GlideCar): integer
+---@field UpdateGearList fun(self: GlideCar)
+"#;
+    const GLIDE_TOOL_FILE: &str = "lua/autorun/glide_tool.lua";
+    const GLIDE_TOOL: &str = r#"
+local function IsGlideVehicle(ent)
+    return IsValid(ent) and ent.IsGlideVehicle
+end
+
+local function IsGlideCar(ent)
+    return IsValid(ent) and ent.IsGlideVehicle and ent.GetGear
+end
+
+local function GetWheels(ent)
+    return IsValid(ent) and ent.wheels
+end
+
+---@param vehicle Entity
+function ApplyTires(vehicle)
+    if not IsGlideVehicle(vehicle) then return end
+    local wheels = vehicle.wheels
+end
+
+---@param vehicle Entity
+function ApplyGears(vehicle)
+    if not IsGlideCar(vehicle) then return end
+    vehicle:UpdateGearList()
+end
+
+---@param vehicle Entity
+function Inspect(vehicle)
+    isGlide = IsGlideVehicle(vehicle)
+    wheels = GetWheels(vehicle)
+end
+"#;
+
+    fn glide_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        enable_gmod(&mut ws);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/annotations/getter_api.lua",
+            include_str!("fixtures/getter_guard/api.lua"),
+        );
+        ws
+    }
+
+    fn glide_tool_reports(ws: &mut VirtualWorkspace) -> Vec<(u32, String)> {
+        let uri = ws.virtual_url_generator.new_uri(GLIDE_TOOL_FILE);
+        let file_id = ws.analysis.get_file_id(&uri).expect("tool file");
+        [
+            DiagnosticCode::InferUnguardedChild,
+            DiagnosticCode::InferUnknown,
+        ]
+        .into_iter()
+        .flat_map(|code| diagnostics_for(ws, file_id, code))
+        .map(|diagnostic| (diagnostic.range.start.line, diagnostic.message))
+        .collect()
+    }
+
+    /// A helper whose `and` chain reads a member only a child class has is
+    /// truthy only for that child, so a caller that returns when the helper is
+    /// falsy holds the child after it, as with the test written in place.
+    #[test]
+    fn a_local_helper_testing_a_child_member_narrows_its_argument() {
+        let mut ws = glide_workspace();
+        ws.def_file(GLIDE_CLASS_FILE, GLIDE_CLASS);
+        ws.def_file(GLIDE_TOOL_FILE, GLIDE_TOOL);
+
+        assert_eq!(glide_tool_reports(&mut ws), vec![]);
+    }
+
+    /// The helper returns the member its chain reads where the chain narrows
+    /// the receiver, `false` where `IsValid` fails, and `nil` for a valid
+    /// entity that is not the child.
+    #[test]
+    fn a_local_helper_testing_a_child_member_returns_what_the_member_holds() {
+        let mut ws = glide_workspace();
+        ws.def_file(GLIDE_CLASS_FILE, GLIDE_CLASS);
+        ws.def_file(GLIDE_TOOL_FILE, GLIDE_TOOL);
+
+        let is_glide = ws.expr_ty("isGlide");
+        let wheels = ws.expr_ty("wheels");
+        assert_eq!(
+            (ws.humanize_type(is_glide), ws.humanize_type(wheels)),
+            ("boolean?".to_string(), "(false|table)?".to_string())
+        );
+    }
+
+    #[test]
+    fn a_child_class_edited_deleted_and_reopened_settles_the_helper_as_a_cold_build() {
+        const WITHOUT_MARKER: &str = r#"
+---@class GlideVehicle: Entity
+---@field wheels table
+"#;
+        let cold = |class: Option<&str>| {
+            let mut ws = glide_workspace();
+            if let Some(class) = class {
+                ws.def_file(GLIDE_CLASS_FILE, class);
+            }
+            ws.def_file(GLIDE_TOOL_FILE, GLIDE_TOOL);
+            glide_tool_reports(&mut ws)
+        };
+        let mut warm = glide_workspace();
+        warm.def_file(GLIDE_CLASS_FILE, GLIDE_CLASS);
+        warm.def_file(GLIDE_TOOL_FILE, GLIDE_TOOL);
+        let class_uri = warm.virtual_url_generator.new_uri(GLIDE_CLASS_FILE);
+
+        warm.def_file(GLIDE_CLASS_FILE, WITHOUT_MARKER);
+        let edited = glide_tool_reports(&mut warm);
+        warm.analysis
+            .remove_file_by_uri(&class_uri)
+            .0
+            .expect("class file must be removed");
+        let deleted = glide_tool_reports(&mut warm);
+        warm.def_file(GLIDE_CLASS_FILE, GLIDE_CLASS);
+        let reopened = glide_tool_reports(&mut warm);
+
+        assert_eq!(
+            (edited, deleted, reopened),
+            (
+                cold(Some(WITHOUT_MARKER)),
+                cold(None),
+                cold(Some(GLIDE_CLASS))
+            )
+        );
+    }
 }
 
 #[cfg(test)]

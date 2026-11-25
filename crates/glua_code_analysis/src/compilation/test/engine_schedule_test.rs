@@ -34,11 +34,12 @@ mod test {
     }
 
     /// The passes that infer across a whole file, and the dynamic-field
-    /// writes, of which the probe has one.
-    const WHOLE_FILE_PASSES: [DerivationKind; 3] = [
-        DerivationKind::DynamicFieldWrite,
-        DerivationKind::CallSiteParams,
-        DerivationKind::LocalFallbacks,
+    /// writes, of which the probe has four: one assignment and three calls
+    /// with arguments.
+    const WHOLE_FILE_PASSES: [(DerivationKind, usize); 3] = [
+        (DerivationKind::DynamicFieldWrite, 4),
+        (DerivationKind::CallSiteParams, 1),
+        (DerivationKind::LocalFallbacks, 1),
     ];
 
     /// The passes of each call and function body, which run once for every
@@ -76,8 +77,8 @@ net.Broadcast()
         );
 
         let stats = ws.analysis.compilation.last_stats();
-        let evaluations = WHOLE_FILE_PASSES.map(|kind| (kind, stats.evaluations(kind)));
-        assert_eq!(evaluations, WHOLE_FILE_PASSES.map(|kind| (kind, 1)));
+        let evaluations = WHOLE_FILE_PASSES.map(|(kind, _)| (kind, stats.evaluations(kind)));
+        assert_eq!(evaluations, WHOLE_FILE_PASSES);
         let reader_graph = ws.analysis.compilation.get_db().reader_graph();
         for kind in PER_SITE_PASSES {
             let sites = reader_graph

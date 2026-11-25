@@ -1,17 +1,19 @@
 use std::{ops::Deref, sync::Arc};
 
+use rowan::TextRange;
+
 use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr,
-    LuaLiteralToken, LuaTableExpr, LuaTableField,
+    LuaAstNode, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
+    LuaIndexKey, LuaIndexMemberExpr, LuaLiteralToken, LuaTableExpr, LuaTableField,
 };
 
 use crate::{
     DbIndex, FileId, FlowNode, FlowTree, GMOD_ATTR_SELF_GUARD, GMOD_DOMAIN_SCRIPTED_CLASS,
     GMOD_ROLE_SCRIPTED_BASED_ON, GMOD_ROLE_SCRIPTED_CLASS_NAME, InFiled, InferFailReason,
-    InferGuard, LuaAliasCallKind, LuaAliasCallType, LuaFunctionType, LuaInferCache, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType, TypeOps,
-    check_type_compact, find_best_direct_call_arg_role_for_param, find_signature_attribute_use,
-    infer_call_expr_func, infer_expr,
+    InferGuard, LuaAliasCallKind, LuaAliasCallType, LuaFunctionType, LuaGuardedParam,
+    LuaInferCache, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast,
+    LuaSignatureId, LuaType, TypeOps, check_type_compact, find_best_direct_call_arg_role_for_param,
+    find_signature_attribute_use, infer_call_expr_func, infer_expr,
     semantic::{
         SemanticDeclGuard, SemanticDeclLevel,
         infer::{
@@ -431,9 +433,6 @@ fn try_inferred_positive_guard(
     condition_flow: InferConditionFlow,
     policy: FlowWalkPolicy,
 ) -> Result<Option<LuaType>, InferFailReason> {
-    if call_expr.is_colon_call() {
-        return Ok(None);
-    }
     let Some(guard) = db
         .get_signature_index()
         .inferred_positive_guard(&signature_id)
@@ -442,31 +441,21 @@ fn try_inferred_positive_guard(
         return Ok(None);
     };
     if let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr()
-        && typed_literal_field_has_writes(db, cache, &index_expr)
+        && typed_literal_field_has_writes(db, cache, &index_expr, Some(signature_id))
     {
         return Ok(None);
     }
-    let Some(signature) = db.get_signature_index().get(&signature_id) else {
+    let Some(narrowed_type) = guarded_param_type(
+        db,
+        cache,
+        root,
+        var_ref_id,
+        call_expr,
+        signature_id,
+        &guard.narrowed,
+    ) else {
         return Ok(None);
     };
-    let Some(argument) = inferred_guard_target_expr(call_expr, signature, guard.param_idx) else {
-        return Ok(None);
-    };
-    let Some(argument_ref_id) = get_var_expr_var_ref_id(db, cache, argument.clone()) else {
-        return Ok(None);
-    };
-    if argument_ref_id != *var_ref_id
-        && !can_narrow_type_guard_through_decl_alias(
-            db,
-            cache,
-            root,
-            var_ref_id,
-            &argument_ref_id,
-            &argument,
-        )
-    {
-        return Ok(None);
-    }
 
     let antecedent_type = get_condition_antecedent_type(
         db,
@@ -481,13 +470,184 @@ fn try_inferred_positive_guard(
         InferConditionFlow::TrueCondition => Some(narrow_type_guard_true_branch(
             db,
             antecedent_type,
-            guard.narrowed_type,
+            narrowed_type,
             false,
         )),
         InferConditionFlow::FalseCondition => guard
             .false_removed_type
             .map(|removed| TypeOps::Remove.apply(db, &antecedent_type, &removed)),
     })
+}
+
+/// The type `params` give the argument of `call_expr` that names `var_ref_id`.
+fn guarded_param_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+    params: &[LuaGuardedParam],
+) -> Option<LuaType> {
+    let signature = db.get_signature_index().get(&signature_id)?;
+    params.iter().find_map(|param| {
+        let argument = inferred_guard_target_expr(call_expr, signature, param.param_idx)?;
+        let argument_ref_id = get_var_expr_var_ref_id(db, cache, argument.clone())?;
+        (argument_ref_id == *var_ref_id
+            || can_narrow_type_guard_through_decl_alias(
+                db,
+                cache,
+                root,
+                var_ref_id,
+                &argument_ref_id,
+                &argument,
+            ))
+        .then(|| param.narrowed_type.clone())
+    })
+}
+
+/// The type `var_ref_id` holds once `call_expr` returns, where every function
+/// the call may reach returns only with the argument naming it narrowed.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::semantic::infer::narrow) fn get_type_after_asserting_call(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    call_expr: &LuaCallExpr,
+    policy: FlowWalkPolicy,
+) -> Result<Option<LuaType>, InferFailReason> {
+    let Some(narrowed_type) = asserted_call_type(db, cache, root, var_ref_id, call_expr) else {
+        return Ok(None);
+    };
+    let antecedent_type =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
+    Ok(Some(narrow_type_guard_true_branch(
+        db,
+        antecedent_type,
+        narrowed_type,
+        false,
+    )))
+}
+
+/// The type every function `call_expr` may reach asserts of the argument
+/// naming `var_ref_id`.
+pub(in crate::semantic::infer::narrow) fn asserted_call_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    call_expr: &LuaCallExpr,
+) -> Option<LuaType> {
+    // Only an argument can be asserted, so a call passing none naming the
+    // variable is passed by without resolving what it calls. A call names at
+    // most an entry, as `call_names_var` explains.
+    let names_entry = matches!(var_ref_id, VarRefId::IndexRef(..));
+    let passes_var = call_expr
+        .get_args_list()?
+        .get_args()
+        .map(crate::semantic::without_parens)
+        .filter(|argument| names_entry || !matches!(argument, LuaExpr::CallExpr(_)))
+        .any(|argument| {
+            let Some(argument_ref_id) = get_var_expr_var_ref_id(db, cache, argument.clone()) else {
+                return false;
+            };
+            argument_ref_id == *var_ref_id
+                || can_narrow_type_guard_through_decl_alias(
+                    db,
+                    cache,
+                    root,
+                    var_ref_id,
+                    &argument_ref_id,
+                    &argument,
+                )
+        });
+    if !passes_var {
+        return None;
+    }
+    let callees = asserting_callees(db, cache, call_expr)?;
+    let mut narrowed_type = LuaType::Never;
+    for signature_id in callees.iter().copied() {
+        let asserted = db
+            .get_signature_index()
+            .inferred_positive_guard(&signature_id)
+            .map(|guard| guard.asserted.clone())?;
+        let typ = guarded_param_type(
+            db,
+            cache,
+            root,
+            var_ref_id,
+            call_expr,
+            signature_id,
+            &asserted,
+        )?;
+        narrowed_type = TypeOps::Union.apply(db, &narrowed_type, &typ);
+    }
+    Some(narrowed_type)
+}
+
+/// The signatures `call_expr` may reach when every one asserts some of its
+/// arguments. The flow walk asks this of every call node it reaches, so the
+/// answer is memoised for as long as the facts it reads hold still.
+fn asserting_callees(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<Arc<[LuaSignatureId]>> {
+    let syntax_id = call_expr.get_syntax_id();
+    if let Some(callees) = cache.tracked_get(|cache| &mut cache.asserting_callees_cache, &syntax_id)
+    {
+        return callees;
+    }
+    let frame = crate::db_index::derivation::open_frame();
+    let callees = asserting_callees_uncached(db, cache, call_expr);
+    cache.tracked_insert(
+        |cache| &mut cache.asserting_callees_cache,
+        syntax_id,
+        callees.clone(),
+        frame,
+    );
+    callees
+}
+
+fn asserting_callees_uncached(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<Arc<[LuaSignatureId]>> {
+    let prefix_expr = call_expr.get_prefix_expr()?;
+    let function_type = infer_expr(db, cache, prefix_expr.clone()).ok()?;
+    let candidates = match &function_type {
+        LuaType::Union(union) => union.types().cloned().collect(),
+        typ => vec![typ.clone()],
+    };
+    let single_candidate = candidates.len() == 1;
+    let mut callees = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let signature_id = match candidate {
+            LuaType::Signature(signature_id) => signature_id,
+            LuaType::DocFunction(_) if single_candidate => {
+                get_call_prefix_signature_id(db, cache, call_expr)?
+            }
+            _ => return None,
+        };
+        let asserts = db
+            .get_signature_index()
+            .inferred_positive_guard(&signature_id)
+            .is_some_and(|guard| !guard.asserted.is_empty());
+        if !asserts {
+            return None;
+        }
+        if let LuaExpr::IndexExpr(index_expr) = &prefix_expr
+            && typed_literal_field_has_writes(db, cache, index_expr, Some(signature_id))
+        {
+            return None;
+        }
+        callees.push(signature_id);
+    }
+    Some(callees.into())
 }
 
 /// Narrows the object a scripted-class base test checks: the callee marks the
@@ -635,7 +795,11 @@ fn inferred_guard_target_expr(
         (true, false) => param_idx.checked_sub(1),
         _ => Some(param_idx),
     }?;
-    call_expr.get_args_list()?.get_args().nth(argument_idx)
+    call_expr
+        .get_args_list()?
+        .get_args()
+        .nth(argument_idx)
+        .map(crate::semantic::without_parens)
 }
 
 /// Resolves an alias chain for member-guard predicate callees. When the
@@ -1111,14 +1275,16 @@ fn asserted_type_by_function_type(
     let id = signature_id?;
     let signature = db.get_signature_index().get(&id)?;
     if let Some(guard) = db.get_signature_index().inferred_positive_guard(&id)
-        && targets_var(
-            cache,
-            inferred_guard_target_expr(call_expr, signature, guard.param_idx),
-        )
-        && !guard.narrowed_type.is_any()
-        && !guard.narrowed_type.is_unknown()
+        && let Some(param) = guard.narrowed.iter().find(|param| {
+            targets_var(
+                cache,
+                inferred_guard_target_expr(call_expr, signature, param.param_idx),
+            )
+        })
+        && !param.narrowed_type.is_any()
+        && !param.narrowed_type.is_unknown()
     {
-        return Some(guard.narrowed_type.clone());
+        return Some(param.narrowed_type.clone());
     }
     let cast = signature.return_cast.as_ref()?;
     let target = if cast.name == "self" {
@@ -1137,7 +1303,7 @@ fn asserted_type_by_function_type(
     }
 }
 
-fn type_guard_target_expr(call_expr: &LuaCallExpr) -> Option<LuaExpr> {
+pub(crate) fn type_guard_target_expr(call_expr: &LuaCallExpr) -> Option<LuaExpr> {
     let mut target = if call_expr.is_colon_call()
         && let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr()
         && let Some(self_expr) = index_expr.get_prefix_expr()
@@ -1171,7 +1337,7 @@ fn narrow_type_guard_true_branch(
     }
 
     if guard_type.is_nullable() {
-        return guard_type;
+        return narrow_by_nullable_guard(db, antecedent_type, guard_type);
     }
 
     if let Some(narrowed_type) =
@@ -1185,12 +1351,53 @@ fn narrow_type_guard_true_branch(
     guard_accepted_arms(db, &antecedent_type, &guard_type).unwrap_or(guard_type)
 }
 
+/// A guard that lets `nil` through keeps it only for a value that could hold
+/// it, and narrows the rest by what else it accepts. A value none of whose
+/// other arms it accepts can only have been `nil`.
+fn narrow_by_nullable_guard(
+    db: &DbIndex,
+    antecedent_type: LuaType,
+    guard_type: LuaType,
+) -> LuaType {
+    if antecedent_type.is_any() || antecedent_type.is_unknown() {
+        return guard_type;
+    }
+    let guard_type = TypeOps::Remove.apply(db, &guard_type, &LuaType::Nil);
+    if guard_type.is_never() {
+        return LuaType::Nil;
+    }
+    let could_be_nil = antecedent_type.is_optional();
+    let value = TypeOps::Remove.apply(db, &antecedent_type, &LuaType::Nil);
+    if value.is_never() {
+        return LuaType::Nil;
+    }
+    let narrowed = narrow_down_type(db, value.clone(), guard_type.clone(), None)
+        .or_else(|| guard_accepted_arms(db, &value, &guard_type));
+    match narrowed {
+        Some(narrowed) if could_be_nil => TypeOps::Union.apply(db, &narrowed, &LuaType::Nil),
+        Some(narrowed) => narrowed,
+        None if could_be_nil && union_arms(&value).iter().all(is_settled_value_type) => {
+            LuaType::Nil
+        }
+        None => antecedent_type,
+    }
+}
+
+fn union_arms(typ: &LuaType) -> Vec<LuaType> {
+    match typ {
+        LuaType::Union(union) => union.types().cloned().collect(),
+        _ => vec![typ.clone()],
+    }
+}
+
+/// Whether a failed guard check on `typ` proves the value is not one: a
+/// generic, a class or an unsettled type may still turn out to pass.
+fn is_settled_value_type(typ: &LuaType) -> bool {
+    typ.is_string() || typ.is_number() || typ.is_boolean() || typ.is_function() || typ.is_table()
+}
+
 fn guard_accepted_arms(db: &DbIndex, value: &LuaType, guard_type: &LuaType) -> Option<LuaType> {
-    let arms = match value {
-        LuaType::Union(union) => union.types().cloned().collect::<Vec<_>>(),
-        _ => vec![value.clone()],
-    };
-    let accepted = arms
+    let accepted = union_arms(value)
         .into_iter()
         .filter(|arm| {
             !arm.is_nil()
@@ -1312,15 +1519,17 @@ pub(crate) fn presence_guard_target(
     if let Some(guard) = db
         .get_signature_index()
         .inferred_positive_guard(&signature_id)
-        && !guard.narrowed_type.contain_tpl()
-        && !may_be_nil(
-            db,
-            &guard.narrowed_type,
-            &mut rustc_hash::FxHashSet::default(),
-        )
+        && let Some(param) = guard.narrowed.iter().find(|param| {
+            !param.narrowed_type.contain_tpl()
+                && !may_be_nil(
+                    db,
+                    &param.narrowed_type,
+                    &mut rustc_hash::FxHashSet::default(),
+                )
+        })
         && let Some(signature) = db.get_signature_index().get(&signature_id)
     {
-        return inferred_guard_target_expr(call_expr, signature, guard.param_idx);
+        return inferred_guard_target_expr(call_expr, signature, param.param_idx);
     }
     let guards_presence = call_prefix_signature_is_valid_guard(db, cache, call_expr, signature_id)
         || db
@@ -1368,7 +1577,7 @@ fn get_callable_expr_signature_id(
     }
 
     if let LuaExpr::IndexExpr(index_expr) = &expr
-        && typed_literal_field_has_writes(db, cache, index_expr)
+        && typed_literal_field_has_writes(db, cache, index_expr, None)
     {
         return None;
     }
@@ -1430,10 +1639,15 @@ fn declared_signature_id(
     get_value_expr_signature_id(db, cache, file_id, value_expr, depth)
 }
 
+/// Whether the field `index_expr` reads on a typed table literal is written
+/// outside the literal, so a call through it may not reach the function the
+/// literal holds. The statement defining `defined`, the function the call is
+/// known to reach, is not such a write.
 fn typed_literal_field_has_writes(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     index_expr: &LuaIndexExpr,
+    defined: Option<LuaSignatureId>,
 ) -> bool {
     let Some(LuaExpr::NameExpr(receiver)) = index_expr.get_prefix_expr() else {
         return false;
@@ -1464,12 +1678,19 @@ fn typed_literal_field_has_writes(
                 _ => None,
             }),
     );
+    let defining_name = defined.and_then(|signature_id| defining_name_range(db, signature_id));
+    let defines = |file_id: FileId, range: TextRange| {
+        defining_name
+            .as_ref()
+            .is_some_and(|name| name.file_id == file_id && name.value.contains_range(range))
+    };
     owners.iter().any(|owner| {
         db.get_member_index()
             .get_members_for_owner_key(owner, &member_key)
             .iter()
             .any(|member| {
                 member.get_syntax_id().get_kind() == glua_parser::LuaSyntaxKind::IndexExpr
+                    && !defines(member.get_file_id(), member.get_syntax_id().get_range())
             })
             || crate::dynamic_field_owner_of(db, owner).is_some_and(|owner| match &member_key {
                 LuaMemberKey::Name(name) => db
@@ -1477,15 +1698,30 @@ fn typed_literal_field_has_writes(
                     .field_definitions(&owner, name.as_str())
                     .iter()
                     .any(|definition| {
-                        definition.file_id != table_file
-                            || !table.get_fields().any(|field| {
-                                field.get_field_key().and_then(|key| key.get_range())
-                                    == Some(definition.value)
-                            })
+                        !defines(definition.file_id, definition.value)
+                            && (definition.file_id != table_file
+                                || !table.get_fields().any(|field| {
+                                    field.get_field_key().and_then(|key| key.get_range())
+                                        == Some(definition.value)
+                                }))
                     }),
                 _ => false,
             })
     })
+}
+
+/// The name a `function` statement defining `signature_id` assigns, as
+/// `Checks.Usable` in `function Checks.Usable(ent) ... end`.
+fn defining_name_range(db: &DbIndex, signature_id: LuaSignatureId) -> Option<InFiled<TextRange>> {
+    let file_id = signature_id.get_file_id();
+    let root = db.get_vfs().get_syntax_tree(&file_id)?.get_red_root();
+    let closure = root
+        .token_at_offset(signature_id.get_position())
+        .right_biased()?
+        .parent_ancestors()
+        .find_map(LuaClosureExpr::cast)?;
+    let name = closure.get_parent::<LuaFuncStat>()?.get_func_name()?;
+    Some(InFiled::new(file_id, name.get_range()))
 }
 
 fn receiver_table_literal(

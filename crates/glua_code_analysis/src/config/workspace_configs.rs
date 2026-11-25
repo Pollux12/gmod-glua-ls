@@ -396,10 +396,6 @@ fn merge_shared_fields(shared: &mut Emmyrc, root_emmyrc: &Emmyrc) {
         root_emmyrc.runtime.require_pattern.clone(),
     );
     extend_unique(
-        &mut shared.runtime.require_like_function,
-        root_emmyrc.runtime.require_like_function.clone(),
-    );
-    extend_unique(
         &mut shared.runtime.nonstandard_symbol,
         root_emmyrc.runtime.nonstandard_symbol.clone(),
     );
@@ -591,7 +587,7 @@ mod tests {
     }
 
     /// An addon's config still adds what every file is parsed and analysed
-    /// with, such as its require-like loaders, to the shared config.
+    /// with, such as its require patterns, to the shared config.
     #[test]
     fn an_addon_config_still_shares_its_runtime_settings() {
         let gmod = create_temp_dir().join("garrysmod");
@@ -599,7 +595,7 @@ mod tests {
         fs::create_dir_all(gmod.join("gamemodes")).unwrap();
         fs::write(
             gmod.join("addons/wire/.gluarc.json"),
-            r#"{ "runtime": { "requireLikeFunction": ["wire_require"] }, "diagnostics": { "disable": ["undefined-global"] } }"#,
+            r#"{ "runtime": { "requirePattern": ["?/wire.lua"] }, "diagnostics": { "disable": ["undefined-global"] } }"#,
         )
         .unwrap();
         let prepare = |_: &mut crate::Emmyrc| {};
@@ -618,10 +614,10 @@ mod tests {
 
         assert_eq!(
             (
-                configs.emmyrc.runtime.require_like_function.clone(),
+                configs.emmyrc.runtime.require_pattern.clone(),
                 configs.emmyrc.diagnostics.disable.len()
             ),
-            (vec!["wire_require".to_string()], 0)
+            (vec!["?/wire.lua".to_string()], 0)
         );
         let _ = fs::remove_dir_all(gmod.parent().unwrap());
     }

@@ -289,6 +289,13 @@ mod tests {
         let old_id = {
             let mut analysis = snapshot.analysis().write().await;
             analysis.add_main_workspace(root.to_path_buf());
+            let builtins_uri =
+                file_path_to_uri(&root.join("lua/includes/glua_ls_gmod_call_arg_builtins.lua"))
+                    .expect("builtins URI");
+            analysis.update_file_by_uri(
+                &builtins_uri,
+                Some(glua_code_analysis::GMOD_CALL_ARG_BUILTINS_FIXTURE.to_string()),
+            );
             analysis.update_file_by_uri(&loader_uri, Some(LOADER.to_string()));
             analysis
                 .update_file_by_uri(&old_uri, Some(text.to_string()))

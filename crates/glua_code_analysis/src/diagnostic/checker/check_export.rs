@@ -1,9 +1,7 @@
 use glua_parser::LuaSyntaxNodeExt;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use glua_parser::{
-    LuaAst, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaSyntaxKind, LuaVarExpr,
-};
+use glua_parser::{LuaAst, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaVarExpr};
 
 use crate::{
     DiagnosticCode, FileId, LuaMemberId, LuaMemberOwner, LuaType, ModuleInfo, SemanticModel,
@@ -428,10 +426,7 @@ fn check_require_table_const_with_export<'a>(
         .get_db()
         .get_decl_index()
         .get_decl(&decl_id)?;
-    if decl
-        .get_value_syntax_id()
-        .is_none_or(|syntax_id| syntax_id.get_kind() != LuaSyntaxKind::RequireCallExpr)
-    {
+    if !crate::is_require_decl(semantic_model.get_db(), &decl) {
         return None;
     }
 

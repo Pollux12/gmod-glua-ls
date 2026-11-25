@@ -8,8 +8,8 @@ use std::sync::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    DbIndex, FileId, GmodStateMask, InFiled, LuaDecl, LuaInstanceKind, LuaMemberFeature,
-    LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, TypeOps,
+    DbIndex, FileId, GmodStateMask, InFiled, LuaDecl, LuaInstanceKind, LuaIntersectionType,
+    LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, TypeOps,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::type_check::check_type_compact,
 };
@@ -23,6 +23,7 @@ pub use find_members::{
 pub(crate) use find_members::{
     find_structural_members, visible_super_types_in_workspace_for_file_at_offset,
 };
+pub(crate) use get_member_map::snapshot_table_type;
 pub use get_member_map::{
     get_member_map, get_member_map_in_workspace_for_file,
     get_member_map_in_workspace_for_file_at_offset,
@@ -69,10 +70,28 @@ type RawGetMemberTypeResult = Result<LuaType, InferFailReason>;
 
 pub(crate) fn intersect_member_types(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
     if left == right {
-        left
-    } else {
-        TypeOps::Intersect.apply(db, &left, &right)
+        return left;
     }
+    match TypeOps::Intersect.apply(db, &left, &right) {
+        // A table can hold every field each shape asks for.
+        LuaType::Never if is_table_shape(&left) && is_table_shape(&right) => {
+            LuaType::Intersection(LuaIntersectionType::new(vec![left, right]).into())
+        }
+        intersected => intersected,
+    }
+}
+
+fn is_table_shape(typ: &LuaType) -> bool {
+    matches!(
+        typ,
+        LuaType::Object(_)
+            | LuaType::Intersection(_)
+            | LuaType::TableConst(_)
+            | LuaType::Array(_)
+            | LuaType::Tuple(_)
+            | LuaType::TableGeneric(_)
+            | LuaType::MergedTable(_)
+    )
 }
 
 pub(crate) fn merge_open_table_types(db: &DbIndex, types: Vec<LuaType>) -> LuaType {
@@ -1042,6 +1061,8 @@ enum DynamicFieldDefinitionVisibility {
 struct VisibleDynamicFieldDefinition {
     member_id: Option<LuaMemberId>,
     visibility: DynamicFieldDefinitionVisibility,
+    /// Written on a subclass of the class read, not on the class itself.
+    on_subclass: bool,
 }
 
 pub(crate) fn resolve_dynamic_field_member(
@@ -1157,6 +1178,7 @@ fn resolve_dynamic_field_uncached(
         db,
         cache,
         definitions,
+        field_name,
         false,
     ))
 }
@@ -1194,20 +1216,23 @@ pub(crate) fn dynamic_field_type_without(
         return Some(None);
     }
     Some(Some(
-        dynamic_field_definitions_type(db, cache, kept, true).0,
+        dynamic_field_definitions_type(db, cache, kept, field_name, true).0,
     ))
 }
 
 /// The type the dynamic writers `definitions` give a field, with the member
 /// the first of them names. `informative_only` leaves out writers whose value
-/// is `any` or `unknown`, which say nothing of the field. A writer whose value
-/// is unresolved adds no type while another writer has one, as a member
-/// slot's untyped writers do not: otherwise the floor a cycle of writers took
-/// before one of them landed stays in the field for good.
+/// is `any` or `unknown`, which say nothing of the field. A writer on the
+/// class read whose value is unresolved adds no type while another writer has
+/// one, as a member slot's untyped writers do not: otherwise the floor a
+/// cycle of writers took before one of them landed stays in the field for
+/// good. One on a subclass keeps its unresolved value: another subclass's
+/// writer says nothing of what the field holds on it.
 fn dynamic_field_definitions_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     definitions: Vec<VisibleDynamicFieldDefinition>,
+    field_name: &str,
     informative_only: bool,
 ) -> (LuaType, Option<LuaSemanticDeclId>) {
     let mut member_types = Vec::new();
@@ -1220,18 +1245,22 @@ fn dynamic_field_definitions_type(
         if semantic_decl.is_none() {
             semantic_decl = Some(LuaSemanticDeclId::Member(member_id));
         }
-        if let Some(typ) = dynamic_field_member_type(db, cache, &member_id)
+        if let Some(typ) = dynamic_field_member_type(db, cache, &member_id, field_name)
             && !(informative_only && matches!(typ, LuaType::Any | LuaType::Unknown))
         {
-            member_types.push(typ);
+            member_types.push((typ, definition.on_subclass));
             if definition.visibility == DynamicFieldDefinitionVisibility::Runtime {
                 has_runtime_type = true;
             }
         }
     }
-    if member_types.iter().any(|typ| !typ.is_unknown()) {
-        member_types.retain(|typ| !typ.is_unknown());
+    if member_types.iter().any(|(typ, _)| !typ.is_unknown()) {
+        member_types.retain(|(typ, on_subclass)| *on_subclass || !typ.is_unknown());
     }
+    let mut member_types = member_types
+        .into_iter()
+        .map(|(typ, _)| typ)
+        .collect::<Vec<_>>();
 
     if !member_types.is_empty() && !has_runtime_type {
         member_types.push(LuaType::Nil);
@@ -1260,12 +1289,29 @@ pub(crate) fn resolve_dynamic_field_member_for_file(
         .unwrap_or_default()
 }
 
+/// What the definition `member_id` gives `field_name`. A definition at a
+/// call's argument is a call through a function writing a key built from its
+/// parameters, whose fields differ by name, so it is not cached by member.
 fn dynamic_field_member_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     member_id: &LuaMemberId,
+    field_name: &str,
 ) -> Option<LuaType> {
-    if let Some(cached) = cache.tracked_get(|cache| &mut cache.dynamic_field_type_cache, member_id)
+    let kind = member_id.get_syntax_id().get_kind();
+    let is_call_install = if LuaTableField::can_cast(kind) {
+        false
+    } else if kind == LuaSyntaxKind::IndexExpr {
+        db.get_vfs()
+            .syntax_node_around(&member_id.file_id, *member_id.get_syntax_id())
+            .and_then(|node| node.parent())
+            .is_some_and(|parent| glua_parser::LuaCallArgList::can_cast(parent.kind().into()))
+    } else {
+        true
+    };
+    if !is_call_install
+        && let Some(cached) =
+            cache.tracked_get(|cache| &mut cache.dynamic_field_type_cache, member_id)
     {
         return cached;
     }
@@ -1275,6 +1321,14 @@ fn dynamic_field_member_type(
         return None;
     }
 
+    if is_call_install {
+        cache
+            .dynamic_field_resolving
+            .insert(*member_id, crate::db_index::derivation::scope_mark());
+        let result = installed_member_type(db, cache, member_id, field_name);
+        cache.dynamic_field_resolving.remove(member_id);
+        return result;
+    }
     let frame = crate::db_index::derivation::open_frame();
     cache
         .dynamic_field_resolving
@@ -1333,6 +1387,23 @@ fn dynamic_field_member_type_inner(
     None
 }
 
+/// What the call whose argument `member_id` is gives `field_name` through a
+/// function writing a key built from its parameters.
+fn installed_member_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    member_id: &LuaMemberId,
+    field_name: &str,
+) -> Option<LuaType> {
+    let root = db
+        .get_vfs()
+        .syntax_tree_around(&member_id.file_id, member_id.get_syntax_id().get_range())?
+        .get_red_root();
+    let arg = LuaExpr::cast(member_id.get_syntax_id().to_node_from_root(&root)?)?;
+    let mut call_cache = dynamic_field_definition_cache(cache, member_id.file_id);
+    crate::compilation::analyzer::installed_field_type(db, &mut call_cache, &arg, field_name)
+}
+
 fn dynamic_field_definition_cache(cache: &LuaInferCache, file_id: FileId) -> LuaInferCache {
     let mut definition_cache = LuaInferCache::new(file_id, cache.get_config().clone());
     definition_cache.dynamic_field_type_cache = cache.dynamic_field_type_cache.clone();
@@ -1381,7 +1452,7 @@ fn dynamic_field_definitions_of(
             field_name,
             access_position,
             None,
-            false,
+            direct_only,
         ),
         LuaType::TableConst(table_range) => dynamic_field_definitions_for_table(
             db,
@@ -1529,10 +1600,14 @@ fn dynamic_field_definitions_for_owner(
     // Consulted in the index's canonical order, unfiltered and unsorted: the
     // elected arm and the elected semantic decl both follow it.
     let index = db.get_dynamic_field_index();
-    let definitions = if direct_only {
-        index.direct_definitions_of(owner, field_name)
+    let (definitions, direct) = if direct_only {
+        (index.direct_definitions_of(owner, field_name), None)
     } else {
-        index.field_definitions(owner, field_name)
+        let definitions = index.field_definitions(owner, field_name);
+        let direct = matches!(owner, crate::DynamicFieldOwner::Type(_))
+            .then(|| index.direct_definitions_of(owner, field_name))
+            .filter(|direct| direct.len() != definitions.len());
+        (definitions, direct)
     };
     for definition in definitions {
         if source_min_position.is_some_and(|source_min_position| {
@@ -1563,6 +1638,7 @@ fn dynamic_field_definitions_for_owner(
             visible.push(VisibleDynamicFieldDefinition {
                 member_id: syntax.member_id,
                 visibility,
+                on_subclass: direct.is_some_and(|direct| !direct.contains(definition)),
             });
         }
     }
@@ -1673,6 +1749,15 @@ fn dynamic_field_definition_syntax_uncached(
                     || table_field.get_field_key().and_then(|key| key.get_range()) == Some(range))
             {
                 syntax.member_id = Some(LuaMemberId::new(table_field.get_syntax_id(), file_id));
+            }
+            if syntax.member_id.is_none()
+                && node.text_range() == range
+                && (node.parent().is_some_and(|parent| {
+                    glua_parser::LuaCallArgList::can_cast(parent.kind().into())
+                }) || glua_parser::LuaCallExpr::can_cast(node.kind().into()))
+                && let Some(arg) = LuaExpr::cast(node.clone())
+            {
+                syntax.member_id = Some(LuaMemberId::new(arg.get_syntax_id(), file_id));
             }
         }
         if syntax.enclosing_assign_range.is_none()

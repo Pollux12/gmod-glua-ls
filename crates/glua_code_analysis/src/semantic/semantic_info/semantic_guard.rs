@@ -2,7 +2,8 @@
 pub struct SemanticDeclGuard {
     level: i32,
     limit: i32,
-    /// Whether the lookup reached the current class from one of its subclasses.
+    /// Whether the lookup reached the current class from one of its subclasses
+    /// or from an object a call made of it.
     inherited: bool,
 }
 

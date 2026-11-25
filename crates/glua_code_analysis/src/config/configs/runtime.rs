@@ -13,9 +13,6 @@ pub struct EmmyrcRuntime {
     #[serde(default)]
     pub version: EmmyrcLuaVersion,
     #[serde(default)]
-    /// Functions that like require.
-    pub require_like_function: Vec<String>,
-    #[serde(default)]
     /// file Extensions. eg: .lua, .lua.txt
     pub extensions: Vec<String>,
     #[serde(default)]
@@ -33,7 +30,6 @@ impl Default for EmmyrcRuntime {
     fn default() -> Self {
         Self {
             version: EmmyrcLuaVersion::default(),
-            require_like_function: Vec::new(),
             extensions: Vec::new(),
             require_pattern: Vec::new(),
             nonstandard_symbol: default_nonstandard_symbols(),
@@ -46,9 +42,7 @@ impl EmmyrcRuntime {
     /// Whether text parses the same under `other`: the settings the parser
     /// config is built from agree.
     pub fn parses_like(&self, other: &Self) -> bool {
-        self.special == other.special
-            && self.require_like_function == other.require_like_function
-            && self.nonstandard_symbol == other.nonstandard_symbol
+        self.special == other.special && self.nonstandard_symbol == other.nonstandard_symbol
     }
 }
 
@@ -184,7 +178,6 @@ impl From<EmmyrcNonStdSymbol> for LuaNonStdSymbol {
 pub enum EmmyrcSpecialSymbol {
     #[serde(rename = "none")]
     None,
-    Require,
     Error,
     Assert,
     Type,
@@ -200,7 +193,6 @@ impl<'de> Deserialize<'de> for EmmyrcSpecialSymbol {
         let s = String::deserialize(deserializer)?;
         match s.as_str() {
             "none" => Ok(EmmyrcSpecialSymbol::None),
-            "require" => Ok(EmmyrcSpecialSymbol::Require),
             "error" => Ok(EmmyrcSpecialSymbol::Error),
             "assert" => Ok(EmmyrcSpecialSymbol::Assert),
             "type" => Ok(EmmyrcSpecialSymbol::Type),
@@ -215,7 +207,6 @@ impl From<EmmyrcSpecialSymbol> for Option<SpecialFunction> {
     fn from(symbol: EmmyrcSpecialSymbol) -> Self {
         match symbol {
             EmmyrcSpecialSymbol::None => None,
-            EmmyrcSpecialSymbol::Require => Some(SpecialFunction::Require),
             EmmyrcSpecialSymbol::Error => Some(SpecialFunction::Error),
             EmmyrcSpecialSymbol::Assert => Some(SpecialFunction::Assert),
             EmmyrcSpecialSymbol::Type => Some(SpecialFunction::Type),
@@ -227,6 +218,20 @@ impl From<EmmyrcSpecialSymbol> for Option<SpecialFunction> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config written for name-matched loaders still loads; the loaders come
+    /// from `gmod.load` annotations instead.
+    #[test]
+    fn a_config_naming_require_like_functions_still_loads() {
+        let runtime: EmmyrcRuntime = serde_json::from_str(
+            r#"{ "requireLikeFunction": ["MyAddon.Load"], "special": { "MyAddon.Load": "require" } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.special.get("MyAddon.Load"),
+            Some(&EmmyrcSpecialSymbol::None)
+        );
+    }
 
     #[test]
     fn test_emmyrc_runtime() {

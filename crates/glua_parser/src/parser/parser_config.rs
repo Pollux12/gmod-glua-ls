@@ -57,7 +57,6 @@ impl<'cache> ParserConfig<'cache> {
 
     pub fn get_special_function(&self, name: &str) -> SpecialFunction {
         match name {
-            "require" => SpecialFunction::Require,
             "error" => SpecialFunction::Error,
             "assert" => SpecialFunction::Assert,
             "type" => SpecialFunction::Type,
@@ -101,7 +100,6 @@ impl Default for ParserConfig<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpecialFunction {
     None,
-    Require,
     Error,
     Assert,
     Type,

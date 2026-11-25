@@ -125,7 +125,7 @@ fn push_vgui_panel_entries(
 }
 
 fn extract_vgui_panel_name(call: &GmodScriptedClassCallMetadata) -> Option<&str> {
-    let panel_arg_index = call.vgui_panel_define_arg_idx();
+    let panel_arg_index = call.class_registration_define_arg_idx();
     match call.literal_args.get(panel_arg_index) {
         Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => Some(name.as_str()),
         _ => None,

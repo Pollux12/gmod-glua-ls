@@ -58,6 +58,7 @@ pub(crate) fn resolve_signature_with_index(
     let resolved = resolve_signature_by_args(
         db,
         &candidates,
+        main_idx,
         &expr_types,
         call_expr.is_colon_call(),
         arg_count,

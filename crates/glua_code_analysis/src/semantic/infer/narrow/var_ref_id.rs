@@ -434,7 +434,7 @@ fn get_call_expr_var_ref_id(
 
 /// The access path a `rawget(obj, key)`-style call names, read off its
 /// syntax: the object's text, which need not be exact, and the key.
-pub(crate) fn raw_get_access_path(call_expr: &LuaCallExpr) -> Option<String> {
+fn raw_get_access_path(call_expr: &LuaCallExpr) -> Option<String> {
     let mut args = call_expr.get_args_list()?.get_args();
     let mut access_path = args.next()?.syntax().text().to_string();
     access_path.push('.');

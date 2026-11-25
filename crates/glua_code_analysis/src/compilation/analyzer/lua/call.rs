@@ -1,6 +1,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::StatementWrite;
+use crate::compilation::analyzer::function_summary::installed_methods_of;
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
     LuaIndexKey, LuaLiteralToken, LuaNameExpr, LuaTableExpr, LuaVarExpr, NumberResult, PathTrait,
@@ -145,7 +146,10 @@ pub(in crate::compilation::analyzer) fn build_special_call_direct_matcher(
         .get_signature_index()
         .iter()
         .filter_map(|(signature_id, signature)| {
-            signature.has_special_call_params().then_some(*signature_id)
+            (signature.has_special_call_params()
+                || !super::super::function_summary::installed_methods_of(db, *signature_id)
+                    .is_empty())
+            .then_some(*signature_id)
         })
         .collect::<Vec<_>>();
     let mut matcher = SpecialCallDirectMatcher::default();
@@ -543,7 +547,9 @@ fn expr_matches_direct_special_call(
         return analyzer
             .db
             .get_signature_index()
-            .has_special_call_params(&signature_id);
+            .has_special_call_params(&signature_id)
+            || !super::super::function_summary::installed_methods_of(analyzer.db, signature_id)
+                .is_empty();
     }
 
     if let Some(name_expr) = LuaNameExpr::cast(node.clone())
@@ -1070,9 +1076,11 @@ fn get_member_owner_for_cached_type(prefix_type: LuaType) -> Option<LuaMemberOwn
 
 fn type_has_special_call_signature(db: &DbIndex, typ: &LuaType) -> bool {
     match typ {
-        LuaType::Signature(signature_id) => db
-            .get_signature_index()
-            .has_special_call_params(signature_id),
+        LuaType::Signature(signature_id) => {
+            db.get_signature_index()
+                .has_special_call_params(signature_id)
+                || !installed_methods_of(db, *signature_id).is_empty()
+        }
         LuaType::DocFunction(func) => func.get_params().iter().any(|(_, param_type)| {
             param_type
                 .as_ref()
@@ -1563,8 +1571,18 @@ fn find_owner_for_prefix(analyzer: &mut LuaAnalyzer, prefix: &LuaExpr) -> Option
         return Some(LuaMemberOwner::Type(type_decl_id));
     }
 
-    match analyzer.infer_expr(prefix).ok()? {
-        LuaType::TableConst(range) => Some(LuaMemberOwner::Element(range)),
+    table_owner(&analyzer.infer_expr(prefix).ok()?)
+}
+
+/// The owner of the members written into the table `typ`: a per-call copy
+/// holds its own, any other instance's belong to the table it folds into.
+fn table_owner(typ: &LuaType) -> Option<LuaMemberOwner> {
+    match typ {
+        LuaType::TableConst(range) => Some(LuaMemberOwner::Element(range.clone())),
+        LuaType::Instance(instance) if instance.get_kind() != crate::LuaInstanceKind::Shared => {
+            Some(LuaMemberOwner::Element(instance.get_range().clone()))
+        }
+        LuaType::Instance(instance) => table_owner(instance.get_base()),
         _ => None,
     }
 }
@@ -1656,7 +1674,7 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
             field_args: Vec::new(),
             inheritance_roles: None,
             network_var_roles: None,
-            vgui_panel_roles: None,
+            class_registration_roles: None,
             derma_skin_roles: None,
             register_roles: None,
         }),

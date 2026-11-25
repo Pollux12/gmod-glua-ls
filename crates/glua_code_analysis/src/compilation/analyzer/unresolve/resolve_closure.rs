@@ -1,7 +1,8 @@
 use std::{ops::Deref, sync::Arc};
 
 use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexMemberExpr, LuaLiteralToken, LuaTableExpr, LuaVarExpr,
+    LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexMemberExpr, LuaLiteralToken, LuaNameExpr,
+    LuaTableExpr, LuaVarExpr,
 };
 use rustc_hash::FxHashSet;
 use smol_str::SmolStr;
@@ -9,15 +10,17 @@ use smol_str::SmolStr;
 use crate::{
     DbIndex, GlobalId, GmodHookKind, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo,
     LuaDocReturnInfo, LuaFunctionType, LuaInferCache, LuaMemberKey, LuaMemberOwner, LuaSignature,
-    LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel, ReturnTypeKind, SignatureReturnStatus,
-    TypeOps, VariadicType, get_real_type, humanize_type, infer_call_expr_func, infer_expr,
-    infer_table_should_be, instantiate_outside_signature,
+    LuaSignatureId, LuaType, LuaTypeDeclId, LuaTypeOwner, RenderLevel, ReturnTypeKind,
+    SignatureReturnStatus, TypeOps, VariadicType, get_real_type, humanize_type,
+    infer_call_expr_func, infer_expr, infer_table_should_be, instantiate_outside_signature,
 };
 
 use super::{
     ResolveResult, UnResolveCallClosureParams, UnResolveClosureReturn, UnResolveParentAst,
-    UnResolveParentClosureParams, UnResolveReturn, find_decl_function::find_decl_function_type,
-    resolve::try_resolve_return_point, writes::ResolveWrites,
+    UnResolveParentClosureParams, UnResolveReturn,
+    find_decl_function::find_decl_function_type,
+    resolve::{is_unsettled_inferred_return, try_resolve_return_point},
+    writes::ResolveWrites,
 };
 
 pub fn try_resolve_call_closure_params(
@@ -495,7 +498,9 @@ pub fn try_resolve_closure_parent_params(
                     )
                     .ok_or(InferFailReason::None)?
                 }
-                _ => return Ok(()),
+                LuaVarExpr::NameExpr(name_expr) => {
+                    return resolve_name_defined_params(db, writes, closure_params, &name_expr);
+                }
             }
         }
         UnResolveParentAst::LuaTableField(table_field) => {
@@ -537,7 +542,9 @@ pub fn try_resolve_closure_parent_params(
                     )
                     .ok_or(InferFailReason::None)?
                 }
-                _ => return Ok(()),
+                LuaVarExpr::NameExpr(name_expr) => {
+                    return resolve_name_defined_params(db, writes, closure_params, name_expr);
+                }
             }
         }
     };
@@ -550,6 +557,192 @@ pub fn try_resolve_closure_parent_params(
         self_type,
         &InferGuard::new(),
     )
+}
+
+/// Gives a function a name defines the parameter types of the library
+/// function it replaces. A `module()` member takes its documented member's
+/// contract, as `function module.Name` does; a global takes the documented
+/// global's; a local replaces nothing.
+fn resolve_name_defined_params(
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
+    closure_params: &mut UnResolveParentClosureParams,
+    name_expr: &LuaNameExpr,
+) -> ResolveResult {
+    let decl = db
+        .get_reference_index()
+        .get_local_reference(&closure_params.file_id)
+        .and_then(|references| references.get_decl_id(&name_expr.get_range()))
+        .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id));
+    match decl {
+        Some(decl) if decl.is_module_scoped() => {
+            let Some(member_type) = documented_module_member(db, closure_params, decl, name_expr)
+            else {
+                return Ok(());
+            };
+            resolve_closure_member_type(
+                db,
+                writes,
+                closure_params,
+                &member_type,
+                None,
+                &InferGuard::new(),
+            )
+        }
+        Some(decl) if !decl.is_global() => Ok(()),
+        _ => resolve_documented_global_params(db, writes, closure_params, name_expr),
+    }
+}
+
+/// The documented member of `decl`'s `module()` the function `name_expr`
+/// defines replaces: the library's earliest.
+fn documented_module_member(
+    db: &DbIndex,
+    closure_params: &UnResolveParentClosureParams,
+    decl: &crate::LuaDecl,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaType> {
+    let owner = LuaMemberOwner::GlobalPath(GlobalId::new(decl.get_module_path()?));
+    let key = LuaMemberKey::Name(name_expr.get_name_text()?);
+    let module_index = db.get_module_index();
+    let gmod_enabled = db.get_emmyrc().gmod.enabled;
+    let infer_index = db.get_gmod_infer_index();
+    let caller_mask =
+        infer_index.get_state_mask_at_offset(&closure_params.file_id, name_expr.get_position());
+    let mut member_ids = db
+        .get_member_index()
+        .get_members_with_key(&owner, &key)?
+        .into_iter()
+        .map(|member| member.get_id())
+        .filter(|member_id| {
+            (module_index.is_library(&member_id.file_id) || module_index.is_std(&member_id.file_id))
+                && (!gmod_enabled
+                    || caller_mask.is_compatible_with(
+                        infer_index
+                            .get_state_mask_at_offset(&member_id.file_id, member_id.get_position()),
+                    ))
+        })
+        .collect::<Vec<_>>();
+    member_ids.sort_by_key(|member_id| (member_id.file_id, member_id.get_position()));
+    member_ids
+        .into_iter()
+        .filter_map(|member_id| db.get_type_index().get_type_cache(&member_id.into()))
+        .find_map(|cache| match cache.as_type() {
+            LuaType::Signature(id) if *id != closure_params.signature_id => {
+                Some(LuaType::Signature(*id))
+            }
+            _ => None,
+        })
+}
+
+/// Gives a workspace function replacing a global a library documents that
+/// global's parameter types. Its returns stay its body's, as a replacement
+/// may return what the documented one does not, unless the body's return
+/// says nothing: then it returns the documented one.
+fn resolve_documented_global_params(
+    db: &DbIndex,
+    writes: &mut ResolveWrites,
+    closure_params: &UnResolveParentClosureParams,
+    name_expr: &LuaNameExpr,
+) -> ResolveResult {
+    let Some((documented_id, documented)) = documented_global(db, closure_params, name_expr) else {
+        return Ok(());
+    };
+    if !documented.is_resolve_return() {
+        return Err(InferFailReason::UnResolveSignatureReturn(documented_id));
+    }
+    let target = db
+        .get_signature_index()
+        .get(&closure_params.signature_id)
+        .ok_or(InferFailReason::None)?;
+    let contract = Arc::new(contract_outside_signature(db, documented, LuaType::Unknown));
+    let documented_return =
+        instantiate_outside_signature(db, documented, &documented.get_return_type());
+    let signature_id = closure_params.signature_id;
+    defer_resolve_doc_function(
+        db,
+        writes,
+        signature_id,
+        &contract_for_target(db, target, &contract),
+        None,
+    )?;
+    writes.push(move |db, _| fill_unsettled_return(db, signature_id, documented_return));
+    Ok(())
+}
+
+/// The library global the function `name_expr` defines replaces: within the
+/// library this file resolves the name to first, the earliest declaration.
+fn documented_global<'a>(
+    db: &'a DbIndex,
+    closure_params: &UnResolveParentClosureParams,
+    name_expr: &LuaNameExpr,
+) -> Option<(LuaSignatureId, &'a LuaSignature)> {
+    let name = name_expr.get_name_text()?;
+    let module_index = db.get_module_index();
+    let gmod_enabled = db.get_emmyrc().gmod.enabled;
+    let infer_index = db.get_gmod_infer_index();
+    let caller_mask =
+        infer_index.get_state_mask_at_offset(&closure_params.file_id, name_expr.get_position());
+    let workspace_id = module_index
+        .get_workspace_id(closure_params.file_id)
+        .unwrap_or(crate::WorkspaceId::MAIN);
+    let owners: Vec<LuaTypeOwner> = db
+        .get_global_index()
+        .get_global_decl_id_priority_tiers(&name, module_index, workspace_id)
+        .into_iter()
+        .flatten()
+        .flat_map(|(_, mut decl_ids)| {
+            decl_ids.retain(|decl_id| {
+                (module_index.is_library(&decl_id.file_id) || module_index.is_std(&decl_id.file_id))
+                    && (!gmod_enabled
+                        || caller_mask.is_compatible_with(
+                            infer_index
+                                .get_state_mask_at_offset(&decl_id.file_id, decl_id.position),
+                        ))
+            });
+            decl_ids.sort_by_key(|decl_id| (decl_id.file_id, decl_id.position));
+            decl_ids
+        })
+        .map(Into::into)
+        .collect();
+    owners
+        .iter()
+        .filter_map(|owner| db.get_type_index().get_type_cache(owner))
+        .find_map(|cache| match cache.as_type() {
+            LuaType::Signature(id) if *id != closure_params.signature_id => {
+                db.get_signature_index().get(id).map(|sig| (*id, sig))
+            }
+            _ => None,
+        })
+}
+
+/// Fills the inferred return of `signature_id` with `documented_return` while
+/// the body's says nothing. The fill stays marked as one, so a return the body
+/// settles later replaces it.
+fn fill_unsettled_return(
+    db: &mut DbIndex,
+    signature_id: LuaSignatureId,
+    documented_return: LuaType,
+) {
+    let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id) else {
+        return;
+    };
+    let fillable = signature.resolve_return == SignatureReturnStatus::InferResolve
+        && (signature.return_filled_from_slot
+            || is_unsettled_inferred_return(&signature.get_return_type()));
+    if !fillable || signature.get_return_type() == documented_return {
+        return;
+    }
+    signature.return_filled_from_slot = true;
+    signature.return_docs = vec![LuaDocReturnInfo {
+        name: None,
+        type_ref: documented_return,
+        default_value: None,
+        description: None,
+        attributes: None,
+        return_kind: ReturnTypeKind::default(),
+    }];
+    db.get_signature_index_mut().note_return_write(signature_id);
 }
 
 /// Defers one `resolve_doc_function` write. The signature's existence is the
@@ -741,17 +934,15 @@ fn resolve_doc_function(
     doc_func: &LuaFunctionType,
     self_type: Option<LuaType>,
 ) -> ResolveResult {
-    let signature = db
-        .get_signature_index_mut()
-        .get_mut(&signature_id)
-        .ok_or(InferFailReason::None)?;
-
-    let async_before = signature.async_state;
-    signature.async_state = doc_func.get_async_state();
-
+    let is_colon_define = db
+        .get_signature_index()
+        .get(&signature_id)
+        .ok_or(InferFailReason::None)?
+        .is_colon_define;
     let mut doc_params = doc_func.get_params().to_vec();
+    let optional_params = optional_params_for(doc_func, is_colon_define);
     // doc_func is the valid signature traced upwards, signature is the unresolved signature
-    match (doc_func.is_colon_define(), signature.is_colon_define) {
+    match (doc_func.is_colon_define(), is_colon_define) {
         (true, false) => {
             // The original signature is colon-defined but the unresolved one is not, so the first parameter must be inserted
             doc_params.insert(0, ("self".to_string(), Some(LuaType::SelfInfer)));
@@ -763,6 +954,26 @@ fn resolve_doc_function(
         }
         _ => {}
     }
+    // An optional param may be left out, as a documented `name?` may.
+    for (param, _) in doc_params
+        .iter_mut()
+        .zip(&optional_params)
+        .filter(|(_, optional)| **optional)
+    {
+        if let Some(typ) = &param.1
+            && !typ.is_nullable()
+        {
+            param.1 = Some(TypeOps::Union.apply(db, typ, &LuaType::Nil));
+        }
+    }
+
+    let signature = db
+        .get_signature_index_mut()
+        .get_mut(&signature_id)
+        .ok_or(InferFailReason::None)?;
+
+    let async_before = signature.async_state;
+    signature.async_state = doc_func.get_async_state();
 
     let receiver_filled_from_slot = !signature.is_colon_define
         && doc_params
@@ -792,7 +1003,7 @@ fn resolve_doc_function(
                 type_ref: param.1.clone().unwrap_or(LuaType::Any),
                 default_value: None,
                 description: None,
-                nullable: false,
+                nullable: optional_params.get(index).copied().unwrap_or(false),
                 attributes: None,
             },
         );
@@ -811,10 +1022,11 @@ fn resolve_doc_function(
         signature.return_filled_from_slot,
     );
 
-    // An unknown contract return says nothing about the result, so the
-    // closure keeps the return its own body gives.
+    // An unconstrained contract return (`unknown`, `any`, or variadic/multi
+    // slots made solely of them) says nothing about the result, so the closure
+    // keeps the return its own body gives.
     let doc_return = doc_func.get_ret();
-    let constrains_return = !doc_return.is_unknown();
+    let constrains_return = !is_unconstrained_contract_return(doc_return);
     let inferred_tail = (constrains_return
         && signature.resolve_return == SignatureReturnStatus::InferResolve)
         .then(|| {
@@ -827,10 +1039,7 @@ fn resolve_doc_function(
         .flatten();
     let should_apply_return = constrains_return
         && match signature.resolve_return {
-            SignatureReturnStatus::UnResolve => true,
-            SignatureReturnStatus::InferResolve => {
-                should_doc_return_override_inferred(doc_return, &signature.get_return_type())
-            }
+            SignatureReturnStatus::UnResolve | SignatureReturnStatus::InferResolve => true,
             SignatureReturnStatus::DocResolve => signature.return_filled_from_slot,
         };
 
@@ -961,10 +1170,17 @@ fn exact_non_nil_type(typ: &LuaType) -> LuaType {
     }
 }
 
-fn should_doc_return_override_inferred(doc_return: &LuaType, inferred_return: &LuaType) -> bool {
-    !(doc_return.is_any() || doc_return.is_unknown())
-        || inferred_return.is_any()
-        || inferred_return.is_unknown()
+fn is_unconstrained_contract_return(doc_return: &LuaType) -> bool {
+    match doc_return {
+        LuaType::Any | LuaType::Unknown => true,
+        LuaType::Variadic(variadic) => match variadic.as_ref() {
+            VariadicType::Base(inner) => is_unconstrained_contract_return(inner),
+            VariadicType::Multi(types) => {
+                !types.is_empty() && types.iter().all(is_unconstrained_contract_return)
+            }
+        },
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1053,13 +1269,18 @@ fn contract_outside_signature(db: &DbIndex, sig: &LuaSignature, ret: LuaType) ->
             ))
         })
         .collect();
+    let main_params = sig.get_type_params();
     let params = merge_contract_params(
         db,
-        instantiate_params(&sig.get_type_params()),
+        instantiate_params(&main_params),
         sig.is_colon_define,
         &overloads,
         ParamMerge::Agreement,
     );
+    // A param only an overload has is one the main form is called without.
+    let mut optional_params = sig.get_param_optional_flags();
+    optional_params.resize(main_params.len(), false);
+    optional_params.resize(params.len(), true);
     LuaFunctionType::new(
         sig.async_state,
         sig.is_colon_define,
@@ -1067,7 +1288,7 @@ fn contract_outside_signature(db: &DbIndex, sig: &LuaSignature, ret: LuaType) ->
         params,
         instantiate_outside_signature(db, sig, &ret),
     )
-    .with_optional_params(sig.get_param_optional_flags())
+    .with_optional_params(optional_params)
 }
 
 /// `contract` as `target` takes it, by `target`'s own params.
@@ -1094,6 +1315,21 @@ fn contract_for_target(
         ),
         contract.get_ret().clone(),
     )
+    .with_optional_params(optional_params_for(contract, target.is_colon_define))
+}
+
+/// `contract`'s optional-param flags at the positions a signature defined
+/// with or without a colon, as `is_colon_define` says, gives its params.
+fn optional_params_for(contract: &LuaFunctionType, is_colon_define: bool) -> Vec<bool> {
+    let mut optional_params = contract.get_optional_params().to_vec();
+    match (contract.is_colon_define(), is_colon_define) {
+        (true, false) => optional_params.insert(0, false),
+        (false, true) if !optional_params.is_empty() => {
+            optional_params.remove(0);
+        }
+        _ => {}
+    }
+    optional_params
 }
 
 /// How [`merge_contract_params`] settles a position its contracts type

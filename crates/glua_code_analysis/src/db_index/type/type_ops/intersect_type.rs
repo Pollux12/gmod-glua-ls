@@ -20,9 +20,9 @@ pub fn intersect_type(db: &DbIndex, source: LuaType, target: LuaType) -> LuaType
         (LuaType::IntegerConst(i) | LuaType::DocIntegerConst(i), LuaType::Integer) => {
             LuaType::IntegerConst(*i)
         }
-        // float | float const
-        (LuaType::Number, right) if right.is_number() => LuaType::Number,
-        (left, LuaType::Number) if left.is_number() => LuaType::Number,
+        // number & any number type = the narrower one
+        (LuaType::Number, right) if right.is_number() => right.clone(),
+        (left, LuaType::Number) if left.is_number() => (*left).clone(),
         // string | string const
         (LuaType::String, LuaType::StringConst(s) | LuaType::DocStringConst(s)) => {
             LuaType::StringConst(s.clone())

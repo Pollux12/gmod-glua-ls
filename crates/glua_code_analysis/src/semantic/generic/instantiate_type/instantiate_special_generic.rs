@@ -293,6 +293,23 @@ fn instantiate_unpack_call(db: &DbIndex, operands: &[LuaType]) -> LuaType {
                     break;
                 }
             }
+            // An integer key that is not a constant covers indices no
+            // positional member names: the values past them are open.
+            let open = members
+                .iter()
+                .filter(|(key, _)| {
+                    matches!(
+                        key,
+                        LuaMemberKey::ExprType(LuaType::Integer | LuaType::Number)
+                    )
+                })
+                .flat_map(|(_, infos)| infos.iter().map(|info| info.typ.clone()))
+                .reduce(|left, right| TypeOps::Union.apply(db, &left, &right));
+            if let Some(open) = open {
+                multi_types.push(LuaType::Variadic(
+                    VariadicType::Base(TypeOps::Union.apply(db, &open, &LuaType::Nil)).into(),
+                ));
+            }
 
             LuaType::Variadic(VariadicType::Multi(multi_types).into())
         }

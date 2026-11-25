@@ -317,6 +317,7 @@ parser:parse()",
 
     fn setup_vehicle_weapon_registry_real_multifile_fixture() -> (VirtualWorkspace, crate::FileId) {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
@@ -1301,7 +1302,7 @@ parser:parse()",
     }
 
     #[gtest]
-    fn test_unknown_dynamic_key_does_not_apply_to_unresolved_named_field_lookup() {
+    fn a_named_lookup_keeps_its_own_write_and_reads_computed_writes_otherwise() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -1329,7 +1330,7 @@ parser:parse()",
         );
 
         let unobserved_lookup_ty = ws.expr_ty("C");
-        assert_eq!(ws.humanize_type(unobserved_lookup_ty), "nil");
+        assert_eq!(ws.humanize_type(unobserved_lookup_ty), "true?");
     }
 
     /// A computed-key write whose key already settled to `string` files under
@@ -1488,7 +1489,7 @@ parser:parse()",
         let owner_display = ws.humanize_type_detailed(owner_ty);
         assert_that!(
             owner_display.as_str(),
-            contains_substring("[dynamic]"),
+            contains_substring("[string]"),
             "expected real-style registry fixture to preserve dynamic owner shape: {}",
             owner_display
         );
@@ -1909,7 +1910,80 @@ parser:parse()",
         let user = ws.def_file("lua/c_user.lua", "local alpha = Meta.Alpha\n");
 
         let alpha = ws.local_ty(user, "alpha");
-        assert_that!(ws.humanize_type(alpha), eq("1?"));
+        assert_that!(ws.humanize_type(alpha), eq("1"));
+    }
+
+    /// A function in the read's own file may run before the read, so what it
+    /// writes under a computed key is a possible value of the named read.
+    #[gtest]
+    fn named_read_of_a_registry_filled_by_computed_keys_in_the_same_file_uses_the_written_values() {
+        let mut ws = VirtualWorkspace::new();
+        let file = ws.def_file(
+            "lua/autorun/registry.lua",
+            r#"
+            local reg = {}
+            local function addLocal(name) reg[name] = 1 end
+            local r1 = reg.tom
+
+            Holder = {}
+            Holder.Map = {}
+            local function addField(name) Holder.Map[name] = 1 end
+            local r2 = Holder.Map.tom
+
+            local Box = { Map = {} }
+            local function addInner(name) Box.Map[name] = 1 end
+            local r3 = Box.Map.tom
+            "#,
+        );
+
+        let reads = ["r1", "r2", "r3"].map(|name| ws.humanize_type(ws.local_ty(file, name)));
+        assert_that!(reads, each(eq("1?")));
+    }
+
+    /// A field only ever written with what is read back from it holds the
+    /// values that enter from outside the cycle: the `0` default.
+    #[gtest]
+    fn a_member_written_only_from_its_own_reads_holds_the_values_entering_the_cycle() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "lua/entities/base_thing/cl_init.lua",
+            r#"
+            function ENT:Read()
+                local current = self._value or 0
+                return current
+            end
+            function ENT:Tick()
+                self._value = self:Read()
+            end
+            "#,
+        );
+
+        let current = ws.local_ty(file, "current");
+        assert_that!(ws.humanize_type(current), eq("0"));
+    }
+
+    /// A method that runs every frame reads back what its last run stored.
+    #[gtest]
+    fn a_field_a_method_reads_before_storing_it_again_holds_the_stored_values() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "lua/entities/base_thing/cl_init.lua",
+            r#"
+            ---@param from number
+            ---@param to number
+            ---@return number
+            local function decay(from, to) return to + (from - to) * 0.5 end
+            function ENT:Think()
+                local stored = self._expanded
+                local current = stored or 0
+                current = decay(current, 1)
+                self._expanded = current
+            end
+            "#,
+        );
+
+        let stored = ws.local_ty(file, "stored");
+        assert_that!(ws.humanize_type(stored), eq("number"));
     }
 
     #[gtest]
@@ -5240,11 +5314,10 @@ marauth.character = marauth.character or {}
         let cold = local_name_type(&mut ws, consumer, "cost");
         ws.analysis.reindex_files(vec![consumer]);
         let warm = local_name_type(&mut ws, consumer, "cost");
-        // The member the read waits on holds an `unknown` value, so the sealed
-        // index answers `unknown|nil` for `stored[itemID]` and `.cost` of its
-        // unknown arm is `unknown` — the answer the read must also reach when
-        // it first runs before the deferred write lands.
-        assert_that!(warm, eq(&LuaType::Unknown));
+        // The member the read waits on holds the registered `ITEM`, so `.cost`
+        // is its `0` — the answer the read must also reach when it first runs
+        // before the deferred write lands.
+        assert_that!(warm, eq(&LuaType::IntegerConst(0)));
         assert_eq!(cold, warm, "re-index moved the dynamic-key read's answer");
     }
 
@@ -6075,6 +6148,7 @@ end
         #[test]
         fn test_plugin_shared_local_alias_preserves_included_fields_and_methods() {
             let mut ws = VirtualWorkspace::new();
+            ws.def_gmod_call_arg_builtins();
             ws.def_file(
                 "lua/plugins/plugin_a/config.lua",
                 r#"
@@ -6952,5 +7026,228 @@ string = {}
                 )],
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod created_instance_write_test {
+    use crate::{Emmyrc, FileId, VirtualWorkspace};
+
+    const PANELS: &str = "lua/autorun/client/cl_panels.lua";
+    const WRITER: &str = "lua/autorun/client/cl_writer.lua";
+    const WRITER_TEXT: &str =
+        "local b = vgui.Create(\"DTextEntry\")\nb.MyData = 1\nlocal own = b.MyData\n";
+    const READER: &str = "lua/autorun/client/cl_reader.lua";
+
+    fn workspace(writer: &str, reader: &str) -> (VirtualWorkspace, FileId, FileId) {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(PANELS, "---@class Panel\n---@class DTextEntry: Panel\n");
+        let writer = ws.def_file(WRITER, writer);
+        let reader = ws.def_file(READER, reader);
+        (ws, writer, reader)
+    }
+
+    fn ty(ws: &VirtualWorkspace, file_id: FileId, name: &str) -> String {
+        ws.humanize_type(ws.local_ty(file_id, name))
+    }
+
+    const FRESH: &str = "local e = vgui.Create(\"DTextEntry\")\nlocal d = e.MyData\nlocal control = e.NeverWritten\n";
+
+    /// A field set on one created panel is that panel's: another panel the
+    /// same call makes elsewhere does not have it.
+    #[test]
+    fn a_field_set_on_one_created_panel_is_not_on_another() {
+        let (ws, _, reader) = workspace(WRITER_TEXT, FRESH);
+
+        assert_eq!(ty(&ws, reader, "d"), ty(&ws, reader, "control"));
+    }
+
+    /// The panel the field was set on reads it.
+    #[test]
+    fn the_created_panel_reads_its_own_field() {
+        let (ws, writer, _) = workspace(WRITER_TEXT, FRESH);
+
+        assert_eq!(ty(&ws, writer, "own"), "1");
+    }
+
+    /// Code that can be given any panel of the class sees the field: a
+    /// parameter typed as the class and the panel a callback receives.
+    #[test]
+    fn code_given_any_panel_of_the_class_sees_the_field() {
+        let (ws, writer, reader) = workspace(
+            &format!("{WRITER_TEXT}function b:OnChange()\n    local mine = self.MyData\nend\n"),
+            "---@param p DTextEntry\nlocal function Read(p)\n    local given = p.MyData\nend\n",
+        );
+
+        assert_eq!(
+            (ty(&ws, writer, "mine"), ty(&ws, reader, "given")),
+            ("1".to_string(), "1".to_string())
+        );
+    }
+
+    /// A field every panel of a class gets in its `Init` is on a fresh panel.
+    #[test]
+    fn a_field_set_in_init_is_on_every_created_panel() {
+        let (ws, _, reader) = workspace(
+            "local PANEL = {}\nfunction PANEL:Init()\n    self.MyData = 1\nend\nvgui.Register(\"MyEntry\", PANEL, \"Panel\")\n",
+            "local e = vgui.Create(\"MyEntry\")\nlocal d = e.MyData\n",
+        );
+
+        assert_eq!(ty(&ws, reader, "d"), "1");
+    }
+
+    /// Moving the field from one created panel into the class's `Init`, and
+    /// back, settles as a cold build.
+    #[test]
+    fn moving_a_field_between_one_panel_and_init_settles_as_a_cold_build() {
+        let setup = |ws: &mut VirtualWorkspace| {
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+            ws.def_gmod_call_arg_builtins();
+        };
+        const INIT: &str = "local PANEL = {}\nfunction PANEL:Init()\n    self.MyData = 1\nend\nvgui.Register(\"DTextEntry\", PANEL, \"Panel\")\n";
+        let files = [
+            (PANELS, "---@class Panel\n"),
+            (WRITER, WRITER_TEXT),
+            (READER, FRESH),
+        ];
+        VirtualWorkspace::assert_warm_matches_cold(setup, &files, &[(WRITER, INIT)]);
+        VirtualWorkspace::assert_warm_matches_cold(
+            setup,
+            &[
+                (PANELS, "---@class Panel\n"),
+                (WRITER, INIT),
+                (READER, FRESH),
+            ],
+            &[(WRITER, WRITER_TEXT)],
+        );
+    }
+}
+
+#[cfg(test)]
+mod created_entity_write_test {
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{DiagnosticCode, Emmyrc, FileId, VirtualWorkspace};
+
+    const ENTITIES: &str = "---@meta
+---@class Entity
+---@class NULL
+---@class Vehicle: Entity
+---@class prop_vehicle_prisoner_pod: Vehicle
+---@class prop_physics: Entity
+ents = {}
+---@generic T: Entity
+---@param class `T`
+---@return (instance) T|NULL
+function ents.Create(class) end
+";
+    const WRITER: &str = "lua/autorun/server/sv_writer.lua";
+    const SEAT_WRITER: &str =
+        "local seat = ents.Create(\"prop_vehicle_prisoner_pod\")\nseat.SeatIndex = 1\n";
+    const READER: &str = "lua/autorun/server/sv_reader.lua";
+    const VEHICLE_READER: &str =
+        "---@param v Vehicle\nlocal function Read(v)\n    local seatIndex = v.SeatIndex\nend\n";
+
+    fn workspace(writer: &str, reader: &str) -> (VirtualWorkspace, FileId) {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file("lua/includes/entities.lua", ENTITIES);
+        ws.def_file(WRITER, writer);
+        let reader = ws.def_file(READER, reader);
+        (ws, reader)
+    }
+
+    fn unguarded_child_messages(ws: &mut VirtualWorkspace, file_id: FileId) -> Vec<String> {
+        messages(ws, file_id, DiagnosticCode::InferUnguardedChild)
+    }
+
+    fn messages(ws: &mut VirtualWorkspace, file_id: FileId, code: DiagnosticCode) -> Vec<String> {
+        ws.analysis.diagnostic.enable_only(code);
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String(code.get_name().to_string()))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect()
+    }
+
+    /// `ents.Create` returns `T|NULL`: a field set on one created entity is
+    /// still not on another of the same class.
+    #[test]
+    fn a_field_set_on_one_created_entity_is_not_on_another() {
+        let (ws, reader) = workspace(
+            "local a = ents.Create(\"prop_physics\")\na.OnlyA = 1\n",
+            "local b = ents.Create(\"prop_physics\")\nlocal d = b.OnlyA\nlocal control = b.NeverWritten\n",
+        );
+
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(reader, "d")),
+            ws.humanize_type(ws.local_ty(reader, "control"))
+        );
+    }
+
+    /// Reading a field another created entity was given is reported as
+    /// undefined, as a field no entity was given is.
+    #[test]
+    fn a_field_only_another_created_entity_was_given_is_undefined() {
+        let (mut ws, reader) = workspace(
+            "local a = ents.Create(\"prop_physics\")\na.OnlyA = 1\n",
+            "local b = ents.Create(\"prop_physics\")\nprint(b.OnlyA)\nprint(b.NeverWritten)\n",
+        );
+
+        assert_eq!(
+            messages(&mut ws, reader, DiagnosticCode::UndefinedField),
+            [
+                "Undefined field `OnlyA`. ",
+                "Undefined field `NeverWritten`. "
+            ]
+        );
+    }
+
+    /// A field set on a created entity is declared by its class, so a read
+    /// through a parent class is told which class to guard for.
+    #[test]
+    fn a_field_set_on_a_created_entity_names_its_class_to_a_parent_class_read() {
+        let (mut ws, reader) = workspace(SEAT_WRITER, VEHICLE_READER);
+
+        assert_eq!(
+            unguarded_child_messages(&mut ws, reader),
+            [
+                "`SeatIndex` is only defined on `prop_vehicle_prisoner_pod`, but the value is `Vehicle`. Add a guard that narrows it to `prop_vehicle_prisoner_pod`."
+            ]
+        );
+    }
+
+    /// Deleting the writing file withdraws the class's declaration, and
+    /// reopening it restores it.
+    #[test]
+    fn deleting_and_reopening_the_writer_withdraws_and_restores_the_declaration() {
+        let (mut ws, reader) = workspace(SEAT_WRITER, VEHICLE_READER);
+        let initial = unguarded_child_messages(&mut ws, reader);
+        let writer_uri = ws.virtual_url_generator.new_uri(WRITER);
+        ws.analysis
+            .remove_file_by_uri(&writer_uri)
+            .0
+            .expect("writer must be removed");
+        let deleted = unguarded_child_messages(&mut ws, reader);
+        ws.def_file(WRITER, SEAT_WRITER);
+        let reopened = unguarded_child_messages(&mut ws, reader);
+
+        assert_eq!(
+            (initial.len(), deleted, reopened == initial),
+            (1, Vec::<String>::new(), true)
+        );
     }
 }

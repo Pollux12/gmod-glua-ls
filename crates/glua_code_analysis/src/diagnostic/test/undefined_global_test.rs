@@ -2012,6 +2012,7 @@ mod test {
             ),
         ] {
             let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            ws.def_gmod_call_arg_builtins();
             ws.def_file(
                 "lua/includes/extensions/util.lua",
                 "---@param value any\n---@return TypeGuard<table>\nfunction istable(value) end\npredicates = {}\n---@param value any\n---@return TypeGuard<table>\nfunction predicates.isTable(value) end\n",

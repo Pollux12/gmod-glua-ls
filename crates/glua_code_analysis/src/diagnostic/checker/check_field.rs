@@ -832,13 +832,49 @@ fn has_unresolved_metatable_index_inner(
                 metatable_leaves_members_open(db, semantic_model, metatable, position)
             })
         }
-        LuaType::Instance(instance) => has_unresolved_metatable_index_inner(
-            db,
-            semantic_model,
-            instance.get_base(),
-            position,
-            visited,
-        ),
+        // A table one call made has the metatable `__index` that call's
+        // arguments give it.
+        LuaType::Instance(instance) => {
+            let factory_index = if instance.get_kind() != crate::LuaInstanceKind::Shared
+                && let LuaType::TableConst(base) = instance.get_base()
+            {
+                crate::semantic::factory_bound_metatable_index(
+                    db,
+                    &mut semantic_model.get_cache().borrow_mut(),
+                    base,
+                    std::slice::from_ref(instance.get_range()),
+                )
+            } else {
+                None
+            };
+            if let Some(index_type) = factory_index {
+                return index_type.is_unknown()
+                    || index_type.is_any()
+                    || matches!(
+                        index_type,
+                        LuaType::Function | LuaType::Signature(_) | LuaType::DocFunction(_)
+                    )
+                    || has_unresolved_metatable_index_inner(
+                        db,
+                        semantic_model,
+                        &index_type,
+                        position,
+                        visited,
+                    );
+            }
+            has_unresolved_metatable_index_inner(
+                db,
+                semantic_model,
+                instance.get_base(),
+                position,
+                visited,
+            )
+        }
+        // A class is the metatable of the values typed as it: an `__index`
+        // function of its own, or one it inherits, answers any key.
+        LuaType::Ref(_) | LuaType::Def(_) => {
+            crate::semantic::code_index_function(db, prefix_typ).is_some()
+        }
         LuaType::Union(union) => match union.nullable_inner() {
             Some(typ) => {
                 has_unresolved_metatable_index_inner(db, semantic_model, typ, position, visited)
@@ -1509,12 +1545,12 @@ fn is_unresolved_panel_registration_table(
     .flat_map(|(calls, default_table_arg_idx)| {
         calls.iter().map(move |call| {
             (
-                call.vgui_panel_table_arg_source(default_table_arg_idx),
+                call.class_registration_table_arg_source(default_table_arg_idx),
                 call,
             )
         })
     })
-    .filter(|(source, _)| !source.is_derived())
+    .filter_map(|(source, call)| Some((source.filter(|source| !source.is_derived())?, call)))
     .any(|(source, call)| {
         call.args
             .get(source.arg_idx)
@@ -1540,15 +1576,24 @@ fn table_const_has_only_dynamic_key_members(
     id: &crate::InFiled<rowan::TextRange>,
 ) -> bool {
     // Literal-key writes fold to `Name`/`Integer` in `LuaMemberKey::from_expr_type`.
-    // An all-`ExprType` owner therefore has a fully dynamic key set, not a closed struct.
+    // An all-`ExprType` owner therefore has a fully dynamic key set, not a closed struct,
+    // unless every computed write names a known set of fields.
     let owner = LuaMemberOwner::Element(id.clone());
     let Some(members) = db.get_member_index().get_members(&owner) else {
         return false;
+    };
+    let dynamic_owner = crate::dynamic_field_owner_of(db, &owner);
+    let names_known = |member: &crate::LuaMember| {
+        dynamic_owner.as_ref().is_some_and(|dynamic_owner| {
+            db.get_dynamic_field_index()
+                .member_has_finite_named_definition(dynamic_owner, member.get_id())
+        })
     };
     !members.is_empty()
         && members
             .iter()
             .all(|member| matches!(member.get_key(), LuaMemberKey::ExprType(_)))
+        && !members.iter().all(|member| names_known(member))
 }
 
 fn index_key_is_literal_member(index_key: &LuaIndexKey) -> bool {
@@ -1794,8 +1839,7 @@ fn is_nil_safe_expr_context<T: LuaAstNode>(semantic_model: &SemanticModel, node:
 
                 return false;
             }
-            LuaSyntaxKind::RequireCallExpr
-            | LuaSyntaxKind::ErrorCallExpr
+            LuaSyntaxKind::ErrorCallExpr
             | LuaSyntaxKind::AssertCallExpr
             | LuaSyntaxKind::TypeCallExpr
             | LuaSyntaxKind::SetmetatableCallExpr
@@ -2855,7 +2899,12 @@ fn has_dynamic_field_for_type_inner(
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => {
             let owner = crate::DynamicFieldOwner::Type(id.clone());
-            if index.has_field(&owner, field_name) || owner_wildcard_covers_any_field(db, &owner) {
+            let has_field = if direct_only {
+                index.has_direct_field(&owner, field_name)
+            } else {
+                index.has_field(&owner, field_name)
+            };
+            if has_field || owner_wildcard_covers_any_field(db, &owner) {
                 return true;
             }
             // Walk parent types: dynamic fields written on a parent class

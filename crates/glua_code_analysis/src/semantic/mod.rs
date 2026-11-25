@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(test)]
 pub(crate) use infer::CONSTANT_EXPR_CLASSIFICATIONS;
 #[cfg(test)]
+pub(crate) use infer::FUNCTION_INDEX_READS;
+#[cfg(test)]
 pub(crate) use infer::narrow::get_type_at_flow::BASELINE_FLOW_WALKS;
 
 pub(crate) use cache::MemoFootprint;
@@ -35,7 +37,10 @@ pub(crate) use decl::value::{
     local_name_value, metatable_member_owner, semantic_decl_closure_signature_id,
     semantic_decl_signature_id, semantic_decl_value, semantic_decl_value_expr,
 };
-pub use decl::{enum_variable_is_param, parse_require_module_info};
+pub use decl::{
+    enum_variable_is_param, is_require_call, is_require_decl, parse_require_module_info,
+    require_path_arg,
+};
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaDocType,
     LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, LuaNameExpr, LuaParseError,
@@ -47,30 +52,40 @@ pub(crate) use gmod_vgui_context::{
     resolve_registered_vgui_method_context_for_func,
 };
 pub(crate) use infer::check_iter_var_range;
+pub(crate) use infer::code_index_function;
 pub(crate) use infer::get_prefix_expr_signature_id;
 pub(crate) use infer::infer_bind_value_type;
 pub(crate) use infer::infer_expr_list_types;
 pub use infer::infer_index_expr;
+pub(crate) use infer::loaded_file_of_call;
 pub(crate) use infer::local_call_reference_expectations;
 pub(crate) use infer::narrow::{InferConditionFlow, apply_cast};
 pub use infer::narrow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
 };
 pub(crate) use infer::narrow::{
-    get_var_ref_type, infer_true_condition_narrowing, infer_var_type_at_node, type_name_test,
+    get_var_ref_type, infer_true_condition_narrowing, infer_var_type_at_closure_end,
+    infer_var_type_at_node, type_name_test,
 };
 pub(crate) use infer::pairs_iter_value_registry_path;
-pub(crate) use infer::presence_guard_target;
 pub(crate) use infer::resolve_decl_backed_global_path_member_type;
 pub(crate) use infer::resolve_type_text;
-pub(crate) use infer::table_backing_range_from_expr;
+pub(crate) use infer::setmetatable_target_of_literal;
 pub(crate) use infer::{
     AccessPaths, keep_access_paths, restore_access_path_snapshot, stop_keeping_access_paths,
     take_access_path_snapshot, with_access_paths,
 };
 pub(crate) use infer::{declaring_for_range, try_infer_enclosing_for_range_iter_type};
+pub(crate) use infer::{
+    factory_bound_metatable_index, passed_arg, seen_local_function_calls,
+    takes_local_call_site_args, with_file_cache,
+};
+pub(crate) use infer::{
+    getmetatable_call_metatable, proxy_metatable, table_backing_range_from_expr,
+};
 use infer::{infer_call_arg_expr_list_types, infer_expr_list_value_type_at};
 pub use infer::{infer_table_field_value_should_be, infer_table_should_be};
+pub(crate) use infer::{presence_guard_target, type_guard_target_expr};
 use lsp_types::Uri;
 pub use member::LuaMemberInfo;
 pub use member::find_index_operations;
@@ -83,6 +98,7 @@ pub(crate) use member::infer_owner_raw_member_type_with_realm;
 pub(crate) use member::infer_raw_member_type_with_cache;
 pub(crate) use member::member_key_matches_type;
 pub(crate) use member::merge_open_table_types;
+pub(crate) use member::snapshot_table_type;
 pub(crate) use member::visible_super_types_in_workspace_for_file_at_offset;
 pub(crate) use member::{MetatableIndexField, find_metatable_index_field};
 pub(crate) use member::{dynamic_field_type_without, resolve_dynamic_field_member};
@@ -127,9 +143,11 @@ pub use guard::{InferGuard, InferGuardRef};
 pub use infer::InferFailReason;
 pub(crate) use infer::floors_unsettled;
 pub(crate) use infer::infer_authoritative_method_self_type;
+pub(crate) use infer::infer_binary_expr_and;
 pub use infer::infer_call_expr_func;
 pub(crate) use infer::infer_enclosing_self_type;
 pub(crate) use infer::infer_expr;
+pub(crate) use infer::infer_member_by_member_key;
 pub(crate) use infer::is_authoritative_self_receiver_type;
 pub(crate) use infer::is_concrete_self_receiver_type;
 pub(crate) use infer::remove_false_or_nil;
@@ -139,7 +157,7 @@ pub use infer::{SelfRefId, VarRefId, VarRefRootId};
 pub(crate) use infer::{
     condition_has_concrete_type_evidence, condition_nominal_type, contains_gmod_null_type,
     get_var_expr_var_ref_id, getter_access_path, is_gmod_null_entity_candidate,
-    narrowing_root_decl, raw_get_access_path, respell_path_root,
+    narrowing_root_decl, respell_path_root,
 };
 pub use infer::{infer_param, infer_param_with_cache};
 use overload_resolve::resolve_signature;
@@ -157,6 +175,19 @@ pub(crate) fn unwrap_paren_to_name_expr(expr: &LuaExpr) -> Option<LuaNameExpr> {
         LuaExpr::NameExpr(name_expr) => Some(name_expr.clone()),
         LuaExpr::ParenExpr(paren_expr) => unwrap_paren_to_name_expr(&paren_expr.get_expr()?),
         _ => None,
+    }
+}
+
+/// `expr` without the parentheses around it.
+pub(crate) fn without_parens(mut expr: LuaExpr) -> LuaExpr {
+    loop {
+        let LuaExpr::ParenExpr(paren) = &expr else {
+            return expr;
+        };
+        let Some(inner) = paren.get_expr() else {
+            return expr;
+        };
+        expr = inner;
     }
 }
 

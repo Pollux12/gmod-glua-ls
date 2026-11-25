@@ -63,12 +63,43 @@ struct SignatureFacts {
     class_name_param_return_alias: Option<LuaClassNameReturnAlias>,
     /// Every return is the colon receiver `self`, never reassigned.
     returns_receiver: bool,
+    instance_return_alias: Option<LuaInstanceReturnAlias>,
     falsy_param_nil_free_return_slots: Vec<LuaFalsyParamNilFreeReturnSlot>,
     falsy_param_return_aliases: Vec<LuaFalsyParamReturnAlias>,
     /// The table constructors and calls whose value the function returns and
     /// which each call of it evaluates anew, relative to the function's start
     /// so a shift of its file leaves the fact unchanged.
     fresh_returned_values: Vec<TextRange>,
+}
+
+/// A function whose every return is a table given the metatable `metatable`
+/// names: each call returns an instance of that call's metatable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LuaInstanceReturnAlias {
+    pub metatable: LuaInstanceMetatable,
+    /// Whether the metatable is the literal `{ __index = X }` around what
+    /// `metatable` names, which instances then read through directly.
+    pub index_is_metatable_field: bool,
+    /// The table constructor every call makes anew for the instance, relative
+    /// to the function's start so a shift of its file leaves the fact unchanged.
+    pub table: Option<TextRange>,
+}
+
+/// Where a call of a function with a [`LuaInstanceReturnAlias`] takes the
+/// metatable of the instance it returns from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LuaInstanceMetatable {
+    /// Its parameter, counting a method's `self` as parameter 0.
+    Param(usize),
+    /// A table the function that made it constructs, named at `name`
+    /// (relative to the function's start). That function makes a new one on
+    /// each call, along with this function, so a call through one of those
+    /// tables makes instances of that one.
+    Upvalue { name: TextRange },
+    /// Its parameter `param`, when it returns the call `param.key(...)` or
+    /// `param:key(...)` at `call` (relative to the function's start) and that
+    /// call makes an instance of `param`.
+    MadeBy { param: usize, call: TextRange },
 }
 
 /// A call whose result the function returns and which is handed some of the
@@ -174,6 +205,7 @@ impl Hash for LuaSignature {
         self.direct_param_return_alias().hash(state);
         self.class_name_param_return_alias().hash(state);
         self.returns_receiver().hash(state);
+        self.instance_return_alias().hash(state);
         self.falsy_param_nil_free_return_slots().hash(state);
         self.falsy_param_return_aliases().hash(state);
         self.fresh_returned_values().hash(state);
@@ -262,6 +294,14 @@ impl LuaSignature {
 
     pub fn set_returns_receiver(&mut self) {
         self.facts_mut().returns_receiver = true;
+    }
+
+    pub fn set_instance_return_alias(&mut self, alias: LuaInstanceReturnAlias) {
+        self.facts_mut().instance_return_alias = Some(alias);
+    }
+
+    pub fn instance_return_alias(&self) -> Option<&LuaInstanceReturnAlias> {
+        self.facts.as_ref()?.instance_return_alias.as_ref()
     }
 
     pub fn returns_receiver(&self) -> bool {

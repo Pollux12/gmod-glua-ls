@@ -2,7 +2,8 @@ mod infer_binary_and;
 mod infer_binary_or;
 
 use glua_parser::{BinaryOperator, LuaAstNode, LuaBinaryExpr, LuaExpr, LuaIndexKey, LuaNameExpr};
-use infer_binary_and::{infer_binary_expr_and, special_and_rule};
+pub(crate) use infer_binary_and::infer_binary_expr_and;
+use infer_binary_and::special_and_rule;
 use infer_binary_or::{infer_binary_expr_or, special_or_rule};
 use smol_str::SmolStr;
 
@@ -12,7 +13,9 @@ use crate::{
     get_real_type,
 };
 
-use super::{InferFailReason, InferResult, get_custom_type_operator, infer_expr};
+use super::{
+    InferFailReason, InferResult, get_custom_type_operator, infer_expr, infer_metamethod_result,
+};
 
 pub fn infer_binary_expr(
     db: &DbIndex,
@@ -327,6 +330,13 @@ fn infer_binary_custom_operator(
         }
     }
 
+    if let Some(result) = [left, right]
+        .into_iter()
+        .find_map(|operand| infer_metamethod_result(db, operand, op))
+    {
+        return result;
+    }
+
     match op {
         LuaOperatorMetaMethod::Add
         | LuaOperatorMetaMethod::Sub
@@ -391,18 +401,33 @@ fn infer_binary_expr_add(db: &DbIndex, left: LuaType, right: LuaType) -> InferRe
         };
     }
 
-    // A value we know nothing about takes the other operand's type, unless that
-    // operand's own `__add` is what runs for a `nil`.
-    let nil_has_operator = |nil_side: &LuaType, other: &LuaType| {
-        nil_side.is_nil() && has_operator_taking_nil(db, other, BinaryOperator::OpAdd)
+    // Adding a value we know nothing about yields the other operand's type when
+    // that is a number or a class whose `__add` may return itself, a number for
+    // a string Lua coerces, and nothing known otherwise. A `nil` leaves the
+    // answer to the other operand's `__add` when that takes `nil`.
+    let sum_with_unknown = |unknown_side: &LuaType, other: &LuaType| {
+        if (unknown_side.is_nil() && has_operator_taking_nil(db, other, BinaryOperator::OpAdd))
+            || infer_metamethod_result(db, other, LuaOperatorMetaMethod::Add).is_some()
+        {
+            None
+        } else if other.is_number() || other.is_custom_type() {
+            Some(other.clone())
+        } else if other.is_string() {
+            Some(LuaType::Number)
+        } else {
+            Some(LuaType::Unknown)
+        }
     };
-    match (
+    let sum = match (
         left.is_nil() || left.is_any() || left.is_unknown(),
         right.is_nil() || right.is_any() || right.is_unknown(),
     ) {
-        (true, false) if !nil_has_operator(&left, &right) => return Ok(right),
-        (false, true) if !nil_has_operator(&right, &left) => return Ok(left),
-        _ => {}
+        (true, false) => sum_with_unknown(&left, &right),
+        (false, true) => sum_with_unknown(&right, &left),
+        _ => None,
+    };
+    if let Some(sum) = sum {
+        return Ok(sum);
     }
 
     infer_binary_custom_operator(db, &left, &right, LuaOperatorMetaMethod::Add)
@@ -539,7 +564,7 @@ fn infer_binary_expr_pow(db: &DbIndex, left: LuaType, right: LuaType) -> InferRe
 }
 
 fn infer_binary_expr_concat(db: &DbIndex, left: LuaType, right: LuaType) -> InferResult {
-    if left.is_number() || left.is_string() || right.is_number() || right.is_string() {
+    if (left.is_number() || left.is_string()) && (right.is_number() || right.is_string()) {
         match (&left, &right) {
             (LuaType::StringConst(s1), LuaType::StringConst(s2)) => {
                 return Ok(LuaType::StringConst(

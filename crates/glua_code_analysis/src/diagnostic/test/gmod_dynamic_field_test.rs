@@ -1598,6 +1598,70 @@ function UnknownPosition() end"
         );
     }
 
+    /// GMod's `permissions.lua` reads `self:GetParent():GetParent().Title` as
+    /// a `Panel`: `ServerPermissionsPanel` sets it from an untyped group id,
+    /// `ugcpublish.lua`'s window to a `DTextEntry`.
+    #[gtest]
+    fn test_base_panel_field_one_subclass_sets_untyped_is_no_param_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/gmod.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@class Panel : Entity
+            ---@return Panel
+            function Panel:GetParent() end
+            ---@class DTextEntry : Panel
+            ---@class DFrame : Panel
+            ---@generic T: Panel
+            ---@param classname `T`
+            ---@param parent? Panel
+            ---@return (instance) T?
+            function vgui.Create(classname, parent) end
+            ---@generic T: Panel
+            ---@param classname string
+            ---@param panelTable T
+            ---@param baseName? string
+            ---@return T
+            function vgui.Register(classname, panelTable, baseName) end
+            ---@param name string
+            function permissions_Revoke(name) end
+            "#,
+        );
+        ws.def_file(
+            "lua/menu/ugcpublish.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Init()
+                self.Title = vgui.Create("DTextEntry", self)
+            end
+            vgui.Register("UGCPublishWindow", PANEL, "DFrame")
+            "#,
+        );
+        let target_file = ws.def_file(
+            "lua/menu/problems/permissions.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:SetGroup(groupID)
+                self.Title = groupID
+            end
+            vgui.Register("ServerPermissionsPanel", PANEL, "Panel")
+
+            ---@param row Panel
+            local function revoke(row)
+                permissions_Revoke(row:GetParent().Title)
+            end
+            "#,
+        );
+
+        assert_that!(
+            diagnostic_messages_for_file(&mut ws, target_file, DiagnosticCode::ParamTypeMismatch),
+            is_empty()
+        );
+    }
+
     #[gtest]
     fn test_reassigned_param_is_not_treated_as_direct_return_alias() {
         let mut ws = VirtualWorkspace::new();
@@ -1952,10 +2016,10 @@ function UnknownPosition() end"
         );
     }
 
-    /// A table populated only through computed keys has no statically knowable
-    /// field names, so reads off it are never actionable typos.
+    /// A table populated only through computed keys holds the names its
+    /// function's calls pass, when every call is seen.
     #[gtest]
-    fn test_pure_computed_key_registry_suppresses_undefined_field() {
+    fn test_computed_key_registry_reports_names_no_call_passes() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def_file(
             "lua/registry.lua",
@@ -1977,7 +2041,7 @@ function UnknownPosition() end"
 
         assert_eq!(
             diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedField),
-            Vec::<String>::new()
+            vec!["Undefined field `Anything`. "]
         );
     }
 
@@ -2408,6 +2472,60 @@ function UnknownPosition() end"
             vec!["Undefined field `Speed`. "]
         );
         assert_eq!(ws.humanize_type(ws.local_ty(reader, "speed")), "1");
+    }
+
+    /// A registered panel's instance overriding a method its base declares
+    /// changes that panel class, not the method every other panel reads.
+    #[gtest]
+    fn subclass_write_of_a_member_an_ancestor_declares_stays_off_the_parents() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Panel
+            local Panel = {}
+            ---@return any
+            function Panel:GetValue() end
+            ---@class DTextEntry: Panel
+
+            vgui = {}
+            ---@generic T: Panel
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@param classname `T`
+            ---@return (instance) T?
+            function vgui.Create(classname) end
+
+            ---@[call_arg("gmod.vgui_panel", "define")]
+            ---@param name string
+            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@param panel table
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param base string
+            function vgui.Register(name, panel, base) end
+            "#,
+        );
+        ws.def_file(
+            "lua/vgui/my_text_entry.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Init() end
+            vgui.Register("myTextEntry", PANEL, "DTextEntry")
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/client/use_entries.lua",
+            r#"
+            local panel = vgui.Create("myTextEntry")
+            panel.GetValue = function() return 5 end
+            local entry = vgui.Create("DTextEntry")
+            local v = entry:GetValue()
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "v")), "any");
     }
 
     #[gtest]

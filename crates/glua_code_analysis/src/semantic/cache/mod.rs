@@ -21,7 +21,7 @@ use crate::db_index::derivation::{
 };
 use crate::{
     FileId, FlowId, GmodRealm, InFiled, LuaDeclId, LuaFunctionType, LuaMemberId, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, VarRefId, VarRefRootId,
+    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, VarRefId, VarRefRootId,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::{
         generic::FuncGenericBinding,
@@ -390,14 +390,18 @@ pub struct LuaInferCache {
     /// contradicts, so the files holding these reads are re-derived alongside
     /// the fallback files once the chains settle.
     pub vgui_parent_chain_calls: FxHashSet<LuaSyntaxId>,
-    /// Call sites of a local function, keyed by its declaration. Syntax ids,
-    /// not nodes: red nodes are `!Send`.
-    pub local_function_call_sites_cache: FxHashMap<LuaDeclId, Arc<Vec<LuaSyntaxId>>>,
+    /// Same-file call sites of a function called through a local name, keyed
+    /// by its signature. Syntax ids, not nodes: red nodes are `!Send`.
+    pub local_function_call_sites_cache: FxHashMap<LuaSignatureId, Arc<Vec<LuaSyntaxId>>>,
     /// Whether a call diverges, keyed by the call expression. The flow walk asks
     /// this of every call node it reaches, and answering means resolving what
     /// the call targets through the reference, property, member and signature
     /// indexes.
     pub call_returns_never_cache: TrackedMap<LuaSyntaxId, bool>,
+    /// The signatures a call may reach when every one asserts some of its
+    /// arguments, keyed by the call expression. Asked of every call node the
+    /// flow walk reaches, like [`Self::call_returns_never_cache`].
+    pub asserting_callees_cache: TrackedMap<LuaSyntaxId, Option<Arc<[LuaSignatureId]>>>,
     /// Whether a call site's signature is generic, keyed by the call
     /// expression. Consulted per call-site during inference, so re-inferring
     /// the call prefix each time is avoided.
@@ -462,6 +466,7 @@ impl LuaInferCache {
             vgui_parent_chain_calls: Default::default(),
             local_function_call_sites_cache: Default::default(),
             call_returns_never_cache: Default::default(),
+            asserting_callees_cache: Default::default(),
             signature_is_generic_cache: Default::default(),
             generic_call_bindings: Default::default(),
         }
@@ -841,6 +846,7 @@ impl LuaInferCache {
         empty(&mut self.expr_in_progress);
         self.expr_var_ref_id_cache.clear_local();
         self.call_returns_never_cache.clear_local();
+        self.asserting_callees_cache.clear_local();
         self.local_class_table_member_ids_cache.clear_local();
         self.dynamic_field_resolution_cache.clear_local();
         self.exact_table_member_cache.clear_local();
@@ -923,6 +929,7 @@ impl LuaInferCache {
             dynamic_field_type_cache,
             dynamic_field_definition_syntax_cache,
             call_returns_never_cache,
+            asserting_callees_cache,
             owner_raw_member_type_cache,
             gamemode_class_cache,
         );

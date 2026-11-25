@@ -550,6 +550,146 @@ mod test {
         );
     }
 
+    /// A prototype method reads the fields every instance its constructor
+    /// literal makes starts with.
+    fn prototype_reads_constructor_fields(metatable: &str, constructor_metatable: &str) -> bool {
+        let mut ws = VirtualWorkspace::new();
+        ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            &format!(
+                r#"
+                local Tween = {{}}
+                {metatable}
+
+                function Tween:set(clock)
+                    if clock >= self.duration then
+                        self.clock = self.duration
+                    end
+                end
+
+                function Tween:update(dt)
+                    return self:set(self.clock + dt)
+                end
+
+                ---@param duration number
+                function NewTween(duration)
+                    return setmetatable({{ duration = duration, clock = 0 }}, {constructor_metatable})
+                end
+                "#
+            ),
+        )
+    }
+
+    #[test]
+    fn test_self_indexed_prototype_reads_inline_constructor_fields() {
+        assert!(prototype_reads_constructor_fields(
+            "Tween.__index = Tween",
+            "Tween"
+        ));
+    }
+
+    #[test]
+    fn test_prototype_behind_index_metatable_reads_inline_constructor_fields() {
+        assert!(prototype_reads_constructor_fields(
+            "local Tween_mt = { __index = Tween }",
+            "Tween_mt"
+        ));
+    }
+
+    /// Editing the constructor literal changes what the prototype's methods
+    /// read, and editing it back restores it.
+    #[test]
+    fn test_prototype_follows_edits_to_its_constructor_literal() {
+        let source = |fields: &str| {
+            format!(
+                r#"
+                local Tween = {{}}
+                Tween.__index = Tween
+
+                function Tween:set(clock)
+                    if clock >= self.duration then
+                        self.clock = self.duration
+                    end
+                end
+
+                function Tween:update(dt)
+                    return self:set(self.clock + dt)
+                end
+
+                ---@param duration number
+                function NewTween(duration)
+                    return setmetatable({{ {fields} }}, Tween)
+                end
+                "#
+            )
+        };
+        let mut ws = VirtualWorkspace::new();
+        let mut reads_set_fields = |fields: &str| {
+            ws.check_file_for(
+                DiagnosticCode::NeedCheckNil,
+                "lua/autorun/sh_tween.lua",
+                &source(fields),
+            )
+        };
+        let full = reads_set_fields("duration = duration, clock = 0");
+        let without_duration = reads_set_fields("clock = 0");
+        let restored = reads_set_fields("duration = duration, clock = 0");
+
+        assert_eq!([full, without_duration, restored], [true, false, true]);
+    }
+
+    /// A table of defaults behind `__index` has no methods reading an
+    /// instance as `self`, so what instances start with is not its own.
+    #[test]
+    fn test_defaults_table_behind_index_keeps_its_own_fields() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            local defaults = { color = "red" }
+            local mt = { __index = defaults }
+
+            function NewThing()
+                return setmetatable({ size = 1 }, mt)
+            end
+            "#,
+        );
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let defaults_range = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaTableExpr>()
+            .next()
+            .expect("expected the defaults table")
+            .get_range();
+        let owner = LuaMemberOwner::Element(InFiled::new(file_id, defaults_range));
+        let keys = semantic_model
+            .get_db()
+            .get_member_index()
+            .get_members(&owner)
+            .unwrap_or_default()
+            .iter()
+            .map(|member| member.get_key().clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(keys, vec![LuaMemberKey::Name("color".into())]);
+    }
+
+    #[test]
+    fn test_environment_behind_index_keeps_globals_unchanged() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedGlobal,
+            r#"
+            local env = setmetatable({ sandboxed = true }, { __index = _G })
+            print(sandboxed)
+            "#,
+        ));
+    }
+
     #[test]
     fn test_callable_table_parameter_resolves_as_instance_metatable() {
         let mut ws = VirtualWorkspace::new();
@@ -1194,13 +1334,15 @@ mod test {
     }
 
     #[test]
-    fn test_arbitrary_factory_parameter_leaves_instance_methods_open_but_unattributed() {
+    fn test_arbitrary_factory_parameter_makes_an_instance_of_each_argument() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(
             r#"
             local Class = {}
             Class.__index = Class
             function Class:known() end
+            local Other = {}
+            Other.__index = Other
 
             local function make(metatable)
                 return setmetatable({}, metatable)
@@ -1208,9 +1350,11 @@ mod test {
 
             make(Class):known()
             local probe = make(Class).known
+            local other = make(Other).known
             "#,
         );
-        assert!(!is_function_type(&ws.local_ty(file_id, "probe")));
+        assert!(is_function_type(&ws.local_ty(file_id, "probe")));
+        assert!(!is_function_type(&ws.local_ty(file_id, "other")));
     }
 
     #[test]
@@ -2107,6 +2251,1533 @@ mod test {
             object:Known()
             "#,
         ));
+    }
+
+    /// `getmetatable` answers with the metatable `setmetatable` gave the
+    /// table, whether the table is the call's result or was passed to it.
+    #[test]
+    fn getmetatable_returns_the_metatable_the_table_was_given() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/cat.lua",
+            r#"
+            local CAT = {}
+            CAT.__index = CAT
+            function CAT:Meow() return "meow" end
+
+            local cat = setmetatable({}, CAT)
+            local from_result = getmetatable(cat).Meow
+
+            local dog = {}
+            setmetatable(dog, CAT)
+            local from_statement = getmetatable(dog).Meow
+            "#,
+        );
+
+        for name in ["from_result", "from_statement"] {
+            let typ = ws.local_ty(file_id, name);
+            assert!(is_function_type(&typ), "{name}: {}", ws.humanize_type(typ));
+        }
+    }
+
+    const REGISTERED_COLOR: (&str, &str) = (
+        "lua/autorun/sh_color.lua",
+        r#"
+        local COLOR = {}
+        COLOR.__index = COLOR
+        function COLOR:Brighten() return self end
+        RegisterMetaTable("MyColor", COLOR)
+        local made = setmetatable({}, COLOR)
+        "#,
+    );
+
+    fn registered_color_workspace(reader: &str) -> (VirtualWorkspace, crate::FileId) {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![REGISTERED_COLOR]);
+        let reader = ws.def_file("lua/autorun/sh_reader.lua", reader);
+        (ws, reader)
+    }
+
+    /// `RegisterMetaTable(name, table)` is a class registration call.
+    #[test]
+    fn register_metatable_is_filed_as_a_class_registration() {
+        let (ws, _) = registered_color_workspace("");
+        let db = ws.analysis.compilation.get_db();
+        let uri = ws.virtual_url_generator.new_uri(REGISTERED_COLOR.0);
+        let file_id = ws.analysis.get_file_id(&uri).expect("file id");
+        let calls = db
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(&file_id)
+            .map(|metadata| metadata.metatable_register_calls.len());
+        assert_eq!(calls, Some(1));
+    }
+
+    /// A registered metatable is the class of that name: `FindMetaTable`
+    /// returns it, with its methods and the fields registration adds, and the
+    /// tables given it by `setmetatable` are its instances.
+    #[test]
+    fn a_registered_metatable_is_the_class_find_metatable_returns() {
+        let (ws, reader) = registered_color_workspace(
+            r#"
+            local meta = FindMetaTable("MyColor")
+            local brighten = meta.Brighten
+            local name = meta.MetaName
+            "#,
+        );
+
+        let meta = ws.local_ty(reader, "meta");
+        assert_eq!(ws.humanize_type(meta), "MyColor");
+        assert!(is_function_type(&ws.local_ty(reader, "brighten")));
+        let name = ws.local_ty(reader, "name");
+        assert_eq!(ws.humanize_type(name), "string");
+        let uri = ws.virtual_url_generator.new_uri(REGISTERED_COLOR.0);
+        let color_file = ws.analysis.get_file_id(&uri).expect("file id");
+        let made = ws.local_ty(color_file, "made");
+        assert_eq!(ws.humanize_type(made), "MyColor");
+    }
+
+    /// Renaming a registration, removing it and putting it back leaves what a
+    /// fresh analysis of the final text has.
+    #[test]
+    fn editing_a_metatable_registration_matches_a_fresh_analysis() {
+        let reader = (
+            "lua/autorun/sh_reader.lua",
+            "local meta = FindMetaTable(\"MyColor\")",
+        );
+        let renamed = REGISTERED_COLOR.1.replace("\"MyColor\"", "\"OtherColor\"");
+        let unregistered = REGISTERED_COLOR
+            .1
+            .replace("RegisterMetaTable(\"MyColor\", COLOR)", "");
+        let setup = |ws: &mut VirtualWorkspace| {
+            ws.def_gmod_call_arg_builtins();
+        };
+        VirtualWorkspace::assert_warm_matches_cold(
+            setup,
+            &[REGISTERED_COLOR, reader],
+            &[
+                (REGISTERED_COLOR.0, &renamed),
+                (REGISTERED_COLOR.0, &unregistered),
+            ],
+        );
+        VirtualWorkspace::assert_warm_matches_cold(
+            setup,
+            &[(REGISTERED_COLOR.0, &unregistered), reader],
+            &[REGISTERED_COLOR],
+        );
+    }
+
+    /// `newproxy(true)` gives the proxy a metatable of its own, which
+    /// `getmetatable` returns; `newproxy(p)` shares p's metatable, and reads
+    /// on a proxy go through that metatable's `__index`.
+    #[test]
+    fn a_proxy_has_the_metatable_newproxy_gave_it() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/proxy.lua",
+            r#"
+            local proxy = newproxy(true)
+            local meta = getmetatable(proxy)
+            meta.__index = meta
+            function meta:Name() return "proxy" end
+
+            local other = newproxy(proxy)
+            local from_meta = getmetatable(proxy).Name
+            local from_shared = getmetatable(other).Name
+            local called = other:Name()
+            "#,
+        );
+
+        for name in ["from_meta", "from_shared"] {
+            let typ = ws.local_ty(file_id, name);
+            assert!(is_function_type(&typ), "{name}: {}", ws.humanize_type(typ));
+        }
+        let called = ws.local_ty(file_id, "called");
+        assert_eq!(ws.humanize_type(called), "\"proxy\"");
+    }
+
+    /// A proxy's metatable registered under a name is that class, and the
+    /// proxies sharing it are its instances.
+    #[test]
+    fn a_registered_proxy_metatable_is_a_class() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_handle.lua",
+            r#"
+            local proxy = newproxy(true)
+            local meta = getmetatable(proxy)
+            RegisterMetaTable("Handle", meta)
+            meta.__index = meta
+            function meta:Close() return true end
+
+            local handle = newproxy(proxy)
+            local found = FindMetaTable("Handle")
+            local close = found.Close
+            "#,
+        );
+
+        let handle = ws.local_ty(file_id, "handle");
+        assert_eq!(ws.humanize_type(handle), "Handle");
+        let found = ws.local_ty(file_id, "found");
+        assert_eq!(ws.humanize_type(found), "Handle");
+        assert!(is_function_type(&ws.local_ty(file_id, "close")));
+    }
+
+    const HANDLE_PROXY: (&str, &str) = (
+        "lua/autorun/sh_handle.lua",
+        r#"
+        local meta = FindMetaTable("Handle")
+        local proxy = newproxy(true)
+        meta = getmetatable(proxy)
+        RegisterMetaTable("Handle", meta)
+        meta.__index = meta
+        function meta:Close() return true end
+        HandleProxy = proxy
+        "#,
+    );
+
+    /// The reload-safe form, which reuses the local `FindMetaTable` filled,
+    /// registers the proxy's metatable too, and another file's proxies made
+    /// from the shared one are its instances.
+    #[test]
+    fn a_proxy_metatable_registered_through_a_reused_local_is_a_class() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![HANDLE_PROXY]);
+        let reader = ws.def_file(
+            "lua/autorun/sh_reader.lua",
+            r#"
+            local handle = newproxy(HandleProxy)
+            local closed = handle:Close()
+            local close = FindMetaTable("Handle").Close
+            "#,
+        );
+
+        let handle = ws.local_ty(reader, "handle");
+        assert_eq!(ws.humanize_type(handle), "Handle");
+        let closed = ws.local_ty(reader, "closed");
+        assert_eq!(ws.humanize_type(closed), "true");
+        assert!(is_function_type(&ws.local_ty(reader, "close")));
+    }
+
+    /// Dropping the registration or the proxy's own metatable, and putting
+    /// them back, leaves what a fresh analysis of the final text has.
+    #[test]
+    fn editing_a_proxy_metatable_matches_a_fresh_analysis() {
+        let reader = (
+            "lua/autorun/sh_reader.lua",
+            "local handle = newproxy(HandleProxy)\nlocal closed = handle:Close()",
+        );
+        let unregistered = HANDLE_PROXY
+            .1
+            .replace("RegisterMetaTable(\"Handle\", meta)", "");
+        let no_metatable = HANDLE_PROXY.1.replace("newproxy(true)", "newproxy(false)");
+        let setup = |ws: &mut VirtualWorkspace| {
+            ws.def_gmod_call_arg_builtins();
+        };
+        VirtualWorkspace::assert_warm_matches_cold(
+            setup,
+            &[HANDLE_PROXY, reader],
+            &[
+                (HANDLE_PROXY.0, &unregistered),
+                (HANDLE_PROXY.0, &no_metatable),
+                HANDLE_PROXY,
+            ],
+        );
+    }
+
+    const METATABLE_FACTORY: (&str, &str) = (
+        "lua/autorun/sh_meta.lua",
+        r#"
+        function CreateMetaTable(name)
+            local metaName = "Example." .. name
+            local meta = FindMetaTable(metaName)
+            if meta then
+                return meta
+            end
+
+            local proxy = newproxy(true)
+            meta = getmetatable(proxy)
+            RegisterMetaTable(metaName, meta)
+            meta.__index = meta
+            function meta:GetTable() return {} end
+            return meta
+        end
+        "#,
+    );
+
+    /// A function that registers the metatable it returns makes each call a
+    /// class registration: the local the call fills is the named class.
+    #[test]
+    fn a_metatable_factory_call_registers_the_class_it_returns() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![METATABLE_FACTORY]);
+        let bone = ws.def_file(
+            "lua/autorun/sh_bone.lua",
+            r#"
+            local BONE = CreateMetaTable("Bone")
+            function BONE:Name() return "bone" end
+            "#,
+        );
+        let reader = ws.def_file(
+            "lua/autorun/sh_reader.lua",
+            r#"
+            local found = FindMetaTable("Example.Bone")
+            local name = found.Name
+            "#,
+        );
+
+        let class = ws.local_ty(bone, "BONE");
+        assert_eq!(ws.humanize_type(class), "Example.Bone");
+        let found = ws.local_ty(reader, "found");
+        assert_eq!(ws.humanize_type(found), "Example.Bone");
+        assert!(is_function_type(&ws.local_ty(reader, "name")));
+    }
+
+    /// What the factory puts on the table it returns, including the fields
+    /// the registration adds, belongs to every class a call makes.
+    #[test]
+    fn a_factory_made_class_has_what_the_factory_put_on_its_table() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![METATABLE_FACTORY]);
+        let bone = ws.def_file(
+            "lua/autorun/sh_bone.lua",
+            r#"
+            local BONE = CreateMetaTable("Bone")
+            function BONE:Name() return self:GetTable() end
+            local name = BONE.MetaName
+            local tab = BONE:Name()
+            "#,
+        );
+
+        let name = ws.local_ty(bone, "name");
+        assert_eq!(ws.humanize_type(name), "string");
+        let tab = ws.local_ty(bone, "tab");
+        assert_eq!(ws.humanize_type(tab), "table");
+    }
+
+    /// A function that returns what a factory call returns is a factory
+    /// too, whether it returns the call or a local holding it.
+    #[test]
+    fn a_function_returning_a_factory_call_is_a_factory() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![(
+            "lua/autorun/sh_meta.lua",
+            r#"
+            function NewClass(name)
+                local meta = {}
+                meta.__index = meta
+                RegisterMetaTable(name, meta)
+                return meta
+            end
+
+            function NewWidget(name)
+                return NewClass("Widget." .. name)
+            end
+
+            function NewGadget(name)
+                local gadget = NewClass("Gadget." .. name)
+                gadget.Kind = name
+                return gadget
+            end
+            "#,
+        )]);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_use.lua",
+            r#"
+            local WIDGET = NewWidget("Button")
+            local GADGET = NewGadget("Lamp")
+            "#,
+        );
+
+        let widget = ws.local_ty(file_id, "WIDGET");
+        assert_eq!(ws.humanize_type(widget), "Widget.Button");
+        let gadget = ws.local_ty(file_id, "GADGET");
+        assert_eq!(ws.humanize_type(gadget), "Gadget.Lamp");
+    }
+
+    /// Factories are not particular to metatables: a function returning the
+    /// panel table it registers makes each call a panel class.
+    #[test]
+    fn a_panel_factory_call_registers_the_panel_it_returns() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![(
+            "lua/autorun/client/cl_panels.lua",
+            r#"
+            function MakePanel(name)
+                local PANEL = {}
+                vgui.Register(name, PANEL, "DPanel")
+                return PANEL
+            end
+            "#,
+        )]);
+        let file_id = ws.def_file(
+            "lua/autorun/client/cl_use.lua",
+            r#"
+            local PNL = MakePanel("MyPanel")
+            "#,
+        );
+
+        let panel = ws.local_ty(file_id, "PNL");
+        assert_eq!(ws.humanize_type(panel), "MyPanel");
+    }
+
+    /// Making the factory return something else or drop a method, and back, leaves what a
+    /// fresh analysis of the final text has.
+    #[test]
+    fn editing_a_metatable_factory_matches_a_fresh_analysis() {
+        let user = (
+            "lua/autorun/sh_bone.lua",
+            "local BONE = CreateMetaTable(\"Bone\")\nfunction BONE:Name() return self:GetTable() end",
+        );
+        let (head, tail) = METATABLE_FACTORY
+            .1
+            .rsplit_once("return meta")
+            .expect("return");
+        let not_returned = format!("{head}return proxy{tail}");
+        let no_method = METATABLE_FACTORY
+            .1
+            .replace("function meta:GetTable() return {} end", "");
+        let setup = |ws: &mut VirtualWorkspace| {
+            ws.def_gmod_call_arg_builtins();
+        };
+        VirtualWorkspace::assert_warm_matches_cold(
+            setup,
+            &[METATABLE_FACTORY, user],
+            &[
+                (METATABLE_FACTORY.0, &not_returned),
+                METATABLE_FACTORY,
+                (METATABLE_FACTORY.0, &no_method),
+                METATABLE_FACTORY,
+            ],
+        );
+    }
+
+    const STORED_OBJECT: (&str, &str) = (
+        "lua/autorun/sh_stored.lua",
+        r#"
+        local Storage = setmetatable({}, { __mode = "k" })
+        local META = {}
+        RegisterMetaTable("Stored", META)
+
+        function META:__index(key)
+            local value = Storage[self][key]
+            if value ~= nil then
+                return value
+            end
+            return rawget(META, key)
+        end
+
+        function META:GetCount()
+            local count = self.Count
+            local label = self.Label
+            local other = self.Unlisted
+            return count
+        end
+
+        function NewStored(label)
+            local object = setmetatable({}, META)
+            Storage[object] = { Label = label, Count = 0 }
+            return object
+        end
+        "#,
+    );
+
+    /// A key a class does not define reads what its `__index` function
+    /// returns: with `__index` reading `Storage[self][key]`, the fields of
+    /// the stored table are the object's fields.
+    #[test]
+    fn a_function_index_reads_fields_from_the_table_it_looks_in() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        let file_id = ws.def_file(STORED_OBJECT.0, STORED_OBJECT.1);
+
+        let count = ws.local_ty(file_id, "count");
+        assert_eq!(ws.humanize_type(count), "integer");
+        let label = ws.local_ty(file_id, "label");
+        assert!(!label.is_nil(), "{}", ws.humanize_type(label));
+        let other = ws.local_ty(file_id, "other");
+        assert!(!other.is_nil(), "{}", ws.humanize_type(other));
+    }
+
+    /// An `__index` function written on a class a doc declares, as code
+    /// that speeds up `Entity` lookups does, leaves the class its declared
+    /// shape: a key it does not declare is still undefined.
+    #[test]
+    fn an_index_function_on_a_declared_class_keeps_its_fields_checked() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!ws.check_file_for(
+            DiagnosticCode::UndefinedField,
+            "lua/autorun/sh_fast_index.lua",
+            r#"
+            ---@class Thing
+            ---@field Name string
+            local THING = {}
+
+            function THING:__index(key)
+                return rawget(THING, key)
+            end
+
+            ---@param thing Thing
+            local function read(thing)
+                return thing.Nmae
+            end
+            "#,
+        ));
+    }
+
+    /// A class whose `__index` is a function can answer any key, so no
+    /// key it does not list is undefined.
+    #[test]
+    fn a_function_index_leaves_no_field_undefined() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        assert!(ws.check_file_for(
+            DiagnosticCode::UndefinedField,
+            STORED_OBJECT.0,
+            STORED_OBJECT.1,
+        ));
+    }
+
+    const KIND_FACTORY: (&str, &str) = (
+        "lua/autorun/sh_kinds.lua",
+        r#"
+        Kinds = Kinds or { Root = {} }
+        Make = Make or {}
+
+        function Kinds.Root:Describe() return "kind" end
+
+        local function lookup(meta, key)
+            while meta do
+                local value = rawget(meta, key)
+                if value ~= nil then
+                    return value
+                end
+                meta = rawget(meta, "Parent")
+            end
+        end
+
+        function DefineKind(name, parent)
+            local meta = {}
+            RegisterMetaTable("Kind." .. name, meta)
+            Kinds[name] = meta
+            meta.Parent = parent and Kinds[parent] or Kinds.Root
+
+            function meta:__index(key)
+                return lookup(meta, key)
+            end
+
+            Make[name] = function(...)
+                local object = setmetatable({}, meta)
+                return object
+            end
+            return meta
+        end
+        "#,
+    );
+
+    const KIND_USES: (&str, &str) = (
+        "lua/autorun/sh_animals.lua",
+        r#"
+        local ANIMAL = DefineKind("Animal")
+        function ANIMAL:Speak() return "..." end
+        local DOG = DefineKind("Dog", "Animal")
+        "#,
+    );
+
+    /// Writes a factory makes under a key built from its parameters are
+    /// named per call: the registry entry is the call's class, and a
+    /// constructor returning the factory's instances returns that class.
+    #[test]
+    fn a_factory_call_names_what_the_factory_writes_under_its_arguments() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![KIND_FACTORY, KIND_USES]);
+        let reader = ws.def_file(
+            "lua/autorun/sh_reader.lua",
+            r#"
+            local registered = Kinds.Dog
+            local dog = Make.Dog()
+            "#,
+        );
+
+        let registered = ws.local_ty(reader, "registered");
+        assert_eq!(ws.humanize_type(registered), "Kind.Dog");
+        let dog = ws.local_ty(reader, "dog");
+        assert_eq!(ws.humanize_type(dog), "Kind.Dog");
+    }
+
+    /// An `__index` walking `rawget(meta, "Parent")` inherits through
+    /// `Parent`: what the factory stores there for a call is the class's
+    /// parent.
+    #[test]
+    fn an_index_walk_through_a_parent_field_is_inheritance() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![KIND_FACTORY, KIND_USES]);
+        let reader = ws.def_file(
+            "lua/autorun/sh_reader.lua",
+            r#"
+            local speak = Kinds.Dog.Speak
+            local describe = Kinds.Animal.Describe
+            "#,
+        );
+
+        assert!(is_function_type(&ws.local_ty(reader, "speak")));
+        assert!(is_function_type(&ws.local_ty(reader, "describe")));
+    }
+
+    /// Renaming a factory call's arguments, and back, leaves what a fresh
+    /// analysis of the final text has.
+    #[test]
+    fn editing_a_factory_call_argument_matches_a_fresh_analysis() {
+        let reader = (
+            "lua/autorun/sh_reader.lua",
+            "local dog = Make.Dog()\nlocal speak = Kinds.Dog.Speak",
+        );
+        let renamed = KIND_USES
+            .1
+            .replace("\"Dog\", \"Animal\"", "\"Dog\", \"Plant\"");
+        assert_ne!(renamed, KIND_USES.1);
+        let setup = |ws: &mut VirtualWorkspace| {
+            ws.def_gmod_call_arg_builtins();
+        };
+        VirtualWorkspace::assert_warm_matches_cold(
+            setup,
+            &[KIND_FACTORY, KIND_USES, reader],
+            &[(KIND_USES.0, &renamed), KIND_USES],
+        );
+    }
+
+    /// A factory in a `module` file writing a constructor into the module
+    /// table under the call's name gives each call a constructor of its class.
+    #[test]
+    fn a_module_factory_names_a_constructor_per_call() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_files(vec![
+            (
+                "lua/kinds/sh_meta.lua",
+                r#"
+            module("kinds", package.seeall)
+            Registry = Registry or {}
+            function Define(name)
+                local metaName = "K." .. name
+                local proxy = newproxy(true)
+                local meta = getmetatable(proxy)
+                RegisterMetaTable(metaName, meta)
+                Registry[name] = meta
+                kinds[name] = function(owner, ...)
+                    local instance = newproxy(proxy)
+                    return instance
+                end
+                return meta
+            end
+            "#,
+            ),
+            (
+                "lua/kinds/sh_bone.lua",
+                r#"
+            module("kinds", package.seeall)
+            local BONE = Define("Bone")
+            function BONE:Grow() end
+            "#,
+            ),
+        ]);
+        let reader = ws.def_file(
+            "lua/autorun/sh_reader.lua",
+            r#"
+            local made = kinds.Bone(1)
+            local registered = kinds.Registry.Bone
+            "#,
+        );
+        let made = ws.local_ty(reader, "made");
+        assert_eq!(ws.humanize_type(made), "K.Bone");
+        let registered = ws.local_ty(reader, "registered");
+        assert_eq!(ws.humanize_type(registered), "K.Bone");
+    }
+
+    /// A method that makes an instance of `self` and turns it into a class
+    /// of its own (`sub.__index = sub`) settles: the instance is `self`'s
+    /// class, and the write to its `__index` does not feed back into it.
+    #[test]
+    fn a_subclass_made_from_self_settles() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_extend.lua",
+            r#"
+            local Base = {}
+            Base.__index = Base
+            function Base:extend()
+                local sub = setmetatable({}, self)
+                sub.__index = sub
+                return sub
+            end
+            function Base:Hello() return 1 end
+            local Sub = Base:extend()
+            local hello = Sub.Hello
+            "#,
+        );
+
+        assert!(is_function_type(&ws.local_ty(file_id, "hello")));
+    }
+
+    /// A method defined on a subclass belongs to the subclass: an instance of
+    /// the parent does not have it, while an instance of the subclass still
+    /// inherits the parent's methods.
+    #[test]
+    fn a_subclass_method_stays_off_the_parent() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_animals.lua",
+            r#"
+            local Animal = {}
+            Animal.__index = Animal
+            function Animal:Speak() return "..." end
+            local Dog = setmetatable({}, Animal)
+            Dog.__index = Dog
+            function Dog:Fetch() return true end
+            local cat = setmetatable({}, Animal)
+            local catFetch = cat.Fetch
+            local dog = setmetatable({}, Dog)
+            local dogSpeak = dog.Speak
+            local dogFetch = dog.Fetch
+            "#,
+        );
+
+        assert!(!is_function_type(&ws.local_ty(file_id, "catFetch")));
+        assert!(is_function_type(&ws.local_ty(file_id, "dogSpeak")));
+        assert!(is_function_type(&ws.local_ty(file_id, "dogFetch")));
+    }
+
+    /// The same holds for a subclass held in a global.
+    #[test]
+    fn a_global_subclass_method_stays_off_the_parent() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_animals.lua",
+            r#"
+            Animal = {}
+            Animal.__index = Animal
+            function Animal:Speak() return "..." end
+            Dog = setmetatable({}, Animal)
+            Dog.__index = Dog
+            function Dog:Fetch() return true end
+            local cat = setmetatable({}, Animal)
+            local catFetch = cat.Fetch
+            local dog = setmetatable({}, Dog)
+            local dogSpeak = dog.Speak
+            local dogFetch = dog.Fetch
+            "#,
+        );
+
+        assert!(!is_function_type(&ws.local_ty(file_id, "catFetch")));
+        assert!(is_function_type(&ws.local_ty(file_id, "dogSpeak")));
+        assert!(is_function_type(&ws.local_ty(file_id, "dogFetch")));
+    }
+
+    const VECTOR_CLASS: &str = r#"
+            local V = {}
+            V.__index = V
+            local function new(x) return setmetatable({ x = x }, V) end
+            V.__add = function(a, b) return new(a.x + b.x) end
+            function V.__unm(a) return new(-a.x) end
+            V.__concat = function(a, b) return new(0) end
+            function V:Length() return 1 end
+            local v = new(1)
+    "#;
+
+    /// An operator on values whose metatable defines its metamethod returns
+    /// what the metamethod returns, however the metamethod was written.
+    #[test]
+    fn an_operator_returns_what_its_metamethod_returns() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_vector.lua",
+            &format!(
+                "{VECTOR_CLASS}
+            local sum = v + v
+            local neg = -v
+            local joined = v .. v
+            local sumLength = sum.Length
+            local negLength = neg.Length
+            local joinedLength = joined.Length
+            "
+            ),
+        );
+
+        assert!(is_function_type(&ws.local_ty(file_id, "sumLength")));
+        assert!(is_function_type(&ws.local_ty(file_id, "negLength")));
+        assert!(is_function_type(&ws.local_ty(file_id, "joinedLength")));
+    }
+
+    /// A metamethod on a registered class types the operator on its
+    /// instances.
+    #[test]
+    fn an_operator_on_a_registered_class_returns_what_its_metamethod_returns() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_money.lua",
+            r#"
+            local META = {}
+            META.__index = META
+            function META.__add(a, b) return a end
+            RegisterMetaTable("Money", META)
+            local money = setmetatable({}, FindMetaTable("Money"))
+            local total = money + money
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "total")), "Money");
+    }
+
+    /// Without a metamethod the operator keeps its plain Lua result.
+    #[test]
+    fn an_operator_without_a_metamethod_keeps_its_plain_result() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_plain.lua",
+            r#"
+            local P = {}
+            P.__index = P
+            local p = setmetatable({}, P)
+            local joined = p .. "x"
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "joined")), "string");
+    }
+
+    /// A table made callable by `__call` returns what `__call` returns, with
+    /// the table itself passed first.
+    #[test]
+    fn calling_a_table_runs_its_call_metamethod_on_it() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_point.lua",
+            r#"
+            local Point = {}
+            Point.__index = Point
+            function Point:Length() return 1 end
+            function Point.new(x)
+                local o = setmetatable({}, Point)
+                o.x = x
+                return o
+            end
+            setmetatable(Point, { __call = function(cls, x) return cls.new(x) end })
+            local Shape = setmetatable({}, { __call = function(cls)
+                return setmetatable({}, cls)
+            end })
+            Shape.__index = Shape
+            function Shape:Area() return 2 end
+            local point = Point(1)
+            local length = point.Length
+            local shape = Shape()
+            local area = shape.Area
+            "#,
+        );
+
+        assert!(is_function_type(&ws.local_ty(file_id, "length")));
+        assert!(is_function_type(&ws.local_ty(file_id, "area")));
+    }
+
+    /// An `__index` function that reads back through the table it serves
+    /// recurses forever at runtime; typing a read through it ends at the
+    /// first repeated read, not when the stack runs low.
+    #[test]
+    fn an_index_function_reading_back_through_its_table_types_a_read() {
+        for code in [
+            r#"
+            local M = {}
+            setmetatable(M, M)
+            function M:__index(key)
+                return self.parent[key]
+            end
+            local x = M.foo
+            "#,
+            r#"
+            local M = {}
+            local inst = setmetatable({}, M)
+            function M:__index(key)
+                return inst.fallback
+            end
+            local x = inst.foo
+            "#,
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            crate::semantic::FUNCTION_INDEX_READS.with(|reads| reads.set(0));
+            let file_id = ws.def(code);
+            let x = ws.humanize_type(ws.local_ty(file_id, "x"));
+            let reads = crate::semantic::FUNCTION_INDEX_READS.with(|reads| reads.get());
+            assert_eq!(x, "unknown");
+            assert!(reads < 50, "{reads} __index function reads");
+        }
+    }
+
+    /// A method that may end without returning its instance returns `nil`
+    /// then, as a plain table or a local function returning one would: also
+    /// when a `goto` skips its `return`, but not when one only skips to the
+    /// next turn of a loop.
+    #[test]
+    fn a_method_that_may_not_return_its_instance_may_return_nil() {
+        for (body, expected) in [
+            ("if ok then return setmetatable({}, self) end", "table?"),
+            (
+                "if not ok then goto done end do return setmetatable({}, self) end ::done::",
+                "table?",
+            ),
+            (
+                "for i = 1, 3 do if i == 2 then goto continue end ::continue:: end return setmetatable({}, self)",
+                "table",
+            ),
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let file_id = ws.def(&format!(
+                r#"
+                local Class = {{}}
+                Class.__index = Class
+                function Class:TryCreate(ok)
+                    {body}
+                end
+                local inst = Class:TryCreate(Cond)
+                "#
+            ));
+            assert_eq!(
+                ws.humanize_type(ws.local_ty(file_id, "inst")),
+                expected,
+                "{body}"
+            );
+        }
+    }
+
+    const ACCOUNT_CLASS: &str = r#"
+            Account = { balance = 0 }
+            function Account:new(o)
+                o = o or {}
+                setmetatable(o, self)
+                self.__index = self
+                return o
+            end
+            function Account:deposit(v) self.balance = self.balance + v end
+            SpecialAccount = Account:new()
+            function SpecialAccount:getLimit() return self.limit or 0 end
+    "#;
+
+    /// `Class:new(o)` makes an instance of whatever it is called on, so a
+    /// class made by calling it on another is a subclass with its own methods.
+    #[test]
+    fn a_new_method_makes_an_instance_of_its_receiver() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_account.lua",
+            &format!(
+                "{ACCOUNT_CLASS}
+            local account = Account:new({{ balance = 10 }})
+            local special = SpecialAccount:new({{ limit = 100 }})
+            local accountDeposit = account.deposit
+            local accountLimit = account.getLimit
+            local specialDeposit = special.deposit
+            local specialLimit = special.getLimit
+            "
+            ),
+        );
+
+        assert!(is_function_type(&ws.local_ty(file_id, "accountDeposit")));
+        assert!(!is_function_type(&ws.local_ty(file_id, "accountLimit")));
+        assert!(is_function_type(&ws.local_ty(file_id, "specialDeposit")));
+        assert!(is_function_type(&ws.local_ty(file_id, "specialLimit")));
+    }
+
+    /// A method returning `setmetatable({}, self)` extends whatever it is
+    /// called on: a class extended from a subclass inherits both.
+    #[test]
+    fn an_extend_method_extends_its_receiver() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_extend.lua",
+            r#"
+            local Base = {}
+            Base.__index = Base
+            function Base:extend()
+                local sub = setmetatable({}, self)
+                sub.__index = sub
+                return sub
+            end
+            function Base:hello() return 1 end
+            local A = Base:extend()
+            function A:onlyA() return 2 end
+            local B = A:extend()
+            local b = setmetatable({}, B)
+            local bHello = b.hello
+            local bOnlyA = b.onlyA
+            local base = setmetatable({}, Base)
+            local baseOnlyA = base.onlyA
+            "#,
+        );
+
+        assert!(is_function_type(&ws.local_ty(file_id, "bHello")));
+        assert!(is_function_type(&ws.local_ty(file_id, "bOnlyA")));
+        assert!(!is_function_type(&ws.local_ty(file_id, "baseOnlyA")));
+    }
+
+    /// `table.Inherit` gives its target the base's members and `BaseClass`.
+    #[test]
+    fn table_inherit_gives_the_target_the_base_members() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_inherit.lua",
+            r#"
+            local Base = { hp = 100 }
+            function Base:Heal() return self.hp end
+            local Child = table.Inherit({ armor = 5 }, Base)
+            local heal = Child.Heal
+            local armor = Child.armor
+            local base = Child.BaseClass
+            local baseHeal = base.Heal
+            "#,
+        );
+
+        assert!(is_function_type(&ws.local_ty(file_id, "heal")));
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "armor")), "5");
+        assert!(is_function_type(&ws.local_ty(file_id, "baseHeal")));
+    }
+
+    /// An `__index` function reading the key with `rawget(P, key)`, also as
+    /// one side of an `or`, gives `P`'s field.
+    #[test]
+    fn an_index_function_reading_with_rawget_gives_the_field() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_rawget.lua",
+            r#"
+            local MT = {}
+            MT.__index = function(self, key)
+                return rawget(MT, key) or rawget(self, "_" .. key)
+            end
+            function MT:Ping() return "pong" end
+            local object = setmetatable({}, MT)
+            local ping = object.Ping
+            "#,
+        );
+
+        assert!(is_function_type(&ws.local_ty(file_id, "ping")));
+    }
+
+    /// An `__index` function returning a lookup `or` a default gives the
+    /// field when it is there and the default when it is not.
+    #[test]
+    fn an_index_function_with_a_default_gives_the_field_or_the_default() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_defaults.lua",
+            r#"
+            ---@type { label: string? }
+            local Stored = {}
+            local MT = {}
+            MT.__index = function(self, key)
+                return Stored[key] or 5
+            end
+            local object = setmetatable({}, MT)
+            local label = object.label
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "label")),
+            "(integer|string)"
+        );
+    }
+
+    /// An `__index` function that returns a value of its own for some keys
+    /// gives that value too, not only the field it looks up.
+    #[test]
+    fn an_index_function_returning_its_own_value_for_some_keys_gives_it_too() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_special_key.lua",
+            r#"
+            ---@type { label: string }
+            local Stored = {}
+            local MT = {}
+            MT.__index = function(self, key)
+                if key == "id" then
+                    return false
+                end
+                return Stored[key]
+            end
+            local object = setmetatable({}, MT)
+            local label = object.label
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "label")),
+            "(boolean|string)"
+        );
+    }
+
+    /// A field a table may not hold reads as its own value when it is there
+    /// and the `__index` table's when it is not: either one, not only what
+    /// both could be.
+    #[test]
+    fn a_field_the_table_may_lack_reads_its_value_or_the_index_value() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_read_through.lua",
+            r#"
+            ---@return number?
+            local function maybeSize() end
+            local sized = { size = maybeSize() }
+            setmetatable(sized, { __index = { size = 1 } })
+            local size = sized.size
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "size")), "number");
+    }
+
+    /// A bracketed key expression whose type names one exact field reads
+    /// through to the metatable fallback just like a dot-named field access.
+    #[test]
+    fn an_exact_bracket_key_reads_through_to_the_metatable_like_a_field_name() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_read_through_const_key.lua",
+            r#"
+            ---@return number?
+            local function maybeNumber() end
+            ---@type "size"
+            local key = "size"
+            local sized = { size = maybeNumber() }
+            setmetatable(sized, { __index = { size = "fallback" } })
+            local viaDot = sized.size
+            local viaKey = sized[key]
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "viaKey")),
+            ws.humanize_type(ws.local_ty(file_id, "viaDot"))
+        );
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "viaKey")),
+            "(\"fallback\"|number)"
+        );
+    }
+
+    /// A key computed at runtime does not name a field the table lacks: a
+    /// table holding values of its own reads as them, not as every member its
+    /// class holds too, while one holding nothing reads its class's.
+    #[test]
+    fn a_runtime_key_reads_the_class_only_when_the_table_holds_nothing() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_runtime_key.lua",
+            r#"
+            local Stream = {}
+            Stream.__index = Stream
+            function Stream:Destroy() end
+            ---@return string
+            local function anyKey() end
+            local filled = setmetatable({ id = 1, label = "x" }, Stream)
+            local fromFilled = filled[anyKey()]
+            local empty = setmetatable({}, Stream)
+            local fromEmpty = empty[anyKey()]
+            "#,
+        );
+
+        let holds_method = |name: &str| match ws.local_ty(file_id, name) {
+            LuaType::Union(union) => union.types().any(is_function_type),
+            typ => is_function_type(&typ),
+        };
+        assert_eq!(
+            (holds_method("fromFilled"), holds_method("fromEmpty")),
+            (false, true)
+        );
+    }
+
+    /// A field a table may not hold, read through an `__index` table whose
+    /// field may be missing too, keeps what both may hold.
+    #[test]
+    fn a_field_both_tables_may_lack_reads_either_value_or_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_read_through_nil.lua",
+            r#"
+            ---@return string?
+            local function maybeLabel() end
+            ---@return integer?
+            local function maybeId() end
+            local labelled = setmetatable({ label = maybeLabel() }, { __index = { label = maybeId() } })
+            local label = labelled.label
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "label")),
+            "(integer|string)?"
+        );
+    }
+
+    /// `getmetatable` gives a metatable's `__metatable` field when it has one.
+    #[test]
+    fn getmetatable_gives_the_metatable_field_that_hides_it() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_locked.lua",
+            r#"
+            local Locked = setmetatable({}, { __metatable = "locked", __index = { a = 1 } })
+            local Open = setmetatable({}, { __index = { a = 1 } })
+            local locked = getmetatable(Locked)
+            local open = getmetatable(Open).__index
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "locked")), "string");
+        assert!(ws.humanize_type(ws.local_ty(file_id, "open")).contains("a"));
+    }
+
+    /// A function stored on a local table takes its parameter types from the
+    /// calls through that table, as a local function does, so the fields a
+    /// constructor copies from them have those types.
+    #[test]
+    fn a_constructor_field_takes_the_type_its_callers_pass() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_point.lua",
+            r#"
+            local Point = {}
+            Point.__index = Point
+            function Point.new(x, label)
+                local o = setmetatable({}, Point)
+                o.x = x
+                o.label = label
+                return o
+            end
+            function Point:Scale(by) return by end
+            local p = Point.new(3, "a")
+            local q = Point.new(4.5, "b")
+            local px = p.x
+            local plabel = p.label
+            local scaled = Point:Scale(2)
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "px")), "(3|4.5)");
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "plabel")),
+            r#"("a"|"b")"#
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "scaled")), "2");
+    }
+
+    /// A `class(base)` helper makes a new table on each call, with `base` as
+    /// its parent: each class has its own methods and inherits its parent's,
+    /// also for a class made by a method calling the helper on `self`.
+    #[test]
+    fn a_class_helper_makes_each_class_inherit_from_its_base() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_class.lua",
+            r#"
+            local function class(base)
+                local c = {}
+                c.__index = c
+                setmetatable(c, { __index = base, __call = function(cls, ...) return cls.new(...) end })
+                function c.new(...)
+                    local o = setmetatable({}, c)
+                    if o.init then o:init(...) end
+                    return o
+                end
+                function c:extend() return class(self) end
+                return c
+            end
+            local Animal = class()
+            function Animal:Speak() return "..." end
+            local Dog = class(Animal)
+            function Dog:Fetch() return 1 end
+            local Puppy = Dog:extend()
+            function Puppy:Nap() return true end
+            local dog = Dog.new()
+            local animal = Animal.new()
+            local puppy = Puppy()
+            local dogSpeak = dog.Speak
+            local dogFetch = dog.Fetch
+            local dogNap = dog.Nap
+            local animalFetch = animal.Fetch
+            local puppySpeak = puppy.Speak
+            local puppyFetch = puppy.Fetch
+            local puppyNap = puppy.Nap
+            "#,
+        );
+
+        for name in [
+            "dogSpeak",
+            "dogFetch",
+            "puppySpeak",
+            "puppyFetch",
+            "puppyNap",
+        ] {
+            assert!(is_function_type(&ws.local_ty(file_id, name)), "{name}");
+        }
+        for name in ["dogNap", "animalFetch"] {
+            assert!(!is_function_type(&ws.local_ty(file_id, name)), "{name}");
+        }
+    }
+
+    /// A class library whose `extend` copies a class into a new table with
+    /// the class as its metatable, and whose `__call` method makes instances:
+    /// each class has its own methods, and `super` names its own parent.
+    #[test]
+    fn a_class_library_extending_through_a_metatable_keeps_each_class() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_classic.lua",
+            r#"
+            local Object = {}
+            Object.__index = Object
+            function Object:new() end
+            function Object:extend()
+                local cls = {}
+                for k, v in pairs(self) do
+                    if k:find("__") == 1 then
+                        cls[k] = v
+                    end
+                end
+                cls.__index = cls
+                cls.super = self
+                setmetatable(cls, self)
+                return cls
+            end
+            function Object:__call(...)
+                local obj = setmetatable({}, self)
+                obj:new(...)
+                return obj
+            end
+            local Point = Object:extend()
+            function Point:Len() return 1 end
+            local Rect = Point:extend()
+            function Rect:Area() return 2 end
+            local p = Point()
+            local r = Rect()
+            local pointLen = p.Len
+            local pointArea = p.Area
+            local rectLen = r.Len
+            local rectArea = r.Area
+            local rectSuperLen = Rect.super.Len
+            local pointSuperLen = Point.super.Len
+            "#,
+        );
+
+        for name in ["pointLen", "rectLen", "rectArea", "rectSuperLen"] {
+            assert!(is_function_type(&ws.local_ty(file_id, name)), "{name}");
+        }
+        for name in ["pointArea", "pointSuperLen"] {
+            assert!(!is_function_type(&ws.local_ty(file_id, name)), "{name}");
+        }
+    }
+
+    /// A factory whose metatable's `__call` makes instances reading through
+    /// the class it made, with a parent per call: an instance reads its
+    /// class's members and its parent's, including accessors a helper
+    /// installs on the parent, past the ones it may install on the class.
+    #[test]
+    fn a_call_metamethod_closing_over_its_class_makes_instances_of_it() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_call_arg_builtins();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_oop.lua",
+            r#"
+            local function Class(name, parent)
+                local t = {}
+                local meta = {}
+                meta.__call = function(_, ...)
+                    local inst = setmetatable({}, {__index = t})
+                    if inst.initialize then inst:initialize(...) end
+                    return inst
+                end
+                if parent then meta.__index = parent end
+                setmetatable(t, meta)
+                return t
+            end
+            local function AccessorFunc(panel, fieldname, name)
+                panel["Get" .. name] = function(self) return self[fieldname] end
+                panel["Set" .. name] = function(self, value) self[fieldname] = value end
+            end
+            local GridDim = Class("GridDim")
+            AccessorFunc(GridDim, "_size", "Size")
+            function GridDim:Reset() end
+            local Row = Class("Row", GridDim)
+            AccessorFunc(Row, "_marginTop", "MarginTop")
+            function Row:Width() return 1 end
+            local Cell = Class("Cell")
+            local PANEL = {}
+            function PANEL:Init() self._rows = {} end
+            function PANEL:Row()
+                local row = Row()
+                self._rows[#self._rows + 1] = row
+                return row
+            end
+            function PANEL:RowCount() return #self._rows end
+            function PANEL:Layout()
+                for r = 1, self:RowCount() do
+                    local row = self._rows[r]
+                    local rowSetSize = row.SetSize
+                end
+            end
+            local row = Row()
+            local cell = Cell()
+            local rowReset = row.Reset
+            local rowWidth = row.Width
+            local cellReset = cell.Reset
+            "#,
+        );
+
+        for name in ["rowSetSize", "rowReset", "rowWidth"] {
+            assert!(is_function_type(&ws.local_ty(file_id, name)), "{name}");
+        }
+        assert!(!is_function_type(&ws.local_ty(file_id, "cellReset")));
+    }
+
+    /// A field a factory sets from its parameter holds what the call making
+    /// the table passed.
+    #[test]
+    fn a_factory_field_holds_what_its_call_passed() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_named.lua",
+            r#"
+            local function class(name)
+                local cls = { name = name }
+                cls.__index = cls
+                return cls
+            end
+            local Shape = class("Shape")
+            local Square = class("Square")
+            local shapeName = Shape.name
+            local squareName = Square.name
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "shapeName")),
+            r#""Shape""#
+        );
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "squareName")),
+            r#""Square""#
+        );
+    }
+
+    /// A factory that gives its parameter a default before storing it stores
+    /// the default when its call passes nothing, not the `nil` it was passed.
+    #[test]
+    fn a_factory_field_from_a_reassigned_parameter_holds_the_new_value() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_named.lua",
+            r#"
+            local function class(name)
+                name = name or "Object"
+                local cls = { name = name }
+                cls.__index = cls
+                return cls
+            end
+            local Base = class()
+            local baseName = Base.name
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "baseName")), "string");
+    }
+
+    /// An `__index` function returning `left or right` falls through to `right`
+    /// when `left` can be `false`, not only when `left` can be `nil`.
+    #[test]
+    fn function_index_or_falls_through_on_false() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            local Primary = { flag = false }
+            local Fallback = { flag = 42 }
+            local obj = setmetatable({}, {
+                __index = function(_, key)
+                    return Primary[key] or Fallback[key]
+                end,
+            })
+            local value = obj.flag
+            "#,
+        );
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "value")),
+            "(integer|true)"
+        );
+    }
+
+    /// A local `getmetatable` shadows the builtin rather than returning the
+    /// argument's metatable.
+    #[test]
+    fn shadowed_local_getmetatable_does_not_act_as_builtin() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            local function getmetatable(_)
+                return 123
+            end
+            local t = setmetatable({}, { x = "hi" })
+            local mt = getmetatable(t)
+            "#,
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "mt")), "123");
+    }
+
+    /// Adding an `unknown` operand to a class with `__add` resolves through
+    /// `__add` instead of collapsing to `number`.
+    #[test]
+    fn add_with_unknown_respects_add_metamethod() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@class Vec2
+            ---@operator add(any): Vec2
+            local Vec2 = {}
+            ---@type Vec2
+            local v
+            ---@type unknown
+            local u
+            local sum1 = v + u
+            local sum2 = u + v
+            "#,
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "sum1")), "Vec2");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "sum2")), "Vec2");
+    }
+
+    /// A separate metatable table with `__index = Proto` types `self` in its
+    /// metamethods as `Proto`, not the metatable table itself.
+    #[test]
+    fn separate_metatable_metamethod_self_uses_index_target() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@class Vec3
+            ---@field x number
+            local Vec3 = {}
+            local mt = { __index = Vec3 }
+            function mt.__add(self, other)
+                local sx = self.x
+                return sx
+            end
+            "#,
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "sx")), "number");
     }
 
     fn is_function_type(typ: &LuaType) -> bool {

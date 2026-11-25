@@ -324,6 +324,26 @@ mod test {
         assert_eq!(ws.humanize_type(sum), ws.humanize_type(expected));
     }
 
+    /// GMod's `utf8.lua` adds `b1 >= 0xF0 and 3 or ... and 1` to an unresolved
+    /// position.
+    #[test]
+    fn adding_an_unknown_to_a_value_that_may_be_false_is_never_a_boolean() {
+        let mut ws = VirtualWorkspace::new();
+        let file = ws.def_file(
+            "addons/add_unknown/lua/autorun/sh_add_unknown.lua",
+            r#"
+            ---@param unresolved unknown
+            ---@param b1 integer
+            local function finish(unresolved, b1)
+                local sum = unresolved + (b1 >= 0xF0 and 3 or b1 >= 0xC0 and 1)
+                return sum
+            end
+            "#,
+        );
+        let sum = infer_last_name_expr_type_in_file(&ws, file, "sum");
+        assert_eq!(ws.humanize_type(sum), "(integer|unknown)");
+    }
+
     #[test]
     fn direct_param_return_alias_returns_one_actual_argument_value() {
         let mut ws = VirtualWorkspace::new();
@@ -1796,6 +1816,7 @@ mod test {
     #[test]
     fn test_require_with_computed_path_is_unresolved() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def(
             r#"
             some_computed_path = nil

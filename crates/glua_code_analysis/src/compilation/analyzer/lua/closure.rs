@@ -18,8 +18,8 @@ use crate::{
         UnResolveParentClosureParams, UnResolveReturn,
     },
     db_index::{
-        LuaClassNameReturnAlias, LuaDocReturnInfo, LuaMemberOwner, LuaReturnCorrelation,
-        LuaSignatureId,
+        LuaClassNameReturnAlias, LuaDocReturnInfo, LuaInstanceMetatable, LuaInstanceReturnAlias,
+        LuaMemberOwner, LuaReturnCorrelation, LuaSignatureId,
     },
     infer_expr,
 };
@@ -61,6 +61,7 @@ pub fn analyze_closure(analyzer: &mut LuaAnalyzer, closure: LuaClosureExpr) -> O
     analyze_direct_param_return_alias(analyzer, &signature_id, &closure);
     analyze_class_name_param_return_alias(analyzer, &signature_id, &closure);
     analyze_returns_receiver(analyzer, &signature_id, &closure);
+    analyze_instance_return_alias(analyzer, &signature_id, &closure);
     analyze_fresh_returned_values(analyzer, &signature_id, &closure);
     analyze_return(analyzer, &signature_id, &closure);
     Some(())
@@ -264,6 +265,214 @@ fn analyze_returns_receiver(
         change: SignatureChange::ReturnsReceiver,
     });
     Some(())
+}
+
+/// Records which parameter a function returns an instance of: each return
+/// gives `setmetatable(t, p)`, or a name such a call gave its metatable earlier
+/// in the body, for one never-reassigned parameter `p` (`self` in a method).
+fn analyze_instance_return_alias(
+    analyzer: &mut LuaAnalyzer,
+    signature_id: &LuaSignatureId,
+    closure: &LuaClosureExpr,
+) -> Option<()> {
+    let signature = analyzer.db.get_signature_index().get(signature_id)?;
+    if !signature.overloads.is_empty()
+        || (signature.resolve_return == SignatureReturnStatus::DocResolve
+            && !signature.return_docs.is_empty())
+    {
+        return Some(());
+    }
+    let params = signature
+        .is_colon_define
+        .then(|| "self".to_string())
+        .into_iter()
+        .chain(closure.get_params_list()?.get_params().filter_map(|param| {
+            param
+                .get_name_token()
+                .map(|name| name.get_name_text().to_string())
+        }))
+        .collect::<Vec<_>>();
+    let block = closure.get_block()?;
+    let closure_start = closure.get_range().start();
+    let mut alias = None;
+    for return_stat in closure_own_return_stats(analyzer, closure, &block).iter() {
+        let mut exprs = return_stat.get_expr_list();
+        let (Some(expr), None) = (exprs.next(), exprs.next()) else {
+            return Some(());
+        };
+        let call = match expr {
+            LuaExpr::CallExpr(call) => call,
+            LuaExpr::NameExpr(name) => {
+                setmetatable_given_to(&block, &name.get_name_text()?, return_stat.get_position())?
+            }
+            _ => return Some(()),
+        };
+        let found = match setmetatable_args(&call) {
+            Some((table, metatable)) => {
+                let (named, index_is_metatable_field) = match metatable {
+                    LuaExpr::TableExpr(literal) => (metatable_index_field(&literal)?, true),
+                    metatable => (metatable, false),
+                };
+                let LuaExpr::NameExpr(named) = named else {
+                    return Some(());
+                };
+                let name = named.get_name_text()?;
+                // A literal metatable over a parameter, given to a table the
+                // function returns as its own, is that table's per-call
+                // parent, which reading the copy each call makes binds.
+                let metatable = match params.iter().position(|param| *param == name) {
+                    Some(_)
+                        if index_is_metatable_field && !matches!(table, LuaExpr::TableExpr(_)) =>
+                    {
+                        return Some(());
+                    }
+                    Some(param) => LuaInstanceMetatable::Param(param),
+                    None if local_table_constructor(&block, &name).is_none() => {
+                        LuaInstanceMetatable::Upvalue {
+                            name: named.get_range() - closure_start,
+                        }
+                    }
+                    None => return Some(()),
+                };
+                let table = match table {
+                    LuaExpr::TableExpr(table) => Some(table.get_range() - closure_start),
+                    LuaExpr::NameExpr(name) => {
+                        local_table_constructor(&block, &name.get_name_text()?)
+                            .map(|table| table.get_range() - closure_start)
+                    }
+                    _ => None,
+                };
+                let alias = LuaInstanceReturnAlias {
+                    metatable,
+                    index_is_metatable_field,
+                    table,
+                };
+                (alias, name)
+            }
+            None => {
+                let LuaExpr::IndexExpr(callee) = call.get_prefix_expr()? else {
+                    return Some(());
+                };
+                let receiver = expr_name_text(&callee.get_prefix_expr()?)?;
+                let alias = LuaInstanceReturnAlias {
+                    metatable: LuaInstanceMetatable::MadeBy {
+                        param: params.iter().position(|param| *param == receiver)?,
+                        call: call.get_range() - closure_start,
+                    },
+                    index_is_metatable_field: false,
+                    table: None,
+                };
+                (alias, receiver.into())
+            }
+        };
+        if alias.as_ref().is_some_and(|existing| *existing != found) {
+            return Some(());
+        }
+        alias = Some(found);
+    }
+    let (alias, metatable_name) = alias?;
+    if block
+        .get_stats()
+        .any(|stat| stat_may_write_name(&stat, &metatable_name))
+        || analyze_func_body_returns(Some((analyzer.db, analyzer.file_id)), block)
+            .iter()
+            .any(|point| matches!(point, LuaReturnPoint::Nil))
+    {
+        return Some(());
+    }
+    analyzer.write(StatementWrite::Signature {
+        signature_id: *signature_id,
+        change: SignatureChange::InstanceReturnAlias(alias),
+    });
+    Some(())
+}
+
+/// The `setmetatable(name, mt)` or `local name = setmetatable(t, mt)` before
+/// `position` that last gave `name` its metatable, when nothing after it
+/// writes `name`.
+fn setmetatable_given_to(block: &LuaBlock, name: &str, position: TextSize) -> Option<LuaCallExpr> {
+    let stats = block
+        .get_stats()
+        .filter(|stat| stat.get_position() < position)
+        .collect::<Vec<_>>();
+    let (at, call) = stats.iter().enumerate().rev().find_map(|(at, stat)| {
+        let call = match stat {
+            LuaStat::CallExprStat(call_stat) => {
+                let call = call_stat.get_call_expr()?;
+                let (table, _) = setmetatable_args(&call)?;
+                (expr_name_text(&table)?.as_str() == name).then_some(call)?
+            }
+            LuaStat::LocalStat(local_stat) => {
+                let mut names = local_stat.get_local_name_list();
+                let (Some(local), None) = (names.next(), names.next()) else {
+                    return None;
+                };
+                if local.get_name_token()?.get_name_text() != name {
+                    return None;
+                }
+                let mut values = local_stat.get_value_exprs();
+                let (Some(LuaExpr::CallExpr(call)), None) = (values.next(), values.next()) else {
+                    return None;
+                };
+                setmetatable_args(&call)?;
+                call
+            }
+            _ => return None,
+        };
+        Some((at, call))
+    })?;
+    stats[at + 1..]
+        .iter()
+        .all(|stat| !stat_may_write_name(stat, name))
+        .then_some(call)
+}
+
+/// `X` of a metatable literal `{ __index = X, ... }`.
+fn metatable_index_field(literal: &LuaTableExpr) -> Option<LuaExpr> {
+    literal.get_fields().find_map(|field| {
+        let LuaIndexKey::Name(key) = field.get_field_key()? else {
+            return None;
+        };
+        (key.get_name_text() == "__index")
+            .then(|| field.get_value_expr())
+            .flatten()
+    })
+}
+
+/// The table constructor `local name = {...}` of `block` initialises `name`
+/// with, each run of the block making a new table.
+fn local_table_constructor(block: &LuaBlock, name: &str) -> Option<LuaTableExpr> {
+    block.get_stats().find_map(|stat| {
+        let LuaStat::LocalStat(local_stat) = stat else {
+            return None;
+        };
+        let mut names = local_stat.get_local_name_list();
+        let (Some(local), None) = (names.next(), names.next()) else {
+            return None;
+        };
+        if local.get_name_token()?.get_name_text() != name {
+            return None;
+        }
+        match local_stat.get_value_exprs().next()? {
+            LuaExpr::TableExpr(table) => Some(table),
+            _ => None,
+        }
+    })
+}
+
+/// `(t, mt)` of a `setmetatable(t, mt)` call.
+fn setmetatable_args(call: &LuaCallExpr) -> Option<(LuaExpr, LuaExpr)> {
+    let LuaExpr::NameExpr(callee) = call.get_prefix_expr()? else {
+        return None;
+    };
+    if callee.get_name_text()? != "setmetatable" {
+        return None;
+    }
+    let mut args = call.get_args_list()?.get_args();
+    let (Some(table), Some(metatable), None) = (args.next(), args.next(), args.next()) else {
+        return None;
+    };
+    Some((table, metatable))
 }
 
 /// Records the table constructors and calls a function returns on its own,
@@ -1791,9 +2000,13 @@ fn analyze_lambda_params(
         }
         LuaAst::LuaFuncStat(func_stat) => {
             // `try_resolve_closure_parent_params` returns `Ok` without reading
-            // or writing anything unless the defined name is an index expression,
-            // so a plain `function foo() end` is not enqueued.
-            if !func_stat_defines_index_target(&func_stat) {
+            // or writing anything unless the defined name is an index expression
+            // or a global a library may document, so a local one is not enqueued.
+            if !func_stat_defines_index_target(&func_stat)
+                && !func_stat
+                    .get_func_name()
+                    .is_some_and(|name| names_global(analyzer, &name))
+            {
                 return Some(());
             }
             let unresolved = UnResolveParentClosureParams {
@@ -1815,10 +2028,13 @@ fn analyze_lambda_params(
         }
         LuaAst::LuaAssignStat(assign_stat) => {
             // Same no-op rule as the `FuncStat` arm: an assignment whose slot for
-            // this closure is a plain name returns `Ok` with no reads or writes.
-            // Only the slot at this closure's position matters; when it cannot
-            // be identified the item is enqueued as before.
-            if assign_slot_is_plain_name(&assign_stat, closure.get_position()) {
+            // this closure is a plain local name returns `Ok` with no reads or
+            // writes. Only the slot at this closure's position matters; when it
+            // cannot be identified the item is enqueued as before.
+            if assign_slot_is_plain_name(&assign_stat, closure.get_position())
+                && !assign_slot(&assign_stat, closure.get_position())
+                    .is_some_and(|var| names_global(analyzer, &var))
+            {
                 return Some(());
             }
             let unresolved = UnResolveParentClosureParams {
@@ -1841,16 +2057,36 @@ fn func_stat_defines_index_target(func_stat: &LuaFuncStat) -> bool {
     matches!(func_stat.get_func_name(), Some(LuaVarExpr::IndexExpr(_)))
 }
 
-/// Whether the assignment slot holding the closure at `closure_pos` is a plain
-/// name. Mirrors the `UnResolveParentClosureParams::LuaAssignStat` attempt,
-/// which returns `Ok` without reads or writes for any non-index target. A slot
-/// that cannot be found is enqueued.
-fn assign_slot_is_plain_name(assign_stat: &LuaAssignStat, closure_pos: rowan::TextSize) -> bool {
+/// Whether `var` is a name no local declares: a definition through it may
+/// replace a function a library documents.
+fn names_global(analyzer: &LuaAnalyzer, var: &LuaVarExpr) -> bool {
+    let LuaVarExpr::NameExpr(name_expr) = var else {
+        return false;
+    };
+    !analyzer
+        .db
+        .get_reference_index()
+        .get_local_reference(&analyzer.file_id)
+        .and_then(|references| references.get_decl_id(&name_expr.get_range()))
+        .and_then(|decl_id| analyzer.db.get_decl_index().get_decl(&decl_id))
+        .is_some_and(|decl| decl.is_local())
+}
+
+/// The assignment target holding the closure at `closure_pos`.
+fn assign_slot(assign_stat: &LuaAssignStat, closure_pos: rowan::TextSize) -> Option<LuaVarExpr> {
     let (vars, exprs) = assign_stat.get_var_and_expr_list();
     exprs
         .iter()
         .position(|expr| expr.get_position() == closure_pos)
-        .and_then(|idx| vars.get(idx))
+        .and_then(|idx| vars.get(idx).cloned())
+}
+
+/// Whether the assignment slot holding the closure at `closure_pos` is a plain
+/// name. Mirrors the `UnResolveParentClosureParams::LuaAssignStat` attempt,
+/// which reads a plain name only for a global a library documents. A slot
+/// that cannot be found is enqueued.
+fn assign_slot_is_plain_name(assign_stat: &LuaAssignStat, closure_pos: rowan::TextSize) -> bool {
+    assign_slot(assign_stat, closure_pos)
         .is_some_and(|var| !matches!(var, LuaVarExpr::IndexExpr(_)))
 }
 
@@ -2327,7 +2563,15 @@ pub fn analyze_return_point(
     for point in return_points {
         match point {
             LuaReturnPoint::Expr(expr) => {
-                let expr_type = infer_expr(db, cache, expr.clone())?;
+                let expr_type = returned_value_type(db, cache, expr)?;
+                let expr_type = match expr_type {
+                    LuaType::TypeGuard(_)
+                        if !tests_guard_subject(db, cache.get_file_id(), expr) =>
+                    {
+                        LuaType::Boolean
+                    }
+                    expr_type => expr_type,
+                };
                 let expr_type = super::super::common::widen_mutable_local_name_copy(
                     db,
                     cache.get_file_id(),
@@ -2375,6 +2619,115 @@ pub fn analyze_return_point(
         attributes: None,
         return_kind: ReturnTypeKind::default(),
     }])
+}
+
+/// Whether `expr`, returned from its function, is a guard call testing the
+/// value a call of that function narrows as a guard: its first parameter, or
+/// `self` in a method. A returned guard testing anything else is a plain
+/// boolean to the function's callers.
+fn tests_guard_subject(db: &DbIndex, file_id: crate::FileId, expr: &LuaExpr) -> bool {
+    let mut expr = expr.clone();
+    while let LuaExpr::ParenExpr(paren) = expr {
+        let Some(inner) = paren.get_expr() else {
+            return false;
+        };
+        expr = inner;
+    }
+    let LuaExpr::CallExpr(call) = expr else {
+        return false;
+    };
+    let Some(LuaExpr::NameExpr(tested)) = crate::semantic::type_guard_target_expr(&call) else {
+        return false;
+    };
+    let Some(closure) = call.ancestors::<LuaClosureExpr>().next() else {
+        return false;
+    };
+    let method_index_token = closure
+        .get_parent::<LuaFuncStat>()
+        .and_then(|func_stat| func_stat.get_func_name())
+        .and_then(|name| match name {
+            LuaVarExpr::IndexExpr(index_expr) => index_expr.get_index_token(),
+            LuaVarExpr::NameExpr(_) => None,
+        })
+        .filter(|token| token.is_colon());
+    let subject_position = match method_index_token {
+        Some(colon) => colon.get_range().start(),
+        None => match closure
+            .get_params_list()
+            .and_then(|params| params.get_params().next())
+        {
+            Some(first_param) => first_param.get_position(),
+            None => return false,
+        },
+    };
+    let subject_decl_id = LuaDeclId::new(file_id, subject_position);
+    if db
+        .get_reference_index()
+        .get_decl_references(&file_id, &subject_decl_id)
+        .is_some_and(|references| references.is_written_after_declaration(subject_decl_id.position))
+    {
+        return false;
+    }
+    db.get_reference_index()
+        .get_var_reference_decl(&file_id, tested.get_range())
+        == Some(subject_decl_id)
+}
+
+/// The value `expr` returns. In `cond and value.Member`, a member the
+/// receiver lacks is read only where `cond` holds, so it holds the member of
+/// the class a truthy chain narrows the receiver to, or `nil` for the rest.
+fn returned_value_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> Result<LuaType, InferFailReason> {
+    let and_operands = match expr {
+        LuaExpr::BinaryExpr(binary)
+            if binary
+                .get_op_token()
+                .is_some_and(|token| token.get_op() == BinaryOperator::OpAnd) =>
+        {
+            binary.get_exprs()
+        }
+        _ => None,
+    };
+    let Some((left, right)) = and_operands else {
+        return infer_expr(db, cache, expr.clone());
+    };
+    let left_type = returned_value_type(db, cache, &left)?;
+    let right_type = match missing_member_read_under(db, cache, &right, expr) {
+        Some(member_type) => TypeOps::Union.apply(db, &member_type, &LuaType::Nil),
+        None => infer_expr(db, cache, right)?,
+    };
+    crate::semantic::infer_binary_expr_and(db, left_type, right_type)
+}
+
+/// The type of the member `read` names on the class `condition` narrows its
+/// receiver to, when the receiver as it reaches `read` lacks that member.
+fn missing_member_read_under(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    read: &LuaExpr,
+    condition: &LuaExpr,
+) -> Option<LuaType> {
+    let LuaExpr::IndexExpr(index_expr) = read else {
+        return None;
+    };
+    let receiver = index_expr.get_prefix_expr()?;
+    if !matches!(receiver, LuaExpr::NameExpr(_)) {
+        return None;
+    }
+    let receiver_type = infer_expr(db, cache, receiver.clone()).ok()?;
+    let member = glua_parser::LuaIndexMemberExpr::IndexExpr(index_expr.clone());
+    if !matches!(
+        crate::semantic::infer_member_by_member_key(db, cache, &receiver_type, member.clone()),
+        Err(InferFailReason::FieldNotFound)
+    ) {
+        return None;
+    }
+    let (_, narrowed) =
+        crate::semantic::infer_true_condition_narrowing(db, cache, receiver, condition.clone())?;
+    crate::semantic::infer_member_by_member_key(db, cache, &narrowed, member).ok()
 }
 
 pub fn analyze_return_correlations(
@@ -2514,81 +2867,34 @@ fn union_return_expr(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
                     let union_base = TypeOps::Union.apply(db, left_base, right_base);
                     LuaType::Variadic(VariadicType::Base(union_base).into())
                 }
-                (VariadicType::Multi(left_multi), VariadicType::Multi(right_multi)) => {
-                    let mut new_multi = vec![];
-                    let max_len = left_multi.len().max(right_multi.len());
-                    for i in 0..max_len {
-                        let left_type = left_multi.get(i).cloned().unwrap_or(LuaType::Nil);
-                        let right_type = right_multi.get(i).cloned().unwrap_or(LuaType::Nil);
-                        new_multi.push(TypeOps::Union.apply(db, &left_type, &right_type));
-                    }
-                    LuaType::Variadic(VariadicType::Multi(new_multi).into())
-                }
-                // difficult to merge the type, use let
-                _ => left.clone(),
+                _ => union_return_packs(db, left_variadic, right_variadic),
             }
         }
         (LuaType::Variadic(variadic), _) => {
-            let first_type = variadic.get_type(0).cloned().unwrap_or(LuaType::Unknown);
-            let first_union_type = union_return_expr(db, first_type, right.clone());
-
-            match variadic.deref() {
-                VariadicType::Base(base) => {
-                    let union_base = union_return_expr(db, base.clone(), LuaType::Nil);
-                    LuaType::Variadic(
-                        VariadicType::Multi(vec![
-                            first_union_type,
-                            LuaType::Variadic(VariadicType::Base(union_base).into()),
-                        ])
-                        .into(),
-                    )
-                }
-                VariadicType::Multi(multi) => {
-                    let mut new_multi = multi.clone();
-                    if !new_multi.is_empty() {
-                        new_multi[0] = first_union_type;
-                        for mult in new_multi.iter_mut().skip(1) {
-                            *mult = union_return_expr(db, mult.clone(), LuaType::Nil);
-                        }
-                    } else {
-                        new_multi.push(first_union_type);
-                    }
-
-                    LuaType::Variadic(VariadicType::Multi(new_multi).into())
-                }
-            }
+            union_return_packs(db, variadic, &VariadicType::Multi(vec![right.clone()]))
         }
         (_, LuaType::Variadic(variadic)) => {
-            let first_type = variadic.get_type(0).cloned().unwrap_or(LuaType::Unknown);
-            let first_union_type = union_return_expr(db, left.clone(), first_type);
-            match variadic.deref() {
-                VariadicType::Base(base) => {
-                    let union_base = union_return_expr(db, base.clone(), LuaType::Nil);
-                    LuaType::Variadic(
-                        VariadicType::Multi(vec![
-                            first_union_type,
-                            LuaType::Variadic(VariadicType::Base(union_base).into()),
-                        ])
-                        .into(),
-                    )
-                }
-                VariadicType::Multi(multi) => {
-                    let mut new_multi = multi.clone();
-                    if !new_multi.is_empty() {
-                        new_multi[0] = first_union_type;
-                        for mult in new_multi.iter_mut().skip(1) {
-                            *mult = union_return_expr(db, mult.clone(), LuaType::Nil);
-                        }
-                    } else {
-                        new_multi.push(first_union_type);
-                    }
-
-                    LuaType::Variadic(VariadicType::Multi(new_multi).into())
-                }
-            }
+            union_return_packs(db, &VariadicType::Multi(vec![left.clone()]), variadic)
         }
         _ => TypeOps::Union.apply(db, &left, &right),
     }
+}
+
+/// Merges two return packs position by position: a position one pack does
+/// not reach is `nil` there, and past the positions both fix, a pack with an
+/// open tail keeps returning its tail's values.
+fn union_return_packs(db: &DbIndex, left: &VariadicType, right: &VariadicType) -> LuaType {
+    let fixed = |pack: &VariadicType| pack.get_max_len().or(pack.get_min_len()).unwrap_or(0);
+    let at = |pack: &VariadicType, idx: usize| pack.get_type(idx).cloned().unwrap_or(LuaType::Nil);
+    let len = fixed(left).max(fixed(right));
+    let mut types = (0..len)
+        .map(|idx| union_return_expr(db, at(left, idx), at(right, idx)))
+        .collect::<Vec<_>>();
+    if left.get_max_len().is_none() || right.get_max_len().is_none() {
+        let tail = union_return_expr(db, at(left, len), at(right, len));
+        types.push(LuaType::Variadic(VariadicType::Base(tail).into()));
+    }
+    LuaType::Variadic(VariadicType::Multi(types).into())
 }
 
 fn table_const_has_no_known_members(db: &DbIndex, table: &crate::InFiled<TextRange>) -> bool {

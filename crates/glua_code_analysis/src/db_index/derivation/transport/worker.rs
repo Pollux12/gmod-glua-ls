@@ -208,6 +208,30 @@ impl WorkerContext {
                 .is_some_and(|slot| self.graph().keys().windowed(slot))
     }
 
+    /// Whether `key` (or a base key it is read out of) has an uncommitted
+    /// write or open recomputing window on this worker or in its snapshot.
+    pub(in super::super) fn in_flight(&self, key: &HashedKey) -> bool {
+        if self.keys.in_flight(key, &self.snapshot.graph) {
+            return true;
+        }
+        let table = self.snapshot.graph.keys();
+        let mut current = Some(std::borrow::Cow::Borrowed(key));
+        while let Some(key) = current {
+            if self
+                .snapshot
+                .graph
+                .find_slot(key.as_ref())
+                .is_some_and(|slot| table.windowed(slot))
+            {
+                return true;
+            }
+            current = key
+                .base()
+                .map(|base| std::borrow::Cow::Owned(HashedKey::new(base)));
+        }
+        false
+    }
+
     /// Whether any of the entries `locals` was written here after `since`.
     pub(in super::super) fn local_freshness(&self, locals: &[u32], since: u64) -> Freshness {
         self.keys.freshness(locals, since)
@@ -420,12 +444,13 @@ impl ComputeInputs {
                 };
                 table
                     .find(&keys.new_keys[index as usize])
-                    .is_none_or(|slot| !table.taints(slot))
+                    .is_none_or(|slot| !table.recomputing_or_held(slot))
             })
-            && self
-                .absent_base_flags
-                .iter()
-                .all(|key| table.find(key).is_none_or(|slot| !table.taints(slot)))
+            && self.absent_base_flags.iter().all(|key| {
+                table
+                    .find(key)
+                    .is_none_or(|slot| !table.recomputing_or_held(slot))
+            })
             && self.reads.iter().all(|(local, seen)| {
                 let (key, slot) = match keys.entries[*local as usize] {
                     super::WorkerKey::Known(slot) => (table.live_key(slot), Some(slot)),
@@ -986,6 +1011,28 @@ mod tests {
             guard.finish(&mut table);
             graph.restore_keys(table);
         }
+    }
+
+    #[test]
+    fn a_task_memo_that_read_a_held_key_holds_until_the_task_writes_it() {
+        let mut graph = ReaderGraph::default();
+        graph.intern_read(key(1));
+        graph.hold_windows([&key(1)]);
+        let (snapshot, guard) = snapshot(graph);
+        let recorder = TaskRecorder::start(&snapshot);
+        let (proof, _) = evaluate(&recorder, || memo_of(&key(1)));
+        evaluate(&recorder, || {
+            assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Held);
+        });
+        evaluate(&recorder, || write(&key(1)));
+        evaluate(&recorder, || {
+            assert_eq!(derivation::reuse(&proof, 0, &[], None), Reuse::Stale);
+        });
+        drop(recorder.finish());
+        let mut graph = recover(snapshot);
+        let mut table = graph.lend_keys();
+        guard.finish(&mut table);
+        graph.restore_keys(table);
     }
 
     #[test]

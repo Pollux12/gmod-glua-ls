@@ -1,12 +1,13 @@
 use glua_parser::{
-    BinaryOperator, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexKey,
-    LuaTableExpr, LuaTableField, LuaVarExpr,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaClosureExpr,
+    LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaNameExpr, LuaStat, LuaTableExpr,
+    LuaVarExpr,
 };
 
 use crate::semantic::semantic_decl_value;
 use crate::{
-    DbIndex, InFiled, InferFailReason, LuaDeclExtra, LuaInferCache, LuaInstanceType, LuaMemberKey,
-    LuaMemberOwner, LuaType, SemanticDeclLevel, infer_expr,
+    DbIndex, InFiled, InferFailReason, LuaDeclExtra, LuaDeclId, LuaInferCache, LuaInstanceType,
+    LuaMemberKey, LuaMemberOwner, LuaType, SemanticDeclLevel, infer_expr,
     semantic::{
         SemanticDeclGuard, get_member_value_expr, infer::InferResult, infer_expr_semantic_decl,
         member::find_members_with_key,
@@ -48,17 +49,19 @@ pub fn infer_setmetatable_call(
     };
     match &basic_table {
         LuaExpr::TableExpr(table_expr) => {
-            if table_expr.is_empty() && is_index {
-                return Ok(meta_type);
-            }
-
             if is_index {
+                let range = InFiled::new(cache.get_file_id(), table_expr.get_range());
+                if result_used_as_class(db, cache, &call_expr) {
+                    return Ok(LuaType::Instance(
+                        LuaInstanceType::with_kind(meta_type, range, crate::LuaInstanceKind::Copy)
+                            .into(),
+                    ));
+                }
+                if table_expr.is_empty() {
+                    return Ok(meta_type);
+                }
                 return Ok(LuaType::Instance(
-                    LuaInstanceType::new(
-                        meta_type,
-                        InFiled::new(cache.get_file_id(), table_expr.get_range()),
-                    )
-                    .into(),
+                    LuaInstanceType::new(meta_type, range).into(),
                 ));
             }
 
@@ -81,6 +84,374 @@ pub fn infer_setmetatable_call(
             Ok(meta_type)
         }
     }
+}
+
+/// Whether the table `setmetatable({}, mt)` makes is used as a class of its
+/// own: the variable holding it gets its own `__index`, or is the metatable of
+/// another `setmetatable` call. Such a table is a subclass that keeps its own
+/// members; a plain instance shares its class's.
+fn result_used_as_class(db: &DbIndex, cache: &LuaInferCache, call_expr: &LuaCallExpr) -> bool {
+    let Some(holder) = call_expr.get_parent::<LuaStat>() else {
+        return false;
+    };
+    let Some(root) = call_expr.syntax().ancestors().last() else {
+        return false;
+    };
+    let file_id = cache.get_file_id();
+    let decl_used_as_class = |decl_id: LuaDeclId| {
+        db.get_reference_index()
+            .get_decl_references(&file_id, &decl_id)
+            .is_some_and(|references| {
+                references.cells.iter().any(|cell| {
+                    root.covering_element(cell.range)
+                        .parent()
+                        .and_then(LuaNameExpr::cast)
+                        .is_some_and(|use_| is_class_use(&use_))
+                })
+            })
+    };
+    match holder {
+        LuaStat::LocalStat(local_stat) => {
+            let Some(pos) = local_stat
+                .get_value_exprs()
+                .position(|expr| expr.syntax() == call_expr.syntax())
+            else {
+                return false;
+            };
+            let Some(name) = local_stat.get_local_name_list().nth(pos) else {
+                return false;
+            };
+            decl_used_as_class(LuaDeclId::new(file_id, name.get_position()))
+        }
+        LuaStat::AssignStat(assign_stat) => {
+            let (vars, exprs) = assign_stat.get_var_and_expr_list();
+            let Some(pos) = exprs
+                .iter()
+                .position(|expr| expr.syntax() == call_expr.syntax())
+            else {
+                return false;
+            };
+            let Some(LuaVarExpr::NameExpr(target)) = vars.get(pos) else {
+                return false;
+            };
+            if let Some(decl_id) = db
+                .get_reference_index()
+                .get_var_reference_decl(&file_id, target.get_range())
+                && db
+                    .get_decl_index()
+                    .get_decl(&decl_id)
+                    .is_some_and(|decl| decl.is_local())
+            {
+                return decl_used_as_class(decl_id);
+            }
+            let Some(name) = target.get_name_text() else {
+                return false;
+            };
+            root.descendants()
+                .filter_map(LuaNameExpr::cast)
+                .any(|use_| {
+                    use_.get_name_text() == Some(name.clone())
+                        && !db
+                            .get_reference_index()
+                            .get_var_reference_decl(&file_id, use_.get_range())
+                            .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
+                            .is_some_and(|decl| decl.is_local())
+                        && is_class_use(&use_)
+                })
+        }
+        _ => false,
+    }
+}
+
+/// `name.__index = ...`, `function name:method()`, or `setmetatable(x, name)`.
+fn is_class_use(name: &LuaNameExpr) -> bool {
+    let Some(parent) = name.syntax().parent() else {
+        return false;
+    };
+    if let Some(index_expr) = LuaIndexExpr::cast(parent.clone()) {
+        if index_expr.get_parent::<LuaFuncStat>().is_some() {
+            return true;
+        }
+        return index_expr
+            .get_name_token()
+            .is_some_and(|key| key.get_name_text() == "__index")
+            && index_expr
+                .get_parent::<LuaAssignStat>()
+                .is_some_and(|assign| {
+                    assign
+                        .get_var_and_expr_list()
+                        .0
+                        .iter()
+                        .any(|var| var.syntax() == index_expr.syntax())
+                });
+    }
+    let Some(args) = LuaCallArgList::cast(parent) else {
+        return false;
+    };
+    args.get_args().nth(1).is_some_and(|arg| arg.syntax() == name.syntax())
+        && args
+            .get_parent::<LuaCallExpr>()
+            .and_then(|call| call.get_prefix_expr())
+            .is_some_and(|prefix| {
+                matches!(prefix, LuaExpr::NameExpr(callee) if callee.get_name_text().as_deref() == Some("setmetatable"))
+            })
+}
+
+/// Whether `index` already reads through the table at `range`, which Lua
+/// rejects as a loop in `gettable`. The tables under a per-call copy are the
+/// ones another call made, so a constructor there is a different table.
+fn index_chain_reaches(index: &LuaType, range: &InFiled<rowan::TextRange>) -> bool {
+    let mut current = index;
+    loop {
+        if current == &LuaType::TableConst(range.clone()) {
+            return true;
+        }
+        let LuaType::Instance(instance) = current else {
+            return false;
+        };
+        if instance.get_range() == range {
+            return true;
+        }
+        if instance.get_kind() != crate::LuaInstanceKind::Shared {
+            return false;
+        }
+        current = instance.get_base();
+    }
+}
+
+/// The `__index` of the metatable `metatable`, which its instances read
+/// through.
+pub(crate) fn infer_metatable_index_of(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    metatable: LuaExpr,
+) -> Option<LuaType> {
+    match infer_metatable_index_type(db, cache, metatable).ok()? {
+        MetatableIndex::Index(index) => Some(index),
+        _ => None,
+    }
+}
+
+/// What a call of a function returning an instance reading through `index`
+/// gives (see `LuaInstanceReturnAlias`): `index`, on the
+/// table the function makes for it when the function writes members into it,
+/// and for a result used as a class of its own, an instance at the call so
+/// each call's class keeps its own members. A table made empty folds into the
+/// class, as `setmetatable({}, Class)` does.
+pub(crate) fn infer_instance_on_index(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    index: LuaType,
+    table: Option<InFiled<rowan::TextRange>>,
+) -> Option<LuaType> {
+    let index = match table {
+        Some(table)
+            if !index_chain_reaches(&index, &table)
+                && db
+                    .get_member_index()
+                    .get_members(&LuaMemberOwner::Element(table.clone()))
+                    .is_some_and(|members| !members.is_empty()) =>
+        {
+            LuaType::Instance(LuaInstanceType::new(index, table).into())
+        }
+        _ => index,
+    };
+    let call = InFiled::new(cache.get_file_id(), call_expr.get_range());
+    Some(
+        if result_used_as_class(db, cache, call_expr) && !index_chain_reaches(&index, &call) {
+            LuaType::Instance(
+                LuaInstanceType::with_kind(index, call, crate::LuaInstanceKind::Copy).into(),
+            )
+        } else {
+            index
+        },
+    )
+}
+
+/// `getmetatable(t)` for a table `setmetatable` gave a metatable, or a
+/// proxy `newproxy` gave one: that metatable, or its `__metatable` field,
+/// which Lua returns in its place. `None` for any other call, which then
+/// reads as declared.
+pub fn infer_getmetatable_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<LuaType> {
+    let metatable_range = getmetatable_call_metatable(db, cache, call_expr)?;
+    let metatable = metatable_type(db, metatable_range.clone());
+    let owner = crate::semantic::metatable_member_owner(db, &metatable_range);
+    let hidden_by = db
+        .get_member_index()
+        .get_member_item(&owner, &LuaMemberKey::Name("__metatable".into()))
+        .and_then(|item| item.resolve_type(db).ok())
+        .filter(|typ| !typ.is_nil() && !typ.is_never() && !typ.is_unknown());
+    Some(match hidden_by {
+        Some(typ) => crate::db_index::widen_literal_type_for_assignment(&typ),
+        None => metatable,
+    })
+}
+
+/// The table a `getmetatable(t)` call returns, before any registration made
+/// a class of it.
+pub(crate) fn getmetatable_call_metatable(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<InFiled<rowan::TextRange>> {
+    let LuaExpr::NameExpr(name) = call_expr.get_prefix_expr()? else {
+        return None;
+    };
+    if name.get_name_text()? != "getmetatable" || is_shadowed_local(db, cache.get_file_id(), &name)
+    {
+        return None;
+    }
+    let [table]: [LuaExpr; 1] = call_expr
+        .get_args_list()?
+        .get_args()
+        .collect::<Vec<_>>()
+        .try_into()
+        .ok()?;
+    if let Some(metatable) = proxy_metatable_range(db, cache, &table, &mut Vec::new()) {
+        return Some(metatable);
+    }
+    let range = resolve_table_backing_range(db, cache, &table)
+        .or_else(|| setmetatable_target_range(db, cache, &table))?;
+    db.get_metatable_index().get(&range).cloned()
+}
+
+fn is_shadowed_local(db: &DbIndex, file_id: crate::FileId, name: &LuaNameExpr) -> bool {
+    db.get_reference_index()
+        .get_var_reference_decl(&file_id, name.get_range())
+        .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
+        .is_some_and(|decl| decl.is_local())
+}
+
+/// The class a registration made of `metatable`, or the table itself.
+fn metatable_type(db: &DbIndex, metatable: InFiled<rowan::TextRange>) -> LuaType {
+    db.get_type_index()
+        .table_class(&metatable)
+        .cloned()
+        .unwrap_or(LuaType::TableConst(metatable))
+}
+
+/// `newproxy(...)` for a proxy whose metatable has a table `__index`: what
+/// reads on the proxy reach. `None` for any other call, which then reads as
+/// declared.
+pub fn infer_newproxy_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<LuaType> {
+    let call = LuaExpr::CallExpr(call_expr.clone());
+    let metatable = proxy_metatable_range(db, cache, &call, &mut Vec::new())?;
+    match index_type_from_writers(db, &metatable_type(db, metatable))? {
+        MetatableIndex::Index(index_type) => Some(index_type),
+        MetatableIndex::NoIndex(_) | MetatableIndex::Unresolved => None,
+    }
+}
+
+/// The metatable of the proxy `expr` is, or evaluates to.
+pub(crate) fn proxy_metatable(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> Option<InFiled<rowan::TextRange>> {
+    proxy_metatable_range(db, cache, expr, &mut Vec::new())
+}
+
+/// The metatable of the proxy `expr` is, or evaluates to. `newproxy(true)`
+/// creates a metatable, named here by the call's range; `newproxy(p)`
+/// shares p's.
+fn proxy_metatable_range(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+    visited: &mut Vec<InFiled<rowan::TextRange>>,
+) -> Option<InFiled<rowan::TextRange>> {
+    let (file_id, value) = match expr {
+        LuaExpr::CallExpr(_) => (cache.get_file_id(), expr.clone()),
+        LuaExpr::ParenExpr(paren_expr) => {
+            return proxy_metatable_range(db, cache, &paren_expr.get_expr()?, visited);
+        }
+        _ => semantic_decl_value(
+            db,
+            infer_expr_semantic_decl(
+                db,
+                cache,
+                expr.clone(),
+                SemanticDeclGuard::default(),
+                SemanticDeclLevel::default(),
+            )?,
+        )?,
+    };
+    let value_range = InFiled::new(file_id, value.get_range());
+    if visited.contains(&value_range) {
+        return None;
+    }
+    visited.push(value_range);
+    if file_id != cache.get_file_id() {
+        let mut value_cache = LuaInferCache::new(file_id, cache.get_config().clone());
+        return proxy_metatable_of_value(db, &mut value_cache, &value, visited);
+    }
+    proxy_metatable_of_value(db, cache, &value, visited)
+}
+
+fn proxy_metatable_of_value(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    value: &LuaExpr,
+    visited: &mut Vec<InFiled<rowan::TextRange>>,
+) -> Option<InFiled<rowan::TextRange>> {
+    let LuaExpr::CallExpr(call) = value else {
+        return proxy_metatable_range(db, cache, value, visited);
+    };
+    let LuaExpr::NameExpr(name) = call.get_prefix_expr()? else {
+        return None;
+    };
+    if name.get_name_text()? != "newproxy" || is_shadowed_local(db, cache.get_file_id(), &name) {
+        return None;
+    }
+    let arg = call.get_args_list()?.get_args().next()?;
+    match infer_expr(db, cache, arg.clone()) {
+        Ok(LuaType::BooleanConst(true) | LuaType::DocBooleanConst(true)) => {
+            Some(InFiled::new(cache.get_file_id(), call.get_range()))
+        }
+        Ok(LuaType::BooleanConst(false) | LuaType::DocBooleanConst(false)) => None,
+        _ => proxy_metatable_range(db, cache, &arg, visited),
+    }
+}
+
+/// The table literal a `setmetatable(t, mt)` call `expr` evaluates to, or is
+/// the value of: the call returns `t`.
+fn setmetatable_target_range(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> Option<InFiled<rowan::TextRange>> {
+    let (file_id, value) = match expr {
+        LuaExpr::CallExpr(_) => (cache.get_file_id(), expr.clone()),
+        _ => semantic_decl_value(
+            db,
+            infer_expr_semantic_decl(
+                db,
+                cache,
+                expr.clone(),
+                SemanticDeclGuard::default(),
+                SemanticDeclLevel::default(),
+            )?,
+        )?,
+    };
+    let LuaExpr::CallExpr(call) = value else {
+        return None;
+    };
+    if !call.is_setmetatable() {
+        return None;
+    }
+    let target = call.get_args_list()?.get_args().next()?;
+    crate::semantic::with_file_cache(cache, file_id, |cache| {
+        resolve_table_backing_range(db, cache, &target)
+    })
 }
 
 fn resolve_table_backing_range(
@@ -216,26 +587,8 @@ fn infer_metatable_index_type(
         ExactMetatableIndexType::None => {}
     }
 
-    // Every `__index` writer, so writers that disagree are seen to disagree.
-    if let Some(meta_members) =
-        find_members_with_key(db, &meta_type, LuaMemberKey::Name("__index".into()), true)
-    {
-        let mut index_types = Vec::with_capacity(meta_members.len());
-        for meta_member in meta_members {
-            match classify_metatable_index_candidate(&meta_member.typ) {
-                MetatableIndexCandidate::Supported(index_type) => index_types.push(index_type),
-                MetatableIndexCandidate::Unsupported => {
-                    return Ok(MetatableIndex::NoIndex(LuaType::Unknown));
-                }
-            }
-        }
-
-        if let Some(index_type) = index_types.first() {
-            if index_types.iter().all(|candidate| candidate == index_type) {
-                return Ok(MetatableIndex::Index(index_type.clone()));
-            }
-            return Ok(MetatableIndex::NoIndex(LuaType::Unknown));
-        }
+    if let Some(index) = index_type_from_writers(db, &meta_type) {
+        return Ok(index);
     }
 
     // No `__index` was found. Whether that is an answer depends on whether
@@ -247,6 +600,114 @@ fn infer_metatable_index_type(
         return Ok(MetatableIndex::Unresolved);
     }
     Ok(MetatableIndex::NoIndex(meta_type))
+}
+
+/// The `__index` every writer of it on `meta_type` agrees on, so writers that
+/// disagree are seen to disagree. `None` when nothing writes `__index`.
+fn index_type_from_writers(db: &DbIndex, meta_type: &LuaType) -> Option<MetatableIndex> {
+    index_from_writers_at(db, meta_type, meta_type)
+}
+
+/// [`index_type_from_writers`] from `level` of `receiver`'s instance chain:
+/// a level that writes `__index` hides the levels it extends, as Lua reads
+/// the nearest one.
+fn index_from_writers_at(
+    db: &DbIndex,
+    receiver: &LuaType,
+    level: &LuaType,
+) -> Option<MetatableIndex> {
+    let key = LuaMemberKey::Name("__index".into());
+    if let LuaType::Instance(instance) = level {
+        let own = LuaType::TableConst(instance.get_range().clone());
+        return match find_members_with_key(db, &own, key, false) {
+            Some(members) if !members.is_empty() => agreed_index(db, receiver, members),
+            _ => index_from_writers_at(db, receiver, instance.get_base()),
+        };
+    }
+    agreed_index(db, receiver, find_members_with_key(db, level, key, true)?)
+}
+
+fn agreed_index(
+    db: &DbIndex,
+    receiver: &LuaType,
+    members: Vec<crate::LuaMemberInfo>,
+) -> Option<MetatableIndex> {
+    let mut index_types = Vec::with_capacity(members.len());
+    for member in members {
+        if indexes_its_receiver(db, &member) {
+            index_types.push(receiver.clone());
+            continue;
+        }
+        match classify_metatable_index_candidate(&member.typ) {
+            MetatableIndexCandidate::Supported(index_type) => index_types.push(index_type),
+            MetatableIndexCandidate::Unsupported => {
+                return Some(MetatableIndex::NoIndex(LuaType::Unknown));
+            }
+        }
+    }
+    let index_type = index_types.first()?;
+    Some(
+        if index_types.iter().all(|candidate| candidate == index_type) {
+            MetatableIndex::Index(index_type.clone())
+        } else {
+            MetatableIndex::NoIndex(LuaType::Unknown)
+        },
+    )
+}
+
+/// Whether the `__index` write `member` is `t.__index = t` through a table
+/// the writing function holds for the call, such as `self` or a table it
+/// makes: whatever table it runs on indexes itself.
+fn indexes_its_receiver(db: &DbIndex, member: &crate::LuaMemberInfo) -> bool {
+    let Some(crate::LuaSemanticDeclId::Member(member_id)) = member.property_owner_id else {
+        return false;
+    };
+    let Some(tree) = db
+        .get_vfs()
+        .syntax_tree_around(&member_id.file_id, member_id.get_syntax_id().get_range())
+    else {
+        return false;
+    };
+    let Some(index_expr) = member_id
+        .get_syntax_id()
+        .to_node_from_root(&tree.get_red_root())
+        .and_then(LuaIndexExpr::cast)
+    else {
+        return false;
+    };
+    let Some(LuaExpr::NameExpr(receiver)) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some(assign) = index_expr.get_parent::<LuaAssignStat>() else {
+        return false;
+    };
+    let (vars, values) = assign.get_var_and_expr_list();
+    let assigns_receiver = vars
+        .iter()
+        .position(|var| var.syntax() == index_expr.syntax())
+        .and_then(|at| values.get(at))
+        .is_some_and(|value| {
+            matches!(value, LuaExpr::NameExpr(value) if value.get_name_text() == receiver.get_name_text())
+        });
+    if !assigns_receiver {
+        return false;
+    }
+    let member_index = db.get_member_index();
+    let file_id = member_id.file_id;
+    let Some(writer) =
+        member_index.enclosing_function_scope_range(file_id, index_expr.get_position())
+    else {
+        return false;
+    };
+    receiver.get_name_text().as_deref() == Some("self")
+        || db
+            .get_reference_index()
+            .get_local_reference(&file_id)
+            .and_then(|references| references.get_decl_id(&receiver.get_range()))
+            .is_some_and(|decl_id| {
+                member_index.enclosing_function_scope_range(file_id, decl_id.position)
+                    == Some(writer)
+            })
 }
 
 /// Whether the resolution machinery has already given up on this
@@ -352,39 +813,7 @@ fn infer_receiver_owner_type(
             .map(ReceiverOwnerType::Exact)
             .unwrap_or(ReceiverOwnerType::Rejected);
     }
-    if implicit_self || signature.is_colon_define {
-        return ReceiverOwnerType::NotReceiver;
-    }
-
-    let Some(closure) = name_expr
-        .syntax()
-        .ancestors()
-        .find_map(LuaClosureExpr::cast)
-    else {
-        return ReceiverOwnerType::NotReceiver;
-    };
-    if crate::LuaSignatureId::from_closure(cache.get_file_id(), &closure) != signature_id {
-        return ReceiverOwnerType::NotReceiver;
-    }
-    let Some(field) = closure.syntax().parent().and_then(LuaTableField::cast) else {
-        return ReceiverOwnerType::NotReceiver;
-    };
-    let Some(LuaIndexKey::Name(key)) = field.get_field_key() else {
-        return ReceiverOwnerType::NotReceiver;
-    };
-    if key.get_name_text() != "__call" {
-        return ReceiverOwnerType::NotReceiver;
-    }
-    let Some(owner) = field.syntax().parent().and_then(LuaTableExpr::cast) else {
-        return ReceiverOwnerType::NotReceiver;
-    };
-    if decl_is_mutated(db, &decl_id) {
-        return ReceiverOwnerType::Rejected;
-    }
-    ReceiverOwnerType::Exact(LuaType::TableConst(InFiled::new(
-        cache.get_file_id(),
-        owner.get_range(),
-    )))
+    ReceiverOwnerType::NotReceiver
 }
 
 fn decl_is_mutated(db: &DbIndex, decl_id: &crate::LuaDeclId) -> bool {

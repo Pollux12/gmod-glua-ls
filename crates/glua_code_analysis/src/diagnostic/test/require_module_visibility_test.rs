@@ -8,6 +8,7 @@ mod tests {
         ws.enable_check(DiagnosticCode::RequireModuleNotVisible);
 
         // Define a module with an @export namespace restriction
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "test.lua",
             r#"
@@ -31,6 +32,7 @@ mod tests {
     #[test]
     fn test_2() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::RequireModuleNotVisible);
 
         // `@export` without a namespace restriction
@@ -60,6 +62,7 @@ mod tests {
         ws.enable_check(DiagnosticCode::RequireModuleNotVisible);
 
         // With `@export namespace` but no namespace in the current file, the module is treated as invisible
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "test.lua",
             r#"

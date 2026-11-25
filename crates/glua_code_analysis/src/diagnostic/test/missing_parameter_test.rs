@@ -9,6 +9,22 @@ mod test {
     }
 
     #[test]
+    fn a_wrapper_of_a_documented_global_takes_a_param_only_an_overload_has_as_optional() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/autorun/sh_functions.lua",
+            r#"
+            local origtonumber = tonumber
+            function tonumber(str, base)
+                return origtonumber(str, base)
+            end
+            "#,
+        );
+
+        assert!(ws.check_code_for(DiagnosticCode::MissingParameter, "local n = tonumber('1')"));
+    }
+
+    #[test]
     fn calling_a_gamemode_hook_with_fewer_arguments_is_not_missing_parameters() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         set_gmod_enabled(&mut ws);

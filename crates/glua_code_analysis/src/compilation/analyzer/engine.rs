@@ -608,6 +608,10 @@ pub(crate) struct Engine {
     /// before they were removed: what a reader settled on of it, whatever it
     /// saw while the files were rebuilt.
     removed_outputs: FxHashMap<HashedKey, derivation::Fingerprint>,
+    /// The derivations that stopped producing each key during this run: what
+    /// a reader settled on of it may have come from one that no longer
+    /// supplies it.
+    withdrawn: std::cell::RefCell<FxHashMap<HashedKey, Vec<DerivationId>>>,
     /// The members of the loops this run cleared at quiescence for good, at
     /// the first check after them that cleared none (see
     /// [`Self::settled_loop_members`]). Settled again from nothing once the
@@ -648,7 +652,9 @@ pub(crate) struct Engine {
     /// What the outputs of the loops being cleared held before: a memo that
     /// read one holds again once the loops settle if it settles back to it.
     loop_before: FxHashMap<HashedKey, derivation::Fingerprint>,
-    /// How often each derivation ran since the run entered its stage.
+    /// How often each derivation ran since the run entered its stage. One
+    /// [`Self::admit_run`] stopped keeps its count into later stages, so it
+    /// stays stopped until the run starts over or its loop is cleared.
     stage_runs: FxHashMap<DerivationId, StageRuns>,
     /// Whether a derivation that runs more often within a stage than settling
     /// can need panics rather than being left as its last run left it.
@@ -957,18 +963,63 @@ impl Engine {
         self.removed_outputs.entry(key).or_insert(fingerprint);
     }
 
-    /// Carries the removed outputs noted so far to where `edits` moved them.
+    /// Notes that `id` no longer produces any of `keys`.
+    fn note_withdrawn(&self, id: DerivationId, keys: Vec<HashedKey>) {
+        let mut withdrawn = self.withdrawn.borrow_mut();
+        for key in keys {
+            let producers = withdrawn.entry(key).or_default();
+            if !producers.contains(&id) {
+                producers.push(id);
+            }
+        }
+    }
+
+    /// Carries the removed and withdrawn outputs noted so far to where `edits`
+    /// moved them.
     pub(crate) fn follow_removed_outputs(&mut self, edits: &derivation::EditMaps) {
-        self.removed_outputs = std::mem::take(&mut self.removed_outputs)
-            .into_iter()
-            .map(|(key, fingerprint)| {
-                let key = edits
-                    .map_key(&key)
-                    .filter(|moved| moved != key.key())
-                    .map_or(key, HashedKey::new);
-                (key, fingerprint)
-            })
-            .collect();
+        let mut next_removed = FxHashMap::default();
+        let mut lost_removed = Vec::new();
+        for (key, fingerprint) in std::mem::take(&mut self.removed_outputs) {
+            match edits.map_key(&key) {
+                Some(moved) if moved != *key.key() => {
+                    next_removed.insert(HashedKey::new(moved), fingerprint);
+                }
+                Some(_) => {
+                    next_removed.insert(key, fingerprint);
+                }
+                None => lost_removed.push((key, fingerprint)),
+            }
+        }
+        for (key, fingerprint) in lost_removed {
+            next_removed.entry(key).or_insert(fingerprint);
+        }
+        self.removed_outputs = next_removed;
+
+        let withdrawn = self.withdrawn.get_mut();
+        let mut next_withdrawn: FxHashMap<HashedKey, Vec<DerivationId>> = FxHashMap::default();
+        let mut lost_withdrawn = Vec::new();
+        for (key, ids) in std::mem::take(withdrawn) {
+            match edits.map_key(&key) {
+                Some(moved) => {
+                    let target = if moved != *key.key() {
+                        HashedKey::new(moved)
+                    } else {
+                        key
+                    };
+                    let entry = next_withdrawn.entry(target).or_default();
+                    for id in ids {
+                        if !entry.contains(&id) {
+                            entry.push(id);
+                        }
+                    }
+                }
+                None => lost_withdrawn.push((key, ids)),
+            }
+        }
+        for (key, ids) in lost_withdrawn {
+            next_withdrawn.entry(key).or_insert(ids);
+        }
+        *withdrawn = next_withdrawn;
     }
 
     /// Queues `id` as changed, or parks it while the focus settles if it
@@ -1198,7 +1249,7 @@ impl Engine {
         reader: DerivationId,
         seen: derivation::Fingerprint,
     ) {
-        if reader.kind.is_statement() {
+        if reader.kind.closes_loops() {
             let settled = db.analysis_stage() == AnalysisStage::Closed;
             let moved = self.moved_from.entry(reader).or_default();
             if moved.iter().all(|moved| moved.key != *key) {
@@ -1347,9 +1398,10 @@ impl Engine {
     }
 
     /// Whether `file_id` has work still to settle: queued, waiting, in the
-    /// focus or a source layer to rebuild.
+    /// focus or a source layer to rebuild. Every file settles while cleared
+    /// loops do: their facts are reset, and any file can read them.
     pub(crate) fn is_settling(&self, file_id: crate::FileId) -> bool {
-        self.focus.contains(&file_id) || self.has_work(file_id)
+        self.focus.contains(&file_id) || !self.loop_focus.is_empty() || self.has_work(file_id)
     }
 
     /// Whether `file_id` has work queued, waiting, held or on a worker, or a
@@ -1364,11 +1416,12 @@ impl Engine {
             || self.carried.iter().any(|plan| plan.touches_file(file_id))
     }
 
-    /// Whether `file_id` is in the focus that is still settling and has work
-    /// left in it: one whose own work settled answers while the rest of the
-    /// focus settles.
+    /// Whether `file_id` is in the focus that is still settling, or becomes it
+    /// once cleared loops settle, and has work left in it: one whose own work
+    /// settled answers while the rest of the focus settles.
     pub(crate) fn in_focus(&self, file_id: crate::FileId) -> bool {
-        self.focus.contains(&file_id) && self.has_work(file_id)
+        (self.focus.contains(&file_id) || self.after_loops.contains(&file_id))
+            && self.has_work(file_id)
     }
 
     /// Whether `reader` waits for the focus to settle.
@@ -1461,6 +1514,7 @@ impl Engine {
 
     /// Starts the run over from the first stage.
     pub(crate) fn open(&mut self, db: &mut DbIndex) {
+        self.stage_runs.clear();
         self.enter_stage(db, AnalysisStage::Open);
     }
 
@@ -1481,12 +1535,15 @@ impl Engine {
             if !on_workers {
                 self.requeue_carried();
             }
+            // Cleared loops settle in supersteps even within one file: a
+            // loop with more than one fixed point lands on the one its
+            // order of evaluation reaches, which must not hang on whether
+            // a loop in another file was cleared with it.
             let superstep_due = on_workers
                 && (!self.carried.is_empty()
-                    || self
-                        .worklist
-                        .first_rank()
-                        .is_some_and(|rank| self.worklist.spans_files(rank)));
+                    || self.worklist.first_rank().is_some_and(|rank| {
+                        !self.loop_focus.is_empty() || self.worklist.spans_files(rank)
+                    }));
             if interrupted || slice.over(self.stats.total_evaluations() - started) {
                 // The superstep due next runs while readers share the index,
                 // and the next slice installs it.
@@ -1883,6 +1940,10 @@ impl Engine {
             member.file_id == crate::FileId::VIRTUAL
                 || self.serial_files.contains(&member.file_id)
                 || self.cycle_members.contains(member)
+                || self
+                    .stage_runs
+                    .get(member)
+                    .is_some_and(|runs| runs.on_index > MAX_INDEX_RUNS)
         }) {
             return Dispatched::Root;
         }
@@ -1912,14 +1973,14 @@ impl Engine {
             }
             self.unqueue(*member);
             self.stats.evaluated(*member);
-            if member.kind.is_statement()
+            if member.kind.closes_loops()
                 && self.ran.insert(*member)
                 && db.reader_graph().contains(*member)
             {
                 self.from_before.insert(*member);
             }
             let mut moved = self.moved_from.remove(member).unwrap_or_default();
-            if member.kind.is_statement() {
+            if member.kind.closes_loops() {
                 for (key, seen) in moved_in_task {
                     if moved.iter().all(|moved| moved.key != *key) {
                         moved.push(Moved {
@@ -2190,16 +2251,19 @@ impl Engine {
             produced
         };
         drop(producing);
-        crate::profile::phase("records: replace all kept", || {
+        let withdrawn = crate::profile::phase("records: replace all kept", || {
             db.reader_graph_mut()
                 .replace_all_kept(records, &mut released, derivation::new_stamp)
         });
+        for (id, keys) in withdrawn {
+            self.note_withdrawn(id, keys);
+        }
         if !self.removed_outputs.is_empty() {
             for member in tasks
                 .iter()
                 .flat_map(|(_, groups, ..)| groups.iter().flat_map(|group| &group.members))
             {
-                if member.kind.is_statement() && self.rebuilt.contains(&member.file_id) {
+                if member.kind.closes_loops() && self.rebuilt.contains(&member.file_id) {
                     self.settled_on_removed(db, *member);
                 }
             }
@@ -2507,7 +2571,7 @@ impl Engine {
         let stale = crate::profile::phase("engine: stale check", || {
             self.needs_evaluation(db, id, reason)
         });
-        if !stale || !self.admit_run(id) {
+        if !stale || !self.admit_run(db, id) {
             self.moved_from.remove(&id);
             if id.kind.is_query() {
                 db.queries().set_stale(id, false);
@@ -2535,14 +2599,14 @@ impl Engine {
                 ran.insert(*member);
             }
             self.stats.evaluated(*member);
-            if member.kind.is_statement()
+            if member.kind.closes_loops()
                 && self.ran.insert(*member)
                 && db.reader_graph().contains(*member)
             {
                 self.from_before.insert(*member);
             }
             let moved = self.moved_from.remove(member).unwrap_or_default();
-            if member.kind.is_statement() {
+            if member.kind.closes_loops() {
                 self.settled_on(*member, moved);
             }
         }
@@ -2555,7 +2619,7 @@ impl Engine {
         let rebuilt = group
             .iter()
             .copied()
-            .filter(|member| member.kind.is_statement() && self.rebuilt.contains(&member.file_id))
+            .filter(|member| member.kind.closes_loops() && self.rebuilt.contains(&member.file_id))
             .collect::<Vec<_>>();
         let started = self.stats.profiling().then(std::time::Instant::now);
         let touched = crate::profile::phase("engine: evaluate", || {
@@ -2681,15 +2745,22 @@ impl Engine {
             .chain(moved_since)
             .flatten()
             .any(|moved| {
-                // A fact a removed derivation wrote is read from outside the
-                // loop: what the removed writer supplied, nothing in the loop
+                // A fact a removed derivation wrote, or one a derivation
+                // outside the loop stopped writing, is read from outside the
+                // loop: what that writer supplied, nothing in the loop
                 // supplies any more.
                 self.net_moved(db, member, moved)
-                    && (self.removed_outputs.contains_key(&moved.key) || {
-                        let mut producers = graph.producers(&moved.key).peekable();
-                        producers.peek().is_none()
-                            || producers.any(|producer| !lp.contains(&producer))
-                    })
+                    && (self.removed_outputs.contains_key(&moved.key)
+                        || self
+                            .withdrawn
+                            .borrow()
+                            .get(&moved.key)
+                            .is_some_and(|ids| ids.iter().any(|id| !lp.contains(id)))
+                        || {
+                            let mut producers = graph.producers(&moved.key).peekable();
+                            producers.peek().is_none()
+                                || producers.any(|producer| !lp.contains(&producer))
+                        })
             })
     }
 
@@ -3065,6 +3136,7 @@ impl Engine {
             // The loop's own reset is not a fact from outside it.
             self.moved_from.remove(&member);
             self.settled_on.remove(&member);
+            self.stage_runs.remove(&member);
             self.stats.requeue_cause(member, "loop cleared");
             self.queue(member, Reason::Changed);
         }
@@ -3150,8 +3222,9 @@ impl Engine {
     /// [`MAX_INDEX_RUNS`] within one stage the facts it reads keep moving, so
     /// some rule among them does not converge: it panics under
     /// `GLUALS_CHECK_CONVERGENCE` or debug assertions, and otherwise warns
-    /// once and leaves `id` as its last run left it.
-    fn admit_run(&mut self, id: DerivationId) -> bool {
+    /// once, naming where, and leaves `id` as its last run left it for the
+    /// rest of the run.
+    fn admit_run(&mut self, db: &DbIndex, id: DerivationId) -> bool {
         let runs = &mut self.stage_runs.entry(id).or_default().on_index;
         *runs = runs.saturating_add(1);
         self.stats.note_runs(id, *runs);
@@ -3160,11 +3233,14 @@ impl Engine {
         }
         assert!(
             !self.unsettled_panics,
-            "{id:?} evaluated {runs} times without the run moving to another stage"
+            "{id:?} at {} evaluated {runs} times without the run moving to another stage",
+            location(db, id)
         );
         if *runs == MAX_INDEX_RUNS + 1 {
             log::warn!(
-                "{id:?} ran {MAX_INDEX_RUNS} times without settling; it keeps what its last run left"
+                "analysis did not settle at {}: its {:?} ran {MAX_INDEX_RUNS} times and keeps what its last run left. This is a language server bug; please report it with the code there",
+                location(db, id),
+                id.kind
             );
         }
         false
@@ -3179,7 +3255,10 @@ impl Engine {
 
     /// Moves the run to `stage`. Returns the keys of the rules that moved.
     fn enter_stage(&mut self, db: &mut DbIndex, stage: AnalysisStage) -> Vec<HashedKey> {
-        self.stage_runs.clear();
+        self.stage_runs.retain(|_, runs| {
+            runs.in_tasks = 0;
+            runs.on_index > MAX_INDEX_RUNS
+        });
         self.serial_files.clear();
         self.cycle_members.clear();
         self.cycle_outputs.clear();
@@ -3223,6 +3302,10 @@ impl Engine {
             }
             for reader in waited {
                 self.stats.stage_requeued(reader);
+                if reader.kind.is_query() {
+                    db.queries().set_stale(reader, true);
+                    self.pending_stale_queries.remove(&reader);
+                }
                 if crate::profile::tracing_evaluations() {
                     self.trace(db, reader, "stage barrier queues", &[]);
                 }
@@ -3436,7 +3519,7 @@ impl Engine {
             }
             // A member left out is counted when it is stepped.
             let joins = co_producers(db, id).len() == 1;
-            if joins && !self.admit_run(id) {
+            if joins && !self.admit_run(db, id) {
                 continue;
             }
             self.trace_evaluation(db, id, reason);
@@ -3592,7 +3675,7 @@ impl Engine {
             let runs = self.needs_evaluation(db, id, reason);
             let batched = runs && co_producers(db, id).len() == 1;
             // A query left out of the batch is counted when it is stepped.
-            if !runs || (batched && !self.admit_run(id)) {
+            if !runs || (batched && !self.admit_run(db, id)) {
                 self.moved_from.remove(&id);
                 db.queries().set_stale(id, false);
                 continue;
@@ -4000,7 +4083,7 @@ impl Engine {
                 }
                 None => slots.into_iter().map(|slot| (slot, None)).collect(),
             };
-            graph.replace_slots(
+            let withdrawn = graph.replace_slots(
                 id,
                 slots,
                 outputs,
@@ -4008,6 +4091,7 @@ impl Engine {
                 &mut released,
                 now,
             );
+            self.note_withdrawn(id, withdrawn);
         }
         graph.release_keys(released);
         *db.reader_graph_mut() = graph;
@@ -5044,7 +5128,7 @@ fn moved_in_task(
     written: &FxHashSet<HashedKey>,
     member: DerivationId,
 ) -> Vec<(HashedKey, derivation::Fingerprint)> {
-    if !member.kind.is_statement() || written.is_empty() {
+    if !member.kind.closes_loops() || written.is_empty() {
         return Vec::new();
     }
     let graph = frozen.reader_graph();
@@ -5353,6 +5437,21 @@ fn co_producers(db: &DbIndex, id: DerivationId) -> Vec<DerivationId> {
 /// Forgets the lent key table if evaluating a group unwinds.
 fn scopeguard_lent_keys() -> impl Drop {
     OnDrop(derivation::forget_lent_keys)
+}
+
+/// Where `id` is in the workspace, as `path:line:column`.
+fn location(db: &DbIndex, id: DerivationId) -> String {
+    let Some(document) = db.get_vfs().get_document(&id.file_id) else {
+        return "the workspace".to_string();
+    };
+    let start = id.syntax_id().get_range().start();
+    let (line, column) = document.get_line_col(start).unwrap_or_default();
+    format!(
+        "{}:{}:{}",
+        document.get_file_path().display(),
+        line + 1,
+        column + 1
+    )
 }
 
 /// How often one derivation may run on the index within one stage before
@@ -5948,6 +6047,48 @@ print(tuned{index})"
         );
     }
 
+    /// [`Feedback`] whose reader also reads every stage rule, so each stage
+    /// barrier queues it again.
+    struct StagedFeedback;
+
+    impl Recipe for StagedFeedback {
+        fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+            for rule in StageRule::ALL {
+                db.stage_rule_holds(rule);
+            }
+            Feedback.evaluate(db, id);
+        }
+
+        fn splits(&self, _: DerivationKind) -> bool {
+            false
+        }
+
+        fn compute(&self, _: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
+            unreachable!("feedback does not split")
+        }
+
+        fn apply(&self, _: &mut DbIndex, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
+            unreachable!("feedback does not split")
+        }
+    }
+
+    #[test]
+    fn a_loop_that_never_settles_stays_stopped_in_later_stages() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        engine.unsettled_panics = false;
+        for start in [READER, WRITER] {
+            engine.changed(statement(start));
+        }
+        engine.open(db);
+
+        let settled = engine.run(db, &StagedFeedback, Slice::Whole);
+
+        let runs = i64::from(MAX_INDEX_RUNS);
+        assert_eq!((settled, integer(db, COPIED)), (true, runs));
+    }
+
     #[test]
     fn a_group_member_reads_a_later_members_own_fact_as_that_member_leaves_it() {
         let mut ws = VirtualWorkspace::new();
@@ -6427,6 +6568,18 @@ print(tuned{index})"
         assert!(engine.in_focus(FileId::new(FILE)));
         assert!(!engine.in_focus(settled));
         assert!(engine.is_settling(settled));
+    }
+
+    /// A file edited while cleared loops settle becomes the focus once they
+    /// have: until then its document must not answer half evaluated.
+    #[test]
+    fn a_file_prioritised_while_cleared_loops_settle_settles_first() {
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        engine.loop_focus.insert(statement(1));
+        engine.prioritise(&[FileId::new(FILE)]);
+        engine.changed(statement(2));
+
+        assert!(engine.in_focus(FileId::new(FILE)));
     }
 
     #[test]
@@ -7455,6 +7608,102 @@ function holder.receiver:Use() end
         }
     }
 
+    /// [`Unions`]' statements, each binding what the first of its reads that
+    /// is bound holds, tagged with its own position when that is `INPUT`: a
+    /// loop of them settles on whichever value its order of evaluation
+    /// reaches first.
+    struct FirstBound(Unions);
+
+    impl Recipe for FirstBound {
+        fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+            let start = u32::from(id.syntax_id().get_range().start());
+            let (_, reads) = self
+                .0
+                .reads
+                .iter()
+                .find(|(at, _)| *at == start)
+                .expect("a statement of the recipe");
+            let read = reads
+                .iter()
+                .map(|position| {
+                    let read = db
+                        .get_type_index()
+                        .get_type_cache(&owner(*position))
+                        .map(|cache| cache.as_type().clone());
+                    (*position, read)
+                })
+                .collect::<Vec<_>>();
+            if let Some((position, value)) = read
+                .into_iter()
+                .find_map(|(position, read)| Some((position, read?)))
+            {
+                let value = if position == INPUT {
+                    TypeOps::Union.apply(db, &value, &text(&start.to_string()))
+                } else {
+                    value
+                };
+                bind(db, start, value);
+            }
+        }
+
+        fn splits(&self, _: DerivationKind) -> bool {
+            false
+        }
+
+        fn compute(&self, _: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
+            unreachable!("first-bound statements do not split")
+        }
+
+        fn apply(&self, _: &mut DbIndex, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
+            unreachable!("first-bound statements do not split")
+        }
+    }
+
+    /// What `recipe`'s statements bind once `INPUT` turns from "old" to "new"
+    /// under them, on worker supersteps.
+    fn first_bound_after_edit(recipe: &FirstBound) -> Vec<Option<LuaType>> {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+        bind(db, INPUT, text("old"));
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        for (start, _) in &recipe.0.reads {
+            engine.changed(recipe.0.derivation(*start));
+        }
+        engine.open(db);
+        assert!(engine.run(db, recipe, Slice::Whole));
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        move_input(db, &mut engine, "new");
+        engine.open(db);
+        assert!(engine.run(db, recipe, Slice::Whole));
+        recipe.0.bound(db)
+    }
+
+    #[test]
+    fn a_loop_cleared_alone_settles_as_when_a_loop_in_another_file_clears_with_it() {
+        let reads = vec![
+            (10, vec![30, INPUT, 40]),
+            (20, vec![10, 40]),
+            (30, vec![50, INPUT]),
+            (40, vec![10]),
+            (50, vec![20]),
+        ];
+        let mut with_other = reads.clone();
+        with_other.extend([(110, vec![INPUT, 120]), (120, vec![110])]);
+        let alone = FirstBound(Unions {
+            reads,
+            exports: Vec::new(),
+        });
+        let with_other = FirstBound(Unions {
+            reads: with_other,
+            exports: Vec::new(),
+        });
+
+        let alone = first_bound_after_edit(&alone);
+        let with_other = first_bound_after_edit(&with_other);
+
+        assert_eq!(alone, with_other[..alone.len()]);
+    }
+
     #[test]
     fn a_loop_clears_once_no_source_layer_is_left_to_rebuild() {
         let _serial = serial_engine();
@@ -7494,11 +7743,28 @@ function holder.receiver:Use() end
     /// positions it reads: each binds there the union of what it reads and
     /// what the group it runs in wrote there before it, as statements assigning
     /// one local add to its type. An unknown adds nothing to a known value.
+    /// The entries at `passes` are instead call-site passes, which run once
+    /// the statements settle.
     struct Supplies {
         writes: Vec<(u32, u32, Vec<u32>)>,
+        passes: Vec<u32>,
     }
 
     impl Supplies {
+        fn id(&self, start: u32) -> DerivationId {
+            if !self.passes.contains(&start) {
+                return statement(start);
+            }
+            DerivationId::new(
+                DerivationKind::CallSiteParam,
+                FileId::new(FILE),
+                LuaSyntaxId::new(
+                    LuaSyntaxKind::CallExpr.into(),
+                    TextRange::at(TextSize::new(start), TextSize::new(1)),
+                ),
+            )
+        }
+
         fn bound(&self, db: &DbIndex) -> Vec<Option<LuaType>> {
             self.writes
                 .iter()
@@ -7518,7 +7784,7 @@ function holder.receiver:Use() end
             bind(db, INPUT, value);
             let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
             for (start, _, _) in &self.writes {
-                engine.changed(statement(*start));
+                engine.changed(self.id(*start));
             }
             engine.open(db);
             assert!(engine.run(db, self, Slice::Whole));
@@ -7586,6 +7852,45 @@ function holder.receiver:Use() end
                 (30, 30, vec![20]),
                 (40, 10, vec![10, 30]),
             ],
+            passes: Vec::new(),
+        };
+
+        for serial in [true, false] {
+            for schedule in [
+                Schedule::Canonical,
+                Schedule::Reversed,
+                Schedule::Shuffled(7),
+                Schedule::Deferred,
+            ] {
+                let _serial = serial.then(serial_engine);
+                let mut warm = recipe.settled_from(text("old"));
+                let db = warm.get_db_mut();
+                let mut engine = Engine::new(derivation::EditMaps::default(), schedule);
+                bind(db, INPUT, LuaType::Unknown);
+                let input = HashedKey::new(FactKey::TypeCache(owner(INPUT)));
+                db.reader_graph().forget_fingerprint(&input);
+                engine.readers_of(db, [&input]);
+                engine.open(db);
+                assert!(engine.run(db, &recipe, Slice::Whole));
+
+                assert_eq!(
+                    recipe.bound(db),
+                    recipe.bound(recipe.settled_from(LuaType::Unknown).get_db_mut()),
+                    "{schedule:?} serial={serial}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_loop_whose_only_outside_reader_is_a_pass_settles_as_a_cold_build() {
+        // A pass guesses `x` from `INPUT` and from `y`, and `y = x` reads the
+        // guess back: the loop keeps what `INPUT` gave it unless it is
+        // cleared, and only the pass, which runs once statements settle,
+        // reads `INPUT`.
+        let recipe = Supplies {
+            writes: vec![(10, 10, vec![INPUT, 20]), (20, 20, vec![10])],
+            passes: vec![10],
         };
 
         for serial in [true, false] {

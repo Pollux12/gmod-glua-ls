@@ -18,18 +18,24 @@ use glua_parser::{
 #[cfg(test)]
 pub(crate) use infer_binary::CONSTANT_EXPR_CLASSIFICATIONS;
 use infer_binary::infer_binary_expr;
-pub(crate) use infer_call::get_prefix_expr_signature_id;
+pub(crate) use infer_binary::infer_binary_expr_and;
 use infer_call::infer_call_expr;
 pub use infer_call::infer_call_expr_func;
 pub(crate) use infer_call::signature_call_selects_declared_overload;
-pub(crate) use infer_call::table_backing_range_from_expr;
+pub(crate) use infer_call::{get_prefix_expr_signature_id, loaded_file_of_call};
+pub(crate) use infer_call::{
+    getmetatable_call_metatable, proxy_metatable, table_backing_range_from_expr,
+};
 pub(crate) use infer_call::{
     infer_instance_type_doc_function, infer_table_type_doc_function,
     normalize_call_operator_doc_function,
 };
 pub use infer_doc_type::{DocTypeInferContext, infer_doc_type};
 pub use infer_fail_reason::InferFailReason;
+#[cfg(test)]
+pub(crate) use infer_index::FUNCTION_INDEX_READS;
 pub(crate) use infer_index::check_iter_var_range;
+pub(crate) use infer_index::code_index_function;
 pub(crate) use infer_index::global_expr_access_path;
 pub use infer_index::infer_index_expr;
 pub(crate) use infer_index::infer_member_by_member_key;
@@ -39,6 +45,10 @@ pub(crate) use infer_index::{
     AccessPaths, keep_access_paths, restore_access_path_snapshot, stop_keeping_access_paths,
     take_access_path_snapshot, with_access_paths,
 };
+pub(crate) use infer_index::{
+    factory_bound_metatable_index, member_is_finite_named_dynamic_assignment, passed_arg,
+    with_file_cache,
+};
 pub(crate) use infer_name::find_self_ref_id;
 pub(crate) use infer_name::infer_authoritative_method_self_type;
 pub(crate) use infer_name::infer_enclosing_self_type;
@@ -47,11 +57,13 @@ pub(crate) use infer_name::is_authoritative_self_receiver_type;
 pub(crate) use infer_name::is_concrete_self_receiver_type;
 pub(crate) use infer_name::resolve_global_singleton_scripted_type_decl_id;
 pub(crate) use infer_name::resolve_type_text;
+pub(crate) use infer_name::setmetatable_target_of_literal;
 pub(crate) use infer_name::try_local_decl_initializer_fallback_type;
 pub(crate) use infer_name::type_decl_is_vgui_panel;
 pub(crate) use infer_name::{ParamInferenceSource, infer_param_is_weak, infer_param_source};
 pub(crate) use infer_name::{declaring_for_range, try_infer_enclosing_for_range_iter_type};
 pub use infer_name::{infer_param, infer_param_with_cache};
+pub(crate) use infer_name::{seen_local_function_calls, takes_local_call_site_args};
 use infer_table::infer_table_expr;
 pub(crate) use infer_table::local_call_reference_expectations;
 pub use infer_table::{infer_table_field_value_should_be, infer_table_should_be};
@@ -60,8 +72,8 @@ pub use narrow::{SelfRefId, VarRefId, VarRefRootId};
 pub(crate) use narrow::{
     condition_has_concrete_type_evidence, condition_nominal_type, contains_gmod_null_type,
     get_var_expr_var_ref_id, getter_access_path, is_gmod_null_entity_candidate,
-    narrowing_root_decl, presence_guard_target, raw_get_access_path, remove_false_or_nil,
-    respell_path_root,
+    narrowing_root_decl, presence_guard_target, remove_false_or_nil, respell_path_root,
+    type_guard_target_expr,
 };
 
 use rowan::TextRange;
@@ -330,6 +342,81 @@ fn get_custom_type_operator(
         Some(operators)
     } else {
         None
+    }
+}
+
+/// What the metamethod `op` on `operand`'s metatable returns, when code
+/// writes it there: `MT.__add = f`, `function MT.__add(a, b)`, or a field of
+/// a metatable literal. Lua reads a metamethod raw, so one an `__index`
+/// parent defines does not apply.
+fn infer_metamethod_result(
+    db: &DbIndex,
+    operand: &LuaType,
+    op: LuaOperatorMetaMethod,
+) -> Option<InferResult> {
+    match metamethod_of(db, operand, op)? {
+        LuaType::Signature(signature_id) => {
+            let signature = db.get_signature_index().get(&signature_id)?;
+            Some(if signature.is_resolve_return() {
+                Ok(first_value(db, signature.get_return_type()))
+            } else {
+                Err(InferFailReason::UnResolveSignatureReturn(signature_id))
+            })
+        }
+        LuaType::DocFunction(func) => Some(Ok(first_value(db, func.get_ret().clone()))),
+        _ => None,
+    }
+}
+
+/// The function code writes as the metamethod `op` of `operand`'s metatable.
+pub(crate) fn metamethod_of(
+    db: &DbIndex,
+    operand: &LuaType,
+    op: LuaOperatorMetaMethod,
+) -> Option<LuaType> {
+    let key = LuaMemberKey::Name(op.metatable_name()?.into());
+    let mut owners = Vec::new();
+    collect_metatable_owners(db, operand, &mut owners);
+    owners.into_iter().find_map(|owner| {
+        let member_index = db.get_member_index();
+        let member = member_index
+            .get_current_owner_members_for_key(&owner, &key)
+            .into_iter()
+            .next()?;
+        let metamethod = db
+            .get_type_index()
+            .get_type_cache(&member.get_id().into())?
+            .as_type()
+            .clone();
+        matches!(metamethod, LuaType::Signature(_) | LuaType::DocFunction(_)).then_some(metamethod)
+    })
+}
+
+/// The owners of the metatables `operand` reads metamethods from: a table
+/// instances fold into is its instances' metatable, so it comes before the
+/// metatable `setmetatable` gave it.
+fn collect_metatable_owners(
+    db: &DbIndex,
+    operand: &LuaType,
+    owners: &mut Vec<crate::LuaMemberOwner>,
+) {
+    match operand {
+        LuaType::TableConst(table) => {
+            owners.push(crate::semantic::metatable_member_owner(db, table));
+            if let Some(metatable) = db.get_metatable_index().get(table) {
+                owners.push(crate::semantic::metatable_member_owner(db, metatable));
+            }
+        }
+        LuaType::Instance(instance) => {
+            if let Some(metatable) = db.get_metatable_index().get(instance.get_range()) {
+                owners.push(crate::semantic::metatable_member_owner(db, metatable));
+            }
+            collect_metatable_owners(db, instance.get_base(), owners);
+        }
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            owners.push(crate::LuaMemberOwner::Type(type_id.clone()));
+        }
+        _ => {}
     }
 }
 

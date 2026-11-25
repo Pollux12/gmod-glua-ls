@@ -117,24 +117,28 @@ fn setmetatable_factory_binding(
     metatable_range: InFiled<rowan::TextRange>,
 ) -> Option<SetmetatableFactoryBinding> {
     // The post-UnResolve transfer is intentionally limited to the canonical
-    // factory idiom: a direct local table variable is given a direct class table
-    // metatable. Inline metatables, aliases, and reassigned locals are handled by
-    // ordinary table/metatable inference and are not bridged into class members.
-    let LuaExpr::NameExpr(table_name) = table else {
-        return None;
-    };
-    let LuaExpr::NameExpr(_) = metatable else {
-        return None;
-    };
-
-    let decl_id = analyzer
-        .db
-        .get_reference_index()
-        .get_var_reference_decl(&analyzer.file_id, table_name.get_range())?;
-    let decl = analyzer.db.get_decl_index().get_decl(&decl_id)?;
-    if !decl.is_local() {
+    // factory idiom: a direct local table variable, or a table literal written
+    // in the call, is given a class table or a metatable indexing one. Aliases
+    // and reassigned locals are handled by ordinary table/metatable inference
+    // and are not bridged into class members.
+    if !matches!(metatable, LuaExpr::NameExpr(_) | LuaExpr::TableExpr(_)) {
         return None;
     }
+    let local_name = match table {
+        LuaExpr::NameExpr(table_name) => {
+            let decl_id = analyzer
+                .db
+                .get_reference_index()
+                .get_var_reference_decl(&analyzer.file_id, table_name.get_range())?;
+            let decl = analyzer.db.get_decl_index().get_decl(&decl_id)?;
+            if !decl.is_local() {
+                return None;
+            }
+            Some(table_name.get_name_text()?)
+        }
+        LuaExpr::TableExpr(_) => None,
+        _ => return None,
+    };
 
     let table_range = resolve_metatable_backing_table(analyzer, table)?;
     let function_scope = analyzer
@@ -146,7 +150,7 @@ fn setmetatable_factory_binding(
         file_id: analyzer.file_id,
         table_range,
         metatable_range,
-        local_name: table_name.get_name_text()?,
+        local_name,
         call_position: call_expr.get_position(),
         function_scope,
     })
@@ -338,6 +342,9 @@ fn receiver_owner_table_range(
     }
 
     let table = field.syntax().parent().and_then(LuaTableExpr::cast)?;
+    if let Some(target) = crate::semantic::setmetatable_target_of_literal(&table) {
+        return table_backing_range_from_expr(analyzer, &target);
+    }
     Some(InFiled::new(analyzer.file_id, table.get_range()))
 }
 

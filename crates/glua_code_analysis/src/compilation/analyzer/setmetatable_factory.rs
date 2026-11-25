@@ -21,10 +21,12 @@ pub fn synthesize_setmetatable_factory_members(db: &mut DbIndex, file_ids: &[Fil
     bindings.sort_by_key(|binding| (binding.file_id.id, u32::from(binding.call_position)));
 
     for binding in bindings {
+        let Some(class_owner) = prototype_owner(db, &binding) else {
+            continue;
+        };
         let Some(member_ids) = transferable_factory_member_ids(db, &binding) else {
             continue;
         };
-        let class_owner = crate::semantic::metatable_member_owner(db, &binding.metatable_range);
         for member_id in member_ids {
             add_member(db, class_owner.clone(), member_id);
         }
@@ -35,10 +37,9 @@ fn transferable_factory_member_ids(
     db: &DbIndex,
     binding: &SetmetatableFactoryBinding,
 ) -> Option<Vec<LuaMemberId>> {
-    if !metatable_has_self_index(db, binding) {
-        return None;
-    }
-    if factory_local_has_blocking_write_or_alias(db, binding) {
+    if let Some(local_name) = &binding.local_name
+        && factory_local_has_blocking_write_or_alias(db, binding, local_name)
+    {
         return None;
     }
 
@@ -49,19 +50,19 @@ fn transferable_factory_member_ids(
     for member in members {
         let member_id = member.get_id();
         let member_position = member_id.get_position();
-        if member_id.file_id != binding.file_id || member_position >= binding.call_position {
+        let in_constructor = binding.table_range.file_id == binding.file_id
+            && binding.table_range.value.contains(member_position);
+        if member_id.file_id != binding.file_id
+            || (member_position >= binding.call_position && !in_constructor)
+        {
             continue;
         }
 
         let member_scope = db.get_member_index().member_function_scope_range(member_id);
-        let in_constructor = binding.table_range.value.contains(member_position);
         let direct_member = in_constructor
-            || member_defined_via_variable_strict(
-                db,
-                binding.file_id,
-                member_position,
-                binding.local_name.as_str(),
-            );
+            || binding.local_name.as_ref().is_some_and(|local_name| {
+                member_defined_via_variable_strict(db, binding.file_id, member_position, local_name)
+            });
 
         if !direct_member || (!in_constructor && member_scope != Some(binding.function_scope)) {
             // Any field collected for the factory table through an alias or a
@@ -77,36 +78,81 @@ fn transferable_factory_member_ids(
     Some(member_ids)
 }
 
-fn metatable_has_self_index(db: &DbIndex, binding: &SetmetatableFactoryBinding) -> bool {
+/// The class whose methods read what each instance the constructor makes
+/// starts with: the metatable when it indexes itself, or a table literal it
+/// indexes whose methods take the instance as `self`. A table indexed only
+/// for its defaults has no such methods, and what instances start with is
+/// not its own.
+fn prototype_owner(db: &DbIndex, binding: &SetmetatableFactoryBinding) -> Option<LuaMemberOwner> {
     let owner = crate::semantic::metatable_member_owner(db, &binding.metatable_range);
     let key = LuaMemberKey::Name("__index".into());
     db.get_member_index()
         .get_current_owner_members_for_key(&owner, &key)
         .into_iter()
-        .any(|member| {
-            db.get_type_index()
-                .get_type_cache(&member.get_id().into())
-                .is_some_and(|cache| type_points_to_metatable(cache.as_type(), binding, &owner))
+        .find_map(|member| {
+            let cache = db
+                .get_type_index()
+                .get_type_cache(&member.get_id().into())?;
+            prototype_of(db, cache.as_type(), binding, &owner)
         })
 }
 
-fn type_points_to_metatable(
+fn prototype_of(
+    db: &DbIndex,
     typ: &LuaType,
     binding: &SetmetatableFactoryBinding,
-    owner: &LuaMemberOwner,
-) -> bool {
+    metatable_owner: &LuaMemberOwner,
+) -> Option<LuaMemberOwner> {
     match typ {
-        LuaType::TableConst(range) => *range == binding.metatable_range,
-        LuaType::Instance(instance) => *instance.get_range() == binding.metatable_range,
-        LuaType::Def(id) | LuaType::Ref(id) => owner.get_type_id() == Some(id),
-        LuaType::TypeGuard(inner) => type_points_to_metatable(inner, binding, owner),
-        _ => false,
+        LuaType::TableConst(_) | LuaType::Instance(_)
+            if typ_range(typ) == Some(&binding.metatable_range) =>
+        {
+            Some(metatable_owner.clone())
+        }
+        LuaType::Def(id) | LuaType::Ref(id) if metatable_owner.get_type_id() == Some(id) => {
+            Some(metatable_owner.clone())
+        }
+        LuaType::TableConst(range) => {
+            let prototype = crate::semantic::metatable_member_owner(db, range);
+            has_method(db, &prototype).then_some(prototype)
+        }
+        LuaType::Def(id) => {
+            let prototype = LuaMemberOwner::Type(id.clone());
+            has_method(db, &prototype).then_some(prototype)
+        }
+        LuaType::TypeGuard(inner) => prototype_of(db, inner, binding, metatable_owner),
+        _ => None,
     }
+}
+
+fn typ_range(typ: &LuaType) -> Option<&crate::InFiled<TextRange>> {
+    match typ {
+        LuaType::TableConst(range) => Some(range),
+        LuaType::Instance(instance) => Some(instance.get_range()),
+        _ => None,
+    }
+}
+
+fn has_method(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
+    db.get_member_index()
+        .get_members(owner)
+        .into_iter()
+        .flatten()
+        .any(|member| {
+            db.get_type_index()
+                .get_type_cache(&member.get_id().into())
+                .is_some_and(|cache| {
+                    matches!(cache.as_type(), LuaType::Signature(signature_id)
+                        if db.get_signature_index().get(signature_id)
+                            .is_some_and(|signature| signature.is_colon_define))
+                })
+        })
 }
 
 fn factory_local_has_blocking_write_or_alias(
     db: &DbIndex,
     binding: &SetmetatableFactoryBinding,
+    local_name: &str,
 ) -> bool {
     let Some(tree) = db.get_vfs().get_syntax_tree(&binding.file_id) else {
         return true;
@@ -118,16 +164,10 @@ fn factory_local_has_blocking_write_or_alias(
             continue;
         }
         let (vars, exprs) = assign_stat.get_var_and_expr_list();
-        if vars
-            .iter()
-            .any(|var| var_is_name(var, binding.local_name.as_str()))
-        {
+        if vars.iter().any(|var| var_is_name(var, local_name)) {
             return true;
         }
-        if exprs
-            .iter()
-            .any(|expr| expr_is_name(expr, binding.local_name.as_str()))
-        {
+        if exprs.iter().any(|expr| expr_is_name(expr, local_name)) {
             return true;
         }
     }
@@ -138,7 +178,7 @@ fn factory_local_has_blocking_write_or_alias(
         }
         if local_stat
             .get_value_exprs()
-            .any(|expr| expr_is_name(&expr, binding.local_name.as_str()))
+            .any(|expr| expr_is_name(&expr, local_name))
         {
             return true;
         }

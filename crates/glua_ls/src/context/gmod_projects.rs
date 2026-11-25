@@ -876,25 +876,21 @@ mod tests {
     }
 
     /// [`modules`] once a scheduled reload has settled: unchanged for a second.
-    fn settled_modules(
+    /// The loaded modules once they are `expected`, as a scheduled reload
+    /// settles, or the last ones seen when they never are.
+    fn modules_reaching(
         runtime: &tokio::runtime::Runtime,
         snapshot: &ServerContextSnapshot,
         base: &Path,
+        expected: &[(String, String, String)],
     ) -> Vec<(String, String, String)> {
         let mut last = modules(runtime, snapshot, base);
-        let mut unchanged = 0;
         for _ in 0..300 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let now = modules(runtime, snapshot, base);
-            if now == last {
-                unchanged += 1;
-                if unchanged == 10 {
-                    break;
-                }
-            } else {
-                unchanged = 0;
-                last = now;
+            if last == expected {
+                break;
             }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            last = modules(runtime, snapshot, base);
         }
         last
     }
@@ -946,22 +942,7 @@ mod tests {
         let base = root.parent().expect("temp dir").to_path_buf();
         let (context, _peer) = start(&runtime, &root.join("gamemodes/beta"));
         let snapshot = context.snapshot();
-        let gamemode = settled_modules(&runtime, &snapshot, &base);
-
-        change_folders(&runtime, &snapshot, &[root.join("addons")], &[]);
-        let added = settled_modules(&runtime, &snapshot, &base);
-        let tools_config = runtime.block_on(async {
-            let manager = snapshot.workspace_manager().read().await;
-            let loaded = manager.loaded_config.as_ref().expect("loaded config");
-            loaded
-                .workspace_emmyrcs
-                .get(&root.join("addons/tools"))
-                .map(|emmyrc| format!("{:?}", emmyrc.diagnostics.disable))
-        });
-        change_folders(&runtime, &snapshot, &[], &[root.join("addons")]);
-        let removed = settled_modules(&runtime, &snapshot, &base);
-
-        let beta = [
+        let beta = vec![
             module(
                 "garrysmod/gamemodes/alpha/gamemode/shared.lua",
                 "gamemode.shared",
@@ -973,27 +954,38 @@ mod tests {
                 "garrysmod/gamemodes/beta",
             ),
         ];
+        let with_addons = vec![
+            module(
+                "garrysmod/addons/tools/lua/autorun/sh_tools.lua",
+                "lua.autorun.sh_tools",
+                "garrysmod/addons/tools",
+            ),
+            module(
+                "garrysmod/addons/wire/lua/autorun/sh_wire.lua",
+                "lua.autorun.sh_wire",
+                "garrysmod/addons/wire",
+            ),
+            beta[0].clone(),
+            beta[1].clone(),
+        ];
+        let gamemode = modules_reaching(&runtime, &snapshot, &base, &beta);
+
+        change_folders(&runtime, &snapshot, &[root.join("addons")], &[]);
+        let added = modules_reaching(&runtime, &snapshot, &base, &with_addons);
+        let tools_config = runtime.block_on(async {
+            let manager = snapshot.workspace_manager().read().await;
+            let loaded = manager.loaded_config.as_ref().expect("loaded config");
+            loaded
+                .workspace_emmyrcs
+                .get(&root.join("addons/tools"))
+                .map(|emmyrc| format!("{:?}", emmyrc.diagnostics.disable))
+        });
+        change_folders(&runtime, &snapshot, &[], &[root.join("addons")]);
+        let removed = modules_reaching(&runtime, &snapshot, &base, &beta);
+
         assert_eq!(
             (&gamemode, &added, tools_config.as_deref(), &removed),
-            (
-                &beta.to_vec(),
-                &vec![
-                    module(
-                        "garrysmod/addons/tools/lua/autorun/sh_tools.lua",
-                        "lua.autorun.sh_tools",
-                        "garrysmod/addons/tools",
-                    ),
-                    module(
-                        "garrysmod/addons/wire/lua/autorun/sh_wire.lua",
-                        "lua.autorun.sh_wire",
-                        "garrysmod/addons/wire",
-                    ),
-                    beta[0].clone(),
-                    beta[1].clone(),
-                ],
-                Some("[Unused]"),
-                &beta.to_vec(),
-            )
+            (&beta, &with_addons, Some("[Unused]"), &beta)
         );
         let _ = fs::remove_dir_all(base);
     }
@@ -1011,25 +1003,26 @@ mod tests {
 
         change_folders(&runtime, &snapshot, std::slice::from_ref(&root), &[]);
 
+        let expected = vec![
+            module(
+                "garrysmod/addons/tools/lua/autorun/sh_tools.lua",
+                "lua.autorun.sh_tools",
+                "garrysmod/addons/tools",
+            ),
+            module(
+                "garrysmod/gamemodes/alpha/gamemode/shared.lua",
+                "gamemode.shared",
+                "garrysmod/gamemodes/alpha",
+            ),
+            module(
+                "garrysmod/gamemodes/beta/gamemode/init.lua",
+                "gamemode.init",
+                "garrysmod/gamemodes/beta",
+            ),
+        ];
         assert_eq!(
-            settled_modules(&runtime, &snapshot, &base),
-            vec![
-                module(
-                    "garrysmod/addons/tools/lua/autorun/sh_tools.lua",
-                    "lua.autorun.sh_tools",
-                    "garrysmod/addons/tools",
-                ),
-                module(
-                    "garrysmod/gamemodes/alpha/gamemode/shared.lua",
-                    "gamemode.shared",
-                    "garrysmod/gamemodes/alpha",
-                ),
-                module(
-                    "garrysmod/gamemodes/beta/gamemode/init.lua",
-                    "gamemode.init",
-                    "garrysmod/gamemodes/beta",
-                ),
-            ]
+            modules_reaching(&runtime, &snapshot, &base, &expected),
+            expected
         );
         let _ = fs::remove_dir_all(base);
     }

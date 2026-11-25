@@ -5,7 +5,9 @@ use crate::{
     db_index::{DbIndex, LuaOperatorMetaMethod, LuaType},
 };
 
-use super::{InferFailReason, InferResult, get_custom_type_operator, infer_expr};
+use super::{
+    InferFailReason, InferResult, get_custom_type_operator, infer_expr, infer_metamethod_result,
+};
 
 pub fn infer_unary_expr(
     db: &DbIndex,
@@ -40,6 +42,10 @@ fn infer_unary_custom_operator(
                 return Ok(res);
             }
         }
+    }
+
+    if let Some(result) = infer_metamethod_result(db, inner, op) {
+        return result;
     }
 
     match op {

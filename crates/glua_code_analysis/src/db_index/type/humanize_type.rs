@@ -669,11 +669,19 @@ fn humanize_table_const_type_detail_and_simple(
             Some(type_cache) => type_cache,
             None => &super::LuaTypeCache::InferType(LuaType::Any),
         };
+        let member_type = type_cache.as_type();
+        // A member holding the table itself (`T.__index = T`) names it rather
+        // than expanding the table into itself.
+        let refers_to_owner = matches!((member_type, &member_owned), (LuaType::TableConst(table), LuaMemberOwner::Element(owner)) if table == owner);
         let member_string = build_table_member_string(
             db,
             key,
-            type_cache.as_type(),
-            humanize_type(db, type_cache.as_type(), level.next_level()),
+            member_type,
+            if refers_to_owner {
+                "self".to_string()
+            } else {
+                humanize_type(db, member_type, level.next_level())
+            },
             level,
         );
 

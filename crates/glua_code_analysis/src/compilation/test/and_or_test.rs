@@ -4,6 +4,30 @@ mod test {
     use glua_parser::{LuaAstNode, LuaBinaryExpr};
     use googletest::prelude::*;
 
+    /// A type guard's result is a boolean, so `IsValid(p) and p.Name` is
+    /// `false` when the guard fails.
+    #[test]
+    fn a_type_guard_and_value_can_be_false() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return TypeGuard<any>
+            function IsValid(value) end
+
+            ---@class Named
+            ---@field Name string
+
+            ---@param named Named
+            function Probe(named)
+                name = IsValid(named) and named.Name
+            end
+            "#,
+        );
+        let name = ws.expr_ty("name");
+        assert_eq!(ws.humanize_type(name), "(false|string)");
+    }
+
     #[test]
     fn test_issue_221() {
         let mut ws = VirtualWorkspace::new();

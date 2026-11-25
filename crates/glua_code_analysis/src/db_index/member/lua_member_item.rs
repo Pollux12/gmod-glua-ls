@@ -9,7 +9,10 @@ use crate::{
     db_index::{WorkspaceKind, WorkspaceResolutionKey, gmod_infer::GmodRealm},
     is_informative_type, is_table_assignment_merge_type, widen_literal_type_for_assignment,
 };
-use glua_parser::{BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, LuaSyntaxNode, PathTrait};
+use glua_parser::{
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaSyntaxNode,
+    LuaTableExpr, PathTrait,
+};
 use rowan::TextSize;
 
 use super::{LuaMemberFeature, LuaMemberId, LuaMemberOwner};
@@ -615,6 +618,97 @@ fn same_file_define_shares_execution_region(
         member_index.enclosing_function_scope_range(*caller_file_id, caller_position);
 
     member_function == caller_function
+        && member_function.is_none_or(|function| {
+            owner_created_in_function(db, member_id, caller_file_id, function)
+        })
+}
+
+/// Whether the table a member is written on is created inside `function`, so
+/// each call starts with it empty. A receiver that outlives the call (`self`,
+/// a parameter, an upvalue, a global) may hold what an earlier call wrote.
+fn owner_created_in_function(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+    file_id: &FileId,
+    function: rowan::TextRange,
+) -> bool {
+    let member_index = db.get_member_index();
+    let created_in = |position| {
+        member_index.enclosing_function_scope_range(*file_id, position) == Some(function)
+    };
+    if written_through_fresh_local(db, member_id, created_in).is_some() {
+        return true;
+    }
+    match member_index.get_member_owner(&member_id) {
+        Some(LuaMemberOwner::Element(table)) => {
+            table.file_id == *file_id && created_in(table.value.start())
+        }
+        Some(LuaMemberOwner::Type(decl_id)) => db
+            .get_type_index()
+            .get_type_decl(decl_id)
+            .is_some_and(|decl| {
+                decl.get_locations().iter().any(|location| {
+                    location.file_id == *file_id && created_in(location.range.start())
+                })
+            }),
+        Some(LuaMemberOwner::LocalUnresolve) | None => true,
+        Some(LuaMemberOwner::GlobalPath(_)) => false,
+    }
+}
+
+/// Whether a member is written through a never-reassigned local of the
+/// function that a table constructor or a call initialises: each call makes
+/// that table anew, whatever class the write is filed under.
+fn written_through_fresh_local(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+    created_in: impl Fn(TextSize) -> bool,
+) -> Option<()> {
+    let file_id = member_id.file_id;
+    let member_range = db.get_member_index().get_member(&member_id)?.get_range();
+    let root = db
+        .get_vfs()
+        .syntax_tree_around(&file_id, member_range)?
+        .get_red_root();
+    let index_expr = LuaIndexExpr::cast(member_id.get_syntax_id().to_node_from_root(&root)?)?;
+    let LuaExpr::NameExpr(receiver) = index_expr.get_prefix_expr()? else {
+        return None;
+    };
+    let references = db.get_reference_index().get_local_reference(&file_id)?;
+    let decl_id = references.get_decl_id(&receiver.get_range())?;
+    if !created_in(decl_id.position)
+        || references
+            .get_decl_references(&decl_id)
+            .is_some_and(|reference| reference.mutable)
+    {
+        return None;
+    }
+    let initializer = db.get_decl_index().get_decl(&decl_id)?.get_initializer()?;
+    let kind = initializer.get_expr_syntax_id().get_kind();
+    if initializer.get_ret_idx() != 0 {
+        return None;
+    }
+    if LuaTableExpr::can_cast(kind) {
+        return Some(());
+    }
+    if LuaCallExpr::can_cast(kind) {
+        let is_fresh_call = db
+            .get_type_index()
+            .get_type_cache(&decl_id.into())
+            .is_some_and(|cache| {
+                matches!(
+                    cache.as_type(),
+                    LuaType::Instance(_) | LuaType::TableConst(_)
+                )
+            })
+            || initializer
+                .get_expr_syntax_id()
+                .to_node_from_root(&root)
+                .and_then(LuaCallExpr::cast)
+                .is_some_and(|call| call.is_setmetatable());
+        return is_fresh_call.then_some(());
+    }
+    None
 }
 
 fn member_hidden_by_enclosing_assignment_with_root(
@@ -784,16 +878,21 @@ fn typed_members<'a>(
         }
     }
     match untyped {
-        Some(member_id)
-            if typed.is_empty()
-                || !db.stage_rule_holds(
-                    crate::db_index::derivation::StageRule::SkipUntypedWriters,
-                ) =>
-        {
+        Some(member_id) if !untyped_writers_are_skipped(db, typed.is_empty()) => {
             Err(InferFailReason::UnResolveMemberType(member_id))
         }
         _ => Ok(typed),
     }
+}
+
+/// Whether a slot's untyped writers are left out. While others have a type
+/// they are from the stage that skips them; when none has, they hold no value
+/// yet only until the run closes, so writers on a cycle through the slot
+/// settle from nothing and a writer that never lands still reads as a floor.
+fn untyped_writers_are_skipped(db: &DbIndex, none_typed: bool) -> bool {
+    use crate::db_index::derivation::StageRule;
+    db.stage_rule_holds(StageRule::SkipUntypedWriters)
+        && !(none_typed && db.stage_rule_holds(StageRule::FloorUnsettled))
 }
 
 fn resolve_member_type(
@@ -805,6 +904,7 @@ fn resolve_member_type(
             let member_type_cache = db.get_type_index().get_type_cache(&(*member_id).into());
             match member_type_cache {
                 Some(cache) => Ok(cache.as_type().clone()),
+                None if untyped_writers_are_skipped(db, true) => Ok(LuaType::Never),
                 None => Err(InferFailReason::UnResolveMemberType(*member_id)),
             }
         }
@@ -2446,7 +2546,10 @@ mod tests {
         let caller_file = FileId::new(10);
         let earlier_member = make_member_id_with_kind(caller_file, 10, LuaSyntaxKind::IndexExpr);
         let later_member = make_member_id_with_kind(caller_file, 30, LuaSyntaxKind::IndexExpr);
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OrderSensitiveOwner"));
+        let owner = LuaMemberOwner::Element(InFiled::new(
+            caller_file,
+            TextRange::new(TextSize::new(2), TextSize::new(4)),
+        ));
         let key = LuaMemberKey::Name("field".into());
         let shared_scope = TextRange::new(TextSize::new(0), TextSize::new(100));
 
@@ -2479,7 +2582,10 @@ mod tests {
         let future_only_member =
             make_member_id_with_kind(caller_file, 50, LuaSyntaxKind::IndexExpr);
         db.get_member_index_mut().add_member(
-            LuaMemberOwner::Type(LuaTypeDeclId::global("FutureOnlyOwner")),
+            LuaMemberOwner::Element(InFiled::new(
+                caller_file,
+                TextRange::new(TextSize::new(5), TextSize::new(7)),
+            )),
             LuaMember::new(
                 future_only_member,
                 LuaMemberKey::Name("field".into()),

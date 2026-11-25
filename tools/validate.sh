@@ -18,6 +18,9 @@ OUT=${VALIDATE_OUT:-$REPO/target/validate/$TIER}
 REL=${VALIDATE_BIN:-$REPO/target/release}
 X=""; [ -f "$REL/glua_ls.exe" ] || [ "${OS:-}" = "Windows_NT" ] && X=".exe"
 ANN=${GLUALS_ANNOTATIONS:?GLUALS_ANNOTATIONS is required}
+# A loop the run limit stops is a defect in every step, cold or incremental:
+# the analysis panics on it instead of keeping what its last run left.
+export GLUALS_CHECK_CONVERGENCE=1
 mkdir -p "$OUT"
 cd "$REPO"
 FAILED=0
@@ -36,7 +39,7 @@ step() { # name command...: runs, logs, prints a summary line
 
 det() { # corpus jobs env...
   local corpus=$1 jobs=$2; shift 2
-  env GLUALS_CHECK_CONVERGENCE=1 DET_CODEBASE="$corpus" DET_ANNOTATIONS="$ANN" DET_JOBS="$jobs" "$@" "$REL/determinism$X"
+  env DET_CODEBASE="$corpus" DET_ANNOTATIONS="$ANN" DET_JOBS="$jobs" "$@" "$REL/determinism$X"
 }
 
 corpus() { # name dir: glua_check JSON, diffed against VALIDATE_REF/<name>.json when present

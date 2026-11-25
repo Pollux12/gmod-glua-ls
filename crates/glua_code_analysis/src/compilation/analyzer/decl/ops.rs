@@ -10,12 +10,11 @@ use crate::{
     compilation::analyzer::{
         AnalyzeContext,
         common::{TypeCacheWriteMode, bind_type, write_type_cache},
-        gmod::{ensure_scoped_class_type_decl_for_file, resolve_load_dependency_target},
+        gmod::ensure_scoped_class_type_decl_for_file,
     },
     db_index::{
         DbIndex, FileReferenceBatch, GlobalId, GmodScopedClassInfo, LegacyModuleEnv, LuaDecl,
-        LuaDeclId, LuaDeclarationTree, LuaDependencyKind, LuaDependencySite, LuaMember,
-        LuaMemberOwner, LuaTypeCache, LuaTypeDecl,
+        LuaDeclId, LuaDeclarationTree, LuaMember, LuaMemberOwner, LuaTypeCache, LuaTypeDecl,
     },
 };
 
@@ -71,18 +70,6 @@ pub(super) enum DeclOp {
     },
     ModuleVersions(Vec<LuaVersionCondition>),
     LegacyModuleEnv(LegacyModuleEnv),
-    /// A load call. Its target is looked up when the op is applied: it depends
-    /// on the modules the files before it registered.
-    Dependency {
-        kind: LuaDependencyKind,
-        path: Option<String>,
-        self_reference: bool,
-        path_keys: Vec<String>,
-        original_expr: String,
-        call_range: TextRange,
-        /// The path argument's range, or the call's when it has no argument.
-        range: TextRange,
-    },
 }
 
 /// What the walk adds to the file's [`AnalyzeContext`].
@@ -231,34 +218,6 @@ impl DeclOp {
             Self::LegacyModuleEnv(env) => db
                 .get_module_index_mut()
                 .set_legacy_module_env(file_id, env),
-            Self::Dependency {
-                kind,
-                path,
-                self_reference,
-                path_keys,
-                original_expr,
-                call_range,
-                range,
-            } => {
-                let target_file_id = if let Some(path) = &path {
-                    resolve_load_dependency_target(db, file_id, kind, path)
-                } else if self_reference {
-                    Some(file_id)
-                } else {
-                    None
-                };
-                db.get_file_dependencies_index_mut()
-                    .add_dependency_site(LuaDependencySite {
-                        source_file_id: file_id,
-                        target_file_id,
-                        kind,
-                        path,
-                        path_keys,
-                        original_expr,
-                        call_range,
-                        range,
-                    });
-            }
         }
     }
 }

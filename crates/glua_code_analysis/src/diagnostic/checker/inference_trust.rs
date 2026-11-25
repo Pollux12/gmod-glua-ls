@@ -26,6 +26,8 @@ impl Checker for InferenceTrustChecker {
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
+        // A read several guessed definitions reach is reported once per message.
+        let mut reported = rustc_hash::FxHashSet::default();
         for inference in file_inference_events(semantic_model, context.get_file_id()) {
             let (code, is_unguarded_child) = match inference.event.kind {
                 LuaInferenceProvenanceKind::ContextualUnknown => {
@@ -74,30 +76,29 @@ impl Checker for InferenceTrustChecker {
             } else {
                 None
             };
-            context.add_diagnostic_with_severity(
-                code,
-                inference.event.source.value.get_range(),
-                if is_unguarded_child {
-                    let found = step
-                        .and_then(|step| step.found_type.as_deref())
-                        .map_or_else(
-                            || "unknown".to_string(),
-                            |typ| humanize_type(semantic_model.get_db(), typ, RenderLevel::Simple),
-                        );
-                    unguarded_child_message(
-                        semantic_model,
-                        context.get_file_id(),
-                        &inference.event.source,
-                        inferred_type,
-                        &typ,
-                        &found,
-                    )
-                } else {
-                    inferred_from_usage_message(&typ)
-                },
-                severity,
-                None,
-            );
+            let range = inference.event.source.value.get_range();
+            let message = if is_unguarded_child {
+                let found = step
+                    .and_then(|step| step.found_type.as_deref())
+                    .map_or_else(
+                        || "unknown".to_string(),
+                        |typ| humanize_type(semantic_model.get_db(), typ, RenderLevel::Simple),
+                    );
+                unguarded_child_message(
+                    semantic_model,
+                    context.get_file_id(),
+                    &inference.event.source,
+                    inferred_type,
+                    &typ,
+                    &found,
+                )
+            } else {
+                inferred_from_usage_message(&typ)
+            };
+            if !reported.insert((code, range, message.clone())) {
+                continue;
+            }
+            context.add_diagnostic_with_severity(code, range, message, severity, None);
         }
     }
 }

@@ -157,6 +157,7 @@ mod test {
             ),
         ];
 
+        ws.def_gmod_call_arg_builtins();
         ws.def_files(files);
 
         let ty = ws.expr_ty("require('rx').subject.new()");
@@ -167,6 +168,7 @@ mod test {
     #[test]
     fn test_unorder_analysis_2() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
 
         let files = vec![
             (

@@ -8,6 +8,8 @@ mod tags;
 mod type_def_tags;
 mod type_ref_tags;
 
+pub(super) use type_ref_tags::receiver_member_name_for_closure;
+
 pub(crate) use type_ref_tags::register_inferred_accessor_generators;
 
 use super::AnalyzeContext;

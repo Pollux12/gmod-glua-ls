@@ -1,3 +1,9 @@
+mod factory_call;
+pub(crate) use factory_call::{passed_arg, with_file_cache};
+mod function_index;
+#[cfg(test)]
+pub(crate) use function_index::FUNCTION_INDEX_READS;
+pub(crate) use function_index::code_index_function;
 mod infer_array;
 pub(crate) use infer_array::{check_index_in_range, check_iter_var_range};
 
@@ -66,23 +72,28 @@ use super::{
     infer_name::{contains_self_infer, infer_global_type},
 };
 
-/// The tables a member lookup is walking, the per-call table whose base
-/// the lookup is reading through, and whether it reached the current class
-/// from one of its subclasses.
+/// The tables a member lookup is walking, each with the innermost instance it
+/// reached it through, the per-call table whose base the lookup is reading
+/// through, the ranges of the instances it is reading through, outermost
+/// first, which name the calls that made per-call copies, and whether it
+/// reached the current class from one of its subclasses.
 #[derive(Default)]
 struct TableMemberLookupGuard {
-    tables: FxHashSet<InFiled<TextRange>>,
+    tables: FxHashSet<(InFiled<TextRange>, Option<InFiled<TextRange>>)>,
     instance: Option<Arc<LuaInstanceType>>,
+    made_by: Vec<InFiled<TextRange>>,
     inherited: bool,
 }
 
 impl TableMemberLookupGuard {
     fn insert(&mut self, table: InFiled<TextRange>) -> bool {
-        self.tables.insert(table)
+        let made_by = self.made_by.last().cloned();
+        self.tables.insert((table, made_by))
     }
 
     fn remove(&mut self, table: &InFiled<TextRange>) {
-        self.tables.remove(table);
+        let made_by = self.made_by.last().cloned();
+        self.tables.remove(&(table.clone(), made_by));
     }
 
     /// The type the dynamic fields of `table` are read through: the per-call
@@ -944,13 +955,30 @@ fn infer_table_member(
         return Err(InferFailReason::FieldNotFound);
     }
 
-    let result = infer_table_member_owner(
+    let mut result = infer_table_member_owner(
         db,
         cache,
         inst.clone(),
-        index_expr,
+        index_expr.clone(),
         table_member_lookup_guard,
     );
+    // A field the table may not hold reads through to its metatable's
+    // `__index` when it is absent.
+    if let Ok(own) = &result
+        && db.get_metatable_index().get(&inst).is_some()
+        && let Some(index_key) = index_expr.get_index_key()
+        && reads_through(db, cache, &index_key, own)
+        && let Ok(fallback) = infer_table_metatable_member(
+            db,
+            cache,
+            &inst,
+            index_expr,
+            &index_key,
+            table_member_lookup_guard,
+        )
+    {
+        result = Ok(read_through_to(db, own, &fallback));
+    }
     table_member_lookup_guard.remove(&inst);
     result
 }
@@ -1025,6 +1053,18 @@ fn infer_table_member_owner(
     );
     let literal_key = !matches!(key, LuaMemberKey::ExprType(_));
     if literal_key
+        && let Some(member_type) = factory_call_member_type(
+            db,
+            cache,
+            &inst,
+            &owner,
+            &key,
+            &table_member_lookup_guard.made_by,
+        )
+    {
+        return Ok(member_type);
+    }
+    if literal_key
         && let Some(member_type) =
             exact_member_memo_get(cache, &memo_key, site_realm, access_position)
     {
@@ -1074,6 +1114,11 @@ fn infer_table_member_owner(
                     return Err(reason);
                 }
             }
+        } else if matches!(key, LuaMemberKey::ExprType(LuaType::String))
+            && !constructed_under_the_reads_key(db, cache.get_file_id(), &owner, &key, &index_key)
+        {
+            // A write under some string key proves only the keys it wrote.
+            nullable_if_needed(db, member_type)
         } else {
             member_type
         };
@@ -1206,8 +1251,19 @@ fn infer_table_member_owner(
             // named read of a registry (`cityrp.item.stored.pot`) that a bare
             // `table` answers as `any` with no nil at all, which is strictly
             // less that we know. Whether a computed key may be missing is
-            // decided per access by `table_index_result_may_be_nil`.
-            return Ok(LuaType::Any);
+            // decided per access by `table_index_result_may_be_nil`. A class
+            // those writes store is still what the key holds.
+            return Ok(infer_table_dynamic_key_member_type(
+                db,
+                &owner,
+                &key,
+                cache.get_file_id(),
+                Some(index_expr.get_position()),
+                source_min_position.as_ref(),
+                false,
+            )
+            .filter(is_precise_unknown_wildcard_value_type)
+            .unwrap_or(LuaType::Any));
         }
     }
 
@@ -1242,7 +1298,7 @@ fn infer_table_member_owner(
             // a registry does not lose its nil just because the key-specific
             // lookup resolved to `unknown`.
             if !crate::db_index::is_informative_type(&typ)
-                && let Some(member_type) = infer_cross_file_matching_expr_key_member_type(
+                && let Some(member_type) = infer_written_expr_key_member_type(
                     db,
                     &owner,
                     &key,
@@ -1309,10 +1365,10 @@ fn infer_table_member_owner(
             }
 
             // Consulted last, after every key-specific source above: a
-            // computed write in another file is evidence about the *values* a
-            // table holds, never about this key being one of them. So it only
-            // answers when nothing better did, and it answers `V?`.
-            if let Some(member_type) = infer_cross_file_matching_expr_key_member_type(
+            // computed write is evidence about the *values* a table holds,
+            // never about this key being one of them. So it only answers when
+            // nothing better did, and it answers `V?`.
+            if let Some(member_type) = infer_written_expr_key_member_type(
                 db,
                 &owner,
                 &key,
@@ -1409,12 +1465,28 @@ fn infer_table_metatable_member(
         None,
     ) {
         Ok(index_type) => {
+            let index_type = factory_call_member_type(
+                db,
+                cache,
+                metatable,
+                &meta_owner,
+                &index_member_key,
+                &table_member_lookup_guard.made_by,
+            )
+            .unwrap_or(index_type);
             let index_type =
                 match super::infer_call::classify_metatable_index_candidate(&index_type) {
                     super::infer_call::MetatableIndexCandidate::Supported(index_type) => index_type,
                     super::infer_call::MetatableIndexCandidate::Unsupported => index_type,
                 };
-            if !metatable_index_type_points_to_table(&index_type, table_range)
+            if let Some(typ) =
+                function_index::infer_function_index_member(db, cache, &index_type, index_key)
+            {
+                return Ok(typ);
+            }
+            // A `nil` `__index` is none: the lookup ends at the table.
+            if !index_type.is_nil()
+                && !metatable_index_type_points_to_table(&index_type, table_range)
                 && let Ok(typ) = infer_member_by_member_key_with_table_guard(
                     db,
                     cache,
@@ -1454,6 +1526,77 @@ fn infer_table_metatable_member(
     }
 
     Err(InferFailReason::FieldNotFound)
+}
+
+/// The member `key` of `owner`, the table literal `table`, in the copy of it
+/// a factory call the lookup reads through made, when its one write sets it
+/// from that call's arguments.
+fn factory_call_member_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    table: &InFiled<TextRange>,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    made_by: &[InFiled<TextRange>],
+) -> Option<LuaType> {
+    if made_by.is_empty() {
+        return None;
+    }
+    let members = db.get_member_index().get_members_with_key(owner, key)?;
+    let [member] = members.as_slice() else {
+        return None;
+    };
+    let value = crate::semantic::get_member_value_expr(db, member.get_id())?;
+    factory_call::infer_factory_call_value(
+        db,
+        cache,
+        table,
+        InFiled::new(member.get_id().file_id, value),
+        made_by,
+    )
+}
+
+/// The `__index` the metatable of the table literal `table` holds in the copy
+/// of it the calls `made_by`, innermost last, made, when its one write sets it
+/// from their arguments.
+pub(crate) fn factory_bound_metatable_index(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    table: &InFiled<TextRange>,
+    made_by: &[InFiled<TextRange>],
+) -> Option<LuaType> {
+    let metatable = db.get_metatable_index().get(table)?;
+    let owner = crate::semantic::metatable_member_owner(db, metatable);
+    factory_call_member_type(
+        db,
+        cache,
+        metatable,
+        &owner,
+        &LuaMemberKey::Name("__index".into()),
+        made_by,
+    )
+}
+
+/// Whether a read of `key` that finds `own` in the table reaches the
+/// metatable. A key naming a field does when the field may be absent. A key
+/// computed at runtime does not say which field is absent, so it does only
+/// when the table holds nothing for it, instead of taking in every value the
+/// metatable holds besides the table's own.
+fn reads_through(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    key: &LuaIndexKey,
+    own: &LuaType,
+) -> bool {
+    own.is_nullable() && (own.is_nil() || !LuaMemberKey::index_key_is_dynamic(db, cache, key))
+}
+
+/// A field a table may not hold, `own`, read where Lua falls back to
+/// `fallback` when it is absent: the field when it is there, the fallback
+/// when it is not.
+fn read_through_to(db: &DbIndex, own: &LuaType, fallback: &LuaType) -> LuaType {
+    let present = TypeOps::Remove.apply(db, own, &LuaType::Nil);
+    TypeOps::Union.apply(db, &present, fallback)
 }
 
 fn metatable_index_type_points_to_table(typ: &LuaType, table_range: &InFiled<TextRange>) -> bool {
@@ -1902,7 +2045,23 @@ fn nullable_if_needed(db: &DbIndex, typ: LuaType) -> LuaType {
     }
 }
 
-fn infer_cross_file_matching_expr_key_member_type(
+/// Whether a write in the reading file runs in a function that does not
+/// contain the read: it may have run any number of times before it, while a
+/// write in the read's own region is ordered against it by flow.
+fn same_file_write_may_run_first(
+    db: &DbIndex,
+    member: &LuaMember,
+    access_position: TextSize,
+) -> bool {
+    let member_index = db.get_member_index();
+    let file_id = member.get_file_id();
+    let write_function =
+        member_index.enclosing_function_scope_range(file_id, member.get_id().get_position());
+    write_function.is_some()
+        && write_function != member_index.enclosing_function_scope_range(file_id, access_position)
+}
+
+fn infer_written_expr_key_member_type(
     db: &DbIndex,
     owner: &LuaMemberOwner,
     key: &LuaMemberKey,
@@ -1935,7 +2094,8 @@ fn infer_cross_file_matching_expr_key_member_type(
     let mut pending_reason = None;
 
     for member in members {
-        if member.get_file_id() == access_file_id
+        if (member.get_file_id() == access_file_id
+            && !same_file_write_may_run_first(db, member, access_position))
             || !is_dynamic_field_fallback_realm_compatible(
                 db,
                 access_realm,
@@ -2047,7 +2207,7 @@ fn is_literal_member_key(key: &LuaMemberKey) -> bool {
     matches!(key, LuaMemberKey::Name(_) | LuaMemberKey::Integer(_))
 }
 
-fn member_is_finite_named_dynamic_assignment(
+pub(crate) fn member_is_finite_named_dynamic_assignment(
     db: &DbIndex,
     access_file_id: FileId,
     owner: &LuaMemberOwner,
@@ -2605,7 +2765,20 @@ fn infer_custom_type_member(
         }
     }
 
-    let resolve_dynamic_field = if table_member_lookup_guard.inherited {
+    // Read through one object a call made of the class, the class passes down
+    // the fields written on it, not those other objects' writes put there.
+    let through_made = table_member_lookup_guard
+        .instance
+        .as_ref()
+        .is_some_and(|instance| {
+            let is_class = |typ: &LuaType| matches!(typ, LuaType::Ref(_) | LuaType::Def(_));
+            instance.get_kind() == crate::LuaInstanceKind::Made
+                && match instance.get_base() {
+                    LuaType::Union(union) => union.types().all(is_class),
+                    base => is_class(base),
+                }
+        });
+    let resolve_dynamic_field = if table_member_lookup_guard.inherited || through_made {
         resolve_inherited_dynamic_field_member
     } else {
         resolve_dynamic_field_member
@@ -3283,6 +3456,7 @@ fn infer_instance_member(
             .instance
             .replace(Arc::new(inst.clone()))
     });
+    table_member_lookup_guard.made_by.push(range.clone());
     let base_result = infer_member_by_member_key_with_table_guard(
         db,
         cache,
@@ -3291,6 +3465,7 @@ fn infer_instance_member(
         infer_guard,
         table_member_lookup_guard,
     );
+    table_member_lookup_guard.made_by.pop();
     if let Some(previous) = previous_instance {
         table_member_lookup_guard.instance = previous;
     }
@@ -3302,6 +3477,13 @@ fn infer_instance_member(
             index_expr.clone(),
             table_member_lookup_guard,
         ) {
+            Ok(table_type)
+                if index_expr
+                    .get_index_key()
+                    .is_some_and(|key| reads_through(db, cache, &key, &table_type)) =>
+            {
+                return Ok(read_through_to(db, &table_type, &typ));
+            }
             Ok(table_type) => {
                 return Ok(match TypeOps::Intersect.apply(db, &typ, &table_type) {
                     LuaType::Never if table_type.is_nullable() => {
@@ -3453,11 +3635,18 @@ fn infer_global_path_member(
     };
 
     let owner = LuaMemberOwner::GlobalPath(GlobalId::new(&prefix_path));
+    let access_position = index_expr.get_position();
     let Some(member_item) = db.get_member_index().get_member_item(&owner, &member_key) else {
-        return Err(InferFailReason::FieldNotFound);
+        return registry_computed_value_type(
+            db,
+            cache.get_file_id(),
+            &prefix_path,
+            &member_key,
+            access_position,
+        )
+        .ok_or(InferFailReason::FieldNotFound);
     };
 
-    let access_position = index_expr.get_position();
     let mut visible_member_ids = member_item.visible_member_ids_with_realm_at_offset(
         db,
         &cache.get_file_id(),
@@ -3502,6 +3691,51 @@ fn infer_global_path_member(
     }
 
     resolved
+}
+
+/// What `key` may hold on the global path `path` when nothing writes it by
+/// name: a value written there under a computed key, or into every entry of
+/// the registry `path` is an entry of (`REG.[]` for `REG.alpha`). Such a write
+/// is evidence about the values, not that this key is one, so it may be nil.
+fn registry_computed_value_type(
+    db: &DbIndex,
+    file_id: FileId,
+    path: &str,
+    key: &LuaMemberKey,
+    position: TextSize,
+) -> Option<LuaType> {
+    let access_key_type = member_key_as_type(key)?;
+    let matcher = crate::semantic::member::AccessKeyMatcher::new(&access_key_type);
+    let sibling = path
+        .rsplit_once('.')
+        .filter(|(_, last)| *last != "[]")
+        .map(|(registry, _)| format!("{registry}.[]"));
+    let mut types = Vec::new();
+    for path in std::iter::once(path.to_string()).chain(sibling) {
+        let owner = LuaMemberOwner::GlobalPath(GlobalId::new(&path));
+        for member in db
+            .get_member_index()
+            .get_expr_key_members(&owner)
+            .unwrap_or_default()
+        {
+            if !(member_key_is_unknown_expr(member.get_key())
+                || matcher.matches(db, member.get_key()))
+            {
+                continue;
+            }
+            types.extend(
+                resolve_member_item_with_realm(
+                    db,
+                    &LuaMemberIndexItem::One(member.get_id()),
+                    file_id,
+                    Some(position),
+                    None,
+                )
+                .ok(),
+            );
+        }
+    }
+    (!types.is_empty()).then(|| nullable_if_needed(db, TypeOps::union_all(db, types)))
 }
 
 pub(crate) fn global_expr_access_path(
@@ -3722,6 +3956,58 @@ fn is_inferred_index_member_key(key: &LuaMemberKey) -> bool {
 /// Whether a member key is a non-constant numeric index (`integer`/`number`),
 /// as opposed to a constant `[n]`. Used to decide when to fall back to a
 /// `TableConst`'s unioned array element base.
+/// Whether every write of `key` on `owner` is a table constructor field keyed
+/// by the same local the read uses, which no later write changes: the table
+/// holds that key from the start.
+fn constructed_under_the_reads_key(
+    db: &DbIndex,
+    file_id: FileId,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    index_key: &LuaIndexKey,
+) -> bool {
+    let LuaIndexKey::Expr(LuaExpr::NameExpr(read_key)) = index_key else {
+        return false;
+    };
+    let Some(file_refs) = db.get_reference_index().get_local_reference(&file_id) else {
+        return false;
+    };
+    let Some(decl_id) = file_refs.get_decl_id(&read_key.get_range()) else {
+        return false;
+    };
+    if file_refs
+        .get_decl_references(&decl_id)
+        .is_none_or(|refs| refs.is_written_after_declaration(decl_id.position))
+    {
+        return false;
+    }
+    let Some(item) = db.get_member_index().get_member_item(owner, key) else {
+        return false;
+    };
+    item.member_ids_slice().iter().all(|member_id| {
+        if member_id.file_id != file_id {
+            return false;
+        }
+        let Some(root) = db
+            .get_vfs()
+            .syntax_tree_around(&member_id.file_id, member_id.get_syntax_id().get_range())
+        else {
+            return false;
+        };
+        member_id
+            .get_syntax_id()
+            .to_node_from_root(&root.get_red_root())
+            .and_then(glua_parser::LuaTableField::cast)
+            .and_then(|field| match field.get_field_key()? {
+                LuaIndexKey::Expr(LuaExpr::NameExpr(name)) => {
+                    file_refs.get_decl_id(&name.get_range())
+                }
+                _ => None,
+            })
+            == Some(decl_id)
+    })
+}
+
 fn dynamic_numeric_index_key(key: &LuaMemberKey) -> bool {
     matches!(
         key,
@@ -3858,6 +4144,13 @@ fn infer_member_by_index_custom_type(
                 Err(err) => return Err(err),
             }
         }
+    }
+
+    if let Some(index_function) = code_index_function(db, &LuaType::Ref(prefix_type_id.clone()))
+        && let Some(typ) =
+            function_index::infer_function_index_member(db, cache, &index_function, &index_key)
+    {
+        return Ok(typ);
     }
 
     Err(InferFailReason::FieldNotFound)

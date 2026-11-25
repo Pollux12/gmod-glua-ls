@@ -1479,6 +1479,7 @@ fn a_validated_remap_rejects_an_identity_the_new_index_does_not_hold() {
 #[gtest]
 fn an_identity_remap_leaves_every_owner_alone() {
     let mut ws = workspace();
+    ws.def_gmod_call_arg_builtins();
     let uri = ws.virtual_url_generator.new_uri("lua/subject.lua");
     let file_id = write(&mut ws, &uri, "registry = { first = 1 }\n");
     let db = ws.analysis.compilation.get_db();

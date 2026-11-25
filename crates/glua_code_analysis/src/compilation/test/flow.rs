@@ -2683,6 +2683,7 @@ end
     #[test]
     fn test_return_cast_multi_file() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "test.lua",
             r#"
@@ -3322,6 +3323,61 @@ _2 = a[1]
         assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
     }
 
+    /// A write under a string key proves only that key, so a read under the
+    /// same key after a branch that may skip the write may be nil.
+    #[gtest]
+    fn test_conditional_write_under_a_string_key_keeps_the_read_nilable() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@return boolean
+            local function ShouldAssign() end
+
+            ---@param key string
+            function Fill(key)
+                local cache = {}
+                if ShouldAssign() then
+                    cache[key] = {}
+                end
+                skipped = cache[key]
+                cache[key] = {}
+                written = cache[key]
+            end
+            "#,
+        );
+
+        let skipped = ws.expr_ty("skipped");
+        assert_eq!(ws.humanize_type(skipped), "table?");
+        let written = ws.expr_ty("written");
+        assert_eq!(ws.humanize_type(written), "table");
+    }
+
+    /// A number equal to a constant is that constant, so it reads the entry the
+    /// constant keys.
+    #[gtest]
+    fn test_number_equal_to_a_constant_narrows_to_it() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            local MODE_WORLD = 1
+            local CALC_POS = { [MODE_WORLD] = { up = 1 } }
+
+            ---@param mode number
+            function Calc(mode)
+                if mode == MODE_WORLD then
+                    narrowed = mode
+                    entry = CALC_POS[mode]
+                end
+            end
+            "#,
+        );
+
+        let narrowed = ws.expr_ty("narrowed");
+        assert_eq!(ws.humanize_type(narrowed), "1");
+        let entry = ws.expr_ty("entry");
+        assert!(!entry.is_nullable(), "{entry:?}");
+    }
+
     #[gtest]
     fn test_nil_guard_reassignment_join_keeps_non_nil() {
         let mut ws = VirtualWorkspace::new();
@@ -3475,6 +3531,471 @@ _2 = a[1]
         assert_eq!(ws.humanize_type(narrowed), "(Entity|true)");
     }
 
+    /// The types two locals have inside `if <call> then`, where both are
+    /// `Entity?` before it and `helper` defines the predicate `call` uses.
+    fn guarded_pair(helper: &str, call: &str) -> (String, String) {
+        pair_types(
+            helper,
+            &format!("if {call} then local first, second = x, y print(first, second) end"),
+        )
+    }
+
+    /// The types two locals have after `statements`, where both are `Entity?`
+    /// before them and `helper` defines what they call.
+    fn asserted_pair(helper: &str, statements: &str) -> (String, String) {
+        pair_types(
+            helper,
+            &format!("{statements}\nlocal first, second = x, y\nprint(first, second)"),
+        )
+    }
+
+    fn pair_types(helper: &str, body: &str) -> (String, String) {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+        let file_id = ws.def(&format!(
+            r#"
+            ---@return Entity?
+            local function find() end
+
+            {helper}
+
+            local function use()
+                local x, y = find(), find()
+                {body}
+            end
+            "#
+        ));
+        let types = [("first", 0), ("second", 0)]
+            .map(|(name, nth)| nth_name_expr_type_from_end(&mut ws, file_id, name, nth));
+        let [first, second] = types.map(|typ| ws.humanize_type(typ));
+        (first, second)
+    }
+
+    #[gtest]
+    fn test_predicate_wrapper_narrows_only_the_argument_it_tests() {
+        let narrowed = guarded_pair(
+            "local function ok(reason, ent) return IsValid(ent) end",
+            "ok(x, y)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity".to_string()));
+    }
+
+    #[gtest]
+    fn test_predicate_wrapper_narrows_every_argument_it_tests() {
+        let narrowed = guarded_pair(
+            "local function both(a, b) return IsValid(a) and IsValid(b) end",
+            "both(x, y)",
+        );
+        assert_eq!(narrowed, ("Entity".to_string(), "Entity".to_string()));
+    }
+
+    /// A false result only says the arguments are not all valid, so it rules
+    /// out nothing for any one of them.
+    #[gtest]
+    fn test_false_predicate_wrapper_of_several_arguments_narrows_none() {
+        let narrowed = guarded_pair(
+            "local function both(a, b) return IsValid(a) and IsValid(b) end",
+            "not both(x, y)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    #[gtest]
+    fn test_helper_that_errors_unless_valid_narrows_its_argument() {
+        let narrowed = guarded_pair(
+            "local function RequireValid(ent) if not IsValid(ent) then error(\"invalid\") end return true end",
+            "RequireValid(x)",
+        );
+        assert_eq!(narrowed, ("Entity".to_string(), "Entity?".to_string()));
+    }
+
+    #[gtest]
+    fn test_helper_that_asserts_validity_narrows_its_argument() {
+        let narrowed = guarded_pair(
+            "local function RequireValid(ent) assert(IsValid(ent)) return true end",
+            "RequireValid(x)",
+        );
+        assert_eq!(narrowed, ("Entity".to_string(), "Entity?".to_string()));
+    }
+
+    #[gtest]
+    fn test_helper_that_always_returns_true_narrows_nothing() {
+        let narrowed = guarded_pair(
+            "local function Always(ent) print(ent) return true end",
+            "Always(x)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    #[gtest]
+    fn test_method_predicate_wrapper_narrows_its_argument() {
+        let narrowed = guarded_pair(
+            "Checks = {}\nfunction Checks:Usable(ent) return IsValid(ent) end",
+            "Checks:Usable(x)",
+        );
+        assert_eq!(narrowed, ("Entity".to_string(), "Entity?".to_string()));
+    }
+
+    const IS_PLAYER: &str = "---@class Entity\n---@field IsPlayer fun(self: Entity): boolean";
+
+    #[gtest]
+    fn test_method_predicate_chain_narrows_its_argument() {
+        let narrowed = guarded_pair(
+            &format!(
+                "{IS_PLAYER}\nChecks = {{}}\n---@param ent Entity?\nfunction Checks:Usable(ent) return IsValid(ent) and ent:IsPlayer() end"
+            ),
+            "Checks:Usable(x)",
+        );
+        assert_eq!(narrowed, ("Entity".to_string(), "Entity?".to_string()));
+    }
+
+    /// The statement defining a table's predicate field writes that field,
+    /// but nothing replaces the predicate it defines.
+    #[gtest]
+    fn test_table_field_predicate_narrows_in_its_own_file() {
+        let narrowed = guarded_pair(
+            &format!(
+                "{IS_PLAYER}\nChecks = {{}}\n---@param ent Entity?\nfunction Checks.Usable(ent) return IsValid(ent) and ent:IsPlayer() end"
+            ),
+            "Checks.Usable(x)",
+        );
+        assert_eq!(narrowed, ("Entity".to_string(), "Entity?".to_string()));
+    }
+
+    /// A predicate field another statement replaces may no longer be the
+    /// predicate defined first, so a call through it narrows nothing.
+    #[gtest]
+    fn test_replaced_table_field_predicate_does_not_narrow() {
+        let narrowed = guarded_pair(
+            &format!(
+                "{IS_PLAYER}\nChecks = {{}}\n---@param ent Entity?\nfunction Checks.Usable(ent) return IsValid(ent) and ent:IsPlayer() end\nChecks.Usable = function(ent) return true end"
+            ),
+            "Checks.Usable(x)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    /// A replacement of the predicate field in another file stops the
+    /// narrowing, and deleting and reopening that file follows it.
+    #[gtest]
+    fn test_table_field_predicate_follows_a_replacement_in_another_file() {
+        const REPLACEMENT: &str = "lua/autorun/sh_replace.lua";
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_checks.lua",
+            &format!(
+                r#"
+                {IS_PLAYER}
+                Checks = {{}}
+                ---@param ent Entity?
+                function Checks.Usable(ent) return IsValid(ent) and ent:IsPlayer() end
+
+                ---@return Entity?
+                local function find() end
+
+                local function use()
+                    local x = find()
+                    if Checks.Usable(x) then
+                        local first = x
+                        print(first)
+                    end
+                end
+                "#
+            ),
+        );
+        let replacement = "Checks.Usable = function(ent) return true end";
+        let narrowed = |ws: &mut VirtualWorkspace| {
+            let typ = nth_name_expr_type_from_end(ws, file_id, "first", 0);
+            ws.humanize_type(typ)
+        };
+        let alone = narrowed(&mut ws);
+        ws.def_file(REPLACEMENT, replacement);
+        let replaced = narrowed(&mut ws);
+        let uri = ws.virtual_url_generator.new_uri(REPLACEMENT);
+        ws.analysis.remove_file_by_uri(&uri);
+        let deleted = narrowed(&mut ws);
+        ws.def_file(REPLACEMENT, replacement);
+        let reopened = narrowed(&mut ws);
+
+        assert_eq!(
+            [alone, replaced, deleted, reopened],
+            ["Entity", "Entity?", "Entity", "Entity?"].map(str::to_string)
+        );
+    }
+
+    const ASSERT_VALID: &str = "local function AssertValid(ent) assert(IsValid(ent)) end";
+
+    #[gtest]
+    fn test_helper_that_errors_unless_valid_narrows_its_argument_after_the_call() {
+        let narrowed = asserted_pair(
+            "local function AssertValid(ent) if not IsValid(ent) then error(\"invalid\") end end",
+            "AssertValid(y)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity".to_string()));
+    }
+
+    #[gtest]
+    fn test_helper_that_asserts_validity_narrows_its_argument_after_the_call() {
+        let narrowed = asserted_pair(ASSERT_VALID, "AssertValid(y)");
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity".to_string()));
+    }
+
+    #[gtest]
+    fn test_helper_that_asserts_several_arguments_narrows_each() {
+        let narrowed = asserted_pair(
+            "local function AssertBoth(a, b) assert(IsValid(a)) assert(IsValid(b)) end",
+            "AssertBoth(x, y)",
+        );
+        assert_eq!(narrowed, ("Entity".to_string(), "Entity".to_string()));
+    }
+
+    #[gtest]
+    fn test_method_helper_that_asserts_narrows_its_argument_after_the_call() {
+        let narrowed = asserted_pair(
+            "Checks = {}\nfunction Checks:Require(ent) assert(IsValid(ent)) end",
+            "Checks:Require(y)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity".to_string()));
+    }
+
+    /// A helper that can return before it checks its argument proves nothing
+    /// of it once it returns.
+    #[gtest]
+    fn test_helper_that_can_return_before_asserting_narrows_nothing() {
+        let narrowed = asserted_pair(
+            "local function MaybeAssert(ent, strict) if not strict then return end assert(IsValid(ent)) end",
+            "MaybeAssert(y, false)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    /// A predicate returns whether its argument is valid, so calling it as a
+    /// statement proves nothing.
+    #[gtest]
+    fn test_predicate_called_as_a_statement_narrows_nothing() {
+        let narrowed = asserted_pair("local function ok(ent) return IsValid(ent) end", "ok(y)");
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    /// A helper that asserts a value it assigned to its parameter proves
+    /// nothing of the argument.
+    #[gtest]
+    fn test_helper_asserting_a_reassigned_parameter_narrows_nothing() {
+        let narrowed = asserted_pair(
+            "local function Refind(ent) ent = find() assert(IsValid(ent)) end",
+            "Refind(y)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    #[gtest]
+    fn test_asserted_argument_reassigned_after_the_call_is_not_narrowed() {
+        let narrowed = asserted_pair(ASSERT_VALID, "AssertValid(y) y = find()");
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    /// The narrowing reaches past a branch whose every arm asserts.
+    #[gtest]
+    fn test_asserting_call_in_every_branch_narrows_after_them() {
+        let narrowed = asserted_pair(
+            ASSERT_VALID,
+            "if math.random() > 0.5 then AssertValid(y) else AssertValid(y) end",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity".to_string()));
+    }
+
+    #[gtest]
+    fn test_replaced_table_field_assertion_does_not_narrow() {
+        let narrowed = asserted_pair(
+            "Checks = {}\nfunction Checks.Require(ent) assert(IsValid(ent)) end\nChecks.Require = function(ent) end",
+            "Checks.Require(y)",
+        );
+        assert_eq!(narrowed, ("Entity?".to_string(), "Entity?".to_string()));
+    }
+
+    #[gtest]
+    fn test_helper_that_asserts_narrows_a_field_argument() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+        let file_id = ws.def(&format!(
+            r#"
+            ---@class Holder
+            ---@field Owner Entity?
+
+            {ASSERT_VALID}
+
+            ---@param holder Holder
+            local function use(holder)
+                AssertValid(holder.Owner)
+                local owner = holder.Owner
+                print(owner)
+            end
+            "#
+        ));
+        let owner = nth_name_expr_type_from_end(&mut ws, file_id, "owner", 0);
+        assert_eq!(ws.humanize_type(owner), "Entity");
+    }
+
+    /// A helper that lets `nil` through narrows an argument without making it
+    /// nilable: a non-nil argument stays non-nil, a nilable one stays nilable,
+    /// and one whose other values it rejects can only be `nil`. A predicate
+    /// that lets `nil` through narrows its true branch the same way.
+    #[gtest]
+    fn test_helper_that_lets_nil_through_keeps_the_arguments_nilability() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@param x string|number|nil
+            local function forbid_number(x)
+                if type(x) == "number" then error("no numbers") end
+            end
+
+            ---@param x string|number|nil
+            local function is_not_number(x)
+                if type(x) == "number" then return false end
+                return true
+            end
+
+            ---@param s string
+            ---@param m string|number|nil
+            ---@param n number?
+            ---@param g string
+            local function use(s, m, n, g)
+                local none = nil
+                forbid_number(s)
+                forbid_number(m)
+                forbid_number(n)
+                forbid_number(none)
+                after_s = s
+                after_m = m
+                after_n = n
+                after_none = none
+                if is_not_number(g) then
+                    guarded = g
+                end
+            end
+            "#,
+        );
+        let types = ["after_s", "after_m", "after_n", "after_none", "guarded"].map(|name| {
+            let typ = ws.expr_ty(name);
+            ws.humanize_type(typ)
+        });
+        assert_eq!(types, ["string", "string?", "nil", "nil", "string"]);
+    }
+
+    /// A helper that other calls pass a nilable value to narrows each
+    /// caller's own argument, not by what the other calls passed.
+    #[gtest]
+    fn test_helper_called_with_a_nilable_value_elsewhere_narrows_each_argument() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            function require_present(x)
+                if not x then error("missing") end
+            end
+            ---@return string?
+            local function maybe() end
+            require_present(maybe())
+
+            ---@class Ent
+
+            ---@param map table<string, Ent>
+            ---@param k string
+            local function use(map, k)
+                local ent = map[k]
+                require_present(ent)
+                after = ent
+            end
+            "#,
+        );
+        let after = ws.expr_ty("after");
+        assert_eq!(ws.humanize_type(after), "Ent");
+    }
+
+    /// A helper that asserts or errors on its argument narrows a getter
+    /// passed to it, as a guard on the getter would, also through an alias
+    /// of its receiver or in parentheses.
+    #[gtest]
+    fn test_helper_that_asserts_narrows_a_getter_argument() {
+        for call in [
+            "AssertValid(holder:GetOwner())",
+            "RequireValid(holder:GetOwner())",
+            "local alias = holder RequireValid(alias:GetOwner())",
+            "RequireValid((holder:GetOwner()))",
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            set_gmod_enabled(&mut ws);
+            def_isvalid_guard(&mut ws);
+            let file_id = ws.def(&format!(
+                r#"
+                ---@class Holder
+                local Holder = {{}}
+                ---@return Entity?
+                function Holder:GetOwner() end
+
+                {ASSERT_VALID}
+                local function RequireValid(ent) if not IsValid(ent) then error("invalid") end end
+
+                ---@param holder Holder
+                local function use(holder)
+                    {call}
+                    local owner = holder:GetOwner()
+                    print(owner)
+                end
+                "#
+            ));
+            let owner = nth_name_expr_type_from_end(&mut ws, file_id, "owner", 0);
+            assert_eq!(ws.humanize_type(owner), "Entity", "{call}");
+        }
+    }
+
+    /// An asserting helper in another file narrows while it asserts, and
+    /// editing, deleting and reopening that file follows it.
+    #[gtest]
+    fn test_asserting_helper_follows_edits_in_another_file() {
+        const HELPER: &str = "lua/autorun/sh_assert.lua";
+        let asserting = "function AssertValid(ent) assert(IsValid(ent)) end";
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+        ws.def_file(HELPER, asserting);
+        let file_id = ws.def_file(
+            "lua/autorun/sh_use.lua",
+            r#"
+            ---@return Entity?
+            local function find() end
+
+            local function use()
+                local x = find()
+                AssertValid(x)
+                local first = x
+                print(first)
+            end
+            "#,
+        );
+        let narrowed = |ws: &mut VirtualWorkspace| {
+            let typ = nth_name_expr_type_from_end(ws, file_id, "first", 0);
+            ws.humanize_type(typ)
+        };
+        let asserted = narrowed(&mut ws);
+        ws.def_file(HELPER, "function AssertValid(ent) print(ent) end");
+        let edited = narrowed(&mut ws);
+        let uri = ws.virtual_url_generator.new_uri(HELPER);
+        ws.analysis.remove_file_by_uri(&uri);
+        let deleted = narrowed(&mut ws);
+        ws.def_file(HELPER, asserting);
+        let reopened = narrowed(&mut ws);
+
+        assert_eq!(
+            [asserted, edited, deleted, reopened],
+            ["Entity", "Entity?", "Entity?", "Entity"].map(str::to_string)
+        );
+    }
+
     #[gtest]
     fn test_unannotated_predicate_wrapper_narrows_member_expression_on_true_branch() {
         let mut ws = VirtualWorkspace::new();
@@ -3523,10 +4044,11 @@ _2 = a[1]
                     .get_signature_index()
                     .inferred_positive_guard(signature_id)
             })
-            .map(|guard| {
+            .flat_map(|guard| guard.narrowed.iter())
+            .map(|param| {
                 (
-                    guard.param_idx,
-                    ws.humanize_type(guard.narrowed_type.clone()),
+                    param.param_idx,
+                    ws.humanize_type(param.narrowed_type.clone()),
                 )
             })
             .collect::<Vec<_>>();
@@ -4278,7 +4800,9 @@ _2 = a[1]
                             .into_values()
                             .next()
                             .expect("wrapper inferred guard")
+                            .narrowed[0]
                             .narrowed_type
+                            .clone()
                     })
                     .collect::<Vec<_>>()
             };
@@ -10044,5 +10568,73 @@ _2 = a[1]
         let at_label = local_in_function(goto_loop, "seen");
         expect_that!(at_label, not(eq("unknown")));
         expect_that!(at_label, eq(&local_in_function(while_loop, "seen")));
+    }
+
+    #[gtest]
+    fn nil_type_guard_narrows_to_nil_on_true_branch() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@param x any
+            ---@return TypeGuard<nil>
+            local function is_nil(x) return x == nil end
+
+            ---@param v string?
+            local function check(v)
+                if is_nil(v) then
+                    local inside = v
+                else
+                    local outside = v
+                end
+            end
+            "#,
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "inside")), "nil");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "outside")), "string");
+    }
+
+    #[gtest]
+    fn asserting_helper_narrows_aliased_source_local() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            local function require_str(x)
+                assert(type(x) == "string")
+            end
+
+            ---@param raw string?
+            local function check(raw)
+                local alias = raw
+                require_str(raw)
+                local after = alias
+            end
+            "#,
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "after")), "string");
+    }
+
+    #[gtest]
+    fn mutated_guard_subject_does_not_produce_type_guard() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@param x any
+            local function misleading(x)
+                x = "always"
+                return type(x) == "string"
+            end
+
+            ---@param v integer|string
+            local function check(v)
+                if misleading(v) then
+                    local inside = v
+                end
+            end
+            "#,
+        );
+        assert_eq!(
+            ws.humanize_type(ws.local_ty(file_id, "inside")),
+            "(integer|string)"
+        );
     }
 }

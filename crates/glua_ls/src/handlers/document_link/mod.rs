@@ -2,7 +2,7 @@ mod build_link;
 
 use crate::context::ServerContextSnapshot;
 use build_link::build_links;
-pub use build_link::is_require_path;
+pub use build_link::linked_file;
 use glua_parser::LuaAstNode;
 use lsp_types::{
     ClientCapabilities, DocumentLink, DocumentLinkOptions, DocumentLinkParams, ServerCapabilities,

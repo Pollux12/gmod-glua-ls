@@ -1499,6 +1499,10 @@ mod test {
         let command_path = schema_root.join("schema/sh_commands.lua");
         analysis.update_files_by_path(vec![
             (
+                helix_root.join("builtins.lua"),
+                Some(crate::GMOD_CALL_ARG_BUILTINS_FIXTURE.to_string()),
+            ),
+            (
                 helix_root.join("gamemode/shared.lua"),
                 Some(shared.to_string()),
             ),
@@ -1520,6 +1524,24 @@ mod test {
         let shared_file = analysis
             .get_file_id(&shared_uri)
             .expect("expected shared file id");
+        let init_uri = lsp_types::Uri::parse_from_file_path(&helix_root.join("gamemode/init.lua"))
+            .expect("expected init path to convert to uri");
+        let init_file = analysis
+            .get_file_id(&init_uri)
+            .expect("expected init file id");
+        let init_loads = analysis
+            .compilation
+            .get_db()
+            .get_file_dependencies_index()
+            .get_dependency_sites(&init_file)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|site| site.target_file_id)
+            .collect::<Vec<_>>();
+        assert!(
+            init_loads.contains(&shared_file),
+            "init.lua should load shared.lua, loads {init_loads:?}"
+        );
         let tree = analysis
             .compilation
             .get_db()
@@ -3591,6 +3613,7 @@ mod test {
     #[test]
     fn test_export() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "a.lua",
             r#"
@@ -4660,6 +4683,479 @@ owner:CompletelyMadeUpMethod()
                 local offset = data.buoyancyOffsetZ
             "#,
         ));
+    }
+
+    fn dynamic_field_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws
+    }
+
+    const INSTALL: &str = r#"
+        local function Install(t, name, value)
+            t["Set" .. name] = value
+        end
+    "#;
+
+    /// A function building a key from its parameters gives each table the
+    /// names its own calls pass, not every caller's.
+    #[test]
+    fn test_installed_key_names_belong_to_the_call_that_passed_them() {
+        let mut ws = dynamic_field_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!(
+                r#"{INSTALL}
+                local A, B = {{}}, {{}}
+                Install(A, "X", 1)
+                Install(B, "Y", "s")
+                local ax = A.SetX
+                local by = B.SetY
+                "#
+            ),
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!(
+                r#"{INSTALL}
+                local A, B = {{}}, {{}}
+                Install(A, "X", 1)
+                Install(B, "Y", "s")
+                local ay = A.SetY
+                "#
+            ),
+        ));
+    }
+
+    /// A key reading the same parameter twice holds the same string both
+    /// times: a call passing `"a"` or `"b"` installs `a_a` or `b_b`, never a
+    /// key mixing the two.
+    #[test]
+    fn test_installed_key_reading_a_parameter_twice_uses_one_string() {
+        const INSTALL_TWICE: &str = r#"
+            local function InstallTwice(t, name)
+                t[name .. "_" .. name] = true
+            end
+            ---@type "a"|"b"
+            local name = "a"
+            local A = {}
+            InstallTwice(A, name)
+        "#;
+        let mut ws = dynamic_field_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!("{INSTALL_TWICE}\nlocal aa, bb = A.a_a, A.b_b\n"),
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!("{INSTALL_TWICE}\nlocal ab = A.a_b\n"),
+        ));
+    }
+
+    /// A defaulted parameter read twice with different defaults still takes
+    /// one value per call: either the passed string both times, or each
+    /// occurrence's default when absent.
+    #[test]
+    fn test_installed_key_reading_defaulted_parameter_twice_uses_one_value() {
+        const INSTALL_DEFAULTED: &str = r#"
+            local function InstallDefaulted(t, name)
+                t[(name or "x") .. "_" .. (name or "y")] = true
+            end
+            ---@type "a"|nil
+            local name = "a"
+            local A = {}
+            InstallDefaulted(A, name)
+        "#;
+        let mut ws = dynamic_field_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!("{INSTALL_DEFAULTED}\nlocal aa, xy = A.a_a, A.x_y\n"),
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!("{INSTALL_DEFAULTED}\nlocal ay = A.a_y\n"),
+        ));
+    }
+
+    /// An installer whose distinct parameters would expand into a large
+    /// Cartesian product widens to a wildcard string key instead of blowing up.
+    #[test]
+    fn test_installed_key_with_many_param_combinations_widens_to_any_string() {
+        let mut ws = dynamic_field_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local function InstallMany(t, a, b, c, d, e, f, g, h, i)
+                t[a .. b .. c .. d .. e .. f .. g .. h .. i] = true
+            end
+            ---@type "a"|"b"
+            local k = "a"
+            local A = {}
+            InstallMany(A, k, k, k, k, k, k, k, k, k)
+            local any_field = A.anything_at_all
+            "#,
+        ));
+    }
+
+    /// Chained local concatenations inside an installer do not expand
+    /// `key_template` exponentially.
+    #[test]
+    fn test_installed_key_with_chained_local_concat_stays_bounded() {
+        let mut source = String::from("local function InstallChain(t, k)\n    local s0 = k\n");
+        for i in 1..=30 {
+            let prev = i - 1;
+            source.push_str(&format!("    local s{i} = s{prev} .. s{prev}\n"));
+        }
+        source.push_str(
+            r#"
+                t[s30] = true
+            end
+            ---@type "a"|"b"
+            local k = "a"
+            local A = {}
+            InstallChain(A, k)
+            "#,
+        );
+        let mut ws = dynamic_field_workspace();
+        ws.def_file("lua/autorun/sh_chain.lua", &source);
+    }
+
+    /// A field a call installs holds the value that call passed.
+    #[test]
+    fn test_installed_field_holds_the_value_its_call_passed() {
+        let mut ws = dynamic_field_workspace();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_vehicles.lua",
+            r#"
+            Vehicles = {}
+            local function RegisterVehicle(name, data)
+                Vehicles["Car" .. name] = data
+            end
+            RegisterVehicle("Sedan", { seats = 4 })
+            RegisterVehicle("Truck", { cargo = 100 })
+            local seats = Vehicles.CarSedan.seats
+            local cargo = Vehicles.CarTruck.cargo
+
+            local function set(t, k, v) t[k] = v end
+            local C = {}
+            set(C, "x", 5)
+            local x = C.x
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "seats")), "4");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "cargo")), "100");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "x")), "5");
+    }
+
+    /// A field a call installs without passing its value holds `nil`, not
+    /// what other calls passed, unless an expanding last argument may fill it.
+    #[test]
+    fn test_installed_field_a_call_passes_no_value_for_holds_nil() {
+        let mut ws = dynamic_field_workspace();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_fields.lua",
+            r#"
+            local function set_field(t, k, v) t[k] = v end
+            ---@return integer
+            local function value() end
+            local A, B, C = {}, {}, {}
+            set_field(A, "x", 123)
+            set_field(B, "y")
+            set_field(C, "z", value())
+            local y = B.y
+            local z = C.z
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "y")), "nil");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "z")), "integer");
+    }
+
+    /// An installer that replaces its value before storing it installs what it
+    /// stores, not what the call passed.
+    #[test]
+    fn test_installed_field_a_replaced_value_holds_what_is_stored() {
+        let mut ws = dynamic_field_workspace();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_fields.lua",
+            r#"
+            local function set_defaulted(t, k, v)
+                v = v or 0
+                t[k] = v
+            end
+            ---@return number
+            local function to_number(v) end
+            local function set_converted(t, k, v)
+                v = to_number(v)
+                t[k] = v
+            end
+            local T, U = {}, {}
+            set_defaulted(T, "a", 123)
+            set_defaulted(T, "b")
+            set_converted(U, "c", "42")
+            local b = T.b
+            local c = U.c
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "b")), "integer");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "c")), "number");
+    }
+
+    /// A registry only holds the keys its calls register.
+    #[test]
+    fn test_registry_reports_a_key_no_call_registered() {
+        let mut ws = dynamic_field_workspace();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local Vehicles = {}
+            local function RegisterVehicle(name, data)
+                Vehicles["Car" .. name] = data
+            end
+            RegisterVehicle("Sedan", { seats = 4 })
+            local bogus = Vehicles.CarBogus
+            "#,
+        ));
+    }
+
+    /// A key built into a local first, or from a parameter with a default,
+    /// names what each call passes, or the default when it passes nothing.
+    #[test]
+    fn test_installed_key_through_a_local_and_a_default() {
+        const REGISTER: &str = r#"
+            local Vehicles = {}
+            local function RegisterVehicle(name, data, prefix)
+                local key = (prefix or "Car") .. name
+                Vehicles[key] = data
+            end
+            RegisterVehicle("Sedan", { seats = 4 })
+            RegisterVehicle("Mk1", { armor = 2 }, "Tank")
+        "#;
+        let mut ws = dynamic_field_workspace();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_vehicles.lua",
+            &format!(
+                r#"{REGISTER}
+                local seats = Vehicles.CarSedan.seats
+                local armor = Vehicles.TankMk1.armor
+                "#
+            ),
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "seats")), "4");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "armor")), "2");
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!("{REGISTER}\nlocal bogus = Vehicles.CarMk1"),
+        ));
+    }
+
+    /// A field read by name from a table another file fills under string keys
+    /// holds the class those writes store.
+    #[test]
+    fn test_named_read_of_a_string_keyed_table_from_another_file_keeps_its_class() {
+        let mut ws = dynamic_field_workspace();
+        ws.def_file(
+            "lua/autorun/sh_sounds.lua",
+            r#"
+            ---@class LoopSound
+            ---@field Stop fun(self: LoopSound)
+
+            ---@return LoopSound
+            function MakeSound() end
+
+            Sounds = {}
+            ---@param id string
+            function AddSound(id)
+                Sounds[id] = MakeSound()
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_use.lua",
+            r#"
+            if Sounds.turbo then
+                turbo = Sounds.turbo
+            end
+            "#,
+        );
+
+        let turbo = ws.expr_ty("turbo");
+        assert_eq!(ws.humanize_type(turbo), "LoopSound");
+    }
+
+    /// A key parameter the body rewrites no longer holds the name the call
+    /// passed, so the write keeps accepting any key.
+    #[test]
+    fn test_rewritten_key_param_installs_no_name() {
+        let mut ws = dynamic_field_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local Registry = {}
+            local function Register(name, value)
+                name = name .. "_x"
+                Registry[name] = value
+            end
+            Register("Sedan", 4)
+            local renamed = Registry.Sedan_x
+            "#,
+        ));
+    }
+
+    /// A registry written under a bare string key holds only the keys its
+    /// calls pass, when every call is seen and passes a string.
+    #[test]
+    fn test_string_keyed_registry_reports_a_key_no_call_registered() {
+        let mut ws = dynamic_field_workspace();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_registry.lua",
+            r#"
+            local Registry = {}
+            local function Register(name, value)
+                Registry[name] = value
+            end
+            Register("Sedan", 4)
+            local sedan = Registry.Sedan
+            function Lookup(key)
+                broad = Registry[key]
+            end
+            "#,
+        );
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "sedan")), "4");
+        let broad = ws.expr_ty("broad");
+        assert_eq!(ws.humanize_type(broad), "4?");
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local Registry = {}
+            local function Register(name, value)
+                Registry[name] = value
+            end
+            Register("Sedan", 4)
+            local bogus = Registry.Bogus
+            "#,
+        ));
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local Registry = {}
+            local function Register(name, value)
+                Registry[name] = value
+            end
+            Register(GetName(), 4)
+            local any = Registry.Anything
+            "#,
+        ));
+    }
+
+    /// A call passing a string whose value is unknown may install any key, on
+    /// its own table only.
+    #[test]
+    fn test_unknown_installed_name_accepts_any_key_on_that_table_only() {
+        let mut ws = dynamic_field_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!(
+                r#"{INSTALL}
+                ---@type string
+                local someName
+                local D = {{}}
+                Install(D, someName, 1)
+                local anything = D.SetAnything
+                "#
+            ),
+        ));
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            &format!(
+                r#"{INSTALL}
+                ---@type string
+                local someName
+                local D, E = {{}}, {{}}
+                Install(D, someName, 1)
+                Install(E, "Known", 1)
+                local anything = E.SetAnything
+                "#
+            ),
+        ));
+    }
+
+    /// A function whose calls cannot all be seen, such as one passed on as a
+    /// value or called by the engine, keeps accepting any key it may write.
+    #[test]
+    fn test_writes_of_a_function_with_unseen_calls_accept_any_key() {
+        let mut ws = dynamic_field_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local Vehicles = {}
+            local function RegisterVehicle(name, data)
+                Vehicles["Car" .. name] = data
+            end
+            Registry = { register = RegisterVehicle }
+            RegisterVehicle("Sedan", { seats = 4 })
+            local other = Vehicles.CarOther
+            "#,
+        ));
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            local Commands = {}
+            OnCommand(function(text)
+                Commands["cmd_" .. text] = true
+            end)
+            local help = Commands.cmd_help
+            "#,
+        ));
+    }
+
+    /// A class a factory makes inherits only from the parent its own call
+    /// passed: one made without a parent has no `__index`, and one made with
+    /// one reads that parent's methods and no others.
+    #[test]
+    fn test_factory_class_reads_only_the_parent_its_call_passed() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedMethod);
+        let file_id = ws.def(
+            r#"
+            local function Class(name, parent)
+                local t = {}
+                local meta = {}
+                meta.__call = function(_, ...)
+                    return setmetatable({}, {__index = t})
+                end
+                if parent then meta.__index = parent end
+                setmetatable(t, meta)
+                return t
+            end
+            local Base = Class("Base")
+            function Base:Foo() end
+            local Child = Class("Child", Base)
+            local child = Child()
+            child:Foo()
+            child:Bogus()
+            local Lone = Class("Lone")
+            Lone:Bogus()
+            "#,
+        );
+        let messages = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            vec!["Undefined method `Bogus`. ", "Undefined method `Bogus`. "]
+        );
     }
 
     #[test]
@@ -7981,5 +8477,70 @@ mod presence_argument_target_tests {
         warm.analysis.remove_file_by_uri(&uri);
         let reopened = warm.def_file(PATH, SOURCE);
         assert_eq!(diagnostics(&mut warm, reopened), vec![]);
+    }
+
+    #[test]
+    fn test_installer_with_omitted_defaulted_key_and_falsy_key() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+        let file_id = ws.def(
+            r#"
+            local function install(target, key, value)
+                local k = key or "DefaultKey"
+                target[k] = value
+            end
+            local function install_const(target, key)
+                local k = key or "DefaultKey"
+                target[k] = 99
+            end
+            local T = {}
+            install(T, nil, 1)
+            install(T, false, 2)
+            local U = {}
+            install_const(U)
+            local a = T.DefaultKey
+            local b = U.DefaultKey
+            "#,
+        );
+        let diags = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(diags.is_empty(), "{diags:#?}");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "a")), "(1|2)");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "b")), "99");
+    }
+
+    #[test]
+    fn test_persistent_call_receiver_sees_later_same_function_field_write() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+        let file_id = ws.def(
+            r#"
+            ---@class PersistentPlayer
+            local PersistentPlayer = {}
+
+            ---@return PersistentPlayer
+            local function GetCurrentPlayer()
+                return PersistentPlayer
+            end
+
+            local function think()
+                local ply = GetCurrentPlayer()
+                local prev = ply.lastTick
+                ply.lastTick = 123
+                return prev
+            end
+            "#,
+        );
+        let diags = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(diags.is_empty(), "{diags:#?}");
     }
 }

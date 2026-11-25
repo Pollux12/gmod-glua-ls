@@ -736,7 +736,6 @@ fn parse_assign_or_expr_or_global_stat(p: &mut LuaParser) -> ParseResult {
         LuaSyntaxKind::CallExpr
             | LuaSyntaxKind::AssertCallExpr
             | LuaSyntaxKind::ErrorCallExpr
-            | LuaSyntaxKind::RequireCallExpr
             | LuaSyntaxKind::TypeCallExpr
             | LuaSyntaxKind::SetmetatableCallExpr
     ) {

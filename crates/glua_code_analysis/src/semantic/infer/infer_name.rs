@@ -1,6 +1,6 @@
 use glua_parser::{
-    LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr,
-    LuaForRangeStat, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat, LuaLocalStat,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaChunk, LuaClosureExpr,
+    LuaExpr, LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat,
     LuaNameExpr, LuaReturnStat, LuaStat, LuaSyntaxId, LuaSyntaxNode, LuaTableExpr, LuaTableField,
     LuaVarExpr, PathTrait,
 };
@@ -1082,6 +1082,24 @@ fn infer_param_inner(
         _ => unreachable!(),
     };
 
+    // A metamethod's first param is the value Lua calls it on, which a
+    // contract the slot filled in (`std.metatable`) leaves untyped.
+    if param_idx == 0
+        && let Some(member_id) = member_id
+        && let Some(cache) = cache.as_mut()
+        && db
+            .get_signature_index()
+            .get(&signature_id)
+            .is_some_and(|signature| {
+                !signature.is_colon_define
+                    && (signature.params_filled_from_slot
+                        || signature.get_param_info_by_id(0).is_none())
+            })
+        && let Some(receiver) = metamethod_receiver_type(db, cache, member_id)
+    {
+        return Ok((receiver, ParamInferenceSource::Concrete));
+    }
+
     let mut colon_define = false;
     // find local annotation
     if let Some(signature) = db.get_signature_index().get_declared(&signature_id) {
@@ -1343,11 +1361,7 @@ fn infer_param_type_from_call_sites(
         return None;
     }
 
-    let target_decl_id = db
-        .get_signature_index()
-        .local_func_decl_for(&signature_id)?;
-    let call_sites =
-        local_function_call_sites(db, cache, signature_id.get_file_id(), target_decl_id);
+    let call_sites = local_function_call_sites(db, cache, signature_id);
     infer_param_type_from_local_call_sites_inner(
         db,
         cache,
@@ -1398,11 +1412,25 @@ fn infer_param_type_from_local_call_sites_inner(
     is_dots: bool,
 ) -> Option<LuaType> {
     let mut inferred_type: Option<LuaType> = None;
+    let mut has_omitted_arg = false;
     for (file_id, call_expr) in call_sites {
-        let Some(arg) = call_expr
-            .get_args_list()
-            .and_then(|args| args.get_args().nth(param_idx))
-        else {
+        let Some(args) = call_expr.get_args_list() else {
+            continue;
+        };
+        let Some(arg) = args.get_args().nth(param_idx) else {
+            let is_complete_call = args.is_single_arg_no_parens()
+                || args.syntax().children_with_tokens().any(|el| {
+                    el.kind()
+                        == glua_parser::LuaKind::Token(glua_parser::LuaTokenKind::TkRightParen)
+                });
+            if !is_dots
+                && is_complete_call
+                && !args.get_args().last().is_some_and(|last| {
+                    crate::compilation::analyzer::expr_expands_to_fill_slots(&last)
+                })
+            {
+                has_omitted_arg = true;
+            }
             continue;
         };
         if !can_call_arg_drive_local_param_inference(db, file_id, &arg, param_idx) {
@@ -1411,7 +1439,7 @@ fn infer_param_type_from_local_call_sites_inner(
         if !is_local_call_site_arg_shape_supported(&arg) {
             continue;
         }
-        let arg_type = if is_global_pairs_for_range_var_arg(db, file_id, &arg) {
+        let arg_type = if is_builtin_loop_var_arg(db, file_id, &arg) {
             let Ok(arg_type) = infer_expr(db, cache, arg) else {
                 continue;
             };
@@ -1480,6 +1508,11 @@ fn infer_param_type_from_local_call_sites_inner(
         });
     }
 
+    if has_omitted_arg {
+        inferred_type =
+            inferred_type.map(|current| TypeOps::Union.apply(db, &current, &LuaType::Nil));
+    }
+
     inferred_type
 }
 
@@ -1536,7 +1569,7 @@ fn is_local_call_site_arg_read(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> 
     match arg {
         LuaExpr::NameExpr(name_expr) => {
             param_arg_decl(db, file_id, arg).is_some()
-                || is_global_pairs_for_range_var_arg(db, file_id, arg)
+                || is_builtin_loop_var_arg(db, file_id, arg)
                 || supported_local_value_expr(db, file_id, name_expr).is_some()
         }
         _ => is_local_call_site_arg_shape_supported(arg),
@@ -1553,18 +1586,14 @@ fn infer_unread_local_call_site_args(
     signature_id: LuaSignatureId,
     param_idx: usize,
 ) -> Result<Option<LuaType>, InferFailReason> {
-    let Some(target_decl_id) = db.get_signature_index().local_func_decl_for(&signature_id) else {
-        return Ok(None);
-    };
-    let unread_args =
-        local_function_call_sites(db, cache, signature_id.get_file_id(), target_decl_id)
-            .into_iter()
-            .filter_map(|(file_id, call_expr)| {
-                call_expr
-                    .get_args_list()
-                    .and_then(|args| args.get_args().nth(param_idx))
-                    .filter(|arg| !is_local_call_site_arg_read(db, file_id, arg))
-            });
+    let unread_args = local_function_call_sites(db, cache, signature_id)
+        .into_iter()
+        .filter_map(|(file_id, call_expr)| {
+            call_expr
+                .get_args_list()
+                .and_then(|args| args.get_args().nth(param_idx))
+                .filter(|arg| !is_local_call_site_arg_read(db, file_id, arg))
+        });
 
     let mut inferred_type: Option<LuaType> = None;
     for arg in unread_args {
@@ -1621,10 +1650,7 @@ fn infer_forwarded_param_arg_type(
     if decl.get_file_id() != signature_id.get_file_id() {
         return None;
     }
-    let closure = signature_closure(db, signature_id)?;
-    let name = closure.get_parent::<LuaLocalFuncStat>()?.get_local_name()?;
-    let target = LuaDeclId::new(signature_id.get_file_id(), name.get_position());
-    let calls = local_function_call_sites(db, cache, signature_id.get_file_id(), target);
+    let calls = local_function_call_sites(db, cache, signature_id);
     infer_param_type_from_local_call_sites_inner(
         db,
         cache,
@@ -1660,33 +1686,25 @@ fn is_call_argument_closure(db: &DbIndex, signature_id: LuaSignatureId) -> bool 
     })
 }
 
-/// The calls of a local function in `file_id`, read out of the file's
-/// references, which a call added or removed moves, and the top-level
-/// statement of each.
+/// The calls of the function `signature_id` in its own file through a local
+/// name: a local function's, or that of a local table it is stored on. Read
+/// out of the file's references, which a call added or removed moves.
 fn local_function_call_sites(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    file_id: FileId,
-    target_decl_id: LuaDeclId,
+    signature_id: LuaSignatureId,
 ) -> Vec<(FileId, LuaCallExpr)> {
-    let Some(file_refs) = db.get_reference_index().get_local_reference(&file_id) else {
-        return Vec::new();
-    };
+    let file_id = signature_id.get_file_id();
     // Parameter inference asks for the same function's call sites once per
     // parameter index, and each miss walks the tree from the root for every
     // reference. Derive the set once and re-resolve the ids on later calls.
-    let syntax_ids = match cache.local_function_call_sites_cache.get(&target_decl_id) {
+    let syntax_ids = match cache.local_function_call_sites_cache.get(&signature_id) {
         Some(cached) => cached.clone(),
         None => {
-            let ids = Arc::new(find_local_function_call_sites(
-                db,
-                file_id,
-                file_refs,
-                target_decl_id,
-            ));
+            let ids = Arc::new(find_local_function_call_sites(db, signature_id));
             cache
                 .local_function_call_sites_cache
-                .insert(target_decl_id, ids.clone());
+                .insert(signature_id, ids.clone());
             ids
         }
     };
@@ -1704,19 +1722,91 @@ fn local_function_call_sites(
         .collect()
 }
 
-fn find_local_function_call_sites(
+/// Whether the parameters of `signature_id` take their callers' arguments
+/// where they are read: a local function, or one stored on a local table.
+pub(crate) fn takes_local_call_site_args(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    db.get_signature_index()
+        .local_func_decl_for(&signature_id)
+        .is_some()
+        || db
+            .get_reference_index()
+            .get_local_reference(&signature_id.get_file_id())
+            .and_then(|file_refs| local_table_member_call_sites(db, file_refs, signature_id))
+            .is_some()
+}
+
+fn find_local_function_call_sites(db: &DbIndex, signature_id: LuaSignatureId) -> Vec<LuaSyntaxId> {
+    let file_id = signature_id.get_file_id();
+    let Some(file_refs) = db.get_reference_index().get_local_reference(&file_id) else {
+        return Vec::new();
+    };
+    if let Some(target_decl_id) = db.get_signature_index().local_func_decl_for(&signature_id) {
+        return decl_name_exprs(db, file_id, file_refs, target_decl_id)
+            .into_iter()
+            .filter_map(|name_expr| name_expr.get_parent::<LuaCallExpr>())
+            .filter(|call_expr| matches!(call_expr.get_prefix_expr(), Some(LuaExpr::NameExpr(_))))
+            .map(|call_expr| call_expr.get_syntax_id())
+            .collect();
+    }
+    local_table_member_call_sites(db, file_refs, signature_id).unwrap_or_default()
+}
+
+/// Every call of the function `signature_id`, when all are in its file: a
+/// local holds it, nothing reassigns that local, and every reference calls it.
+pub(crate) fn seen_local_function_calls(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+) -> Option<Vec<LuaCallExpr>> {
+    let file_id = signature_id.get_file_id();
+    let file_refs = db.get_reference_index().get_local_reference(&file_id)?;
+    let decl_id = local_decl_holding(db, signature_id)?;
+    if file_refs
+        .get_decl_references(&decl_id)
+        .is_none_or(|refs| refs.is_written_after_declaration(decl_id.position))
+    {
+        return None;
+    }
+    decl_name_exprs(db, file_id, file_refs, decl_id)
+        .into_iter()
+        .map(|name_expr| {
+            name_expr.get_parent::<LuaCallExpr>().filter(|call_expr| {
+                call_expr
+                    .get_prefix_expr()
+                    .is_some_and(|prefix| prefix.get_syntax_id() == name_expr.get_syntax_id())
+            })
+        })
+        .collect()
+}
+
+/// The local the function `signature_id` is declared as or assigned to.
+fn local_decl_holding(db: &DbIndex, signature_id: LuaSignatureId) -> Option<LuaDeclId> {
+    if let Some(decl_id) = db.get_signature_index().local_func_decl_for(&signature_id) {
+        return Some(decl_id);
+    }
+    let closure = signature_closure(db, signature_id)?;
+    let local_stat = closure.get_parent::<LuaLocalStat>()?;
+    let position = local_stat
+        .get_value_exprs()
+        .position(|value| value.get_syntax_id() == closure.get_syntax_id())?;
+    let name = local_stat.get_local_name_list().nth(position)?;
+    Some(LuaDeclId::new(
+        signature_id.get_file_id(),
+        name.get_position(),
+    ))
+}
+
+/// The name expressions referring to the variable `decl_id`, in file order.
+fn decl_name_exprs(
     db: &DbIndex,
     file_id: FileId,
     file_refs: &crate::FileReference,
-    target_decl_id: LuaDeclId,
-) -> Vec<LuaSyntaxId> {
-    let Some(decl_refs) = file_refs.get_decl_references(&target_decl_id) else {
+    decl_id: LuaDeclId,
+) -> Vec<LuaNameExpr> {
+    let Some(decl_refs) = file_refs.get_decl_references(&decl_id) else {
         return Vec::new();
     };
-
     let mut cells = decl_refs.cells.clone();
     cells.sort_by_key(|cell| cell.range.start());
-
     cells
         .into_iter()
         .filter_map(|cell| {
@@ -1728,10 +1818,131 @@ fn find_local_function_call_sites(
                 .find_map(LuaNameExpr::cast)
                 .filter(|name_expr| name_expr.get_range() == cell.range)
         })
-        .filter_map(|name_expr| name_expr.get_parent::<LuaCallExpr>())
-        .filter(|call_expr| matches!(call_expr.get_prefix_expr(), Some(LuaExpr::NameExpr(_))))
-        .map(|call_expr| call_expr.get_syntax_id())
         .collect()
+}
+
+/// The calls `T.key(...)` of a function defined as `T.key` on a local table
+/// `T` nothing reassigns, and `T:key(...)` of one defined as `T:key`. `None`
+/// when another write to `T.key` may replace the function.
+fn local_table_member_call_sites(
+    db: &DbIndex,
+    file_refs: &crate::FileReference,
+    signature_id: LuaSignatureId,
+) -> Option<Vec<LuaSyntaxId>> {
+    let file_id = signature_id.get_file_id();
+    let closure = signature_closure(db, signature_id)?;
+    let LuaVarExpr::IndexExpr(target) = closure.get_parent::<LuaFuncStat>()?.get_func_name()?
+    else {
+        return None;
+    };
+    let LuaExpr::NameExpr(table) = target.get_prefix_expr()? else {
+        return None;
+    };
+    let key = target.get_name_token()?.get_name_text().to_string();
+    let is_colon = target.get_index_token()?.is_colon();
+    let table_decl_id = file_refs.get_decl_id(&table.get_range())?;
+    let table_decl = db.get_decl_index().get_decl(&table_decl_id)?;
+    if !matches!(table_decl.extra, LuaDeclExtra::Local { .. })
+        || file_refs
+            .get_decl_references(&table_decl_id)?
+            .is_written_after_declaration(table_decl.get_position())
+    {
+        return None;
+    }
+    let mut calls = Vec::new();
+    for name_expr in decl_name_exprs(db, file_id, file_refs, table_decl_id) {
+        let Some(index_expr) = name_expr.get_parent::<LuaIndexExpr>() else {
+            // Allow `T.__index = T` and `setmetatable(..., T)` without treating `T` as escaping.
+            let is_self_index_assign =
+                name_expr
+                    .get_parent::<LuaAssignStat>()
+                    .is_some_and(|assign| {
+                        let (vars, exprs) = assign.get_var_and_expr_list();
+                        exprs
+                            .iter()
+                            .position(|expr| expr.get_syntax_id() == name_expr.get_syntax_id())
+                            .and_then(|pos| vars.get(pos))
+                            .is_some_and(|var| match var {
+                                LuaVarExpr::IndexExpr(lhs) => {
+                                    matches!(
+                                        lhs.get_prefix_expr(),
+                                        Some(LuaExpr::NameExpr(prefix))
+                                            if file_refs.get_decl_id(&prefix.get_range())
+                                                == Some(table_decl_id)
+                                    ) && lhs
+                                        .get_name_token()
+                                        .is_some_and(|name| name.get_name_text() == "__index")
+                                }
+                                LuaVarExpr::NameExpr(_) => false,
+                            })
+                    });
+            let is_setmetatable_arg = name_expr
+                .get_parent::<glua_parser::LuaCallArgList>()
+                .and_then(|args| args.get_parent::<LuaCallExpr>())
+                .is_some_and(|call| call.is_setmetatable());
+            if is_self_index_assign || is_setmetatable_arg {
+                continue;
+            }
+            return None;
+        };
+        if index_expr
+            .get_prefix_expr()
+            .is_none_or(|prefix| prefix.get_syntax_id() != name_expr.get_syntax_id())
+        {
+            return None;
+        }
+        if index_expr.get_syntax_id() == target.get_syntax_id() {
+            continue;
+        }
+        let is_same_key = match index_expr.get_index_key() {
+            Some(LuaIndexKey::Name(name)) => name.get_name_text() == key,
+            Some(LuaIndexKey::String(string)) => string.get_value() == key,
+            Some(LuaIndexKey::Integer(_)) => false,
+            _ => return None,
+        };
+        if !is_same_key {
+            if let Some(other_func) = index_expr.get_parent::<LuaFuncStat>()
+                && let Some(other_closure) = other_func.get_closure()
+                && other_closure.descendants::<LuaIndexExpr>().any(|nested| {
+                    matches!(
+                        nested.get_prefix_expr(),
+                        Some(LuaExpr::NameExpr(prefix))
+                            if prefix.get_name_text().as_deref() == Some("self")
+                    ) && match nested.get_index_key() {
+                        Some(LuaIndexKey::Name(name)) => name.get_name_text() == key,
+                        Some(LuaIndexKey::String(string)) => string.get_value() == key,
+                        _ => false,
+                    }
+                })
+            {
+                return None;
+            }
+            continue;
+        }
+        let writes_key = index_expr.get_parent::<LuaFuncStat>().is_some()
+            || index_expr
+                .get_parent::<LuaAssignStat>()
+                .is_some_and(|assign| {
+                    assign
+                        .get_var_and_expr_list()
+                        .0
+                        .iter()
+                        .any(|var| var.get_syntax_id() == index_expr.get_syntax_id())
+                });
+        if writes_key {
+            return None;
+        }
+        let call_expr = index_expr.get_parent::<LuaCallExpr>()?;
+        if call_expr
+            .get_prefix_expr()
+            .is_none_or(|prefix| prefix.get_syntax_id() != index_expr.get_syntax_id())
+            || call_expr.is_colon_call() != is_colon
+        {
+            return None;
+        }
+        calls.push(call_expr.get_syntax_id());
+    }
+    Some(calls)
 }
 
 fn can_call_arg_drive_local_param_inference(
@@ -1741,7 +1952,7 @@ fn can_call_arg_drive_local_param_inference(
     target_param_idx: usize,
 ) -> bool {
     if is_for_range_var_arg(db, file_id, arg) {
-        return is_global_pairs_for_range_var_arg(db, file_id, arg);
+        return is_builtin_loop_var_arg(db, file_id, arg);
     }
 
     if is_mutable_local_name_arg(db, file_id, arg) {
@@ -1803,7 +2014,9 @@ fn is_for_range_var_arg(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> bool {
         })
 }
 
-fn is_global_pairs_for_range_var_arg(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> bool {
+/// Whether `arg` reads a variable of a loop the standard library drives: a
+/// numeric `for`, or a `for` over the global `pairs` or `ipairs`.
+fn is_builtin_loop_var_arg(db: &DbIndex, file_id: FileId, arg: &LuaExpr) -> bool {
     let LuaExpr::NameExpr(name_expr) = arg else {
         return false;
     };
@@ -1815,16 +2028,19 @@ fn is_global_pairs_for_range_var_arg(db: &DbIndex, file_id: FileId, arg: &LuaExp
         return false;
     };
 
-    name_expr
-        .syntax()
-        .ancestors()
-        .find_map(LuaForRangeStat::cast)
-        .is_some_and(|for_range| {
-            let is_loop_var = for_range
+    name_expr.syntax().ancestors().any(|node| {
+        if let Some(for_stat) = LuaForStat::cast(node.clone()) {
+            return for_stat
+                .get_var_name()
+                .is_some_and(|var_name| var_name.get_position() == decl_id.position);
+        }
+        LuaForRangeStat::cast(node).is_some_and(|for_range| {
+            for_range
                 .get_var_name_list()
-                .any(|var_name| var_name.get_position() == decl_id.position);
-            is_loop_var && is_global_pairs_for_range(db, file_id, &for_range)
+                .any(|var_name| var_name.get_position() == decl_id.position)
+                && is_global_pairs_for_range(db, file_id, &for_range)
         })
+    })
 }
 
 fn is_global_pairs_for_range(db: &DbIndex, file_id: FileId, for_range: &LuaForRangeStat) -> bool {
@@ -1834,7 +2050,10 @@ fn is_global_pairs_for_range(db: &DbIndex, file_id: FileId, for_range: &LuaForRa
     let Some(LuaExpr::NameExpr(name_expr)) = call_expr.get_prefix_expr() else {
         return false;
     };
-    if name_expr.get_name_text().as_deref() != Some("pairs") {
+    if !matches!(
+        name_expr.get_name_text().as_deref(),
+        Some("pairs" | "ipairs")
+    ) {
         return false;
     }
 
@@ -1948,6 +2167,96 @@ fn find_param_type_from_inherited_members(
     }
 
     None
+}
+
+/// The value Lua passes first to the metamethod `member_id`: for a field of
+/// `setmetatable(t, { __call = f })`'s literal, `t`; for another literal's
+/// field, that table; for `T.__add = f` or `function T.__add`, `T`. A table
+/// instances fold into stands for them.
+fn metamethod_receiver_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    member_id: LuaMemberId,
+) -> Option<LuaType> {
+    fn usable_receiver(typ: LuaType) -> Option<LuaType> {
+        (!matches!(
+            typ,
+            LuaType::Unknown | LuaType::Nil | LuaType::Never | LuaType::Any
+        ))
+        .then_some(typ)
+    }
+
+    let member = db.get_member_index().get_member(&member_id)?;
+    let LuaMemberKey::Name(name) = member.get_key() else {
+        return None;
+    };
+    crate::LuaOperatorMetaMethod::from_metatable_name(name)?;
+    let root = db
+        .get_vfs()
+        .syntax_tree_around(&member_id.file_id, member_id.get_syntax_id().get_range())?
+        .get_red_root();
+    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
+    if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
+        let prefix_type = infer_expr(db, cache, index_expr.get_prefix_expr()?)
+            .ok()
+            .and_then(usable_receiver)?;
+        // When a separate metatable table defines `__index = Class`, the
+        // receiver passed to its metamethods is an instance of `Class`, not
+        // the metatable table itself.
+        if let LuaType::TableConst(table_range) = &prefix_type
+            && db.get_type_index().table_class(table_range).is_none()
+            && let Some(index_members) = db.get_member_index().get_members_with_key(
+                &crate::LuaMemberOwner::Element(table_range.clone()),
+                &LuaMemberKey::Name("__index".into()),
+            )
+            && let Some(index_target) = index_members.into_iter().find_map(|index_member| {
+                let target = db
+                    .get_type_index()
+                    .get_type_cache(&index_member.get_id().into())?
+                    .as_type()
+                    .clone();
+                match &target {
+                    LuaType::Ref(_) | LuaType::Def(_) => Some(target),
+                    LuaType::TableConst(target_range) if target_range != table_range => {
+                        Some(target)
+                    }
+                    _ => None,
+                }
+            })
+        {
+            return Some(index_target);
+        }
+        return Some(prefix_type);
+    }
+    let literal = LuaTableField::cast(node)?.get_parent::<LuaTableExpr>()?;
+    if let Some(target) = setmetatable_target_of_literal(&literal) {
+        return infer_expr(db, cache, target).ok().and_then(usable_receiver);
+    }
+    let table = crate::InFiled::new(member_id.file_id, literal.get_range());
+    Some(
+        db.get_type_index()
+            .table_class(&table)
+            .cloned()
+            .unwrap_or(LuaType::TableConst(table)),
+    )
+}
+
+/// `t` in `setmetatable(t, literal)`.
+pub(crate) fn setmetatable_target_of_literal(literal: &LuaTableExpr) -> Option<LuaExpr> {
+    let call = literal
+        .syntax()
+        .parent()
+        .and_then(|args| args.parent())
+        .and_then(LuaCallExpr::cast)?;
+    let LuaExpr::NameExpr(callee) = call.get_prefix_expr()? else {
+        return None;
+    };
+    if callee.get_name_text().as_deref() != Some("setmetatable") {
+        return None;
+    }
+    let mut args = call.get_args_list()?.get_args();
+    let target = args.next()?;
+    (args.next()?.syntax() == literal.syntax()).then_some(target)
 }
 
 fn find_param_type_from_outer_factory_member(

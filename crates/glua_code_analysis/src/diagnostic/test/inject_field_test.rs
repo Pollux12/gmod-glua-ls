@@ -215,6 +215,7 @@ mod test {
     #[test]
     fn test_export() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "a.lua",
             r#"
@@ -245,6 +246,7 @@ mod test {
     #[test]
     fn test_export_2() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "a.lua",
             r#"

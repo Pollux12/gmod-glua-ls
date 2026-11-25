@@ -266,6 +266,7 @@ end
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         ws.def_file(
             "lua/utils.lua",
             "Utils = Utils or {}\nfunction Utils.Ping() return 1 end\n",
@@ -383,6 +384,7 @@ end
     #[test]
     fn deleting_one_entitys_shared_file_re_runs_nothing_in_another_entity() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
@@ -1039,6 +1041,212 @@ function Drive(car) local speed = car.speed end
         assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![car]);
     }
 
+    const FACTORY: &str = "gamemodes/cityrp/gamemode/core/sh_factory.lua";
+    const FACTORY_TEXT: &str = "function MakeTab(name)
+    return { name = name }
+end
+";
+    const FACTORY_READER: &str = "gamemodes/cityrp/gamemode/core/cl_menu.lua";
+    const FACTORY_READER_TEXT: &str = "local tab = MakeTab(\"Inventory\")
+local name = tab.name
+";
+
+    /// A field of a table a factory builds reads as what the call passed, found
+    /// in the factory's function; a shift above that function moves it
+    /// without changing what the field holds.
+    #[test]
+    fn a_shift_above_a_factory_re_runs_nothing_in_a_file_reading_what_it_built() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            (FACTORY, FACTORY_TEXT),
+            (FACTORY_READER, FACTORY_READER_TEXT),
+        ]);
+
+        let factory = ws.def_file(FACTORY, &format!("\n{FACTORY_TEXT}"));
+
+        assert_eq!(
+            ws.analysis.compilation.last_evaluated_files(),
+            vec![factory]
+        );
+    }
+
+    /// A read through an `__index` function gets what that function returns,
+    /// found in its body; a shift above the function moves it without
+    /// changing the read.
+    #[test]
+    fn a_shift_above_an_index_function_re_runs_nothing_in_a_file_reading_through_it() {
+        const PROXY: &str = "gamemodes/cityrp/gamemode/core/sh_proxy.lua";
+        const PROXY_TEXT: &str = "Base = { speed = 1 }
+Proxy = setmetatable({}, { __index = function(t, k) return Base[k] end })
+";
+        let mut ws = VirtualWorkspace::new();
+        ws.def_files(vec![
+            (PROXY, PROXY_TEXT),
+            (
+                "gamemodes/cityrp/gamemode/core/cl_drive.lua",
+                "local speed = Proxy.speed\n",
+            ),
+        ]);
+
+        let proxy = ws.def_file(PROXY, &format!("\n{PROXY_TEXT}"));
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files(), vec![proxy]);
+    }
+
+    const PANELS: &str = "gamemodes/cityrp/gamemode/core/sh_panels.lua";
+    const PANELS_TEXT: &str = "---@class Panel
+---@class DFrame: Panel
+---@field GetTitle fun(self: DFrame): string
+";
+    const ELEMENTS: &str = "gamemodes/cityrp/gamemode/core/derma/cl_elements.lua";
+    const ELEMENTS_TEXT: &str = "local PANEL = {}
+AccessorFunc(PANEL, \"m_sTitle\", \"Title\")
+vgui.Register(\"MCategory\", PANEL, \"Panel\")
+";
+    const SKIN: &str = "gamemodes/cityrp/gamemode/core/cl_skin.lua";
+    const SKIN_TEXT: &str = "---@param panel Panel
+local function PaintFrame(panel)
+    local title = panel:GetTitle()
+    print(panel)
+end
+";
+
+    /// A panel parameter calling a method only some panel classes have reads
+    /// as those classes; a shift in the file registering one of them leaves
+    /// the guess as it is.
+    #[test]
+    fn a_shift_in_a_file_registering_a_guessed_panel_re_runs_nothing_in_the_guess() {
+        let mut ws = VirtualWorkspace::new();
+        gmod(&mut ws);
+        ws.def_files(vec![
+            (PANELS, PANELS_TEXT),
+            (ELEMENTS, ELEMENTS_TEXT),
+            (SKIN, SKIN_TEXT),
+        ]);
+
+        let elements = ws.def_file(ELEMENTS, &format!("\n{ELEMENTS_TEXT}"));
+
+        assert_eq!(
+            ws.analysis.compilation.last_evaluated_files(),
+            vec![elements]
+        );
+    }
+
+    /// Renaming the registered class reaches the guess.
+    #[test]
+    fn renaming_a_guessed_panel_re_runs_the_guess() {
+        let ws = VirtualWorkspace::assert_warm_matches_cold(
+            gmod,
+            &[
+                (PANELS, PANELS_TEXT),
+                (ELEMENTS, ELEMENTS_TEXT),
+                (SKIN, SKIN_TEXT),
+            ],
+            &[(ELEMENTS, &ELEMENTS_TEXT.replace("MCategory", "MCollapse"))],
+        );
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files().len(), 2);
+    }
+
+    /// Dropping the registration takes the class out of the guess.
+    #[test]
+    fn unregistering_a_guessed_panel_settles_as_a_cold_build() {
+        VirtualWorkspace::assert_warm_matches_cold(
+            gmod,
+            &[
+                (PANELS, PANELS_TEXT),
+                (ELEMENTS, ELEMENTS_TEXT),
+                (SKIN, SKIN_TEXT),
+            ],
+            &[(
+                ELEMENTS,
+                &ELEMENTS_TEXT.replace("vgui.Register(\"MCategory\", PANEL, \"Panel\")", ""),
+            )],
+        );
+    }
+
+    /// Deleting the file registering a guessed panel and opening it again
+    /// each settle as a cold build of what is left.
+    #[test]
+    fn a_guessed_panels_file_deleted_and_reopened_settles_as_a_cold_build() {
+        let cold = |files: &[(&str, &str)]| {
+            let mut ws = VirtualWorkspace::new();
+            gmod(&mut ws);
+            ws.def_files(files.to_vec());
+            ws.semantic_digest()
+        };
+        let all = [
+            (PANELS, PANELS_TEXT),
+            (ELEMENTS, ELEMENTS_TEXT),
+            (SKIN, SKIN_TEXT),
+        ];
+        let mut ws = VirtualWorkspace::new();
+        gmod(&mut ws);
+        ws.def_files(all.to_vec());
+        let elements = ws.virtual_url_generator.new_uri(ELEMENTS);
+
+        ws.analysis.remove_file_by_uri(&elements);
+        let deleted = ws.semantic_digest();
+        ws.def_file(ELEMENTS, ELEMENTS_TEXT);
+        let reopened = ws.semantic_digest();
+
+        assert_eq!(
+            (deleted, reopened),
+            (
+                cold(&[(PANELS, PANELS_TEXT), (SKIN, SKIN_TEXT)]),
+                cold(&all)
+            )
+        );
+    }
+
+    /// A call of a function that forwards its class name to `vgui.Create` gets
+    /// that class, found at the create call in the function; a shift above the
+    /// function moves the call without changing what it creates.
+    #[test]
+    fn a_shift_above_a_create_wrapper_re_runs_nothing_in_its_callers() {
+        const WRAPPER: &str = "gamemodes/cityrp/gamemode/core/cl_util.lua";
+        const WRAPPER_TEXT: &str = "function MakePanel(class)
+    local panel = vgui.Create(class)
+    return panel
+end
+";
+        let mut ws = VirtualWorkspace::new();
+        gmod(&mut ws);
+        ws.def_files(vec![
+            (WRAPPER, WRAPPER_TEXT),
+            (
+                "gamemodes/cityrp/gamemode/core/cl_menu.lua",
+                "local button = MakePanel(\"DButton\")\n",
+            ),
+        ]);
+
+        let wrapper = ws.def_file(WRAPPER, &format!("\n{WRAPPER_TEXT}"));
+
+        assert_eq!(
+            ws.analysis.compilation.last_evaluated_files(),
+            vec![wrapper]
+        );
+    }
+
+    /// An edit of what the factory puts in the table reaches the file reading
+    /// the field.
+    #[test]
+    fn an_edit_inside_a_factory_re_runs_a_file_reading_what_it_built() {
+        let ws = VirtualWorkspace::assert_warm_matches_cold(
+            |_| {},
+            &[
+                (FACTORY, FACTORY_TEXT),
+                (FACTORY_READER, FACTORY_READER_TEXT),
+            ],
+            &[(
+                FACTORY,
+                &FACTORY_TEXT.replace("name = name", "name = #name"),
+            )],
+        );
+
+        assert_eq!(ws.analysis.compilation.last_evaluated_files().len(), 2);
+    }
+
     /// A field a class does not declare is looked up on the local tables bound
     /// to it; an edit elsewhere in their file leaves that lookup standing.
     #[test]
@@ -1489,6 +1697,7 @@ end
         const INIT: &str = "lua/entities/shift_car/init.lua";
         const INIT_TEXT: &str = "include(\"sv_input.lua\")\n\nfunction ENT:Initialize()\n    self.holdInputActions = {}\nend\n";
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
@@ -1514,6 +1723,7 @@ end
         const INIT: &str = "lua/entities/shift_car/init.lua";
         const INIT_TEXT: &str = "include(\"sv_input.lua\")\n\nfunction ENT:Initialize()\n    self.holdInputActions = {}\nend\n";
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);

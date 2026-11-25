@@ -294,6 +294,133 @@ mod test {
         }
     }
 
+    /// A local function's parameter takes what its callers pass from the
+    /// variables of `ipairs` and numeric `for` loops, alongside the literals
+    /// they pass.
+    #[test]
+    fn a_local_function_param_takes_loop_values_its_callers_pass() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@class Thing
+            ---@field name string
+
+            ---@type Thing[]
+            local things = {}
+
+            local function show(thing)
+                shown = thing
+            end
+            for _, thing in ipairs(things) do
+                show(thing)
+            end
+
+            local function count(value)
+                counted = value
+            end
+            for i = 1, 3 do
+                count(i)
+            end
+            count("none")
+            "#,
+        );
+
+        for (name, expected) in [("shown", "Thing"), ("counted", r#"("none"|integer)"#)] {
+            let typ = ws.expr_ty(name);
+            assert_eq!(ws.humanize_type(typ), expected, "{name}");
+        }
+    }
+
+    /// A parameter of a method or global function takes the values its
+    /// callers in other files pass, as a local function's does.
+    #[test]
+    fn a_method_or_global_param_takes_the_values_its_callers_pass() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/sh_money.lua",
+            r#"
+            Money = {}
+            function Money:SetAmount(amount)
+                self._Amount = amount
+            end
+            function Describe(label)
+                shown = label
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_use.lua",
+            r#"
+            Money:SetAmount(5)
+            Describe("cash")
+            stored = Money._Amount
+            "#,
+        );
+
+        for (name, expected) in [("stored", LuaType::Integer), ("shown", LuaType::String)] {
+            let typ = ws.expr_ty(name);
+            assert!(
+                !typ.is_unknown() && !typ.is_any() && ws.check_type(&expected, &typ),
+                "{name}: {typ:?}"
+            );
+        }
+    }
+
+    /// An argument holds what its local holds at the call, not what the local
+    /// is written later.
+    #[test]
+    fn a_callers_later_write_to_its_argument_does_not_reach_the_param() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/sh_apply.lua",
+            r#"
+            function Apply(list)
+                got = list
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_use.lua",
+            r#"
+            local list = { 1 }
+            Apply(list)
+            list = nil
+            "#,
+        );
+
+        let got = ws.expr_ty("got");
+        assert!(!got.is_nullable() && !got.is_unknown(), "{got:?}");
+    }
+
+    /// A guard before the call rules out the values the argument cannot hold
+    /// there, so they do not reach the param.
+    #[test]
+    fn a_callers_guarded_argument_passes_only_what_the_guard_lets_through() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/sh_use.lua",
+            r#"
+            function Use(value)
+                got = value
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_caller.lua",
+            r#"
+            local value = false
+            if Flag then
+                value = "found"
+            end
+            if not value then return end
+            Use(value)
+            "#,
+        );
+
+        let got = ws.expr_ty("got");
+        assert_eq!(ws.humanize_type(got), "string");
+    }
+
     #[test]
     fn test_closure_param_infer() {
         let mut ws = VirtualWorkspace::new();
@@ -320,7 +447,7 @@ mod test {
     }
 
     #[test]
-    fn unannotated_function_callback_infers_table_param_from_direct_invocations() {
+    fn unannotated_function_callback_infers_params_from_direct_invocations() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -372,7 +499,7 @@ mod test {
                 .clone()
         };
 
-        assert_eq!(param_type("ok"), LuaType::Unknown);
+        assert_eq!(ws.humanize_type(param_type("ok")), "boolean");
         let proc_expr = semantic_model
             .get_root()
             .descendants::<LuaIndexExpr>()
@@ -384,7 +511,7 @@ mod test {
                 .expect("callback proc type"),
             expected_entity
         );
-        assert_eq!(param_type("err"), LuaType::Unknown);
+        assert_eq!(ws.humanize_type(param_type("err")), "string?");
     }
 
     #[test]
@@ -453,6 +580,44 @@ mod test {
             index_expr_type(&ws, consumer_file_id, "data.proc"),
             ws.ty("CallbackEntityA")
         );
+    }
+
+    #[test]
+    fn callback_shared_table_dag_remains_bounded() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let mut source = String::from(
+            r#"
+            local function run(cb)
+                local t0 = { value = 1 }
+            "#,
+        );
+        for i in 1..=30 {
+            let prev = i - 1;
+            source.push_str(&format!(
+                "    local t{i} = {{ a = t{prev}, b = t{prev} }}\n"
+            ));
+        }
+        source.push_str(
+            r#"
+                cb(t30)
+            end
+            run(function(data)
+                local shallow = data.a.b
+                local deep = data.a.b.a.b.a.b
+            end)
+            "#,
+        );
+
+        let file_id = ws.def_file("lua/autorun/shared/dag_callback.lua", &source);
+        let shallow_ty = ws.local_ty(file_id, "shallow");
+        let deep_ty = ws.local_ty(file_id, "deep");
+        assert!(matches!(shallow_ty, LuaType::Object(_)));
+        assert_eq!(deep_ty, LuaType::Table);
+        let _ = ws.humanize_type(shallow_ty);
     }
 
     #[test]
@@ -874,6 +1039,7 @@ mod test {
     #[test]
     fn test_issue_416() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_files(vec![
             (
                 "test.lua",
@@ -970,6 +1136,7 @@ mod test {
     #[test]
     fn test_issue_498() {
         let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
         ws.def_files(vec![
             (
                 "test.lua",
@@ -1326,6 +1493,176 @@ mod test {
         let ty = ws.expr_ty("inferred_panel");
         let expected = ws.ty("ControlPanel");
         assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+    }
+
+    #[test]
+    fn a_global_function_overriding_a_documented_one_takes_its_param_types() {
+        let mut ws = VirtualWorkspace::new();
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "library/globals.lua",
+            r#"
+            ---@meta
+            ---@param toBeValidated any
+            ---@return boolean
+            function IsValid(toBeValidated) end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_optimisation.lua",
+            r#"
+            function IsValid(object)
+                overriding_param = object
+                if not object then return false end
+                local func = object.IsValid
+                if not func then return false end
+                return func(object)
+            end
+            "#,
+        );
+        ws.def_file("lua/autorun/sh_caller.lua", "IsValid(5)");
+
+        assert_eq!(ws.expr_ty("overriding_param"), LuaType::Any);
+    }
+
+    /// GMod's `hook.lua`, `markup.lua` and `derma.lua` define `hook.Remove( event_name, name )`,
+    /// `markup.Color( col )` and `derma.Color( strName, panel, default )` after `module()`,
+    /// while a global `Color` exists.
+    #[test]
+    fn a_module_function_takes_its_documented_members_param_types() {
+        let mut ws = VirtualWorkspace::new();
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "library/globals.lua",
+            r#"
+            ---@meta
+            ---@param r number
+            ---@return table
+            function Color(r) end
+
+            markup = {}
+            ---@param col table
+            ---@return string
+            function markup.Color(col) end
+
+            hook = {}
+            ---@param eventName string
+            ---@param identifier any
+            function hook.Remove(eventName, identifier) end
+            "#,
+        );
+        ws.def_files(vec![
+            (
+                "lua/includes/modules/markup.lua",
+                r#"
+                module( "markup", package.seeall )
+                function Color( col )
+                    _G.color_param = col
+                end
+                "#,
+            ),
+            (
+                "lua/includes/modules/hook.lua",
+                r#"
+                module( "hook", package.seeall )
+                function Remove( event_name, name )
+                    _G.remove_param = name
+                end
+                "#,
+            ),
+            (
+                "lua/includes/modules/skin.lua",
+                r#"
+                module( "skin", package.seeall )
+                function Color( name )
+                    _G.undocumented_param = name
+                end
+                "#,
+            ),
+            (
+                "lua/autorun/sh_caller.lua",
+                r#"hook.Remove( "Think", "id" )"#,
+            ),
+        ]);
+
+        assert_eq!(ws.expr_ty("color_param"), LuaType::Table);
+        assert_eq!(ws.expr_ty("remove_param"), LuaType::Any);
+        assert_ne!(ws.expr_ty("undocumented_param"), LuaType::Number);
+    }
+
+    /// A replacement whose own return says nothing, such as one returning
+    /// `func(object)` for an `any` object, returns what the global it replaces
+    /// documents.
+    #[test]
+    fn a_global_replacement_with_an_uninformative_return_returns_the_documented_type() {
+        let mut ws = VirtualWorkspace::new();
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "library/globals.lua",
+            r#"
+            ---@meta
+            ---@param toBeValidated any
+            ---@return boolean
+            function IsValid(toBeValidated) end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/sh_optimisation.lua",
+            r#"
+            function IsValid(object)
+                if not object then return false end
+                local func = object.IsValid
+                if not func then return false end
+                return func(object)
+            end
+            "#,
+        );
+        ws.def_file("lua/autorun/sh_caller.lua", "valid = IsValid(5)");
+
+        assert_eq!(ws.expr_ty("valid"), LuaType::Boolean);
+    }
+
+    /// A replacement's return that settles after the documented one filled
+    /// it, as when an edit gives the function it returns a value, is its own,
+    /// as in a cold build.
+    #[test]
+    fn a_global_replacement_whose_return_settles_after_an_edit_keeps_its_own_return() {
+        const DESCRIBE_FILE: &str = "lua/autorun/sh_describe.lua";
+        const DESCRIBED: &str = "function Describe(object) return \"described\" end";
+        let workspace = |describe: &str| {
+            let mut ws = VirtualWorkspace::new();
+            let library_root = ws.virtual_url_generator.base.join("library");
+            ws.analysis.add_library_workspace(library_root);
+            ws.def_file(
+                "library/globals.lua",
+                r#"
+                ---@meta
+                ---@param toBeValidated any
+                ---@return boolean
+                function IsValid(toBeValidated) end
+                "#,
+            );
+            ws.def_file(
+                "lua/autorun/sh_optimisation.lua",
+                "function IsValid(object) return Describe(object) end",
+            );
+            ws.def_file(DESCRIBE_FILE, describe);
+            ws.def_file("lua/autorun/sh_caller.lua", "valid = IsValid(5)");
+            ws
+        };
+        let mut warm = workspace("function Describe(object) return Unknown end");
+        warm.def_file(DESCRIBE_FILE, DESCRIBED);
+        let mut cold = workspace(DESCRIBED);
+
+        let warm_valid = warm.expr_ty("valid");
+        let cold_valid = cold.expr_ty("valid");
+        assert_eq!(
+            warm.humanize_type(warm_valid),
+            cold.humanize_type(cold_valid)
+        );
     }
 
     #[test]
@@ -2190,5 +2527,617 @@ mod test {
             .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
             .expect("diagnostics")
             .len()
+    }
+
+    /// A global function passed where a callback is documented takes the
+    /// parameter types the callback is documented to receive, as a function
+    /// written in place does.
+    #[test]
+    fn a_global_function_passed_as_a_documented_callback_takes_its_param_types() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lib.lua",
+            "---@meta
+concommand = {}
+---@param name string
+---@param callback fun(ply: Player, cmd: string, args: string[], argStr: string)
+function concommand.Add(name, callback) end
+---@class Player
+",
+        );
+        let file = ws.def_file(
+            "lua/autorun/sh_cmd.lua",
+            "function OnCommand(ply, cmd, args)
+    local commandArgs = args
+end
+concommand.Add(\"example\", OnCommand)
+",
+        );
+
+        let args = ws.local_ty(file, "commandArgs");
+        assert_eq!(ws.humanize_type(args), "string[]");
+    }
+
+    /// Removing the call that passes the function as a callback, putting it
+    /// back, and deleting and reopening its file move its parameter types as a
+    /// cold build has them.
+    #[test]
+    fn a_callback_registration_edited_deleted_and_reopened_moves_the_param_types() {
+        const LIB: &str = "---@meta
+concommand = {}
+---@param name string
+---@param callback fun(ply: Player, cmd: string, args: string[])
+function concommand.Add(name, callback) end
+---@class Player
+";
+        const HANDLER: &str = "function OnCommand(ply, cmd, args)
+    local commandArgs = args
+end
+";
+        const REGISTER_FILE: &str = "lua/autorun/sh_register.lua";
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lib.lua", LIB);
+        let handler = ws.def_file("lua/autorun/sh_handler.lua", HANDLER);
+        ws.def_file(
+            REGISTER_FILE,
+            "concommand.Add(\"example\", OnCommand)
+",
+        );
+        let args = |ws: &VirtualWorkspace| ws.humanize_type(ws.local_ty(handler, "commandArgs"));
+
+        ws.def_file(
+            REGISTER_FILE,
+            "
+",
+        );
+        let removed = args(&ws);
+        ws.def_file(
+            REGISTER_FILE,
+            "concommand.Add(\"example\", OnCommand)
+",
+        );
+        let restored = args(&ws);
+        let register_uri = ws.virtual_url_generator.new_uri(REGISTER_FILE);
+        ws.analysis
+            .remove_file_by_uri(&register_uri)
+            .0
+            .expect("registering file must be removed");
+        let deleted = args(&ws);
+        ws.def_file(
+            REGISTER_FILE,
+            "concommand.Add(\"example\", OnCommand)
+",
+        );
+        let reopened = args(&ws);
+
+        assert_eq!(
+            (
+                removed.as_str(),
+                restored.as_str(),
+                deleted.as_str(),
+                reopened.as_str()
+            ),
+            ("unknown", "string[]", "unknown", "string[]")
+        );
+    }
+
+    const PLUGIN_COMMANDS: &str = r#"
+---@type PLUGIN
+local PLUGIN = PLUGIN
+PLUGIN.commands = {}
+
+function PLUGIN.commands:issue(transactionId, steamId)
+    local issueSelf = self
+    self.commands.sync(self, steamId)
+end
+
+function PLUGIN.commands:sync(steamId)
+    local syncSelf = self
+end
+
+function PLUGIN:sync(ply)
+end
+"#;
+
+    fn plugin_command_selves(dispatch: &str) -> (String, String) {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "gamemodes/cityrp/gamemode/core/libraries/sh_plugin.lua",
+            "--- @class PLUGIN
+",
+        );
+        let file = ws.def_file(
+            "gamemodes/cityrp/plugins/tebex/sv_init.lua",
+            &format!("{PLUGIN_COMMANDS}{dispatch}"),
+        );
+        let issue_self = ws.local_ty(file, "issueSelf");
+        let sync_self = ws.local_ty(file, "syncSelf");
+        (ws.humanize_type(issue_self), ws.humanize_type(sync_self))
+    }
+
+    /// A plugin's command methods, kept in a table on the plugin and run with
+    /// the plugin as receiver, take the plugin as `self`.
+    #[test]
+    fn plugin_commands_called_with_the_plugin_take_it_as_self() {
+        let selves = plugin_command_selves(
+            r#"
+---@param sub string
+function RunSub(sub, ...)
+    local command = PLUGIN.commands[sub]
+    return command(PLUGIN, ...)
+end
+"#,
+        );
+
+        assert_eq!(selves, ("tebex".to_string(), "tebex".to_string()));
+    }
+
+    /// A plugin local written again holds whatever was written, so calls
+    /// passing it say nothing about the plugin.
+    #[test]
+    fn a_reassigned_plugin_local_passes_no_plugin_receiver() {
+        let selves = plugin_command_selves(
+            r#"
+---@param sub string
+function RunSub(sub, ...)
+    local command = PLUGIN.commands[sub]
+    PLUGIN = {}
+    return command(PLUGIN, ...)
+end
+"#,
+        );
+
+        assert_ne!(selves.0, "tebex");
+    }
+
+    const AREA_REGISTRY: &str = r#"
+---@class AreaColor
+---@return AreaColor
+function MakeAreaColor() end
+
+---@class AreaButton
+---@return AreaButton
+function MakeAreaButton() end
+
+---@param color AreaColor
+function UseAreaColor(color) end
+
+AreaTypes = { string = 1, bool = 4, color = 1024 }
+AreaProps = {}
+
+function AddAreaProperty(name, type, default)
+    AreaProps[name] = { type = type, default = default }
+end
+"#;
+    const AREA_REGISTRATIONS_FILE: &str = "lua/autorun/sh_area_props.lua";
+    const AREA_REGISTRATIONS: &str = r#"
+AddAreaProperty("color", AreaTypes.color, MakeAreaColor())
+AddAreaProperty("display", AreaTypes.bool, true)
+AreaProps.color.label = "Colour"
+"#;
+    const AREA_EDITOR_FILE: &str = "lua/autorun/cl_area_edit.lua";
+    const AREA_EDITOR: &str = r#"
+for _, v in pairs(AreaProps) do
+    if v.type == AreaTypes.color then
+        local panel = MakeAreaButton()
+        panel.value = v.default
+        UseAreaColor(panel.value)
+        local label = v.label
+    end
+end
+"#;
+
+    fn area_workspace(registrations: Option<&str>) -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut config = Emmyrc::default();
+        config.gmod.enabled = true;
+        ws.update_emmyrc(config);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file("lua/autorun/sh_area.lua", AREA_REGISTRY);
+        if let Some(registrations) = registrations {
+            ws.def_file(AREA_REGISTRATIONS_FILE, registrations);
+        }
+        ws.def_file(AREA_EDITOR_FILE, AREA_EDITOR);
+        ws
+    }
+
+    /// What the editor sees for an entry it picked: its default, the label
+    /// written onto it later, and whether passing the default on is reported.
+    fn area_editor_view(ws: &mut VirtualWorkspace) -> (String, String, Vec<String>) {
+        let uri = ws.virtual_url_generator.new_uri(AREA_EDITOR_FILE);
+        let file = ws.analysis.get_file_id(&uri).expect("editor file");
+        let (default, label) = {
+            let semantic_model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file)
+                .expect("semantic model");
+            let read = |text: &str| {
+                let index_expr = semantic_model
+                    .get_root()
+                    .descendants::<LuaIndexExpr>()
+                    .find(|expr| expr.syntax().text() == text)
+                    .expect("index expression");
+                match semantic_model.infer_expr(LuaExpr::IndexExpr(index_expr)) {
+                    Ok(typ) => ws.humanize_type(typ),
+                    Err(reason) => format!("{reason:?}"),
+                }
+            };
+            (read("v.default"), read("v.label"))
+        };
+        let code = crate::DiagnosticCode::ParamTypeMismatch;
+        ws.analysis.diagnostic.enable_only(code);
+        let reports = ws
+            .analysis
+            .diagnose_file(file, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(lsp_types::NumberOrString::String(
+                        code.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        (default, label, reports)
+    }
+
+    /// Entries a registry function builds from its arguments keep each call's
+    /// pairing, so testing one field against a constant picks the entries
+    /// with that value and the sibling fields they were given, and a field
+    /// written onto an entry afterwards stays on it.
+    #[test]
+    fn a_registry_entry_tested_by_a_constant_field_holds_its_own_siblings() {
+        let mut ws = area_workspace(Some(AREA_REGISTRATIONS));
+
+        assert_eq!(
+            area_editor_view(&mut ws),
+            ("AreaColor".to_string(), "\"Colour\"".to_string(), vec![])
+        );
+    }
+
+    /// A table literal's field is only its first value, so testing it against
+    /// another constant keeps the table: code may set the field later.
+    #[test]
+    fn a_table_whose_field_starts_as_another_constant_survives_the_test() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+---@type boolean
+Flag = nil
+local target = { active = false, name = "a" }
+if Flag then
+    target = { active = false, name = 1 }
+end
+function Activate()
+    target.active = true
+end
+if target.active == true then
+    picked = target.name
+end
+"#,
+        );
+
+        let picked = ws.expr_ty("picked");
+        assert_eq!(ws.humanize_type(picked), "(\"a\"|1)");
+    }
+
+    /// An entry's field written again through a loop over the registry may
+    /// hold the new value, so testing for that value keeps the entry.
+    #[test]
+    fn a_registry_entry_whose_field_is_written_again_survives_the_test() {
+        let mut ws = area_workspace(Some(AREA_REGISTRATIONS));
+        ws.def_file(
+            "lua/autorun/cl_area_flags.lua",
+            r#"
+for _, e in pairs(AreaProps) do
+    e.type = AreaTypes.bool
+end
+for _, v in pairs(AreaProps) do
+    if v.type == AreaTypes.bool then
+        flagDefault = v.default
+    end
+end
+"#,
+        );
+
+        let default = ws.expr_ty("flagDefault");
+        assert_eq!(ws.humanize_type(default), "(AreaColor|boolean)");
+    }
+
+    #[test]
+    fn registry_calls_shifted_edited_deleted_and_reopened_settle_as_a_cold_build() {
+        const SHIFTED: &str = r#"
+
+AddAreaProperty("color", AreaTypes.color, MakeAreaColor())
+AddAreaProperty("display", AreaTypes.bool, true)
+AreaProps.color.label = "Colour"
+"#;
+        const EDITED: &str = r#"
+AddAreaProperty("color", AreaTypes.color, true)
+AreaProps.color.label = "Colour"
+"#;
+        let cold =
+            |registrations: Option<&str>| area_editor_view(&mut area_workspace(registrations));
+        let mut warm = area_workspace(Some(AREA_REGISTRATIONS));
+        let uri = warm.virtual_url_generator.new_uri(AREA_REGISTRATIONS_FILE);
+
+        warm.def_file(AREA_REGISTRATIONS_FILE, SHIFTED);
+        let shifted = area_editor_view(&mut warm);
+        warm.def_file(AREA_REGISTRATIONS_FILE, EDITED);
+        let edited = area_editor_view(&mut warm);
+        warm.analysis
+            .remove_file_by_uri(&uri)
+            .0
+            .expect("registrations must be removed");
+        let deleted = area_editor_view(&mut warm);
+        warm.def_file(AREA_REGISTRATIONS_FILE, AREA_REGISTRATIONS);
+        let reopened = area_editor_view(&mut warm);
+
+        assert_eq!(
+            (shifted, edited, deleted, reopened),
+            (
+                cold(Some(SHIFTED)),
+                cold(Some(EDITED)),
+                cold(None),
+                cold(Some(AREA_REGISTRATIONS))
+            )
+        );
+    }
+
+    /// A local holding a call's result passes that result to the functions it
+    /// is given to, as a literal or variable would.
+    #[test]
+    fn a_param_takes_the_result_a_caller_holds_in_a_local() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "lua/autorun/sh_cmd.lua",
+            r#"
+---@param separator string
+---@param str string
+---@return string[]
+function Explode(separator, str) end
+
+function HandleArgs(args)
+    local commandArgs = args
+end
+
+function OnCommand(argStr)
+    local args = Explode(" ", argStr)
+    HandleArgs(args)
+end
+"#,
+        );
+
+        let args = ws.local_ty(file, "commandArgs");
+        assert_eq!(ws.humanize_type(args), "string[]");
+    }
+
+    /// A local the caller checks before passing it holds no `nil` there, even
+    /// when the call it holds may return nothing.
+    #[test]
+    fn a_param_takes_a_held_result_without_the_nil_its_caller_checked_out() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            crate::DiagnosticCode::NeedCheckNil,
+            r#"
+---@class PoseVehicle
+local PoseVehicle = {}
+function PoseVehicle:GetPose(seat) end
+
+---@type PoseVehicle
+ThePoseVehicle = nil
+
+function ApplyPose(pose)
+    local bone = pose["spine"]
+end
+
+function TickPose()
+    local pose = ThePoseVehicle:GetPose(1)
+    if pose then
+        ApplyPose(pose)
+    end
+end
+"#,
+        ));
+    }
+
+    /// A closure given to a helper takes what the helper calls it with.
+    #[test]
+    fn a_closure_given_to_a_helper_takes_what_the_helper_calls_it_with() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "lua/autorun/sh_helper.lua",
+            r#"
+local function Run(callback)
+    callback(1, "name")
+end
+
+Run(function(who, label)
+    local count = who
+    local text = label
+end)
+"#,
+        );
+
+        assert_eq!(
+            (
+                ws.humanize_type(ws.local_ty(file, "count")),
+                ws.humanize_type(ws.local_ty(file, "text"))
+            ),
+            ("integer".to_string(), "string".to_string())
+        );
+    }
+
+    /// A closure a helper hands to `pcall` or `xpcall` takes the arguments
+    /// they forward to it.
+    #[test]
+    fn a_closure_takes_what_pcall_and_xpcall_forward_to_it() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "lua/autorun/sh_safe.lua",
+            r#"
+local function RunSafe(callback)
+    pcall(callback, 1)
+end
+
+local function RunHandled(callback)
+    xpcall(callback, print, "name")
+end
+
+RunSafe(function(who)
+    local count = who
+end)
+
+RunHandled(function(who)
+    local text = who
+end)
+"#,
+        );
+
+        assert_eq!(
+            (
+                ws.humanize_type(ws.local_ty(file, "count")),
+                ws.humanize_type(ws.local_ty(file, "text"))
+            ),
+            ("integer".to_string(), "string".to_string())
+        );
+    }
+
+    const REGISTRY_TYPES: &str = "---@meta
+---@class RegistryPlayer
+";
+    const REGISTRY: &str = r#"
+cmds = cmds or {}
+cmds.stored = cmds.stored or {}
+function cmds.add(name, callback)
+    cmds.stored[name] = { access = 1, callback = callback }
+end
+"#;
+    const DISPATCH: &str = r#"
+---@param who RegistryPlayer
+---@param list string[]
+function cmds.run(name, who, list)
+    pcall(cmds.stored[name].callback, who, list)
+end
+"#;
+    const COMMAND: &str = r#"
+cmds.add("kick", function(who, list)
+    local target = who
+    local words = list
+end)
+"#;
+    const REGISTRY_FILES: [(&str, &str); 4] = [
+        ("lua/includes/registry_types.lua", REGISTRY_TYPES),
+        ("lua/autorun/sh_registry.lua", REGISTRY),
+        ("lua/autorun/sh_dispatch.lua", DISPATCH),
+        ("lua/autorun/sh_command.lua", COMMAND),
+    ];
+
+    fn registry_param_types(ws: &VirtualWorkspace) -> (String, String) {
+        let command = ws
+            .analysis
+            .get_file_id(&ws.virtual_url_generator.new_uri(REGISTRY_FILES[3].0))
+            .expect("command file");
+        (
+            ws.humanize_type(ws.local_ty(command, "target")),
+            ws.humanize_type(ws.local_ty(command, "words")),
+        )
+    }
+
+    /// A closure registered in a table takes what the code calling it out of
+    /// the table passes, through `pcall`.
+    #[test]
+    fn a_registered_closure_takes_what_its_registry_calls_it_with() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_files(REGISTRY_FILES.to_vec());
+
+        assert_eq!(
+            registry_param_types(&ws),
+            ("RegistryPlayer".to_string(), "string[]".to_string())
+        );
+    }
+
+    /// A function stored directly under a key takes what a call of that key
+    /// passes.
+    #[test]
+    fn a_function_stored_under_a_key_takes_what_a_call_of_the_key_passes() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file = ws.def_file(
+            "lua/autorun/sh_plain.lua",
+            r#"
+Handlers = {}
+function On(name, handler)
+    Handlers[name] = handler
+end
+function Emit(name)
+    Handlers[name](42)
+end
+On("tick", function(who)
+    local count = who
+end)
+Emit("tick")
+"#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file, "count")), "integer");
+    }
+
+    /// Edits to the registry, the code calling through it and a registering
+    /// file each settle as a cold build.
+    #[test]
+    fn registry_edits_settle_as_a_cold_build() {
+        let setup = |ws: &mut VirtualWorkspace| ws.analysis.init_std_lib();
+        for (path, text) in [
+            (
+                REGISTRY_FILES[1].0,
+                "
+-- moved
+"
+                .to_string()
+                    + REGISTRY,
+            ),
+            (
+                REGISTRY_FILES[2].0,
+                DISPATCH.replace(
+                    "who, list)
+end",
+                    "who)
+end",
+                ),
+            ),
+            (
+                REGISTRY_FILES[3].0,
+                "
+"
+                .to_string()
+                    + COMMAND,
+            ),
+        ] {
+            VirtualWorkspace::assert_warm_matches_cold(setup, &REGISTRY_FILES, &[(path, &text)]);
+        }
+    }
+
+    /// Deleting the code calling through the registry withdraws what it gave
+    /// the closures, and reopening it gives it back.
+    #[test]
+    fn deleting_and_reopening_the_dispatch_withdraws_and_restores_the_types() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_files(REGISTRY_FILES.to_vec());
+        let typed = registry_param_types(&ws);
+        let dispatch = ws.virtual_url_generator.new_uri(REGISTRY_FILES[2].0);
+        ws.analysis
+            .remove_file_by_uri(&dispatch)
+            .0
+            .expect("dispatch file must be removed");
+        let deleted = registry_param_types(&ws);
+        ws.def_file(REGISTRY_FILES[2].0, DISPATCH);
+        let reopened = registry_param_types(&ws);
+
+        assert_eq!((deleted.0.as_str(), reopened == typed), ("unknown", true));
     }
 }

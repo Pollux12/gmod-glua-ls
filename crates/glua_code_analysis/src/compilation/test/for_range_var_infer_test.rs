@@ -661,12 +661,13 @@ mod test {
     }
 
     /// Without the wildcard bucket this read answers `any?`, which is what the
-    /// `may be nil` reports on such registries come from.
+    /// `may be nil` reports on such registries come from. The key is a string
+    /// its callers pass, which the computed write does not prove present.
     #[test]
     fn pairs_value_var_write_is_read_back_through_the_registry_path() {
         let mut ws = load_registry("REGREAD", "REGREAD", false);
         let ty = ws.expr_ty("REGREAD_Read('alpha', 'door')");
-        assert_eq!(ws.humanize_type(ty), "table");
+        assert_eq!(ws.humanize_type(ty), "table?");
     }
 
     /// Same member, reached through a second loop's value variable. Nullable
@@ -677,6 +678,28 @@ mod test {
         let mut ws = load_registry("REGITER", "REGITER", false);
         let ty = ws.expr_ty("REGITER_ReadThroughIterVar('door')");
         assert_eq!(ws.humanize_type(ty), "table?");
+    }
+
+    /// An entry read by name may hold what the loop wrote into every entry,
+    /// under the key read by name or by a string-typed key.
+    #[test]
+    fn pairs_value_var_write_is_read_back_from_a_named_entry() {
+        let mut ws = load_registry("REGNAMED", "REGNAMED", false);
+        ws.def_file(
+            "lua/autorun/sh_regnamed_named.lua",
+            r#"
+            named_door = REGNAMED.alpha.door
+            ---@param name string
+            ---@param key string
+            function REGNAMED_ReadTyped(name, key)
+                typed_door = REGNAMED[name][key]
+            end
+            "#,
+        );
+        for name in ["named_door", "typed_door"] {
+            let ty = ws.expr_ty(name);
+            assert_eq!(ws.humanize_type(ty), "table?", "{name}");
+        }
     }
 
     #[test]

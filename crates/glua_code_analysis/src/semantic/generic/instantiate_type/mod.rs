@@ -1,3 +1,4 @@
+mod bounded_depth;
 mod instantiate_func_generic;
 mod instantiate_special_generic;
 
@@ -344,14 +345,17 @@ fn instantiate_intersection(
     intersection: &LuaIntersectionType,
     substitutor: &TypeSubstitutor,
 ) -> LuaType {
-    let types = intersection.get_types();
-    let mut new_types = Vec::new();
-    for t in types {
-        let t = instantiate_type_generic(db, t, substitutor);
-        new_types.push(t);
+    let mut new_types = intersection
+        .get_types()
+        .iter()
+        .map(|t| instantiate_type_generic(db, t, substitutor))
+        .filter(|t| !t.is_unknown())
+        .collect::<Vec<_>>();
+    match new_types.len() {
+        0 => LuaType::Unknown,
+        1 => new_types.remove(0),
+        _ => LuaType::Intersection(LuaIntersectionType::new(new_types).into()),
     }
-
-    LuaType::Intersection(LuaIntersectionType::new(new_types).into())
 }
 
 pub fn instantiate_generic(

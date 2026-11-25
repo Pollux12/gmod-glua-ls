@@ -3259,6 +3259,15 @@ impl LuaTypeIndex {
         derivation::note_write(|| FactKey::TableClass(table.clone()));
     }
 
+    /// The class a registration turned the table `table` into.
+    pub fn table_class(&self, table: &InFiled<TextRange>) -> Option<&LuaType> {
+        derivation::note_read(|| FactKey::TableClass(table.clone()));
+        self.table_classes
+            .get(table)
+            .and_then(|registrations| registrations.first())
+            .map(|(_, class_type)| class_type)
+    }
+
     /// `typ` with every table literal a registration turned into a class
     /// replaced by the class.
     fn with_table_classes(&self, typ: &LuaType) -> Option<LuaType> {
@@ -3269,8 +3278,7 @@ impl LuaTypeIndex {
         }
         let mut replacements = std::collections::HashMap::new();
         for table in tables {
-            derivation::note_read(|| FactKey::TableClass(table.clone()));
-            if let Some((_, class_type)) = self.table_classes.get(&table).and_then(|r| r.first()) {
+            if let Some(class_type) = self.table_class(&table) {
                 replacements.insert(table, class_type.clone());
             }
         }

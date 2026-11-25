@@ -18,12 +18,13 @@ pub(crate) mod unresolve;
 
 pub(crate) use call_site_params::{CallbackArg, CallbackParamsQuery, ReceiverAuthorityQuery};
 pub(crate) use common::{
-    is_falsy_literal_expr, is_nil_literal_expr, is_presence_tested, union_widens_cached_type,
-    widen_mutable_decl_literal,
+    expr_expands_to_fill_slots, is_falsy_literal_expr, is_nil_literal_expr, is_presence_tested,
+    union_widens_cached_type, widen_mutable_decl_literal,
 };
 pub(crate) use dynamic_field::is_provably_builtin_iterator_call;
 pub(crate) use dynamic_field::{
-    copies_table_into_itself, for_range_pairs_source_for_var, writes_own_pairs_key,
+    copies_table_into_itself, for_range_pairs_source_for_var, installed_field_type,
+    writes_own_pairs_key,
 };
 pub(crate) use engine::EngineStats;
 #[cfg(test)]
@@ -1354,6 +1355,7 @@ fn document_source(
         }
     }
     if let Some((summaries, fingerprint)) = tail.summaries {
+        function_summary::register_receiver_writers(db, file_id, &source_root, &summaries);
         db.set_function_summaries(file_id, summaries, fingerprint);
     }
     if let Some(mentions) = tail.role_mentions {

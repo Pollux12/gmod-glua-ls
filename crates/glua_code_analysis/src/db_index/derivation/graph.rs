@@ -646,12 +646,18 @@ pub struct KeyTable {
     more_producers: FxHashMap<KeyIdx, Vec<DerivIdx>>,
     /// The stamp of the latest write or release of a live slot.
     last_written: u64,
+    /// The value of [`Self::last_written`] when this table was last lent to an
+    /// evaluation thread: writes stamped after it have not notified readers yet.
+    lent_at: u64,
     /// The keys an evaluation took away to compute again, each with the stamp
     /// it was written at before; see [`Self::open_window`].
     windows: FxHashMap<KeyIdx, u64>,
     /// The keys a cleared loop took away until it settles again, each with the
     /// stamp it was written at before; see [`Self::hold_window`].
     held: FxHashMap<KeyIdx, u64>,
+    /// The stamp of the latest hold or release: a value computed from a held
+    /// key before it holds no longer; see [`Self::hold_moved`].
+    hold_moved: u64,
     /// The live slots of the keys naming each file's positions, built by the
     /// first edit that renames keys and kept from then on.
     positional: Option<FxHashMap<FileId, FxHashSet<KeyIdx>>>,
@@ -904,18 +910,25 @@ impl KeyTable {
     }
 
     pub(super) fn intern_read(&mut self, key: HashedKey, now: u64) -> KeyIdx {
-        self.intern(key, now)
+        let (slot, created) = self.intern_created(key, now);
+        self.inherit_ancestor_marks(slot, created);
+        slot
     }
 
     /// Interns a key a worker read that its snapshot lacked: created when the
     /// release epoch began, whichever evaluation of the epoch publishes it first.
     pub(super) fn intern_worker_read(&mut self, key: HashedKey) -> KeyIdx {
         let (slot, created) = self.intern_created(key, self.retirement_started);
+        self.inherit_ancestor_marks(slot, created);
+        slot
+    }
+
+    fn inherit_ancestor_marks(&mut self, slot: KeyIdx, created: Option<Option<KeyIdx>>) {
         if self.windows.is_empty() && self.held.is_empty() {
-            return slot;
+            return;
         }
         let mut base_slot = match created {
-            Some(None) => return slot,
+            Some(None) => return,
             Some(Some(base_slot)) => base_slot,
             None => {
                 let Some(base_slot) = self
@@ -923,7 +936,7 @@ impl KeyTable {
                     .base()
                     .and_then(|base| self.find(&HashedKey::new(base)))
                 else {
-                    return slot;
+                    return;
                 };
                 base_slot
             }
@@ -941,7 +954,7 @@ impl KeyTable {
                 entry.set_mark(HELD, true);
             }
             let Some(base) = self.key(base_slot).base() else {
-                return slot;
+                return;
             };
             base_slot = self
                 .find(&HashedKey::new(base))
@@ -1045,6 +1058,7 @@ impl KeyTable {
         let Some(slot) = self.find(key) else {
             return;
         };
+        self.hold_moved = self.hold_moved.max(now);
         self.last_written = self.last_written.max(now);
         let derived = self.derived.get(&slot).into_iter().flat_map(|d| &d.slots);
         for slot in std::iter::once(&slot).chain(derived) {
@@ -1058,6 +1072,7 @@ impl KeyTable {
     /// Closes every held window: a key `unchanged` accepts, and each key read
     /// out of it, is written as it was before its window opened.
     pub(super) fn release_held(&mut self, unchanged: impl Fn(&HashedKey) -> bool) {
+        self.hold_moved = super::new_stamp();
         let held = std::mem::take(&mut self.held);
         for (slot, before) in &held {
             let entry = &mut self.keys[*slot as usize];
@@ -1174,11 +1189,24 @@ impl KeyTable {
     }
 
     /// Whether a read of `slot` sees a value only the evaluation reading it
-    /// can rely on: one being computed again, or one a cleared loop holds
-    /// until it settles.
+    /// can rely on: one being computed again.
     pub(super) fn taints(&self, slot: KeyIdx) -> bool {
-        let entry = &self.keys[slot as usize];
-        entry.marked(WINDOWED | HELD)
+        self.keys[slot as usize].marked(WINDOWED)
+    }
+
+    /// Whether a read of `slot` sees a value being computed again or one a
+    /// cleared loop holds: what an evaluation recorded without seeing it so
+    /// does not hold.
+    pub(super) fn recomputing_or_held(&self, slot: KeyIdx) -> bool {
+        self.keys[slot as usize].marked(WINDOWED | HELD)
+    }
+
+    /// The stamp of the latest hold or release: a value computed from a held
+    /// key holds only if it was computed after it, since the loop holding the
+    /// key may move it and settle it back, and a release restores the stamp
+    /// it was written at.
+    pub(super) fn hold_moved(&self) -> u64 {
+        self.hold_moved
     }
 
     /// Whether a slot was written or released after stamp `stamp`.
@@ -1189,6 +1217,29 @@ impl KeyTable {
     /// The stamp of the latest write or release of a live slot.
     pub(super) fn last_written(&self) -> u64 {
         self.last_written
+    }
+
+    /// Marks the write watermark at which this table was lent to an evaluation.
+    pub(super) fn mark_lent(&mut self) {
+        self.lent_at = self.last_written;
+    }
+
+    /// Whether `key` (or any base key it is read out of) has an open
+    /// recomputing window or a write made since this table was lent.
+    pub(super) fn in_flight(&self, key: &HashedKey) -> bool {
+        let mut current = Some(std::borrow::Cow::Borrowed(key));
+        while let Some(key) = current {
+            if let Some(slot) = self.find(key.as_ref()) {
+                let entry = &self.keys[slot as usize];
+                if entry.marked(WINDOWED) || entry.written > self.lent_at {
+                    return true;
+                }
+            }
+            current = key
+                .base()
+                .map(|base| std::borrow::Cow::Owned(HashedKey::new(base)));
+        }
+        false
     }
 
     /// Whether any of `slots` was written after stamp `since`.
@@ -1711,18 +1762,28 @@ impl ReaderGraph {
     /// `stamp` gives each. Each record is diffed against the one it replaces
     /// on worker threads, unless the batch files one derivation twice, and
     /// the readers of the keys they read are updated a page of slots at a
-    /// time on worker threads.
+    /// time on worker threads. Returns, per derivation, the outputs its
+    /// previous evaluation produced and this one did not.
     pub fn replace_all_kept(
         &mut self,
         records: Vec<KeptRecord>,
         released: &mut Vec<KeyIdx>,
         mut stamp: impl FnMut() -> u64,
-    ) {
+    ) -> Vec<(DerivationId, Vec<HashedKey>)> {
         use rayon::prelude::*;
         let mut ids = FxHashSet::with_capacity_and_hasher(records.len(), Default::default());
         let distinct = records.iter().all(|record| ids.insert(record.id));
         drop(ids);
         let mut ops = Vec::with_capacity(records.len());
+        let mut withdrawn = Vec::new();
+        let mut finish = |graph: &mut Self, diffed: DiffedRecord, ops: &mut Vec<_>| {
+            let id = diffed.id;
+            let (dropped, record_ops) = graph.finish_kept(diffed, released);
+            if !dropped.is_empty() {
+                withdrawn.push((id, dropped));
+            }
+            ops.push(record_ops);
+        };
         if distinct {
             let known = crate::profile::phase("records: kept known", || {
                 records
@@ -1753,7 +1814,7 @@ impl ReaderGraph {
             });
             crate::profile::phase("records: kept finish", || {
                 for diffed in diffed {
-                    ops.push(self.finish_kept(diffed, released).1);
+                    finish(self, diffed, &mut ops);
                 }
             });
         } else {
@@ -1764,12 +1825,13 @@ impl ReaderGraph {
                 let deriv = self.intern_derivation(record.id);
                 let prepared = self.prepare_kept(record, deriv, now);
                 let diffed = prepared.diff(self.derivations[deriv as usize].record.as_ref(), None);
-                ops.push(self.finish_kept(diffed, released).1);
+                finish(self, diffed, &mut ops);
             }
         }
         crate::profile::phase("records: apply reader ops", || {
             self.table.apply_reader_ops(ops)
         });
+        withdrawn
     }
 
     /// Interns the outputs of `record`, which is `deriv`'s, at `now`.

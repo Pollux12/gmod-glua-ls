@@ -257,6 +257,7 @@ impl EditMaps {
             K::ValidGuard(id) => K::ValidGuard(self.signature_id(*id)?),
             K::InferredGuard(id) => K::InferredGuard(self.signature_id(*id)?),
             K::Contrib(id, idx) => K::Contrib(self.signature_id(*id)?, *idx),
+            K::ParamCalls(id, idx) => K::ParamCalls(self.signature_id(*id)?, *idx),
             K::ReceiverAuthority(id) => K::ReceiverAuthority(self.signature_id(*id)?),
             K::CallbackParams(id) => K::CallbackParams(self.signature_id(*id)?),
             K::CallRole(super::CallRoleKey::Signature(id)) => {
