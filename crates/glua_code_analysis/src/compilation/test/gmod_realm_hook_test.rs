@@ -3628,6 +3628,44 @@ end
         assert_eq!(state_mask, GmodStateMask::empty());
     }
 
+    /// A load inside a realm branch nested in one for the other realm never
+    /// runs, whether it loads directly, through a wrapper or by a search.
+    #[gtest]
+    fn test_load_index_load_in_contradictory_nested_branches_loads_nowhere() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let direct = ws.def_file("lua/mylib/direct.lua", "return true");
+        let wrapped = ws.def_file("lua/mylib/wrapped.lua", "return true");
+        let found = ws.def_file("lua/mylib/found/part.lua", "return true");
+        ws.def_file(
+            "lua/autorun/sh_loader.lua",
+            "function IncludeAny(path) include(path) end\n",
+        );
+        ws.def_file(
+            "lua/autorun/sh_boot.lua",
+            r#"
+            if SERVER then
+                if CLIENT then
+                    include("mylib/direct.lua")
+                    IncludeAny("mylib/wrapped.lua")
+                    for _, name in ipairs(file.Find("mylib/found/*.lua", "LUA")) do
+                        include("mylib/found/" .. name)
+                    end
+                end
+            end
+            "#,
+        );
+
+        let masks = [direct, wrapped, found].map(|file_id| {
+            ws.get_db_mut()
+                .get_gmod_load_index()
+                .get_file_info(&file_id)
+                .map(|info| info.state_mask)
+                .unwrap_or_default()
+        });
+        assert_eq!(masks, [GmodStateMask::empty(); 3]);
+    }
+
     /// A global loader that sends its file to clients on the server and
     /// includes it everywhere loads the file in every realm its shared caller
     /// runs in, ready for clients, as calling both itself would.

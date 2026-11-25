@@ -13741,7 +13741,7 @@ fn source_states_for_dynamic_operation(
     source_file_id: FileId,
     ranges: &[TextRange],
 ) -> GmodStateMask {
-    let mut source_states = file_infos
+    let source_states = file_infos
         .get(&source_file_id)
         .map(|info| info.state_mask)
         .filter(|states| !states.is_empty())
@@ -13751,24 +13751,29 @@ fn source_states_for_dynamic_operation(
     let Some(branch_ranges) = branch_realm_ranges.get(&source_file_id) else {
         return source_states;
     };
-
-    for range in ranges {
-        let Some(branch_realm) = branch_ranges
-            .iter()
-            .find(|branch_range| branch_range.range.contains(range.start()))
-            .map(|branch_range| branch_range.realm)
-        else {
-            continue;
-        };
-        let branch_states = GmodStateMask::from_realm(branch_realm);
-        source_states = if source_states.is_empty() {
-            branch_states
-        } else {
-            source_states.intersection(branch_states)
-        };
+    let Some(limit) = ranges
+        .iter()
+        .filter_map(|range| branch_states_at(branch_ranges, range.start()))
+        .reduce(GmodStateMask::intersection)
+    else {
+        return source_states;
+    };
+    if source_states.is_empty() {
+        limit
+    } else {
+        source_states.intersection(limit)
     }
+}
 
-    source_states
+/// The states the realm branches holding `position` run it in: those every
+/// enclosing branch names, so a branch inside one for the other realm never
+/// runs.
+fn branch_states_at(branch_ranges: &[GmodRealmRange], position: TextSize) -> Option<GmodStateMask> {
+    branch_ranges
+        .iter()
+        .filter(|branch_range| branch_range.range.contains(position))
+        .map(|branch_range| GmodStateMask::from_realm(branch_range.realm))
+        .reduce(GmodStateMask::intersection)
 }
 
 fn dynamic_operation_target_states(
@@ -13988,12 +13993,7 @@ fn source_states_for_load_site(
         .unwrap_or_else(GmodStateMask::empty);
     let branch_realm = branch_realm_ranges
         .get(&site.source_file_id)
-        .and_then(|ranges| {
-            ranges
-                .iter()
-                .find(|range| range.range.contains(site.range.start()))
-        })
-        .map(|range| GmodStateMask::from_realm(range.realm));
+        .and_then(|ranges| branch_states_at(ranges, site.range.start()));
     let Some(limit) = [branch_realm, site.realms]
         .into_iter()
         .flatten()
