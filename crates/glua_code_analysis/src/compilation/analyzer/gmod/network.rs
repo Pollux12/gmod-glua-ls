@@ -27,10 +27,6 @@ use crate::db_index::derivation::{self, Provenance, Reuse};
 /// A function body: its owning file and the body block's range.
 type HelperId = InFiled<TextRange>;
 
-/// [`NetOpItem`]-composition `low` value for an answer that assumed nothing
-/// about a still-open helper.
-const NO_CYCLE: usize = usize::MAX;
-
 /// What a call does in the net subsystem, resolved purely from the callee's
 /// signature metadata. Because resolution goes through the type layer, aliases
 /// (`local netStart = net.Start`), cross-file globals, and annotated replacement
@@ -1442,24 +1438,18 @@ impl NetCollectCtx<'_> {
 
     fn reach(&mut self, id: &HelperId) -> NetReach {
         let db = self.site.db;
-        composed(&mut self.compositions.reach, id, || {
-            reach_walk(db, id, &mut Vec::new(), &mut HashMap::default()).0
-        })
+        composed(&mut self.compositions.reach, id, || reach_walk(db, id))
     }
 
     fn send(&mut self, id: &HelperId) -> Option<HelperSendAnswer> {
         let db = self.site.db;
-        composed(&mut self.compositions.send, id, || {
-            send_walk(db, id, &mut Vec::new(), &mut HashMap::default()).0
-        })
+        composed(&mut self.compositions.send, id, || send_walk(db, id))
     }
 
     /// The payload walk of a helper's expansion, in both directions.
     fn ops(&mut self, id: &HelperId) -> Arc<Vec<ComposedOp>> {
         let db = self.site.db;
-        composed(&mut self.compositions.ops, id, || {
-            helper_walk(db, id, &mut Vec::new(), &mut HashMap::default()).0
-        })
+        composed(&mut self.compositions.ops, id, || helper_walk(db, id))
     }
 }
 
@@ -1810,15 +1800,7 @@ fn resolve_helper_start_message(
 ) -> Option<String> {
     let target = ctx.site.target(call_expr)?;
     let args = arg_templates(call_expr);
-    helper_start_message(
-        ctx,
-        target,
-        &args,
-        call_expr.is_colon_call(),
-        &HashMap::default(),
-        &mut Vec::new(),
-    )
-    .0
+    helper_start_message(ctx, target, &args, call_expr.is_colon_call())
 }
 
 fn helper_start_message(
@@ -1826,28 +1808,56 @@ fn helper_start_message(
     helper_id: HelperId,
     args: &[Option<StringTemplate>],
     colon_call: bool,
-    caller_bindings: &HashMap<String, String>,
-    stack: &mut Vec<HelperId>,
-) -> (Option<String>, usize) {
-    // A helper that reaches no `net.Start` names no message, however its
-    // calls recurse or its caller binds it.
+) -> Option<String> {
     if !ctx.reach(&helper_id).start {
-        return (None, NO_CYCLE);
+        return None;
     }
-    let helper = ctx.helper(&helper_id);
-    let bindings = helper_bindings(&helper, args, colon_call, caller_bindings);
-    let cache_key = (helper_id, sorted_bindings(&bindings));
-    if let Some(cached) = ctx.memo.start_message.get(&cache_key) {
-        return (cached.clone(), NO_CYCLE);
+    let root_helper = ctx.helper(&helper_id);
+    let root_bindings = helper_bindings(&root_helper, args, colon_call, &HashMap::default());
+    let root_key = (helper_id, sorted_bindings(&root_bindings));
+    if let Some(cached) = ctx.memo.start_message.get(&root_key) {
+        return cached.clone();
     }
-    if let Some(open_depth) = stack.iter().position(|open| *open == cache_key.0) {
-        return (None, open_depth);
-    }
-    let depth = stack.len();
-    stack.push(cache_key.0.clone());
 
     let mut messages = Vec::new();
-    let mut low = NO_CYCLE;
+    let mut seen_states = HashSet::default();
+    let mut active_helpers = Vec::new();
+    collect_start_messages(
+        ctx,
+        root_key.clone(),
+        root_bindings,
+        &mut seen_states,
+        &mut active_helpers,
+        &mut messages,
+    );
+
+    let mut messages = messages.into_iter();
+    let answer = match messages.next() {
+        Some(message) => messages
+            .all(|candidate| candidate == message)
+            .then_some(message),
+        None => None,
+    };
+    ctx.memo.start_message.insert(root_key, answer.clone());
+    answer
+}
+
+fn collect_start_messages(
+    ctx: &mut NetCollectCtx<'_>,
+    state_key: HelperBindingsKey,
+    bindings: HashMap<String, String>,
+    seen_states: &mut HashSet<HelperBindingsKey>,
+    active_helpers: &mut Vec<HelperId>,
+    messages: &mut Vec<String>,
+) {
+    if !ctx.reach(&state_key.0).start {
+        return;
+    }
+    if active_helpers.contains(&state_key.0) || !seen_states.insert(state_key.clone()) {
+        return;
+    }
+    active_helpers.push(state_key.0.clone());
+    let helper = ctx.helper(&state_key.0);
     for call in helper.calls.iter().filter(|call| !call.nested) {
         match &call.role {
             Some(NetCallRole::Start { message_idx }) => {
@@ -1860,38 +1870,25 @@ fn helper_start_message(
                 let Some(target) = &call.target else {
                     continue;
                 };
-                let (nested_message, nested_low) = helper_start_message(
-                    ctx,
-                    target.clone(),
-                    &call.args,
-                    call.colon_call,
-                    &bindings,
-                    stack,
-                );
-                low = low.min(nested_low);
-                if let Some(message) = nested_message {
-                    messages.push(message);
+                if !ctx.reach(target).start {
+                    continue;
                 }
+                let child_helper = ctx.helper(target);
+                let child_bindings =
+                    helper_bindings(&child_helper, &call.args, call.colon_call, &bindings);
+                let child_key = (target.clone(), sorted_bindings(&child_bindings));
+                collect_start_messages(
+                    ctx,
+                    child_key,
+                    child_bindings,
+                    seen_states,
+                    active_helpers,
+                    messages,
+                );
             }
         }
     }
-
-    stack.pop();
-    let mut messages = messages.into_iter();
-    let answer = match messages.next() {
-        Some(message) => messages
-            .all(|candidate| candidate == message)
-            .then_some(message),
-        None => None,
-    };
-    // Consensus over a pruned branch set is unsound: a cycle-hidden call may
-    // disagree with the visible ones, turning this `Some` into `None` once
-    // the open helper resolves.
-    if low >= depth {
-        ctx.memo.start_message.insert(cache_key, answer.clone());
-        return (answer, NO_CYCLE);
-    }
-    (answer, low)
+    active_helpers.pop();
 }
 
 fn resolve_helper_send(
@@ -2045,16 +2042,7 @@ fn collect_unannotated_net_wrapper_send_flows(
     };
     let args = arg_templates(call_expr);
     let fn_args = call_fn_args(&ctx.site, None, call_expr);
-    let (bodies, _) = helper_send_body(
-        ctx,
-        target,
-        &args,
-        &fn_args,
-        call_expr.is_colon_call(),
-        &HashMap::default(),
-        &[],
-        &mut Vec::new(),
-    );
+    let bodies = helper_send_body(ctx, target, &args, &fn_args, call_expr.is_colon_call());
     let origin_range = call_expr.get_range();
     let display_name = call_display_name(call_expr);
     bodies
@@ -2082,33 +2070,50 @@ fn helper_send_body(
     args: &[Option<StringTemplate>],
     fn_args: &[Option<FnArg>],
     colon_call: bool,
-    caller_bindings: &HashMap<String, String>,
-    caller_fns: &[Option<HelperId>],
-    stack: &mut Vec<HelperId>,
-) -> (Vec<CachedSendBody>, usize) {
-    let helper = ctx.helper(&helper_id);
-    let bindings = helper_bindings(&helper, args, colon_call, caller_bindings);
-    let fns = helper_fns(&helper, fn_args, colon_call, caller_fns);
-    let cache_key = (helper_id, sorted_bindings(&bindings), fns);
-    if let Some(cached) = ctx.memo.send_body.get(&cache_key) {
-        return (cached.clone(), NO_CYCLE);
+) -> Vec<CachedSendBody> {
+    if !ctx.reach(&helper_id).start {
+        return Vec::new();
     }
-    let helper_id = &cache_key.0;
-    if let Some(open_depth) = stack.iter().position(|open| open == helper_id) {
-        return (Vec::new(), open_depth);
+    let root_helper = ctx.helper(&helper_id);
+    let root_bindings = helper_bindings(&root_helper, args, colon_call, &HashMap::default());
+    let root_fns = helper_fns(&root_helper, fn_args, colon_call, &[]);
+    let root_key = (helper_id, sorted_bindings(&root_bindings), root_fns);
+    if let Some(cached) = ctx.memo.send_body.get(&root_key) {
+        return cached.clone();
     }
-
-    // A send flow always starts at a `net.Start` somewhere in the expansion, so
-    // a helper that cannot reach one contributes nothing however it is called.
-    if !ctx.reach(helper_id).start {
-        return (Vec::new(), NO_CYCLE);
-    }
-
-    let depth = stack.len();
-    stack.push(helper_id.clone());
 
     let mut bodies = Vec::new();
-    let mut low = NO_CYCLE;
+    let mut seen_states = HashSet::default();
+    let mut active_helpers = Vec::new();
+    collect_send_bodies(
+        ctx,
+        root_key.clone(),
+        root_bindings,
+        &mut seen_states,
+        &mut active_helpers,
+        &mut bodies,
+    );
+    ctx.memo.send_body.insert(root_key, bodies.clone());
+    bodies
+}
+
+fn collect_send_bodies(
+    ctx: &mut NetCollectCtx<'_>,
+    state_key: HelperBoundKey,
+    bindings: HashMap<String, String>,
+    seen_states: &mut HashSet<HelperBoundKey>,
+    active_helpers: &mut Vec<HelperId>,
+    bodies: &mut Vec<CachedSendBody>,
+) {
+    if !ctx.reach(&state_key.0).start {
+        return;
+    }
+    if active_helpers.contains(&state_key.0) || !seen_states.insert(state_key.clone()) {
+        return;
+    }
+    active_helpers.push(state_key.0.clone());
+    let helper = ctx.helper(&state_key.0);
+
     for send in &helper.sends {
         let Some(message_name) = send.message.resolve(&bindings) else {
             continue;
@@ -2120,7 +2125,7 @@ fn helper_send_body(
                 ctx,
                 items,
                 NetOpDirection::Write,
-                &cache_key.2,
+                &state_key.2,
                 &mut writes,
                 &mut writes_opaque,
             );
@@ -2135,7 +2140,7 @@ fn helper_send_body(
             send_target,
             writes_opaque,
             materialized_from: Some(crate::db_index::NetFlowOrigin {
-                file_id: helper_id.file_id,
+                file_id: state_key.0.file_id,
                 start_range: send.start_range,
             }),
         });
@@ -2151,28 +2156,24 @@ fn helper_send_body(
         let Some(target) = &call.target else {
             continue;
         };
-        let (nested_bodies, nested_low) = helper_send_body(
+        if !ctx.reach(target).start {
+            continue;
+        }
+        let child_helper = ctx.helper(target);
+        let child_bindings = helper_bindings(&child_helper, &call.args, call.colon_call, &bindings);
+        let child_fns = helper_fns(&child_helper, &call.fn_args, call.colon_call, &state_key.2);
+        let child_key = (target.clone(), sorted_bindings(&child_bindings), child_fns);
+        collect_send_bodies(
             ctx,
-            target.clone(),
-            &call.args,
-            &call.fn_args,
-            call.colon_call,
-            &bindings,
-            &cache_key.2,
-            stack,
+            child_key,
+            child_bindings,
+            seen_states,
+            active_helpers,
+            bodies,
         );
-        low = low.min(nested_low);
-        bodies.extend(nested_bodies);
     }
 
-    stack.pop();
-    // A pruned branch may hide a conflicting transaction, so only cycle-free
-    // expansions are shared.
-    if low >= depth {
-        ctx.memo.send_body.insert(cache_key, bodies.clone());
-        return (bodies, NO_CYCLE);
-    }
-    (bodies, low)
+    active_helpers.pop();
 }
 
 fn collect_net_receive_flows(
@@ -2239,16 +2240,7 @@ fn collect_receive_flows_from_helper_call(
     };
     let args = arg_templates(call_expr);
     let fn_args = call_fn_args(&ctx.site, None, call_expr);
-    let (bodies, _) = helper_receive_body(
-        ctx,
-        target,
-        &args,
-        &fn_args,
-        call_expr.is_colon_call(),
-        &HashMap::default(),
-        &[],
-        &mut Vec::new(),
-    );
+    let bodies = helper_receive_body(ctx, target, &args, &fn_args, call_expr.is_colon_call());
     let origin_range = call_expr.get_range();
     for body in bodies {
         flows.push(NetReceiveFlow {
@@ -2269,33 +2261,50 @@ fn helper_receive_body(
     args: &[Option<StringTemplate>],
     fn_args: &[Option<FnArg>],
     colon_call: bool,
-    caller_bindings: &HashMap<String, String>,
-    caller_fns: &[Option<HelperId>],
-    stack: &mut Vec<HelperId>,
-) -> (Vec<CachedReceiveBody>, usize) {
-    let helper = ctx.helper(&helper_id);
-    let bindings = helper_bindings(&helper, args, colon_call, caller_bindings);
-    let fns = helper_fns(&helper, fn_args, colon_call, caller_fns);
-    let cache_key = (helper_id, sorted_bindings(&bindings), fns);
-    if let Some(cached) = ctx.memo.receive_body.get(&cache_key) {
-        return (cached.clone(), NO_CYCLE);
+) -> Vec<CachedReceiveBody> {
+    if !ctx.reach(&helper_id).receive {
+        return Vec::new();
     }
-    let helper_id = &cache_key.0;
-    if let Some(open_depth) = stack.iter().position(|open| open == helper_id) {
-        return (Vec::new(), open_depth);
+    let root_helper = ctx.helper(&helper_id);
+    let root_bindings = helper_bindings(&root_helper, args, colon_call, &HashMap::default());
+    let root_fns = helper_fns(&root_helper, fn_args, colon_call, &[]);
+    let root_key = (helper_id, sorted_bindings(&root_bindings), root_fns);
+    if let Some(cached) = ctx.memo.receive_body.get(&root_key) {
+        return cached.clone();
     }
-
-    // A receive flow always originates at a `net.Receive` somewhere in the
-    // expansion, so a helper that cannot reach one contributes nothing.
-    if !ctx.reach(helper_id).receive {
-        return (Vec::new(), NO_CYCLE);
-    }
-
-    let depth = stack.len();
-    stack.push(helper_id.clone());
 
     let mut bodies = Vec::new();
-    let mut low = NO_CYCLE;
+    let mut seen_states = HashSet::default();
+    let mut active_helpers = Vec::new();
+    collect_receive_bodies(
+        ctx,
+        root_key.clone(),
+        root_bindings,
+        &mut seen_states,
+        &mut active_helpers,
+        &mut bodies,
+    );
+    ctx.memo.receive_body.insert(root_key, bodies.clone());
+    bodies
+}
+
+fn collect_receive_bodies(
+    ctx: &mut NetCollectCtx<'_>,
+    state_key: HelperBoundKey,
+    bindings: HashMap<String, String>,
+    seen_states: &mut HashSet<HelperBoundKey>,
+    active_helpers: &mut Vec<HelperId>,
+    bodies: &mut Vec<CachedReceiveBody>,
+) {
+    if !ctx.reach(&state_key.0).receive {
+        return;
+    }
+    if active_helpers.contains(&state_key.0) || !seen_states.insert(state_key.clone()) {
+        return;
+    }
+    active_helpers.push(state_key.0.clone());
+    let helper = ctx.helper(&state_key.0);
+
     for call in helper.calls.iter().filter(|call| !call.nested) {
         match &call.role {
             Some(NetCallRole::Receive { message_idx, .. }) => {
@@ -2306,7 +2315,7 @@ fn helper_receive_body(
                     continue;
                 };
                 let (reads, reads_opaque) =
-                    compose_receive_reads(ctx, &call.receive_reads, &cache_key.2);
+                    compose_receive_reads(ctx, &call.receive_reads, &state_key.2);
                 bodies.push(CachedReceiveBody {
                     message_name,
                     reads,
@@ -2318,28 +2327,28 @@ fn helper_receive_body(
                 let Some(target) = &call.target else {
                     continue;
                 };
-                let (nested_bodies, nested_low) = helper_receive_body(
+                if !ctx.reach(target).receive {
+                    continue;
+                }
+                let child_helper = ctx.helper(target);
+                let child_bindings =
+                    helper_bindings(&child_helper, &call.args, call.colon_call, &bindings);
+                let child_fns =
+                    helper_fns(&child_helper, &call.fn_args, call.colon_call, &state_key.2);
+                let child_key = (target.clone(), sorted_bindings(&child_bindings), child_fns);
+                collect_receive_bodies(
                     ctx,
-                    target.clone(),
-                    &call.args,
-                    &call.fn_args,
-                    call.colon_call,
-                    &bindings,
-                    &cache_key.2,
-                    stack,
+                    child_key,
+                    child_bindings,
+                    seen_states,
+                    active_helpers,
+                    bodies,
                 );
-                low = low.min(nested_low);
-                bodies.extend(nested_bodies);
             }
         }
     }
 
-    stack.pop();
-    if low >= depth {
-        ctx.memo.receive_body.insert(cache_key, bodies.clone());
-        return (bodies, NO_CYCLE);
-    }
-    (bodies, low)
+    active_helpers.pop();
 }
 
 /// The writes of `stat` outside the parts `replaced` gives to another message,
@@ -2532,127 +2541,245 @@ impl NetReach {
     }
 }
 
-/// What `helper_id`'s expansion reaches, and the lowest open helper the walk
-/// was pruned at. Only answers that assumed nothing about a helper still open
-/// on `stack` are memoised, so a cycle is never answered from a pruned walk.
-fn reach_walk(
-    db: &DbIndex,
-    helper_id: &HelperId,
-    stack: &mut Vec<HelperId>,
-    memo: &mut HashMap<HelperId, NetReach>,
-) -> (NetReach, usize) {
-    if let Some(cached) = memo.get(helper_id) {
-        return (*cached, NO_CYCLE);
-    }
-    if let Some(open_depth) = stack.iter().position(|open| open == helper_id) {
-        return (NetReach::default(), open_depth);
-    }
-    let depth = stack.len();
-    stack.push(helper_id.clone());
-
-    let helper = helper_summary(db, helper_id);
+/// What `helper_id`'s expansion reaches: its own calls and those of every
+/// helper it can call.
+fn reach_walk(db: &DbIndex, helper_id: &HelperId) -> NetReach {
     let mut reach = NetReach::default();
-    for call in &helper.calls {
-        reach = reach.union(NetReach::of_role(call.role.as_ref()));
-    }
-    // A function its caller passes may write anything.
-    reach.payload |= helper
-        .ops
-        .iter()
-        .any(|item| matches!(item, NetOpItem::Param { .. }));
-    let mut low = NO_CYCLE;
-    for target in helper.calls.iter().filter_map(|call| call.target.as_ref()) {
+    let mut seen = HashSet::default();
+    seen.insert(helper_id.clone());
+    let mut open = vec![helper_id.clone()];
+    while let Some(id) = open.pop() {
+        let helper = helper_summary(db, &id);
+        for call in &helper.calls {
+            reach = reach.union(NetReach::of_role(call.role.as_ref()));
+        }
+        // A function its caller passes may write anything.
+        reach.payload |= helper
+            .ops
+            .iter()
+            .any(|item| matches!(item, NetOpItem::Param { .. }));
         if reach == NetReach::ALL {
             break;
         }
-        let (nested_reach, nested_low) = reach_walk(db, target, stack, memo);
-        low = low.min(nested_low);
-        reach = reach.union(nested_reach);
+        for target in helper
+            .calls
+            .iter()
+            .rev()
+            .filter_map(|call| call.target.as_ref())
+        {
+            if seen.insert(target.clone()) {
+                open.push(target.clone());
+            }
+        }
     }
-
-    stack.pop();
-    if reach == NetReach::ALL || low >= depth {
-        memo.insert(helper_id.clone(), reach);
-        return (reach, NO_CYCLE);
-    }
-    (reach, low)
+    reach
 }
 
 /// The send `helper_id`'s expansion ends a message with: the one its sends
-/// agree on the kind of; and the lowest open helper the walk was pruned at.
-fn send_walk(
-    db: &DbIndex,
-    helper_id: &HelperId,
-    stack: &mut Vec<HelperId>,
-    memo: &mut HashMap<HelperId, Option<HelperSendAnswer>>,
-) -> (Option<HelperSendAnswer>, usize) {
-    if let Some(cached) = memo.get(helper_id) {
-        return (cached.clone(), NO_CYCLE);
-    }
-    if let Some(open_depth) = stack.iter().position(|open| open == helper_id) {
-        return (None, open_depth);
-    }
-    let depth = stack.len();
-    stack.push(helper_id.clone());
-
-    let helper = helper_summary(db, helper_id);
-    let mut sends = Vec::new();
-    let mut low = NO_CYCLE;
-    for call in helper.calls.iter().filter(|call| !call.nested) {
-        match &call.role {
-            Some(NetCallRole::Send(send_kind)) => {
-                sends.push((*send_kind, call.send_target.clone()));
-            }
-            Some(_) => {}
-            None => {
-                let Some(target) = &call.target else {
-                    continue;
-                };
-                let (nested_send, nested_low) = send_walk(db, target, stack, memo);
-                low = low.min(nested_low);
-                if let Some(send) = nested_send {
-                    sends.push(send);
+/// agree on the kind of.
+fn send_walk(db: &DbIndex, helper_id: &HelperId) -> Option<HelperSendAnswer> {
+    fn collect(
+        db: &DbIndex,
+        helper_id: &HelperId,
+        seen: &mut HashSet<HelperId>,
+        sends: &mut Vec<HelperSendAnswer>,
+    ) {
+        if !seen.insert(helper_id.clone()) {
+            return;
+        }
+        let helper = helper_summary(db, helper_id);
+        for call in helper.calls.iter().filter(|call| !call.nested) {
+            match &call.role {
+                Some(NetCallRole::Send(send_kind)) => {
+                    sends.push((*send_kind, call.send_target.clone()));
+                }
+                Some(_) => {}
+                None => {
+                    if let Some(target) = &call.target {
+                        collect(db, target, seen, sends);
+                    }
                 }
             }
         }
     }
 
-    stack.pop();
+    let mut sends = Vec::new();
+    let mut seen = HashSet::default();
+    collect(db, helper_id, &mut seen, &mut sends);
     let mut sends = sends.into_iter();
-    let answer = match sends.next() {
+    match sends.next() {
         Some(send) => sends.all(|candidate| candidate.0 == send.0).then_some(send),
         None => None,
-    };
-    if low >= depth {
-        memo.insert(helper_id.clone(), answer.clone());
-        return (answer, NO_CYCLE);
     }
-    (answer, low)
+}
+
+/// Tarjan SCC state over the reachable helper payload-op graph.
+struct HelperSccBuilder<'a> {
+    db: &'a DbIndex,
+    next_index: usize,
+    indices: HashMap<HelperId, usize>,
+    lowlinks: HashMap<HelperId, usize>,
+    on_stack: HashSet<HelperId>,
+    stack: Vec<HelperId>,
+    scc_of: HashMap<HelperId, usize>,
+    next_scc: usize,
+    summaries: HashMap<HelperId, Arc<NetHelper>>,
+}
+
+impl<'a> HelperSccBuilder<'a> {
+    fn new(db: &'a DbIndex) -> Self {
+        Self {
+            db,
+            next_index: 0,
+            indices: HashMap::default(),
+            lowlinks: HashMap::default(),
+            on_stack: HashSet::default(),
+            stack: Vec::new(),
+            scc_of: HashMap::default(),
+            next_scc: 0,
+            summaries: HashMap::default(),
+        }
+    }
+
+    fn strongconnect(&mut self, id: &HelperId) -> usize {
+        let index = self.next_index;
+        self.next_index += 1;
+        self.indices.insert(id.clone(), index);
+        self.lowlinks.insert(id.clone(), index);
+        self.stack.push(id.clone());
+        self.on_stack.insert(id.clone());
+
+        let helper = self
+            .summaries
+            .entry(id.clone())
+            .or_insert_with(|| helper_summary(self.db, id))
+            .clone();
+
+        let mut low = index;
+        for item in &helper.ops {
+            let NetOpItem::Helper {
+                target, fn_args, ..
+            } = item
+            else {
+                continue;
+            };
+            low = low.min(self.visit_edge(target));
+            for body in fn_args.iter().filter_map(|arg| match arg {
+                Some(FnArg::Body(body)) => Some(body),
+                _ => None,
+            }) {
+                low = low.min(self.visit_edge(body));
+            }
+        }
+        self.lowlinks.insert(id.clone(), low);
+
+        if low == index {
+            let scc_id = self.next_scc;
+            self.next_scc += 1;
+            while let Some(member) = self.stack.pop() {
+                self.on_stack.remove(&member);
+                self.scc_of.insert(member.clone(), scc_id);
+                if &member == id {
+                    break;
+                }
+            }
+        }
+        low
+    }
+
+    fn visit_edge(&mut self, target: &HelperId) -> usize {
+        if let Some(&target_index) = self.indices.get(target) {
+            if self.on_stack.contains(target) {
+                target_index
+            } else {
+                usize::MAX
+            }
+        } else {
+            self.strongconnect(target)
+        }
+    }
 }
 
 /// A helper's composed payload walk: its own walk with each helper step
 /// expanded, and the calls of its own parameters left for its callers to
-/// bind. The callbacks of its callees that it does not pass on are no steps:
-/// only a function handed to a transaction makes its payload unknown. Returns
-/// the lowest open helper the walk was pruned at.
-fn helper_walk(
+/// bind. Cross-SCC (DAG) calls preserve full call-site multiplicity via
+/// memoisation; intra-SCC (cyclic) calls expand each SCC member at most once
+/// per entry into that SCC.
+fn helper_walk(db: &DbIndex, root: &HelperId) -> Arc<Vec<ComposedOp>> {
+    let mut scc = HelperSccBuilder::new(db);
+    scc.strongconnect(root);
+    let mut memo = HashMap::default();
+    let mut visited_in_scc = HashSet::default();
+    expand_helper_scc(
+        db,
+        root,
+        None,
+        &mut visited_in_scc,
+        &scc.scc_of,
+        &scc.summaries,
+        &mut memo,
+    )
+}
+
+fn expand_helper_scc(
     db: &DbIndex,
     helper_id: &HelperId,
-    stack: &mut Vec<HelperId>,
+    active_scc: Option<usize>,
+    visited_in_scc: &mut HashSet<HelperId>,
+    scc_of: &HashMap<HelperId, usize>,
+    summaries: &HashMap<HelperId, Arc<NetHelper>>,
     memo: &mut HashMap<HelperId, Arc<Vec<ComposedOp>>>,
-) -> (Arc<Vec<ComposedOp>>, usize) {
-    if let Some(cached) = memo.get(helper_id) {
-        return (cached.clone(), NO_CYCLE);
-    }
-    if let Some(open_depth) = stack.iter().position(|open| open == helper_id) {
-        return (Arc::default(), open_depth);
-    }
+) -> Arc<Vec<ComposedOp>> {
+    let my_scc = scc_of.get(helper_id).copied();
+    let entering_new_scc = active_scc.is_none() || my_scc != active_scc;
 
-    let depth = stack.len();
-    stack.push(helper_id.clone());
-    let helper = helper_summary(db, helper_id);
+    if entering_new_scc {
+        if let Some(cached) = memo.get(helper_id) {
+            return cached.clone();
+        }
+        let mut child_visited = HashSet::default();
+        child_visited.insert(helper_id.clone());
+        let walk = Arc::new(expand_helper_body(
+            db,
+            helper_id,
+            my_scc,
+            &mut child_visited,
+            scc_of,
+            summaries,
+            memo,
+        ));
+        memo.insert(helper_id.clone(), walk.clone());
+        walk
+    } else {
+        if !visited_in_scc.insert(helper_id.clone()) {
+            return Arc::default();
+        }
+        Arc::new(expand_helper_body(
+            db,
+            helper_id,
+            my_scc,
+            visited_in_scc,
+            scc_of,
+            summaries,
+            memo,
+        ))
+    }
+}
+
+fn expand_helper_body(
+    db: &DbIndex,
+    helper_id: &HelperId,
+    my_scc: Option<usize>,
+    visited_in_scc: &mut HashSet<HelperId>,
+    scc_of: &HashMap<HelperId, usize>,
+    summaries: &HashMap<HelperId, Arc<NetHelper>>,
+    memo: &mut HashMap<HelperId, Arc<Vec<ComposedOp>>>,
+) -> Vec<ComposedOp> {
+    let helper = summaries
+        .get(helper_id)
+        .cloned()
+        .unwrap_or_else(|| helper_summary(db, helper_id));
     let mut walk = Vec::new();
-    let mut low = NO_CYCLE;
     for item in &helper.ops {
         match item {
             NetOpItem::Op(entry) => walk.push(ComposedOp::Op(entry.clone())),
@@ -2673,9 +2800,12 @@ fn helper_walk(
                 fn_args,
                 colon_call,
             } => {
-                let (callee_walk, callee_low) = helper_walk(db, target, stack, memo);
-                low = low.min(callee_low);
-                let callee = helper_summary(db, target);
+                let callee_walk =
+                    expand_helper_scc(db, target, my_scc, visited_in_scc, scc_of, summaries, memo);
+                let callee = summaries
+                    .get(target)
+                    .cloned()
+                    .unwrap_or_else(|| helper_summary(db, target));
                 let bind = |idx: usize| match callee_fn_arg(&callee, fn_args, *colon_call, idx) {
                     Some(FnArg::Body(body)) => Binding::Fn(body.clone()),
                     Some(FnArg::Param(own)) => Binding::Param(*own),
@@ -2688,24 +2818,14 @@ fn helper_walk(
                     *dynamic,
                     flow_path,
                     &mut |body| {
-                        let (body_walk, body_low) = helper_walk(db, body, stack, memo);
-                        low = low.min(body_low);
-                        body_walk
+                        expand_helper_scc(db, body, my_scc, visited_in_scc, scc_of, summaries, memo)
                     },
                     &mut walk,
                 );
             }
         }
     }
-    stack.pop();
-    let walk = Arc::new(walk);
-    // Only cycle-free walks are shared; the current expansion still uses its
-    // pruned walk.
-    if low >= depth {
-        memo.insert(helper_id.clone(), walk.clone());
-        return (walk, NO_CYCLE);
-    }
-    (walk, low)
+    walk
 }
 
 /// `entry` stamped with a caller's dynamic context: `dynamic` is the OR of the

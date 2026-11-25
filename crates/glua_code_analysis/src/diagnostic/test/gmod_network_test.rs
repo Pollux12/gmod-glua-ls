@@ -4835,4 +4835,168 @@ mod tests {
             eq(1usize)
         );
     }
+
+    #[gtest]
+    fn test_wide_helper_clique_without_writes_terminates() {
+        let names: Vec<String> = (0..20).map(|i| format!("h{i}")).collect();
+        let mut source = format!("local {}\n", names.join(", "));
+        for name in &names {
+            source.push_str(&format!("{name} = function()\n    local _ = 1\n"));
+            for other in names.iter().filter(|other| *other != name) {
+                source.push_str(&format!("    {other}()\n"));
+            }
+            source.push_str("end\n");
+        }
+        source.push_str(
+            "util.AddNetworkString(\"WideNoWrite\")\nnet.Start(\"WideNoWrite\")\nh0()\nnet.Send(Entity(1))\n",
+        );
+        let mut ws = new_gmod_workspace();
+        ws.def_file("lua/autorun/server/send.lua", &source);
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            "net.Receive(\"WideNoWrite\", function() end)\n",
+        );
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        assert_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_wide_helper_clique_with_writes_terminates_and_counts_each_once() {
+        let names: Vec<String> = (0..20).map(|i| format!("h{i}")).collect();
+        let mut source = format!("local {}\n", names.join(", "));
+        for name in &names {
+            source.push_str(&format!(
+                "{name} = function()\n    net.WriteString(\"x\")\n"
+            ));
+            for other in names.iter().filter(|other| *other != name) {
+                source.push_str(&format!("    {other}()\n"));
+            }
+            source.push_str("end\n");
+        }
+        source.push_str(
+            "util.AddNetworkString(\"WideWrite\")\nnet.Start(\"WideWrite\")\nh0()\nnet.Send(Entity(1))\n",
+        );
+        let mut reads = String::from("net.Receive(\"WideWrite\", function()\n");
+        for i in 0..20 {
+            reads.push_str(&format!("    local s{i} = net.ReadString()\n"));
+        }
+        reads.push_str("end)\n");
+        let mut ws = new_gmod_workspace();
+        ws.def_file("lua/autorun/server/send.lua", &source);
+        let client_file_id = ws.def_file("lua/autorun/client/receive.lua", &reads);
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        assert_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_helper_dag_diamond_preserves_write_multiplicity() {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            local function leaf()
+                net.WriteString("x")
+            end
+            local function left()
+                leaf()
+            end
+            local function right()
+                leaf()
+            end
+            local function root()
+                left()
+                right()
+            end
+            util.AddNetworkString("Diamond")
+            net.Start("Diamond")
+            root()
+            net.Send(Entity(1))
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("Diamond", function()
+                local a = net.ReadString()
+                local b = net.ReadString()
+            end)
+            "#,
+        );
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        assert_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_calling_two_entries_of_downstream_cycle_expands_both() {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            local a, b
+            a = function()
+                net.WriteString("a")
+                b()
+            end
+            b = function()
+                net.WriteBool(true)
+                a()
+            end
+            local function root()
+                a()
+                b()
+            end
+            util.AddNetworkString("MultiEntry")
+            net.Start("MultiEntry")
+            root()
+            net.Send(Entity(1))
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("MultiEntry", function()
+                local s1 = net.ReadString()
+                local b1 = net.ReadBool()
+                local b2 = net.ReadBool()
+                local s2 = net.ReadString()
+            end)
+            "#,
+        );
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        assert_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_callback_induced_helper_cycle_terminates() {
+        let mut ws = new_gmod_workspace();
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            local a, b
+            a = function(cb)
+                net.WriteString("a")
+                cb()
+            end
+            b = function()
+                net.WriteBool(true)
+                a(b)
+            end
+            util.AddNetworkString("CallbackCycle")
+            net.Start("CallbackCycle")
+            b()
+            net.Send(Entity(1))
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("CallbackCycle", function()
+                local b1 = net.ReadBool()
+                local s1 = net.ReadString()
+            end)
+            "#,
+        );
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        assert_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
 }
