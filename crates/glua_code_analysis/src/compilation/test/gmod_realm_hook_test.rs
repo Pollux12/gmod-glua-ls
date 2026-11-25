@@ -3586,6 +3586,8 @@ end
             "function MyLoad(path)\n    if SERVER then include(path) end\nend\n",
             "function MyLoad(path)\n    if CLIENT then\n        return\n    else\n        include(path)\n    end\nend\n",
             "function MyLoad(path)\n    if CLIENT then return else print(path) end\n    include(path)\nend\n",
+            "function MyLoad(path)\n    if SERVER then include(path) else print(path) end\nend\n",
+            "function MyLoad(path, x)\n    if SERVER then include(path) elseif x then print(path) end\nend\n",
         ] {
             let mut ws = VirtualWorkspace::new();
             set_gmod_enabled(&mut ws);

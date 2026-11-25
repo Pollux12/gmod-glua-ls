@@ -863,7 +863,7 @@ fn forwarded_reach(call_expr: &LuaCallExpr, closure: &LuaClosureExpr) -> Forward
                 !narrows_realm(&if_stat)
                     || if_stat
                         .get_all_clause()
-                        .take_while(|clause| !clause.get_range().contains(position))
+                        .take_while(|clause| clause.get_range().end() <= position)
                         .any(|clause| {
                             clause
                                 .get_condition_expr()
