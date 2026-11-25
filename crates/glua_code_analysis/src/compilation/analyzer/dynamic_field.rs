@@ -1194,14 +1194,21 @@ fn assigned_value(target: &glua_parser::LuaIndexExpr) -> Option<LuaExpr> {
     exprs.get(position).cloned()
 }
 
-/// The parameter of `signature_id` that `value` reads.
+/// The parameter of `signature_id` that `value` reads, when the body never
+/// writes it: a written one no longer holds what the call passed.
 fn forwarded_param(db: &DbIndex, signature_id: LuaSignatureId, value: &LuaExpr) -> Option<usize> {
     let LuaExpr::NameExpr(name_expr) = value else {
         return None;
     };
-    let decl_id = db
-        .get_reference_index()
-        .get_var_reference_decl(&signature_id.get_file_id(), name_expr.get_range())?;
+    let file_id = signature_id.get_file_id();
+    let references = db.get_reference_index();
+    let decl_id = references.get_var_reference_decl(&file_id, name_expr.get_range())?;
+    if references
+        .get_decl_references(&file_id, &decl_id)
+        .is_some_and(|refs| refs.is_written_after_declaration(decl_id.position))
+    {
+        return None;
+    }
     match db.get_decl_index().get_decl(&decl_id)?.extra {
         crate::LuaDeclExtra::Param {
             idx,

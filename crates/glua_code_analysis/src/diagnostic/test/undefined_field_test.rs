@@ -4807,6 +4807,36 @@ owner:CompletelyMadeUpMethod()
         assert_eq!(ws.humanize_type(ws.local_ty(file_id, "z")), "integer");
     }
 
+    /// An installer that replaces its value before storing it installs what it
+    /// stores, not what the call passed.
+    #[test]
+    fn test_installed_field_a_replaced_value_holds_what_is_stored() {
+        let mut ws = dynamic_field_workspace();
+        let file_id = ws.def_file(
+            "lua/autorun/sh_fields.lua",
+            r#"
+            local function set_defaulted(t, k, v)
+                v = v or 0
+                t[k] = v
+            end
+            ---@return number
+            local function to_number(v) end
+            local function set_converted(t, k, v)
+                v = to_number(v)
+                t[k] = v
+            end
+            local T, U = {}, {}
+            set_defaulted(T, "b")
+            set_converted(U, "c", "42")
+            local b = T.b
+            local c = U.c
+            "#,
+        );
+
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "b")), "integer");
+        assert_eq!(ws.humanize_type(ws.local_ty(file_id, "c")), "number");
+    }
+
     /// A registry only holds the keys its calls register.
     #[test]
     fn test_registry_reports_a_key_no_call_registered() {
