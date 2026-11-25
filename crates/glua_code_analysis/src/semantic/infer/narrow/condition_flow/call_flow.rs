@@ -560,6 +560,7 @@ pub(in crate::semantic::infer::narrow) fn asserted_call_type(
     let passes_var = call_expr
         .get_args_list()?
         .get_args()
+        .map(crate::semantic::without_parens)
         .filter(|argument| names_entry || !matches!(argument, LuaExpr::CallExpr(_)))
         .any(|argument| get_var_expr_var_ref_id(db, cache, argument).as_ref() == Some(var_ref_id));
     if !passes_var {
@@ -790,7 +791,11 @@ fn inferred_guard_target_expr(
         (true, false) => param_idx.checked_sub(1),
         _ => Some(param_idx),
     }?;
-    call_expr.get_args_list()?.get_args().nth(argument_idx)
+    call_expr
+        .get_args_list()?
+        .get_args()
+        .nth(argument_idx)
+        .map(crate::semantic::without_parens)
 }
 
 /// Resolves an alias chain for member-guard predicate callees. When the

@@ -178,6 +178,19 @@ pub(crate) fn unwrap_paren_to_name_expr(expr: &LuaExpr) -> Option<LuaNameExpr> {
     }
 }
 
+/// `expr` without the parentheses around it.
+pub(crate) fn without_parens(mut expr: LuaExpr) -> LuaExpr {
+    loop {
+        let LuaExpr::ParenExpr(paren) = &expr else {
+            return expr;
+        };
+        let Some(inner) = paren.get_expr() else {
+            return expr;
+        };
+        expr = inner;
+    }
+}
+
 pub(crate) fn infer_expr_fact_with_cache(
     db: &DbIndex,
     cache: &mut LuaInferCache,

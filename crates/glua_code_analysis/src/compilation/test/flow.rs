@@ -3900,12 +3900,15 @@ _2 = a[1]
     }
 
     /// A helper that asserts or errors on its argument narrows a getter
-    /// passed to it, as a guard on the getter would.
+    /// passed to it, as a guard on the getter would, also through an alias
+    /// of its receiver or in parentheses.
     #[gtest]
     fn test_helper_that_asserts_narrows_a_getter_argument() {
         for call in [
             "AssertValid(holder:GetOwner())",
             "RequireValid(holder:GetOwner())",
+            "local alias = holder RequireValid(alias:GetOwner())",
+            "RequireValid((holder:GetOwner()))",
         ] {
             let mut ws = VirtualWorkspace::new_with_init_std_lib();
             set_gmod_enabled(&mut ws);

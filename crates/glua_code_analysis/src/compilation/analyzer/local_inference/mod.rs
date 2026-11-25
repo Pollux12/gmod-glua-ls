@@ -3040,20 +3040,9 @@ fn is_presence_guard_target(
     value: &LuaExpr,
 ) -> bool {
     crate::semantic::presence_guard_target(db, cache, call).is_some_and(|target| {
-        without_parens(target).syntax() == without_parens(value.clone()).syntax()
+        crate::semantic::without_parens(target).syntax()
+            == crate::semantic::without_parens(value.clone()).syntax()
     })
-}
-
-fn without_parens(mut expr: LuaExpr) -> LuaExpr {
-    loop {
-        let LuaExpr::ParenExpr(paren) = &expr else {
-            return expr;
-        };
-        let Some(inner) = paren.get_expr() else {
-            return expr;
-        };
-        expr = inner;
-    }
 }
 
 fn is_equality_operand(index_expr: &LuaIndexExpr) -> bool {

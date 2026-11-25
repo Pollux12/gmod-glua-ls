@@ -435,6 +435,7 @@ impl<'a> FlowBinder<'a> {
             .get_args_list()
             .into_iter()
             .flat_map(|args| args.get_args())
+            .map(crate::semantic::without_parens)
         {
             match arg {
                 LuaExpr::NameExpr(name_expr) => {
@@ -452,25 +453,32 @@ impl<'a> FlowBinder<'a> {
                     .or_else(|| index_expr.get_access_path()) else {
                         continue;
                     };
-                    if let Some(aliased) = self.aliased_index_path(&index_expr, &path) {
-                        self.record_call_argument(NarrowingTarget::CallArgumentPath(
-                            crate::db_index::intern_smol_str(&aliased),
-                        ));
-                    }
-                    self.record_call_argument(NarrowingTarget::CallArgumentPath(
-                        crate::db_index::intern_smol_str(&path),
-                    ));
+                    self.record_call_argument_path(&index_expr, &path);
                 }
-                LuaExpr::CallExpr(_) => {
-                    if let Some(path) = crate::semantic::getter_access_path(&arg) {
-                        self.record_call_argument(NarrowingTarget::CallArgumentPath(
-                            crate::db_index::intern_smol_str(&path),
-                        ));
+                LuaExpr::CallExpr(call_expr) => {
+                    if let Some(path) =
+                        crate::semantic::getter_access_path(&LuaExpr::CallExpr(call_expr.clone()))
+                        && let Some(LuaExpr::IndexExpr(method)) = call_expr.get_prefix_expr()
+                    {
+                        self.record_call_argument_path(&method, &path);
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// Records the path `index_expr` reads, and the same path spelled from
+    /// the binding its root aliases.
+    fn record_call_argument_path(&mut self, index_expr: &LuaIndexExpr, path: &str) {
+        if let Some(aliased) = self.aliased_index_path(index_expr, path) {
+            self.record_call_argument(NarrowingTarget::CallArgumentPath(
+                crate::db_index::intern_smol_str(&aliased),
+            ));
+        }
+        self.record_call_argument(NarrowingTarget::CallArgumentPath(
+            crate::db_index::intern_smol_str(path),
+        ));
     }
 
     fn record_call_argument(&mut self, target: NarrowingTarget) {
