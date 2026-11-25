@@ -43,46 +43,131 @@ pub fn get_member_map_in_workspace_for_file_at_offset(
     build_member_map(members)
 }
 
+/// Maximum nesting depth of materialized by-value [`LuaObjectType`] trees.
+/// Matches `bounded_depth::MAX_DEPTH`.
+const MAX_SNAPSHOT_DEPTH: usize = 6;
+
+/// Maximum expanded [`LuaObjectType`] nodes in a single materialized tree,
+/// bounding downstream tree traversals (`PartialEq`, `visit_type`, `humanize`).
+const MAX_SNAPSHOT_NODES: usize = 256;
+
+struct SnapshotOutcome {
+    typ: Option<LuaType>,
+    nodes: usize,
+    cacheable: bool,
+}
+
+struct SnapshotState {
+    visited: rustc_hash::FxHashSet<LuaType>,
+    memo: FxHashMap<(LuaType, usize), (Option<LuaType>, usize)>,
+    remaining_nodes: usize,
+}
+
 /// The fields of the table literal `typ` as a shape of their own, for a value
 /// copied out of the file that holds the literal.
 pub(crate) fn snapshot_table_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
-    let mut visited = rustc_hash::FxHashSet::default();
-    snapshot_table_type_inner(db, typ, &mut visited)
+    let mut state = SnapshotState {
+        visited: rustc_hash::FxHashSet::default(),
+        memo: FxHashMap::default(),
+        remaining_nodes: MAX_SNAPSHOT_NODES,
+    };
+    snapshot_table_type_inner(db, typ, MAX_SNAPSHOT_DEPTH, &mut state).typ
 }
 
 fn snapshot_table_type_inner(
     db: &DbIndex,
     typ: &LuaType,
-    visited: &mut rustc_hash::FxHashSet<LuaType>,
-) -> Option<LuaType> {
+    depth: usize,
+    state: &mut SnapshotState,
+) -> SnapshotOutcome {
     if let LuaType::Union(union) = typ {
         let mut changed = false;
+        let mut total_nodes = 0usize;
+        let mut cacheable = true;
         let members = union
             .types()
-            .map(|arm| match snapshot_table_type_inner(db, arm, visited) {
-                Some(snap) => {
-                    changed = true;
-                    snap
+            .map(|arm| {
+                let outcome = snapshot_table_type_inner(db, arm, depth, state);
+                total_nodes = total_nodes.saturating_add(outcome.nodes);
+                cacheable &= outcome.cacheable;
+                match outcome.typ {
+                    Some(snap) => {
+                        changed = true;
+                        snap
+                    }
+                    None => arm.clone(),
                 }
-                None => arm.clone(),
             })
             .collect::<Vec<_>>();
-        return changed.then(|| LuaType::from_vec(members));
+        return SnapshotOutcome {
+            typ: changed.then(|| LuaType::from_vec(members)),
+            nodes: total_nodes,
+            cacheable,
+        };
     }
-    if !matches!(typ, LuaType::TableConst(_)) || !visited.insert(typ.clone()) {
-        return None;
+    if !matches!(typ, LuaType::TableConst(_)) {
+        return SnapshotOutcome {
+            typ: None,
+            nodes: 0,
+            cacheable: true,
+        };
     }
-    let member_map = match get_member_map(db, typ) {
-        Some(map) => map,
-        None => {
-            visited.remove(typ);
-            return None;
+    if depth == 0 {
+        return SnapshotOutcome {
+            typ: Some(LuaType::Table),
+            nodes: 0,
+            cacheable: true,
+        };
+    }
+    if state.visited.contains(typ) {
+        return SnapshotOutcome {
+            typ: None,
+            nodes: 0,
+            cacheable: false,
+        };
+    }
+    let cache_key = (typ.clone(), depth);
+    if let Some((cached, nodes)) = state.memo.get(&cache_key) {
+        if *nodes <= state.remaining_nodes {
+            state.remaining_nodes -= *nodes;
+            return SnapshotOutcome {
+                typ: cached.clone(),
+                nodes: *nodes,
+                cacheable: true,
+            };
         }
+        return SnapshotOutcome {
+            typ: Some(LuaType::Table),
+            nodes: 0,
+            cacheable: false,
+        };
+    }
+    if state.remaining_nodes == 0 {
+        return SnapshotOutcome {
+            typ: Some(LuaType::Table),
+            nodes: 0,
+            cacheable: false,
+        };
+    }
+
+    state.visited.insert(typ.clone());
+    let Some(member_map) = get_member_map(db, typ) else {
+        state.visited.remove(typ);
+        state.memo.insert(cache_key, (None, 0));
+        return SnapshotOutcome {
+            typ: None,
+            nodes: 0,
+            cacheable: true,
+        };
     };
+
+    state.remaining_nodes -= 1;
     let mut fields = std::collections::BTreeMap::new();
     let mut index_access = Vec::new();
     let mut entries = member_map.into_iter().collect::<Vec<_>>();
     entries.sort_by_cached_key(|(key, _)| format!("{key:?}"));
+    let mut cacheable = true;
+    let mut tree_nodes = 1usize;
     for (key, members) in entries {
         let member_type = LuaType::from_inferred_vec(
             members
@@ -93,8 +178,10 @@ fn snapshot_table_type_inner(
         if member_type.is_never() {
             continue;
         }
-        let member_type =
-            snapshot_table_type_inner(db, &member_type, visited).unwrap_or(member_type);
+        let outcome = snapshot_table_type_inner(db, &member_type, depth - 1, state);
+        cacheable &= outcome.cacheable;
+        tree_nodes = tree_nodes.saturating_add(outcome.nodes);
+        let member_type = outcome.typ.unwrap_or(member_type);
         match key {
             LuaMemberKey::ExprType(key_type) => index_access.push((key_type, member_type)),
             other => {
@@ -102,8 +189,18 @@ fn snapshot_table_type_inner(
             }
         }
     }
-    visited.remove(typ);
-    Some(LuaObjectType::new_with_fields(fields, index_access).into())
+    state.visited.remove(typ);
+    let result: LuaType = LuaObjectType::new_with_fields(fields, index_access).into();
+    if cacheable {
+        state
+            .memo
+            .insert(cache_key, (Some(result.clone()), tree_nodes));
+    }
+    SnapshotOutcome {
+        typ: Some(result),
+        nodes: tree_nodes,
+        cacheable,
+    }
 }
 
 fn build_member_map(

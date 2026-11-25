@@ -583,6 +583,44 @@ mod test {
     }
 
     #[test]
+    fn callback_shared_table_dag_remains_bounded() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let mut source = String::from(
+            r#"
+            local function run(cb)
+                local t0 = { value = 1 }
+            "#,
+        );
+        for i in 1..=30 {
+            let prev = i - 1;
+            source.push_str(&format!(
+                "    local t{i} = {{ a = t{prev}, b = t{prev} }}\n"
+            ));
+        }
+        source.push_str(
+            r#"
+                cb(t30)
+            end
+            run(function(data)
+                local shallow = data.a.b
+                local deep = data.a.b.a.b.a.b
+            end)
+            "#,
+        );
+
+        let file_id = ws.def_file("lua/autorun/shared/dag_callback.lua", &source);
+        let shallow_ty = ws.local_ty(file_id, "shallow");
+        let deep_ty = ws.local_ty(file_id, "deep");
+        assert!(matches!(shallow_ty, LuaType::Object(_)));
+        assert_eq!(deep_ty, LuaType::Table);
+        let _ = ws.humanize_type(shallow_ty);
+    }
+
+    #[test]
     fn test_function_param_inherit() {
         let mut ws = VirtualWorkspace::new();
 
