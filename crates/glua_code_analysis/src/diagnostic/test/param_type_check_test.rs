@@ -6304,14 +6304,25 @@ Send({
 }
 
 /// A table no overload accepts is reported against a table overload, not a
-/// scalar one listed before it that misses its fields as often.
+/// scalar one listed before it that misses its fields as often: optional,
+/// union and literal scalars included.
 #[test]
 fn a_table_no_overload_accepts_is_not_reported_against_a_scalar_overload() {
-    for call in ["f({ count = \"wrong\" })", "f({})"] {
+    for (scalar, call) in [
+        "string",
+        "string?",
+        "string|number",
+        "1",
+        "\"a\"|\"b\"",
+        "fun()?",
+    ]
+    .into_iter()
+    .flat_map(|scalar| [(scalar, "f({ count = \"wrong\" })"), (scalar, "f({})")])
+    {
         let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
         let file = ws.def(&format!(
             r#"
----@overload fun(name: string)
+---@overload fun(name: {scalar})
 ---@param opts {{ count: number }}
 local function f(opts) end
 {call}
@@ -6333,10 +6344,9 @@ local function f(opts) end
         .collect::<Vec<_>>();
         assert!(
             !reports.is_empty()
-                && !reports
-                    .iter()
-                    .any(|report| report.contains("expected `string`")),
-            "{call}: {reports:#?}"
+                && !reports.iter().any(|report| report.starts_with("expected `")
+                    && !report.starts_with("expected `{ count: number }`")),
+            "{scalar} {call}: {reports:#?}"
         );
     }
 }
