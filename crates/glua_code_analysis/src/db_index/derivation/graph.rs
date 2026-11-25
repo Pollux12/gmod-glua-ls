@@ -907,18 +907,25 @@ impl KeyTable {
     }
 
     pub(super) fn intern_read(&mut self, key: HashedKey, now: u64) -> KeyIdx {
-        self.intern(key, now)
+        let (slot, created) = self.intern_created(key, now);
+        self.inherit_ancestor_marks(slot, created);
+        slot
     }
 
     /// Interns a key a worker read that its snapshot lacked: created when the
     /// release epoch began, whichever evaluation of the epoch publishes it first.
     pub(super) fn intern_worker_read(&mut self, key: HashedKey) -> KeyIdx {
         let (slot, created) = self.intern_created(key, self.retirement_started);
+        self.inherit_ancestor_marks(slot, created);
+        slot
+    }
+
+    fn inherit_ancestor_marks(&mut self, slot: KeyIdx, created: Option<Option<KeyIdx>>) {
         if self.windows.is_empty() && self.held.is_empty() {
-            return slot;
+            return;
         }
         let mut base_slot = match created {
-            Some(None) => return slot,
+            Some(None) => return,
             Some(Some(base_slot)) => base_slot,
             None => {
                 let Some(base_slot) = self
@@ -926,7 +933,7 @@ impl KeyTable {
                     .base()
                     .and_then(|base| self.find(&HashedKey::new(base)))
                 else {
-                    return slot;
+                    return;
                 };
                 base_slot
             }
@@ -944,7 +951,7 @@ impl KeyTable {
                 entry.set_mark(HELD, true);
             }
             let Some(base) = self.key(base_slot).base() else {
-                return slot;
+                return;
             };
             base_slot = self
                 .find(&HashedKey::new(base))

@@ -977,21 +977,49 @@ impl Engine {
     /// Carries the removed and withdrawn outputs noted so far to where `edits`
     /// moved them.
     pub(crate) fn follow_removed_outputs(&mut self, edits: &derivation::EditMaps) {
-        let follow = |key: HashedKey| {
-            edits
-                .map_key(&key)
-                .filter(|moved| moved != key.key())
-                .map_or(key, HashedKey::new)
-        };
-        self.removed_outputs = std::mem::take(&mut self.removed_outputs)
-            .into_iter()
-            .map(|(key, fingerprint)| (follow(key), fingerprint))
-            .collect();
+        let mut next_removed = FxHashMap::default();
+        let mut lost_removed = Vec::new();
+        for (key, fingerprint) in std::mem::take(&mut self.removed_outputs) {
+            match edits.map_key(&key) {
+                Some(moved) if moved != *key.key() => {
+                    next_removed.insert(HashedKey::new(moved), fingerprint);
+                }
+                Some(_) => {
+                    next_removed.insert(key, fingerprint);
+                }
+                None => lost_removed.push((key, fingerprint)),
+            }
+        }
+        for (key, fingerprint) in lost_removed {
+            next_removed.entry(key).or_insert(fingerprint);
+        }
+        self.removed_outputs = next_removed;
+
         let withdrawn = self.withdrawn.get_mut();
-        *withdrawn = std::mem::take(withdrawn)
-            .into_iter()
-            .map(|(key, ids)| (follow(key), ids))
-            .collect();
+        let mut next_withdrawn: FxHashMap<HashedKey, Vec<DerivationId>> = FxHashMap::default();
+        let mut lost_withdrawn = Vec::new();
+        for (key, ids) in std::mem::take(withdrawn) {
+            match edits.map_key(&key) {
+                Some(moved) => {
+                    let target = if moved != *key.key() {
+                        HashedKey::new(moved)
+                    } else {
+                        key
+                    };
+                    let entry = next_withdrawn.entry(target).or_default();
+                    for id in ids {
+                        if !entry.contains(&id) {
+                            entry.push(id);
+                        }
+                    }
+                }
+                None => lost_withdrawn.push((key, ids)),
+            }
+        }
+        for (key, ids) in lost_withdrawn {
+            next_withdrawn.entry(key).or_insert(ids);
+        }
+        *withdrawn = next_withdrawn;
     }
 
     /// Queues `id` as changed, or parks it while the focus settles if it
@@ -1912,6 +1940,10 @@ impl Engine {
             member.file_id == crate::FileId::VIRTUAL
                 || self.serial_files.contains(&member.file_id)
                 || self.cycle_members.contains(member)
+                || self
+                    .stage_runs
+                    .get(member)
+                    .is_some_and(|runs| runs.on_index > MAX_INDEX_RUNS)
         }) {
             return Dispatched::Root;
         }
