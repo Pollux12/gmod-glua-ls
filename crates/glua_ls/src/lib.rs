@@ -1,3 +1,5 @@
+#[cfg(feature = "alloc-sample")]
+pub mod alloc_sample;
 pub mod cmd_args;
 mod codestyle;
 mod context;
