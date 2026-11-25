@@ -32,6 +32,8 @@ pub(crate) use infer_call::{
 };
 pub use infer_doc_type::{DocTypeInferContext, infer_doc_type};
 pub use infer_fail_reason::InferFailReason;
+#[cfg(test)]
+pub(crate) use infer_index::FUNCTION_INDEX_READS;
 pub(crate) use infer_index::check_iter_var_range;
 pub(crate) use infer_index::code_index_function;
 pub(crate) use infer_index::global_expr_access_path;

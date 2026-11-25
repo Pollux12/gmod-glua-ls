@@ -1,6 +1,8 @@
 mod factory_call;
 pub(crate) use factory_call::{passed_arg, with_file_cache};
 mod function_index;
+#[cfg(test)]
+pub(crate) use function_index::FUNCTION_INDEX_READS;
 pub(crate) use function_index::code_index_function;
 mod infer_array;
 pub(crate) use infer_array::{check_index_in_range, check_iter_var_range};

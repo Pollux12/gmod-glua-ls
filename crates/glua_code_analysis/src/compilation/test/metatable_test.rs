@@ -3088,7 +3088,8 @@ mod test {
     }
 
     /// An `__index` function that reads back through the table it serves
-    /// recurses forever at runtime; typing a read through it still ends.
+    /// recurses forever at runtime; typing a read through it ends at the
+    /// first repeated read, not when the stack runs low.
     #[test]
     fn an_index_function_reading_back_through_its_table_types_a_read() {
         for code in [
@@ -3110,8 +3111,12 @@ mod test {
             "#,
         ] {
             let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            crate::semantic::FUNCTION_INDEX_READS.with(|reads| reads.set(0));
             let file_id = ws.def(code);
-            assert_eq!(ws.humanize_type(ws.local_ty(file_id, "x")), "unknown");
+            let x = ws.humanize_type(ws.local_ty(file_id, "x"));
+            let reads = crate::semantic::FUNCTION_INDEX_READS.with(|reads| reads.get());
+            assert_eq!(x, "unknown");
+            assert!(reads < 50, "{reads} __index function reads");
         }
     }
 

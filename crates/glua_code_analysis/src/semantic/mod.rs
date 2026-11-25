@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(test)]
 pub(crate) use infer::CONSTANT_EXPR_CLASSIFICATIONS;
 #[cfg(test)]
+pub(crate) use infer::FUNCTION_INDEX_READS;
+#[cfg(test)]
 pub(crate) use infer::narrow::get_type_at_flow::BASELINE_FLOW_WALKS;
 
 pub(crate) use cache::MemoFootprint;

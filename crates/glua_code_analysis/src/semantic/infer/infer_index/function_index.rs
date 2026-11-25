@@ -1,6 +1,10 @@
+use std::cell::RefCell;
+
 use glua_parser::{
     BinaryOperator, LuaAstNode, LuaClosureExpr, LuaExpr, LuaIndexKey, LuaNameExpr, LuaReturnStat,
 };
+
+use rustc_hash::FxHashSet;
 
 use crate::db_index::widen_literal_type_for_assignment;
 use crate::semantic::member::LuaMemberInfo;
@@ -9,6 +13,20 @@ use crate::{
     LuaSignatureId, LuaType, TypeOps, infer_expr,
     semantic::{local_initializer_expr, member::find_members_with_key},
 };
+
+thread_local! {
+    /// The `__index` function reads being typed on this thread: a function
+    /// that reads back through the table it serves reaches its own read again.
+    static READING: RefCell<FxHashSet<(LuaSignatureId, LuaMemberKey)>> = RefCell::default();
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `__index` function reads typed on this thread, so a test can tell a
+    /// cycle that ends at once from one only the stack reserve ends.
+    pub(crate) static FUNCTION_INDEX_READS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// What a read of `key` gets from an `__index` function: a key the table
 /// does not hold reaches `__index(self, key)`. Each `P[key]` or
@@ -30,13 +48,33 @@ pub(super) fn infer_function_index_member(
         LuaIndexKey::String(string) => string.get_value(),
         _ => return Some(LuaType::Unknown),
     };
+    let key_name = LuaMemberKey::Name(key_name.into());
+    let reading = (*signature_id, key_name.clone());
+    if !READING.with(|reading_now| reading_now.borrow_mut().insert(reading.clone())) {
+        // Where the cycle is cut depends on which read started it.
+        crate::db_index::derivation::taint();
+        return Some(LuaType::Unknown);
+    }
+    #[cfg(test)]
+    FUNCTION_INDEX_READS.with(|reads| reads.set(reads.get() + 1));
+    let typ = function_index_member(db, cache, signature_id, key_name);
+    READING.with(|reading_now| reading_now.borrow_mut().remove(&reading));
+    typ
+}
+
+fn function_index_member(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    signature_id: &LuaSignatureId,
+    key_name: LuaMemberKey,
+) -> Option<LuaType> {
     let closure = signature_closure(db, signature_id)?;
     let signature = db.get_signature_index().get(signature_id)?;
     let mut read = KeyRead {
         db,
         signature_id,
         key_param_idx: if signature.is_colon_define { 0 } else { 1 },
-        key_name: LuaMemberKey::Name(key_name.into()),
+        key_name,
         cache: LuaInferCache::new(signature_id.get_file_id(), cache.get_config().clone()),
         found_field: false,
     };
