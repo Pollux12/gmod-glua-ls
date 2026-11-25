@@ -48,9 +48,6 @@ pub struct LuaCompilation {
     index_revision: u64,
     /// The scripted scopes, lent to each re-analysis.
     scopes: analyzer::ScopesCache,
-    /// Each file's inference memo from the last settled re-analysis, which
-    /// the file's next diagnostics take; the next re-analysis drops the rest.
-    memos: Mutex<rustc_hash::FxHashMap<FileId, LuaInferCache>>,
     /// Whether re-analyses leave worker supersteps' tasks to
     /// [`Self::run_detached_tasks`]; see [`Self::set_detached_tasks`].
     detach_tasks: bool,
@@ -86,7 +83,6 @@ impl LuaCompilation {
             interrupt: Arc::default(),
             index_revision: next_index_revision(),
             scopes: analyzer::ScopesCache::default(),
-            memos: Mutex::default(),
             detach_tasks: false,
         };
 
@@ -96,34 +92,6 @@ impl LuaCompilation {
 
     pub fn get_semantic_model(&'_ self, file_id: FileId) -> Option<SemanticModel<'_>> {
         let cache = LuaInferCache::new(file_id, Default::default());
-        let tree = self.db.get_vfs().get_syntax_tree(&file_id)?;
-        Some(SemanticModel::new(
-            file_id,
-            &self.db,
-            cache,
-            self.db.get_file_emmyrc(file_id).clone(),
-            tree.get_chunk_node(),
-        ))
-    }
-
-    /// [`Self::get_semantic_model`] for `file_id`'s diagnostics, starting from
-    /// the memo the last settled re-analysis left for the file.
-    pub(crate) fn get_diagnostic_semantic_model(
-        &'_ self,
-        file_id: FileId,
-    ) -> Option<SemanticModel<'_>> {
-        let memo = self
-            .memos
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&file_id);
-        let cache = match memo {
-            Some(mut cache) => {
-                *cache.config_mut() = Default::default();
-                cache
-            }
-            None => LuaInferCache::new(file_id, Default::default()),
-        };
         let tree = self.db.get_vfs().get_syntax_tree(&file_id)?;
         Some(SemanticModel::new(
             file_id,
@@ -163,15 +131,6 @@ impl LuaCompilation {
         self.index_revision = next_index_revision();
         if let Some(log) = &mut self.batch_log {
             log.push(file_ids.clone());
-        }
-        let memos = std::mem::take(
-            self.memos
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        // Freeing every file's memo takes long enough to hold up the take.
-        if !memos.is_empty() {
-            std::thread::spawn(move || drop(memos));
         }
         let edits = derivation::EditMaps::new(self.db.get_vfs_mut().take_staged(&file_ids));
         let reanalysis = self
@@ -226,10 +185,6 @@ impl LuaCompilation {
         let reanalysis = session.take().expect("a re-analysis in progress");
         let reanalysed = reanalysis.finish(&mut self.db);
         self.scopes = reanalysed.scopes;
-        *self
-            .memos
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = reanalysed.memos;
         self.last_evaluated_files = reanalysed.evaluated_files;
         self.last_stats = reanalysed.stats;
         UpdateProgress::Settled(reanalysed.stale_diagnostics)
@@ -495,7 +450,6 @@ impl LuaCompilation {
             interrupt: Arc::default(),
             index_revision: self.index_revision,
             scopes: self.scopes.clone(),
-            memos: Mutex::default(),
             detach_tasks: self.detach_tasks,
         }
     }
@@ -529,10 +483,6 @@ impl LuaCompilation {
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        self.memos
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
     }
 
     /// Drops the compilation part by part, calling `dropped` with each part's
@@ -545,12 +495,6 @@ impl LuaCompilation {
                 .take(),
         );
         dropped("reanalysis");
-        drop(std::mem::take(
-            self.memos
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        ));
-        dropped("inference memos");
         drop(std::mem::take(
             self.diagnosed
                 .get_mut()
