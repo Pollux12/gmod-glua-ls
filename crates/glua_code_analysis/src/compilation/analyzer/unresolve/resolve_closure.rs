@@ -1022,10 +1022,11 @@ fn resolve_doc_function(
         signature.return_filled_from_slot,
     );
 
-    // An unknown contract return says nothing about the result, so the
-    // closure keeps the return its own body gives.
+    // An unconstrained contract return (`unknown`, `any`, or variadic/multi
+    // slots made solely of them) says nothing about the result, so the closure
+    // keeps the return its own body gives.
     let doc_return = doc_func.get_ret();
-    let constrains_return = !doc_return.is_unknown();
+    let constrains_return = !is_unconstrained_contract_return(doc_return);
     let inferred_tail = (constrains_return
         && signature.resolve_return == SignatureReturnStatus::InferResolve)
         .then(|| {
@@ -1038,10 +1039,7 @@ fn resolve_doc_function(
         .flatten();
     let should_apply_return = constrains_return
         && match signature.resolve_return {
-            SignatureReturnStatus::UnResolve => true,
-            SignatureReturnStatus::InferResolve => {
-                should_doc_return_override_inferred(doc_return, &signature.get_return_type())
-            }
+            SignatureReturnStatus::UnResolve | SignatureReturnStatus::InferResolve => true,
             SignatureReturnStatus::DocResolve => signature.return_filled_from_slot,
         };
 
@@ -1172,10 +1170,17 @@ fn exact_non_nil_type(typ: &LuaType) -> LuaType {
     }
 }
 
-fn should_doc_return_override_inferred(doc_return: &LuaType, inferred_return: &LuaType) -> bool {
-    !(doc_return.is_any() || doc_return.is_unknown())
-        || inferred_return.is_any()
-        || inferred_return.is_unknown()
+fn is_unconstrained_contract_return(doc_return: &LuaType) -> bool {
+    match doc_return {
+        LuaType::Any | LuaType::Unknown => true,
+        LuaType::Variadic(variadic) => match variadic.as_ref() {
+            VariadicType::Base(inner) => is_unconstrained_contract_return(inner),
+            VariadicType::Multi(types) => {
+                !types.is_empty() && types.iter().all(is_unconstrained_contract_return)
+            }
+        },
+        _ => false,
+    }
 }
 
 #[cfg(test)]

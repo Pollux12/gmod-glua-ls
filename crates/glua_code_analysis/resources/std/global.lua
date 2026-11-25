@@ -351,30 +351,30 @@ function select(index, ...) end
 ---@field __metatable? any
 ---@field __tostring? (fun(t):string)
 ---@field __gc? fun(t)
----@field __add? fun(t1,t2):unknown
----@field __sub? fun(t1,t2):unknown
----@field __mul? fun(t1,t2):unknown
----@field __div? fun(t1,t2):unknown
----@field __mod? fun(t1,t2):unknown
----@field __pow? fun(t1,t2):unknown
----@field __unm? fun(t):unknown
----@field __idiv? fun(t1,t2):unknown
----@field __band? fun(t1,t2):unknown
----@field __bor? fun(t1,t2):unknown
----@field __bxor? fun(t1,t2):unknown
----@field __bnot? fun(t):unknown
----@field __shl? fun(t1,t2):unknown
----@field __shr? fun(t1,t2):unknown
----@field __concat? fun(t1,t2):unknown
+---@field __add? fun(t1,t2):any
+---@field __sub? fun(t1,t2):any
+---@field __mul? fun(t1,t2):any
+---@field __div? fun(t1,t2):any
+---@field __mod? fun(t1,t2):any
+---@field __pow? fun(t1,t2):any
+---@field __unm? fun(t):any
+---@field __idiv? fun(t1,t2):any
+---@field __band? fun(t1,t2):any
+---@field __bor? fun(t1,t2):any
+---@field __bxor? fun(t1,t2):any
+---@field __bnot? fun(t):any
+---@field __shl? fun(t1,t2):any
+---@field __shr? fun(t1,t2):any
+---@field __concat? fun(t1,t2):any
 ---@field __len? fun(t):integer
 ---@field __eq? fun(t1,t2):boolean
 ---@field __lt? fun(t1,t2):boolean
 ---@field __le? fun(t1,t2):boolean
----@field __index? table|fun(t,k):unknown
+---@field __index? table|fun(t,k):any
 ---@field __newindex? table|fun(t,k,v)
----@field __call? fun(t,...): unknown
+---@field __call? fun(t,...): any...
 ---@field __pairs? fun(t):((fun(t,k,v):any,any),any,any)
----@field __close? fun(t,errobj):unknown
+---@field __close? fun(t,errobj):any
 
 --NOTE: The actual implementation of setmetatable is provided by the language server
 
