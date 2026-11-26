@@ -1164,6 +1164,27 @@ fn initializer_type_a_later_write_displaced(
     }
     match try_infer_decl_initializer_type(db, cache, root, var_ref_id) {
         Ok(Some(init_type)) if !crate::is_informative_type(&init_type) => Some(init_type),
+        Ok(Some(init_type)) => {
+            let widened_init = crate::compilation::analyzer::widen_mutable_decl_literal(
+                db,
+                &decl_id.into(),
+                crate::LuaTypeCache::InferType(init_type.clone()),
+            );
+            let widened_init = widened_init.as_type();
+            (widened_init != slot_type
+                && (crate::compilation::analyzer::union_widens_cached_type(
+                    slot_type,
+                    widened_init,
+                ) || crate::compilation::analyzer::settled_covers_cached_type(
+                    slot_type,
+                    widened_init,
+                ) || crate::compilation::analyzer::settled_extends_cached_classes(
+                    db,
+                    slot_type,
+                    widened_init,
+                )))
+            .then_some(init_type)
+        }
         Err(InferFailReason::FieldNotFound) => Some(LuaType::Unknown),
         Ok(None) => {
             let name = root
