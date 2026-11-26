@@ -225,8 +225,22 @@ fn guessed_slot_evidence(
     let at = exprs
         .iter()
         .position(|expr| expr.syntax() == name_expr.syntax())?;
-    let LuaVarExpr::IndexExpr(target) = vars.get(at)? else {
-        return None;
+    let target = match vars.get(at)? {
+        LuaVarExpr::IndexExpr(target) => target,
+        LuaVarExpr::NameExpr(target) => {
+            let decl_id = db
+                .get_reference_index()
+                .get_var_reference_decl(&file_id, target.get_range())?;
+            let is_unannotated_local = db
+                .get_decl_index()
+                .get_decl(&decl_id)
+                .is_some_and(|decl| matches!(decl.extra, crate::LuaDeclExtra::Local { .. }))
+                && !db
+                    .get_type_index()
+                    .get_type_cache(&decl_id.into())
+                    .is_some_and(|cache| cache.is_doc());
+            return is_unannotated_local.then_some(None);
+        }
     };
     let member_index = db.get_member_index();
     let member_id = crate::LuaMemberId::new(target.get_syntax_id(), file_id);
@@ -1212,8 +1226,9 @@ fn collect_unguarded_child_file(
             // Prefer a stabilized initializer type (e.g. a later same-file
             // field assignment) over heuristic child-union refinement when
             // that initializer already owns the used member.
-            if let Some(initializer_type) =
-                refined_initializer_type_for_decl(db, &mut infer_cache, decl_id, file_id)
+            if !references[&decl_id].mutable
+                && let Some(initializer_type) =
+                    refined_initializer_type_for_decl(db, &mut infer_cache, decl_id, file_id)
             {
                 if type_has_visible_static_member_at_use(
                     db,

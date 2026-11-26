@@ -1,6 +1,7 @@
 use lsp_types::{Uri, VersionedTextDocumentIdentifier};
 use std::collections::HashMap;
-use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 use super::{InFlightChangeGuard, ServerContextSnapshot};
 use crate::handlers::on_did_change_text_document;
@@ -13,6 +14,25 @@ struct QueuedDidChange {
     enqueue_profile: Option<crate::util::ls_profile::DidChangeEnqueue>,
 }
 
+#[derive(Default)]
+struct PendingChanges {
+    latest: HashMap<Uri, QueuedDidChange>,
+    closed: bool,
+}
+
+struct SharedState {
+    pending: Mutex<PendingChanges>,
+    notify: Notify,
+}
+
+impl SharedState {
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, PendingChanges> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// Coalesces rapid `textDocument/didChange` notifications.
 ///
 /// When the user types character-by-character, VS Code sends one `didChange`
@@ -21,26 +41,42 @@ struct QueuedDidChange {
 /// creates 33 serialised write-lock acquisitions plus 33 parses.
 ///
 /// Each queued change carries the document's full text after it, so the
-/// coalescer keeps only the **latest** text per URI and processes them one
-/// batch at a time through a single worker task.  This turns 33 write-lock
-/// acquisitions into 1–3.
+/// coalescer stores only the **latest** text per URI in a latest-wins map and
+/// processes them one batch at a time through a single worker task.  This
+/// bounds memory to at most one buffered copy per dirty URI even when the
+/// worker is stalled on a long reindex, and turns 33 write-lock acquisitions
+/// into 1–3.
 pub struct DidChangeCoalescer {
-    /// Send a didChange to the worker.  The worker reads all pending
-    /// messages before doing any work, so the channel acts as a buffer.
-    tx: mpsc::UnboundedSender<QueuedDidChange>,
+    shared: Arc<SharedState>,
+}
+
+impl Drop for DidChangeCoalescer {
+    fn drop(&mut self) {
+        let leftover = {
+            let mut pending = self.shared.lock_pending();
+            pending.closed = true;
+            std::mem::take(&mut pending.latest)
+        };
+        drop(leftover);
+        self.shared.notify.notify_one();
+    }
 }
 
 impl DidChangeCoalescer {
     /// Create a new coalescer and spawn its background worker.
     pub fn new(context: ServerContextSnapshot) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(Self::worker(rx, context));
-        Self { tx }
+        let shared = Arc::new(SharedState {
+            pending: Mutex::new(PendingChanges::default()),
+            notify: Notify::new(),
+        });
+        tokio::spawn(Self::worker(shared.clone(), context));
+        Self { shared }
     }
 
     /// Enqueue a document's full text after a didChange.
-    /// If the worker is busy, the texts accumulate in the channel and
-    /// the worker drains + deduplicates them in the next batch.
+    /// Replaces any older unprocessed text for the same URI immediately so
+    /// buffered memory never grows with keystroke count while the worker is
+    /// busy.
     pub fn enqueue(
         &self,
         document: VersionedTextDocumentIdentifier,
@@ -49,46 +85,74 @@ impl DidChangeCoalescer {
         in_flight: InFlightChangeGuard,
         enqueue_profile: Option<crate::util::ls_profile::DidChangeEnqueue>,
     ) {
-        if let Err(err) = self.tx.send(QueuedDidChange {
+        let uri = document.uri.clone();
+        let queued = QueuedDidChange {
             document,
             text,
             session,
             in_flight,
             enqueue_profile,
-        }) {
+        };
+        let (closed, superseded) = {
+            let mut pending = self.shared.lock_pending();
+            if pending.closed {
+                (true, Some(queued))
+            } else {
+                (false, pending.latest.insert(uri, queued))
+            }
+        };
+        // Drop any superseded entry outside the mutex so its
+        // `InFlightChangeGuard::drop` settles without holding the lock.
+        drop(superseded);
+        if closed {
             log::error!(
-                "LS_COALESCER_SEND_FAILED didChange worker channel is closed; settling dropped change"
+                "LS_COALESCER_SEND_FAILED didChange worker is closed; settling dropped change"
             );
-            drop(err);
+            return;
         }
+        self.shared.notify.notify_one();
     }
 
-    /// Worker loop: wait for at least one message, then drain all pending
-    /// messages, keep only the latest per URI, and process the batch.
-    async fn worker(
-        mut rx: mpsc::UnboundedReceiver<QueuedDidChange>,
-        context: ServerContextSnapshot,
-    ) {
+    /// Worker loop: wait for at least one pending change, take the latest
+    /// map atomically, and process each URI.
+    async fn worker(shared: Arc<SharedState>, context: ServerContextSnapshot) {
+        let shutdown = context.debounced_analysis_arc().shutdown_token();
         loop {
-            // Wait for at least one message.
-            let first = match rx.recv().await {
-                Some(params) => params,
-                None => {
-                    // Every sender is gone: shutdown.
-                    log::info!("didChange coalescer stopped: channel closed");
-                    return;
+            let latest = loop {
+                let notified = shared.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                let taken = {
+                    let mut pending = shared.lock_pending();
+                    if !pending.latest.is_empty() {
+                        Some(std::mem::take(&mut pending.latest))
+                    } else if pending.closed {
+                        log::info!("didChange coalescer stopped: closed");
+                        return;
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(batch) = taken {
+                    break batch;
+                }
+
+                tokio::select! {
+                    _ = notified => {}
+                    _ = shutdown.cancelled() => {
+                        let leftover = {
+                            let mut pending = shared.lock_pending();
+                            pending.closed = true;
+                            std::mem::take(&mut pending.latest)
+                        };
+                        drop(leftover);
+                        log::info!("didChange coalescer stopped: shutdown");
+                        return;
+                    }
                 }
             };
-
-            // Drain remaining messages without blocking.
-            let mut latest: HashMap<Uri, QueuedDidChange> = HashMap::new();
-            latest.insert(first.document.uri.clone(), first);
-
-            while let Ok(params) = rx.try_recv() {
-                if let Some(superseded) = latest.insert(params.document.uri.clone(), params) {
-                    superseded.in_flight.finish().await;
-                }
-            }
 
             // Process only the latest version for each URI.
             for (uri, queued) in latest {
@@ -159,5 +223,65 @@ impl DidChangeCoalescer {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::ServerContext;
+    use lsp_server::Connection;
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn rapid_enqueues_for_same_uri_keep_only_latest_and_settle_superseded_guards() {
+        let (server, _client) = Connection::memory();
+        let server_context = ServerContext::new(server, lsp_types::ClientCapabilities::default());
+        let snapshot = server_context.snapshot();
+        let debounced = snapshot.debounced_analysis_arc();
+        let uri = Uri::from_str("file:///test/rapid.lua").unwrap();
+
+        let shared = Arc::new(SharedState {
+            pending: Mutex::new(PendingChanges::default()),
+            notify: Notify::new(),
+        });
+        let coalescer = DidChangeCoalescer {
+            shared: shared.clone(),
+        };
+
+        for version in 1..=50 {
+            let guard = debounced.begin_document_change(uri.clone());
+            coalescer.enqueue(
+                VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version,
+                },
+                format!("local x = {version}"),
+                1,
+                guard,
+                None,
+            );
+        }
+
+        let latest = {
+            let mut pending = shared.lock_pending();
+            assert_eq!(pending.latest.len(), 1);
+            pending.latest.remove(&uri).unwrap()
+        };
+        assert_eq!(latest.document.version, 50);
+        assert_eq!(latest.text, "local x = 50");
+
+        latest.in_flight.finish().await;
+        // Superseded guards settle asynchronously on the runtime; yield until
+        // all 49 drop-spawned finishes complete.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while debounced.is_dirty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("superseded in-flight guards must settle");
+
+        server_context.close().await;
     }
 }

@@ -148,4 +148,95 @@ mod test {
         );
         assert!(digest.is_some(), "the analysis settles");
     }
+
+    /// A local initialized to a subclass (`Player`), read for a subclass
+    /// method before being conditionally reassigned to its superclass
+    /// (`Entity`), settles cleanly across every schedule with exact flow types.
+    #[test]
+    fn a_subclass_local_reassigned_to_its_superclass_after_method_call_settles() {
+        let source = r#"
+            ---@meta
+            ---@class Entity
+            local Entity = {}
+            ---@return boolean
+            ---@return_cast self Entity
+            ---@[self_guard("gmod.entity")]
+            function Entity:IsValid() end
+
+            ---@class Player : Entity
+            local Player = {}
+            ---@return Entity
+            function Player:GetViewEntity() end
+            ---@return Entity
+            function Player:lvsGetVehicle() end
+
+            ---@return Player
+            local function LocalPlayer() end
+
+            ---@param ent any
+            ---@return boolean
+            local function IsValid(ent) end
+
+            local function f()
+                local Target = LocalPlayer()
+                if IsValid(Target) then
+                    local veh = Target:lvsGetVehicle()
+                    local ViewEnt = Target:GetViewEntity()
+                    if IsValid(ViewEnt) then
+                        Target = ViewEnt
+                        local assigned = Target
+                    end
+                    local after = Target
+                end
+            end
+        "#;
+
+        let mut digests = Vec::new();
+        for schedule in [
+            crate::Schedule::Canonical,
+            crate::Schedule::Reversed,
+            crate::Schedule::Deferred,
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            ws.analysis.compilation.set_schedule(schedule);
+            let file_id = ws.def_file("lua/autorun/cl_target.lua", source);
+
+            let veh = ws.local_ty(file_id, "veh");
+            let view_ent = ws.local_ty(file_id, "ViewEnt");
+            let assigned = ws.local_ty(file_id, "assigned");
+            let after = ws.local_ty(file_id, "after");
+            assert_eq!(ws.humanize_type(veh), "Entity", "{schedule:?}");
+            assert_eq!(ws.humanize_type(view_ent), "Entity", "{schedule:?}");
+            assert_eq!(ws.humanize_type(assigned), "Entity", "{schedule:?}");
+            let after_ty = ws.humanize_type(after);
+            assert!(
+                after_ty.contains("Entity"),
+                "post-join Target must admit Entity ({schedule:?}): {after_ty}"
+            );
+
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+                .unwrap_or_default();
+            let forbidden = [
+                DiagnosticCode::UndefinedField.get_name(),
+                DiagnosticCode::InferUnguardedChild.get_name(),
+                DiagnosticCode::NeedCheckNil.get_name(),
+            ];
+            for diag in &diagnostics {
+                let code = match &diag.code {
+                    Some(lsp_types::NumberOrString::String(code)) => code.as_str(),
+                    _ => "",
+                };
+                assert!(
+                    !forbidden.contains(&code),
+                    "unexpected diagnostic under {schedule:?}: {diag:?}"
+                );
+            }
+            digests.push(ws.semantic_digest());
+        }
+
+        assert_eq!(digests[1], digests[0], "Reversed matches Canonical");
+        assert_eq!(digests[2], digests[0], "Deferred matches Canonical");
+    }
 }

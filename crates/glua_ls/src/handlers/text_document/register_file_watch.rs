@@ -9,7 +9,13 @@ use notify::{
     Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
     event::{ModifyKind, RenameMode},
 };
-use std::{path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::sync::Notify;
 
 use crate::{
     context::{ClientProxy, ServerContextSnapshot},
@@ -116,19 +122,135 @@ fn path_changes(event: &Event) -> Vec<(&PathBuf, FileChangeType)> {
     event.paths.iter().map(|path| (path, typ)).collect()
 }
 
+fn is_watched_path(path: &Path) -> bool {
+    let text = path.as_os_str().to_string_lossy();
+    WATCH_FILE_EXTENSIONS.iter().any(|ext| text.ends_with(ext)) || is_gamemode_manifest(path)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoalescedChange {
+    Single(FileChangeType),
+    /// A deletion followed by a creation/modification on the same path: emit
+    /// both so `on_did_change_watched_files` deletes if gone or reloads if
+    /// recreated on disk.
+    DeletedThen(FileChangeType),
+}
+
+impl CoalescedChange {
+    fn merge(self, next: FileChangeType) -> Self {
+        if next == FileChangeType::DELETED {
+            return Self::Single(FileChangeType::DELETED);
+        }
+        match self {
+            Self::Single(FileChangeType::DELETED) => Self::DeletedThen(next),
+            Self::Single(FileChangeType::CREATED) => Self::Single(FileChangeType::CREATED),
+            Self::Single(_) => Self::Single(next),
+            Self::DeletedThen(prev) => {
+                if prev == FileChangeType::CREATED {
+                    Self::DeletedThen(FileChangeType::CREATED)
+                } else {
+                    Self::DeletedThen(next)
+                }
+            }
+        }
+    }
+
+    fn push_into(self, path: PathBuf, out: &mut Vec<(PathBuf, FileChangeType)>) {
+        match self {
+            Self::Single(typ) => out.push((path, typ)),
+            Self::DeletedThen(next) => {
+                out.push((path.clone(), FileChangeType::DELETED));
+                out.push((path, next));
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingWatchedFiles {
+    entries: HashMap<PathBuf, (u64, CoalescedChange)>,
+    next_seq: u64,
+    closed: bool,
+}
+
+impl PendingWatchedFiles {
+    fn push_event(&mut self, event: &Event) -> bool {
+        if self.closed {
+            return false;
+        }
+        let mut added = false;
+        for (path, typ) in path_changes(event) {
+            if !is_watched_path(path) {
+                continue;
+            }
+            self.push_change(path.clone(), typ);
+            added = true;
+        }
+        added
+    }
+
+    fn push_change(&mut self, path: PathBuf, typ: FileChangeType) {
+        if let Some((_, existing)) = self.entries.get_mut(&path) {
+            *existing = existing.merge(typ);
+        } else {
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            self.entries
+                .insert(path, (seq, CoalescedChange::Single(typ)));
+        }
+    }
+
+    fn take_batch(&mut self) -> Vec<(PathBuf, FileChangeType)> {
+        if self.entries.is_empty() {
+            return Vec::new();
+        }
+        let mut ordered: Vec<_> = self.entries.drain().collect();
+        ordered.sort_unstable_by_key(|(_, (seq, _))| *seq);
+        let mut changes = Vec::with_capacity(ordered.len());
+        for (path, (_, change)) in ordered {
+            change.push_into(path, &mut changes);
+        }
+        changes
+    }
+}
+
+struct SharedWatchQueue {
+    pending: Mutex<PendingWatchedFiles>,
+    notify: Notify,
+}
+
+impl SharedWatchQueue {
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, PendingWatchedFiles> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+struct WatchQueueSender(Arc<SharedWatchQueue>);
+
+impl Drop for WatchQueueSender {
+    fn drop(&mut self) {
+        self.0.lock_pending().closed = true;
+        self.0.notify.notify_one();
+    }
+}
+
 async fn register_files_watch_use_fsnotify(context: ServerContextSnapshot) -> Option<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let queue = Arc::new(SharedWatchQueue {
+        pending: Mutex::new(PendingWatchedFiles::default()),
+        notify: Notify::new(),
+    });
+    let sender = WatchQueueSender(queue.clone());
     let config = Config::default().with_poll_interval(Duration::from_secs(5));
     let mut watcher = match RecommendedWatcher::new(
         move |res| {
             if let Ok(event) = res {
-                match tx.send(event) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("send notify event failed: {:?}", e);
-                    }
-                };
-            };
+                let added = sender.0.lock_pending().push_event(&event);
+                if added {
+                    sender.0.notify.notify_one();
+                }
+            }
         },
         config,
     ) {
@@ -149,17 +271,44 @@ async fn register_files_watch_use_fsnotify(context: ServerContextSnapshot) -> Op
     drop(workspace_manager);
 
     tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            let file_events = path_changes(&event)
+        let shutdown = context.debounced_analysis_arc().shutdown_token();
+        loop {
+            let batch = loop {
+                let notified = queue.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                let taken = {
+                    let mut pending = queue.lock_pending();
+                    if !pending.entries.is_empty() {
+                        Some(pending.take_batch())
+                    } else if pending.closed {
+                        return;
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(batch) = taken {
+                    break batch;
+                }
+
+                tokio::select! {
+                    _ = notified => {}
+                    _ = shutdown.cancelled() => {
+                        let mut pending = queue.lock_pending();
+                        pending.closed = true;
+                        pending.entries.clear();
+                        return;
+                    }
+                }
+            };
+
+            let file_events = batch
                 .into_iter()
-                .filter(|(path, _)| {
-                    let text = path.as_os_str().to_string_lossy();
-                    WATCH_FILE_EXTENSIONS.iter().any(|ext| text.ends_with(ext))
-                        || is_gamemode_manifest(path)
-                })
                 .filter_map(|(path, typ)| {
                     Some(FileEvent {
-                        uri: file_path_to_uri(path)?,
+                        uri: file_path_to_uri(&path)?,
                         typ,
                     })
                 })
@@ -244,5 +393,57 @@ mod tests {
                 vec![(PathBuf::from("a.lua"), FileChangeType::DELETED)],
             )
         );
+    }
+
+    #[test]
+    fn pending_watch_queue_filters_and_coalesces_per_path() {
+        let mut pending = PendingWatchedFiles::default();
+        let make = |kind, path: &str| Event::new(kind).add_path(PathBuf::from(path));
+
+        // Non-watched paths are ignored before entering the queue.
+        assert!(!pending.push_event(&make(
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            "README.md"
+        )));
+        assert!(pending.entries.is_empty());
+
+        // Repeated edits to a.lua coalesce to one entry; b.lua create + modify stays CREATED.
+        assert!(pending.push_event(&make(
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            "a.lua"
+        )));
+        assert!(pending.push_event(&make(EventKind::Create(CreateKind::File), "b.lua")));
+        assert!(pending.push_event(&make(
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            "b.lua"
+        )));
+        assert!(pending.push_event(&make(
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            "a.lua"
+        )));
+
+        // Delete followed by create or modify preserves both events so a
+        // missing file is still deleted while a recreated file is reloaded.
+        assert!(pending.push_event(&make(EventKind::Remove(RemoveKind::File), "c.lua")));
+        assert!(pending.push_event(&make(EventKind::Create(CreateKind::File), "c.lua")));
+        assert!(pending.push_event(&make(EventKind::Remove(RemoveKind::File), "d.lua")));
+        assert!(pending.push_event(&make(
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            "d.lua"
+        )));
+
+        assert_eq!(pending.entries.len(), 4);
+        assert_eq!(
+            pending.take_batch(),
+            vec![
+                (PathBuf::from("a.lua"), FileChangeType::CHANGED),
+                (PathBuf::from("b.lua"), FileChangeType::CREATED),
+                (PathBuf::from("c.lua"), FileChangeType::DELETED),
+                (PathBuf::from("c.lua"), FileChangeType::CREATED),
+                (PathBuf::from("d.lua"), FileChangeType::DELETED),
+                (PathBuf::from("d.lua"), FileChangeType::CHANGED),
+            ]
+        );
+        assert!(pending.entries.is_empty());
     }
 }
