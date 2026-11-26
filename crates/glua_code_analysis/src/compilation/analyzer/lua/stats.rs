@@ -2787,9 +2787,7 @@ mod tests {
                     file_id,
                     LuaSyntaxId::from_node(assign.syntax()),
                 );
-                db.reader_graph()
-                    .outputs_of(id)
-                    .any(|key| key.key() == &slot)
+                db.reader_graph().outputs_of(id).any(|key| key == &slot)
             })
             .collect::<Vec<_>>();
 

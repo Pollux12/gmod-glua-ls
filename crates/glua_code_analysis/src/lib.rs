@@ -99,6 +99,17 @@ pub fn release_analysis_caches_with(on_thread: impl Fn() + Sync) {
     on_thread();
 }
 
+static ANALYSIS_HEAP_COLLECTOR: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Registers the process allocator's thread-local collection hook.
+pub fn set_analysis_heap_collector(collect: fn()) {
+    ANALYSIS_HEAP_COLLECTOR.get_or_init(|| collect);
+}
+
+pub(crate) fn purge_analysis_heap() {
+    release_analysis_caches_with(ANALYSIS_HEAP_COLLECTOR.get().copied().unwrap_or(|| {}));
+}
+
 /// True when `call_expr` calls an annotated net operation — a message start, a
 /// send terminator, or a payload write/read.
 ///

@@ -491,9 +491,11 @@ impl Reanalysis {
                 break true;
             };
             let slice = slice.remaining(self.engine.stats().total_evaluations() - evaluated);
+            let before = engine::Engine::index_before_diagnostic_writes(db);
             let settled = crate::profile::phase("reanalyze: engine run", || {
                 self.engine.run(db, &**recipes, slice)
             });
+            self.engine.finish_diagnostic_writes(db, before);
             if !settled {
                 break false;
             }
@@ -646,6 +648,22 @@ impl Reanalysis {
         if self.needs_stale_check() {
             self.engine.note_stale_diagnostics(db, &stale);
             self.stale = Some(stale);
+        }
+    }
+
+    pub(crate) fn refresh_filed_diagnostics(
+        &mut self,
+        part: &[(derivation::DerivationId, derivation::ViewedReads)],
+        graph: &derivation::ReaderGraph,
+    ) {
+        if let Some(stale) = &mut self.stale {
+            stale.retain(|file| {
+                part.binary_search_by_key(file, |(id, _)| id.file_id)
+                    .ok()
+                    .is_none_or(|index| {
+                        part[index].1.file_revision != Some(graph.file_fact_revision(*file))
+                    })
+            });
         }
     }
 
@@ -891,6 +909,7 @@ fn replace_files(
     scopes: &ScriptedScopes,
     moved: HashSet<derivation::HashedKey>,
 ) -> HashSet<derivation::HashedKey> {
+    let before = engine::Engine::index_before_diagnostic_writes(db);
     let mut touched = moved;
     touched.insert(derivation::HashedKey::new(derivation::FactKey::FileSet));
     let forgetting = crate::profile::PhaseGuard::new("replace: forget derivations");
@@ -912,6 +931,9 @@ fn replace_files(
         )));
         touch_paths(db, *file_id, &mut touched);
         let live = live_files.contains(file_id);
+        if live && db.reader_graph().has_file_diagnostics(*file_id) {
+            engine.check_diagnostics(*file_id);
+        }
         for producer in producers {
             if replaced.contains(&producer.file_id) {
                 continue;
@@ -932,7 +954,7 @@ fn replace_files(
                     .filter(|key| {
                         key.owning_file() == Some(*file_id) && !key.keeps_foreign_contributions()
                     })
-                    .map(|key| format!("{:?}", key.key()))
+                    .map(|key| format!("{key:?}"))
                     .collect::<Vec<_>>();
                 eprintln!("[trace] foreign producer {producer:?} of {file_id:?} for {kept:?}");
             }
@@ -953,7 +975,12 @@ fn replace_files(
         outputs.extend(
             db.reader_graph()
                 .derivations_of_file(*file_id)
-                .flat_map(|id| db.reader_graph().outputs_of(id).cloned()),
+                .flat_map(|id| {
+                    db.reader_graph()
+                        .outputs_of(id)
+                        .cloned()
+                        .map(derivation::HashedKey::new)
+                }),
         );
     }
     // A key read out of a removed output held, before the removal, what its
@@ -976,6 +1003,12 @@ fn replace_files(
         engine.note_removed_output(key, fingerprint);
     }
     let removed = db.reader_graph_mut().remove_files(file_ids);
+    for file_id in file_ids
+        .iter()
+        .filter(|file_id| live_files.contains(file_id))
+    {
+        engine.file_facts_changed(db, *file_id);
+    }
     for (id, outputs) in removed {
         for key in outputs.iter() {
             if key.is_primary() && key.owning_file() != Some(id.file_id) {
@@ -1103,11 +1136,15 @@ fn replace_files(
         crate::progress::advance_current_phase(documented_count, total, "files");
     }
     engine.changed_all(changed);
-    if let Some(edits) = engine.edits_to_apply() {
-        engine.follow_removed_outputs(&edits);
+    let edits = engine.edits_to_apply();
+    if let Some(edits) = &edits {
+        engine.follow_removed_outputs(edits);
         touched = crate::profile::phase("reanalyze: follow edits", || {
-            follow_edits(db, engine, &edits, touched)
+            follow_edits(db, engine, edits, touched)
         });
+    }
+    if let Some(before) = before {
+        engine.compare_diagnostic_writes(db, &before, &touched, edits.as_ref());
     }
     for kind in derive::WORKSPACE_DERIVATIONS {
         let id = derivation::DerivationId::workspace(kind);
@@ -1131,6 +1168,7 @@ fn follow_edits(
     let mut files = edits.files().collect::<Vec<_>>();
     files.sort();
     let mut remapped = Vec::new();
+    let mut lost_owners = std::collections::BTreeSet::new();
     for file_id in files {
         let Some(map) = edits.map(file_id) else {
             continue;
@@ -1162,6 +1200,7 @@ fn follow_edits(
             let keys = lost.iter().map(|fact| &fact.key).collect::<Vec<_>>();
             eprintln!("[trace] remap of {file_id:?} lost positions in {keys:?}");
         }
+        lost_owners.extend(lost.iter().filter_map(|fact| fact.key.owning_file()));
         for id in producers_of_lost(db, file_id, &lost) {
             rerun(engine, id);
         }
@@ -1169,6 +1208,12 @@ fn follow_edits(
     let applied = crate::profile::phase("follow edits: rename reads", || {
         db.reader_graph_mut().apply_edits(edits)
     });
+    lost_owners.extend(applied.lost_owners);
+    for owner in lost_owners {
+        if db.reader_graph().has_file_diagnostics(owner) {
+            engine.file_facts_changed(db, owner);
+        }
+    }
     for reader in applied.lost {
         if crate::profile::tracing_evaluations() {
             eprintln!("[trace] a read of {reader:?} names a destroyed position");

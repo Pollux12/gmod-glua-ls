@@ -62,7 +62,7 @@ pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> Vec<LostFact> {
         .reader_graph()
         .derivations_of_file(remap.file_id)
         .flat_map(|id| db.reader_graph().outputs_of(id))
-        .filter_map(|key| match key.key() {
+        .filter_map(|key| match key {
             FactKey::TypeCache(owner) => Some(owner.to_owner()),
             _ => None,
         })

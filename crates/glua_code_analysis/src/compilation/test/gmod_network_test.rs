@@ -464,7 +464,7 @@ mod test {
         db.reader_graph()
             .derivations_of_file(file_id)
             .filter(|id| matches!(id.kind, DerivationKind::NetCall | DerivationKind::NetFlows))
-            .flat_map(|id| db.reader_graph().reads_of(id).map(|key| key.key().clone()))
+            .flat_map(|id| db.reader_graph().reads_of(id).cloned())
             .collect()
     }
 
@@ -576,7 +576,7 @@ end
             let mut reads = db
                 .reader_graph()
                 .reads_of(id)
-                .map(|key| format!("{:?}", key.key()))
+                .map(|key| format!("{key:?}"))
                 .collect::<Vec<_>>();
             reads.sort();
             let network = db.get_gmod_network_index();

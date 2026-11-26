@@ -218,9 +218,20 @@ impl LuaCompilation {
             if let Some(files) = reanalysis.stale_check_files() {
                 // Checked off the lock, which every freshness question takes.
                 drop(session);
-                let stale = crate::profile::phase("reanalyze: stale diagnostics", || {
+                let mut stale = crate::profile::phase("reanalyze: stale diagnostics", || {
                     analyzer::stale_among(&self.db, files)
                 });
+                let diagnosed = self
+                    .diagnosed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let graph = self.db.reader_graph();
+                stale.retain(|file| {
+                    diagnosed.get(file).is_none_or(|reads| {
+                        reads.file_revision != Some(graph.file_fact_revision(*file))
+                    })
+                });
+                drop(diagnosed);
                 if let Some(reanalysis) = self.session().as_mut() {
                     reanalysis.keep_stale(&self.db, stale);
                 }
@@ -333,7 +344,7 @@ impl LuaCompilation {
         let mut keys = graph
             .derivations()
             .filter(|id| id.kind == DerivationKind::Diagnostics)
-            .flat_map(|id| graph.reads_of(id).map(|key| key.key().clone()))
+            .flat_map(|id| graph.reads_of(id).cloned())
             .collect::<Vec<_>>();
         let diagnosed = self
             .diagnosed
@@ -366,10 +377,12 @@ impl LuaCompilation {
         let result = diagnose();
         drop(viewed);
         // Fingerprints the engine took stand while nothing writes.
-        let recorded = derivation::end();
+        let mut recorded = derivation::end();
         if result.is_some() {
-            let reads = recorded
-                .into_viewed_reads(self.db.reader_graph(), |key| self.db.fact_fingerprint(key));
+            let graph = self.db.reader_graph();
+            recorded.elide_diagnostic_reads(graph);
+            let mut reads = recorded.into_viewed_reads(graph, |key| self.db.fact_fingerprint(key));
+            reads.file_revision = Some(graph.file_fact_revision(file_id));
             self.diagnosed
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -419,6 +432,13 @@ impl LuaCompilation {
         let _filing = crate::profile::PhaseGuard::new("diagnostic reads part");
         let more = !diagnosed.is_empty();
         let graph = self.db.reader_graph_mut();
+        if let Some(reanalysis) = self
+            .reanalysis
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            reanalysis.refresh_filed_diagnostics(&part, graph);
+        }
         if more {
             graph.file_viewed_part(part);
         } else {

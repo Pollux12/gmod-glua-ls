@@ -67,7 +67,7 @@ impl EditMaps {
         Self::new(maps)
     }
 
-    fn inverse(&self) -> Self {
+    pub(crate) fn inverse(&self) -> Self {
         Self {
             maps: self
                 .maps

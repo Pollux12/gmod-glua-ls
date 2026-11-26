@@ -34,6 +34,30 @@ fn encode_varint_buf(mut v: u32, buf: &mut [u8; 5]) -> usize {
     n + 1
 }
 
+#[inline]
+fn decode_varint(input: &mut &[u8]) -> u32 {
+    let bytes = *input;
+    let b0 = bytes[0];
+    if b0 < 0x80 {
+        *input = &bytes[1..];
+        return u32::from(b0);
+    }
+    let mut delta = u32::from(b0 & 0x7f);
+    let mut shift = 7u32;
+    let mut i = 1usize;
+    loop {
+        let b = bytes[i];
+        i += 1;
+        delta |= u32::from(b & 0x7f) << shift;
+        if b < 0x80 {
+            break;
+        }
+        shift += 7;
+    }
+    *input = &bytes[i..];
+    delta
+}
+
 fn encode_sorted(vals: impl Iterator<Item = u32>, out: &mut Vec<u8>) -> u32 {
     let mut prev = 0u32;
     let mut count = 0u32;
@@ -81,33 +105,10 @@ impl Iterator for DeltaVarintIter<'_> {
 
     #[inline]
     fn next(&mut self) -> Option<u32> {
-        let bytes = self.bytes;
-        if bytes.is_empty() {
+        if self.bytes.is_empty() {
             return None;
         }
-        let b0 = bytes[0];
-        if b0 < 0x80 {
-            self.bytes = &bytes[1..];
-            self.prev = self.prev.wrapping_add(u32::from(b0));
-            if self.remaining != u32::MAX && self.remaining > 0 {
-                self.remaining -= 1;
-            }
-            return Some(self.prev);
-        }
-        let mut delta = u32::from(b0 & 0x7f);
-        let mut shift = 7u32;
-        let mut i = 1usize;
-        loop {
-            let b = bytes[i];
-            i += 1;
-            delta |= u32::from(b & 0x7f) << shift;
-            if b < 0x80 {
-                break;
-            }
-            shift += 7;
-        }
-        self.bytes = &bytes[i..];
-        self.prev = self.prev.wrapping_add(delta);
+        self.prev = self.prev.wrapping_add(decode_varint(&mut self.bytes));
         if self.remaining != u32::MAX && self.remaining > 0 {
             self.remaining -= 1;
         }
@@ -129,72 +130,93 @@ impl Iterator for DeltaVarintIter<'_> {
 /// The fingerprint a read saw is the reader group the derivation sits in on
 /// the key ([`Readers`]).
 #[derive(Debug, Clone, Default)]
-struct Record {
-    /// Delta-varint encoded sorted reads, followed by delta-varint encoded sorted outputs.
-    bytes: Box<[u8]>,
-    reads_bytes: u32,
-    read_count: u32,
-}
+struct Record(Box<[u8]>);
+
+const _: () = assert!(std::mem::size_of::<Record>() == 16);
 
 impl Record {
     fn new(reads: impl ExactSizeIterator<Item = KeyIdx>, outputs: &[KeyIdx]) -> Self {
-        let mut bytes = Vec::with_capacity((reads.len() + outputs.len()) * 2);
-        let read_count = encode_sorted(reads, &mut bytes);
-        let reads_bytes = u32::try_from(bytes.len()).expect("fewer than 2^32 record read bytes");
-        encode_sorted(outputs.iter().copied(), &mut bytes);
-        Self {
-            bytes: bytes.into_boxed_slice(),
-            reads_bytes,
-            read_count,
+        Self::encode(reads, outputs, &[])
+    }
+
+    fn encode(
+        reads: impl ExactSizeIterator<Item = KeyIdx>,
+        outputs: &[KeyIdx],
+        encoded_outputs: &[u8],
+    ) -> Self {
+        if reads.len() == 0 && outputs.is_empty() && encoded_outputs.is_empty() {
+            return Self::default();
         }
+        let mut bytes =
+            Vec::with_capacity(2 + (reads.len() + outputs.len()) * 2 + encoded_outputs.len());
+        bytes.extend_from_slice(&[0, 0]);
+        let read_count = encode_sorted(reads, &mut bytes);
+        let reads_end = bytes.len();
+        bytes.extend_from_slice(encoded_outputs);
+        encode_sorted(outputs.iter().copied(), &mut bytes);
+
+        let reads_bytes = u32::try_from(reads_end - 2).expect("fewer than 2^32 record read bytes");
+        let (mut length, mut count) = ([0; 5], [0; 5]);
+        let length_len = encode_varint_buf(reads_bytes, &mut length);
+        let count_len = encode_varint_buf(read_count, &mut count);
+        let header_len = length_len + count_len;
+        if header_len > 2 {
+            let len = bytes.len();
+            bytes.resize(len + header_len - 2, 0);
+            bytes.copy_within(2..len, header_len);
+        }
+        bytes[..length_len].copy_from_slice(&length[..length_len]);
+        bytes[length_len..header_len].copy_from_slice(&count[..count_len]);
+        Self(bytes.into_boxed_slice())
+    }
+
+    fn parts(&self) -> (u32, &[u8], &[u8]) {
+        if self.0.is_empty() {
+            return (0, &[], &[]);
+        }
+        let mut bytes = self.0.as_ref();
+        let reads_bytes = decode_varint(&mut bytes);
+        let read_count = decode_varint(&mut bytes);
+        let (reads, outputs) = bytes.split_at(reads_bytes as usize);
+        (read_count, reads, outputs)
     }
 
     fn reads(&self) -> DeltaVarintIter<'_> {
-        DeltaVarintIter::new(&self.bytes[..self.reads_bytes as usize], self.read_count)
+        let (count, reads, _) = self.parts();
+        DeltaVarintIter::new(reads, count)
     }
 
     fn reads_len(&self) -> usize {
-        self.read_count as usize
+        self.parts().0 as usize
     }
 
     fn outputs(&self) -> DeltaVarintIter<'_> {
-        DeltaVarintIter::new(&self.bytes[self.reads_bytes as usize..], u32::MAX)
+        DeltaVarintIter::new(self.parts().2, u32::MAX)
     }
 
     fn heap_bytes(&self) -> usize {
-        self.bytes.len()
+        self.0.len()
     }
 
     #[cfg(test)]
     fn bytes_ptr(&self) -> *const u8 {
-        self.bytes.as_ptr()
+        self.0.as_ptr()
     }
 
-    /// This record with `reads` in place of its reads.
     fn with_reads(&self, reads: &[KeyIdx]) -> Self {
-        let old_outputs = &self.bytes[self.reads_bytes as usize..];
-        let mut bytes = Vec::with_capacity(reads.len() * 2 + old_outputs.len());
-        let read_count = encode_sorted(reads.iter().copied(), &mut bytes);
-        let reads_bytes = u32::try_from(bytes.len()).expect("fewer than 2^32 record read bytes");
-        bytes.extend_from_slice(old_outputs);
-        Self {
-            bytes: bytes.into_boxed_slice(),
-            reads_bytes,
-            read_count,
-        }
+        Self::encode(reads.iter().copied(), &[], self.parts().2)
     }
 
-    /// This record with `outputs` in place of its outputs.
     fn with_outputs(&self, outputs: &[KeyIdx]) -> Self {
-        let old_reads = &self.bytes[..self.reads_bytes as usize];
-        let mut bytes = Vec::with_capacity(old_reads.len() + outputs.len() * 2);
-        bytes.extend_from_slice(old_reads);
-        encode_sorted(outputs.iter().copied(), &mut bytes);
-        Self {
-            bytes: bytes.into_boxed_slice(),
-            reads_bytes: self.reads_bytes,
-            read_count: self.read_count,
+        let (_, reads, old_outputs) = self.parts();
+        if reads.is_empty() {
+            return Self::new(std::iter::empty(), outputs);
         }
+        let retained = self.0.len() - old_outputs.len();
+        let mut bytes = Vec::with_capacity(retained + outputs.len() * 2);
+        bytes.extend_from_slice(&self.0[..retained]);
+        encode_sorted(outputs.iter().copied(), &mut bytes);
+        Self(bytes.into_boxed_slice())
     }
 }
 
@@ -275,14 +297,14 @@ impl Clone for FpSlot {
 /// while the slot is free.
 #[derive(Debug, Clone)]
 struct KeySlot {
-    key: Option<HashedKey>,
+    key: Option<FactKey>,
     readers: Readers,
     /// The key's first producer ([`NO_PRODUCER`]: none) in the bits under
     /// [`MORE_PRODUCERS`], [`WINDOWED`] and [`HELD`].
     marks: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<KeySlot>() == 56);
+const _: () = assert!(std::mem::size_of::<KeySlot>() == 48);
 
 impl KeySlot {
     fn producer(&self) -> DerivIdx {
@@ -307,9 +329,7 @@ impl KeySlot {
 
     /// Whether the key is a query's output.
     fn is_query(&self) -> bool {
-        self.key
-            .as_ref()
-            .is_some_and(|key| key.key().is_query_output())
+        self.key.as_ref().is_some_and(FactKey::is_query_output)
     }
 }
 
@@ -343,7 +363,7 @@ mod query_presence_tests {
 
     #[test]
     fn parallel_transport_query_slot_width_clone_and_recycle() {
-        assert_eq!(std::mem::size_of::<KeySlot>(), 56);
+        assert_eq!(std::mem::size_of::<KeySlot>(), 48);
         let mut graph = ReaderGraph::default();
         let query = HashedKey::new(FactKey::CallbackParams(LuaSignatureId::new(
             FileId::new(1),
@@ -375,7 +395,11 @@ mod query_presence_tests {
         super::super::note_read(|| fact.key().clone());
         let evaluation = super::super::end();
         evaluation.fingerprint_unlent_reads(&graph, |key| {
-            assert_ne!(key, &query, "a query output was fingerprinted off the root");
+            assert_ne!(
+                key,
+                query.key(),
+                "a query output was fingerprinted off the root"
+            );
             17
         });
         assert_eq!(
@@ -1111,6 +1135,8 @@ struct DerivSlot {
     record: Option<Record>,
 }
 
+const _: () = assert!(std::mem::size_of::<DerivSlot>() == 32);
+
 /// The reader graph: for every derivation the facts its last evaluation read
 /// (with the fingerprint it saw) and the facts it produced, plus the reverse
 /// edges from a fact to its readers and producers.
@@ -1301,7 +1327,7 @@ impl KeyTable {
         }
     }
 
-    pub(super) fn live_key(&self, slot: KeyIdx) -> Option<&HashedKey> {
+    pub(super) fn live_key(&self, slot: KeyIdx) -> Option<&FactKey> {
         self.keys.get(slot as usize)?.key.as_ref()
     }
 
@@ -1311,16 +1337,15 @@ impl KeyTable {
         matches: impl FnOnce(&FactKey) -> bool,
     ) -> Option<KeyIdx> {
         let entry = self.keys.get(slot as usize)?;
-        entry
-            .key
-            .as_ref()
-            .filter(|key| matches(key.key()))
-            .map(|_| slot)
+        entry.key.as_ref().filter(|key| matches(key)).map(|_| slot)
     }
 
     /// The slot `key` is interned to.
     pub(super) fn find(&self, key: &HashedKey) -> Option<KeyIdx> {
-        let half = FiledKey::half(key);
+        self.find_half(key.key(), FiledKey::half(key))
+    }
+
+    fn find_half(&self, key: &FactKey, half: u32) -> Option<KeyIdx> {
         self.key_slots
             .find(FiledKey::index_hash(half), |filed| {
                 filed.hash == half && self.keys[filed.slot as usize].key.as_ref() == Some(key)
@@ -1329,8 +1354,8 @@ impl KeyTable {
     }
 
     /// Unfiles the live `slot`, whose key is `key`.
-    fn unfile(&mut self, key: &HashedKey, slot: KeyIdx) {
-        let index_hash = FiledKey::index_hash(FiledKey::half(key));
+    fn unfile(&mut self, key: &FactKey, slot: KeyIdx) {
+        let index_hash = FiledKey::index_hash(HashedKey::hash_fact(key) as u32);
         if let Ok(entry) = self
             .key_slots
             .find_entry(index_hash, |filed| filed.slot == slot)
@@ -1394,7 +1419,7 @@ impl KeyTable {
                 positional.entry(file_id).or_default().insert(slot);
             }
         }
-        entry.key = Some(key);
+        entry.key = Some(key.key);
         if !self.stamps.is_empty() || now != 0 {
             self.stamps
                 .resize_with(self.keys.len(), SlotStamps::default);
@@ -1421,7 +1446,7 @@ impl KeyTable {
         (slot, Some(base))
     }
 
-    pub(super) fn key(&self, slot: KeyIdx) -> &HashedKey {
+    pub(super) fn key(&self, slot: KeyIdx) -> &FactKey {
         self.keys[slot as usize]
             .key
             .as_ref()
@@ -1589,7 +1614,7 @@ impl KeyTable {
             let Some(key) = entry.key.as_ref() else {
                 continue;
             };
-            if key.base().is_some() || !unchanged(key) {
+            if key.base().is_some() || !unchanged(&HashedKey::new(key.clone())) {
                 continue;
             }
             self.stamps[*slot as usize].written = *before;
@@ -1633,7 +1658,7 @@ impl KeyTable {
             let Some(key) = entry.key.as_ref() else {
                 continue;
             };
-            if key.base().is_some() || !unchanged(key) {
+            if key.base().is_some() || !unchanged(&HashedKey::new(key.clone())) {
                 continue;
             }
             self.stamps[*slot as usize].written = *before;
@@ -1823,6 +1848,7 @@ pub struct AppliedEdits {
     /// The keys whose reads moved, each read still holding the fingerprint
     /// it saw before the edits.
     pub moved: Vec<HashedKey>,
+    pub lost_owners: Vec<FileId>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1844,9 +1870,30 @@ pub struct ReaderGraph {
     /// Slots [`Self::file_viewed_part`] left unreferenced, kept until every
     /// viewed record naming the graph as it stood is filed.
     held_releases: Vec<KeyIdx>,
+    file_fact_revisions: FxHashMap<FileId, u64>,
+    next_file_fact_revision: u64,
+    diagnosed_file_revisions: FxHashMap<FileId, u64>,
 }
 
 impl ReaderGraph {
+    pub(crate) fn file_fact_revision(&self, file_id: FileId) -> u64 {
+        self.file_fact_revisions.get(&file_id).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn bump_file_fact_revision(&mut self, file_id: FileId) {
+        self.next_file_fact_revision += 1;
+        self.file_fact_revisions
+            .insert(file_id, self.next_file_fact_revision);
+    }
+
+    pub(crate) fn has_diagnostics(&self) -> bool {
+        !self.diagnosed_file_revisions.is_empty()
+    }
+
+    pub(crate) fn has_file_diagnostics(&self, file_id: FileId) -> bool {
+        self.diagnosed_file_revisions.contains_key(&file_id)
+    }
+
     pub(crate) fn quarantine_releases(&mut self) -> super::ReleaseQuarantine {
         self.table.quarantine_releases()
     }
@@ -1942,7 +1989,7 @@ impl ReaderGraph {
             + derivation_maps;
         let mut by_variant =
             FxHashMap::<std::mem::Discriminant<FactKey>, (usize, &FactKey)>::default();
-        for key in table.keys.iter().filter_map(|slot| slot.key.as_deref()) {
+        for key in table.keys.iter().filter_map(|slot| slot.key.as_ref()) {
             by_variant
                 .entry(std::mem::discriminant(key))
                 .or_insert((0, key))
@@ -2027,7 +2074,7 @@ impl ReaderGraph {
     pub fn current_fingerprint(
         &self,
         key: &HashedKey,
-        fingerprint: impl FnOnce(&HashedKey) -> Fingerprint,
+        fingerprint: impl FnOnce(&FactKey) -> Fingerprint,
     ) -> Fingerprint {
         match self.table.find(key) {
             Some(slot) => self.slot_fingerprint(slot, fingerprint),
@@ -2040,7 +2087,7 @@ impl ReaderGraph {
     pub(crate) fn slot_fingerprint(
         &self,
         slot: KeyIdx,
-        fingerprint: impl FnOnce(&HashedKey) -> Fingerprint,
+        fingerprint: impl FnOnce(&FactKey) -> Fingerprint,
     ) -> Fingerprint {
         let Some(fp) = self.table.fp_cache.get(slot as usize) else {
             return fingerprint(self.key(slot));
@@ -2082,7 +2129,7 @@ impl ReaderGraph {
             .and_then(|slot| self.table.derived.get(&slot))
             .into_iter()
             .flat_map(|derived| &derived.slots)
-            .map(|slot| self.key(*slot).clone())
+            .map(|slot| HashedKey::new(self.key(*slot).clone()))
             .collect()
     }
 
@@ -2110,7 +2157,7 @@ impl ReaderGraph {
         derived
             .slots
             .iter()
-            .map(|slot| self.key(*slot).clone())
+            .map(|slot| HashedKey::new(self.key(*slot).clone()))
             .collect()
     }
 
@@ -2151,7 +2198,7 @@ impl ReaderGraph {
     }
 
     /// Every key whose fingerprint is cached, with it.
-    pub fn cached_fingerprints(&self) -> impl Iterator<Item = (&HashedKey, Fingerprint)> {
+    pub fn cached_fingerprints(&self) -> impl Iterator<Item = (&FactKey, Fingerprint)> {
         self.table
             .keys
             .iter()
@@ -2170,7 +2217,7 @@ impl ReaderGraph {
         id: DerivationId,
         reads: Vec<(HashedKey, Option<Fingerprint>)>,
         outputs: Vec<HashedKey>,
-        fingerprint: impl Fn(&HashedKey) -> Fingerprint,
+        fingerprint: impl Fn(&FactKey) -> Fingerprint,
     ) -> Vec<HashedKey> {
         let now = super::new_stamp();
         let slots = reads
@@ -2224,6 +2271,12 @@ impl ReaderGraph {
         let records = records
             .into_iter()
             .map(|(id, reads)| {
+                if id.kind == DerivationKind::Diagnostics {
+                    let revision = reads
+                        .file_revision
+                        .unwrap_or_else(|| self.file_fact_revision(id.file_id));
+                    self.diagnosed_file_revisions.insert(id.file_id, revision);
+                }
                 let (mut slots, keys) = reads.into_parts();
                 slots.extend(
                     keys.into_iter()
@@ -2268,11 +2321,11 @@ impl ReaderGraph {
         id: DerivationId,
         slots: Vec<(KeyIdx, Option<Fingerprint>)>,
         outputs: Vec<HashedKey>,
-        fingerprint: impl Fn(&HashedKey) -> Fingerprint,
+        fingerprint: impl Fn(&FactKey) -> Fingerprint,
         released: &mut Vec<KeyIdx>,
         now: u64,
     ) -> Vec<HashedKey> {
-        let output_set = outputs.iter().collect::<FxHashSet<_>>();
+        let output_set = outputs.iter().map(HashedKey::key).collect::<FxHashSet<_>>();
         let (reads, dropped_reads) = kept_reads(
             id,
             slots,
@@ -2433,7 +2486,7 @@ impl ReaderGraph {
         let dropped = dropped
             .into_iter()
             .map(|key| {
-                let fact = self.key(key).clone();
+                let fact = HashedKey::new(self.key(key).clone());
                 self.unproduce(key, deriv, id.file_id);
                 released.push(key);
                 fact
@@ -2460,7 +2513,11 @@ impl ReaderGraph {
         use rayon::prelude::*;
         let derivs = file_ids
             .iter()
-            .filter_map(|file_id| self.by_file.remove(file_id))
+            .filter_map(|file_id| {
+                self.file_fact_revisions.remove(file_id);
+                self.diagnosed_file_revisions.remove(file_id);
+                self.by_file.remove(file_id)
+            })
             .flatten()
             .collect::<Vec<_>>();
         // Each key's readers lose every derivation of the files at once. A key
@@ -2542,7 +2599,7 @@ impl ReaderGraph {
     pub fn warm_reads(
         &self,
         ids: impl Iterator<Item = DerivationId>,
-        fingerprint: impl Fn(&HashedKey) -> Fingerprint + Sync,
+        fingerprint: impl Fn(&FactKey) -> Fingerprint + Sync,
     ) {
         let slots = ids
             .filter_map(|id| self.record(id))
@@ -2554,7 +2611,7 @@ impl ReaderGraph {
     fn warm_slots(
         &self,
         mut slots: Vec<KeyIdx>,
-        fingerprint: impl Fn(&HashedKey) -> Fingerprint + Sync,
+        fingerprint: impl Fn(&FactKey) -> Fingerprint + Sync,
     ) {
         use rayon::prelude::*;
         slots.retain(|slot| !self.table.is_query(*slot));
@@ -2571,15 +2628,22 @@ impl ReaderGraph {
     pub fn is_stale(
         &self,
         id: DerivationId,
-        fingerprint: impl Fn(&HashedKey) -> Fingerprint,
+        fingerprint: impl Fn(&FactKey) -> Fingerprint,
         holds_moved: impl Fn(&HashedKey, Fingerprint) -> bool,
     ) -> bool {
         let Some((deriv, record)) = self.record(id) else {
             return true;
         };
+        if id.kind == DerivationKind::Diagnostics
+            && self.diagnosed_file_revisions.get(&id.file_id)
+                != Some(&self.file_fact_revision(id.file_id))
+        {
+            return true;
+        }
         record.reads().any(|slot| {
             let seen = self.seen(slot, deriv);
-            seen != self.slot_fingerprint(slot, &fingerprint) && !holds_moved(self.key(slot), seen)
+            seen != self.slot_fingerprint(slot, &fingerprint)
+                && !holds_moved(&HashedKey::new(self.key(slot).clone()), seen)
         })
     }
 
@@ -2596,7 +2660,7 @@ impl ReaderGraph {
     }
 
     /// The keys `id` last read.
-    pub fn reads_of(&self, id: DerivationId) -> impl Iterator<Item = &HashedKey> + '_ {
+    pub fn reads_of(&self, id: DerivationId) -> impl Iterator<Item = &FactKey> + '_ {
         self.record(id)
             .into_iter()
             .flat_map(|(_, record)| record.reads())
@@ -2680,7 +2744,7 @@ impl ReaderGraph {
                         .as_ref()
                         .filter(|_| !entry.readers.is_empty() || entry.producer() != NO_PRODUCER)?;
                     match edits.map_key(key) {
-                        Some(moved) if moved == **key => None,
+                        Some(moved) if moved == *key => None,
                         moved => Some((*slot, moved.map(HashedKey::new))),
                     }
                 })
@@ -2690,18 +2754,23 @@ impl ReaderGraph {
         let mut sources = Vec::new();
         let mut new_keys = Vec::new();
         let mut lost = Vec::new();
+        let mut lost_owners = Vec::new();
         for (slot, moved) in mapped {
             match moved {
                 Some(moved) => {
                     sources.push(slot);
                     new_keys.push(moved);
                 }
-                None => lost.extend(
-                    self.table.keys[slot as usize]
-                        .readers
-                        .iter()
-                        .map(|(_, deriv)| self.derivations[deriv as usize].id),
-                ),
+                None => {
+                    let entry = &self.table.keys[slot as usize];
+                    lost_owners.extend(entry.key.as_ref().and_then(FactKey::owning_file));
+                    lost.extend(
+                        entry
+                            .readers
+                            .iter()
+                            .map(|(_, deriv)| self.derivations[deriv as usize].id),
+                    );
+                }
             }
         }
         lost.sort();
@@ -2822,9 +2891,12 @@ impl ReaderGraph {
                 self.table.free_keys.len()
             );
         }
+        lost_owners.sort_unstable();
+        lost_owners.dedup();
         AppliedEdits {
             lost,
             moved: moved_to,
+            lost_owners,
         }
     }
 
@@ -2835,7 +2907,7 @@ impl ReaderGraph {
             .keys
             .iter()
             .filter(|slot| !slot.readers.is_empty())
-            .filter_map(|slot| slot.key.as_deref())
+            .filter_map(|slot| slot.key.as_ref())
     }
 
     /// Every derivation with a record.
@@ -3265,7 +3337,7 @@ impl ReaderGraph {
         self.record(id).is_some()
     }
 
-    pub fn outputs_of(&self, id: DerivationId) -> impl Iterator<Item = &HashedKey> + '_ {
+    pub fn outputs_of(&self, id: DerivationId) -> impl Iterator<Item = &FactKey> + '_ {
         self.record(id)
             .into_iter()
             .flat_map(|(_, record)| record.outputs())
@@ -3273,9 +3345,18 @@ impl ReaderGraph {
     }
 
     pub fn producers(&self, key: &HashedKey) -> impl Iterator<Item = DerivationId> + '_ {
-        self.table
-            .find(key)
-            .into_iter()
+        self.producers_at(self.table.find(key))
+    }
+
+    pub(crate) fn producers_of_fact(
+        &self,
+        key: &FactKey,
+    ) -> impl Iterator<Item = DerivationId> + '_ {
+        self.producers_at(self.table.find_half(key, HashedKey::hash_fact(key) as u32))
+    }
+
+    fn producers_at(&self, slot: Option<KeyIdx>) -> impl Iterator<Item = DerivationId> + '_ {
+        slot.into_iter()
             .flat_map(|slot| self.table.producers(slot))
             .map(|deriv| self.derivations[deriv as usize].id)
     }
@@ -3293,7 +3374,7 @@ impl ReaderGraph {
     pub fn dependent_files(&self) -> FxHashMap<FileId, FxHashSet<FileId>> {
         let mut dependents: FxHashMap<FileId, FxHashSet<FileId>> = FxHashMap::default();
         for slot in self.table.keys.iter() {
-            let Some(owner) = slot.key.as_deref().and_then(FactKey::owning_file) else {
+            let Some(owner) = slot.key.as_ref().and_then(FactKey::owning_file) else {
                 continue;
             };
             for (_, deriv) in slot.readers.iter() {
@@ -3329,7 +3410,7 @@ impl ReaderGraph {
         &self.table
     }
 
-    pub(super) fn key(&self, slot: KeyIdx) -> &HashedKey {
+    pub(super) fn key(&self, slot: KeyIdx) -> &FactKey {
         self.table.key(slot)
     }
 
@@ -3348,7 +3429,8 @@ impl ReaderGraph {
         slots
             .into_iter()
             .map(|slot| {
-                let moved = self.table.written_of(slot) > ended && !reset_before(self.key(slot));
+                let moved = self.table.written_of(slot) > ended
+                    && !reset_before(&HashedKey::new(self.key(slot).clone()));
                 (slot, moved.then_some(super::UNSEEN))
             })
             .collect()
@@ -3536,7 +3618,7 @@ impl ReaderGraph {
         let outputs = record
             .outputs()
             .map(|key| {
-                let fact = self.key(key).clone();
+                let fact = HashedKey::new(self.key(key).clone());
                 self.unproduce(key, deriv, id.file_id);
                 self.release_slots([key], still_read);
                 fact
@@ -3776,7 +3858,7 @@ impl KeyTable {
             .read
             .iter()
             .filter(|slot| self.is_query(**slot))
-            .map(|slot| self.key(*slot).clone())
+            .map(|slot| HashedKey::new(self.key(*slot).clone()))
             .collect()
     }
 
@@ -3806,7 +3888,10 @@ impl KeyTable {
             id,
             slots,
             |slot| self.key(slot),
-            |key| super::contains_hashed(&written, key),
+            |key| {
+                !written.is_empty()
+                    && super::contains_fact(&written, key, HashedKey::hash_fact(key))
+            },
         );
         let mut outputs = Vec::with_capacity(written.len());
         let mut new_outputs = Vec::new();
@@ -3834,8 +3919,8 @@ impl KeyTable {
 fn kept_reads<'a, T>(
     id: DerivationId,
     slots: Vec<(KeyIdx, T)>,
-    key: impl Fn(KeyIdx) -> &'a HashedKey,
-    is_output: impl Fn(&HashedKey) -> bool,
+    key: impl Fn(KeyIdx) -> &'a FactKey,
+    is_output: impl Fn(&FactKey) -> bool,
 ) -> (Vec<(KeyIdx, T)>, Vec<KeyIdx>) {
     let mut dropped = Vec::new();
     let mut reads = Vec::with_capacity(slots.len());
@@ -3972,7 +4057,10 @@ mod tests {
             vec![id(1, 0)]
         );
         assert_eq!(graph.stale_readers(&key(8), |_| false).count(), 0);
-        assert_eq!(graph.reads_of(id(1, 0)).collect::<Vec<_>>(), vec![&key(9)]);
+        assert_eq!(
+            graph.reads_of(id(1, 0)).collect::<Vec<_>>(),
+            vec![key(9).key()]
+        );
     }
 
     #[test]
@@ -4073,7 +4161,10 @@ mod tests {
         );
         graph.release_keys(released);
 
-        assert_eq!(graph.reads_of(id(2, 0)).collect::<Vec<_>>(), vec![&key(9)]);
+        assert_eq!(
+            graph.reads_of(id(2, 0)).collect::<Vec<_>>(),
+            vec![key(9).key()]
+        );
         assert_eq!(graph.reads_of(producer).count(), 0);
     }
 
@@ -4104,7 +4195,10 @@ mod tests {
         );
         graph.release_keys(released);
 
-        assert_eq!(graph.reads_of(id(2, 0)).collect::<Vec<_>>(), vec![&key(9)]);
+        assert_eq!(
+            graph.reads_of(id(2, 0)).collect::<Vec<_>>(),
+            vec![key(9).key()]
+        );
         assert_eq!(graph.producers(&key(9)).count(), 0);
     }
 
@@ -4258,7 +4352,10 @@ mod tests {
             PositionMap::new(&old_text, &new_text),
         )]));
 
-        let mut outputs = graph.outputs_of(id(2, 0)).cloned().collect::<Vec<_>>();
+        let mut outputs = graph
+            .outputs_of(id(2, 0))
+            .map(|key| HashedKey::new(key.clone()))
+            .collect::<Vec<_>>();
         outputs.sort_by_key(|key| format!("{key:?}"));
         let producers = [20, 30, 40].map(|at| graph.producers(&decl(at)).collect::<Vec<_>>());
         assert_eq!(
@@ -4321,7 +4418,7 @@ mod tests {
         assert_eq!(graph.producers(&key(9)).collect::<Vec<_>>(), vec![id(1, 0)]);
         assert_eq!(
             graph.outputs_of(id(1, 0)).collect::<Vec<_>>(),
-            vec![&key(9)]
+            vec![key(9).key()]
         );
     }
 
@@ -4534,11 +4631,7 @@ mod tests {
         let keys = (0..graph.table.keys.len())
             .map(|slot| {
                 let entry = &graph.table.keys[slot];
-                format!(
-                    "{slot} {:?} {:?}",
-                    entry.key.as_ref().map(HashedKey::key),
-                    entry.readers
-                )
+                format!("{slot} {:?} {:?}", entry.key.as_ref(), entry.readers)
             })
             .collect::<Vec<_>>();
         let records = graph
@@ -4608,7 +4701,7 @@ mod tests {
                 continue;
             };
             match edits.map_key(key) {
-                Some(new) if new == **key => {}
+                Some(new) if new == *key => {}
                 Some(new) => renames.push((slot, HashedKey::new(new))),
                 None => lost.extend(
                     entry
@@ -4651,7 +4744,11 @@ mod tests {
         }
         lost.sort();
         lost.dedup();
-        AppliedEdits { lost, moved }
+        AppliedEdits {
+            lost,
+            moved,
+            lost_owners: Vec::new(),
+        }
     }
 
     /// An insertion shifts the declarations after it in chains onto each

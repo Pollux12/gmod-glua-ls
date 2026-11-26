@@ -694,11 +694,15 @@ pub struct HashedKey {
 
 impl HashedKey {
     pub fn new(key: FactKey) -> Self {
-        use std::hash::BuildHasher;
         Self {
-            hash: rustc_hash::FxBuildHasher.hash_one(&key),
+            hash: Self::hash_fact(&key),
             key,
         }
+    }
+
+    fn hash_fact(key: &FactKey) -> u64 {
+        use std::hash::BuildHasher;
+        rustc_hash::FxBuildHasher.hash_one(key)
     }
 
     pub fn key(&self) -> &FactKey {
@@ -1385,6 +1389,8 @@ pub struct DerivationId {
     end: u32,
 }
 
+const _: () = assert!(std::mem::size_of::<DerivationId>() == 16);
+
 impl DerivationId {
     pub fn new(kind: DerivationKind, file_id: FileId, syntax: LuaSyntaxId) -> Self {
         let range = syntax.get_range();
@@ -1639,7 +1645,7 @@ impl Evaluation {
     pub fn fingerprint_unlent_reads(
         &self,
         graph: &ReaderGraph,
-        fingerprint: impl Fn(&HashedKey) -> Fingerprint,
+        fingerprint: impl Fn(&FactKey) -> Fingerprint,
     ) {
         for key in &self.reads {
             if let Some(slot) = graph.find_slot(key)
@@ -1668,7 +1674,7 @@ impl Evaluation {
             if self.staged.contains_key(key) {
                 continue;
             }
-            if !records_read(id, key, |key| contains_hashed(&self.outputs, key)) {
+            if !records_read(id, key, |_| contains_hashed(&self.outputs, key)) {
                 continue;
             }
             self.staged.insert(key.clone(), fingerprint(key));
@@ -1744,12 +1750,21 @@ impl Evaluation {
         (id, slots, reads, outputs)
     }
 
+    pub(crate) fn elide_diagnostic_reads(&mut self, graph: &ReaderGraph) {
+        let file_id = self.id.file_id;
+        let retain = |key: &FactKey| {
+            key.owning_file() != Some(file_id) || matches!(key, FactKey::FilePath(_))
+        };
+        self.reads.retain(|key| retain(key));
+        self.viewed.retain(|slot| retain(graph.key(*slot)));
+    }
+
     /// The reads of an evaluation that viewed `graph` (see [`view_graph`]),
     /// each fingerprinted as it stands.
     pub fn into_viewed_reads(
         mut self,
         graph: &ReaderGraph,
-        fingerprint: impl Fn(&HashedKey) -> Fingerprint,
+        fingerprint: impl Fn(&FactKey) -> Fingerprint,
     ) -> ViewedReads {
         let id = self.id;
         // A key read before the graph was viewed is a slot read if it has one.
@@ -1780,6 +1795,7 @@ impl Evaluation {
             slots,
             seen,
             keys: keys.into_boxed_slice(),
+            file_revision: None,
         }
     }
 
@@ -1800,7 +1816,7 @@ impl Evaluation {
         let reads = self
             .reads
             .drain()
-            .filter(|key| records_read(id, key, |key| contains_hashed(&self.outputs, key)))
+            .filter(|key| records_read(id, key, |_| contains_hashed(&self.outputs, key)))
             .map(|key| {
                 let seen = self
                     .staged
@@ -1825,6 +1841,7 @@ pub struct ViewedReads {
     slots: Box<[KeyIdx]>,
     seen: Box<[Fingerprint]>,
     keys: Box<[(HashedKey, Fingerprint)]>,
+    pub(crate) file_revision: Option<u64>,
 }
 
 impl ViewedReads {
@@ -1834,6 +1851,7 @@ impl ViewedReads {
             slots: Box::default(),
             seen: Box::default(),
             keys: keys.into_boxed_slice(),
+            file_revision: None,
         }
     }
 
@@ -1862,7 +1880,7 @@ impl ViewedReads {
     pub fn keys<'a>(&'a self, graph: &'a ReaderGraph) -> impl Iterator<Item = &'a FactKey> {
         self.slots
             .iter()
-            .map(|slot| graph.key(*slot).key())
+            .map(|slot| graph.key(*slot))
             .chain(self.keys.iter().map(|(key, _)| key.key()))
     }
 }
@@ -1873,8 +1891,8 @@ impl ViewedReads {
 /// before any of its file's derivations.
 pub(crate) fn records_read(
     id: DerivationId,
-    key: &HashedKey,
-    is_output: impl Fn(&HashedKey) -> bool,
+    key: &FactKey,
+    is_output: impl Fn(&FactKey) -> bool,
 ) -> bool {
     let own = key.owning_file() == Some(id.file_id);
     !(key.is_primary() && is_output(key))
@@ -1884,11 +1902,15 @@ pub(crate) fn records_read(
 /// Whether `key` is one of `sorted`, a vec sorted by [`HashedKey`]'s stored
 /// hash and deduplicated.
 fn contains_hashed(sorted: &[HashedKey], key: &HashedKey) -> bool {
-    let start = sorted.partition_point(|probe| probe.hash < key.hash);
+    contains_fact(sorted, key.key(), key.hash)
+}
+
+fn contains_fact(sorted: &[HashedKey], key: &FactKey, hash: u64) -> bool {
+    let start = sorted.partition_point(|probe| probe.hash < hash);
     sorted[start..]
         .iter()
-        .take_while(|probe| probe.hash == key.hash)
-        .any(|probe| probe == key)
+        .take_while(|probe| probe.hash == hash)
+        .any(|probe| probe.key() == key)
 }
 
 thread_local! {
@@ -2412,7 +2434,7 @@ fn record_read(evaluation: &mut Evaluation, key: HashedKey) -> Option<KeyIdx> {
             // its key hash names it again without probing the table's index.
             let seen = evaluation
                 .seen_slots
-                .find(key.hash, |entry| table.live_key(entry.1) == Some(&key))
+                .find(key.hash, |entry| table.live_key(entry.1) == Some(key.key()))
                 .map(|entry| entry.1);
             let slot = match seen {
                 Some(slot) => slot,

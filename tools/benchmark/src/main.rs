@@ -575,6 +575,8 @@ fn load_env_file_beside_exe() {
 /// thread, so each one, like the thread driving the runtime, gets
 /// [`glua_code_analysis::ANALYSIS_STACK_SIZE`], as in the server.
 fn main() {
+    #[cfg(not(feature = "dhat-heap"))]
+    glua_code_analysis::set_analysis_heap_collector(|| collect_thread_heap(true));
     load_env_file_beside_exe();
     std::thread::Builder::new()
         .stack_size(glua_code_analysis::ANALYSIS_STACK_SIZE)
@@ -929,8 +931,10 @@ async fn run() {
         let db = analysis.compilation.get_db_mut();
         let evicted = db.get_vfs_mut().evict_cold_trees(|_| false);
         db.release_fingerprint_cache();
-        drop(evicted);
-        glua_code_analysis::release_analysis_caches_with(|| collect_thread_heap(true));
+        if !evicted.is_empty() {
+            drop(evicted);
+            glua_code_analysis::release_analysis_caches_with(|| collect_thread_heap(true));
+        }
         glua_code_analysis::profile::memory::checkpoint("after evicting cold vfs");
     }
     results.push(BenchmarkResult {

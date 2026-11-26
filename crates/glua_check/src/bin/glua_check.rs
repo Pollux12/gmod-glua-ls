@@ -6,10 +6,15 @@ use std::error::Error;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+unsafe extern "C" {
+    fn mi_collect(force: bool);
+}
+
 /// Analysis recurses over deeply nested syntax and runs on every runtime
 /// thread, so each one, like the thread driving the runtime, gets
 /// [`glua_code_analysis::ANALYSIS_STACK_SIZE`].
 fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
+    glua_code_analysis::set_analysis_heap_collector(|| unsafe { mi_collect(true) });
     std::thread::Builder::new()
         .stack_size(glua_code_analysis::ANALYSIS_STACK_SIZE)
         .spawn(|| {

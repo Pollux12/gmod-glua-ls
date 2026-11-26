@@ -184,12 +184,12 @@ mod test {
             let mut reads = graph
                 .reads_of(id)
                 .zip(graph.recorded_slots(id))
-                .map(|(key, (_, seen))| format!("{:?}={seen:?}", key.key()))
+                .map(|(key, (_, seen))| format!("{key:?}={seen:?}"))
                 .collect::<Vec<_>>();
             reads.sort();
             let mut outputs = graph
                 .outputs_of(id)
-                .map(|key| format!("{:?}", key.key()))
+                .map(|key| format!("{key:?}"))
                 .collect::<Vec<_>>();
             outputs.sort();
             digest.push(format!("{id:?} reads {reads:?} writes {outputs:?}"));

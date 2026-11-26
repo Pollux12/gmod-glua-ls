@@ -1495,7 +1495,6 @@ end
             .get_db()
             .reader_graph()
             .reads_of(DerivationId::workspace(DerivationKind::VguiChains))
-            .map(|key| key.key())
             .collect::<Vec<_>>();
         assert!(
             !reads

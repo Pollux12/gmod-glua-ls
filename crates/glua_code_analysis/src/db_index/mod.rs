@@ -2018,12 +2018,12 @@ mod tests {
         db.reader_graph_mut().intern_read(rule.clone());
         let at_open = db
             .reader_graph()
-            .current_fingerprint(&rule, |key| db.fact_fingerprint(key.key()));
+            .current_fingerprint(&rule, |key| db.fact_fingerprint(key));
 
         db.set_analysis_stage(AnalysisStage::Closed);
         let at_closed = db
             .reader_graph()
-            .current_fingerprint(&rule, |key| db.fact_fingerprint(key.key()));
+            .current_fingerprint(&rule, |key| db.fact_fingerprint(key));
 
         assert_ne!(at_open, db.fact_fingerprint(rule.key()), "the rule moves");
         assert_eq!(at_closed, db.fact_fingerprint(rule.key()));

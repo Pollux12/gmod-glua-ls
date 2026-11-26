@@ -593,6 +593,7 @@ pub(crate) struct Engine {
     held: Parked,
     /// The files whose derivations this engine evaluated.
     evaluated: FxHashSet<crate::FileId>,
+    diagnostic_writes: FxHashSet<HashedKey>,
     /// Where the edits being re-analysed moved positions: a read of a fact
     /// whose value only moved still holds.
     edits: derivation::EditMaps,
@@ -952,7 +953,7 @@ impl Engine {
             return;
         }
         for (key, cached) in db.reader_graph().cached_fingerprints() {
-            let excepted = except.contains(key)
+            let excepted = except.contains(&HashedKey::new(key.clone()))
                 || key
                     .base()
                     .is_some_and(|base| except.contains(&HashedKey::new(base)));
@@ -1052,6 +1053,80 @@ impl Engine {
         &self.stats
     }
 
+    pub(super) fn index_before_diagnostic_writes(db: &DbIndex) -> Option<DbIndex> {
+        if !db.reader_graph().has_diagnostics() {
+            return None;
+        }
+        let mut before = db.fork();
+        before.release_reader_graph();
+        Some(before)
+    }
+
+    pub(super) fn finish_diagnostic_writes(&mut self, db: &mut DbIndex, before: Option<DbIndex>) {
+        let written = std::mem::take(&mut self.diagnostic_writes);
+        if let Some(before) = before {
+            self.compare_diagnostic_writes(db, &before, &written, None);
+        }
+    }
+
+    pub(super) fn compare_diagnostic_writes<'a>(
+        &mut self,
+        db: &mut DbIndex,
+        before: &DbIndex,
+        keys: impl IntoIterator<Item = &'a HashedKey>,
+        edits: Option<&derivation::EditMaps>,
+    ) {
+        let mut changed = BTreeSet::new();
+        let inverse = edits.map(derivation::EditMaps::inverse);
+        for key in keys {
+            let Some(owner) = key.owning_file() else {
+                continue;
+            };
+            if !db.reader_graph().has_file_diagnostics(owner) {
+                continue;
+            }
+            if key.is_query_output() {
+                // Query filing already compared the old and new memo.
+                self.check_diagnostics(owner);
+            } else if !changed.contains(&owner) {
+                let old = before.fact_fingerprint(key);
+                let new = db.fact_fingerprint(key);
+                if old == new {
+                    continue;
+                }
+                if let (Some(edits), Some(inverse)) = (edits, &inverse) {
+                    let mapped = |key: &FactKey| {
+                        derivation::fingerprint_before_edits(edits, || db.fact_fingerprint(key))
+                    };
+                    let old_holds = old == derivation::ABSENT
+                        || edits.map_key(key).is_some_and(|key| old == mapped(&key));
+                    let new_holds = new == derivation::ABSENT
+                        || inverse
+                            .map_key(key)
+                            .is_some_and(|old| before.fact_fingerprint(&old) == mapped(key));
+                    if old_holds && new_holds {
+                        continue;
+                    }
+                }
+                if crate::profile::tracing_evaluations() {
+                    eprintln!("[trace] diagnostics revision of {owner:?} moved by {key:?}");
+                }
+                changed.insert(owner);
+            }
+        }
+        for owner in changed {
+            self.file_facts_changed(db, owner);
+        }
+    }
+
+    pub(super) fn file_facts_changed(&mut self, db: &mut DbIndex, file_id: crate::FileId) {
+        let graph = db.reader_graph_mut();
+        graph.bump_file_fact_revision(file_id);
+        if graph.has_file_diagnostics(file_id) {
+            self.check_diagnostics(file_id);
+        }
+    }
+
     /// Queues the readers of `keys`, and of every key read out of them, whose
     /// recorded fingerprint differs from the current value.
     pub(crate) fn readers_of<'a>(
@@ -1060,6 +1135,13 @@ impl Engine {
         keys: impl IntoIterator<Item = &'a HashedKey>,
     ) {
         let keys = keys.into_iter().collect::<Vec<_>>();
+        if db.reader_graph().has_diagnostics() {
+            self.diagnostic_writes.extend(keys.iter().filter_map(|key| {
+                key.owning_file()
+                    .filter(|owner| db.reader_graph().has_file_diagnostics(*owner))
+                    .map(|_| (*key).clone())
+            }));
+        }
         let found = self.stale_readers_of(db, &keys);
         let derived = self.derived_keys_to_check(db, &keys);
         for (key, readers) in keys.into_iter().zip(found) {
@@ -1528,9 +1610,20 @@ impl Engine {
                     continue;
                 }
                 if self.next_round.is_empty() {
-                    if crate::profile::phase("engine: stage", || self.advance_stage(db)) {
+                    let before = db.analysis_stage();
+                    let advanced =
+                        crate::profile::phase("engine: stage", || self.advance_stage(db));
+                    if before != AnalysisStage::Closed
+                        && db.analysis_stage() == AnalysisStage::Closed
+                        && self.evaluated.len() >= 64
+                    {
+                        recipe.release_all_caches();
+                        crate::purge_analysis_heap();
+                    } else if advanced {
                         recipe.release_all_caches();
                         crate::release_analysis_caches_with(|| {});
+                    }
+                    if advanced {
                         continue;
                     }
                     if slice.yields()
@@ -2224,7 +2317,10 @@ impl Engine {
             let mut produced = FxHashMap::<HashedKey, Vec<DerivationId>>::default();
             for member in &ran {
                 for key in graph.outputs_of(*member) {
-                    produced.entry(key.clone()).or_default().push(*member);
+                    produced
+                        .entry(HashedKey::new(key.clone()))
+                        .or_default()
+                        .push(*member);
                 }
             }
             produced
@@ -2474,12 +2570,7 @@ impl Engine {
         let mut outputs = db
             .reader_graph()
             .outputs_of(member)
-            .map(|key| {
-                (
-                    derivation::fingerprint_of(key.key()),
-                    self.fingerprint(db, key),
-                )
-            })
+            .map(|key| (derivation::fingerprint_of(key), db.fact_fingerprint(key)))
             .collect::<Vec<_>>();
         outputs.sort_unstable();
         let now = derivation::fingerprint_of(&outputs);
@@ -2648,9 +2739,10 @@ impl Engine {
             .reader_graph()
             .reads_of(member)
             .filter_map(|key| {
-                let seen = *self.removed_outputs.get(key)?;
+                let key = HashedKey::new(key.clone());
+                let seen = *self.removed_outputs.get(&key)?;
                 Some(Moved {
-                    key: key.clone(),
+                    key,
                     seen,
                     settled: true,
                 })
@@ -2951,8 +3043,11 @@ impl Engine {
                 .filter(|reader| !members.contains(reader))
                 .chain(sources)
                 .collect::<Vec<_>>();
-            let outputs = upstream.iter().flat_map(|id| graph.outputs_of(*id));
-            graph.readers_downstream(outputs, |_| true)
+            let outputs = upstream
+                .iter()
+                .flat_map(|id| graph.outputs_of(*id).cloned().map(HashedKey::new))
+                .collect::<Vec<_>>();
+            graph.readers_downstream(outputs.iter(), |_| true)
         };
         let loops = loops
             .into_iter()
@@ -3071,7 +3166,12 @@ impl Engine {
         self.stats.loop_members_cleared += members.len();
         let mut touched = FxHashSet::default();
         for member in &members {
-            touched.extend(db.reader_graph().outputs_of(*member).cloned());
+            touched.extend(
+                db.reader_graph()
+                    .outputs_of(*member)
+                    .cloned()
+                    .map(HashedKey::new),
+            );
         }
         self.pending_loops.extend(cleared);
         self.loop_before = touched
@@ -3132,7 +3232,7 @@ impl Engine {
                 for key in graph.reads_of(*member) {
                     let base = key.base().map(HashedKey::new);
                     let closes = graph
-                        .producers(key)
+                        .producers_of_fact(key)
                         .chain(base.iter().flat_map(|base| graph.producers(base)))
                         .any(|producer| producer != *member && members.contains(&producer));
                     if closes {
@@ -3436,10 +3536,12 @@ impl Engine {
             .zip(graph.recorded_slots(id))
             .filter(|(key, (_, seen))| {
                 !key.is_stage_rule()
-                    && *seen != self.fingerprint(db, key)
-                    && (self.edits.is_empty() || *seen != self.fingerprint_before_edits(db, key))
+                    && *seen != db.fact_fingerprint(key)
+                    && (self.edits.is_empty()
+                        || *seen
+                            != self.fingerprint_before_edits(db, &HashedKey::new((*key).clone())))
             })
-            .map(|(key, _)| format!("{:?}", key.key()))
+            .map(|(key, _)| format!("{key:?}"))
             .collect()
     }
 
@@ -3585,7 +3687,7 @@ impl Engine {
         for member in &batch {
             let widened = db.reader_graph().outputs_of(*member).any(|key| {
                 key.is_primary()
-                    && db.reader_graph().producers(key).any(|producer| {
+                    && db.reader_graph().producers_of_fact(key).any(|producer| {
                         producer.kind != DerivationKind::Source && producer != *member
                     })
             });
@@ -3681,7 +3783,7 @@ impl Engine {
         let mut owners = ResetOwners::default();
         for id in &batch {
             for key in db.reader_graph().outputs_of(*id) {
-                owners.note(key.clone(), Some(*id));
+                owners.note(HashedKey::new(key.clone()), Some(*id));
             }
         }
         let profiling = self.stats.profiling();
@@ -3726,10 +3828,7 @@ impl Engine {
                             &snapshot,
                             id,
                             || recipe.compute(db, id),
-                            |key| {
-                                db.reader_graph()
-                                    .current_fingerprint(key, |key| db.fact_fingerprint(key))
-                            },
+                            |key| db.fact_fingerprint(key),
                         )
                     });
                 (
@@ -3746,7 +3845,7 @@ impl Engine {
         for (id, (result, computing)) in batch.iter().zip(computed) {
             let started = profiling.then(std::time::Instant::now);
             let valid = result.evaluation.validate(db.reader_graph(), |key, slot| {
-                if key.key().is_query_output() {
+                if key.is_query_output() {
                     db.queries().ready_fingerprint(key)
                 } else if let Some(slot) = slot {
                     Some(
@@ -3754,12 +3853,12 @@ impl Engine {
                             .slot_fingerprint(slot, |key| db.fact_fingerprint(key)),
                     )
                 } else {
-                    Some(self.fingerprint(db, key))
+                    Some(db.fact_fingerprint(key))
                 }
-            }) && result
-                .evaluation
-                .read_keys(db.reader_graph())
-                .all(|key| !reset.contains(key) || owners.owner(key) == Some(*id));
+            }) && result.evaluation.read_keys(db.reader_graph()).all(|key| {
+                let key = HashedKey::new(key.clone());
+                !reset.contains(&key) || owners.owner(&key) == Some(*id)
+            });
             if profiling {
                 self.stats.parallel_attempts += 1;
             }
@@ -3839,7 +3938,12 @@ impl Engine {
     ) -> FxHashSet<HashedKey> {
         let mut touched = also.clone();
         for member in members {
-            touched.extend(db.reader_graph().outputs_of(*member).cloned());
+            touched.extend(
+                db.reader_graph()
+                    .outputs_of(*member)
+                    .cloned()
+                    .map(HashedKey::new),
+            );
         }
         *self.recomputing.borrow_mut() = touched
             .iter()
@@ -4880,8 +4984,12 @@ fn staleness(
     }
     let fingerprints = db
         .reader_graph()
-        .reads_of(id)
-        .map(|key| current_fingerprint(db, key))
+        .recorded_slots(id)
+        .into_iter()
+        .map(|(slot, _)| {
+            db.reader_graph()
+                .slot_fingerprint(slot, |key| db.fact_fingerprint(key))
+        })
         .collect();
     let moved = db.reader_graph().moved_fingerprints(id, fingerprints);
     if moved.is_empty() {
@@ -4892,8 +5000,8 @@ fn staleness(
         key.follows_edits()
             || key
                 .writer_share(id)
-                .is_some_and(|share| outputs.iter().any(|output| *output.key() == share))
-            || current_fingerprint(db, key) == before(key)
+                .is_some_and(|share| outputs.iter().any(|output| **output == share))
+            || db.fact_fingerprint(key) == before(&HashedKey::new((*key).clone()))
     });
     if holds {
         Staleness::Rebased(moved)
@@ -4992,7 +5100,12 @@ fn evaluate_on_worker(
         let mut reset = FxHashMap::default();
         let mut outputs = discarded.clone();
         for member in group {
-            outputs.extend(db.reader_graph().outputs_of(*member).cloned());
+            outputs.extend(
+                db.reader_graph()
+                    .outputs_of(*member)
+                    .cloned()
+                    .map(HashedKey::new),
+            );
         }
         let recomputing = outputs
             .iter()
@@ -5093,13 +5206,13 @@ fn moved_in_task(
         .zip(graph.recorded_slots(member))
         .filter(|(key, _)| {
             !key.is_stage_rule()
-                && (written.contains(*key)
+                && (written.contains(&HashedKey::new((*key).clone()))
                     || key
                         .base()
                         .is_some_and(|base| written.contains(&HashedKey::new(base))))
         })
         .filter(|(key, (_, seen))| db.fact_fingerprint(key) != *seen)
-        .map(|(key, (_, seen))| (key.clone(), seen))
+        .map(|(key, (_, seen))| (HashedKey::new(key.clone()), seen))
         .collect()
 }
 
@@ -5169,15 +5282,16 @@ fn group_resets(
             if !placed.insert(key) {
                 continue;
             }
-            if position == 0 || shared.contains(key) || discarded.contains(key) {
-                resets.front.insert(key.clone());
+            let key = HashedKey::new(key.clone());
+            if position == 0 || shared.contains(&key) || discarded.contains(&key) {
+                resets.front.insert(key);
             } else if graph
-                .producers(key)
+                .producers(&key)
                 .all(|producer| producer == *member || producer.kind == DerivationKind::Source)
             {
-                resets.own[position].push(key.clone());
+                resets.own[position].push(key);
             } else {
-                resets.joint[position].push(key.clone());
+                resets.joint[position].push(key);
             }
         }
     }
@@ -5298,6 +5412,11 @@ fn file_queries_into(db: &mut DbIndex, released: &mut Vec<derivation::KeyIdx>) -
     let mut records = Vec::with_capacity(filings.len());
     for filing in filings {
         if let Some(key) = filing.moved {
+            if let Some(owner) = key.owning_file()
+                && graph.has_file_diagnostics(owner)
+            {
+                graph.bump_file_fact_revision(owner);
+            }
             graph.forget_fingerprint(&key);
             moved.push(key);
         }
@@ -5350,7 +5469,7 @@ fn widened(db: &DbIndex, group: &[DerivationId]) -> bool {
     group.iter().any(|member| {
         db.reader_graph().outputs_of(*member).any(|key| {
             key.is_primary()
-                && db.reader_graph().producers(key).any(|producer| {
+                && db.reader_graph().producers_of_fact(key).any(|producer| {
                     producer.kind != DerivationKind::Source && !group.contains(&producer)
                 })
         })
@@ -5378,7 +5497,7 @@ fn co_producers(db: &DbIndex, id: DerivationId) -> Vec<DerivationId> {
         for key in graph.outputs_of(member).filter(|key| key.is_primary()) {
             // The source layer is what a reset restores, not a co-producer.
             for producer in graph
-                .producers(key)
+                .producers_of_fact(key)
                 .filter(|producer| producer.kind != DerivationKind::Source)
             {
                 if group.insert(producer) {
@@ -5515,12 +5634,12 @@ mod tests {
             let mut reads = graph
                 .reads_of(id)
                 .zip(graph.recorded_slots(id))
-                .map(|(key, (_, seen))| format!("{:?}={seen:?}", key.key()))
+                .map(|(key, (_, seen))| format!("{key:?}={seen:?}"))
                 .collect::<Vec<_>>();
             reads.sort();
             let mut outputs = graph
                 .outputs_of(id)
-                .map(|key| format!("{:?}", key.key()))
+                .map(|key| format!("{key:?}"))
                 .collect::<Vec<_>>();
             outputs.sort();
             digest.push(format!("{id:?} reads {reads:?} writes {outputs:?}"));
@@ -5636,8 +5755,7 @@ mod tests {
         let readers = graph
             .derivations()
             .filter(|id| {
-                id.kind == DerivationKind::CallTarget
-                    && graph.reads_of(*id).any(|key| *key.key() == read)
+                id.kind == DerivationKind::CallTarget && graph.reads_of(*id).any(|key| *key == read)
             })
             .map(|id| id.file_id)
             .collect::<FxHashSet<_>>()
@@ -6492,6 +6610,68 @@ print(tuned{index})"
         assert_eq!(copied(db), Some(LuaType::IntegerConst(2)));
     }
 
+    fn stale_after_foreign_type_write(value: i64) -> (FileId, Vec<FileId>) {
+        let mut ws = VirtualWorkspace::new();
+        let diagnosed = ws.def_file("lua/autorun/diagnosed.lua", "local value = 1");
+        let writer = ws.def_file("lua/autorun/writer.lua", "return");
+        let owner = LuaTypeOwner::Decl(LuaDeclId::new(diagnosed, TextSize::new(6)));
+        let fact = HashedKey::new(FactKey::type_cache(&owner));
+        let write = |db: &mut DbIndex, value| {
+            db.get_type_index_mut().force_bind_type(
+                owner.clone(),
+                LuaTypeCache::InferType(LuaType::IntegerConst(value)),
+            );
+        };
+        write(ws.get_db_mut(), 1);
+        let compilation = &mut ws.analysis.compilation;
+        compilation.record_diagnostic_reads(diagnosed, || {
+            derivation::note_read(|| fact.key().clone());
+            Some(())
+        });
+        compilation.file_some_diagnostic_reads(1);
+        let db = compilation.get_db_mut();
+        assert_eq!(
+            db.reader_graph()
+                .reads_of(DerivationId::diagnostics(diagnosed))
+                .collect::<Vec<_>>(),
+            vec![&FactKey::FilePath(diagnosed)],
+        );
+
+        let mut engine = Engine::new(derivation::EditMaps::default(), Schedule::Canonical);
+        let before = Engine::index_before_diagnostic_writes(db);
+        let id = DerivationId::new(
+            DerivationKind::LocalStat,
+            writer,
+            LuaSyntaxId::new(LuaSyntaxKind::LocalStat.into(), TextRange::default()),
+        );
+        let _recording = derivation::begin(id);
+        write(db, value);
+        let evaluation = derivation::end();
+        let mut touched = FxHashSet::default();
+        engine.record(
+            db,
+            vec![(evaluation, None)],
+            &mut touched,
+            &FxHashMap::default(),
+            String::new,
+        );
+        engine.readers_of(db, touched.iter());
+        engine.finish_diagnostic_writes(db, before);
+        (diagnosed, engine.stale_diagnostics(db))
+    }
+
+    #[test]
+    fn a_foreign_write_invalidates_diagnostics_with_elided_same_file_reads() {
+        let (file, stale) = stale_after_foreign_type_write(2);
+        assert_eq!(stale, vec![file]);
+    }
+
+    #[test]
+    fn an_identical_foreign_write_leaves_diagnostics_fresh() {
+        let (_, stale) = stale_after_foreign_type_write(1);
+        assert!(stale.is_empty());
+    }
+
     /// A query the evaluations computed is filed with them: a key only its
     /// previous record and an unfiled evaluation read stays live for the
     /// evaluation's record.
@@ -6536,7 +6716,7 @@ print(tuned{index})"
         assert!(
             db.reader_graph()
                 .reads_of(statement(READER))
-                .any(|key| *key == read)
+                .any(|key| key == read.key())
         );
     }
 

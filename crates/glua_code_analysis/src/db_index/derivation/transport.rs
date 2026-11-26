@@ -77,27 +77,28 @@ pub(crate) struct WorkerKeys {
 }
 
 impl WorkerKeys {
-    fn push(&mut self, key: WorkerKey, snapshot: &ReaderGraph) -> u32 {
+    fn push(&mut self, key: WorkerKey, hash: u64, snapshot: &ReaderGraph) -> u32 {
         let local = u32::try_from(self.entries.len()).expect("fewer than 2^32 fact keys");
         self.entries.push(key);
         self.visitation.push(0);
         self.written.push(0);
         self.windowed.push(false);
-        let (stored, query) = match key {
-            WorkerKey::Known(slot) => (snapshot.key(slot), snapshot.keys().is_query(slot)),
-            WorkerKey::New(index) => {
-                let stored = &self.new_keys[index as usize];
-                (stored, stored.key().is_query_output())
-            }
+        let stored = match key {
+            WorkerKey::Known(slot) => snapshot.key(slot),
+            WorkerKey::New(index) => self.new_keys[index as usize].key(),
         };
+        let query = stored.is_query_output();
         let flags = u8::from(self.snapshot_taints(local, snapshot)) | (u8::from(query) << 1);
         self.flags.push(flags);
-        self.hashes.push(stored.hash);
+        self.hashes.push(hash);
         let hashes = &self.hashes;
         self.lookup
-            .insert_unique(stored.hash, local, |local| hashes[*local as usize]);
+            .insert_unique(hash, local, |local| hashes[*local as usize]);
         if !self.awaiting_base.is_empty()
-            && let Some(children) = self.awaiting_base.remove(stored)
+            && let Some(children) = self.awaiting_base.remove(&HashedKey {
+                hash,
+                key: stored.clone(),
+            })
         {
             self.derived.entry(local).or_default().extend(children);
         }
@@ -117,11 +118,11 @@ impl WorkerKeys {
         local
     }
 
-    fn known(&mut self, slot: KeyIdx, snapshot: &ReaderGraph) -> u32 {
+    fn known(&mut self, slot: KeyIdx, hash: u64, snapshot: &ReaderGraph) -> u32 {
         if let Some(local) = self.known.get(&slot) {
             return *local;
         }
-        let local = self.push(WorkerKey::Known(slot), snapshot);
+        let local = self.push(WorkerKey::Known(slot), hash, snapshot);
         self.known.insert(slot, local);
         local
     }
@@ -131,17 +132,18 @@ impl WorkerKeys {
             return local;
         }
         if let Some(slot) = snapshot.find_slot(&key) {
-            return self.known(slot, snapshot);
+            return self.known(slot, key.hash, snapshot);
         }
         let index = u32::try_from(self.new_keys.len()).expect("fewer than 2^32 fact keys");
+        let hash = key.hash;
         self.new_keys.push(key);
-        self.push(WorkerKey::New(index), snapshot)
+        self.push(WorkerKey::New(index), hash, snapshot)
     }
 
     /// The entry `key` has here, without adding one.
     fn find(&self, key: &HashedKey, snapshot: &ReaderGraph) -> Option<u32> {
         self.lookup
-            .find(key.hash, |local| self.key(*local, snapshot) == key)
+            .find(key.hash, |local| self.key(*local, snapshot) == key.key())
             .copied()
     }
 
@@ -158,9 +160,13 @@ impl WorkerKeys {
             None => snapshot.find_slot(key),
         };
         let slot = slot?;
-        let local = self.known(slot, snapshot);
+        let local = self.known(slot, key.hash, snapshot);
         for derived in snapshot.keys().derived_slots(slot) {
-            self.known(*derived, snapshot);
+            self.known(
+                *derived,
+                HashedKey::hash_fact(snapshot.key(*derived)),
+                snapshot,
+            );
         }
         Some(local)
     }
@@ -234,7 +240,7 @@ impl WorkerKeys {
         for (local, before) in &windows {
             self.windowed[*local as usize] = false;
             let key = self.key(*local, snapshot);
-            if key.base().is_some() || !unchanged(key) {
+            if key.base().is_some() || !unchanged(&self.hashed_key(*local, snapshot)) {
                 continue;
             }
             self.written[*local as usize] = *before;
@@ -321,17 +327,24 @@ impl WorkerKeys {
     pub(crate) fn written_keys<'a>(
         &'a self,
         snapshot: &'a ReaderGraph,
-    ) -> impl Iterator<Item = &'a HashedKey> {
+    ) -> impl Iterator<Item = HashedKey> + 'a {
         (0..self.entries.len() as u32)
             .filter(|local| self.written[*local as usize] != 0)
-            .map(|local| self.key(local, snapshot))
-            .chain(&self.unread_writes)
+            .map(|local| self.hashed_key(local, snapshot))
+            .chain(self.unread_writes.iter().cloned())
     }
 
-    pub(crate) fn key<'a>(&'a self, local: u32, snapshot: &'a ReaderGraph) -> &'a HashedKey {
+    pub(crate) fn key<'a>(&'a self, local: u32, snapshot: &'a ReaderGraph) -> &'a super::FactKey {
         match self.entries[local as usize] {
             WorkerKey::Known(slot) => snapshot.key(slot),
-            WorkerKey::New(index) => &self.new_keys[index as usize],
+            WorkerKey::New(index) => self.new_keys[index as usize].key(),
+        }
+    }
+
+    fn hashed_key(&self, local: u32, snapshot: &ReaderGraph) -> HashedKey {
+        HashedKey {
+            hash: self.hashes[local as usize],
+            key: self.key(local, snapshot).clone(),
         }
     }
 
@@ -397,8 +410,8 @@ impl WorkerKeys {
         slot: KeyIdx,
         snapshot: &ReaderGraph,
     ) -> Option<u32> {
-        snapshot.keys().live_key(slot)?;
-        let local = self.known(slot, snapshot);
+        let key = snapshot.keys().live_key(slot)?;
+        let local = self.known(slot, HashedKey::hash_fact(key), snapshot);
         self.log(evaluation, local, snapshot);
         Some(local)
     }

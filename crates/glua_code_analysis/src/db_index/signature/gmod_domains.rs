@@ -1402,12 +1402,7 @@ end
         let reads = db
             .reader_graph()
             .reads_of(scan)
-            .filter(|key| {
-                !matches!(
-                    key.key(),
-                    crate::db_index::derivation::FactKey::ValidGuardName(_)
-                )
-            })
+            .filter(|key| !matches!(key, crate::db_index::derivation::FactKey::ValidGuardName(_)))
             .count();
         assert!(
             reads < 20,

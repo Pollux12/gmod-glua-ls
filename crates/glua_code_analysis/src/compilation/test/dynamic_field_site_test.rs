@@ -167,7 +167,7 @@ e[key] = 4
                 .get_db()
                 .reader_graph()
                 .reads_of(site)
-                .any(|key| *key.key() == x)
+                .any(|key| *key == x)
         };
 
         assert_eq!(

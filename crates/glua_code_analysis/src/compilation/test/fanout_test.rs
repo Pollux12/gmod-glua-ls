@@ -318,7 +318,7 @@ end
             .reads_of(crate::db_index::derivation::DerivationId::workspace(
                 DerivationKind::GmodLoad,
             ))
-            .filter(|key| matches!(key.key(), crate::db_index::derivation::FactKey::FileText(_)))
+            .filter(|key| matches!(key, crate::db_index::derivation::FactKey::FileText(_)))
             .count();
 
         assert_eq!(text_reads, 0);
@@ -1349,7 +1349,7 @@ Registry = {}
         let reads = graph
             .derivations_of_file(reader)
             .flat_map(|id| graph.reads_of(id))
-            .map(|key| key.key().clone())
+            .cloned()
             .collect::<Vec<_>>();
 
         assert!(
@@ -1418,7 +1418,7 @@ Registry = {}
         let text_reads = graph
             .derivations_of_file(reader)
             .flat_map(|id| graph.reads_of(id))
-            .filter(|key| matches!(key.key(), crate::db_index::derivation::FactKey::FileText(_)))
+            .filter(|key| matches!(key, crate::db_index::derivation::FactKey::FileText(_)))
             .count();
 
         assert_eq!(text_reads, 0);
@@ -1972,7 +1972,7 @@ function IsValid(obj) end
             .filter(|id| {
                 graph
                     .reads_of(*id)
-                    .any(|key| matches!(key.key(), FactKey::FileText(read) if *read == file_id))
+                    .any(|key| matches!(key, FactKey::FileText(read) if *read == file_id))
             })
             .map(|id| id.file_id)
             .collect::<Vec<_>>();
