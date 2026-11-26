@@ -1,4 +1,6 @@
 use lsp_server::Message;
+use std::collections::HashSet;
+
 use lsp_types::Uri;
 use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
@@ -17,9 +19,11 @@ use crate::context::EditorDocuments;
 /// bounded: with incremental sync a keystroke burst is one `didChange` per
 /// keystroke, and folding each document's queued changes into one full-text
 /// change keeps the queue at a few entries per open document instead of one
-/// entry per keystroke. A `didClose` supersedes the `didOpen` and `didChange`
-/// notifications queued before it for the same document, and a run of
-/// `didSave` notifications keeps only the last.
+/// entry per keystroke. A `didClose` supersedes the `didOpen` and
+/// `didChange` notifications queued before it for the same document - and,
+/// within the rewrite window, the closes before it, so an open/close
+/// churn loop cannot grow the queue either - and a run of `didSave`
+/// notifications keeps only the last.
 ///
 /// Only the trailing run of document notifications is ever rewritten: every
 /// message before the last queued request stays exactly as the client sent
@@ -31,6 +35,13 @@ pub(super) struct PendingInitQueue {
     /// the `didOpen` text with every queued `didChange` applied, the same
     /// way the replayed notifications will update the editor's documents.
     documents: EditorDocuments,
+    /// Documents whose queued `didChange` notifications include one the
+    /// fold could not take. That raw notification stays in the queue, so
+    /// the next successful fold starts a new chain appended after it
+    /// instead of rewriting the change queued before the failure: replay
+    /// must apply the rejected change before the full-text change that
+    /// recovered from it, or it ends out of sync again.
+    fold_boundaries: HashSet<Uri>,
 }
 
 impl PendingInitQueue {
@@ -38,6 +49,7 @@ impl PendingInitQueue {
         Self {
             messages: Vec::new(),
             documents: EditorDocuments::default(),
+            fold_boundaries: HashSet::new(),
         }
     }
 
@@ -58,7 +70,8 @@ impl PendingInitQueue {
                 };
                 let uri = params.text_document.uri;
                 let window = self.document_window_start();
-                self.remove_document_edits(window, &uri);
+                self.remove_document_entries(window, &uri, false);
+                self.fold_boundaries.remove(&uri);
                 self.documents.open(uri, params.text_document.text);
                 self.messages.push(Message::Notification(notification));
             }
@@ -78,11 +91,21 @@ impl PendingInitQueue {
                     Ok(text) => {
                         let folded = folded_change(&uri, version, text);
                         let mut tail = self.messages.split_off(window);
-                        let folded_position = tail.iter().position(|msg| {
-                            queued_doc(msg).is_some_and(|(method, doc_uri)| {
-                                method == DidChangeTextDocument::METHOD && doc_uri == uri.as_str()
+                        // A change that could not fold broke this document's
+                        // chain: the raw notification stayed in the queue,
+                        // so this fold starts a new chain appended after it
+                        // rather than rewriting the one before the failure.
+                        let chain_broken = self.fold_boundaries.remove(&uri);
+                        let folded_position = if chain_broken {
+                            None
+                        } else {
+                            tail.iter().rposition(|msg| {
+                                queued_doc(msg).is_some_and(|(method, doc_uri)| {
+                                    method == DidChangeTextDocument::METHOD
+                                        && doc_uri == uri.as_str()
+                                })
                             })
-                        });
+                        };
                         match folded_position {
                             Some(position) => tail[position] = folded,
                             None => tail.push(folded),
@@ -91,8 +114,12 @@ impl PendingInitQueue {
                     }
                     // Nothing to fold against: no `didOpen` was ever queued,
                     // or a change the editor text could not take. Keep the
-                    // notification as the client sent it.
-                    Err(_) => self.messages.push(Message::Notification(notification)),
+                    // notification as the client sent it, and mark the
+                    // chain broken for the next change that folds.
+                    Err(_) => {
+                        self.fold_boundaries.insert(uri);
+                        self.messages.push(Message::Notification(notification));
+                    }
                 }
             }
             DidCloseTextDocument::METHOD => {
@@ -104,7 +131,8 @@ impl PendingInitQueue {
                 };
                 let uri = params.text_document.uri;
                 let window = self.document_window_start();
-                self.remove_document_edits(window, &uri);
+                self.remove_document_entries(window, &uri, true);
+                self.fold_boundaries.remove(&uri);
                 self.documents.close(&uri);
                 self.messages.push(Message::Notification(notification));
             }
@@ -145,6 +173,7 @@ impl PendingInitQueue {
     /// Takes every queued message, resetting the per-document fold state.
     pub(super) fn take(&mut self) -> Vec<Message> {
         self.documents = EditorDocuments::default();
+        self.fold_boundaries.clear();
         std::mem::take(&mut self.messages)
     }
 
@@ -158,20 +187,24 @@ impl PendingInitQueue {
         start
     }
 
-    /// Removes the window's queued `didOpen` and `didChange` notifications
-    /// for `uri`. A `didClose` before them stays: closing still has side
-    /// effects of its own, and a `didSave`'s workspace recheck is not
-    /// superseded by a later open or close.
-    fn remove_document_edits(&mut self, window: usize, uri: &Uri) {
+    /// Removes the window's queued document notifications for `uri`.
+    ///
+    /// `didOpen` and `didChange` entries always go: a close or a reopen
+    /// supersedes them. A `didClose` before them stays for a reopen - it
+    /// still runs for its own side effects - but a later close drops it,
+    /// so an open/close churn loop cannot grow the window; a `didSave`'s
+    /// workspace recheck is superseded by neither.
+    fn remove_document_entries(&mut self, window: usize, uri: &Uri, include_closes: bool) {
         let uri = uri.as_str();
         let tail = self.messages.split_off(window);
         self.messages.extend(tail.into_iter().filter(|msg| {
             queued_doc(msg).is_some_and(|(method, doc_uri)| {
                 doc_uri != uri
-                    || !matches!(
-                        method,
-                        DidOpenTextDocument::METHOD | DidChangeTextDocument::METHOD
-                    )
+                    || match method {
+                        DidOpenTextDocument::METHOD | DidChangeTextDocument::METHOD => false,
+                        DidCloseTextDocument::METHOD => !include_closes,
+                        _ => true,
+                    }
             })
         }));
     }
@@ -485,6 +518,73 @@ mod tests {
             queued_changes_of(&messages),
             vec![(2, "b".to_string())],
             "a change with nothing to fold against keeps its own text"
+        );
+    }
+
+    /// A full-text change recovers a document a rejected change left out of
+    /// sync: the recovered fold starts a new chain after the raw change, so
+    /// replay applies the rejection and then the resync, ending in sync with
+    /// the editor's text.
+    #[test]
+    fn a_full_text_resync_after_a_rejected_change_replays_in_sync() {
+        let mut queue = PendingInitQueue::new();
+        queue.queue(open(1, "local a = 1\n"));
+        queue.queue(change(2, Some((0, 6, 0, 7)), "b"));
+        queue.queue(change(3, Some((5, 0, 5, 0)), "x"));
+        queue.queue(change(4, None, "local fixed\n"));
+
+        let messages = queue.take();
+        assert_eq!(
+            methods_of(&messages),
+            vec![
+                "textDocument/didOpen".to_string(),
+                "textDocument/didChange".to_string(),
+                "textDocument/didChange".to_string(),
+                "textDocument/didChange".to_string(),
+            ],
+            "the rejected change stays queued, with the recovered fold after it"
+        );
+
+        // Replay as the real handlers do: each didChange applies to the
+        // editor's documents, a rejected one is reported and skipped.
+        let mut replayed = crate::context::EditorDocuments::default();
+        replayed.open(uri(), "local a = 1\n".to_string());
+        for msg in &messages {
+            let lsp_server::Message::Notification(notification) = msg else {
+                continue;
+            };
+            if notification.method == lsp_types::notification::DidChangeTextDocument::METHOD {
+                let params: DidChangeTextDocumentParams =
+                    serde_json::from_value(notification.params.clone()).unwrap();
+                let _ = replayed.change(&uri(), params.content_changes);
+            }
+        }
+
+        // An empty change returns the current text, and fails when the
+        // document is out of sync: the replay must end in sync, at the
+        // resyncing change's text.
+        assert_eq!(
+            replayed.change(&uri(), Vec::new()),
+            Ok("local fixed\n".to_string()),
+            "the replayed queue must resync the document, not end out of sync"
+        );
+    }
+
+    /// An open/close churn loop for one document leaves the rewrite window
+    /// at one close (and at most one open), not one entry per cycle.
+    #[test]
+    fn open_close_cycles_keep_the_window_bounded() {
+        let mut queue = PendingInitQueue::new();
+        for _ in 0..3 {
+            queue.queue(open(1, "local a = 1\n"));
+            queue.queue(close());
+        }
+
+        let messages = queue.take();
+        assert_eq!(
+            methods_of(&messages),
+            vec!["textDocument/didClose".to_string()],
+            "within the window a new close supersedes the opens and closes queued before it"
         );
     }
 
