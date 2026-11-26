@@ -155,12 +155,15 @@ impl CallSiteParamIndex {
         source: EvidenceSource,
         contributions: Vec<(LuaSignatureId, usize, Option<LuaTypeFact>)>,
     ) {
-        derivation::note_write(|| source.fact_key(file_id));
         let mut slots = self.take_source(file_id, source);
         if contributions.is_empty() {
-            self.refold(slots);
+            if !slots.is_empty() {
+                derivation::note_write(|| source.fact_key(file_id));
+                self.refold(slots);
+            }
             return;
         }
+        derivation::note_write(|| source.fact_key(file_id));
         derivation::note_write(|| FactKey::CallSiteFile(file_id));
         let contributions = contributions
             .into_iter()
@@ -206,9 +209,11 @@ impl CallSiteParamIndex {
     }
 
     fn retract_source(&mut self, file_id: FileId, source: EvidenceSource) {
-        derivation::note_write(|| source.fact_key(file_id));
         let slots = self.take_source(file_id, source);
-        self.refold(slots);
+        if !slots.is_empty() {
+            derivation::note_write(|| source.fact_key(file_id));
+            self.refold(slots);
+        }
     }
 
     /// Re-files `holder` under the files its evidence came to name and no

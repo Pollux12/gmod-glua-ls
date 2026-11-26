@@ -754,7 +754,7 @@ pub(crate) fn evaluate_net_helper(
         &closure,
         &block,
     );
-    if summary != NetHelper::default() {
+    if !summary.calls.is_empty() || !summary.ops.is_empty() || !summary.sends.is_empty() {
         db.set_net_helper(file_id, block.syntax().text_range(), Arc::new(summary));
     }
 }
