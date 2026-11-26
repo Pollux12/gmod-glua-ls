@@ -14,11 +14,10 @@ use crate::handlers::hover::{
     infer_prefix_global_name,
 };
 use glua_code_analysis::{
-    AsyncState, DbIndex, InferGuard, LuaDocDefaultValue, LuaDocParamInfo, LuaDocReturnInfo,
-    LuaFunctionType, LuaMember, LuaMemberOwner, LuaSemanticDeclId, LuaType, RenderLevel,
-    ReturnTypeKind, SemanticDeclLevel, TypeSubstitutor, VariadicType, humanize_type,
-    infer_call_expr_func, infer_self_type, instantiate_doc_function,
-    try_extract_signature_id_from_field,
+    AsyncState, DbIndex, InferGuard, LuaDocDefaultValue, LuaDocReturnInfo, LuaFunctionType,
+    LuaMember, LuaMemberOwner, LuaSemanticDeclId, LuaType, ParamDocs, RenderLevel, ReturnTypeKind,
+    SemanticDeclLevel, TypeSubstitutor, VariadicType, humanize_type, infer_call_expr_func,
+    infer_self_type, instantiate_doc_function, try_extract_signature_id_from_field,
 };
 
 pub fn build_function_hover(
@@ -512,7 +511,7 @@ fn hover_doc_function_type(
     is_local: bool,
     is_field: bool, /* whether it is a class field */
     concrete_owner_type: Option<&LuaType>,
-    param_docs: Option<&HashMap<usize, LuaDocParamInfo>>,
+    param_docs: Option<&ParamDocs>,
     return_docs: Vec<LuaDocReturnInfo>, /* the return values are authoritative here */
 ) -> String {
     let async_label = match func.get_async_state() {
@@ -726,7 +725,7 @@ fn get_signature_hover_docs<'a>(
     db: &'a DbIndex,
     semantic_decl: &LuaSemanticDeclId,
     function_member: Option<&LuaMember>,
-) -> Option<(&'a HashMap<usize, LuaDocParamInfo>, &'a [LuaDocReturnInfo])> {
+) -> Option<(&'a ParamDocs, &'a [LuaDocReturnInfo])> {
     let signature_id = match semantic_decl {
         LuaSemanticDeclId::Signature(signature_id) => Some(*signature_id),
         LuaSemanticDeclId::Member(_) => db
@@ -744,7 +743,7 @@ fn get_signature_hover_docs<'a>(
 fn build_function_param(
     db: &DbIndex,
     func: &LuaFunctionType,
-    param_docs: Option<&HashMap<usize, LuaDocParamInfo>>,
+    param_docs: Option<&ParamDocs>,
     index: usize,
     param: &(String, Option<LuaType>),
     is_method: bool,

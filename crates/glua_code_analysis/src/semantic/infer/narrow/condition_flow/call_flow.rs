@@ -187,7 +187,7 @@ fn get_type_at_call_expr_by_function_type(
             let signature_cast = prefix_signature_id.and_then(|signature_id| {
                 db.get_signature_index()
                     .get(&signature_id)
-                    .and_then(|signature| signature.return_cast.as_ref())
+                    .and_then(|signature| signature.return_cast.as_deref())
                     .map(|cast| (cast, signature_id))
             });
             let return_type = f.get_ret();
@@ -240,7 +240,7 @@ fn get_type_at_call_expr_by_function_type(
             };
 
             let ret = signature.get_return_type();
-            let signature_cast = signature.return_cast.as_ref();
+            let signature_cast = signature.return_cast.as_deref();
             let is_valid_guard =
                 call_prefix_signature_is_valid_guard(db, cache, &call_expr_ref, signature_id);
             let mut type_guard_did_not_apply = false;
@@ -1120,7 +1120,7 @@ fn asserted_type_by_function_type(
     {
         return Some(guard.narrowed_type.clone());
     }
-    let cast = signature.return_cast.as_ref()?;
+    let cast = signature.return_cast.as_deref()?;
     let target = if cast.name == "self" {
         signature_self_target_expr(db, call_expr, id)
     } else {

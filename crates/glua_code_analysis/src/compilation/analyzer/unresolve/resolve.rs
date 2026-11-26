@@ -1765,7 +1765,7 @@ fn collect_signature_special_call_params(
     signature_id: LuaSignatureId,
 ) -> Vec<SpecialCallParamInfo> {
     let mut param_infos = Vec::new();
-    for (idx, param_info) in &signature.param_docs {
+    for (idx, param_info) in signature.param_docs.iter() {
         let is_constructor = param_info.get_attribute_by_name("constructor").is_some();
         let is_base_class = param_info
             .get_attribute_by_name(BASE_CLASS_ATTRIBUTE)
