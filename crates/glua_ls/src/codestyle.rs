@@ -1162,20 +1162,30 @@ mod tests {
         let workspace_root_normalized = normalize_path(&workspace_root);
         fs::create_dir_all(&workspace_root).expect("should create temp formatter workspace");
 
-        // Only this process's files are compared, so other sessions running
-        // on the same machine cannot make the assertion flaky.
+        // Generated names are `{hash}-{pid}-{timestamp}-{attempt}.editorconfig`:
+        // matching this process's exact pid component keeps other sessions'
+        // files out of the comparison, and sorting makes the listing order
+        // irrelevant.
         let generated_dir = std::env::temp_dir()
             .join("gluals")
             .join("formatter")
             .join("generated");
         let pid = std::process::id().to_string();
-        let files_with_this_pid = || match fs::read_dir(&generated_dir) {
-            Ok(entries) => entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.file_name().to_string_lossy().to_string())
-                .filter(|name| name.contains(&pid))
-                .collect::<Vec<_>>(),
-            Err(_) => Vec::new(),
+        let files_with_this_pid = || {
+            let mut names = match fs::read_dir(&generated_dir) {
+                Ok(entries) => entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().to_string())
+                    .filter(|name| {
+                        name.strip_suffix(".editorconfig")
+                            .and_then(|stem| stem.split('-').nth(1))
+                            .is_some_and(|component| component == pid)
+                    })
+                    .collect::<Vec<_>>(),
+                Err(_) => Vec::new(),
+            };
+            names.sort();
+            names
         };
 
         let mut emmyrc = Emmyrc::default();
@@ -1185,8 +1195,10 @@ mod tests {
         remove_code_style(&workspace_root_normalized);
         let before = files_with_this_pid();
         let workspaces = vec![WorkspaceFolder::new(workspace_root.clone(), false)];
-        apply_workspace_code_style(&workspaces, &emmyrc);
-        apply_workspace_code_style(&workspaces, &emmyrc);
+        // Each apply must load the generated style: a failed write would
+        // otherwise make the leak check below pass vacuously.
+        assert!(apply_workspace_code_style(&workspaces, &emmyrc).is_some());
+        assert!(apply_workspace_code_style(&workspaces, &emmyrc).is_some());
         let after = files_with_this_pid();
 
         assert_eq!(
