@@ -151,7 +151,6 @@ impl<'a> FlowBinder<'a> {
 
         let id = FlowId(self.flow_nodes.len() as u32);
         let flow_node = FlowNode {
-            id,
             kind,
             antecedent: None,
         };

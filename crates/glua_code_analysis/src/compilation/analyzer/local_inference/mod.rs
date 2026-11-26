@@ -71,7 +71,7 @@ pub(super) fn stabilize_unknown_locals(
                     .filter(|name| name.get_range() == cell.range)
                     .is_some_and(|name| read_would_error_on_nil(&name))
         });
-        for cell in cells {
+        for cell in &cells {
             let Some(name_expr) = root
                 .covering_element(cell.range)
                 .ancestors()

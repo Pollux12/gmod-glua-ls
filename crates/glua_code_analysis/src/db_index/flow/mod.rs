@@ -1,4 +1,6 @@
 mod flow_node;
+
+use super::SiteList;
 mod flow_tree;
 
 use crate::db_index::cow_shards::{CowCell, CowShards};
@@ -27,7 +29,7 @@ pub struct LuaFlowIndex {
     file_flow_tree: CowCell<HashMap<FileId, FlowTree>>,
     /// [`FlowTree::content_fingerprint`] of each stored tree.
     flow_tree_fingerprints: CowCell<HashMap<FileId, Fingerprint>>,
-    special_call_effects: CowShards<FileId, HashMap<TextSize, Vec<LuaSpecialCallEffect>>>,
+    special_call_effects: CowShards<FileId, HashMap<TextSize, SiteList<LuaSpecialCallEffect>>>,
     /// Every special-call fact installed, by the call site that installed it.
     /// One call-site can install several facts (a synthesized class plus its
     /// super edge, say), and several call-sites can install facts for the same
@@ -256,7 +258,7 @@ impl LuaFlowIndex {
         self.special_call_effects
             .get(file_id)?
             .get(&position)
-            .map(|effects| effects.as_slice())
+            .map(|effects| &**effects)
     }
 
     pub fn special_call_effects(
@@ -332,7 +334,10 @@ impl LuaFlowIndex {
                         effects
                             .iter()
                             .map(|(position, entries)| {
-                                derivation::fingerprint_of(&(derivation::Local(position), entries))
+                                derivation::fingerprint_of(&(
+                                    derivation::Local(position),
+                                    &**entries,
+                                ))
                             })
                             .fold(0u64, u64::wrapping_add)
                             .max(1)
@@ -365,7 +370,7 @@ impl LuaFlowIndex {
                 if effects.is_none() && facts == 0 {
                     return derivation::ABSENT;
                 }
-                derivation::fingerprint_of(&(effects, facts))
+                derivation::fingerprint_of(&(effects.map(|entries| &**entries), facts))
             }
             _ => {
                 debug_assert!(false, "{key:?} is not a flow fact");

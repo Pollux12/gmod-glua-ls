@@ -23,10 +23,11 @@ pub enum FlowAntecedent {
 /// Main flow node structure containing all flow analysis information
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FlowNode {
-    pub id: FlowId,
     pub kind: FlowNodeKind,
     pub antecedent: Option<FlowAntecedent>,
 }
+
+const _: () = assert!(std::mem::size_of::<FlowNode>() == 24);
 
 /// Lightweight hint about which kinds of LHS variables appear in an assignment.
 /// Used to skip non-matching assignments in flow analysis without AST reconstruction.

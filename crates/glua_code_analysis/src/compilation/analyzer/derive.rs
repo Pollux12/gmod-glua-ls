@@ -78,7 +78,9 @@ pub(super) fn syntax_derivations(file_id: FileId, root: &LuaChunk) -> Vec<Deriva
             }
         }
         if let LuaAst::LuaClosureExpr(closure) = &node
-            && closure.get_block().is_some()
+            && closure
+                .get_block()
+                .is_some_and(|block| block.get_stats().next().is_some())
         {
             ids.push(DerivationId::new(
                 DerivationKind::NetHelper,

@@ -27,6 +27,7 @@ mod reference;
 mod schema;
 mod semantic_decl;
 mod signature;
+mod site_list;
 mod traits;
 mod r#type;
 pub(crate) use intern::intern_smol_str;
@@ -75,6 +76,7 @@ pub use reference::*;
 pub use schema::*;
 pub use semantic_decl::*;
 pub use signature::*;
+pub use site_list::SiteList;
 pub use traits::LuaIndex;
 pub use r#type::*;
 

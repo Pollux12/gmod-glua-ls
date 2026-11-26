@@ -200,12 +200,8 @@ mod tests {
             .to_ptr()
     }
 
-    fn node(id: u32, kind: FlowNodeKind, antecedent: Option<FlowAntecedent>) -> FlowNode {
-        FlowNode {
-            id: FlowId(id),
-            kind,
-            antecedent,
-        }
+    fn node(kind: FlowNodeKind, antecedent: Option<FlowAntecedent>) -> FlowNode {
+        FlowNode { kind, antecedent }
     }
 
     fn tree(
@@ -232,19 +228,16 @@ mod tests {
         let first = assignment_ptr("value = 1");
         let second = assignment_ptr("value = 2");
         let nodes = vec![
-            node(0, FlowNodeKind::Start, None),
+            node(FlowNodeKind::Start, None),
             node(
-                1,
                 FlowNodeKind::DeclPosition(decl_id.position),
                 Some(FlowAntecedent::Single(FlowId(0))),
             ),
             node(
-                2,
                 FlowNodeKind::Assignment(first, AssignVarHint::NameOnly),
                 Some(FlowAntecedent::Single(FlowId(1))),
             ),
             node(
-                3,
                 FlowNodeKind::Assignment(second.clone(), AssignVarHint::NameOnly),
                 Some(FlowAntecedent::Single(FlowId(2))),
             ),
@@ -284,22 +277,16 @@ mod tests {
         let left = assignment_ptr("value = 1");
         let right = assignment_ptr("value = 22");
         let nodes = vec![
-            node(0, FlowNodeKind::Start, None),
+            node(FlowNodeKind::Start, None),
             node(
-                1,
                 FlowNodeKind::Assignment(right, AssignVarHint::NameOnly),
                 Some(FlowAntecedent::Single(FlowId(0))),
             ),
             node(
-                2,
                 FlowNodeKind::Assignment(left, AssignVarHint::NameOnly),
                 Some(FlowAntecedent::Single(FlowId(0))),
             ),
-            node(
-                3,
-                FlowNodeKind::BranchLabel,
-                Some(FlowAntecedent::Multiple(0)),
-            ),
+            node(FlowNodeKind::BranchLabel, Some(FlowAntecedent::Multiple(0))),
         ];
         let target = || AssignmentFlowInfo {
             name_targets: vec![AssignmentNameTarget {
@@ -329,9 +316,8 @@ mod tests {
         let file_id = FileId::new(3);
         let decl_id = LuaDeclId::new(file_id, TextSize::new(4));
         let nodes = vec![
-            node(0, FlowNodeKind::Start, None),
+            node(FlowNodeKind::Start, None),
             node(
-                1,
                 FlowNodeKind::DeclPosition(decl_id.position),
                 Some(FlowAntecedent::Single(FlowId(0))),
             ),
@@ -354,14 +340,12 @@ mod tests {
         let decl_id = LuaDeclId::new(file_id, TextSize::new(4));
         let assignment = assignment_ptr("value = 1");
         let nodes = vec![
-            node(0, FlowNodeKind::Start, None),
+            node(FlowNodeKind::Start, None),
             node(
-                1,
                 FlowNodeKind::Assignment(assignment.clone(), AssignVarHint::NameOnly),
                 Some(FlowAntecedent::Single(FlowId(0))),
             ),
             node(
-                2,
                 FlowNodeKind::ClosureEntry(TextSize::new(12)),
                 Some(FlowAntecedent::Single(FlowId(1))),
             ),
@@ -398,19 +382,16 @@ mod tests {
         let decl_id = LuaDeclId::new(file_id, TextSize::new(4));
         let assignment = assignment_ptr("value = 1");
         let nodes = vec![
-            node(0, FlowNodeKind::Start, None),
+            node(FlowNodeKind::Start, None),
             node(
-                1,
                 FlowNodeKind::Assignment(assignment.clone(), AssignVarHint::NameOnly),
                 Some(FlowAntecedent::Single(FlowId(0))),
             ),
             node(
-                2,
                 FlowNodeKind::ClosureEntry(TextSize::new(12)),
                 Some(FlowAntecedent::Single(FlowId(1))),
             ),
             node(
-                3,
                 FlowNodeKind::ClosureEntry(TextSize::new(24)),
                 Some(FlowAntecedent::Single(FlowId(2))),
             ),
@@ -460,7 +441,7 @@ impl AssignmentFlowInfo {
 #[derive(Debug, Clone)]
 pub struct FlowTree {
     decl_bind_expr_ref: HashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
-    flow_nodes: Vec<FlowNode>,
+    flow_nodes: Box<[FlowNode]>,
     multiple_antecedents: Vec<Box<[FlowId]>>,
     // labels: HashMap<LuaClosureId, HashMap<SmolStr, FlowId>>,
     bindings: HashMap<LuaSyntaxId, FlowId>,
@@ -474,10 +455,22 @@ pub struct FlowTree {
     narrowing_capability: FileNarrowingCapability,
 }
 
+struct IndexedFlowNodes<'a>(&'a [FlowNode]);
+
+impl Hash for IndexedFlowNodes<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.len().hash(state);
+        for (index, node) in self.0.iter().enumerate() {
+            FlowId(index as u32).hash(state);
+            node.hash(state);
+        }
+    }
+}
+
 impl FlowTree {
     pub fn new(
         mut decl_bind_expr_ref: HashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
-        mut flow_nodes: Vec<FlowNode>,
+        flow_nodes: Vec<FlowNode>,
         multiple_antecedents: Vec<Vec<FlowId>>,
         // labels: HashMap<LuaClosureId, HashMap<SmolStr, FlowId>>,
         mut bindings: HashMap<LuaSyntaxId, FlowId>,
@@ -487,7 +480,6 @@ impl FlowTree {
         narrowing_capability: FileNarrowingCapability,
     ) -> Self {
         decl_bind_expr_ref.shrink_to_fit();
-        flow_nodes.shrink_to_fit();
         bindings.shrink_to_fit();
         branch_label_info.shrink_to_fit();
         condition_label_entries.shrink_to_fit();
@@ -504,7 +496,7 @@ impl FlowTree {
             .into_boxed_slice();
         Self {
             decl_bind_expr_ref,
-            flow_nodes,
+            flow_nodes: flow_nodes.into_boxed_slice(),
             multiple_antecedents,
             bindings,
             branch_label_info,
@@ -523,7 +515,7 @@ impl FlowTree {
                     .iter()
                     .map(|(decl_id, ptr)| (decl_id, Local(&ptr.syntax_id))),
             ),
-            &self.flow_nodes,
+            IndexedFlowNodes(&self.flow_nodes),
             &self.multiple_antecedents,
             unordered_fingerprint(
                 self.bindings

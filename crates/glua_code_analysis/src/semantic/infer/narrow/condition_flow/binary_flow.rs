@@ -6,7 +6,7 @@ use glua_parser::{
 use rowan::{TextRange, TextSize};
 
 use crate::{
-    DbIndex, FlowNode, FlowTree, InferFailReason, LuaArrayLen, LuaArrayType, LuaInferCache,
+    DbIndex, FlowId, FlowNode, FlowTree, InferFailReason, LuaArrayLen, LuaArrayType, LuaInferCache,
     LuaMemberKey, LuaType, TypeOps, infer_expr,
     semantic::type_check::is_sub_type_of,
     semantic::{
@@ -39,6 +39,7 @@ pub fn get_type_at_binary_expr(
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
+    flow_id: FlowId,
     flow_node: &FlowNode,
     binary_expr: LuaBinaryExpr,
     condition_flow: InferConditionFlow,
@@ -109,6 +110,7 @@ pub fn get_type_at_binary_expr(
             cache,
             root,
             var_ref_id,
+            flow_id,
             flow_node,
             left_expr.clone(),
             right_expr.clone(),
@@ -1559,6 +1561,7 @@ fn try_get_at_and_expr(
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
+    flow_id: FlowId,
     flow_node: &FlowNode,
     left_expr: LuaExpr,
     right_expr: LuaExpr,
@@ -1573,6 +1576,7 @@ fn try_get_at_and_expr(
                 cache,
                 root,
                 var_ref_id,
+                flow_id,
                 flow_node,
                 left_expr,
                 condition_flow,
@@ -1596,6 +1600,7 @@ fn try_get_at_and_expr(
         cache,
         root,
         var_ref_id,
+        flow_id,
         flow_node,
         left_expr,
         condition_flow,
@@ -1609,6 +1614,7 @@ fn try_get_at_and_expr(
         cache,
         root,
         var_ref_id,
+        flow_id,
         flow_node,
         right_expr,
         condition_flow,

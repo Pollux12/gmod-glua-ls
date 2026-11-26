@@ -22,7 +22,11 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::db_index::derivation::{self, Provenance, Reuse};
+use crate::db_index::{
+    derivation::{self, Provenance, Reuse},
+    intern_smol_str,
+};
+use internment::ArcIntern;
 
 /// A function body: its owning file and the body block's range.
 type HelperId = InFiled<TextRange>;
@@ -109,18 +113,26 @@ fn push_template_parts(expr: &LuaExpr, parts: &mut Vec<TemplatePart>) -> Option<
     Some(())
 }
 
+fn positional_args<T>(args: impl Iterator<Item = Option<T>>) -> Vec<Option<T>> {
+    let mut values = Vec::new();
+    for (index, value) in args
+        .enumerate()
+        .filter_map(|(index, value)| Some((index, value?)))
+    {
+        values.resize_with(index, || None);
+        values.push(Some(value));
+    }
+    values
+}
+
 fn arg_templates(call_expr: &LuaCallExpr) -> Vec<Option<StringTemplate>> {
-    call_expr
-        .get_args_list()
-        .map(|args| {
-            let mut templates: Vec<_> = args
-                .get_args()
-                .map(|arg| StringTemplate::of(&arg))
-                .collect();
-            templates.shrink_to_fit();
-            templates
-        })
-        .unwrap_or_default()
+    positional_args(
+        call_expr
+            .get_args_list()
+            .into_iter()
+            .flat_map(|args| args.get_args())
+            .map(|arg| StringTemplate::of(&arg)),
+    )
 }
 
 fn resolve_arg(
@@ -146,7 +158,7 @@ fn helper_bindings(
         .filter_map(|(param_idx, param)| {
             let arg_idx = arg_index(param_idx, helper.colon_define, colon_call)?;
             Some((
-                param.clone()?,
+                param.as_ref()?.as_str().to_owned(),
                 args.get(arg_idx)?.as_ref()?.resolve(caller_bindings)?,
             ))
         })
@@ -290,20 +302,31 @@ struct NetReceiveReads {
 /// One call inside a helper body.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct HelperCall {
-    /// Inside a closure nested in the helper: only reachability sees it.
-    nested: bool,
+    flags: u8,
     role: Option<Box<NetCallRole>>,
     target: Option<HelperId>,
     args: Box<[Option<StringTemplate>]>,
-    /// The functions the call passes, by argument position.
     fn_args: Box<[Option<FnArg>]>,
-    /// Whether the call is written with `:`, passing its receiver first.
-    colon_call: bool,
-    /// A send's recipient snippet.
     send_target: Option<Box<str>>,
-    /// A receive with a literal message name, already indexed where it is.
-    literal_receive: bool,
     receive_reads: Option<Box<NetReceiveReads>>,
+}
+
+impl HelperCall {
+    const NESTED: u8 = 1 << 0;
+    const COLON_CALL: u8 = 1 << 1;
+    const LITERAL_RECEIVE: u8 = 1 << 2;
+
+    fn nested(&self) -> bool {
+        self.flags & Self::NESTED != 0
+    }
+
+    fn colon_call(&self) -> bool {
+        self.flags & Self::COLON_CALL != 0
+    }
+
+    fn literal_receive(&self) -> bool {
+        self.flags & Self::LITERAL_RECEIVE != 0
+    }
 }
 
 /// A `net.Start` .. send transaction written directly in a helper body.
@@ -326,18 +349,31 @@ impl Hash for HelperSend {
 }
 
 /// What a function body contributes to net flows, without its callers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct NetHelper {
     /// Each parameter, by position, named when the body's message or argument
     /// templates read it: a parameter nothing reads binds nothing.
-    params: Vec<Option<String>>,
+    params: Box<[Option<ArcIntern<SmolStr>>]>,
     /// Whether the function is defined with `:`, taking its receiver as `self`.
     colon_define: bool,
     /// Every call in the body, in document order.
-    calls: Vec<HelperCall>,
+    calls: Box<[HelperCall]>,
     /// The payload walk of the whole body.
-    ops: Vec<NetOpItem>,
-    sends: Vec<HelperSend>,
+    ops: Box<[NetOpItem]>,
+    sends: Box<[HelperSend]>,
+}
+
+impl Hash for NetHelper {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.params.len().hash(state);
+        for param in &self.params {
+            param.as_ref().map(|name| name.as_str()).hash(state);
+        }
+        self.colon_define.hash(state);
+        self.calls.hash(state);
+        self.ops.hash(state);
+        self.sends.hash(state);
+    }
 }
 
 impl NetOpItem {
@@ -821,53 +857,42 @@ fn summarize_helper(
     block: &LuaBlock,
 ) -> NetHelper {
     let owner = Some(LuaSignatureId::from_closure(site.file_id, closure));
-    let mut calls = block
+    let mut params = get_closure_param_names(closure)
+        .into_iter()
+        .map(|name| (name, false))
+        .collect::<Vec<_>>();
+    let mut read_params = |template: &StringTemplate| {
+        for name in template.names() {
+            for (param, read) in &mut params {
+                *read |= param == name;
+            }
+        }
+    };
+    let calls = block
         .descendants::<LuaCallExpr>()
-        .map(|call_expr| summarize_helper_call(site, owner, block, &call_expr))
+        .filter_map(|call| summarize_helper_call(site, owner, block, &call, &mut read_params))
         .collect::<Vec<_>>();
     let mut ops = Vec::new();
     op_items(site, owner, block, block.syntax(), &mut ops);
-    let mut sends = helper_sends(site, owner, block);
-    let params = read_params(closure, &calls, &sends);
-    // A call with neither a role nor a target is no net step; only its
-    // arguments could name a parameter, which `params` has read.
-    calls.retain(|call| call.role.is_some() || call.target.is_some());
-    calls.shrink_to_fit();
-    ops.shrink_to_fit();
-    sends.shrink_to_fit();
+    let sends = helper_sends(site, owner, block);
+    for send in &sends {
+        read_params(&send.message);
+    }
+    let params = positional_args(
+        params
+            .into_iter()
+            .map(|(name, read)| read.then(|| intern_smol_str(&name))),
+    );
     let colon_define = owner
         .and_then(|owner| site.db.get_signature_index().get(&owner))
         .is_some_and(|signature| signature.is_colon_define);
     NetHelper {
-        params,
+        params: params.into_boxed_slice(),
         colon_define,
-        calls,
-        ops,
-        sends,
+        calls: calls.into_boxed_slice(),
+        ops: ops.into_boxed_slice(),
+        sends: sends.into_boxed_slice(),
     }
-}
-
-/// `closure`'s parameters by position, named where `calls` and `sends` read
-/// them, without the unread ones at the end.
-fn read_params(
-    closure: &LuaClosureExpr,
-    calls: &[HelperCall],
-    sends: &[HelperSend],
-) -> Vec<Option<String>> {
-    let read = calls
-        .iter()
-        .flat_map(|call| call.args.iter().flatten())
-        .chain(sends.iter().map(|send| &send.message))
-        .flat_map(StringTemplate::names)
-        .collect::<HashSet<_>>();
-    let mut params = get_closure_param_names(closure)
-        .into_iter()
-        .map(|param| read.contains(param.as_str()).then_some(param))
-        .collect::<Vec<_>>();
-    while params.last().is_some_and(Option::is_none) {
-        params.pop();
-    }
-    params
 }
 
 fn summarize_helper_call(
@@ -875,7 +900,15 @@ fn summarize_helper_call(
     owner: Option<LuaSignatureId>,
     block: &LuaBlock,
     call_expr: &LuaCallExpr,
-) -> HelperCall {
+    read_params: &mut impl FnMut(&StringTemplate),
+) -> Option<HelperCall> {
+    let nested = is_call_expr_in_nested_closure(block, call_expr);
+    let args = if nested {
+        Vec::new()
+    } else {
+        arg_templates(call_expr)
+    };
+    args.iter().flatten().for_each(read_params);
     let (role, target) = match site.call(call_expr) {
         Some(crate::db_index::NetCallLookup::TargetOnly(target)) => (None, Some(target)),
         Some(crate::db_index::NetCallLookup::Full(fact)) => {
@@ -883,21 +916,22 @@ fn summarize_helper_call(
         }
         None => (None, None),
     };
+    if role.is_none() && target.is_none() {
+        return None;
+    }
     let mut call = HelperCall {
-        nested: is_call_expr_in_nested_closure(block, call_expr),
+        flags: (u8::from(nested) * HelperCall::NESTED)
+            | (u8::from(call_expr.is_colon_call()) * HelperCall::COLON_CALL),
         role,
         target,
-        args: Box::default(),
+        args: args.into_boxed_slice(),
         fn_args: Box::default(),
-        colon_call: call_expr.is_colon_call(),
         send_target: None,
-        literal_receive: false,
         receive_reads: None,
     };
-    if call.nested {
-        return call;
+    if nested {
+        return Some(call);
     }
-    call.args = arg_templates(call_expr).into_boxed_slice();
     if call.target.is_some() {
         call.fn_args = call_fn_args(site, owner, call_expr).into_boxed_slice();
     }
@@ -910,9 +944,9 @@ fn summarize_helper_call(
             message_idx,
             callback_idx,
         }) => {
-            call.literal_receive =
-                !extract_static_string_arg_values(call_expr, *message_idx).is_empty();
-            if !call.literal_receive {
+            if !extract_static_string_arg_values(call_expr, *message_idx).is_empty() {
+                call.flags |= HelperCall::LITERAL_RECEIVE;
+            } else {
                 let reads = receive_reads(site, owner, call_expr, *callback_idx);
                 if reads.items.is_some() || reads.opaque {
                     call.receive_reads = Some(Box::new(reads));
@@ -921,7 +955,7 @@ fn summarize_helper_call(
         }
         _ => {}
     }
-    call
+    Some(call)
 }
 
 /// The `net.Start` .. send transactions in a helper body. A callback the helper
@@ -1134,18 +1168,13 @@ fn call_fn_args(
     owner: Option<LuaSignatureId>,
     call_expr: &LuaCallExpr,
 ) -> Vec<Option<FnArg>> {
-    let Some(args) = call_expr.get_args_list() else {
-        return Vec::new();
-    };
-    let mut fn_args = args
-        .get_args()
-        .map(|arg| fn_arg(site, owner, &arg))
-        .collect::<Vec<_>>();
-    while fn_args.last().is_some_and(Option::is_none) {
-        fn_args.pop();
-    }
-    fn_args.shrink_to_fit();
-    fn_args
+    positional_args(
+        call_expr
+            .get_args_list()
+            .into_iter()
+            .flat_map(|args| args.get_args())
+            .map(|arg| fn_arg(site, owner, &arg)),
+    )
 }
 
 fn fn_arg(site: &NetFileSite<'_>, owner: Option<LuaSignatureId>, arg: &LuaExpr) -> Option<FnArg> {
@@ -1899,7 +1928,7 @@ fn collect_start_messages(
     }
     active_helpers.push(state_key.0.clone());
     let helper = ctx.helper(&state_key.0);
-    for call in helper.calls.iter().filter(|call| !call.nested) {
+    for call in helper.calls.iter().filter(|call| !call.nested()) {
         match call.role.as_deref() {
             Some(NetCallRole::Start { message_idx }) => {
                 if let Some(message) = resolve_arg(&call.args, *message_idx, &bindings) {
@@ -1916,7 +1945,7 @@ fn collect_start_messages(
                 }
                 let child_helper = ctx.helper(target);
                 let child_bindings =
-                    helper_bindings(&child_helper, &call.args, call.colon_call, &bindings);
+                    helper_bindings(&child_helper, &call.args, call.colon_call(), &bindings);
                 let child_key = (target.clone(), sorted_bindings(&child_bindings));
                 collect_start_messages(
                     ctx,
@@ -2192,7 +2221,7 @@ fn collect_send_bodies(
     for call in helper
         .calls
         .iter()
-        .filter(|call| !call.nested && call.role.is_none())
+        .filter(|call| !call.nested() && call.role.is_none())
     {
         let Some(target) = &call.target else {
             continue;
@@ -2201,8 +2230,14 @@ fn collect_send_bodies(
             continue;
         }
         let child_helper = ctx.helper(target);
-        let child_bindings = helper_bindings(&child_helper, &call.args, call.colon_call, &bindings);
-        let child_fns = helper_fns(&child_helper, &call.fn_args, call.colon_call, &state_key.2);
+        let child_bindings =
+            helper_bindings(&child_helper, &call.args, call.colon_call(), &bindings);
+        let child_fns = helper_fns(
+            &child_helper,
+            &call.fn_args,
+            call.colon_call(),
+            &state_key.2,
+        );
         let child_key = (target.clone(), sorted_bindings(&child_bindings), child_fns);
         collect_send_bodies(
             ctx,
@@ -2368,10 +2403,10 @@ fn helper_receive_body(
         let helper = ctx.helper(&state_key.0);
         let mut direct = Vec::new();
         let mut edges = Vec::new();
-        for call in helper.calls.iter().filter(|call| !call.nested) {
+        for call in helper.calls.iter().filter(|call| !call.nested()) {
             match call.role.as_deref() {
                 Some(NetCallRole::Receive { message_idx, .. }) => {
-                    if call.literal_receive {
+                    if call.literal_receive() {
                         continue;
                     }
                     let Some(message_name) = resolve_arg(&call.args, *message_idx, &bindings)
@@ -2397,9 +2432,13 @@ fn helper_receive_body(
                     }
                     let child_helper = ctx.helper(target);
                     let child_bindings =
-                        helper_bindings(&child_helper, &call.args, call.colon_call, &bindings);
-                    let child_fns =
-                        helper_fns(&child_helper, &call.fn_args, call.colon_call, &state_key.2);
+                        helper_bindings(&child_helper, &call.args, call.colon_call(), &bindings);
+                    let child_fns = helper_fns(
+                        &child_helper,
+                        &call.fn_args,
+                        call.colon_call(),
+                        &state_key.2,
+                    );
                     let child_key = (target.clone(), sorted_bindings(&child_bindings), child_fns);
                     if let Some(child_idx) = discover(
                         ctx,
@@ -2790,7 +2829,7 @@ fn send_walk(db: &DbIndex, helper_id: &HelperId) -> Option<HelperSendAnswer> {
             return;
         }
         let helper = helper_summary(db, helper_id);
-        for call in helper.calls.iter().filter(|call| !call.nested) {
+        for call in helper.calls.iter().filter(|call| !call.nested()) {
             match call.role.as_deref() {
                 Some(NetCallRole::Send(send_kind)) => {
                     sends.push((*send_kind, call.send_target.as_deref().map(str::to_owned)));

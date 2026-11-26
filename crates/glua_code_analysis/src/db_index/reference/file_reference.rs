@@ -1,7 +1,7 @@
 use rowan::{TextRange, TextSize};
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::db_index::LuaDeclId;
+use crate::db_index::{LuaDeclId, SiteList};
 
 #[derive(Debug, Clone)]
 pub struct FileReference {
@@ -37,6 +37,11 @@ impl FileReference {
             .add_cell(decl_ref);
     }
 
+    pub(super) fn shrink_to_fit(&mut self) {
+        self.decl_references.shrink_to_fit();
+        self.references_to_decl.shrink_to_fit();
+    }
+
     pub fn get_decl_references(&self, decl_id: &LuaDeclId) -> Option<&DeclReference> {
         self.decl_references.get(decl_id)
     }
@@ -63,7 +68,7 @@ pub struct DeclReferenceCell {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DeclReference {
-    pub cells: Vec<DeclReferenceCell>,
+    pub cells: SiteList<DeclReferenceCell>,
     pub mutable: bool,
 }
 
@@ -76,7 +81,7 @@ impl Default for DeclReference {
 impl DeclReference {
     pub fn new() -> Self {
         Self {
-            cells: Vec::new(),
+            cells: SiteList::default(),
             mutable: false,
         }
     }

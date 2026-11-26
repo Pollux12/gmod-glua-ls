@@ -483,6 +483,7 @@ fn local_flow_evidence_reaches(
                     &mut semantic_model.get_cache().borrow_mut(),
                     root,
                     var_ref,
+                    current,
                     node,
                 ) {
                     return true;

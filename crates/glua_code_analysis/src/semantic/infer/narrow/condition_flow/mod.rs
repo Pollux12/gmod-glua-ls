@@ -10,7 +10,7 @@ use std::sync::Arc;
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr, LuaNameExpr, LuaUnaryExpr, UnaryOperator};
 
 use crate::{
-    DbIndex, FlowNode, FlowNodeKind, FlowTree, InferFailReason, LuaInferCache,
+    DbIndex, FlowId, FlowNode, FlowNodeKind, FlowTree, InferFailReason, LuaInferCache,
     semantic::infer::{
         InferResult, VarRefId,
         narrow::{
@@ -34,6 +34,7 @@ pub(crate) fn condition_has_concrete_type_evidence(
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
+    flow_id: FlowId,
     flow_node: &FlowNode,
 ) -> bool {
     let (condition, outcome) = match &flow_node.kind {
@@ -58,6 +59,7 @@ pub(crate) fn condition_has_concrete_type_evidence(
         cache,
         root,
         var_ref_id,
+        flow_id,
         flow_node,
         condition.clone(),
         outcome,
@@ -190,6 +192,7 @@ pub fn get_type_at_condition_flow(
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
+    flow_id: FlowId,
     flow_node: &FlowNode,
     condition: LuaExpr,
     condition_flow: InferConditionFlow,
@@ -203,7 +206,7 @@ pub fn get_type_at_condition_flow(
     let config = cache.get_config();
     let key = FlowConditionKey {
         var_ref: var_ref_id.clone(),
-        flow: flow_node.id,
+        flow: flow_id,
         antecedent: flow_node.antecedent.clone(),
         view: (
             config.analysis_phase as u8,
@@ -227,6 +230,7 @@ pub fn get_type_at_condition_flow(
                 fresh,
                 root,
                 var_ref_id,
+                flow_id,
                 flow_node,
                 condition.clone(),
                 condition_flow,
@@ -244,6 +248,7 @@ pub fn get_type_at_condition_flow(
         cache,
         root,
         var_ref_id,
+        flow_id,
         flow_node,
         condition,
         condition_flow,
@@ -270,6 +275,7 @@ fn get_type_at_condition_flow_uncached(
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
+    flow_id: FlowId,
     flow_node: &FlowNode,
     condition: LuaExpr,
     condition_flow: InferConditionFlow,
@@ -284,6 +290,7 @@ fn get_type_at_condition_flow_uncached(
             cache,
             root,
             var_ref_id,
+            flow_id,
             flow_node,
             name_expr,
             condition_flow,
@@ -335,6 +342,7 @@ fn get_type_at_condition_flow_uncached(
             cache,
             root,
             var_ref_id,
+            flow_id,
             flow_node,
             binary_expr,
             condition_flow,
@@ -346,6 +354,7 @@ fn get_type_at_condition_flow_uncached(
             cache,
             root,
             var_ref_id,
+            flow_id,
             flow_node,
             unary_expr,
             condition_flow,
@@ -362,6 +371,7 @@ fn get_type_at_condition_flow_uncached(
                 cache,
                 root,
                 var_ref_id,
+                flow_id,
                 flow_node,
                 inner_expr,
                 condition_flow,
@@ -378,6 +388,7 @@ fn get_type_at_name_expr(
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
+    flow_id: FlowId,
     flow_node: &FlowNode,
     name_expr: LuaNameExpr,
     condition_flow: InferConditionFlow,
@@ -396,6 +407,7 @@ fn get_type_at_name_expr(
             cache,
             root,
             var_ref_id,
+            flow_id,
             flow_node,
             name_expr,
             condition_flow,
@@ -421,6 +433,7 @@ fn get_type_at_name_ref(
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
+    flow_id: FlowId,
     flow_node: &FlowNode,
     name_expr: LuaNameExpr,
     condition_flow: InferConditionFlow,
@@ -460,6 +473,7 @@ fn get_type_at_name_ref(
         cache,
         root,
         var_ref_id,
+        flow_id,
         flow_node,
         expr.clone(),
         condition_flow,
@@ -474,7 +488,6 @@ fn get_type_at_name_ref(
         return Ok(ResultTypeOrContinue::Continue);
     };
     let declaration_condition = FlowNode {
-        id: entry,
         kind: if condition_flow.is_true() {
             FlowNodeKind::TrueCondition(expr.to_ptr())
         } else {
@@ -488,6 +501,7 @@ fn get_type_at_name_ref(
         cache,
         root,
         var_ref_id,
+        entry,
         &declaration_condition,
         expr,
         condition_flow,
@@ -502,6 +516,7 @@ fn get_type_at_unary_flow(
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
+    flow_id: FlowId,
     flow_node: &FlowNode,
     unary_expr: LuaUnaryExpr,
     condition_flow: InferConditionFlow,
@@ -528,6 +543,7 @@ fn get_type_at_unary_flow(
         cache,
         root,
         var_ref_id,
+        flow_id,
         flow_node,
         inner_expr,
         condition_flow.get_negated(),
@@ -603,7 +619,6 @@ mod memo_tests {
             .get_flow_id(condition.get_syntax_id())
             .unwrap();
         let node = FlowNode {
-            id: FlowId(999_999),
             kind: FlowNodeKind::TrueCondition(condition.to_ptr()),
             antecedent: Some(FlowAntecedent::Single(antecedent)),
         };
@@ -630,6 +645,7 @@ mod memo_tests {
             cache,
             root,
             var,
+            FlowId(999_999),
             node,
             condition.clone(),
             outcome,

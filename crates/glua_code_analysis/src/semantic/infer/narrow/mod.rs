@@ -267,7 +267,6 @@ pub(crate) fn infer_condition_narrowing(
         InferConditionFlow::FalseCondition => FlowNodeKind::FalseCondition(condition.to_ptr()),
     };
     let flow_node = FlowNode {
-        id: flow_id,
         kind,
         antecedent: Some(FlowAntecedent::Single(flow_id)),
     };
@@ -293,6 +292,7 @@ pub(crate) fn infer_condition_narrowing(
             cache,
             &root,
             &var_ref_id,
+            flow_id,
             &flow_node,
             condition,
             InferConditionFlow::TrueCondition,

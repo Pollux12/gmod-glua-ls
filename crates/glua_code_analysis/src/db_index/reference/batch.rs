@@ -3,7 +3,6 @@ use std::hash::Hash;
 use glua_parser::LuaSyntaxId;
 use rowan::TextRange;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use smol_str::SmolStr;
 
 use super::{
     FileReference, StringReference, decl_reference_fingerprint, global_reference_fingerprint,
@@ -11,7 +10,7 @@ use super::{
 };
 use crate::{
     FileId,
-    db_index::{LuaDeclId, LuaMemberKey, derivation::Fingerprint},
+    db_index::{LuaDeclId, LuaMemberKey, derivation::Fingerprint, intern::InternedName},
 };
 
 /// The sites under one name and their fingerprints' sum.
@@ -69,10 +68,10 @@ impl<K: Clone + Eq + Hash> OrderedNameSites<K> {
 pub struct FileReferenceBatch {
     file_id: FileId,
     pub(super) file_reference: FileReference,
-    pub(super) globals: OrderedNameSites<SmolStr>,
+    pub(super) globals: OrderedNameSites<InternedName>,
     pub(super) indexes: OrderedNameSites<LuaMemberKey>,
     pub(super) strings: StringReference,
-    pub(super) string_fingerprints: HashMap<SmolStr, Fingerprint>,
+    pub(super) string_fingerprints: HashMap<InternedName, Fingerprint>,
     pub(super) fingerprint: Fingerprint,
     pub(super) fingerprinted: bool,
     pub(super) revisions: u64,
@@ -126,7 +125,7 @@ impl FileReferenceBatch {
     }
 
     pub fn add_global_reference(&mut self, name: &str, syntax_id: LuaSyntaxId) {
-        let name = SmolStr::new(name);
+        let name = InternedName::new(name);
         let fingerprint = global_reference_fingerprint(self.file_id, &name, &syntax_id);
         if self.globals.insert(name, syntax_id, fingerprint) {
             self.add_fingerprint(fingerprint);
@@ -147,7 +146,7 @@ impl FileReferenceBatch {
         self.add_fingerprint(fingerprint);
         let slot = self
             .string_fingerprints
-            .entry(SmolStr::new(string))
+            .entry(InternedName::new(string))
             .or_default();
         *slot = slot.wrapping_add(fingerprint);
         self.strings.add_string_reference(string, range);
