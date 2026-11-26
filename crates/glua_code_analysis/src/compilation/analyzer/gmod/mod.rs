@@ -3422,7 +3422,7 @@ fn resolve_vgui_parent_source(
                                 db,
                                 cache,
                                 &typ,
-                                &LuaMemberKey::Name(field.as_str().into()),
+                                &LuaMemberKey::name(field.as_str()),
                             )
                             .ok()
                         })
@@ -5547,7 +5547,7 @@ fn synthesize_from_wrapper_call(
     let member_id = LuaMemberId::new(getter_syntax_id, file_id);
     let member = LuaMember::new(
         member_id,
-        LuaMemberKey::Name(getter_name.as_str().into()),
+        LuaMemberKey::name(getter_name.as_str()),
         LuaMemberFeature::FileMethodDecl,
         None,
     );
@@ -5572,7 +5572,7 @@ fn synthesize_from_wrapper_call(
     let member_id = LuaMemberId::new(setter_syntax_id, file_id);
     let member = LuaMember::new(
         member_id,
-        LuaMemberKey::Name(setter_name.as_str().into()),
+        LuaMemberKey::name(setter_name.as_str()),
         LuaMemberFeature::FileMethodDecl,
         None,
     );
@@ -5770,7 +5770,7 @@ fn synthesize_define_baseclass_parent_alias(
     }
 
     let owner = LuaMemberOwner::Type(class_decl_id.clone());
-    let member_key = LuaMemberKey::Name(alias_name.as_str().into());
+    let member_key = LuaMemberKey::name(alias_name.as_str());
 
     // If the user already defined this field (e.g. `GM.Sandbox = BaseClass`),
     // let their definition win — don't shadow it with a synthetic decl. The
@@ -5875,7 +5875,7 @@ fn synthesize_accessor_func(
             let member_id = LuaMemberId::new(field_syntax_id, file_id);
             let member = LuaMember::new(
                 member_id,
-                LuaMemberKey::Name(var_key_name.as_str().into()),
+                LuaMemberKey::name(var_key_name.as_str()),
                 LuaMemberFeature::FileFieldDecl,
                 None,
             );
@@ -5905,7 +5905,7 @@ fn synthesize_accessor_func(
         let member_id = LuaMemberId::new(getter_syntax_id, file_id);
         let member = LuaMember::new(
             member_id,
-            LuaMemberKey::Name(getter_name.as_str().into()),
+            LuaMemberKey::name(getter_name.as_str()),
             LuaMemberFeature::FileMethodDecl,
             None,
         );
@@ -5933,7 +5933,7 @@ fn synthesize_accessor_func(
     let member_id = LuaMemberId::new(setter_syntax_id, file_id);
     let member = LuaMember::new(
         member_id,
-        LuaMemberKey::Name(setter_name.as_str().into()),
+        LuaMemberKey::name(setter_name.as_str()),
         LuaMemberFeature::FileMethodDecl,
         None,
     );
@@ -6002,7 +6002,7 @@ fn synthesize_network_var(
         let member_id = LuaMemberId::new(getter_syntax_id, file_id);
         let member = LuaMember::new(
             member_id,
-            LuaMemberKey::Name(getter_name.as_str().into()),
+            LuaMemberKey::name(getter_name.as_str()),
             LuaMemberFeature::FileMethodDecl,
             None,
         );
@@ -6028,7 +6028,7 @@ fn synthesize_network_var(
     let member_id = LuaMemberId::new(setter_syntax_id, file_id);
     let member = LuaMember::new(
         member_id,
-        LuaMemberKey::Name(setter_name.as_str().into()),
+        LuaMemberKey::name(setter_name.as_str()),
         LuaMemberFeature::FileMethodDecl,
         None,
     );
@@ -6115,7 +6115,7 @@ fn synthesize_data_table_slot(
             owner,
             LuaMember::new(
                 member_id,
-                LuaMemberKey::Name(key.into()),
+                LuaMemberKey::name(key),
                 LuaMemberFeature::FileFieldDecl,
                 None,
             ),
@@ -6194,7 +6194,7 @@ fn synthesize_network_var_element(
         let member_id = LuaMemberId::new(getter_syntax_id, file_id);
         let member = LuaMember::new(
             member_id,
-            LuaMemberKey::Name(getter_name.as_str().into()),
+            LuaMemberKey::name(getter_name.as_str()),
             LuaMemberFeature::FileMethodDecl,
             None,
         );
@@ -6220,7 +6220,7 @@ fn synthesize_network_var_element(
     let member_id = LuaMemberId::new(setter_syntax_id, file_id);
     let member = LuaMember::new(
         member_id,
-        LuaMemberKey::Name(setter_name.as_str().into()),
+        LuaMemberKey::name(setter_name.as_str()),
         LuaMemberFeature::FileMethodDecl,
         None,
     );
@@ -7370,7 +7370,7 @@ fn synthesize_baseclass_member(
     // analysed first own the record, and its realm or position then decide
     // which readers see the base.
     let owner = LuaMemberOwner::Type(class_decl_id.clone());
-    let member_key = LuaMemberKey::Name("BaseClass".into());
+    let member_key = LuaMemberKey::name("BaseClass");
     let member_id = LuaMemberId::new(syntax_id, file_id);
     let member = LuaMember::new(member_id, member_key, LuaMemberFeature::FileFieldDecl, None);
     db.get_member_index_mut().add_member(owner, member);

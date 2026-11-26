@@ -1060,7 +1060,7 @@ impl LuaObjectType {
                     fields.insert(LuaMemberKey::Integer(i), value_type);
                 }
                 LuaIndexAccessKey::String(s) => {
-                    fields.insert(LuaMemberKey::Name(s.clone()), value_type.clone());
+                    fields.insert(LuaMemberKey::name(s.as_str()), value_type.clone());
                 }
                 LuaIndexAccessKey::Type(t) => {
                     index_access.push((t, value_type));
@@ -2644,10 +2644,10 @@ mod tests {
             LuaType::Object(Arc::new(LuaObjectType::new_with_fields(
                 BTreeMap::from([
                     (
-                        LuaMemberKey::Name("model".into()),
+                        LuaMemberKey::name("model"),
                         LuaType::StringConst(ArcIntern::new(SmolStr::new(model))),
                     ),
-                    (LuaMemberKey::Name("bodygroups".into()), table(groups)),
+                    (LuaMemberKey::name("bodygroups"), table(groups)),
                 ]),
                 Vec::new(),
             )))
@@ -2664,10 +2664,7 @@ mod tests {
                 .iter()
                 .map(|member| match member {
                     LuaType::Object(object) => {
-                        format!(
-                            "{:?}",
-                            object.get_field(&LuaMemberKey::Name("model".into()))
-                        )
+                        format!("{:?}", object.get_field(&LuaMemberKey::name("model")))
                     }
                     other => format!("{other:?}"),
                 })

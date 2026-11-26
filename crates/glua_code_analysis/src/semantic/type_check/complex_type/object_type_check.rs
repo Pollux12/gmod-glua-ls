@@ -307,8 +307,8 @@ fn check_member_value(
 fn member_key_type_for_index(member_key: &LuaMemberKey) -> Option<LuaType> {
     match member_key {
         LuaMemberKey::Integer(i) => Some(LuaType::IntegerConst(*i)),
-        LuaMemberKey::Name(name) => Some(LuaType::StringConst(name.clone().into())),
-        LuaMemberKey::ExprType(typ) => Some(typ.clone()),
+        LuaMemberKey::Name(name) => Some(LuaType::StringConst(name.clone())),
+        LuaMemberKey::ExprType(typ) => Some(typ.as_ref().clone()),
         LuaMemberKey::None => None,
     }
 }

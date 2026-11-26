@@ -346,7 +346,7 @@ pub fn resolve_gmod_hook_callback_doc_function(
                 && site.callback_arg_idx == Some(param_idx)
         })?;
     let hook_name = hook_site.hook_name.as_ref()?.clone();
-    let member_key = LuaMemberKey::Name(hook_name.clone().into());
+    let member_key = LuaMemberKey::name(hook_name.clone());
     let mut candidates = Vec::new();
     let mut seen_member_ids = FxHashSet::default();
     for owner_name in iter_hook_owner_names(db, call_file_id) {

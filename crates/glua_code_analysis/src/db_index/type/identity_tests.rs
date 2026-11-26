@@ -83,7 +83,10 @@ fn nested_types(inner: LuaType) -> Vec<LuaType> {
             true,
         ))),
         LuaType::Object(Arc::new(LuaObjectType::new_with_fields(
-            BTreeMap::from([(LuaMemberKey::ExprType(inner.clone()), LuaType::String)]),
+            BTreeMap::from([(
+                LuaMemberKey::ExprType(Box::new(inner.clone())),
+                LuaType::String,
+            )]),
             vec![],
         ))),
         LuaType::Object(Arc::new(LuaObjectType::new_with_fields(
@@ -213,7 +216,7 @@ abcdefghij",
 #[test]
 fn table_merges_preserve_precise_components() {
     let named = LuaType::Object(Arc::new(LuaObjectType::new_with_fields(
-        BTreeMap::from([(LuaMemberKey::Name("foo".into()), LuaType::String)]),
+        BTreeMap::from([(LuaMemberKey::name("foo"), LuaType::String)]),
         vec![],
     )));
     let components = vec![

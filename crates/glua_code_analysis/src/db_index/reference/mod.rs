@@ -386,7 +386,7 @@ impl LuaReferenceIndex {
     }
 
     fn collect_index_reference_files(&self, name: &SmolStr) -> Vec<FileId> {
-        let member_key = LuaMemberKey::Name(name.clone());
+        let member_key = LuaMemberKey::name(name.as_str());
         let mut files = self
             .index_reference
             .get(&member_key)
@@ -411,7 +411,7 @@ impl LuaReferenceIndex {
     /// themselves are not materialized.
     pub fn files_referencing_name(&self, name: &SmolStr) -> HashSet<FileId> {
         derivation::note_read(|| FactKey::ReferencesByName(name.as_str().into()));
-        let member_key = LuaMemberKey::Name(name.clone());
+        let member_key = LuaMemberKey::name(name.as_str());
         self.index_reference
             .get(&member_key)
             .into_iter()
@@ -425,7 +425,7 @@ impl LuaReferenceIndex {
     /// tables.
     pub fn name_references_in_file(&self, name: &SmolStr, file_id: FileId) -> Vec<LuaSyntaxId> {
         derivation::note_read(|| FactKey::ReferencesByName(name.as_str().into()));
-        let member_key = LuaMemberKey::Name(name.clone());
+        let member_key = LuaMemberKey::name(name.as_str());
         self.index_reference
             .get(&member_key)
             .and_then(|references| references.get(&file_id))
@@ -454,7 +454,7 @@ impl LuaReferenceIndex {
                 .and_then(|sites| sites.get(&file_id))
                 .is_some_and(|ids| ids.contains(&syntax_id))
         };
-        let member_key = LuaMemberKey::Name(name.clone());
+        let member_key = LuaMemberKey::name(name.as_str());
         in_file(self.global_references.get(name))
             || in_file(self.index_reference.get(&member_key))
             || self
@@ -912,7 +912,7 @@ fn range_key(range: &TextRange) -> (TextSize, TextSize) {
 /// The name a member-key reference is fingerprinted and read under.
 fn member_key_name(key: &LuaMemberKey) -> SmolStr {
     match key {
-        LuaMemberKey::Name(name) => name.clone(),
+        LuaMemberKey::Name(name) => name.as_ref().clone(),
         LuaMemberKey::Integer(index) => SmolStr::new(format!("[{index}]")),
         LuaMemberKey::None | LuaMemberKey::ExprType(_) => SmolStr::new_static("[]"),
     }
@@ -1132,12 +1132,12 @@ mod tests {
         index.add_type_reference(file, LuaTypeDeclId::global("Relay"), range);
         assert_eq!(index.fact_fingerprint(&key), empty);
         assert!(index.files_with_index_references(&name).is_empty());
-        index.add_index_reference(LuaMemberKey::Name(name.clone()), file, site);
+        index.add_index_reference(LuaMemberKey::name(name.as_str()), file, site);
         let present = index.fact_fingerprint(&key);
         assert_ne!(present, empty);
         index.add_global_reference(&name, file, site);
         index.add_index_reference(
-            LuaMemberKey::Name(name.clone()),
+            LuaMemberKey::name(name.as_str()),
             file,
             LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), later),
         );
@@ -1163,7 +1163,7 @@ mod tests {
         let name: smol_str::SmolStr = "Send".into();
 
         index.add_global_reference(&name, first, global_site);
-        index.add_index_reference(LuaMemberKey::Name(name.clone()), first, index_site);
+        index.add_index_reference(LuaMemberKey::name(name.as_str()), first, index_site);
         index.add_global_reference(&name, second, global_site);
         let first_revision = index.file_reference_revision(first);
 
@@ -1211,7 +1211,7 @@ mod tests {
         index.add_type_reference(first, first_type.clone(), range);
         index.add_type_reference(surviving, surviving_type.clone(), range);
         let syntax_id = LuaSyntaxId::new(LuaSyntaxKind::NameExpr.into(), range);
-        let member_key = LuaMemberKey::Name("field".into());
+        let member_key = LuaMemberKey::name("field");
         index.add_global_reference("GLOBAL", first, syntax_id);
         index.add_global_reference("GLOBAL", surviving, syntax_id);
         index.add_index_reference(member_key.clone(), first, syntax_id);
@@ -1256,7 +1256,7 @@ mod tests {
         );
 
         let syntax_id = LuaSyntaxId::new(LuaSyntaxKind::NameExpr.into(), range);
-        let member_key = LuaMemberKey::Name("field".into());
+        let member_key = LuaMemberKey::name("field");
         index.add_index_reference(member_key.clone(), first, syntax_id);
         index.add_global_reference("GLOBAL", first, syntax_id);
 

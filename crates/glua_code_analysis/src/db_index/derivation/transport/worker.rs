@@ -1452,7 +1452,7 @@ mod tests {
                 assert!(handle.note(|| fact.clone(), |key| key == &fact));
                 assert_eq!(handle.0.load(Ordering::Relaxed), 123);
                 let owner = LuaMemberOwner::LocalUnresolve;
-                let name = LuaMemberKey::Name("field".into());
+                let name = LuaMemberKey::name("field");
                 derivation::note_member_slot_read(&owner, &name);
                 derivation::note_member_slot_read(&owner, &name);
                 let proof = derivation::close_frame(frame, 0).unwrap();

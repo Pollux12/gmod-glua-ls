@@ -188,7 +188,7 @@ impl EditMaps {
         let LuaMemberKey::ExprType(typ) = key else {
             return Some(key.clone());
         };
-        let mut typ = typ.clone();
+        let mut typ = typ.as_ref().clone();
         for (file_id, map) in &self.maps {
             let result = crate::db_index::remap_identities_in_type(
                 &typ,
@@ -201,7 +201,7 @@ impl EditMaps {
                 typ = moved;
             }
         }
-        Some(LuaMemberKey::ExprType(typ))
+        Some(LuaMemberKey::ExprType(Box::new(typ)))
     }
 
     /// `key` in the coordinates after the edits, or `None` when a position it

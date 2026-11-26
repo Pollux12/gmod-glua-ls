@@ -389,7 +389,7 @@ fn class_computed_key_target(
         return Some(ComputedKeyTarget::Undeclared);
     }
 
-    let visible_ids = crate::LuaMemberIndexItem::Many(declared_ids)
+    let visible_ids = crate::LuaMemberIndexItem::Many(declared_ids.into_boxed_slice())
         .visible_member_ids_with_realm_at_offset(
             db,
             &semantic_model.get_file_id(),
@@ -399,7 +399,7 @@ fn class_computed_key_target(
         return Some(ComputedKeyTarget::Undeclared);
     }
     Some(
-        crate::LuaMemberIndexItem::Many(visible_ids)
+        crate::LuaMemberIndexItem::Many(visible_ids.into_boxed_slice())
             .resolve_type(db)
             .map_or(ComputedKeyTarget::Undeclared, ComputedKeyTarget::Declared),
     )
@@ -482,7 +482,7 @@ fn prior_writers_type(
                 && (sibling_id.file_id != member_id.file_id || sibling_id.get_position() < position)
         })
         .collect::<Vec<_>>();
-    let visible_ids = crate::LuaMemberIndexItem::Many(prior_ids)
+    let visible_ids = crate::LuaMemberIndexItem::Many(prior_ids.into_boxed_slice())
         .visible_member_ids_with_realm_at_offset_from_history(
             db,
             &semantic_model.get_file_id(),
@@ -491,7 +491,7 @@ fn prior_writers_type(
     if visible_ids.is_empty() {
         return None;
     }
-    crate::LuaMemberIndexItem::Many(visible_ids)
+    crate::LuaMemberIndexItem::Many(visible_ids.into_boxed_slice())
         .resolve_type(db)
         .ok()
 }
@@ -780,7 +780,7 @@ fn member_flags_before_position(
     position: rowan::TextSize,
     include_current_position: bool,
 ) -> Option<(bool, bool)> {
-    let member_ids = semantic_model
+    let member_ids: Vec<_> = semantic_model
         .get_db()
         .get_member_index()
         .get_members_for_owner_key(owner, member_key)
@@ -797,7 +797,7 @@ fn member_flags_before_position(
         })
         .map(|member| member.get_id())
         .collect();
-    let visible_member_ids = crate::LuaMemberIndexItem::Many(member_ids)
+    let visible_member_ids = crate::LuaMemberIndexItem::Many(member_ids.into_boxed_slice())
         .visible_member_ids_with_realm_at_offset_from_history(
             semantic_model.get_db(),
             &semantic_model.get_file_id(),

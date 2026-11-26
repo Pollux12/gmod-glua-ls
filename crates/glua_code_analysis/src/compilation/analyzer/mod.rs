@@ -1554,7 +1554,7 @@ fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
             };
             db.get_member_index_mut().add_member(
                 member.owner,
-                LuaMember::new(member_id, LuaMemberKey::Name(member.name), feature, None),
+                LuaMember::new(member_id, LuaMemberKey::name(member.name), feature, None),
             );
             write_type_cache(
                 db,

@@ -1819,7 +1819,7 @@ net.Broadcast()
                 panic!("pairs value should be a compact record");
             };
             value
-                .get_field(&LuaMemberKey::Name("damageReduction".into()))
+                .get_field(&LuaMemberKey::name("damageReduction"))
                 .cloned()
                 .expect("damageReduction field")
         }

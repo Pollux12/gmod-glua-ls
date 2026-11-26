@@ -720,12 +720,12 @@ fn static_member_path_keys(path: &str) -> Option<Vec<LuaMemberKey>> {
                 return None;
             }
             if let Some(key) = glua_parser::path_segment_string_key(part) {
-                return Some(LuaMemberKey::Name(key.into()));
+                return Some(LuaMemberKey::name(key));
             }
 
             Some(
                 part.parse::<i64>()
-                    .map_or_else(|_| LuaMemberKey::Name(part.into()), LuaMemberKey::Integer),
+                    .map_or_else(|_| LuaMemberKey::name(part), LuaMemberKey::Integer),
             )
         })
         .collect()
@@ -778,7 +778,7 @@ fn infer_local_class_table_member_type(
         [member_id] => crate::LuaMemberIndexItem::One(*member_id)
             .resolve_type(db)
             .ok(),
-        _ => crate::LuaMemberIndexItem::Many(member_ids.as_ref().clone())
+        _ => crate::LuaMemberIndexItem::Many(member_ids.as_slice().into())
             .resolve_type(db)
             .ok(),
     }

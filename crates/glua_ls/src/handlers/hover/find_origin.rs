@@ -319,7 +319,7 @@ fn member_ids_to_visible_same_named(
     member_ids: Vec<LuaMemberId>,
     position_offset: Option<rowan::TextSize>,
 ) -> Vec<LuaMemberId> {
-    let member_item = LuaMemberIndexItem::Many(member_ids);
+    let member_item = LuaMemberIndexItem::Many(member_ids.into_boxed_slice());
     position_offset.map_or_else(
         || {
             member_item.visible_member_ids_with_realm(

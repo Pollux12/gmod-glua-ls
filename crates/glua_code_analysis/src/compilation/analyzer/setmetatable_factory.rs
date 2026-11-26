@@ -79,7 +79,7 @@ fn transferable_factory_member_ids(
 
 fn metatable_has_self_index(db: &DbIndex, binding: &SetmetatableFactoryBinding) -> bool {
     let owner = crate::semantic::metatable_member_owner(db, &binding.metatable_range);
-    let key = LuaMemberKey::Name("__index".into());
+    let key = LuaMemberKey::name("__index");
     db.get_member_index()
         .get_current_owner_members_for_key(&owner, &key)
         .into_iter()

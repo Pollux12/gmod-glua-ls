@@ -1119,8 +1119,8 @@ fn instantiate_mapped_value(
 
 pub(super) fn key_type_to_member_key(key_ty: &LuaType) -> Option<LuaMemberKey> {
     match key_ty {
-        LuaType::DocStringConst(s) => Some(LuaMemberKey::Name(s.deref().clone())),
-        LuaType::StringConst(s) => Some(LuaMemberKey::Name(s.deref().clone())),
+        LuaType::DocStringConst(s) => Some(LuaMemberKey::Name(s.clone())),
+        LuaType::StringConst(s) => Some(LuaMemberKey::Name(s.clone())),
         LuaType::DocIntegerConst(i) => Some(LuaMemberKey::Integer(*i)),
         LuaType::IntegerConst(i) => Some(LuaMemberKey::Integer(*i)),
         _ => None,

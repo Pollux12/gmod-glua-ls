@@ -771,7 +771,7 @@ fn try_add_accessor_location(
     locations: &mut Vec<Location>,
     position_offset: rowan::TextSize,
 ) -> bool {
-    let accessor_key = LuaMemberKey::Name(accessor_name.as_str().into());
+    let accessor_key = LuaMemberKey::name(accessor_name.as_str());
     if let Some(member_infos) = semantic_model.get_member_info_with_key_at_offset(
         prefix_type,
         accessor_key,

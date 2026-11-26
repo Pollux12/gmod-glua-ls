@@ -3385,7 +3385,7 @@ fn assigned_prefix_member_type(
         return Ok(None);
     }
 
-    let key = LuaMemberKey::Name(path.to_string().into());
+    let key = LuaMemberKey::name(path.to_string());
     let Some(type_id) = assigned_member_type_id(assigned_type) else {
         return Ok(None);
     };

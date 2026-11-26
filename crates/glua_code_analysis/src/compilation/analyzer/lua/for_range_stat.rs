@@ -527,8 +527,8 @@ fn try_infer_pairs_iter_types_from_table_members(
             } else {
                 match key {
                     LuaMemberKey::Integer(i) => LuaType::IntegerConst(*i),
-                    LuaMemberKey::Name(name) => LuaType::StringConst(name.clone().into()),
-                    LuaMemberKey::ExprType(typ) => typ.clone(),
+                    LuaMemberKey::Name(name) => LuaType::StringConst(name.clone()),
+                    LuaMemberKey::ExprType(typ) => typ.as_ref().clone(),
                     LuaMemberKey::None => continue,
                 }
             };
@@ -735,31 +735,29 @@ fn infer_table_projection_key_type(db: &DbIndex, inner: &LuaType) -> LuaType {
 }
 
 fn is_sampled_pairs_key(key: &LuaMemberKey) -> bool {
-    match key {
-        LuaMemberKey::ExprType(LuaType::Union(union))
-            if !union.is_empty()
-                && union.types().all(|typ| {
-                    matches!(
-                        typ,
-                        LuaType::StringConst(_)
-                            | LuaType::DocStringConst(_)
-                            | LuaType::IntegerConst(_)
-                            | LuaType::DocIntegerConst(_)
-                    )
-                }) =>
-        {
-            false
-        }
-        LuaMemberKey::ExprType(_) => true,
-        _ => false,
-    }
+    let LuaMemberKey::ExprType(typ) = key else {
+        return false;
+    };
+    let LuaType::Union(union) = typ.as_ref() else {
+        return true;
+    };
+    union.is_empty()
+        || !union.types().all(|typ| {
+            matches!(
+                typ,
+                LuaType::StringConst(_)
+                    | LuaType::DocStringConst(_)
+                    | LuaType::IntegerConst(_)
+                    | LuaType::DocIntegerConst(_)
+            )
+        })
 }
 
 fn table_projection_member_key_type(key: &LuaMemberKey) -> Option<LuaType> {
     match key {
         LuaMemberKey::Name(_) => Some(LuaType::String),
         LuaMemberKey::Integer(_) => Some(LuaType::Integer),
-        LuaMemberKey::ExprType(typ) => Some(match typ {
+        LuaMemberKey::ExprType(typ) => Some(match typ.as_ref() {
             LuaType::StringConst(_) | LuaType::DocStringConst(_) => LuaType::String,
             LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_) => LuaType::Integer,
             LuaType::FloatConst(_) => LuaType::Number,

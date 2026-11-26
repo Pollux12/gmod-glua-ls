@@ -465,7 +465,7 @@ fn check_index_expr(
                 context.get_file_id(),
                 index_expr,
                 &placeholder_constraint(db, &prefix_typ).unwrap_or_else(|| prefix_typ.clone()),
-                &LuaMemberKey::Name(field_name.clone()),
+                &LuaMemberKey::name(field_name.clone()),
             )
             .map(|children| children.to_vec())
         })
@@ -787,7 +787,7 @@ fn metatable_leaves_members_open(
         }
         crate::BoundMetatable::Table(metatable) => metatable,
     };
-    let index_member_key = LuaMemberKey::Name("__index".into());
+    let index_member_key = LuaMemberKey::name("__index");
     let meta_owner = crate::semantic::metatable_member_owner(db, metatable);
     let index_type = infer_owner_raw_member_type_with_realm(
         db,
@@ -1105,7 +1105,7 @@ fn is_valid_member_inner(
             // This handles cases where runtime type checks guard the field access.
             let db = semantic_model.get_db();
             let field_name = index_key.get_path_part();
-            let key = LuaMemberKey::Name(field_name.into());
+            let key = LuaMemberKey::name(field_name);
             for member in union.types() {
                 if member.is_nil() {
                     continue;
@@ -2105,7 +2105,7 @@ fn get_keyof_keys(db: &DbIndex, alias_call: &LuaAliasCallType) -> Option<Vec<Lua
         .iter()
         .filter_map(|m| match &m.key {
             LuaMemberKey::Integer(i) => Some(LuaType::DocIntegerConst(*i)),
-            LuaMemberKey::Name(s) => Some(LuaType::DocStringConst(s.clone().into())),
+            LuaMemberKey::Name(s) => Some(LuaType::DocStringConst(s.clone())),
             _ => None,
         })
         .collect::<Vec<_>>();

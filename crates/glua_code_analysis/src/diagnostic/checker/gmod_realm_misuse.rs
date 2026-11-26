@@ -716,7 +716,7 @@ fn resolve_global_name_candidate_realms(
     };
 
     let mut realms = Vec::new();
-    let member_key = LuaMemberKey::Name(name);
+    let member_key = LuaMemberKey::name(name);
     if let Some(member_infos) =
         semantic_model.get_member_info_with_key(&LuaType::Global, member_key, true)
     {

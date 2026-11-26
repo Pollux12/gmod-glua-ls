@@ -194,7 +194,7 @@ fn extends_prototype_class(
     db.get_member_index().is_member_owner_only(&member_id)
         && db
             .get_member_index()
-            .get_current_owner_members_for_key(owner, &LuaMemberKey::Name("__index".into()))
+            .get_current_owner_members_for_key(owner, &LuaMemberKey::name("__index"))
             .into_iter()
             .any(|member| {
                 db.get_type_index()
@@ -1063,7 +1063,7 @@ fn collect_assigned_table_fields_for_declared_member(
     let Some(member_types) = find_declared_member_types_for_dynamic_field(
         db,
         owner_type,
-        LuaMemberKey::Name(field_name.clone()),
+        LuaMemberKey::name(field_name.clone()),
         member_id,
     ) else {
         return;
@@ -1254,12 +1254,8 @@ fn infer_enclosing_method_self_type(
 }
 
 fn infer_index_type_from_metatable_type(db: &DbIndex, metatable_type: &LuaType) -> Option<LuaType> {
-    let index_members = find_members_with_key(
-        db,
-        metatable_type,
-        LuaMemberKey::Name("__index".into()),
-        false,
-    )?;
+    let index_members =
+        find_members_with_key(db, metatable_type, LuaMemberKey::name("__index"), false)?;
 
     index_members
         .into_iter()
@@ -2113,7 +2109,7 @@ fn owner_has_member(db: &DbIndex, owner: &DynamicFieldOwner, name: &SmolStr) -> 
         DynamicFieldOwner::GlobalPath(path) => LuaMemberOwner::GlobalPath(path.clone()),
     };
     !db.get_member_index()
-        .get_current_owner_members_for_key(&member_owner, &LuaMemberKey::Name(name.clone()))
+        .get_current_owner_members_for_key(&member_owner, &LuaMemberKey::name(name.as_str()))
         .is_empty()
 }
 

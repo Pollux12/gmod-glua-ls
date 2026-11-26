@@ -256,7 +256,7 @@ fn guessed_slot_evidence(
     let others = match others.as_slice() {
         [] => return Some(None),
         [writer] => crate::LuaMemberIndexItem::One(*writer),
-        _ => crate::LuaMemberIndexItem::Many(others),
+        _ => crate::LuaMemberIndexItem::Many(others.into_boxed_slice()),
     };
     Some(
         others

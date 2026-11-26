@@ -1045,8 +1045,8 @@ fn resolve_cached_expr_type(
 
 fn get_static_member_key(index_expr: &LuaIndexExpr) -> Option<LuaMemberKey> {
     match index_expr.get_index_key()? {
-        LuaIndexKey::Name(name) => Some(LuaMemberKey::Name(name.get_name_text().into())),
-        LuaIndexKey::String(string) => Some(LuaMemberKey::Name(string.get_value().into())),
+        LuaIndexKey::Name(name) => Some(LuaMemberKey::name(name.get_name_text())),
+        LuaIndexKey::String(string) => Some(LuaMemberKey::name(string.get_value())),
         LuaIndexKey::Integer(number) => match number.get_number_value() {
             NumberResult::Int(value) => Some(LuaMemberKey::Integer(value)),
             _ => None,

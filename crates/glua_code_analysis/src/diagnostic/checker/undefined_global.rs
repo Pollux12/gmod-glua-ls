@@ -1173,7 +1173,7 @@ fn is_legacy_module_local_name_visible(
     }
 
     let owner = LuaMemberOwner::GlobalPath(GlobalId::new(&module_env.module_path));
-    let key = LuaMemberKey::Name(name.into());
+    let key = LuaMemberKey::name(name);
     let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) else {
         return false;
     };

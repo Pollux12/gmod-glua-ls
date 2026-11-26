@@ -1845,7 +1845,7 @@ mod tests {
     }
 
     fn path_key(name: &str) -> LuaMemberKey {
-        LuaMemberKey::Name(name.into())
+        LuaMemberKey::name(name)
     }
 
     fn sorted<K: std::fmt::Debug, V: std::fmt::Debug>(map: &CowShards<K, V>) -> Vec<String> {

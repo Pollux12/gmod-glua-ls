@@ -392,7 +392,7 @@ impl<'a> DeclAnalyzer<'a> {
             let member_id = LuaMemberId::new(syntax_id, file_id);
             let member = LuaMember::new(
                 member_id,
-                LuaMemberKey::Name(name.into()),
+                LuaMemberKey::name(name),
                 LuaMemberFeature::FileFieldDecl,
                 None,
             );
@@ -604,7 +604,7 @@ impl<'a> DeclAnalyzer<'a> {
             let owner = LuaMemberOwner::GlobalPath(GlobalId::new(&owner_path));
             let member = LuaMember::new(
                 member_id,
-                LuaMemberKey::Name(child_segment.into()),
+                LuaMemberKey::name(child_segment),
                 LuaMemberFeature::FileFieldDecl,
                 Some(GlobalId::new(&child_path)),
             );

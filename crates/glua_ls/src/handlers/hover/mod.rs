@@ -370,7 +370,7 @@ pub(crate) fn resolve_hook_property_owner(
     position_offset: TextSize,
     hook_name: &str,
 ) -> Option<LuaSemanticDeclId> {
-    let member_key = LuaMemberKey::Name(hook_name.into());
+    let member_key = LuaMemberKey::name(hook_name);
     let db = semantic_model.get_db();
     let call_realm = db
         .get_gmod_infer_index()

@@ -8,7 +8,6 @@ use glua_parser::{
     LuaNameExpr, LuaVarExpr,
 };
 use rowan::{TextRange, TextSize};
-use smol_str::SmolStr;
 
 use super::LuaInferCache;
 
@@ -135,7 +134,7 @@ pub(crate) fn registered_vgui_method_param_is_own_class(
     let class_id = LuaTypeDeclId::global(&context.panel_name);
     let mut supers = Vec::new();
     class_id.collect_super_types(db, &mut supers);
-    let member_key = LuaMemberKey::Name(SmolStr::new(context.method_name.as_str()));
+    let member_key = LuaMemberKey::name(context.method_name.as_str());
     for class_id in
         std::iter::once(class_id).chain(supers.into_iter().filter_map(|typ| match typ {
             LuaType::Ref(id) | LuaType::Def(id) => Some(id),

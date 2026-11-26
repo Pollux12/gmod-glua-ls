@@ -76,9 +76,9 @@ pub fn analyze_field(analyzer: &mut DocAnalyzer, tag: LuaDocTagField) -> Option<
     let field_key = tag.get_field_key()?;
     let key = match field_key {
         LuaDocFieldKey::Name(name_token) => {
-            LuaMemberKey::Name(name_token.get_name_text().to_string().into())
+            LuaMemberKey::name(name_token.get_name_text().to_string())
         }
-        LuaDocFieldKey::String(string_token) => LuaMemberKey::Name(string_token.get_value().into()),
+        LuaDocFieldKey::String(string_token) => LuaMemberKey::name(string_token.get_value()),
         LuaDocFieldKey::Integer(int_token) => {
             if let NumberResult::Int(idx) = int_token.get_number_value() {
                 LuaMemberKey::Integer(idx)
@@ -113,7 +113,7 @@ pub fn analyze_field(analyzer: &mut DocAnalyzer, tag: LuaDocTagField) -> Option<
                 ))),
             );
             analyzer.db.add_operator(operator);
-            LuaMemberKey::ExprType(key_type_ref)
+            LuaMemberKey::ExprType(Box::new(key_type_ref))
         }
     };
 

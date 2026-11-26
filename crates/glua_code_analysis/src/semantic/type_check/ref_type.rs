@@ -608,7 +608,7 @@ fn get_object_field_type<'a>(
             object_type
                 .get_index_access()
                 .iter()
-                .find_map(|(index_key, value)| (index_key == t).then_some(value))
+                .find_map(|(index_key, value)| (index_key == t.as_ref()).then_some(value))
         } else {
             None
         }
@@ -651,7 +651,7 @@ fn check_ref_type_compact_tuple(
                     check_guard.next_level()?,
                 )?;
             }
-            LuaMemberKey::ExprType(LuaType::Integer) => {
+            LuaMemberKey::ExprType(typ) if matches!(typ.as_ref(), LuaType::Integer) => {
                 // Walk the tuple to check that all elements match
                 for tuple_type in tuple_types {
                     check_general_type_compact(

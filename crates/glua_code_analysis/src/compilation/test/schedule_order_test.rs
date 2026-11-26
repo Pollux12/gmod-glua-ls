@@ -300,7 +300,7 @@ AccessorFunc(PANEL, \"m_bDrawProgress\", \"DrawProgress\", FORCE_BOOL)
         let db = ws.analysis.compilation.get_db();
         let getters = db
             .get_member_index()
-            .get_current_members_for_key(&crate::LuaMemberKey::Name("GetDrawProgress".into()))
+            .get_current_members_for_key(&crate::LuaMemberKey::name("GetDrawProgress"))
             .into_iter()
             .map(|member| {
                 db.get_type_index()

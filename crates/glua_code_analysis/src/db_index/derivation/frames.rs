@@ -1709,7 +1709,7 @@ mod tests {
     fn member_slot() -> FactKey {
         FactKey::member_slot(
             crate::LuaMemberOwner::GlobalPath(crate::GlobalId::new("resume_test")),
-            crate::LuaMemberKey::Name("field".into()),
+            crate::LuaMemberKey::name("field"),
         )
     }
 
@@ -1861,7 +1861,7 @@ mod tests {
     fn reads_noted_by_owner_and_name_keep_distinct_keys_apart() {
         use crate::{GlobalId, LuaMemberKey, LuaMemberOwner};
         let owner = |path: &str| LuaMemberOwner::GlobalPath(GlobalId::new(path));
-        let name = |name: &str| LuaMemberKey::Name(name.into());
+        let name = |name: &str| LuaMemberKey::name(name);
         let _recording = derivation::begin(DerivationId::workspace(DerivationKind::GmodLoad));
         derivation::note_member_slot_read(&owner("named_test.a"), &name("x"));
         derivation::note_member_slot_read(&owner("named_test.a"), &name("y"));

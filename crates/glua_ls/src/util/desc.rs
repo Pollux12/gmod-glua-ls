@@ -251,7 +251,7 @@ fn find_members(
 ) -> Option<Vec<SemanticInfo>> {
     for (item, _) in path {
         let member_key = match item {
-            LuaDescRefPathItem::Name(name) => LuaMemberKey::Name(name.into()),
+            LuaDescRefPathItem::Name(name) => LuaMemberKey::name(name),
             LuaDescRefPathItem::Number(num) => LuaMemberKey::Integer(*num),
             LuaDescRefPathItem::Type(_) => {
                 // XXX: supporting complex types requires additional consideration,

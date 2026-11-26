@@ -2918,7 +2918,7 @@ mod tests {
                     record_pending_dynamic_key_collection_widening(
                         analyzer,
                         owner.clone(),
-                        LuaMemberKey::ExprType(LuaType::String),
+                        LuaMemberKey::ExprType(Box::new(LuaType::String)),
                         additional_base,
                     );
                 }

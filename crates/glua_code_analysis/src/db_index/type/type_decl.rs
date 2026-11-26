@@ -451,9 +451,9 @@ impl LuaTypeDecl {
             for enum_member in enum_members {
                 let member_key = enum_member.get_key();
                 let fake_type = match member_key {
-                    LuaMemberKey::Name(name) => LuaType::DocStringConst(name.clone().into()),
+                    LuaMemberKey::Name(name) => LuaType::DocStringConst(name.clone()),
                     LuaMemberKey::Integer(i) => LuaType::IntegerConst(*i),
-                    LuaMemberKey::ExprType(typ) => typ.clone(),
+                    LuaMemberKey::ExprType(typ) => typ.as_ref().clone(),
                     LuaMemberKey::None => continue,
                 };
 

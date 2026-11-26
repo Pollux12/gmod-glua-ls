@@ -1256,8 +1256,8 @@ fn exact_receiver_key_has_candidate(db: &DbIndex, member_key: &LuaMemberKey) -> 
 
 fn exact_receiver_member_key(index_expr: &glua_parser::LuaIndexExpr) -> Option<LuaMemberKey> {
     match index_expr.get_index_key()? {
-        LuaIndexKey::Name(name) => Some(LuaMemberKey::Name(name.get_name_text().into())),
-        LuaIndexKey::String(string) => Some(LuaMemberKey::Name(string.get_value().into())),
+        LuaIndexKey::Name(name) => Some(LuaMemberKey::name(name.get_name_text())),
+        LuaIndexKey::String(string) => Some(LuaMemberKey::name(string.get_value())),
         _ => None,
     }
 }
@@ -1793,7 +1793,7 @@ fn member_history_item(db: &DbIndex, member_id: LuaMemberId) -> Option<LuaMember
     let history_item = match historical_ids.as_slice() {
         [] => return None,
         [member_id] => LuaMemberIndexItem::One(*member_id),
-        _ => LuaMemberIndexItem::Many(historical_ids),
+        _ => LuaMemberIndexItem::Many(historical_ids.into_boxed_slice()),
     };
     Some(history_item)
 }

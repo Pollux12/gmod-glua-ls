@@ -51,7 +51,7 @@ pub fn instantiate_alias_call(
                 .iter()
                 .filter_map(|m| match &m.key {
                     LuaMemberKey::Integer(i) => Some(LuaType::DocIntegerConst(*i)),
-                    LuaMemberKey::Name(s) => Some(LuaType::DocStringConst(s.clone().into())),
+                    LuaMemberKey::Name(s) => Some(LuaType::DocStringConst(s.clone())),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -301,8 +301,8 @@ fn instantiate_unpack_call(db: &DbIndex, operands: &[LuaType]) -> LuaType {
 
 fn instantiate_rawget_call(db: &DbIndex, owner: &LuaType, key: &LuaType) -> LuaType {
     let member_key = match key {
-        LuaType::DocStringConst(s) => LuaMemberKey::Name(s.deref().clone()),
-        LuaType::StringConst(s) => LuaMemberKey::Name(s.deref().clone()),
+        LuaType::DocStringConst(s) => LuaMemberKey::Name(s.clone()),
+        LuaType::StringConst(s) => LuaMemberKey::Name(s.clone()),
         LuaType::DocIntegerConst(i) => LuaMemberKey::Integer(*i),
         LuaType::IntegerConst(i) => LuaMemberKey::Integer(*i),
         _ => return LuaType::Unknown,

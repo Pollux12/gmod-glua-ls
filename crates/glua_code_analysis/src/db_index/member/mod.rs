@@ -1584,24 +1584,16 @@ impl LuaMemberIndex {
                 }
             }
             LuaMemberIndexItem::Many(ids) => {
-                // `Many` is always sorted by `member_id_sort_key`: `One`
-                // promotes through `sorted_member_pair`, every later insert
-                // lands through the paths below, and removals only filter —
-                // so the binary search doubles as the duplicate check and no
-                // linear scan is needed.
-                if ids
-                    .last()
-                    .is_none_or(|last_id| member_id_sort_key(*last_id) < member_id_sort_key(id))
+                if let Err(index) = ids
+                    .binary_search_by_key(&member_id_sort_key(id), |existing_id| {
+                        member_id_sort_key(*existing_id)
+                    })
                 {
-                    ids.push(id);
-                    return;
-                }
-
-                match ids.binary_search_by_key(&member_id_sort_key(id), |existing_id| {
-                    member_id_sort_key(*existing_id)
-                }) {
-                    Ok(_) => {}
-                    Err(index) => ids.insert(index, id),
+                    let mut grown = Vec::with_capacity(ids.len() + 1);
+                    grown.extend_from_slice(&ids[..index]);
+                    grown.push(id);
+                    grown.extend_from_slice(&ids[index..]);
+                    *ids = grown.into_boxed_slice();
                 }
             }
         }
@@ -1935,7 +1927,7 @@ impl LuaMemberIndex {
             .get(&LuaMemberOwner::Element(site))
             .into_iter()
             .flat_map(LuaOwnerMembers::get_member_items)
-            .flat_map(member_ids_from_item)
+            .flat_map(LuaMemberIndexItem::get_member_ids)
             .collect();
         self.stamp_path_provenance_if_absent(member_ids, &path);
     }
@@ -2300,7 +2292,7 @@ impl LuaMemberIndex {
             .get(&path_owner)
             .into_iter()
             .flat_map(|members| members.get_member_items())
-            .flat_map(member_ids_from_item)
+            .flat_map(LuaMemberIndexItem::get_member_ids)
             .filter(|id| {
                 !self.is_pinned(id)
                     && self.member_current_owner.get(id) == Some(&path_owner)
@@ -2316,7 +2308,7 @@ impl LuaMemberIndex {
                     .get(&old_owner)
                     .into_iter()
                     .flat_map(|members| members.get_member_items())
-                    .flat_map(member_ids_from_item)
+                    .flat_map(LuaMemberIndexItem::get_member_ids)
                     .filter(|id| {
                         !self.is_pinned(id)
                             && self.member_current_owner.get(id) == Some(&old_owner)
@@ -2364,7 +2356,7 @@ impl LuaMemberIndex {
             .get(path_owner)
             .into_iter()
             .flat_map(|members| members.get_member_items())
-            .flat_map(member_ids_from_item);
+            .flat_map(LuaMemberIndexItem::get_member_ids);
         let indexed = [
             &self.member_owner_key_index,
             &self.member_owner_key_displaced,
@@ -2832,9 +2824,9 @@ impl LuaMemberIndex {
             }));
         };
         match glua_parser::path_segment_string_key(segment) {
-            Some(key) => collect(&LuaMemberKey::Name(key.into()), &mut matched),
+            Some(key) => collect(&LuaMemberKey::name(key), &mut matched),
             None => {
-                collect(&LuaMemberKey::Name(segment.into()), &mut matched);
+                collect(&LuaMemberKey::name(segment), &mut matched);
                 // A numeric field is keyed by its integer, not by its spelling.
                 if let Ok(index) = segment.parse::<i64>() {
                     collect(&LuaMemberKey::Integer(index), &mut matched);
@@ -2951,7 +2943,7 @@ impl LuaMemberIndex {
             .owner_members
             .get(&owner)
             .and_then(|owner_members| owner_members.get_member(&key))
-            .map(member_ids_from_item)?;
+            .map(LuaMemberIndexItem::get_member_ids)?;
         // Only a slot whose every writer is a guarded assignment accumulates
         // them all; one holding a real writer keeps deciding by the rules that
         // put it there.
@@ -3208,11 +3200,11 @@ pub(crate) fn member_id_sort_key(member_id: LuaMemberId) -> (u32, u32, u32, u16,
     )
 }
 
-fn sorted_member_pair(first: LuaMemberId, second: LuaMemberId) -> Vec<LuaMemberId> {
+fn sorted_member_pair(first: LuaMemberId, second: LuaMemberId) -> Box<[LuaMemberId]> {
     if member_id_sort_key(first) <= member_id_sort_key(second) {
-        vec![first, second]
+        Box::new([first, second])
     } else {
-        vec![second, first]
+        Box::new([second, first])
     }
 }
 
@@ -3472,10 +3464,7 @@ impl LuaMemberIndex {
                     .get(&old_owner)
                     .into_iter()
                     .flat_map(|items| items.get_member_items())
-                    .flat_map(|item| match item {
-                        LuaMemberIndexItem::One(id) => vec![*id],
-                        LuaMemberIndexItem::Many(ids) => ids.clone(),
-                    })
+                    .flat_map(|item| item.member_ids_slice().iter().copied())
                     .map(move |id| (id, old_owner.clone(), new_owner.clone()))
                     .collect::<Vec<_>>()
             })
@@ -3532,7 +3521,7 @@ impl LuaMemberIndex {
             if result.lost {
                 lost.push(member_id);
             } else if let Some(moved) = result.typ {
-                self.rekey_member(member_id, LuaMemberKey::ExprType(moved));
+                self.rekey_member(member_id, LuaMemberKey::ExprType(Box::new(moved)));
             }
         }
         lost
@@ -3706,13 +3695,6 @@ impl LuaIndex for LuaMemberIndex {
         self.path_class_holders.clear();
         self.derived_path_classes.clear();
         self.member_path_provenance.clear();
-    }
-}
-
-fn member_ids_from_item(item: &LuaMemberIndexItem) -> Vec<LuaMemberId> {
-    match item {
-        LuaMemberIndexItem::One(id) => vec![*id],
-        LuaMemberIndexItem::Many(ids) => ids.clone(),
     }
 }
 

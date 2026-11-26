@@ -415,7 +415,7 @@ pub fn remap_identities_in_type(typ: &LuaType, remap: &crate::FileRemap) -> Type
                     lost |= result.lost;
                     if let Some(typ) = result.typ {
                         changed = true;
-                        crate::LuaMemberKey::ExprType(typ)
+                        crate::LuaMemberKey::ExprType(Box::new(typ))
                     } else {
                         k.clone()
                     }
@@ -1372,6 +1372,9 @@ struct TypeFact {
     read: derivation::FactRead,
 }
 
+const _: () = assert!(std::mem::size_of::<LuaType>() == 16);
+const _: () = assert!(std::mem::size_of::<TypeFact>() == 32);
+
 impl std::ops::Deref for TypeFact {
     type Target = LuaTypeCache;
 
@@ -1383,6 +1386,35 @@ impl std::ops::Deref for TypeFact {
 impl std::hash::Hash for TypeFact {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::hash::Hash::hash(&self.cache, state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileIdSet {
+    One(FileId),
+    Many(Box<[FileId]>),
+}
+
+const _: () = assert!(std::mem::size_of::<FileIdSet>() == 16);
+
+impl FileIdSet {
+    fn from_set(files: HashSet<FileId>) -> Option<Self> {
+        match files.len() {
+            0 => None,
+            1 => files.into_iter().next().map(Self::One),
+            _ => {
+                let mut files: Vec<_> = files.into_iter().collect();
+                files.sort_unstable();
+                Some(Self::Many(files.into_boxed_slice()))
+            }
+        }
+    }
+
+    fn as_slice(&self) -> &[FileId] {
+        match self {
+            Self::One(file) => std::slice::from_ref(file),
+            Self::Many(files) => files,
+        }
     }
 }
 
@@ -1438,12 +1470,12 @@ pub struct LuaTypeIndex {
     /// and support files plus `TableConst`/`Instance`/`Signature` files in the
     /// step types), so a fact outside the edited file's bucket remaps to
     /// itself.
-    fact_ref_files: CowShards<LuaTypeOwner, HashSet<FileId>>,
+    fact_ref_files: CowShards<LuaTypeOwner, FileIdSet>,
     fact_refs_by_file: CowShards<FileId, HashSet<LuaTypeOwner>>,
     /// The [`Self::fact_ref_files`] counterpart for definition facts, whose
     /// payload type can name another file's literal or signature on top of
     /// the provenance every fact carries.
-    definition_fact_ref_files: CowShards<LuaDefinitionId, HashSet<FileId>>,
+    definition_fact_ref_files: CowShards<LuaDefinitionId, FileIdSet>,
     definition_fact_refs_by_file: CowShards<FileId, HashSet<LuaDefinitionId>>,
     /// For each decl whose type a write has seeded: that write's source
     /// position, and whether its right-hand side was a call or index read. See
@@ -4319,15 +4351,21 @@ fn collect_type_files(typ: &LuaType, files: &mut HashSet<FileId>) {
 /// Re-points `key`'s reverse edges at `files`, dropping the stale ones.
 fn replace_reverse_edges<K>(
     by_file: &mut CowShards<FileId, HashSet<K>>,
-    forward: &mut CowShards<K, HashSet<FileId>>,
+    forward: &mut CowShards<K, FileIdSet>,
     key: K,
     files: HashSet<FileId>,
 ) where
     K: ShardKey + Clone,
 {
-    if let Some(previous) = forward.insert(key.clone(), files.clone()) {
-        for file_id in previous.difference(&files) {
-            if let Some(keys) = by_file.get_mut(file_id) {
+    let Some(files) = FileIdSet::from_set(files) else {
+        remove_reverse_edges(by_file, forward, &key);
+        return;
+    };
+    if let Some(previous) = forward.get(&key) {
+        for file_id in previous.as_slice() {
+            if files.as_slice().binary_search(file_id).is_err()
+                && let Some(keys) = by_file.get_mut(file_id)
+            {
                 keys.remove(&key);
                 if keys.is_empty() {
                     by_file.remove(file_id);
@@ -4335,18 +4373,16 @@ fn replace_reverse_edges<K>(
             }
         }
     }
-    for file_id in &files {
+    for file_id in files.as_slice() {
         by_file.entry(*file_id).or_default().insert(key.clone());
     }
-    if files.is_empty() {
-        forward.remove(&key);
-    }
+    forward.insert(key, files);
 }
 
 /// Drops `key`'s reverse edges entirely.
 fn remove_reverse_edges<K>(
     by_file: &mut CowShards<FileId, HashSet<K>>,
-    forward: &mut CowShards<K, HashSet<FileId>>,
+    forward: &mut CowShards<K, FileIdSet>,
     key: &K,
 ) where
     K: ShardKey + Clone,
@@ -4354,11 +4390,11 @@ fn remove_reverse_edges<K>(
     let Some(files) = forward.remove(key) else {
         return;
     };
-    for file_id in files {
-        if let Some(keys) = by_file.get_mut(&file_id) {
+    for file_id in files.as_slice() {
+        if let Some(keys) = by_file.get_mut(file_id) {
             keys.remove(key);
             if keys.is_empty() {
-                by_file.remove(&file_id);
+                by_file.remove(file_id);
             }
         }
     }
@@ -5238,15 +5274,21 @@ mod batch_removal_tests {
     fn assert_reverse_maps_consistent(index: &LuaTypeIndex) {
         for (owner, metadata) in &index.fact_metadata {
             let expected = LuaTypeIndex::metadata_referenced_files(metadata);
+            let mut expected: Vec<_> = expected.into_iter().collect();
+            expected.sort_unstable();
             assert_eq!(
-                index.fact_ref_files.get(owner).cloned().unwrap_or_default(),
+                index
+                    .fact_ref_files
+                    .get(owner)
+                    .map(FileIdSet::as_slice)
+                    .unwrap_or_default(),
                 expected,
                 "fact refs for {owner:?}"
             );
         }
         let mut expected_by_file: HashMap<FileId, HashSet<LuaTypeOwner>> = HashMap::default();
         for (owner, files) in &index.fact_ref_files {
-            for file_id in files {
+            for file_id in files.as_slice() {
                 expected_by_file
                     .entry(*file_id)
                     .or_default()
@@ -5257,11 +5299,13 @@ mod batch_removal_tests {
 
         for (definition, fact) in &index.definition_facts {
             let expected = type_fact_referenced_files(fact);
+            let mut expected: Vec<_> = expected.into_iter().collect();
+            expected.sort_unstable();
             assert_eq!(
                 index
                     .definition_fact_ref_files
                     .get(definition)
-                    .cloned()
+                    .map(FileIdSet::as_slice)
                     .unwrap_or_default(),
                 expected,
                 "definition fact refs for {definition:?}"
@@ -5270,7 +5314,7 @@ mod batch_removal_tests {
         let mut expected_definitions: HashMap<FileId, HashSet<LuaDefinitionId>> =
             HashMap::default();
         for (definition, files) in &index.definition_fact_ref_files {
-            for file_id in files {
+            for file_id in files.as_slice() {
                 expected_definitions
                     .entry(*file_id)
                     .or_default()

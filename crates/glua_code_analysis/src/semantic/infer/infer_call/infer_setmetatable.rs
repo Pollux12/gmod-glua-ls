@@ -132,7 +132,7 @@ pub(crate) fn table_backing_range_from_expr(
 //     table_expr: LuaTableExpr,
 // ) -> Option<LuaType> {
 //     let meta_members =
-//         find_members_with_key(db, &meta_type, LuaMemberKey::Name("__index".into()), true)?;
+//         find_members_with_key(db, &meta_type, LuaMemberKey::name("__index"), true)?;
 //     for member in meta_members {
 //         let index_members = find_members(db, &member.typ)?;
 //         let table_type = infer_expr(db, cache, LuaExpr::TableExpr(table_expr.clone())).ok()?;
@@ -218,7 +218,7 @@ fn infer_metatable_index_type(
 
     // Every `__index` writer, so writers that disagree are seen to disagree.
     if let Some(meta_members) =
-        find_members_with_key(db, &meta_type, LuaMemberKey::Name("__index".into()), true)
+        find_members_with_key(db, &meta_type, LuaMemberKey::name("__index"), true)
     {
         let mut index_types = Vec::with_capacity(meta_members.len());
         for meta_member in meta_members {
@@ -416,7 +416,7 @@ fn exact_table_index_type(
         _ => return ExactMetatableIndexType::None,
     };
     let owner = LuaMemberOwner::Element(table_range.clone());
-    let key = LuaMemberKey::Name("__index".into());
+    let key = LuaMemberKey::name("__index");
     // The writers a reader at the call sees: a later plain write in the same
     // file has replaced the earlier ones by then.
     let mut member_ids = crate::LuaMemberIndexItem::Many(

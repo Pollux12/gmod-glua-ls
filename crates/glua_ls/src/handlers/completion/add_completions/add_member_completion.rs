@@ -65,7 +65,7 @@ pub fn add_member_completion_with_description_hint(
             LuaMemberKey::Name(name) => name.to_string(),
             LuaMemberKey::Integer(index) => format!("[{}]", index),
             LuaMemberKey::ExprType(typ) => {
-                if let LuaType::Call(alias_call) = typ {
+                if let LuaType::Call(alias_call) = typ.as_ref() {
                     if alias_call.get_call_kind() == LuaAliasCallKind::KeyOf
                         && alias_call.get_operands().len() == 1
                     {

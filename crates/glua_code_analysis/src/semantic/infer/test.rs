@@ -1569,7 +1569,7 @@ mod test {
         };
 
         let db = ws.analysis.compilation.get_db();
-        let missing_key = LuaMemberKey::Name("Max".into());
+        let missing_key = LuaMemberKey::name("Max");
         let missing_lookup = infer_owner_raw_member_type_with_realm(
             db,
             LuaMemberOwner::Element(table_id.clone()),
@@ -1583,7 +1583,7 @@ mod test {
             "unexpected lookup result for missing exact key: {missing_lookup:?}"
         );
 
-        let existing_key = LuaMemberKey::Name("max".into());
+        let existing_key = LuaMemberKey::name("max");
         let existing_lookup = infer_owner_raw_member_type_with_realm(
             db,
             LuaMemberOwner::Element(table_id),
@@ -1954,7 +1954,7 @@ mod test {
             .get_member_index()
             .get_file_members(reader)
             .into_iter()
-            .find(|member| member.get_key() == &LuaMemberKey::Name("owner".into()))
+            .find(|member| member.get_key() == &LuaMemberKey::name("owner"))
             .expect("the table field member");
         let cached = db
             .get_type_index()

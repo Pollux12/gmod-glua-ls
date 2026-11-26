@@ -400,7 +400,7 @@ fn object_tpl_pattern_match_member_owner_match(
     for (k, v) in members.iter() {
         let resolve_key = match k {
             LuaMemberKey::Integer(i) => Some(LuaType::IntegerConst(*i)),
-            LuaMemberKey::Name(s) => Some(LuaType::StringConst(s.clone().into())),
+            LuaMemberKey::Name(s) => Some(LuaType::StringConst(s.clone())),
             _ => None,
         };
         let resolve_type = match v.len() {
@@ -614,8 +614,8 @@ fn table_generic_tpl_pattern_member_owner_match(
     for (k, v) in members.iter() {
         let key_type = match k {
             LuaMemberKey::Integer(i) => LuaType::IntegerConst(*i),
-            LuaMemberKey::Name(s) => LuaType::StringConst(s.clone().into()),
-            LuaMemberKey::ExprType(typ) => typ.clone(),
+            LuaMemberKey::Name(s) => LuaType::StringConst(s.clone()),
+            LuaMemberKey::ExprType(typ) => typ.as_ref().clone(),
             _ => continue,
         };
 
@@ -667,7 +667,7 @@ fn table_generic_tpl_pattern_member_owner_match(
                     return;
                 }
                 let key_type = match &m.key {
-                    LuaMemberKey::ExprType(typ) => typ.clone(),
+                    LuaMemberKey::ExprType(typ) => typ.as_ref().clone(),
                     _ => return,
                 };
                 if check_type_compact(context.db, &target_key_type, &key_type).is_ok() {
@@ -1347,7 +1347,7 @@ fn try_handle_pairs_metamethod(
     members: &FxHashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
 ) -> TplPatternMatchResult {
     let pairs_member = members
-        .get(&LuaMemberKey::Name("__pairs".into()))
+        .get(&LuaMemberKey::name("__pairs"))
         .ok_or(InferFailReason::None)?
         .first()
         .ok_or(InferFailReason::None)?;

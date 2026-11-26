@@ -6396,7 +6396,7 @@ print(tuned{index})"
         fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
             let joined = joined_owner();
             if id == statement(self.reader) {
-                let key = crate::LuaMemberKey::Name("value".into());
+                let key = crate::LuaMemberKey::name("value");
                 let slot = db
                     .get_member_index()
                     .get_members_for_owner_key(&joined, &key)
@@ -6429,7 +6429,7 @@ print(tuned{index})"
                     );
                     let member = crate::LuaMember::new(
                         crate::LuaMemberId::new(syntax, id.file_id),
-                        crate::LuaMemberKey::Name("value".into()),
+                        crate::LuaMemberKey::name("value"),
                         crate::LuaMemberFeature::FileFieldDecl,
                         None,
                     );
@@ -6745,7 +6745,7 @@ function holder.receiver:Use() end
         let signature = crate::LuaSignatureId::new(file_id, closure.get_position());
         assert!(*db.queries().receiver_authority.get(db, signature));
         file_queries(db);
-        let key = crate::LuaMemberKey::Name("receiver".into());
+        let key = crate::LuaMemberKey::name("receiver");
         let member = db
             .get_member_index()
             .get_current_members_for_key(&key)
@@ -6759,7 +6759,7 @@ function holder.receiver:Use() end
             .unwrap()
             .clone();
         db.get_member_index_mut()
-            .rekey_member(member, crate::LuaMemberKey::Name("renamed".into()))
+            .rekey_member(member, crate::LuaMemberKey::name("renamed"))
             .unwrap();
         let slot = HashedKey::new(FactKey::member_slot(owner.clone(), key));
         let map = HashedKey::new(FactKey::MemberOwnerMap(owner));
