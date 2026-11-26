@@ -289,8 +289,8 @@ mod tests {
             batched.member_owner_key_index
         );
         assert_eq!(
-            sequential.member_owner_key_history_index,
-            batched.member_owner_key_history_index
+            sequential.member_owner_key_displaced,
+            batched.member_owner_key_displaced
         );
     }
 
@@ -1220,7 +1220,7 @@ mod tests {
             assert!(!index.current_members_by_key.contains_key(key));
         }
         assert!(!index.member_owner_key_index.contains_key(&owner));
-        assert!(!index.member_owner_key_history_index.contains_key(&owner));
+        assert!(!index.member_owner_key_displaced.contains_key(&owner));
         assert!(!index.member_current_owner.contains_key(&member_id));
     }
 
@@ -1270,11 +1270,7 @@ mod tests {
 
     /// How many ids `owner`'s history slot for `key` holds, homed or not.
     fn history_len(index: &LuaMemberIndex, owner: &LuaMemberOwner, key: &LuaMemberKey) -> usize {
-        index
-            .member_owner_key_history_index
-            .get(owner)
-            .and_then(|items| items.get(key))
-            .map_or(0, |ids| ids.len())
+        index.history_slot_ids(owner, key).len()
     }
 
     #[test]
@@ -1377,16 +1373,21 @@ mod tests {
                 members.fingerprint()
             )
         }));
-        state.extend(
-            index
-                .member_owner_key_history_index
-                .iter()
-                .flat_map(|(owner, slots)| {
-                    slots
-                        .iter()
-                        .map(move |(key, ids)| format!("slot {owner:?} {key:?} {ids:?}"))
-                }),
-        );
+        let mut owners_keys = HashSet::default();
+        for map in [
+            &index.member_owner_key_index,
+            &index.member_owner_key_displaced,
+        ] {
+            for (owner, slots) in map {
+                for key in slots.keys() {
+                    owners_keys.insert((owner.clone(), key.clone()));
+                }
+            }
+        }
+        state.extend(owners_keys.into_iter().map(|(owner, key)| {
+            let ids = index.history_slot_ids(&owner, &key);
+            format!("slot {owner:?} {key:?} {ids:?}")
+        }));
         state.sort();
         state
     }

@@ -239,7 +239,10 @@ pub struct LuaMemberIndex {
     owner_members: CowShards<LuaMemberOwner, LuaOwnerMembers>,
     member_current_owner: CowShards<LuaMemberId, LuaMemberOwner>,
     member_owner_key_index: OwnerKeyMap,
-    member_owner_key_history_index: OwnerKeyMap,
+    /// Members displaced from `member_owner_key_index` by a later write or
+    /// re-home. The history view is `member_owner_key_index ∪ member_owner_key_displaced`,
+    /// avoiding a full duplicate of every visible member.
+    member_owner_key_displaced: OwnerKeyMap,
     /// The owners under which a file's members were filed in the two
     /// owner-key indexes. A file sweep only has to visit these owners, rather
     /// than every owner in the workspace. Entries may outlive the members that
@@ -363,7 +366,7 @@ impl LuaMemberIndex {
             owner_members: CowShards::default(),
             member_current_owner: Default::default(),
             member_owner_key_index: Default::default(),
-            member_owner_key_history_index: Default::default(),
+            member_owner_key_displaced: Default::default(),
             owner_key_index_owners_by_file: Default::default(),
             current_owner_member_history: CowShards::default(),
             current_members_by_key: CowShards::default(),
@@ -548,6 +551,41 @@ impl LuaMemberIndex {
         }
     }
 
+    fn history_slot_ids<'a>(
+        &'a self,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+    ) -> std::borrow::Cow<'a, [LuaMemberId]> {
+        let visible = self
+            .member_owner_key_index
+            .get(owner)
+            .and_then(|slots| slots.get(key))
+            .map(SlotIds::as_slice);
+        let displaced = self
+            .member_owner_key_displaced
+            .get(owner)
+            .and_then(|slots| slots.get(key))
+            .map(SlotIds::as_slice);
+        match (visible, displaced) {
+            (None, None) => std::borrow::Cow::Borrowed(&[]),
+            (Some(v), None) => std::borrow::Cow::Borrowed(v),
+            (None, Some(d)) => std::borrow::Cow::Borrowed(d),
+            (Some(v), Some(d)) => {
+                let mut merged = Vec::with_capacity(v.len() + d.len());
+                merged.extend_from_slice(v);
+                merged.extend_from_slice(d);
+                merged.sort_unstable_by_key(|id| member_id_sort_key(*id));
+                merged.dedup();
+                std::borrow::Cow::Owned(merged)
+            }
+        }
+    }
+
+    fn has_owner_history(&self, owner: &LuaMemberOwner) -> bool {
+        self.member_owner_key_index.contains_key(owner)
+            || self.member_owner_key_displaced.contains_key(owner)
+    }
+
     /// The item listed under `(owner, key)` and both owner-key index slots in
     /// order, each id with whether it is still homed there under `key`.
     fn slot_fingerprint(&self, owner: &LuaMemberOwner, key: &LuaMemberKey) -> Fingerprint {
@@ -559,16 +597,12 @@ impl LuaMemberIndex {
             .member_owner_key_index
             .get(owner)
             .and_then(|slots| slots.get(key));
-        let history = self
-            .member_owner_key_history_index
-            .get(owner)
-            .and_then(|slots| slots.get(key));
-        if item.is_none() && visible.is_none() && history.is_none() {
+        let history = self.history_slot_ids(owner, key);
+        if item.is_none() && visible.is_none() && history.is_empty() {
             return ABSENT;
         }
-        let entries = [visible, history].map(|ids| {
-            ids.map_or(&[][..], SlotIds::as_slice)
-                .iter()
+        let entries = [visible.map_or(&[][..], SlotIds::as_slice), &history].map(|ids| {
+            ids.iter()
                 .map(|id| {
                     let homed = self.member_current_owner.get(id) == Some(owner);
                     let key_matches =
@@ -641,19 +675,30 @@ impl LuaMemberIndex {
     /// `owner`'s history fingerprint summed afresh, which is what the
     /// incremental `owner_history_fingerprints` sum holds.
     fn recomputed_owner_history_fingerprint(&self, owner: &LuaMemberOwner) -> Fingerprint {
-        let keyed = self
-            .member_owner_key_history_index
-            .get(owner)
+        let visible_map = self.member_owner_key_index.get(owner);
+        let visible = visible_map
             .into_iter()
             .flatten()
             .flat_map(|(key, ids)| ids.iter().map(move |id| history_element(key, *id)));
+        let displaced = self
+            .member_owner_key_displaced
+            .get(owner)
+            .into_iter()
+            .flatten()
+            .flat_map(move |(key, ids)| {
+                let visible_slot = visible_map.and_then(|m| m.get(key));
+                ids.iter()
+                    .filter(move |id| visible_slot.is_none_or(|v| !v.contains(id)))
+                    .map(move |id| history_element(key, *id))
+            });
         let current = self
             .current_owner_member_history
             .get(owner)
             .into_iter()
             .flat_map(|history| history.iter())
             .map(|id| current_history_element(*id));
-        keyed
+        visible
+            .chain(displaced)
             .chain(current)
             .fold(ABSENT, |sum: Fingerprint, element| {
                 sum.wrapping_add(element)
@@ -852,7 +897,7 @@ impl LuaMemberIndex {
         }
         for index in [
             &self.member_owner_key_index,
-            &self.member_owner_key_history_index,
+            &self.member_owner_key_displaced,
         ] {
             for (owner, slots) in index {
                 note_owner_map_write(owner);
@@ -1562,8 +1607,9 @@ impl LuaMemberIndex {
         }
     }
 
-    /// Files `id` under its owner and key in both owner-key indexes, ignoring a
-    /// slot that already holds it.
+    /// Files `id` under its owner and key in the visible owner-key index,
+    /// removing any displaced record for the same `(owner, key, id)` so
+    /// `history = visible ∪ displaced` stays disjoint.
     fn add_member_to_owner_key_indexes(&mut self, owner: LuaMemberOwner, id: LuaMemberId) {
         let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
             return;
@@ -1576,26 +1622,22 @@ impl LuaMemberIndex {
             key.clone(),
             id,
         );
-        let history_changed = push_owner_key_id_unique(
-            &mut self.member_owner_key_history_index,
-            owner.clone(),
-            key.clone(),
-            id,
-        );
-        if history_changed {
+        let was_displaced =
+            remove_owner_key_id(&mut self.member_owner_key_displaced, &owner, &key, id);
+        if visible_changed && !was_displaced {
             self.fold_history_fingerprint(&owner, history_element(&key, id), true);
         }
-        if visible_changed || history_changed {
+        if visible_changed {
             note_slot_write(&owner, &key);
         }
     }
 
     /// [`add_member_to_owner_key_indexes`](Self::add_member_to_owner_key_indexes)
-    /// for a member whose *current* filing is new. The history index keeps
+    /// for a member whose *current* filing is new. The displaced index keeps
     /// entries a later owner move left behind, and an alias filing
     /// ([`Self::add_member_alias_to_owner`]) lists the id under an owner its
     /// current owner never names, so either slot can already hold the id when
-    /// the member returns to a former `(owner, key)`: both pushes dedupe.
+    /// the member returns to a former `(owner, key)`: both operations dedupe.
     fn add_new_member_to_owner_key_indexes(&mut self, owner: LuaMemberOwner, id: LuaMemberId) {
         let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
             return;
@@ -1603,18 +1645,15 @@ impl LuaMemberIndex {
 
         self.record_owner_key_index_owner(id.file_id, &owner);
         note_slot_write(&owner, &key);
-        push_owner_key_id_unique(
+        let visible_changed = push_owner_key_id_unique(
             &mut self.member_owner_key_index,
             owner.clone(),
             key.clone(),
             id,
         );
-        if push_owner_key_id_unique(
-            &mut self.member_owner_key_history_index,
-            owner.clone(),
-            key.clone(),
-            id,
-        ) {
+        let was_displaced =
+            remove_owner_key_id(&mut self.member_owner_key_displaced, &owner, &key, id);
+        if visible_changed && !was_displaced {
             self.fold_history_fingerprint(&owner, history_element(&key, id), true);
         }
     }
@@ -1629,8 +1668,8 @@ impl LuaMemberIndex {
         }
     }
 
-    /// Drops `id` from the visible index only, leaving the history index to
-    /// remember that this owner once held it.
+    /// Drops `id` from the visible index only, recording it in the displaced
+    /// index so history still remembers that this owner once held it.
     fn remove_member_from_visible_owner_key_index(
         &mut self,
         owner: &LuaMemberOwner,
@@ -1640,6 +1679,12 @@ impl LuaMemberIndex {
             return;
         };
         if remove_owner_key_id(&mut self.member_owner_key_index, owner, &key, id) {
+            push_owner_key_id_unique(
+                &mut self.member_owner_key_displaced,
+                owner.clone(),
+                key.clone(),
+                id,
+            );
             note_slot_write(owner, &key);
         }
     }
@@ -1654,12 +1699,10 @@ impl LuaMemberIndex {
         };
         let visible_changed =
             remove_owner_key_id(&mut self.member_owner_key_index, owner, &key, id);
-        let history_changed =
-            remove_owner_key_id(&mut self.member_owner_key_history_index, owner, &key, id);
-        if history_changed {
+        let displaced_changed =
+            remove_owner_key_id(&mut self.member_owner_key_displaced, owner, &key, id);
+        if visible_changed || displaced_changed {
             self.fold_history_fingerprint(owner, history_element(&key, id), false);
-        }
-        if visible_changed || history_changed {
             note_slot_write(owner, &key);
         }
     }
@@ -1675,19 +1718,27 @@ impl LuaMemberIndex {
             removed,
             &owners,
         );
-        if derivation::recording() {
-            for (owner, key, _) in &visible {
-                note_slot_write(owner, key);
-            }
-        }
-        let history = Self::remove_files_members_from_owner_key_map(
-            &mut self.member_owner_key_history_index,
+        let displaced = Self::remove_files_members_from_owner_key_map(
+            &mut self.member_owner_key_displaced,
             removed,
             &owners,
         );
-        for (owner, key, id) in &history {
-            note_slot_write(owner, key);
-            self.fold_history_fingerprint(owner, history_element(key, *id), false);
+        if displaced.is_empty() {
+            for (owner, key, id) in &visible {
+                note_slot_write(owner, key);
+                self.fold_history_fingerprint(owner, history_element(key, *id), false);
+            }
+        } else {
+            let mut seen = HashSet::with_capacity_and_hasher(
+                visible.len() + displaced.len(),
+                Default::default(),
+            );
+            for (owner, key, id) in visible.into_iter().chain(displaced) {
+                if seen.insert((owner.clone(), key.clone(), id)) {
+                    note_slot_write(&owner, &key);
+                    self.fold_history_fingerprint(&owner, history_element(&key, id), false);
+                }
+            }
         }
     }
 
@@ -2316,7 +2367,7 @@ impl LuaMemberIndex {
             .flat_map(member_ids_from_item);
         let indexed = [
             &self.member_owner_key_index,
-            &self.member_owner_key_history_index,
+            &self.member_owner_key_displaced,
         ]
         .into_iter()
         .filter_map(|index| index.get(path_owner))
@@ -2720,11 +2771,17 @@ impl LuaMemberIndex {
     pub fn get_member_history(&self, owner: &LuaMemberOwner) -> Vec<&LuaMember> {
         let owner = self.canonical(owner);
         note_owner_map_read(owner);
-        let Some(owner_items) = self.member_owner_key_history_index.get(owner) else {
+        let visible = self.member_owner_key_index.get(owner);
+        let displaced = self.member_owner_key_displaced.get(owner);
+        if visible.is_none() && displaced.is_none() {
             return Vec::new();
-        };
+        }
 
-        let mut member_ids = owner_items.values().flatten().copied().collect::<Vec<_>>();
+        let mut member_ids = visible
+            .into_iter()
+            .chain(displaced)
+            .flat_map(|owner_items| owner_items.values().flatten().copied())
+            .collect::<Vec<_>>();
         member_ids.sort_unstable_by_key(|member_id| member_id_sort_key(*member_id));
         member_ids.dedup();
         member_ids
@@ -2746,10 +2803,10 @@ impl LuaMemberIndex {
         // it. Reading the whole history to filter it built and sorted every
         // member the owner has ever held, once per resolution event, against
         // paths that gain a member per assignment.
-        let Some(owner_items) = self.member_owner_key_history_index.get(owner) else {
+        if !self.has_owner_history(owner) {
             note_owner_map_read(owner);
             return Vec::new();
-        };
+        }
         let name = global_id.get_name();
         // The segment below the owner: a string key that is no name, such as
         // `a.b` in `T["a.b"] = v`, is one bracketed segment.
@@ -2764,9 +2821,10 @@ impl LuaMemberIndex {
         let mut matched = Vec::new();
         let collect = |key: &LuaMemberKey, matched: &mut Vec<LuaMemberId>| {
             note_slot_read(owner, key);
-            let Some(member_ids) = owner_items.get(key) else {
+            let member_ids = self.history_slot_ids(owner, key);
+            if member_ids.is_empty() {
                 return;
-            };
+            }
             matched.extend(member_ids.iter().copied().filter(|member_id| {
                 self.get_member(member_id)
                     .and_then(|member| member.get_global_id())
@@ -2959,13 +3017,10 @@ impl LuaMemberIndex {
     ) -> Vec<LuaMemberId> {
         let owner = self.canonical(owner);
         note_slot_read(owner, key);
-        let Some(member_ids) = self
-            .member_owner_key_history_index
-            .get(owner)
-            .and_then(|owner_items| owner_items.get(key))
-        else {
+        let member_ids = self.history_slot_ids(owner, key);
+        if member_ids.is_empty() {
             return Vec::new();
-        };
+        }
 
         member_ids
             .iter()
@@ -3556,12 +3611,16 @@ impl LuaMemberIndex {
                 }
             }
             let visible = self.member_owner_key_index.remove(&owner);
-            let history = self.member_owner_key_history_index.remove(&owner);
+            let displaced = self.member_owner_key_displaced.remove(&owner);
             if let Some(current) = self.current_owner_member_history.remove(&owner) {
                 held.extend(current.iter().copied());
             }
             if derivation::recording() {
-                for key in visible.iter().chain(history.iter()).flat_map(HashMap::keys) {
+                for key in visible
+                    .iter()
+                    .chain(displaced.iter())
+                    .flat_map(HashMap::keys)
+                {
                     note_slot_write(&owner, key);
                 }
             }
@@ -3626,7 +3685,7 @@ impl LuaIndex for LuaMemberIndex {
         self.owner_members.clear();
         self.member_current_owner.clear();
         self.member_owner_key_index.clear();
-        self.member_owner_key_history_index.clear();
+        self.member_owner_key_displaced.clear();
         self.owner_key_index_owners_by_file.clear();
         self.current_owner_member_history.clear();
         self.current_members_by_key.clear();
@@ -3666,7 +3725,7 @@ crate::db_index::cow_shards::task_fork_fields!(LuaMemberIndex {
     member_owner_key_index => |current, frozen, fork| {
         crate::db_index::cow_shards::merge_map(current, frozen, fork, merge_member_ids)
     },
-    member_owner_key_history_index => |current, frozen, fork| {
+    member_owner_key_displaced => |current, frozen, fork| {
         crate::db_index::cow_shards::merge_map(current, frozen, fork, merge_member_ids)
     },
     owner_key_index_owners_by_file => crate::db_index::cow_shards::merge_set,

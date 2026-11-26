@@ -14,8 +14,8 @@ pub struct LuaOwnerMembers {
     // `members` is private and these four mutators are the complete id-set
     // invalidation surface: `add_member`, `get_member_mut`, `iter_mut`, and
     // `remove_member`.
-    sorted_ids_cache: OnceLock<Vec<LuaMemberId>>,
-    sorted_expr_ids_cache: OnceLock<Vec<LuaMemberId>>,
+    sorted_ids_cache: OnceLock<Box<[LuaMemberId]>>,
+    sorted_expr_ids_cache: OnceLock<Box<[LuaMemberId]>>,
     resolve_state: OwnerMemberStatus,
     /// Wrapping sum of [`listed_id_fingerprint`] over every listed
     /// `(key, id)`. `add_member`, `remove_member` and `remove_id` keep it;
@@ -231,7 +231,7 @@ impl LuaOwnerMembers {
 
     pub fn sorted_member_ids(&self) -> &[LuaMemberId] {
         self.sorted_ids_cache.get_or_init(|| {
-            let mut member_ids = Vec::new();
+            let mut member_ids = Vec::with_capacity(self.members.len());
             for item in self.members.values() {
                 match item {
                     LuaMemberIndexItem::One(id) => member_ids.push(*id),
@@ -239,7 +239,7 @@ impl LuaOwnerMembers {
                 }
             }
             member_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
-            member_ids
+            member_ids.into_boxed_slice()
         })
     }
 
@@ -250,7 +250,7 @@ impl LuaOwnerMembers {
                 member_ids.extend_from_slice(item.member_ids_slice());
             }
             member_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
-            member_ids
+            member_ids.into_boxed_slice()
         })
     }
 

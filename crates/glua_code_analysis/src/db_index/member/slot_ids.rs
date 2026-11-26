@@ -6,23 +6,22 @@ use super::{LuaMemberId, member_id_sort_key};
 /// slots hold one id, which then lives inline, without a list.
 ///
 /// A list of one id is always `One`, so equal slots have equal shapes.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) enum SlotIds {
+    #[default]
+    Empty,
     One(LuaMemberId),
-    Many(Vec<LuaMemberId>),
+    Many(Box<[LuaMemberId]>),
 }
 
-impl Default for SlotIds {
-    fn default() -> Self {
-        Self::Many(Vec::new())
-    }
-}
+const _: () = assert!(std::mem::size_of::<SlotIds>() == 24);
 
 impl Deref for SlotIds {
     type Target = [LuaMemberId];
 
     fn deref(&self) -> &[LuaMemberId] {
         match self {
+            Self::Empty => &[],
             Self::One(id) => std::slice::from_ref(id),
             Self::Many(ids) => ids,
         }
@@ -30,14 +29,11 @@ impl Deref for SlotIds {
 }
 
 impl SlotIds {
-    pub(super) fn from_vec(mut ids: Vec<LuaMemberId>) -> Self {
+    pub(super) fn from_vec(ids: Vec<LuaMemberId>) -> Self {
         match ids.len() {
+            0 => Self::Empty,
             1 => Self::One(ids[0]),
-            0 => Self::default(),
-            _ => {
-                ids.shrink_to_fit();
-                Self::Many(ids)
-            }
+            _ => Self::Many(ids.into_boxed_slice()),
         }
     }
 
@@ -48,16 +44,23 @@ impl SlotIds {
     /// Files `id` at `at`, which keeps the slot's order.
     pub(super) fn insert(&mut self, at: usize, id: LuaMemberId) {
         match self {
+            Self::Empty => *self = Self::One(id),
             Self::One(existing) => {
                 let existing = *existing;
-                *self = Self::Many(if at == 0 {
-                    vec![id, existing]
+                let pair = if at == 0 {
+                    [id, existing]
                 } else {
-                    vec![existing, id]
-                });
+                    [existing, id]
+                };
+                *self = Self::Many(Box::new(pair));
             }
-            Self::Many(ids) if ids.is_empty() => *self = Self::One(id),
-            Self::Many(ids) => ids.insert(at, id),
+            Self::Many(ids) => {
+                let mut vec = Vec::with_capacity(ids.len() + 1);
+                vec.extend_from_slice(&ids[..at]);
+                vec.push(id);
+                vec.extend_from_slice(&ids[at..]);
+                *self = Self::Many(vec.into_boxed_slice());
+            }
         }
     }
 
@@ -84,11 +87,16 @@ impl SlotIds {
             return false;
         };
         match self {
-            Self::One(_) => *self = Self::default(),
+            Self::Empty => return false,
+            Self::One(_) => *self = Self::Empty,
             Self::Many(ids) => {
-                ids.remove(at);
-                if ids.len() < 2 {
-                    *self = Self::from_vec(std::mem::take(ids));
+                if ids.len() == 2 {
+                    *self = Self::One(ids[1 - at]);
+                } else {
+                    let mut vec = Vec::with_capacity(ids.len() - 1);
+                    vec.extend_from_slice(&ids[..at]);
+                    vec.extend_from_slice(&ids[at + 1..]);
+                    *self = Self::Many(vec.into_boxed_slice());
                 }
             }
         }
@@ -97,15 +105,21 @@ impl SlotIds {
 
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&LuaMemberId) -> bool) {
         match self {
+            Self::Empty => {}
             Self::One(id) => {
                 if !keep(id) {
-                    *self = Self::default();
+                    *self = Self::Empty;
                 }
             }
             Self::Many(ids) => {
-                ids.retain(|id| keep(id));
-                if ids.len() < 2 {
-                    *self = Self::from_vec(std::mem::take(ids));
+                let mut kept = Vec::with_capacity(ids.len());
+                for id in ids.iter() {
+                    if keep(id) {
+                        kept.push(*id);
+                    }
+                }
+                if kept.len() != ids.len() {
+                    *self = Self::from_vec(kept);
                 }
             }
         }
