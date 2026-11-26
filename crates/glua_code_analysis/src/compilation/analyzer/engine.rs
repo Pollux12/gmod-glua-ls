@@ -389,14 +389,19 @@ impl Queue {
 
     /// [`Self::take_rank`] bounded to the files, in order, whose entries come
     /// to `entries`, with the file that reaches it whole; the workspace's
-    /// entries stay queued until the rank's last files are taken.
+    /// entries stay queued until the rank's last files are taken. Also returns
+    /// the exclusive `file_key` boundary taken (`None` when every real file at
+    /// `rank` was taken).
     fn take_rank_bounded(
         &mut self,
         rank: u8,
         entries: usize,
-    ) -> Vec<(crate::FileId, Vec<(DerivationId, Reason)>)> {
+    ) -> (
+        Vec<(crate::FileId, Vec<(DerivationId, Reason)>)>,
+        Option<u64>,
+    ) {
         let Some(cut) = self.rank_cut(rank, entries) else {
-            return self.take_rank(rank);
+            return (self.take_rank(rank), None);
         };
         let mut taken = Vec::new();
         for reason in [Reason::Changed, Reason::Read] {
@@ -407,7 +412,7 @@ impl Queue {
                     .extract_if(range, |(.., id)| id.file_id != crate::FileId::VIRTUAL),
             );
         }
-        self.by_file(taken)
+        (self.by_file(taken), Some(cut))
     }
 
     /// The entries `taken` out of the order, file by file in the order a
@@ -722,6 +727,13 @@ pub(crate) struct Engine {
     /// The worker superstep whose tasks run outside the run, and its files.
     detached: Option<Superstep>,
     detached_files: Vec<crate::FileId>,
+    /// The real-file sweep boundary worker supersteps have taken at the
+    /// current rank in this round: `Some((rank, cut))` where `Some(file_key)`
+    /// means real files with `file_key < cut` at `rank` were taken, and `None`
+    /// means every real file at `rank` was taken. Persists across slice yields
+    /// and detached installs, and resets at round, stage, focus and loop
+    /// boundaries.
+    superstep_sweep: Option<(u8, Option<u64>)>,
 }
 
 /// The seconds a group of each file's superstep task took at each rank, by
@@ -811,6 +823,7 @@ struct Moved {
 thread_local! {
     static TEST_SLOT_BATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static TEST_SUPERSTEP: std::cell::Cell<Option<SuperstepMode>> = const { std::cell::Cell::new(None) };
+    static TEST_SUPERSTEP_ENTRIES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// Until the guard drops, engines this thread creates run the serial engine.
@@ -1026,6 +1039,19 @@ impl Engine {
     /// evaluated on the index in the round's order, or ranks before the one a
     /// superstep decided last, else in the next. A changed entry stays changed.
     fn queue(&mut self, id: DerivationId, reason: Reason) {
+        if reason == Reason::Read
+            && id.file_id != crate::FileId::VIRTUAL
+            && self.task != Some(id.file_id)
+            && !self.cycle_members.contains(&id)
+            && self.superstep_sweep.is_some_and(|(rank, cut)| {
+                id.kind.rank() < rank
+                    || (id.kind.rank() == rank
+                        && cut.is_none_or(|cut| self.worklist.schedule.file_key(id.file_id) < cut))
+            })
+        {
+            self.next_round.insert(id, reason);
+            return;
+        }
         let Some((cursor, cursor_reason)) = self.cursor else {
             self.worklist.insert(id, reason);
             return;
@@ -1379,6 +1405,7 @@ impl Engine {
             return;
         }
         self.requeue_carried();
+        self.superstep_sweep = None;
         let resumed = self
             .waiting
             .extract_if(|id| self.focus.contains(&id.file_id));
@@ -1659,6 +1686,7 @@ impl Engine {
                 let schedule = self.next_round.schedule;
                 self.worklist = std::mem::replace(&mut self.next_round, Queue::new(schedule));
                 self.cursor = None;
+                self.superstep_sweep = None;
                 self.stats.rounds += 1;
                 self.stats.round_started(self.worklist.order.len());
                 continue;
@@ -1676,6 +1704,7 @@ impl Engine {
             self.step(db, recipe, id, reason);
         }
         self.cursor = None;
+        self.superstep_sweep = None;
         crate::profile::phase("engine: rebase moved reads", || self.rebase_moved_reads(db));
         if check_settled() {
             self.report_unsettled(db);
@@ -1807,8 +1836,25 @@ impl Engine {
         // Each member of a planned group, with the plan and position of its
         // group: the files of a group that spans several share one.
         let mut grouped = FxHashMap::<DerivationId, (usize, usize)>::default();
-        let taken = crate::profile::phase("dispatch: take rank", || {
-            self.worklist.take_rank_bounded(rank, SUPERSTEP_ENTRIES)
+        let entries_limit = {
+            #[cfg(test)]
+            {
+                TEST_SUPERSTEP_ENTRIES.with(|limit| limit.get().unwrap_or(SUPERSTEP_ENTRIES))
+            }
+            #[cfg(not(test))]
+            {
+                SUPERSTEP_ENTRIES
+            }
+        };
+        let (taken, cut) = crate::profile::phase("dispatch: take rank", || {
+            self.worklist.take_rank_bounded(rank, entries_limit)
+        });
+        self.superstep_sweep = Some(match self.superstep_sweep {
+            Some((prev_rank, None)) if prev_rank == rank => (rank, None),
+            Some((prev_rank, Some(prev_cut))) if prev_rank == rank => {
+                (rank, cut.map(|next| prev_cut.max(next)))
+            }
+            _ => (rank, cut),
         });
         let checked = crate::profile::phase("dispatch: check", || self.check_dispatch(db, &taken));
         for ((file_id, entries), checked) in taken.into_iter().zip(checked) {
@@ -3200,6 +3246,7 @@ impl Engine {
         self.worklist = Queue::new(Schedule::Canonical);
         self.next_round = Queue::new(Schedule::Canonical);
         self.cursor = None;
+        self.superstep_sweep = None;
         self.readers_of(db, touched.iter());
         for member in members {
             // The loop's own reset is not a fact from outside it.
@@ -3326,6 +3373,7 @@ impl Engine {
         self.back_edges.clear();
         self.query_deferrals.clear();
         self.serial_stage = false;
+        self.superstep_sweep = None;
         let before = db.analysis_stage();
         db.set_analysis_stage(stage);
         let moved = StageRule::ALL
@@ -3479,6 +3527,7 @@ impl Engine {
         }
         self.stats.focus_settled(queued);
         self.cursor = None;
+        self.superstep_sweep = None;
         // Files prioritised while the loops settled become the focus now,
         // whether or not the release queued anything.
         let after_loops = std::mem::take(&mut self.after_loops);
@@ -6280,7 +6329,8 @@ print(tuned{index})"
         queue.insert(workspace, Reason::Changed);
         let rank = DerivationKind::LocalStat.rank();
 
-        let bounded = queue.take_rank_bounded(rank, 3);
+        let (bounded, cut) = queue.take_rank_bounded(rank, 3);
+        assert_eq!(cut, Some(Schedule::Canonical.file_key(third)));
         let rest = queue.take_rank(rank);
 
         let entries = |file_id| {
@@ -7832,6 +7882,115 @@ function holder.receiver:Use() end
                     "{schedule:?} serial={serial}"
                 );
             }
+        }
+    }
+
+    /// A reader in an early file that reads what 20 later files write, split
+    /// across small bounded supersteps, must wait for the next round instead
+    /// of re-entering every remaining superstep of round 0 — both in whole and
+    /// sliced runs, and when the reader's file is already serial.
+    #[test]
+    fn bounded_supersteps_defer_invalidated_early_readers_to_next_round() {
+        struct FanIn {
+            reader_file: FileId,
+            writer_files: Vec<FileId>,
+        }
+
+        impl Recipe for FanIn {
+            fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
+                if id.file_id == self.reader_file {
+                    let mut combined = LuaType::Never;
+                    for &writer in &self.writer_files {
+                        if let Some(ty) = db
+                            .get_type_index()
+                            .get_type_cache(&owner_in(writer, 0))
+                            .map(|cache| cache.as_type().clone())
+                        {
+                            combined = TypeOps::Union.apply(db, &combined, &ty);
+                        }
+                    }
+                    bind_in(db, self.reader_file, 0, combined);
+                } else {
+                    let idx = self
+                        .writer_files
+                        .iter()
+                        .position(|&file| file == id.file_id)
+                        .expect("writer file");
+                    bind_in(db, id.file_id, 0, text(&format!("w{idx}")));
+                }
+            }
+
+            fn splits(&self, _: DerivationKind) -> bool {
+                false
+            }
+
+            fn compute(&self, _: &DbIndex, _: DerivationId) -> Box<dyn std::any::Any + Send> {
+                unreachable!("fan-in does not split")
+            }
+
+            fn apply(&self, _: &mut DbIndex, _: DerivationId, _: Box<dyn std::any::Any + Send>) {
+                unreachable!("fan-in does not split")
+            }
+        }
+
+        fn owner_in(file_id: FileId, pos: u32) -> LuaTypeOwner {
+            LuaTypeOwner::Decl(LuaDeclId::new(file_id, TextSize::new(pos)))
+        }
+
+        fn bind_in(db: &mut DbIndex, file_id: FileId, pos: u32, typ: LuaType) {
+            db.get_type_index_mut()
+                .force_bind_type(owner_in(file_id, pos), LuaTypeCache::InferType(typ));
+        }
+
+        let _limit = {
+            TEST_SUPERSTEP_ENTRIES.with(|limit| limit.set(Some(1)));
+            OnDrop(|| TEST_SUPERSTEP_ENTRIES.with(|limit| limit.set(None)))
+        };
+
+        let run_case = |schedule: Schedule, sliced: bool, reader_serial: bool| {
+            let mut ws = VirtualWorkspace::new();
+            let mut files = Vec::new();
+            for i in 0..22 {
+                files.push(ws.def_file(&format!("lua/autorun/f_{i:02}.lua"), "local x = 1\n"));
+            }
+            let (reader_file, writer_files) = match schedule {
+                Schedule::Reversed => (files[21], files[..21].to_vec()),
+                _ => (files[0], files[1..].to_vec()),
+            };
+            let recipe = FanIn {
+                reader_file,
+                writer_files: writer_files.clone(),
+            };
+            let db = ws.get_db_mut();
+            let mut engine = Engine::new(derivation::EditMaps::default(), schedule);
+            if reader_serial {
+                engine.serial_files.insert(reader_file);
+            }
+            for &file_id in &files {
+                engine.changed(statement_in(file_id, 0));
+            }
+            engine.open(db);
+            if sliced {
+                while !engine.run(db, &recipe, Slice::Evaluations(1)) {}
+            } else {
+                assert!(engine.run(db, &recipe, Slice::Whole));
+            }
+            let settled = db
+                .get_type_index()
+                .get_type_cache(&owner_in(reader_file, 0))
+                .map(|cache| cache.as_type().clone());
+            (engine.stats.most_runs(), settled)
+        };
+
+        for schedule in [Schedule::Canonical, Schedule::Reversed] {
+            let (whole_runs, whole_ty) = run_case(schedule, false, false);
+            let (sliced_runs, sliced_ty) = run_case(schedule, true, false);
+            let (serial_runs, serial_ty) = run_case(schedule, false, true);
+            assert!(whole_runs <= 2, "{schedule:?} whole runs={whole_runs}");
+            assert!(sliced_runs <= 3, "{schedule:?} sliced runs={sliced_runs}");
+            assert!(serial_runs <= 2, "{schedule:?} serial runs={serial_runs}");
+            assert_eq!(sliced_ty, whole_ty, "{schedule:?} sliced vs whole");
+            assert_eq!(serial_ty, whole_ty, "{schedule:?} serial vs whole");
         }
     }
 }
