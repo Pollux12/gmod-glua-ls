@@ -690,8 +690,16 @@ fn try_collapse(match_source: &LuaType, source: &LuaType, target: &LuaType) -> O
             LuaType::Integer
         }
         // float | float const
-        (LuaType::Number, right) if right.is_number() => LuaType::Number,
-        (left, LuaType::Number) if left.is_number() => LuaType::Number,
+        (LuaType::Number, right)
+            if right.is_number() || matches!(right, LuaType::DocIntegerConst(_)) =>
+        {
+            LuaType::Number
+        }
+        (left, LuaType::Number)
+            if left.is_number() || matches!(left, LuaType::DocIntegerConst(_)) =>
+        {
+            LuaType::Number
+        }
         // string | string const
         (LuaType::String, LuaType::StringConst(_) | LuaType::DocStringConst(_)) => LuaType::String,
         (LuaType::StringConst(_) | LuaType::DocStringConst(_), LuaType::String) => LuaType::String,

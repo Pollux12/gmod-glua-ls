@@ -848,4 +848,48 @@ mod tests {
             other => panic!("expected a union from the large tuple index, got {other:?}"),
         }
     }
+
+    /// `Number` absorbs `Integer`, and `Integer` absorbs `DocIntegerConst`, so
+    /// pairwise `TypeOps::Union` must also collapse `Number` with
+    /// `DocIntegerConst`; otherwise `(Number | 1) | Integer` drops `1` while
+    /// `(Number | Integer) | 1` keeps it, breaking associativity and oscillating
+    /// fixpoint collection widening.
+    #[test]
+    fn number_absorbs_doc_integer_const_associatively_in_pairwise_union() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+
+        assert_eq!(
+            TypeOps::Union.apply(db, &LuaType::Number, &LuaType::DocIntegerConst(1)),
+            LuaType::Number
+        );
+        assert_eq!(
+            TypeOps::Union.apply(db, &LuaType::DocIntegerConst(1), &LuaType::Number),
+            LuaType::Number
+        );
+
+        let left_assoc = TypeOps::Union.apply(
+            db,
+            &TypeOps::Union.apply(db, &LuaType::Number, &LuaType::DocIntegerConst(1)),
+            &LuaType::Integer,
+        );
+        let right_assoc = TypeOps::Union.apply(
+            db,
+            &TypeOps::Union.apply(db, &LuaType::Number, &LuaType::Integer),
+            &LuaType::DocIntegerConst(1),
+        );
+        assert_eq!(left_assoc, LuaType::Number);
+        assert_eq!(right_assoc, LuaType::Number);
+
+        let mixed = LuaType::from_vec(vec![
+            LuaType::Nil,
+            LuaType::Number,
+            LuaType::Unknown,
+            LuaType::Any,
+        ]);
+        let with_const = TypeOps::Union.apply(db, &mixed, &LuaType::DocIntegerConst(1));
+        let with_int = TypeOps::Union.apply(db, &with_const, &LuaType::Integer);
+        assert_eq!(with_const, mixed);
+        assert_eq!(with_int, mixed);
+    }
 }
