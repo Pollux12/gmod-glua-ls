@@ -939,4 +939,150 @@ end
             ),
         ]);
     }
+
+    #[test]
+    fn sibling_collection_initializers_with_guarded_append_drop_transient_null_under_any_schedule()
+    {
+        let files = &[
+            (
+                "lua/includes/util.lua",
+                "---@class Entity
+local Entity = {}
+function Entity:IsValid()
+    return true
+end
+---@class NULL : Entity
+NULL = {}
+---@param object any
+---@return TypeGuard<any>
+---@return_cast object -NULL
+---@[valid_guard]
+function IsValid(object) end
+---@class prop_vehicle_prisoner_pod: Entity
+local Pod = {}
+ents = {}
+---@return prop_vehicle_prisoner_pod | NULL
+function ents.Create(className)
+    return Pod
+end
+",
+            ),
+            (
+                "lua/entities/base_glide/init.lua",
+                "ENT.Type = \"anim\"
+function ENT:Refresh()
+    local selfTbl = self
+    selfTbl.selfTraceFilter = { self }
+    selfTbl.wheelTraceFilter = { self, \"player\" }
+end
+function ENT:Initialize()
+    self.selfTraceFilter = { self }
+    self.wheelTraceFilter = { self, \"player\", \"npc_*\" }
+end
+function ENT:GetTraceData()
+    local data = {}
+    data.filter = self.selfTraceFilter
+    return data
+end
+function ENT:CreateSeat()
+    local seat = ents.Create(\"prop_vehicle_prisoner_pod\")
+    if not IsValid(seat) then
+        return
+    end
+    self.selfTraceFilter[#self.selfTraceFilter + 1] = seat
+    self.wheelTraceFilter[#self.wheelTraceFilter + 1] = seat
+end
+",
+            ),
+            (
+                "lua/entities/base_glide/sv_wheels.lua",
+                "function ENT:CheckWheel()
+    local filter = self.wheelTraceFilter
+    return filter
+end
+",
+            ),
+        ];
+        assert_schedule_independent(files);
+
+        // Also verify incremental edit-then-revert lands identically with no NULL.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.analysis.compilation.set_schedule(Schedule::Deferred);
+        ws.def_files(files.to_vec());
+        let wheel_file = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(
+                &ws.virtual_url_generator
+                    .new_uri("lua/entities/base_glide/sv_wheels.lua"),
+            )
+            .expect("wheel file registered");
+        let before_ty = ws.local_ty(wheel_file, "filter");
+        let before = crate::humanize_type(
+            ws.analysis.compilation.get_db(),
+            &before_ty,
+            crate::RenderLevel::Detailed,
+        );
+        assert!(
+            !before.contains("NULL"),
+            "guarded seat append should not retain NULL: {before}"
+        );
+        assert!(
+            before.contains("prop_vehicle_prisoner_pod"),
+            "guarded seat append should include seat type: {before}"
+        );
+
+        let edited = files[1]
+            .1
+            .replace("if not IsValid(seat) then", "if false then");
+        ws.def_file(files[1].0, &edited);
+        let with_null_ty = ws.local_ty(wheel_file, "filter");
+        let with_null = crate::humanize_type(
+            ws.analysis.compilation.get_db(),
+            &with_null_ty,
+            crate::RenderLevel::Detailed,
+        );
+        assert!(
+            with_null.contains("NULL"),
+            "unguarded seat append should include NULL: {with_null}"
+        );
+
+        ws.def_file(files[1].0, files[1].1);
+        let after_ty = ws.local_ty(wheel_file, "filter");
+        let after = crate::humanize_type(
+            ws.analysis.compilation.get_db(),
+            &after_ty,
+            crate::RenderLevel::Detailed,
+        );
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn self_referential_sibling_collection_writes_settle_under_any_schedule() {
+        assert_schedule_independent(&[(
+            "lua/entities/gmod_wire_waypoint.lua",
+            "ENT.Type = \"anim\"
+function ENT:Initialize()
+    self.waypoints = { self }
+end
+function ENT:SetNextWaypoint()
+    local waypoints = self.waypoints
+    for _, ent in ipairs(waypoints) do
+        ent.waypoints = { ent }
+    end
+    for _, ent in ipairs(self.waypoints) do
+        ent.waypoints = self.waypoints
+    end
+end
+function ENT:OnRemove()
+    local waypoints = self.waypoints
+    for _, ent in ipairs(waypoints) do
+        ent.waypoints = { ent }
+    end
+end
+",
+        )]);
+    }
 }

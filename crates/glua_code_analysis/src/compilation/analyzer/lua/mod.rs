@@ -19,8 +19,10 @@ pub use for_range_stat::{
 pub use func_body::LuaReturnPoint;
 use glua_parser::{LuaAst, LuaAstNode, LuaChunk, LuaExpr, LuaSyntaxId, with_syntax_resolver};
 use member_write_policy::DynamicKeyCollectionWideningKey;
-pub(in crate::compilation::analyzer) use member_write_policy::alias_target_global_path;
-pub(in crate::compilation::analyzer) use member_write_policy::resolve_index_expr_member_owner_for_file;
+pub(in crate::compilation::analyzer) use member_write_policy::{
+    alias_target_global_path, record_and_widen_member_collection,
+    resolve_index_expr_member_owner_for_file,
+};
 use metatable::analyze_setmetatable;
 use module::analyze_chunk_return;
 pub use module::compute_module_semantic_id;
@@ -35,7 +37,7 @@ pub(crate) use stats::{
 pub(crate) use stats::{expr_fills_own_default, expr_reads_out_of_decl};
 pub(in crate::compilation::analyzer) use stats::{
     has_multiple_distinct_index_expr_member_owners, is_guarded_table_assignment_index_expr,
-    mark_resolved_member_assignment,
+    is_guarded_table_assignment_member, mark_resolved_member_assignment,
 };
 
 use crate::{

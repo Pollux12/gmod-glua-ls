@@ -25,9 +25,7 @@ use crate::{
 
 use super::{
     IterVarInference, is_member_assignment_in_conditional_branch,
-    member_write_policy::{
-        CollectionWidening, widen_member_collections, widened_member_assignment_collection_type,
-    },
+    member_write_policy::{record_and_widen_member_collection, widen_member_collections},
     stats::{
         canonical_guarded_table_bootstrap_type, is_assignment_file_define_member,
         is_guarded_table_assignment_member,
@@ -265,7 +263,7 @@ pub(in crate::compilation::analyzer) enum StatementWrite {
     },
     WidenCollections {
         member_ids: Vec<LuaMemberId>,
-        incoming: CollectionWidening,
+        element_type: LuaType,
     },
     /// Widens a `for ... in` statement's variables with what their iterator
     /// binds, against the types they hold.
@@ -349,12 +347,13 @@ impl StatementWrite {
                     None
                 };
                 let value = match canonical {
-                    Some(canonical) => canonical,
-                    None if !dynamic_key => {
-                        widened_member_assignment_collection_type(db, member_id, value)
-                            .unwrap_or_else(|| value.clone())
+                    Some(canonical) => {
+                        db.get_type_index_mut()
+                            .set_member_collection_base(member_id, None);
+                        canonical
                     }
-                    None => value.clone(),
+                    None => record_and_widen_member_collection(db, member_id, value, !dynamic_key)
+                        .unwrap_or_else(|| value.clone()),
                 };
                 bind_type(db, member_id.into(), LuaTypeCache::InferType(value));
                 if is_assignment_file_define_member(db, member_id)
@@ -380,9 +379,9 @@ impl StatementWrite {
             }
             StatementWrite::WidenCollections {
                 member_ids,
-                incoming,
+                element_type,
             } => {
-                widen_member_collections(db, member_ids, incoming);
+                widen_member_collections(db, member_ids, element_type);
             }
             StatementWrite::IterVarUpdates {
                 file_id,

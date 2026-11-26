@@ -219,6 +219,7 @@ impl EditMaps {
             }),
             K::DefinitionFact(id) => K::DefinitionFact(self.definition_id(id)?),
             K::DeclClaim(id) => K::DeclClaim(self.decl_id(*id)?),
+            K::MemberCollection(id) => K::MemberCollection(self.member_id(*id)?),
             K::Decl(id) => K::Decl(self.decl_id(*id)?),
             K::DeclDefault(id) => K::DeclDefault(self.decl_id(*id)?),
             K::DeclReferences(id) => K::DeclReferences(self.decl_id(*id)?),

@@ -14,8 +14,8 @@ use super::traits::LuaIndex;
 use crate::db_index::cow_shards::{CowCell, CowShards, ShardKey};
 use crate::db_index::derivation::{self, DerivationId, FactKey, Fingerprint};
 use crate::{
-    DbIndex, FileId, InFiled, LuaDeclId, LuaDeclSourceKey, LuaMemberOwner, LuaSignatureId,
-    db_index::r#type::type_decl::LuaTypeIdentifier,
+    DbIndex, FileId, InFiled, LuaDeclId, LuaDeclSourceKey, LuaMemberId, LuaMemberOwner,
+    LuaSignatureId, db_index::r#type::type_decl::LuaTypeIdentifier,
 };
 use flagset::FlagSet;
 pub use generic_param::GenericParam;
@@ -1481,6 +1481,9 @@ pub struct LuaTypeIndex {
     /// position, and whether its right-hand side was a call or index read. See
     /// `bind_decl_write`.
     decl_write_claims: CowShards<LuaDeclId, (TextSize, bool)>,
+    /// Raw inferred collection element base assigned directly to each member,
+    /// before sibling-collection widening or element appends.
+    member_collection_bases: CowShards<LuaMemberId, LuaType>,
     definition_facts: CowShards<LuaDefinitionId, LuaTypeFact>,
     inference_events_by_file: CowCell<HashMap<FileId, Arc<[LuaInferenceDiagnosticEvent]>>>,
     support_dependents: CowCell<HashMap<LuaInferenceNodeId, HashSet<FileId>>>,
@@ -1610,6 +1613,7 @@ impl LuaTypeIndex {
             definition_fact_refs_by_file: Default::default(),
             fact_metadata: CowShards::default(),
             decl_write_claims: Default::default(),
+            member_collection_bases: Default::default(),
             definition_facts: Default::default(),
             inference_events_by_file: Default::default(),
             support_dependents: Default::default(),
@@ -2586,6 +2590,38 @@ impl LuaTypeIndex {
         }
     }
 
+    pub fn member_collection_base(&self, member_id: &LuaMemberId) -> Option<&LuaType> {
+        derivation::note_read(|| FactKey::MemberCollection(*member_id));
+        self.member_collection_bases.get(member_id)
+    }
+
+    pub fn set_member_collection_base(&mut self, member_id: LuaMemberId, base: Option<LuaType>) {
+        let base = base.filter(|_| {
+            !self
+                .types
+                .get(&member_id.into())
+                .is_some_and(|fact| fact.cache.is_doc())
+        });
+        match base {
+            Some(new_base) => {
+                if self.member_collection_bases.get(&member_id) == Some(&new_base) {
+                    return;
+                }
+                if let Some(old) = self
+                    .member_collection_bases
+                    .insert(member_id, new_base.clone())
+                {
+                    self.cache_refs.remove(member_id.file_id, &old);
+                }
+                self.cache_refs.add(member_id.file_id, &new_base);
+                derivation::note_write(|| FactKey::MemberCollection(member_id));
+            }
+            None => {
+                self.reset_member_collection_base(&member_id);
+            }
+        }
+    }
+
     fn commit_type_cache(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
         let replaced = self.insert_type_cache(owner.clone(), cache);
         if replaced && self.fact_metadata.remove(&owner).is_some() {
@@ -3060,6 +3096,13 @@ impl LuaTypeIndex {
         }
     }
 
+    pub(crate) fn reset_member_collection_base(&mut self, member_id: &LuaMemberId) {
+        if let Some(old) = self.member_collection_bases.remove(member_id) {
+            self.cache_refs.remove(member_id.file_id, &old);
+            derivation::note_write(|| FactKey::MemberCollection(*member_id));
+        }
+    }
+
     pub(crate) fn reset_definition_fact(&mut self, definition: &LuaDefinitionId) {
         if self.definition_facts.remove(definition).is_some() {
             self.drop_definition_fact_refs(definition);
@@ -3399,6 +3442,46 @@ impl LuaTypeIndex {
         }
         if !changed_files.is_empty() {
             self.mark_inference_derived_state_dirty();
+        }
+        let collection_candidates: Vec<LuaMemberId> = self
+            .cache_refs
+            .owners_referencing_file(remap.file_id)
+            .flat_map(|owner_file_id| {
+                self.member_collection_bases
+                    .file_entries(owner_file_id)
+                    .map(|(member_id, _)| *member_id)
+            })
+            .collect();
+        let mut collection_updates = Vec::new();
+        for member_id in collection_candidates {
+            if rebuilt.contains(&member_id.into()) {
+                continue;
+            }
+            let Some(base) = self.member_collection_bases.get(&member_id) else {
+                continue;
+            };
+            let result = remap_identities_in_type(base, remap);
+            if result.lost {
+                lost.push(crate::LostFact::new(
+                    member_id.file_id,
+                    FactKey::MemberCollection(member_id),
+                ));
+            } else if let Some(new_base) = result.typ {
+                collection_updates.push((member_id, new_base));
+            }
+        }
+        collection_updates.sort_by(|left, right| {
+            LuaTypeOwner::Member(left.0).stable_cmp(&LuaTypeOwner::Member(right.0))
+        });
+        for (member_id, new_base) in collection_updates {
+            if let Some(old) = self
+                .member_collection_bases
+                .insert(member_id, new_base.clone())
+            {
+                self.cache_refs.remove(member_id.file_id, &old);
+            }
+            self.cache_refs.add(member_id.file_id, &new_base);
+            derivation::note_write(|| FactKey::MemberCollection(member_id));
         }
         lost.extend(self.remap_inference_facts(remap));
         lost
@@ -3761,6 +3844,9 @@ impl LuaTypeIndex {
                     derivation::fingerprint_of(&(derivation::Local(position), *may_narrow))
                 },
             ),
+            FactKey::MemberCollection(member_id) => {
+                derivation::fingerprint_opt(self.member_collection_bases.get(member_id))
+            }
             FactKey::TypeDeclScan => self.decl_scan_fingerprint,
             FactKey::TypeFile(file_id) => {
                 let namespace = self.file_namespace.get(file_id);
@@ -4112,6 +4198,7 @@ impl LuaIndex for LuaTypeIndex {
         self.fact_ref_files.clear();
         self.fact_refs_by_file.clear();
         self.decl_write_claims.clear();
+        self.member_collection_bases.clear();
         self.decl_type_binds.clear();
         self.type_bound_decls.clear();
         self.table_literal_decls.clear();
@@ -4247,6 +4334,16 @@ impl LuaTypeIndex {
             self.source_types.remove(&type_owner);
         }
 
+        let collection_members: Vec<LuaMemberId> = self
+            .member_collection_bases
+            .file_entries(file_id)
+            .map(|(member_id, _)| *member_id)
+            .collect();
+        for member_id in collection_members {
+            if self.member_collection_bases.remove(&member_id).is_some() {
+                derivation::note_write(|| FactKey::MemberCollection(member_id));
+            }
+        }
         self.cache_refs.remove_file(file_id);
     }
 
@@ -4292,6 +4389,9 @@ impl LuaTypeIndex {
         }
         for decl_id in self.decl_write_claims.keys() {
             derivation::note_write(|| FactKey::DeclClaim(*decl_id));
+        }
+        for member_id in self.member_collection_bases.keys() {
+            derivation::note_write(|| FactKey::MemberCollection(*member_id));
         }
         for definition in self.definition_facts.keys() {
             derivation::note_write(|| FactKey::DefinitionFact(*definition));
@@ -5619,6 +5719,7 @@ crate::db_index::cow_shards::task_fork_fields!(LuaTypeIndex {
     definition_fact_ref_files,
     definition_fact_refs_by_file => crate::db_index::cow_shards::merge_set,
     decl_write_claims,
+    member_collection_bases,
     definition_facts,
     inference_events_by_file,
     support_dependents,

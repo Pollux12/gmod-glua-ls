@@ -378,6 +378,9 @@ impl DbIndex {
                 .get_gmod_network_index_mut()
                 .reset_call_flows(site.file_id, site.value),
             K::DeclClaim(decl_id) => self.get_type_index_mut().reset_decl_claim(decl_id),
+            K::MemberCollection(member_id) => self
+                .get_type_index_mut()
+                .reset_member_collection_base(member_id),
             K::DefinitionFact(definition) => {
                 self.get_type_index_mut().reset_definition_fact(definition)
             }
@@ -584,6 +587,7 @@ impl DbIndex {
             | K::SubTypes(_)
             | K::BoundDecls(..)
             | K::DeclClaim(_)
+            | K::MemberCollection(_)
             | K::TypeDeclScan
             | K::TypeFile(_)
             | K::TableClass(_) => self.types_index.fact_fingerprint(key),

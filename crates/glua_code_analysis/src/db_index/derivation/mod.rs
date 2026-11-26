@@ -402,6 +402,9 @@ pub enum FactKey {
     BoundDecls(LuaTypeDeclId, FileId),
     /// The positional claim on a local's type.
     DeclClaim(LuaDeclId),
+    /// The raw inferred collection element base assigned directly to a member,
+    /// before sibling-collection widening or element appends.
+    MemberCollection(LuaMemberId),
     /// Every type declaration (whole-map enumeration).
     TypeDeclScan,
     /// A file's namespace, `using` list and declared types.
@@ -829,6 +832,7 @@ impl FactKey {
                 | K::TypeFallbacks(_)
                 | K::DefinitionFact(_)
                 | K::DeclClaim(_)
+                | K::MemberCollection(_)
                 | K::Decl(_)
                 | K::Member(_)
                 | K::MemberTransfer(_)
@@ -903,6 +907,7 @@ impl FactKey {
         matches!(
             self,
             K::DeclClaim(_)
+                | K::MemberCollection(_)
                 | K::MemberFile(_)
                 | K::MemberOwnerPresence(_)
                 | K::MemberKey(_)
@@ -1094,6 +1099,7 @@ impl FactKey {
                 Some(decl_id.file_id)
             }
             K::Member(member_id)
+            | K::MemberCollection(member_id)
             | K::MemberObject(member_id)
             | K::MemberHome(member_id)
             | K::MemberTransfer(member_id)
