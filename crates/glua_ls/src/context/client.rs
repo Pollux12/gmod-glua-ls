@@ -105,7 +105,9 @@ impl ClientProxy {
     /// cancelled is never sent. A request left unanswered until the timeout
     /// is given up on: its response sender is unparked, so a late response
     /// finds nothing to deliver to and a client that never answers cannot
-    /// leak the awaiting task.
+    /// leak the awaiting task. A request that cannot be sent at all — the
+    /// client is gone — is given up on the same way, without waiting out
+    /// the timeout.
     pub async fn send_request(
         &self,
         id: RequestId,
@@ -136,11 +138,24 @@ impl ClientProxy {
             }
         };
 
-        let _ = self.conn.sender.send(Message::Request(lsp_server::Request {
-            id: id.clone(),
-            method: method.to_string(),
-            params,
-        }));
+        if self
+            .conn
+            .sender
+            .send(Message::Request(lsp_server::Request {
+                id: id.clone(),
+                method: method.to_string(),
+                params,
+            }))
+            .is_err()
+        {
+            log::warn!(
+                "request {} ({}) could not be sent; the client is gone",
+                id,
+                method
+            );
+            self.response_manager.lock().await.remove(&id);
+            return None;
+        }
         let response = select! {
             response = receiver => response.ok(),
             _ = cancel_token.cancelled() => None,
@@ -396,13 +411,22 @@ mod tests {
         let (client, peer) = create_client_proxy();
         let id = client.next_id();
 
-        let response = runtime.block_on(client.send_request(
-            id,
-            "workspace/configuration",
-            lsp_types::ConfigurationParams { items: vec![] },
-            tokio_util::sync::CancellationToken::new(),
-            Duration::from_millis(50),
-        ));
+        // The wrapper's own deadline turns a timeout regression into a
+        // failed test instead of a hung one.
+        let response = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                client.send_request(
+                    id,
+                    "workspace/configuration",
+                    lsp_types::ConfigurationParams { items: vec![] },
+                    tokio_util::sync::CancellationToken::new(),
+                    Duration::from_millis(50),
+                ),
+            )
+            .await
+            .expect("send_request must give up at its timeout, not hang")
+        });
 
         verify_that!(response, none())?;
         let request = recv_request(&peer);
