@@ -455,6 +455,51 @@ impl super::engine::Recipe for Recipes {
         self.store_cache(id.file_id, cache);
     }
 
+    fn release_file_caches(&self, rank: u8, files: &[FileId]) {
+        if files.is_empty() {
+            return;
+        }
+        let mut dropped = Vec::new();
+        for &file_id in files {
+            if let Some(cache) = self.cache_shard(file_id).remove(&file_id) {
+                dropped.push(cache);
+            }
+        }
+        if rank == DerivationKind::DynamicFieldWrite.rank() {
+            let mut sites = self.write_sites.lock().expect("write sites");
+            for file_id in files {
+                sites.remove(file_id);
+            }
+        } else if rank == DerivationKind::NetFlows.rank() {
+            let mut syntax = self.net_syntax.lock().expect("net syntax");
+            let mut compositions = self.net_compositions.lock().expect("net compositions");
+            for file_id in files {
+                syntax.remove(file_id);
+                compositions.remove(file_id);
+            }
+        }
+        if dropped.len() >= 16 {
+            dropped.into_par_iter().for_each(drop);
+        }
+    }
+
+    fn release_all_caches(&self) {
+        let mut dropped = Vec::new();
+        for shard in self.caches.iter() {
+            let mut map = shard.lock().expect("cache store");
+            dropped.extend(map.drain().map(|(_, cache)| cache));
+        }
+        self.write_sites.lock().expect("write sites").clear();
+        self.net_syntax.lock().expect("net syntax").clear();
+        self.net_compositions
+            .lock()
+            .expect("net compositions")
+            .clear();
+        if dropped.len() >= 16 {
+            dropped.into_par_iter().for_each(drop);
+        }
+    }
+
     fn evaluate(&self, db: &mut DbIndex, id: DerivationId) {
         match id.kind {
             DerivationKind::NetCall => {

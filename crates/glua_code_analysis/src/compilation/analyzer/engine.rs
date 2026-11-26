@@ -322,6 +322,17 @@ impl Queue {
         self.order.first().map(|(rank, ..)| *rank)
     }
 
+    /// Whether `file_id` has any queued entry at `rank`.
+    fn has_file_at(&self, rank: u8, file_id: crate::FileId) -> bool {
+        let file_key = self.schedule.file_key(file_id);
+        [Reason::Changed, Reason::Read].into_iter().any(|reason| {
+            self.order
+                .range((rank, reason, file_key, DerivationId::floor())..)
+                .take_while(|&&(r, rs, fk, _)| r == rank && rs == reason && fk == file_key)
+                .any(|&(.., id)| id.file_id == file_id)
+        })
+    }
+
     /// Whether the entries at `rank` belong to more than one file besides
     /// the workspace's.
     fn spans_files(&self, rank: u8) -> bool {
@@ -530,6 +541,12 @@ pub(crate) trait Recipe: Sync {
 
     /// Drops a worker result [`Self::apply`] will not publish.
     fn discard(&self, _id: DerivationId, _computed: Box<dyn std::any::Any + Send>) {}
+
+    /// Drops per-file caches for `files` that have finished `rank`.
+    fn release_file_caches(&self, _rank: u8, _files: &[crate::FileId]) {}
+
+    /// Drops all cached per-file memos at a stage transition.
+    fn release_all_caches(&self) {}
 }
 
 #[derive(Default)]
@@ -1512,6 +1529,8 @@ impl Engine {
                 }
                 if self.next_round.is_empty() {
                     if crate::profile::phase("engine: stage", || self.advance_stage(db)) {
+                        recipe.release_all_caches();
+                        crate::release_analysis_caches_with(|| {});
                         continue;
                     }
                     if slice.yields()
@@ -1771,6 +1790,13 @@ impl Engine {
             stop,
             tasks,
         } = superstep;
+        let mut touched_files = Vec::with_capacity(plans.len() + on_root.len());
+        for plan in &plans {
+            touched_files.extend(plan.files());
+        }
+        for (file_id, _) in &on_root {
+            touched_files.push(*file_id);
+        }
         if let Some(tasks) = tasks {
             self.install_tasks(db, recipe, slice, rank, plans, tasks);
         }
@@ -1804,6 +1830,20 @@ impl Engine {
             self.run_root(db, recipe, &stop, vec![(id, reason)]);
         }
         self.root_list_ran = None;
+        if !touched_files.is_empty() {
+            touched_files.sort_unstable();
+            touched_files.dedup();
+            let carried_files: FxHashSet<crate::FileId> =
+                self.carried.iter().flat_map(TaskPlan::files).collect();
+            touched_files.retain(|&file_id| {
+                !carried_files.contains(&file_id)
+                    && !self.worklist.has_file_at(rank, file_id)
+                    && !self.next_round.has_file_at(rank, file_id)
+            });
+            if !touched_files.is_empty() {
+                recipe.release_file_caches(rank, &touched_files);
+            }
+        }
     }
 
     /// Whether `id`'s group already ran in the root list running now.
