@@ -235,24 +235,54 @@ fn build_positional(keys: &Paged<KeySlot>) -> FxHashMap<FileId, FxHashSet<KeyIdx
         .collect()
 }
 
+/// Ephemeral per-slot log/write stamps kept only while a reanalysis is active
+/// and freed once it finishes.
+#[derive(Debug, Clone, Copy, Default)]
+struct SlotStamps {
+    /// The stamp the key was last logged under; see [`KeyTable::log`].
+    stamp: u64,
+    /// The stamp current when the key was last written.
+    written: u64,
+}
+
+/// Ephemeral per-slot fingerprint cache, freed once diagnostics go idle.
+#[derive(Debug)]
+struct FpSlot {
+    current: AtomicU64,
+    generation: AtomicU32,
+}
+
+impl Default for FpSlot {
+    fn default() -> Self {
+        Self {
+            current: AtomicU64::new(0),
+            generation: AtomicU32::new(NO_GENERATION),
+        }
+    }
+}
+
+impl Clone for FpSlot {
+    fn clone(&self) -> Self {
+        let generation = self.generation.load(Ordering::Acquire);
+        Self {
+            current: AtomicU64::new(self.current.load(Ordering::Relaxed)),
+            generation: AtomicU32::new(generation),
+        }
+    }
+}
+
 /// A fact key and the derivations that read or produced it. `key` is `None`
 /// while the slot is free.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct KeySlot {
     key: Option<HashedKey>,
     readers: Readers,
     /// The key's first producer ([`NO_PRODUCER`]: none) in the bits under
     /// [`MORE_PRODUCERS`], [`WINDOWED`] and [`HELD`].
     marks: u32,
-    /// The key's fingerprint as last taken, and the generation it was taken in
-    /// ([`NO_GENERATION`]: none); see [`ReaderGraph::current_fingerprint`].
-    current: AtomicU64,
-    current_generation: AtomicU32,
-    /// The stamp the key was last logged under; see [`KeyTable::log`].
-    stamp: u64,
-    /// The stamp current when the key was last written.
-    written: u64,
 }
+
+const _: () = assert!(std::mem::size_of::<KeySlot>() == 56);
 
 impl KeySlot {
     fn producer(&self) -> DerivIdx {
@@ -283,31 +313,12 @@ impl KeySlot {
     }
 }
 
-impl Clone for KeySlot {
-    fn clone(&self) -> Self {
-        let generation = self.current_generation.load(Ordering::Acquire);
-        Self {
-            key: self.key.clone(),
-            readers: self.readers.clone(),
-            marks: self.marks,
-            current: AtomicU64::new(self.current.load(Ordering::Relaxed)),
-            current_generation: AtomicU32::new(generation),
-            stamp: self.stamp,
-            written: self.written,
-        }
-    }
-}
-
 impl Default for KeySlot {
     fn default() -> Self {
         Self {
             key: None,
             readers: Readers::default(),
             marks: NO_PRODUCER,
-            current: AtomicU64::new(0),
-            current_generation: AtomicU32::new(NO_GENERATION),
-            stamp: 0,
-            written: 0,
         }
     }
 }
@@ -332,7 +343,7 @@ mod query_presence_tests {
 
     #[test]
     fn parallel_transport_query_slot_width_clone_and_recycle() {
-        assert_eq!(std::mem::size_of::<KeySlot>(), 80);
+        assert_eq!(std::mem::size_of::<KeySlot>(), 56);
         let mut graph = ReaderGraph::default();
         let query = HashedKey::new(FactKey::CallbackParams(LuaSignatureId::new(
             FileId::new(1),
@@ -1109,12 +1120,17 @@ struct DerivSlot {
 /// map. A slot nothing refers to any more is freed for reuse.
 /// Fact keys interned to slots. While the engine evaluates a group, the table
 /// is lent to the recording thread so a read is interned where it is made.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct KeyTable {
     /// Each live slot, found by its key's hash: the key itself is kept only
     /// in its slot.
     key_slots: HashTable<FiledKey>,
     keys: Paged<KeySlot>,
+    /// Ephemeral log/write stamps for `keys`, freed once reanalysis settles.
+    stamps: Paged<SlotStamps>,
+    /// Ephemeral cached fingerprints for `keys`, freed once diagnostics go idle.
+    fp_cache: Paged<FpSlot>,
+    fp_cache_enabled: bool,
     free_keys: Vec<KeyIdx>,
     retirement: Option<Arc<AtomicBool>>,
     retirement_started: u64,
@@ -1135,6 +1151,28 @@ pub struct KeyTable {
     /// The live slots of the keys naming each file's positions, built by the
     /// first edit that renames keys and kept from then on.
     positional: Option<FxHashMap<FileId, FxHashSet<KeyIdx>>>,
+}
+
+impl Default for KeyTable {
+    fn default() -> Self {
+        Self {
+            key_slots: HashTable::new(),
+            keys: Paged::default(),
+            stamps: Paged::default(),
+            fp_cache: Paged::default(),
+            fp_cache_enabled: true,
+            free_keys: Vec::new(),
+            retirement: None,
+            retirement_started: 0,
+            retired: Vec::new(),
+            derived: FxHashMap::default(),
+            more_producers: FxHashMap::default(),
+            last_written: 0,
+            windows: FxHashMap::default(),
+            held: FxHashMap::default(),
+            positional: None,
+        }
+    }
 }
 
 /// A live slot in [`KeyTable::key_slots`], with the low half of its key's
@@ -1357,11 +1395,17 @@ impl KeyTable {
             }
         }
         entry.key = Some(key);
-        entry.stamp = 0;
-        entry.written = now;
-        entry
-            .current_generation
-            .store(NO_GENERATION, Ordering::Relaxed);
+        self.stamps
+            .resize_with(self.keys.len(), SlotStamps::default);
+        let stamps = &mut self.stamps[slot as usize];
+        stamps.stamp = 0;
+        stamps.written = now;
+        if self.fp_cache_enabled {
+            self.fp_cache.resize_with(self.keys.len(), FpSlot::default);
+            self.fp_cache[slot as usize]
+                .generation
+                .store(NO_GENERATION, Ordering::Relaxed);
+        }
         self.key_slots.insert_unique(
             FiledKey::index_hash(half),
             FiledKey { slot, hash: half },
@@ -1414,13 +1458,14 @@ impl KeyTable {
         loop {
             let windowed = self.windowed(base_slot);
             let held = self.held(base_slot);
+            let written = self.written_of(slot);
             let entry = &mut self.keys[slot as usize];
             if windowed {
-                self.windows.entry(slot).or_insert(entry.written);
+                self.windows.entry(slot).or_insert(written);
                 entry.set_mark(WINDOWED, true);
             }
             if held {
-                self.held.entry(slot).or_insert(entry.written);
+                self.held.entry(slot).or_insert(written);
                 entry.set_mark(HELD, true);
             }
             let Some(base) = self.key(base_slot).base() else {
@@ -1432,14 +1477,41 @@ impl KeyTable {
         }
     }
 
+    #[inline]
+    fn stamp_of(&self, slot: KeyIdx) -> u64 {
+        self.stamps.get(slot as usize).map_or(0, |s| s.stamp)
+    }
+
+    #[inline]
+    fn written_of(&self, slot: KeyIdx) -> u64 {
+        self.stamps.get(slot as usize).map_or(0, |s| s.written)
+    }
+
+    #[inline]
+    fn ensure_stamps(&mut self) {
+        if self.stamps.len() < self.keys.len() {
+            self.stamps
+                .resize_with(self.keys.len(), SlotStamps::default);
+        }
+    }
+
+    #[inline]
+    fn ensure_fp_cache(&mut self) {
+        self.fp_cache_enabled = true;
+        if self.fp_cache.len() < self.keys.len() {
+            self.fp_cache.resize_with(self.keys.len(), FpSlot::default);
+        }
+    }
+
     /// Marks `key` written at stamp `now`, if anything ever read it, and every
     /// key read out of it.
     pub(super) fn mark_written(&mut self, key: &HashedKey, now: u64) {
         if let Some(slot) = self.find(key) {
             self.last_written = self.last_written.max(now);
-            self.keys[slot as usize].written = now;
+            self.ensure_stamps();
+            self.stamps[slot as usize].written = now;
             for derived in self.derived.get(&slot).into_iter().flat_map(|d| &d.slots) {
-                self.keys[*derived as usize].written = now;
+                self.stamps[*derived as usize].written = now;
             }
         }
     }
@@ -1450,11 +1522,12 @@ impl KeyTable {
         let Some(slot) = self.find(key) else {
             return false;
         };
-        let logged = self.keys[slot as usize].stamp >= since;
+        let logged = self.stamp_of(slot) >= since;
         self.last_written = self.last_written.max(now);
-        self.keys[slot as usize].written = now;
+        self.ensure_stamps();
+        self.stamps[slot as usize].written = now;
         for derived in self.derived.get(&slot).into_iter().flat_map(|d| &d.slots) {
-            self.keys[*derived as usize].written = now;
+            self.stamps[*derived as usize].written = now;
         }
         logged
     }
@@ -1467,9 +1540,11 @@ impl KeyTable {
             return;
         }
         self.last_written = self.last_written.max(now);
+        self.ensure_stamps();
         slots.par_sort_unstable();
         let slots: &[KeyIdx] = slots;
-        self.par_reached_chunks(
+        par_reached_chunks_in(
+            &mut self.stamps,
             slots,
             |slot| *slot,
             |first, chunk, range| {
@@ -1489,12 +1564,13 @@ impl KeyTable {
             return;
         };
         self.last_written = self.last_written.max(now);
+        self.ensure_stamps();
         let derived = self.derived.get(&slot).into_iter().flat_map(|d| &d.slots);
         for slot in std::iter::once(&slot).chain(derived) {
-            let entry = &mut self.keys[*slot as usize];
-            self.windows.entry(*slot).or_insert(entry.written);
-            entry.written = now;
-            entry.set_mark(WINDOWED, true);
+            let stamps = &mut self.stamps[*slot as usize];
+            self.windows.entry(*slot).or_insert(stamps.written);
+            stamps.written = now;
+            self.keys[*slot as usize].set_mark(WINDOWED, true);
         }
     }
 
@@ -1502,6 +1578,9 @@ impl KeyTable {
     /// of it, is written as it was before its window opened.
     pub(super) fn close_windows(&mut self, unchanged: impl Fn(&HashedKey) -> bool) {
         let windows = std::mem::take(&mut self.windows);
+        if !windows.is_empty() {
+            self.ensure_stamps();
+        }
         for (slot, before) in &windows {
             let entry = &mut self.keys[*slot as usize];
             entry.set_mark(WINDOWED, false);
@@ -1511,11 +1590,11 @@ impl KeyTable {
             if key.base().is_some() || !unchanged(key) {
                 continue;
             }
-            entry.written = *before;
+            self.stamps[*slot as usize].written = *before;
             let derived = self.derived.get(slot).into_iter().flat_map(|d| &d.slots);
             for derived in derived {
                 if let Some(before) = windows.get(derived) {
-                    self.keys[*derived as usize].written = *before;
+                    self.stamps[*derived as usize].written = *before;
                 }
             }
         }
@@ -1529,12 +1608,13 @@ impl KeyTable {
             return;
         };
         self.last_written = self.last_written.max(now);
+        self.ensure_stamps();
         let derived = self.derived.get(&slot).into_iter().flat_map(|d| &d.slots);
         for slot in std::iter::once(&slot).chain(derived) {
-            let entry = &mut self.keys[*slot as usize];
-            self.held.entry(*slot).or_insert(entry.written);
-            entry.written = now;
-            entry.set_mark(HELD, true);
+            let stamps = &mut self.stamps[*slot as usize];
+            self.held.entry(*slot).or_insert(stamps.written);
+            stamps.written = now;
+            self.keys[*slot as usize].set_mark(HELD, true);
         }
     }
 
@@ -1542,6 +1622,9 @@ impl KeyTable {
     /// out of it, is written as it was before its window opened.
     pub(super) fn release_held(&mut self, unchanged: impl Fn(&HashedKey) -> bool) {
         let held = std::mem::take(&mut self.held);
+        if !held.is_empty() {
+            self.ensure_stamps();
+        }
         for (slot, before) in &held {
             let entry = &mut self.keys[*slot as usize];
             entry.set_mark(HELD, false);
@@ -1551,11 +1634,11 @@ impl KeyTable {
             if key.base().is_some() || !unchanged(key) {
                 continue;
             }
-            entry.written = *before;
+            self.stamps[*slot as usize].written = *before;
             let derived = self.derived.get(slot).into_iter().flat_map(|d| &d.slots);
             for derived in derived {
                 if let Some(before) = held.get(derived) {
-                    self.keys[*derived as usize].written = *before;
+                    self.stamps[*derived as usize].written = *before;
                 }
             }
         }
@@ -1678,10 +1761,10 @@ impl KeyTable {
     pub(super) fn written_since(&self, slots: &[KeyIdx], since: u64) -> Freshness {
         let mut freshness = Freshness::Unwritten;
         for slot in slots {
-            let Some(entry) = self.keys.get(*slot as usize) else {
+            if self.keys.get(*slot as usize).is_none() {
                 return Freshness::Written;
-            };
-            if entry.written <= since {
+            }
+            if self.written_of(*slot) <= since {
                 continue;
             }
             match self.held.get(slot).or_else(|| self.windows.get(slot)) {
@@ -1694,12 +1777,13 @@ impl KeyTable {
 
     /// The stamp `slot` was last logged under.
     pub(super) fn log_stamp(&self, slot: KeyIdx) -> u64 {
-        self.keys[slot as usize].stamp
+        self.stamp_of(slot)
     }
 
     /// Puts back the log stamp a nested evaluation overwrote.
     pub(super) fn restore_log_stamp(&mut self, slot: KeyIdx, stamp: u64) {
-        self.keys[slot as usize].stamp = stamp;
+        self.ensure_stamps();
+        self.stamps[slot as usize].stamp = stamp;
     }
 
     /// Whether a read of `slot` goes into a log whose innermost open frame
@@ -1713,13 +1797,14 @@ impl KeyTable {
         frame: u64,
         evaluation: u64,
     ) -> (Option<bool>, bool) {
-        let entry = &mut self.keys[slot as usize];
-        let is_query = entry.is_query();
-        if entry.stamp >= frame {
+        let is_query = self.keys[slot as usize].is_query();
+        self.ensure_stamps();
+        let stamps = &mut self.stamps[slot as usize];
+        if stamps.stamp >= frame {
             return (None, is_query);
         }
-        let first = entry.stamp < evaluation;
-        entry.stamp = frame;
+        let first = stamps.stamp < evaluation;
+        stamps.stamp = frame;
         (Some(first), is_query)
     }
 }
@@ -1764,10 +1849,13 @@ impl ReaderGraph {
         self.table.quarantine_releases()
     }
 
-    /// Trims spare capacity in reader lists after a bulk build so `reserve_readers`'s
-    /// growth headroom is not retained across millions of settled keys.
+    /// Trims spare capacity in reader lists and frees ephemeral per-reanalysis
+    /// stamp arrays after a bulk build settles.
     pub fn shrink_reader_sets(&mut self) {
         use rayon::prelude::*;
+        if self.table.windows.is_empty() && self.table.held.is_empty() {
+            self.table.stamps.clear_and_free();
+        }
         if self.table.keys.len() < 10_000 {
             return;
         }
@@ -1776,6 +1864,16 @@ impl ReaderGraph {
                 slot.readers.shrink_to_fit();
             }
         });
+    }
+
+    /// Frees the ephemeral fingerprint cache once diagnostics have settled;
+    /// re-enabled automatically on the next reanalysis. Returns whether any
+    /// cache pages were freed.
+    pub fn release_fingerprint_cache(&mut self) -> bool {
+        let had = !self.table.fp_cache.is_empty();
+        self.table.fp_cache_enabled = false;
+        self.table.fp_cache.clear_and_free();
+        had
     }
 
     /// Counts and estimated heap sizes of the graph's parts, for the profile.
@@ -1821,7 +1919,9 @@ impl ReaderGraph {
                 )
             });
         let key_map = hash_table_bytes(table.key_slots.capacity(), size_of::<FiledKey>());
-        let key_slots = table.keys.capacity() * size_of::<KeySlot>();
+        let key_slots = table.keys.capacity() * size_of::<KeySlot>()
+            + table.stamps.capacity() * size_of::<SlotStamps>()
+            + table.fp_cache.capacity() * size_of::<FpSlot>();
         let derivation_maps = hash_table_bytes(self.deriv_slots.capacity(), size_of::<DerivIdx>())
             + self.derivations.capacity() * size_of::<DerivSlot>();
         let total = key_map
@@ -1933,21 +2033,24 @@ impl ReaderGraph {
         slot: KeyIdx,
         fingerprint: impl FnOnce(&HashedKey) -> Fingerprint,
     ) -> Fingerprint {
-        let entry = &self.table.keys[slot as usize];
-        if entry.current_generation.load(Ordering::Acquire) == self.generation {
-            return entry.current.load(Ordering::Relaxed);
+        let Some(fp) = self.table.fp_cache.get(slot as usize) else {
+            return fingerprint(self.key(slot));
+        };
+        if fp.generation.load(Ordering::Acquire) == self.generation {
+            return fp.current.load(Ordering::Relaxed);
         }
         let current = fingerprint(self.key(slot));
-        entry.current.store(current, Ordering::Relaxed);
-        entry
-            .current_generation
-            .store(self.generation, Ordering::Release);
+        fp.current.store(current, Ordering::Relaxed);
+        fp.generation.store(self.generation, Ordering::Release);
         current
     }
 
     /// Forgets the cached fingerprints of `key` and of every key read out of
     /// it: their values may have moved.
     pub fn forget_fingerprint(&self, key: &HashedKey) {
+        if self.table.fp_cache.is_empty() {
+            return;
+        }
         if let Some(slot) = self.table.find(key) {
             for slot in std::iter::once(&slot).chain(
                 self.table
@@ -1956,9 +2059,9 @@ impl ReaderGraph {
                     .into_iter()
                     .flat_map(|derived| &derived.slots),
             ) {
-                self.table.keys[*slot as usize]
-                    .current_generation
-                    .store(NO_GENERATION, Ordering::Relaxed);
+                if let Some(fp) = self.table.fp_cache.get(*slot as usize) {
+                    fp.generation.store(NO_GENERATION, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -2035,14 +2138,19 @@ impl ReaderGraph {
     /// Forgets every cached fingerprint.
     pub fn forget_fingerprints(&mut self) {
         self.generation = (self.generation + 1) % NO_GENERATION;
+        self.table.ensure_fp_cache();
     }
 
     /// Every key whose fingerprint is cached, with it.
     pub fn cached_fingerprints(&self) -> impl Iterator<Item = (&HashedKey, Fingerprint)> {
-        self.table.keys.iter().filter_map(|slot| {
-            (slot.current_generation.load(Ordering::Acquire) == self.generation)
-                .then(|| Some((slot.key.as_ref()?, slot.current.load(Ordering::Relaxed))))?
-        })
+        self.table
+            .keys
+            .iter()
+            .zip(self.table.fp_cache.iter())
+            .filter_map(|(slot, fp)| {
+                (fp.generation.load(Ordering::Acquire) == self.generation)
+                    .then(|| Some((slot.key.as_ref()?, fp.current.load(Ordering::Relaxed))))?
+            })
     }
 
     /// Replaces `id`'s record with the reads and outputs of its latest
@@ -3231,8 +3339,7 @@ impl ReaderGraph {
         slots
             .into_iter()
             .map(|slot| {
-                let moved =
-                    self.table.keys[slot as usize].written > ended && !reset_before(self.key(slot));
+                let moved = self.table.written_of(slot) > ended && !reset_before(self.key(slot));
                 (slot, moved.then_some(super::UNSEEN))
             })
             .collect()
@@ -3296,9 +3403,12 @@ impl ReaderGraph {
         let Some(key) = entry.key.take() else {
             return;
         };
-        entry.written = u64::MAX;
         entry.set_mark(HELD, false);
         entry.set_mark(WINDOWED, false);
+        if !self.table.stamps.is_empty() {
+            self.table.ensure_stamps();
+            self.table.stamps[slot as usize].written = u64::MAX;
+        }
         self.table.held.remove(&slot);
         self.table.windows.remove(&slot);
         self.table.last_written = super::new_stamp();
@@ -3603,43 +3713,39 @@ impl KeyTable {
             }
         });
     }
+}
 
-    /// Runs `apply` on worker threads for each chunk of slots that `items`,
-    /// ascending by the slot `slot_of` gives each, reach, with the chunk's
-    /// first slot, the chunk, and the range of `items` in it.
-    fn par_reached_chunks<T>(
-        &mut self,
-        items: &[T],
-        slot_of: impl Fn(&T) -> KeyIdx,
-        apply: impl Fn(usize, &mut [KeySlot], std::ops::Range<usize>) + Sync,
-    ) {
-        use rayon::prelude::*;
-        let chunk_of = |item: &T| slot_of(item) as usize / READER_CHUNK;
-        let mut reached = Vec::new();
-        let mut start = 0;
-        while let Some(item) = items.get(start) {
-            let chunk = chunk_of(item);
-            let end = start + items[start..].partition_point(|item| chunk_of(item) == chunk);
-            reached.push((chunk, start..end));
-            start = end;
-        }
-        let mut reached = reached.into_iter().peekable();
-        let chunks = self
-            .keys
-            .pages_mut()
-            .iter_mut()
-            .flat_map(|page| page.chunks_mut(READER_CHUNK))
-            .enumerate()
-            .filter_map(|(index, chunk)| {
-                reached
-                    .next_if(|(reached, _)| *reached == index)
-                    .map(|(_, range)| (index * READER_CHUNK, chunk, range))
-            })
-            .collect::<Vec<_>>();
-        chunks
-            .into_par_iter()
-            .for_each(|(first, chunk, range)| apply(first, chunk, range));
+fn par_reached_chunks_in<S: Send, T>(
+    paged: &mut Paged<S>,
+    items: &[T],
+    slot_of: impl Fn(&T) -> KeyIdx,
+    apply: impl Fn(usize, &mut [S], std::ops::Range<usize>) + Sync,
+) {
+    use rayon::prelude::*;
+    let chunk_of = |item: &T| slot_of(item) as usize / READER_CHUNK;
+    let mut reached = Vec::new();
+    let mut start = 0;
+    while let Some(item) = items.get(start) {
+        let chunk = chunk_of(item);
+        let end = start + items[start..].partition_point(|item| chunk_of(item) == chunk);
+        reached.push((chunk, start..end));
+        start = end;
     }
+    let mut reached = reached.into_iter().peekable();
+    let chunks = paged
+        .pages_mut()
+        .iter_mut()
+        .flat_map(|page| page.chunks_mut(READER_CHUNK))
+        .enumerate()
+        .filter_map(|(index, chunk)| {
+            reached
+                .next_if(|(reached, _)| *reached == index)
+                .map(|(_, range)| (index * READER_CHUNK, chunk, range))
+        })
+        .collect::<Vec<_>>();
+    chunks
+        .into_par_iter()
+        .for_each(|(first, chunk, range)| apply(first, chunk, range));
 }
 
 /// A task evaluation's record with the reads it keeps sorted and those it
@@ -4343,7 +4449,7 @@ mod tests {
 
         let now = graph.table.last_written();
         for (position, slot) in slots.iter().enumerate() {
-            let written = graph.table.keys[*slot as usize].written;
+            let written = graph.table.written_of(*slot);
             assert_eq!(written == now, position % 2 == 0, "slot {slot}");
         }
     }

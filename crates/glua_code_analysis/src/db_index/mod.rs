@@ -345,6 +345,12 @@ impl DbIndex {
         Arc::make_mut(&mut self.derivations)
     }
 
+    /// Frees the reader graph's ephemeral fingerprint cache once diagnostics
+    /// have settled; re-enabled automatically on the next reanalysis.
+    pub fn release_fingerprint_cache(&mut self) -> bool {
+        self.reader_graph_mut().release_fingerprint_cache()
+    }
+
     /// Restores a primary fact to its source-layer value, dropping what every
     /// derivation stored under it. The engine re-runs all of the key's
     /// producers afterwards, so a multi-writer key is rebuilt in canonical

@@ -767,13 +767,11 @@ impl DiagnosticStore {
                 .file_some_diagnostic_reads(FILED_PER_LOCK)
             {
                 let open = self.state().open.clone();
-                let evicted = analysis
-                    .compilation
-                    .get_db_mut()
-                    .get_vfs_mut()
-                    .evict_cold_trees(|id| open.contains(id));
+                let db = analysis.compilation.get_db_mut();
+                let evicted = db.get_vfs_mut().evict_cold_trees(|id| open.contains(id));
+                let released_fp = db.release_fingerprint_cache();
                 drop(analysis);
-                if !evicted.is_empty() {
+                if !evicted.is_empty() || released_fp {
                     drop(evicted);
                     crate::util::spawn_release_free_memory();
                 }
