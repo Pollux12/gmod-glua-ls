@@ -558,4 +558,47 @@ mod tests {
         let vfs = ws.analysis.compilation.get_db().get_vfs();
         assert!(vfs.file_order_key(&library_file) < vfs.file_order_key(&workspace_file));
     }
+
+    #[test]
+    fn union_callee_arms_follow_file_order_key_not_raw_disk_path() {
+        let resolve_with_library_dir = |lib_dir: &str| {
+            let mut ws = VirtualWorkspace::new();
+            let library_root = ws.virtual_url_generator.new_path(lib_dir);
+            ws.analysis.add_library_workspace(library_root.clone());
+            let library_uri =
+                lsp_types::Uri::parse_from_file_path(&library_root.join("lib.lua")).unwrap();
+            ws.analysis
+                .update_file_by_uri(
+                    &library_uri,
+                    Some(
+                        r#"
+                        ---@class LibResult
+                        ---@return LibResult
+                        function LibFn() end
+                        "#
+                        .to_string(),
+                    ),
+                )
+                .expect("library file indexed");
+            let ws_file = ws.def_file(
+                "mm_workspace/main.lua",
+                r#"
+                ---@class WsResult
+                ---@return WsResult
+                function WsFn() end
+
+                ---@type (fun(): LibResult) | nil
+                local _keep
+                local fn = (math.random() > 0.5) and LibFn or WsFn
+                local out = fn()
+                "#,
+            );
+            ws.humanize_type(ws.local_ty(ws_file, "out"))
+        };
+
+        let before = resolve_with_library_dir("aa_annotations");
+        let after = resolve_with_library_dir("zz_annotations");
+        assert_eq!(before, after);
+        assert_eq!(before, "LibResult");
+    }
 }

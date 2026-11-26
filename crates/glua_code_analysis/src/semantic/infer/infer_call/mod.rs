@@ -2016,15 +2016,14 @@ pub(crate) fn normalize_call_operator_doc_function(func: &LuaFunctionType) -> Ar
 }
 
 /// Orders a union callee's arms by what they are: a signature by its file's
-/// path and position, a function type by its rendering.
+/// canonical order key and position, a function type by its rendering.
 fn callee_arm_order_key(db: &DbIndex, arm: &LuaType) -> (u8, String, u32) {
     match arm {
         LuaType::Signature(signature_id) => (
             0,
             db.get_vfs()
-                .get_file_path(&signature_id.get_file_id())
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+                .file_order_key(&signature_id.get_file_id())
+                .to_string(),
             u32::from(signature_id.get_position()),
         ),
         LuaType::DocFunction(_) => (
