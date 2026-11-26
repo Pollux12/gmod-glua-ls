@@ -2865,6 +2865,7 @@ struct HelperSccBuilder<'a> {
     scc_of: HashMap<HelperId, usize>,
     next_scc: usize,
     summaries: HashMap<HelperId, Arc<NetHelper>>,
+    invoked_params: HashMap<HelperId, Vec<usize>>,
 }
 
 impl<'a> HelperSccBuilder<'a> {
@@ -2879,7 +2880,102 @@ impl<'a> HelperSccBuilder<'a> {
             scc_of: HashMap::default(),
             next_scc: 0,
             summaries: HashMap::default(),
+            invoked_params: HashMap::default(),
         }
+    }
+
+    fn summary(&mut self, id: &HelperId) -> Arc<NetHelper> {
+        self.summaries
+            .entry(id.clone())
+            .or_insert_with(|| helper_summary(self.db, id))
+            .clone()
+    }
+
+    /// Parameter indices of `target` that can be invoked when `target` expands,
+    /// directly or forwarded via `FnArg::Param` through direct helper calls.
+    fn invoked_params(&mut self, target: &HelperId) -> Vec<usize> {
+        if let Some(cached) = self.invoked_params.get(target) {
+            return cached.clone();
+        }
+        let mut reachable = Vec::new();
+        let mut seen = HashSet::default();
+        let mut open = vec![target.clone()];
+        seen.insert(target.clone());
+        while let Some(id) = open.pop() {
+            if self.invoked_params.contains_key(&id) {
+                continue;
+            }
+            let helper = self.summary(&id);
+            reachable.push(id);
+            for item in &helper.ops {
+                if let NetOpItem::Helper { target: sub, .. } = item
+                    && seen.insert(sub.clone())
+                {
+                    open.push(sub.clone());
+                }
+            }
+        }
+        let mut used: HashMap<HelperId, HashSet<usize>> = HashMap::default();
+        for id in &reachable {
+            let mut params = HashSet::default();
+            for item in &self.summaries[id].ops {
+                if let NetOpItem::Param { idx, .. } = item {
+                    params.insert(*idx);
+                }
+            }
+            used.insert(id.clone(), params);
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for id in &reachable {
+                let helper = self.summaries[id].clone();
+                let mut forwarded = Vec::new();
+                for item in &helper.ops {
+                    let NetOpItem::Helper {
+                        target: sub,
+                        fn_args,
+                        colon_call,
+                        ..
+                    } = item
+                    else {
+                        continue;
+                    };
+                    let sub_summary = &self.summaries[sub];
+                    if let Some(sub_used) = self.invoked_params.get(sub) {
+                        for &param_idx in sub_used {
+                            if let Some(FnArg::Param(own_idx)) =
+                                callee_fn_arg(sub_summary, fn_args, *colon_call, param_idx)
+                            {
+                                forwarded.push(*own_idx);
+                            }
+                        }
+                    } else if let Some(sub_used) = used.get(sub) {
+                        for &param_idx in sub_used {
+                            if let Some(FnArg::Param(own_idx)) =
+                                callee_fn_arg(sub_summary, fn_args, *colon_call, param_idx)
+                            {
+                                forwarded.push(*own_idx);
+                            }
+                        }
+                    }
+                }
+                if !forwarded.is_empty() {
+                    let entry = used.entry(id.clone()).or_default();
+                    for own_idx in forwarded {
+                        if entry.insert(own_idx) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        for id in reachable {
+            let mut params: Vec<usize> = used.remove(&id).into_iter().flatten().collect();
+            params.sort_unstable();
+            self.invoked_params.insert(id, params);
+        }
+        self.invoked_params.get(target).cloned().unwrap_or_default()
     }
 
     fn strongconnect(&mut self, id: &HelperId) -> usize {
@@ -2890,26 +2986,35 @@ impl<'a> HelperSccBuilder<'a> {
         self.stack.push(id.clone());
         self.on_stack.insert(id.clone());
 
-        let helper = self
-            .summaries
-            .entry(id.clone())
-            .or_insert_with(|| helper_summary(self.db, id))
-            .clone();
+        let helper = self.summary(id);
 
         let mut low = index;
         for item in &helper.ops {
             let NetOpItem::Helper {
-                target, fn_args, ..
+                target,
+                fn_args,
+                colon_call,
+                ..
             } = item
             else {
                 continue;
             };
             low = low.min(self.visit_edge(target));
-            for body in fn_args.iter().filter_map(|arg| match arg {
-                Some(FnArg::Body(body)) => Some(body),
-                _ => None,
-            }) {
-                low = low.min(self.visit_edge(body));
+            if fn_args
+                .iter()
+                .any(|arg| matches!(arg, Some(FnArg::Body(_))))
+            {
+                let invoked = self.invoked_params(target);
+                if !invoked.is_empty() {
+                    let callee = self.summary(target);
+                    for param_idx in invoked {
+                        if let Some(FnArg::Body(body)) =
+                            callee_fn_arg(&callee, fn_args, *colon_call, param_idx)
+                        {
+                            low = low.min(self.visit_edge(body));
+                        }
+                    }
+                }
             }
         }
         self.lowlinks.insert(id.clone(), low);
