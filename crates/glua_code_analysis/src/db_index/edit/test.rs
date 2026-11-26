@@ -412,7 +412,7 @@ fn a_setmetatable_instance_keeps_inherited_members_after_edit_and_reopen() {
     let consumer_id = write(&mut ws, &consumer_uri, consumer);
     let before = inherited_member(&ws, consumer_id).unwrap();
     let db = ws.analysis.compilation.get_db();
-    assert!(db.get_type_index().file_type_owners(consumer_id).unwrap().iter().any(|owner| {
+    assert!(db.get_type_index().file_type_owners(consumer_id).any(|owner| {
         matches!(db.get_type_index().get_type_cache(owner).map(|cache| cache.as_type()),
             Some(LuaType::Instance(instance)) if matches!(instance.get_base(), LuaType::TableConst(range) if range.file_id == provider_id))
     }));
@@ -841,10 +841,7 @@ fn edit_and_reevaluated(
 /// Every position-carrying identity a file's cached types name, as text.
 fn cached_identities(db: &DbIndex, file_id: FileId) -> Vec<String> {
     let mut found = Vec::new();
-    let Some(owners) = db.get_type_index().file_type_owners(file_id) else {
-        return found;
-    };
-    for owner in owners {
+    for owner in db.get_type_index().file_type_owners(file_id) {
         let Some(cache) = db.get_type_index().get_type_cache(owner) else {
             continue;
         };
@@ -1092,10 +1089,7 @@ fn live_table_ranges(db: &DbIndex, file_id: FileId) -> Vec<String> {
 /// The `LuaSignatureId`s a file's cached types name, as values.
 fn cached_signature_ids(db: &DbIndex, file_id: FileId) -> Vec<LuaSignatureId> {
     let mut found = Vec::new();
-    let Some(owners) = db.get_type_index().file_type_owners(file_id) else {
-        return found;
-    };
-    for owner in owners {
+    for owner in db.get_type_index().file_type_owners(file_id) {
         let Some(cache) = db.get_type_index().get_type_cache(owner) else {
             continue;
         };
@@ -1485,8 +1479,8 @@ fn an_identity_remap_leaves_every_owner_alone() {
     let owners: Vec<LuaTypeOwner> = db
         .get_type_index()
         .file_type_owners(file_id)
-        .map(|owners| owners.iter().cloned().collect())
-        .unwrap_or_default();
+        .cloned()
+        .collect();
     let remap = FileRemap::identity(file_id);
     for owner in owners {
         expect_that!(

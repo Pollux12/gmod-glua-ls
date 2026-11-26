@@ -1430,7 +1430,6 @@ pub struct LuaTypeIndex {
     table_literal_decls: CowCell<HashMap<FileId, HashSet<LuaDeclId>>>,
     types: CowShards<LuaTypeOwner, TypeFact>,
     cache_refs: TypeCacheRefIndex,
-    in_filed_type_owner: CowShards<FileId, HashSet<LuaTypeOwner>>,
     fact_metadata: CowShards<LuaTypeOwner, LuaTypeFactMetadata>,
     /// The files one fact's provenance and step types name, per fact owner,
     /// with the reverse map beside it. [`Self::remap_inference_facts`] visits
@@ -1573,7 +1572,6 @@ impl LuaTypeIndex {
             table_literal_decls: Default::default(),
             types: CowShards::default(),
             cache_refs: Default::default(),
-            in_filed_type_owner: Default::default(),
             fact_ref_files: Default::default(),
             fact_refs_by_file: Default::default(),
             definition_fact_ref_files: Default::default(),
@@ -2557,12 +2555,7 @@ impl LuaTypeIndex {
     }
 
     fn commit_type_cache(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
-        let file_id = owner.get_file_id();
         let replaced = self.insert_type_cache(owner.clone(), cache);
-        self.in_filed_type_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner.clone());
         if replaced && self.fact_metadata.remove(&owner).is_some() {
             self.drop_fact_refs(&owner);
             self.mark_inference_derived_state_dirty();
@@ -2572,8 +2565,8 @@ impl LuaTypeIndex {
     /// The type-cache owners recorded for a file, used to re-derive a file's
     /// decls after a late index (e.g. vgui parent chains) makes a broad fallback
     /// resolvable.
-    pub fn file_type_owners(&self, file_id: FileId) -> Option<&HashSet<LuaTypeOwner>> {
-        self.in_filed_type_owner.get(&file_id)
+    pub fn file_type_owners(&self, file_id: FileId) -> impl Iterator<Item = &LuaTypeOwner> + '_ {
+        self.types.file_entries(file_id).map(|(owner, _)| owner)
     }
 
     pub fn get_file_type_decl_ids(&self, file_id: FileId) -> Option<&Vec<LuaTypeDeclId>> {
@@ -2590,12 +2583,7 @@ impl LuaTypeIndex {
         }) {
             return;
         }
-        let file_id = owner.get_file_id();
         self.insert_type_cache(owner.clone(), cache);
-        self.in_filed_type_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner.clone());
         if self.fact_metadata.remove(&owner).is_some() {
             self.drop_fact_refs(&owner);
             self.mark_inference_derived_state_dirty();
@@ -2633,12 +2621,7 @@ impl LuaTypeIndex {
             return;
         }
 
-        let file_id = owner.get_file_id();
         self.insert_type_cache(owner.clone(), cache);
-        self.in_filed_type_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner.clone());
         self.fact_metadata.insert(owner.clone(), metadata);
         self.refresh_fact_refs(&owner);
         self.mark_inference_derived_state_dirty();
@@ -2904,10 +2887,6 @@ impl LuaTypeIndex {
             return file_id;
         }
         self.insert_type_cache(owner.clone(), cache);
-        self.in_filed_type_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner.clone());
         self.fact_metadata.insert(owner.clone(), metadata);
         self.refresh_fact_refs(&owner);
         self.record_source_write(&owner);
@@ -3028,9 +3007,6 @@ impl LuaTypeIndex {
                 }
             }
             None => {
-                if let Some(set) = self.in_filed_type_owner.get_mut(&owner.get_file_id()) {
-                    set.remove(owner);
-                }
                 if let LuaTypeOwner::Decl(decl_id) = owner {
                     self.unbind_decl(decl_id);
                 }
@@ -3292,9 +3268,6 @@ impl LuaTypeIndex {
         for member_id in member_ids {
             let owner = LuaTypeOwner::Member(*member_id);
             derivation::note_write(|| FactKey::type_cache(&owner));
-            if let Some(set) = self.in_filed_type_owner.get_mut(&member_id.file_id) {
-                set.remove(&owner);
-            }
             // `cache_refs` has to come off with the cache, the way
             // `insert_type_cache` and the file sweep both keep them in step.
             if let Some(previous) = self.types.remove(&owner) {
@@ -3330,8 +3303,11 @@ impl LuaTypeIndex {
         let candidate_owners: Vec<LuaTypeOwner> = self
             .cache_refs
             .owners_referencing_file(remap.file_id)
-            .filter_map(|owner_file_id| self.in_filed_type_owner.get(&owner_file_id))
-            .flatten()
+            .flat_map(|owner_file_id| {
+                self.types
+                    .file_entries(owner_file_id)
+                    .map(|(owner, _)| owner)
+            })
             .cloned()
             .collect();
 
@@ -4100,7 +4076,6 @@ impl LuaIndex for LuaTypeIndex {
         self.table_classes.clear();
         self.fallbacks.clear();
         self.cache_refs = Default::default();
-        self.in_filed_type_owner.clear();
         self.fact_metadata.clear();
         self.fact_ref_files.clear();
         self.fact_refs_by_file.clear();
@@ -4221,20 +4196,23 @@ impl LuaTypeIndex {
         if self.fallbacks.remove(&file_id).is_some() {
             derivation::note_write(|| FactKey::TypeFallbacks(file_id));
         }
-        if let Some(type_owners) = self.in_filed_type_owner.remove(&file_id) {
-            for type_owner in type_owners {
-                derivation::note_write(|| FactKey::type_cache(&type_owner));
-                if let LuaTypeOwner::Decl(decl_id) = &type_owner {
-                    if self.decl_write_claims.remove(decl_id).is_some() {
-                        derivation::note_write(|| FactKey::DeclClaim(*decl_id));
-                    }
-                    self.unbind_decl(decl_id);
+        let type_owners: Vec<LuaTypeOwner> = self
+            .types
+            .file_entries(file_id)
+            .map(|(owner, _)| owner.clone())
+            .collect();
+        for type_owner in type_owners {
+            derivation::note_write(|| FactKey::type_cache(&type_owner));
+            if let LuaTypeOwner::Decl(decl_id) = &type_owner {
+                if self.decl_write_claims.remove(decl_id).is_some() {
+                    derivation::note_write(|| FactKey::DeclClaim(*decl_id));
                 }
-                self.types.remove(&type_owner);
-                self.fact_metadata.remove(&type_owner);
-                self.drop_fact_refs(&type_owner);
-                self.source_types.remove(&type_owner);
+                self.unbind_decl(decl_id);
             }
+            self.types.remove(&type_owner);
+            self.fact_metadata.remove(&type_owner);
+            self.drop_fact_refs(&type_owner);
+            self.source_types.remove(&type_owner);
         }
 
         self.cache_refs.remove_file(file_id);
@@ -5200,7 +5178,6 @@ mod batch_removal_tests {
         assert_eq!(left.decl_type_binds, right.decl_type_binds);
         assert_eq!(left.type_bound_decls, right.type_bound_decls);
         assert_eq!(type_cache_types(left), type_cache_types(right));
-        assert_eq!(left.in_filed_type_owner, right.in_filed_type_owner);
         assert_eq!(left.fact_metadata, right.fact_metadata);
         assert_eq!(left.definition_facts, right.definition_facts);
         assert_eq!(
@@ -5392,7 +5369,6 @@ mod batch_removal_tests {
         assert_eq!(removed.supers_by_file, fresh.supers_by_file);
         assert_eq!(removed.sub_types, fresh.sub_types);
         assert_eq!(type_cache_types(&removed), type_cache_types(&fresh));
-        assert_eq!(removed.in_filed_type_owner, fresh.in_filed_type_owner);
         assert_eq!(removed.fact_metadata, fresh.fact_metadata);
         assert_eq!(removed.fact_ref_files, fresh.fact_ref_files);
         assert_eq!(removed.fact_refs_by_file, fresh.fact_refs_by_file);
@@ -5593,7 +5569,6 @@ crate::db_index::cow_shards::task_fork_fields!(LuaTypeIndex {
     table_literal_decls,
     types,
     cache_refs,
-    in_filed_type_owner,
     fact_metadata,
     fact_ref_files,
     fact_refs_by_file => crate::db_index::cow_shards::merge_set,
