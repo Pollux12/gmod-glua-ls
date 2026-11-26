@@ -97,9 +97,22 @@ async fn apply_document_update_without_queuing(
     outcome
 }
 
-async fn check_schema_update(context: &ServerContextSnapshot) {
+/// Re-fetches the JSON schemas an edit or a save left pending.
+///
+/// `wait` decides how the analysis read lock is taken: the save of a JSON
+/// file always waits for it, while any other save's retry takes the lock
+/// only when free, so a save's schema recheck never queues behind the
+/// re-analysis it would interrupt — the next save retries.
+async fn check_schema_update(context: &ServerContextSnapshot, wait: bool) {
     let urls = {
-        let read_analysis = context.analysis().read().await;
+        let read_analysis = if wait {
+            context.analysis().read().await
+        } else {
+            let Ok(read_analysis) = context.analysis().try_read() else {
+                return;
+            };
+            read_analysis
+        };
         if !read_analysis.check_schema_update() {
             return;
         }
@@ -112,9 +125,23 @@ async fn check_schema_update(context: &ServerContextSnapshot) {
     }
 
     let url_contents = fetch_schema_urls(urls).await;
+    if url_contents.is_empty() {
+        // Nothing resolved; applying would only take the write lock to do
+        // nothing, and the pending URLs stay queued for the next recheck.
+        return;
+    }
 
     let mut write_analysis = context.analysis().write().await;
     write_analysis.apply_fetched_schemas(url_contents);
+}
+
+/// Whether a save of `uri` can change schema inputs: a JSON file may be a
+/// fetched schema or a config that names schemas.
+fn save_can_change_schema_inputs(uri: &lsp_types::Uri) -> bool {
+    uri_to_file_path(uri).is_some_and(|path| {
+        path.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    })
 }
 
 async fn preparse_document(text: String, emmyrc: Arc<Emmyrc>) -> Option<PreparsedDocument> {
@@ -215,7 +242,7 @@ pub async fn on_did_open_text_document(
 
 pub async fn on_did_save_text_document(
     context: ServerContextSnapshot,
-    _: DidSaveTextDocumentParams,
+    params: DidSaveTextDocumentParams,
 ) -> Option<()> {
     let emmyrc = context.analysis().read().await.get_emmyrc();
     if emmyrc.workspace.enable_reindex {
@@ -224,7 +251,11 @@ pub async fn on_did_save_text_document(
         workspace.recheck_workspace(delay, context.clone()).await;
     }
 
-    check_schema_update(&context).await;
+    // A JSON save may be a fetched schema or a config that names schemas,
+    // so it always rechecks; any other save is only the retry point for
+    // schema URLs an edit registered.
+    let recheck_waits = save_can_change_schema_inputs(&params.text_document.uri);
+    check_schema_update(&context, recheck_waits).await;
     Some(())
 }
 
@@ -795,5 +826,76 @@ mod tests {
             };
             verify_that!(read.as_deref(), some(eq(NEW_TEXT)))
         })
+    }
+
+    /// Only a JSON save counts as one that can change schema inputs: a
+    /// fetched schema or a config that names schemas.
+    #[test]
+    fn only_json_saves_count_as_schema_inputs() {
+        let uri = |path: &str| lsp_types::Uri::from_str(path).expect("uri should parse");
+        assert!(save_can_change_schema_inputs(&uri(
+            "file:///w/.gluarc.json"
+        )));
+        assert!(save_can_change_schema_inputs(&uri("file:///w/.luarc.json")));
+        assert!(save_can_change_schema_inputs(&uri("file:///w/schema.json")));
+        assert!(!save_can_change_schema_inputs(&uri(
+            "file:///w/lua/autorun/init.lua"
+        )));
+    }
+
+    /// A best-effort schema recheck skips a held analysis lock instead of
+    /// waiting behind the re-analysis it would interrupt.
+    #[test]
+    fn a_best_effort_recheck_skips_a_held_analysis_lock() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (connection, _peer) = lsp_server::Connection::memory();
+            let context =
+                crate::context::ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let _held = snapshot.analysis().write().await;
+
+            let recheck = tokio::time::timeout(
+                Duration::from_millis(500),
+                check_schema_update(&snapshot, false),
+            )
+            .await;
+            assert!(
+                recheck.is_ok(),
+                "a best-effort recheck must skip a held analysis lock, not wait for it"
+            );
+        });
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// A recheck that waits — the save of a JSON file, a schema or a config
+    /// — waits for the analysis lock and completes once it is free.
+    #[test]
+    fn a_waiting_recheck_waits_for_the_analysis_lock() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (connection, _peer) = lsp_server::Connection::memory();
+            let context =
+                crate::context::ServerContext::new(connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let held = snapshot.analysis().write().await;
+
+            let recheck = {
+                let snapshot = snapshot.clone();
+                tokio::spawn(async move {
+                    check_schema_update(&snapshot, true).await;
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !recheck.is_finished(),
+                "the recheck must wait for the held analysis lock"
+            );
+
+            drop(held);
+            let done = tokio::time::timeout(Duration::from_secs(5), recheck).await;
+            assert!(done.is_ok(), "the recheck completes once the lock is free");
+        });
+        runtime.shutdown_timeout(Duration::from_secs(5));
     }
 }
